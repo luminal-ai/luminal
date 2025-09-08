@@ -7,30 +7,35 @@ description = "Deep learning at the speed of light."
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+as-any = "0.3.1"
+colored = "2.0.4"
+dyn-clone = "1.0.12"
+egg = "0.9.5"
+generational-box = "0.5.6"
+half = "*"
 itertools = "0.11.0"
 num-traits = "0.2.16"
 petgraph = "0.6.4"
 rand = "0.9.2"
-urlencoding = "2.1.2"
-webbrowser = "1.0.0"
-dyn-clone = "1.0.12"
-half = "*"
-tinyvec = { version = "1.6.0", features = ["serde"] }
-term_size = "0.3.2"
-colored = "2.0.4"
 regex = "1.9.5"
 rustc-hash = "2.1.1"
-uuid = { version = "1.7.0", features = ["v4"] }
-as-any = "0.3.1"
-egg = "0.9.5"
-symbolic_expressions = "5.0.3"
 serde = { version = "1.0.202", features = ["derive"] }
-thread_local = "1.1.8"
-generational-box = "0.5.6"
 serde_json = "1.0.140"
+symbolic_expressions = "5.0.3"
+term_size = "0.3.2"
+thread_local = "1.1.8"
+tinyvec = { version = "1.6.0", features = ["serde"] }
+urlencoding = "2.1.2"
+uuid = { version = "1.7.0", features = ["v4"] }
+webbrowser = "1.0.0"
 
 [dev-dependencies]
 dfdx = { version = "0.13", features = ["f16"] }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
 
 [workspace]
 members = [
