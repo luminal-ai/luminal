@@ -30,10 +30,14 @@ pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 #[cfg(feature = "metal")]
 pub type Function = Retained<ProtocolObject<dyn MTLFunction>>;
 
+#[cfg(feature = "blade")]
+use blade_graphics as gpu;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum GPUArch {
     CUDA,
     Metal(HashMap<usize, &'static str>),
+    Blade,
 }
 
 impl GPUArch {
@@ -179,6 +183,12 @@ impl Operator for CompatKernel {
         todo!()
     }
 }
+#[cfg(feature = "blade")]
+impl Operator for CompatKernel {
+    fn process(&mut self, _inputs: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        todo!()
+    }
+}
 
 pub fn custom_kernel(
     inputs: &[GraphTensor],
@@ -226,6 +236,12 @@ impl Operator for Diff {
         todo!()
     }
 }
+#[cfg(feature = "blade")]
+impl Operator for Diff {
+    fn process(&mut self, _inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        todo!()
+    }
+}
 
 pub trait GT2 {
     fn diff2(self, name: impl ToString) -> Self;
@@ -267,4 +283,10 @@ impl Operator for GraphBreak {
     fn process(&mut self, inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
         inp.into_iter().map(|i| i.0.cloned()).collect()
     }
+}
+
+#[cfg(feature = "blade")]
+pub struct Buffer {
+    pub raw: gpu::Buffer,
+    pub size: usize,
 }

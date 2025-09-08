@@ -1,8 +1,8 @@
 use itertools::Itertools;
 use luminal::{
     prelude::{
+        petgraph::{algo::toposort, prelude::StableGraph, visit::EdgeRef, Directed, Direction},
         NodeIndex,
-        petgraph::{Directed, Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef},
     },
     shape::{Expression, Term},
 };
@@ -13,10 +13,10 @@ use std::{
 };
 
 use crate::{
-    GMEMBuffer, GPUArch, GraphTerm, Kernel,
     debug::display_graph,
     translate::{MetaGraph, SubGraph},
     utils::validate_graph,
+    GMEMBuffer, GPUArch, GraphTerm, Kernel,
 };
 
 pub const GRID_DIMS: usize = 2;
@@ -184,7 +184,7 @@ pub fn codegen(
             return None;
         }
         let kernel_lines = kernel.into_iter().map(|s| format!("\t{s}")).join("\n");
-        let kernel = match &arch {
+        let kernel = match arch {
             GPUArch::CUDA => {
                 let inputs = inputs
                     .into_iter()
@@ -221,6 +221,72 @@ pub fn codegen(
                 )
             }
             GPUArch::Metal { .. } => {
+                let n_inputs = inputs.len();
+                let n_inputs_outputs = inputs.len() + outputs.len();
+                let mut input_string = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (buf, a))| {
+                        format!(
+                            "device float* {} [[buffer({i})]],{}",
+                            var_to_char(node_to_var[&a].0),
+                            if let GMEMBuffer::Input { node } = buf {
+                                format!(" // GMEM({})", gmem_names[&node])
+                            } else {
+                                "".to_string()
+                            }
+                        )
+                    })
+                    .chain(outputs.iter().enumerate().map(|(i, (_, n))| {
+                        format!(
+                            "device float* {} [[buffer({})]], // Output",
+                            var_to_char(node_to_var[&n].0),
+                            n_inputs + i
+                        )
+                    }))
+                    .chain(dyn_vars.iter().sorted().enumerate().map(|(i, (c, _))| {
+                        format!(
+                            "constant uint& const_{c} [[buffer({})]]",
+                            i + n_inputs_outputs
+                        )
+                    }))
+                    .collect_vec();
+                *input_string.last_mut().unwrap() = input_string.last().unwrap().replace(",", " ");
+                let (smem_setup, smem_input) = if smem_buffers.is_empty() {
+                    ("".to_string(), "".to_string())
+                } else {
+                    (
+                        smem_buffers
+                            .iter()
+                            .scan("".to_string(), |prev_buffers, (n, _, size)| {
+                                let r = format!(
+                                    "\tthreadgroup float* {} = sm{prev_buffers};\n",
+                                    var_to_char(*n)
+                                );
+                                prev_buffers.push_str(&format!(" + {size}"));
+                                Some(r)
+                            })
+                            .join(""),
+                        ", threadgroup float* sm [[threadgroup(0)]]".to_string(),
+                    )
+                };
+                // println!("is this getting reached?");
+
+                format!(
+                    "#include <metal_stdlib>
+using namespace metal;
+kernel void kernel_name(
+	uint3 blockIdx [[threadgroup_position_in_grid]],
+	uint3 threadIdx [[thread_position_in_threadgroup]],
+	{}{smem_input}
+) {{
+{smem_setup}{kernel_lines}
+}}",
+                    input_string.join("\n\t")
+                )
+            }
+            GPUArch::Blade => {
+                //TODO: proper WGSL
                 let n_inputs = inputs.len();
                 let n_inputs_outputs = inputs.len() + outputs.len();
                 let mut input_string = inputs
@@ -807,6 +873,7 @@ fn make_kernel(
                 let sync_barrier = match arch {
                     GPUArch::CUDA => "__syncthreads()",
                     GPUArch::Metal(_) => "threadgroup_barrier(mem_flags::mem_threadgroup)",
+                    GPUArch::Blade => "storageBarrier(); workgroupBarrier()",
                 };
                 match term {
                     GraphTerm::SMEMLoad => {
@@ -1528,7 +1595,7 @@ pub fn stitch_meta_graph_together(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GPUArch, GraphTerm, Kernel, translate::SubGraph};
+    use crate::{translate::SubGraph, GPUArch, GraphTerm, Kernel};
     use std::collections::HashMap;
 
     #[test]

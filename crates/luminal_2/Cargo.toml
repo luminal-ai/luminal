@@ -7,6 +7,7 @@ edition = "2024"
 default = []
 cuda = ["dep:cudarc", "dep:luminal_cuda"]
 metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+blade = ["dep:blade-graphics"]
 
 [dependencies]
 luminal = { path = "../../" }
@@ -42,3 +43,4 @@ objc2-foundation = { version = "0.3.1", optional = true }
 eframe = "0.28"
 egui = "0.28"
 anyhow = "1.0.99"
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "2f86d1b94fd8d9fee4e3649bb09f7e0529450ee7", optional = true }

@@ -13,6 +13,8 @@ use crate::{Buffer, Device};
 use crate::{GPUArch, GraphTerm};
 #[cfg(feature = "cuda")]
 use anyhow::Result;
+#[cfg(feature = "blade")]
+use blade_graphics as gpu;
 use colored::Colorize;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaContext, CudaSlice, DriverError};
@@ -55,7 +57,7 @@ where
     objc2::rc::autoreleasepool(|_| f())
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(not(feature = "cuda"))]
 #[inline]
 fn with_autoreleasepool<F, R>(f: F) -> R
 where
@@ -361,7 +363,7 @@ pub fn search(
         };
         possibles += 1;
         // let inputs = inputs.into_iter().filter_map(|(l, d)| graph.node_indices().find(|n| matches!(graph.node_weight(*n).unwrap(), GraphTerm::GMEM { label } if label == l)).map(|i| (i, d.clone()))).collect_vec();
-        match &arch {
+        match arch {
             GPUArch::CUDA => {
                 let k = print_kernels(&kernels);
                 if seen.contains(&k) {
@@ -444,6 +446,79 @@ pub fn search(
                 } else {
                     seen.insert(k);
                 }
+                if let Some((us, outs)) = cost(
+                    &graph,
+                    &kernels,
+                    &node_index_to_init_data,
+                    &gmem_mapping,
+                    dyn_vars,
+                ) {
+                    valid_graphs += 1;
+                    if let Some((progress, logs, title, _)) = &ui_functions {
+                        progress(((n as f32 / total_trajectories as f32) * 100.0) as u16);
+                        logs(print_kernels(&kernels));
+                        title(format!("Graph {valid_graphs} {us}µs"));
+                    } else if option_env!("DEBUG").is_some() {
+                        println!("{}", print_kernels(&kernels));
+                        println!("Graph {valid_graphs} {us}µs");
+                        if ref_outputs.is_empty() {
+                            ref_outputs = outs;
+                            println!("{}", "Initial".bold().on_bright_green());
+                        } else {
+                            for (a, b) in ref_outputs.iter().zip(&outs) {
+                                for (x, y) in a.iter().zip(b) {
+                                    if (x - y).abs() >= 1e-3 {
+                                        if option_env!("DEBUG").is_some() {
+                                            // display_graph(&graph, &[]);
+                                            println!(
+                                                "REF: {:?}",
+                                                &ref_outputs
+                                                    .iter()
+                                                    .map(|v| &v[..v.len().min(20)])
+                                                    .collect_vec()
+                                            );
+                                            println!(
+                                                "New: {:?}",
+                                                &outs
+                                                    .iter()
+                                                    .map(|v| &v[..v.len().min(20)])
+                                                    .collect_vec()
+                                            );
+                                            // crate::utils::generate_proof(&og, &graph);
+                                            println!("{}", og_kernels);
+                                            println!("{}", print_kernels(&kernels));
+                                            crate::debug::display_multiple_graphs(&[&og, &graph]);
+                                            panic!(
+                                                "{} {x} != {y}",
+                                                "Output Mismatch".bold().on_bright_red()
+                                            );
+                                        }
+                                        continue 'trajectory_loop;
+                                    }
+                                }
+                            }
+                            println!("{}", "Outputs Validated".bold().on_bright_green());
+                        }
+                    }
+                    let kernel_string = print_kernels(&kernels);
+                    if og_kernels.is_empty() {
+                        og_kernels = kernel_string.clone();
+                    }
+                    if us < best_time {
+                        best_time = us;
+                        best_graph = Some(graph);
+                        fastest = kernel_string;
+                    }
+                }
+            }
+            GPUArch::Blade => {
+                let k = print_kernels(&kernels);
+                if seen.contains(&k) {
+                    continue;
+                } else {
+                    seen.insert(k);
+                }
+                //TODO: proper WGSL
                 if let Some((us, outs)) = cost(
                     &graph,
                     &kernels,
@@ -759,12 +834,15 @@ fn cost<'a>(
     with_autoreleasepool(|| {
         // Get buffer info
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
-        let compiled_kernels = compile_kernels(&kernels);
         #[cfg(feature = "metal")]
         let device = MTLCreateSystemDefaultDevice().unwrap();
         #[cfg(feature = "cuda")]
-        let ctx = CudaContext::new(0).unwrap(); // will need to expand beyond single host
-                                                // Copy input buffers over
+        let device = CudaContext::new(0).unwrap(); // will need to expand beyond single host
+        #[cfg(feature = "blade")]
+        let device = unsafe { gpu::Context::init(gpu::ContextDesc::default()).unwrap() };
+        let compiled_kernels = compile_kernels(&device, &kernels);
+
+        // Copy input buffers over
         let mut inputs = inputs
             .into_iter()
             .map(|(n, b)| {
@@ -774,7 +852,9 @@ fn cost<'a>(
                         #[cfg(feature = "metal")]
                         copy_metal_buffer(&b.clone().to_vec(dyn_vars), &device),
                         #[cfg(feature = "cuda")]
-                        copy_cuda_buffer(&b.clone().to_vec(dyn_vars), ctx.clone()),
+                        copy_cuda_buffer(&b.clone().to_vec(dyn_vars), &device),
+                        #[cfg(feature = "blade")]
+                        copy_blade_buffer(&b.clone().to_vec(dyn_vars), &device),
                         false,
                     ),
                 )
@@ -784,6 +864,7 @@ fn cost<'a>(
         for _ in 0..WARMUP_TRIALS {
             #[cfg(feature = "metal")]
             run_graph(
+                &device,
                 &graph,
                 &mut inputs,
                 &kernels,
@@ -792,8 +873,9 @@ fn cost<'a>(
                 &int_buffers,
                 &int_buffer_map,
             );
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "blade"))]
             run_graph(
+                &device,
                 &mut inputs,
                 &kernels,
                 dyn_vars,
@@ -811,6 +893,7 @@ fn cost<'a>(
                 #[cfg(feature = "metal")]
                 {
                     run_graph(
+                        &device,
                         &graph,
                         &mut inputs,
                         &kernels,
@@ -821,9 +904,10 @@ fn cost<'a>(
                     )
                 }
 
-                #[cfg(feature = "cuda")]
+                #[cfg(any(feature = "cuda", feature = "blade"))]
                 {
                     run_graph(
+                        &device,
                         &mut inputs,
                         &kernels,
                         dyn_vars,
@@ -842,12 +926,14 @@ fn cost<'a>(
             outputs.iter().map(copy_metal_buffer_back).collect_vec(),
             #[cfg(feature = "cuda")]
             outputs.iter().map(copy_cuda_buffer_back).collect_vec(),
+            #[cfg(feature = "blade")]
+            outputs.iter().map(copy_blade_buffer_back).collect_vec(),
         ))
     })
 }
 
 #[cfg(feature = "cuda")]
-pub fn copy_cuda_buffer(v: &[f32], ctx: Arc<CudaContext>) -> CudaSlice<f32> {
+pub fn copy_cuda_buffer(v: &[f32], ctx: &CudaContext) -> CudaSlice<f32> {
     assert!(!v.is_empty(), "Can't copy empty slice to device");
 
     // Then copy host data to the allocated device memory
@@ -864,7 +950,7 @@ pub fn copy_cuda_buffer_back(buf: &CudaSlice<f32>) -> Vec<f32> {
 }
 
 #[cfg(feature = "metal")]
-pub fn copy_metal_buffer(v: &Vec<f32>, device: &Device) -> Buffer {
+pub fn copy_metal_buffer(v: &[f32], device: &Device) -> Buffer {
     assert!(v.len() > 0);
     unsafe {
         let ptr = NonNull::new(v.as_ptr() as *mut c_void).unwrap();
@@ -885,6 +971,29 @@ pub fn copy_metal_buffer_back(v: &Buffer) -> Vec<f32> {
         *d = unsafe { *ptr.add(i) };
     }
     data
+}
+
+#[cfg(feature = "blade")]
+pub fn copy_blade_buffer(v: &[f32], ctx: &gpu::Context) -> super::Buffer {
+    assert!(!v.is_empty(), "Can't copy empty slice to device");
+    let buffer = ctx.create_buffer(gpu::BufferDesc {
+        name: "upload",
+        size: (v.len() * size_of::<f32>()) as u64,
+        memory: gpu::Memory::Shared,
+    });
+    unsafe {
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buffer.data() as *mut f32, v.len());
+    }
+    super::Buffer {
+        raw: buffer,
+        size: v.len() * size_of::<f32>(),
+    }
+}
+
+#[cfg(feature = "blade")]
+pub fn copy_blade_buffer_back(v: &super::Buffer) -> Vec<f32> {
+    let count = v.size / size_of::<f32>();
+    unsafe { std::slice::from_raw_parts(v.raw.data() as *const f32, count) }.to_vec()
 }
 
 pub fn make_test_inputs(

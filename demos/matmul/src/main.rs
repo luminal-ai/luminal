@@ -7,6 +7,8 @@ use luminal::prelude::{
     petgraph::{visit::EdgeRef, Direction},
     *,
 };
+#[cfg(feature = "blade")]
+use luminal_2::Buffer;
 use luminal_2::{
     codegen::{codegen, stitch_meta_graph_together},
     extract::{make_test_inputs, search},
@@ -20,21 +22,19 @@ use luminal_2::{Buffer, Device};
 use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
 use rustc_hash::FxHashMap;
 
-#[cfg(feature = "metal")]
 #[inline]
 fn with_autoreleasepool<F: FnOnce()>(f: F) {
+    #[cfg(feature = "metal")]
     objc2::rc::autoreleasepool(|_| f());
+    #[cfg(not(feature = "metal"))]
+    f();
 }
 
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
-#[cfg(feature = "cuda")]
-#[inline]
-fn with_autoreleasepool<F: FnOnce()>(f: F) {
-    // Non-Apple or no "metal" feature: just run the closure
-    f();
-}
+#[cfg(feature = "blade")]
+use blade_graphics as gpu;
 
 fn main() {
     with_autoreleasepool(|| {
@@ -45,6 +45,8 @@ fn main() {
         let arch = GPUArch::Metal(HashMap::default());
         #[cfg(feature = "cuda")]
         let arch = GPUArch::CUDA;
+        #[cfg(feature = "blade")]
+        let arch = GPUArch::Blade;
 
         #[allow(non_snake_case)]
         let (M, K, N) = (512, 512, 512);
@@ -125,13 +127,15 @@ fn main() {
         let (kernels, gmem_mapping) =
             codegen(graph.clone(), outputs, arch, 0, &HashMap::default()).unwrap();
 
-        let compiled = compile_kernels(&kernels);
-        let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
-
         #[cfg(feature = "metal")]
         let device = &MTLCreateSystemDefaultDevice().unwrap();
         #[cfg(feature = "cuda")]
         let device = &CudaContext::new(0).unwrap();
+        #[cfg(feature = "blade")]
+        let device = &unsafe { gpu::Context::init(gpu::ContextDesc::default()) }.unwrap();
+
+        let compiled = compile_kernels(&device, &kernels);
+        let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
 
         let mut inputs = FxHashMap::default();
         inputs.insert(
@@ -159,32 +163,17 @@ fn main() {
             }
         }
 
-        let (outputs, _) = {
+        let (outputs, _) = run_graph(
+            &device,
             #[cfg(feature = "metal")]
-            {
-                run_graph(
-                    &graph,
-                    &mut inputs,
-                    &kernels,
-                    &FxHashMap::default(),
-                    &compiled,
-                    &int_buffers,
-                    &int_buffer_map,
-                )
-            }
-
-            #[cfg(feature = "cuda")]
-            {
-                run_graph(
-                    &mut inputs,
-                    &kernels,
-                    &FxHashMap::default(),
-                    &compiled,
-                    &int_buffers,
-                    &int_buffer_map,
-                )
-            }
-        };
+            &graph,
+            &mut inputs,
+            &kernels,
+            &FxHashMap::default(),
+            &compiled,
+            &int_buffers,
+            &int_buffer_map,
+        );
         println!("{:?}", &copy_buffer_back(&outputs[0])[..10]);
     });
 }
@@ -227,4 +216,27 @@ pub fn copy_buffer_back(v: &Buffer) -> Vec<f32> {
         *d = unsafe { *ptr.add(i) };
     }
     data
+}
+
+#[cfg(feature = "blade")]
+pub fn copy_buffer(v: &[f32], ctx: &gpu::Context) -> Buffer {
+    assert!(!v.is_empty(), "Can't copy empty slice to device");
+    let buffer = ctx.create_buffer(gpu::BufferDesc {
+        name: "upload",
+        size: (v.len() * size_of::<f32>()) as u64,
+        memory: gpu::Memory::Shared,
+    });
+    unsafe {
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buffer.data() as *mut f32, v.len());
+    }
+    Buffer {
+        raw: buffer,
+        size: v.len() * size_of::<f32>(),
+    }
+}
+
+#[cfg(feature = "blade")]
+pub fn copy_buffer_back(v: &Buffer) -> Vec<f32> {
+    let count = v.size / size_of::<f32>();
+    unsafe { std::slice::from_raw_parts(v.raw.data() as *const f32, count) }.to_vec()
 }
