@@ -316,11 +316,16 @@ pub fn compile_kernels(
     kernels: &StableGraph<Kernel, (usize, usize)>,
 ) -> FxHashMap<String, gpu::Shader> {
     let mut compiled = FxHashMap::default();
+    let mut kernel_i = 0;
     for kernel in kernels.node_weights() {
         if !compiled.contains_key(&kernel.code)
             && kernel.code != "Inputs"
             && kernel.code != "Outputs"
         {
+            //TEMP
+            std::fs::write(format!("kernel-{}.wgsl", kernel_i), &kernel.code).unwrap();
+            kernel_i += 1;
+
             let shader = ctx.create_shader(gpu::ShaderDesc {
                 source: &kernel.code,
             });
