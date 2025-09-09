@@ -117,7 +117,7 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
         match op {
             "Constant" => {
                 // attribute 'value' -> TensorProto
-                let out_name = n.output.get(0).cloned().unwrap_or_default();
+                let out_name = n.output.first().cloned().unwrap_or_default();
                 let attr = n
                     .attribute
                     .iter()
@@ -205,9 +205,7 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
                     bb = bb.permute((1, 0)).reshape((n, m));
                 }
                 let mut y = aa.matmul(bb) * alpha;
-                if let Some(cc) = c {
-                    y = y + cc * beta;
-                }
+                if let Some(cc) = c { y += cc * beta; }
                 set_output(ctx, n, y);
             }
             "Softmax" => {
@@ -233,10 +231,10 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
                     .copied()
                     .ok_or_else(|| OnnxImportError::MissingInput(shape_name.clone()))?;
                 // Pull shape values from Tensor if constant
-                let mut new_shape_ints: Vec<i64> =
+                let new_shape_ints: Vec<i64> =
                     shape_const.data().into_iter().map(|e| e as i64).collect();
                 let mut shape_spec: Vec<usize> = Vec::with_capacity(new_shape_ints.len());
-                for (i, v) in new_shape_ints.iter().enumerate() {
+                for v in new_shape_ints.iter() {
                     if *v == -1 {
                         shape_spec.push(usize::MAX - 1);
                     } else if *v == 0 {
@@ -286,9 +284,7 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
                 let mut out = a;
                 // Insert in sorted order to maintain correct indexes
                 axes.sort();
-                for ax in axes {
-                    out = out.unsqueeze(ax as usize);
-                }
+                for ax in axes { out = out.unsqueeze(ax); }
                 set_output(ctx, n, out);
             }
             "Squeeze" => {
@@ -316,10 +312,7 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
                 }
                 let mut dims = a.dims();
                 if axes.is_empty() {
-                    dims = dims
-                        .into_iter()
-                        .filter(|d| d.to_usize().unwrap_or(1) != 1)
-                        .collect();
+                    dims.retain(|d| d.to_usize().unwrap_or(1) != 1);
                 } else {
                     // remove given axes
                     axes.sort();
@@ -436,7 +429,7 @@ fn value_info_shape(ctx: &mut Ctx, vi: &onnx::ValueInfoProto) -> Option<Vec<Expr
     Some(to_dims(ctx, &dim_vals))
 }
 
-fn to_dims(ctx: &mut Ctx, dims: &Vec<Option<i64>>) -> Vec<Expression> {
+fn to_dims(ctx: &mut Ctx, dims: &[Option<i64>]) -> Vec<Expression> {
     let mut out = vec![];
     for (i, d) in dims.iter().enumerate() {
         match d {

@@ -165,7 +165,7 @@ fn main() {
         let output_id = argmax(&logits.data());
         logits.drop();
         output_ids.push(output_id);
-        println!("ID: {}", output_id);
+        println!("ID: {output_id}");
 
         // Get the current decoded output
         let current_output = tokenizer.decode(&output_ids, false).unwrap();

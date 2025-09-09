@@ -145,9 +145,7 @@ fn test_import_and_run() {
 
     // Build inputs
     let mut x_data = vec![0f32; (n * in_dim) as usize];
-    for i in 0..x_data.len() {
-        x_data[i] = ((i as f32) * 0.2).sin();
-    }
+    for (i, v) in x_data.iter_mut().enumerate() { *v = ((i as f32) * 0.2).sin(); }
     let _x = res
         .inputs
         .get("X")
@@ -181,6 +179,6 @@ fn test_import_and_run() {
 
     assert_eq!(y.len(), y_ref.len());
     for (a, b) in y.iter().zip(y_ref.iter()) {
-        assert!((a - b).abs() < 1e-3, "{} vs {}", a, b);
+        assert!((a - b).abs() < 1e-3, "{a} vs {b}");
     }
 }
