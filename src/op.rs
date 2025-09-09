@@ -181,7 +181,7 @@ impl Operator for Constant {
 
 /// Graph break for chunking search graphs
 #[derive(Clone, PartialEq)]
-pub struct GraphBreak(pub ConstantValue, pub *const FxHashMap<char, usize>);
+pub struct GraphBreak;
 impl Debug for GraphBreak {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GraphBreak")
@@ -189,8 +189,8 @@ impl Debug for GraphBreak {
 }
 
 impl Operator for GraphBreak {
-    fn process(&mut self, _: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
-        unimplemented!()
+    fn process(&mut self, inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        inp.into_iter().map(|(t, _)| t.cloned()).collect() // inefficient, but we don't care as this won't execute on the kernel
     }
 }
 

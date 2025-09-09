@@ -1,3 +1,5 @@
+#![allow(unreachable_code)]
+
 use std::{
     io::{self, Write},
     time::Instant,
@@ -30,6 +32,9 @@ pub struct CLIArgs {
 }
 
 fn main() {
+    #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
+    panic!("Either metal or cuda feature must be used for this example!");
+
     let cli_args = CLIArgs::parse();
     let tokenizer = Tokenizer::from_file("setup/tokenizer.json").unwrap();
 
@@ -83,8 +88,6 @@ fn main() {
                 luminal_cuda::CudaCompiler::<f16>::default(),
                 luminal_cuda::CudaQuantizedCompiler::<f16>::new(q_weights),
             ),
-            #[cfg(all(not(feature = "metal"), not(feature = "cuda")))]
-            luminal_cpu::CPUCompiler::default(),
         ),
         (
             &mut input,
@@ -162,12 +165,19 @@ fn main() {
         let current_output = tokenizer.decode(&output_ids, false).unwrap();
 
         // Print the new substring added to the decoded output
-        print!("{}", current_output[prev_output_len..].bright_green());
-        io::stdout().flush().unwrap();
+        let legal_byte_num = utf8_legal_byte_num(current_output.as_bytes()[prev_output_len]);
+        if let Some(byte_num) = legal_byte_num {
+            if current_output.len() > legal_byte_num.unwrap() + prev_output_len {
+                print!(
+                    "{}",
+                    current_output[prev_output_len..prev_output_len + byte_num].bright_green()
+                );
+                io::stdout().flush().unwrap();
 
-        // Update the previous output
-        prev_output_len = current_output.len();
-
+                // Update the previous output
+                prev_output_len += byte_num
+            }
+        }
         // Swap caches
         transfer_data_same_graph(&cache_dest, &cache_src, &mut cx);
     }
@@ -187,4 +197,20 @@ fn argmax(dist: &[f32]) -> u32 {
     dist.iter()
         .position_max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap() as u32
+}
+
+/// return utf8 char num corresponding to start byte, if it's not a start byte return [`None`]
+fn utf8_legal_byte_num(byte: u8) -> Option<usize> {
+    match byte {
+        // ASCII  (0xxxxxxx)
+        0x00..=0x7F => Some(1),
+        // char of 2 bytes (110xxxxx)
+        0xC0..=0xDF => Some(2),
+        // char of 3 bytes (1110xxxx)
+        0xE0..=0xEF => Some(3),
+        // char of 4 bytes (11110xxx)
+        0xF0..=0xF7 => Some(4),
+        // not a start byte
+        _ => None,
+    }
 }

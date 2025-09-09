@@ -9,10 +9,10 @@ luminal::test_imports!();
 
 unary_test!(|a| a.sin(), |a| a.sin(), test_sin, f32);
 unary_test!(|a| a.sqrt(), |a| a.sqrt(), test_sqrt, f32);
-unary_test!(|a| a.reciprocal(), |a| a.reciprocal(), test_reciprocal, f32);
+unary_test!(|a| a.reciprocal(), |a| a.recip(), test_reciprocal, f32);
 unary_test!(|a| a * a, |a| a.clone() * a, test_square, f32);
-unary_test!(|a| a.log(), |a| a.log(), test_log, f32);
-unary_test!(|a| a.log2(), |a| a.log() / 2_f32.ln(), test_log2, f32);
+unary_test!(|a| a.log(), |a| a.ln(), test_log, f32);
+unary_test!(|a| a.log2(), |a| a.ln() / 2_f32.ln(), test_log2, f32);
 unary_test!(|a| a.exp2(), |a| (a * 2_f32.ln()).exp(), test_exp2, f32);
 unary_test!(
     |a| a.softmax(0),
@@ -37,8 +37,8 @@ binary_test!(
     test_mod,
     f32
 );
-binary_test!(|a, b| a.min(b), |a, b| a.minimum(b), test_min, f32);
-binary_test!(|a, b| a.max(b), |a, b| a.maximum(b), test_max, f32);
+binary_test!(|a, b| a.minimum(b), |a, b| a.minimum(b), test_min, f32);
+binary_test!(|a, b| a.maximum(b), |a, b| a.maximum(b), test_max, f32);
 
 #[test]
 fn test_contiguous() {

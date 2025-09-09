@@ -61,6 +61,8 @@ impl GraphTensor {
                 // Sum Reduce
                 mul.sum(4)
             } else if rhs.shape.len() == 4 {
+                assert_eq!(self.dims()[0], rhs.dims()[0]);
+                assert_eq!(self.dims()[1], rhs.dims()[1]);
                 // ABCDxABDE -> ABCE
                 let (_, _, _, e) = rhs.dims4();
                 // Reshape

@@ -11,22 +11,20 @@ First we'll take a look at what the simplest program will look like:
 ```rust
 use luminal::prelude::*;
 
-// Setup graph and tensors (1)
+// Setup graph and tensors
 let mut cx = Graph::new();
-let a = cx.new_tensor::<R1<3>>()
-    .set(vec![1.0, 2.0, 3.0]);
-let b = cx.new_tensor::<R1<3>>()
-    .set(vec![1.0, 2.0, 3.0]);
+let a = cx.tensor((3, 1)).set([[1.0], [2.0], [3.0]]);
+let b = cx.tensor((1, 4)).set([[1.0, 2.0, 3.0, 4.0]]);
 
-// Actual operations (2)
-let c = (a + b).retrieve();
+// Do math...
+let mut c = a.matmul(b).retrieve();
 
-// Run graph (3)
+// Compile and run graph
+cx.compile(<(GenericCompiler, CPUCompiler)>::default(), &mut c);
 cx.execute();
 
-// Get result (4)
+// Get result
 println!("Result: {:?}", c);
-// Prints out [2.0, 4.0, 6.0]
 ```
 Wow! A lot is going on here just to add two tensors together. That's because luminal isn't really designed for such simple computation, and there's little benefit to using it here. But we'll see it pay off when we start doing more complex operations.
 

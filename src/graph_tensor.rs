@@ -273,8 +273,13 @@ impl Debug for GraphTensor {
         let shape = shape.shape_usize();
         writeln!(f, "Tensor with Shape: {shape:?}")?;
 
-        // Print the data by going dimension by dimension, recursively
-        pretty_print_tensor_recursive(f, &self.data(), &shape, 0)
+        if self.graph().tensors.contains_key(&(self.id, 0)) {
+            // Print the data by going dimension by dimension, recursively
+            pretty_print_tensor_recursive(f, &self.data(), &shape, 0)
+        } else {
+            // Print for empty tensors
+            writeln!(f, "Tensor is empty.")
+        }
     }
 }
 

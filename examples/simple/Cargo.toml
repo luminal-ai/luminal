@@ -9,8 +9,6 @@ edition = "2021"
 itertools = "0.14.0"
 luminal = { path = "../.." }
 luminal_nn = {path="../../crates/luminal_nn"}
-#luminal_2 = {path="../../crates/luminal_2"}
-#metal = "0.32.0"
 rand = "0.9.1"
 regex = "1.11.1"
 serde_json = "1.0.140"

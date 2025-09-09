@@ -7,7 +7,6 @@ fn main() {
                 println!("{}", format!("Success: {s:?}").bright_green().bold())
             }
             println!("Kernel: {}", el_repr.bold());
-            println!("Nvidia CUDA:\n{}", include_str!("code.c").bright_green());
             // println!("{serialized}");
         }
         Err(e) => println!("{e}"),
@@ -15,40 +14,59 @@ fn main() {
 }
 
 use colored::Colorize;
-use egglog::{EGraph, Error, Term, TermDag, ast::Literal, var};
+use egglog::{EGraph, Error, var};
+
+/// Optional imports for graphviz feature
+#[cfg(feature = "graphvis")]
+use egglog::{Term, TermDag, ast::Literal};
+#[cfg(feature = "graphvis")]
 use petgraph::{Directed, graph::NodeIndex, prelude::StableGraph};
+#[cfg(feature = "graphvis")]
 use regex::Regex;
+#[cfg(feature = "graphvis")]
 use std::collections::HashMap;
 
 /// Runs an Egglog program from a string and returns its output messages.
 pub fn run_egglog_program(code: &str) -> Result<(Vec<String>, String, String), Error> {
     // Create a fresh EGraph with all the defaults
     let mut egraph = EGraph::default();
-    egraph.enable_messages();
     // The first argument is an optional “filename” used for error messages;
     // here we don’t have one, so pass None.
     let commands = egraph.parser.get_program_from_string(None, code)?;
-    let msgs = egraph.run_program(commands)?;
-    println!("Run Report:  {}", egraph.get_run_report().as_ref().unwrap());
+    let msgs: Vec<String> = egraph
+        .run_program(commands)?
+        .into_iter()
+        .filter_map(|output| {
+            // Convert to string and trim whitespace (like trailing newlines)
+            let s = output.to_string().trim().to_string();
+            // Only keep the string if it's not empty
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .collect();
+    println!("Run Report:  {}", egraph.get_overall_run_report());
     let (sort, value) = egraph.eval_expr(&var!("one_output"))?;
-    let (termdag, root, _) = egraph.extract_value(&sort, value)?; 
+    let (termdag, root, _) = egraph.extract_value(&sort, value)?;
     // Remove the underscore prefix and uncomment the display_graph call to display the graph in GraphViz.
-    let (_petgraph, _root_idx) = dag_to_petgraph(&termdag, root.clone());
-    // display_graph(&petgraph, &[root_idx]);
+    #[cfg(feature = "graphvis")]
+    {
+        let (petgraph, root_idx) = dag_to_petgraph(&termdag, root.clone());
+        display_graph(&petgraph, &[root_idx]);
+    }
     let s = egraph.serialize(egglog::SerializeConfig {
         root_eclasses: vec![(sort, value)],
         ..Default::default()
     });
     println!(
         "Nodes: {} Roots: {} Class Data: {}",
-        s.nodes.len(),
-        s.root_eclasses.len(),
-        s.class_data.len()
+        s.egraph.nodes.len(),
+        s.egraph.root_eclasses.len(),
+        s.egraph.class_data.len()
     );
-    let json = serde_json::to_string_pretty(&s).unwrap();
+    let json = serde_json::to_string_pretty(&s.egraph).unwrap();
     Ok((msgs, json, termdag.to_string(&root)))
 }
 
+#[cfg(feature = "graphvis")]
 fn dag_to_petgraph(dag: &TermDag, root: Term) -> (StableGraph<String, u8, Directed>, NodeIndex) {
     let mut graph: StableGraph<String, u8, Directed> = StableGraph::new();
     let mut map: HashMap<Term, NodeIndex> = HashMap::new();
@@ -95,6 +113,7 @@ fn dag_to_petgraph(dag: &TermDag, root: Term) -> (StableGraph<String, u8, Direct
 }
 
 /// View a debug graph in the browser
+#[cfg(feature = "graphvis")]
 pub fn display_graph(
     graph: &petgraph::stable_graph::StableGraph<String, u8, petgraph::Directed, u32>,
     mark_nodes: &[NodeIndex],

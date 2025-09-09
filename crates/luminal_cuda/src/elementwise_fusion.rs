@@ -702,8 +702,8 @@ mod tests {
         let x1 = split.slice((.., .., .., .., 1..)).contiguous();
 
         // Apply sin and cos embeddings
-        let x0_out = x0 * emb.cos().expand_to(x0.shape) - x1 * emb.sin().expand_to(x1.shape);
-        let x1_out = x0 * emb.sin().expand_to(x0.shape) + x1 * emb.cos().expand_to(x1.shape);
+        let x0_out = x0 * emb.cos().expand(x0.shape) - x1 * emb.sin().expand(x1.shape);
+        let x1_out = x0 * emb.sin().expand(x0.shape) + x1 * emb.cos().expand(x1.shape);
 
         // Combine back into output
         let mut out = x0_out
@@ -783,8 +783,8 @@ mod tests {
             let x1 = split.slice((.., .., .., .., 1..));
 
             // Apply sin and cos embeddings
-            let x0_out = x0 * emb.cos().expand_to(x0.shape) - x1 * emb.sin().expand_to(x1.shape);
-            let x1_out = x0 * emb.sin().expand_to(x0.shape) + x1 * emb.cos().expand_to(x1.shape);
+            let x0_out = x0 * emb.cos().expand(x0.shape) - x1 * emb.sin().expand(x1.shape);
+            let x1_out = x0 * emb.sin().expand(x0.shape) + x1 * emb.cos().expand(x1.shape);
 
             // Combine back into output
             x0_out.concat_along(x1_out, 4).reshape(input.shape)

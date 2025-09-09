@@ -9,7 +9,7 @@ edition = "2021"
 itertools = "0.12.1"
 luminal = { path = "../.." }
 rustc-hash = "1.1.0"
-rand = "0.8.5"
+rand = "0.9.2"
 
 [dev-dependencies]
 dfdx = { version = "0.13", features = ["f16"] }

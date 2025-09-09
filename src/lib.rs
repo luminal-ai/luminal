@@ -14,6 +14,7 @@ pub mod prelude {
     pub use crate::generic_compiler::*;
     pub use crate::graph::*;
     pub use crate::graph_tensor::*;
+    pub use crate::hl_ops::binary::F32Pow;
     pub use crate::hl_ops::*;
     pub use crate::module::*;
     pub use crate::op::*;

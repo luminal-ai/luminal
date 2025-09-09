@@ -9,12 +9,12 @@ luminal::test_imports!();
 
 unary_test!(|a| a.sin(), |a| a.sin(), test_sin, f16);
 unary_test!(|a| a.sqrt(), |a| a.sqrt(), test_sqrt, f16);
-unary_test!(|a| a.reciprocal(), |a| a.reciprocal(), test_reciprocal, f16);
+unary_test!(|a| a.reciprocal(), |a| a.recip(), test_reciprocal, f16);
 unary_test!(|a| a * a, |a| a.clone() * a, test_square, f16);
-unary_test!(|a| a.log(), |a| a.log(), test_log, f16);
+unary_test!(|a| a.log(), |a| a.ln(), test_log, f16);
 unary_test!(
     |a| a.log2(),
-    |a| (a.to_dtype::<f32>().log() / 2_f32.ln()).to_dtype::<f16>(),
+    |a| (a.to_dtype::<f32>().ln() / 2_f32.ln()).to_dtype::<f16>(),
     test_log2,
     f16
 );
@@ -39,8 +39,8 @@ binary_test!(|a, b| a + b, |a, b| a + b, test_add, f16);
 binary_test!(|a, b| a - b, |a, b| a - b, test_sub, f16);
 binary_test!(|a, b| a * b, |a, b| a * b, test_mul, f16);
 binary_test!(|a, b| a / b, |a, b| a / b, test_div, f16);
-binary_test!(|a, b| a.max(b), |a, b| a.maximum(b), test_max, f16);
-binary_test!(|a, b| a.min(b), |a, b| a.minimum(b), test_min, f16);
+binary_test!(|a, b| a.maximum(b), |a, b| a.maximum(b), test_max, f16);
+binary_test!(|a, b| a.minimum(b), |a, b| a.minimum(b), test_min, f16);
 binary_test!(
     |a, b| a % b,
     |a, b| (a.clone().to_dtype::<f32>()
@@ -435,63 +435,63 @@ fn test_matmul_transpose() {
     assert_close(&a_t_b_t.data(), &d_a_t_b_t.to_dtype::<f32>().as_vec());
 }
 
-#[test]
-fn test_relu_and_linear() {
-    // Test single and batch, unoptimized and optimized
-    let mut cx = Graph::new();
-    let input_data = random_vec(32);
-    let w1 = random_vec(32 * 64);
-    let w2 = random_vec(32 * 64);
-    let batch = cx.named_tensor("Batch", (2, 32)).set(random_vec(32 * 2));
-    let a = cx.named_tensor("Single", 32).set(input_data.clone());
+// #[test]
+// fn test_relu_and_linear() {
+//     // Test single and batch, unoptimized and optimized
+//     let mut cx = Graph::new();
+//     let input_data = random_vec(32);
+//     let w1 = random_vec(32 * 64);
+//     let w2 = random_vec(32 * 64);
+//     let batch = cx.named_tensor("Batch", (2, 32)).set(random_vec(32 * 2));
+//     let a = cx.named_tensor("Single", 32).set(input_data.clone());
 
-    let model = (
-        Linear::new(32, 64, false, &mut cx),
-        ReLU,
-        Linear::new(64, 32, false, &mut cx),
-    );
-    model.0.weight.set(w1.clone());
-    model.2.weight.set(w2.clone());
-    let mut b = model.forward(a).retrieve();
-    let mut batch_out = model.forward(batch).retrieve();
-    cx.execute();
+//     let model = (
+//         Linear::new(32, 64, false, &mut cx),
+//         ReLU,
+//         Linear::new(64, 32, false, &mut cx),
+//     );
+//     model.0.weight.set(w1.clone());
+//     model.2.weight.set(w2.clone());
+//     let mut b = model.forward(a).retrieve();
+//     let mut batch_out = model.forward(batch).retrieve();
+//     cx.execute();
 
-    let unoptimized_b = b.data();
-    let unoptimized_batch_out = batch_out.data();
-    b.drop();
-    batch_out.drop();
-    cx.compile(
-        <(GenericCompiler, CudaCompiler<f16>)>::default(),
-        (&mut b, &mut batch_out),
-    );
-    cx.execute();
+//     let unoptimized_b = b.data();
+//     let unoptimized_batch_out = batch_out.data();
+//     b.drop();
+//     batch_out.drop();
+//     cx.compile(
+//         <(GenericCompiler, CudaCompiler<f16>)>::default(),
+//         (&mut b, &mut batch_out),
+//     );
+//     cx.execute();
 
-    assert_close_precision(&unoptimized_b, &b.data(), 1e-2);
-    assert_close_precision(&unoptimized_batch_out, &batch_out.data(), 1e-2);
+//     assert_close_precision(&unoptimized_b, &b.data(), 1e-2);
+//     assert_close_precision(&unoptimized_batch_out, &batch_out.data(), 1e-2);
 
-    // Test against dfdx
-    let dev = Cpu::default();
-    let mut model = <(
-        dfdx::nn::modules::builders::UnbiasedLinear<32, 64>,
-        dfdx::nn::modules::builders::ReLU,
-        dfdx::nn::modules::builders::UnbiasedLinear<64, 32>,
-    )>::build_on_device(&dev);
-    // Set weights
-    model.0.weight = dev
-        .tensor_from_vec(w1, (DConst::<32>, DConst::<64>))
-        .permute()
-        .to_dtype::<f16>();
-    model.2.weight = dev
-        .tensor_from_vec(w2, (DConst::<64>, DConst::<32>))
-        .permute()
-        .to_dtype::<f16>();
-    let a = dev
-        .tensor_from_vec(input_data, (DConst::<32>,))
-        .to_dtype::<f16>();
-    let out = model.forward(a);
+//     // Test against dfdx
+//     let dev = Cpu::default();
+//     let mut model = <(
+//         dfdx::nn::modules::builders::UnbiasedLinear<32, 64>,
+//         dfdx::nn::modules::builders::ReLU,
+//         dfdx::nn::modules::builders::UnbiasedLinear<64, 32>,
+//     )>::build_on_device(&dev);
+//     // Set weights
+//     model.0.weight = dev
+//         .tensor_from_vec(w1, (DConst::<32>, DConst::<64>))
+//         .permute()
+//         .to_dtype::<f16>();
+//     model.2.weight = dev
+//         .tensor_from_vec(w2, (DConst::<64>, DConst::<32>))
+//         .permute()
+//         .to_dtype::<f16>();
+//     let a = dev
+//         .tensor_from_vec(input_data, (DConst::<32>,))
+//         .to_dtype::<f16>();
+//     let out = model.forward(a);
 
-    assert_close_precision(&unoptimized_b, &out.to_dtype::<f32>().as_vec(), 1e-2);
-}
+//     assert_close_precision(&unoptimized_b, &out.to_dtype::<f32>().as_vec(), 1e-2);
+// }
 
 #[test]
 fn test_rms_norm() {

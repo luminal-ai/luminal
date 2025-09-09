@@ -80,6 +80,15 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref)
     }
 
+    pub fn graph_break(self) -> GraphTensor {
+        let new_id = self
+            .graph()
+            .add_op(op::GraphBreak)
+            .input(self.id, 0, self.shape)
+            .finish();
+        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref)
+    }
+
     /// Scale so std is 1.0
     pub fn std_norm<T>(self, axes: impl ToAxes, epsilon: T) -> GraphTensor
     where
@@ -117,7 +126,7 @@ impl GraphTensor {
     pub fn softmax(self, axes: impl ToAxes) -> GraphTensor {
         let m = self - self.max(axes.to_axes()).expand(self.shape);
         let exp = m.exp();
-        exp / exp.sum(axes).expand(exp.shape)
+        exp / exp.sum(axes).expand(self.shape)
     }
 
     /// Applies a log softmax function along an axis

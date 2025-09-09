@@ -1,7 +1,7 @@
 [package]
 name = "qwen"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [features]
 metal = ["dep:luminal_metal"]
@@ -13,7 +13,7 @@ luminal_nn = { path = "../../crates/luminal_nn" }
 luminal_cpu = { path = "../../crates/luminal_cpu" }
 luminal_metal = { path = "../../crates/luminal_metal", optional = true }
 luminal_cuda = { path = "../../crates/luminal_cuda", optional = true }
-clap = { version = "4.4.18", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 byteorder = "1.5.0"
 memmap2 = "0.9.4"
 colored = "2.1.0"

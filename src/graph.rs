@@ -378,12 +378,6 @@ impl DerefMut for Graph {
     }
 }
 
-impl Drop for Graph {
-    fn drop(&mut self) {
-        expression_cleanup();
-    }
-}
-
 /// Get source tensor array for a node
 fn get_source_tensors<'a>(
     no_delete: &'a FxHashSet<NodeIndex>,

@@ -150,8 +150,8 @@ macro_rules! cuda_unary_op {
                 let type_name = T::type_name();
                 let code = format!(
                     "
-        #include \"cuda_fp16.h\"
-        extern \"C\" __global__ void kernel({type_name} *out, const {type_name} *inp, int numel{rendered}) {{
+    #include <cuda_fp16.h>
+extern \"C\" __global__ void kernel({type_name} *out, const {type_name} *inp, int numel{rendered}) {{
             int idx = blockIdx.x * blockDim.x + threadIdx.x;
             if (idx < numel && {valid_exp} != 0) {{
                 out[idx] = {}(inp[{idx_exp}]);

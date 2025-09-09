@@ -29,7 +29,8 @@ impl GraphTensor {
 
     /// Broadcast tensor along new dimensions (with explicitly given dest shape)
     pub fn expand(mut self, shape: impl ToShape) -> GraphTensor {
-        for (i, s) in shape.to_shape().into_iter().enumerate() {
+        let s = shape.to_shape();
+        for (i, s) in s.into_iter().enumerate() {
             if self.shape.len() <= i || self.shape.dims[self.shape.indexes[i]] != s {
                 self.shape.expand_dim(i, s);
             }

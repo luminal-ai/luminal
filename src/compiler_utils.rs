@@ -329,7 +329,7 @@ impl Graph {
     ///     .finish();
     /// let b = GraphTensor::from_id(b_id, a.shape, a.graph());
     /// ```
-    pub fn add_op<O: Operator + 'static>(&mut self, op: O) -> NewOp {
+    pub fn add_op<O: Operator + 'static>(&mut self, op: O) -> NewOp<'_> {
         self.linearized_graph = None;
         NewOp {
             new_op_id: self.graph.add_node(Box::new(op)),
@@ -338,7 +338,7 @@ impl Graph {
         }
     }
     /// Add op on the graph, and get back a NewOp. Just like add_op, except a boxed op is expected.
-    pub fn add_boxed_op(&mut self, op: Box<dyn Operator + 'static>) -> NewOp {
+    pub fn add_boxed_op(&mut self, op: Box<dyn Operator + 'static>) -> NewOp<'_> {
         self.linearized_graph = None;
         NewOp {
             new_op_id: self.graph.add_node(op),

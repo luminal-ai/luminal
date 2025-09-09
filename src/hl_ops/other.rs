@@ -16,20 +16,14 @@ impl GraphTensor {
             self = self.contiguous();
         }
         // Pad out length
-        let orig_length = self.shape.dims[self.shape.indexes[axis]];
-        self.shape.padding[self.shape.indexes[axis]].0 = orig_length - 1;
-        self = self.contiguous();
+        let orig_length = self.dims()[axis];
+        self = self.pad_along(orig_length - 1, 0, axis).contiguous();
 
         // Pool
-        let mut pooled = self.pool_last_dim(orig_length, 1, 1);
+        self = self.pool_last_dim(orig_length, 1, 1);
+
         // Sum Reduce along new dimension
-        let final_id = self
-            .graph()
-            .add_op(op::SumReduce(axis))
-            .input(pooled.id, 0, pooled.shape)
-            .finish();
-        pooled.shape.remove_dim(axis + 1);
-        GraphTensor::from_id(final_id, pooled.shape, self.graph_ref)
+        self.sum(axis + 1)
     }
 
     /// Cumulative max last dimension
@@ -39,20 +33,14 @@ impl GraphTensor {
             self = self.contiguous();
         }
         // Pad out length
-        let orig_length = self.shape.dims[self.shape.indexes[axis]];
+        let orig_length = self.dims()[axis];
         self.shape.padding[self.shape.indexes[axis]].0 = orig_length - 1;
         self = self.contiguous();
 
         // Pool
-        let mut pooled = self.pool_last_dim(orig_length, 1, 1);
+        self = self.pool_last_dim(orig_length, 1, 1);
         // Max Reduce along new dimension
-        let final_id = self
-            .graph()
-            .add_op(op::MaxReduce(axis))
-            .input(pooled.id, 0, pooled.shape)
-            .finish();
-        pooled.shape.remove_dim(axis + 1);
-        GraphTensor::from_id(final_id, pooled.shape, self.graph_ref)
+        self.max(axis + 1)
     }
 
     /// Cumulative product last dimension
@@ -84,10 +72,7 @@ impl Graph {
 
     /// ARange from beg to end
     pub fn arange_in_range(&mut self, beg: usize, end: usize) -> GraphTensor {
-        let range = end - beg;
-        let mut tensor = self.arange(range);
-        tensor = tensor + beg;
-        tensor
+        self.arange(end - beg) + beg
     }
 
     /// ARange from beg to end
@@ -117,8 +102,8 @@ impl Graph {
     /// Same API as https://pytorch.org/docs/stable/generated/torch.triu
     pub fn triu(&mut self, size: impl Into<Expression>, diagonal: i32) -> GraphTensor {
         let size = size.into();
-        let horizontal = self.arange(size).expand_dim(0, size);
-        let vertical = self.arange(size).expand_dim(1, size);
+        let horizontal = self.arange(size).expand_dim(0, size).contiguous();
+        let vertical = self.arange(size).expand_dim(1, size).contiguous();
 
         (horizontal - (diagonal as f32 - 1.)).gt(vertical)
     }
@@ -187,8 +172,10 @@ impl GraphTensor {
                             *r = d[ind.exec_single_var_stack(i, &mut stack)];
                         }
                     }
-                    let bin_data = std::fs::read(&path)
-                        .unwrap()
+                    let Ok(bytes) = std::fs::read(&path) else {
+                        return vec![];
+                    };
+                    let bin_data = bytes
                         .chunks(4)
                         .map(|i| {
                             f32::from_ne_bytes([i[0], i[1], i[2], i[3]]).clamp(f32::MIN, f32::MAX)

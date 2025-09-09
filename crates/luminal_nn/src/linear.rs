@@ -1,4 +1,4 @@
-use rand::{thread_rng, Rng};
+use rand::{rng, Rng};
 
 use luminal::prelude::*;
 
@@ -36,16 +36,16 @@ impl Linear {
 
     pub fn init_rand(self) -> Self {
         // Init weight as uniform(-1, 1)
-        let mut rng = thread_rng();
+        let mut rng = rng();
         self.weight.set(
             (0..self.weight.shape.n_elements().to_usize().unwrap())
-                .map(|_| rng.gen_range(-1_f32..1_f32))
+                .map(|_| rng.random_range(-1_f32..1_f32))
                 .collect::<Vec<_>>(),
         );
         if let Some(bias) = self.bias {
             bias.set(
                 (0..bias.shape.n_elements().to_usize().unwrap())
-                    .map(|_| rng.gen_range(-1_f32..1_f32))
+                    .map(|_| rng.random_range(-1_f32..1_f32))
                     .collect::<Vec<_>>(),
             );
         }

@@ -1,0 +1,37 @@
+[package]
+name = "matmul"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["metal"]
+cuda = ["dep:cudarc", "dep:luminal_cuda", "luminal_2/cuda"]
+metal = [
+    "dep:objc2",
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "luminal_2/metal",
+]
+
+[dependencies]
+itertools = "0.14.0"
+luminal = { path = "../.." }
+luminal_cuda = { path = "../../crates/luminal_cuda", optional = true }
+cudarc = { version = "0.16.6", features = [
+    "f16",
+    "cuda-12080",
+], optional = true }
+luminal_nn = { path = "../../crates/luminal_nn" }
+luminal_2 = { path = "../../crates/luminal_2" }
+rand = "0.9.1"
+regex = "1.11.1"
+serde_json = "1.0.140"
+urlencoding = "2.1.3"
+webbrowser = "1.0.5"
+rustc-hash = "2.1.1"
+objc2 = { version = "0.6.2", optional = true }
+objc2-metal = { version = "0.3.1", optional = true }
+objc2-foundation = { version = "0.3.1", optional = true }
