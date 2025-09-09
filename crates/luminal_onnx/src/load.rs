@@ -205,7 +205,9 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
                     bb = bb.permute((1, 0)).reshape((n, m));
                 }
                 let mut y = aa.matmul(bb) * alpha;
-                if let Some(cc) = c { y += cc * beta; }
+                if let Some(cc) = c {
+                    y += cc * beta;
+                }
                 set_output(ctx, n, y);
             }
             "Softmax" => {
@@ -284,7 +286,9 @@ fn import_graph(ctx: &mut Ctx, gp: &onnx::GraphProto) -> Result<(), OnnxImportEr
                 let mut out = a;
                 // Insert in sorted order to maintain correct indexes
                 axes.sort();
-                for ax in axes { out = out.unsqueeze(ax); }
+                for ax in axes {
+                    out = out.unsqueeze(ax);
+                }
                 set_output(ctx, n, out);
             }
             "Squeeze" => {

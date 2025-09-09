@@ -145,7 +145,9 @@ fn test_import_and_run() {
 
     // Build inputs
     let mut x_data = vec![0f32; (n * in_dim) as usize];
-    for (i, v) in x_data.iter_mut().enumerate() { *v = ((i as f32) * 0.2).sin(); }
+    for (i, v) in x_data.iter_mut().enumerate() {
+        *v = ((i as f32) * 0.2).sin();
+    }
     let _x = res
         .inputs
         .get("X")
