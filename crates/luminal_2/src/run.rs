@@ -36,6 +36,11 @@ use std::{fs::File, io::Read};
 
 use crate::Kernel;
 
+static VAR_NAMES: &[&'static str] = &[
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+
 #[cfg(feature = "metal")]
 pub fn chunk_based_search_compiler(
     device: &MTLDevice,
@@ -322,7 +327,7 @@ pub fn compile_kernels(
             && kernel.code != "Inputs"
             && kernel.code != "Outputs"
         {
-            //TEMP
+            //TEMP: write down the generated file to disk
             std::fs::write(format!("kernel-{}.wgsl", kernel_i), &kernel.code).unwrap();
             kernel_i += 1;
 
@@ -811,7 +816,7 @@ pub fn run_graph(
                 std::ptr::copy_nonoverlapping(&data, dest_buffer.raw.data() as *mut _, data.len());
             }
         } else {
-            //TODO: set thread group size via specialization constants
+            //Note: this is baked into the shader. Do `dyn_vars` change that?
             let tb = (
                 kernel.threadblock.0.exec(dyn_vars).unwrap(),
                 kernel.threadblock.1.exec(dyn_vars).unwrap(),
@@ -822,23 +827,13 @@ pub fn run_graph(
                 "threadblock is too big: {tb:?} > 1024"
             );
 
-            let mut pass = command_buffer.compute("");
-            let pipeline = ctx.create_compute_pipeline(gpu::ComputePipelineDesc {
-                name: "",
-                data_layouts: &[], //TODO
-                compute: compiled_kernels[&kernel.code].at("main"),
-            });
-            let mut encoder = pass.with(&pipeline);
-
             // set inputs
-            /*let mut buffer_count = 0;
-
             for (input, input_index) in kernels
                 .edges_directed(node, Direction::Incoming)
                 .sorted_by_key(|n| n.weight().1)
                 .map(|n| (n.source(), n.weight().0))
             {
-                if input == input_node {
+                /*if input == input_node {
                     unsafe {
                         encoder.setBuffer_offset_atIndex(
                             Some(&inputs[&input_index].0),
@@ -854,20 +849,18 @@ pub fn run_graph(
                             buffer_count,
                         );
                     }
-                }
-                buffer_count += 1;
-            }*/
+                }*/
+            }
             // set output
-            /*for o in 0..kernel.outputs.len() {
-                unsafe {
+            for _output in kernel.outputs.iter() {
+                /*unsafe {
                     encoder.setBuffer_offset_atIndex(
                         Some(&buffers[intermediate_buffer_map[&node][o]]),
                         0,
                         buffer_count,
                     );
-                }
-                buffer_count += 1;
-            }*/
+                }*/
+            }
             // set dynamic dimensions
             for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
                 let buffer = ctx.create_buffer(gpu::BufferDesc {
@@ -886,6 +879,25 @@ pub fn run_graph(
                 //unsafe { encoder.setBuffer_offset_atIndex(Some(&buf), 0, buffer_count) };
                 //buffer_count += 1;
             }
+
+            let num_inputs = kernels.edges_directed(node, Direction::Incoming).count();
+            let layout = gpu::ShaderDataLayout {
+                //HACK: relying on `var_to_node` mapping to be constructed this way in codegen
+                bindings: (0..num_inputs + kernel.outputs.len())
+                    .map(|i| (VAR_NAMES[i], gpu::ShaderBinding::Buffer))
+                    .collect(),
+            };
+
+            //TODO: clean up after we are done
+            let pipeline = ctx.create_compute_pipeline(gpu::ComputePipelineDesc {
+                name: "",
+                data_layouts: &[&layout],
+                compute: compiled_kernels[&kernel.code].at("main"),
+            });
+
+            //TODO: share the pass between independent kernels of the same rank
+            let mut pass = command_buffer.compute("");
+            let mut encoder = pass.with(&pipeline);
 
             // Set dispatch
             let grid = [

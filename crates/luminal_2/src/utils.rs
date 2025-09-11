@@ -2,19 +2,19 @@
 
 use std::{collections::HashMap, io::Write};
 
-use egglog::{CommandOutput, EGraph, Error, Term, prelude::exprs::var};
+use egglog::{prelude::exprs::var, CommandOutput, EGraph, Error, Term};
 use egui::Color32;
 use itertools::Itertools;
 use luminal::{
     prelude::{
-        NodeIndex,
         petgraph::{
-            Directed, Direction,
             algo::toposort,
             dot::{Config, Dot},
             prelude::StableGraph,
             visit::{EdgeRef, Topo},
+            Directed, Direction,
         },
+        NodeIndex,
     },
     shape::Expression,
 };
@@ -101,7 +101,7 @@ pub fn pad_out(
     node
 }
 
-use crate::{GraphTerm, Kernel, debug::display_graph};
+use crate::{debug::display_graph, GraphTerm, Kernel};
 
 pub fn validate_graph(graph: &StableGraph<(GraphTerm, usize), (), Directed>) {
     // walk the graph and make sure loopins -> next loop level (or loopout) and prev loop (or loopin) -> loopout
@@ -547,7 +547,6 @@ use crossterm::{
     terminal::{self, LeaveAlternateScreen},
 };
 use ratatui::{
-    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout},
     style::{Color, Style},
@@ -555,6 +554,7 @@ use ratatui::{
     widgets::{
         Block, Borders, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
     },
+    Terminal,
 };
 use std::{
     sync::mpsc,

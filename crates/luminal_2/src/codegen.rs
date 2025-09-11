@@ -324,47 +324,42 @@ kernel void kernel_name(
                 )
             }
             GPUArch::Blade => {
-                //TODO: proper WGSL
-                let n_inputs = inputs.len();
-                let n_inputs_outputs = inputs.len() + outputs.len();
                 let declarations = inputs
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, (buf, a))| {
+                    .map(|(buf, a)| {
                         format!(
-                            "@group(0) @binding({}) var<storage, read> {}: array<f32>;",
-                            i,
+                            "var<storage, read> {}: array<f32>;",
                             var_to_char(node_to_var[&a].index),
                         )
                     })
-                    .chain(outputs.iter().enumerate().map(|(i, (_, n))| {
+                    .chain(outputs.iter().map(|(_, n)| {
                         format!(
-                            "@group(0) @binding({}) var<storage, read_write> {}: array<f32>;",
-                            n_inputs + i,
+                            "var<storage, read_write> {}: array<f32>;",
                             var_to_char(node_to_var[&n].index),
                         )
                     }))
-                    .chain(dyn_vars.iter().sorted().enumerate().map(|(i, (c, _))| {
-                        format!(
-                            "@group(0) @binding({}) var<uniform> const_{}: u32;",
-                            i + n_inputs_outputs,
-                            c
-                        )
-                    }))
+                    .chain(
+                        dyn_vars
+                            .iter()
+                            .sorted()
+                            .map(|(c, _)| format!("var<uniform> const_{}: u32;", c)),
+                    )
                     .collect_vec();
 
                 format!(
-                    "
-{}
+                    "{}
 
-@workgroup_size(8,8,1) //TODO
+@workgroup_size({},{},{})
 @compute fn main(
 	@builtin(workgroup_id) blockIdx: vec3<u32>,
 	@builtin(local_invocation_id) threadIdx: vec3<u32>,
 ) {{
 {kernel_lines}
 }}",
-                    declarations.join("\n")
+                    declarations.join("\n"),
+                    threadblock[0],
+                    threadblock[1],
+                    threadblock[2],
                 )
             }
         };
@@ -395,6 +390,7 @@ kernel void kernel_name(
             outputs: outputs.into_iter().map(|(o, _)| o.simplify()).collect(),
         };
     }
+
     Some((meta_graph, gmem_mapping))
 }
 
