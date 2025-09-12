@@ -326,7 +326,7 @@ kernel void kernel_name(
             GPUArch::Blade => {
                 let declarations = inputs
                     .into_iter()
-                    .map(|(buf, a)| {
+                    .map(|(_buf, a)| {
                         format!(
                             "var<storage, read> {}: array<f32>;",
                             var_to_char(node_to_var[&a].index),
@@ -1101,8 +1101,8 @@ fn make_kernel(
                 c_inner_stride,
                 k_outer_loops,
             } => {
-                if cfg!(feature = "cuda") {
-                    // CUDA build: skip / fallback
+                if cfg!(not(feature = "metal")) {
+                    // CUDA/Blade build: skip / fallback
                     return None; // or generate a non-TC matmul
                 }
 

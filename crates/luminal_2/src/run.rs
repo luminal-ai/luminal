@@ -11,10 +11,6 @@ use blade_graphics as gpu;
 #[cfg(feature = "cuda")]
 use cudarc::{driver::*, nvrtc::CompileOptions};
 use itertools::Itertools;
-#[cfg(feature = "cuda")]
-use std::fs::OpenOptions;
-#[cfg(feature = "cuda")]
-use std::io::Write;
 
 use luminal::{
     prelude::{
@@ -32,14 +28,31 @@ use luminal::{
 use objc2_metal::{MTLBuffer, MTLDevice};
 use rustc_hash::FxHashMap;
 use std::{collections::HashMap, ffi::c_void, ptr::NonNull};
-use std::{fs::File, io::Read};
+use std::{fs::File, io::Read as _, io::Write as _};
 
 use crate::Kernel;
 
+#[cfg(feature = "blade")]
 static VAR_NAMES: &[&'static str] = &[
     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
     "t", "u", "v", "w", "x", "y", "z",
 ];
+#[cfg(feature = "blade")]
+struct BladeShaderData {
+    buffers: Vec<gpu::Buffer>,
+}
+#[cfg(feature = "blade")]
+impl gpu::ShaderData for BladeShaderData {
+    fn layout() -> gpu::ShaderDataLayout {
+        Default::default()
+    }
+    fn fill(&self, mut ctx: gpu::PipelineContext) {
+        use gpu::ShaderBindable as _;
+        for (i, buffer) in self.buffers.iter().enumerate() {
+            buffer.at(0).bind_to(&mut ctx, i as u32);
+        }
+    }
+}
 
 #[cfg(feature = "metal")]
 pub fn chunk_based_search_compiler(
@@ -255,7 +268,7 @@ pub fn compile_kernels(
 
     // Open (or create) the log file, appending logs to it
     let log_path = "kernel_log.txt";
-    let mut log_file = OpenOptions::new()
+    let mut log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true) // overwrite on each run
@@ -320,16 +333,22 @@ pub fn compile_kernels(
     ctx: &gpu::Context,
     kernels: &StableGraph<Kernel, (usize, usize)>,
 ) -> FxHashMap<String, gpu::Shader> {
+    let log_path = "kernel_log.txt";
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true) // overwrite on each run
+        .open(log_path)
+        .expect("Failed to open kernel log file");
+
     let mut compiled = FxHashMap::default();
-    let mut kernel_i = 0;
     for kernel in kernels.node_weights() {
         if !compiled.contains_key(&kernel.code)
             && kernel.code != "Inputs"
             && kernel.code != "Outputs"
         {
-            //TEMP: write down the generated file to disk
-            std::fs::write(format!("kernel-{}.wgsl", kernel_i), &kernel.code).unwrap();
-            kernel_i += 1;
+            writeln!(log_file, "Compiling kernel:\n{}\n", kernel.code)
+                .expect("Failed to write to kernel log file");
 
             let shader = ctx.create_shader(gpu::ShaderDesc {
                 source: &kernel.code,
@@ -343,7 +362,7 @@ pub fn compile_kernels(
 #[cfg(feature = "cuda")]
 pub fn run_graph(
     ctx: &cudarc::driver::CudaContext,
-    inputs: &mut FxHashMap<usize, (CudaSlice<f32>, bool)>,
+    inputs: &FxHashMap<usize, CudaSlice<f32>>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
     dyn_vars: &FxHashMap<char, usize>,
     compiled_kernels: &FxHashMap<String, CudaFunction>,
@@ -431,7 +450,7 @@ pub fn run_graph(
                 .map(|n| (n.source(), n.weight().0))
             {
                 if input == input_node {
-                    builder.arg(&inputs[&input_index].0);
+                    builder.arg(&inputs[&input_index]);
                 } else {
                     builder.arg(&buffers[intermediate_buffer_map[&input][input_index]]);
                 }
@@ -483,7 +502,7 @@ pub fn run_graph(
 pub fn run_graph(
     device: &MTLDevice,
     graph: &StableGraph<GraphTerm, ()>,
-    inputs: &mut FxHashMap<usize, (Buffer, bool)>,
+    inputs: &FxHashMap<usize, (Buffer, bool)>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
     dyn_vars: &FxHashMap<char, usize>,
     compiled_kernels: &FxHashMap<String, Function>,
@@ -618,7 +637,7 @@ pub fn run_graph(
                     if input == input_node {
                         unsafe {
                             encoder.setBuffer_offset_atIndex(
-                                Some(&inputs[&input_index].0),
+                                Some(&inputs[&input_index]),
                                 0,
                                 buffer_count,
                             );
@@ -705,17 +724,19 @@ pub fn run_graph(
 #[cfg(feature = "blade")]
 pub fn run_graph(
     ctx: &gpu::Context,
-    inputs: &mut FxHashMap<usize, (super::Buffer, bool)>,
+    inputs: &FxHashMap<usize, super::Buffer>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
     dyn_vars: &FxHashMap<char, usize>,
     compiled_kernels: &FxHashMap<String, gpu::Shader>,
     intermediate_buffers: &Vec<Expression>,
     intermediate_buffer_map: &FxHashMap<NodeIndex, Vec<usize>>,
-) -> (Vec<super::Buffer>, u128) {
+) -> (Vec<Vec<f32>>, u128) {
     let mut command_buffer = ctx.create_command_encoder(gpu::CommandEncoderDesc {
         name: "main",
         buffer_count: 1,
     });
+    command_buffer.start();
+
     let start = std::time::Instant::now();
     let mut pipelines = Vec::new();
     let mut extra_buffers = Vec::new();
@@ -729,7 +750,8 @@ pub fn run_graph(
             let raw = ctx.create_buffer(gpu::BufferDesc {
                 name: "",
                 size: size as u64,
-                memory: gpu::Memory::Device,
+                //TODO: only share the outputs
+                memory: gpu::Memory::Shared,
             });
             super::Buffer { raw, size }
         })
@@ -749,14 +771,6 @@ pub fn run_graph(
             let sync_point = ctx.submit(&mut command_buffer);
             ctx.wait_for(&sync_point, !0);
 
-            // Clean up
-            for pipeline in pipelines.iter_mut() {
-                ctx.destroy_compute_pipeline(pipeline);
-            }
-            for buffer in extra_buffers {
-                ctx.destroy_buffer(buffer);
-            }
-
             let outputs = kernels
                 .edges_directed(node, Direction::Incoming)
                 .map(|e| {
@@ -767,10 +781,23 @@ pub fn run_graph(
                 })
                 .sorted_by_key(|(_, b)| *b)
                 .rev()
-                .map(|(a, b)| (a, buffers.remove(b)))
+                .map(|(a, b)| (a, copy_blade_buffer_back(&buffers[b])))
                 .sorted_by_key(|(a, _)| *a)
                 .map(|(_, a)| a)
                 .collect_vec();
+
+            // Clean up
+            ctx.destroy_command_encoder(&mut command_buffer);
+            for pipeline in pipelines.iter_mut() {
+                ctx.destroy_compute_pipeline(pipeline);
+            }
+            for buffer in buffers {
+                ctx.destroy_buffer(buffer.raw);
+            }
+            for buffer in extra_buffers {
+                ctx.destroy_buffer(buffer);
+            }
+
             return (outputs, start.elapsed().as_micros());
         } else if kernel.code.starts_with("Diff") {
             // Load file and diff numbers
@@ -827,42 +854,30 @@ pub fn run_graph(
                 "threadblock is too big: {tb:?} > 1024"
             );
 
+            let mut shader_data = BladeShaderData {
+                buffers: Vec::new(),
+            };
             // set inputs
             for (input, input_index) in kernels
                 .edges_directed(node, Direction::Incoming)
                 .sorted_by_key(|n| n.weight().1)
                 .map(|n| (n.source(), n.weight().0))
             {
-                /*if input == input_node {
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(
-                            Some(&inputs[&input_index].0),
-                            0,
-                            buffer_count,
-                        );
-                    }
+                shader_data.buffers.push(if input == input_node {
+                    inputs[&input_index].raw
                 } else {
-                    unsafe {
-                        encoder.setBuffer_offset_atIndex(
-                            Some(&buffers[intermediate_buffer_map[&input][input_index]]),
-                            0,
-                            buffer_count,
-                        );
-                    }
-                }*/
+                    buffers[intermediate_buffer_map[&input][input_index]].raw
+                });
             }
             // set output
-            for _output in kernel.outputs.iter() {
-                /*unsafe {
-                    encoder.setBuffer_offset_atIndex(
-                        Some(&buffers[intermediate_buffer_map[&node][o]]),
-                        0,
-                        buffer_count,
-                    );
-                }*/
+            for output_index in 0..kernel.outputs.len() {
+                shader_data
+                    .buffers
+                    .push(buffers[intermediate_buffer_map[&node][output_index]].raw);
             }
             // set dynamic dimensions
             for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
+                unimplemented!("Use uniform buffers for dynamic vars");
                 let buffer = ctx.create_buffer(gpu::BufferDesc {
                     name: "temp",
                     size: size_of::<u64>() as u64,
@@ -898,6 +913,8 @@ pub fn run_graph(
             //TODO: share the pass between independent kernels of the same rank
             let mut pass = command_buffer.compute("");
             let mut encoder = pass.with(&pipeline);
+            // Bind all used resources
+            encoder.bind(0, &shader_data);
 
             // Set dispatch
             let grid = [
@@ -909,6 +926,7 @@ pub fn run_graph(
             assert!(grid[1] <= 65535, "grid.y > 65535");
             assert!(grid[2] <= 65535, "grid.z > 65535");
             encoder.dispatch(grid);
+            pipelines.push(pipeline);
         }
     }
     panic!("No output kernel detected in graph!");
@@ -936,4 +954,11 @@ pub fn copy_metal_buffer_back(v: &Buffer) -> Vec<f32> {
         *d = unsafe { *ptr.add(i) };
     }
     data
+}
+
+#[cfg(feature = "blade")]
+pub fn copy_blade_buffer_back(v: &super::Buffer) -> Vec<f32> {
+    assert!(!v.raw.data().is_null(), "Buffer is not mappable");
+    unsafe { std::slice::from_raw_parts(v.raw.data() as *const f32, v.size / size_of::<f32>()) }
+        .to_vec()
 }

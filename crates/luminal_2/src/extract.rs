@@ -676,6 +676,8 @@ fn cost<'a>(
     gmem_mapping: &HashMap<NodeIndex, usize>,
     dyn_vars: &FxHashMap<char, usize>,
 ) -> Option<(Cost, Vec<Vec<f32>>)> {
+    #[cfg(not(feature = "cuda"))]
+    let _ = graph;
     with_autoreleasepool(|| {
         // Get buffer info
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
@@ -684,24 +686,27 @@ fn cost<'a>(
         #[cfg(feature = "cuda")]
         let device = CudaContext::new(0).unwrap(); // will need to expand beyond single host
         #[cfg(feature = "blade")]
-        let device = unsafe { gpu::Context::init(gpu::ContextDesc::default()).unwrap() };
+        let device = unsafe {
+            gpu::Context::init(gpu::ContextDesc {
+                validation: cfg!(debug_assertions),
+                ..Default::default()
+            })
+            .unwrap()
+        };
         let compiled_kernels = compile_kernels(&device, &kernels);
 
         // Copy input buffers over
-        let mut inputs = inputs
+        let inputs = inputs
             .into_iter()
             .map(|(n, b)| {
                 (
                     gmem_mapping[n],
-                    (
-                        #[cfg(feature = "metal")]
-                        copy_metal_buffer(&b.clone().to_vec(dyn_vars), &device),
-                        #[cfg(feature = "cuda")]
-                        copy_cuda_buffer(&b.clone().to_vec(dyn_vars), &device),
-                        #[cfg(feature = "blade")]
-                        copy_blade_buffer(&b.clone().to_vec(dyn_vars), &device),
-                        false,
-                    ),
+                    #[cfg(feature = "metal")]
+                    copy_metal_buffer(&b.clone().to_vec(dyn_vars), &device),
+                    #[cfg(feature = "cuda")]
+                    copy_cuda_buffer(&b.clone().to_vec(dyn_vars), &device),
+                    #[cfg(feature = "blade")]
+                    copy_blade_buffer(&b.clone().to_vec(dyn_vars), &device),
                 )
             })
             .collect::<FxHashMap<_, _>>();
@@ -711,7 +716,7 @@ fn cost<'a>(
                 &device,
                 #[cfg(feature = "metal")]
                 &graph,
-                &mut inputs,
+                &inputs,
                 &kernels,
                 dyn_vars,
                 &compiled_kernels,
@@ -729,7 +734,7 @@ fn cost<'a>(
                     &device,
                     #[cfg(feature = "metal")]
                     &graph,
-                    &mut inputs,
+                    &inputs,
                     &kernels,
                     dyn_vars,
                     &compiled_kernels,
@@ -740,6 +745,11 @@ fn cost<'a>(
             outputs = o;
             micros.push(m_val);
         }
+
+        #[cfg(feature = "blade")]
+        for input in inputs.values() {
+            device.destroy_buffer(input.raw);
+        }
         Some((
             micros.into_iter().sum::<u128>() / TRIALS as u128,
             #[cfg(feature = "metal")]
@@ -747,7 +757,7 @@ fn cost<'a>(
             #[cfg(feature = "cuda")]
             outputs.iter().map(copy_cuda_buffer_back).collect_vec(),
             #[cfg(feature = "blade")]
-            outputs.iter().map(copy_blade_buffer_back).collect_vec(),
+            outputs,
         ))
     })
 }
@@ -808,12 +818,6 @@ pub fn copy_blade_buffer(v: &[f32], ctx: &gpu::Context) -> super::Buffer {
         raw: buffer,
         size: v.len() * size_of::<f32>(),
     }
-}
-
-#[cfg(feature = "blade")]
-pub fn copy_blade_buffer_back(v: &super::Buffer) -> Vec<f32> {
-    let count = v.size / size_of::<f32>();
-    unsafe { std::slice::from_raw_parts(v.raw.data() as *const f32, count) }.to_vec()
 }
 
 pub fn make_test_inputs(

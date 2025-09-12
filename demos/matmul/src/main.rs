@@ -140,11 +140,11 @@ fn main() {
         let mut inputs = FxHashMap::default();
         inputs.insert(
             gmem_mapping[&unified_map[&a.id]],
-            (copy_buffer(&vec![1.; M * K], device), false),
+            copy_buffer(&vec![1.; M * K], device),
         );
         inputs.insert(
             gmem_mapping[&unified_map[&b.id]],
-            (copy_buffer(&vec![1.; K * M], device), false),
+            copy_buffer(&vec![1.; K * M], device),
         );
         for (label, val) in &accs {
             if let Some(node) = gmem_to_node_mapping.get(label) {
@@ -153,11 +153,11 @@ fn main() {
                         let val = e.exec(&cx.dyn_map).unwrap();
                         inputs.insert(gmem_mapping[node], {
                             let v = vec![val as f32];
-                            (copy_buffer(&v, device), true)
+                            copy_buffer(&v, device)
                         });
                     }
                     InitData::Data(d) => {
-                        inputs.insert(gmem_mapping[node], (copy_buffer(d, device), true));
+                        inputs.insert(gmem_mapping[node], copy_buffer(d, device));
                     }
                 }
             }
@@ -167,14 +167,20 @@ fn main() {
             &device,
             #[cfg(feature = "metal")]
             &graph,
-            &mut inputs,
+            &inputs,
             &kernels,
             &FxHashMap::default(),
             &compiled,
             &int_buffers,
             &int_buffer_map,
         );
-        println!("{:?}", &copy_buffer_back(&outputs[0])[..10]);
+        let outputs = copy_buffer_back(&outputs[0]);
+        println!("{:?}", &outputs[..10]);
+
+        #[cfg(feature = "blade")]
+        for input in inputs.values() {
+            device.destroy_buffer(input.raw);
+        }
     });
 }
 
@@ -236,7 +242,6 @@ pub fn copy_buffer(v: &[f32], ctx: &gpu::Context) -> Buffer {
 }
 
 #[cfg(feature = "blade")]
-pub fn copy_buffer_back(v: &Buffer) -> Vec<f32> {
-    let count = v.size / size_of::<f32>();
-    unsafe { std::slice::from_raw_parts(v.raw.data() as *const f32, count) }.to_vec()
+pub fn copy_buffer_back(v: &[f32]) -> Vec<f32> {
+    v.to_vec()
 }
