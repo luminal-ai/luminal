@@ -199,7 +199,9 @@ fn add_grad(
     grad.shape.indexes = new_indexes;
 
     // Undo expands (sum reduce)
-    for i in fwd.shape.indexes.into_iter().rev() {
+    // Iterate over logical dimension indices in reverse order to correctly identify fake dimensions.
+    // The fake dimension flags are stored in logical dimension order, not physical storage order.
+    for i in (0..fwd.shape.len()).rev() {
         if fwd.shape.fake[i] {
             grad.id = graph
                 .add_op(SumReduce(i))
@@ -551,5 +553,47 @@ mod tests {
                 .permute()
                 .as_vec(),
         );
+    }
+
+    #[test]
+    fn test_add_grad_decreasing_idx_r1() {
+        let mut cx = Graph::new();
+        // Create a tensor, expand to add fake dims and permute to produce
+        // a non-monotonic indexes mapping. This mirrors the original intent
+        // without relying on compile-time shape generics.
+        let a = cx.tensor(2);
+        let a = a.expand((1, 1, 2));
+        let a = a.permute((2, 1, 0));
+
+        // has multiple fake dimensions
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 2);
+        // indexes should not be strictly increasing
+        let not_strict = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
+        assert!(not_strict);
+
+        // reduce to scalar and ensure autograd compiles
+        let loss = a.sum((0, 1, 2));
+        let _grads = cx.compile(Autograd::new(vec![a.id], loss), ());
+    }
+
+    #[test]
+    fn test_add_grad_decreasing_idx_r2() {
+        let mut cx = Graph::new();
+        // Start with a 2x3 tensor, expand to add fake dims, then permute to
+        // create a non-monotonic indexes mapping.
+        let a = cx.tensor((2, 3));
+        let a = a.expand((2, 1, 1, 1, 3));
+        let a = a.permute((4, 1, 0, 3, 2));
+
+        // has multiple fake dimensions
+        let fake_count = a.shape.fake.iter().filter(|&&b| b).count();
+        assert!(fake_count >= 3);
+        // indexes should not be strictly increasing
+        let not_strict = a.shape.indexes.windows(2).any(|w| w[0] >= w[1]);
+        assert!(not_strict);
+
+        let loss = a.sum((0, 1, 2, 3, 4));
+        let _grads = cx.compile(Autograd::new(vec![a.id], loss), ());
     }
 }
