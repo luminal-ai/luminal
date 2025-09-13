@@ -32,11 +32,31 @@ struct Var {
 }
 
 impl crate::GPUArch {
+    fn declaration<'a>(&self, ty: &'a str) -> &'a str {
+        match *self {
+            Self::Blade => "let",
+            _ => ty,
+        }
+    }
+    fn loop_declaration(&self) -> &str {
+        match *self {
+            Self::Blade => "var",
+            _ => "int",
+        }
+    }
+    fn resolve_stride(&self, name: &str) -> String {
+        match *self {
+            Self::Blade => format!("u32(loop_{name})"),
+            _ => format!("loop_{name}"),
+        }
+    }
+
+    /// Resolves the value/pointer distinction and returns an expression for the value.
     fn resolve_value(&self, v: Var) -> String {
         let name = var_to_char(v.index);
         match v.pointer_owner {
             Some(owner_index) => match *self {
-                GPUArch::Blade => {
+                Self::Blade => {
                     // Case for global variables that are buffers.
                     if owner_index == v.index {
                         format!("{}[0]", name)
@@ -51,6 +71,20 @@ impl crate::GPUArch {
                 ),
             },
             None => name,
+        }
+    }
+
+    /// Resolves the value/pointer distinction and returns an offset from the owning pointer.
+    fn resolve_offset(&self, v: Var) -> String {
+        match *self {
+            Self::Blade => {
+                if v.pointer_owner == Some(v.index) {
+                    "0".to_string()
+                } else {
+                    var_to_char(v.index)
+                }
+            }
+            _ => var_to_char(v.index),
         }
     }
 }
@@ -583,28 +617,18 @@ fn make_kernel(
                         // Use a single loop with correct striding from the input
                         kernel_lines.push(format!(
                             "{spacing}for ({} load = 0; load < {}; load+=1) {{",
-                            match arch {
-                                GPUArch::Blade => "var",
-                                _ => "int",
-                            },
+                            arch.loop_declaration(),
                             loads.to_kernel()
                         ));
                         let indexing_expression = indexing_expression
                             .simplify()
                             .to_kernel()
                             .replace("const_z", "load");
-                        kernel_lines.push(match arch {
-                            GPUArch::Blade => format!(
-                                "{inner_spacing}{}[{indexing_expression}] = {}[{indexing_expression}];",
-                                var_to_char(accumulator),
-                                var_to_char(node_to_var[&outer_input].index),
-                            ),
-                            _ => format!(
-                                "{inner_spacing}{}[{indexing_expression}] = *({} + {indexing_expression});",
-                                var_to_char(accumulator),
-                                var_to_char(node_to_var[&outer_input].index),
-                            ),
-                        });
+                        kernel_lines.push(format!(
+                            "{inner_spacing}{}[{indexing_expression}] = {}[{indexing_expression}];",
+                            var_to_char(accumulator),
+                            var_to_char(node_to_var[&outer_input].index),
+                        ));
                         kernel_lines.push(format!("{spacing}}}"));
                         let v = Var {
                             index: accumulator,
@@ -670,10 +694,7 @@ fn make_kernel(
                         *prev_max_var += 1;
                         kernel_lines.push(format!(
                             "{} loop_{} = {};",
-                            match arch {
-                                GPUArch::Blade => "let",
-                                _ => "int",
-                            },
+                            arch.declaration("int"),
                             var_to_char(*prev_max_var),
                             if current_loop_level >= GRID_DIMS {
                                 ["threadIdx.x", "threadIdx.y", "threadIdx.z"]
@@ -687,11 +708,7 @@ fn make_kernel(
                     // for
                     *prev_max_var += 1;
                     let loop_var = var_to_char(*prev_max_var);
-                    let type_decl = match arch {
-                        GPUArch::Blade => "var",
-                        _ => "int",
-                    };
-                    kernel_lines.push(format!("{spacing}for ({type_decl} loop_{loop_var} = 0; loop_{loop_var} < {}; loop_{loop_var}+=1) {{",range.to_kernel()));
+                    kernel_lines.push(format!("{spacing}for ({} loop_{loop_var} = 0; loop_{loop_var} < {}; loop_{loop_var}+=1) {{", arch.loop_declaration(), range.to_kernel()));
                 };
                 let loop_var = var_to_char(*prev_max_var);
                 let loop_var_int = *prev_max_var;
@@ -718,23 +735,17 @@ fn make_kernel(
                             );
                             let stride_str = stride
                                 .to_kernel()
-                                .replace("const_z", &format!("loop_{loop_var}"));
+                                .replace("const_z", &arch.resolve_stride(&loop_var));
                             //TODO: operate on indices instead of pointers in all backends?
                             assert!(real_input.pointer_owner.is_some());
-                            kernel_lines.push(match arch {
-                                GPUArch::Blade => format!(
-                                    "{inner_spacing}let {} = {};",
-                                    var_to_char(pointer_var),
-                                    stride_str
-                                ),
-                                _ => format!(
-                                    "{inner_spacing}{}float* {} = {} + {};",
-                                    arch.metal_buffer_type(pointer_var),
-                                    var_to_char(pointer_var),
-                                    var_to_char(real_input.index),
-                                    stride_str
-                                ),
-                            });
+                            kernel_lines.push(format!(
+                                "{inner_spacing}{}{} {} = {} + {};",
+                                arch.metal_buffer_type(pointer_var),
+                                arch.declaration("float*"),
+                                var_to_char(pointer_var),
+                                arch.resolve_offset(real_input),
+                                stride_str
+                            ));
                             node_to_var.insert(
                                 *input,
                                 Var {
@@ -753,7 +764,7 @@ fn make_kernel(
                     }
                     let stride_str = stride
                         .to_kernel()
-                        .replace("const_z", &format!("loop_{loop_var}"));
+                        .replace("const_z", &arch.resolve_stride(&loop_var));
                     let dest = kernel_graph
                         .neighbors_directed(*output, Direction::Outgoing)
                         .next()
@@ -776,20 +787,14 @@ fn make_kernel(
                                 arch.metal_buffer_type(real_output.index),
                             );
                             assert!(real_output.pointer_owner.is_some());
-                            kernel_lines.push(match arch {
-                                GPUArch::Blade => format!(
-                                    "{inner_spacing}let {} = {};",
-                                    var_to_char(pointer_var),
-                                    stride_str
-                                ),
-                                _ => format!(
-                                    "{inner_spacing}{}float* {} = {} + {};",
-                                    arch.metal_buffer_type(pointer_var),
-                                    var_to_char(pointer_var),
-                                    var_to_char(real_output.index),
-                                    stride_str
-                                ),
-                            });
+                            kernel_lines.push(format!(
+                                "{inner_spacing}{}{} {} = {} + {};",
+                                arch.metal_buffer_type(pointer_var),
+                                arch.declaration("float*"),
+                                var_to_char(pointer_var),
+                                arch.resolve_offset(real_output),
+                                stride_str
+                            ));
                             new_output_vars.push(pointer_var);
                             node_to_var.insert(
                                 *output,
@@ -803,23 +808,20 @@ fn make_kernel(
                         *prev_max_var += 1;
                         let pointer_var = *prev_max_var;
                         arch.add_metal_buffer_type(
-                            *prev_max_var,
+                            pointer_var,
                             arch.metal_buffer_type(real_output),
                         );
-                        kernel_lines.push(match arch {
-                            GPUArch::Blade => format!(
-                                "{inner_spacing}let {} = {};",
-                                var_to_char(pointer_var),
-                                stride_str
-                            ),
-                            _ => format!(
-                                "{inner_spacing}{}float* {} = {} + {};",
-                                arch.metal_buffer_type(pointer_var),
-                                var_to_char(pointer_var),
-                                var_to_char(real_output),
-                                stride_str
-                            ),
-                        });
+                        kernel_lines.push(format!(
+                            "{inner_spacing}{}{} {} = {} + {};",
+                            arch.metal_buffer_type(pointer_var),
+                            arch.declaration("float*"),
+                            var_to_char(pointer_var),
+                            arch.resolve_offset(Var {
+                                index: real_output,
+                                pointer_owner: Some(real_output),
+                            }),
+                            stride_str
+                        ));
                         new_output_vars.push(pointer_var);
                         node_to_var.insert(
                             *output,
@@ -940,28 +942,18 @@ fn make_kernel(
                         }
                         kernel_lines.push(format!(
                             "{spacing}for ({} save = 0; save < {}; save+=1) {{",
-                            match arch {
-                                GPUArch::Blade => "var",
-                                _ => "int",
-                            },
+                            arch.loop_declaration(),
                             size.to_kernel()
                         ));
                         let indexing_expression = indexing_expression
                             .simplify()
                             .to_kernel()
                             .replace("const_z", "save");
-                        kernel_lines.push(match arch {
-                            GPUArch::Blade => format!(
-                                "{inner_spacing}{}[{indexing_expression}] = {}[{indexing_expression}];",
-                                var_to_char(outer_out.index),
-                                var_to_char(output.index),
-                            ),
-                            _ => format!(
-                                "{inner_spacing}{}[{indexing_expression}] = *({} + {indexing_expression});",
-                                var_to_char(outer_out.index),
-                                var_to_char(output.index),
-                            ),
-                        });
+                        kernel_lines.push(format!(
+                            "{inner_spacing}{}[{indexing_expression}] = {}[{indexing_expression}];",
+                            var_to_char(outer_out.index),
+                            var_to_char(output.index),
+                        ));
                         kernel_lines.push(format!("{spacing}}}"));
                     }
                 }
@@ -1054,10 +1046,7 @@ fn make_kernel(
                 };
                 kernel_lines.push(format!(
                     "{spacing}{} {} = {expr};",
-                    match arch {
-                        GPUArch::Blade => "let",
-                        _ => "float",
-                    },
+                    arch.declaration("float"),
                     var_to_char(*prev_max_var),
                 ));
             }
@@ -1106,10 +1095,7 @@ fn make_kernel(
                 };
                 kernel_lines.push(format!(
                     "{spacing}{} {} = {expr};",
-                    match arch {
-                        GPUArch::Blade => "let",
-                        _ => "float",
-                    },
+                    arch.declaration("float"),
                     var_to_char(*prev_max_var)
                 ));
             }
