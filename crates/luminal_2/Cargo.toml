@@ -43,4 +43,4 @@ objc2-foundation = { version = "0.3.1", optional = true }
 eframe = "0.28"
 egui = "0.28"
 anyhow = "1.0.99"
-blade-graphics = { git = "https://github.com/kvark/blade", rev = "2f86d1b94fd8d9fee4e3649bb09f7e0529450ee7", optional = true }
+blade-graphics = { git = "https://github.com/kvark/blade", rev = "99162daf690e05d4489b57adeb37a2cc0086d1be", optional = true }

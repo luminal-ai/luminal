@@ -324,7 +324,7 @@ kernel void kernel_name(
                 )
             }
             GPUArch::Blade => {
-                let declarations = inputs
+                let mut declarations = inputs
                     .into_iter()
                     .map(|(_buf, a)| {
                         format!(
@@ -338,13 +338,15 @@ kernel void kernel_name(
                             var_to_char(node_to_var[&n].index),
                         )
                     }))
-                    .chain(
-                        dyn_vars
-                            .iter()
-                            .sorted()
-                            .map(|(c, _)| format!("var<uniform> const_{}: u32;", c)),
-                    )
                     .collect_vec();
+                if !dyn_vars.is_empty() {
+                    let lines = dyn_vars
+                        .iter()
+                        .map(|(c, _)| format!("    m_{}: u32;\n", c))
+                        .collect_vec();
+                    declarations.push(format!("struct DynamicVariables {{\n{}}}", lines.join("")));
+                    declarations.push(format!("var<uniform> dyn_vars: DynamicVariables;"));
+                }
 
                 format!(
                     "{}
@@ -552,17 +554,18 @@ fn make_kernel(
                         }
                         // Make accumulator
                         *prev_max_var += 1;
-                        arch.add_metal_buffer_type(*prev_max_var, "thread ");
+                        let accumulator = *prev_max_var;
+                        arch.add_metal_buffer_type(accumulator, "thread ");
                         kernel_lines.push(match arch {
                             GPUArch::Blade => format!(
                                 "{spacing}var {} = array<f32, {}>();",
-                                var_to_char(*prev_max_var),
+                                var_to_char(accumulator),
                                 size.to_usize().unwrap(),
                             ),
                             _ => format!(
                                 "{spacing}{}float {}[{}] = {{0.0}};",
-                                arch.metal_buffer_type(*prev_max_var),
-                                var_to_char(*prev_max_var),
+                                arch.metal_buffer_type(accumulator),
+                                var_to_char(accumulator),
                                 size.to_usize().unwrap()
                             ),
                         });
@@ -588,19 +591,19 @@ fn make_kernel(
                         kernel_lines.push(match arch {
                             GPUArch::Blade => format!(
                                 "{inner_spacing}{}[{indexing_expression}] = {}[{indexing_expression}];",
-                                var_to_char(*prev_max_var),
+                                var_to_char(accumulator),
                                 var_to_char(node_to_var[&outer_input].index),
                             ),
                             _ => format!(
                                 "{inner_spacing}{}[{indexing_expression}] = *({} + {indexing_expression});",
-                                var_to_char(*prev_max_var),
+                                var_to_char(accumulator),
                                 var_to_char(node_to_var[&outer_input].index),
                             ),
                         });
                         kernel_lines.push(format!("{spacing}}}"));
                         let v = Var {
-                            index: *prev_max_var,
-                            pointer_owner: Some(*prev_max_var),
+                            index: accumulator,
+                            pointer_owner: Some(accumulator),
                         };
                         node_to_var.insert(*input, v);
                         node_to_var.insert(corresponding_output, v);
@@ -623,20 +626,28 @@ fn make_kernel(
                         }
                         // We don't have a place to save this output to. Need to allocate a register buffer
                         *prev_max_var += 1;
-                        kernel_lines.push(format!(
-                            "{spacing}thread float {}[{}] = {{0.0}};",
-                            var_to_char(*prev_max_var),
-                            size.to_usize().unwrap()
-                        ));
+                        let local_var = *prev_max_var;
+                        kernel_lines.push(match arch {
+                            GPUArch::Blade => format!(
+                                "{spacing}var<private> {} = array<f32, {}>();",
+                                var_to_char(local_var),
+                                size.to_usize().unwrap()
+                            ),
+                            _ => format!(
+                                "{spacing}float {}[{}] = {{0.0}};",
+                                var_to_char(local_var),
+                                size.to_usize().unwrap()
+                            ),
+                        });
                         node_to_var.insert(
                             *output,
                             Var {
-                                index: *prev_max_var,
-                                pointer_owner: Some(*prev_max_var),
+                                index: local_var,
+                                pointer_owner: Some(local_var),
                             },
                         );
-                        created_buffers.insert(*output, *prev_max_var);
-                        arch.add_metal_buffer_type(*prev_max_var, "thread ");
+                        created_buffers.insert(*output, local_var);
+                        arch.add_metal_buffer_type(local_var, "thread ");
                     }
                 }
 
@@ -695,24 +706,26 @@ fn make_kernel(
                             node_to_var.insert(*input, real_input);
                         } else {
                             *prev_max_var += 1;
+                            let pointer_var = *prev_max_var;
                             arch.add_metal_buffer_type(
-                                *prev_max_var,
+                                pointer_var,
                                 arch.metal_buffer_type(real_input.index),
                             );
                             let stride_str = stride
                                 .to_kernel()
                                 .replace("const_z", &format!("loop_{loop_var}"));
                             //TODO: operate on indices instead of pointers in all backends?
+                            assert!(real_input.pointer_owner.is_some());
                             kernel_lines.push(match arch {
                                 GPUArch::Blade => format!(
                                     "{inner_spacing}let {} = {};",
-                                    var_to_char(*prev_max_var),
+                                    var_to_char(pointer_var),
                                     stride_str
                                 ),
                                 _ => format!(
                                     "{inner_spacing}{}float* {} = {} + {};",
-                                    arch.metal_buffer_type(*prev_max_var),
-                                    var_to_char(*prev_max_var),
+                                    arch.metal_buffer_type(pointer_var),
+                                    var_to_char(pointer_var),
                                     var_to_char(real_input.index),
                                     stride_str
                                 ),
@@ -720,7 +733,7 @@ fn make_kernel(
                             node_to_var.insert(
                                 *input,
                                 Var {
-                                    index: *prev_max_var,
+                                    index: pointer_var,
                                     pointer_owner: real_input.pointer_owner,
                                 },
                             );
@@ -752,59 +765,62 @@ fn make_kernel(
                                 "Only pointers can be offset!"
                             );
                             *prev_max_var += 1;
+                            let pointer_var = *prev_max_var;
                             arch.add_metal_buffer_type(
-                                *prev_max_var,
+                                pointer_var,
                                 arch.metal_buffer_type(real_output.index),
                             );
+                            assert!(real_output.pointer_owner.is_some());
                             kernel_lines.push(match arch {
                                 GPUArch::Blade => format!(
                                     "{inner_spacing}let {} = {};",
-                                    var_to_char(*prev_max_var),
+                                    var_to_char(pointer_var),
                                     stride_str
                                 ),
                                 _ => format!(
                                     "{inner_spacing}{}float* {} = {} + {};",
-                                    arch.metal_buffer_type(*prev_max_var),
-                                    var_to_char(*prev_max_var),
+                                    arch.metal_buffer_type(pointer_var),
+                                    var_to_char(pointer_var),
                                     var_to_char(real_output.index),
                                     stride_str
                                 ),
                             });
-                            new_output_vars.push(*prev_max_var);
+                            new_output_vars.push(pointer_var);
                             node_to_var.insert(
                                 *output,
                                 Var {
-                                    index: *prev_max_var,
+                                    index: pointer_var,
                                     pointer_owner: real_output.pointer_owner,
                                 },
                             );
                         }
-                    } else if let Some(real_output) = created_buffers.get(output) {
+                    } else if let Some(&real_output) = created_buffers.get(output) {
                         *prev_max_var += 1;
+                        let pointer_var = *prev_max_var;
                         arch.add_metal_buffer_type(
                             *prev_max_var,
-                            arch.metal_buffer_type(*real_output),
+                            arch.metal_buffer_type(real_output),
                         );
                         kernel_lines.push(match arch {
                             GPUArch::Blade => format!(
                                 "{inner_spacing}let {} = {};",
-                                var_to_char(*prev_max_var),
+                                var_to_char(pointer_var),
                                 stride_str
                             ),
                             _ => format!(
                                 "{inner_spacing}{}float* {} = {} + {};",
-                                arch.metal_buffer_type(*prev_max_var),
-                                var_to_char(*prev_max_var),
-                                var_to_char(*real_output),
+                                arch.metal_buffer_type(pointer_var),
+                                var_to_char(pointer_var),
+                                var_to_char(real_output),
                                 stride_str
                             ),
                         });
-                        new_output_vars.push(*prev_max_var);
+                        new_output_vars.push(pointer_var);
                         node_to_var.insert(
                             *output,
                             Var {
-                                index: *prev_max_var,
-                                pointer_owner: Some(*real_output),
+                                index: pointer_var,
+                                pointer_owner: Some(real_output),
                             },
                         );
                     }
@@ -984,9 +1000,9 @@ fn make_kernel(
                     GPUArch::Metal(_) => "threadgroup_barrier(mem_flags::mem_threadgroup)",
                     GPUArch::Blade => "storageBarrier(); workgroupBarrier()",
                 };
+                kernel_lines.push(format!("{spacing}{sync_barrier};"));
                 match term {
                     GraphTerm::SMEMLoad => {
-                        kernel_lines.push(format!("{spacing}{sync_barrier};"));
                         kernel_lines.push(format!(
                             "{spacing}*{} = {};",
                             var_to_char(smem.index),
@@ -996,7 +1012,6 @@ fn make_kernel(
                     }
                     GraphTerm::SMEMRead => {
                         // gmem ptr isn't actually gmem, it should be pointing to the smem copy
-                        kernel_lines.push(format!("{spacing}{sync_barrier};"));
                         node_to_var.insert(node, smem);
                     }
                     _ => panic!(),
@@ -1035,7 +1050,7 @@ fn make_kernel(
                 kernel_lines.push(format!(
                     "{spacing}{} {} = {expr};",
                     match arch {
-                        GPUArch::Blade => "var",
+                        GPUArch::Blade => "let",
                         _ => "float",
                     },
                     var_to_char(*prev_max_var),
@@ -1087,7 +1102,7 @@ fn make_kernel(
                 kernel_lines.push(format!(
                     "{spacing}{} {} = {expr};",
                     match arch {
-                        GPUArch::Blade => "var",
+                        GPUArch::Blade => "let",
                         _ => "float",
                     },
                     var_to_char(*prev_max_var)

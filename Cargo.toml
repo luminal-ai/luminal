@@ -47,3 +47,6 @@ exclude = [
     "crates/luminal_2",
     "demos/flash_attention",
 ]
+
+#[patch."https://github.com/kvark/blade"]
+#blade-graphics = { path = "../blade/blade-graphics" }

@@ -854,6 +854,13 @@ pub fn run_graph(
                 "threadblock is too big: {tb:?} > 1024"
             );
 
+            //HACK: relying on `node_to_var` mapping to be constructed this way in codegen
+            let num_inputs = kernels.edges_directed(node, Direction::Incoming).count();
+            let mut layout = gpu::ShaderDataLayout {
+                bindings: (0..num_inputs + kernel.outputs.len())
+                    .map(|i| (VAR_NAMES[i], gpu::ShaderBinding::Buffer))
+                    .collect(),
+            };
             let mut shader_data = BladeShaderData {
                 buffers: Vec::new(),
             };
@@ -876,34 +883,24 @@ pub fn run_graph(
                     .push(buffers[intermediate_buffer_map[&node][output_index]].raw);
             }
             // set dynamic dimensions
-            for (_, v) in dyn_vars.iter().sorted_by_key(|(k, _)| **k) {
-                unimplemented!("Use uniform buffers for dynamic vars");
-                let buffer = ctx.create_buffer(gpu::BufferDesc {
-                    name: "temp",
-                    size: size_of::<u64>() as u64,
+            if !dyn_vars.is_empty() {
+                let temp_buffer = ctx.create_buffer(gpu::BufferDesc {
+                    name: "dyn_vars",
+                    size: dyn_vars.len() as u64 * 4,
                     memory: gpu::Memory::Shared,
                 });
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        v as *const usize as *const u64,
-                        buffer.data() as *mut u64,
-                        size_of::<u64>(),
-                    );
+                for (i, (_k, &v)) in dyn_vars.iter().enumerate() {
+                    unsafe {
+                        *(temp_buffer.data() as *mut u32).add(i) = v as u32;
+                    }
                 }
-                extra_buffers.push(buffer);
-                //unsafe { encoder.setBuffer_offset_atIndex(Some(&buf), 0, buffer_count) };
-                //buffer_count += 1;
+                layout
+                    .bindings
+                    .push(("dyn_vars", gpu::ShaderBinding::Buffer));
+                shader_data.buffers.push(temp_buffer);
+                extra_buffers.push(temp_buffer);
             }
 
-            let num_inputs = kernels.edges_directed(node, Direction::Incoming).count();
-            let layout = gpu::ShaderDataLayout {
-                //HACK: relying on `var_to_node` mapping to be constructed this way in codegen
-                bindings: (0..num_inputs + kernel.outputs.len())
-                    .map(|i| (VAR_NAMES[i], gpu::ShaderBinding::Buffer))
-                    .collect(),
-            };
-
-            //TODO: clean up after we are done
             let pipeline = ctx.create_compute_pipeline(gpu::ComputePipelineDesc {
                 name: "",
                 data_layouts: &[&layout],
@@ -926,6 +923,7 @@ pub fn run_graph(
             assert!(grid[1] <= 65535, "grid.y > 65535");
             assert!(grid[2] <= 65535, "grid.z > 65535");
             encoder.dispatch(grid);
+
             pipelines.push(pipeline);
         }
     }
