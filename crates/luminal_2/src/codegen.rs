@@ -326,15 +326,20 @@ kernel void kernel_name(
             GPUArch::Blade => {
                 let mut declarations = inputs
                     .into_iter()
-                    .map(|(_buf, a)| {
+                    .map(|(buf, a)| {
                         format!(
-                            "var<storage, read> {}: array<f32>;",
+                            "var<storage, read> {}: array<f32>; {}",
                             var_to_char(node_to_var[&a].index),
+                            if let GMEMBuffer::Input { node } = buf {
+                                format!(" // GMEM({})", gmem_names[&node])
+                            } else {
+                                "".to_string()
+                            }
                         )
                     })
                     .chain(outputs.iter().map(|(_, n)| {
                         format!(
-                            "var<storage, read_write> {}: array<f32>;",
+                            "var<storage, read_write> {}: array<f32>; // Output",
                             var_to_char(node_to_var[&n].index),
                         )
                     }))

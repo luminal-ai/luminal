@@ -48,22 +48,19 @@ const INVALID_IR: &[&str] = &[
     "TiledMatmulAcc",
 ];
 
-#[cfg(feature = "metal")]
 #[inline]
 fn with_autoreleasepool<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    objc2::rc::autoreleasepool(|_| f())
-}
-
-#[cfg(not(feature = "cuda"))]
-#[inline]
-fn with_autoreleasepool<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    f()
+    #[cfg(feature = "metal")]
+    {
+        objc2::rc::autoreleasepool(|_| f())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        f()
+    }
 }
 
 type Cost = u128; // Execution time in microseconds

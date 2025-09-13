@@ -11,6 +11,8 @@ use blade_graphics as gpu;
 #[cfg(feature = "cuda")]
 use cudarc::{driver::*, nvrtc::CompileOptions};
 use itertools::Itertools;
+#[cfg(feature = "metal")]
+use objc2_metal::{MTLBuffer as _, MTLDevice as _};
 
 use luminal::{
     prelude::{
@@ -24,8 +26,6 @@ use luminal::{
     },
     shape::Expression,
 };
-#[cfg(feature = "metal")]
-use objc2_metal::{MTLBuffer, MTLDevice};
 use rustc_hash::FxHashMap;
 use std::{collections::HashMap, ffi::c_void, ptr::NonNull};
 use std::{fs::File, io::Read as _, io::Write as _};
@@ -56,7 +56,7 @@ impl gpu::ShaderData for BladeShaderData {
 
 #[cfg(feature = "metal")]
 pub fn chunk_based_search_compiler(
-    device: &MTLDevice,
+    device: &Device,
     original_graph: Graph,
     original_graph_input: Vec<(GraphTensor, Vec<f32>)>,
     original_graph_output: &GraphTensor,
@@ -153,7 +153,7 @@ pub fn chunk_based_search_compiler(
         for (input, data) in original_graph_input {
             inputs.insert(
                 gmem_mapping[&new_old_to_new_mapping[&input.id]],
-                (copy_metal_buffer(&data, &device), true),
+                copy_metal_buffer(&data, &device),
             );
         }
         let mut gmem_to_node_mapping = FxHashMap::default();
@@ -171,23 +171,24 @@ pub fn chunk_based_search_compiler(
                         gmem_mapping[&new_old_to_new_mapping[&gmem_to_node_mapping[label]]],
                         {
                             let v = vec![val as f32];
-                            (copy_metal_buffer(&v, &device), true)
+                            copy_metal_buffer(&v, &device)
                         },
                     );
                 }
                 InitData::Data(d) => {
                     inputs.insert(
                         gmem_mapping[&new_old_to_new_mapping[&gmem_to_node_mapping[label]]],
-                        (copy_metal_buffer(d, &device), true),
+                        copy_metal_buffer(d, &device),
                     );
                 }
             }
         }
-        let compiled_kernels = compile_kernels(&kernels);
+        let compiled_kernels = compile_kernels(device, &kernels);
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
         let (outputs, _) = run_graph(
+            device,
             &StableGraph::default(),
-            &mut inputs,
+            &inputs,
             &kernels,
             &original_graph.dyn_map,
             &compiled_kernels,
@@ -306,9 +307,18 @@ pub fn compile_kernels(
 
 #[cfg(feature = "metal")]
 pub fn compile_kernels(
-    device: &MTLDevice,
+    device: &Device,
     kernels: &StableGraph<Kernel, (usize, usize)>,
 ) -> FxHashMap<String, Function> {
+    // Open (or create) the log file, appending logs to it
+    let log_path = "kernel_log.txt";
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true) // overwrite on each run
+        .open(log_path)
+        .expect("Failed to open kernel log file");
+
     let mut compiled = FxHashMap::default();
     for kernel in kernels.node_weights() {
         if !compiled.contains_key(&kernel.code)
@@ -317,6 +327,9 @@ pub fn compile_kernels(
         {
             use objc2_foundation::{ns_string, NSString};
             use objc2_metal::MTLLibrary;
+
+            writeln!(log_file, "Compiling kernel:\n{}\n", kernel.code)
+                .expect("Failed to write to kernel log file");
 
             let lib = device
                 .newLibraryWithSource_options_error(&NSString::from_str(&kernel.code), None)
@@ -500,9 +513,9 @@ pub fn run_graph(
 
 #[cfg(feature = "metal")]
 pub fn run_graph(
-    device: &MTLDevice,
+    device: &Device,
     graph: &StableGraph<GraphTerm, ()>,
-    inputs: &FxHashMap<usize, (Buffer, bool)>,
+    inputs: &FxHashMap<usize, Buffer>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
     dyn_vars: &FxHashMap<char, usize>,
     compiled_kernels: &FxHashMap<String, Function>,
@@ -909,21 +922,22 @@ pub fn run_graph(
 
             //TODO: share the pass between independent kernels of the same rank
             let mut pass = command_buffer.compute("");
-            let mut encoder = pass.with(&pipeline);
-            // Bind all used resources
-            encoder.bind(0, &shader_data);
+            {
+                let mut encoder = pass.with(&pipeline);
+                // Bind all used resources
+                encoder.bind(0, &shader_data);
 
-            // Set dispatch
-            let grid = [
-                kernel.grid.0.exec(dyn_vars).unwrap() as u32,
-                kernel.grid.1.exec(dyn_vars).unwrap() as u32,
-                kernel.grid.2.exec(dyn_vars).unwrap() as u32,
-            ];
-            assert!(grid[0] <= 2147483647, "grid.x > 2147483647");
-            assert!(grid[1] <= 65535, "grid.y > 65535");
-            assert!(grid[2] <= 65535, "grid.z > 65535");
-            encoder.dispatch(grid);
-
+                // Set dispatch
+                let grid = [
+                    kernel.grid.0.exec(dyn_vars).unwrap() as u32,
+                    kernel.grid.1.exec(dyn_vars).unwrap() as u32,
+                    kernel.grid.2.exec(dyn_vars).unwrap() as u32,
+                ];
+                assert!(grid[0] <= 2147483647, "grid.x > 2147483647");
+                assert!(grid[1] <= 65535, "grid.y > 65535");
+                assert!(grid[2] <= 65535, "grid.z > 65535");
+                encoder.dispatch(grid);
+            }
             pipelines.push(pipeline);
         }
     }
