@@ -37,6 +37,7 @@ use std::sync::Arc;
 use blade_graphics as gpu;
 
 fn main() {
+    env_logger::init();
     with_autoreleasepool(|| {
         #[cfg(feature = "cuda")]
         println!("CUDA MODE ENABLED");
@@ -132,7 +133,13 @@ fn main() {
         #[cfg(feature = "cuda")]
         let device = &CudaContext::new(0).unwrap();
         #[cfg(feature = "blade")]
-        let device = &unsafe { gpu::Context::init(gpu::ContextDesc::default()) }.unwrap();
+        let device = &unsafe {
+            gpu::Context::init(gpu::ContextDesc {
+                timing: true,
+                ..Default::default()
+            })
+        }
+        .unwrap();
 
         let compiled = compile_kernels(&device, &kernels);
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);

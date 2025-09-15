@@ -7,10 +7,9 @@ use std::usize;
 use crate::run::{assign_buffers, compile_kernels, run_graph};
 use crate::translate::InitData;
 use crate::utils::{build_search_space, generate_proof, print_kernels};
-use crate::Kernel;
 #[cfg(feature = "metal")]
-use crate::{Buffer, Device};
-use crate::{GPUArch, GraphTerm};
+use crate::Buffer;
+use crate::{Device, GPUArch, GraphTerm, Kernel};
 #[cfg(feature = "cuda")]
 use anyhow::Result;
 #[cfg(feature = "blade")]
@@ -280,6 +279,19 @@ pub fn search(
     arch: GPUArch,
     dyn_vars: &FxHashMap<char, usize>,
 ) -> Option<StableGraph<GraphTerm, ()>> {
+    #[cfg(feature = "metal")]
+    let device = MTLCreateSystemDefaultDevice().unwrap();
+    #[cfg(feature = "cuda")]
+    let device = CudaContext::new(0).unwrap(); // will need to expand beyond single host
+    #[cfg(feature = "blade")]
+    let device = unsafe {
+        gpu::Context::init(gpu::ContextDesc {
+            validation: cfg!(debug_assertions),
+            ..Default::default()
+        })
+        .unwrap()
+    };
+
     let og = graph.clone();
     let egraph = build_search_space(graph, steps);
     let trajectories = extract_trajectories(
@@ -367,6 +379,7 @@ pub fn search(
             seen.insert(k);
         }
         let (us, outs) = match cost(
+            &device,
             &graph,
             &kernels,
             &node_index_to_init_data,
@@ -667,6 +680,7 @@ pub fn extraction_to_graph(
 }
 
 fn cost<'a>(
+    device: &Device,
     graph: &StableGraph<GraphTerm, ()>,
     kernels: &StableGraph<Kernel, (usize, usize), Directed>,
     inputs: &[(NodeIndex, InitData)],
@@ -678,18 +692,6 @@ fn cost<'a>(
     with_autoreleasepool(|| {
         // Get buffer info
         let (int_buffers, int_buffer_map) = assign_buffers(&kernels);
-        #[cfg(feature = "metal")]
-        let device = MTLCreateSystemDefaultDevice().unwrap();
-        #[cfg(feature = "cuda")]
-        let device = CudaContext::new(0).unwrap(); // will need to expand beyond single host
-        #[cfg(feature = "blade")]
-        let device = unsafe {
-            gpu::Context::init(gpu::ContextDesc {
-                validation: cfg!(debug_assertions),
-                ..Default::default()
-            })
-            .unwrap()
-        };
         let compiled_kernels = compile_kernels(&device, &kernels);
 
         // Copy input buffers over

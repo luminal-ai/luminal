@@ -8,6 +8,9 @@ pub mod utils;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "blade")]
+use blade_graphics as gpu;
+
 #[cfg(feature = "cuda")]
 use itertools::Itertools;
 use luminal::prelude::*;
@@ -30,8 +33,11 @@ pub type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 #[cfg(feature = "metal")]
 pub type Function = Retained<ProtocolObject<dyn MTLFunction>>;
 
+#[cfg(feature = "cuda")]
+pub type Device = CudaContext;
+
 #[cfg(feature = "blade")]
-use blade_graphics as gpu;
+pub type Device = gpu::Context;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum GPUArch {

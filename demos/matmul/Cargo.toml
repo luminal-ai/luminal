@@ -21,6 +21,7 @@ blade = [
 ]
 
 [dependencies]
+env_logger = "0.11"
 itertools = "0.14.0"
 luminal = { path = "../.." }
 luminal_cuda = { path = "../../crates/luminal_cuda", optional = true }
