@@ -754,194 +754,261 @@ pub fn run_graph(
     let mut pipelines = Vec::new();
     let mut extra_buffers = Vec::new();
 
+    let input_node = kernels
+        .node_indices()
+        .find(|n| kernels[*n].code == "Inputs")
+        .unwrap();
+    let output_node = kernels
+        .node_indices()
+        .find(|n| kernels[*n].code == "Outputs")
+        .unwrap();
+
     // Allocate intermediate buffers
-    let mut buffers = intermediate_buffers
+    let buffers = intermediate_buffers
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(buffer_index, e)| {
+            let is_output = kernels
+                .edges_directed(output_node, Direction::Incoming)
+                .any(|e| intermediate_buffer_map[&e.source()][e.weight().0] == buffer_index);
             let count = e.exec(dyn_vars).unwrap();
             let size = count * size_of::<f32>();
             let raw = ctx.create_buffer(gpu::BufferDesc {
                 name: "",
                 size: size as u64,
-                //TODO: only share the outputs
-                memory: gpu::Memory::Shared,
+                //Note: alternative, we could have all `Device` here
+                // and then specifically create buffers for reading.
+                memory: if is_output {
+                    gpu::Memory::Shared
+                } else {
+                    gpu::Memory::Device
+                },
             });
             super::Buffer { raw, size }
         })
         .collect_vec();
-    let input_node = kernels
-        .node_indices()
-        .find(|n| kernels[*n].code == "Inputs")
-        .unwrap();
+
+    /// Form layers of the topological graph traversal.
+    /// Each layer contains nodes independent from each other.
+    #[derive(Default)]
+    struct Layer {
+        compute_nodes: Vec<NodeIndex>,
+        transfer_nodes: Vec<NodeIndex>,
+    }
+    let mut layers = vec![
+        Layer::default(), // initial layer for inputs
+    ];
     for node in toposort(kernels, None).unwrap() {
-        let kernel = &kernels[node];
-        // println!("Our wonderful kernel: {:?}", kernel);
-        if kernel.code == "Inputs" {
-            // Inputs should already be in the buffer map
-        } else if kernel.code == "Outputs" {
-            //TODO: schedule copies from Device memory into Host
-            // Run
-            let sync_point = ctx.submit(&mut command_buffer);
-            ctx.wait_for(&sync_point, !0);
-
-            let outputs = kernels
-                .edges_directed(node, Direction::Incoming)
-                .map(|e| {
-                    (
-                        e.weight().1,
-                        intermediate_buffer_map[&e.source()][e.weight().0],
-                    )
-                })
-                .sorted_by_key(|(_, b)| *b)
-                .rev()
-                .map(|(a, b)| (a, copy_blade_buffer_back(&buffers[b])))
-                .sorted_by_key(|(a, _)| *a)
-                .map(|(_, a)| a)
-                .collect_vec();
-
-            // Clean up
-            ctx.destroy_command_encoder(&mut command_buffer);
-            for pipeline in pipelines.iter_mut() {
-                ctx.destroy_compute_pipeline(pipeline);
-            }
-            for buffer in buffers {
-                ctx.destroy_buffer(buffer.raw);
-            }
-            for buffer in extra_buffers {
-                ctx.destroy_buffer(buffer);
-            }
-
-            return (outputs, start.elapsed().as_micros());
-        } else if kernel.code.starts_with("Diff") {
-            // Load file and diff numbers
-
-            let diff_name = kernel.code.replace("Diff", "");
-            let (input, input_index) = kernels
-                .edges_directed(node, Direction::Incoming)
-                .sorted_by_key(|n| n.weight().1)
-                .map(|n| (n.source(), n.weight().0))
-                .next()
-                .unwrap();
-            let buffer = &buffers[intermediate_buffer_map[&input][input_index]];
-            //TODO: remove this copy, we can compare directly
-            let mut data = vec![0_f32; buffer.size / size_of::<f32>()];
-            unsafe {
-                std::ptr::copy_nonoverlapping(buffer.raw.data() as *const _, &mut data, data.len());
-            }
-            let mut file = File::open(format!("{diff_name}.bin")).unwrap();
-            let mut file_buffer = Vec::new();
-            file.read_to_end(&mut file_buffer).unwrap();
-            assert_eq!(file_buffer.len() % std::mem::size_of::<f32>(), 0);
-
-            let num_floats = file_buffer.len() / std::mem::size_of::<f32>();
-            let floats: Vec<f32> = unsafe {
-                let ptr = file_buffer.as_ptr() as *const f32;
-                Vec::from_raw_parts(ptr as *mut f32, num_floats, num_floats)
-            };
-            let mut matched = true;
-            println!("Diff {} | {}", data.len(), floats.len());
-            for (ind, (i, j)) in data.iter().zip(floats).enumerate() {
-                if (i - j).abs() > 1e-5 {
-                    matched = false;
-                    println!("Diff {diff_name} failed: curr: {i} != file: {j}, index {ind}");
-                    break;
+        let current_layer = layers.len() - 1;
+        match kernels.edges_directed(node, Direction::Incoming).next() {
+            Some(e) => {
+                let last = layers.last().unwrap();
+                if last.compute_nodes.contains(&e.source()) {
+                    // Dependency found, create a new layer
+                    layers.push(Layer::default());
                 }
             }
-            std::mem::forget(file_buffer);
-            if matched {
-                println!("DIFF {diff_name} MATCHED");
+            None => {
+                assert_eq!(current_layer, 0);
             }
-            let dest_buffer = &mut buffers[intermediate_buffer_map[&node][0]];
-            unsafe {
-                std::ptr::copy_nonoverlapping(&data, dest_buffer.raw.data() as *mut _, data.len());
-            }
+        };
+        let last = layers.last_mut().unwrap();
+        if kernels[node].code.starts_with("Diff") {
+            last.transfer_nodes.push(node);
         } else {
-            //Note: this is baked into the shader. Do `dyn_vars` change that?
-            let tb = (
-                kernel.threadblock.0.exec(dyn_vars).unwrap(),
-                kernel.threadblock.1.exec(dyn_vars).unwrap(),
-                kernel.threadblock.2.exec(dyn_vars).unwrap(),
-            );
-            assert!(
-                tb.0 * tb.1 * tb.2 <= 1024,
-                "threadblock is too big: {tb:?} > 1024"
-            );
-
-            //HACK: relying on `node_to_var` mapping to be constructed this way in codegen
-            let num_inputs = kernels.edges_directed(node, Direction::Incoming).count();
-            let mut layout = gpu::ShaderDataLayout {
-                bindings: (0..num_inputs + kernel.outputs.len())
-                    .map(|i| (VAR_NAMES[i], gpu::ShaderBinding::Buffer))
-                    .collect(),
-            };
-            let mut shader_data = BladeShaderData {
-                buffers: Vec::new(),
-            };
-            // set inputs
-            for (input, input_index) in kernels
-                .edges_directed(node, Direction::Incoming)
-                .sorted_by_key(|n| n.weight().1)
-                .map(|n| (n.source(), n.weight().0))
-            {
-                shader_data.buffers.push(if input == input_node {
-                    inputs[&input_index].raw
-                } else {
-                    buffers[intermediate_buffer_map[&input][input_index]].raw
-                });
-            }
-            // set output
-            for output_index in 0..kernel.outputs.len() {
-                shader_data
-                    .buffers
-                    .push(buffers[intermediate_buffer_map[&node][output_index]].raw);
-            }
-            // set dynamic dimensions
-            if !dyn_vars.is_empty() {
-                let temp_buffer = ctx.create_buffer(gpu::BufferDesc {
-                    name: "dyn_vars",
-                    size: dyn_vars.len() as u64 * 4,
-                    memory: gpu::Memory::Shared,
-                });
-                for (i, (_k, &v)) in dyn_vars.iter().enumerate() {
-                    unsafe {
-                        *(temp_buffer.data() as *mut u32).add(i) = v as u32;
-                    }
-                }
-                layout
-                    .bindings
-                    .push(("dyn_vars", gpu::ShaderBinding::Buffer));
-                shader_data.buffers.push(temp_buffer);
-                extra_buffers.push(temp_buffer);
-            }
-
-            let pipeline = ctx.create_compute_pipeline(gpu::ComputePipelineDesc {
-                name: "",
-                data_layouts: &[&layout],
-                compute: compiled_kernels[&kernel.code].at("main"),
-            });
-
-            //TODO: share the pass between independent kernels of the same rank
-            let mut pass = command_buffer.compute("");
-            {
-                let mut encoder = pass.with(&pipeline);
-                // Bind all used resources
-                encoder.bind(0, &shader_data);
-
-                // Set dispatch
-                let grid = [
-                    kernel.grid.0.exec(dyn_vars).unwrap() as u32,
-                    kernel.grid.1.exec(dyn_vars).unwrap() as u32,
-                    kernel.grid.2.exec(dyn_vars).unwrap() as u32,
-                ];
-                assert!(grid[0] <= 2147483647, "grid.x > 2147483647");
-                assert!(grid[1] <= 65535, "grid.y > 65535");
-                assert!(grid[2] <= 65535, "grid.z > 65535");
-                encoder.dispatch(grid);
-            }
-            pipelines.push(pipeline);
+            last.compute_nodes.push(node);
         }
     }
-    panic!("No output kernel detected in graph!");
+
+    for layer in layers {
+        if !layer.transfer_nodes.is_empty() {
+            let mut pass = command_buffer.transfer("diff");
+            for node in layer.transfer_nodes {
+                let kernel = &kernels[node];
+
+                // Load file and diff numbers
+                let diff_name = kernel.code.replace("Diff", "");
+                let (input, input_index) = kernels
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|n| n.weight().1)
+                    .map(|n| (n.source(), n.weight().0))
+                    .next()
+                    .unwrap();
+                let buffer = &buffers[intermediate_buffer_map[&input][input_index]];
+                //TODO: remove this copy, we can compare directly
+                let mut data = vec![0_f32; buffer.size / size_of::<f32>()];
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buffer.raw.data() as *const _,
+                        &mut data,
+                        data.len(),
+                    );
+                }
+                let mut file = File::open(format!("{diff_name}.bin")).unwrap();
+                let mut file_buffer = Vec::new();
+                file.read_to_end(&mut file_buffer).unwrap();
+                assert_eq!(file_buffer.len() % std::mem::size_of::<f32>(), 0);
+
+                let num_floats = file_buffer.len() / std::mem::size_of::<f32>();
+                let floats: Vec<f32> = unsafe {
+                    let ptr = file_buffer.as_ptr() as *const f32;
+                    Vec::from_raw_parts(ptr as *mut f32, num_floats, num_floats)
+                };
+                let mut matched = true;
+                println!("Diff {} | {}", data.len(), floats.len());
+                for (ind, (i, j)) in data.iter().zip(floats).enumerate() {
+                    if (i - j).abs() > 1e-5 {
+                        matched = false;
+                        println!("Diff {diff_name} failed: curr: {i} != file: {j}, index {ind}");
+                        break;
+                    }
+                }
+                std::mem::forget(file_buffer);
+                if matched {
+                    println!("DIFF {diff_name} MATCHED");
+                }
+
+                let dest_buffer = &buffers[intermediate_buffer_map[&node][0]];
+                pass.copy_buffer_to_buffer(
+                    buffer.raw.at(0),
+                    dest_buffer.raw.at(0),
+                    data.len() as u64,
+                );
+            }
+        }
+
+        let mut pass = command_buffer.compute("");
+        for node in layer.compute_nodes {
+            let kernel = &kernels[node];
+            assert!(!kernel.code.starts_with("Diff"));
+            // println!("Our wonderful kernel: {:?}", kernel);
+            if kernel.code == "Inputs" {
+                // Inputs should already be in the buffer map
+                assert_eq!(node, input_node);
+            } else if kernel.code == "Outputs" {
+                // This will end now
+                assert_eq!(node, output_node);
+            } else {
+                //Note: this is baked into the shader. Do `dyn_vars` change that?
+                let tb = (
+                    kernel.threadblock.0.exec(dyn_vars).unwrap(),
+                    kernel.threadblock.1.exec(dyn_vars).unwrap(),
+                    kernel.threadblock.2.exec(dyn_vars).unwrap(),
+                );
+                assert!(
+                    tb.0 * tb.1 * tb.2 <= 1024,
+                    "threadblock is too big: {tb:?} > 1024"
+                );
+
+                //HACK: relying on `node_to_var` mapping to be constructed this way in codegen
+                let num_inputs = kernels.edges_directed(node, Direction::Incoming).count();
+                let mut layout = gpu::ShaderDataLayout {
+                    bindings: (0..num_inputs + kernel.outputs.len())
+                        .map(|i| (VAR_NAMES[i], gpu::ShaderBinding::Buffer))
+                        .collect(),
+                };
+                let mut shader_data = BladeShaderData {
+                    buffers: Vec::new(),
+                };
+                // set inputs
+                for (input, input_index) in kernels
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|n| n.weight().1)
+                    .map(|n| (n.source(), n.weight().0))
+                {
+                    shader_data.buffers.push(if input == input_node {
+                        inputs[&input_index].raw
+                    } else {
+                        buffers[intermediate_buffer_map[&input][input_index]].raw
+                    });
+                }
+                // set output
+                for output_index in 0..kernel.outputs.len() {
+                    shader_data
+                        .buffers
+                        .push(buffers[intermediate_buffer_map[&node][output_index]].raw);
+                }
+                // set dynamic dimensions
+                if !dyn_vars.is_empty() {
+                    let temp_buffer = ctx.create_buffer(gpu::BufferDesc {
+                        name: "dyn_vars",
+                        size: dyn_vars.len() as u64 * 4,
+                        memory: gpu::Memory::Shared,
+                    });
+                    for (i, (_k, &v)) in dyn_vars.iter().enumerate() {
+                        unsafe {
+                            *(temp_buffer.data() as *mut u32).add(i) = v as u32;
+                        }
+                    }
+                    layout
+                        .bindings
+                        .push(("dyn_vars", gpu::ShaderBinding::Buffer));
+                    shader_data.buffers.push(temp_buffer);
+                    extra_buffers.push(temp_buffer);
+                }
+
+                let pipeline = ctx.create_compute_pipeline(gpu::ComputePipelineDesc {
+                    name: "",
+                    data_layouts: &[&layout],
+                    compute: compiled_kernels[&kernel.code].at("main"),
+                });
+                {
+                    let mut encoder = pass.with(&pipeline);
+                    // Bind all used resources
+                    encoder.bind(0, &shader_data);
+
+                    // Set dispatch
+                    let grid = [
+                        kernel.grid.0.exec(dyn_vars).unwrap() as u32,
+                        kernel.grid.1.exec(dyn_vars).unwrap() as u32,
+                        kernel.grid.2.exec(dyn_vars).unwrap() as u32,
+                    ];
+                    assert!(grid[0] <= 2147483647, "grid.x > 2147483647");
+                    assert!(grid[1] <= 65535, "grid.y > 65535");
+                    assert!(grid[2] <= 65535, "grid.z > 65535");
+                    encoder.dispatch(grid);
+                }
+                pipelines.push(pipeline);
+            }
+        }
+    }
+
+    // Run
+    let sync_point = ctx.submit(&mut command_buffer);
+    ctx.wait_for(&sync_point, !0);
+
+    let outputs = kernels
+        .edges_directed(output_node, Direction::Incoming)
+        .map(|e| {
+            (
+                e.weight().1,
+                intermediate_buffer_map[&e.source()][e.weight().0],
+            )
+        })
+        .sorted_by_key(|(_, b)| *b)
+        .rev()
+        .map(|(a, b)| (a, copy_blade_buffer_back(&buffers[b])))
+        .sorted_by_key(|(a, _)| *a)
+        .map(|(_, a)| a)
+        .collect_vec();
+
+    // Clean up
+    for pipeline in pipelines.iter_mut() {
+        ctx.destroy_compute_pipeline(pipeline);
+    }
+    for buffer in buffers {
+        ctx.destroy_buffer(buffer.raw);
+    }
+    for buffer in extra_buffers {
+        ctx.destroy_buffer(buffer);
+    }
+
+    let time_measured = start.elapsed().as_micros();
+
+    // Command encoder creation wasn't timed
+    ctx.destroy_command_encoder(&mut command_buffer);
+
+    (outputs, time_measured)
 }
 
 #[cfg(feature = "metal")]
