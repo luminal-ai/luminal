@@ -38,16 +38,13 @@ impl crate::GPUArch {
             _ => ty,
         }
     }
-    fn loop_declaration(&self) -> &str {
+
+    fn loop_header(&self, index_name: &str, limit_name: &str) -> String {
         match *self {
-            Self::Blade => "var",
-            _ => "int",
-        }
-    }
-    fn resolve_stride(&self, name: &str) -> String {
-        match *self {
-            Self::Blade => format!("u32(loop_{name})"),
-            _ => format!("loop_{name}"),
+            Self::Blade => format!(
+                "var {index_name} = 0u; {index_name} < u32({limit_name}); {index_name} += 1u"
+            ),
+            _ => format!("int {index_name} = 0; {index_name} < {limit_name}; ++{index_name}"),
         }
     }
 
@@ -616,9 +613,8 @@ fn make_kernel(
                             .unwrap();
                         // Use a single loop with correct striding from the input
                         kernel_lines.push(format!(
-                            "{spacing}for ({} load = 0; load < {}; load+=1) {{",
-                            arch.loop_declaration(),
-                            loads.to_kernel()
+                            "{spacing}for ({}) {{",
+                            arch.loop_header("load", &loads.to_kernel()),
                         ));
                         let indexing_expression = indexing_expression
                             .simplify()
@@ -707,11 +703,14 @@ fn make_kernel(
                 } else {
                     // for
                     *prev_max_var += 1;
-                    let loop_var = var_to_char(*prev_max_var);
-                    kernel_lines.push(format!("{spacing}for ({} loop_{loop_var} = 0; loop_{loop_var} < {}; loop_{loop_var}+=1) {{", arch.loop_declaration(), range.to_kernel()));
+                    let loop_var_name = format!("loop_{}", var_to_char(*prev_max_var));
+                    kernel_lines.push(format!(
+                        "{spacing}for ({}) {{",
+                        arch.loop_header(&loop_var_name, &range.to_kernel()),
+                    ));
                 };
-                let loop_var = var_to_char(*prev_max_var);
-                let loop_var_int = *prev_max_var;
+                let loop_var = *prev_max_var;
+                let loop_var_name = format!("loop_{}", var_to_char(loop_var));
 
                 // Move input pointers (allocate new variables)
                 for (input, stride) in &loop_inputs {
@@ -733,9 +732,7 @@ fn make_kernel(
                                 pointer_var,
                                 arch.metal_buffer_type(real_input.index),
                             );
-                            let stride_str = stride
-                                .to_kernel()
-                                .replace("const_z", &arch.resolve_stride(&loop_var));
+                            let stride_str = stride.to_kernel().replace("const_z", &loop_var_name);
                             //TODO: operate on indices instead of pointers in all backends?
                             assert!(real_input.pointer_owner.is_some());
                             kernel_lines.push(format!(
@@ -762,9 +759,7 @@ fn make_kernel(
                     if stride.is_acc() {
                         continue; // Accumulators are set up in input handling (above) and results are copied back to output after body (below)
                     }
-                    let stride_str = stride
-                        .to_kernel()
-                        .replace("const_z", &arch.resolve_stride(&loop_var));
+                    let stride_str = stride.to_kernel().replace("const_z", &loop_var_name);
                     let dest = kernel_graph
                         .neighbors_directed(*output, Direction::Outgoing)
                         .next()
@@ -833,7 +828,7 @@ fn make_kernel(
                     }
                 }
                 for (inp, _) in &loop_inputs {
-                    loop_indexes.insert(*inp, loop_var_int);
+                    loop_indexes.insert(*inp, loop_var);
                 }
                 let loop_body = make_kernel(
                     kernel_graph,
@@ -941,9 +936,8 @@ fn make_kernel(
                             current_elem_size *= range;
                         }
                         kernel_lines.push(format!(
-                            "{spacing}for ({} save = 0; save < {}; save+=1) {{",
-                            arch.loop_declaration(),
-                            size.to_kernel()
+                            "{spacing}for ({}) {{",
+                            arch.loop_header("save", &size.to_kernel()),
                         ));
                         let indexing_expression = indexing_expression
                             .simplify()
