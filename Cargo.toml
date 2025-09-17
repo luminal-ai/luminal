@@ -38,6 +38,7 @@ members = [
     "crates/luminal_cpu",
     "crates/luminal_nn",
     "crates/luminal_training",
+    "crates/luminal_onnx",
     "docs/company",
 ]
 exclude = [
@@ -47,3 +48,4 @@ exclude = [
     "crates/luminal_2",
     "demos/flash_attention",
 ]
+
