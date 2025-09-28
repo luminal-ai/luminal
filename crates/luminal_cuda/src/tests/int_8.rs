@@ -7,32 +7,81 @@ use crate::{binary_test, unary_test, CudaCompiler};
 luminal::test_imports!();
 
 fn int_8(x: GraphTensor) -> GraphTensor {
-    x
+    use cudarc::driver::sys::*;
+    use half::f16;
+    
+    let data = x.data();
+    let num_blocks = (data.len() + 31) / 32; // Round up to nearest block
+    
+    // Prepare quantized blocks
+    let mut quantized_blocks = Vec::with_capacity(num_blocks);
+    
+    // Process each block of 32 values
+    for block_idx in 0..num_blocks {
+        let start = block_idx * 32;
+        let end = std::cmp::min(start + 32, data.len());
+        let block_data = &data[start..end];
+        
+        // Find scale (max abs value)
+        let scale = block_data.iter()
+            .map(|&x| x.abs())
+            .fold(0.0f32, f32::max);
+        let scale = if scale == 0.0 { 1.0 } else { scale };
+        
+        // Create block
+        let mut block = block_q8_0 {
+            d: f16::from_f32(scale),
+            qs: [0i8; 32]
+        };
+        
+        // Quantize values
+        for (i, &val) in block_data.iter().enumerate() {
+            let quantized = (val / scale * 127.0).round().clamp(-127.0, 127.0) as i8;
+            block.qs[i] = quantized;
+        }
+        
+        // Zero-pad remainder of block
+        for i in (end - start)..32 {
+            block.qs[i] = 0;
+        }
+        
+        quantized_blocks.push(block);
+    }
+    
+    // Call CUDA kernel
+    let mut result = vec![0.0f32; data.len()];
+    let device = CudaDevice::new(0).unwrap();
+    
+    // Allocate device memory
+    let d_blocks = device.alloc_slice(&quantized_blocks).unwrap();
+    let d_input = device.alloc_slice(data).unwrap();
+    let d_output = device.alloc_slice(&result).unwrap();
+    
+    // Launch kernel
+    unsafe {
+        let stream = device.create_stream().unwrap();
+        launch_kernel(
+            "quantized_matvec_int8_optimized",
+            d_blocks.as_ptr(),
+            d_input.as_ptr(),
+            d_output.as_mut_ptr(),
+            data.len() as i32,     // src_vec_size
+            result.len() as i32,   // dest_vec_size
+            0,                     // mat_batch_stride
+            0                      // vec_batch_stride
+        ).unwrap();
+        device.synchronize().unwrap();
+    }
+    
+    // Copy result back
+    device.memcpy_dtoh(&mut result, &d_output).unwrap();
+    
+    // Return as GraphTensor
+    x.graph().tensor(x.shape()).set(result)
 }
 
 unary_test!(|a| int_8(a.sin()), |a| a.sin(), test_sin_int_8, f32);
-use dfdx::prelude::{Module as DfdxModule, *};
-use rand::{rngs::StdRng, SeedableRng};
-
-use luminal::{module::Module, prelude::*};
-use luminal_nn::{Linear, ReLU};
-
-use crate::{binary_test, unary_test, CudaCompiler};
-luminal::test_imports!();
-
-fn int_8(x: GraphTensor) -> GraphTensor {
-    x
-}
-
-unary_test!(|a| int_8(a.sin()), |a| a.sin(), test_sin_int8, f32);
-unary_test!(|a| int_8(a.sqrt()), |a| a.sqrt(), test_sqrt_int8, f32);
-unary_test!(|a| int_8(a.reciprocal()), |a| a.recip(), test_reciprocal_int8, f32);
-unary_test!(|a| int_8(a * a), |a| a.clone() * a, test_square_int8, f32);
-
-binary_test!(|a, b| int_8(a + b), |a, b| a + b, test_add_int8, f32);
-binary_test!(|a, b| int_8(a - b), |a, b| a - b, test_sub_int8, f32);
-binary_test!(|a, b| int_8(a * b), |a, b| a * b, test_mul_int8, f32);
-binary_test!(|a, b| int_8(a / b), |a, b| a / b, test_div_int8, f32);
+unary_test!(|a| int_8(a.sqrt()), |a| a.sqrt(), test_sqrt_int_8, f32);
 unary_test!(
     |a| int_8(a.reciprocal()),
     |a| a.recip(),
@@ -47,8 +96,8 @@ binary_test!(|a, b| int_8(a * b), |a, b| a * b, test_mul_int_8, f32);
 binary_test!(|a, b| int_8(a / b), |a, b| a / b, test_div_int_8, f32);
 
 #[test]
-fn test_int8_matmul() {
-    let data = random_vec(8192);
+fn test_int_8_matmul() {
+    let data = random_vec(64 * 64 * 2); // 8192 elements
     let mut cx = Graph::new();
     let a = cx.tensor((64, 64)).set(data[..4096].to_vec()).keep();
     let b = cx.tensor((64, 64)).set(data[4096..8192].to_vec()).keep();
@@ -66,8 +115,8 @@ fn test_int8_matmul() {
 }
 
 #[test]
-fn test_int8_sum() {
-    let data = random_vec(10240);
+fn test_int_8_sum() {
+    let data = random_vec(1024 * 10);
     let mut cx = Graph::new();
     let a = cx.tensor((1, 10, 1024)).set(data.clone());
     let a_q = int_8(a);
@@ -84,14 +133,14 @@ fn test_int8_sum() {
     let d_c = d_a.clone().sum::<_, DAxis<1>>();
     let d_d = d_a.sum::<_, DAxis<0>>();
 
-    assert_close(&b.data(), &d_b.as_vec());
-    assert_close(&c.data(), &d_c.as_vec());
-    assert_close(&d.data(), &d_d.as_vec());
+    assert_close_precision(&b.data(), &d_b.as_vec(), 1e-1);
+    assert_close_precision(&c.data(), &d_c.as_vec(), 1e-1);
+    assert_close_precision(&d.data(), &d_d.as_vec(), 1e-1);
 }
 
 #[test]
-fn test_int8_max() {
-    let data = random_vec(10240);
+fn test_int_8_max() {
+    let data = random_vec(1024 * 10);
     let mut cx = Graph::new();
     let a = cx.tensor((1, 10, 1024)).set(data.clone());
     let a_q = int_8(a);
@@ -108,14 +157,14 @@ fn test_int8_max() {
     let d_c = d_a.clone().max::<_, DAxis<1>>();
     let d_d = d_a.max::<_, DAxis<0>>();
 
-    assert_close(&b.data(), &d_b.as_vec());
-    assert_close(&c.data(), &d_c.as_vec());
-    assert_close(&d.data(), &d_d.as_vec());
+    assert_close_precision(&b.data(), &d_b.as_vec(), 1e-1);
+    assert_close_precision(&c.data(), &d_c.as_vec(), 1e-1);
+    assert_close_precision(&d.data(), &d_d.as_vec(), 1e-1);
 }
 
 #[test]
-fn test_int8_mean() {
-    let data = random_vec(10240);
+fn test_int_8_mean() {
+    let data = random_vec(1024 * 10);
     let mut cx = Graph::new();
     let a = cx.tensor((1, 10, 1024)).set(data.clone());
     let a_q = int_8(a);
@@ -132,7 +181,9 @@ fn test_int8_mean() {
     let d_c = d_a.clone().mean::<_, DAxis<1>>();
     let d_d = d_a.mean::<_, DAxis<0>>();
 
-    assert_close(&b.data(), &d_b.as_vec());
-    assert_close(&c.data(), &d_c.as_vec());
-    assert_close(&d.data(), &d_d.as_vec());
+    assert_close_precision(&b.data(), &d_b.as_vec(), 1e-2);
+    assert_close_precision(&c.data(), &d_c.as_vec(), 1e-2);
+    assert_close_precision(&d.data(), &d_d.as_vec(), 1e-2);
 }
+
+

@@ -1,4 +1,4 @@
-#include "quantized_common.cuh"
+#include "common_header.cuh"
 
 // ===== OPTIMIZED INT8 QUANTIZED MATRIX-VECTOR MULTIPLICATION =====
 // Uses quantize_fp32_to_int8 for runtime quantization when needed
