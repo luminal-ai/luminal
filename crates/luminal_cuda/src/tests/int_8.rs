@@ -61,7 +61,7 @@ binary_test!(
 
 #[test]
 fn test_int8_matmul() {
-    let data = random_vec(1024);
+    let data = random_vec(64 * 64 * 2); // 8192 elements
     let mut cx = Graph::new();
     let a = cx.tensor((64, 64)).set(data[..4096].to_vec()).keep();
     let b = cx.tensor((64, 64)).set(data[4096..8192].to_vec()).keep();
