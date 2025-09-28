@@ -1799,9 +1799,9 @@ name = "luminal_cuda"
 version = "0.2.0"
 dependencies = [
  "cudarc 0.16.6",
+ "half",
  "itertools 0.12.1",
  "luminal",
- "num-traits",
  "rustc-hash 2.1.1",
 ]
 
