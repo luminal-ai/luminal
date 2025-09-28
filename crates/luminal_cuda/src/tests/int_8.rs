@@ -2,86 +2,137 @@ use dfdx::prelude::{Module as DfdxModule, *};
 use rand::{rngs::StdRng, SeedableRng};
 
 use luminal::{module::Module, prelude::*};
+
+use crate::{binary_test, unary_test, CudaCompiler};
+luminal::test_imports!();
+
+fn int_8(x: GraphTensor) -> GraphTensor {
+    x
+}
+
+unary_test!(|a| int_8(a.sin()), |a| a.sin(), test_sin_int_8, f32);
+use dfdx::prelude::{Module as DfdxModule, *};
+use rand::{rngs::StdRng, SeedableRng};
+
+use luminal::{module::Module, prelude::*};
 use luminal_nn::{Linear, ReLU};
 
 use crate::{binary_test, unary_test, CudaCompiler};
 luminal::test_imports!();
 
-// NOTE: INT8 tests would require special handling since dfdx doesn't have native INT8 support
-// We'll focus on operations that make sense for quantized INT8 data
-
-// For now, we'll add placeholder tests that demonstrate the test structure
-// These would need to be implemented with proper quantization logic
-
-#[test]
-fn test_int8_quantized_matmul() {
-    // This is a placeholder test for INT8 quantized matrix multiplication
-    // In a real implementation, this would:
-    // 1. Create quantized INT8 matrices using the block_q8_0 format
-    // 2. Perform matrix multiplication using the quantized kernels
-    // 3. Compare results with a reference implementation
-    println!("INT8 quantized matmul test placeholder");
-    // TODO: Implement proper INT8 quantized matrix multiplication test
+fn int_8(x: GraphTensor) -> GraphTensor {
+    x
 }
 
-#[test]
-fn test_int8_quantization_process() {
-    // This is a placeholder test for the quantization process itself
-    // In a real implementation, this would:
-    // 1. Take FP32 input data
-    // 2. Quantize it to INT8 format (block_q8_0)
-    // 3. Verify the quantization is within acceptable error bounds
-    println!("INT8 quantization process test placeholder");
-    // TODO: Implement proper quantization accuracy test
-}
+unary_test!(|a| int_8(a.sin()), |a| a.sin(), test_sin_int8, f32);
+unary_test!(|a| int_8(a.sqrt()), |a| a.sqrt(), test_sqrt_int8, f32);
+unary_test!(|a| int_8(a.reciprocal()), |a| a.recip(), test_reciprocal_int8, f32);
+unary_test!(|a| int_8(a * a), |a| a.clone() * a, test_square_int8, f32);
+
+binary_test!(|a, b| int_8(a + b), |a, b| a + b, test_add_int8, f32);
+binary_test!(|a, b| int_8(a - b), |a, b| a - b, test_sub_int8, f32);
+binary_test!(|a, b| int_8(a * b), |a, b| a * b, test_mul_int8, f32);
+binary_test!(|a, b| int_8(a / b), |a, b| a / b, test_div_int8, f32);
+unary_test!(
+    |a| int_8(a.reciprocal()),
+    |a| a.recip(),
+    test_reciprocal_int_8,
+    f32
+);
+unary_test!(|a| int_8(a * a), |a| a.clone() * a, test_square_int_8, f32);
+
+binary_test!(|a, b| int_8(a + b), |a, b| a + b, test_add_int_8, f32);
+binary_test!(|a, b| int_8(a - b), |a, b| a - b, test_sub_int_8, f32);
+binary_test!(|a, b| int_8(a * b), |a, b| a * b, test_mul_int_8, f32);
+binary_test!(|a, b| int_8(a / b), |a, b| a / b, test_div_int_8, f32);
 
 #[test]
-fn test_int8_dequantization() {
-    // This is a placeholder test for dequantization
-    // In a real implementation, this would:
-    // 1. Create quantized INT8 data
-    // 2. Dequantize it back to FP32
-    // 3. Verify the round-trip accuracy
-    println!("INT8 dequantization test placeholder");
-    // TODO: Implement proper dequantization test
-}
-
-// Note: The existing macros (unary_test, binary_test) are designed for FP32/FP16 types
-// INT8 quantized operations would require different test macros that handle:
-// - Quantization/dequantization steps
-// - Different error tolerances
-// - Special data formats (block_q8_0)
-
-// Example of what a proper INT8 test might look like:
-/*
-#[test]
-fn test_int8_matmul_accuracy() {
-    let mut rng = StdRng::seed_from_u64(42);
-    let m = 128;
-    let k = 256;
-    let n = 64;
-    
-    // Generate random FP32 matrices
-    let a_data: Vec<f32> = (0..m*k).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    let b_data: Vec<f32> = (0..k*n).map(|_| rng.gen_range(-1.0..1.0)).collect();
-    
-    // Reference FP32 computation
-    let reference_result = matmul_fp32(&a_data, &b_data, m, k, n);
-    
-    // Quantize matrix A to INT8
-    let quantized_a = quantize_to_block_q8_0(&a_data, m, k);
-    
-    // Perform quantized matrix multiplication
+fn test_int8_matmul() {
+    let data = random_vec(8192);
     let mut cx = Graph::new();
-    let a_tensor = cx.tensor((m, k)).set_quantized(quantized_a);
-    let b_tensor = cx.tensor((k, n)).set(b_data.clone());
-    let mut result = (a_tensor.matmul(b_tensor)).retrieve();
-    
-    cx.compile(CudaCompiler::<f32>::default(), &mut result);
+    let a = cx.tensor((64, 64)).set(data[..4096].to_vec()).keep();
+    let b = cx.tensor((64, 64)).set(data[4096..8192].to_vec()).keep();
+    let mut c = int_8(a.matmul(b)).retrieve();
+
+    cx.compile(CudaCompiler::<f32>::default(), &mut c);
     cx.execute();
-    
-    // Compare with reference, allowing for quantization error
-    let quantized_result = result.data();
-    assert_close_with_tolerance(&quantized_result, &reference_result, 0.1); // Higher tolerance for quantized ops
+
+    let d_dev = Cpu::default();
+    let d_a = d_dev.tensor_from_vec(data[..4096].to_vec(), (DConst::<64>, DConst::<64>));
+    let d_b = d_dev.tensor_from_vec(data[4096..8192].to_vec(), (DConst::<64>, DConst::<64>));
+    let d_c = d_a.matmul(d_b);
+
+    assert_close(&c.data(), &d_c.as_vec());
 }
-*/
+
+#[test]
+fn test_int8_sum() {
+    let data = random_vec(10240);
+    let mut cx = Graph::new();
+    let a = cx.tensor((1, 10, 1024)).set(data.clone());
+    let a_q = int_8(a);
+    let mut b = a_q.sum(2).retrieve();
+    let mut c = a_q.sum(1).retrieve();
+    let mut d = a_q.sum(0).retrieve();
+
+    cx.compile(CudaCompiler::<f32>::default(), (&mut b, &mut c, &mut d));
+    cx.execute();
+
+    let d_dev = Cpu::default();
+    let d_a = d_dev.tensor_from_vec(data, (DConst::<1>, DConst::<10>, DConst::<1024>));
+    let d_b = d_a.clone().sum::<_, DAxis<2>>();
+    let d_c = d_a.clone().sum::<_, DAxis<1>>();
+    let d_d = d_a.sum::<_, DAxis<0>>();
+
+    assert_close(&b.data(), &d_b.as_vec());
+    assert_close(&c.data(), &d_c.as_vec());
+    assert_close(&d.data(), &d_d.as_vec());
+}
+
+#[test]
+fn test_int8_max() {
+    let data = random_vec(10240);
+    let mut cx = Graph::new();
+    let a = cx.tensor((1, 10, 1024)).set(data.clone());
+    let a_q = int_8(a);
+    let mut b = a_q.max(2).retrieve();
+    let mut c = a_q.max(1).retrieve();
+    let mut d = a_q.max(0).retrieve();
+
+    cx.compile(CudaCompiler::<f32>::default(), (&mut b, &mut c, &mut d));
+    cx.execute();
+
+    let d_dev = Cpu::default();
+    let d_a = d_dev.tensor_from_vec(data, (DConst::<1>, DConst::<10>, DConst::<1024>));
+    let d_b = d_a.clone().max::<_, DAxis<2>>();
+    let d_c = d_a.clone().max::<_, DAxis<1>>();
+    let d_d = d_a.max::<_, DAxis<0>>();
+
+    assert_close(&b.data(), &d_b.as_vec());
+    assert_close(&c.data(), &d_c.as_vec());
+    assert_close(&d.data(), &d_d.as_vec());
+}
+
+#[test]
+fn test_int8_mean() {
+    let data = random_vec(10240);
+    let mut cx = Graph::new();
+    let a = cx.tensor((1, 10, 1024)).set(data.clone());
+    let a_q = int_8(a);
+    let mut b = a_q.mean(2).retrieve();
+    let mut c = a_q.mean(1).retrieve();
+    let mut d = a_q.mean(0).retrieve();
+
+    cx.compile(CudaCompiler::<f32>::default(), (&mut b, &mut c, &mut d));
+    cx.execute();
+
+    let d_dev = Cpu::default();
+    let d_a = d_dev.tensor_from_vec(data, (DConst::<1>, DConst::<10>, DConst::<1024>));
+    let d_b = d_a.clone().mean::<_, DAxis<2>>();
+    let d_c = d_a.clone().mean::<_, DAxis<1>>();
+    let d_d = d_a.mean::<_, DAxis<0>>();
+
+    assert_close(&b.data(), &d_b.as_vec());
+    assert_close(&c.data(), &d_c.as_vec());
+    assert_close(&d.data(), &d_d.as_vec());
+}
