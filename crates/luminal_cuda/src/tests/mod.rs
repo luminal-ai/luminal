@@ -2,6 +2,7 @@ use luminal::{graph::Graph, op::Operator};
 
 mod fp16;
 mod fp32;
+mod int_8;
 
 #[macro_export]
 macro_rules! single_unary_test {
