@@ -5,7 +5,7 @@ pub mod other;
 pub mod prim;
 pub mod quantized;
 pub mod unary;
-pub mod utils;  // New utilities module for CUDA functionality
+pub mod utils; // New utilities module for CUDA functionality
 pub use quantized::*;
 
 pub use cudarc::driver::CudaContext;

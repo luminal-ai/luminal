@@ -8,10 +8,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 luminal = { path = "../.." }
 cudarc = { version = "0.16.6", features = [
-    "f16",
-    "cuda-11080",  # Added CUDA 11.8 for better INT8 support
-    "cuda-12080",  # Keep 12.8 for newer features
-    "cudnn",       # Added cuDNN for better INT8 support
+    "f16",        # Enable FP16 support
+    "cuda-11080", # CUDA 11.8 for AWS Deep Learning AMI compatibility
+    "cudnn",      # Enable cuDNN for better INT8 support
+    "cuda-12080", # Keep CUDA 12.8 support for newer AWS instances
 ] }
 itertools = "0.12.1"
 rustc-hash = "2.1.1"
