@@ -2,7 +2,9 @@
 
 // ===== OPTIMIZED INT8 QUANTIZED MATRIX-VECTOR MULTIPLICATION =====
 // Uses quantize_fp32_to_int8 for runtime quantization when needed
+// Supports different architectures with optimized paths
 
+#if __CUDA_ARCH__ >= 700  
 extern "C" __global__ void quantized_matvec_int8_optimized(
     const block_q8_0* __restrict__ x,    // Quantized matrix
     const float* __restrict__ y,         // Input vector (FP32)

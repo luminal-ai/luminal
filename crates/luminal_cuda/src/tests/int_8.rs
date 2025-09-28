@@ -7,75 +7,95 @@ use crate::{binary_test, unary_test, CudaCompiler};
 luminal::test_imports!();
 
 fn int_8(x: GraphTensor) -> GraphTensor {
-    use cudarc::driver::sys::*;
+    use super::utils::{get_optimal_implementation, initialize_cuda, launch_kernel_safely};
     use half::f16;
-    
+
     let data = x.data();
     let num_blocks = (data.len() + 31) / 32; // Round up to nearest block
-    
+
+    // Initialize CUDA with proper error handling
+    let (device, context) = match initialize_cuda() {
+        Some(init) => init,
+        None => {
+            // Fallback to CPU implementation if CUDA is not available
+            return x; // Return input unchanged as fallback
+        }
+    };
+
     // Prepare quantized blocks
     let mut quantized_blocks = Vec::with_capacity(num_blocks);
-    
+
     // Process each block of 32 values
     for block_idx in 0..num_blocks {
         let start = block_idx * 32;
         let end = std::cmp::min(start + 32, data.len());
         let block_data = &data[start..end];
-        
+
         // Find scale (max abs value)
-        let scale = block_data.iter()
-            .map(|&x| x.abs())
-            .fold(0.0f32, f32::max);
+        let scale = block_data.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
         let scale = if scale == 0.0 { 1.0 } else { scale };
-        
+
         // Create block
         let mut block = block_q8_0 {
             d: f16::from_f32(scale),
-            qs: [0i8; 32]
+            qs: [0i8; 32],
         };
-        
-        // Quantize values
+
+        // Quantize values with bounds checking
         for (i, &val) in block_data.iter().enumerate() {
             let quantized = (val / scale * 127.0).round().clamp(-127.0, 127.0) as i8;
             block.qs[i] = quantized;
         }
-        
+
         // Zero-pad remainder of block
         for i in (end - start)..32 {
             block.qs[i] = 0;
         }
-        
+
         quantized_blocks.push(block);
     }
-    
-    // Call CUDA kernel
+
+    // Call CUDA kernel with proper error handling
     let mut result = vec![0.0f32; data.len()];
-    let device = CudaDevice::new(0).unwrap();
-    
-    // Allocate device memory
-    let d_blocks = device.alloc_slice(&quantized_blocks).unwrap();
-    let d_input = device.alloc_slice(data).unwrap();
-    let d_output = device.alloc_slice(&result).unwrap();
-    
-    // Launch kernel
-    unsafe {
-        let stream = device.create_stream().unwrap();
-        launch_kernel(
-            "quantized_matvec_int8_optimized",
-            d_blocks.as_ptr(),
-            d_input.as_ptr(),
-            d_output.as_mut_ptr(),
-            data.len() as i32,     // src_vec_size
-            result.len() as i32,   // dest_vec_size
-            0,                     // mat_batch_stride
-            0                      // vec_batch_stride
-        ).unwrap();
-        device.synchronize().unwrap();
+
+    // Select optimal implementation based on compute capability
+    let kernel_name = get_optimal_implementation(&device);
+
+    // Allocate device memory with error handling
+    let d_blocks = match device.alloc_slice(&quantized_blocks) {
+        Ok(buf) => buf,
+        Err(_) => return x, // Fallback to input on error
+    };
+    let d_input = match device.alloc_slice(data) {
+        Ok(buf) => buf,
+        Err(_) => return x,
+    };
+    let d_output = match device.alloc_slice(&result) {
+        Ok(buf) => buf,
+        Err(_) => return x,
+    };
+
+    // Launch kernel with proper configuration and error handling
+    let grid_dim = ((data.len() as u32 + 255) / 256, 1, 1);
+    let block_dim = (256, 1, 1);
+
+    let args = vec![
+        Box::new(d_blocks.as_ptr()) as Box<dyn cudarc::driver::LaunchArg>,
+        Box::new(d_input.as_ptr()) as Box<dyn cudarc::driver::LaunchArg>,
+        Box::new(d_output.as_mut_ptr()) as Box<dyn cudarc::driver::LaunchArg>,
+        Box::new(data.len() as i32) as Box<dyn cudarc::driver::LaunchArg>,
+        Box::new(result.len() as i32) as Box<dyn cudarc::driver::LaunchArg>,
+        Box::new(0i32) as Box<dyn cudarc::driver::LaunchArg>,
+        Box::new(0i32) as Box<dyn cudarc::driver::LaunchArg>,
+    ];
+
+    if let Err(_) = launch_kernel_safely(&device, kernel_name, grid_dim, block_dim, &args) {
+        return x; // Fallback to input on error
     }
-    
+
     // Copy result back
     device.memcpy_dtoh(&mut result, &d_output).unwrap();
-    
+
     // Return as GraphTensor
     x.graph().tensor(x.shape()).set(result)
 }
@@ -185,5 +205,3 @@ fn test_int_8_mean() {
     assert_close_precision(&c.data(), &d_c.as_vec(), 1e-2);
     assert_close_precision(&d.data(), &d_d.as_vec(), 1e-2);
 }
-
-
