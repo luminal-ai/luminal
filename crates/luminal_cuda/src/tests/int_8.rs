@@ -118,49 +118,19 @@ fn test_int_8_mean() {
     assert_close_precision(&c.data(), &d_c.as_vec(), 1e-2);
     assert_close_precision(&d.data(), &d_d.as_vec(), 1e-2);
 }
-unary_test!(
-    |a| int_8(a.sqrt()),
-    |a| a.sqrt(),
-    test_sqrt_int8,
-    f32
-);
+unary_test!(|a| int_8(a.sqrt()), |a| a.sqrt(), test_sqrt_int8, f32);
 unary_test!(
     |a| int_8(a.reciprocal()),
     |a| a.recip(),
     test_reciprocal_int8,
     f32
 );
-unary_test!(
-    |a| int_8(a * a),
-    |a| a.clone() * a,
-    test_square_int8,
-    f32
-);
+unary_test!(|a| int_8(a * a), |a| a.clone() * a, test_square_int8, f32);
 
-binary_test!(
-    |a, b| int_8(a + b),
-    |a, b| a + b,
-    test_add_int8,
-    f32
-);
-binary_test!(
-    |a, b| int_8(a - b),
-    |a, b| a - b,
-    test_sub_int8,
-    f32
-);
-binary_test!(
-    |a, b| int_8(a * b),
-    |a, b| a * b,
-    test_mul_int8,
-    f32
-);
-binary_test!(
-    |a, b| int_8(a / b),
-    |a, b| a / b,
-    test_div_int8,
-    f32
-);
+binary_test!(|a, b| int_8(a + b), |a, b| a + b, test_add_int8, f32);
+binary_test!(|a, b| int_8(a - b), |a, b| a - b, test_sub_int8, f32);
+binary_test!(|a, b| int_8(a * b), |a, b| a * b, test_mul_int8, f32);
+binary_test!(|a, b| int_8(a / b), |a, b| a / b, test_div_int8, f32);
 
 #[test]
 fn test_int8_matmul_simple() {
