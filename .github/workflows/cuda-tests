@@ -1,0 +1,59 @@
+name: CUDA Tests
+
+on:
+  push:
+    branches: [main, test]
+    paths:
+      - 'crates/luminal_cuda/**'
+      - '.github/workflows/cuda-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/luminal_cuda/**'
+
+jobs:
+  cuda-tests:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.2.0-devel-ubuntu22.04
+      options: --gpus all
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: |
+        apt-get update
+        apt-get install -y build-essential curl git pkg-config
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: cuda-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check formatting
+      working-directory: crates/luminal_cuda
+      run: cargo fmt --check
+
+    - name: Run clippy
+      working-directory: crates/luminal_cuda
+      run: cargo clippy -- -D warnings
+
+    - name: Build and test
+      working-directory: crates/luminal_cuda
+      run: |
+        cargo test --release -- --test-threads=1
+      env:
+        RUST_BACKTRACE: 1
+
+    - name: Run quantization tests
+      working-directory: crates/luminal_cuda
+      run: |
+        cargo test --release int_8 fp16 fp32 -- --test-threads=1
