@@ -1,0 +1,22 @@
+name: CUDA Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  cuda_tests:
+    name: CUDA Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Build Docker image
+        run: docker build -t luminal-cuda -f crates/luminal_cuda/Dockerfile .
+      
+      - name: Run tests
+        run: docker run --gpus all luminal-cuda
