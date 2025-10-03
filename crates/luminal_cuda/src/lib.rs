@@ -242,7 +242,7 @@ fn compile_and_load_kernel(mut code: String, device: &Arc<CudaContext>) -> CudaF
             compile_ptx_with_opts(
                 code,
                 CompileOptions {
-                    include_paths: vec!["/usr/include".into()],
+                    include_paths: vec!["/usr/local/cuda/include".into()],
                     options: vec![
                         "--gpu-architecture=compute_75".into(),
                         "--relocatable-device-code=false".into(),
