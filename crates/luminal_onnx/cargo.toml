@@ -1,0 +1,8 @@
+[package]
+name = "luminal_onnx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+onnxruntime = "0.18"
+luminal = { path = "../luminal" }
