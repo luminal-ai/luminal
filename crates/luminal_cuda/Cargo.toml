@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 luminal = { path = "../.." }
-cudarc = { version = "0.16.6", features = [
+cudarc = { git = "https://github.com/rust-cuda/cudarc.git", branch = "main", features = [
 	"f16",
 	"cuda-12200",
 ] }
