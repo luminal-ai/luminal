@@ -12,9 +12,9 @@ metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
 [dependencies]
 luminal = { path = "../../" }
 luminal_cuda = { path = "../luminal_cuda", optional = true }
-cudarc = { version = "0.16.6", features = [
+cudarc = { git = "https://github.com/rust-cuda/cudarc.git", branch = "main", features = [
     "f16",
-    "cuda-12080",
+    "cuda-12200",
 ], optional = true }
 #metal-rs = { version = "0.28.0", package = "metal", optional=true }
 objc2 = { version = "0.6.2", optional = true }

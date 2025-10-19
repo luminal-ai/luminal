@@ -20,9 +20,9 @@ metal = [
 itertools = "0.14.0"
 luminal = { path = "../.." }
 luminal_cuda = { path = "../../crates/luminal_cuda", optional = true }
-cudarc = { version = "0.16.6", features = [
+cudarc = { git = "https://github.com/rust-cuda/cudarc.git", branch = "main", features = [
     "f16",
-    "cuda-12080",
+    "cuda-12200",
 ], optional = true }
 luminal_nn = { path = "../../crates/luminal_nn" }
 luminal_2 = { path = "../../crates/luminal_2" }
