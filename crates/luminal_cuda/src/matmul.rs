@@ -110,6 +110,102 @@ impl<T: CudaFloat> Operator for Matmul<T> {
     }
 }
 
+#[derive(Clone)]
+pub struct CublasGemm<T>(Arc<CudaBlas>, Arc<CudaContext>, PhantomData<T>);
+crate::debug_type!(CublasGemm);
+
+impl<T: CudaFloat> Operator for CublasGemm<T> {
+    fn process(&mut self, inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
+        // Delegate to the same fast cuBLAS path used by Matmul.
+        let stream = self.1.default_stream();
+        let (a_shape, b_shape) = (inp[0].1.dims(), inp[1].1.dims());
+        let (batch_size, m, k, n) = (
+            a_shape
+                .iter()
+                .take(a_shape.len() - 2)
+                .map(|i| i.to_usize().unwrap())
+                .product::<usize>() as i32,
+            a_shape[a_shape.len() - 2].to_usize().unwrap() as i32,
+            a_shape[a_shape.len() - 1].to_usize().unwrap() as i32,
+            b_shape[b_shape.len() - 1].to_usize().unwrap() as i32,
+        );
+        let a = get_buffer_from_tensor::<T>(&inp[0].0);
+        let b = get_buffer_from_tensor::<T>(&inp[1].0);
+        let out = self
+            .1
+            .default_stream()
+            .alloc_zeros::<T>((m * n * batch_size) as usize)
+            .unwrap();
+        let (a_row_major, b_row_major) = (
+            inp[0].1.indexes[inp[0].1.len() - 1] > inp[0].1.indexes[inp[0].1.len() - 2],
+            inp[1].1.indexes[inp[1].1.len() - 1] > inp[1].1.indexes[inp[1].1.len() - 2],
+        );
+        let (transa, transb) = match (a_row_major, b_row_major) {
+            (true, true) => (CUBLAS_OP_N, CUBLAS_OP_N),
+            (false, false) => (CUBLAS_OP_T, CUBLAS_OP_T),
+            (false, true) => (CUBLAS_OP_N, CUBLAS_OP_T),
+            (true, false) => (CUBLAS_OP_T, CUBLAS_OP_N),
+        };
+
+        let a_dims = inp[0].1.fake.iter().filter(|f| !**f).count();
+        let b_dims = inp[1].1.fake.iter().filter(|f| !**f).count();
+        let (a_ptr, _a) = a.device_ptr(&stream);
+        let (b_ptr, _b) = b.device_ptr(&stream);
+        let (out_ptr, _out) = out.device_ptr(&stream);
+        if T::is_f32() {
+            unsafe {
+                cudarc::cublas::result::sgemm_strided_batched(
+                    *self.0.handle(),
+                    transa,
+                    transb,
+                    n,
+                    m,
+                    k,
+                    &1.0_f32 as *const f32,
+                    b_ptr as *const f32,
+                    if b_row_major { n } else { k },
+                    if b_dims == 2 { 0 } else { (n * k) as i64 },
+                    a_ptr as *const f32,
+                    if a_row_major { k } else { m },
+                    if a_dims == 2 { 0 } else { (m * k) as i64 },
+                    &0.0_f32 as *const f32,
+                    out_ptr as *mut f32,
+                    n,
+                    (m * n) as i64,
+                    batch_size,
+                )
+                .unwrap();
+            }
+        } else {
+            unsafe {
+                cudarc::cublas::result::hgemm_strided_batched(
+                    *self.0.handle(),
+                    transa,
+                    transb,
+                    n,
+                    m,
+                    k,
+                    &f16::from_f32(1.0) as *const f16,
+                    b_ptr as *const f16,
+                    if b_row_major { n } else { k },
+                    if b_dims == 2 { 0 } else { (n * k) as i64 },
+                    a_ptr as *const f16,
+                    if a_row_major { k } else { m },
+                    if a_dims == 2 { 0 } else { (m * k) as i64 },
+                    &f16::from_f32(0.0) as *const f16,
+                    out_ptr as *mut f16,
+                    n,
+                    (m * n) as i64,
+                    batch_size,
+                )
+                .unwrap();
+            }
+        }
+        drop(_out);
+        vec![Tensor::new(CudaData(out))]
+    }
+}
+
 #[derive(Default)]
 pub struct MatMulCompiler<T>(PhantomData<T>);
 
@@ -224,7 +320,7 @@ where
             dims.swap(src2_shape.len() - 2, src2_shape.len() - 1);
             src2_shape.permute(&dims);
             let new_op = graph
-                .add_op(Matmul::<T>(
+                .add_op(CublasGemm::<T>(
                     Arc::new(CudaBlas::new(dev.default_stream()).unwrap()),
                     dev.clone(),
                     Default::default(),
