@@ -66,7 +66,7 @@ fn is_more_than_one_view(
 impl<T: CudaFloat> Compiler for ElementwiseFusionCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let device = CudaContext::new(0).unwrap();
+        let device = crate::shared_cuda_context(0);
         // Track fused ops to compile later
         let mut fused_ops = FxHashSet::default();
 

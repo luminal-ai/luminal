@@ -366,7 +366,7 @@ pub fn search(
     #[cfg(feature = "metal")]
     let device = MTLCreateSystemDefaultDevice().unwrap();
     #[cfg(feature = "cuda")]
-    let device = CudaContext::new(0).unwrap();
+    let device = crate::run::shared_cuda_context();
     let inputs = inputs
         .into_iter()
         .map(|(n, init)| {

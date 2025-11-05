@@ -7,7 +7,7 @@ use luminal::prelude::{
     petgraph::{Directed, algo::toposort, prelude::StableGraph},
     *,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
@@ -25,12 +25,12 @@ pub type OptimalGraphNodeIndex = NodeIndex;
 pub type SubGraph = StableGraph<GraphTerm, (), Directed>;
 pub type MetaGraph = StableGraph<SubGraph, CrossSubGraphTensorIndexes, Directed>;
 
-fn collect_ancestors(graph: &Graph, n: NodeIndex) -> HashSet<NodeIndex> {
-    let mut seen = HashSet::new();
+fn collect_ancestors(graph: &Graph, n: NodeIndex) -> FxHashSet<NodeIndex> {
+    let mut seen: FxHashSet<NodeIndex> = FxHashSet::default(); // faster non-cryptographic hash
     let mut stack = vec![n];
     while let Some(cur) = stack.pop() {
         for (src, _out, _shape) in graph.get_sources(cur) {
-            if seen.insert(src) {
+            if seen.insert(src) { // success iff src is not in seen (note for myself)
                 stack.push(src);
             }
         }

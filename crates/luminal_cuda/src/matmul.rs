@@ -119,7 +119,7 @@ where
 {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Look for the matmul pattern
         // Mul ([A, C(fake), B] | [A(fake), C, B]) -> SumReduce(2) -> [A, C]
         // Actually starts at [A,B] | [B, C]

@@ -42,6 +42,8 @@ pub enum GPUArch {
 }
 
 impl GPUArch {
+    // Maybe derive here the architecture of the CUDA device to avoid any weird bugs
+
     fn metal_buffer_type(&self, var: usize) -> &'static str {
         match self {
             Self::Metal(m) => m.get(&var).copied().unwrap_or(""),
@@ -123,7 +125,7 @@ impl Operator for CompatKernel {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         use luminal_cuda::CudaData;
         let dyn_vars = &unsafe { self.1.as_ref().unwrap() }.dyn_map;
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        let ctx = crate::run::shared_cuda_context();
         let stream = ctx.default_stream();
 
         let ptx = cudarc::nvrtc::compile_ptx(&self.0.code).unwrap();
@@ -207,7 +209,7 @@ pub struct Diff {
 impl Operator for Diff {
     fn process(&mut self, inp: Vec<(InputTensor, ShapeTracker)>) -> Vec<Tensor> {
         // Dump
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        let ctx = crate::run::shared_cuda_context();
         let stream = ctx.default_stream();
         let buffer = inp[0].0.borrowed().downcast_ref::<CudaData<f32>>().unwrap();
         let data: Vec<f32> = stream.memcpy_dtov(&buffer.0).unwrap();

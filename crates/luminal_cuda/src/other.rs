@@ -77,7 +77,7 @@ pub struct ARangeCompiler<T: CudaFloat>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for ARangeCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, _: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // TODO: Make sure this actually checks the shape transformations to ensure pooling happens
         let contig_one = constant::<T>(1.);
         let contig1 = unary::<CudaContiguous<T>>(contig_one.clone());

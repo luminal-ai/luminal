@@ -128,7 +128,7 @@ fn main() {
         #[cfg(feature = "metal")]
         let device = &MTLCreateSystemDefaultDevice().unwrap();
         #[cfg(feature = "cuda")]
-        let device = &CudaContext::new(0).unwrap();
+        let device = &luminal_2::run::shared_cuda_context();
 
         let mut inputs = FxHashMap::default();
         let mut rng = rng();

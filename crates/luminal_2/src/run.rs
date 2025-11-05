@@ -2,6 +2,8 @@ use itertools::Itertools;
 
 #[cfg(feature = "cuda")]
 use cudarc::{driver::*, nvrtc::CompileOptions};
+#[cfg(feature = "cuda")]
+use std::sync::OnceLock;
 
 use luminal::{
     prelude::{
@@ -50,7 +52,7 @@ pub fn assign_buffers(
         let k = &graph[node];
         if k.code == "Inputs" {
             continue; // user-provided; ignore
-        }
+        } // Can replace with look ups in the use_count -> if there, then not an Input
 
         // Allocate exact-size buffers for this node's outputs
         let mut outs = vec![];
@@ -72,7 +74,7 @@ pub fn assign_buffers(
             let src = e.source();
             if graph[src].code == "Inputs" {
                 continue;
-            }
+            }  // Can replace with look ups in the use_count -> if there, then not an Input
             let (src_out_idx, _) = *e.weight();
             if let Some(c) = use_count.get_mut(&(src, src_out_idx)) {
                 *c -= 1;
@@ -94,7 +96,7 @@ pub fn assign_buffers(
 pub fn compile_kernels(
     kernels: &StableGraph<Kernel, (usize, usize)>,
 ) -> FxHashMap<String, CudaFunction> {
-    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let ctx = shared_cuda_context();
     let mut compiled = FxHashMap::default();
 
     for kernel in kernels.node_weights() {
@@ -153,11 +155,11 @@ pub fn run_graph(
     inputs: &mut FxHashMap<usize, (&CudaSlice<f32>, bool)>,
     kernels: &StableGraph<Kernel, (usize, usize)>,
     dyn_vars: &FxHashMap<char, usize>,
-    compiled_kernels: &FxHashMap<String, CudaFunction>,
+    compiled_kernels: &FxHashMap<String, CudaFunction>, // wonder how this impacts performance inserting a string of kernel code vs inserting an object (e.g. struct with code as string)
     intermediate_buffers: &mut Vec<Buffer>,
     intermediate_buffer_map: &FxHashMap<NodeIndex, Vec<usize>>,
 ) -> (Vec<Vec<f32>>, u128) {
-    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let ctx = shared_cuda_context();
     let stream = ctx.default_stream();
     let start = std::time::Instant::now();
 
@@ -558,7 +560,13 @@ pub fn new_buffer(size: usize) -> Buffer {
 
 #[cfg(feature = "cuda")]
 pub fn new_buffer(size: usize) -> Buffer {
-    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let ctx = shared_cuda_context();
     let stream = ctx.default_stream();
     stream.alloc_zeros::<f32>(size / size_of::<f32>()).unwrap()
+}
+
+#[cfg(feature = "cuda")]
+pub fn shared_cuda_context() -> std::sync::Arc<CudaContext> {
+    static CTX: OnceLock<std::sync::Arc<CudaContext>> = OnceLock::new();
+    CTX.get_or_init(|| CudaContext::new(0).unwrap()).clone()
 }

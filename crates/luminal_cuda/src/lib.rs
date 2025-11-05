@@ -25,7 +25,12 @@ use itertools::Itertools;
 use prim::CudaConstant;
 use rustc_hash::FxHashMap;
 
-use std::{collections::hash_map::DefaultHasher, fmt::Write, hash::Hasher, sync::Arc};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::Hasher,
+    sync::{Arc, OnceLock},
+};
 
 use luminal::{op::InputTensor, prelude::*};
 
@@ -217,6 +222,16 @@ fn hash<T: std::hash::Hash>(obj: T) -> u64 {
     let mut hasher = DefaultHasher::new();
     obj.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Returns a shared CUDA context for the given device index.
+/// All CUDA compiler passes and ops should acquire the context via this function
+/// to ensure a single context is used across the entire graph execution.
+pub fn shared_cuda_context(device_index: u32) -> Arc<CudaContext> {
+    static CUDA_CTX: OnceLock<Arc<CudaContext>> = OnceLock::new();
+    CUDA_CTX
+        .get_or_init(|| CudaContext::new(device_index as usize).unwrap())
+        .clone()
 }
 
 fn get_buffer_from_tensor<'a, T: CudaFloat>(tensor: &'a InputTensor) -> &'a CudaSlice<T> {

@@ -127,7 +127,7 @@ pub struct MeanReduceCompiler<T>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for MeanReduceCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Look for the mean-reduce pattern
         // mul(recip(fake_sum_reduce(const_ones)), sum_reduce(x))
         let fake_sum_reduce = op::<CudaConstant<T>>();
@@ -308,7 +308,7 @@ pub struct StdNormCompiler<T>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for StdNormCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Look for the RMSNorm pattern
         // mul(recip(sqrt(add(mean_reduce(mul(x, x)), 1e-6))), x)
 
@@ -400,7 +400,7 @@ pub struct CudaExpCompiler<T: CudaFloat>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for CudaExpCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Look for the exp pattern
         // exp2(mul(x, const))
 
@@ -448,7 +448,7 @@ pub struct CudaCosCompiler<T>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for CudaCosCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Look for the cos pattern
         // sin(add(mul(const_neg_one, x), const_pi_over_2))
 
@@ -599,7 +599,7 @@ pub struct SoftmaxCompiler<T>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for SoftmaxCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Look for the mean-reduce pattern
         // mul(recip(fake_sum_reduce(const_ones)), sum_reduce(x))
 

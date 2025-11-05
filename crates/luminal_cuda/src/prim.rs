@@ -681,7 +681,7 @@ pub struct PrimitiveCompiler<T>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for PrimitiveCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, mut ids: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         // Go through the graph and insert copy ops
         // Copy function output to device and input from device
         for function_node in graph

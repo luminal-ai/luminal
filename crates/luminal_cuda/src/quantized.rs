@@ -244,7 +244,7 @@ impl<T> CudaQuantizedCompiler<T> {
 impl<T: CudaFloat + Default> Compiler for CudaQuantizedCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, _: To) {
-        let device = CudaContext::new(0).unwrap();
+        let device = crate::shared_cuda_context(0);
         let weight_ids = self.0.clone();
         // Modify ops directly downstream of weights
         for weight in downstream(&weight_ids, graph) {

@@ -94,7 +94,7 @@ pub struct SubtractionCompiler<T: CudaFloat>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for SubtractionCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, _: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         let (lhs, rhs) = (node(), node());
         let mul = binary::<CudaMul<T>>(rhs.clone(), constant::<T>(-1.));
         let add = binary::<CudaAdd<T>>(lhs.clone(), mul.clone());
@@ -225,7 +225,7 @@ pub struct EqualCompiler<T: CudaFloat>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for EqualCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, _: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         let one = constant::<T>(1.);
         let (lhs, rhs) = (node(), node());
         let lt1 = binary::<CudaLessThan<T>>(lhs.clone(), rhs.clone());
@@ -349,7 +349,7 @@ pub struct GatherCompiler<T: CudaFloat>(PhantomData<T>);
 impl<T: CudaFloat> Compiler for GatherCompiler<T> {
     type Output = ();
     fn compile<To: ToIdsMut>(&self, graph: &mut Graph, _: To) {
-        let dev = CudaContext::new(0).unwrap();
+        let dev = crate::shared_cuda_context(0);
         let indexes = node();
         let ind_copy = unary::<CudaCopyToDevice<T>>(indexes.clone());
         let equal = binary::<CudaEqual<T>>(op::<CudaARange<T>>(), ind_copy.clone());
