@@ -169,12 +169,21 @@ impl Conv2D {
             .weight
             .expand_dim(0, batch)
             .matmul(input_pooled)
-            .reshape((batch, self.ch_out, dimx_out, dimy_out));
+            .reshape((
+                batch,
+                self.ch_out,
+                dimx_out.to_usize().unwrap(),
+                dimy_out.to_usize().unwrap(),
+            ));
         if let Some(b) = self.bias {
             o += b.expand(o.shape);
         }
         if expanded {
-            o.reshape((self.ch_out, dimx_out, dimy_out))
+            o.reshape((
+                self.ch_out,
+                dimx_out.to_usize().unwrap(),
+                dimy_out.to_usize().unwrap(),
+            ))
         } else {
             o
         }
