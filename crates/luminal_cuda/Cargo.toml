@@ -5,23 +5,18 @@ edition = "2021"
 description = "Cuda compiler for luminal"
 license = "MIT OR Apache-2.0"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 luminal = { path = "../.." }
 cudarc = { version = "0.16.6", features = [
-	"f16",
-	"cuda-12080",
+    "f16",        # Required for INT8 scale factors
+    "cuda-11080", # CUDA 11.8 for AWS Deep Learning AMI
+    "cudnn"       # Required for INT8 optimizations
 ] }
 itertools = "0.12.1"
 rustc-hash = "2.1.1"
-num-traits = "0.2.18"
-regex = "1.10.4"
-indicatif = "0.17.8"
+half = "2.3.1"        # Required for INT8 quantization
 
 [dev-dependencies]
-dfdx = { version = "0.13", features = ["f16"] }
 rand = "0.9.2"
 paste = "1.0.14"
 luminal_nn = { path = "../../crates/luminal_nn" }
-candle-core = "=0.9.1"

@@ -1,0 +1,5 @@
+*.DS_Store
+._*
+.git
+.gitignore
+

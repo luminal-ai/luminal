@@ -1,14 +1,82 @@
-/target
-/crates/**/target
-/examples/**/target
+# Build artifacts
+/target/
+/crates/**/target/
+/examples/**/target/
+/demos/**/target/
 
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific files
 .DS_Store
-*.vscode
-Cargo.lock
+Thumbs.db
+
+# Binary and large files
 *.st
 *.npx
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Documentation
+/target/doc/
+/crates/**/target/doc/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Backup files
+*.bak
+*.backup
+*.orig
 *.npz
-/**/llama-7b-hf
-/**/setup_weights/target
 *.model
 *.gguf
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Generated files
+tree.txt
+tree.ext
+*.log
+
+# Model weights and data
+/**/llama-7b-hf/
+/**/setup_weights/
+/models/
+
+# Lock files (uncomment if you want to ignore)
+# Cargo.lock
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
