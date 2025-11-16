@@ -183,12 +183,11 @@ impl Compiler for Autograd {
     }
 }
 
-fn add_grad(
+fn normalize_grad_for_input(
     mut grad: GraphTensor,
-    fwd: GraphTensor,
+    fwd: &GraphTensor,
     graph: &mut Graph,
-    grad_map: &mut FxHashMap<NodeIndex, (NodeIndex, ShapeTracker)>,
-) {
+) -> GraphTensor {
     // Reshape gradient to match the shape of the input source (before the input was reshaped)
     // Undo permutes
     let mut new_indexes = ArrayVec::new();
@@ -224,6 +223,18 @@ fn add_grad(
             grad.shape = pre_fwd_shape.contiguous();
         }
     }
+    grad
+}
+
+fn add_grad(
+    mut grad: GraphTensor,
+    fwd: GraphTensor,
+    graph: &mut Graph,
+    grad_map: &mut FxHashMap<NodeIndex, (NodeIndex, ShapeTracker)>,
+) {
+
+    // Normalize/reshape incoming grad to match `fwd`'s semantics.
+    let grad = normalize_grad_for_input(grad, &fwd, graph);
 
     if let Some((existing_grad_node, existing_grad_shape)) = grad_map.get(&fwd.id).copied() {
         let grad = GraphTensor::from_id(grad.id, grad.shape, graph);
@@ -970,6 +981,87 @@ mod tests {
             assert_eq!(grad_vec.len(), 4);
             // Verify gradient values are reasonable (not NaN or Inf)
             assert!(grad_vec.iter().all(|&v| v.is_finite()));
+        }
+    }
+
+        // ---------------------------
+    // Unit tests for normalize_grad_for_input
+    // ---------------------------
+    mod normalize_tests {
+        use super::*;
+
+        // Helper to get materialized data from a GraphTensor
+        fn data_of(t: &GraphTensor, cx: &mut Graph) -> Vec<f32> {
+            GraphTensor::from_id(t.id, t.shape, cx as *mut Graph).data()
+        }
+
+        /// White-box unit test replicating `test_add_grad_decreasing.rs`.
+        /// It verifies that `normalize_grad_for_input` correctly handles a `fwd` tensor
+        /// with multiple fake dimensions and non-monotonic `indexes`.
+        #[test]
+        fn test_normalize_handles_non_monotonic_indexes_and_multi_fake_dims() {
+            let mut cx = Graph::new();
+            // 1. Construct `fwd` tensor state with non-monotonic indexes and multiple fake dims.
+            // Use a real tensor (constant reshaped) instead of an uninitialized placeholder
+            // so execution doesn't attempt to load an unset value for this node.
+            let fwd_base = cx.constant(0.0).reshape((2, 3));
+            let fwd_expanded = fwd_base.expand((2, 1, 3, 1));
+            // Sanity-check the expanded state before permuting
+            assert_eq!(fwd_expanded.shape.shape_usize(), vec![2, 1, 3, 1]);
+            assert_eq!(fwd_expanded.shape.indexes.as_slice(), &[0, 2, 1, 3]);
+            assert_eq!(fwd_expanded.shape.fake.as_slice(), &[false, false, true, true]);
+            let fwd = fwd_expanded.permute((2, 3, 0, 1));
+
+            // Sanity-check the forward tensor's shape properties.
+            assert_eq!(fwd.shape.shape_usize(), vec![3, 1, 2, 1]);
+            assert_eq!(fwd.shape.indexes.as_slice(), &[1, 3, 0, 2]);
+            assert_eq!(fwd.shape.fake.as_slice(), &[false, false, true, true]); 
+
+            // 2. Simulate upstream gradient of broadcasted `1.0`.
+            let grad: GraphTensor = cx.constant(1.0).expand((3, 1, 2, 1));
+
+            // 3. Call the function under test.
+            let out = super::normalize_grad_for_input(grad, &fwd, &mut cx);
+
+            // 4. White-box verification:
+            //    - The output should have had two SumReduce ops applied.
+            //    - We can verify this by checking the final shape, which should be [2, 3].
+            assert_eq!(out.shape.shape_usize(), vec![2, 3]);
+
+            // 5. Execute graph and verify final data.
+            //    The gradient of 1.0, reduced over two fake dims of size 1, should
+            //    result in a [2, 3] tensor of ones.
+            cx.keep_tensors(vec![(out.id, out.shape)]);
+            cx.execute();
+            let expected_data = vec![1.0; 6];
+            assert_exact(&data_of(&out, &mut cx), &expected_data);
+        }
+
+        /// Unit test to verify `normalize_grad_for_input` does nothing when no fake
+        /// dimensions or permutes are present.
+        #[test]
+        fn test_normalize_is_noop_for_simple_shapes() {
+            let mut cx = Graph::new();
+            // 1. `fwd` tensor is a simple, contiguous tensor.
+            let fwd = cx.tensor(3).set([1.0, 2.0, 3.0]);
+
+            // 2. Upstream grad is ones with the same shape.
+            let grad = cx.tensor(3).set([1.0, 1.0, 1.0]);
+            let original_grad_id = grad.id;
+
+            // 3. Call the function under test.
+            let out = super::normalize_grad_for_input(grad, &fwd, &mut cx);
+
+            // 4. White-box verification:
+            //    - No new ops should be added. The output ID should be the same as the input.
+            assert_eq!(out.id, original_grad_id, "No new nodes should be created");
+            //    - The output shape should be identical to the input shape.
+            assert_eq!(out.shape.shape_usize(), vec![3]);
+
+            // 5. Verify data.
+            cx.keep_tensors(vec![(out.id, out.shape)]);
+            cx.execute();
+            assert_exact(&data_of(&out, &mut cx), &vec![1.0, 1.0, 1.0]);
         }
     }
 }
