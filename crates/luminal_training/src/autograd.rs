@@ -188,15 +188,15 @@ fn normalize_grad_for_input(
     fwd: &GraphTensor,
     graph: &mut Graph,
 ) -> GraphTensor {
-
     // If grad has fewer logical axes than fwd (common when forward used expand/broadcast),
     // insert broadcasted axes into grad at the logical positions where fwd is fake.
     // Do this before undoing permutes so indexes line up.
     if grad.shape.len() < fwd.shape.len() {
         let _need = fwd.shape.len() - grad.shape.len();
         // insert fake positions from highest -> lowest so indices remain valid
-        let mut fake_positions: Vec<usize> =
-            (0..fwd.shape.len()).filter(|&i| fwd.shape.fake[i]).collect();
+        let mut fake_positions: Vec<usize> = (0..fwd.shape.len())
+            .filter(|&i| fwd.shape.fake[i])
+            .collect();
         fake_positions.sort_unstable_by(|a, b| b.cmp(a));
         for &pos in &fake_positions {
             if grad.shape.len() >= fwd.shape.len() {
@@ -226,8 +226,9 @@ fn normalize_grad_for_input(
     grad.shape.indexes = new_indexes;
 
     // Undo expands (sum-reduce on every fake dimension)
-    let mut fake_dims: Vec<usize> =
-        (0..fwd.shape.len()).filter(|&idx| fwd.shape.fake[idx]).collect();
+    let mut fake_dims: Vec<usize> = (0..fwd.shape.len())
+        .filter(|&idx| fwd.shape.fake[idx])
+        .collect();
 
     // Remove highest indices first so later indices stay valid.
     fake_dims.sort_unstable_by(|a, b| b.cmp(a));
@@ -266,7 +267,6 @@ fn add_grad(
     graph: &mut Graph,
     grad_map: &mut FxHashMap<NodeIndex, (NodeIndex, ShapeTracker)>,
 ) {
-
     // Normalize/reshape incoming grad to match `fwd`'s semantics.
     let grad = normalize_grad_for_input(grad, &fwd, graph);
 
@@ -466,7 +466,8 @@ mod tests {
 
             let d_dev = Cpu::default();
             let mut d_model = d_dev
-                .build_module::<dfdx::nn::modules::builders::TransformerEncoderBlock<3, 1, 4>, f32>();
+                .build_module::<dfdx::nn::modules::builders::TransformerEncoderBlock<3, 1, 4>, f32>(
+                );
             d_model.self_attn.w_k.bias.copy_from(&[0.0, 0.0, 0.0]);
             d_model.self_attn.w_v.bias.copy_from(&[0.0, 0.0, 0.0]);
             d_model.self_attn.w_q.bias.copy_from(&[0.0, 0.0, 0.0]);
@@ -515,7 +516,8 @@ mod tests {
             d_model.norm2.beta = d_dev.tensor_from_vec(vec![0., 0., 0.], (DConst::<3>,));
             d_model.norm1.beta = d_dev.tensor_from_vec(vec![0., 0., 0.], (DConst::<3>,));
             d_model.norm2.epsilon = 1e-5;
-            let d_a = d_dev.tensor_from_vec(vec![-1., 2., 3., 3., 3., -1.], (DConst::<2>, DConst::<3>));
+            let d_a =
+                d_dev.tensor_from_vec(vec![-1., 2., 3., 3., 3., -1.], (DConst::<2>, DConst::<3>));
             let d_target =
                 d_dev.tensor_from_vec(vec![0., 1., 0., 0., 0., 1.], (DConst::<2>, DConst::<3>));
             let d_b = d_model.forward(d_a.trace(Gradients::leaky()));
@@ -953,26 +955,30 @@ mod tests {
             cx.execute();
 
             // Expected gradient is still all ones (two sums in series)
-            assert_exact(&GraphTensor::from_id(g[0].0, g[0].1, &mut cx).data(),
-                        &vec![1., 1., 1., 1., 1., 1.]);
+            assert_exact(
+                &GraphTensor::from_id(g[0].0, g[0].1, &mut cx).data(),
+                &vec![1., 1., 1., 1., 1., 1.],
+            );
         }
         #[test]
         fn test_add_grad_preserves_unfaked_dim() {
             let mut cx = Graph::new();
 
             // b is broadcast → fake for forward, but we turn it real with *a
-            let b = cx.tensor(1).set([2.]);          // shape [1] fake dim
-            let a = cx.tensor(3).set([1., 2., 3.]);  // shape [3]
-            let c = b.expand((3,)) * a;              // broadcast multiply
-            let loss = c.sum(0);                     // scalar
+            let b = cx.tensor(1).set([2.]); // shape [1] fake dim
+            let a = cx.tensor(3).set([1., 2., 3.]); // shape [3]
+            let c = b.expand((3,)) * a; // broadcast multiply
+            let loss = c.sum(0); // scalar
 
             let grads = cx.compile(Autograd::new(b.id, loss), ());
             cx.keep_tensors(&grads);
             cx.execute();
 
             // dloss/db = sum(a) = 6
-            assert_exact(&GraphTensor::from_id(grads[0].0, grads[0].1, &mut cx).data(),
-                        &vec![6.0]);
+            assert_exact(
+                &GraphTensor::from_id(grads[0].0, grads[0].1, &mut cx).data(),
+                &vec![6.0],
+            );
         }
 
         #[test]
@@ -980,8 +986,8 @@ mod tests {
             let mut cx = Graph::new();
             // Test with maximum supported rank (6 dimensions) with many fake dims
             // ShapeTracker uses ArrayVec with capacity 6, so this is the limit
-            let a = cx.tensor((2, 1, 3, 1, 1, 4));   // 6 dims, many fake
-            // Set some values - we need 2*3*4 = 24 values
+            let a = cx.tensor((2, 1, 3, 1, 1, 4)); // 6 dims, many fake
+                                                   // Set some values - we need 2*3*4 = 24 values
             a.set(vec![1.0; 24]);
             let orig = a.id;
             let loss = a.sum((0, 1, 2, 3, 4, 5));
@@ -1001,7 +1007,7 @@ mod tests {
             let mut cx = Graph::new();
             // Weight is 2×2 but permuted so strides are swapped
             // This tests that autograd correctly handles non-contiguous tensors
-            let w = cx.tensor((2,2)).set([[1.,2.],[3.,4.]]).permute((1,0));
+            let w = cx.tensor((2, 2)).set([[1., 2.], [3., 4.]]).permute((1, 0));
             let x = cx.tensor(2).set([10., 5.]);
             let out = x.matmul(w).sum(0);
 
@@ -1018,7 +1024,7 @@ mod tests {
         }
     }
 
-        // ---------------------------
+    // ---------------------------
     // Unit tests for normalize_grad_for_input
     // ---------------------------
     mod normalize_tests {
@@ -1043,13 +1049,16 @@ mod tests {
             // Sanity-check the expanded state before permuting
             assert_eq!(fwd_expanded.shape.shape_usize(), vec![2, 1, 3, 1]);
             assert_eq!(fwd_expanded.shape.indexes.as_slice(), &[0, 2, 1, 3]);
-            assert_eq!(fwd_expanded.shape.fake.as_slice(), &[false, false, true, true]);
+            assert_eq!(
+                fwd_expanded.shape.fake.as_slice(),
+                &[false, false, true, true]
+            );
             let fwd = fwd_expanded.permute((2, 3, 0, 1));
 
             // Sanity-check the forward tensor's shape properties.
             assert_eq!(fwd.shape.shape_usize(), vec![3, 1, 2, 1]);
             assert_eq!(fwd.shape.indexes.as_slice(), &[1, 3, 0, 2]);
-            assert_eq!(fwd.shape.fake.as_slice(), &[false, false, true, true]); 
+            assert_eq!(fwd.shape.fake.as_slice(), &[false, false, true, true]);
 
             // 2. Simulate upstream gradient of broadcasted `1.0`.
             let grad: GraphTensor = cx.constant(1.0).expand((3, 1, 2, 1));
