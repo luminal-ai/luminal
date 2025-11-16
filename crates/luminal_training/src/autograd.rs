@@ -189,6 +189,34 @@ fn normalize_grad_for_input(
     graph: &mut Graph,
 ) -> GraphTensor {
 
+    // If grad has fewer logical axes than fwd (common when forward used expand/broadcast),
+    // insert broadcasted axes into grad at the logical positions where fwd is fake.
+    // Do this before undoing permutes so indexes line up.
+    if grad.shape.len() < fwd.shape.len() {
+        let _need = fwd.shape.len() - grad.shape.len();
+        // insert fake positions from highest -> lowest so indices remain valid
+        let mut fake_positions: Vec<usize> =
+            (0..fwd.shape.len()).filter(|&i| fwd.shape.fake[i]).collect();
+        fake_positions.sort_unstable_by(|a, b| b.cmp(a));
+        for &pos in &fake_positions {
+            if grad.shape.len() >= fwd.shape.len() {
+                break;
+            }
+            // Insert a logical axis with the forward logical size (broadcast view).
+            let size = fwd.shape.dims[fwd.shape.indexes[pos]];
+            grad.shape.expand_dim(pos, size);
+            // Rewrap so the updated shape is used downstream.
+            grad = GraphTensor::from_id(grad.id, grad.shape, graph as *mut Graph);
+        }
+        // Defensive: if we still didn't reach target rank (e.g., malformed fake flags), pad at end.
+        while grad.shape.len() < fwd.shape.len() {
+            let pos = grad.shape.len();
+            let size = fwd.shape.dims[fwd.shape.indexes[pos]];
+            grad.shape.expand_dim(pos, size);
+            grad = GraphTensor::from_id(grad.id, grad.shape, graph as *mut Graph);
+        }
+    }
+
     // Undo permutes
     let mut new_indexes = ArrayVec::new();
     new_indexes.resize(fwd.shape.len(), 0);
