@@ -19,6 +19,17 @@ pub const HEAD_DIM: usize = 128;
 pub const KV_GROUPS: usize = 4;
 pub const VOCAB_SIZE: usize = 128256;
 
+pub const BR: usize = 32;
+pub const BC: usize = 32;
+
+fn ceil_div(x: usize, y: usize) -> usize {
+    (x + y - 1) / y
+}
+
+fn ceil_div_expr(x: Expression, y: usize) -> Expression {
+    (x + y - 1) / y
+}
+
 pub struct Llama {
     embedding: GraphTensor,
     layers: Vec<LlamaLayer>,
@@ -533,6 +544,118 @@ impl BlockOp for LlamaAttention {
             flatten_mul_strides(&self.range, &q_pos_stride),
             flatten_mul_strides(&self.range, &group_pos_stride),
             flatten_mul_strides(&self.range, &head_pos_stride),
+        ]
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct LlamaAttentionOpt {
+    range: Vec<Expression>,
+    head_dim: Expression,
+    cur_seq: Expression,
+    num_q_tiles: Expression,  // ceil(T / BR)
+    prev_seq: Expression,
+    k_cache: u64,
+    v_cache: u64,
+}
+
+impl LlamaAttentionOpt {
+    fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
+        Self {
+            range: (HIDDEN / HEAD_DIM, ceil_div_expr(seq, BR)).to_shape(),
+            head_dim: HEAD_DIM.into(),
+            cur_seq: seq,
+            num_q_tiles: ceil_div_expr(seq, BR),
+            prev_seq,
+            k_cache,
+            v_cache,
+        }
+    }
+}
+
+impl CustomOp for LlamaAttentionOpt {
+    fn to_llir_op(&self) -> luminal::op::LLIROp {
+        LLIROp::new::<dyn BlockOp>(Box::new(self.clone()))
+    }
+}
+
+impl BlockOp for LlamaAttentionOpt {
+    fn op_name(&self) -> &'static str {
+        "LlamaAttentionOpt"
+    }
+
+    fn launch_range(&self) -> Vec<Expression> {
+        self.range.clone()
+    }
+
+    fn output_size(&self) -> Expression {
+        self.cur_seq * HIDDEN  // outputs to shape (B, H, T, D)
+    }
+
+    fn producer_barriers_seperate(&self) -> Vec<bool> {
+        vec![true; self.range.len()]
+    }
+
+    fn consumer_barriers_seperate(&self) -> Vec<Vec<bool>> {
+        let mut q = vec![true; self.range.len()];
+        q[self.range.len() - 1] = false;
+        let mut k = vec![true; self.range.len()];
+        k[self.range.len() - 1] = false;
+        let mut v = vec![true; self.range.len()];
+        v[self.range.len() - 1] = false;
+        vec![q, k, v]
+    }
+
+    fn cuda_struct(&self) -> String {
+        "
+            int head_dim;
+            int seq_len;
+            int num_q_tiles;    // ceil(seq / BR)
+            int prev_seq;
+            int br;             // query tile size
+            int bc;             // k/v tile size
+            int n_heads;
+            int kv_groups;
+            int hidden;
+            float* key_cache;
+            float* val_cache;
+        "
+        .to_string()
+    }
+
+    fn cuda_function(&self) -> String {
+        "
+        "
+        .to_string()
+    }
+
+    fn schedule_op(
+        &self,
+        _: &Arc<CudaStream>,
+        expressions: &FxHashMap<Expression, i32>,
+    ) -> Vec<u8> {
+        CStruct::new()
+            .int(expressions[&self.head_dim])
+            .int(expressions[&self.cur_seq])
+            .int(expressions[&self.num_q_tiles])
+            .int(expressions[&self.prev_seq])
+            .int(BR as i32)           // constant, no expression needed
+            .int(BC as i32)
+            .int((HIDDEN / HEAD_DIM) as i32)  // n_heads
+            .int(KV_GROUPS as i32)
+            .int(HIDDEN as i32)
+            .ptr_mut_f32(self.k_cache as *mut f32)
+            .ptr_mut_f32(self.v_cache as *mut f32)
+            .finish_struct()
+    }
+
+    fn expressions(&self) -> Vec<Expression> {
+        vec![
+            self.head_dim,
+            self.cur_seq,
+            self.num_q_tiles,
+            self.prev_seq,
         ]
     }
 }
