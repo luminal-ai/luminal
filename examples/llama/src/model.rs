@@ -624,8 +624,10 @@ impl BlockOp for LlamaAttentionOpt {
         .to_string()
     }
 
+    // (LlamaAttentionOptPayload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad)
     fn cuda_function(&self) -> String {
         "
+
         "
         .to_string()
     }
