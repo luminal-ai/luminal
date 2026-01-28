@@ -2,10 +2,10 @@ use luminal::{
     graph::Graph,
     op::{CustomOp, LLIROp},
     prelude::GraphTensor,
-    shape::{Expression, ToShape, flatten_mul_strides},
+    shape::{flatten_mul_strides, Expression, ToShape},
 };
 use luminal_cuda::{
-    block::{BlockOp, cstruct::CStruct},
+    block::{cstruct::CStruct, BlockOp},
     cudarc::driver::{CudaSlice, CudaStream, DevicePtr},
 };
 use luminal_nn::LayerNorm;
