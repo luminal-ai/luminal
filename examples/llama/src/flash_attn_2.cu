@@ -18,18 +18,13 @@ extern __shared__ float shmem[];
 #define KV_STRIDE (HIDDEN / KV_GROUPS)
 
 int tmp; // reuse registers
-// int lane_id = threadIdx.x % WARP_SIZE;
-// int warp_id = threadIdx.x / WARP_SIZE;
-// int warp_group_id = threadIdx.x / THREADS_PER_GROUP; // 0..7
-// int group_q_row = warp_group_id * ROWS_PER_GROUP; // 0, 4, 8, ..., 28
-// int warp_id_in_group = (threadIdx.x % THREADS_PER_GROUP) / WARP_SIZE;
-// int gtid = threadIdx.x % THREADS_PER_GROUP;
-#define lane_id (threadIdx.x % WARP_SIZE)
-#define warp_id (threadIdx.x / WARP_SIZE)
-#define warp_group_id (threadIdx.x / THREADS_PER_GROUP)
-#define group_q_row (warp_group_id * ROWS_PER_GROUP)
-#define warp_id_in_group ((threadIdx.x % THREADS_PER_GROUP) / WARP_SIZE)
-#define gtid (threadIdx.x % THREADS_PER_GROUP)
+
+int lane_id = threadIdx.x % WARP_SIZE;
+int warp_id = threadIdx.x / WARP_SIZE;
+int warp_group_id = threadIdx.x / THREADS_PER_GROUP; // 0..7
+int group_q_row = warp_group_id * ROWS_PER_GROUP; // 0, 4, 8, ..., 28
+int warp_id_in_group = (threadIdx.x % THREADS_PER_GROUP) / WARP_SIZE;
+int gtid = threadIdx.x % THREADS_PER_GROUP;
 
 const int seq_len = eval_expression(payload.seq_len, 0);
 const int num_q_tiles = eval_expression(payload.num_q_tiles, 0);
@@ -85,34 +80,38 @@ __shared__ float qk_scores[NUM_WARP_GROUPS][ROWS_PER_GROUP][32];
 __shared__ float o_scales[NUM_WARP_GROUPS][ROWS_PER_GROUP];
 __shared__ float sums_final[NUM_WARP_GROUPS][ROWS_PER_GROUP];
 
-auto warp_reduce_sum = [](float val) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    }
-    return val;
-};
+#define warp_reduce_sum(val) \
+    do { \
+        (val) += __shfl_down_sync(FULL_MASK, (val), 16); \
+        (val) += __shfl_down_sync(FULL_MASK, (val), 8); \
+        (val) += __shfl_down_sync(FULL_MASK, (val), 4); \
+        (val) += __shfl_down_sync(FULL_MASK, (val), 2); \
+        (val) += __shfl_down_sync(FULL_MASK, (val), 1); \
+    } while(0)
 
-auto warp_reduce_max = [](float val) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
-    }
-    return val;
-};
+#define warp_reduce_max(val) \
+    do { \
+        (val) = fmaxf((val), __shfl_down_sync(FULL_MASK, (val), 16)); \
+        (val) = fmaxf((val), __shfl_down_sync(FULL_MASK, (val), 8)); \
+        (val) = fmaxf((val), __shfl_down_sync(FULL_MASK, (val), 4)); \
+        (val) = fmaxf((val), __shfl_down_sync(FULL_MASK, (val), 2)); \
+        (val) = fmaxf((val), __shfl_down_sync(FULL_MASK, (val), 1)); \
+    } while(0)
 
-auto warp_group_reduce_sum = [&](float val) {
-    val = warp_reduce_sum(val);
-    if (lane_id == 0) {
-        block_shmem_sum[warp_id] = val;
-    }
-    __syncthreads();
-    if (gtid == 0) {
-        val = block_shmem_sum[warp_group_id * WARPS_PER_GROUP]
-            + block_shmem_sum[warp_group_id * WARPS_PER_GROUP + 1]
-            + block_shmem_sum[warp_group_id * WARPS_PER_GROUP + 2]
-            + block_shmem_sum[warp_group_id * WARPS_PER_GROUP + 3];
-    }
-    return val;
-};
+#define warp_group_reduce_sum(val) \
+    do { \
+        warp_reduce_sum(val); \
+        if (lane_id == 0) { \
+            block_shmem_sum[warp_id] = (val); \
+        } \
+        __syncthreads(); \
+        if (gtid == 0) { \
+            (val) = block_shmem_sum[warp_group_id * WARPS_PER_GROUP] \
+                  + block_shmem_sum[warp_group_id * WARPS_PER_GROUP + 1] \
+                  + block_shmem_sum[warp_group_id * WARPS_PER_GROUP + 2] \
+                  + block_shmem_sum[warp_group_id * WARPS_PER_GROUP + 3]; \
+        } \
+    } while(0)
 
 float q_reg[ROWS_PER_GROUP] = {0};
 float o_reg[ROWS_PER_GROUP] = {0};
@@ -121,6 +120,8 @@ float max_prev = NEG_INF;
 float sum_prev = 0.0f;
 
 // load our warp groups tile
+
+#pragma unroll 1
 for (int i = 0; i < ROWS_PER_GROUP; i++) {
     int global_q_row = q_row + group_q_row + i;
     if (global_q_row < seq_len && gtid < HEAD_DIM) {
@@ -137,7 +138,6 @@ tmp = prev_seq + q_row + BR - 1; // max_kv_idx
 const int num_kv_tiles_needed = ( tmp / BC) + 1;
 
 for (int j = 0; j < num_kv_tiles_needed; j++) {
-    int kv_pos = j * BC + lane_id; // key-value position for causal masking
     __syncthreads();  // make sure previous iteration is finished
 
     // load K and V into shmem
@@ -164,12 +164,14 @@ for (int j = 0; j < num_kv_tiles_needed; j++) {
     }
     __syncthreads();
 
+    #pragma unroll 1
     for (int i = 0; i < BC; i++) {
         int global_k_row = j * BC + i;
         float cur_k = (global_k_row < total_seq) ? sK[i * HEAD_DIM + gtid] : 0.0f;
+        #pragma unroll 1
         for (int r = 0; r < ROWS_PER_GROUP; r++) {
             float cur_qk = q_reg[r] * cur_k;
-            cur_qk = warp_group_reduce_sum(cur_qk);
+            warp_group_reduce_sum(cur_qk);
             if (gtid == 0) {
                 qk_scores[warp_group_id][r][i] = cur_qk * rscaled;
             }
@@ -178,18 +180,22 @@ for (int j = 0; j < num_kv_tiles_needed; j++) {
 
     __syncthreads();
 
-    float tid_score = qk_scores[warp_group_id][warp_id_in_group][lane_id];
-    if (kv_pos > q_pos || kv_pos >= total_seq) tid_score = NEG_INF;
-    float max_curr = warp_reduce_max(tid_score);
-    max_curr = __shfl_sync(FULL_MASK, max_curr, 0); // all threads in warp see same max value
-    float max_new = fmaxf(max_prev, max_curr);
-    float o_scale = (j == 0) ? 1.0f : expf(max_prev - max_new);
-    float exp_score = expf(tid_score - max_new);
-    qk_scores[warp_group_id][warp_id_in_group][lane_id] = exp_score;
-    float sum_curr = warp_reduce_sum(exp_score);
-    sum_curr = __shfl_sync(FULL_MASK, sum_curr, 0); // all threads in warp see same sum value
-    sum_prev = (sum_prev * o_scale) + sum_curr;
-    max_prev = max_new;
+    float o_scale = 0.0f;
+    {
+        int kv_pos = j * BC + lane_id; // key-value position for causal masking
+        float tid_score = qk_scores[warp_group_id][warp_id_in_group][lane_id];
+        if (kv_pos > q_pos || kv_pos >= total_seq) tid_score = NEG_INF;
+        float max_curr = tid_score; warp_reduce_max(max_curr);
+        max_curr = __shfl_sync(FULL_MASK, max_curr, 0); // all threads in warp see same max value
+        float max_new = fmaxf(max_prev, max_curr);
+        o_scale = (j == 0) ? 1.0f : expf(max_prev - max_new);
+        float exp_score = expf(tid_score - max_new);
+        qk_scores[warp_group_id][warp_id_in_group][lane_id] = exp_score;
+        float sum_curr = exp_score; warp_reduce_sum(sum_curr);
+        sum_curr = __shfl_sync(FULL_MASK, sum_curr, 0); // all threads in warp see same sum value
+        sum_prev = (sum_prev * o_scale) + sum_curr;
+        max_prev = max_new;
+    }
 
     if (lane_id == 0) {
         o_scales[warp_group_id][warp_id_in_group] = o_scale;
@@ -199,6 +205,8 @@ for (int j = 0; j < num_kv_tiles_needed; j++) {
         }
     }
     __syncthreads();
+
+    #pragma unroll 1
     for (int i = 0; i < ROWS_PER_GROUP; i++) {
         float scale = o_scales[warp_group_id][i];
         float out_val = 0.0f;
@@ -216,6 +224,7 @@ for (int j = 0; j < num_kv_tiles_needed; j++) {
 
 __syncthreads();
 
+#pragma unroll 1
 for (int i = 0; i < ROWS_PER_GROUP; i++) {
     int global_out_row = q_row + group_q_row + i;
     if (global_out_row < seq_len && gtid < HEAD_DIM) {
@@ -237,14 +246,11 @@ for (int i = 0; i < ROWS_PER_GROUP; i++) {
 #undef HEAD_DIM
 #undef BR
 #undef BC
-#undef HIDDEN
-#undef lane_id
-#undef warp_id
-#undef warp_group_id
-#undef group_q_row
-#undef warp_id_in_group
-#undef gtid
 #undef KV_GROUPS
 #undef KV_STRIDE
+#undef HIDDEN
+#undef warp_reduce_max
+#undef warp_reduce_sum
+#undef warp_group_reduce_sum
 
 }
