@@ -1,5 +1,8 @@
 mod model;
 
+#[cfg(test)]
+mod tests;
+
 use luminal::prelude::*;
 use luminal_cuda::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use model::*;

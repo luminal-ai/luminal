@@ -22,10 +22,6 @@ pub const VOCAB_SIZE: usize = 128256;
 pub const BR: usize = 32;
 pub const BC: usize = 32;
 
-fn ceil_div(x: usize, y: usize) -> usize {
-    (x + y - 1) / y
-}
-
 fn ceil_div_expr(x: Expression, y: usize) -> Expression {
     (x + y - 1) / y
 }
@@ -561,7 +557,7 @@ pub struct LlamaAttentionOpt {
 }
 
 impl LlamaAttentionOpt {
-    fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
+    pub fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
         Self {
             range: (HIDDEN / HEAD_DIM, ceil_div_expr(seq, BR)).to_shape(),
             head_dim: HEAD_DIM.into(),
@@ -626,10 +622,11 @@ impl BlockOp for LlamaAttentionOpt {
 
     // (LlamaAttentionOptPayload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad)
     fn cuda_function(&self) -> String {
-        "
-
-        "
-        .to_string()
+        // write cuda code in own file, then remove outer braces
+        let s = include_str!("flash_attn_2.cu");
+        let start = s.find('{').unwrap() + 1;
+        let end = s.rfind('}').unwrap();
+        s[start..end].to_string()
     }
 
     fn schedule_op(
