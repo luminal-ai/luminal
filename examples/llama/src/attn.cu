@@ -109,8 +109,8 @@ float sum_prev = 0.0f;
 for (int i = 0; i < ROWS_PER_GROUP; i++) {
     int global_q_row = q_row + group_q_row + i;
     if (global_q_row < seq_len && gtid < head_dim) {
-        int q_offset = hidden * (group_q_row + i);
-        q_reg[i] = Q_base[q_offset + gtid];
+        int q_local_offset = hidden * (group_q_row + i);
+        q_reg[i] = Q_base[q_local_offset + gtid];
     } else {
         q_reg[i] = 0.0f;
     }
