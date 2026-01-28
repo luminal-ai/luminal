@@ -699,10 +699,6 @@ impl Runtime for CudaRuntime {
                             max_dynamic_allowed,
                         )
                         .unwrap();
-                    println!(
-                        "Shared memory - per_block_optin: {}, static: {}, max_dynamic: {}",
-                        per_block_optin, static_shared, max_dynamic_allowed
-                    );
 
                     // Launch kernel
                     let cfg = LaunchConfig {

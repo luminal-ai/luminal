@@ -765,6 +765,11 @@ fn compile_interpreter(
         .unwrap();
         let module = cuda_stream.context().load_module(ptx).unwrap();
         let func = module.load_function("worker_kernel").unwrap();
+        let num_regs = func
+            .get_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS)
+            .unwrap();
+        let op_names: Vec<_> = ops.iter().map(|op| op.op_name()).collect();
+        println!("Kernel registers per thread: {} (ops: {:?})", num_regs, op_names);
         kernel_cache.insert(kernel.clone(), (module.clone(), func.clone()));
         (module, func)
     };

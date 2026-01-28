@@ -181,7 +181,7 @@ impl LlamaLayer {
         let q_rope = llama_rotary_embeddings(q, pos_ids);
         let k_rope = llama_rotary_embeddings(k, pos_ids);
         let attn_out = x.graph().custom_op(
-            LlamaAttention::new(k_cache, v_cache, q_rope.dims()[0], 'p'.into()),
+            LlamaAttentionOpt::new(k_cache, v_cache, q_rope.dims()[0], 'p'.into()),
             (q_rope, k_rope, v),
             q_rope.shape,
             q_rope.dtype,
@@ -242,7 +242,7 @@ pub struct LlamaAttention {
 }
 
 impl LlamaAttention {
-    fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
+    pub fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
         Self {
             range: (HIDDEN / HEAD_DIM / KV_GROUPS, KV_GROUPS, seq).to_shape(),
             head_dim: HEAD_DIM.into(),
@@ -607,13 +607,8 @@ impl BlockOp for LlamaAttentionOpt {
         "
             int head_dim;
             int seq_len;
-            int num_q_tiles;    // ceil(seq / BR)
+            int num_q_tiles;
             int prev_seq;
-            int br;             // query tile size
-            int bc;             // k/v tile size
-            int n_heads;
-            int kv_groups;
-            int hidden;
             float* key_cache;
             float* val_cache;
         "
@@ -639,11 +634,6 @@ impl BlockOp for LlamaAttentionOpt {
             .int(expressions[&self.cur_seq])
             .int(expressions[&self.num_q_tiles])
             .int(expressions[&self.prev_seq])
-            .int(BR as i32)           // constant, no expression needed
-            .int(BC as i32)
-            .int((HIDDEN / HEAD_DIM) as i32)  // n_heads
-            .int(KV_GROUPS as i32)
-            .int(HIDDEN as i32)
             .ptr_mut_f32(self.k_cache as *mut f32)
             .ptr_mut_f32(self.v_cache as *mut f32)
             .finish_struct()

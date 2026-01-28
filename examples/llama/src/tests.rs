@@ -497,3 +497,181 @@ fn test_llama_attention_opt_cuda() {
     
     println!("\n=== TEST PASSED ===");
 }
+
+/// Benchmark comparing LlamaAttention vs LlamaAttentionOpt across sequence lengths
+/// 
+/// Run with: cargo test -p llama test_attention_benchmark -- --nocapture --ignored
+#[test]
+#[ignore] // Run explicitly with --ignored flag
+fn test_attention_benchmark() {
+    use luminal::prelude::*;
+    use luminal::op::DType;
+    use luminal_cuda::{cudarc::driver::{CudaContext, DevicePtr}, runtime::CudaRuntime};
+    use crate::model::{LlamaAttention, LlamaAttentionOpt, HEAD_DIM, HIDDEN, KV_GROUPS};
+    use std::time::Instant;
+    
+    println!("\n=== Attention Benchmark: LlamaAttention vs LlamaAttentionOpt ===\n");
+    
+    let n_heads = HIDDEN / HEAD_DIM;
+    let head_dim = HEAD_DIM;
+    let hidden = HIDDEN;
+    let kv_groups = KV_GROUPS;
+    let n_kv_heads = n_heads / kv_groups;
+    let kv_hidden = n_kv_heads * head_dim;
+    
+    // Sequence lengths to test
+    let seq_lengths = [1, 8, 32, 64, 128, 256, 512, 1024];
+    let warmup_iters = 3;
+    let bench_iters = 10;
+    
+    // Set up CUDA
+    let ctx = CudaContext::new(0).expect("No CUDA device found");
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+    
+    // Allocate dummy KV cache buffers (needed because kernels do pointer arithmetic before null check)
+    let max_seq = *seq_lengths.iter().max().unwrap();
+    let cache_size = max_seq * kv_hidden * std::mem::size_of::<f32>();
+    let k_cache_buf: luminal_cuda::cudarc::driver::CudaSlice<u8> = stream.alloc_zeros(cache_size).unwrap();
+    let v_cache_buf: luminal_cuda::cudarc::driver::CudaSlice<u8> = stream.alloc_zeros(cache_size).unwrap();
+    let k_cache_ptr = k_cache_buf.device_ptr(&stream).0;
+    let v_cache_ptr = v_cache_buf.device_ptr(&stream).0;
+    
+    println!("Dimensions: hidden={}, kv_hidden={}, head_dim={}", hidden, kv_hidden, head_dim);
+    println!("Warmup iterations: {}, Benchmark iterations: {}\n", warmup_iters, bench_iters);
+    println!("{:>8} {:>15} {:>15} {:>10}", "SeqLen", "Original (μs)", "Optimized (μs)", "Speedup");
+    println!("{}", "-".repeat(55));
+    
+    // Store results for summary
+    let mut results: Vec<(usize, f64, f64, f64)> = Vec::new();
+    
+    for &seq_len in &seq_lengths {
+        // Generate data
+        let q_data = random_vec(seq_len * hidden);
+        let k_data = random_vec(seq_len * kv_hidden);
+        let v_data = random_vec(seq_len * kv_hidden);
+        
+        // ===== Benchmark LlamaAttention (Original) =====
+        let original_time = {
+            let mut cx = Graph::default();
+            let q = cx.tensor((seq_len, hidden));
+            let k = cx.tensor((seq_len, kv_hidden));
+            let v = cx.tensor((seq_len, kv_hidden));
+            
+            let _output = cx.custom_op(
+                LlamaAttention::new(k_cache_ptr, v_cache_ptr, (seq_len as i32).into(), 0.into()),
+                (q, k, v),
+                (seq_len, hidden),
+                DType::F32,
+            ).output();
+            
+            cx.build_search_space::<CudaRuntime>();
+            let mut rt = CudaRuntime::initialize(stream.clone());
+            rt.set_data(q, q_data.clone());
+            rt.set_data(k, k_data.clone());
+            rt.set_data(v, v_data.clone());
+            rt = cx.search(rt, 5);
+            
+            // Warmup
+            for _ in 0..warmup_iters {
+                rt.execute(&cx.dyn_map);
+            }
+            stream.synchronize().unwrap();
+            
+            // Benchmark
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                rt.execute(&cx.dyn_map);
+            }
+            stream.synchronize().unwrap();
+            let elapsed = start.elapsed();
+            
+            elapsed.as_micros() as f64 / bench_iters as f64
+        };
+        
+        // ===== Benchmark LlamaAttentionOpt =====
+        let optimized_time = {
+            let mut cx = Graph::default();
+            let q = cx.tensor((seq_len, hidden));
+            let k = cx.tensor((seq_len, kv_hidden));
+            let v = cx.tensor((seq_len, kv_hidden));
+            
+            let _output = cx.custom_op(
+                LlamaAttentionOpt::new(k_cache_ptr, v_cache_ptr, (seq_len as i32).into(), 0.into()),
+                (q, k, v),
+                (seq_len, hidden),
+                DType::F32,
+            ).output();
+            
+            cx.build_search_space::<CudaRuntime>();
+            let mut rt = CudaRuntime::initialize(stream.clone());
+            rt.set_data(q, q_data.clone());
+            rt.set_data(k, k_data.clone());
+            rt.set_data(v, v_data.clone());
+            rt = cx.search(rt, 5);
+            
+            // Warmup
+            for _ in 0..warmup_iters {
+                rt.execute(&cx.dyn_map);
+            }
+            stream.synchronize().unwrap();
+            
+            // Benchmark
+            let start = Instant::now();
+            for _ in 0..bench_iters {
+                rt.execute(&cx.dyn_map);
+            }
+            stream.synchronize().unwrap();
+            let elapsed = start.elapsed();
+            
+            elapsed.as_micros() as f64 / bench_iters as f64
+        };
+        
+        let speedup = original_time / optimized_time;
+        println!("{:>8} {:>15.2} {:>15.2} {:>10.2}x", 
+                 seq_len, original_time, optimized_time, speedup);
+        results.push((seq_len, original_time, optimized_time, speedup));
+    }
+    
+    // Print summary table
+    println!("\n");
+    println!("╔══════════════════════════════════════════════════════════════════╗");
+    println!("║                      BENCHMARK SUMMARY                           ║");
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    println!("║  SeqLen  │  Original (μs)  │  Optimized (μs)  │    Speedup      ║");
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    
+    for (seq_len, orig, opt, speedup) in &results {
+        let speedup_bar = if *speedup >= 1.0 {
+            let bars = ((*speedup - 1.0) * 10.0).min(8.0) as usize;
+            format!("{}{}", "█".repeat(bars), " ".repeat(8 - bars))
+        } else {
+            let bars = ((1.0 - *speedup) * 10.0).min(8.0) as usize;
+            format!("{}{}", " ".repeat(8 - bars), "░".repeat(bars))
+        };
+        println!("║  {:>6}  │  {:>13.2}  │  {:>14.2}  │ {:>6.2}x {}║",
+                 seq_len, orig, opt, speedup, speedup_bar);
+    }
+    
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    
+    // Calculate averages
+    let avg_orig: f64 = results.iter().map(|(_, o, _, _)| o).sum::<f64>() / results.len() as f64;
+    let avg_opt: f64 = results.iter().map(|(_, _, o, _)| o).sum::<f64>() / results.len() as f64;
+    let avg_speedup: f64 = results.iter().map(|(_, _, _, s)| s).sum::<f64>() / results.len() as f64;
+    let min_speedup = results.iter().map(|(_, _, _, s)| *s).fold(f64::INFINITY, f64::min);
+    let max_speedup = results.iter().map(|(_, _, _, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+    
+    println!("║  AVERAGE │  {:>13.2}  │  {:>14.2}  │ {:>6.2}x         ║", avg_orig, avg_opt, avg_speedup);
+    println!("╠══════════════════════════════════════════════════════════════════╣");
+    println!("║  Min Speedup: {:>6.2}x    Max Speedup: {:>6.2}x                   ║", min_speedup, max_speedup);
+    println!("╚══════════════════════════════════════════════════════════════════╝");
+    
+    if avg_speedup > 1.0 {
+        println!("\n✓ LlamaAttentionOpt is {:.1}% faster on average", (avg_speedup - 1.0) * 100.0);
+    } else {
+        println!("\n✗ LlamaAttentionOpt is {:.1}% slower on average", (1.0 - avg_speedup) * 100.0);
+    }
+    
+    println!("\n=== Benchmark Complete ===");
+}
