@@ -63,6 +63,46 @@ jobs:
               run: rustup update
             - name: Run CUDA crate tests
               run: CUDARC_CUDA_VERSION=12080 cargo test -p luminal_cuda --verbose
+    cuda_qwen:
+        name: Cuda Qwen
+        runs-on: cuda_t4_runner
+        timeout-minutes: 60
+        env:
+            CUDA_HOME: /usr/local/cuda-12.8
+            LD_LIBRARY_PATH: /usr/local/cuda-12.8/lib64
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Install system deps
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends \
+                  protobuf-compiler \
+                  cuda-nvrtc-12-8
+            - name: Install Rust
+              run: |
+                  curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+                  echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            - name: Update Rust
+              run: rustup update
+            - name: Install uv
+              run: curl -LsSf https://astral.sh/uv/install.sh | sh
+            - name: Download Qwen
+              working-directory: examples/qwen
+              run: ~/.local/bin/uv run --script setup/setup.py
+            - name: Run Qwen
+              working-directory: examples/qwen
+              run: |
+                  OUTPUT=$(cargo run --release 2>&1)
+                  echo "$OUTPUT"
+                  EXPECTED="The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of Portugal is Lisbon."
+                  if echo "$OUTPUT" | grep -qF "$EXPECTED"; then
+                    echo "Output matches expected text"
+                  else
+                    echo "ERROR: Output does not match expected text"
+                    echo "Expected: $EXPECTED"
+                    exit 1
+                  fi
     # cuda_llama: # disabled because t4 doesn't have enough memory for full precision llama. re-enable when we can run on larger machines or use 8-bit precision
     #     name: Cuda Llama
     #     runs-on: cuda_t4_runner

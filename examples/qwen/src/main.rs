@@ -17,7 +17,7 @@ fn main() {
 
     // Set up tracing to perfetto
     let trace_session = luminal_tracing::subscriber()
-        .perfetto("trace.pftrace")
+        //.perfetto("trace.pftrace") // Enable for perfetto tracing
         .env_filter(format!(
             "{}=trace,luminal=trace,luminal_cuda=trace",
             env!("CARGO_PKG_NAME")
