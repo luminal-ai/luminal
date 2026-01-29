@@ -16,8 +16,7 @@ fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 10;
     let search_graphs = 5; // the number of graphs we want to search during compilation
-    // let prompt = "Hello, how are you";
-    let prompt = "The history of artificial intelligence began in antiquity, with myths and stories of artificial beings endowed with intelligence. The seeds of modern AI were planted by philosophers who attempted to describe the process of human thinking as mechanical manipulation of symbols. This work culminated in the invention of the programmable digital computer in the 1940s, a machine based on the abstract essence of mathematical reasoning. This device inspired scientists to begin seriously discussing the possibility of building an electronic brain. The field of AI research was founded at a workshop at Dartmouth College in 1956, where the term artificial intelligence was coined.";
+    let prompt = "Hello, how are you";
 
     // Set up tracing to perfetto
     let trace_session = luminal_tracing::subscriber()

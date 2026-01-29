@@ -1,4 +1,4 @@
-//! Tests for LlamaAttentionOpt correctness
+//! Tests for LlamaFlashAttention correctness
 //! 
 //! Run with: cargo test -p llama test_llama_attention -- --nocapture
 
@@ -230,7 +230,7 @@ fn test_reference_attention_with_cache() {
 
 #[test]
 fn test_flash_attention_vs_reference() {
-    // Main test: compare LlamaAttentionOpt against reference
+    // Main test: compare LlamaFlashAttention against reference
     // 
     // This test uses dimensions matching the actual Llama model
     // but scaled down for faster testing
@@ -274,12 +274,12 @@ fn test_flash_attention_vs_reference() {
     println!("Reference output computed: {} elements", reference_output.len());
     println!("First 10 values: {:?}", &reference_output[..10]);
     
-    // TODO: Run LlamaAttentionOpt and compare
+    // TODO: Run LlamaFlashAttention and compare
     // For now, just verify reference runs correctly
     
     // To actually test the CUDA kernel, you would:
     // 1. Create a Graph with Q, K, V inputs
-    // 2. Apply LlamaAttentionOpt custom op
+    // 2. Apply LlamaFlashAttention custom op
     // 3. Run on CUDA
     // 4. Compare output against reference_output
     
@@ -288,7 +288,7 @@ fn test_flash_attention_vs_reference() {
     println!("Reference implementation verified working.");
 }
 
-/// Test LlamaAttentionOpt with smaller dimensions for quick debugging
+/// Test LlamaFlashAttention with smaller dimensions for quick debugging
 /// This requires a CUDA GPU to run
 /// 
 /// Run with: cargo test -p llama test_llama_attention_opt_small -- --nocapture
@@ -297,9 +297,9 @@ fn test_llama_attention_opt_small() {
     use luminal::prelude::*;
     use luminal::op::DType;
     use luminal_cuda::{cudarc::driver::CudaContext, runtime::CudaRuntime};
-    use crate::model::{LlamaAttentionOpt, HEAD_DIM, HIDDEN, KV_GROUPS};
+    use crate::model::{LlamaFlashAttention, HEAD_DIM, HIDDEN, KV_GROUPS};
     
-    println!("\n=== LlamaAttentionOpt SMALL Test ===\n");
+    println!("\n=== LlamaFlashAttention SMALL Test ===\n");
     
     // Use smaller sequence for faster debugging
     let seq_len = 32;  // Smaller than BR=32, so just 1 tile
@@ -352,7 +352,7 @@ fn test_llama_attention_opt_small() {
     let v = cx.tensor((seq_len, kv_hidden));
     
     let output = cx.custom_op(
-        LlamaAttentionOpt::new(0u64, 0u64, (seq_len as i32).into(), 0.into()),
+        LlamaFlashAttention::new(0u64, 0u64, (seq_len as i32).into(), 0.into()),
         (q, k, v),
         (seq_len, hidden),
         DType::F32,
@@ -377,7 +377,7 @@ fn test_llama_attention_opt_small() {
     println!("\n=== SMALL TEST PASSED ===");
 }
 
-/// Test LlamaAttentionOpt with actual CUDA execution
+/// Test LlamaFlashAttention with actual CUDA execution
 /// This requires a CUDA GPU to run
 /// 
 /// Run with: cargo test -p llama test_llama_attention_opt_cuda -- --nocapture
@@ -386,9 +386,9 @@ fn test_llama_attention_opt_cuda() {
     use luminal::prelude::*;
     use luminal::op::DType;
     use luminal_cuda::{cudarc::driver::CudaContext, runtime::CudaRuntime};
-    use crate::model::{LlamaAttentionOpt, HEAD_DIM, HIDDEN, KV_GROUPS};
+    use crate::model::{LlamaFlashAttention, HEAD_DIM, HIDDEN, KV_GROUPS};
     
-    println!("\n=== LlamaAttentionOpt CUDA Correctness Test ===\n");
+    println!("\n=== LlamaFlashAttention CUDA Correctness Test ===\n");
     
     // Use full Llama dimensions
     let seq_len = 64;
@@ -457,9 +457,9 @@ fn test_llama_attention_opt_cuda() {
     let k_cache_ptr = 0u64;
     let v_cache_ptr = 0u64;
     
-    // Apply LlamaAttentionOpt custom op
+    // Apply LlamaFlashAttention custom op
     let output = cx.custom_op(
-        LlamaAttentionOpt::new(
+        LlamaFlashAttention::new(
             k_cache_ptr,
             v_cache_ptr,
             (seq_len as i32).into(),  // cur_seq
@@ -493,12 +493,12 @@ fn test_llama_attention_opt_cuda() {
     
     // Compare
     println!("\nComparing outputs...");
-    assert_close(&cuda_output, &reference_output, 1e-2, "LlamaAttentionOpt vs Reference");
+    assert_close(&cuda_output, &reference_output, 1e-2, "LlamaFlashAttention vs Reference");
     
     println!("\n=== TEST PASSED ===");
 }
 
-/// Benchmark comparing LlamaAttention vs LlamaAttentionOpt across sequence lengths
+/// Benchmark comparing LlamaAttention vs LlamaFlashAttention across sequence lengths
 /// 
 /// Run with: cargo test -p llama test_attention_benchmark -- --nocapture --ignored
 #[test]
@@ -507,10 +507,10 @@ fn test_attention_benchmark() {
     use luminal::prelude::*;
     use luminal::op::DType;
     use luminal_cuda::{cudarc::driver::{CudaContext, DevicePtr}, runtime::CudaRuntime};
-    use crate::model::{LlamaAttention, LlamaAttentionOpt, HEAD_DIM, HIDDEN, KV_GROUPS};
+    use crate::model::{LlamaAttention, LlamaFlashAttention, HEAD_DIM, HIDDEN, KV_GROUPS};
     use std::time::Instant;
     
-    println!("\n=== Attention Benchmark: LlamaAttention vs LlamaAttentionOpt ===\n");
+    println!("\n=== Attention Benchmark: LlamaAttention vs LlamaFlashAttention ===\n");
     
     let n_heads = HIDDEN / HEAD_DIM;
     let head_dim = HEAD_DIM;
@@ -589,7 +589,7 @@ fn test_attention_benchmark() {
             elapsed.as_micros() as f64 / bench_iters as f64
         };
         
-        // ===== Benchmark LlamaAttentionOpt =====
+        // ===== Benchmark LlamaFlashAttention =====
         let optimized_time = {
             let mut cx = Graph::default();
             let q = cx.tensor((seq_len, hidden));
@@ -597,7 +597,7 @@ fn test_attention_benchmark() {
             let v = cx.tensor((seq_len, kv_hidden));
             
             let _output = cx.custom_op(
-                LlamaAttentionOpt::new(k_cache_ptr, v_cache_ptr, (seq_len as i32).into(), 0.into()),
+                LlamaFlashAttention::new(k_cache_ptr, v_cache_ptr, (seq_len as i32).into(), 0.into()),
                 (q, k, v),
                 (seq_len, hidden),
                 DType::F32,
@@ -668,9 +668,9 @@ fn test_attention_benchmark() {
     println!("╚══════════════════════════════════════════════════════════════════╝");
     
     if avg_speedup > 1.0 {
-        println!("\n✓ LlamaAttentionOpt is {:.1}% faster on average", (avg_speedup - 1.0) * 100.0);
+        println!("\n✓ LlamaFlashAttention is {:.1}% faster on average", (avg_speedup - 1.0) * 100.0);
     } else {
-        println!("\n✗ LlamaAttentionOpt is {:.1}% slower on average", (1.0 - avg_speedup) * 100.0);
+        println!("\n✗ LlamaFlashAttention is {:.1}% slower on average", (1.0 - avg_speedup) * 100.0);
     }
     
     println!("\n=== Benchmark Complete ===");

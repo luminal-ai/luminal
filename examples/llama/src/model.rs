@@ -19,9 +19,6 @@ pub const HEAD_DIM: usize = 128;
 pub const KV_GROUPS: usize = 4;
 pub const VOCAB_SIZE: usize = 128256;
 
-pub const BR: usize = 32;
-pub const BC: usize = 32;
-
 fn ceil_div_expr(x: Expression, y: usize) -> Expression {
     (x + y - 1) / y
 }
@@ -181,7 +178,7 @@ impl LlamaLayer {
         let q_rope = llama_rotary_embeddings(q, pos_ids);
         let k_rope = llama_rotary_embeddings(k, pos_ids);
         let attn_out = x.graph().custom_op(
-            LlamaAttentionOpt::new(k_cache, v_cache, q_rope.dims()[0], 'p'.into()),
+            LlamaFlashAttention::new(k_cache, v_cache, q_rope.dims()[0], 'p'.into()),
             (q_rope, k_rope, v),
             q_rope.shape,
             q_rope.dtype,
@@ -546,7 +543,7 @@ impl BlockOp for LlamaAttention {
 
 
 #[derive(Debug, Clone)]
-pub struct LlamaAttentionOpt {
+pub struct LlamaFlashAttention {
     range: Vec<Expression>,
     head_dim: Expression,
     cur_seq: Expression,
@@ -556,13 +553,14 @@ pub struct LlamaAttentionOpt {
     v_cache: u64,
 }
 
-impl LlamaAttentionOpt {
+impl LlamaFlashAttention {
     pub fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
+        let br: usize = 32;
         Self {
-            range: (HIDDEN / HEAD_DIM, ceil_div_expr(seq, BR)).to_shape(),
+            range: (HIDDEN / HEAD_DIM, ceil_div_expr(seq, br)).to_shape(),
             head_dim: HEAD_DIM.into(),
             cur_seq: seq,
-            num_q_tiles: ceil_div_expr(seq, BR),
+            num_q_tiles: ceil_div_expr(seq, br),
             prev_seq,
             k_cache,
             v_cache,
@@ -570,15 +568,15 @@ impl LlamaAttentionOpt {
     }
 }
 
-impl CustomOp for LlamaAttentionOpt {
+impl CustomOp for LlamaFlashAttention {
     fn to_llir_op(&self) -> luminal::op::LLIROp {
         LLIROp::new::<dyn BlockOp>(Box::new(self.clone()))
     }
 }
 
-impl BlockOp for LlamaAttentionOpt {
+impl BlockOp for LlamaFlashAttention {
     fn op_name(&self) -> &'static str {
-        "LlamaAttentionOpt"
+        "LlamaFlashAttention"
     }
 
     fn launch_range(&self) -> Vec<Expression> {
@@ -615,7 +613,7 @@ impl BlockOp for LlamaAttentionOpt {
         .to_string()
     }
 
-    // (LlamaAttentionOptPayload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad)
+    // (LlamaFlashAttentionPayload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad)
     fn cuda_function(&self) -> String {
         // write cuda code in own file, then remove outer braces
         let s = include_str!("flash_attn_2.cu");
