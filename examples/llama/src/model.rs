@@ -19,6 +19,10 @@ pub const HEAD_DIM: usize = 128;
 pub const KV_GROUPS: usize = 4;
 pub const VOCAB_SIZE: usize = 128256;
 
+fn ceil_div_expr(x: Expression, y: usize) -> Expression {
+    (x + y - 1) / y
+}
+
 pub struct Llama {
     embedding: GraphTensor,
     layers: Vec<LlamaLayer>,
@@ -174,7 +178,7 @@ impl LlamaLayer {
         let q_rope = llama_rotary_embeddings(q, pos_ids);
         let k_rope = llama_rotary_embeddings(k, pos_ids);
         let attn_out = x.graph().custom_op(
-            LlamaAttention::new(k_cache, v_cache, q_rope.dims()[0], 'p'.into()),
+            LlamaFlashAttention::new(k_cache, v_cache, q_rope.dims()[0], 'p'.into()),
             (q_rope, k_rope, v),
             q_rope.shape,
             q_rope.dtype,
@@ -235,7 +239,7 @@ pub struct LlamaAttention {
 }
 
 impl LlamaAttention {
-    fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
+    pub fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
         Self {
             range: (HIDDEN / HEAD_DIM / KV_GROUPS, KV_GROUPS, seq).to_shape(),
             head_dim: HEAD_DIM.into(),
@@ -497,5 +501,111 @@ impl BlockOp for LlamaAttention {
             }
         "
         .to_string()
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct LlamaFlashAttention {
+    range: Vec<Expression>,
+    head_dim: Expression,
+    cur_seq: Expression,
+    num_q_tiles: Expression,  // ceil(T / BR)
+    prev_seq: Expression,
+    k_cache: u64,
+    v_cache: u64,
+}
+
+impl LlamaFlashAttention {
+    pub fn new(k_cache: u64, v_cache: u64, seq: Expression, prev_seq: Expression) -> Self {
+        let br: usize = 32;
+        Self {
+            range: (HIDDEN / HEAD_DIM, ceil_div_expr(seq, br)).to_shape(),
+            head_dim: HEAD_DIM.into(),
+            cur_seq: seq,
+            num_q_tiles: ceil_div_expr(seq, br),
+            prev_seq,
+            k_cache,
+            v_cache,
+        }
+    }
+}
+
+impl CustomOp for LlamaFlashAttention {
+    fn to_llir_op(&self) -> luminal::op::LLIROp {
+        LLIROp::new::<dyn BlockOp>(Box::new(self.clone()))
+    }
+}
+
+impl BlockOp for LlamaFlashAttention {
+    fn op_name(&self) -> &'static str {
+        "LlamaFlashAttention"
+    }
+
+    fn launch_range(&self) -> Vec<Expression> {
+        self.range.clone()
+    }
+
+    fn output_size(&self) -> Expression {
+        self.cur_seq * HIDDEN  // outputs to shape (B, H, T, D)
+    }
+
+    fn producer_barriers_seperate(&self) -> Vec<bool> {
+        vec![true; self.range.len()]
+    }
+
+    fn consumer_barriers_seperate(&self) -> Vec<Vec<bool>> {
+        let mut q = vec![true; self.range.len()];
+        q[self.range.len() - 1] = false;
+        let mut k = vec![true; self.range.len()];
+        k[self.range.len() - 1] = false;
+        let mut v = vec![true; self.range.len()];
+        v[self.range.len() - 1] = false;
+        vec![q, k, v]
+    }
+
+    fn cuda_struct(&self) -> String {
+        "
+            int head_dim;
+            int seq_len;
+            int num_q_tiles;
+            int prev_seq;
+            float* key_cache;
+            float* val_cache;
+        "
+        .to_string()
+    }
+
+    // (LlamaFlashAttentionPayload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad)
+    fn cuda_function(&self) -> String {
+        // write cuda code in own file, then remove outer braces
+        let s = include_str!("flash_attn_2.cu");
+        let start = s.find('{').unwrap() + 1;
+        let end = s.rfind('}').unwrap();
+        s[start..end].to_string()
+    }
+
+    fn schedule_op(
+        &self,
+        _: &Arc<CudaStream>,
+        expressions: &FxHashMap<Expression, i32>,
+    ) -> Vec<u8> {
+        CStruct::new()
+            .int(expressions[&self.head_dim])
+            .int(expressions[&self.cur_seq])
+            .int(expressions[&self.num_q_tiles])
+            .int(expressions[&self.prev_seq])
+            .ptr_mut_f32(self.k_cache as *mut f32)
+            .ptr_mut_f32(self.v_cache as *mut f32)
+            .finish_struct()
+    }
+
+    fn expressions(&self) -> Vec<Expression> {
+        vec![
+            self.head_dim,
+            self.cur_seq,
+            self.num_q_tiles,
+            self.prev_seq,
+        ]
     }
 }
