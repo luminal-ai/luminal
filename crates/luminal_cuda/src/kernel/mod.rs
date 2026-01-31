@@ -5,7 +5,6 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::prelude::*;
 
-pub mod fusion;
 pub mod ops;
 pub use ops::Ops;
 
@@ -45,11 +44,6 @@ pub trait KernelOp: luminal::op::EgglogOp {
     /// Returns the name of this kernel for profiling display.
     fn kernel_name(&self) -> &'static str {
         "Unknown"
-    }
-
-    /// Whether this op is a simple elementwise op that can participate in fusion.
-    fn elementwise(&self) -> bool {
-        false
     }
 }
 
