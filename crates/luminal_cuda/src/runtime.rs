@@ -352,6 +352,12 @@ impl Runtime for CudaRuntime {
         // reallocated and re-registered with the new work_queue
         self.buffers.clear();
         self.exec_graph.clear();
+
+        // Apply elementwise kernel fusion
+        let mut llir_graph = llir_graph.clone();
+        crate::kernel::fusion::fuse_elementwise(&mut llir_graph);
+        let llir_graph = &llir_graph;
+
         let block_ops_in_graph = llir_graph
             .node_indices()
             .filter(|n| llir_graph[*n].to_dialect::<dyn BlockOp>().is_some())

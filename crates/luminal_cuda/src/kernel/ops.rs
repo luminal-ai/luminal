@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{cuda_dtype, kernel::KernelOp};
+use crate::{cuda_dtype, kernel::KernelOp, kernel::fusion::ElementwiseFusable};
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream},
     nvrtc::{CompileOptions, compile_ptx},
@@ -900,7 +900,29 @@ impl EgglogOp for KernelAdd {
     }
 }
 
+impl ElementwiseFusable for KernelAdd {
+    fn elem_out_shape(&self) -> &[Expression] {
+        &self.out_shape
+    }
+    fn elem_out_strides(&self) -> &[Expression] {
+        &self.out_stride
+    }
+    fn elem_input_strides(&self) -> Vec<&[Expression]> {
+        vec![&self.a_stride, &self.b_stride]
+    }
+    fn elem_dtype(&self) -> DType {
+        self.dtype
+    }
+    fn elem_cuda_expr(&self, inputs: &[String]) -> String {
+        format!("({} + {})", inputs[0], inputs[1])
+    }
+}
+
 impl KernelOp for KernelAdd {
+    fn as_fusable(&self) -> Option<&dyn ElementwiseFusable> {
+        Some(self)
+    }
+
     fn compile(
         &self,
         stream: &Arc<CudaStream>,
@@ -1034,7 +1056,29 @@ impl EgglogOp for KernelMul {
     }
 }
 
+impl ElementwiseFusable for KernelMul {
+    fn elem_out_shape(&self) -> &[Expression] {
+        &self.out_shape
+    }
+    fn elem_out_strides(&self) -> &[Expression] {
+        &self.out_stride
+    }
+    fn elem_input_strides(&self) -> Vec<&[Expression]> {
+        vec![&self.a_stride, &self.b_stride]
+    }
+    fn elem_dtype(&self) -> DType {
+        self.dtype
+    }
+    fn elem_cuda_expr(&self, inputs: &[String]) -> String {
+        format!("({} * {})", inputs[0], inputs[1])
+    }
+}
+
 impl KernelOp for KernelMul {
+    fn as_fusable(&self) -> Option<&dyn ElementwiseFusable> {
+        Some(self)
+    }
+
     fn compile(
         &self,
         stream: &Arc<CudaStream>,
