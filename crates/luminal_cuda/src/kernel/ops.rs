@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{cuda_dtype, kernel::KernelOp};
+use crate::{cuda_dtype, kernel::KernelOp, kernel::fusion::ElementwiseFusedOp};
 use cudarc::{
     driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream},
     nvrtc::{CompileOptions, compile_ptx},
@@ -22,6 +22,7 @@ pub type Ops = (
     KernelMaxReduce,
     KernelMeanReduce,
     KernelArgsort,
+    ElementwiseFusedOp,
 );
 
 #[derive(Default, Debug, Clone)]
@@ -976,6 +977,10 @@ extern \"C\" {{
     fn kernel_name(&self) -> &'static str {
         "Add"
     }
+
+    fn elementwise(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Default, Debug, Clone)]
@@ -1109,6 +1114,10 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "Mul"
+    }
+
+    fn elementwise(&self) -> bool {
+        true
     }
 }
 
