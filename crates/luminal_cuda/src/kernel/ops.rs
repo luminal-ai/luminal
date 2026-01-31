@@ -13,9 +13,49 @@ use luminal::{
     prelude::*,
 };
 
+/// Reference to an input buffer or a temp from a previous step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ref {
+    Input(usize),
+    Temp(usize),
+}
+
+/// Identity of a binary elementwise op (used for rewrites, step encoding, and codegen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ElementwiseKind {
+    Add,
+    Mul,
+}
+
+impl ElementwiseKind {
+    pub fn to_step_code(self) -> u32 {
+        match self {
+            ElementwiseKind::Add => 0,
+            ElementwiseKind::Mul => 1,
+        }
+    }
+
+    pub fn from_step_code(n: u32) -> Option<ElementwiseKind> {
+        match n {
+            0 => Some(ElementwiseKind::Add),
+            1 => Some(ElementwiseKind::Mul),
+            _ => None,
+        }
+    }
+}
+
+/// One elementwise operation in a fused chain (kind + refs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElementwiseStep {
+    pub kind: ElementwiseKind,
+    pub lhs: Ref,
+    pub rhs: Ref,
+}
+
 pub type Ops = (
     KernelAdd,
     KernelMul,
+    ComplexElementwiseOp,
     KernelIota,
     KernelGather,
     KernelSumReduce,
@@ -1109,6 +1149,220 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "Mul"
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ComplexElementwiseOp {
+    out_shape: Vec<Expression>,
+    input_strides: Vec<Vec<Expression>>,
+    out_stride: Vec<Expression>,
+    steps: Vec<ElementwiseStep>,
+    dtype: DType,
+}
+
+impl EgglogOp for ComplexElementwiseOp {
+    fn term(&self) -> (String, Vec<OpParam>) {
+        (
+            "ComplexElementwiseOp".to_string(),
+            // out_shape, inputs (IList), all_strides_flat, out_strides, steps, dtype
+            vec![EList, IList, EList, EList, EList, Dty],
+        )
+    }
+
+    fn rewrites(&self) -> Vec<String> {
+        let add_rule = r#"
+(rule
+    (
+        (= ?a (Add ?out_shape ?inp_a ?inp_a_strides ?inp_b ?inp_b_strides ?out_strides))
+        (= ?dty (dtype ?inp_a))
+    )
+    (
+        (let ?inputs (ICons ?inp_a (ICons ?inp_b (INil))))
+        (let ?all_strides (Concat ?inp_a_strides ?inp_b_strides))
+        (union ?a (ComplexElementwiseOp ?out_shape ?inputs ?all_strides ?out_strides (ECons (MNum 0) (ENil)) ?dty))
+    )
+    :name "elementwise add to ComplexElementwiseOp"
+)"#;
+        let mul_rule = r#"
+(rule
+    (
+        (= ?a (Mul ?out_shape ?inp_a ?inp_a_strides ?inp_b ?inp_b_strides ?out_strides))
+        (= ?dty (dtype ?inp_a))
+    )
+    (
+        (let ?inputs (ICons ?inp_a (ICons ?inp_b (INil))))
+        (let ?all_strides (Concat ?inp_a_strides ?inp_b_strides))
+        (union ?a (ComplexElementwiseOp ?out_shape ?inputs ?all_strides ?out_strides (ECons (MNum 1) (ENil)) ?dty))
+    )
+    :name "elementwise mul to ComplexElementwiseOp"
+)"#;
+        vec![add_rule.to_string(), mul_rule.to_string()]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &self,
+        egraph: &'a SerializedEGraph,
+        children: &[&'a ENodeId],
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        // children: [0]=out_shape, [1]=inputs(IList), [2]=all_strides_flat, [3]=out_strides, [4]=steps, [5]=dtype
+        let out_shape = extract_expr_list(egraph, children[0], list_cache, expr_cache).unwrap();
+        let ndim = out_shape.len();
+        // Skip children[1] — IList sources are resolved generically by graph.rs
+        let all_strides = extract_expr_list(egraph, children[2], list_cache, expr_cache).unwrap();
+        let input_strides: Vec<Vec<Expression>> =
+            all_strides.chunks(ndim).map(|c| c.to_vec()).collect();
+        let out_stride = extract_expr_list(egraph, children[3], list_cache, expr_cache).unwrap();
+        let steps_list = extract_expr_list(egraph, children[4], list_cache, expr_cache).unwrap();
+        let dtype = extract_dtype(egraph, children[5]);
+
+        let steps: Vec<ElementwiseStep> = steps_list
+            .into_iter()
+            .filter_map(|e| {
+                e.as_num()
+                    .and_then(|n| ElementwiseKind::from_step_code(n as u32))
+                    .map(|kind| ElementwiseStep {
+                        kind,
+                        lhs: Ref::Input(0),
+                        rhs: Ref::Input(1),
+                    })
+            })
+            .collect();
+
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(ComplexElementwiseOp {
+                out_shape,
+                input_strides,
+                out_stride,
+                steps,
+                dtype,
+            }) as Box<dyn KernelOp>),
+            vec![], // sources come from IList walking in graph.rs
+        )
+    }
+}
+
+impl KernelOp for ComplexElementwiseOp {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .out_shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(
+                self.input_strides
+                    .iter()
+                    .flat_map(|s| s.iter().flat_map(|e| e.dyn_vars())),
+            )
+            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+
+        let out_idx = flatten_mul_strides(&self.out_shape, &self.out_stride).to_kernel();
+        let input_idxs: Vec<String> = self
+            .input_strides
+            .iter()
+            .map(|strides| flatten_mul_strides(&self.out_shape, strides).to_kernel())
+            .collect();
+
+        let ref_to_expr = |r: Ref| -> String {
+            match r {
+                Ref::Input(i) => format!("in{}[{}]", i, input_idxs[i]),
+                Ref::Temp(i) => format!("t{i}"),
+            }
+        };
+
+        let scalar_ty = cuda_dtype(self.dtype);
+        let body: String = self
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let lhs_expr = ref_to_expr(step.lhs);
+                let rhs_expr = ref_to_expr(step.rhs);
+                let expr = match step.kind {
+                    ElementwiseKind::Add => format!("{} + {}", lhs_expr, rhs_expr),
+                    ElementwiseKind::Mul => format!("{} * {}", lhs_expr, rhs_expr),
+                };
+                if i == self.steps.len() - 1 {
+                    format!("out[{}] = {};", out_idx, expr)
+                } else {
+                    format!("{} t{} = {};", scalar_ty, i, expr)
+                }
+            })
+            .join("\n        ");
+
+        let input_params: String = (0..self.input_strides.len())
+            .map(|i| format!(", const {dtype} *in{i}"))
+            .collect::<String>();
+
+        let kernel = format!(
+            "
+{constants}
+extern \"C\" {{
+    __global__ void complex_elementwise_k({dtype} *out{input_params}) {{
+        int const_z = blockIdx.x * blockDim.x + threadIdx.x;
+        {body}
+    }}
+}}",
+            constants = vars
+                .iter()
+                .map(|i| format!("__constant__ int const_{i}[1];"))
+                .join("\n"),
+        );
+        let ptx = compile_ptx(&kernel).unwrap();
+        let module = stream.context().load_module(ptx).unwrap();
+        let func = module.load_function("complex_elementwise_k").unwrap();
+        let constants = vars
+            .into_iter()
+            .map(|d| (d, module.get_global(&format!("const_{d}"), stream).unwrap()))
+            .collect();
+        let out_size = self.out_shape.iter().copied().product::<Expression>();
+        (
+            func,
+            module,
+            kernel,
+            (out_size.ceil_div(128), 1.into(), 1.into()),
+            (out_size.min(128), 1.into(), 1.into()),
+            0.into(),
+            constants,
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        self.output_size() * 4 * self.input_strides.len() as i32
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_size() * 4
+    }
+
+    fn flops(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "ComplexElementwise"
     }
 }
 

@@ -781,7 +781,22 @@ pub fn egglog_to_llir(
                     todo!("{} extraction not implemented!", egraph.enodes[node].0);
                 };
                 // Extract this op
-                let (op_instance, sources) = op.extract(egraph, &ch, &mut lc, &mut c);
+                let (op_instance, mut sources) = op.extract(egraph, &ch, &mut lc, &mut c);
+                // Generic: walk any IList parameters to find IR input sources
+                for (idx, param) in op.term().1.iter().enumerate() {
+                    if matches!(param, OpParam::IList) {
+                        let ilist_eclass = &egraph.enodes[node].1[idx];
+                        let mut ilist_ch = &egraph.eclasses[ilist_eclass].1[0];
+                        loop {
+                            if egraph.enodes[ilist_ch].0 == "INil" {
+                                break;
+                            }
+                            let input_eclass = &egraph.enodes[ilist_ch].1[0];
+                            sources.push(choice[input_eclass]);
+                            ilist_ch = &egraph.eclasses[&egraph.enodes[ilist_ch].1[1]].1[0];
+                        }
+                    }
+                }
                 let r = graph.add_node(op_instance);
                 enode_to_node.insert(node, r);
                 for source in sources {

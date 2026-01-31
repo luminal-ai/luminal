@@ -33,6 +33,7 @@
         (ReplaceNthFromEnd EList Expression i64)
         (RemoveNthFromEnd EList i64)
         (RowMajor EList)
+        (Concat EList EList)
     )
 
     (DType
@@ -209,3 +210,7 @@
     )
     :ruleset expr
 )
+
+; Concat reduction rules
+(rewrite (Concat (ENil) ?b) ?b :ruleset expr)
+(rewrite (Concat (ECons ?h ?t) ?b) (ECons ?h (Concat ?t ?b)) :ruleset expr)
