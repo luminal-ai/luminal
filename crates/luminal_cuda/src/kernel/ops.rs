@@ -13,14 +13,13 @@ use luminal::{
     prelude::*,
 };
 
-/// Reference to an input buffer or a temp from a previous step.
+// Either an input buffer or a temp from a previous step in complex elementwise ops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Ref {
     Input(usize),
     Temp(usize),
 }
 
-/// Identity of a binary elementwise op (used for rewrites, step encoding, and codegen).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ElementwiseKind {
     Add,
@@ -44,7 +43,7 @@ impl ElementwiseKind {
     }
 }
 
-/// One elementwise operation in a fused chain (kind + refs).
+/// ElementwiseStep = One elementwise operation in a fused chain (kind + refs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ElementwiseStep {
     pub kind: ElementwiseKind,
@@ -1171,6 +1170,10 @@ impl EgglogOp for ComplexElementwiseOp {
     }
 
     fn rewrites(&self) -> Vec<String> {
+    // The biggest assumption for fusion of elementwise ops is currently the linear chain assumption
+    // This means that input for the elementwise_op{i+1} in the chain is the temp{i} (output of elementwise_op{i})
+    // and the input{i+1}. Currently, this is done for simplicity reasons.
+    // TODO: This should be generalized to support more general patterns (e.g. inputs are both temps)
         let add_rule = r#"
 (rule
     (
@@ -1197,7 +1200,27 @@ impl EgglogOp for ComplexElementwiseOp {
     )
     :name "elementwise mul to ComplexElementwiseOp"
 )"#;
-        vec![add_rule.to_string(), mul_rule.to_string()]
+        let fusion_rule = r#"
+(rule
+    (
+        (= ?outer (ComplexElementwiseOp ?shape (ICons ?inner ?outer_rest) ?outer_all_strides ?out_strides ?outer_steps ?dty))
+        (= ?inner (ComplexElementwiseOp ?shape ?inner_inputs ?inner_strides ?out_strides ?inner_steps ?dty))
+        (= ?ndim (len ?shape))
+    )
+    (
+        (let ?fused_inputs (IConcat ?inner_inputs ?outer_rest))
+        (let ?outer_strides_tail (Drop ?outer_all_strides ?ndim))
+        (let ?fused_strides (Concat ?inner_strides ?outer_strides_tail))
+        (let ?fused_steps (Concat ?inner_steps ?outer_steps))
+        (union ?outer (ComplexElementwiseOp ?shape ?fused_inputs ?fused_strides ?out_strides ?fused_steps ?dty))
+    )
+    :name "fuse two ComplexElementwiseOp"
+)"#;
+        vec![
+            add_rule.to_string(),
+            mul_rule.to_string(),
+            fusion_rule.to_string(),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1225,15 +1248,24 @@ impl EgglogOp for ComplexElementwiseOp {
         let steps: Vec<ElementwiseStep> = steps_list
             .into_iter()
             .filter_map(|e| {
-                e.as_num()
-                    .and_then(|n| ElementwiseKind::from_step_code(n as u32))
-                    .map(|kind| ElementwiseStep {
-                        kind,
-                        lhs: Ref::Input(0),
-                        rhs: Ref::Input(1),
-                    })
+                e.as_num().and_then(|n| ElementwiseKind::from_step_code(n as u32))
+            })
+            .enumerate()
+            .map(|(i, kind)| ElementwiseStep {
+                kind,
+                lhs: if i == 0 {
+                    Ref::Input(0)
+                } else {
+                    Ref::Temp(i - 1)
+                },
+                rhs: Ref::Input(i + 1),
             })
             .collect();
+        assert_eq!(
+            input_strides.len(),
+            steps.len() + 1,
+            "ComplexElementwiseOp linear chain: #inputs must equal #steps + 1"
+        );
 
         (
             LLIROp::new::<dyn KernelOp>(Box::new(ComplexElementwiseOp {

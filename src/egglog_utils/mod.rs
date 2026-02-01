@@ -27,11 +27,19 @@ fn op_defs_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
         (IList
             (ICons IR IList)
             (INil)
+            (IConcat IList IList)
         )
     )
     (function dtype (IR) DType :merge new)
     "
     )
+}
+
+fn ilist_concat_rules() -> &'static str {
+    r#"
+    (rewrite (IConcat (INil) ?b) ?b :ruleset expr)
+    (rewrite (IConcat (ICons ?h ?t) ?b) (ICons ?h (IConcat ?t ?b)) :ruleset expr)
+    "#
 }
 
 fn op_cleanups_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
@@ -65,6 +73,7 @@ pub fn early_egglog(
     [
         BASE.to_string(),
         op_defs_string(ops),
+        ilist_concat_rules().to_string(),
         ops.iter().flat_map(|o| o.early_rewrites()).join("\n"),
         if cleanup {
             op_cleanups_string(ops)
@@ -89,6 +98,7 @@ pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool)
     [
         BASE.to_string(),
         op_defs_string(ops),
+        ilist_concat_rules().to_string(),
         ops.iter().flat_map(|o| o.rewrites()).join("\n"),
         if cleanup {
             op_cleanups_string(ops)

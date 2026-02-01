@@ -526,9 +526,39 @@ pub fn extract_expr_list<'a>(
     if let Some(l) = list_cache.get(node) {
         return Some(l.clone());
     }
-    if egraph.enodes[node].0 == "ENil" {
-        return Some(vec![]);
+    match egraph.enodes[node].0.as_str() {
+        "ENil" => return Some(vec![]),
+        "Concat" => {
+            let children = &egraph.enodes[node].1;
+            if children.len() < 2 {
+                return None;
+            }
+            let a_rep = &egraph.eclasses[&children[0]].1[0];
+            let b_rep = &egraph.eclasses[&children[1]].1[0];
+            let mut a_list =
+                extract_expr_list(egraph, a_rep, list_cache, expr_cache)?;
+            let b_list =
+                extract_expr_list(egraph, b_rep, list_cache, expr_cache)?;
+            a_list.extend(b_list);
+            list_cache.insert(node, a_list.clone());
+            return Some(a_list);
+        }
+        "Drop" => {
+            let children = &egraph.enodes[node].1;
+            if children.len() < 2 {
+                return None;
+            }
+            let list_rep = &egraph.eclasses[&children[0]].1[0];
+            let n_rep = &egraph.eclasses[&children[1]].1[0];
+            let list = extract_expr_list(egraph, list_rep, list_cache, expr_cache)?;
+            let n = extract_drop_count(egraph, n_rep, list_cache, expr_cache)?;
+            let dropped: Vec<Expression> = list.into_iter().skip(n).collect();
+            list_cache.insert(node, dropped.clone());
+            return Some(dropped);
+        }
+        _ => {}
     }
+    // ECons
     let eclass = &egraph.enodes[node].1[0];
     let expr = extract_expr(egraph, &egraph.eclasses[eclass].1[0], expr_cache)?;
     match egraph.enodes[&egraph.eclasses[&egraph.enodes[node].1[1]].1[0]]
@@ -547,8 +577,35 @@ pub fn extract_expr_list<'a>(
             list_cache.insert(node, rest.clone());
             Some(rest)
         }
+        "Concat" | "Drop" => {
+            let rest_rep = &egraph.eclasses[&egraph.enodes[node].1[1]].1[0];
+            let mut rest =
+                extract_expr_list(egraph, rest_rep, list_cache, expr_cache)?;
+            rest.insert(0, expr);
+            list_cache.insert(node, rest.clone());
+            Some(rest)
+        }
         _ => unreachable!(),
     }
+}
+
+fn extract_drop_count<'a>(
+    egraph: &'a SerializedEGraph,
+    node: &'a NodeId,
+    list_cache: &mut FxHashMap<&'a NodeId, Vec<Expression>>,
+    expr_cache: &mut FxHashMap<&'a NodeId, Expression>,
+) -> Option<usize> {
+    let label = &egraph.enodes[node].0;
+    if let Ok(n) = label.parse::<i64>() {
+        return Some(n.max(0) as usize);
+    }
+    if label == "len" && egraph.enodes[node].1.len() == 1 {
+        let list_eclass = &egraph.enodes[node].1[0];
+        let list_rep = &egraph.eclasses[list_eclass].1[0];
+        let list = extract_expr_list(egraph, list_rep, list_cache, expr_cache)?;
+        return Some(list.len());
+    }
+    None
 }
 
 pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DType {
@@ -678,6 +735,74 @@ pub fn extract_expr<'a>(
     Some(e)
 }
 
+fn add_ilist_inputs_to_reachable<'a>(
+    egraph: &'a SerializedEGraph,
+    ilist_rep: &'a NodeId,
+    choice: &'a FxHashMap<&'a ClassId, &'a NodeId>,
+    reachable: &mut FxHashSet<&'a NodeId>,
+    stack: &mut Vec<&'a NodeId>,
+) {
+    match egraph.enodes[ilist_rep].0.as_str() {
+        "INil" => {}
+        "ICons" => {
+            let input_eclass = &egraph.enodes[ilist_rep].1[0];
+            let chosen = choice
+                .iter()
+                .find(|(k, _)| ***k == *input_eclass)
+                .map(|(_, v)| *v)
+                .unwrap();
+            if !reachable.contains(chosen) {
+                reachable.insert(chosen);
+                stack.push(chosen);
+            }
+            let rest_eclass = &egraph.enodes[ilist_rep].1[1];
+            let rest_rep = &egraph.eclasses[rest_eclass].1[0];
+            add_ilist_inputs_to_reachable(egraph, rest_rep, choice, reachable, stack);
+        }
+        "IConcat" => {
+            let a_eclass = &egraph.enodes[ilist_rep].1[0];
+            let b_eclass = &egraph.enodes[ilist_rep].1[1];
+            let a_rep = &egraph.eclasses[a_eclass].1[0];
+            let b_rep = &egraph.eclasses[b_eclass].1[0];
+            add_ilist_inputs_to_reachable(egraph, a_rep, choice, reachable, stack);
+            add_ilist_inputs_to_reachable(egraph, b_rep, choice, reachable, stack);
+        }
+        _ => {}
+    }
+}
+
+fn collect_ilist_sources<'a>(
+    egraph: &'a SerializedEGraph,
+    ilist_rep: &'a NodeId,
+    choice: &'a FxHashMap<&'a ClassId, &'a NodeId>,
+    sources: &mut Vec<&'a NodeId>,
+) {
+    match egraph.enodes[ilist_rep].0.as_str() {
+        "INil" => {}
+        "ICons" => {
+            let input_eclass = &egraph.enodes[ilist_rep].1[0];
+            let chosen = choice
+                .iter()
+                .find(|(k, _)| ***k == *input_eclass)
+                .map(|(_, v)| *v)
+                .unwrap();
+            sources.push(chosen);
+            let rest_eclass = &egraph.enodes[ilist_rep].1[1];
+            let rest_rep = &egraph.eclasses[rest_eclass].1[0];
+            collect_ilist_sources(egraph, rest_rep, choice, sources);
+        }
+        "IConcat" => {
+            let a_eclass = &egraph.enodes[ilist_rep].1[0];
+            let b_eclass = &egraph.enodes[ilist_rep].1[1];
+            let a_rep = &egraph.eclasses[a_eclass].1[0];
+            let b_rep = &egraph.eclasses[b_eclass].1[0];
+            collect_ilist_sources(egraph, a_rep, choice, sources);
+            collect_ilist_sources(egraph, b_rep, choice, sources);
+        }
+        _ => {}
+    }
+}
+
 #[tracing::instrument(skip_all)]
 pub fn egglog_to_llir(
     egraph: &SerializedEGraph,
@@ -714,6 +839,15 @@ pub fn egglog_to_llir(
         reachable.insert(choice[&egraph.roots[0]]);
         let mut reachability_stack = vec![choice[&egraph.roots[0]]];
         while let Some(r) = reachability_stack.pop() {
+            if egraph.eclasses[&egraph.node_to_class[r]].0.contains("IList") {
+                add_ilist_inputs_to_reachable(
+                    egraph,
+                    r,
+                    &choice,
+                    &mut reachable,
+                    &mut reachability_stack,
+                );
+            }
             for ch in &egraph.enodes[r].1 {
                 if egraph.eclasses[ch].0.contains("IR") || egraph.eclasses[ch].0.contains("IList") {
                     let n = choice[ch];
@@ -786,15 +920,8 @@ pub fn egglog_to_llir(
                 for (idx, param) in op.term().1.iter().enumerate() {
                     if matches!(param, OpParam::IList) {
                         let ilist_eclass = &egraph.enodes[node].1[idx];
-                        let mut ilist_ch = &egraph.eclasses[ilist_eclass].1[0];
-                        loop {
-                            if egraph.enodes[ilist_ch].0 == "INil" {
-                                break;
-                            }
-                            let input_eclass = &egraph.enodes[ilist_ch].1[0];
-                            sources.push(choice[input_eclass]);
-                            ilist_ch = &egraph.eclasses[&egraph.enodes[ilist_ch].1[1]].1[0];
-                        }
+                        let ilist_ch = &egraph.eclasses[ilist_eclass].1[0];
+                        collect_ilist_sources(egraph, ilist_ch, &choice, &mut sources);
                     }
                 }
                 let r = graph.add_node(op_instance);

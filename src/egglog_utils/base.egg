@@ -34,6 +34,7 @@
         (RemoveNthFromEnd EList i64)
         (RowMajor EList)
         (Concat EList EList)
+        (Drop EList i64)
     )
 
     (DType
@@ -214,3 +215,8 @@
 ; Concat reduction rules
 (rewrite (Concat (ENil) ?b) ?b :ruleset expr)
 (rewrite (Concat (ECons ?h ?t) ?b) (ECons ?h (Concat ?t ?b)) :ruleset expr)
+
+; Drop reduction rules
+(rewrite (Drop (ENil) ?n) (ENil) :ruleset expr)
+(rewrite (Drop (ECons ?h ?t) 0) (ECons ?h ?t) :ruleset expr)
+(rewrite (Drop (ECons ?h ?t) ?n) (Drop ?t (- ?n 1)) :when ((> ?n 0)) :ruleset expr)
