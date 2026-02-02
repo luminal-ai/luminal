@@ -33,6 +33,43 @@ impl GraphTensor {
         self
     }
 
+    /// Repeat tensor along each dimension
+    pub fn repeat(self, reps: impl ToShape) -> GraphTensor {
+        let reps = reps.to_shape();
+        assert_eq!(
+            reps.len(), self.shape.len(),
+            "Repeat dimensions ({}) must match tensor dimensions ({})!",
+            reps.len(), self.shape.len()
+        );
+
+        let input_dims = self.dims();
+
+        let mut output_dims = vec![];
+        let mut index_expr = Expression::from(0);
+        // cumulative size of output/input strides to the right
+        let mut output_stride = Expression::from(1);
+        let mut input_stride = Expression::from(1);
+
+        // loop inner -> outer dims
+        for (in_dim, rep) in input_dims.iter().zip(&reps).rev() {
+            let out_dim = (*in_dim * *rep).simplify();
+            let axis_out_idx = (Expression::from('z') / output_stride) % out_dim;
+            let axis_in_idx = axis_out_idx % *in_dim; // wrap around input dim
+            // build the index expression (i.e. which input index to read for output position z)
+            index_expr = index_expr + axis_in_idx * input_stride;
+
+            // accumulate strides
+            output_stride = output_stride * out_dim;
+            input_stride = input_stride * *in_dim;
+            output_dims.push(out_dim);
+        }
+        output_dims.reverse();
+
+        // build indices (iota) then materialize (gather) where `output[i] = self[indices[i]]`
+        let indices = self.graph().iota(index_expr.simplify(), output_dims);
+        self.gather(indices)
+    }
+
     /// Broadcast tensor along new dimensions on the right-hand-side. For instance, if the original tensor is [5, 2] and you call .expand([4, 2, 3]), the final  tensor will be [5, 2, 4, 2, 3]
     pub fn expand_rhs(mut self, shape: impl ToShape) -> GraphTensor {
         let orig_dims = self.shape.len();
@@ -668,6 +705,25 @@ mod tests {
         rt.execute(&cx.dyn_map);
         assert_eq!(*rt.get_f32(gathered.id), vec![5., 0., 3., 2.]);
         assert_eq!(*rt.get_f32(inv.id), vec![5., 3., 1., 0., 2., 4.]);
+    }
+
+    #[test]
+    fn test_repeat() {
+        test_unary(
+            3,
+            |a| a.repeat(2),
+            |a| a.repeat(&[2]).unwrap(),
+        );
+        test_unary(
+            (2, 3),
+            |a| a.repeat((1, 2)),
+            |a| a.repeat(&[1, 2]).unwrap(),
+        );
+        test_unary(
+            (2, 3),
+            |a| a.repeat((2, 3)),
+            |a| a.repeat(&[2, 3]).unwrap(),
+        );
     }
 
     //     // #[test]
