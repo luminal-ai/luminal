@@ -55,7 +55,7 @@ impl GraphTensor {
             let out_dim = (*in_dim * *rep).simplify();
             let axis_out_idx = (Expression::from('z') / output_stride) % out_dim;
             let axis_in_idx = axis_out_idx % *in_dim; // wrap around input dim
-            // build the index expression (i.e. which input index to read for output position z)
+            // build the index expression for iota (i.e. which input index to read for output position z)
             index_expr = index_expr + axis_in_idx * input_stride;
 
             // accumulate strides
@@ -65,7 +65,7 @@ impl GraphTensor {
         }
         output_dims.reverse();
 
-        // build indices (iota) then materialize (gather) where `output[i] = self[indices[i]]`
+        // build output indices (iota) then materialize (gather) where `output[i] = self[indices[i]]`
         let indices = self.graph().iota(index_expr.simplify(), output_dims);
         self.gather(indices)
     }
