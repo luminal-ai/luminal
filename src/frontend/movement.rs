@@ -61,6 +61,10 @@ impl GraphTensor {
             input_dims.len(),
             repeats.len()
         );
+        assert!(
+            repeats.iter().all(|r| r.to_usize() != Some(0)),
+            "repeat counts must be non-zero"
+        );
 
         let output_dims = input_dims
             .iter()
@@ -691,6 +695,13 @@ mod tests {
     fn test_repeat_panics_on_dim_mismatch() {
         let mut cx = Graph::new();
         let _ = cx.tensor((2, 3)).repeat((1, 2, 3));
+    }
+
+    #[test]
+    #[should_panic(expected = "repeat counts must be non-zero")]
+    fn test_repeat_panics_on_zero_repeat_count() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor((2, 3)).repeat((0, 2));
     }
 
     #[test]
