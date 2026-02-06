@@ -50,6 +50,41 @@ impl GraphTensor {
         self
     }
 
+    /// Repeat each dimension of a tensor according to `repeats`
+    pub fn repeat(self, repeats: impl ToShape) -> GraphTensor {
+        let repeats = repeats.to_shape();
+        let input_dims = self.dims();
+        assert_eq!(
+            repeats.len(),
+            input_dims.len(),
+            "repeat expected {} dimensions but got {}",
+            input_dims.len(),
+            repeats.len()
+        );
+
+        let output_dims = input_dims
+            .iter()
+            .zip(&repeats)
+            .map(|(dim, rep)| *dim * *rep)
+            .collect::<Vec<_>>();
+
+        let mut input_strides = vec![Expression::from(1); input_dims.len()];
+        let mut acc = Expression::from(1);
+        for (dim, stride) in input_dims.iter().zip(&mut input_strides).rev() {
+            *stride = acc;
+            acc *= *dim;
+        }
+
+        let axis_exprs = repeats
+            .into_iter()
+            .zip(input_strides)
+            .map(|(rep, stride)| (Expression::from('z') / rep) * stride)
+            .collect::<Vec<_>>();
+
+        let index_expression = flatten_z_strides(&output_dims, &axis_exprs).simplify();
+        self.gather(self.graph().iota(index_expression, output_dims))
+    }
+
     pub fn expand_to_shape_on_axes(
         mut self,
         shape: impl ToShape,
@@ -630,6 +665,32 @@ mod tests {
             |a| a.broadcast_as((2, 3)).unwrap(),
         );
         test_unary((2, 1, 3), |a| a.squeeze(1), |a| a.reshape((2, 3)).unwrap());
+    }
+
+    #[test]
+    fn test_repeat_all_dims() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let repeated = a.repeat((1, 2));
+        assert_eq!(repeated.dims(), &[2, 6]);
+
+        let repeated_out = repeated.output();
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+        rt.set_data(a.id, vec![1., 2., 3., 4., 5., 6.]);
+        rt.execute(&cx.dyn_map);
+
+        assert_eq!(
+            *rt.get_f32(repeated_out.id),
+            vec![1., 1., 2., 2., 3., 3., 4., 4., 5., 5., 6., 6.]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "repeat expected")]
+    fn test_repeat_panics_on_dim_mismatch() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor((2, 3)).repeat((1, 2, 3));
     }
 
     #[test]
