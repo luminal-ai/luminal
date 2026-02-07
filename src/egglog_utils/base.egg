@@ -35,6 +35,7 @@
         (RowMajor EList)
         (Concat EList EList)
         (Drop EList i64)
+        (Take EList i64)
     )
 
     (DType
@@ -220,3 +221,7 @@
 (rewrite (Drop (ENil) ?n) (ENil) :ruleset expr)
 (rewrite (Drop (ECons ?h ?t) 0) (ECons ?h ?t) :ruleset expr)
 (rewrite (Drop (ECons ?h ?t) ?n) (Drop ?t (- ?n 1)) :when ((> ?n 0)) :ruleset expr)
+
+; Take reduction rules
+(rewrite (Take ?l 0) (ENil) :ruleset expr)
+(rewrite (Take (ECons ?h ?t) ?n) (ECons ?h (Take ?t (- ?n 1))) :when ((> ?n 0)) :ruleset expr)

@@ -535,10 +535,8 @@ pub fn extract_expr_list<'a>(
             }
             let a_rep = &egraph.eclasses[&children[0]].1[0];
             let b_rep = &egraph.eclasses[&children[1]].1[0];
-            let mut a_list =
-                extract_expr_list(egraph, a_rep, list_cache, expr_cache)?;
-            let b_list =
-                extract_expr_list(egraph, b_rep, list_cache, expr_cache)?;
+            let mut a_list = extract_expr_list(egraph, a_rep, list_cache, expr_cache)?;
+            let b_list = extract_expr_list(egraph, b_rep, list_cache, expr_cache)?;
             a_list.extend(b_list);
             list_cache.insert(node, a_list.clone());
             return Some(a_list);
@@ -555,6 +553,19 @@ pub fn extract_expr_list<'a>(
             let dropped: Vec<Expression> = list.into_iter().skip(n).collect();
             list_cache.insert(node, dropped.clone());
             return Some(dropped);
+        }
+        "Take" => {
+            let children = &egraph.enodes[node].1;
+            if children.len() < 2 {
+                return None;
+            }
+            let list_rep = &egraph.eclasses[&children[0]].1[0];
+            let n_rep = &egraph.eclasses[&children[1]].1[0];
+            let list = extract_expr_list(egraph, list_rep, list_cache, expr_cache)?;
+            let n = extract_drop_count(egraph, n_rep, list_cache, expr_cache)?;
+            let taken: Vec<Expression> = list.into_iter().take(n).collect();
+            list_cache.insert(node, taken.clone());
+            return Some(taken);
         }
         _ => {}
     }
@@ -577,10 +588,9 @@ pub fn extract_expr_list<'a>(
             list_cache.insert(node, rest.clone());
             Some(rest)
         }
-        "Concat" | "Drop" => {
+        "Concat" | "Drop" | "Take" => {
             let rest_rep = &egraph.eclasses[&egraph.enodes[node].1[1]].1[0];
-            let mut rest =
-                extract_expr_list(egraph, rest_rep, list_cache, expr_cache)?;
+            let mut rest = extract_expr_list(egraph, rest_rep, list_cache, expr_cache)?;
             rest.insert(0, expr);
             list_cache.insert(node, rest.clone());
             Some(rest)
@@ -839,7 +849,10 @@ pub fn egglog_to_llir(
         reachable.insert(choice[&egraph.roots[0]]);
         let mut reachability_stack = vec![choice[&egraph.roots[0]]];
         while let Some(r) = reachability_stack.pop() {
-            if egraph.eclasses[&egraph.node_to_class[r]].0.contains("IList") {
+            if egraph.eclasses[&egraph.node_to_class[r]]
+                .0
+                .contains("IList")
+            {
                 add_ilist_inputs_to_reachable(
                     egraph,
                     r,
