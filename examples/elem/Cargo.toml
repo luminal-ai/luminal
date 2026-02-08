@@ -1,8 +1,0 @@
-[package]
-name = "elem"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-luminal = { path = "../.." }
-luminal_cuda = { path = "../../crates/luminal_cuda"}
