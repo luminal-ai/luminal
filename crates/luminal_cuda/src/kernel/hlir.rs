@@ -29,6 +29,7 @@ pub type Ops = (
     KernelSqrt,
     KernelConstant,
     KernelCast,
+    ComplexElementwiseOp
 );
 
 #[derive(Default, Debug, Clone)]
@@ -2359,6 +2360,7 @@ impl KernelOp for ComplexElementwiseOp {
     fn compile(
         &self,
         stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> (
         CudaFunction,
         Arc<CudaModule>,
@@ -2494,9 +2496,15 @@ extern \"C\" {{
                 .map(|i| format!("__constant__ int const_{i}[1];"))
                 .join("\n"),
         );
-        let ptx = compile_ptx(&kernel).unwrap();
-        let module = stream.context().load_module(ptx).unwrap();
-        let func = module.load_function("complex_elementwise_k").unwrap();
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_ptx(&kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("complex_elementwise_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
         let constants = vars
             .into_iter()
             .map(|d| (d, module.get_global(&format!("const_{d}"), stream).unwrap()))
