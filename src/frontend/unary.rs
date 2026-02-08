@@ -253,10 +253,13 @@ impl GraphTensor {
     pub fn argsort(self, axis: usize, descending: bool) -> GraphTensor {
         // Compare all elements with all other elements by making an axis
         let ax_size = self.dims()[axis];
-        let a = self.expand_dim(axis + 1, ax_size);
+        // Materialize expanded tensors to avoid stride issues with sum reduction
+        let a = self.expand_dim(axis + 1, ax_size) + 0.0;
         let b = self.expand_dim(axis, ax_size) + 1e-9; // eps for stable sort
-        let mut ind = if descending { a.lt(b) } else { a.gt(b) };
-        ind = ind.sum(axis).cast(DType::Int);
+        // lt/gt return Bool, cast to F32 for sum
+        let cmp = if descending { a.gt(b) } else { a.lt(b) };
+        // Adding 0 forces materialization before sum, avoiding stride issues
+        let ind = (cmp.cast(DType::F32) + 0.0).sum(axis).cast(DType::Int);
         ind.inverse_permutation(axis)
     }
 
@@ -267,7 +270,7 @@ impl GraphTensor {
 
     /// Sort and retrieve top-k **indexes**
     pub fn topk_indexes(self, k: usize, axis: usize) -> GraphTensor {
-        self.argsort(axis, false).slice_along(..k, axis)
+        self.argsort(axis, true).slice_along(..k, axis)
     }
 
     /// Apply a cumulative reduction operation along dimensions

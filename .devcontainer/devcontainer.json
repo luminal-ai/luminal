@@ -1,0 +1,32 @@
+{
+    "name": "Luminal",
+    "image":"ghcr.io/luminal-ai/luminal-docker:latest",
+    "runArgs": [
+        "--privileged",
+        "--gpus=all",
+        "--pull=always"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.debugpy",
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.vscode-python-envs",
+                "ms-vscode.cmake-tools",
+                "ms-vscode.cpptools",
+                "ms-vscode.cpptools-extension-pack",
+                "ms-vscode.cpptools-themes",
+                "ms-vscode.makefile-tools",
+                "streetsidesoftware.code-spell-checker",
+                "hatookov.egglog-language",
+                "rust-lang.rust-analyzer",
+                "anthropic.claude-code",
+                "tamasfe.even-better-toml",
+                "eamodio.gitlens",
+                "ms-vscode.live-server",
+                "tintinweb.graphviz-interactive-preview"
+            ]
+        }
+    }
+}

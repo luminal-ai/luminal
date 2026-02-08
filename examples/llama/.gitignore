@@ -18,3 +18,12 @@ setup/*.json
 *.safetensors
 tokenizer.json
 *.pftrace
+
+.ruff_cache/
+*.cache/
+
+*.dot 
+*.html
+
+egraph/
+llir_graphs/

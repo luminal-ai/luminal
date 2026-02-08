@@ -1,5 +1,8 @@
 use std::fmt::Debug;
 
+use crate::egglog_utils::{
+    extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
+};
 use crate::prelude::*;
 use candle_core::{Device, Tensor};
 use proptest::prelude::*;
@@ -165,4 +168,261 @@ pub fn random_vec(n: usize) -> Vec<f32> {
 
 pub fn random_vec_rng<R: Rng>(n: usize, rng: &mut R) -> Vec<f32> {
     (0..n).map(|_| rng.random_range(-0.5..0.5)).collect()
+}
+
+/// Fuzz test to verify all genomes in the search space produce valid graphs.
+/// This tests the genetic algorithm by generating many random genomes and mutations,
+/// validating each one, and checking that extraction doesn't panic.
+#[test]
+fn fuzz_test_genome_validity() {
+    use crate::egglog_utils::egglog_to_llir;
+
+    // Build a moderately complex graph to test
+    let mut cx = Graph::new();
+    let a = cx.tensor((4, 8));
+    let b = cx.tensor((8, 4));
+    let c = cx.tensor((4, 4));
+
+    // Create a graph with multiple operations that can have equivalent rewrites
+    let d = a.matmul(b);
+    let e = (d + c).relu();
+    let f = e.softmax(1);
+    let _out = f.output();
+
+    // Build search space
+    cx.build_search_space::<NativeRuntime>();
+    let egraph = cx.egraph().unwrap();
+    let ops = cx.egglog_ops().unwrap();
+
+    // Debug: count eclasses with choices
+    let mutable_eclasses: usize = egraph
+        .eclasses
+        .iter()
+        .filter(|(_, (label, enodes))| {
+            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
+        })
+        .count();
+    println!(
+        "Search space: {} total eclasses, {} mutable (have >1 enode)",
+        egraph.eclasses.len(),
+        mutable_eclasses
+    );
+
+    let mut rng = rand::rng();
+    let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
+    let mut list_cache = FxHashMap::default();
+    let mut expr_cache = FxHashMap::default();
+
+    // Test initial random choice
+    let initial = random_initial_choice(egraph, &mut rng);
+    println!("Initial choice has {} entries", initial.len());
+    prev_selected.insert(hash_choice_set(&initial));
+
+    // Validate initial choice
+    if let Err(e) = validate_choice_set(egraph, &initial, ops) {
+        panic!("Initial choice is invalid: {}", e);
+    }
+    println!("Initial choice validated successfully");
+
+    // Test extraction doesn't panic
+    let _graph = egglog_to_llir(
+        egraph,
+        initial.clone(),
+        ops,
+        &cx.custom_ops,
+        &mut list_cache,
+        &mut expr_cache,
+        None,
+    );
+    println!(
+        "Initial extraction successful, graph has {} nodes",
+        _graph.node_count()
+    );
+
+    // Generate many mutations and validate each
+    let mut base = initial;
+    let mut valid_count = 0;
+    let mut total_count = 0;
+    let target_count = 100;
+
+    for generation in 0..20 {
+        let offspring = extract_generation(
+            egraph,
+            &base,
+            10, // generation size
+            2,  // mutations per offspring
+            &mut prev_selected,
+            &mut rng,
+        );
+        println!(
+            "Generation {}: {} offspring, prev_selected has {} entries",
+            generation,
+            offspring.len(),
+            prev_selected.len()
+        );
+
+        if offspring.is_empty() {
+            // Search space exhausted
+            println!("Search space exhausted at generation {}", generation);
+            break;
+        }
+
+        for genome in offspring {
+            total_count += 1;
+
+            // Validate the choice set
+            if let Err(e) = validate_choice_set(egraph, &genome, ops) {
+                panic!("Generation {} produced invalid genome: {}", generation, e);
+            }
+
+            // Test extraction doesn't panic
+            let graph = egglog_to_llir(
+                egraph,
+                genome.clone(),
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+
+            // Basic sanity check on extracted graph
+            assert!(graph.node_count() > 0, "Extracted graph has no nodes");
+
+            valid_count += 1;
+
+            // Use the first valid offspring as base for next generation
+            if valid_count == 1 {
+                base = genome;
+            }
+
+            if valid_count >= target_count {
+                break;
+            }
+        }
+
+        if valid_count >= target_count {
+            break;
+        }
+    }
+
+    println!(
+        "Fuzz test: validated {}/{} genomes successfully",
+        valid_count, total_count
+    );
+    // If no mutable eclasses, only the initial genome exists, which is valid
+    if mutable_eclasses == 0 {
+        println!("Search space has only one valid graph (no mutable eclasses)");
+    } else {
+        assert!(
+            valid_count > 0,
+            "No valid genomes were generated despite having {} mutable eclasses",
+            mutable_eclasses
+        );
+    }
+}
+
+/// More extensive fuzz test with execution validation
+#[test]
+fn fuzz_test_genome_execution() {
+    use crate::egglog_utils::egglog_to_llir;
+
+    // Build a simple graph where we can verify correctness
+    let mut cx = Graph::new();
+    let a = cx.tensor((2, 3));
+    let b = cx.tensor((2, 3));
+    let c = (a + b).relu().output();
+
+    cx.build_search_space::<NativeRuntime>();
+    let egraph = cx.egraph().unwrap();
+    let ops = cx.egglog_ops().unwrap();
+
+    let mut rng = rand::rng();
+    let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
+
+    // Generate and test multiple genomes
+    let initial = random_initial_choice(egraph, &mut rng);
+    prev_selected.insert(hash_choice_set(&initial));
+
+    let test_input_a = vec![1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0];
+    let test_input_b = vec![0.5f32, 0.5, 0.5, 0.5, 0.5, 0.5];
+    let expected: Vec<f32> = test_input_a
+        .iter()
+        .zip(&test_input_b)
+        .map(|(x, y)| (x + y).max(0.0))
+        .collect();
+
+    let mut base = initial;
+    let mut tested = 0;
+
+    for _generation in 0..10 {
+        let offspring = extract_generation(egraph, &base, 5, 2, &mut prev_selected, &mut rng);
+
+        if offspring.is_empty() {
+            break;
+        }
+
+        for genome in offspring {
+            // Validate
+            if let Err(e) = validate_choice_set(egraph, &genome, ops) {
+                panic!("Invalid genome: {}", e);
+            }
+
+            // Extract and execute
+            let mut list_cache = FxHashMap::default();
+            let mut expr_cache = FxHashMap::default();
+            let llir_graph = egglog_to_llir(
+                egraph,
+                genome.clone(),
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+
+            let mut rt = NativeRuntime::default();
+            rt.load_llir(&llir_graph);
+            rt.set_data(a.id, test_input_a.clone());
+            rt.set_data(b.id, test_input_b.clone());
+            rt.execute(&cx.dyn_map);
+
+            let result = rt.get_f32(c.id);
+            assert_close(result, &expected);
+
+            tested += 1;
+            base = genome;
+
+            if tested >= 20 {
+                break;
+            }
+        }
+
+        if tested >= 20 {
+            break;
+        }
+    }
+
+    // Count mutable eclasses
+    let mutable_eclasses: usize = egraph
+        .eclasses
+        .iter()
+        .filter(|(_, (label, enodes))| {
+            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
+        })
+        .count();
+
+    println!(
+        "Execution test: verified {} genomes produce correct results",
+        tested
+    );
+    if mutable_eclasses == 0 {
+        println!("Search space has only one valid graph (no mutable eclasses)");
+    } else {
+        assert!(
+            tested > 0,
+            "No genomes were tested for execution despite having {} mutable eclasses",
+            mutable_eclasses
+        );
+    }
 }

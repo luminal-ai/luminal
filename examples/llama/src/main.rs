@@ -1,35 +1,47 @@
+mod hf;
 mod model;
 
+use hf::prepare_hf_model;
 use luminal::prelude::*;
 use luminal_cuda::{cudarc::driver::CudaContext, runtime::CudaRuntime};
+use luminal_tracing::*;
 use model::*;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing::{span, Level};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
 
 // This example compiles and runs Llama 3 8B on CUDA. On an H100, this should hit >75% MBU
 
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 10;
-    let search_graphs = 5; // the number of graphs we want to search during compilation
+    let search_graphs = 500; // the number of graphs we want to search during compilation
     let prompt = "Hello, how are you";
 
-    // Set up tracing to perfetto
-    let trace_session = luminal_tracing::subscriber()
-        .perfetto("trace.pftrace")
-        .env_filter(format!(
-            "{}=trace,luminal=trace,luminal_cuda=trace",
-            env!("CARGO_PKG_NAME")
-        ))
+    // Tracing
+    //let (perfetto_layer, perfetto_guard) = perfetto_layer("trace.pftrace");
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            luminal_filter(), //.with_target("luminal", LevelFilter::TRACE)
+                              //.with_target("llama", Level::TRACE),
+        )
+        //.with(perfetto_layer)
         .init();
 
     // Set up cuda context and stream
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
 
+    // Download model if needed and prepare weights (converts to FP32)
+    let model_dir = prepare_hf_model(REPO_ID).expect("Failed to prepare model");
+    println!("Using model directory: {}", model_dir.display());
+
     // Tokenize prompt
-    let tokenizer = Tokenizer::from_file("setup/tokenizer.json").unwrap();
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     let mut sentence = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
 
     // Allocate kv cache
@@ -49,7 +61,8 @@ fn main() {
     // Load model weights from safetensors file
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
-    runtime.load_safetensors(&cx, "setup/model_combined.safetensors");
+    let weights_path = model_dir.join("model_combined.safetensors");
+    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
     // Run search process
     println!("Compiling...");
@@ -77,6 +90,7 @@ fn main() {
 
         // Set runtime dimensions
         let seq_len = sentence.len();
+
         cx.set_dim('s', seq_len);
         cx.set_dim('p', prev_seq);
 
@@ -114,11 +128,9 @@ fn main() {
             * 1_000.
     );
     runtime.print_execution_stats();
-    // Dump cuda trace to timeline
-    trace_session.stop();
-    if let Some(path) = trace_session.perfetto_path {
-        runtime.record_cuda_perfetto_trace(path);
-    }
+
+    println!("Dumping device execution trace to perfetto...");
+    //runtime.record_cuda_perfetto_trace(perfetto_guard);
 }
 
 #[tracing::instrument(skip_all)]

@@ -196,7 +196,13 @@ impl ShapeTracker {
 
     /// The number of elements in this tensor, not including pads and mask
     pub fn n_physical_elements(&self) -> Expression {
-        self.n_elements()
+        self.dims
+            .into_iter()
+            .zip(&self.strides)
+            .filter(|(_, s)| **s != 0)
+            .map(|(s, _)| s)
+            .product::<Expression>()
+            .max(1)
     }
 
     /// The number of dimensions

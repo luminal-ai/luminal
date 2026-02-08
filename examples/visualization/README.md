@@ -16,6 +16,10 @@ The integrated nature of these extensions makes viewing these files easy even on
 - `Live Preview` by microsoft. 
 - `Graphviz Interactive Preview` by tintinweb 
 
+## Visualization Providers
+- `.html` file formatting is provided by [egraph-visualizer](https://github.com/egraphs-good/egraph-visualizer)
+- `.dot` file formatting is provided by [graphviz-rust](https://crates.io/crates/graphviz-rust)
+
 ## Example Provided 
 In the example program, as simple program is defined. 
 From this a HLIR graph is created and visualized. 

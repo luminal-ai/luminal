@@ -10,19 +10,19 @@ use std::{
         Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Div, DivAssign, Mul, MulAssign,
         Neg, Rem, RemAssign, Sub, SubAssign,
     },
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, OnceLock, RwLock},
 };
 
-use crate::{egglog_utils, graph::extract_expr, prelude::*};
-use egglog::{prelude::RustSpan, var};
-use egglog_ast::span::Span;
+use crate::egglog_utils::{self, SerializedEGraph, extract_expr};
+use egglog::{ast::Span, prelude::RustSpan, var};
 
 type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
 
-static EXPR_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
+pub static EXPR_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
 static SIMPLIFY_CACHE: OnceLock<Mutex<LruCache<Expression, Expression>>> = OnceLock::new();
+static EXPRESSION_INTERNER: OnceLock<RwLock<FxHashMap<Vec<Term>, ExprBox>>> = OnceLock::new();
 
-const MAX_CACHED_SIMPLIFICATIONS: usize = 100_000;
+const MAX_CACHED_SIMPLIFICATIONS: usize = 10_000;
 
 #[derive(Copy, Clone)]
 pub struct Expression {
@@ -41,9 +41,53 @@ impl Serialize for Expression {
 
 impl Expression {
     pub fn new(terms: Vec<Term>) -> Self {
-        Self {
-            terms: EXPR_OWNER.get_or_init(SyncStorage::owner).insert(terms),
+        let interner = EXPRESSION_INTERNER.get_or_init(|| RwLock::new(FxHashMap::default()));
+
+        // Fast path: check if expression already exists (read lock only)
+        {
+            let read_guard = interner.read().unwrap();
+            if let Some(&existing) = read_guard.get(&terms) {
+                return Self { terms: existing };
+            }
         }
+
+        // Slow path: need to insert (write lock)
+        let mut write_guard = interner.write().unwrap();
+
+        // Double-check after acquiring write lock (another thread may have inserted)
+        if let Some(&existing) = write_guard.get(&terms) {
+            return Self { terms: existing };
+        }
+
+        let box_ = EXPR_OWNER
+            .get_or_init(SyncStorage::owner)
+            .insert(terms.clone());
+        write_guard.insert(terms, box_);
+        Self { terms: box_ }
+    }
+
+    /// Clear all interned expressions. Call this between major operations
+    /// (like search iterations) when no expressions are expected to be in use.
+    /// WARNING: Any existing Expression handles will become invalid after this call.
+    pub fn clear_interner() {
+        if let Some(interner) = EXPRESSION_INTERNER.get() {
+            let mut write_guard = interner.write().unwrap();
+            for (_, box_) in write_guard.drain() {
+                box_.recycle();
+            }
+        }
+        // Also clear the simplify cache since it contains Expression keys
+        if let Some(cache) = SIMPLIFY_CACHE.get() {
+            cache.lock().unwrap().clear();
+        }
+    }
+
+    /// Returns the number of interned expressions (for debugging/monitoring)
+    pub fn interner_size() -> usize {
+        EXPRESSION_INTERNER
+            .get()
+            .map(|i| i.read().unwrap().len())
+            .unwrap_or(0)
     }
 
     pub fn is_dynamic(&self) -> bool {
@@ -1082,5 +1126,38 @@ mod tests {
             let env = [('z', z_val)].into_iter().collect();
             assert_eq!(substituted.exec(&env).unwrap(), substituted.simplify().exec(&env).unwrap());
         }
+    }
+
+    #[test]
+    fn test_hash_consing() {
+        // Creating identical expressions should return the same underlying storage
+        // Use unique variable names to avoid interference from other tests
+        let unique_var = '\u{E000}'; // Private use area character unlikely to conflict
+
+        // Create expression with unique var + 42
+        let x1 = Expression::from(unique_var) + 42;
+
+        // Create the same expression again - should reuse storage
+        let x2 = Expression::from(unique_var) + 42;
+
+        // The expressions should be equal
+        assert_eq!(x1, x2);
+
+        // They should share the same GenerationalBox (same id)
+        // This is the key test for hash consing - identical terms = same box
+        assert_eq!(
+            x1.terms.id(),
+            x2.terms.id(),
+            "Hash consing failed: identical expressions should share storage"
+        );
+
+        // Different expression should create new entry
+        let unique_var2 = '\u{E001}';
+        let y = Expression::from(unique_var2) + 43;
+        assert_ne!(
+            x1.terms.id(),
+            y.terms.id(),
+            "Different expressions should have different storage"
+        );
     }
 }

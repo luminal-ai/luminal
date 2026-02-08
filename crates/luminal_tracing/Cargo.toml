@@ -7,4 +7,4 @@ edition.workspace = true
 tracing-appender = "0.2.4"
 tracing-perfetto-sdk-layer = "0.13.0"
 tracing-perfetto-sdk-schema = "0.13.0"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = "0.3"
