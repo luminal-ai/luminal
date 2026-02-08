@@ -1,17 +1,17 @@
 use luminal::{
     graph::Graph,
     op::{CustomOp, DType, LLIROp},
-    prelude::{F32Pow, GraphTensor},
-    shape::{flatten_mul_strides, Expression, ShapeTracker, ToShape},
+    prelude::{F32Pow, FxHashMap, GraphTensor},
+    shape::{flatten_mul_strides, Expression, ToShape},
 };
 use luminal_cuda::{
-    block::{cstruct::CStruct, BlockOp},
+    block::{BlockOp, CStruct},
     cudarc::driver::{CudaSlice, CudaStream, DevicePtr},
 };
 use luminal_nn::LayerNorm;
 use std::{fmt::Debug, sync::Arc};
 
-// Llama 3 8B hyperparams
+// Llama 7b hyperparams
 pub const LAYERS: usize = 32;
 pub const HIDDEN: usize = 4096;
 pub const INTERMEDIATE: usize = 14336;
@@ -94,20 +94,18 @@ impl Llama {
         pos_ids: GraphTensor,
         kv_cache: &KVCache,
     ) -> GraphTensor {
-        let seq = token_ids.dims1();
+        let batch = token_ids.dims1();
         let mut x = self.embedding.gather(
             (token_ids * HIDDEN).expand_dim(1, HIDDEN)
-                + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
+                + token_ids.graph().arange(HIDDEN).expand_dim(0, batch),
         );
         for (layer, (k_cache, v_cache)) in self.layers.iter().zip(&kv_cache.layers) {
-            x = layer
-                .forward(
-                    x,
-                    pos_ids,
-                    k_cache.device_ptr(v_cache.stream()).0,
-                    v_cache.device_ptr(k_cache.stream()).0,
-                )
-                .graph_break();
+            x = layer.forward(
+                x,
+                pos_ids,
+                k_cache.device_ptr(v_cache.stream()).0,
+                v_cache.device_ptr(k_cache.stream()).0,
+            );
         }
         self.lm_norm.forward(x).matmul(self.lm_head.t())
     }
@@ -155,8 +153,7 @@ fn llama_rotary_embeddings(mut input: GraphTensor, pos_ids: GraphTensor) -> Grap
 
     // Combine back into output
     let mut s = x0_out.concat_along(x1_out, 3);
-    let (n_heads, seq_dim, _) = input.dims3();
-    s.shape = ShapeTracker::new((n_heads, seq_dim, HEAD_DIM));
+    s.shape = input.shape; // need to have a proper merge_dims!
     s = s.transpose(0, 1) * 1.0;
     s.shape = orig_shape;
     s
@@ -288,36 +285,23 @@ impl BlockOp for LlamaAttention {
         vec![q, k, v]
     }
 
-    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
-        let mut q_pos_stride = vec![0.into(); self.range.len()];
-        q_pos_stride[self.range.len() - 1] = 1.into();
-        let mut group_pos_stride = vec![0.into(); self.range.len()];
-        group_pos_stride[self.range.len() - 2] = 1.into();
-        let mut head_pos_stride = vec![0.into(); self.range.len()];
-        head_pos_stride[self.range.len() - 3] = 1.into();
-        payload
-            .expr("head_size", self.head_dim)
-            .expr("cur_seq", self.cur_seq)
-            .expr("kv_row_stride", self.kv_row_stride)
-            .expr("q", flatten_mul_strides(&self.range, &self.q_stride))
-            .expr("k", flatten_mul_strides(&self.range, &self.k_stride))
-            .expr("v", flatten_mul_strides(&self.range, &self.v_stride))
-            .expr("out", flatten_mul_strides(&self.range, &self.o_stride))
-            .ptr_mut_f32("key_cache", self.k_cache as *mut f32)
-            .ptr_mut_f32("val_cache", self.v_cache as *mut f32)
-            .expr("prev_seq", self.prev_seq)
-            .expr(
-                "q_pos_stride",
-                flatten_mul_strides(&self.range, &q_pos_stride),
-            )
-            .expr(
-                "group_pos_stride",
-                flatten_mul_strides(&self.range, &group_pos_stride),
-            )
-            .expr(
-                "head_pos_stride",
-                flatten_mul_strides(&self.range, &head_pos_stride),
-            )
+    fn cuda_struct(&self) -> String {
+        "
+            int head_size;
+            int cur_seq;
+            int kv_row_stride;
+            const int q;
+            const int k;
+            const int v;
+            const int out;
+            float* key_cache;
+            float* val_cache;
+            int prev_seq;
+            int q_pos_stride;
+            int group_pos_stride;
+            int head_pos_stride;
+        "
+        .to_string()
     }
 
     fn cuda_function(&self) -> String {
@@ -500,5 +484,55 @@ impl BlockOp for LlamaAttention {
             }
         "
         .to_string()
+    }
+
+    fn schedule_op(
+        &self,
+        _: &Arc<CudaStream>,
+        expressions: &FxHashMap<Expression, i32>,
+    ) -> Vec<u8> {
+        let mut q_pos_stride = vec![0.into(); self.range.len()];
+        q_pos_stride[self.range.len() - 1] = 1.into();
+        let mut group_pos_stride = vec![0.into(); self.range.len()];
+        group_pos_stride[self.range.len() - 2] = 1.into();
+        let mut head_pos_stride = vec![0.into(); self.range.len()];
+        head_pos_stride[self.range.len() - 3] = 1.into();
+        CStruct::new()
+            .int(expressions[&self.head_dim])
+            .int(expressions[&self.cur_seq])
+            .int(expressions[&self.kv_row_stride])
+            .int(expressions[&flatten_mul_strides(&self.range, &self.q_stride)])
+            .int(expressions[&flatten_mul_strides(&self.range, &self.k_stride)])
+            .int(expressions[&flatten_mul_strides(&self.range, &self.v_stride)])
+            .int(expressions[&flatten_mul_strides(&self.range, &self.o_stride)])
+            .ptr_mut_f32(self.k_cache as *mut f32)
+            .ptr_mut_f32(self.v_cache as *mut f32)
+            .int(expressions[&self.prev_seq])
+            .int(expressions[&flatten_mul_strides(&self.range, &q_pos_stride)])
+            .int(expressions[&flatten_mul_strides(&self.range, &group_pos_stride)])
+            .int(expressions[&flatten_mul_strides(&self.range, &head_pos_stride)])
+            .finish_struct()
+    }
+
+    fn expressions(&self) -> Vec<Expression> {
+        let mut q_pos_stride = vec![0.into(); self.range.len()];
+        q_pos_stride[self.range.len() - 1] = 1.into();
+        let mut group_pos_stride = vec![0.into(); self.range.len()];
+        group_pos_stride[self.range.len() - 2] = 1.into();
+        let mut head_pos_stride = vec![0.into(); self.range.len()];
+        head_pos_stride[self.range.len() - 3] = 1.into();
+        vec![
+            flatten_mul_strides(&self.range, &self.q_stride),
+            flatten_mul_strides(&self.range, &self.k_stride),
+            flatten_mul_strides(&self.range, &self.v_stride),
+            flatten_mul_strides(&self.range, &self.o_stride),
+            self.head_dim,
+            self.cur_seq,
+            self.kv_row_stride,
+            self.prev_seq,
+            flatten_mul_strides(&self.range, &q_pos_stride),
+            flatten_mul_strides(&self.range, &group_pos_stride),
+            flatten_mul_strides(&self.range, &head_pos_stride),
+        ]
     }
 }

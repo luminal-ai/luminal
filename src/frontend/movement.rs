@@ -137,16 +137,9 @@ impl GraphTensor {
             position = position.expand_dim(i, dims2[i]);
         }
         // one_hot[candidate, ..., position, ...] = (self[position, ...] == candidate)
-        // eq() returns F32 (0.0 or 1.0)
-        let one_hot = self
-            .expand_dim(axis, ax_size)
-            .eq(candidate)
-            .cast(DType::F32);
+        let one_hot = self.expand_dim(axis, ax_size).eq(candidate);
         // inv[candidate, ...] = Σ_pos one_hot * position
-        // Cast position to F32 for multiplication, then result back to Int
-        // Adding 0.0 forces materialization before sum, avoiding stride issues
-        let product = one_hot * position.cast(DType::F32) + 0.0;
-        product.sum(axis + 1).cast(DType::Int)
+        (one_hot * position).sum(axis + 1)
     }
 
     /// Extracts sliding local windows from an input tensor.

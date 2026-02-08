@@ -1,5 +1,5 @@
 use std::{
-    fmt::{Debug, Display},
+    fmt::Debug,
     sync::{Arc, Mutex},
 };
 
@@ -19,115 +19,7 @@ pub trait Runtime {
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
-        trials: usize,
     ) -> (Self::ProfileMetric, String);
-    /// Allocate a dummy input buffer for a boundary node during per-chunk profiling.
-    /// `node_index` is the HLIR node index used in the Input op's `node` field.
-    /// `num_elements` is the number of f32 elements to allocate.
-    fn allocate_dummy_input(&mut self, _node_index: usize, _num_elements: usize) {}
-    /// Clear intermediate buffers to prepare for loading a different chunk's LLIR.
-    fn clear_intermediate_buffers(&mut self) {}
-}
-
-/// Optional runtime instrumentation for collecting execution statistics.
-pub trait RuntimeStats: Runtime {
-    fn execute_with_stats(&mut self, dyn_map: &FxHashMap<char, usize>) -> Option<ExecutionStats>;
-}
-
-/// Timing method used for execution statistics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimingMethod {
-    /// Device-side timing (e.g. GPU timestamps / CUDA events).
-    DeviceTimestamp,
-    /// Host-side wall-clock timing.
-    /// Includes any host/device synchronization overhead.
-    #[default]
-    WallClock,
-}
-
-impl std::fmt::Display for TimingMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TimingMethod::DeviceTimestamp => write!(f, "Device"),
-            TimingMethod::WallClock => write!(f, "Wall"),
-        }
-    }
-}
-
-/// Detailed execution statistics from a single run.
-///
-/// This struct captures basic counters and timing.
-#[derive(Debug, Clone, Default)]
-pub struct ExecutionStats {
-    /// Execution time in microseconds.
-    pub execution_time_us: f64,
-    /// Total bytes read.
-    pub bytes_loaded: usize,
-    /// Total bytes written.
-    pub bytes_stored: usize,
-    /// Total floating-point operations.
-    pub flops: usize,
-    /// Timing method used for this measurement.
-    pub timing_method: TimingMethod,
-}
-
-impl ExecutionStats {
-    pub fn new(
-        execution_time_us: f64,
-        bytes_loaded: usize,
-        bytes_stored: usize,
-        flops: usize,
-    ) -> Self {
-        Self {
-            execution_time_us,
-            bytes_loaded,
-            bytes_stored,
-            flops,
-            timing_method: TimingMethod::DeviceTimestamp,
-        }
-    }
-
-    /// Create new execution stats with explicit timing method.
-    pub fn with_timing_method(
-        execution_time_us: f64,
-        bytes_loaded: usize,
-        bytes_stored: usize,
-        flops: usize,
-        timing_method: TimingMethod,
-    ) -> Self {
-        Self {
-            execution_time_us,
-            bytes_loaded,
-            bytes_stored,
-            flops,
-            timing_method,
-        }
-    }
-
-    /// Total bytes transferred (loaded + stored).
-    pub fn total_bytes(&self) -> usize {
-        self.bytes_loaded + self.bytes_stored
-    }
-
-    pub fn merge(&mut self, other: &ExecutionStats) {
-        self.execution_time_us += other.execution_time_us;
-        self.bytes_loaded += other.bytes_loaded;
-        self.bytes_stored += other.bytes_stored;
-        self.flops += other.flops;
-    }
-}
-
-impl std::fmt::Display for ExecutionStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ExecutionStats {{ time: {:.2}µs ({}), bytes: {:.2}MB, flops: {:.2}M }}",
-            self.execution_time_us,
-            self.timing_method,
-            self.total_bytes() as f64 / 1_000_000.0,
-            self.flops as f64 / 1_000_000.0
-        )
-    }
 }
 
 pub trait EgglogOp: Debug {
@@ -169,24 +61,6 @@ pub enum DType {
     Bf16,
     /// 32-bit integer
     Int,
-    /// Boolean (stored as u8, 0 or 1)
-    Bool,
-}
-
-impl Display for DType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-
-impl DType {
-    pub fn sizeof(&self) -> usize {
-        match self {
-            DType::F32 | DType::Int => 4,
-            DType::Bf16 | DType::F16 => 2,
-            DType::Bool => 1,
-        }
-    }
 }
 
 /// The main HLIROp trait.

@@ -1,5 +1,4 @@
 const int N_OPS = 0;
-const int N_TIMING_SLOTS = 0;
 
 enum OpCode {
   //%extra_op_codes%
@@ -114,7 +113,7 @@ __device__ inline bool fetch_next_task(Task *tasks, int num_tasks, int *head,
 
 __device__ inline void record_event(SMEvent *__restrict__ timings,
                                     int *event_idx, int event_type) {
-  if (*event_idx < N_TIMING_SLOTS) {
+  if (*event_idx < 1000) {
     unsigned long long now = read_globaltimer();
     if (*event_idx > 0) { // record the end of the previous op
       timings[*event_idx - 1].stop = now;
@@ -141,7 +140,7 @@ __global__ void worker_kernel(Task *__restrict__ tasks, int num_tasks,
   __shared__ bool stop_wait_loop;
   __shared__ float scratchpad[8192]; // 32 KB scratchpad
   int recorded_event = 0;
-  timings += blockIdx.x * N_TIMING_SLOTS;
+  timings += blockIdx.x * 1000;
   if (threadIdx.x == 0) {
     start_times[blockIdx.x] = read_globaltimer();
   }
@@ -205,14 +204,8 @@ __global__ void worker_kernel(Task *__restrict__ tasks, int num_tasks,
             run_a_prologue = true;
             a_done = true;
             // Propagate to same deps
-            if (ab_same) {
-              run_b_prologue = true;
-              b_done = true;
-            }
-            if (ac_same) {
-              run_c_prologue = true;
-              c_done = true;
-            }
+            if (ab_same) { run_b_prologue = true; b_done = true; }
+            if (ac_same) { run_c_prologue = true; c_done = true; }
           }
         }
         if (!b_done && !ab_same) {
@@ -220,10 +213,7 @@ __global__ void worker_kernel(Task *__restrict__ tasks, int num_tasks,
           if (tmp) {
             run_b_prologue = true;
             b_done = true;
-            if (bc_same) {
-              run_c_prologue = true;
-              c_done = true;
-            }
+            if (bc_same) { run_c_prologue = true; c_done = true; }
           }
         }
         if (!c_done && !ac_same && !bc_same) {

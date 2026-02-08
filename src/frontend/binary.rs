@@ -249,9 +249,8 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
     }
 }
 
-// Comparisons, all redurn bools (based on https://github.com/tinygrad/tinygrad/blob/3e0c2d256fe9f4f5f85cd3e4d8733a51d7b4a984/tinygrad/tensor.py#L653)
+// Comparisons (based on https://github.com/tinygrad/tinygrad/blob/3e0c2d256fe9f4f5f85cd3e4d8733a51d7b4a984/tinygrad/tensor.py#L653)
 impl GraphTensor {
-    /// Less than comparison
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
         assert_eq!(self.dims(), rhs.dims(), "Dims must match to lt tensors.");
         let new_id = self
@@ -260,33 +259,27 @@ impl GraphTensor {
             .input(self.id, self.shape)
             .input(rhs.id, rhs.shape)
             .finish();
-        // Comparison operations always output Bool
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, DType::Bool)
+        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
-    /// Greater than comparison
     pub fn gt(self, rhs: GraphTensor) -> GraphTensor {
         rhs.lt(self)
     }
 
-    /// Less than or equal
     pub fn le(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.gt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
+        -self.gt(rhs) + 1.0
     }
 
-    /// Greater than or equal
     pub fn ge(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.lt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
+        -self.lt(rhs) + 1.0
     }
 
-    /// Not equal
     pub fn ne(self, rhs: GraphTensor) -> GraphTensor {
-        self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)
+        self.lt(rhs) + self.gt(rhs)
     }
 
-    /// Equal
     pub fn eq(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.ne(rhs) + 1.0).cast(DType::Bool)
+        -self.ne(rhs) + 1.0
     }
 
     /// Raise the tensor to a power
@@ -297,13 +290,13 @@ impl GraphTensor {
         // Approximate, see full impl here: https://github.com/tinygrad/tinygrad/blob/a32c67760140dd26b60d7932268f2e62e96a66e0/tinygrad/tensor.py#L568
         self.abs().log().mul(e).exp()
     }
+}
 
-    // Clipping ops (minimum, maximum, clip)
-
+// Clipping ops (minimum, maximum, clip)
+impl GraphTensor {
     /// Take the elementwise maximum of two tensors
     pub fn maximum(self, rhs: GraphTensor) -> GraphTensor {
-        // Cast Bool to F32 for arithmetic
-        (self.lt(rhs).cast(DType::F32) * rhs) + (rhs.le(self).cast(DType::F32) * self)
+        (self.lt(rhs) * rhs) + (rhs.le(self) * self)
     }
 
     /// Take the elementwise maximum of a tensor and a float
@@ -326,13 +319,9 @@ impl GraphTensor {
         self.maximum_f32(min).minimum_f32(max)
     }
 
-    /// Return a tensor of elements selected from either self or other, depending on condition. Condition should be a boolean tensor
+    /// Return a tensor of elements selected from either self or other, depending on condition.
     pub fn cond(self, cond: GraphTensor, other: GraphTensor) -> GraphTensor {
-        assert_eq!(
-            self.dtype, other.dtype,
-            "self and other need to be the same dtype!"
-        );
-        (cond.cast(self.dtype) * self) + ((1.0 - cond.cast(DType::F32)).cast(other.dtype) * other)
+        (cond * self) + ((1.0 - cond) * other)
     }
 }
 
@@ -507,7 +496,7 @@ pub(super) mod tests {
             test_binary(
                 size,
                 size,
-                |a, b| a.lt(b).cast(crate::op::DType::F32),
+                |a, b| a.lt(b),
                 |a, b| a.lt(&b).unwrap().to_dtype(DType::F32).unwrap(),
             );
         }
@@ -520,7 +509,7 @@ pub(super) mod tests {
             test_binary(
                 size,
                 size,
-                |a, b| a.gt(b).cast(crate::op::DType::F32),
+                |a, b| a.gt(b),
                 |a, b| a.gt(&b).unwrap().to_dtype(DType::F32).unwrap(),
             );
         }
@@ -533,7 +522,7 @@ pub(super) mod tests {
             test_binary(
                 size,
                 size,
-                |a, b| a.le(b).cast(crate::op::DType::F32),
+                |a, b| a.le(b),
                 |a, b| a.le(&b).unwrap().to_dtype(DType::F32).unwrap(),
             );
         }
@@ -546,7 +535,7 @@ pub(super) mod tests {
             test_binary(
                 size,
                 size,
-                |a, b| a.ge(b).cast(crate::op::DType::F32),
+                |a, b| a.ge(b),
                 |a, b| a.ge(&b).unwrap().to_dtype(DType::F32).unwrap(),
             );
         }
@@ -557,7 +546,7 @@ pub(super) mod tests {
         test_binary(
             27,
             27,
-            |a, b| a.ne(b).cast(crate::op::DType::F32),
+            |a, b| a.ne(b),
             |a, b| a.ne(&b).unwrap().to_dtype(DType::F32).unwrap(),
         );
     }
@@ -567,7 +556,7 @@ pub(super) mod tests {
         test_binary(
             27,
             27,
-            |a, b| a.eq(b).cast(crate::op::DType::F32),
+            |a, b| a.eq(b),
             |a, b| a.eq(&b).unwrap().to_dtype(DType::F32).unwrap(),
         );
     }
@@ -632,10 +621,7 @@ pub(super) mod tests {
             27,
             27,
             |a, b| {
-                // gt() returns Bool, cast to F32 for cond which expects F32
-                let cond = a
-                    .gt(b.graph().constant_float(0.0).expand_rhs(a.shape))
-                    .cast(crate::op::DType::F32);
+                let cond = a.gt(b.graph().constant_float(0.0).expand_rhs(a.shape));
                 a.cond(cond, b)
             },
             |a, b| {

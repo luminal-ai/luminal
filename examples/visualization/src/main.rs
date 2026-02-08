@@ -2,11 +2,10 @@ use std::fs;
 
 use luminal::{
     self,
-    egglog_utils::{egglog_to_llir, hlir_to_egglog, random_initial_choice},
     op::IntoEgglogOp,
     prelude::{
-        egglog::var,
-        egglog_ast::{RustSpan, Span},
+        egglog::{prelude::RustSpan, var},
+        egglog_ast::span::Span,
         *,
     },
     visualization::{ToDot, ToHtml},
@@ -48,15 +47,8 @@ fn main() {
 
     let (sort, value) = egglog_obj.eval_expr(&var!(root)).unwrap();
     let s_egraph = SerializedEGraph::new(&egglog_obj, vec![(sort, value)]);
-    let example_llir_graph = egglog_to_llir(
-        &s_egraph,
-        random_initial_choice(&s_egraph, &mut rand::rng()),
-        &ops,
-        &[],
-        &mut FxHashMap::default(),
-        &mut FxHashMap::default(),
-        None,
-    );
+    let llir_graphs = egglog_to_llir(&s_egraph, &ops, &[], 100);
+    let example_llir_graph = llir_graphs.last().unwrap();
 
     println!("Visualizing LLIR Graph");
     fs::write("LLIR.dot", example_llir_graph.to_dot().unwrap()).unwrap();

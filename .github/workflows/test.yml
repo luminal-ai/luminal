@@ -18,7 +18,7 @@ jobs:
         steps:
             - uses: actions/checkout@v6
             - name: Run tests
-              run: sudo apt-get install protobuf-compiler; rustup update; cargo test --workspace --exclude luminal_cuda --exclude luminal_metal --exclude luminal_bench --verbose
+              run: sudo apt-get install protobuf-compiler; rustup update; cargo test --workspace --exclude luminal_cuda --exclude luminal_metal --verbose
 
     clippy:
         name: Clippy
@@ -28,7 +28,7 @@ jobs:
         steps:
             - uses: actions/checkout@v6
             - name: Run clippy
-              run: sudo apt-get install protobuf-compiler; rustup update; cargo clippy --workspace --exclude luminal_metal --exclude luminal_bench --all-targets -- -D warnings
+              run: sudo apt-get install protobuf-compiler; rustup update; cargo clippy --workspace --exclude luminal_metal --all-targets -- -D warnings
 
     fmt:
         name: Fmt
@@ -52,14 +52,9 @@ jobs:
             - name: Install system deps
               run: |
                   sudo apt-get update
-                  sudo apt-get install -y --no-install-recommends protobuf-compiler
-            - name: Install CUDA toolkit
-              uses: Jimver/cuda-toolkit@v0.2.30
-              with:
-                  cuda: '12.8.0'
-                  method: 'network'
-                  sub-packages: '["nvcc", "nvrtc"]'
-                  non-cuda-sub-packages: '["libcublas"]'
+                  sudo apt-get install -y --no-install-recommends \
+                  protobuf-compiler \
+                  cuda-nvrtc-12-8
             - name: Install Rust
               run: |
                   curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
