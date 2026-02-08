@@ -1,0 +1,70 @@
+; Column-major × Column-major matmul: C[m,n] = A[m,k] × B[k,n]
+; A[m,k] column-major → expand to [m, n, k] with strides [1, 0, m]
+; B[k,n] column-major → expand to [m, n, k] with strides [0, k, 1]
+;
+; Row-major viewed as column-major (swap trick):
+;   Column-major A[m,k] is already column-major with lda=m
+;   Column-major B[k,n] is already column-major with ldb=k
+;   Row-major C[m,n] ≡ column-major C^T[n,m] with ldc=n
+;
+; C^T[n,m] = (A × B)^T = B^T[n,k] × A^T[k,m]
+; cuBLAS: cublasSgemm(OP_T, OP_T, n, m, k, α, B, k, A, m, β, C, n)
+(rule
+    (
+        ; Match Mul node
+        (= ?mul (Mul ?mul_shape ?a ?a_stride ?b ?b_stride ?mul_out_stride))
+
+        ; Match Sum that reduces the Mul (k dimension)
+        (= ?sum (Sum ?out_shape ?k ?mul ?sum_in_stride ?k_stride ?sum_out_stride))
+
+        ; Get dimensions from output shape
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+
+        ; Get A strides in [m, n, k] space
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        ; Get B strides in [m, n, k] space
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        ; Assert contiguous k stride on output (required for reduction)
+        (= ?k_stride (MNum 1))
+
+        ; Assert A has strides [1, 0, m] (column-major A[m,k] broadcast to [m,n,k])
+        (= ?a_m_stride (MNum 1))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride ?m)
+
+        ; Assert B has strides [0, k, 1] (column-major B[k,n] broadcast to [m,n,k])
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride ?k)
+        (= ?b_k_stride (MNum 1))
+
+        (= (F32) (dtype ?a))
+        (= (F32) (dtype ?b))
+    )
+    (
+        ; For column-major A × column-major B with cuBLAS:
+        ; C^T = B^T × A^T → cublasSgemm(OP_T, OP_T, n, m, k, α, B, k, A, m, β, C, n)
+        (let ?sgemm (cublasSgemmV2
+            ?b             ; First matrix = B (swapped)
+            ?a             ; Second matrix = A (swapped)
+            ?n             ; cuBLAS m = our n (swapped)
+            ?m             ; cuBLAS n = our m (swapped)
+            ?k             ; k unchanged
+            "T"            ; transa = Transpose (B is column-major [k,n], need B^T[n,k])
+            "T"            ; transb = Transpose (A is column-major [m,k], need A^T[k,m])
+            ?k             ; lda = k (column-major B[k,n])
+            ?m             ; ldb = m (column-major A[m,k])
+            ?n))           ; ldc = n (row-major C[m,n] viewed as col-major [n,m])
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :name "cublas sgemm column-major × column-major"
+)

@@ -1,6 +1,8 @@
 #![allow(clippy::mutable_key_type)]
+pub mod cstruct;
 mod ops;
 use itertools::Itertools;
+use lru::LruCache;
 pub use ops::*;
 
 use cudarc::{
@@ -16,7 +18,6 @@ use luminal::{
     },
     shape::{Expression, flatten_z_strides},
 };
-use prost::Message;
 use std::{
     collections::HashMap,
     fmt::Debug,
@@ -31,7 +32,9 @@ use tracing_perfetto_sdk_schema::{
     track_event,
 };
 
-use crate::runtime::CudaRuntime;
+use crate::block::cstruct::CStruct;
+
+pub const N_TIMING_SLOTS: usize = 1000;
 
 #[allow(unused_variables)]
 pub trait BlockOp: Debug + as_any::AsAny {
@@ -45,10 +48,6 @@ pub trait BlockOp: Debug + as_any::AsAny {
     }
     fn producer_barriers_seperate(&self) -> Vec<bool>;
     fn consumer_barriers_seperate(&self) -> Vec<Vec<bool>>;
-    /// C struct body
-    fn cuda_struct(&self) -> String {
-        "".to_string()
-    }
     /// C function body
     fn cuda_function(&self) -> String {
         "".to_string()
@@ -73,16 +72,9 @@ pub trait BlockOp: Debug + as_any::AsAny {
     fn flops(&self) -> Expression {
         0.into()
     }
-    #[allow(clippy::mutable_key_type)]
-    fn schedule_op(
-        &self,
-        stream: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
+    /// Build C-struct paylod
+    fn build_payload<'a>(&self, stream: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
         unimplemented!()
-    } // C struct
-    fn expressions(&self) -> Vec<Expression> {
-        vec![]
     }
     fn prologue_a(&self) -> String {
         "".to_string()
@@ -327,7 +319,7 @@ fn get_barrier_strides(
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub(crate) struct SMEvent {
+pub struct SMEvent {
     pub start: u64,
     pub stop: u64,
     pub event: i32,
@@ -380,26 +372,23 @@ impl TaskQueue {
         source_ptrs: [*const f32; 3],
         out_ptr: *mut f32,
         payload: &[u8],
+        expressions: &FxHashMap<Expression, i32>,
     ) {
-        use crate::block::CStruct;
-
-        let mut bytes = CStruct::new()
-            .int(op)
-            .int(range)
-            .int(remaining)
-            .int(in_dep_a_stride)
-            .int(in_dep_a_base)
-            .int(in_dep_b_stride)
-            .int(in_dep_b_base)
-            .int(in_dep_c_stride)
-            .int(in_dep_c_base)
-            .int(out_dep_stride)
-            .int(out_dep_base)
-            .ptr_const_f32(source_ptrs[0])
-            .ptr_const_f32(source_ptrs[1])
-            .ptr_const_f32(source_ptrs[2])
-            .ptr_mut_f32(out_ptr)
-            .bytes(1, payload) // Add payload with byte alignment
+        let mut bytes = CStruct::new(Some(expressions))
+            .int("op", op)
+            .int("range", range)
+            .int("remaining", remaining)
+            .int("in_dep_a_stride", in_dep_a_stride)
+            .int("in_dep_a_base", in_dep_a_base)
+            .int("in_dep_b_stride", in_dep_b_stride)
+            .int("in_dep_b_base", in_dep_b_base)
+            .int("in_dep_c_stride", in_dep_c_stride)
+            .int("in_dep_c_base", in_dep_c_base)
+            .int("out_dep_stride", out_dep_stride)
+            .int("out_dep_base", out_dep_base)
+            .ptr_const_f32_arr("source_ptrs", source_ptrs.as_slice())
+            .ptr_mut_f32("out_ptr", out_ptr)
+            .bytes(1, "payload", payload) // Add payload with byte alignment
             .finish_struct();
 
         // Pad to task_stride
@@ -567,24 +556,177 @@ fn hash32<T: Hash>(val: T) -> u32 {
     (hash64(val) & 0xffff_ffff) as u32
 }
 
+/// Build a mapping from interned string IDs to their string values for a given sequence.
+fn build_interned_strings(trace: &schema::Trace) -> std::collections::HashMap<(u32, u64), String> {
+    let mut interned: std::collections::HashMap<(u32, u64), String> =
+        std::collections::HashMap::new();
+    for packet in &trace.packet {
+        let seq_id = match &packet.optional_trusted_packet_sequence_id {
+            Some(trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(seq)) => {
+                *seq
+            }
+            _ => 0,
+        };
+        // interned_data is a field on TracePacket, not a Data variant
+        if let Some(data) = &packet.interned_data {
+            for entry in &data.debug_annotation_names {
+                if let Some(name) = &entry.name {
+                    interned.insert((seq_id, entry.iid()), name.clone());
+                }
+            }
+        }
+    }
+    interned
+}
+
+/// Check if a debug annotation has key "id" and the given UUID value.
+fn annotation_matches_id(
+    a: &schema::DebugAnnotation,
+    id: &uuid::Uuid,
+    interned: &std::collections::HashMap<(u32, u64), String>,
+    seq_id: u32,
+) -> bool {
+    let key_matches = match &a.name_field {
+        Some(NameField::Name(k)) => k == "id",
+        Some(NameField::NameIid(iid)) => interned
+            .get(&(seq_id, *iid))
+            .map(|s| s == "id")
+            .unwrap_or(false),
+        None => false,
+    };
+    if !key_matches {
+        return false;
+    }
+    match &a.value {
+        Some(tracing_perfetto_sdk_schema::debug_annotation::Value::StringValue(v)) => {
+            *v == format!("{id}")
+        }
+        _ => false,
+    }
+}
+
+/// Record block op timings from megakernels to perfetto trace packets
+pub fn record_block_op_timings(
+    trace: &schema::Trace,
+    ops: &[Arc<Box<dyn BlockOp>>],
+    timings: &[Vec<(Vec<SMEvent>, u64, uuid::Uuid)>],
+) -> Vec<schema::TracePacket> {
+    // Build interned string lookup table
+    let interned = build_interned_strings(trace);
+
+    let host_start_times: Vec<(u64, u32)> = timings
+        .iter()
+        .flatten()
+        .map(|(_, _, id)| {
+            trace
+                .packet
+                .iter()
+                .find_map(|p| {
+                    let seq_id = match &p.optional_trusted_packet_sequence_id {
+                        Some(
+                            trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(
+                                seq,
+                            ),
+                        ) => *seq,
+                        _ => 0,
+                    };
+                    match &p.data {
+                        Some(trace_packet::Data::TrackEvent(TrackEvent {
+                            r#type: ty,
+                            debug_annotations,
+                            ..
+                        })) if *ty == Some(track_event::Type::SliceBegin as i32)
+                            && debug_annotations
+                                .iter()
+                                .any(|a| annotation_matches_id(a, id, &interned, seq_id)) =>
+                        {
+                            Some((p.timestamp?, p.timestamp_clock_id?))
+                        }
+                        _ => None,
+                    }
+                })
+                .expect("Couldn't find span with correct uuid for gpu timing dump")
+        })
+        .collect();
+
+    let mut packets = Vec::new();
+    let n_ops = ops.len();
+    for ((device_timings, device_start_time, _), (host_time, host_clock_id)) in
+        timings.iter().flatten().zip(host_start_times)
+    {
+        for (sm, sm_timings) in device_timings.chunks(1000).enumerate() {
+            let mut builder = ManualTrackBuilder::new(sm as u32, host_time, host_clock_id);
+            for n_op in 0..sm_timings.len() - 1 {
+                let event = sm_timings[n_op].event as usize;
+                let op_label = if event == 0 {
+                    "Issue".to_string()
+                } else if event == 1 {
+                    "Wait".to_string()
+                } else if event >= 2 && event < 2 + n_ops {
+                    ops[event - 2].op_name().to_string()
+                } else if event >= 2 + n_ops {
+                    let prologue_event = event - 2 - n_ops;
+                    let op_idx = prologue_event / 3;
+                    let prologue_type = prologue_event % 3;
+                    if op_idx < n_ops {
+                        let suffix = match prologue_type {
+                            0 => "prologue A",
+                            1 => "prologue B",
+                            2 => "prologue C",
+                            _ => "prologue ?",
+                        };
+                        format!("{} ({})", ops[op_idx].op_name(), suffix)
+                    } else {
+                        format!("Unknown({})", event)
+                    }
+                } else {
+                    format!("Unknown({})", event)
+                };
+                if sm_timings[n_op + 1].start == 0 {
+                    break;
+                }
+                builder.push_slice(
+                    &op_label,
+                    sm_timings[n_op].start - *device_start_time,
+                    sm_timings[n_op + 1].start - *device_start_time,
+                    host_time,
+                    host_clock_id,
+                );
+            }
+            packets.extend(builder.into_packets());
+        }
+    }
+    packets
+}
+
 #[tracing::instrument(skip_all)]
 fn compile_interpreter(
     cuda_stream: &Arc<CudaStream>,
     ops: &Vec<Arc<Box<dyn BlockOp>>>,
     expressions: &FxHashSet<Expression>,
     payload_size: usize,
-    kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    kernel_cache: &mut LruCache<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> (
     CudaFunction,
     FxHashMap<Expression, i32>,
     FxHashMap<char, CudaSlice<u8>>,
 ) {
+    let expression_map = expressions
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (*e, i as i32))
+        .collect::<FxHashMap<_, _>>();
+
     // Compile the interpreter
     let mut kernel = include_str!("interpreter.cu").to_string();
     let n_ops = ops.len();
     kernel = kernel.replace(
         "const int N_OPS = 0;",
         &format!("const int N_OPS = {};", n_ops),
+    );
+    kernel = kernel.replace(
+        "const int N_TIMING_SLOTS = 0;",
+        &format!("const int N_TIMING_SLOTS = {N_TIMING_SLOTS};"),
     );
     kernel = kernel.replace(
         "//%extra_op_codes%",
@@ -596,7 +738,13 @@ fn compile_interpreter(
     kernel = kernel.replace(
         "//%extra_op_structs%",
         &ops.iter()
-            .map(|op| format!("struct {}Payload {{{}}};", op.op_name(), op.cuda_struct()))
+            .map(|op| {
+                format!(
+                    "struct {}Payload {{{}}};",
+                    op.op_name(),
+                    op.build_payload(cuda_stream, CStruct::new(Some(&expression_map))),
+                )
+            })
             .join("\n"),
     );
     kernel = kernel.replace(
@@ -726,11 +874,6 @@ fn compile_interpreter(
         .iter()
         .map(|v| format!("__constant__ int const_{v}[1];"))
         .join("\n");
-    let expression_map = expressions
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (*e, i as i32))
-        .collect::<FxHashMap<_, _>>();
     let lambdas = expression_map
         .iter()
         .sorted_by_key(|(_, i)| **i)
@@ -765,7 +908,7 @@ fn compile_interpreter(
         .unwrap();
         let module = cuda_stream.context().load_module(ptx).unwrap();
         let func = module.load_function("worker_kernel").unwrap();
-        kernel_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+        kernel_cache.push(kernel.clone(), (module.clone(), func.clone()));
         (module, func)
     };
     let constants = constants
@@ -782,120 +925,12 @@ fn compile_interpreter(
     (func, expression_map, constants)
 }
 
-impl CudaRuntime {
-    pub fn record_cuda_perfetto_trace(&self, file_path: impl AsRef<std::path::Path>) {
-        let ops = self
-            .llir_graph
-            .node_indices()
-            .filter_map(|n| self.llir_graph[n].to_dialect::<dyn BlockOp>())
-            .map(|bo| (bo.op_name(), bo.clone()))
-            .collect::<HashMap<_, _>>()
-            .into_iter()
-            .sorted_by_key(|(n, _)| *n)
-            .map(|(_, o)| o)
-            .collect_vec();
-        let data = std::fs::read(&file_path).unwrap();
-        let mut trace = tracing_perfetto_sdk_schema::Trace::decode(data.as_slice()).unwrap();
-        let host_start_times: Vec<(u64, u32)> = self
-            .timings
-            .iter()
-            .flatten()
-            .map(|(_, _, id)| {
-                trace
-                    .packet
-                    .iter()
-                    .find_map(|p| match &p.data {
-                        Some(trace_packet::Data::TrackEvent(TrackEvent {
-                            r#type: ty,
-                            debug_annotations,
-                            ..
-                        })) if *ty == Some(track_event::Type::SliceBegin as i32)
-                            && debug_annotations.iter().any(|a| {
-                                matches!(
-                                    (&a.name_field, &a.value),
-                                    (
-                                        Some(NameField::Name(k)),
-                                        Some(tracing_perfetto_sdk_schema::debug_annotation::Value::StringValue(v)),
-                                    ) if k == "id" && *v == format!("{id}")
-                                )
-                            }) =>
-                        {
-                            Some((p.timestamp?, p.timestamp_clock_id?))
-                        }
-                        _ => {
-                            None
-                        },
-                    })
-                    .expect("Couldn't find span with correct uuid for gpu timing dump")
-            })
-            .collect_vec();
-        let mut extra_packets = Vec::new();
-        let n_ops = ops.len();
-        for ((device_timings, device_start_time, _span_id), (host_time, host_clock_id)) in
-            self.timings.iter().flatten().zip(host_start_times)
-        {
-            for (sm, sm_timings) in device_timings.chunks(1000).enumerate() {
-                let mut builder = ManualTrackBuilder::new(sm as u32, host_time, host_clock_id);
-                for n_op in 0..sm_timings.len() - 1 {
-                    let event = sm_timings[n_op].event as usize;
-                    // Event encoding:
-                    // 0: Issue
-                    // 1: Wait
-                    // 2 to 2 + n_ops - 1: Main ops
-                    // 2 + n_ops + op_idx * 3 + 0: Prologue A
-                    // 2 + n_ops + op_idx * 3 + 1: Prologue B
-                    // 2 + n_ops + op_idx * 3 + 2: Prologue C
-                    let op_label = if event == 0 {
-                        "Issue".to_string()
-                    } else if event == 1 {
-                        "Wait".to_string()
-                    } else if event >= 2 && event < 2 + n_ops {
-                        ops[event - 2].op_name().to_string()
-                    } else if event >= 2 + n_ops {
-                        let prologue_event = event - 2 - n_ops;
-                        let op_idx = prologue_event / 3;
-                        let prologue_type = prologue_event % 3;
-                        if op_idx < n_ops {
-                            let suffix = match prologue_type {
-                                0 => "prologue A",
-                                1 => "prologue B",
-                                2 => "prologue C",
-                                _ => "prologue ?",
-                            };
-                            format!("{} ({})", ops[op_idx].op_name(), suffix)
-                        } else {
-                            format!("Unknown({})", event)
-                        }
-                    } else {
-                        format!("Unknown({})", event)
-                    };
-                    if sm_timings[n_op + 1].start == 0 {
-                        break;
-                    }
-                    builder.push_slice(
-                        &op_label,
-                        sm_timings[n_op].start - *device_start_time,
-                        sm_timings[n_op + 1].start - *device_start_time,
-                        host_time,
-                        host_clock_id,
-                    );
-                }
-                extra_packets.extend(builder.into_packets());
-            }
-        }
-        trace.packet.extend(extra_packets);
-        let mut buf = Vec::with_capacity(trace.encoded_len());
-        trace.encode(&mut buf).unwrap();
-        std::fs::write(file_path, buf).unwrap();
-    }
-}
-
 #[allow(clippy::type_complexity)]
 pub(crate) fn make_megakernel_from_llir_graph(
     llir_graph: &LLIRGraph,
     subgraph: &FxHashSet<NodeIndex>,
     cuda_stream: &Arc<CudaStream>,
-    kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    kernel_cache: &mut LruCache<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> (
     CudaFunction,
     FxHashMap<char, CudaSlice<u8>>,
@@ -931,7 +966,8 @@ pub(crate) fn make_megakernel_from_llir_graph(
         .node_weights()
         .filter_map(|op| op.to_dialect::<dyn BlockOp>())
         .flat_map(|op| {
-            op.expressions()
+            op.build_payload(cuda_stream, CStruct::new(None))
+                .recorded_expressions
                 .into_iter()
                 .chain(once(op.launch_range().iter().copied().product()))
         })
@@ -967,7 +1003,11 @@ pub(crate) fn make_megakernel_from_llir_graph(
     // Calculate actual max payload size from the ops being used
     let max_payload_size = block_ops
         .iter()
-        .map(|op| op.schedule_op(cuda_stream, &temp_expression_map).len())
+        .map(|op| {
+            op.build_payload(cuda_stream, CStruct::new(Some(&temp_expression_map)))
+                .finish_struct()
+                .len()
+        })
         .max()
         .unwrap_or(0);
 
@@ -996,7 +1036,9 @@ pub(crate) fn make_megakernel_from_llir_graph(
             .iter()
             .position(|o| o.op_name() == op.op_name())
             .unwrap();
-        let mut payload = op.schedule_op(cuda_stream, &expressions);
+        let mut payload = op
+            .build_payload(cuda_stream, CStruct::new(Some(&expressions)))
+            .finish_struct();
         // Pad payload to max_payload_size
         payload.resize(max_payload_size, 0);
         let range = op.launch_range();
@@ -1053,6 +1095,7 @@ pub(crate) fn make_megakernel_from_llir_graph(
             [null(); 3],
             null_mut(),
             &payload,
+            &expressions,
         );
     }
     (

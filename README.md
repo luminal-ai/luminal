@@ -9,10 +9,6 @@ Luminal is a high-performance general-purpose inference compiler.
 [![Current Crates.io Version](https://img.shields.io/crates/v/luminal.svg?style=for-the-badge&logo=rust)](https://crates.io/crates/luminal)
 [![discord](https://dcbadge.limes.pink/api/server/APjuwHAbGy)](https://discord.gg/APjuwHAbGy)
 
-
-> [!IMPORTANT]  
-> The examples may be temporarily broken on the latest main. We're undergoing a large transition to "2.0", which introduces multi-level kernel search. This radically simplifies the compiler stack and allows us to discover complex optimizations entirely automatically while interfacing with high-performace kernel libraries.
-
 ## Usage
 
 ```rust
@@ -29,8 +25,8 @@ cx.build_search_space::<NativeRuntime>();
 let mut rt = cx.search(NativeRuntime::default(), 1);
 
 // Set input tensors
-rt.set_data(a, vec![1.0, 2.0, 3.0].into());
-rt.set_data(b, vec![1.0, 2.0, 3.0, 3.0].into());
+rt.set_data(a, vec![1.0, 2.0, 3.0]);
+rt.set_data(b, vec![1.0, 2.0, 3.0, 3.0]);
 
 // Run
 rt.execute(&cx.dyn_map);
@@ -43,13 +39,9 @@ println!("Result: {:?}", rt.get_f32(c));
 
 **Llama 3 8B**
 
-- the below is a quick example of how you can run Llama 3 8B locally using Luminal
-
+Here's a quick example of how you can run Llama 3 8B locally using Luminal on CUDA:
 ```bash
 cd ./examples/llama
-# Download the model
-uv run --script setup/setup.py
-# Run the model
 cargo run --release
 ```
 
@@ -57,25 +49,21 @@ cargo run --release
 
 ### Speed
 
-Luminal can run Q8 Llama 3 8B on M-series Macbooks at 15-25 tokens per second. The goal is to become the fastest ML framework for any model on any device.
+Luminal can run Q8 Llama 3 8B at ~80% of theoretical max performance on an H100. The goal is to become the fastest ML framework for any model on any device.
 
 ### Simplicity
 
-The core of luminal is and always will be minimal. It should be possible to understand the entire core library in an afternoon.
+The core of Luminal is and always will be minimal. It should be possible to understand the entire core library in an afternoon.
 
 ### RISC-style architecture
 
-Everything in luminal boils down to 12 primitive ops:
+Everything in Luminal boils down to 14 primitive ops:
 
 - Unary - `Log2, Exp2, Sin, Sqrt, Recip`
 - Binary - `Add, Mul, Mod, LessThan`
-- Other - `SumReduce, MaxReduce, Contiguous`
+- Other - `SumReduce, MaxReduce, Iota, Gather, Cast`
 
-These ops are enough to support transformers, convnets, etc.
-
-### Speed
-
-We compile these ops into complex GPU kernels, so even though our ops are simple, we get high performance through the power of compilers! This is how we overcome the typical RISC disadvantages, btw.
+These ops are enough to support transformers, convnets, and nearly every popular model.
 
 ### Search
 
@@ -87,7 +75,7 @@ The current ML ecosystem is too fragmented, and the solution isn't another layer
 
 ### Validated against Pytorch
 
-Correctness matters. So we write as much tests as possible to cover all ops and verify they work the same as an equivalent Pytorch implementation. ([Improvements needed!](https://github.com/jafioti/luminal/issues/20))
+Correctness matters. We write as much tests as possible to cover all ops and verify they work the same as an equivalent Pytorch implementation. ([Improvements needed!](https://github.com/jafioti/luminal/issues/20))
 
 ## Ideology
 

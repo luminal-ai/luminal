@@ -1,9 +1,21 @@
-use crate::{block::*, kernel::KernelOp};
-use cudarc::driver::CudaModule;
-use cudarc::driver::sys::{CUdevice_attribute, CUfunction_attribute};
-use cudarc::driver::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg, sys::CUevent_flags,
+use crate::{
+    block::{
+        BlockOp, N_TIMING_SLOTS, SMEvent, TaskQueue, make_megakernel_from_llir_graph,
+        record_block_op_timings,
+    },
+    host::HostOp,
+    kernel::{
+        CudaFunctionExt, CudaGraphExecHandle, CudaGraphHandle, CudaGraphKernelTiming,
+        CudaGraphTiming, KernelOp, KernelParams, create_cuda_event, destroy_cuda_event,
+        event_elapsed_ms, record_cuda_graph_timings,
+    },
 };
+use colorize::AnsiColor;
+use cudarc::driver::{
+    CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PinnedHostSlice,
+    PushKernelArg, sys::CUgraphNode,
+};
+
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use luminal::hlir::*;
@@ -16,10 +28,16 @@ use luminal::prelude::{
     },
     *,
 };
+
+use luminal_tracing::PerfettoGuard;
 use memmap2::MmapOptions;
+use prost::Message;
 use safetensors::SafeTensors;
-use std::{collections::VecDeque, fmt::Debug, fs::File, sync::Arc, time::Duration};
-use tracing::{Level, field, span};
+use std::{
+    collections::VecDeque, fmt::Debug, fs::File, mem::size_of, num::NonZero, sync::Arc,
+    time::Duration,
+};
+use tracing::{Level, enabled, field, span, trace};
 use uuid::Uuid;
 
 pub enum CudaInput {
@@ -27,7 +45,42 @@ pub enum CudaInput {
     Ptr(u64),
 }
 
-#[derive(Clone)]
+#[allow(dead_code)]
+#[derive(Debug)]
+struct CudaGraphKernelNode {
+    llir_node: NodeIndex,
+    kernel: CudaFunction,
+    launch_grid: (Expression, Expression, Expression),
+    launch_threadblock: (Expression, Expression, Expression),
+    shared_mem: Expression,
+    inputs: Vec<NodeIndex>,
+    output: NodeIndex,
+    kernel_name: &'static str,
+    kernel_str: String,
+    bytes_loaded: Expression,
+    bytes_stored: Expression,
+    flops: Expression,
+}
+
+struct CudaGraphExecData {
+    cuda_graph: Option<CudaGraphHandle>,
+    cuda_graph_exec: Option<CudaGraphExecHandle>,
+    node_to_graph_node: FxHashMap<NodeIndex, CUgraphNode>,
+    kernel_params: Vec<KernelParams>,
+    kernel_info: Vec<CudaGraphKernelNode>,
+    /// Shared device buffer for dynamic dimensions (all kernels read from this)
+    dyn_dims_buffer: Option<CudaSlice<i32>>,
+    /// Order of dynamic dimensions in the buffer (sorted alphabetically)
+    dyn_dims_order: Vec<char>,
+    last_dyn_values: FxHashMap<char, usize>,
+    last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
+    timing_events: Vec<cudarc::driver::sys::CUevent>,
+    // Profiling
+    total_bytes_loaded: Expression,
+    total_bytes_stored: Expression,
+    total_flops: Expression,
+}
+
 enum ExecutableKernel {
     Megakernel {
         interpreter: CudaFunction,
@@ -36,19 +89,12 @@ enum ExecutableKernel {
         work_queue: TaskQueue,
         node_to_task_index: FxHashMap<NodeIndex, usize>,
     },
-    Kernel {
-        kernel: CudaFunction,
-        launch_grid: (Expression, Expression, Expression),
-        launch_threadblock: (Expression, Expression, Expression),
-        shared_mem: Expression,
+    CudaGraphExec(Box<CudaGraphExecData>),
+    HostOp {
+        stream: Arc<CudaStream>,
         inputs: Vec<NodeIndex>,
         output: NodeIndex,
-        constants: FxHashMap<char, CudaSlice<u8>>,
-        // Profiling metrics
-        kernel_name: &'static str,
-        bytes_loaded: Expression,
-        bytes_stored: Expression,
-        flops: Expression,
+        internal: Arc<Box<dyn HostOp>>,
     },
 }
 
@@ -84,32 +130,47 @@ impl Drop for ExecutableKernel {
                 ..
             } => {
                 // Prevent Drop of CudaSlice<u8> (likely calls cuMemFree).
+                // These CudaSlices point to module memory, not separately allocated memory.
                 let m = std::mem::take(interpreter_constants);
                 for (_k, v) in m {
                     std::mem::forget(v);
                 }
             }
-            ExecutableKernel::Kernel { constants, .. } => {
-                let m = std::mem::take(constants);
-                for (_k, v) in m {
-                    std::mem::forget(v);
+            ExecutableKernel::CudaGraphExec(data) => {
+                // Prevent Drop of dyn_dims_buffer (it's managed by the runtime's allocator)
+                if let Some(buf) = data.dyn_dims_buffer.take() {
+                    std::mem::forget(buf);
                 }
+                // Destroy timing events using the context from CudaGraphExecHandle
+                if let Some(exec) = data.cuda_graph_exec.as_ref() {
+                    for event in data.timing_events.drain(..) {
+                        destroy_cuda_event(&exec.ctx, event);
+                    }
+                }
+                // CudaGraphHandle and CudaGraphExecHandle have proper Drop impls
             }
+            ExecutableKernel::HostOp { .. } => {}
         }
     }
 }
 
 impl Debug for ExecutableKernel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Megakernel { work_queue, .. } => format!("Megakernel ({})", work_queue.len()),
-                Self::Kernel { .. } => "Kernel".to_string(),
+        match self {
+            Self::Megakernel { work_queue, .. } => write!(f, "Megakernel ({})", work_queue.len()),
+            Self::CudaGraphExec(data) => {
+                write!(f, "CudaGraph ({})", data.kernel_info.len())
             }
-        )
+            Self::HostOp { internal, .. } => write!(f, "HostOp: ({internal:?})"),
+        }
     }
+}
+
+/// Pending timing data using pinned memory for async copies
+struct PendingTimingData {
+    timing_buffer_idx: usize,
+    start_time_idx: usize,
+    span_id: Uuid,
 }
 
 pub struct CudaRuntime {
@@ -117,21 +178,46 @@ pub struct CudaRuntime {
     pub buffers: FxHashMap<NodeIndex, CudaSlice<u8>>,
     pub llir_graph: luminal::graph::LLIRGraph,
     cuda_stream: Arc<CudaStream>,
+    timing_stream: Arc<CudaStream>,
     exec_graph: StableGraph<ExecutableKernel, (), Directed>,
     node_to_exec: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) timings: Vec<Vec<(Vec<SMEvent>, u64, Uuid)>>,
+    pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
+    /// Pending timing data collected asynchronously using pinned memory
+    pending_timing_data: Vec<PendingTimingData>,
+    /// Pool of pre-allocated pinned timing buffers (one per slot)
+    pinned_timing_pool: Vec<PinnedHostSlice<SMEvent>>,
+    /// Pool of pre-allocated pinned start time buffers (one per slot)
+    pinned_start_pool: Vec<PinnedHostSlice<u64>>,
+    /// Index of next available slot in the pinned buffer pools
+    next_pinned_slot: usize,
     last_dyn_map: FxHashMap<char, usize>,
     intermediate_buffer_dims: FxHashSet<char>,
     llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
     changed_hlir: FxHashSet<NodeIndex>,
-    // Raw stats saved during execute, interpreted lazily in print_execution_stats
+    /// Cached buffer pointers to avoid repeated device_ptr() calls (keyed by llir_node)
+    cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     pub last_kernel_stats: Vec<KernelStats>,
     pub last_total_time_us: f64,
-    kernel_cache: FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    kernel_cache: lru::LruCache<String, (Arc<CudaModule>, CudaFunction)>,
+    num_sms: usize,
 }
 
 impl CudaRuntime {
+    /// Creates a new CudaRuntime with default configuration:
+    /// - Device 0
+    /// - Blocking sync scheduling
+    /// - Default stream
+    pub fn new() -> Result<Self, cudarc::driver::DriverError> {
+        let ctx = cudarc::driver::CudaContext::new(0)?;
+        ctx.bind_to_thread()?;
+        ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
+        let stream = ctx.default_stream();
+
+        Ok(Self::initialize(stream))
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
         let f = File::open(file_path).unwrap();
@@ -182,7 +268,7 @@ impl CudaRuntime {
             .unwrap();
         let _span = span!(Level::TRACE, "dtoh").entered();
         self.cuda_stream
-            .memcpy_dtov(
+            .clone_dtoh(
                 self.buffers
                     .get(&data_id)
                     .expect("Cannot find tensor in runtime!"),
@@ -263,10 +349,22 @@ impl CudaRuntime {
                         .unwrap(),
                 );
                 let ptr = self.buffers[&node].device_ptr(&self.cuda_stream).0;
+                self.cached_buffer_ptrs.insert(node, ptr);
                 self.register_buffer(node, ptr);
             } else if let Some(op) = self.llir_graph[node].to_dialect::<dyn KernelOp>() {
-                self.intermediate_buffer_dims
-                    .extend(op.output_size().dyn_vars());
+                let out_size = op.output_size();
+                let exec_size = out_size.exec(dyn_dims).unwrap();
+                self.intermediate_buffer_dims.extend(out_size.dyn_vars());
+                self.buffers.insert(
+                    node,
+                    self.cuda_stream
+                        .alloc_zeros(exec_size * size_of::<f32>())
+                        .unwrap(),
+                );
+                let ptr = self.buffers[&node].device_ptr(&self.cuda_stream).0;
+                self.cached_buffer_ptrs.insert(node, ptr);
+                self.register_buffer(node, ptr);
+            } else if let Some(op) = self.llir_graph[node].to_dialect::<dyn HostOp>() {
                 self.buffers.insert(
                     node,
                     self.cuda_stream
@@ -274,7 +372,242 @@ impl CudaRuntime {
                         .unwrap(),
                 );
                 let ptr = self.buffers[&node].device_ptr(&self.cuda_stream).0;
+                self.cached_buffer_ptrs.insert(node, ptr);
                 self.register_buffer(node, ptr);
+            }
+        }
+    }
+
+    /// Prebuild all CUDA graphs with the given dynamic dimension values.
+    ///
+    /// Call this after `load_llir` (via `cx.search()`) and before the first `execute()`
+    /// to front-load the graph building overhead. This moves the ~300μs graph instantiation
+    /// cost from the first inference to the initialization phase.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut rt = cx.search(rt, 5);
+    /// rt.prebuild_graphs(&cx.dyn_map);  // Build graphs now
+    /// rt.execute(&cx.dyn_map);          // First execute is fast
+    /// ```
+    #[tracing::instrument(skip_all)]
+    pub fn prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) {
+        // 1. Allocate intermediate buffers (needed for buffer pointers)
+        if self.buffers.is_empty() {
+            self.last_dyn_map = dyn_map.clone();
+            self.allocate_intermediate_buffers(dyn_map);
+            // Synchronize to ensure all async allocations complete before building CUDA graphs
+            self.cuda_stream.synchronize().unwrap();
+        }
+
+        // 2. Process changed HLIR inputs to get their buffer pointers
+        // Only process inputs that have data in hlir_buffers
+        if !self.changed_hlir.is_empty() {
+            // First pass: collect nodes and pointers (immutable borrows)
+            let to_process: Vec<(NodeIndex, NodeIndex, u64)> = self
+                .changed_hlir
+                .iter()
+                .filter_map(|hlir_node| {
+                    self.hlir_buffers.get(hlir_node).map(|input| {
+                        let llir_node = self.hlir_to_llir[hlir_node];
+                        let ptr = match input {
+                            CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
+                            CudaInput::Ptr(p) => *p,
+                        };
+                        (*hlir_node, llir_node, ptr)
+                    })
+                })
+                .collect();
+
+            // Second pass: apply mutations
+            for (hlir_node, llir_node, ptr) in to_process {
+                self.cached_buffer_ptrs.insert(llir_node, ptr);
+                self.register_buffer(llir_node, ptr);
+                self.changed_hlir.remove(&hlir_node);
+            }
+        }
+
+        // 3. Build all CUDA graphs
+        let tracing_enabled = enabled!(Level::TRACE);
+        let exec_nodes: Vec<_> = toposort(&self.exec_graph, None).unwrap();
+        for exec_node in exec_nodes {
+            if let ExecutableKernel::CudaGraphExec(data) = &mut self.exec_graph[exec_node] {
+                let CudaGraphExecData {
+                    cuda_graph,
+                    cuda_graph_exec,
+                    node_to_graph_node,
+                    kernel_params,
+                    kernel_info,
+                    dyn_dims_buffer,
+                    dyn_dims_order,
+                    last_dyn_values,
+                    last_buffer_ptrs,
+                    timing_events,
+                    ..
+                } = &mut **data;
+                // Skip if already built
+                if cuda_graph.is_some() {
+                    continue;
+                }
+
+                let _span = span!(
+                    Level::TRACE,
+                    "prebuild_cuda_graph",
+                    kernels = kernel_info.len()
+                )
+                .entered();
+
+                // Collect buffer pointers - skip this graph if any pointer is missing
+                let mut current_buffer_ptrs = FxHashMap::default();
+                let mut all_ptrs_available = true;
+                'outer: for info in kernel_info.iter() {
+                    if let Some(&output_ptr) = self.cached_buffer_ptrs.get(&info.output) {
+                        current_buffer_ptrs.insert(info.output, output_ptr);
+                    } else {
+                        all_ptrs_available = false;
+                        break;
+                    }
+                    for inp in &info.inputs {
+                        if current_buffer_ptrs.contains_key(inp) {
+                            continue;
+                        }
+                        if let Some(&ptr) = self.cached_buffer_ptrs.get(inp) {
+                            current_buffer_ptrs.insert(*inp, ptr);
+                        } else {
+                            all_ptrs_available = false;
+                            break 'outer;
+                        }
+                    }
+                }
+
+                // Skip building this graph if not all buffer pointers are available
+                if !all_ptrs_available {
+                    continue;
+                }
+
+                // Allocate dyn_dims buffer if needed
+                if !dyn_dims_order.is_empty() && dyn_dims_buffer.is_none() {
+                    *dyn_dims_buffer = Some(
+                        self.cuda_stream
+                            .alloc_zeros::<i32>(dyn_dims_order.len())
+                            .expect("Failed to allocate dyn_dims buffer"),
+                    );
+                    // Initialize with current values
+                    let values: Vec<i32> = dyn_dims_order
+                        .iter()
+                        .map(|d| dyn_map.get(d).copied().unwrap_or(0) as i32)
+                        .collect();
+                    if let Some(buf) = dyn_dims_buffer.as_mut() {
+                        self.cuda_stream
+                            .memcpy_htod(&values, buf)
+                            .expect("Failed to initialize dyn_dims buffer");
+                    }
+                }
+
+                // Build the graph
+                let ctx = self.cuda_stream.context().clone();
+                let mut new_graph =
+                    CudaGraphHandle::new(ctx.clone()).expect("Failed to create CUDA graph");
+
+                kernel_params.clear();
+                kernel_params.reserve(kernel_info.len());
+
+                // Create timing events if tracing
+                if tracing_enabled {
+                    let needed_events = kernel_info.len() + 1;
+                    if timing_events.len() < needed_events {
+                        for _ in timing_events.len()..needed_events {
+                            timing_events.push(
+                                create_cuda_event(&ctx).expect("Failed to create timing event"),
+                            );
+                        }
+                    }
+                }
+
+                let dyn_dims_ptr = dyn_dims_buffer
+                    .as_ref()
+                    .map(|buf| buf.device_ptr(&self.cuda_stream).0)
+                    .unwrap_or(0);
+
+                // Bind context once
+                new_graph.ctx.bind_to_thread().unwrap();
+
+                let mut input_ptrs: Vec<u64> = Vec::with_capacity(16);
+                let mut prev_graph_node: Option<CUgraphNode> = None;
+
+                for (idx, info) in kernel_info.iter().enumerate() {
+                    let grid_dim = (
+                        info.launch_grid.0.exec(dyn_map).unwrap() as u32,
+                        info.launch_grid.1.exec(dyn_map).unwrap() as u32,
+                        info.launch_grid.2.exec(dyn_map).unwrap() as u32,
+                    );
+                    let block_dim = (
+                        info.launch_threadblock.0.exec(dyn_map).unwrap() as u32,
+                        info.launch_threadblock.1.exec(dyn_map).unwrap() as u32,
+                        info.launch_threadblock.2.exec(dyn_map).unwrap() as u32,
+                    );
+                    let shared_mem = info.shared_mem.exec(dyn_map).unwrap() as u32;
+                    let output_ptr = current_buffer_ptrs[&info.output];
+
+                    input_ptrs.clear();
+                    input_ptrs.extend(info.inputs.iter().map(|inp| current_buffer_ptrs[inp]));
+
+                    let mut params = if !dyn_dims_order.is_empty() {
+                        KernelParams::with_dyn_dims(output_ptr, &input_ptrs, dyn_dims_ptr)
+                    } else {
+                        KernelParams::new(output_ptr, &input_ptrs)
+                    };
+                    let cu_func = unsafe { info.kernel.raw_function() };
+
+                    let deps: &[CUgraphNode] = match (&prev_graph_node, tracing_enabled) {
+                        (Some(prev), true) => {
+                            let event_node = new_graph
+                                .add_event_record_node(&[*prev], timing_events[idx])
+                                .expect("Failed to add event record node");
+                            prev_graph_node = Some(event_node);
+                            std::slice::from_ref(prev_graph_node.as_ref().unwrap())
+                        }
+                        (None, true) => {
+                            let event_node = new_graph
+                                .add_event_record_node(&[], timing_events[idx])
+                                .expect("Failed to add event record node");
+                            prev_graph_node = Some(event_node);
+                            std::slice::from_ref(prev_graph_node.as_ref().unwrap())
+                        }
+                        (Some(prev), false) => std::slice::from_ref(prev),
+                        (None, false) => &[],
+                    };
+
+                    let graph_node = unsafe {
+                        new_graph.add_kernel_node(
+                            deps,
+                            cu_func,
+                            grid_dim,
+                            block_dim,
+                            shared_mem,
+                            params.as_cuda_params(),
+                        )
+                    }
+                    .expect("Failed to add kernel node");
+                    node_to_graph_node.insert(info.llir_node, graph_node);
+                    kernel_params.push(params);
+                    prev_graph_node = Some(graph_node);
+                }
+
+                if tracing_enabled && let Some(prev) = prev_graph_node {
+                    new_graph
+                        .add_event_record_node(&[prev], timing_events[kernel_info.len()])
+                        .expect("Failed to add final event node");
+                }
+
+                let new_exec = new_graph
+                    .instantiate()
+                    .expect("Failed to instantiate CUDA graph");
+
+                *cuda_graph = Some(new_graph);
+                *cuda_graph_exec = Some(new_exec);
+                *last_dyn_values = dyn_map.clone();
+                *last_buffer_ptrs = current_buffer_ptrs;
             }
         }
     }
@@ -284,23 +617,11 @@ pub trait ToCudaInput {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput;
 }
 
-impl ToCudaInput for Vec<f32> {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .memcpy_stod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
-    }
-}
-
 impl ToCudaInput for &[f32] {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
         CudaInput::Buffer(
             stream
-                .memcpy_stod(unsafe {
+                .clone_htod(unsafe {
                     std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
                 })
                 .unwrap(),
@@ -312,7 +633,19 @@ impl ToCudaInput for Vec<i32> {
     fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
         CudaInput::Buffer(
             stream
-                .memcpy_stod(unsafe {
+                .clone_htod(unsafe {
+                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
+                })
+                .unwrap(),
+        )
+    }
+}
+
+impl ToCudaInput for Vec<f32> {
+    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
+        CudaInput::Buffer(
+            stream
+                .clone_htod(unsafe {
                     std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
                 })
                 .unwrap(),
@@ -321,93 +654,233 @@ impl ToCudaInput for Vec<i32> {
 }
 
 impl Runtime for CudaRuntime {
-    type Ops = (crate::logical::Ops, crate::kernel::Ops, crate::block::Ops);
+    type Ops = (
+        crate::logical::Ops,
+        crate::kernel::Ops,
+        crate::block::Ops,
+        crate::host::Ops,
+    );
     type CompileArg = Arc<CudaStream>;
     type ExecReturn = ();
     type ProfileMetric = Duration;
 
     fn initialize(stream: Self::CompileArg) -> Self {
+        let ctx = stream.context();
+        let num_sms = ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .unwrap() as usize;
+        let timing_stream = ctx.new_stream().expect("Failed to create timing stream");
+
+        // Pre-allocate pinned buffer pools for async timing collection
+        // We allocate enough slots to handle many megakernels between flushes
+        const PINNED_POOL_SIZE: usize = 64;
+        let timing_len = num_sms * N_TIMING_SLOTS;
+        let pinned_timing_pool;
+        let pinned_start_pool;
+        if enabled!(Level::TRACE) {
+            pinned_timing_pool = (0..PINNED_POOL_SIZE)
+                .map(|_| unsafe {
+                    ctx.alloc_pinned::<SMEvent>(timing_len)
+                        .expect("Failed to allocate pinned timing buffer")
+                })
+                .collect::<Vec<_>>();
+            pinned_start_pool = (0..PINNED_POOL_SIZE)
+                .map(|_| unsafe {
+                    ctx.alloc_pinned::<u64>(num_sms)
+                        .expect("Failed to allocate pinned start time buffer")
+                })
+                .collect::<Vec<_>>();
+        } else {
+            pinned_timing_pool = vec![];
+            pinned_start_pool = vec![]
+        }
+
         Self {
+            num_sms,
             hlir_buffers: FxHashMap::default(),
             buffers: FxHashMap::default(),
             cuda_stream: stream,
+            timing_stream,
             llir_graph: StableGraph::default(),
             exec_graph: StableGraph::default(),
             node_to_exec: FxHashMap::default(),
             hlir_to_llir: FxHashMap::default(),
             llir_to_hlir: FxHashMap::default(),
             changed_hlir: FxHashSet::default(),
+            cached_buffer_ptrs: FxHashMap::default(),
             timings: vec![],
+            cuda_graph_timings: vec![],
+            pending_timing_data: vec![],
+            pinned_timing_pool,
+            pinned_start_pool,
+            next_pinned_slot: 0,
             last_dyn_map: FxHashMap::default(),
             intermediate_buffer_dims: FxHashSet::default(),
             last_kernel_stats: vec![],
             last_total_time_us: 0.0,
-            kernel_cache: FxHashMap::default(),
+            kernel_cache: lru::LruCache::new(NonZero::new(100).unwrap()),
         }
     }
 
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
+        // Synchronize to ensure all CUDA operations are complete before clearing
+        self.cuda_stream.synchronize().unwrap();
         // Clear intermediate buffers when loading new graph - they need to be
-        // reallocated and re-registered with the new work_queue
+        // reallocated and re-registered with the new exec_graph
         self.buffers.clear();
-        self.exec_graph.clear();
-        let block_ops_in_graph = llir_graph
-            .node_indices()
-            .filter(|n| llir_graph[*n].to_dialect::<dyn BlockOp>().is_some())
-            .collect::<FxHashSet<_>>();
-        let block_subgraphs = partition_marked_convex(llir_graph, &block_ops_in_graph).unwrap();
+        self.cached_buffer_ptrs.clear();
 
-        // Add megakernels
         let mut exec_graph = StableGraph::default();
         let mut node_to_exec = FxHashMap::default();
-        for subgraph in block_subgraphs {
-            let (interpreter, constants, n_barriers, tasks, node_to_task_index) =
-                make_megakernel_from_llir_graph(
-                    llir_graph,
-                    &subgraph,
-                    &self.cuda_stream,
-                    &mut self.kernel_cache,
-                );
-            let exec_node = exec_graph.add_node(ExecutableKernel::Megakernel {
-                interpreter,
-                interpreter_constants: constants,
-                n_barriers,
-                work_queue: tasks,
-                node_to_task_index,
-            });
+
+        // Add megakernels
+        {
+            let _span = span!(Level::TRACE, "compile_megakernels").entered();
+            let block_ops_in_graph = llir_graph
+                .node_indices()
+                .filter(|n| llir_graph[*n].to_dialect::<dyn BlockOp>().is_some())
+                .collect::<FxHashSet<_>>();
+            let block_subgraphs = partition_marked_convex(llir_graph, &block_ops_in_graph).unwrap();
+            for subgraph in block_subgraphs {
+                let (interpreter, constants, n_barriers, tasks, node_to_task_index) =
+                    make_megakernel_from_llir_graph(
+                        llir_graph,
+                        &subgraph,
+                        &self.cuda_stream,
+                        &mut self.kernel_cache,
+                    );
+                let exec_node = exec_graph.add_node(ExecutableKernel::Megakernel {
+                    interpreter,
+                    interpreter_constants: constants,
+                    n_barriers,
+                    work_queue: tasks,
+                    node_to_task_index,
+                });
+                for node in subgraph {
+                    node_to_exec.insert(node, exec_node);
+                }
+            }
+        }
+
+        // Add kernels
+        let _span = span!(Level::TRACE, "compile_kernels").entered();
+        let kernel_ops_in_graph = llir_graph
+            .node_indices()
+            .filter(|n| llir_graph[*n].to_dialect::<dyn KernelOp>().is_some())
+            .collect::<FxHashSet<_>>();
+        let kernel_subgraphs = partition_marked_convex(llir_graph, &kernel_ops_in_graph).unwrap();
+        let mut compile_cache = FxHashMap::default();
+        for subgraph in kernel_subgraphs {
+            // Create a CUDA graph for this subgraph (even single kernels)
+            // The actual graph is built lazily on first execute (needs buffer pointers)
+            let mut kernel_info = Vec::with_capacity(subgraph.len());
+            let mut all_dyn_dims = FxHashSet::default();
+            let mut total_bytes_loaded = Expression::from(0);
+            let mut total_bytes_stored = Expression::from(0);
+            let mut total_flops = Expression::from(0);
+
+            // Get topological order for kernels in this subgraph
+            let topo_order: Vec<_> = toposort(llir_graph, None)
+                .unwrap()
+                .into_iter()
+                .filter(|n| subgraph.contains(n))
+                .collect();
+
+            for kernel in &topo_order {
+                let kernel_op = llir_graph[*kernel].to_dialect::<dyn KernelOp>().unwrap();
+                let span = span!(Level::TRACE, "kernel_compile").entered();
+                let (kernel_function, _, kernel_str, grid, tb, shared_mem, _constants) =
+                    kernel_op.compile(&self.cuda_stream, &mut compile_cache);
+                drop(span);
+                let inputs = llir_graph
+                    .edges_directed(*kernel, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .map(|e| e.source())
+                    .collect_vec();
+
+                total_bytes_loaded += kernel_op.bytes_loaded();
+                total_bytes_stored += kernel_op.bytes_stored();
+                total_flops += kernel_op.flops();
+
+                // Collect all dyn dims used by this kernel's expressions
+                all_dyn_dims.extend(grid.0.dyn_vars());
+                all_dyn_dims.extend(grid.1.dyn_vars());
+                all_dyn_dims.extend(grid.2.dyn_vars());
+                all_dyn_dims.extend(tb.0.dyn_vars());
+                all_dyn_dims.extend(tb.1.dyn_vars());
+                all_dyn_dims.extend(tb.2.dyn_vars());
+                all_dyn_dims.extend(shared_mem.dyn_vars());
+                all_dyn_dims.extend(kernel_op.output_size().dyn_vars());
+                all_dyn_dims.extend(kernel_op.bytes_loaded().dyn_vars());
+                all_dyn_dims.extend(kernel_op.bytes_stored().dyn_vars());
+
+                kernel_info.push(CudaGraphKernelNode {
+                    llir_node: *kernel,
+                    kernel: kernel_function,
+                    launch_grid: grid,
+                    launch_threadblock: tb,
+                    shared_mem,
+                    inputs,
+                    kernel_str,
+                    output: *kernel,
+                    kernel_name: kernel_op.kernel_name(),
+                    bytes_loaded: kernel_op.bytes_loaded(),
+                    bytes_stored: kernel_op.bytes_stored(),
+                    flops: kernel_op.flops(),
+                });
+            }
+
+            // Sort dyn dims alphabetically for consistent buffer layout
+            let mut dyn_dims_order: Vec<char> = all_dyn_dims.into_iter().collect();
+            dyn_dims_order.sort();
+
+            let exec_node = exec_graph.add_node(ExecutableKernel::CudaGraphExec(Box::new(
+                CudaGraphExecData {
+                    cuda_graph: None,
+                    cuda_graph_exec: None,
+                    node_to_graph_node: FxHashMap::default(),
+                    kernel_params: Vec::new(),
+                    kernel_info,
+                    dyn_dims_buffer: None,
+                    dyn_dims_order,
+                    last_dyn_values: FxHashMap::default(),
+                    last_buffer_ptrs: FxHashMap::default(),
+                    timing_events: Vec::new(),
+                    total_bytes_loaded,
+                    total_bytes_stored,
+                    total_flops,
+                },
+            )));
+
             for node in subgraph {
                 node_to_exec.insert(node, exec_node);
             }
         }
-        // Add kernels
-        for kernel in llir_graph.node_indices() {
-            if let Some(kernel_op) = llir_graph[kernel].to_dialect::<dyn KernelOp>() {
-                let (kernel_function, _, _, grid, tb, shared_mem, constants) =
-                    kernel_op.compile(&self.cuda_stream);
+
+        // Add host ops
+        let _span = span!(Level::TRACE, "compile_host_ops").entered();
+        for host_op_node_index in llir_graph.node_indices() {
+            if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
                 let inputs = llir_graph
-                    .edges_directed(kernel, Direction::Incoming)
+                    .edges_directed(host_op_node_index, Direction::Incoming)
                     .sorted_by_key(|e| e.id())
                     .map(|e| e.source())
                     .collect_vec();
                 node_to_exec.insert(
-                    kernel,
-                    exec_graph.add_node(ExecutableKernel::Kernel {
-                        kernel: kernel_function,
-                        launch_grid: grid,
-                        launch_threadblock: tb,
+                    host_op_node_index,
+                    exec_graph.add_node(ExecutableKernel::HostOp {
+                        stream: Arc::clone(&self.cuda_stream),
                         inputs,
-                        output: kernel,
-                        shared_mem,
-                        constants,
-                        kernel_name: kernel_op.kernel_name(),
-                        bytes_loaded: kernel_op.bytes_loaded(),
-                        bytes_stored: kernel_op.bytes_stored(),
-                        flops: kernel_op.flops(),
+                        output: host_op_node_index,
+                        internal: Arc::clone(host_op),
                     }),
                 );
             }
         }
+
         // Add edges
         for edge in llir_graph.edge_indices() {
             let (start, end) = llir_graph.edge_endpoints(edge).unwrap();
@@ -424,6 +897,7 @@ impl Runtime for CudaRuntime {
                 exec_graph.add_edge(exec_start, exec_end, ());
             }
         }
+
         self.exec_graph = exec_graph;
         self.llir_graph = llir_graph.clone();
         self.node_to_exec = node_to_exec;
@@ -442,6 +916,12 @@ impl Runtime for CudaRuntime {
                 .insert(NodeIndex::new(hlir_node), llir_node);
             self.changed_hlir.insert(NodeIndex::new(hlir_node));
         }
+
+        // Prebuild CUDA graphs if we have a previous dyn_map (e.g., from search/profile)
+        if !self.last_dyn_map.is_empty() {
+            let dyn_map = self.last_dyn_map.clone();
+            self.prebuild_graphs(&dyn_map);
+        }
     }
 
     #[tracing::instrument(skip_all)]
@@ -449,28 +929,37 @@ impl Runtime for CudaRuntime {
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
+        trials: usize,
     ) -> (Self::ProfileMetric, String) {
-        self.buffers.clear();
+        // Synchronize to ensure all pending operations complete before clearing
+        self.cuda_stream.synchronize().unwrap();
+
+        // Clear timing data from previous profiles to prevent memory accumulation
+        self.timings.clear();
+        self.cuda_graph_timings.clear();
+        self.last_kernel_stats.clear();
+        self.pending_timing_data.clear();
+
         self.load_llir(llir_graph);
-        let start = std::time::Instant::now();
-        self.execute(dyn_map);
-        let duration = start.elapsed();
+        self.last_dyn_map = dyn_map.clone();
+        self.allocate_intermediate_buffers(dyn_map);
+
+        let mut duration = Duration::default();
+        for _ in 0..trials {
+            let start = std::time::Instant::now();
+            self.execute(dyn_map);
+            self.cuda_stream.synchronize().unwrap();
+            duration += start.elapsed();
+        }
+        duration /= trials as u32;
 
         // Compute aggregates for profile display
-        let sm_count = self
-            .cuda_stream
-            .context()
-            .attribute(
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            )
-            .unwrap() as usize;
         let block_op_stats = Self::compute_block_op_stats(
             &self.llir_graph,
-            self.timings.last().unwrap(),
+            self.timings.last().unwrap_or(&vec![]),
             &self.last_dyn_map,
-            sm_count,
+            self.num_sms,
         );
-        self.timings.clear();
 
         let total_bytes: usize = self
             .last_kernel_stats
@@ -506,20 +995,59 @@ impl Runtime for CudaRuntime {
         let duration_str = pretty_duration::pretty_duration(&duration, None);
         let mbu_str = mbu.map_or("-".to_string(), |v| format!("{:.1}%", v * 100.0));
         let mfu_str = mfu.map_or("-".to_string(), |v| format!("{:.1}%", v * 100.0));
-        let display = format!("{duration_str} | MBU: {mbu_str} | MFU: {mfu_str}");
+        let display = format!(
+            "{duration_str:<12} MBU: {} MFU: {} [BLK: {} KRN: {} HOST: {}]",
+            mbu_str.bold(),
+            mfu_str.bold(),
+            self.llir_graph
+                .node_weights()
+                .filter(|n| n.to_dialect::<dyn BlockOp>().is_some())
+                .count()
+                .to_string()
+                .bold(),
+            self.llir_graph
+                .node_weights()
+                .filter(|n| n.to_dialect::<dyn KernelOp>().is_some())
+                .count()
+                .to_string()
+                .bold(),
+            self.llir_graph
+                .node_weights()
+                .filter(|n| n.to_dialect::<dyn HostOp>().is_some())
+                .count()
+                .to_string()
+                .bold(),
+        );
 
         (duration, display)
     }
 
+    fn allocate_dummy_input(&mut self, node_index: usize, num_elements: usize) {
+        let buf = self
+            .cuda_stream
+            .alloc_zeros(num_elements * std::mem::size_of::<f32>())
+            .unwrap();
+        let id = NodeIndex::new(node_index);
+        self.hlir_buffers.insert(id, CudaInput::Buffer(buf));
+        self.changed_hlir.insert(id);
+    }
+
+    fn clear_intermediate_buffers(&mut self) {
+        self.cuda_stream.synchronize().unwrap();
+        self.buffers.clear();
+        self.cached_buffer_ptrs.clear();
+    }
+
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
-        if self.buffers.is_empty()
-            || dyn_map.len() != self.last_dyn_map.len()
-            || dyn_map
-                .iter()
-                .filter(|(d, _)| self.intermediate_buffer_dims.contains(*d))
-                .any(|(d, v)| self.last_dyn_map.get(d).map(|n| *n != *v).unwrap_or(true))
-        {
+        let buffers_empty = self.buffers.is_empty();
+        let dyn_map_len_changed = dyn_map.len() != self.last_dyn_map.len();
+        let dyn_dims_changed = dyn_map
+            .iter()
+            .filter(|(d, _)| self.intermediate_buffer_dims.contains(*d))
+            .any(|(d, v)| self.last_dyn_map.get(d).map(|n| *n != *v).unwrap_or(true));
+        let needs_realloc = buffers_empty || dyn_map_len_changed || dyn_dims_changed;
+        if needs_realloc {
             self.last_dyn_map = dyn_map.clone();
             self.allocate_intermediate_buffers(dyn_map);
         }
@@ -538,111 +1066,16 @@ impl Runtime for CudaRuntime {
                     CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
                     CudaInput::Ptr(p) => *p,
                 };
+                self.cached_buffer_ptrs.insert(llir_node, ptr);
                 self.register_buffer(llir_node, ptr);
             }
             self.changed_hlir.clear();
         }
-        let mut timings = vec![];
         let mut kernel_stats = Vec::new();
         let total_start = std::time::Instant::now();
         for exec_node in toposort(&self.exec_graph, None).unwrap() {
+            trace!("Executing: {:?}", self.exec_graph[exec_node]);
             match &mut self.exec_graph[exec_node] {
-                ExecutableKernel::Kernel {
-                    kernel,
-                    launch_grid,
-                    launch_threadblock,
-                    inputs,
-                    output,
-                    shared_mem,
-                    constants,
-                    kernel_name,
-                    bytes_loaded,
-                    bytes_stored,
-                    flops,
-                } => {
-                    for (dyn_dim, val) in dyn_map {
-                        if let Some(global) = constants.get_mut(dyn_dim) {
-                            let mut view = global.as_view_mut();
-                            let mut symbol = unsafe { view.transmute_mut::<i32>(1).unwrap() };
-                            self.cuda_stream
-                                .memcpy_htod(&[*val as i32], &mut symbol)
-                                .unwrap();
-                        }
-                    }
-                    let cfg = LaunchConfig {
-                        grid_dim: (
-                            launch_grid.0.exec(dyn_map).unwrap() as u32,
-                            launch_grid.1.exec(dyn_map).unwrap() as u32,
-                            launch_grid.2.exec(dyn_map).unwrap() as u32,
-                        ),
-                        block_dim: (
-                            launch_threadblock.0.exec(dyn_map).unwrap() as u32,
-                            launch_threadblock.1.exec(dyn_map).unwrap() as u32,
-                            launch_threadblock.2.exec(dyn_map).unwrap() as u32,
-                        ),
-                        shared_mem_bytes: shared_mem.exec(dyn_map).unwrap() as u32,
-                    };
-                    let mut ptrs = vec![];
-                    for inp in inputs {
-                        if let Some(buf) = self.buffers.get(inp) {
-                            ptrs.push(buf.device_ptr(&self.cuda_stream).0);
-                        } else {
-                            ptrs.push(match &self.hlir_buffers[&self.llir_to_hlir[inp]] {
-                                CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
-                                CudaInput::Ptr(p) => *p,
-                            });
-                        }
-                    }
-                    let mut lb = self.cuda_stream.launch_builder(kernel);
-                    lb.arg(&self.buffers[output]);
-                    for ptr in &ptrs {
-                        lb.arg(ptr);
-                    }
-                    let span = span!(Level::INFO, "kernel", kernel = field::Empty);
-                    span.record("kernel", &kernel_name);
-                    let _entered = span.enter();
-
-                    // Use CUDA events for accurate GPU-side timing
-                    let start_event = self
-                        .cuda_stream
-                        .context()
-                        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-                        .unwrap();
-                    let end_event = self
-                        .cuda_stream
-                        .context()
-                        .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
-                        .unwrap();
-
-                    start_event.record(&self.cuda_stream).unwrap();
-                    unsafe { lb.launch(cfg) }.unwrap();
-                    end_event.record(&self.cuda_stream).unwrap();
-
-                    // elapsed_ms synchronizes internally
-                    let kernel_time_ms = start_event.elapsed_ms(&end_event).unwrap();
-                    let kernel_time_us = kernel_time_ms as f64 * 1000.0;
-
-                    // Calculate metrics
-                    let loaded = bytes_loaded.exec(dyn_map).unwrap_or(0);
-                    let stored = bytes_stored.exec(dyn_map).unwrap_or(0);
-                    let flop_count = flops.exec(dyn_map).unwrap_or(0);
-
-                    // Calculate bandwidth (GB/s) and compute (TFLOPS)
-                    // Total memory traffic = bytes loaded + bytes stored
-                    let total_bytes = loaded + stored;
-                    let bandwidth_gbps = (total_bytes as f64) / (kernel_time_us * 1e-6) / 1e9;
-                    let tflops = (flop_count as f64) / (kernel_time_us * 1e-6) / 1e12;
-
-                    kernel_stats.push(KernelStats {
-                        name: kernel_name,
-                        execution_time_us: kernel_time_us,
-                        bytes_loaded: loaded,
-                        bytes_stored: stored,
-                        flops: flop_count,
-                        bandwidth_gbps,
-                        tflops,
-                    });
-                }
                 ExecutableKernel::Megakernel {
                     interpreter,
                     interpreter_constants,
@@ -655,20 +1088,20 @@ impl Runtime for CudaRuntime {
                         .context()
                         .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
                         .unwrap();
-                    let span = span!(Level::INFO, "megakernel_setup");
+                    let span = span!(Level::TRACE, "megakernel_setup");
                     // Upload queue, barriers and program counter
                     let d_barriers = self
                         .cuda_stream
                         .alloc_zeros::<i32>(n_barriers.exec(dyn_map).unwrap())
                         .unwrap();
-                    let d_tasks = self.cuda_stream.memcpy_stod(work_queue.as_slice()).unwrap();
-                    let d_head = self.cuda_stream.memcpy_stod(&[0i32]).unwrap();
-                    let queue_lock = self.cuda_stream.memcpy_stod(&[0i32]).unwrap();
+                    let d_tasks = self.cuda_stream.clone_htod(work_queue.as_slice()).unwrap();
+                    let d_head = self.cuda_stream.clone_htod(&[0i32]).unwrap();
+                    let queue_lock = self.cuda_stream.clone_htod(&[0i32]).unwrap();
                     // Set up timing buffer storing (start_u64, stop_u64, event_i32) tuples
-                    // for up to 1000 events per SM
+                    // for up to N_TIMING_SLOTS events per SM
                     let timing_buffer = self
                         .cuda_stream
-                        .alloc_zeros::<SMEvent>(sm_count as usize * 1000)
+                        .alloc_zeros::<SMEvent>(sm_count as usize * N_TIMING_SLOTS)
                         .unwrap();
                     let start_time = self
                         .cuda_stream
@@ -687,18 +1120,18 @@ impl Runtime for CudaRuntime {
                     }
 
                     let per_block_optin = self.cuda_stream.context().attribute(
-                        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
-                    ).unwrap();
+                            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+                        ).unwrap();
                     let static_shared = interpreter
-                        .get_attribute(CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)
-                        .unwrap();
+                            .get_attribute(cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)
+                            .unwrap();
                     let max_dynamic_allowed = (per_block_optin - static_shared).max(0);
                     interpreter
-                        .set_attribute(
-                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                            max_dynamic_allowed,
-                        )
-                        .unwrap();
+                            .set_attribute(
+                                cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                max_dynamic_allowed,
+                            )
+                            .unwrap();
 
                     // Launch kernel
                     let cfg = LaunchConfig {
@@ -718,31 +1151,419 @@ impl Runtime for CudaRuntime {
                     drop(span);
                     let mk_span_id = Uuid::new_v4();
                     {
-                        let span = span!(Level::INFO, "megakernel", id = field::Empty);
+                        let span = span!(Level::TRACE, "megakernel", id = field::Empty);
                         // Record fields after span creation to work around tracing-perfetto-sdk-layer sync span bug
                         span.record("id", mk_span_id.to_string().as_str());
                         let _entered = span.enter();
                         unsafe { lb.launch(cfg) }.unwrap();
                         self.cuda_stream.synchronize().unwrap();
                     }
-                    {
-                        let _span = span!(Level::INFO, "mk_timings").entered();
-                        timings.push((
-                            self.cuda_stream.memcpy_dtov(&timing_buffer).unwrap(),
-                            self.cuda_stream
-                                .memcpy_dtov(&start_time)
-                                .unwrap()
-                                .into_iter()
-                                .min()
-                                .unwrap(),
-                            mk_span_id,
-                        ));
+                    if enabled!(Level::TRACE) {
+                        // Use pre-allocated pinned buffers from pool for async copy
+                        let slot = self.next_pinned_slot;
+                        if slot < self.pinned_timing_pool.len() {
+                            self.next_pinned_slot += 1;
+                            // These copies are truly async with pinned memory
+                            self.timing_stream
+                                .memcpy_dtoh(&timing_buffer, &mut self.pinned_timing_pool[slot])
+                                .expect("Failed to copy timing buffer");
+                            self.timing_stream
+                                .memcpy_dtoh(&start_time, &mut self.pinned_start_pool[slot])
+                                .expect("Failed to copy start time buffer");
+                            self.pending_timing_data.push(PendingTimingData {
+                                timing_buffer_idx: slot,
+                                start_time_idx: slot,
+                                span_id: mk_span_id,
+                            });
+                        }
+                        // If pool is exhausted, skip timing collection for this megakernel
                     }
+                }
+                ExecutableKernel::HostOp {
+                    stream,
+                    inputs,
+                    output,
+                    internal,
+                } => {
+                    let mut host_op_buffers: Vec<&CudaSlice<u8>> = vec![&self.buffers[output]];
+                    host_op_buffers.extend(inputs.iter().map(|inp| {
+                        if let Some(buf) = self.buffers.get(inp) {
+                            buf
+                        } else {
+                            match &self.hlir_buffers[&self.llir_to_hlir[inp]] {
+                                CudaInput::Buffer(buf) => buf,
+                                CudaInput::Ptr(_) => unimplemented!(),
+                            }
+                        }
+                    }));
+                    let _span =
+                        span!(Level::TRACE, "host_op_execute", n_inputs = inputs.len()).entered();
+                    internal.execute(stream, &host_op_buffers, dyn_map).unwrap();
+                    self.cuda_stream.synchronize().unwrap();
+                }
+                ExecutableKernel::CudaGraphExec(data) => {
+                    let CudaGraphExecData {
+                        cuda_graph,
+                        cuda_graph_exec,
+                        node_to_graph_node,
+                        kernel_params,
+                        kernel_info,
+                        dyn_dims_buffer,
+                        dyn_dims_order,
+                        last_dyn_values,
+                        last_buffer_ptrs,
+                        timing_events,
+                        total_bytes_loaded,
+                        total_bytes_stored,
+                        total_flops,
+                    } = &mut **data;
+                    // Generate a unique ID for this graph execution (for perfetto correlation)
+                    let graph_span_id = Uuid::new_v4();
+                    let span = span!(
+                        Level::TRACE,
+                        "cuda_graph",
+                        kernels = kernel_info.len(),
+                        id = field::Empty
+                    );
+                    span.record("id", graph_span_id.to_string().as_str());
+                    let _entered = span.enter();
+                    // Capture span entry time to measure setup overhead
+                    let span_entry_instant = std::time::Instant::now();
+
+                    let setup_span = span!(Level::TRACE, "cg_setup").entered();
+
+                    // Fast path: check if dyn_map changed before doing any work
+                    let dyn_map_changed = dyn_map.len() != last_dyn_values.len()
+                        || dyn_map
+                            .iter()
+                            .any(|(k, v)| last_dyn_values.get(k) != Some(v));
+
+                    // Allocate dyn_dims_buffer if needed (first run or size changed)
+                    if !dyn_dims_order.is_empty() && dyn_dims_buffer.is_none() {
+                        *dyn_dims_buffer = Some(
+                            self.cuda_stream
+                                .alloc_zeros::<i32>(dyn_dims_order.len())
+                                .expect("Failed to allocate dyn_dims buffer"),
+                        );
+                    }
+
+                    // Update shared dyn_dims buffer with a single memcpy if dyn_map changed
+                    if dyn_map_changed && !dyn_dims_order.is_empty() {
+                        let _span = span!(Level::TRACE, "dyn_dims_update").entered();
+                        // Build the values array in sorted order
+                        let values: Vec<i32> = dyn_dims_order
+                            .iter()
+                            .map(|d| dyn_map.get(d).copied().unwrap_or(0) as i32)
+                            .collect();
+                        // Single memcpy to update all dyn dims at once
+                        if let Some(buf) = dyn_dims_buffer.as_mut() {
+                            self.cuda_stream
+                                .memcpy_htod(&values, buf)
+                                .expect("Failed to update dyn_dims buffer");
+                        }
+                    }
+
+                    // Check if this is first run (requires full rebuild)
+                    let is_first_run = cuda_graph.is_none();
+
+                    // Determine what kind of update we need:
+                    // - First run: full rebuild (necessary to construct the graph)
+                    // - Buffer pointers changed: surgical update (update params, not graph structure)
+                    // - Only dyn dims changed: surgical update (update grid/block dims)
+                    // - Nothing changed: no update needed
+                    let needs_rebuild;
+                    let needs_buffer_update;
+                    let current_buffer_ptrs: FxHashMap<NodeIndex, u64>;
+
+                    if is_first_run {
+                        // First run: collect all pointers from cache and rebuild
+                        needs_rebuild = true;
+                        needs_buffer_update = false;
+                        let _span = span!(Level::TRACE, "collect buffer pointers").entered();
+                        let mut ptrs = FxHashMap::default();
+                        for info in kernel_info.iter() {
+                            // Use cached pointer (already populated in allocate_intermediate_buffers)
+                            let output_ptr = self.cached_buffer_ptrs[&info.output];
+                            ptrs.insert(info.output, output_ptr);
+                            for inp in &info.inputs {
+                                if !ptrs.contains_key(inp) {
+                                    // Use cached pointer (populated from allocate_intermediate_buffers or changed_hlir processing)
+                                    let ptr = self.cached_buffer_ptrs[inp];
+                                    ptrs.insert(*inp, ptr);
+                                }
+                            }
+                        }
+                        current_buffer_ptrs = ptrs;
+                    } else if needs_realloc {
+                        // Buffers were reallocated - collect new pointers and do surgical update
+                        // (graph structure unchanged, only buffer pointers need updating)
+                        needs_rebuild = false;
+                        needs_buffer_update = true;
+                        let _span = span!(Level::TRACE, "collect buffer pointers").entered();
+                        let mut ptrs = FxHashMap::default();
+                        for info in kernel_info.iter() {
+                            // Use cached pointer (updated in allocate_intermediate_buffers)
+                            let output_ptr = self.cached_buffer_ptrs[&info.output];
+                            ptrs.insert(info.output, output_ptr);
+                            for inp in &info.inputs {
+                                if !ptrs.contains_key(inp) {
+                                    // Use cached pointer
+                                    let ptr = self.cached_buffer_ptrs[inp];
+                                    ptrs.insert(*inp, ptr);
+                                }
+                            }
+                        }
+                        current_buffer_ptrs = ptrs;
+                    } else {
+                        // No buffer changes, reuse last buffer pointers
+                        current_buffer_ptrs = std::mem::take(last_buffer_ptrs);
+                        needs_rebuild = false;
+                        needs_buffer_update = false;
+                    }
+
+                    // Check if we need surgical update for dyn dims (grid/block dimensions changed)
+                    let needs_surgical_update =
+                        !needs_rebuild && (dyn_map_changed || needs_buffer_update);
+
+                    if needs_rebuild {
+                        let _span = span!(Level::TRACE, "rebuild").entered();
+                        // Build new graph from scratch
+                        let ctx = self.cuda_stream.context().clone();
+                        let mut new_graph =
+                            CudaGraphHandle::new(ctx.clone()).expect("Failed to create CUDA graph");
+
+                        // Clear old state but reuse timing events
+                        node_to_graph_node.clear();
+                        kernel_params.clear();
+                        kernel_params.reserve(kernel_info.len());
+
+                        // Only create timing events when tracing is enabled
+                        let tracing_enabled = enabled!(Level::TRACE);
+                        if tracing_enabled {
+                            let needed_events = kernel_info.len() + 1;
+                            if timing_events.len() < needed_events {
+                                for _ in timing_events.len()..needed_events {
+                                    timing_events.push(
+                                        create_cuda_event(&ctx)
+                                            .expect("Failed to create timing event"),
+                                    );
+                                }
+                            }
+                        }
+
+                        // Get dyn_dims pointer if we have dynamic dimensions
+                        let dyn_dims_ptr = dyn_dims_buffer
+                            .as_ref()
+                            .map(|buf| buf.device_ptr(&self.cuda_stream).0)
+                            .unwrap_or(0);
+
+                        new_graph.ctx.bind_to_thread().unwrap();
+
+                        // Reuse this vector for input pointers to avoid per-kernel allocations
+                        let mut input_ptrs: Vec<u64> = Vec::with_capacity(16);
+                        let mut prev_graph_node: Option<CUgraphNode> = None;
+
+                        for (idx, info) in kernel_info.iter().enumerate() {
+                            let grid_dim = (
+                                info.launch_grid.0.exec(dyn_map).unwrap() as u32,
+                                info.launch_grid.1.exec(dyn_map).unwrap() as u32,
+                                info.launch_grid.2.exec(dyn_map).unwrap() as u32,
+                            );
+                            let block_dim = (
+                                info.launch_threadblock.0.exec(dyn_map).unwrap() as u32,
+                                info.launch_threadblock.1.exec(dyn_map).unwrap() as u32,
+                                info.launch_threadblock.2.exec(dyn_map).unwrap() as u32,
+                            );
+                            let shared_mem = info.shared_mem.exec(dyn_map).unwrap() as u32;
+                            let output_ptr = current_buffer_ptrs[&info.output];
+
+                            // Reuse input_ptrs vector
+                            input_ptrs.clear();
+                            input_ptrs
+                                .extend(info.inputs.iter().map(|inp| current_buffer_ptrs[inp]));
+
+                            // Use with_dyn_dims if we have dynamic dimensions
+                            let mut params = if !dyn_dims_order.is_empty() {
+                                KernelParams::with_dyn_dims(output_ptr, &input_ptrs, dyn_dims_ptr)
+                            } else {
+                                KernelParams::new(output_ptr, &input_ptrs)
+                            };
+                            let cu_func = unsafe { info.kernel.raw_function() };
+
+                            // Only add timing event nodes when tracing is enabled
+                            let deps: &[CUgraphNode] = match (&prev_graph_node, tracing_enabled) {
+                                (Some(prev), true) => {
+                                    // Add event node for timing, kernel depends on event
+                                    let event_node = new_graph
+                                        .add_event_record_node(&[*prev], timing_events[idx])
+                                        .expect("Failed to add event record node");
+                                    // Store event_node temporarily - we'll use it as dependency
+                                    prev_graph_node = Some(event_node);
+                                    std::slice::from_ref(prev_graph_node.as_ref().unwrap())
+                                }
+                                (None, true) => {
+                                    // First kernel with tracing - add initial event node
+                                    let event_node = new_graph
+                                        .add_event_record_node(&[], timing_events[idx])
+                                        .expect("Failed to add event record node");
+                                    prev_graph_node = Some(event_node);
+                                    std::slice::from_ref(prev_graph_node.as_ref().unwrap())
+                                }
+                                (Some(prev), false) => std::slice::from_ref(prev),
+                                (None, false) => &[],
+                            };
+
+                            let graph_node = unsafe {
+                                new_graph.add_kernel_node(
+                                    deps,
+                                    cu_func,
+                                    grid_dim,
+                                    block_dim,
+                                    shared_mem,
+                                    params.as_cuda_params(),
+                                )
+                            }
+                            .expect("Failed to add kernel node");
+                            node_to_graph_node.insert(info.llir_node, graph_node);
+                            kernel_params.push(params);
+                            prev_graph_node = Some(graph_node);
+                        }
+
+                        // Add final timing event if tracing
+                        if tracing_enabled && let Some(prev) = prev_graph_node {
+                            new_graph
+                                .add_event_record_node(&[prev], timing_events[kernel_info.len()])
+                                .expect("Failed to add final event node");
+                        }
+
+                        let new_exec = new_graph
+                            .instantiate()
+                            .expect("Failed to instantiate CUDA graph");
+
+                        *cuda_graph = Some(new_graph);
+                        *cuda_graph_exec = Some(new_exec);
+                        *last_dyn_values = dyn_map.clone();
+                        *last_buffer_ptrs = current_buffer_ptrs;
+                    } else if needs_surgical_update {
+                        let _span = span!(Level::TRACE, "update").entered();
+                        let exec = cuda_graph_exec.as_mut().unwrap();
+                        exec.ctx.bind_to_thread().unwrap();
+                        for (idx, info) in kernel_info.iter().enumerate() {
+                            // Update buffer pointers in kernel_params if they changed
+                            if needs_buffer_update {
+                                let output_ptr = current_buffer_ptrs[&info.output];
+                                kernel_params[idx].update_output(output_ptr);
+                                for (inp_idx, inp) in info.inputs.iter().enumerate() {
+                                    kernel_params[idx]
+                                        .update_input(inp_idx, current_buffer_ptrs[inp]);
+                                }
+                            }
+                            let grid_dim = (
+                                info.launch_grid.0.exec(dyn_map).unwrap() as u32,
+                                info.launch_grid.1.exec(dyn_map).unwrap() as u32,
+                                info.launch_grid.2.exec(dyn_map).unwrap() as u32,
+                            );
+                            let block_dim = (
+                                info.launch_threadblock.0.exec(dyn_map).unwrap() as u32,
+                                info.launch_threadblock.1.exec(dyn_map).unwrap() as u32,
+                                info.launch_threadblock.2.exec(dyn_map).unwrap() as u32,
+                            );
+                            let shared_mem = info.shared_mem.exec(dyn_map).unwrap() as u32;
+                            let cu_func = unsafe { info.kernel.raw_function() };
+                            unsafe {
+                                exec.update_kernel_node(
+                                    node_to_graph_node[&info.llir_node],
+                                    cu_func,
+                                    grid_dim,
+                                    block_dim,
+                                    shared_mem,
+                                    kernel_params[idx].as_cuda_params(),
+                                )
+                            }
+                            .expect("Failed to update kernel node");
+                        }
+                        *last_dyn_values = dyn_map.clone();
+                        // Store updated buffer pointers
+                        *last_buffer_ptrs = current_buffer_ptrs;
+                    } else {
+                        // No changes needed, just restore buffer pointers
+                        *last_buffer_ptrs = current_buffer_ptrs;
+                    }
+                    self.cuda_stream.synchronize().unwrap();
+                    drop(setup_span);
+
+                    let ctx = self.cuda_stream.context();
+
+                    // Measure elapsed time from span entry to launch for accurate timeline positioning
+                    let setup_duration_ns = span_entry_instant.elapsed().as_nanos() as u64;
+                    cuda_graph_exec
+                        .as_ref()
+                        .unwrap()
+                        .launch(&self.cuda_stream)
+                        .expect("Failed to launch CUDA graph");
+                    self.cuda_stream.synchronize().unwrap();
+                    let _teardown_span = span!(Level::TRACE, "cg_teardown").entered();
+
+                    // Only collect timing data when tracing is enabled (timing events exist in graph)
+                    let graph_time_us = if enabled!(Level::TRACE) && !timing_events.is_empty() {
+                        // With pre-sync, launch latency should be minimal
+                        let launch_latency_ns: u64 = 0;
+
+                        let mut kernel_timings = Vec::with_capacity(kernel_info.len());
+                        let mut cumulative_ns: u64 = 0;
+                        for (idx, info) in kernel_info.iter().enumerate() {
+                            let elapsed_ns =
+                                (event_elapsed_ms(ctx, timing_events[idx], timing_events[idx + 1])
+                                    .unwrap_or(0.0)
+                                    * 1_000_000.0) as u64;
+                            kernel_timings.push(CudaGraphKernelTiming {
+                                kernel_name: info.kernel_name,
+                                start_ns: cumulative_ns,
+                                end_ns: cumulative_ns + elapsed_ns,
+                            });
+                            cumulative_ns += elapsed_ns;
+                        }
+
+                        self.cuda_graph_timings.push((
+                            CudaGraphTiming {
+                                kernel_timings,
+                                launch_latency_ns,
+                                setup_duration_ns,
+                            },
+                            graph_span_id,
+                        ));
+                        cumulative_ns as f64 / 1000.0
+                    } else {
+                        0.0
+                    };
+                    let loaded = total_bytes_loaded.exec(dyn_map).unwrap_or(0);
+                    let stored = total_bytes_stored.exec(dyn_map).unwrap_or(0);
+                    let flop_count = total_flops.exec(dyn_map).unwrap_or(0);
+
+                    let total_bytes = loaded + stored;
+                    let bandwidth_gbps = if graph_time_us > 0.0 {
+                        (total_bytes as f64) / (graph_time_us * 1e-6) / 1e9
+                    } else {
+                        0.0
+                    };
+                    let tflops = if graph_time_us > 0.0 {
+                        (flop_count as f64) / (graph_time_us * 1e-6) / 1e12
+                    } else {
+                        0.0
+                    };
+
+                    kernel_stats.push(KernelStats {
+                        name: "CudaGraph",
+                        execution_time_us: graph_time_us,
+                        bytes_loaded: loaded,
+                        bytes_stored: stored,
+                        flops: flop_count,
+                        bandwidth_gbps,
+                        tflops,
+                    });
                 }
             }
         }
-        self.timings.push(timings);
-
         // Save raw stats for lazy interpretation in print_execution_stats
         self.last_kernel_stats = kernel_stats;
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
@@ -834,7 +1655,7 @@ impl CudaRuntime {
         let mut wait_count: usize = 0;
 
         for (sm_timings, _start_time, _) in timings {
-            for sm_chunk in sm_timings.chunks(1000) {
+            for sm_chunk in sm_timings.chunks(N_TIMING_SLOTS) {
                 for event in sm_chunk.iter() {
                     if event.start == 0 {
                         break; // No more events recorded for this SM
@@ -1028,7 +1849,6 @@ impl CudaRuntime {
                 count: wait_count,
             });
         }
-
         stats
     }
 
@@ -1246,6 +2066,70 @@ impl CudaRuntime {
             ),
         }
     }
+
+    /// Flush pending timing data to the timings collection.
+    fn flush_pending_timings(&mut self) {
+        if self.pending_timing_data.is_empty() {
+            return;
+        }
+
+        // Sync timing stream first to ensure all async copies are complete
+        self.timing_stream
+            .synchronize()
+            .expect("Failed to sync timing stream");
+
+        // Extract data from pinned memory pool
+        let mut timing_entries = Vec::with_capacity(self.pending_timing_data.len());
+        for pending in self.pending_timing_data.drain(..) {
+            let timing_data = self.pinned_timing_pool[pending.timing_buffer_idx]
+                .as_slice()
+                .expect("Failed to read timing buffer")
+                .to_vec();
+            let min_start = self.pinned_start_pool[pending.start_time_idx]
+                .as_slice()
+                .expect("Failed to read start time buffer")
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(0);
+            timing_entries.push((timing_data, min_start, pending.span_id));
+        }
+
+        // Reset pool index so buffers can be reused
+        self.next_pinned_slot = 0;
+
+        if !timing_entries.is_empty() {
+            self.timings.push(timing_entries);
+        }
+    }
+
+    /// Record GPU timings to an existing perfetto trace file.
+    pub fn record_cuda_perfetto_trace(&mut self, perfetto_guard: PerfettoGuard) {
+        // Flush any pending timing copies first
+        self.flush_pending_timings();
+
+        perfetto_guard.stop();
+        let ops: Vec<Arc<Box<dyn BlockOp>>> = self
+            .llir_graph
+            .node_indices()
+            .filter_map(|n| self.llir_graph[n].to_dialect::<dyn BlockOp>())
+            .map(|bo| (bo.op_name(), bo.clone()))
+            .collect::<std::collections::HashMap<_, _>>()
+            .into_iter()
+            .sorted_by_key(|(n, _)| *n)
+            .map(|(_, o)| o)
+            .collect();
+        let data = std::fs::read(&perfetto_guard.path).unwrap();
+        let mut trace = tracing_perfetto_sdk_schema::Trace::decode(data.as_slice()).unwrap();
+        let mut extra_packets = record_block_op_timings(&trace, &ops, &self.timings);
+        extra_packets.extend(record_cuda_graph_timings(&trace, &self.cuda_graph_timings));
+        trace.packet.extend(extra_packets);
+        // Sort ALL packets by timestamp for proper Perfetto visualization
+        trace.packet.sort_by_key(|p| p.timestamp.unwrap_or(0));
+        let mut buf = Vec::with_capacity(trace.encoded_len());
+        trace.encode(&mut buf).unwrap();
+        std::fs::write(perfetto_guard.path, buf).unwrap();
+    }
 }
 
 fn format_size(bytes: usize) -> String {
@@ -1390,7 +2274,6 @@ fn partition_marked_convex<T, E>(
             let Some(&xpos) = idx_to_pos.get(&x) else {
                 continue;
             };
-
             // Sx = reachable-from-x ∩ component
             let mut sx = reach[xpos].clone();
             sx.intersect_with(&in_comp_pos);
@@ -1522,5 +2405,7 @@ fn would_violate(
 fn intersects(a: &FixedBitSet, b: &FixedBitSet) -> bool {
     let mut tmp = a.clone();
     tmp.intersect_with(b);
-    !tmp.is_empty()
+    // Note: is_empty() checks if length is 0, not if there are no bits set
+    // Use count_ones() to check if there are any set bits after intersection
+    tmp.count_ones(..) > 0
 }

@@ -90,7 +90,7 @@ impl GraphTensor {
         }
         let id = self
             .graph()
-            .add_op(Cast(dtype))
+            .add_op(Cast(self.shape.n_physical_elements(), dtype))
             .input(self.id, self.shape)
             .finish();
         GraphTensor::from_id(id, self.shape, self.graph_ref, dtype)

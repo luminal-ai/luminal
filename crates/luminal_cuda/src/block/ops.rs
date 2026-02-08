@@ -1,15 +1,14 @@
 use std::{fmt::Debug, sync::Arc};
 
 use cudarc::driver::CudaStream;
-use itertools::Itertools;
 use luminal::{
-    graph::{extract_expr, extract_expr_list},
+    egglog_utils::{extract_expr, extract_expr_list},
     op::OpParam::*,
     op::*,
     prelude::*,
 };
 
-use crate::block::BlockOp;
+use crate::block::{BlockOp, CStruct};
 
 pub type Ops = (
     RowAdd,
@@ -51,6 +50,7 @@ impl EgglogOp for RowAdd {
                 (= (MNum 1) (nth_from_end ?b_stride 0))
                 (= (MNum 1) (nth_from_end ?out_stride 0))
                 ;(= (F32) (dtype ?a))
+                ;(= (F32) (dtype ?b))
             )
             (
                 (let ?new_shape (RemoveNthFromEnd ?shape 0))
@@ -124,11 +124,6 @@ impl BlockOp for RowAdd {
         self.range.iter().copied().product::<Expression>().max(1) * self.row_width
     }
 
-    fn cuda_struct(&self) -> String {
-        "const int a_strides; const int b_strides; const int out_strides; int row_width;"
-            .to_string()
-    }
-
     fn bytes_loaded(&self) -> Expression {
         // Load 2 input rows (a + b) per launch
         self.range.iter().copied().product::<Expression>().max(1) * self.row_width * 2 * 4
@@ -147,26 +142,21 @@ impl BlockOp for RowAdd {
         .to_string()
     }
 
-    fn schedule_op(
-        &self,
-        _: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
-        CStruct::new()
-            .int(expressions[&flatten_mul_strides(&self.range, &self.a_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.b_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.out_stride)])
-            .int(expressions[&self.row_width])
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        vec![
-            flatten_mul_strides(&self.range, &self.a_stride),
-            flatten_mul_strides(&self.range, &self.b_stride),
-            flatten_mul_strides(&self.range, &self.out_stride),
-            self.row_width,
-        ]
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr(
+                "a_strides",
+                flatten_mul_strides(&self.range, &self.a_stride),
+            )
+            .expr(
+                "b_strides",
+                flatten_mul_strides(&self.range, &self.b_stride),
+            )
+            .expr(
+                "out_strides",
+                flatten_mul_strides(&self.range, &self.out_stride),
+            )
+            .expr("row_width", self.row_width)
     }
 }
 
@@ -214,6 +204,7 @@ impl EgglogOp for RowSwishMul {
                     (ECons ?width (ECons (MNum 1) (ENil)))
                 ))
                 ;(= (F32) (dtype ?self))
+                ;(= (F32) (dtype ?other))
             )
             (
                 (let ?rsm (RowSwishMul
@@ -306,10 +297,6 @@ impl BlockOp for RowSwishMul {
         self.range.iter().copied().product::<Expression>().max(1) * self.row_width * 5
     }
 
-    fn cuda_struct(&self) -> String {
-        "const int a; const int b; const int out; int row_width; int sm_count;".to_string()
-    }
-
     fn cuda_function(&self) -> String {
         "
         const int row_width = eval_expression(payload.row_width, 0);
@@ -334,11 +321,7 @@ impl BlockOp for RowSwishMul {
         .to_string()
     }
 
-    fn schedule_op(
-        &self,
-        _: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
         // Extend strides with 0 for the SM dimension
         let mut a_stride_ext = self.a_stride.clone();
         a_stride_ext.push(0.into());
@@ -346,28 +329,12 @@ impl BlockOp for RowSwishMul {
         b_stride_ext.push(0.into());
 
         let launch_range = self.launch_range();
-        CStruct::new()
-            .int(expressions[&flatten_mul_strides(&launch_range, &a_stride_ext)])
-            .int(expressions[&flatten_mul_strides(&launch_range, &b_stride_ext)])
-            .int(expressions[&flatten_mul_strides(&launch_range, &a_stride_ext)])
-            .int(expressions[&self.row_width])
-            .int(expressions[&self.sm_count])
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        let mut a_stride_ext = self.a_stride.clone();
-        a_stride_ext.push(0.into());
-        let mut b_stride_ext = self.b_stride.clone();
-        b_stride_ext.push(0.into());
-
-        let launch_range = self.launch_range();
-        vec![
-            flatten_mul_strides(&launch_range, &a_stride_ext),
-            flatten_mul_strides(&launch_range, &b_stride_ext),
-            self.row_width,
-            self.sm_count,
-        ]
+        payload
+            .expr("a", flatten_mul_strides(&launch_range, &a_stride_ext))
+            .expr("b", flatten_mul_strides(&launch_range, &b_stride_ext))
+            .expr("out", flatten_mul_strides(&launch_range, &a_stride_ext))
+            .expr("row_width", self.row_width)
+            .expr("sm_count", self.sm_count)
     }
 }
 
@@ -404,7 +371,7 @@ impl EgglogOp for RowRMSNorm {
                     )
                 )
                 (= ?inv_div_factor
-                    (Recip (ECons ?batch (ENil)) (Cast (Iota ?width (MNum 1)) (F32))
+                    (Recip (ECons ?batch (ENil)) (Cast (Iota ?width (MNum 1)) (MNum 1) (F32))
                                     (ECons (MNum 0) (ENil))  ; broadcast the constant
                                     (ECons (MNum 1) (ENil)))) ; produce per-batch vector
 
@@ -459,7 +426,7 @@ impl EgglogOp for RowRMSNorm {
                         ?inp_stride
                     )
                 )
-                ;(= (F32) (dtype ?x))
+               ;(= (F32) (dtype ?x))
             )
             (
                 (let ?new
@@ -539,8 +506,11 @@ impl BlockOp for RowRMSNorm {
         self.range.iter().copied().product::<Expression>() * self.row_width * 5
     }
 
-    fn cuda_struct(&self) -> String {
-        "const int inp; const int out; int row_width;".to_string()
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr("inp", flatten_mul_strides(&self.range, &self.a_stride))
+            .expr("out", flatten_mul_strides(&self.range, &self.a_stride))
+            .expr("row_width", self.row_width)
     }
 
     fn cuda_function(&self) -> String {
@@ -591,27 +561,9 @@ impl BlockOp for RowRMSNorm {
         "
         .to_string()
     }
-
-    fn schedule_op(
-        &self,
-        _: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
-        CStruct::new()
-            .int(expressions[&flatten_mul_strides(&self.range, &self.a_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.a_stride)])
-            .int(expressions[&self.row_width])
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        vec![
-            flatten_mul_strides(&self.range, &self.a_stride),
-            self.row_width,
-        ]
-    }
 }
 
+// TODO: generalize elementwise fusion and remove rope operations
 #[derive(Debug, Default)]
 pub struct RowRope {
     range: Vec<Expression>,
@@ -673,7 +625,7 @@ impl EgglogOp for RowRope {
                 ;; -----------------------------
                 ;; inv_freq construction (exact literals as in dump)
                 ;; -----------------------------
-                (= ?freq_indices        (Cast (Iota (MMul (MIter) (MNum 2)) (MNum 64)) (F32)))
+                (= ?freq_indices        (Cast (Iota (MMul (MIter) (MNum 2)) (MNum 64)) (MNum 64) (F32)))
                 (= ?c_inv_head_dim      (Constant 0.007812))
                 (= ?freq_scaled         (Mul (ECons (MNum 64) (ENil)) ?freq_indices
                                              (ECons (MNum 1) (ENil)) ?c_inv_head_dim
@@ -694,7 +646,7 @@ impl EgglogOp for RowRope {
                 ;; -----------------------------
                 ;; emb = pos_ids @ inv_freq
                 ;; -----------------------------
-                (= ?pos_f32             (Cast ?pos_ids (F32)))
+                (= ?pos_f32             (Cast ?pos_ids ?cast_sh (F32)))
                 (= ?pos_times_invfreq_bcast
                    (Mul (ECons (MVar "s") (ECons (MNum 64) (ECons (MNum 1) (ENil))))
                         ?pos_f32
@@ -732,6 +684,7 @@ impl EgglogOp for RowRope {
                      ?inp
                      (ECons ?n_heads (ECons (MVar "s") (ECons (MNum 64) (ECons (MNum 2) (ENil)))))
                      ?inp_strides))
+                ;(= (F32) (dtype ?inp))
 
                 ;; -----------------------------
                 ;; cos(emb) = sin(-emb + pi/2), sin(emb)
@@ -880,12 +833,12 @@ impl EgglogOp for RowRope {
                         (ECons (MMul (MNum 128) (MVar "s")) (ECons (MNum 128) (ECons (MNum 2) (ECons (MNum 1) (ENil)))))
                         (ECons (MMul (MNum 128) (MVar "s")) (ECons (MNum 128) (ECons (MNum 2) (ECons (MNum 1) (ENil)))))))
 
-                ;; Final identity mul "* 1.0" with output shape/strides (4096 -> ?hidden_dim)
+                ;; Final identity mul "* 1.0" with output shape/strides
                 (= ?c_one (Constant 1.000000))
                 (= ?rope_out
                    (Mul (ECons (MVar "s") (ECons ?n_heads (ECons (MNum 128) (ENil))))
                         ?interleaved_rot
-                        (ECons ?hidden_dim (ECons (MNum 128) (ECons (MNum 1) (ENil))))
+                        (ECons (MNum 128) (ECons (MMul (MVar "s") (MNum 128)) (ECons (MNum 1) (ENil))))
                         ?c_one
                         (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
                         (ECons ?hidden_dim (ECons (MNum 128) (ECons (MNum 1) (ENil)))))
@@ -902,7 +855,7 @@ impl EgglogOp for RowRope {
                 ; we want to subsume all terms up to ?inp and ?pos_ids. don't know how to do this.
                 (delete (Mul (ECons (MVar "s") (ECons ?n_heads (ECons (MNum 128) (ENil))))
                      ?interleaved_rot
-                     (ECons ?hidden_dim (ECons (MNum 128) (ECons (MNum 1) (ENil))))
+                     (ECons (MNum 128) (ECons (MMul (MVar "s") (MNum 128)) (ECons (MNum 1) (ENil))))
                      ?c_one
                      (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
                      (ECons ?hidden_dim (ECons (MNum 128) (ECons (MNum 1) (ENil))))))
@@ -950,8 +903,12 @@ impl BlockOp for RowRope {
         self.range.iter().copied().product::<Expression>() * self.row_width * 5
     }
 
-    fn cuda_struct(&self) -> String {
-        "const int inp; const int out; int row_width; const int token_ids;".to_string()
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr("inp", flatten_mul_strides(&self.range, &self.a_stride))
+            .expr("out", flatten_mul_strides(&self.range, &self.a_stride))
+            .expr("row_width", self.row_width)
+            .expr("token_ids", 'z')
     }
 
     fn cuda_function(&self) -> String {
@@ -995,30 +952,9 @@ impl BlockOp for RowRope {
         "
         .to_string()
     }
-
-    fn schedule_op(
-        &self,
-        _: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
-        CStruct::new()
-            .int(expressions[&flatten_mul_strides(&self.range, &self.a_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.a_stride)])
-            .int(expressions[&self.row_width])
-            .int(expressions[&'z'.into()])
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        vec![
-            flatten_mul_strides(&self.range, &self.a_stride),
-            self.row_width,
-            'z'.into(),
-        ]
-    }
 }
 
-use crate::TILE_SIZE;
+pub const TILE_SIZE: u32 = 64;
 const K_CHUNK_SIZE: usize = 4096;
 
 #[derive(Debug, Default)]
@@ -1088,7 +1024,7 @@ impl EgglogOp for TileMatmulSplitK {
                 ; Assert B has contiguous k (col-major B / transposed)
                 (= ?b_k_stride (MNum 1))
 
-                (= (F32) (dtype ?a))
+                ;(= (F32) (dtype ?a))
             )
             (
                 ; Create tiled shape with K chunks
@@ -1234,8 +1170,40 @@ impl BlockOp for TileMatmulSplitK {
         batch * m * n * k * 2
     }
 
-    fn cuda_struct(&self) -> String {
-        "const int untiled_range[2]; const int a; const int b; const int c; int total_k; int a_width; int b_width; int c_width; int m_pos_stride; int n_pos_stride; int k_chunk_stride; int k_chunk_size;".to_string()
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        assert_eq!(self.untiled_range.len(), 2);
+        // Range layout: [k_chunks, batch..., tiled_m, tiled_n]
+        // k_chunk is at index 0
+        let mut k_chunk_stride = vec![0.into(); self.range.len()];
+        k_chunk_stride[0] = 1.into();
+        // m_pos (tiled_m) is at index len-2
+        let mut m_pos_stride = vec![0.into(); self.range.len()];
+        m_pos_stride[self.range.len() - 2] = 1.into();
+        // n_pos (tiled_n) is at index len-1
+        let mut n_pos_stride = vec![0.into(); self.range.len()];
+        n_pos_stride[self.range.len() - 1] = 1.into();
+        payload
+            .expr_arr("untiled_range", &self.untiled_range)
+            .expr("a", flatten_mul_strides(&self.range, &self.a_stride))
+            .expr("b", flatten_mul_strides(&self.range, &self.b_stride))
+            .expr("c", flatten_mul_strides(&self.range, &self.out_stride))
+            .expr("total_k", self.total_k)
+            .expr("a_width", self.a_m_stride)
+            .expr("b_width", self.b_n_stride)
+            .expr("c_width", self.out_m_stride)
+            .expr(
+                "m_pos_stride",
+                flatten_mul_strides(&self.range, &m_pos_stride),
+            )
+            .expr(
+                "n_pos_stride",
+                flatten_mul_strides(&self.range, &n_pos_stride),
+            )
+            .expr(
+                "k_chunk_stride",
+                flatten_mul_strides(&self.range, &k_chunk_stride),
+            )
+            .expr("k_chunk_size", self.k_chunk)
     }
 
     fn bytes_loaded(&self) -> Expression {
@@ -1354,69 +1322,6 @@ impl BlockOp for TileMatmulSplitK {
         }}
         ", ts = TILE_SIZE)
     }
-
-    fn schedule_op(
-        &self,
-        _: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
-        assert_eq!(self.untiled_range.len(), 2);
-        // Range layout: [k_chunks, batch..., tiled_m, tiled_n]
-        // k_chunk is at index 0
-        let mut k_chunk_stride = vec![0.into(); self.range.len()];
-        k_chunk_stride[0] = 1.into();
-        // m_pos (tiled_m) is at index len-2
-        let mut m_pos_stride = vec![0.into(); self.range.len()];
-        m_pos_stride[self.range.len() - 2] = 1.into();
-        // n_pos (tiled_n) is at index len-1
-        let mut n_pos_stride = vec![0.into(); self.range.len()];
-        n_pos_stride[self.range.len() - 1] = 1.into();
-        CStruct::new()
-            .ints(
-                &self
-                    .untiled_range
-                    .iter()
-                    .map(|e| expressions[e])
-                    .collect_vec(),
-            )
-            .int(expressions[&flatten_mul_strides(&self.range, &self.a_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.b_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.out_stride)])
-            .int(expressions[&self.total_k])
-            .int(expressions[&self.a_m_stride])
-            .int(expressions[&self.b_n_stride])
-            .int(expressions[&self.out_m_stride])
-            .int(expressions[&flatten_mul_strides(&self.range, &m_pos_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &n_pos_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &k_chunk_stride)])
-            .int(expressions[&self.k_chunk])
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        // Range layout: [k_chunks, batch..., tiled_m, tiled_n]
-        let mut k_chunk_stride = vec![0.into(); self.range.len()];
-        k_chunk_stride[0] = 1.into();
-        let mut m_pos_stride = vec![0.into(); self.range.len()];
-        m_pos_stride[self.range.len() - 2] = 1.into();
-        let mut n_pos_stride = vec![0.into(); self.range.len()];
-        n_pos_stride[self.range.len() - 1] = 1.into();
-        vec![
-            self.untiled_range[0],
-            self.untiled_range[1],
-            flatten_mul_strides(&self.range, &self.a_stride),
-            flatten_mul_strides(&self.range, &self.b_stride),
-            flatten_mul_strides(&self.range, &self.out_stride),
-            self.total_k,
-            self.a_m_stride,
-            self.b_n_stride,
-            self.out_m_stride,
-            flatten_mul_strides(&self.range, &m_pos_stride),
-            flatten_mul_strides(&self.range, &n_pos_stride),
-            flatten_mul_strides(&self.range, &k_chunk_stride),
-            self.k_chunk,
-        ]
-    }
 }
 
 /// TileMatmulFullSplit: Optimally splits matmul work across SMs by computing a dynamic k_chunk_size.
@@ -1513,7 +1418,8 @@ impl EgglogOp for TileMatmulFullSplit {
                 ; Assert B has contiguous k (col-major B / transposed)
                 (= ?b_k_stride (MNum 1))
 
-                (= (F32) (dtype ?a))
+                ;(= (F32) (dtype ?a))
+                ;(= (F32) (dtype ?b))
             )
             (
                 ; Compute tiled dimensions
@@ -1637,10 +1543,6 @@ impl BlockOp for TileMatmulFullSplit {
         let n = self.untiled_range[1];
         let k = self.total_k;
         (m * k + k * n) * 4
-    }
-
-    fn cuda_struct(&self) -> String {
-        "const int untiled_range[2]; int m_tiles; int n_tiles; int total_k; int sm_count; const int a; int a_m_stride; int a_k_stride; int a_width; const int b; int b_n_stride; int b_k_stride; int b_width; const int c; int c_m_stride; int c_n_stride; int c_width;".to_string()
     }
 
     fn cuda_function(&self) -> String {
@@ -1834,54 +1736,25 @@ impl BlockOp for TileMatmulFullSplit {
         )
     }
 
-    fn schedule_op(
-        &self,
-        _stream: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
-        CStruct::new()
-            .ints(
-                &self
-                    .untiled_range
-                    .iter()
-                    .map(|e| expressions[e])
-                    .collect_vec(),
-            )
-            .int(expressions[&self.m_tiles])
-            .int(expressions[&self.n_tiles])
-            .int(expressions[&self.total_k])
-            .int(expressions[&self.sm_count])
-            .int(expressions[&flatten_mul_strides(&[self.sm_count], &[0.into()])])
-            .int(expressions[&self.a_m_stride])
-            .int(expressions[&self.a_k_stride])
-            .int(expressions[&self.a_m_stride]) // a_width = a_m_stride for row-major
-            .int(expressions[&flatten_mul_strides(&[self.sm_count], &[0.into()])])
-            .int(expressions[&self.b_n_stride])
-            .int(expressions[&self.b_k_stride])
-            .int(expressions[&self.b_n_stride]) // b_width = b_n_stride for col-major
-            .int(expressions[&flatten_mul_strides(&[self.sm_count], &[0.into()])])
-            .int(expressions[&self.out_m_stride])
-            .int(expressions[&self.out_n_stride])
-            .int(expressions[&self.out_m_stride]) // c_width = c_m_stride
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        vec![
-            self.untiled_range[0],
-            self.untiled_range[1],
-            self.m_tiles,
-            self.n_tiles,
-            self.total_k,
-            self.sm_count,
-            flatten_mul_strides(&[self.sm_count], &[0.into()]),
-            self.a_m_stride,
-            self.a_k_stride,
-            self.b_n_stride,
-            self.b_k_stride,
-            self.out_m_stride,
-            self.out_n_stride,
-        ]
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr_arr("untiled_range", &self.untiled_range)
+            .expr("m_tiles", self.m_tiles)
+            .expr("n_tiles", self.n_tiles)
+            .expr("total_k", self.total_k)
+            .expr("sm_count", self.sm_count)
+            .expr("a", flatten_mul_strides(&[self.sm_count], &[0.into()]))
+            .expr("a_m_stride", self.a_m_stride)
+            .expr("a_k_stride", self.a_k_stride)
+            .expr("a_width", self.a_m_stride) // a_width = a_m_stride for row-major
+            .expr("b", flatten_mul_strides(&[self.sm_count], &[0.into()]))
+            .expr("b_n_stride", self.b_n_stride)
+            .expr("b_k_stride", self.b_k_stride)
+            .expr("b_width", self.b_n_stride) // b_width = b_n_stride for col-major
+            .expr("c", flatten_mul_strides(&[self.sm_count], &[0.into()]))
+            .expr("c_m_stride", self.out_m_stride)
+            .expr("c_n_stride", self.out_n_stride)
+            .expr("c_width", self.out_m_stride) // c_width = c_m_stride
     }
 }
 
@@ -1909,7 +1782,7 @@ impl EgglogOp for RowEmbed {
                     (= ?gather (Gather ?indices ?idx_shape ?idx_stride ?embed_table ?embed_shape ?embed_stride))
                     (= ?indices (Add ?add_shape ?mul_result ?mul_stride ?iota_result ?iota_stride ?add_out_stride))
                     (= ?mul_result (Mul ?mul_shape ?token_ids_cast ?token_cast_stride ?mul_const ?mul_const_stride ?mul_out_stride))
-                    (= ?token_ids_cast (Cast ?token_ids ?cast_dtype))
+                    (= ?token_ids_cast (Cast ?token_ids ?cast_size ?cast_dtype))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                     (= ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
@@ -1927,7 +1800,7 @@ impl EgglogOp for RowEmbed {
                     (= ?gather (Gather ?indices ?idx_shape ?idx_stride ?embed_table ?embed_shape ?embed_stride))
                     (= ?indices (Add ?add_shape ?iota_result ?iota_stride ?mul_result ?mul_stride ?add_out_stride))
                     (= ?mul_result (Mul ?mul_shape ?token_ids_cast ?token_cast_stride ?mul_const ?mul_const_stride ?mul_out_stride))
-                    (= ?token_ids_cast (Cast ?token_ids ?cast_dtype))
+                    (= ?token_ids_cast (Cast ?token_ids ?cast_size ?cast_dtype))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                     (= ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
@@ -2040,10 +1913,6 @@ impl BlockOp for RowEmbed {
         0.into()
     }
 
-    fn cuda_struct(&self) -> String {
-        "const int token_stride; const int out_stride; int embed_dim;".to_string()
-    }
-
     fn cuda_function(&self) -> String {
         "
         int embed_dim = eval_expression(payload.embed_dim, 0);
@@ -2069,146 +1938,16 @@ impl BlockOp for RowEmbed {
         .to_string()
     }
 
-    fn schedule_op(
-        &self,
-        _: &Arc<CudaStream>,
-        expressions: &FxHashMap<Expression, i32>,
-    ) -> Vec<u8> {
-        CStruct::new()
-            .int(expressions[&flatten_mul_strides(&self.range, &self.token_stride)])
-            .int(expressions[&flatten_mul_strides(&self.range, &self.out_stride)])
-            .int(expressions[&self.embed_dim])
-            .finish_struct()
-    }
-
-    fn expressions(&self) -> Vec<Expression> {
-        vec![
-            flatten_mul_strides(&self.range, &self.token_stride),
-            flatten_mul_strides(&self.range, &self.out_stride),
-            self.embed_dim,
-        ]
-    }
-}
-
-#[derive(Debug)]
-pub struct CStruct {
-    buf: Vec<u8>,
-    max_align: usize,
-}
-
-impl Default for CStruct {
-    fn default() -> Self {
-        Self {
-            buf: Vec::new(),
-            max_align: 1,
-        }
-    }
-}
-
-impl CStruct {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn align_to(&mut self, align: usize) {
-        self.max_align = self.max_align.max(align);
-
-        let len = self.buf.len();
-        let rem = len % align;
-        if rem != 0 {
-            let pad = align - rem;
-            self.buf.extend(std::iter::repeat_n(0u8, pad));
-        }
-    }
-
-    pub fn int(mut self, v: i32) -> Self {
-        self.align_to(4);
-        self.buf.extend_from_slice(&v.to_ne_bytes());
-        self
-    }
-
-    pub fn ints(mut self, vs: &[i32]) -> Self {
-        self.align_to(4);
-        for &v in vs {
-            self.buf.extend_from_slice(&v.to_ne_bytes());
-        }
-        self
-    }
-
-    pub fn long(mut self, v: i64) -> Self {
-        self.align_to(8);
-        self.buf.extend_from_slice(&v.to_ne_bytes());
-        self
-    }
-
-    pub fn float(mut self, v: f32) -> Self {
-        self.align_to(4);
-        self.buf.extend_from_slice(&v.to_ne_bytes());
-        self
-    }
-
-    pub fn floats(mut self, vs: &[f32]) -> Self {
-        self.align_to(4);
-        for &v in vs {
-            self.buf.extend_from_slice(&v.to_ne_bytes());
-        }
-        self
-    }
-
-    pub fn bool(mut self, v: bool) -> Self {
-        self.align_to(1);
-        self.buf.push(if v { 1 } else { 0 });
-        self
-    }
-
-    pub fn ptr_const_f32(mut self, p: *const f32) -> Self {
-        let ptr_size = std::mem::size_of::<usize>(); // usually 8
-        let ptr_align = ptr_size;
-        self.align_to(ptr_align);
-
-        let addr = p as usize;
-        let bytes = addr.to_ne_bytes();
-
-        self.buf.extend_from_slice(&bytes[..ptr_size]);
-        self
-    }
-
-    pub fn ptr_mut_f32(self, p: *mut f32) -> Self {
-        self.ptr_const_f32(p as *const f32)
-    }
-
-    /// Returns the current size of the buffer after alignment for a pointer field.
-    /// Useful for computing field offsets.
-    pub fn current_size(&self) -> usize {
-        let ptr_align = std::mem::size_of::<usize>();
-        let len = self.buf.len();
-        let rem = len % ptr_align;
-        if rem != 0 {
-            len + (ptr_align - rem)
-        } else {
-            len
-        }
-    }
-
-    /// Pad the struct size to a multiple of max_align.
-    pub fn finish_struct(mut self) -> Vec<u8> {
-        let align = self.max_align;
-        if align > 1 {
-            let len = self.buf.len();
-            let rem = len % align;
-            if rem != 0 {
-                let pad = align - rem;
-                self.buf.extend(std::iter::repeat_n(0u8, pad));
-            }
-        }
-        self.buf
-    }
-
-    /// Insert a raw byte field (e.g., another struct).
-    /// `align` must be the alignment of the nested struct.
-    pub fn bytes(mut self, align: usize, data: &[u8]) -> Self {
-        self.align_to(align);
-        self.buf.extend_from_slice(data);
-        self
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr(
+                "token_stride",
+                flatten_mul_strides(&self.range, &self.token_stride),
+            )
+            .expr(
+                "out_stride",
+                flatten_mul_strides(&self.range, &self.out_stride),
+            )
+            .expr("embed_dim", self.embed_dim)
     }
 }

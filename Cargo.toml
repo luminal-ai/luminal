@@ -48,4 +48,5 @@ members = [
     "crates/luminal_cuda",
     "crates/luminal_metal",
     "crates/luminal_tracing",
+    "crates/luminal_bench",
 ]
