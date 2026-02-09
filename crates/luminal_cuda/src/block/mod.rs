@@ -897,11 +897,13 @@ fn compile_interpreter(
     let (module, func) = if let Some((module, kernel)) = kernel_cache.get(&kernel) {
         (module.clone(), kernel.clone())
     } else {
-        let _span = span!(Level::TRACE, "nvrtc").entered();
+        let arch =
+            crate::cuda_nvrtc_arch(cuda_stream.context()).unwrap_or_else(|| "sm_75".to_string());
+        let _span = span!(Level::TRACE, "nvrtc", arch = %arch).entered();
         let ptx = compile_ptx_with_opts(
             &kernel,
             CompileOptions {
-                arch: Some("sm_75"),
+                arch: Some(arch.as_str()),
                 ..Default::default()
             },
         )
