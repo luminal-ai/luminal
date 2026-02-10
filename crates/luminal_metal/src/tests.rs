@@ -1,4 +1,4 @@
-use crate::runtime::MetalRuntime;
+use crate::{kernel::lower_expression_for_metal, runtime::MetalRuntime};
 use luminal::prelude::*;
 use proptest::prelude::*;
 
@@ -22,6 +22,42 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             rel_err
         );
     }
+}
+
+/// dynamic symbols in kernel expressions should route through dyn buffer.
+#[test]
+fn dynamic_const_codegen_uses_dyn_buffer() {
+    let expr = (Expression::from('a') * 2 + Expression::from('z')).simplify();
+    let code = lower_expression_for_metal(&expr, "idx");
+
+    assert!(
+        !code.contains("*const_"),
+        "dynamic symbols should be lowered via dyn buffer, got: {code}"
+    );
+    assert!(
+        code.contains("dyn["),
+        "expected generated kernel expression to reference dyn buffer, got: {code}"
+    );
+}
+
+/// dynamic-dimension reduction should compile and execute on Metal.
+#[test]
+fn dynamic_dim_sum_reduce_runs() {
+    let mut cx = Graph::default();
+    cx.set_dim('a', 3);
+    let input = cx.tensor(('a', 2));
+    let output = input.sum(0).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let out = rt.get_f32(output);
+    assert_close(&out, &[9.0, 12.0], 0.001);
 }
 
 proptest! {

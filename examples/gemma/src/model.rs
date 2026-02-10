@@ -1,8 +1,8 @@
 use luminal::{
     graph::Graph,
-    op::{CustomOp, DType, LLIROp},
-    prelude::{F32Pow, GraphTensor},
-    shape::{flatten_mul_strides, Expression, ShapeTracker, ToShape},
+    op::{CustomOp, LLIROp},
+    prelude::GraphTensor,
+    shape::{flatten_mul_strides, Expression, ToShape},
 };
 use luminal_cuda::{
     block::{cstruct::CStruct, BlockOp},
@@ -15,8 +15,8 @@ pub const LAYERS: usize = 34;
 pub const HIDDEN: usize = 2560;
 pub const INTERMEDIATE: usize = 10240;
 pub const HEAD_DIM: usize = 256;
-pub const N_HEADS: usize = 8; // Number of attention heads for Q
-pub const N_KV_HEADS: usize = 4; // Number of KV heads
+pub const N_HEADS: usize = 8;
+pub const N_KV_HEADS: usize = 4;
 pub const KV_GROUPS: usize = N_HEADS / N_KV_HEADS; // = 2
 pub const Q_DIM: usize = N_HEADS * HEAD_DIM; // = 2048
 pub const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // = 1024
@@ -24,71 +24,12 @@ pub const VOCAB_SIZE: usize = 262208;
 pub const RMS_NORM_EPS: f32 = 1e-6;
 
 // Attention pattern constants
-pub const SLIDING_WINDOW_PATTERN: usize = 6; // Every 6th layer is global attention
-pub const SLIDING_WINDOW_SIZE: usize = 1024; // Local attention window size
-pub const ROPE_THETA_GLOBAL: f32 = 1_000_000.0; // RoPE base for global attention layers
-pub const ROPE_THETA_LOCAL: f32 = 10_000.0; // RoPE base for local attention layers
+pub const SLIDING_WINDOW_PATTERN: usize = 6;
+pub const SLIDING_WINDOW_SIZE: usize = 1024;
+pub const ROPE_THETA_GLOBAL: f32 = 1_000_000.0;
+pub const ROPE_THETA_LOCAL: f32 = 10_000.0;
 
-/// Apply QK-Norm + RoPE using frontend HLIR operations
-fn gemma_qk_norm_rope(
-    mut input: GraphTensor,
-    norm_weight: GraphTensor,
-    pos_ids: GraphTensor,
-    rope_theta: f32,
-) -> GraphTensor {
-    let orig_shape = input.shape;
-
-    // Reshape: (seq, dim) -> (n_heads, seq, head_dim)
-    input = input.split_dims(1, HEAD_DIM).transpose(0, 1);
-
-    // Apply QK-Norm: RMS norm along head_dim with learnable weights
-    // Note: weights are pre-transformed to (1 + weight) in setup.py
-    input = input.std_norm(2, RMS_NORM_EPS);
-    input = input * norm_weight.expand_lhs(&input.dims()[..input.dims().len() - 1]);
-
-    // Get freqs: theta_i = base^(-2i/d) for i in [0, d/2)
-    let freqs = input
-        .graph()
-        .arange_options(0, HEAD_DIM, 2)
-        .cast(DType::F32)
-        / HEAD_DIM as f32;
-    let inv_freqs = rope_theta.pow(freqs).reciprocal();
-
-    // emb = pos * inv_freqs, shape (seq, head_dim/2)
-    let emb = pos_ids
-        .cast(DType::F32)
-        .expand_dim(1, 1)
-        .matmul(inv_freqs.expand_dim(0, 1));
-
-    // Split input into first half (x0) and second half (x1) - SPLIT-HALF style
-    // input: (n_heads, seq, head_dim) -> split into (n_heads, seq, head_dim/2) each
-    let half_dim = HEAD_DIM / 2;
-    let x0 = input.slice((.., .., ..half_dim)); // First half: indices 0-127
-    let x1 = input.slice((.., .., half_dim..)); // Second half: indices 128-255
-
-    // Apply rotary embeddings:
-    // x0_out = x0 * cos(emb) - x1 * sin(emb)
-    // x1_out = x1 * cos(emb) + x0 * sin(emb)
-    let cos_emb = emb.cos().expand_dim(0, x0.dims()[0]);
-    let sin_emb = emb.sin().expand_dim(0, x0.dims()[0]);
-
-    let x0_out = x0 * cos_emb - x1 * sin_emb;
-    let x1_out = x1 * cos_emb + x0 * sin_emb;
-
-    // Concatenate back: [first_half | second_half]
-    let mut s = x0_out.concat_along(x1_out, 2);
-
-    // Set proper strides and reshape back
-    let n_heads = input.dims()[0];
-    let seq_dim = input.dims()[1];
-    s.shape = ShapeTracker::new((n_heads, seq_dim, HEAD_DIM));
-    s = s.transpose(0, 1) * 1.0;
-    s.shape = orig_shape;
-    s
-}
-
-/// Gemma-specific RMSNorm
-/// Note: weights are pre-transformed to (1 + weight) in setup.py
+/// Gemma-specific RMSNorm: weights are pre-transformed to (1 + weight) in hf.rs
 pub struct GemmaRMSNorm {
     pub weight: GraphTensor,
     epsilon: f32,
@@ -103,7 +44,6 @@ impl GemmaRMSNorm {
     }
 
     pub fn forward(&self, input: GraphTensor) -> GraphTensor {
-        // RMS normalize, then multiply by weight (already has +1 applied in setup.py)
         let normalized = input.std_norm(input.shape.last_axis(), self.epsilon);
         let scale = self
             .weight
@@ -153,6 +93,14 @@ impl Gemma {
                     format!("model.layers.{l}.self_attn.o_proj.weight"),
                     (HIDDEN, Q_DIM),
                 ),
+                q_norm: cx.named_tensor(
+                    format!("model.layers.{l}.self_attn.q_norm.weight"),
+                    HEAD_DIM,
+                ),
+                k_norm: cx.named_tensor(
+                    format!("model.layers.{l}.self_attn.k_norm.weight"),
+                    HEAD_DIM,
+                ),
                 input_layernorm: GemmaRMSNorm::new(
                     HIDDEN,
                     &format!("model.layers.{l}.input_layernorm.weight"),
@@ -177,14 +125,6 @@ impl Gemma {
                     RMS_NORM_EPS,
                     cx,
                 ),
-                q_norm: cx.named_tensor(
-                    format!("model.layers.{l}.self_attn.q_norm.weight"),
-                    HEAD_DIM,
-                ),
-                k_norm: cx.named_tensor(
-                    format!("model.layers.{l}.self_attn.k_norm.weight"),
-                    HEAD_DIM,
-                ),
                 is_local,
                 rope_theta: if is_local {
                     ROPE_THETA_LOCAL
@@ -202,27 +142,21 @@ impl Gemma {
         }
     }
 
-    pub fn forward(
-        &self,
-        token_ids: GraphTensor,
-        pos_ids: GraphTensor,
-        kv_cache: &KVCache,
-    ) -> GraphTensor {
+    pub fn forward(&self, token_ids: GraphTensor, kv_cache: &KVCache) -> GraphTensor {
         let batch = token_ids.dims1();
-        // Gemma uses pre-scaled embeddings (scaled by sqrt(hidden_size) in setup.py)
         let mut x = self.embedding.gather(
             (token_ids * HIDDEN).expand_dim(1, HIDDEN)
                 + token_ids.graph().arange(HIDDEN).expand_dim(0, batch),
         );
-        for (layer, (k_cache, v_cache)) in self.layers.iter().zip(&kv_cache.layers) {
-            x = layer.forward(
-                x,
-                pos_ids,
-                k_cache.device_ptr(v_cache.stream()).0,
-                v_cache.device_ptr(k_cache.stream()).0,
-            );
+        for (layer, (k_cache, v_cache)) in self.layers.iter().zip(kv_cache.layers.iter()) {
+            x = layer
+                .forward(
+                    x,
+                    k_cache.device_ptr(v_cache.stream()).0,
+                    v_cache.device_ptr(k_cache.stream()).0,
+                )
+                .graph_break();
         }
-        // Use separate lm_head (not tied to embeddings)
         self.lm_norm.forward(x).matmul(self.lm_head.t())
     }
 }
@@ -235,70 +169,55 @@ struct GemmaLayer {
     k_proj: GraphTensor,
     v_proj: GraphTensor,
     o_proj: GraphTensor,
+    q_norm: GraphTensor,
+    k_norm: GraphTensor,
     input_layernorm: GemmaRMSNorm,
     post_attention_layernorm: GemmaRMSNorm,
     pre_feedforward_layernorm: GemmaRMSNorm,
     post_feedforward_layernorm: GemmaRMSNorm,
-    q_norm: GraphTensor,
-    k_norm: GraphTensor,
-    is_local: bool,  // true for sliding window attention, false for global
-    rope_theta: f32, // RoPE base frequency (different for local vs global attention)
+    is_local: bool,
+    rope_theta: f32,
 }
 
 impl GemmaLayer {
-    pub fn forward(
-        &self,
-        x: GraphTensor,
-        pos_ids: GraphTensor,
-        k_cache: u64,
-        v_cache: u64,
-    ) -> GraphTensor {
-        // 1. Pre-attention norm
+    pub fn forward(&self, x: GraphTensor, k_cache: u64, v_cache: u64) -> GraphTensor {
         let x_attn = self.input_layernorm.forward(x);
-
-        // 2. Q/K/V projections
         let q = x_attn.matmul(self.q_proj.t());
         let k = x_attn.matmul(self.k_proj.t());
         let v = x_attn.matmul(self.v_proj.t());
 
-        // 3. Apply QK-Norm + RoPE using HLIR operations
-        // Use different RoPE base frequency for local vs global attention
-        let q_rope = gemma_qk_norm_rope(q, self.q_norm, pos_ids, self.rope_theta);
-        let k_rope = gemma_qk_norm_rope(k, self.k_norm, pos_ids, self.rope_theta);
-
-        // 4. Attention
-        // Use sliding window for local attention layers, global for others
+        // 5 graph inputs: Q, K, V, q_norm_weights, k_norm_weights
         let attn_out = x.graph().custom_op(
             GemmaAttention::new(
                 k_cache,
                 v_cache,
-                q_rope.dims()[0],
+                q.dims()[0],
                 'p'.into(),
                 self.is_local,
+                self.rope_theta,
             ),
-            (q_rope, k_rope, v),
-            q_rope.shape,
-            q_rope.dtype,
+            (q, k, v, self.q_norm, self.k_norm),
+            q.shape,
+            q.dtype,
         );
 
-        // 5. O projection + post-attention norm + residual
+        // O projection + post-attention norm + residual
         let attn_proj = attn_out.matmul(self.o_proj.t());
         let attn_normed = self.post_attention_layernorm.forward(attn_proj);
         let x = x + attn_normed;
 
-        // 6. Pre-feedforward norm
+        // Pre-feedforward norm + MLP + post-feedforward norm + residual
         let x_ff = self.pre_feedforward_layernorm.forward(x);
-
-        // 7. MLP with SwiGLU
-        // MLP with gated activation (using swish for now - TODO: verify correct activation)
         let mlp_out =
             (x_ff.matmul(self.gate.t()).swish() * x_ff.matmul(self.up.t())).matmul(self.down.t());
-
-        // 8. Post-feedforward norm + residual
         let mlp_normed = self.post_feedforward_layernorm.forward(mlp_out);
         x + mlp_normed
     }
 }
+
+// ---------------------------------------------------------------------------
+// KV Cache
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct KVCache {
@@ -331,6 +250,10 @@ impl KVCache {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GemmaAttention: Fused QK-Norm + RoPE + Causal Attention with KV Cache
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone)]
 pub struct GemmaAttention {
     range: Vec<Expression>,
@@ -344,7 +267,8 @@ pub struct GemmaAttention {
     prev_seq: Expression,
     k_cache: u64,
     v_cache: u64,
-    sliding_window: usize, // 0 for global attention, >0 for local sliding window
+    sliding_window: usize,
+    rope_theta: f32,
 }
 
 impl GemmaAttention {
@@ -354,6 +278,7 @@ impl GemmaAttention {
         seq: Expression,
         prev_seq: Expression,
         is_local: bool,
+        rope_theta: f32,
     ) -> Self {
         let sliding_window = if is_local { SLIDING_WINDOW_SIZE } else { 0 };
         Self {
@@ -369,12 +294,13 @@ impl GemmaAttention {
             k_cache,
             v_cache,
             sliding_window,
+            rope_theta,
         }
     }
 }
 
 impl CustomOp for GemmaAttention {
-    fn to_llir_op(&self) -> luminal::op::LLIROp {
+    fn to_llir_op(&self) -> LLIROp {
         LLIROp::new::<dyn BlockOp>(Box::new(self.clone()))
     }
 }
@@ -403,7 +329,9 @@ impl BlockOp for GemmaAttention {
         k[self.range.len() - 1] = false;
         let mut v = vec![true; self.range.len()];
         v[self.range.len() - 1] = false;
-        vec![q, k, v]
+        // q_norm and k_norm are constant weights, no barriers needed
+        let no_barrier = vec![false; self.range.len()];
+        vec![q, k, v, no_barrier.clone(), no_barrier]
     }
 
     fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
@@ -437,14 +365,16 @@ impl BlockOp for GemmaAttention {
                 flatten_mul_strides(&self.range, &head_pos_stride),
             )
             .int("sliding_window", self.sliding_window as i32)
+            .float("rope_theta", self.rope_theta)
     }
 
     fn cuda_function(&self) -> String {
         "
-            // shared buffer for block-wide reduction
-            __shared__ float shared[32]; // max 32 warps per block
+            __shared__ float shared[32];
+            __shared__ float q_buf[256];
+            __shared__ float k_buf[256];
+            __shared__ float rnorm_s;
 
-            // warp-level reduction
             auto warp_reduce_sum = [](float val) {
                 for (int offset = 16; offset > 0; offset >>= 1) {
                     val += __shfl_down_sync(0xffffffff, val, offset);
@@ -452,113 +382,156 @@ impl BlockOp for GemmaAttention {
                 return val;
             };
 
-            // block-level reduction (sum valid only in thread 0)
             auto block_reduce_sum = [&](float val) {
                 int lane = threadIdx.x & 31;
                 int wid  = threadIdx.x >> 5;
-
                 val = warp_reduce_sum(val);
                 if (lane == 0) shared[wid] = val;
                 __syncthreads();
-
                 val = (threadIdx.x < (blockDim.x >> 5)) ? shared[lane] : 0.0f;
                 if (wid == 0) val = warp_reduce_sum(val);
                 return val;
             };
 
-            const float* q   = source_ptrs[0] + eval_expression(payload.q, current);
-            const float* k   = source_ptrs[1] + eval_expression(payload.k, current);
-            const float* v   = source_ptrs[2] + eval_expression(payload.v, current);
-            float*       out = out_ptr + eval_expression(payload.out, current);
+            // 5 graph inputs: Q, K, V, q_norm_weights, k_norm_weights
+            const float* q_raw = source_ptrs[0] + eval_expression(payload.q, current);
+            const float* k_base = source_ptrs[1] + eval_expression(payload.k, current);
+            const float* v_base = source_ptrs[2] + eval_expression(payload.v, current);
+            const float* q_weights = source_ptrs[3];
+            const float* k_weights = source_ptrs[4];
+
+            float* out = out_ptr + eval_expression(payload.out, current);
             int q_pos_local = eval_expression(payload.q_pos_stride, current);
             const int group_pos_local = eval_expression(payload.group_pos_stride, current);
             const int head_pos_local = eval_expression(payload.head_pos_stride, current);
 
             const int d             = eval_expression(payload.head_size, 0);
-            const float* __restrict__ K_cache = payload.key_cache + head_pos_local * d;
-            const float* __restrict__ V_cache = payload.val_cache + head_pos_local * d;
+            float* __restrict__ K_cache = payload.key_cache + head_pos_local * d;
+            float* __restrict__ V_cache = payload.val_cache + head_pos_local * d;
 
             const int S             = eval_expression(payload.cur_seq, 0);
             const int kv_row_stride = eval_expression(payload.kv_row_stride, 0);
             const int prev          = eval_expression(payload.prev_seq, 0);
-
-            // Sliding window configuration (0 = global attention, >0 = local sliding window)
             const int sliding_window = payload.sliding_window;
+            const float rope_base   = payload.rope_theta;
 
-            const float* __restrict__ K_cur = k;
-            const float* __restrict__ V_cur = v;
-            float*       __restrict__ O     = out;
+            const float* __restrict__ K_cur = k_base;
+            const float* __restrict__ V_cur = v_base;
+            float* __restrict__ O = out;
 
             if (q_pos_local >= S) q_pos_local = S - 1;
             if (q_pos_local < 0)  q_pos_local = 0;
 
             const int q_pos_total = prev + q_pos_local;
+            const float scale = rsqrtf((float)d);
 
-            // For sliding window attention, compute the start position
-            // We only attend to positions within [q_pos_total - sliding_window + 1, q_pos_total]
+            const int half = d / 2;
+            const float eps = 1e-6f;
+
+            // Sliding window: compute attention start position
             int attn_start = 0;
             if (sliding_window > 0 && q_pos_total >= sliding_window) {
                 attn_start = q_pos_total - sliding_window + 1;
             }
 
-            const float scale = rsqrtf((float)d);
-
-            __shared__ float max_l_shared;
-            __shared__ float inv_s_shared;
-            __shared__ float w_shared;
-
-            if (group_pos_local == 0 && K_cache != nullptr && V_cache != nullptr) {
-                for (int r = 0; r < S; ++r) {
-                    const float* __restrict__ srcK = K_cur + r * kv_row_stride;
-                    const float* __restrict__ srcV = V_cur + r * kv_row_stride;
-                          float* __restrict__ dstK = const_cast<float*>(K_cache) + (prev + r) * kv_row_stride;
-                          float* __restrict__ dstV = const_cast<float*>(V_cache) + (prev + r) * kv_row_stride;
-
-                    for (int u = t; u < d; u += blockDim.x) {
-                        dstK[u] = srcK[u];
-                        dstV[u] = srcV[u];
-                    }
+            // ================================================================
+            // Step 1: QK-Norm + RoPE for this Q row
+            // ================================================================
+            {
+                float sum_sq = 0.0f;
+                for (int i = t; i < d; i += blockDim.x) {
+                    float val = q_raw[i];
+                    sum_sq += val * val;
                 }
-            }
-            __syncthreads();
+                sum_sq = block_reduce_sum(sum_sq);
+                if (t == 0) rnorm_s = rsqrtf(sum_sq / (float)d + eps);
+                __syncthreads();
+                float rn = rnorm_s;
 
-            if (t == 0) max_l_shared = -__int_as_float(0x7f800000);
-            __syncthreads();
-
-            // First pass: find max for numerical stability
-            for (int r = attn_start; r <= q_pos_total; ++r) {
-                const float* __restrict__ k_row;
-                if (r < prev) {
-                    k_row = K_cache + r * kv_row_stride;
-                } else {
-                    int r_local = r - prev;
-                    k_row = K_cur + r_local * kv_row_stride;
+                for (int i = t; i < d; i += blockDim.x) {
+                    q_buf[i] = q_raw[i] * rn * q_weights[i];
                 }
+                __syncthreads();
 
-                float partial = 0.0f;
-                for (int u = t; u < d; u += blockDim.x) {
-                    partial += q[u] * k_row[u];
-                }
-                float dot_qk = block_reduce_sum(partial);
-
-                if (t == 0) {
-                    float logit = dot_qk * scale;
-                    max_l_shared = fmaxf(max_l_shared, logit);
+                int pos = prev + q_pos_local;
+                for (int i = t; i < half; i += blockDim.x) {
+                    float freq = powf(rope_base, -2.0f * (float)i / (float)d);
+                    float theta = (float)pos * freq;
+                    float cos_t, sin_t;
+                    __sincosf(theta, &sin_t, &cos_t);
+                    float x0 = q_buf[i];
+                    float x1 = q_buf[i + half];
+                    q_buf[i]        = x0 * cos_t - x1 * sin_t;
+                    q_buf[i + half] = x1 * cos_t + x0 * sin_t;
                 }
                 __syncthreads();
             }
 
+            // ================================================================
+            // Step 2: First group writes K (norm+rope) + V to cache
+            // ================================================================
+            if (group_pos_local == 0) {
+                for (int r = 0; r < S; ++r) {
+                    const float* __restrict__ srcK = K_cur + r * kv_row_stride;
+                    const float* __restrict__ srcV = V_cur + r * kv_row_stride;
+                    float* __restrict__ dstK = K_cache + (prev + r) * kv_row_stride;
+                    float* __restrict__ dstV = V_cache + (prev + r) * kv_row_stride;
+
+                    // Copy V directly
+                    for (int u = t; u < d; u += blockDim.x) {
+                        dstV[u] = srcV[u];
+                    }
+
+                    // K: QK-Norm
+                    float k_sum = 0.0f;
+                    for (int u = t; u < d; u += blockDim.x) {
+                        float val = srcK[u];
+                        k_sum += val * val;
+                    }
+                    k_sum = block_reduce_sum(k_sum);
+                    if (t == 0) rnorm_s = rsqrtf(k_sum / (float)d + eps);
+                    __syncthreads();
+                    float k_rn = rnorm_s;
+
+                    for (int u = t; u < d; u += blockDim.x) {
+                        k_buf[u] = srcK[u] * k_rn * k_weights[u];
+                    }
+                    __syncthreads();
+
+                    // K: Split-half RoPE -> write to cache
+                    int k_pos = prev + r;
+                    for (int i = t; i < half; i += blockDim.x) {
+                        float freq = powf(rope_base, -2.0f * (float)i / (float)d);
+                        float theta = (float)k_pos * freq;
+                        float cos_t, sin_t;
+                        __sincosf(theta, &sin_t, &cos_t);
+                        float kx0 = k_buf[i];
+                        float kx1 = k_buf[i + half];
+                        dstK[i]        = kx0 * cos_t - kx1 * sin_t;
+                        dstK[i + half] = kx1 * cos_t + kx0 * sin_t;
+                    }
+                    __syncthreads();
+                }
+            }
             __syncthreads();
-            float max_l = max_l_shared;
+
+            // ================================================================
+            // Step 3: Online softmax attention with sliding window
+            //   rows < prev  : K from cache, V from cache
+            //   rows >= prev : K norm+rope on-the-fly from source, V from source
+            // ================================================================
+
+            __shared__ float att_m;
+            __shared__ float att_corr;
+            __shared__ float att_w;
+            float att_d = 0.0f;
 
             for (int j = t; j < d; j += blockDim.x) {
                 O[j] = 0.0f;
             }
-
-            float s_local = 0.0f;
+            if (t == 0) att_m = -__int_as_float(0x7f800000);
             __syncthreads();
 
-            // Second pass: compute softmax and weighted sum
             for (int r = attn_start; r <= q_pos_total; ++r) {
                 const float* __restrict__ k_row;
                 const float* __restrict__ v_row;
@@ -568,41 +541,78 @@ impl BlockOp for GemmaAttention {
                     v_row = V_cache + r * kv_row_stride;
                 } else {
                     int r_local = r - prev;
-                    k_row = K_cur + r_local * kv_row_stride;
+                    const float* __restrict__ srcK = K_cur + r_local * kv_row_stride;
                     v_row = V_cur + r_local * kv_row_stride;
+
+                    // K: QK-Norm on the fly
+                    float k_sum = 0.0f;
+                    for (int u = t; u < d; u += blockDim.x) {
+                        float val = srcK[u];
+                        k_sum += val * val;
+                    }
+                    k_sum = block_reduce_sum(k_sum);
+                    if (t == 0) rnorm_s = rsqrtf(k_sum / (float)d + eps);
+                    __syncthreads();
+                    float k_rn = rnorm_s;
+
+                    for (int u = t; u < d; u += blockDim.x) {
+                        k_buf[u] = srcK[u] * k_rn * k_weights[u];
+                    }
+                    __syncthreads();
+
+                    // K: Split-half RoPE
+                    for (int i = t; i < half; i += blockDim.x) {
+                        float freq = powf(rope_base, -2.0f * (float)i / (float)d);
+                        float theta = (float)r * freq;
+                        float cos_t, sin_t;
+                        __sincosf(theta, &sin_t, &cos_t);
+                        float kx0 = k_buf[i];
+                        float kx1 = k_buf[i + half];
+                        k_buf[i]        = kx0 * cos_t - kx1 * sin_t;
+                        k_buf[i + half] = kx1 * cos_t + kx0 * sin_t;
+                    }
+                    __syncthreads();
+
+                    k_row = k_buf;
                 }
 
+                // Dot product: q . k
                 float partial = 0.0f;
                 for (int u = t; u < d; u += blockDim.x) {
-                    partial += q[u] * k_row[u];
+                    partial += q_buf[u] * k_row[u];
                 }
                 float dot_qk = block_reduce_sum(partial);
 
+                // Online softmax update
                 if (t == 0) {
                     float logit = dot_qk * scale;
-                    float w     = __expf(logit - max_l);
-                    s_local    += w;
-                    w_shared    = w;
+                    float m_old = att_m;
+                    float m_new = fmaxf(m_old, logit);
+                    float corr = __expf(m_old - m_new);
+                    float w = __expf(logit - m_new);
+                    att_d = att_d * corr + w;
+                    att_m = m_new;
+                    att_corr = corr;
+                    att_w = w;
                 }
                 __syncthreads();
 
-                float w = w_shared;
+                float corr = att_corr;
+                float w = att_w;
 
                 for (int j = t; j < d; j += blockDim.x) {
-                    O[j] += w * v_row[j];
+                    O[j] = O[j] * corr + w * v_row[j];
                 }
                 __syncthreads();
             }
 
-            if (t == 0) {
-                inv_s_shared = 1.0f / s_local;
-            }
+            // Final normalization
+            if (t == 0) att_w = 1.0f / att_d;
             __syncthreads();
-
-            float inv_s = inv_s_shared;
+            float inv_d = att_w;
 
             for (int j = t; j < d; j += blockDim.x) {
-                O[j] *= inv_s;
+                O[j] *= inv_d;
             }
         "
         .to_string()

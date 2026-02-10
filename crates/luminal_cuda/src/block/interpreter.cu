@@ -1,5 +1,7 @@
 const int N_OPS = 0;
 const int N_TIMING_SLOTS = 0;
+const int N_TASKS = 0;  // Rendered at compile time
+//%n_barriers_const%
 
 enum OpCode {
   //%extra_op_codes%
@@ -23,8 +25,8 @@ struct Task {
   int in_dep_c_base;
   int out_dep_stride;
   int out_dep_base;
-  const float *source_ptrs[3];
-  float *out_ptr;
+  int source_indices[6];
+  int out_index;
   Payload payload;
 };
 
@@ -73,7 +75,7 @@ struct NextTask {
 //   > 0 = iterations remaining (atomicSub to claim, iteration = old - 1)
 //   <= 0 = exhausted
 __device__ inline bool fetch_next_task(Task *tasks, int num_tasks, int *head,
-                                       NextTask *out, int *queue_lock) {
+                                       NextTask *out) {
   while (true) {
     int idx = atomic_load_acquire(head);
     if (idx >= num_tasks)
@@ -104,6 +106,7 @@ __device__ inline bool fetch_next_task(Task *tasks, int num_tasks, int *head,
       if (old == 1) {
         atomicMax(head, idx + 1);
       }
+      // DEBUG: This path indicates successful task claim
       return true;
     }
 
@@ -127,11 +130,27 @@ __device__ inline void record_event(SMEvent *__restrict__ timings,
 }
 
 extern "C" {
-__global__ void worker_kernel(Task *__restrict__ tasks, int num_tasks,
-                              int *__restrict__ head, int *__restrict__ ready,
-                              int *__restrict__ queue_lock,
-                              SMEvent *__restrict__ timings,
-                              unsigned long long *__restrict__ start_times) {
+
+// Kernel params: internal buffers in order, then dyn_dims
+// tasks, head, ready, queue_lock, timings, start_times, buffers, dyn_dims
+__global__ void worker_kernel(
+    Task* __restrict__ tasks,
+    int* __restrict__ head,
+    int* __restrict__ ready,
+    int* __restrict__ queue_lock,
+    SMEvent* __restrict__ timings,
+    unsigned long long* __restrict__ start_times,
+    float* const* buffers,
+    int* __restrict__ dyn_dims
+) {
+  // Constants N_TASKS and N_BARRIERS are baked into the kernel string
+
+  // Note: Reset is now done on host side in pre_execute
+  // All buffers (head, queue_lock, ready, tasks) are pre-initialized
+
+  // DEBUG: Count tasks fetched (use queue_lock as counter since it's not being used)
+  // Note: queue_lock is in internal_bufs[3]
+
   __shared__ NextTask nt;
   __shared__ int done;
   __shared__ int dep_out;
@@ -140,6 +159,8 @@ __global__ void worker_kernel(Task *__restrict__ tasks, int num_tasks,
   __shared__ bool run_c_prologue;
   __shared__ bool stop_wait_loop;
   __shared__ float scratchpad[8192]; // 32 KB scratchpad
+  __shared__ const float* source_ptrs[6];
+  __shared__ float* out_ptr;
   int recorded_event = 0;
   timings += blockIdx.x * N_TIMING_SLOTS;
   if (threadIdx.x == 0) {
@@ -148,13 +169,26 @@ __global__ void worker_kernel(Task *__restrict__ tasks, int num_tasks,
   while (true) {
     if (threadIdx.x == 0) {
       record_event(timings, &recorded_event, 0); // Record issue start
-      done = !fetch_next_task(tasks, num_tasks, head, &nt, queue_lock);
+      done = !fetch_next_task(tasks, N_TASKS, head, &nt);
     }
     __syncthreads();
     if (done)
       break;
 
     const Task *t = &tasks[nt.task_idx];
+
+    // Resolve buffer pointers from indices
+    if (threadIdx.x == 0) {
+      source_ptrs[0] = buffers[t->source_indices[0]];
+      source_ptrs[1] = buffers[t->source_indices[1]];
+      source_ptrs[2] = buffers[t->source_indices[2]];
+      source_ptrs[3] = buffers[t->source_indices[3]];
+      source_ptrs[4] = buffers[t->source_indices[4]];
+      source_ptrs[5] = buffers[t->source_indices[5]];
+      out_ptr = buffers[t->out_index];
+    }
+    __syncthreads();
+
     int dep_a = 0;
     int dep_b = 0;
     int dep_c = 0;

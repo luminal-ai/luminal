@@ -138,7 +138,9 @@ impl HostOp for CuBlasSgemmV2 {
     fn execute(
         &self,
         stream: &Arc<CudaStream>,
-        inputs: &[&CudaSlice<u8>],
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
         // GEMM parameters
@@ -154,19 +156,24 @@ impl HostOp for CuBlasSgemmV2 {
         let alpha = 1.0f32;
         let beta = 0.0f32;
 
+        // Get buffers: output is self_node, inputs are from graph edges
+        let c_buf = buffers[&self_node];
+        let a_buf = buffers[&inputs[0]];
+        let b_buf = buffers[&inputs[1]];
+
         // Get device pointers
-        let (a_ptr, _a_guard) = inputs[1].device_ptr(stream);
-        let (b_ptr, _b_guard) = inputs[2].device_ptr(stream);
-        let (c_ptr, _c_guard) = inputs[0].device_ptr(stream);
+        let (a_ptr, _a_guard) = a_buf.device_ptr(stream);
+        let (b_ptr, _b_guard) = b_buf.device_ptr(stream);
+        let (c_ptr, _c_guard) = c_buf.device_ptr(stream);
 
         // Debug: Check buffer sizes
         trace!(
             "buffer_validation {}=={},{}=={},{}=={}",
-            inputs[1].len(),
+            a_buf.len(),
             m * k * 4,
-            inputs[2].len(),
+            b_buf.len(),
             k * n * 4,
-            inputs[0].len(),
+            c_buf.len(),
             m * n * 4
         );
         let _sgemm_span = span!(

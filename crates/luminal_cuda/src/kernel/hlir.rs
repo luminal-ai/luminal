@@ -259,8 +259,7 @@ impl EgglogOp for KernelSumReduce {
     }
 
     fn cleanup(&self) -> bool {
-        true // TODO: this is very bad! its here so we dont have the Mul -> SumReduce pattern which can exceed memory but we should analytically eliminate that from search sapce!
-        // a slightly better way than this will be to subsume in the cublas match rule
+        false
     }
 
     fn extract<'a>(

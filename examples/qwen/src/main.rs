@@ -15,7 +15,7 @@ const REPO_ID: &str = "Qwen/Qwen3-4B";
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 30;
-    let search_graphs = 5; // the number of graphs we want to search during compilation
+    let search_graphs = 500; // the number of graphs we want to search during compilation
     let prompt = "The capital of France is";
 
     // Set up cuda context and stream
@@ -30,15 +30,15 @@ fn main() {
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
     let mut sentence = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
 
-    // Allocate kv cache
+    // Allocate kv cache and norm weight buffers
     let mut kv_cache = KVCache::new(&stream, max_seq_len);
+    let mut norm_bufs = NormWeightBuffers::new(&stream);
 
     // Create compute graph
     let mut cx = Graph::default();
     let input = cx.named_tensor("input", 's').as_dtype(DType::Int);
-    let token_ids = cx.named_tensor("token_ids", 's').as_dtype(DType::Int);
     let model = model::Qwen::init(&mut cx);
-    let logits = model.forward(input, token_ids, &kv_cache).output();
+    let logits = model.forward(input, &kv_cache, &norm_bufs).output();
 
     // Build search space
     println!("Building E-Graph...");
@@ -50,12 +50,15 @@ fn main() {
     let weights_path = model_dir.join("model_combined.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
+    // Load QK-norm weights directly from safetensors into GPU buffers
+    println!("Loading norm weights...");
+    norm_bufs.load_from_safetensors(&weights_path);
+
     // Run search process
     println!("Compiling...");
     cx.set_dim('s', 1);
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1]);
-    runtime.set_data(token_ids, vec![0]);
     runtime = cx.search(runtime, search_graphs);
     kv_cache.reset();
 
@@ -76,10 +79,6 @@ fn main() {
         runtime.set_data(
             input,
             sentence.iter().map(|i| *i as i32).collect::<Vec<_>>(),
-        );
-        runtime.set_data(
-            token_ids,
-            (prev_seq as i32..(seq_len + prev_seq) as i32).collect::<Vec<_>>(),
         );
 
         // Execute forward pass

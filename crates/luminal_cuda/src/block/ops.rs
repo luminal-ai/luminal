@@ -9,6 +9,7 @@ use luminal::{
 };
 
 use crate::block::{BlockOp, CStruct};
+use luminal::shape::flatten_mul_strides;
 
 pub type Ops = (
     RowAdd,
@@ -18,6 +19,8 @@ pub type Ops = (
     TileMatmulFullSplit,
     // TileMatmulSplitK, // TODO: Fix rewrite rule to not use TileSum and CubeMul
     RowEmbed,
+    TileMatmulNvFp4,
+    TileMatmulMxfp4,
 );
 
 #[derive(Debug, Default)]
@@ -1024,7 +1027,8 @@ impl EgglogOp for TileMatmulSplitK {
                 ; Assert B has contiguous k (col-major B / transposed)
                 (= ?b_k_stride (MNum 1))
 
-                ;(= (F32) (dtype ?a))
+                (= (F32) (dtype ?a))
+                (= (F32) (dtype ?b))
             )
             (
                 ; Create tiled shape with K chunks
@@ -1418,8 +1422,8 @@ impl EgglogOp for TileMatmulFullSplit {
                 ; Assert B has contiguous k (col-major B / transposed)
                 (= ?b_k_stride (MNum 1))
 
-                ;(= (F32) (dtype ?a))
-                ;(= (F32) (dtype ?b))
+                (= (F32) (dtype ?a))
+                (= (F32) (dtype ?b))
             )
             (
                 ; Compute tiled dimensions
@@ -1949,5 +1953,793 @@ impl BlockOp for RowEmbed {
                 flatten_mul_strides(&self.range, &self.out_stride),
             )
             .expr("embed_dim", self.embed_dim)
+    }
+}
+
+/// TileMatmulNvFp4: Matrix multiplication with NvFp4-quantized B (weight) matrix.
+///
+/// Computes C = A * dequant(B) where:
+/// - A is FP32 activations [M, K] (row-major, k-contiguous)
+/// - B is a single NvFp4 buffer laid out as: [packed_data | block_scales]
+///   packed_data: N * K/2 bytes (FP4 E2M1, 2 values per byte, k-contiguous per column)
+///   block_scales: N * ceil(K/16) bytes (FP8 E4M3, 1 scale per 16 elements)
+/// - C is FP32 output [M, N]
+///
+/// 2 inputs: source_ptrs[0]=A (float*), source_ptrs[1]=B (uint8*, NvFp4 buffer)
+/// Tensor scale embedded in payload.
+///
+/// No K-splitting: each SM handles complete dot products for its assigned output tiles.
+#[derive(Debug, Default)]
+pub struct TileMatmulNvFp4 {
+    sm_count: Expression,
+    untiled_range: Vec<Expression>, // [M, N]
+    m_tiles: Expression,
+    n_tiles: Expression,
+    total_k: Expression,
+    a_m_stride: Expression,
+    out_m_stride: Expression,
+    out_n_stride: Expression,
+    tensor_scale: f32,
+}
+
+impl EgglogOp for TileMatmulNvFp4 {
+    fn term(&self) -> (String, Vec<OpParam>) {
+        (
+            "TileMatmulNvFp4".to_string(),
+            vec![
+                Expr,  // sm_count
+                EList, // untiled_range [M, N]
+                Expr,  // m_tiles
+                Expr,  // n_tiles
+                Expr,  // total_k
+                Input, // a (FP32 activations)
+                Expr,  // a_m_stride
+                Input, // b (NvFp4 buffer: packed_data + block_scales)
+                Expr,  // out_m_stride
+                Expr,  // out_n_stride
+                Float, // tensor_scale
+            ],
+        )
+    }
+
+    fn rewrites(&self) -> Vec<String> {
+        vec![
+            // Match Mul -> Sum pattern where B input has NvFp4 dtype
+            format!(
+                "
+        (rule
+            (
+                ; Match Mul node
+                (= ?mul (Mul ?mul_shape ?a ?a_stride ?b ?b_stride ?mul_out_stride))
+
+                ; Match Sum that reduces the Mul (k dimension)
+                (= ?sum (Sum ?out_shape ?k ?mul ?sum_in_stride ?k_stride ?sum_out_stride))
+
+                ; Get dimensions from output shape
+                (= ?m (nth_from_end ?out_shape 1))
+                (= ?n (nth_from_end ?out_shape 0))
+                (!= ?m (MNum 0))
+                (!= ?n (MNum 0))
+
+                ; Get output strides
+                (= ?sum_out_m_stride (nth_from_end ?sum_out_stride 1))
+                (= ?sum_out_n_stride (nth_from_end ?sum_out_stride 0))
+
+                ; Get A strides
+                (= ?a_m_stride (nth_from_end ?a_stride 2))
+                (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+                ; Get B strides
+                (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+                ; Assert contiguous k stride on output
+                (= ?k_stride (MNum 1))
+
+                ; Assert A has contiguous k (row-major A)
+                (= ?a_k_stride (MNum 1))
+
+                ; Assert B has contiguous k
+                (= ?b_k_stride (MNum 1))
+
+                ; B must be NvFp4
+                (= (NvFp4) (dtype ?b))
+            )
+            (
+                ; Compute tiled dimensions
+                (let ?tiled_m (MCeilDiv ?m (MNum {ts})))
+                (let ?tiled_n (MCeilDiv ?n (MNum {ts})))
+
+                (let ?tm (TileMatmulNvFp4
+                    (MNum {sm_count})
+                    ?out_shape
+                    ?tiled_m ?tiled_n ?k
+                    ?a ?a_m_stride
+                    ?b
+                    ?sum_out_m_stride ?sum_out_n_stride
+                    1.0))
+                (union ?sum ?tm)
+                (set (dtype ?tm) (F32))
+            )
+            :name \"tile matmul nvfp4\"
+        )",
+                ts = TILE_SIZE,
+                sm_count = 56
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        children: &[&'a ENodeId],
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let tensor_scale: f64 = egraph.enodes[children[10]].0.parse().unwrap();
+        (
+            LLIROp::new::<dyn BlockOp>(Box::new(Self {
+                sm_count: extract_expr(egraph, children[0], expr_cache).unwrap(),
+                untiled_range: extract_expr_list(egraph, children[1], list_cache, expr_cache)
+                    .unwrap(),
+                m_tiles: extract_expr(egraph, children[2], expr_cache).unwrap(),
+                n_tiles: extract_expr(egraph, children[3], expr_cache).unwrap(),
+                total_k: extract_expr(egraph, children[4], expr_cache).unwrap(),
+                // children[5] = a input (source)
+                a_m_stride: extract_expr(egraph, children[6], expr_cache).unwrap(),
+                // children[7] = b input (NvFp4 buffer)
+                out_m_stride: extract_expr(egraph, children[8], expr_cache).unwrap(),
+                out_n_stride: extract_expr(egraph, children[9], expr_cache).unwrap(),
+                tensor_scale: tensor_scale as f32,
+            })),
+            vec![children[5], children[7]], // a, b
+        )
+    }
+}
+
+impl BlockOp for TileMatmulNvFp4 {
+    fn op_name(&self) -> &'static str {
+        "TileMatmulNvFp4"
+    }
+
+    fn launch_range(&self) -> Vec<Expression> {
+        vec![self.sm_count]
+    }
+
+    fn output_size(&self) -> Expression {
+        self.untiled_range.iter().copied().product::<Expression>()
+    }
+
+    fn producer_barriers_seperate(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn consumer_barriers_seperate(&self) -> Vec<Vec<bool>> {
+        // 2 inputs: A (FP32), B (NvFp4 buffer)
+        vec![vec![false], vec![false]]
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        let m = self.untiled_range[0];
+        let n = self.untiled_range[1];
+        m * n * 4 // FP32 output
+    }
+
+    fn flops(&self) -> Expression {
+        let m = self.untiled_range[0];
+        let n = self.untiled_range[1];
+        let k = self.total_k;
+        m * n * k * 2
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        let m = self.untiled_range[0];
+        let n = self.untiled_range[1];
+        let k = self.total_k;
+        // A: M*K*4 bytes (FP32)
+        // B: N * (K/2 + K/16) bytes (packed FP4 + block scales)
+        m * k * 4 + n * k / 2 + n * k / 16
+    }
+
+    fn cuda_function(&self) -> String {
+        format!(
+            r#"
+        // TileMatmulNvFp4: FP32 activations x NvFp4 weights -> FP32 output
+        // Dequantizes NvFp4 weights inline during matmul.
+        //
+        // Buffer layout for B (per column, K elements):
+        //   [packed_data: K/2 bytes][block_scales: K/16 bytes]
+        // Columns are laid out contiguously: column n starts at offset n * (K/2 + K/16)
+
+        // FP4 E2M1 lookup table (16 entries) + FP8 E4M3 lookup table (256 entries)
+        __shared__ float fp4_lut[16];
+        __shared__ float fp8_lut[256];
+
+        // Initialize FP4 LUT
+        if (t < 16) {{
+            const float table[16] = {{
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+            }};
+            fp4_lut[t] = table[t];
+        }}
+
+        // Initialize FP8 E4M3 LUT: precompute all 256 decoded values
+        for (int i = t; i < 256; i += blockDim.x) {{
+            unsigned int sign = (i >> 7) & 1;
+            unsigned int exp  = (i >> 3) & 0xF;
+            unsigned int mant = i & 0x7;
+            float result;
+            if (exp == 0) {{
+                result = ldexpf((float)mant / 8.0f, -6);
+            }} else if (exp == 15 && mant == 7) {{
+                result = 0.0f; // NaN -> treat as 0 for safety
+            }} else {{
+                result = ldexpf(1.0f + (float)mant / 8.0f, (int)exp - 7);
+            }}
+            fp8_lut[i] = sign ? -result : result;
+        }}
+        __syncthreads();
+
+        const int m_tiles = eval_expression(payload.m_tiles, 0);
+        const int n_tiles = eval_expression(payload.n_tiles, 0);
+        const int total_k = eval_expression(payload.total_k, 0);
+        const int sm_count = eval_expression(payload.sm_count, 0);
+        const int M = eval_expression(payload.untiled_range[0], 0);
+        const int N = eval_expression(payload.untiled_range[1], 0);
+
+        const float* a_base = source_ptrs[0];
+        const unsigned char* b_base = (const unsigned char*)source_ptrs[1];
+        float* c_base = out_ptr;
+
+        const int a_m_stride = eval_expression(payload.a_m_stride, 0);
+        const int c_m_stride = eval_expression(payload.c_m_stride, 0);
+        const int c_n_stride = eval_expression(payload.c_n_stride, 0);
+        const float tensor_scale = payload.tensor_scale;
+
+        // Per-column byte layout: K/2 bytes packed data, then K/16 bytes scales
+        const int packed_per_col = total_k / 2;
+        const int scales_per_col = total_k / 16;
+        const int col_stride = packed_per_col + scales_per_col; // bytes per column in B
+
+        constexpr int TILE_SIZE = {ts};
+        const int threads = blockDim.x;
+        const int lane = t & 31;
+        const int warp_id = t >> 5;
+        const int num_warps = threads >> 5;
+
+        // ============== M=1 DECODE PATH ==============
+        if (M == 1) {{
+            const int cols_per_sm = (N + sm_count - 1) / sm_count;
+            const int col_start = current * cols_per_sm;
+            const int col_end = min(col_start + cols_per_sm, N);
+
+            if (col_start >= N) return;
+
+            const float* a = a_base;
+            const int K = total_k;
+            const int half_K = K / 2;
+
+            // Each warp handles 4 columns simultaneously, reusing activation values
+            constexpr int COLS_PER_WARP = 4;
+
+            for (int col_base = col_start + warp_id * COLS_PER_WARP; col_base < col_end; col_base += num_warps * COLS_PER_WARP) {{
+                float partial[COLS_PER_WARP] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+                const int valid_cols = min(COLS_PER_WARP, col_end - col_base);
+
+                // Pre-compute column data pointers
+                const unsigned char* packed[COLS_PER_WARP];
+                const unsigned char* scales[COLS_PER_WARP];
+                #pragma unroll
+                for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                    const unsigned char* col_data = b_base + (col_base + ci) * col_stride;
+                    packed[ci] = col_data;
+                    scales[ci] = col_data + packed_per_col;
+                }}
+
+                // Each lane processes 8 elements (one packed byte = 2 FP4 values, repeated 4x per block)
+                // Lane processes K elements in blocks of 16, strided by warp width
+                for (int block_start = lane * 16; block_start < K; block_start += 32 * 16) {{
+                    // Load block scales for all columns from LUT (no branches)
+                    const int scale_idx = block_start / 16;
+                    float block_scale[COLS_PER_WARP];
+                    #pragma unroll
+                    for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                        block_scale[ci] = fp8_lut[scales[ci][scale_idx]] * tensor_scale;
+                    }}
+
+                    // Process 16 elements (8 bytes) in this block
+                    const int byte_start = block_start / 2;
+                    #pragma unroll
+                    for (int bi = 0; bi < 8; bi++) {{
+                        const int k0 = block_start + bi * 2;
+                        const int k1 = k0 + 1;
+                        if (k1 >= K) break;
+
+                        // Load activation values (reused across all columns)
+                        float a0 = a[k0];
+                        float a1 = a[k1];
+
+                        // Process all columns for this byte
+                        #pragma unroll
+                        for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                            if (ci < valid_cols) {{
+                                unsigned char pb = packed[ci][byte_start + bi];
+                                float w0 = fp4_lut[pb & 0xF] * block_scale[ci];
+                                float w1 = fp4_lut[pb >> 4] * block_scale[ci];
+                                partial[ci] += a0 * w0 + a1 * w1;
+                            }}
+                        }}
+                    }}
+                }}
+
+                // Warp reduction
+                #pragma unroll
+                for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        partial[ci] += __shfl_down_sync(0xffffffff, partial[ci], offset);
+                    }}
+                }}
+
+                if (lane == 0) {{
+                    if (valid_cols > 0) c_base[col_base] = partial[0];
+                    if (valid_cols > 1) c_base[col_base + 1] = partial[1];
+                    if (valid_cols > 2) c_base[col_base + 2] = partial[2];
+                    if (valid_cols > 3) c_base[col_base + 3] = partial[3];
+                }}
+            }}
+            return;
+        }}
+
+        // ============== GENERAL PATH (M > 1) ==============
+        const int total_tiles = m_tiles * n_tiles;
+        const int tiles_per_sm = (total_tiles + sm_count - 1) / sm_count;
+        const int tile_start = current * tiles_per_sm;
+        const int tile_end = min(tile_start + tiles_per_sm, total_tiles);
+
+        for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {{
+            const int n_tile = tile_idx % n_tiles;
+            const int m_tile = tile_idx / n_tiles;
+
+            const int global_m0 = m_tile * TILE_SIZE;
+            const int global_n0 = n_tile * TILE_SIZE;
+            const int tile_m = min(TILE_SIZE, M - global_m0);
+            const int tile_n = min(TILE_SIZE, N - global_n0);
+
+            if (tile_m <= 0 || tile_n <= 0) continue;
+
+            const int tile_elems = tile_m * tile_n;
+            for (int idx = t; idx < tile_elems; idx += threads) {{
+                const int ty = idx / tile_n;
+                const int tx = idx % tile_n;
+
+                const float* a_row = a_base + (global_m0 + ty) * a_m_stride;
+                const int col = global_n0 + tx;
+                const unsigned char* col_data = b_base + col * col_stride;
+                const unsigned char* packed = col_data;
+                const unsigned char* scales = col_data + packed_per_col;
+                float* c_out = c_base + (global_m0 + ty) * c_m_stride + col * c_n_stride;
+
+                float acc = 0.0f;
+                for (int block_start = 0; block_start < total_k; block_start += 16) {{
+                    float block_scale = fp8_lut[scales[block_start / 16]] * tensor_scale;
+                    const int byte_start = block_start / 2;
+                    #pragma unroll
+                    for (int bi = 0; bi < 8; bi++) {{
+                        const int k0 = block_start + bi * 2;
+                        if (k0 + 1 >= total_k) break;
+                        unsigned char pb = packed[byte_start + bi];
+                        float w0 = fp4_lut[pb & 0xF] * block_scale;
+                        float w1 = fp4_lut[pb >> 4] * block_scale;
+                        acc += a_row[k0] * w0 + a_row[k0 + 1] * w1;
+                    }}
+                }}
+                *c_out = acc;
+            }}
+        }}
+        "#,
+            ts = TILE_SIZE
+        )
+    }
+
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr_arr("untiled_range", &self.untiled_range)
+            .expr("m_tiles", self.m_tiles)
+            .expr("n_tiles", self.n_tiles)
+            .expr("total_k", self.total_k)
+            .expr("sm_count", self.sm_count)
+            .expr("a_m_stride", self.a_m_stride)
+            .expr("c_m_stride", self.out_m_stride)
+            .expr("c_n_stride", self.out_n_stride)
+            .float("tensor_scale", self.tensor_scale)
+    }
+}
+
+/// TileMatmulMxfp4: Matrix multiplication with MXFP4-quantized B (weight) matrix.
+///
+/// Computes C = A * dequant(B) where:
+/// - A is FP32 activations [M, K] (row-major, k-contiguous)
+/// - B is a single MXFP4 buffer laid out as: [packed_data | block_scales]
+///   packed_data: N * K/2 bytes (FP4 E2M1, 2 values per byte, k-contiguous per column)
+///   block_scales: N * ceil(K/32) bytes (E8M0, 1 scale per 32 elements)
+/// - C is FP32 output [M, N]
+///
+/// 2 inputs: source_ptrs[0]=A (float*), source_ptrs[1]=B (uint8*, MXFP4 buffer)
+/// No tensor-level scale (unlike NvFp4).
+///
+/// No K-splitting: each SM handles complete dot products for its assigned output tiles.
+#[derive(Debug, Default)]
+pub struct TileMatmulMxfp4 {
+    sm_count: Expression,
+    untiled_range: Vec<Expression>, // [M, N]
+    m_tiles: Expression,
+    n_tiles: Expression,
+    total_k: Expression,
+    a_m_stride: Expression,
+    out_m_stride: Expression,
+    out_n_stride: Expression,
+}
+
+impl EgglogOp for TileMatmulMxfp4 {
+    fn term(&self) -> (String, Vec<OpParam>) {
+        (
+            "TileMatmulMxfp4".to_string(),
+            vec![
+                Expr,  // sm_count
+                EList, // untiled_range [M, N]
+                Expr,  // m_tiles
+                Expr,  // n_tiles
+                Expr,  // total_k
+                Input, // a (FP32 activations)
+                Expr,  // a_m_stride
+                Input, // b (Mxfp4 buffer: packed_data + block_scales)
+                Expr,  // out_m_stride
+                Expr,  // out_n_stride
+            ],
+        )
+    }
+
+    fn rewrites(&self) -> Vec<String> {
+        vec![
+            // Match Mul -> Sum pattern where B input has Mxfp4 dtype
+            format!(
+                "
+        (rule
+            (
+                ; Match Mul node
+                (= ?mul (Mul ?mul_shape ?a ?a_stride ?b ?b_stride ?mul_out_stride))
+
+                ; Match Sum that reduces the Mul (k dimension)
+                (= ?sum (Sum ?out_shape ?k ?mul ?sum_in_stride ?k_stride ?sum_out_stride))
+
+                ; Get dimensions from output shape
+                (= ?m (nth_from_end ?out_shape 1))
+                (= ?n (nth_from_end ?out_shape 0))
+                (!= ?m (MNum 0))
+                (!= ?n (MNum 0))
+
+                ; Get output strides
+                (= ?sum_out_m_stride (nth_from_end ?sum_out_stride 1))
+                (= ?sum_out_n_stride (nth_from_end ?sum_out_stride 0))
+
+                ; Get A strides
+                (= ?a_m_stride (nth_from_end ?a_stride 2))
+                (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+                ; Get B strides
+                (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+                ; Assert contiguous k stride on output
+                (= ?k_stride (MNum 1))
+
+                ; Assert A has contiguous k (row-major A)
+                (= ?a_k_stride (MNum 1))
+
+                ; Assert B has contiguous k
+                (= ?b_k_stride (MNum 1))
+
+                ; B must be Mxfp4
+                (= (Mxfp4) (dtype ?b))
+            )
+            (
+                ; Compute tiled dimensions
+                (let ?tiled_m (MCeilDiv ?m (MNum {ts})))
+                (let ?tiled_n (MCeilDiv ?n (MNum {ts})))
+
+                (let ?tm (TileMatmulMxfp4
+                    (MNum {sm_count})
+                    ?out_shape
+                    ?tiled_m ?tiled_n ?k
+                    ?a ?a_m_stride
+                    ?b
+                    ?sum_out_m_stride ?sum_out_n_stride))
+                (union ?sum ?tm)
+                (set (dtype ?tm) (F32))
+            )
+            :name \"tile matmul mxfp4\"
+        )",
+                ts = TILE_SIZE,
+                sm_count = 56
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        children: &[&'a ENodeId],
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn BlockOp>(Box::new(Self {
+                sm_count: extract_expr(egraph, children[0], expr_cache).unwrap(),
+                untiled_range: extract_expr_list(egraph, children[1], list_cache, expr_cache)
+                    .unwrap(),
+                m_tiles: extract_expr(egraph, children[2], expr_cache).unwrap(),
+                n_tiles: extract_expr(egraph, children[3], expr_cache).unwrap(),
+                total_k: extract_expr(egraph, children[4], expr_cache).unwrap(),
+                // children[5] = a input (source)
+                a_m_stride: extract_expr(egraph, children[6], expr_cache).unwrap(),
+                // children[7] = b input (Mxfp4 buffer)
+                out_m_stride: extract_expr(egraph, children[8], expr_cache).unwrap(),
+                out_n_stride: extract_expr(egraph, children[9], expr_cache).unwrap(),
+            })),
+            vec![children[5], children[7]], // a, b
+        )
+    }
+}
+
+impl BlockOp for TileMatmulMxfp4 {
+    fn op_name(&self) -> &'static str {
+        "TileMatmulMxfp4"
+    }
+
+    fn launch_range(&self) -> Vec<Expression> {
+        vec![self.sm_count]
+    }
+
+    fn output_size(&self) -> Expression {
+        self.untiled_range.iter().copied().product::<Expression>()
+    }
+
+    fn producer_barriers_seperate(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn consumer_barriers_seperate(&self) -> Vec<Vec<bool>> {
+        // 2 inputs: A (FP32), B (Mxfp4 buffer)
+        vec![vec![false], vec![false]]
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        let m = self.untiled_range[0];
+        let n = self.untiled_range[1];
+        m * n * 4 // FP32 output
+    }
+
+    fn flops(&self) -> Expression {
+        let m = self.untiled_range[0];
+        let n = self.untiled_range[1];
+        let k = self.total_k;
+        m * n * k * 2
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        let m = self.untiled_range[0];
+        let n = self.untiled_range[1];
+        let k = self.total_k;
+        // A: M*K*4 bytes (FP32)
+        // B: N * (K/2 + K/32) bytes (packed FP4 + block scales)
+        m * k * 4 + n * k / 2 + n * k / 32
+    }
+
+    fn cuda_function(&self) -> String {
+        format!(
+            r#"
+        // TileMatmulMxfp4: FP32 activations x MXFP4 weights -> FP32 output
+        // Dequantizes MXFP4 weights inline during matmul.
+        //
+        // Buffer layout for B (per column, K elements):
+        //   [packed_data: K/2 bytes][block_scales: K/32 bytes]
+        // Columns are laid out contiguously: column n starts at offset n * (K/2 + K/32)
+        //
+        // E8M0 scale format: scale = 2^(byte - 127), 0xFF = NaN (treated as 0)
+
+        // FP4 E2M1 lookup table (16 entries)
+        __shared__ float fp4_lut[16];
+
+        // Initialize FP4 LUT
+        if (t < 16) {{
+            const float table[16] = {{
+                0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+            }};
+            fp4_lut[t] = table[t];
+        }}
+        __syncthreads();
+
+        const int m_tiles = eval_expression(payload.m_tiles, 0);
+        const int n_tiles = eval_expression(payload.n_tiles, 0);
+        const int total_k = eval_expression(payload.total_k, 0);
+        const int sm_count = eval_expression(payload.sm_count, 0);
+        const int M = eval_expression(payload.untiled_range[0], 0);
+        const int N = eval_expression(payload.untiled_range[1], 0);
+
+        const float* a_base = source_ptrs[0];
+        const unsigned char* b_base = (const unsigned char*)source_ptrs[1];
+        float* c_base = out_ptr;
+
+        const int a_m_stride = eval_expression(payload.a_m_stride, 0);
+        const int c_m_stride = eval_expression(payload.c_m_stride, 0);
+        const int c_n_stride = eval_expression(payload.c_n_stride, 0);
+
+        // Per-column byte layout: K/2 bytes packed data, then K/32 bytes scales
+        const int packed_per_col = total_k / 2;
+        const int scales_per_col = total_k / 32;
+        const int col_stride = packed_per_col + scales_per_col; // bytes per column in B
+
+        // E8M0 decode helper: 2^(byte - 127)
+        auto e8m0_decode = [](unsigned char s) -> float {{
+            if (s == 0xFF) return 0.0f; // NaN -> 0
+            return ldexpf(1.0f, (int)s - 127);
+        }};
+
+        constexpr int TILE_SIZE = {ts};
+        const int threads = blockDim.x;
+        const int lane = t & 31;
+        const int warp_id = t >> 5;
+        const int num_warps = threads >> 5;
+
+        // ============== M=1 DECODE PATH ==============
+        if (M == 1) {{
+            const int cols_per_sm = (N + sm_count - 1) / sm_count;
+            const int col_start = current * cols_per_sm;
+            const int col_end = min(col_start + cols_per_sm, N);
+
+            if (col_start >= N) return;
+
+            const float* a = a_base;
+            const int K = total_k;
+
+            // Each warp handles 4 columns simultaneously, reusing activation values
+            constexpr int COLS_PER_WARP = 4;
+
+            for (int col_base = col_start + warp_id * COLS_PER_WARP; col_base < col_end; col_base += num_warps * COLS_PER_WARP) {{
+                float partial[COLS_PER_WARP] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+                const int valid_cols = min(COLS_PER_WARP, col_end - col_base);
+
+                // Pre-compute column data pointers
+                const unsigned char* packed[COLS_PER_WARP];
+                const unsigned char* scales[COLS_PER_WARP];
+                #pragma unroll
+                for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                    const unsigned char* col_data = b_base + (col_base + ci) * col_stride;
+                    packed[ci] = col_data;
+                    scales[ci] = col_data + packed_per_col;
+                }}
+
+                // Each lane processes elements in blocks of 32, strided by warp width
+                for (int block_start = lane * 32; block_start < K; block_start += 32 * 32) {{
+                    // Load E8M0 block scales for all columns
+                    const int scale_idx = block_start / 32;
+                    float block_scale[COLS_PER_WARP];
+                    #pragma unroll
+                    for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                        block_scale[ci] = e8m0_decode(scales[ci][scale_idx]);
+                    }}
+
+                    // Process 32 elements (16 bytes) in this block
+                    const int byte_start = block_start / 2;
+                    #pragma unroll
+                    for (int bi = 0; bi < 16; bi++) {{
+                        const int k0 = block_start + bi * 2;
+                        const int k1 = k0 + 1;
+                        if (k1 >= K) break;
+
+                        // Load activation values (reused across all columns)
+                        float a0 = a[k0];
+                        float a1 = a[k1];
+
+                        // Process all columns for this byte
+                        #pragma unroll
+                        for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                            if (ci < valid_cols) {{
+                                unsigned char pb = packed[ci][byte_start + bi];
+                                float w0 = fp4_lut[pb & 0xF] * block_scale[ci];
+                                float w1 = fp4_lut[pb >> 4] * block_scale[ci];
+                                partial[ci] += a0 * w0 + a1 * w1;
+                            }}
+                        }}
+                    }}
+                }}
+
+                // Warp reduction
+                #pragma unroll
+                for (int ci = 0; ci < COLS_PER_WARP; ci++) {{
+                    for (int offset = 16; offset > 0; offset >>= 1) {{
+                        partial[ci] += __shfl_down_sync(0xffffffff, partial[ci], offset);
+                    }}
+                }}
+
+                if (lane == 0) {{
+                    if (valid_cols > 0) c_base[col_base] = partial[0];
+                    if (valid_cols > 1) c_base[col_base + 1] = partial[1];
+                    if (valid_cols > 2) c_base[col_base + 2] = partial[2];
+                    if (valid_cols > 3) c_base[col_base + 3] = partial[3];
+                }}
+            }}
+            return;
+        }}
+
+        // ============== GENERAL PATH (M > 1) ==============
+        const int total_tiles = m_tiles * n_tiles;
+        const int tiles_per_sm = (total_tiles + sm_count - 1) / sm_count;
+        const int tile_start = current * tiles_per_sm;
+        const int tile_end = min(tile_start + tiles_per_sm, total_tiles);
+
+        for (int tile_idx = tile_start; tile_idx < tile_end; tile_idx++) {{
+            const int n_tile = tile_idx % n_tiles;
+            const int m_tile = tile_idx / n_tiles;
+
+            const int global_m0 = m_tile * TILE_SIZE;
+            const int global_n0 = n_tile * TILE_SIZE;
+            const int tile_m = min(TILE_SIZE, M - global_m0);
+            const int tile_n = min(TILE_SIZE, N - global_n0);
+
+            if (tile_m <= 0 || tile_n <= 0) continue;
+
+            const int tile_elems = tile_m * tile_n;
+            for (int idx = t; idx < tile_elems; idx += threads) {{
+                const int ty = idx / tile_n;
+                const int tx = idx % tile_n;
+
+                const float* a_row = a_base + (global_m0 + ty) * a_m_stride;
+                const int col = global_n0 + tx;
+                const unsigned char* col_data = b_base + col * col_stride;
+                const unsigned char* packed = col_data;
+                const unsigned char* scales = col_data + packed_per_col;
+                float* c_out = c_base + (global_m0 + ty) * c_m_stride + col * c_n_stride;
+
+                float acc = 0.0f;
+                for (int block_start = 0; block_start < total_k; block_start += 32) {{
+                    float block_scale = e8m0_decode(scales[block_start / 32]);
+                    const int byte_start = block_start / 2;
+                    #pragma unroll
+                    for (int bi = 0; bi < 16; bi++) {{
+                        const int k0 = block_start + bi * 2;
+                        if (k0 + 1 >= total_k) break;
+                        unsigned char pb = packed[byte_start + bi];
+                        float w0 = fp4_lut[pb & 0xF] * block_scale;
+                        float w1 = fp4_lut[pb >> 4] * block_scale;
+                        acc += a_row[k0] * w0 + a_row[k0 + 1] * w1;
+                    }}
+                }}
+                *c_out = acc;
+            }}
+        }}
+        "#,
+            ts = TILE_SIZE
+        )
+    }
+
+    fn build_payload<'a>(&self, _: &Arc<CudaStream>, payload: CStruct<'a>) -> CStruct<'a> {
+        payload
+            .expr_arr("untiled_range", &self.untiled_range)
+            .expr("m_tiles", self.m_tiles)
+            .expr("n_tiles", self.n_tiles)
+            .expr("total_k", self.total_k)
+            .expr("sm_count", self.sm_count)
+            .expr("a_m_stride", self.a_m_stride)
+            .expr("c_m_stride", self.out_m_stride)
+            .expr("c_n_stride", self.out_n_stride)
     }
 }

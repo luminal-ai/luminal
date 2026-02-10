@@ -398,6 +398,8 @@ impl NativeOp for Cast {
                 NativeData::Int(i) => i.iter().map(|i| *i != 0).collect(),
                 NativeData::Bool(b) => b.clone(),
             }),
+            DType::NvFp4 => unimplemented!("Cast to NvFp4 is not supported in native interpreter"),
+            DType::Mxfp4 => unimplemented!("Cast to Mxfp4 is not supported in native interpreter"),
         }
     }
 }
@@ -882,7 +884,7 @@ impl EgglogOp for Mul {
     fn rewrites(&self) -> Vec<String> {
         vec![
             "(rule
-           ((= ?e (Mul ?shape ?inp_a ?a ?inp_b ?b ?o)) (= ?dty (dtype ?inp_a)))
+           ((= ?e (Mul ?shape ?inp_a ?a ?inp_b ?b ?o)) (= ?dty (dtype ?inp_a)) (= ?dty (dtype ?inp_b)))
            ((set (dtype ?e) ?dty))
         )"
             .to_string(),

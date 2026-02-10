@@ -15,7 +15,7 @@ const REPO_ID: &str = "unsloth/gemma-3-4b-it";
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 100;
-    let search_graphs = 5; // the number of graphs we want to search during compilation
+    let search_graphs = 500; // the number of graphs we want to search during compilation
     let prompt = "Explain what a neural network is in simple terms:";
 
     // Set up cuda context and stream
@@ -36,9 +36,8 @@ fn main() {
     // Create compute graph
     let mut cx = Graph::default();
     let input = cx.named_tensor("input", 's').as_dtype(DType::Int);
-    let token_ids = cx.named_tensor("token_ids", 's').as_dtype(DType::Int);
     let model = model::Gemma::init(&mut cx);
-    let logits = model.forward(input, token_ids, &kv_cache).output();
+    let logits = model.forward(input, &kv_cache).output();
 
     // Build search space
     println!("Building E-Graph...");
@@ -55,7 +54,6 @@ fn main() {
     cx.set_dim('s', 1);
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1]);
-    runtime.set_data(token_ids, vec![0]);
     runtime = cx.search(runtime, search_graphs);
     kv_cache.reset();
 
@@ -77,10 +75,6 @@ fn main() {
         runtime.set_data(
             input,
             sentence.iter().map(|i| *i as i32).collect::<Vec<_>>(),
-        );
-        runtime.set_data(
-            token_ids,
-            (prev_seq as i32..(seq_len + prev_seq) as i32).collect::<Vec<_>>(),
         );
 
         // Execute forward pass

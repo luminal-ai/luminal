@@ -1,12 +1,16 @@
 #![allow(clippy::mutable_key_type)]
 pub mod cstruct;
 mod ops;
+mod to_kernel;
+
 use itertools::Itertools;
-use lru::LruCache;
 pub use ops::*;
+pub use to_kernel::block_to_kernel;
 
 use cudarc::{
-    driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, ValidAsZeroBits},
+    driver::{
+        CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DeviceRepr, ValidAsZeroBits,
+    },
     nvrtc::{CompileOptions, compile_ptx_with_opts},
 };
 use luminal::{
@@ -23,7 +27,6 @@ use std::{
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
     iter::once,
-    ptr::{null, null_mut},
     sync::Arc,
 };
 use tracing::{Level, span};
@@ -318,7 +321,7 @@ fn get_barrier_strides(
 }
 
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct SMEvent {
     pub start: u64,
     pub stop: u64,
@@ -327,30 +330,40 @@ pub struct SMEvent {
 unsafe impl DeviceRepr for SMEvent {}
 unsafe impl ValidAsZeroBits for SMEvent {}
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TaskQueue {
     data: Vec<u8>,
     task_stride: usize,
+    payload_align: usize,
     num_tasks: usize,
 }
 
 impl TaskQueue {
-    pub fn new(payload_size: usize) -> Self {
+    pub fn new(payload_size: usize, payload_align: usize) -> Self {
         // Task layout (must match C struct with alignment):
         // - 11 ints (44 bytes at offset 0)
-        // - 4 bytes padding for 8-byte alignment of pointers
-        // - 3 pointers (24 bytes at offset 48)
-        // - 1 pointer (8 bytes at offset 72)
-        // = 80 bytes base + payload_size, aligned to 8 bytes
+        // - 6 source indices (24 bytes at offset 44)
+        // - 1 out index (4 bytes at offset 68)
+        // = 72 bytes base, then padding for payload alignment, then payload
         let int_section = size_of::<i32>() * 11; // 44 bytes
-        let int_section_aligned = (int_section + 7) & !7; // 48 bytes (aligned for pointers)
-        let ptr_section = size_of::<*const f32>() * 3 + size_of::<*mut f32>(); // 32 bytes
-        let base_size = int_section_aligned + ptr_section; // 80 bytes
-        let total = base_size + payload_size;
-        let task_stride = (total + 7) & !7; // Align to 8 bytes
+        let index_section = size_of::<i32>() * 7; // 28 bytes (6 source + 1 out)
+        let base_size = int_section + index_section; // 72 bytes
+
+        // Add padding before payload if needed for alignment
+        let payload_offset = if payload_align > 1 {
+            (base_size + payload_align - 1) & !(payload_align - 1)
+        } else {
+            base_size
+        };
+        let total = payload_offset + payload_size;
+
+        // Final alignment is max of 4 (for int fields) and payload_align
+        let struct_align = 4.max(payload_align);
+        let task_stride = (total + struct_align - 1) & !(struct_align - 1);
         Self {
             data: Vec::new(),
             task_stride,
+            payload_align,
             num_tasks: 0,
         }
     }
@@ -369,8 +382,8 @@ impl TaskQueue {
         in_dep_c_base: i32,
         out_dep_stride: i32,
         out_dep_base: i32,
-        source_ptrs: [*const f32; 3],
-        out_ptr: *mut f32,
+        source_indices: [i32; 6],
+        out_index: i32,
         payload: &[u8],
         expressions: &FxHashMap<Expression, i32>,
     ) {
@@ -386,9 +399,9 @@ impl TaskQueue {
             .int("in_dep_c_base", in_dep_c_base)
             .int("out_dep_stride", out_dep_stride)
             .int("out_dep_base", out_dep_base)
-            .ptr_const_f32_arr("source_ptrs", source_ptrs.as_slice())
-            .ptr_mut_f32("out_ptr", out_ptr)
-            .bytes(1, "payload", payload) // Add payload with byte alignment
+            .int_arr("source_indices", &source_indices)
+            .int("out_index", out_index)
+            .bytes(self.payload_align, "payload", payload) // Add payload with proper alignment
             .finish_struct();
 
         // Pad to task_stride
@@ -396,25 +409,6 @@ impl TaskQueue {
 
         self.data.extend_from_slice(&bytes);
         self.num_tasks += 1;
-    }
-
-    pub fn set_out_ptr(&mut self, index: usize, ptr: *mut f32) {
-        // Layout: 11 ints (44 bytes) + padding (4 bytes) + 3 ptrs (24 bytes) + out_ptr (8 bytes)
-        let ints_size = size_of::<i32>() * 11; // 44
-        let padding = (8 - (ints_size % 8)) % 8; // 4 bytes padding to align to 8
-        let offset = index * self.task_stride + ints_size + padding + size_of::<*const f32>() * 3;
-        let bytes = (ptr as usize).to_ne_bytes();
-        self.data[offset..offset + size_of::<*mut f32>()].copy_from_slice(&bytes);
-    }
-
-    pub fn set_source_ptr(&mut self, index: usize, input_num: usize, ptr: *const f32) {
-        // Layout: 11 ints (44 bytes) + padding (4 bytes) + source_ptrs[input_num]
-        let ints_size = size_of::<i32>() * 11; // 44
-        let padding = (8 - (ints_size % 8)) % 8; // 4 bytes padding to align to 8
-        let offset =
-            index * self.task_stride + ints_size + padding + size_of::<*const f32>() * input_num;
-        let bytes = (ptr as usize).to_ne_bytes();
-        self.data[offset..offset + size_of::<*const f32>()].copy_from_slice(&bytes);
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -700,14 +694,18 @@ pub fn record_block_op_timings(
 }
 
 #[tracing::instrument(skip_all)]
+#[allow(clippy::type_complexity)]
 fn compile_interpreter(
     cuda_stream: &Arc<CudaStream>,
     ops: &Vec<Arc<Box<dyn BlockOp>>>,
     expressions: &FxHashSet<Expression>,
     payload_size: usize,
-    kernel_cache: &mut LruCache<String, (Arc<CudaModule>, CudaFunction)>,
+    n_tasks: usize,
+    n_barriers: &Expression,
+    kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> (
     CudaFunction,
+    Arc<CudaModule>,
     FxHashMap<Expression, i32>,
     FxHashMap<char, CudaSlice<u8>>,
 ) {
@@ -727,6 +725,15 @@ fn compile_interpreter(
     kernel = kernel.replace(
         "const int N_TIMING_SLOTS = 0;",
         &format!("const int N_TIMING_SLOTS = {N_TIMING_SLOTS};"),
+    );
+    kernel = kernel.replace(
+        "const int N_TASKS = 0;",
+        &format!("const int N_TASKS = {n_tasks};"),
+    );
+    // N_BARRIERS is an expression that may depend on dyn dims, render it as a macro
+    kernel = kernel.replace(
+        "//%n_barriers_const%",
+        &format!("#define N_BARRIERS ({})", n_barriers.simplify().to_kernel()),
     );
     kernel = kernel.replace(
         "//%extra_op_codes%",
@@ -755,7 +762,7 @@ fn compile_interpreter(
                 let op_name = op.op_name();
                 let op_body = op.cuda_function();
                 format!(
-                    "__device__ __forceinline__ void {op_name}_function({op_name}Payload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad) {{
+                    "__device__ __forceinline__ void {op_name}_function({op_name}Payload payload, const float* const source_ptrs[6], float* out_ptr, const int current, int t, float* scratchpad) {{
 {op_body}
 }}"
                 )
@@ -777,7 +784,7 @@ fn compile_interpreter(
     );
     kernel = kernel.replace("//%extra_op_calls%", &ops.iter().map(|op| {
             let op_name = op.op_name();
-            format!("case OpCode::{op_name}Op: {op_name}_function(t->payload.{op_name}, t->source_ptrs, t->out_ptr, nt.current, threadIdx.x, scratchpad); break;")
+            format!("case OpCode::{op_name}Op: {op_name}_function(t->payload.{op_name}, source_ptrs, out_ptr, nt.current, threadIdx.x, scratchpad); break;")
         }).join("\n"));
 
     // Generate prologue functions (only for non-empty prologues)
@@ -795,21 +802,21 @@ fn compile_interpreter(
                 let mut funcs = Vec::new();
                 if !prologue_a.is_empty() {
                     funcs.push(format!(
-                        "__device__ __forceinline__ void {op_name}_prologue_a({op_name}Payload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad) {{
+                        "__device__ __forceinline__ void {op_name}_prologue_a({op_name}Payload payload, const float* const source_ptrs[6], float* out_ptr, const int current, int t, float* scratchpad) {{
 {prologue_a}
 }}"
                     ));
                 }
                 if !prologue_b.is_empty() {
                     funcs.push(format!(
-                        "__device__ __forceinline__ void {op_name}_prologue_b({op_name}Payload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad) {{
+                        "__device__ __forceinline__ void {op_name}_prologue_b({op_name}Payload payload, const float* const source_ptrs[6], float* out_ptr, const int current, int t, float* scratchpad) {{
 {prologue_b}
 }}"
                     ));
                 }
                 if !prologue_c.is_empty() {
                     funcs.push(format!(
-                        "__device__ __forceinline__ void {op_name}_prologue_c({op_name}Payload payload, const float* const source_ptrs[3], float* out_ptr, const int current, int t, float* scratchpad) {{
+                        "__device__ __forceinline__ void {op_name}_prologue_c({op_name}Payload payload, const float* const source_ptrs[6], float* out_ptr, const int current, int t, float* scratchpad) {{
 {prologue_c}
 }}"
                     ));
@@ -829,7 +836,7 @@ fn compile_interpreter(
             } else {
                 // Event code: 2 + N_OPS + op_idx * 3 + 0
                 let event_code = 2 + n_ops + i * 3;
-                Some(format!("case OpCode::{op_name}Op: if (threadIdx.x == 0) record_event(timings, &recorded_event, {event_code}); {op_name}_prologue_a(t->payload.{op_name}, t->source_ptrs, t->out_ptr, nt.current, threadIdx.x, scratchpad); __syncthreads(); if (threadIdx.x == 0) record_event(timings, &recorded_event, 1); break;"))
+                Some(format!("case OpCode::{op_name}Op: if (threadIdx.x == 0) record_event(timings, &recorded_event, {event_code}); {op_name}_prologue_a(t->payload.{op_name}, source_ptrs, out_ptr, nt.current, threadIdx.x, scratchpad); __syncthreads(); if (threadIdx.x == 0) record_event(timings, &recorded_event, 1); break;"))
             }
         }).join("\n"),
     );
@@ -844,7 +851,7 @@ fn compile_interpreter(
             } else {
                 // Event code: 2 + N_OPS + op_idx * 3 + 1
                 let event_code = 2 + n_ops + i * 3 + 1;
-                Some(format!("case OpCode::{op_name}Op: if (threadIdx.x == 0) record_event(timings, &recorded_event, {event_code}); {op_name}_prologue_b(t->payload.{op_name}, t->source_ptrs, t->out_ptr, nt.current, threadIdx.x, scratchpad); if (threadIdx.x == 0) record_event(timings, &recorded_event, 1); __syncthreads(); break;"))
+                Some(format!("case OpCode::{op_name}Op: if (threadIdx.x == 0) record_event(timings, &recorded_event, {event_code}); {op_name}_prologue_b(t->payload.{op_name}, source_ptrs, out_ptr, nt.current, threadIdx.x, scratchpad); if (threadIdx.x == 0) record_event(timings, &recorded_event, 1); __syncthreads(); break;"))
             }
         }).join("\n"),
     );
@@ -859,7 +866,7 @@ fn compile_interpreter(
             } else {
                 // Event code: 2 + N_OPS + op_idx * 3 + 2
                 let event_code = 2 + n_ops + i * 3 + 2;
-                Some(format!("case OpCode::{op_name}Op: if (threadIdx.x == 0) record_event(timings, &recorded_event, {event_code}); {op_name}_prologue_c(t->payload.{op_name}, t->source_ptrs, t->out_ptr, nt.current, threadIdx.x, scratchpad); if (threadIdx.x == 0) record_event(timings, &recorded_event, 1); __syncthreads(); break;"))
+                Some(format!("case OpCode::{op_name}Op: if (threadIdx.x == 0) record_event(timings, &recorded_event, {event_code}); {op_name}_prologue_c(t->payload.{op_name}, source_ptrs, out_ptr, nt.current, threadIdx.x, scratchpad); if (threadIdx.x == 0) record_event(timings, &recorded_event, 1); __syncthreads(); break;"))
             }
         }).join("\n"),
     );
@@ -911,21 +918,309 @@ fn compile_interpreter(
         .unwrap();
         let module = cuda_stream.context().load_module(ptx).unwrap();
         let func = module.load_function("worker_kernel").unwrap();
+
         kernel_cache.push(kernel_cache_key, (module.clone(), func.clone()));
+
+        kernel_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+
         (module, func)
     };
-    let constants = constants
+    let constants: FxHashMap<char, CudaSlice<u8>> = constants
         .into_iter()
         .map(|d| {
-            (
-                d,
-                module
-                    .get_global(&format!("const_{d}"), cuda_stream)
-                    .unwrap(),
-            )
+            let global = module
+                .get_global(&format!("const_{d}"), cuda_stream)
+                .unwrap();
+            (d, global)
         })
         .collect();
-    (func, expression_map, constants)
+    (func, module, expression_map, constants)
+}
+
+/// A compiled megakernel that implements KernelOp.
+/// This allows megakernels to flow through the same compilation pipeline as regular kernels.
+///
+/// Internal buffers are managed via the `internal_buffers()` method, which returns
+/// the buffers the kernel needs allocated and passed as parameters.
+///
+/// Note: Device buffers are managed separately in the runtime.
+/// This struct holds only compile-time information.
+#[derive(Debug)]
+pub struct MegakernelOp {
+    /// The compiled interpreter kernel function
+    pub interpreter: CudaFunction,
+    /// The CUDA module containing the kernel
+    pub module: Arc<CudaModule>,
+    /// Device-side constants for dynamic dimensions
+    pub interpreter_constants: FxHashMap<char, CudaSlice<u8>>,
+    /// Number of barriers needed for synchronization
+    pub n_barriers: Expression,
+    /// Serialized task queue (all operations to execute)
+    pub(crate) work_queue: TaskQueue,
+    /// Mapping from LLIR node to buffer index
+    pub node_to_buffer_index: FxHashMap<NodeIndex, i32>,
+    /// Number of SMs on the device (for grid size)
+    pub sm_count: i32,
+}
+
+impl crate::kernel::KernelOp for MegakernelOp {
+    fn compile(
+        &self,
+        _stream: &Arc<CudaStream>,
+        _compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        // Return the pre-compiled interpreter function with appropriate launch config.
+        (
+            self.interpreter.clone(),
+            self.module.clone(),
+            "megakernel".to_string(),
+            (self.sm_count.into(), 1.into(), 1.into()), // grid: one block per SM
+            (256.into(), 1.into(), 1.into()),           // block: 256 threads
+            0.into(), // No dynamic shared memory (static scratchpad is sufficient)
+            self.interpreter_constants.clone(), // Return constants for runtime to manage
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        // Megakernels don't have a single output size - they write to multiple buffers.
+        // Return 0 as a placeholder; the actual buffer allocation is handled by the
+        // individual BlockOps that make up the megakernel.
+        0.into()
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "Megakernel"
+    }
+
+    fn allocate_internal_buffers(
+        &self,
+        stream: &Arc<CudaStream>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<CudaSlice<u8>> {
+        let buffer_count = self.buffer_count();
+        let n_barriers = self.n_barriers.exec(dyn_map).unwrap();
+
+        vec![
+            // 0: tasks - upload task queue
+            stream.clone_htod(self.work_queue.as_slice()).unwrap(),
+            // 1: head - reset in-kernel
+            stream
+                .alloc_zeros::<u8>(std::mem::size_of::<i32>())
+                .unwrap(),
+            // 2: ready - barrier array, reset in-kernel
+            stream
+                .alloc_zeros::<u8>(n_barriers * std::mem::size_of::<i32>())
+                .unwrap(),
+            // 3: queue_lock - reset in-kernel
+            stream
+                .alloc_zeros::<u8>(std::mem::size_of::<i32>())
+                .unwrap(),
+            // 4: timings - per-SM timing events
+            stream
+                .alloc_zeros::<u8>(
+                    self.sm_count as usize * N_TIMING_SLOTS * std::mem::size_of::<SMEvent>(),
+                )
+                .unwrap(),
+            // 5: start_times - per-SM start times
+            stream
+                .alloc_zeros::<u8>(self.sm_count as usize * std::mem::size_of::<u64>())
+                .unwrap(),
+            // 6: buffers - array of buffer pointers
+            stream
+                .alloc_zeros::<u8>(buffer_count * std::mem::size_of::<u64>())
+                .unwrap(),
+        ]
+    }
+
+    fn build_params(
+        &self,
+        stream: &Arc<CudaStream>,
+        _output_ptr: u64,
+        _input_ptrs: &[u64],
+        internal_bufs: &[CudaSlice<u8>],
+        _dyn_dims_ptr: u64,
+    ) -> Vec<u64> {
+        // Megakernel params: [tasks, head, ready, queue_lock, timings, start_times, buffers, dyn_dims]
+        // dyn_dims is handled via constants, pass 0
+        internal_bufs
+            .iter()
+            .map(|buf| buf.device_ptr(stream).0)
+            .chain(std::iter::once(0u64)) // dyn_dims placeholder
+            .collect()
+    }
+
+    fn pre_execute(
+        &self,
+        stream: &Arc<CudaStream>,
+        internal_bufs: &mut [CudaSlice<u8>],
+        _constants: &mut FxHashMap<char, CudaSlice<u8>>,
+        all_buffer_ptrs: &FxHashMap<NodeIndex, u64>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) {
+        // Update dyn dims in interpreter constants by getting fresh handles from the module.
+        // We do NOT use the `_constants` parameter because CudaSlice.clone() creates copies,
+        // not references to the original __constant__ memory.
+        for (dyn_dim, val) in dyn_map {
+            let global_name = format!("const_{}", dyn_dim);
+            if let Ok(mut global) = self.module.get_global(&global_name, stream) {
+                let mut view = global.as_view_mut();
+                let mut symbol = unsafe { view.transmute_mut::<i32>(1).unwrap() };
+                stream
+                    .memcpy_htod(&[*val as i32], &mut symbol)
+                    .expect("Failed to update dyn dim constant");
+                // IMPORTANT: Don't drop `global` - it would try to free __constant__ memory!
+                // Leak it intentionally to prevent the Drop from running.
+                std::mem::forget(global);
+            }
+        }
+
+        // Re-upload tasks with remaining=-1 (index 0)
+        // This ensures fresh task state for each execution
+        let task_data = self.work_queue.as_slice();
+        stream
+            .memcpy_htod(task_data, &mut internal_bufs[0].as_view_mut())
+            .expect("Failed to re-upload tasks");
+
+        // Reset head to 0 (index 1)
+        {
+            let mut head_view = internal_bufs[1].as_view_mut();
+            let mut head_typed = unsafe { head_view.transmute_mut::<i32>(1).unwrap() };
+            stream
+                .memcpy_htod(&[0i32], &mut head_typed)
+                .expect("Failed to reset head");
+        }
+
+        // Reset barriers to 0 (index 2)
+        // Use the allocated size to avoid buffer overflow
+        let allocated_barrier_size = internal_bufs[2].len();
+        let allocated_n_barriers = allocated_barrier_size / std::mem::size_of::<i32>();
+        {
+            let zeros: Vec<i32> = vec![0; allocated_n_barriers];
+            let mut ready_view = internal_bufs[2].as_view_mut();
+            let mut ready_typed = unsafe {
+                ready_view
+                    .transmute_mut::<i32>(allocated_n_barriers)
+                    .unwrap()
+            };
+            stream
+                .memcpy_htod(&zeros, &mut ready_typed)
+                .expect("Failed to reset barriers");
+        }
+
+        // Reset queue_lock to 0 (index 3)
+        {
+            let mut lock_view = internal_bufs[3].as_view_mut();
+            let mut lock_typed = unsafe { lock_view.transmute_mut::<i32>(1).unwrap() };
+            stream
+                .memcpy_htod(&[0i32], &mut lock_typed)
+                .expect("Failed to reset queue_lock");
+        }
+
+        // Update buffer array (index 6)
+        let buffer_count = self.buffer_count();
+        let mut buffer_array: Vec<u64> = vec![0; buffer_count];
+        for (node, &buffer_idx) in &self.node_to_buffer_index {
+            if let Some(&ptr) = all_buffer_ptrs.get(node) {
+                buffer_array[buffer_idx as usize] = ptr;
+            }
+        }
+
+        let mut buffers_view = internal_bufs[6].as_view_mut();
+        let mut buffers_typed = unsafe {
+            buffers_view
+                .transmute_mut::<u64>(buffer_count)
+                .expect("Failed to transmute buffers")
+        };
+        stream
+            .memcpy_htod(&buffer_array, &mut buffers_typed)
+            .expect("Failed to update buffer array");
+
+        // Ensure all uploads complete before kernel execution
+        stream
+            .synchronize()
+            .expect("Failed to sync after pre_execute");
+    }
+
+    fn timing_buffer_indices(&self) -> Option<(usize, usize, usize)> {
+        // timings at index 4, start_times at index 5, sm_count
+        Some((4, 5, self.sm_count as usize))
+    }
+
+    fn internal_buffer_dyn_dims(&self) -> FxHashSet<char> {
+        // The barrier buffer size depends on n_barriers, which may contain dynamic dimensions
+        self.n_barriers.dyn_vars().into_iter().collect()
+    }
+}
+
+impl MegakernelOp {
+    /// Create a new MegakernelOp from the LLIR graph compilation result.
+    pub fn new(
+        llir_graph: &LLIRGraph,
+        subgraph: &FxHashSet<NodeIndex>,
+        cuda_stream: &Arc<CudaStream>,
+        kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> Self {
+        let (
+            interpreter,
+            module,
+            interpreter_constants,
+            n_barriers,
+            work_queue,
+            _node_to_task_index,
+            node_to_buffer_index,
+        ) = make_megakernel_from_llir_graph(llir_graph, subgraph, cuda_stream, kernel_cache);
+
+        // Get device properties
+        let ctx = cuda_stream.context();
+        let sm_count = ctx
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("Failed to get SM count");
+
+        Self {
+            interpreter,
+            module,
+            interpreter_constants,
+            n_barriers,
+            work_queue,
+            node_to_buffer_index,
+            sm_count,
+        }
+    }
+
+    /// Returns the number of buffers this megakernel uses.
+    pub fn buffer_count(&self) -> usize {
+        self.node_to_buffer_index
+            .values()
+            .map(|&i| i + 1)
+            .max()
+            .unwrap_or(0) as usize
+    }
+}
+
+impl Drop for MegakernelOp {
+    fn drop(&mut self) {
+        // IMPORTANT: interpreter_constants contain CudaSlices pointing to __constant__ memory
+        // in the CUDA module. We must NOT drop these slices because:
+        // 1. __constant__ memory is part of the module and shouldn't be freed separately
+        // 2. Dropping them would try to call cuMemFree on __constant__ addresses, which
+        //    corrupts the CUDA context and causes subsequent allocations to fail
+        //
+        // Leak the slices intentionally to prevent their Drop from running.
+        let constants = std::mem::take(&mut self.interpreter_constants);
+        for (_key, slice) in constants {
+            std::mem::forget(slice);
+        }
+    }
 }
 
 #[allow(clippy::type_complexity)]
@@ -933,13 +1228,15 @@ pub(crate) fn make_megakernel_from_llir_graph(
     llir_graph: &LLIRGraph,
     subgraph: &FxHashSet<NodeIndex>,
     cuda_stream: &Arc<CudaStream>,
-    kernel_cache: &mut LruCache<String, (Arc<CudaModule>, CudaFunction)>,
+    kernel_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> (
     CudaFunction,
+    Arc<CudaModule>, // Module (needed for device globals)
     FxHashMap<char, CudaSlice<u8>>,
     Expression,
     TaskQueue,
     FxHashMap<NodeIndex, usize>,
+    FxHashMap<NodeIndex, i32>, // node_to_buffer_index mapping
 ) {
     let block_ops = llir_graph
         .node_indices()
@@ -1003,28 +1300,48 @@ pub(crate) fn make_megakernel_from_llir_graph(
         .map(|(i, e)| (*e, i as i32))
         .collect::<FxHashMap<_, _>>();
 
-    // Calculate actual max payload size from the ops being used
-    let max_payload_size = block_ops
+    // Calculate actual max payload size and alignment from the ops being used
+    let (max_payload_size, max_payload_align) = block_ops
         .iter()
         .map(|op| {
             op.build_payload(cuda_stream, CStruct::new(Some(&temp_expression_map)))
-                .finish_struct()
-                .len()
+                .size_and_align()
         })
-        .max()
-        .unwrap_or(0);
+        .fold((0, 1), |(max_size, max_align), (size, align)| {
+            (max_size.max(size), max_align.max(align))
+        });
 
-    let (interpreter, expressions, interpreter_constants) = compile_interpreter(
+    // Count number of tasks (one per BlockOp node in subgraph)
+    let n_tasks = subgraph
+        .iter()
+        .filter(|n| llir_graph[**n].to_dialect::<dyn BlockOp>().is_some())
+        .count();
+
+    let (interpreter, module, expressions, interpreter_constants) = compile_interpreter(
         cuda_stream,
         &block_ops,
         &expressions,
         max_payload_size,
+        n_tasks,
+        &n_barriers,
         kernel_cache,
     );
 
-    // Build task queue with dynamic payload size
-    let mut tasks = TaskQueue::new(max_payload_size);
+    // Build task queue with dynamic payload size and alignment
+    let mut tasks = TaskQueue::new(max_payload_size, max_payload_align);
     let mut node_to_task_index = FxHashMap::default();
+    let mut node_to_buffer_index: FxHashMap<NodeIndex, i32> = FxHashMap::default();
+    let mut next_buffer_index: i32 = 0;
+
+    // Helper to get or assign buffer index for a node
+    let mut get_buffer_index = |node: NodeIndex| -> i32 {
+        *node_to_buffer_index.entry(node).or_insert_with(|| {
+            let idx = next_buffer_index;
+            next_buffer_index += 1;
+            idx
+        })
+    };
+
     for node in toposort(&llir_graph, None).unwrap() {
         if !subgraph.contains(&node) {
             continue;
@@ -1034,6 +1351,18 @@ pub(crate) fn make_megakernel_from_llir_graph(
             .sorted_by_key(|e| e.id())
             .map(|e| e.source())
             .collect_vec();
+
+        // Assign buffer indices for source nodes and output node
+        let source_indices: [i32; 6] = [
+            get_buffer_index(sources[0]),
+            sources.get(1).map(|&n| get_buffer_index(n)).unwrap_or(0),
+            sources.get(2).map(|&n| get_buffer_index(n)).unwrap_or(0),
+            sources.get(3).map(|&n| get_buffer_index(n)).unwrap_or(0),
+            sources.get(4).map(|&n| get_buffer_index(n)).unwrap_or(0),
+            sources.get(5).map(|&n| get_buffer_index(n)).unwrap_or(0),
+        ];
+        let out_index = get_buffer_index(node);
+
         let op = llir_graph[node].to_dialect::<dyn BlockOp>().unwrap();
         let op_code = block_ops
             .iter()
@@ -1095,17 +1424,19 @@ pub(crate) fn make_megakernel_from_llir_graph(
             in_dep_c_base_val,
             out_dep_stride_val,
             out_dep_base_val,
-            [null(); 3],
-            null_mut(),
+            source_indices,
+            out_index,
             &payload,
             &expressions,
         );
     }
     (
         interpreter,
+        module,
         interpreter_constants,
         n_barriers,
         tasks,
         node_to_task_index,
+        node_to_buffer_index,
     )
 }

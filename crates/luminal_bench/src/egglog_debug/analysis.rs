@@ -365,7 +365,7 @@ pub fn analyze_with_ops(
     };
 
     // Output input labels (if any Output exists under this root).
-    for (_node_id, (lbl, children)) in &serialized.enodes {
+    for (lbl, children) in serialized.enodes.values() {
         if lbl != "Output" || children.is_empty() {
             continue;
         }

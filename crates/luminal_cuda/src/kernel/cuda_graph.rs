@@ -252,6 +252,72 @@ impl KernelParams {
     }
 }
 
+/// Stored kernel parameters for megakernels that persist for the lifetime of a CUDA graph.
+/// Params: tasks, head, ready, queue_lock, timings, start_times, buffers, dyn_dims
+#[derive(Debug)]
+pub struct MegakernelParams {
+    /// Parameter values: [tasks, head, ready, queue_lock, timings, start_times, buffers, dyn_dims]
+    values: Box<[u64]>,
+    /// Pointer array for CUDA kernel launch
+    ptrs: Box<[*mut c_void]>,
+}
+
+impl MegakernelParams {
+    /// Create megakernel params with all internal buffer pointers and dyn_dims.
+    /// Order: tasks, head, ready, queue_lock, timings, start_times, buffers, dyn_dims
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        tasks_ptr: u64,
+        head_ptr: u64,
+        ready_ptr: u64,
+        queue_lock_ptr: u64,
+        timings_ptr: u64,
+        start_times_ptr: u64,
+        buffers_ptr: u64,
+        dyn_dims_ptr: u64,
+    ) -> Self {
+        let values: Box<[u64]> = vec![
+            tasks_ptr,
+            head_ptr,
+            ready_ptr,
+            queue_lock_ptr,
+            timings_ptr,
+            start_times_ptr,
+            buffers_ptr,
+            dyn_dims_ptr,
+        ]
+        .into_boxed_slice();
+        let ptrs: Box<[*mut c_void]> = values
+            .iter()
+            .map(|v| v as *const u64 as *mut c_void)
+            .collect();
+        Self { values, ptrs }
+    }
+
+    pub fn as_cuda_params(&mut self) -> *mut *mut c_void {
+        // Rebuild pointers (in case struct was moved)
+        for (i, v) in self.values.iter().enumerate() {
+            self.ptrs[i] = v as *const u64 as *mut c_void;
+        }
+        self.ptrs.as_mut_ptr()
+    }
+
+    /// Update the buffers pointer (index 6).
+    pub fn update_buffers(&mut self, ptr: u64) {
+        self.values[6] = ptr;
+    }
+
+    /// Update the dyn_dims pointer (index 7).
+    pub fn update_dyn_dims(&mut self, ptr: u64) {
+        self.values[7] = ptr;
+    }
+
+    /// Get the current buffers pointer value.
+    pub fn buffers_ptr(&self) -> u64 {
+        self.values[6]
+    }
+}
+
 /// Timing data for a single kernel in a CUDA graph.
 #[derive(Clone, Debug)]
 pub struct CudaGraphKernelTiming {

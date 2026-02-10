@@ -168,21 +168,9 @@ pub fn print_var_inspection(inspection: &VarInspection) {
         return;
     }
 
-    let class_id = inspection
-        .class_id
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("<unknown>");
-    let class_type = inspection
-        .class_type
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("<unknown>");
-    let dtype = inspection
-        .dtype
-        .as_ref()
-        .map(|s| s.as_str())
-        .unwrap_or("<missing>");
+    let class_id = inspection.class_id.as_deref().unwrap_or("<unknown>");
+    let class_type = inspection.class_type.as_deref().unwrap_or("<unknown>");
+    let dtype = inspection.dtype.as_deref().unwrap_or("<missing>");
     let labels = if inspection.class_labels.is_empty() {
         "<none>".to_string()
     } else {

@@ -208,6 +208,15 @@ impl<'a> CStruct<'a> {
         self.buf
     }
 
+    /// Returns (size, alignment) of the struct.
+    pub fn size_and_align(&self) -> (usize, usize) {
+        let align = self.max_align;
+        let len = self.buf.len();
+        let rem = len % align;
+        let size = if rem != 0 { len + (align - rem) } else { len };
+        (size, align)
+    }
+
     /// Insert a raw byte field (e.g., another struct).
     /// `align` must be the alignment of the nested struct.
     pub fn bytes(mut self, align: usize, name: impl ToString, data: &[u8]) -> Self {

@@ -154,7 +154,7 @@ pub fn record_cuda_graph_timings(
     packets
 }
 
-pub trait KernelOp: luminal::op::EgglogOp {
+pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     #[allow(clippy::type_complexity)]
     fn compile(
         &self,
@@ -192,6 +192,64 @@ pub trait KernelOp: luminal::op::EgglogOp {
     fn kernel_name(&self) -> &'static str {
         "Unknown"
     }
+
+    /// Allocate internal buffers this kernel needs. Called once during graph building.
+    /// Default: no internal buffers.
+    fn allocate_internal_buffers(
+        &self,
+        _stream: &Arc<CudaStream>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<CudaSlice<u8>> {
+        vec![]
+    }
+
+    /// Returns the set of dynamic dimensions that affect internal buffer sizes.
+    /// When any of these dimensions change, internal buffers should be reallocated.
+    /// Default: empty set (no dimensions affect internal buffers).
+    fn internal_buffer_dyn_dims(&self) -> FxHashSet<char> {
+        FxHashSet::default()
+    }
+
+    /// Build kernel parameters. Returns the u64 values to pass to the kernel.
+    /// Default: [output_ptr, input_ptrs..., dyn_dims_ptr (if non-zero)]
+    fn build_params(
+        &self,
+        _stream: &Arc<CudaStream>,
+        output_ptr: u64,
+        input_ptrs: &[u64],
+        _internal_bufs: &[CudaSlice<u8>],
+        dyn_dims_ptr: u64,
+    ) -> Vec<u64> {
+        let mut params = vec![output_ptr];
+        params.extend_from_slice(input_ptrs);
+        if dyn_dims_ptr != 0 {
+            params.push(dyn_dims_ptr);
+        }
+        params
+    }
+
+    /// Called before each kernel execution. Update internal state if needed.
+    /// `all_buffer_ptrs` contains pointers for all buffers this kernel might use.
+    /// `constants` are device constants returned by compile() that may need updating.
+    fn pre_execute(
+        &self,
+        _stream: &Arc<CudaStream>,
+        _internal_bufs: &mut [CudaSlice<u8>],
+        _constants: &mut FxHashMap<char, CudaSlice<u8>>,
+        _all_buffer_ptrs: &FxHashMap<NodeIndex, u64>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) {
+    }
+
+    /// Returns indices of internal buffers containing timing data, if any.
+    /// Returns (timings_idx, start_times_idx, sm_count).
+    fn timing_buffer_indices(&self) -> Option<(usize, usize, usize)> {
+        None
+    }
 }
 
 luminal::impl_into_ops!(KernelOp);
+
+// Kernel to host op compilation
+mod to_host;
+pub use to_host::{CudaGraphOp, kernel_to_host};

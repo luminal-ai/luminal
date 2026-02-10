@@ -1,4 +1,4 @@
-use crate::kernel::MetalKernelOp;
+use crate::kernel::{MetalKernelOp, DYN_BUFFER_INDEX, DYN_SLOT_COUNT};
 use itertools::Itertools;
 use luminal::{
     graph::LLIRGraph,
@@ -20,6 +20,8 @@ pub struct MetalRuntime {
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
     /// Buffers for LLIR intermediate/output tensors
     pub buffers: FxHashMap<NodeIndex, Buffer>,
+    /// Dynamic dimensions table (a-z), shared across all kernels.
+    dyn_buffer: Buffer,
     /// The current LLIR graph
     llir_graph: LLIRGraph,
     /// Compiled pipeline states for each kernel node
@@ -84,12 +86,17 @@ impl Runtime for MetalRuntime {
     fn initialize(_: Self::CompileArg) -> Self {
         let device = Device::system_default().expect("No Metal device found!");
         let command_queue = device.new_command_queue();
+        let dyn_buffer = device.new_buffer(
+            (DYN_SLOT_COUNT * std::mem::size_of::<i32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
 
         Self {
             device,
             command_queue,
             hlir_buffers: FxHashMap::default(),
             buffers: FxHashMap::default(),
+            dyn_buffer,
             llir_graph: StableGraph::default(),
             pipelines: FxHashMap::default(),
         }
@@ -116,15 +123,21 @@ impl Runtime for MetalRuntime {
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
+        trials: usize,
     ) -> (Self::ProfileMetric, String) {
         self.load_llir(llir_graph);
         self.allocate_intermediate_buffers(dyn_map);
 
-        let start = std::time::Instant::now();
-        self.execute(dyn_map);
-        let elapsed = start.elapsed();
+        let trials = trials.max(1);
+        let mut duration = Duration::default();
+        for _ in 0..trials {
+            let start = std::time::Instant::now();
+            self.execute(dyn_map);
+            duration += start.elapsed();
+        }
+        duration /= trials as u32;
 
-        (elapsed, format!("{:.2?}", elapsed))
+        (duration, format!("{:.2?}", duration))
     }
 
     #[tracing::instrument(skip_all)]
@@ -143,8 +156,10 @@ impl Runtime for MetalRuntime {
 
         let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
 
+        self.update_dyn_buffer(dyn_map);
         let command_buffer = self.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_buffer(DYN_BUFFER_INDEX, Some(&self.dyn_buffer), 0);
 
         for node in topo_order {
             if self.llir_graph[node].to_op::<Input>().is_some()
@@ -236,6 +251,23 @@ impl MetalRuntime {
         }
     }
 
+    fn update_dyn_buffer(&mut self, dyn_map: &FxHashMap<char, usize>) {
+        let ptr = self.dyn_buffer.contents() as *mut i32;
+        unsafe {
+            for idx in 0..DYN_SLOT_COUNT {
+                *ptr.add(idx) = 0;
+            }
+            for (&symbol, &value) in dyn_map {
+                if symbol.is_ascii_lowercase() {
+                    let slot = (symbol as u8 - b'a') as usize;
+                    if slot < DYN_SLOT_COUNT {
+                        *ptr.add(slot) = value as i32;
+                    }
+                }
+            }
+        }
+    }
+
     /// Execute and return GPU-side execution time in microseconds.
     fn execute_timed(&mut self, dyn_map: &FxHashMap<char, usize>) -> (f64, TimingMethod) {
         let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
@@ -252,8 +284,10 @@ impl MetalRuntime {
 
         let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
 
+        self.update_dyn_buffer(dyn_map);
         let command_buffer = self.command_queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_buffer(DYN_BUFFER_INDEX, Some(&self.dyn_buffer), 0);
 
         for node in topo_order {
             if self.llir_graph[node].to_op::<Input>().is_some()

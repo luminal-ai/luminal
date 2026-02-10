@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 //! Micro benchmark runner using criterion.
 //!
 //! Usage and output locations: see `crates/luminal_bench/README.md`.

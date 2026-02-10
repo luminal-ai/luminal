@@ -1,0 +1,25 @@
+[package]
+name = "gpt_oss"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+
+[dependencies]
+luminal = { path = "../.." }
+luminal_nn = { path = "../../crates/luminal_nn" }
+luminal_cuda = { path = "../../crates/luminal_cuda" }
+luminal_tracing = {path="../../crates/luminal_tracing"}
+tokenizers = "0.20"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HuggingFace model download
+hf-hub = {version = "0.4", default-features = false, features = ["rustls-tls", "ureq"]}
+safetensors = "0.7.0"
+serde = {version = "1.0", features = ["derive"]}
+serde_json = "1.0"
+half = {version = "2.7.1", features = ["bytemuck"]}
+bytemuck = "1.24.0"
+memmap2 = "0.9.9"
+anyhow = "1"

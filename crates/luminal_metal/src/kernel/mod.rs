@@ -5,6 +5,9 @@ use luminal::op::EgglogOp;
 use luminal::prelude::*;
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device};
 
+pub const DYN_BUFFER_INDEX: u64 = 30;
+pub const DYN_SLOT_COUNT: usize = 26;
+
 pub trait MetalKernelOp: EgglogOp {
     fn compile(&self, device: &Device) -> ComputePipelineState;
 

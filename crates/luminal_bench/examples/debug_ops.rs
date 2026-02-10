@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 //! Debug script to locate which HLIR op(s) fail to lower to a backend dialect,
 //! leading to `No valid graphs present in the e-graph!`.
 //!
@@ -6,9 +8,9 @@
 //!
 //! Usage examples: see `crates/luminal_bench/README.md`.
 
-use luminal::hlir::HLIROps;
 use luminal::op::IntoEgglogOp;
 use luminal::prelude::*;
+use luminal::{egglog_utils::hlir_to_egglog, hlir::HLIROps};
 use luminal_bench::egglog_debug::{
     DebugReport, FactQuery, analyze_hlir_dtype_chain, analyze_hlir_function_chain,
     analyze_lowering, analyze_with_ops, inspect_var_hlir, print_dtype_chain, print_function_chain,
@@ -365,13 +367,13 @@ where
             base_path.clone()
         };
 
-        let content = format!("; hlir_to_egglog dump\n; root: {}\n{}", root, program);
+        let content = format!("; hlir_to_egglog dump\n; root: {root}\n{program}");
         std::fs::write(&path, content).expect("Failed to write egglog file");
         println!("Wrote egglog program to {}", path.display());
     }
 
     if args.print_egglog {
-        println!("-- Egglog program --\n{}", program);
+        println!("-- Egglog program --\n{program}");
     }
 
     let find_vars_by_head = |head: &str| -> Vec<String> {
@@ -563,6 +565,7 @@ where
     }
 }
 
+#[cfg(feature = "metal")]
 fn main() {
     let args = parse_args();
 
@@ -578,3 +581,6 @@ fn main() {
         run_case::<ActiveBackend>(args.case, args.size, &args);
     }
 }
+
+#[cfg(not(feature = "metal"))]
+fn main() {}
