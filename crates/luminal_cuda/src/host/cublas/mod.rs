@@ -1,6 +1,9 @@
 use cudarc::cublas::{
     CudaBlas,
-    sys::{cublasOperation_t, cublasSetStream_v2, cublasSgemm_v2, cublasStatus_t},
+    sys::{
+        cublasComputeType_t, cublasGemmAlgo_t, cublasGemmEx, cublasOperation_t, cublasSetStream_v2,
+        cublasSgemm_v2, cublasStatus_t, cudaDataType_t,
+    },
 };
 use cudarc::driver::{CudaStream, DevicePtr};
 use luminal::{
@@ -44,6 +47,7 @@ pub struct CuBlasSgemmV2 {
     ldc: Expression,
     /// Lazily initialized cuBLAS handle - created on first execute
     cublas: OnceLock<Arc<CudaBlas>>,
+    supports_tf32_tensor_cores: OnceLock<bool>,
 }
 
 // Useless default for IntoEgglogOp
@@ -59,6 +63,7 @@ impl Default for CuBlasSgemmV2 {
             ldb: Expression::default(),
             ldc: Expression::default(),
             cublas: OnceLock::new(),
+            supports_tf32_tensor_cores: OnceLock::new(),
         }
     }
 }
@@ -115,6 +120,7 @@ impl EgglogOp for CuBlasSgemmV2 {
             ldb,
             ldc,
             cublas: OnceLock::new(),
+            supports_tf32_tensor_cores: OnceLock::new(),
         };
         trace!(?extracted_state);
 
@@ -195,29 +201,85 @@ impl HostOp for CuBlasSgemmV2 {
             cublasSetStream_v2(*cublas.handle(), stream.cu_stream() as _);
         }
 
-        let status = unsafe {
-            cublasSgemm_v2(
-                *cublas.handle(),
-                a_layout,
-                b_layout,
-                m,
-                n,
-                k,
-                &alpha as *const f32,
-                a_ptr as *const f32,
-                lda,
-                b_ptr as *const f32,
-                ldb,
-                &beta as *const f32,
-                c_ptr as *mut f32,
-                ldc,
-            )
+        let use_tf32_tensor_cores = *self
+            .supports_tf32_tensor_cores
+            .get_or_init(|| crate::cuda_supports_tf32_tensor_cores(stream.context()));
+
+        let status = if use_tf32_tensor_cores {
+            let status = unsafe {
+                cublasGemmEx(
+                    *cublas.handle(),
+                    a_layout,
+                    b_layout,
+                    m,
+                    n,
+                    k,
+                    &alpha as *const f32 as *const _,
+                    a_ptr as *const _,
+                    cudaDataType_t::CUDA_R_32F,
+                    lda,
+                    b_ptr as *const _,
+                    cudaDataType_t::CUDA_R_32F,
+                    ldb,
+                    &beta as *const f32 as *const _,
+                    c_ptr as *mut _,
+                    cudaDataType_t::CUDA_R_32F,
+                    ldc,
+                    cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_TF32,
+                    cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
+                )
+            };
+            if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                status
+            } else {
+                trace!(
+                    ?status,
+                    "cuBLAS GEMM_EX TF32 path failed, falling back to cublasSgemm_v2"
+                );
+                unsafe {
+                    cublasSgemm_v2(
+                        *cublas.handle(),
+                        a_layout,
+                        b_layout,
+                        m,
+                        n,
+                        k,
+                        &alpha as *const f32,
+                        a_ptr as *const f32,
+                        lda,
+                        b_ptr as *const f32,
+                        ldb,
+                        &beta as *const f32,
+                        c_ptr as *mut f32,
+                        ldc,
+                    )
+                }
+            }
+        } else {
+            unsafe {
+                cublasSgemm_v2(
+                    *cublas.handle(),
+                    a_layout,
+                    b_layout,
+                    m,
+                    n,
+                    k,
+                    &alpha as *const f32,
+                    a_ptr as *const f32,
+                    lda,
+                    b_ptr as *const f32,
+                    ldb,
+                    &beta as *const f32,
+                    c_ptr as *mut f32,
+                    ldc,
+                )
+            }
         };
         stream.synchronize().unwrap();
 
         if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
             return Err(anyhow::anyhow!(
-                "cuBLAS SGEMM TN failed with status: {:?}",
+                "cuBLAS GEMM failed with status: {:?}",
                 status
             ));
         }

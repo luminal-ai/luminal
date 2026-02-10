@@ -901,21 +901,28 @@ fn compile_interpreter(
     );
     drop(span);
 
-    let (module, func) = if let Some((module, kernel)) = kernel_cache.get(&kernel) {
+    let arch = crate::cuda_nvrtc_arch(cuda_stream.context()).unwrap_or_else(|| "sm_75".to_string());
+    // NVRTC output depends on both source and target arch.
+    let kernel_cache_key = format!("{arch}\n{kernel}");
+    let (module, func) = if let Some((module, kernel)) = kernel_cache.get(&kernel_cache_key) {
         (module.clone(), kernel.clone())
     } else {
-        let _span = span!(Level::TRACE, "nvrtc").entered();
+        let _span = span!(Level::TRACE, "nvrtc", arch = %arch).entered();
         let ptx = compile_ptx_with_opts(
             &kernel,
             CompileOptions {
-                arch: Some("sm_75"),
+                arch: Some(arch.as_str()),
                 ..Default::default()
             },
         )
         .unwrap();
         let module = cuda_stream.context().load_module(ptx).unwrap();
         let func = module.load_function("worker_kernel").unwrap();
+
+        kernel_cache.push(kernel_cache_key, (module.clone(), func.clone()));
+
         kernel_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+
         (module, func)
     };
     let constants: FxHashMap<char, CudaSlice<u8>> = constants
