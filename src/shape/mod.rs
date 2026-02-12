@@ -40,6 +40,43 @@ pub fn flatten_mul_strides(range: &[Expression], strides: &[Expression]) -> Expr
     flat_stride.simplify()
 }
 
+pub fn row_major_strides(shape: &[Expression]) -> Vec<Expression> {
+    let n = shape.len();
+    let mut strides = vec![Expression::from(1); n];
+    for i in (0..n.saturating_sub(1)).rev() {
+        strides[i] = (strides[i + 1] * shape[i + 1]).simplify();
+    }
+    strides
+}
+
+pub fn inverse_flatten_mul_strides(shape: &[Expression], strides: &[Expression]) -> Expression {
+    assert_eq!(shape.len(), strides.len());
+    let n = shape.len();
+    if n == 0 {
+        return Expression::from(0);
+    }
+
+    let rm = row_major_strides(shape);
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let sa = strides[a].as_num().unwrap_or(i32::MAX);
+        let sb = strides[b].as_num().unwrap_or(i32::MAX);
+        sb.cmp(&sa)
+    });
+
+    let mut remainder = Expression::from('z');
+    let mut result = Expression::from(0);
+    for (pos, &dim_idx) in order.iter().enumerate() {
+        let coord = remainder / strides[dim_idx];
+        result += coord * rm[dim_idx];
+        if pos < n - 1 {
+            remainder = (remainder % strides[dim_idx]).simplify();
+        }
+    }
+    result.simplify()
+}
+
 pub fn flatten_z_strides_mask(range: &[Expression], strides: &[Expression]) -> Expression {
     assert_eq!(range.len(), strides.len());
     let mut current_elem_size = Expression::from(1);
