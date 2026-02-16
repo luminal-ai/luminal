@@ -174,7 +174,7 @@ fn compute_barrier_strides(
                     Some(Some(*pr / *cr))
                 }) {
                     *acc *= *pr / factor;
-                    assert!(factor.to_usize().map(|i| i > 0).unwrap_or(true));
+                    assert!(factor.to_usize().map_or(true, |i| i > 0));
                     Some((
                         Expression::from('z') / factor * prev,
                         vec![prev * 'z'; cr.len()],
