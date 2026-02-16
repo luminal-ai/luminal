@@ -516,12 +516,12 @@ impl Expression {
     ) -> Option<usize> {
         for term in self.terms.read().iter() {
             match term {
-                Term::Num(n) => stack.push(*n as i64),
+                Term::Num(n) => stack.push(i64::from(*n)),
                 Term::Var(c) =>
                 {
                     #[allow(clippy::needless_borrow)]
                     if let Some(n) = variables.get(&c) {
-                        stack.push(*n as i64)
+                        stack.push(*n as i64);
                     } else {
                         return None;
                     }
@@ -641,13 +641,13 @@ impl From<&i32> for Expression {
 
 impl From<bool> for Expression {
     fn from(value: bool) -> Self {
-        Expression::new(vec![Term::Num(value as i32)])
+        Expression::new(vec![Term::Num(i32::from(value))])
     }
 }
 
 impl From<&bool> for Expression {
     fn from(value: &bool) -> Self {
-        Expression::new(vec![Term::Num(*value as i32)])
+        Expression::new(vec![Term::Num(i32::from(*value))])
     }
 }
 
