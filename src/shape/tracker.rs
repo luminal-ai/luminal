@@ -21,8 +21,8 @@ impl ShapeTracker {
     /// Make a new row-major shape tracker
     pub fn new(dims: impl ToShape) -> ShapeTracker {
         let mut s = Self {
-            dims: Default::default(),
-            strides: Default::default(),
+            dims: ArrayVec::default(),
+            strides: ArrayVec::default(),
         };
         let mut stride = Expression::from(1);
         for d in dims.to_shape().into_iter().rev() {
@@ -36,8 +36,8 @@ impl ShapeTracker {
     /// Make a new shape tracker with fake dimensions
     pub fn fake(dims: impl ToShape) -> Self {
         let mut s = Self {
-            dims: Default::default(),
-            strides: Default::default(),
+            dims: ArrayVec::default(),
+            strides: ArrayVec::default(),
         };
         for d in dims.to_shape().into_iter() {
             s.dims.push(d);
@@ -56,8 +56,8 @@ impl ShapeTracker {
             "Dimensions and strides need to be the same size!"
         );
         let mut s = Self {
-            dims: Default::default(),
-            strides: Default::default(),
+            dims: ArrayVec::default(),
+            strides: ArrayVec::default(),
         };
         for (dim, stride) in dims.into_iter().zip(strides) {
             s.dims.push(dim);
@@ -227,7 +227,7 @@ impl ShapeTracker {
         Self::new(
             self.dims
                 .into_iter()
-                .map(|i| i.simplify())
+                .map(Expression::simplify)
                 .collect::<Vec<_>>(),
         )
     }
