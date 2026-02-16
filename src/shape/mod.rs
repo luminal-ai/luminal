@@ -538,13 +538,13 @@ impl<const E: usize, A: Into<Expression> + Copy> ToShape for &[A; E] {
 
 impl<const E: usize, A: Into<Expression>> ToShape for [A; E] {
     fn to_shape(self) -> Vec<Expression> {
-        self.into_iter().map(|i| i.into()).collect()
+        self.into_iter().map(A::into).collect()
     }
 }
 
 impl<A: Into<Expression>> ToShape for Vec<A> {
     fn to_shape(self) -> Vec<Expression> {
-        self.into_iter().map(|i| i.into()).collect()
+        self.into_iter().map(A::into).collect()
     }
 }
 

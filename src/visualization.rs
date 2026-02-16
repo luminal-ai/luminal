@@ -78,11 +78,7 @@ fn display_graph_text(
     let mut new_graph = StableGraph::new();
     let mut map = std::collections::HashMap::new();
     for node in graph.node_indices() {
-        if mark_nodes
-            .as_ref()
-            .map(|m| m.contains(&node))
-            .unwrap_or(true)
-        {
+        if mark_nodes.as_ref().map_or(true, |m| m.contains(&node)) {
             map.insert(
                 node,
                 new_graph.add_node(format!("{:?}", graph.node_weight(node).unwrap())),
