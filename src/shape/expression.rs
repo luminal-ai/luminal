@@ -24,6 +24,10 @@ static EXPRESSION_INTERNER: OnceLock<RwLock<FxHashMap<Vec<Term>, ExprBox>>> = On
 
 const MAX_CACHED_SIMPLIFICATIONS: usize = 10_000;
 
+const WELL_FORMED_EXPRESSION: &str = "The expresion was formed in such a way
+that when getting an operation rather than a number or variable,
+the arguments are already pushed on the stack";
+
 #[derive(Copy, Clone)]
 pub struct Expression {
     pub terms: ExprBox,
@@ -288,19 +292,19 @@ impl Expression {
                 Term::Var(c) => format!("(MVar \"{c}\")"),
                 Term::Max => format!(
                     "(MMax {} {})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
                 Term::Min => format!(
                     "(MMin {} {})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
                 _ => format!(
                     "({} {} {})",
                     term.to_egglog(),
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
             };
             symbols.push(new_symbol);
@@ -527,14 +531,21 @@ impl Expression {
                     }
                 }
                 _ => {
-                    let a = stack.pop().unwrap();
-                    let b = stack.pop().unwrap();
-                    stack.push(term.as_op().unwrap()(a, b).unwrap());
+                    let a = stack.pop().expect(WELL_FORMED_EXPRESSION);
+                    let b = stack.pop().expect(WELL_FORMED_EXPRESSION);
+                    #[rustfmt::skip]
+                    stack.push(
+                        term.as_op()
+                            .expect("The term is not a Num or Var so it must be an operation")
+                            (a, b,)
+                        .expect("The operation would fail due to overflow in checked arithmetic or division by 0"),
+                    );
                 }
             }
         }
         stack.pop().map(|i| i as usize)
     }
+
     /// Retrieve all symbols in the expression.
     pub fn to_symbols(&self) -> Vec<char> {
         self.terms
@@ -558,6 +569,10 @@ impl Expression {
     }
     /// Run proper equality check inside egglog
     #[tracing::instrument(skip_all)]
+    // The `program` was constructed directly here.
+    // This is not unsanitized input for `program`
+    // so parsing it and running should not panic.
+    #[allow(clippy::missing_panics_doc)]
     pub fn egglog_equal(self, rhs: impl Into<Expression>) -> bool {
         let lhs_expr = self.to_egglog();
         let rhs_expr = rhs.into().to_egglog();

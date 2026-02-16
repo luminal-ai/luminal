@@ -14,6 +14,8 @@ pub enum ReshapeDim {
 
 use std::ops::{Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeTo, RangeToInclusive};
 
+/// # Panics
+/// - The `range` and `strides` slices must have the same length.
 pub fn flatten_z_strides(range: &[Expression], strides: &[Expression]) -> Expression {
     assert_eq!(range.len(), strides.len());
     let mut current_elem_size = Expression::from(1);
@@ -27,6 +29,8 @@ pub fn flatten_z_strides(range: &[Expression], strides: &[Expression]) -> Expres
     flat_stride.simplify()
 }
 
+/// # Panics
+/// - The `range` and `strides` slices must have the same length.
 pub fn flatten_mul_strides(range: &[Expression], strides: &[Expression]) -> Expression {
     assert_eq!(range.len(), strides.len());
     let mut current_elem_size = Expression::from(1);
@@ -40,6 +44,8 @@ pub fn flatten_mul_strides(range: &[Expression], strides: &[Expression]) -> Expr
     flat_stride.simplify()
 }
 
+/// # Panics
+/// - The `range` and `strides` slices must have the same length.
 pub fn flatten_z_strides_mask(range: &[Expression], strides: &[Expression]) -> Expression {
     assert_eq!(range.len(), strides.len());
     let mut current_elem_size = Expression::from(1);

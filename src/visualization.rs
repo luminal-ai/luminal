@@ -61,6 +61,10 @@ where
 
 #[allow(unused)]
 /// View a debug graph in the browser
+///
+/// # Panics
+/// - Depending on the platform, this function may fail if the full directory path for `file_name` does not exist.
+/// - Even if the file is properly created, there may be an unrecoverable error when writing all the data to it.
 pub fn display_graph(
     graph: &StableGraph<impl Debug, impl Debug, Directed, u32>,
     mark_nodes: Option<Vec<NodeIndex>>,

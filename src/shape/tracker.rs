@@ -47,6 +47,9 @@ impl ShapeTracker {
     }
 
     /// Make a new shape tracker with custom strides
+    ///
+    /// # Panics
+    /// - Dimensions and strides need to be the same size.
     pub fn new_strided(dims: impl ToShape, strides: impl ToShape) -> Self {
         let dims = dims.to_shape();
         let strides = strides.to_shape();
@@ -83,6 +86,10 @@ impl ShapeTracker {
     }
 
     /// Expand this shape to a new shape following PyTorch semantics
+    ///
+    /// # Panics
+    /// - If the new shape is not compatible with the current shape
+    ///   according to the logic of how dimensions of length 1 are treated.
     pub fn expand(&mut self, new_shape: impl ToShape) {
         let new_shape = new_shape.to_shape();
         assert!(
@@ -115,12 +122,18 @@ impl ShapeTracker {
     }
 
     /// Remove a dimension
+    ///
+    /// # Panics
+    /// The dimension being removed must be one of the dimensions
     pub fn remove_dim(&mut self, axis: usize) -> Expression {
         self.strides.remove(axis);
         self.dims.remove(axis)
     }
 
     /// Permute the dimensions
+    ///
+    /// # Panics
+    /// `axes` must be a permutation of the dimensions
     pub fn permute(&mut self, axes: &[usize]) {
         assert!(
             axes.len() == self.len(),
@@ -232,7 +245,11 @@ impl ShapeTracker {
         )
     }
 
-    /// Realize the true shape and convert it to usizes. All dyn dims must be replaced already
+    /// Realize the true shape and convert it to usizes.
+    ///
+    /// # Panics
+    /// - All dyn dims must be replaced already. That is to say no variables should be
+    ///   required anymore.
     pub fn shape_usize(&self) -> Vec<usize> {
         self.dims.iter().map(|e| e.to_usize().unwrap()).collect()
     }
