@@ -70,6 +70,10 @@ impl ShapeTracker {
     }
 
     /// Add dim along a certian axis
+    ///
+    /// # Panics
+    /// - `axis` is out of bounds
+    /// - the capacity of at most 10 dimensions is exhausted
     pub fn add_dim(
         &mut self,
         axis: usize,
@@ -81,6 +85,10 @@ impl ShapeTracker {
     }
 
     /// Add fake dim along a certian axis
+    ///
+    /// # Panics
+    /// - `axis` is out of bounds
+    /// - the capacity of at most 10 dimensions is exhausted
     pub fn expand_dim(&mut self, axis: usize, dim: impl Into<Expression>) {
         self.add_dim(axis, dim, 0);
     }
@@ -91,6 +99,7 @@ impl ShapeTracker {
     /// # Panics
     /// - If the new shape is not compatible with the current shape
     ///   according to the logic of how dimensions of length 1 are treated.
+    /// - Bounds and capacity problems of `expand_dim`
     pub fn expand(&mut self, new_shape: impl ToShape) {
         let new_shape = new_shape.to_shape();
         assert!(
@@ -134,7 +143,10 @@ impl ShapeTracker {
     /// Permute the dimensions
     ///
     /// # Panics
-    /// `axes` must be a permutation of the dimensions
+    /// `axes` should be a permutation of the dimensions
+    /// however it is only checked that it is of the correct length
+    /// and that each value is in the correct range.
+    /// The injectivity/surjectivity are not enforced.
     pub fn permute(&mut self, axes: &[usize]) {
         assert!(
             axes.len() == self.len(),
@@ -146,7 +158,8 @@ impl ShapeTracker {
         self.strides = axes.iter().map(|i| self.strides[*i]).collect();
     }
 
-    /// Create an expression to translate logical indexes into physical indexes, without expression simplification
+    /// Create an expression to translate logical indexes
+    /// into physical indexes, without expression simplification
     pub fn index_expression_no_simplify(&self) -> Expression {
         if self.is_contiguous() {
             return 'z'.into();
@@ -224,14 +237,17 @@ impl ShapeTracker {
         self.dims.len()
     }
 
+    /// There are no dimensions
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// The numbers labelling each axis that is present
     pub fn all_axes(&self) -> Vec<usize> {
         (0..self.len()).collect()
     }
 
+    /// The number labelling the last axis
     pub fn last_axis(&self) -> usize {
         self.len() - 1
     }
@@ -252,7 +268,12 @@ impl ShapeTracker {
     /// - All dyn dims must be replaced already. That is to say no variables should be
     ///   required anymore.
     pub fn shape_usize(&self) -> Vec<usize> {
-        self.dims.iter().map(|e| e.to_usize().unwrap()).collect()
+        self.dims
+            .iter()
+            .map(|e|
+                e.to_usize()
+                .expect("Dyn Dims have been replaced already so each dimension has no variables and is just a number")
+            ).collect()
     }
 
     /// Given a dyn dim map, resolve global dyn dims into known dims

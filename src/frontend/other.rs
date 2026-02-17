@@ -54,6 +54,8 @@ impl Graph {
     }
 
     /// Lower left-hand triangle of 1s. Currently required to be square
+    /// Also capable of doing the stricter lower left-hand triangle of 1s
+    /// below a subdiagonal. Or below a superdiagonal.
     ///
     /// Same API as <https://pytorch.org/docs/stable/generated/torch.tril>
     #[allow(clippy::cast_precision_loss)]
@@ -64,7 +66,9 @@ impl Graph {
         (horizontal - (diagonal as f32 + 1.)).lt(vertical)
     }
 
-    /// Upper right-hand triangle of 1s
+    /// Upper right-hand triangle of 1s. Currently required to be square
+    /// Also capable of doing the stricter upper right-hand triangle of 1s
+    /// above a superdiagonal. Or above a subdiagonal.
     ///
     /// Same API as <https://pytorch.org/docs/stable/generated/torch.triu>
     #[allow(clippy::cast_precision_loss)]
@@ -76,6 +80,10 @@ impl Graph {
     }
 
     /// Stack tensors along a new dimension
+    ///
+    /// There could be unresolved equality of expressions with dyn dims that have not been resolved yet.
+    /// Enforcing that this is a proper stacking has not happened at this stage due to this ambiguity.
+    /// In this case, there may be unintended behavior despite the construction of `GraphTensor` not causing Panic or Error.
     ///
     /// # Panics
     /// - There must be at least one tensor to stack

@@ -47,7 +47,10 @@ proptest! {
     }
 
     #[test]
-    fn test_matmul(m in 1usize..6, k in 1usize..6, n in 1usize..6, lhs in proptest::collection::vec(-2.0f32..2.0, 1..100), rhs in proptest::collection::vec(-2.0f32..2.0, 1..100)) {
+    fn test_matmul(
+        m in 1usize..6, k in 1usize..6, n in 1usize..6,
+        lhs in proptest::collection::vec(-2.0f32..2.0, 1..100),
+        rhs in proptest::collection::vec(-2.0f32..2.0, 1..100)) {
         prop_assume!(lhs.len() >= m * k);
         prop_assume!(rhs.len() >= k * n);
         let mut cx = Graph::new();

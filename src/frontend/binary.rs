@@ -462,6 +462,36 @@ pub(super) mod tests {
         assert_close(rt.get_f32(c.id), &ref_c.to_vec1::<f32>().unwrap())
     }
 
+    pub fn test_binary_transforms_same_tensor(
+        a_shape: impl ToShape,
+        func: impl Fn(GraphTensor, GraphTensor) -> GraphTensor,
+        ref_func: impl Fn(Tensor, Tensor) -> Tensor,
+        data_transform: impl Fn(Vec<f32>) -> Vec<f32>,
+    ) {
+        let a_shape = a_shape
+            .to_shape()
+            .into_iter()
+            .map(|e| e.to_usize().unwrap())
+            .collect_vec();
+        let mut cx = Graph::new();
+        let a = cx.tensor(a_shape.clone());
+        let c = func(a, a).output();
+
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+
+        let a_values = data_transform(random_vec(a_shape.iter().copied().product()));
+        rt.set_data(a.id, a_values.clone());
+        rt.execute(&cx.dyn_map);
+
+        // Reference
+        let device = Device::Cpu;
+        let ref_a = Tensor::from_vec(a_values, a_shape, &device).unwrap();
+        let ref_c = ref_func(ref_a.clone(), ref_a).flatten_all().unwrap();
+
+        assert_close(rt.get_f32(c.id), &ref_c.to_vec1::<f32>().unwrap())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]

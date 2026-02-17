@@ -391,6 +391,9 @@ impl Expression {
         egglog_simplify(self)
     }
     pub fn as_num(&self) -> Option<i32> {
+        if self.is_empty() {
+            return None;
+        }
         if let Term::Num(n) = self.terms.read()[0] {
             if self.terms.read().len() == 1 {
                 return Some(n);
@@ -402,7 +405,7 @@ impl Expression {
         self.terms.read().len()
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.terms.read().is_empty()
     }
     /// Minimum
     pub fn min(self, rhs: impl Into<Self>) -> Self {
@@ -614,6 +617,7 @@ impl Expression {
     // The `program` was constructed directly here.
     // This is not unsanitized input for `program`
     // so parsing it and running should not panic.
+    // There is no reason for the panics doc because of this.
     #[allow(clippy::missing_panics_doc)]
     pub fn egglog_equal(self, rhs: impl Into<Expression>) -> bool {
         let lhs_expr = self.to_egglog();
@@ -1091,7 +1095,10 @@ fn egglog_simplify(e: Expression) -> Expression {
         &mut FxHashMap::default(),
     )
     .unwrap_or(e);
-    cache.lock().unwrap().push(e, simplified);
+    cache
+        .lock()
+        .expect("There was a panic causing a problem with the cache")
+        .push(e, simplified);
     simplified
 }
 
@@ -1106,9 +1113,22 @@ mod tests {
         let a = Expression::from('a');
         // Identity operations simplify away
         assert_eq!(((a * 1) + 0) / 1 + (1 - 1), a);
+        assert_eq!(((a * (3 - 2)) + 0) / 1 + (1 - 1), a);
+
+        // Not manifestly identity operations do not simplify away
+        assert!(((a * 2) / 2) / 1 + (1 - 1) != a);
+        assert_eq!(((a * 2) / 2) / 1 + (1 - 1), (a * 2) / 2);
+
         // Evaluation after simplification
         let n = (x + (256 - (x % 256))).simplify();
-        assert_eq!(n.exec(&[('x', 767)].into_iter().collect()).unwrap(), 768);
+        for (x_in, n_out) in [(767, 768), (0, 256), (1, 256), (255, 256), (256, 512)] {
+            let var_map = [('x', x_in)].into_iter().collect();
+            assert_eq!(
+                n.exec(&var_map)
+                    .expect("Evaluating the expression gives a result"),
+                n_out
+            );
+        }
     }
 
     #[test]
@@ -1116,13 +1136,16 @@ mod tests {
         let x = Expression::from('x');
         let new = (x - 255).substitute('x', x / 2).simplify();
         assert_eq!(new.len(), 5);
+        assert_eq!(new, (x / 2) - 255);
     }
 
     #[test]
     fn test_group_terms() {
         let s = Expression::from('s');
         let expr = (s * ((s - 4) + 1)) + (((s + 1) * ((s - 4) + 1)) - (s * ((s - 4) + 1)));
-        assert_eq!(expr.simplify().len(), 7);
+        let simplified = expr.simplify();
+        assert_eq!(simplified.len(), 7);
+        assert_eq!(simplified, (s + 1) * (s - 3));
     }
 
     #[test]

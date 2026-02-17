@@ -64,6 +64,8 @@ impl Graph {
     }
 
     /// Set a runtime dimension
+    /// Overrides and erases previous values if this runtime
+    /// dimension had been set before.
     pub fn set_dim(&mut self, dimension: char, val: usize) {
         self.dyn_map.insert(dimension, val);
     }
@@ -73,7 +75,10 @@ impl Graph {
         self.named_tensor("Tensor", shape)
     }
 
-    /// Create a new tensor with shape S and a name. This name will show up on the graph when displayed
+    /// Create a new tensor with shape S and a name.
+    /// This name will show up on the graph when displayed.
+    /// The type starts off as the default type since it
+    /// has not been specified yet.
     #[allow(clippy::needless_pass_by_value)]
     pub fn named_tensor(&mut self, name: impl ToString, shape: impl ToShape) -> GraphTensor {
         let id = self.graph.add_node(Box::new(crate::hlir::Input {
@@ -181,6 +186,9 @@ impl Graph {
             .expect("The downcast should be successful")
     }
 
+    /// Create a new tensor which is the result
+    /// of a `CustomOp` and has prescribed
+    /// inputs, shape and dtype.
     pub fn custom_op(
         &mut self,
         op: impl CustomOp + 'static,

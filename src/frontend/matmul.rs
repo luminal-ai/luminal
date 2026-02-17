@@ -17,6 +17,7 @@ impl GraphTensor {
         if (self.shape.len() == 1 || self.shape.len() == 2) && rhs.shape.len() == 2 {
             let vec = self.shape.len() == 1;
             if vec {
+                // k * (k,n) -> (1,k)*(k,n)
                 self = self.expand_dim(0, 1);
             }
             // The two _ here are supposed to be equal but so far they are just
@@ -131,13 +132,27 @@ impl GraphTensor {
 
 #[cfg(test)]
 mod tests {
-    use crate::frontend::binary::tests::test_binary;
+    use crate::frontend::binary::tests::{test_binary, test_binary_transforms_same_tensor};
     use proptest::prelude::*;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
         fn test_matrix_vector(m in 1usize..6, k in 1usize..6, n in 1usize..6) {
+            // Vector - Matrix
+            test_binary(
+                k,
+                (k,n),
+                |a, b| a.matmul(b),
+                |a, b| a.reshape((1,k)).unwrap().matmul(&b).unwrap(),
+            );
+            // Matrix - Vector
+            // The other order where it is (m,k) for LHS and (k,) for RHS
+            // does not get implicitly promoted like above. The (k,) doesn't
+            // get expanded to (k,1,) within `matmul`.
+            // That could be done just like with the `if vec` for the previous case.
+            // It is a matter of when to allow implicit expansion vs when to
+            // mandate being explicit.
             test_binary(
                 (m, k),
                 (k, n),
@@ -156,6 +171,13 @@ mod tests {
                 (k, n),
                 |a, b| a.matmul(b),
                 |a, b| a.matmul(&b).unwrap(),
+            );
+            // A -> A^2 with square matrix multiplication
+            test_binary_transforms_same_tensor(
+                (m, m),
+                |a, b| a.matmul(b),
+                |a, b| a.matmul(&b).unwrap(),
+                |v| v,
             );
         }
     }
