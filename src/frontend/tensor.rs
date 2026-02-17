@@ -1,5 +1,6 @@
-use crate::hlir::*;
-use crate::op::*;
+use crate::hlir::{Input, Output};
+#[allow(unused)]
+use crate::op::{DType, IntoEgglogOp};
 use crate::prelude::*;
 use std::fmt::Debug;
 
@@ -32,7 +33,7 @@ impl From<&GraphTensor> for GraphTensor {
 }
 
 impl GraphTensor {
-    /// Create a GraphTensor from a NodeIndex
+    /// Create a `GraphTensor` from a `NodeIndex`
     pub fn from_id(
         id: NodeIndex,
         shape: ShapeTracker,
@@ -48,6 +49,9 @@ impl GraphTensor {
     }
 
     /// Get a mutable reference to the graph this tensor belongs to
+    /// 
+    /// # Panics
+    /// The graph reference held by self must be valid
     #[allow(clippy::mut_from_ref)]
     pub fn graph(&self) -> &mut Graph {
         unsafe { self.graph_ref.as_mut().unwrap() }
@@ -73,6 +77,10 @@ impl GraphTensor {
         self.shape.dims.to_vec()
     }
 
+    /// For shapes with 1 dimension
+    /// 
+    /// # Panics
+    /// The shape should have 1 dimension
     pub fn dims1(&self) -> Expression {
         assert_eq!(
             self.shape.len(),
@@ -82,6 +90,10 @@ impl GraphTensor {
         );
         self.dims()[0]
     }
+    /// For shapes with 2 dimensions
+    /// 
+    /// # Panics
+    /// The shape should have 2 dimensions
     pub fn dims2(&self) -> (Expression, Expression) {
         assert_eq!(
             self.shape.len(),
@@ -92,6 +104,10 @@ impl GraphTensor {
         let dims = self.dims();
         (dims[0], dims[1])
     }
+    /// For shapes with 3 dimensions
+    /// 
+    /// # Panics
+    /// The shape should have 3 dimensions
     pub fn dims3(&self) -> (Expression, Expression, Expression) {
         assert_eq!(
             self.shape.len(),
@@ -102,6 +118,10 @@ impl GraphTensor {
         let dims = self.dims();
         (dims[0], dims[1], dims[2])
     }
+    /// For shapes with 4 dimensions
+    /// 
+    /// # Panics
+    /// The shape should have 4 dimensions
     pub fn dims4(&self) -> (Expression, Expression, Expression, Expression) {
         assert_eq!(
             self.shape.len(),
@@ -112,6 +132,10 @@ impl GraphTensor {
         let dims = self.dims();
         (dims[0], dims[1], dims[2], dims[3])
     }
+    /// For shapes with 5 dimensions
+    /// 
+    /// # Panics
+    /// The shape should have 5 dimensions
     pub fn dims5(&self) -> (Expression, Expression, Expression, Expression, Expression) {
         assert_eq!(
             self.shape.len(),
@@ -241,12 +265,12 @@ impl ToIds for GraphTensor {
 }
 impl<T: ToIdsMut> ToIdsMut for Vec<T> {
     fn to_ids_mut(&mut self) -> Vec<&mut NodeIndex> {
-        self.iter_mut().flat_map(|i| i.to_ids_mut()).collect()
+        self.iter_mut().flat_map(T::to_ids_mut).collect()
     }
 }
 impl<T: ToIds> ToIds for Vec<T> {
     fn to_ids(&self) -> Vec<NodeIndex> {
-        self.iter().flat_map(|i| i.to_ids()).collect()
+        self.iter().flat_map(T::to_ids).collect()
     }
 }
 impl<T: ToIdsMut> ToIdsMut for &mut [T] {
@@ -266,7 +290,7 @@ impl ToIdsMut for &mut [NodeIndex] {
 }
 impl<T: ToIds> ToIds for &mut [T] {
     fn to_ids(&self) -> Vec<NodeIndex> {
-        self.iter().flat_map(|i| i.to_ids()).collect()
+        self.iter().flat_map(T::to_ids).collect()
     }
 }
 
@@ -303,7 +327,7 @@ impl ToIds for () {
 
 impl<T: ToIds> ToIds for FxHashMap<String, T> {
     fn to_ids(&self) -> Vec<NodeIndex> {
-        self.values().flat_map(|i| i.to_ids()).collect()
+        self.values().flat_map(T::to_ids).collect()
     }
 }
 

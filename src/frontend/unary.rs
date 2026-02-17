@@ -177,6 +177,7 @@ impl GraphTensor {
     }
 
     /// Compute the sample variance along an axes with options
+    #[allow(clippy::needless_pass_by_value)]
     pub fn var_options(self, axes: impl ToAxes, correction: usize) -> GraphTensor {
         let axes = axes.to_axes();
         let n = axes
@@ -276,6 +277,7 @@ impl GraphTensor {
     /// Apply a cumulative reduction operation along dimensions
     ///
     /// See `cumsum` or `cummax` for usage examples.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn cumop(
         mut self,
         axes: impl ToAxes,
@@ -307,16 +309,19 @@ impl GraphTensor {
 
     /// Apply a cumulative sum along dimensions
     pub fn cumsum(self, axes: impl ToAxes) -> Self {
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.cumop(axes, |t, axes| t.sum(axes), 0.)
     }
 
     /// Apply a cumulative max along dimensions
     pub fn cummax(self, axes: impl ToAxes) -> Self {
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.cumop(axes, |t, axes| t.max(axes), f32::MIN)
     }
 
     /// Apply a cumulative product along dimensions
     pub fn cumprod(self, axes: impl ToAxes) -> Self {
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.cumop(axes, |t, axes| t.prod(axes), 1.)
     }
 }

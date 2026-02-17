@@ -92,6 +92,7 @@ impl Graph {
 
     /// Get the sources of a node given it's id
     pub fn get_sources(&self, node_id: NodeIndex) -> Vec<(NodeIndex, ShapeTracker)> {
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.graph
             .edges_directed(node_id, Direction::Incoming)
             .sorted_by_key(|e| e.id())
@@ -102,6 +103,7 @@ impl Graph {
     /// Get the dests of a node given it's id
     #[allow(clippy::borrowed_box)]
     pub fn get_dests(&self, node_id: NodeIndex) -> Vec<(NodeIndex, &Box<dyn HLIROp>)> {
+        #[allow(clippy::redundant_closure_for_method_calls)]
         self.graph
             .edges_directed(node_id, Direction::Outgoing)
             .sorted_by_key(|e| e.id())
@@ -682,7 +684,7 @@ pub struct SubgraphDescriptor {
 /// # Panics
 ///
 /// - The graph has breaks, but is not acyclic
-/// - The graph has breaks and at least one GraphBreak
+/// - The graph has breaks and at least one `GraphBreak`
 ///   failed the contract of having exactly one input
 #[allow(clippy::too_many_lines)]
 pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
@@ -870,7 +872,7 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
 /// 2. **Boundary outputs**: Matched positionally via `SubgraphDescriptor.boundary_outputs`
 /// 3. **Weight/data inputs**: Chunk-specific Input nodes (in one subgraph but not the other) are sorted by index and matched positionally.
 ///
-/// Shared Input nodes (same NodeIndex in both subgraphs) need no remapping.
+/// Shared Input nodes (same `NodeIndex` in both subgraphs) need no remapping.
 /// Build remapping tables for cloning a representative chunk's LLIR to a target chunk.
 ///
 /// Returns:

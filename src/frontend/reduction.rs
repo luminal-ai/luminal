@@ -1,8 +1,9 @@
-use crate::hlir::*;
+use crate::hlir::{SumReduce, MaxReduce};
 use crate::prelude::*;
 
 impl GraphTensor {
     /// Reduce a dimension of the tensor by summing all elements along that axis.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn sum(self, axes: impl ToAxes) -> GraphTensor {
         let (mut shape, mut id) = (self.shape, self.id);
         // Sum reduce each dimension
@@ -29,6 +30,7 @@ impl GraphTensor {
     }
 
     /// Reduce a dimension of the tensor by taking the maximum of all elements along that axis.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn max(self, axes: impl ToAxes) -> GraphTensor {
         let (mut shape, mut id) = (self.shape, self.id);
         // Max reduce each dimension

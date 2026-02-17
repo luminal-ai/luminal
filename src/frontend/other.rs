@@ -1,4 +1,4 @@
-use crate::hlir::*;
+use crate::hlir::{Iota, Constant, Cast, Input};
 use crate::prelude::*;
 
 impl Graph {
@@ -37,12 +37,12 @@ impl Graph {
         )
     }
 
-    /// ARange from 0 to N
+    /// `ARange` from 0 to N
     pub fn arange(&mut self, to: impl Into<Expression>) -> GraphTensor {
         self.iota('z', to)
     }
 
-    /// ARange from beginning to end
+    /// `ARange` from beginning to end
     pub fn arange_options(
         &mut self,
         start: impl Into<Expression>,
@@ -55,7 +55,8 @@ impl Graph {
 
     /// Lower left-hand triangle of 1s. Currently required to be square
     ///
-    /// Same API as https://pytorch.org/docs/stable/generated/torch.tril
+    /// Same API as <https://pytorch.org/docs/stable/generated/torch.tril>
+    #[allow(clippy::cast_precision_loss)]
     pub fn tril(&mut self, size: impl Into<Expression>, diagonal: i32) -> GraphTensor {
         let size = size.into();
         let horizontal = self.arange(size).expand_dim(0, size);
@@ -65,7 +66,8 @@ impl Graph {
 
     /// Upper right-hand triangle of 1s
     ///
-    /// Same API as https://pytorch.org/docs/stable/generated/torch.triu
+    /// Same API as <https://pytorch.org/docs/stable/generated/torch.triu>
+    #[allow(clippy::cast_precision_loss)]
     pub fn triu(&mut self, size: impl Into<Expression>, diagonal: i32) -> GraphTensor {
         let size = size.into();
         let horizontal = self.arange(size).expand_dim(0, size);
@@ -74,6 +76,9 @@ impl Graph {
     }
 
     /// Stack tensors along a new dimension
+    /// 
+    /// # Panics
+    /// - There must be at least one tensor to stack
     pub fn stack(&mut self, tensors: &[GraphTensor], axis: usize) -> GraphTensor {
         assert!(!tensors.is_empty(), "Cannot stack empty tensor list");
         let first = tensors[0].unsqueeze(axis);

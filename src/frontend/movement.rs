@@ -94,6 +94,12 @@ impl GraphTensor {
         self
     }
 
+    /// Create a `Gather` operation with this and the prescribed `indexes`
+    /// on the same graph.
+    /// 
+    /// # Panics
+    /// - The indexes tensor must have an integer dtype
+    /// - The graph reference held by self must be valid
     pub fn gather(self, indexes: GraphTensor) -> GraphTensor {
         assert_eq!(
             indexes.dtype,
@@ -109,9 +115,16 @@ impl GraphTensor {
         GraphTensor::from_id(id, indexes.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
+    #[allow(clippy::doc_markdown)]
     /// Given a tensor of non-repeating indexes along a dimension, generate an inverse permutation
     /// x = [3, 2, 4, 1, 5, 0]
-    /// inv_perm(x) = [5, 3, 1, 0, 2, 4]
+    /// inverse_permutation(x) = [5, 3, 1, 0, 2, 4]
+    /// Creates all the `GraphTensor`s onto the graph reference in order for the returned
+    /// `GraphTensor` to be the inverse permutation of the input tensor eventually in the case it
+    /// was actually non-repeating indices along a dimension. If not, this could be unintended behavior.
+    /// 
+    /// # Panics
+    /// The input tensor does not have Int entries like `x` above.
     #[allow(clippy::needless_range_loop)]
     pub fn inverse_permutation(self, axis: usize) -> GraphTensor {
         // TODO: this is super inefficient because it requires materializing a large (n^2) one-hot tensor
@@ -130,7 +143,7 @@ impl GraphTensor {
         }
         // position: varies along position dim (axis+1), broadcast elsewhere.
         let mut position = self.graph().arange(ax_size);
-        for i in 0..(axis + 1) {
+        for i in 0..=axis {
             position = position.expand_dim(i, dims2[i]);
         }
         for i in (axis + 2)..dims2.len() {
@@ -150,6 +163,10 @@ impl GraphTensor {
     }
 
     /// Extracts sliding local windows from an input tensor.
+    /// 
+    /// # Panics
+    /// `kernel`, `strides`, and `dilation` must all have the same number
+    /// of dimensions as this input tensor.
     pub fn unfold(
         self,
         kernel: impl ToShape,
@@ -193,7 +210,7 @@ impl GraphTensor {
         }
 
         // [win..., kernel...]
-        let mut final_shape: Vec<Expression> = win.into_iter().map(|e| e.simplify()).collect();
+        let mut final_shape: Vec<Expression> = win.into_iter().map(Expression::simplify).collect();
         final_shape.extend(kernel.iter().copied());
 
         // Axis exprs must match final_shape axis order: first w axes, then k axes.
@@ -264,6 +281,7 @@ impl GraphTensor {
     /// let b = a.slice_along(4.., 1); // 5x6 tensor
     /// assert_eq!(b.dims(), vec![Expression::from(5), Expression::from(6)]);
     /// ```
+    #[allow(clippy::needless_pass_by_value)]
     pub fn slice_along(self, slice: impl SliceRange, axis: usize) -> GraphTensor {
         let mut s = vec![(Expression::from(0), Expression::from(i32::MAX)); axis + 1];
         s[axis] = slice.bounds();

@@ -5,8 +5,10 @@ use crate::egglog_utils::extract_dtype;
 use crate::egglog_utils::extract_expr;
 use crate::egglog_utils::extract_expr_list;
 use crate::egglog_utils::list_to_egglog;
+#[allow(clippy::wildcard_imports)]
 use crate::op::OpParam::*;
-use crate::op::*;
+#[allow(unused)]
+use crate::op::{DType, EgglogOp, OpParam, IntoEgglogOp, LLIROp, HLIROp, Runtime};
 use crate::prelude::*;
 
 use as_any::AsAny;
@@ -371,7 +373,7 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
                 NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
                 NativeData::Int(i) => i.clone(),
-                NativeData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
+                NativeData::Bool(b) => b.iter().map(|b| i32::from(*b)).collect(),
             }),
             DType::F16 => NativeData::F16(match &input[0] {
                 NativeData::F32(f) => f.iter().copied().map(f16::from_f32).collect(),
