@@ -44,6 +44,8 @@ impl Serialize for Expression {
 }
 
 impl Expression {
+    // Poisoning type panics
+    #[allow(clippy::missing_panics_doc)]
     pub fn new(terms: Vec<Term>) -> Self {
         let interner = EXPRESSION_INTERNER.get_or_init(|| RwLock::new(FxHashMap::default()));
 
@@ -73,6 +75,8 @@ impl Expression {
     /// Clear all interned expressions. Call this between major operations
     /// (like search iterations) when no expressions are expected to be in use.
     /// WARNING: Any existing Expression handles will become invalid after this call.
+    // Poisoning type panics
+    #[allow(clippy::missing_panics_doc)]
     pub fn clear_interner() {
         if let Some(interner) = EXPRESSION_INTERNER.get() {
             let mut write_guard = interner.write().unwrap();
@@ -87,6 +91,8 @@ impl Expression {
     }
 
     /// Returns the number of interned expressions (for debugging/monitoring)
+    // Poisoning type panics
+    #[allow(clippy::missing_panics_doc)]
     pub fn interner_size() -> usize {
         EXPRESSION_INTERNER
             .get()

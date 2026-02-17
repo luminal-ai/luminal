@@ -558,6 +558,9 @@ fn termdag_to_egglog(td: &egglog::TermDag, root: egglog::TermId) -> (String, Str
 }
 
 #[tracing::instrument(skip_all)]
+/// # Errors
+/// `program` and `root` are just string inputs, so they might
+/// not parse or run correctly
 pub fn run_egglog(
     program: &str,
     root: &str,

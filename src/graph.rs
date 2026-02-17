@@ -6,7 +6,11 @@ use crate::{
     egglog_utils::SerializedEGraph,
     op::{EgglogOp, IntoEgglogOp, LLIROp},
 };
-use crate::{hlir::CustomOpHLIR, op::*, prelude::*};
+use crate::{
+    hlir::CustomOpHLIR,
+    op::{CustomOp, DType, HLIROp, Runtime},
+    prelude::*,
+};
 use colored::Colorize;
 use itertools::Itertools;
 use petgraph::{Direction, algo::toposort, stable_graph::StableGraph, visit::EdgeRef};
@@ -70,6 +74,7 @@ impl Graph {
     }
 
     /// Create a new tensor with shape S and a name. This name will show up on the graph when displayed
+    #[allow(clippy::needless_pass_by_value)]
     pub fn named_tensor(&mut self, name: impl ToString, shape: impl ToShape) -> GraphTensor {
         let id = self.graph.add_node(Box::new(crate::hlir::Input {
             node: 0,
@@ -104,7 +109,7 @@ impl Graph {
             .collect()
     }
 
-    /// Add op on the graph, and get back a NewOp
+    /// Add op on the graph, and get back a `NewOp`
     ///
     /// ```rust
     /// # use luminal::prelude::*;
@@ -123,7 +128,7 @@ impl Graph {
             num_srcs: 0,
         }
     }
-    /// Add op on the graph, and get back a NewOp. Just like add_op, except a boxed op is expected.
+    /// Add op on the graph, and get back a `NewOp`. Just like `add_op`, except a boxed op is expected.
     pub fn add_boxed_op(&mut self, op: Box<dyn HLIROp + 'static>) -> NewOp<'_> {
         NewOp {
             new_op_id: self.graph.add_node(op),
@@ -132,20 +137,46 @@ impl Graph {
         }
     }
 
+    /// Assuming the `dyn HILIROp` is `T`, get that op at the chosen `node`.
+    /// If `T` is not the correct type, returns `None`.
+    ///
+    /// # Panics
+    /// `node` is not a valid node in the graph
     pub fn try_get_op<T: HLIROp + 'static>(&self, node: NodeIndex) -> Option<&T> {
-        self.node_weight(node).unwrap().as_any().downcast_ref::<T>()
+        self.node_weight(node)
+            .expect("node is not a valid node in the graph")
+            .as_any()
+            .downcast_ref::<T>()
     }
+    /// Assuming the `dyn HILIROp` is `T`, get that op at the chosen `node`.
+    ///
+    /// # Panics
+    /// - `node` is not a valid node in the graph
+    /// - `T` is not the correct type for the `dyn HLIROp`
     pub fn get_op<T: HLIROp + 'static>(&self, node: NodeIndex) -> &T {
-        self.try_get_op(node).unwrap()
+        self.try_get_op(node)
+            .expect("The downcast should be successful")
     }
+
+    /// Assuming the `dyn HILIROp` is `T`, get that op at the chosen `node`.
+    /// If `T` is not the correct type, returns `None`.
+    ///
+    /// # Panics
+    /// `node` is not a valid node in the graph
     pub fn try_get_op_mut<T: HLIROp + 'static>(&mut self, node: NodeIndex) -> Option<&mut T> {
         self.node_weight_mut(node)
-            .unwrap()
+            .expect("node is not a valid node in the graph")
             .as_any_mut()
             .downcast_mut::<T>()
     }
+    /// Assuming the `dyn HILIROp` is `T`, get that op at the chosen `node`.
+    ///
+    /// # Panics
+    /// - `node` is not a valid node in the graph
+    /// - `T` is not the correct type for the `dyn HLIROp`
     pub fn get_op_mut<T: HLIROp + 'static>(&mut self, node: NodeIndex) -> &mut T {
-        self.try_get_op_mut(node).unwrap()
+        self.try_get_op_mut(node)
+            .expect("The downcast should be successful")
     }
 
     pub fn custom_op(
@@ -176,7 +207,9 @@ impl Graph {
 
         if subgraphs.len() <= 1 {
             let (program, root) = hlir_to_egglog(self);
-            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
+            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).expect(
+                "Program and root are constructed to be valid even though the type is just String",
+            )];
             self.chunk_groups = vec![ChunkGroup {
                 representative: 0,
                 members: vec![0],
@@ -194,6 +227,7 @@ impl Graph {
     }
 
     #[tracing::instrument(skip_all)]
+    #[allow(clippy::missing_panics_doc)]
     pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(&mut self) {
         let exclude_ops = Ex::into_vec()
             .into_iter()
@@ -207,7 +241,9 @@ impl Graph {
         let subgraphs = split_at_graph_breaks(self);
         if subgraphs.len() <= 1 {
             let (program, root) = hlir_to_egglog(self);
-            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
+            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).expect(
+                "Program and root are constructed to be valid even though the type is just String",
+            )];
             self.chunk_groups = vec![ChunkGroup {
                 representative: 0,
                 members: vec![0],
@@ -260,7 +296,8 @@ impl Graph {
             .iter()
             .map(|g| {
                 let (ref program, ref root) = egglog_texts[g.representative];
-                run_egglog(program, root, ops, cleanup_hlir).unwrap()
+                run_egglog(program, root, ops, cleanup_hlir)
+                    .expect("Program and root are constructed to be valid even though the type is just String")
             })
             .collect();
 
@@ -282,6 +319,11 @@ impl Graph {
     const TRIALS_PER_PROFILE: usize = 10;
 
     #[tracing::instrument(skip_all)]
+    #[allow(clippy::too_many_lines)]
+    ///
+    ///
+    /// # Panics
+    /// The shape at boundaries is not fully resolved
     pub fn search<R: Runtime>(&mut self, mut runtime: R, limit: usize) -> R {
         let n_chunks = self.subgraph_descriptors.len();
         let n_groups = self.chunk_groups.len();
@@ -310,6 +352,11 @@ impl Graph {
 
         fn make_bar(searched: usize, total: usize) -> String {
             let bar_width = 24;
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation
+            )]
             let head = ((searched as f32 / total as f32) * bar_width as f32)
                 .clamp(0.0, bar_width as f32)
                 .floor() as usize;
@@ -586,6 +633,7 @@ impl DerefMut for Graph {
 }
 
 pub struct NewOp<'a> {
+    #[allow(clippy::struct_field_names)]
     new_op_id: NodeIndex,
     graph_ref: &'a mut Graph,
     num_srcs: u8,
@@ -606,30 +654,37 @@ impl NewOp<'_> {
 /// Describes a tensor value crossing a graph break boundary into a chunk.
 #[derive(Debug, Clone)]
 pub struct BoundaryInput {
-    /// The HLIR NodeIndex of the GraphBreak node (unique ID for matching)
+    /// The HLIR `NodeIndex` of the `GraphBreak` node (unique ID for matching)
     pub break_node: NodeIndex,
     /// Shape of the tensor at the boundary
     pub shape: ShapeTracker,
-    /// DType of the tensor at the boundary
+    /// `DType` of the tensor at the boundary
     pub dtype: DType,
 }
 
 /// Describes a subgraph (chunk) of the HLIR graph between graph breaks.
 #[derive(Debug, Clone)]
 pub struct SubgraphDescriptor {
-    /// HLIR nodes in this chunk (excludes GraphBreak nodes themselves)
+    /// HLIR nodes in this chunk (excludes `GraphBreak` nodes themselves)
     pub nodes: FxHashSet<NodeIndex>,
     /// Boundary inputs entering from prior chunks
     pub boundary_inputs: Vec<BoundaryInput>,
-    /// GraphBreak node indices whose predecessor is in this chunk
+    /// `GraphBreak` node indices whose predecessor is in this chunk
     pub boundary_outputs: Vec<NodeIndex>,
 }
 
-/// Split the HLIR graph at GraphBreak nodes into independent subgraphs.
+/// Split the HLIR graph at `GraphBreak` nodes into independent subgraphs.
 ///
-/// Each non-GraphBreak node is assigned to a chunk based on the latest
-/// GraphBreak in its transitive dependency chain. Real Input nodes (weights,
+/// Each non-`GraphBreak` node is assigned to a chunk based on the latest
+/// `GraphBreak` in its transitive dependency chain. Real Input nodes (weights,
 /// data) are included in every chunk that uses them.
+///
+/// # Panics
+///
+/// - The graph has breaks, but is not acyclic
+/// - The graph has breaks and at least one GraphBreak
+///   failed the contract of having exactly one input
+#[allow(clippy::too_many_lines)]
 pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
     use crate::hlir::GraphBreak;
 
@@ -811,8 +866,8 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
 /// to match a different (structurally identical) target chunk.
 ///
 /// The remapping handles three categories of nodes:
-/// 1. **Boundary inputs**: Matched positionally via SubgraphDescriptor.boundary_inputs
-/// 2. **Boundary outputs**: Matched positionally via SubgraphDescriptor.boundary_outputs
+/// 1. **Boundary inputs**: Matched positionally via `SubgraphDescriptor.boundary_inputs`
+/// 2. **Boundary outputs**: Matched positionally via `SubgraphDescriptor.boundary_outputs`
 /// 3. **Weight/data inputs**: Chunk-specific Input nodes (in one subgraph but not the other) are sorted by index and matched positionally.
 ///
 /// Shared Input nodes (same NodeIndex in both subgraphs) need no remapping.
@@ -820,7 +875,7 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
 ///
 /// Returns:
 /// - `node_remap`: maps rep HLIR node indices → target HLIR node indices (for Input/Output nodes)
-/// - `custom_op_id_remap`: maps rep CustomOpHLIR IDs → target CustomOpHLIR IDs
+/// - `custom_op_id_remap`: maps rep `CustomOpHLIR` IDs → target `CustomOpHLIR` IDs
 fn build_chunk_remaps(
     rep_desc: &SubgraphDescriptor,
     target_desc: &SubgraphDescriptor,

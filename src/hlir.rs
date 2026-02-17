@@ -72,10 +72,10 @@ impl EgglogOp for Input {
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         let node = egraph.enodes[children[0]]
             .0
-            .replace("\"", "")
+            .replace('"', "")
             .parse::<usize>()
             .unwrap();
-        let label = egraph.enodes[children[1]].0.replace("\"", "");
+        let label = egraph.enodes[children[1]].0.replace('"', "");
         (
             LLIROp::new::<Input>(Box::new(Self {
                 node,
@@ -137,7 +137,7 @@ impl EgglogOp for Output {
             LLIROp::new::<Output>(Box::new(Self {
                 node: egraph.enodes[children[1]]
                     .0
-                    .replace("\"", "")
+                    .replace('"', "")
                     .parse::<usize>()
                     .unwrap(),
             })),
@@ -246,7 +246,7 @@ impl EgglogOp for Constant {
             LLIROp::new::<dyn NativeOp>(Box::new(Self(
                 egraph.enodes[children[0]]
                     .0
-                    .replace("\"", "")
+                    .replace('"', "")
                     .parse::<f32>()
                     .unwrap(),
             ))),
@@ -303,6 +303,7 @@ impl EgglogOp for Iota {
     }
 }
 impl NativeOp for Iota {
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn execute(&self, _: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
         let length = self.1.exec(dyn_map).unwrap();
         NativeData::Int(
@@ -355,6 +356,7 @@ impl EgglogOp for Cast {
     }
 }
 impl NativeOp for Cast {
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     fn execute(&self, input: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
         match self.1 {
             DType::F32 => NativeData::F32(match &input[0] {
@@ -495,9 +497,9 @@ impl NativeOp for Log2 {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.log2(),
-            |f| f.log2(),
-            |f| f.log2(),
+            f32::log2,
+            f16::log2,
+            bf16::log2,
         )
     }
 }
@@ -557,9 +559,9 @@ impl NativeOp for Exp2 {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.exp2(),
-            |f| f.exp2(),
-            |f| f.exp2(),
+            f32::exp2,
+            f16::exp2,
+            bf16::exp2,
         )
     }
 }
@@ -620,9 +622,9 @@ impl NativeOp for Sin {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.sin(),
-            |f| f.sin(),
-            |f| f.sin(),
+            f32::sin,
+            f16::sin,
+            bf16::sin,
         )
     }
 }
@@ -683,9 +685,9 @@ impl NativeOp for Recip {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.recip(),
-            |f| f.recip(),
-            |f| f.recip(),
+            f32::recip,
+            f16::recip,
+            bf16::recip,
         )
     }
 }
@@ -746,9 +748,9 @@ impl NativeOp for Sqrt {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.sqrt(),
-            |f| f.sqrt(),
-            |f| f.sqrt(),
+            f32::sqrt,
+            f16::sqrt,
+            bf16::sqrt,
         )
     }
 }
@@ -1160,6 +1162,7 @@ impl NativeOp for Gather {
         let NativeData::Int(indexes) = indexes else {
             panic!("indexes must be int!")
         };
+        #[allow(clippy::cast_sign_loss)]
         match data {
             NativeData::F32(a) => NativeData::F32(
                 indexes_ind
@@ -1358,6 +1361,7 @@ impl NativeOp for MaxReduce {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         let iter_stride = self.iter_stride.exec(dyn_map).unwrap();
         let iters = self.iters.exec(dyn_map).unwrap();
+        #[allow(clippy::redundant_closure_for_method_calls)]
         match inputs[0] {
             NativeData::F32(a) => NativeData::F32(
                 ind.map(|start| {
@@ -1416,6 +1420,7 @@ pub enum NativeData {
 impl NativeData {
     #[inline]
     pub fn f32(&self, i: usize) -> f32 {
+        #[allow(clippy::cast_precision_loss)]
         match self {
             NativeData::F32(v) => v[i],
             NativeData::F16(v) => v[i].to_f32(),
@@ -1433,6 +1438,7 @@ impl NativeData {
 
     #[inline]
     pub fn f16(&self, i: usize) -> f16 {
+        #[allow(clippy::cast_precision_loss)]
         match self {
             NativeData::F16(v) => v[i],
             NativeData::F32(v) => f16::from_f32(v[i]),
@@ -1444,6 +1450,7 @@ impl NativeData {
 
     #[inline]
     pub fn bf16(&self, i: usize) -> bf16 {
+        #[allow(clippy::cast_precision_loss)]
         match self {
             NativeData::Bf16(v) => v[i],
             NativeData::F32(v) => bf16::from_f32(v[i]),
@@ -1455,18 +1462,13 @@ impl NativeData {
 
     #[inline]
     pub fn i32(&self, i: usize) -> i32 {
+        #[allow(clippy::cast_possible_truncation)]
         match self {
             NativeData::Int(v) => v[i],
             NativeData::F32(v) => v[i] as i32,
             NativeData::F16(v) => v[i].to_f32() as i32,
             NativeData::Bf16(v) => v[i].to_f32() as i32,
-            NativeData::Bool(v) => {
-                if v[i] {
-                    1
-                } else {
-                    0
-                }
-            }
+            NativeData::Bool(v) => i32::from(v[i]),
         }
     }
 
@@ -1515,6 +1517,10 @@ pub struct NativeRuntime {
 }
 
 impl NativeRuntime {
+    #[allow(clippy::needless_pass_by_value)]
+    /// # Panics
+    ///
+    /// The provided `id` should correspond to an input node in the graph.
     pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
         let id = id.to_id();
         let local_id = self
@@ -1538,10 +1544,10 @@ impl Runtime for NativeRuntime {
     type ExecReturn = ();
     type ProfileMetric = usize;
 
-    fn initialize(_: Self::CompileArg) -> Self {
+    fn initialize((): Self::CompileArg) -> Self {
         Self {
-            buffers: Default::default(),
-            graph: Default::default(),
+            buffers: FxHashMap::default(),
+            graph: StableGraph::default(),
         }
     }
 
@@ -1588,7 +1594,7 @@ impl Runtime for NativeRuntime {
             let inputs = self
                 .graph
                 .edges_directed(node, Direction::Incoming)
-                .sorted_by_key(|e| e.id())
+                .sorted_by_key(EdgeRef::id)
                 .map(|e| &self.buffers[&e.source()])
                 .collect_vec();
             let output = self.graph[node].execute(inputs, dyn_map);
@@ -1598,6 +1604,10 @@ impl Runtime for NativeRuntime {
 }
 
 impl NativeRuntime {
+    #[allow(clippy::needless_pass_by_value)]
+    /// # Panics
+    ///
+    /// The provided `id` should correspond to an output node in the graph.
     pub fn get_f32(&self, id: impl ToId) -> &Vec<f32> {
         let id = id.to_id();
         let output_id = self
@@ -1611,12 +1621,12 @@ impl NativeRuntime {
                     false
                 }
             })
-            .unwrap();
+            .expect("There was an output node in the graph matching the given id");
         let data_id = self
             .graph
             .neighbors_directed(output_id, Direction::Incoming)
             .next()
-            .unwrap();
+            .expect("The output node should have input");
         let NativeData::F32(f) = self.buffers.get(&data_id).unwrap() else {
             panic!()
         };
