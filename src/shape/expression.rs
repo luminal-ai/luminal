@@ -110,7 +110,7 @@ impl Expression {
             .iter()
             .filter_map(|i| {
                 if let Term::Var(v) = i {
-                    if *v != 'z' { Some(*v) } else { None }
+                    if *v == 'z' {None} else {Some(*v)}
                 } else {
                     None
                 }
@@ -180,17 +180,17 @@ impl Default for Term {
 impl Term {
     pub fn as_op(self) -> Option<fn(i64, i64) -> Option<i64>> {
         match self {
-            Term::Add => Some(|a, b| a.checked_add(b)),
-            Term::Sub => Some(|a, b| a.checked_sub(b)),
-            Term::Mul => Some(|a, b| a.checked_mul(b)),
-            Term::Div => Some(|a, b| a.checked_div(b)),
-            Term::Mod => Some(|a, b| a.checked_rem(b)),
+            Term::Add => Some(i64::checked_add),
+            Term::Sub => Some(i64::checked_sub),
+            Term::Mul => Some(i64::checked_mul),
+            Term::Div => Some(i64::checked_div),
+            Term::Mod => Some(i64::checked_rem),
             Term::Max => Some(|a, b| Some(a.max(b))),
             Term::Min => Some(|a, b| Some(a.min(b))),
-            Term::And => Some(|a, b| Some((a != 0 && b != 0) as i64)),
-            Term::Or => Some(|a, b| Some((a != 0 || b != 0) as i64)),
-            Term::Gte => Some(|a, b| Some((a >= b) as i64)),
-            Term::Lt => Some(|a, b| Some((a < b) as i64)),
+            Term::And => Some(|a, b| Some(i64::from(a != 0 && b != 0))),
+            Term::Or => Some(|a, b| Some(i64::from(a != 0 || b != 0))),
+            Term::Gte => Some(|a, b| Some(i64::from(a >= b))),
+            Term::Lt => Some(|a, b| Some(i64::from(a < b))),
             Term::CeilDiv => Some(|a, b| Some(if a % b != 0 { a / b + 1 } else { a / b })),
             _ => None,
         }
@@ -202,12 +202,12 @@ impl Term {
             Term::Mul => Some(|a, b| a * b),
             Term::Div => Some(|a, b| a / b),
             Term::Mod => Some(|a, b| a % b),
-            Term::Max => Some(|a, b| a.max(b)),
-            Term::Min => Some(|a, b| a.min(b)),
-            Term::And => Some(|a, b| (a.abs() > 1e-4 && b.abs() > 1e-4) as i32 as f64),
-            Term::Or => Some(|a, b| (a.abs() > 1e-4 || b.abs() > 1e-4) as i32 as f64),
-            Term::Gte => Some(|a, b| (a >= b) as i32 as f64),
-            Term::Lt => Some(|a, b| (a < b) as i32 as f64),
+            Term::Max => Some(f64::max),
+            Term::Min => Some(f64::min),
+            Term::And => Some(|a, b| f64::from(i32::from(a.abs() > 1e-4 && b.abs() > 1e-4))),
+            Term::Or => Some(|a, b| f64::from(i32::from(a.abs() > 1e-4 || b.abs() > 1e-4))),
+            Term::Gte => Some(|a, b| f64::from(i32::from(a >= b))),
+            Term::Lt => Some(|a, b| f64::from(i32::from(a < b))),
             Term::CeilDiv => Some(|a, b| (a / b).ceil()),
             _ => None,
         }
@@ -320,34 +320,34 @@ impl Expression {
                 Term::Var(c) => format!("{}const_{c}", if *c == 'z' { "" } else { "*" }),
                 Term::Max => format!(
                     "max((int){}, (int){})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
                 Term::Min => format!(
                     "min((int){}, (int){})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
                 Term::Lt => format!(
                     "(int)({} < {})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
                 Term::Gte => format!(
                     "(int)({} >= {})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
                 Term::CeilDiv => {
-                    let a = symbols.pop().unwrap();
-                    let b = symbols.pop().unwrap();
+                    let a = symbols.pop().expect(WELL_FORMED_EXPRESSION);
+                    let b = symbols.pop().expect(WELL_FORMED_EXPRESSION);
                     format!("(({a} + {b} - 1) / {b})")
                 }
-                Term::Div => format!("({} / {})", symbols.pop().unwrap(), symbols.pop().unwrap()),
+                Term::Div => format!("({} / {})", symbols.pop().expect(WELL_FORMED_EXPRESSION), symbols.pop().expect(WELL_FORMED_EXPRESSION)),
                 _ => format!(
                     "({}{term:?}{})",
-                    symbols.pop().unwrap(),
-                    symbols.pop().unwrap()
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
                 ),
             };
             symbols.push(new_symbol);
@@ -494,15 +494,22 @@ impl Expression {
         self.exec_single_var_stack(value, &mut stack)
     }
     /// Evaluate the expression with one value for all variables. Uses a provided stack
+    #[allow(clippy::missing_panics_doc)]
     pub fn exec_single_var_stack(&self, value: usize, stack: &mut Vec<i64>) -> usize {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(*n as i64),
                 Term::Var(_) => stack.push(value as i64),
                 _ => {
-                    let a = stack.pop().unwrap();
-                    let b = stack.pop().unwrap();
-                    stack.push(term.as_op().unwrap()(a, b).unwrap());
+                    let a = stack.pop().expect(WELL_FORMED_EXPRESSION);
+                    let b = stack.pop().expect(WELL_FORMED_EXPRESSION);
+                    #[rustfmt::skip]
+                    stack.push(
+                        term.as_op()
+                            .expect("The term is not a Num or Var so it must be an operation")
+                            (a, b)
+                        .expect("The operation would fail due to overflow in checked arithmetic or division by 0"),
+                    );
                 }
             }
         }
@@ -513,6 +520,7 @@ impl Expression {
         self.exec_stack(variables, &mut Vec::new())
     }
     /// Evaluate the expression given variables. This function requires a stack to be given for use as storage
+    #[allow(clippy::missing_panics_doc)]
     pub fn exec_stack(
         &self,
         variables: &FxHashMap<char, usize>,
@@ -521,10 +529,12 @@ impl Expression {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(i64::from(*n)),
-                Term::Var(c) =>
-                {
+                Term::Var(c) => {
                     #[allow(clippy::needless_borrow)]
                     if let Some(n) = variables.get(&c) {
+                        // Do not expect the value to encounter
+                        // wrap around or truncation issues
+                        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                         stack.push(*n as i64);
                     } else {
                         return None;
@@ -537,7 +547,7 @@ impl Expression {
                     stack.push(
                         term.as_op()
                             .expect("The term is not a Num or Var so it must be an operation")
-                            (a, b,)
+                            (a, b)
                         .expect("The operation would fail due to overflow in checked arithmetic or division by 0"),
                     );
                 }
@@ -560,6 +570,9 @@ impl Expression {
     /// Resolve all known variables from dyn map into real values
     pub fn resolve_vars(&mut self, dyn_map: &FxHashMap<char, usize>) {
         for term in self.terms.write().iter_mut() {
+            // Do not expect the values in `dyn_map` to encounter
+            // wrap around or truncation issues
+            #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             if let Term::Var(v) = *term
                 && let Some(val) = dyn_map.get(&v)
             {
@@ -631,12 +644,18 @@ impl From<&char> for Expression {
 }
 
 impl From<usize> for Expression {
+    // Do not expect the value to encounter
+    // wrap around or truncation issues
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn from(value: usize) -> Self {
         Expression::new(vec![Term::Num(value as i32)])
     }
 }
 
 impl From<&usize> for Expression {
+    // Do not expect the value to encounter
+    // wrap around or truncation issues
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     fn from(value: &usize) -> Self {
         Expression::new(vec![Term::Num(*value as i32)])
     }

@@ -39,7 +39,7 @@ impl ShapeTracker {
             dims: ArrayVec::default(),
             strides: ArrayVec::default(),
         };
-        for d in dims.to_shape().into_iter() {
+        for d in dims.to_shape() {
             s.dims.push(d);
             s.strides.push(0.into());
         }
@@ -85,6 +85,7 @@ impl ShapeTracker {
         self.add_dim(axis, dim, 0);
     }
 
+    #[allow(clippy::doc_markdown)]
     /// Expand this shape to a new shape following PyTorch semantics
     ///
     /// # Panics
@@ -258,6 +259,9 @@ impl ShapeTracker {
     pub fn resolve_dyn_dims(&mut self, dyn_dim_map: &FxHashMap<char, usize>) {
         for d in self.dims.iter_mut().chain(&mut self.strides) {
             for t in d.terms.write().iter_mut() {
+                // Do not expect the values in `dyn_dim_map` to encounter
+                // wrap around or truncation issues
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                 if let Term::Var(v) = *t
                     && let Some(val) = dyn_dim_map.get(&v)
                 {

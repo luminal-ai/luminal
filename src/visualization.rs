@@ -75,6 +75,7 @@ pub fn display_graph(
         .unwrap();
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn display_graph_text(
     graph: &StableGraph<impl Debug, impl Debug, Directed, u32>,
     mark_nodes: Option<Vec<NodeIndex>>,
@@ -82,6 +83,7 @@ fn display_graph_text(
     let mut new_graph = StableGraph::new();
     let mut map = std::collections::HashMap::new();
     for node in graph.node_indices() {
+        #[allow(clippy::unnecessary_map_or)]
         if mark_nodes.as_ref().map_or(true, |m| m.contains(&node)) {
             map.insert(
                 node,
