@@ -503,11 +503,16 @@ impl Expression {
         self.exec_single_var_stack(value, &mut stack)
     }
     /// Evaluate the expression with one value for all variables. Uses a provided stack
-    #[allow(clippy::missing_panics_doc)]
+    #[allow(
+        clippy::missing_panics_doc,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation
+    )]
     pub fn exec_single_var_stack(&self, value: usize, stack: &mut Vec<i64>) -> usize {
         for term in self.terms.read().iter() {
             match term {
-                Term::Num(n) => stack.push(*n as i64),
+                Term::Num(n) => stack.push(i64::from(*n)),
                 Term::Var(_) => stack.push(value as i64),
                 _ => {
                     let a = stack.pop().expect(WELL_FORMED_EXPRESSION);
@@ -522,6 +527,8 @@ impl Expression {
                 }
             }
         }
+        // The final answer is expected to be nonnegative
+        // and no problem casting to usize
         stack.pop().unwrap() as usize
     }
     /// Evaluate the expression given variables.
@@ -529,7 +536,12 @@ impl Expression {
         self.exec_stack(variables, &mut Vec::new())
     }
     /// Evaluate the expression given variables. This function requires a stack to be given for use as storage
-    #[allow(clippy::missing_panics_doc)]
+    #[allow(
+        clippy::missing_panics_doc,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation
+    )]
     pub fn exec_stack(
         &self,
         variables: &FxHashMap<char, usize>,
@@ -562,6 +574,8 @@ impl Expression {
                 }
             }
         }
+        // The final answer is expected to be nonnegative
+        // and no problem casting to usize
         stack.pop().map(|i| i as usize)
     }
 

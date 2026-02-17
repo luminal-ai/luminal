@@ -9,10 +9,18 @@ use petgraph::prelude::StableGraph;
 use std::{fmt::Debug, io::Write};
 
 pub trait ToHtml {
+    /// The contents of .html
+    ///
+    /// # Errors
+    /// Implementors may fail to produce such contents
     fn to_html(&self) -> Result<String>;
 }
 
 pub trait ToDot {
+    /// The contents of .dot
+    ///
+    /// # Errors
+    /// Implementors may fail to produce such contents
     fn to_dot(&self) -> Result<String>;
 }
 
@@ -27,6 +35,7 @@ const EGRAPH_VIS_TEMPLATE: &str = r#"
 </script>"#;
 
 impl ToHtml for EGraph {
+    /// The contents of .html
     fn to_html(&self) -> Result<String> {
         let egraph_as_json = serde_json::to_string_pretty(
             &self.serialize(egglog::SerializeConfig::default()).egraph,
@@ -36,6 +45,7 @@ impl ToHtml for EGraph {
 }
 
 impl ToDot for EGraph {
+    /// The contents of .dot
     fn to_dot(&self) -> Result<String> {
         Ok(self
             .serialize(egglog::SerializeConfig::default())
@@ -51,6 +61,7 @@ where
     N: std::fmt::Debug,
     E: std::fmt::Debug,
 {
+    /// The contents of .dot
     fn to_dot(&self) -> Result<String> {
         Ok(format!(
             "{:?}",

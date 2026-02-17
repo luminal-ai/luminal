@@ -548,9 +548,9 @@ impl<const E: usize, A: Into<Expression>> ToShape for [A; E] {
     }
 }
 
-impl<A: Into<Expression>> ToShape for Vec<A> {
+impl<B: Into<Expression>> ToShape for Vec<B> {
     fn to_shape(self) -> Vec<Expression> {
-        self.into_iter().map(A::into).collect()
+        self.into_iter().map(B::into).collect()
     }
 }
 

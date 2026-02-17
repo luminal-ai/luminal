@@ -118,6 +118,7 @@ impl ExecutionStats {
 }
 
 impl std::fmt::Display for ExecutionStats {
+    #[allow(clippy::cast_precision_loss)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -287,7 +288,7 @@ impl LLIROp {
 
 impl std::fmt::Display for LLIROp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
