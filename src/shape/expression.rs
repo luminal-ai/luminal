@@ -90,8 +90,7 @@ impl Expression {
     pub fn interner_size() -> usize {
         EXPRESSION_INTERNER
             .get()
-            .map(|i| i.read().unwrap().len())
-            .unwrap_or(0)
+            .map_or(0, |i| i.read().unwrap().len())
     }
 
     pub fn is_dynamic(&self) -> bool {
@@ -110,7 +109,7 @@ impl Expression {
             .iter()
             .filter_map(|i| {
                 if let Term::Var(v) = i {
-                    if *v == 'z' {None} else {Some(*v)}
+                    if *v == 'z' { None } else { Some(*v) }
                 } else {
                     None
                 }
@@ -212,6 +211,10 @@ impl Term {
             _ => None,
         }
     }
+    /// Convert to corresponding name in egglog
+    ///
+    /// # Panics
+    /// If there is no implementation of this in egglog
     pub fn to_egglog(self) -> String {
         match self {
             Term::Add => "MAdd",
@@ -284,6 +287,7 @@ impl std::fmt::Display for Expression {
 }
 
 impl Expression {
+    #[allow(clippy::missing_panics_doc)]
     pub fn to_egglog(&self) -> String {
         let mut symbols = vec![];
         for term in self.terms.read().iter() {
@@ -312,6 +316,7 @@ impl Expression {
         symbols.pop().unwrap_or_default()
     }
 
+    #[allow(clippy::missing_panics_doc)]
     pub fn to_kernel(&self) -> String {
         let mut symbols = vec![];
         for term in self.terms.read().iter() {
@@ -343,7 +348,11 @@ impl Expression {
                     let b = symbols.pop().expect(WELL_FORMED_EXPRESSION);
                     format!("(({a} + {b} - 1) / {b})")
                 }
-                Term::Div => format!("({} / {})", symbols.pop().expect(WELL_FORMED_EXPRESSION), symbols.pop().expect(WELL_FORMED_EXPRESSION)),
+                Term::Div => format!(
+                    "({} / {})",
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION),
+                    symbols.pop().expect(WELL_FORMED_EXPRESSION)
+                ),
                 _ => format!(
                     "({}{term:?}{})",
                     symbols.pop().expect(WELL_FORMED_EXPRESSION),

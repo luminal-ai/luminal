@@ -189,10 +189,10 @@ impl Display for DType {
 
 impl DType {
     /// Returns bytes per element for fixed-size dtypes.
-    /// 
+    ///
     /// # Panics
-    /// 
-    /// For block-scaled types like NvFp4 — use `size_of_n` instead.
+    ///
+    /// For block-scaled types like `NvFp4` — use `size_of_n` instead.
     pub fn sizeof(&self) -> usize {
         match self {
             DType::F32 | DType::Int => 4,
@@ -204,7 +204,7 @@ impl DType {
     }
 
     /// Returns the total number of bytes needed to store `n` elements of this dtype.
-    /// 
+    ///
     /// # Panics
     /// - For `NvFp4`, `n` must be divisible by 16 (the block size).
     /// - For `Mxfp4`, `n` must be divisible by 32 (the block size).
@@ -258,7 +258,7 @@ pub struct LLIROp(Arc<Box<dyn DialectOpTrait>>);
 
 impl LLIROp {
     /// Store an op in a generic LLIR op. **Make sure to erase type into your dialect trait!** i.e. `as Box<dyn BlockOp>`
-    /// 
+    ///
     /// # Panics
     /// op types must be erased into dialect traits for dialect casting to work
     pub fn new<T: ?Sized>(op: Box<T>) -> Self
