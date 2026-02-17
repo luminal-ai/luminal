@@ -200,6 +200,9 @@ impl Graph {
     }
 
     #[tracing::instrument(skip_all)]
+    ///
+    /// # Panics
+    /// TODO: failure modes
     pub fn build_search_space<Rt: Runtime + 'static>(&mut self) {
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
@@ -472,6 +475,7 @@ impl Graph {
                             runtime.profile(&llir_graph, &self.dyn_map, Self::TRIALS_PER_PROFILE)
                         }));
 
+                    #[allow(clippy::single_match_else, clippy::manual_let_else)]
                     let (new_metric, display_metric) = match profile_result {
                         Ok(result) => result,
                         Err(_) => {

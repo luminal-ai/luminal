@@ -1,3 +1,4 @@
+#![allow(clippy::similar_names)]
 use crate::hlir::{MaxReduce, SumReduce};
 use crate::prelude::*;
 

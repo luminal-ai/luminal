@@ -12,6 +12,7 @@ impl GraphTensor {
     ///
     /// # Panics
     /// There are some shapes that are not supported by this operation.
+    #[allow(clippy::many_single_char_names)]
     pub fn matmul(mut self, mut rhs: GraphTensor) -> Self {
         if (self.shape.len() == 1 || self.shape.len() == 2) && rhs.shape.len() == 2 {
             let vec = self.shape.len() == 1;

@@ -1,3 +1,4 @@
+#![allow(clippy::similar_names)]
 use itertools::Itertools;
 
 use crate::prelude::*;
@@ -246,8 +247,8 @@ impl GraphTensor {
     /// The Gaussian Error Linear Unit activation function
     #[allow(clippy::excessive_precision)]
     pub fn gelu(self) -> GraphTensor {
-        // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
-        0.5 * self * (1. + (0.7978845608 * self * (1. + 0.044715 * self * self)).tanh())
+        // Based on <https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104>
+        0.5 * self * (1. + (0.797_884_560_8 * self * (1. + 0.044_715 * self * self)).tanh())
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis

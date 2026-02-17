@@ -52,6 +52,7 @@ fn op_cleanups_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
             .filter(|op| op.cleanup())
             .map(|o| {
                 let (name, body) = o.term();
+                #[allow(clippy::cast_possible_truncation)]
                 let body_terms = (0..body.len()).map(|i| (b'a' + i as u8) as char).join(" ");
                 format!(
                     "(rule
@@ -78,7 +79,7 @@ pub fn early_egglog(
         if cleanup {
             op_cleanups_string(ops)
         } else {
-            "".to_string()
+            String::new()
         },
         BASE_CLEANUP.to_string(),
         program.to_string(),
@@ -102,7 +103,7 @@ pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool)
         if cleanup {
             op_cleanups_string(ops)
         } else {
-            "".to_string()
+            String::new()
         },
         BASE_CLEANUP.to_string(),
         program.to_string(),
@@ -121,9 +122,12 @@ use crate::{
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egraph_serialize::{ClassId, NodeId};
 
+#[allow(clippy::doc_markdown)]
 #[derive(Debug)]
-///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
-///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
+///  This is snapshot of an EGraph with Rust native hash maps and sets
+///  for enabling more native traversal / algorithm writing.
+///  The name comes from the serialize egraph crates,
+///  which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
 pub struct SerializedEGraph {
     pub enodes: FxHashMap<NodeId, (String, Vec<ClassId>)>,
     pub eclasses: FxHashMap<ClassId, (String, Vec<NodeId>)>,
@@ -135,6 +139,9 @@ impl SerializedEGraph {
     /// This is an opinionated function which does more than strictly take the state of the egglog object.
     /// It also filters out "[...]" nodes and then changes the structure from the e-termDAG that egraph-serialize
     /// produces to a strict egraph, where the children of e-classes are e-nodes.
+    ///
+    /// # Panics
+    /// TODO: one of `class_data`'s typ Option<String> was None
     pub fn new(egraph: &EGraph, root_eclasses: Vec<(ArcSort, Value)>) -> Self {
         let s = egraph.serialize(egglog::SerializeConfig {
             root_eclasses,
@@ -148,7 +155,7 @@ impl SerializedEGraph {
             classes
                 .entry(node.eclass.clone())
                 .or_insert(vec![])
-                .push(node_id.clone())
+                .push(node_id.clone());
         }
         let mut s_egraph = SerializedEGraph {
             roots: s.egraph.root_eclasses,
@@ -216,8 +223,8 @@ impl SerializedEGraph {
     }
 }
 
-/// Hash a SerializedEGraph by its structural content for dedup comparison.
-/// Only considers IR/IList eclasses and enodes (not primitives like i64, String, DType
+/// Hash a `SerializedEGraph` by its structural content for dedup comparison.
+/// Only considers IR/IList eclasses and enodes (not primitives like i64, String, `DType`
 /// which contain per-chunk-specific values like node indices and weight labels).
 pub fn hash_serialized_egraph(egraph: &SerializedEGraph) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -253,18 +260,19 @@ pub fn hash_serialized_egraph(egraph: &SerializedEGraph) -> u64 {
     hasher.finish()
 }
 
+#[allow(clippy::doc_markdown)]
 /// Hash egglog text with normalization for structural dedup.
 ///
 /// Structurally identical chunks (e.g. transformer layers) produce identical
 /// egglog text except for:
 /// - Input node indices and labels (differ per layer)
 /// - Output node indices (differ per layer)
-/// - CustomOpHLIR integer IDs (global custom_ops index, differs per layer)
+/// - `CustomOpHLIR` integer IDs (global custom_ops index, differs per layer)
 ///
 /// This function hashes the text while normalizing those chunk-specific values:
 /// - Input lines: only the dtype is hashed (not node index or label)
 /// - Output lines: only the "OUTPUT" marker is hashed (not the node index)
-/// - CustomOpHLIR lines: the integer ID is replaced with a constant
+/// - `CustomOpHLIR` lines: the integer ID is replaced with a constant
 /// - All other lines (ops, shapes, strides): hashed verbatim
 pub fn hash_egglog_normalized(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -293,9 +301,9 @@ pub fn hash_egglog_normalized(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// Replace the integer ID in a CustomOpHLIR egglog line with a constant "0".
+/// Replace the integer ID in a `CustomOpHLIR` egglog line with a constant "0".
 /// Input format: `(let tN (CustomOpHLIR (ICons ... (INil))) ID (DTYPE)))`
-/// The ID is the integer between the closing of IList and the opening of DType.
+/// The ID is the integer between the closing of `IList` and the opening of `DType`.
 fn normalize_custom_op_id(line: &str) -> String {
     if let Some(custom_start) = line.find("(CustomOpHLIR ") {
         let after = &line[custom_start + "(CustomOpHLIR ".len()..];
@@ -308,7 +316,7 @@ fn normalize_custom_op_id(line: &str) -> String {
                 if id_str.chars().all(|c| c.is_ascii_digit()) {
                     return format!(
                         "{}0{}",
-                        &line[..custom_start + "(CustomOpHLIR ".len() + space_before_id + 1],
+                        &line[..=(custom_start + "(CustomOpHLIR ".len() + space_before_id)],
                         &line[custom_start + "(CustomOpHLIR ".len() + last_open..]
                     );
                 }
@@ -318,6 +326,11 @@ fn normalize_custom_op_id(line: &str) -> String {
     line.to_string()
 }
 
+///
+///
+/// # Panics
+/// TODO: failure modes
+#[allow(clippy::too_many_lines)]
 pub fn hlir_to_egglog(graph: &Graph) -> (String, String) {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap};
@@ -359,7 +372,7 @@ pub fn hlir_to_egglog(graph: &Graph) -> (String, String) {
             .zip(
                 graph
                     .edges_directed(n, Direction::Incoming)
-                    .sorted_by_key(|e| e.id())
+                    .sorted_by_key(EdgeRef::id)
                     .map(|e| names[&e.source()].clone()),
             )
             .map(|((n, sh), name)| (n, name, sh))
@@ -386,6 +399,10 @@ pub fn hlir_to_egglog(graph: &Graph) -> (String, String) {
 
 /// Convert a subgraph of the HLIR to egglog, injecting synthetic Input/Output
 /// nodes at graph break boundaries.
+///
+/// # Panics
+/// TODO: failure modes
+#[allow(clippy::too_many_lines)]
 pub fn hlir_subgraph_to_egglog(graph: &Graph, subgraph: &SubgraphDescriptor) -> (String, String) {
     use std::cmp::Reverse;
     use std::collections::{BinaryHeap, HashMap};
@@ -450,7 +467,7 @@ pub fn hlir_subgraph_to_egglog(graph: &Graph, subgraph: &SubgraphDescriptor) -> 
                 graph
                     .graph
                     .edges_directed(n, Direction::Incoming)
-                    .sorted_by_key(|e| e.id())
+                    .sorted_by_key(EdgeRef::id)
                     .map(|e| {
                         names.get(&e.source()).cloned().unwrap_or_else(|| {
                             panic!("Missing egglog name for node {:?}", e.source())
@@ -474,10 +491,7 @@ pub fn hlir_subgraph_to_egglog(graph: &Graph, subgraph: &SubgraphDescriptor) -> 
             .next()
             .expect("GraphBreak must have exactly one input");
         let pred_name = names.get(&pred).cloned().unwrap_or_else(|| {
-            panic!(
-                "Missing egglog name for boundary output predecessor {:?}",
-                pred
-            )
+            panic!("Missing egglog name for boundary output predecessor {pred:?}")
         });
         let code = format!("(Output {} {})", pred_name, brk.index());
         out.push_str(&format!("(let t{curr_id} {code})\n"));
@@ -524,7 +538,7 @@ pub fn hlir_subgraph_to_egglog(graph: &Graph, subgraph: &SubgraphDescriptor) -> 
 
 pub fn elist_to_egglog(shape: &[Expression]) -> String {
     list_to_egglog(
-        &shape.iter().map(|e| e.to_egglog()).collect_vec(),
+        &shape.iter().map(Expression::to_egglog).collect_vec(),
         "ECons",
         "ENil",
     )
@@ -559,9 +573,15 @@ fn termdag_to_egglog(td: &egglog::TermDag, root: egglog::TermId) -> (String, Str
 }
 
 #[tracing::instrument(skip_all)]
+///
+///
 /// # Errors
 /// `program` and `root` are just string inputs, so they might
 /// not parse or run correctly
+///
+/// # Panics
+/// TODO: failure modes
+#[allow(clippy::too_many_lines)]
 pub fn run_egglog(
     program: &str,
     root: &str,
@@ -589,7 +609,7 @@ pub fn run_egglog(
         run_report
             .num_matches_per_rule
             .iter()
-            .filter(|(k, _)| !k.contains("("))
+            .filter(|(k, _)| !k.contains('('))
             .map(|(k, v)| format!(
                 "{k}: {v} ({})",
                 pretty_duration::pretty_duration(
@@ -630,7 +650,7 @@ pub fn run_egglog(
         classes
             .entry(node.eclass.clone())
             .or_insert(vec![])
-            .push(node_id.clone())
+            .push(node_id.clone());
     }
     let mut egraph = SerializedEGraph {
         roots: s.egraph.root_eclasses,
@@ -702,6 +722,7 @@ pub fn run_egglog(
     Ok(egraph)
 }
 
+#[allow(clippy::implicit_hasher)]
 pub fn extract_expr_list<'a>(
     egraph: &'a SerializedEGraph,
     node: &'a NodeId,
@@ -736,6 +757,10 @@ pub fn extract_expr_list<'a>(
     }
 }
 
+///
+///
+/// # Panics
+/// If the string at `node` in `egraph.enodes` describing a dtype is not one of the known `DType`s
 pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DType {
     match egraph.enodes[node].0.as_str() {
         "F32" => DType::F32,
@@ -749,7 +774,7 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
     }
 }
 
-#[allow(clippy::implicit_hasher)]
+#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
 pub fn extract_expr<'a>(
     egraph: &'a SerializedEGraph,
     node: &'a NodeId,
@@ -794,7 +819,7 @@ pub fn extract_expr<'a>(
                 cache.insert(en, out.clone());
                 out
             })
-            .min_by_key(|p| p.len())
+            .min_by_key(Vec::len)
     }
 
     let traj = extract_shortest(
@@ -884,7 +909,10 @@ pub fn random_initial_choice<'a>(
 }
 
 /// Validate that a choice set is complete and consistent.
-/// Returns Ok(()) if valid, Err with description if invalid.
+/// Returns Ok(()) if valid
+///
+/// # Errors
+/// The choice set was not valid. Give a description of what was wrong.
 pub fn validate_choice_set<'a>(
     egraph: &'a SerializedEGraph,
     choices: &EGraphChoiceSet<'a>,
@@ -1105,13 +1133,12 @@ pub fn egglog_to_llir<'a>(
             loop {
                 if egraph.enodes[ch].0 == "INil" {
                     break;
-                } else {
-                    // The first child of ICons is an IR node - use choices[] to get the chosen enode
-                    let input_eclass = &egraph.enodes[ch].1[0];
-                    inputs.push(choices[input_eclass]);
-                    // The second child of ICons is the rest of the IList - use choices[] for the tail
-                    ch = choices[&egraph.enodes[ch].1[1]];
                 }
+                // The first child of ICons is an IR node - use choices[] to get the chosen enode
+                let input_eclass = &egraph.enodes[ch].1[0];
+                inputs.push(choices[input_eclass]);
+                // The second child of ICons is the rest of the IList - use choices[] for the tail
+                ch = choices[&egraph.enodes[ch].1[1]];
             }
             let id: usize = egraph.enodes[&egraph.eclasses[&egraph.enodes[node].1[1]].1[0]]
                 .0
