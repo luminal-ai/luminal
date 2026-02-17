@@ -49,7 +49,7 @@ impl GraphTensor {
     }
 
     /// Get a mutable reference to the graph this tensor belongs to
-    /// 
+    ///
     /// # Panics
     /// The graph reference held by self must be valid
     #[allow(clippy::mut_from_ref)]
@@ -78,7 +78,7 @@ impl GraphTensor {
     }
 
     /// For shapes with 1 dimension
-    /// 
+    ///
     /// # Panics
     /// The shape should have 1 dimension
     pub fn dims1(&self) -> Expression {
@@ -91,7 +91,7 @@ impl GraphTensor {
         self.dims()[0]
     }
     /// For shapes with 2 dimensions
-    /// 
+    ///
     /// # Panics
     /// The shape should have 2 dimensions
     pub fn dims2(&self) -> (Expression, Expression) {
@@ -105,7 +105,7 @@ impl GraphTensor {
         (dims[0], dims[1])
     }
     /// For shapes with 3 dimensions
-    /// 
+    ///
     /// # Panics
     /// The shape should have 3 dimensions
     pub fn dims3(&self) -> (Expression, Expression, Expression) {
@@ -119,7 +119,7 @@ impl GraphTensor {
         (dims[0], dims[1], dims[2])
     }
     /// For shapes with 4 dimensions
-    /// 
+    ///
     /// # Panics
     /// The shape should have 4 dimensions
     pub fn dims4(&self) -> (Expression, Expression, Expression, Expression) {
@@ -133,7 +133,7 @@ impl GraphTensor {
         (dims[0], dims[1], dims[2], dims[3])
     }
     /// For shapes with 5 dimensions
-    /// 
+    ///
     /// # Panics
     /// The shape should have 5 dimensions
     pub fn dims5(&self) -> (Expression, Expression, Expression, Expression, Expression) {
@@ -325,6 +325,7 @@ impl ToIds for () {
     }
 }
 
+#[allow(clippy::implicit_hasher)]
 impl<T: ToIds> ToIds for FxHashMap<String, T> {
     fn to_ids(&self) -> Vec<NodeIndex> {
         self.values().flat_map(T::to_ids).collect()

@@ -5,10 +5,10 @@ use crate::egglog_utils::extract_dtype;
 use crate::egglog_utils::extract_expr;
 use crate::egglog_utils::extract_expr_list;
 use crate::egglog_utils::list_to_egglog;
-#[allow(clippy::wildcard_imports)]
+#[allow(clippy::enum_glob_use)]
 use crate::op::OpParam::*;
 #[allow(unused)]
-use crate::op::{DType, EgglogOp, OpParam, IntoEgglogOp, LLIROp, HLIROp, Runtime};
+use crate::op::{DType, EgglogOp, HLIROp, IntoEgglogOp, LLIROp, OpParam, Runtime};
 use crate::prelude::*;
 
 use as_any::AsAny;

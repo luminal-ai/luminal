@@ -1,4 +1,4 @@
-use crate::hlir::{SumReduce, MaxReduce};
+use crate::hlir::{MaxReduce, SumReduce};
 use crate::prelude::*;
 
 impl GraphTensor {

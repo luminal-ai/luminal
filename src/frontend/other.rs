@@ -1,4 +1,4 @@
-use crate::hlir::{Iota, Constant, Cast, Input};
+use crate::hlir::{Cast, Constant, Input, Iota};
 use crate::prelude::*;
 
 impl Graph {
@@ -76,7 +76,7 @@ impl Graph {
     }
 
     /// Stack tensors along a new dimension
-    /// 
+    ///
     /// # Panics
     /// - There must be at least one tensor to stack
     pub fn stack(&mut self, tensors: &[GraphTensor], axis: usize) -> GraphTensor {

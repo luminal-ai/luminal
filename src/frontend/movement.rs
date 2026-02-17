@@ -4,12 +4,16 @@ use crate::{hlir::Gather, prelude::*};
 
 impl GraphTensor {
     /// Swap dimensions of the tensor
+    #[allow(clippy::needless_pass_by_value)]
     pub fn permute(mut self, axes: impl ToAxes) -> GraphTensor {
         self.shape.permute(&axes.to_axes());
         self
     }
 
     /// Swap 2 dimensions. This is a view-only operation and does not materialize a new tensor
+    ///
+    /// # Panics
+    /// The two specified dimensions must be within the number of dimensions of the tensor.
     pub fn transpose(self, dim0: usize, dim1: usize) -> GraphTensor {
         let num_dims = self.shape.len();
         assert!(
@@ -22,6 +26,9 @@ impl GraphTensor {
     }
 
     /// Transpose a 2D tensor
+    ///
+    /// # Panics
+    /// The tensor must actually be be 2 dimensional
     pub fn t(self) -> GraphTensor {
         assert_eq!(self.shape.len(), 2, ".t() supports only 2D tensors");
         self.transpose(0, 1)
@@ -50,6 +57,12 @@ impl GraphTensor {
         self
     }
 
+    #[allow(clippy::needless_pass_by_value)]
+    /// `expand_dim` on many `axes` with sizes prescribed by `shape`
+    ///
+    /// # Panics
+    /// The number of dimensions in shape should match with the current number of dimensions
+    /// combined with the number of axes which are each creating one more dimension
     pub fn expand_to_shape_on_axes(
         mut self,
         shape: impl ToShape,
@@ -77,6 +90,9 @@ impl GraphTensor {
     }
 
     /// add a new dimension of size 1 at the specified place
+    ///
+    /// # Panics
+    /// There can be at most 10 dimensions in a tensor
     pub fn unsqueeze(mut self, dim: usize) -> GraphTensor {
         assert!(self.shape.len() < 10, "Shape is maxed out at 10 dimensions");
         self.shape.expand_dim(dim, 1);
@@ -84,6 +100,11 @@ impl GraphTensor {
     }
 
     /// remove a dimension of size 1
+    ///
+    /// # Panics
+    /// Only dimensions of size 1 can be squeezed
+    /// This means it must be literally 1, not 1 after plugging in
+    /// some dyn dims. There are not variables for this axis.
     pub fn squeeze(mut self, axis: usize) -> GraphTensor {
         assert_eq!(
             self.dims()[axis],
@@ -96,7 +117,7 @@ impl GraphTensor {
 
     /// Create a `Gather` operation with this and the prescribed `indexes`
     /// on the same graph.
-    /// 
+    ///
     /// # Panics
     /// - The indexes tensor must have an integer dtype
     /// - The graph reference held by self must be valid
@@ -122,7 +143,7 @@ impl GraphTensor {
     /// Creates all the `GraphTensor`s onto the graph reference in order for the returned
     /// `GraphTensor` to be the inverse permutation of the input tensor eventually in the case it
     /// was actually non-repeating indices along a dimension. If not, this could be unintended behavior.
-    /// 
+    ///
     /// # Panics
     /// The input tensor does not have Int entries like `x` above.
     #[allow(clippy::needless_range_loop)]
@@ -163,7 +184,7 @@ impl GraphTensor {
     }
 
     /// Extracts sliding local windows from an input tensor.
-    /// 
+    ///
     /// # Panics
     /// `kernel`, `strides`, and `dilation` must all have the same number
     /// of dimensions as this input tensor.

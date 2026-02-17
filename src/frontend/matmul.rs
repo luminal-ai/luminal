@@ -1,12 +1,26 @@
 use crate::prelude::*;
 
 impl GraphTensor {
+    /// Create the `GraphTensor` for the matrix multiplication of these two
+    /// interpreted as summing along different commmon sized dimensions
+    /// depending on ranks.
+    ///
+    /// The broadcasted multiplies do not necessarily assert that the dimensions match up.
+    /// That would be equality of expressions possibly with dyn dims that have not been resolved yet.
+    /// So enforcing that this is a proper matrix multiplication has not happened at this stage.
+    /// In this case, there may be unintended behavior despite the construction of `GraphTensor` not causing Panic or Error.
+    ///
+    /// # Panics
+    /// There are some shapes that are not supported by this operation.
     pub fn matmul(mut self, mut rhs: GraphTensor) -> Self {
         if (self.shape.len() == 1 || self.shape.len() == 2) && rhs.shape.len() == 2 {
             let vec = self.shape.len() == 1;
             if vec {
                 self = self.expand_dim(0, 1);
             }
+            // The two _ here are supposed to be equal but so far they are just
+            // two expressions that are not necessarily identically equal because of
+            // not plugging in dyn dims yet.
             let (m, _) = self.dims2();
             let (_, n) = rhs.dims2();
             // Broadcasted Multiply
@@ -23,6 +37,8 @@ impl GraphTensor {
             let (a, b, _) = self.dims3();
             if rhs.shape.len() == 2 {
                 // ABCxCD -> ABD
+                // but these two C have not been enforced to be strictly equal here
+
                 // Reshape
                 let w = rhs.permute((1, 0));
 
@@ -105,6 +121,8 @@ impl GraphTensor {
     }
 
     /// Simple dot product of two vectors
+    /// But also applies for ABC.. dot ABC.. interpreted
+    /// as BC... going along for the ride in the dot product in R^A
     pub fn dot(self, rhs: GraphTensor) -> GraphTensor {
         (self * rhs).sum(0)
     }

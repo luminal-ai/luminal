@@ -1,3 +1,4 @@
+#![allow(clippy::items_after_statements)]
 use colored::Colorize;
 use egglog::{ast::Span, prelude::RustSpan, var};
 use itertools::Itertools;
@@ -748,6 +749,7 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
     }
 }
 
+#[allow(clippy::implicit_hasher)]
 pub fn extract_expr<'a>(
     egraph: &'a SerializedEGraph,
     node: &'a NodeId,
@@ -947,7 +949,7 @@ pub fn validate_choice_set<'a>(
             continue;
         }
         if !ops.iter().any(|op| op.term().0 == *op_name) {
-            return Err(format!("No extractor for op {}", op_name));
+            return Err(format!("No extractor for op {op_name}"));
         }
     }
 
@@ -974,6 +976,7 @@ pub fn hash_choice_set(choices: &EGraphChoiceSet) -> u64 {
 /// against `prev_selected` (which is updated with new hashes).
 ///
 /// If the search space is exhausted, returns as many unique offspring as possible.
+#[allow(clippy::implicit_hasher)]
 pub fn extract_generation<'a>(
     egraph: &'a SerializedEGraph,
     base: &EGraphChoiceSet<'a>,
@@ -1031,6 +1034,11 @@ pub fn extract_generation<'a>(
     offspring
 }
 
+/// Convert a `SerializedEGraph` to an `LLIRGraph`.
+///
+/// # Panics
+/// TODO: failure modes
+#[allow(clippy::needless_pass_by_value, clippy::implicit_hasher)]
 #[tracing::instrument(skip_all)]
 pub fn egglog_to_llir<'a>(
     egraph: &'a SerializedEGraph,
@@ -1108,7 +1116,7 @@ pub fn egglog_to_llir<'a>(
             let id: usize = egraph.enodes[&egraph.eclasses[&egraph.enodes[node].1[1]].1[0]]
                 .0
                 .parse()
-                .unwrap();
+                .expect("Must be a valid usize");
             let remapped_id = custom_op_id_remap
                 .and_then(|m| m.get(&id).copied())
                 .unwrap_or(id);
@@ -1157,6 +1165,10 @@ pub fn egglog_to_llir<'a>(
 
 /// Merge multiple per-chunk LLIR graphs into a single LLIR graph,
 /// resolving boundary Input/Output nodes at graph break boundaries.
+///
+/// # Panics
+/// The boundary outputs must have exactly one input.
+#[allow(clippy::used_underscore_binding)]
 pub fn stitch_llir_graphs(
     chunk_llirs: &[LLIRGraph],
     descriptors: &[SubgraphDescriptor],

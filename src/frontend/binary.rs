@@ -1,4 +1,4 @@
-use crate::hlir::*;
+use crate::hlir::{LessThan, Mod};
 use crate::prelude::*;
 use std::ops::AddAssign;
 use std::ops::DivAssign;
@@ -249,9 +249,16 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
     }
 }
 
-// Comparisons, all redurn bools (based on https://github.com/tinygrad/tinygrad/blob/3e0c2d256fe9f4f5f85cd3e4d8733a51d7b4a984/tinygrad/tensor.py#L653)
+// Comparisons, all return bools
+// (based on <https://github.com/tinygrad/tinygrad/blob/3e0c2d256fe9f4f5f85cd3e4d8733a51d7b4a984/tinygrad/tensor.py#L653>)
 impl GraphTensor {
     /// Less than comparison
+    ///
+    /// # Panics
+    /// The dimensions must match. This is actually equality of `Vec<Expression>`
+    /// so dyn dims that have not been resolved yet may cause this to Panic
+    /// even if the shapes would end up equal if all the varialbes in the dyn dims
+    /// were replaced with concrete values
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
         assert_eq!(self.dims(), rhs.dims(), "Dims must match to lt tensors.");
         let new_id = self
@@ -265,41 +272,63 @@ impl GraphTensor {
     }
 
     /// Greater than comparison
+    ///
+    /// # Panics
+    /// The dimensions must match. This is actually equality of `Vec<Expression>`
+    /// so dyn dims that have not been resolved yet may cause this to Panic
+    /// even if the shapes would end up equal if all the varialbes in the dyn dims
+    /// were replaced with concrete values
     pub fn gt(self, rhs: GraphTensor) -> GraphTensor {
         rhs.lt(self)
     }
 
     /// Less than or equal
+    ///
+    /// # Panics
+    /// The dimensions must match. This is actually equality of `Vec<Expression>`
+    /// so dyn dims that have not been resolved yet may cause this to Panic
+    /// even if the shapes would end up equal if all the varialbes in the dyn dims
+    /// were replaced with concrete values
     pub fn le(self, rhs: GraphTensor) -> GraphTensor {
         (-self.gt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
     }
 
     /// Greater than or equal
+    ///
+    /// # Panics
+    /// The dimensions must match. This is actually equality of `Vec<Expression>`
+    /// so dyn dims that have not been resolved yet may cause this to Panic
+    /// even if the shapes would end up equal if all the varialbes in the dyn dims
+    /// were replaced with concrete values
     pub fn ge(self, rhs: GraphTensor) -> GraphTensor {
         (-self.lt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
     }
 
     /// Not equal
+    ///
+    /// # Panics
+    /// The dimensions must match. This is actually equality of `Vec<Expression>`
+    /// so dyn dims that have not been resolved yet may cause this to Panic
+    /// even if the shapes would end up equal if all the varialbes in the dyn dims
+    /// were replaced with concrete values
     pub fn ne(self, rhs: GraphTensor) -> GraphTensor {
         self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)
     }
 
     /// Equal
+    ///
+    /// # Panics
+    /// The dimensions must match. This is actually equality of `Vec<Expression>`
+    /// so dyn dims that have not been resolved yet may cause this to Panic
+    /// even if the shapes would end up equal if all the varialbes in the dyn dims
+    /// were replaced with concrete values
     pub fn eq(self, rhs: GraphTensor) -> GraphTensor {
         (-self.ne(rhs) + 1.0).cast(DType::Bool)
     }
+}
 
-    /// Raise the tensor to a power
-    pub fn pow<T>(self, e: T) -> GraphTensor
-    where
-        Self: Mul<T, Output = Self>,
-    {
-        // Approximate, see full impl here: https://github.com/tinygrad/tinygrad/blob/a32c67760140dd26b60d7932268f2e62e96a66e0/tinygrad/tensor.py#L568
-        self.abs().log().mul(e).exp()
-    }
-
-    // Clipping ops (minimum, maximum, clip)
-
+// Clipping ops (minimum, maximum, clip)
+impl GraphTensor {
     /// Take the elementwise maximum of two tensors
     pub fn maximum(self, rhs: GraphTensor) -> GraphTensor {
         // Cast Bool to F32 for arithmetic
@@ -325,8 +354,24 @@ impl GraphTensor {
     pub fn clip(self, min: f32, max: f32) -> GraphTensor {
         self.maximum_f32(min).minimum_f32(max)
     }
+}
 
-    /// Return a tensor of elements selected from either self or other, depending on condition. Condition should be a boolean tensor
+impl GraphTensor {
+    /// Raise the tensor to a power
+    pub fn pow<T>(self, e: T) -> GraphTensor
+    where
+        Self: Mul<T, Output = Self>,
+    {
+        // Approximate, see full impl here:
+        // <https://github.com/tinygrad/tinygrad/blob/a32c67760140dd26b60d7932268f2e62e96a66e0/tinygrad/tensor.py#L568>
+        self.abs().log().mul(e).exp()
+    }
+
+    /// Return a tensor of elements selected from either self or other
+    /// depending on condition. Condition `cond` should be a boolean tensor
+    ///
+    /// # Panics
+    /// The elements of `self` and `other` must be of the same dtype.
     pub fn cond(self, cond: GraphTensor, other: GraphTensor) -> GraphTensor {
         assert_eq!(
             self.dtype, other.dtype,
