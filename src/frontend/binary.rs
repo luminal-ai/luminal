@@ -501,6 +501,79 @@ pub(super) mod tests {
         }
     }
 
+    #[test]
+    fn test_add_dtype() {
+        for flags in [true, false].into_iter().combinations_with_replacement(4) {
+            let (a_type_int, b_type_int, a_data_int, b_data_int) =
+                (flags[0], flags[1], flags[2], flags[3]);
+            let a_shape = vec![2, 1];
+            let b_shape = a_shape.clone();
+            let mut cx = Graph::new();
+            let mut a = cx.tensor(a_shape.clone());
+            let mut b = cx.tensor(b_shape.clone());
+            if a_type_int {
+                // This makes the b.dtype not DType::default as it starts off.
+                // When making the GraphTensor for a+b, it did not check that they had the same
+                // type even though that could have happened.
+                // So this case still works without error despite that.
+                a.dtype = crate::op::DType::Int;
+            }
+            if b_type_int {
+                b.dtype = crate::op::DType::Int;
+            }
+            let c = (a + b).output();
+
+            cx.build_search_space::<NativeRuntime>();
+            let mut rt = cx.search(NativeRuntime::default(), 1);
+
+            let lhs_values_reference = if a_data_int {
+                // set_data just requires the data to be convertable to the relevant kind of data for rt
+                // However, this does not have to match with a.dtype
+                // Here we are setting it with a Vec<i32> whether or not
+                // b.type was DType::Int or DType::default()
+                let lhs_values: Vec<_> = random_vec(a_shape.iter().copied().product())
+                    .into_iter()
+                    .map(|z| i32::from(z.abs() <= 1.0))
+                    .collect();
+                rt.set_data(a.id, lhs_values.clone());
+                lhs_values.into_iter().map(|z| z as f32).collect()
+            } else {
+                let lhs_values: Vec<_> = random_vec(a_shape.iter().copied().product());
+                rt.set_data(a.id, lhs_values.clone());
+                lhs_values
+            };
+            let rhs_values_reference = if b_data_int {
+                let rhs_values: Vec<_> = random_vec(b_shape.iter().copied().product())
+                    .into_iter()
+                    .map(|z| i32::from(z.abs() <= 1.0))
+                    .collect();
+                rt.set_data(b.id, rhs_values.clone());
+                rhs_values.into_iter().map(|z| z as f32).collect()
+            } else {
+                let rhs_values: Vec<_> = random_vec(b_shape.iter().copied().product());
+                rt.set_data(b.id, rhs_values.clone());
+                rhs_values
+            };
+            rt.execute(&cx.dyn_map);
+
+            // Reference
+            // The reference is doing them both as f32
+            let device = Device::Cpu;
+            let ref_a = Tensor::from_vec(lhs_values_reference, a_shape, &device).unwrap();
+            let ref_b = Tensor::from_vec(rhs_values_reference, b_shape, &device).unwrap();
+            let ref_c = (ref_a + ref_b).unwrap().flatten_all().unwrap();
+
+            if !a_type_int {
+                assert_close(rt.get_f32(c.id), &ref_c.to_vec1::<f32>().unwrap());
+            } else {
+                // a_type is DType::Int so is c.dtype and so get_f32 fails because it is getting
+                // matched on the wrong pattern
+                // This is regardless of what a_data_type and b_data_type which governed
+                // the data used in set_data
+            }
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
