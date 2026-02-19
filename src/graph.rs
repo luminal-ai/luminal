@@ -144,6 +144,21 @@ impl Graph {
         }
     }
 
+    /// Is the `dyn HLIROp` associated to this `node` is of type `T`?
+    /// Assuming this `node` exists in the graph.
+    /// If this returns true, then `try_get_op` will return Some(_) and
+    /// and `get_op` will not panic.
+    ///
+    /// # Panics
+    /// `node` is not a valid node in the graph
+    #[inline]
+    pub fn this_node_is<T: HLIROp>(&self, node: NodeIndex) -> bool {
+        self.node_weight(node)
+            .expect("node is not a valid node in the graph")
+            .as_any()
+            .is::<T>()
+    }
+
     /// Assuming the `dyn HILIROp` is `T`, get that op at the chosen `node`.
     /// If `T` is not the correct type, returns `None`.
     ///
