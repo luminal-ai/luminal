@@ -513,7 +513,7 @@ pub fn hlir_subgraph_to_egglog(graph: &Graph, subgraph: &SubgraphDescriptor) -> 
     // Real outputs: only actual Output HLIR ops that exist in this subgraph
     // (not arbitrary nodes that happen to have no subgraph successors)
     for &n in &subgraph.nodes {
-        if graph.try_get_op::<Output>(n).is_some() {
+        if graph.this_node_is::<Output>(n) {
             if let Some(name) = names.get(&n) {
                 output_names.push(name.clone());
             }

@@ -721,7 +721,7 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
     let break_nodes: FxHashSet<NodeIndex> = graph
         .graph
         .node_indices()
-        .filter(|n| graph.try_get_op::<GraphBreak>(*n).is_some())
+        .filter(|n| graph.this_node_is::<GraphBreak>(*n))
         .collect();
 
     if break_nodes.is_empty() {
@@ -778,7 +778,7 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
     let input_nodes: FxHashSet<NodeIndex> = graph
         .graph
         .node_indices()
-        .filter(|n| graph.try_get_op::<crate::hlir::Input>(*n).is_some())
+        .filter(|n| graph.this_node_is::<crate::hlir::Input>(*n))
         .collect();
 
     for (&node, &chunk) in &node_chunk {
