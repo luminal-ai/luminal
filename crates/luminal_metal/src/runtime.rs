@@ -40,6 +40,15 @@ impl MetalRuntime {
         self.hlir_buffers.insert(id.to_id(), buffer);
     }
 
+    pub fn set_data_i32(&mut self, id: impl ToId, data: &[i32]) {
+        let buffer = self.device.new_buffer_with_data(
+            data.as_ptr() as *const _,
+            std::mem::size_of_val(data) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        self.hlir_buffers.insert(id.to_id(), buffer);
+    }
+
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
         let id = id.to_id();
         let output_id = self
