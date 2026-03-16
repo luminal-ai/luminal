@@ -17,7 +17,25 @@ use luminal::{
 };
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
 use objc::runtime::Object;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BufferSpec {
+    bytes: u64,
+    dtype: DType,
+}
+
+#[derive(Debug)]
+struct PooledBuffer {
+    bytes: u64,
+    buffer: Buffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct InputBufferMeta {
+    spec: BufferSpec,
+    version: u64,
+}
 
 pub struct MetalRuntime {
     device: Device,
@@ -35,7 +53,16 @@ pub struct MetalRuntime {
     /// Inferred runtime dtype for each LLIR node.
     node_dtypes: FxHashMap<NodeIndex, DType>,
     /// Compiled pipeline states for each kernel node
-    pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
+    pipelines: FxHashMap<NodeIndex, Arc<ComputePipelineState>>,
+    /// Reusable compute pipelines keyed by op signature.
+    pipeline_cache: FxHashMap<String, Arc<ComputePipelineState>>,
+    /// Intermediate buffers reusable across LLIR reloads.
+    buffer_pool: Vec<PooledBuffer>,
+    /// Per-input device buffer metadata for reuse and dirty checking.
+    input_buffer_meta: FxHashMap<NodeIndex, InputBufferMeta>,
+    /// Monotonic version for each host-side input tensor.
+    input_versions: FxHashMap<NodeIndex, u64>,
+    next_input_version: u64,
 }
 
 impl MetalRuntime {
@@ -135,7 +162,11 @@ impl MetalRuntime {
     }
 
     pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
-        self.input_data.insert(id.to_id(), data.into());
+        let id = id.to_id();
+        self.input_data.insert(id, data.into());
+        let version = self.next_input_version;
+        self.next_input_version = self.next_input_version.wrapping_add(1);
+        self.input_versions.insert(id, version);
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
@@ -233,14 +264,18 @@ impl Runtime for MetalRuntime {
             llir_graph: StableGraph::default(),
             node_dtypes: FxHashMap::default(),
             pipelines: FxHashMap::default(),
+            pipeline_cache: FxHashMap::default(),
+            buffer_pool: Vec::new(),
+            input_buffer_meta: FxHashMap::default(),
+            input_versions: FxHashMap::default(),
+            next_input_version: 1,
         }
     }
 
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
+        self.recycle_intermediate_buffers();
         self.pipelines.clear();
-        self.buffers.clear();
-        self.hlir_buffers.clear();
         self.node_dtypes.clear();
         self.llir_graph = Self::fuse_matmuls(llir_graph);
 
@@ -250,8 +285,8 @@ impl Runtime for MetalRuntime {
                 self.node_dtypes.insert(node, input.dtype);
                 let hlir_id = NodeIndex::new(input.node);
                 if let Some(data) = self.input_data.get(&hlir_id) {
-                    let buffer = self.create_input_buffer(data, input.dtype);
-                    self.hlir_buffers.insert(hlir_id, buffer);
+                    let data = data.clone();
+                    self.ensure_input_buffer(hlir_id, &data, input.dtype);
                 }
                 continue;
             }
@@ -260,7 +295,10 @@ impl Runtime for MetalRuntime {
                 continue;
             }
 
-            if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
+            if let Some(kernel_op) = self.llir_graph[node]
+                .to_dialect::<dyn MetalKernelOp>()
+                .cloned()
+            {
                 let input_nodes: Vec<NodeIndex> = self
                     .llir_graph
                     .edges_directed(node, Direction::Incoming)
@@ -277,7 +315,8 @@ impl Runtime for MetalRuntime {
                     })
                     .collect();
                 let output_dtype = kernel_op.infer_output_dtype(&input_dtypes);
-                let pipeline = kernel_op.compile(&self.device, &input_dtypes, output_dtype);
+                let pipeline =
+                    self.get_or_compile_pipeline(&kernel_op, &input_dtypes, output_dtype);
                 self.node_dtypes.insert(node, output_dtype);
                 self.pipelines.insert(node, pipeline);
             }
@@ -368,7 +407,13 @@ impl Runtime for MetalRuntime {
                 let dyn_idx = input_buffers.len() as u64 + 1;
                 encoder.set_buffer(dyn_idx, Some(&self.dyn_buffer), 0);
 
-                kernel_op.encode(encoder, pipeline, &input_buffers, output_buffer, dyn_map);
+                kernel_op.encode(
+                    encoder,
+                    pipeline.as_ref(),
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                );
             }
         }
 
@@ -404,6 +449,75 @@ impl RuntimeStats for MetalRuntime {
 }
 
 impl MetalRuntime {
+    fn recycle_intermediate_buffers(&mut self) {
+        let mut seen = FxHashMap::default();
+        for (_, buffer) in self.buffers.drain() {
+            let ptr = buffer.contents() as usize;
+            if seen.insert(ptr, ()).is_none() {
+                self.buffer_pool.push(PooledBuffer {
+                    bytes: buffer.length(),
+                    buffer,
+                });
+            }
+        }
+    }
+
+    fn pipeline_cache_key(
+        op: &Arc<Box<dyn MetalKernelOp>>,
+        input_dtypes: &[DType],
+        output_dtype: DType,
+    ) -> String {
+        format!("{op:?}|in={input_dtypes:?}|out={output_dtype:?}")
+    }
+
+    fn get_or_compile_pipeline(
+        &mut self,
+        op: &Arc<Box<dyn MetalKernelOp>>,
+        input_dtypes: &[DType],
+        output_dtype: DType,
+    ) -> Arc<ComputePipelineState> {
+        let key = Self::pipeline_cache_key(op, input_dtypes, output_dtype);
+        if let Some(pipeline) = self.pipeline_cache.get(&key) {
+            return pipeline.clone();
+        }
+        let pipeline = Arc::new(op.compile(&self.device, input_dtypes, output_dtype));
+        self.pipeline_cache.insert(key, pipeline.clone());
+        pipeline
+    }
+
+    fn input_buffer_spec(data: &NativeData, dtype: DType) -> BufferSpec {
+        BufferSpec {
+            bytes: (data.len() * dtype.bits().div_ceil(8)) as u64,
+            dtype,
+        }
+    }
+
+    fn ensure_input_buffer(&mut self, id: NodeIndex, data: &NativeData, dtype: DType) {
+        let version = self.input_versions.get(&id).copied().unwrap_or(0);
+        let spec = Self::input_buffer_spec(data, dtype);
+        if let Some(meta) = self.input_buffer_meta.get(&id) {
+            if *meta == (InputBufferMeta { spec, version }) && self.hlir_buffers.contains_key(&id) {
+                return;
+            }
+        }
+
+        let buffer = self.create_input_buffer(data, dtype);
+        self.hlir_buffers.insert(id, buffer);
+        self.input_buffer_meta
+            .insert(id, InputBufferMeta { spec, version });
+    }
+
+    fn take_pooled_buffer(&mut self, required_bytes: u64) -> Option<Buffer> {
+        let best_idx = self
+            .buffer_pool
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.bytes >= required_bytes)
+            .min_by_key(|(_, entry)| entry.bytes)
+            .map(|(idx, _)| idx)?;
+        Some(self.buffer_pool.swap_remove(best_idx).buffer)
+    }
+
     fn create_input_buffer(&self, data: &NativeData, dtype: DType) -> Buffer {
         match dtype {
             DType::F32 => {
@@ -435,7 +549,8 @@ impl MetalRuntime {
     }
 
     pub fn allocate_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
-        for node in self.llir_graph.node_indices() {
+        let nodes = self.llir_graph.node_indices().collect::<Vec<_>>();
+        for node in nodes {
             if self.llir_graph[node].to_op::<Input>().is_some() {
                 continue;
             }
@@ -443,10 +558,11 @@ impl MetalRuntime {
             if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
                 let size = kernel_op.output_size().exec(dyn_map).unwrap();
                 let dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-                let buffer = self.device.new_buffer(
-                    (size * dtype.bits().div_ceil(8)) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                );
+                let required_bytes = (size * dtype.bits().div_ceil(8)) as u64;
+                let buffer = self.take_pooled_buffer(required_bytes).unwrap_or_else(|| {
+                    self.device
+                        .new_buffer(required_bytes, MTLResourceOptions::StorageModeShared)
+                });
                 self.buffers.insert(node, buffer);
             }
         }
@@ -529,7 +645,13 @@ impl MetalRuntime {
                 let dyn_idx = input_buffers.len() as u64 + 1;
                 encoder.set_buffer(dyn_idx, Some(&self.dyn_buffer), 0);
 
-                kernel_op.encode(encoder, pipeline, &input_buffers, output_buffer, dyn_map);
+                kernel_op.encode(
+                    encoder,
+                    pipeline.as_ref(),
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                );
             }
         }
 
