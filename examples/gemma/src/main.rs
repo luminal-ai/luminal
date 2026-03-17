@@ -1,9 +1,10 @@
+mod backend;
 mod hf;
 mod model;
 
+use backend::*;
 use hf::prepare_hf_model;
 use luminal::prelude::*;
-use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
 use rustc_hash::FxHashSet;
@@ -24,9 +25,6 @@ fn main() {
         .with(luminal_filter())
         .init();
 
-    let ctx = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-
     let model_dir = prepare_hf_model(REPO_ID).expect("Failed to prepare model");
     println!("Using model directory: {}", model_dir.display());
 
@@ -46,18 +44,13 @@ fn main() {
     }
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    build_search_space(&mut cx);
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream);
+    let mut runtime = init_runtime();
     let weights_path = model_dir.join("model_combined.safetensors");
-    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
-
-    let cache_bytes = N_KV_HEADS * max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
-    for i in 0..LAYERS {
-        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
-    }
+    load_weights(&mut runtime, &cx, &weights_path);
+    init_kv_cache(&mut runtime, &kv_cache, max_seq_len);
 
     println!("Compiling...");
     cx.set_dim('s', 1);
@@ -66,10 +59,7 @@ fn main() {
     runtime.set_data(token_ids, vec![1]);
     runtime = cx.search(runtime, search_graphs);
 
-    for i in 0..LAYERS {
-        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
-    }
+    init_kv_cache(&mut runtime, &kv_cache, max_seq_len);
 
     let mut prev_seq = 1usize;
     let mut sentence = vec![prompt_tokens[0]];
@@ -107,13 +97,7 @@ fn main() {
         runtime.execute(&cx.dyn_map);
         let logits_data = runtime.get_f32(logits);
 
-        // Round-trip KV cache
-        for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-            let k_buf = runtime.remove_buffer(*k_out);
-            let v_buf = runtime.remove_buffer(*v_out);
-            runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
-            runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
-        }
+        roundtrip_kv_cache(&mut runtime, &kv_cache, &cache_outputs);
 
         prev_seq += seq_len;
         fwd_durations.push(start.elapsed());

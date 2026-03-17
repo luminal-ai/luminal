@@ -66,6 +66,26 @@ pub struct MetalRuntime {
 }
 
 impl MetalRuntime {
+    fn find_producer_node(&self, id: impl ToId) -> NodeIndex {
+        let id = id.to_id();
+        let output_id = self
+            .llir_graph
+            .node_indices()
+            .find(|n| {
+                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
+                    *node == id.index()
+                } else {
+                    false
+                }
+            })
+            .expect("Cannot find output tensor!");
+
+        self.llir_graph
+            .neighbors_directed(output_id, Direction::Incoming)
+            .next()
+            .unwrap()
+    }
+
     fn fuse_matmuls(llir_graph: &LLIRGraph) -> LLIRGraph {
         let mut graph = llir_graph.clone();
         let planner = MetalMatmulPlanner;
@@ -237,6 +257,28 @@ impl MetalRuntime {
                 }
             }
         }
+    }
+
+    pub fn remove_buffer(&mut self, id: impl ToId) -> Buffer {
+        let data_id = self.find_producer_node(id);
+        if let Some(buf) = self.buffers.remove(&data_id) {
+            return buf;
+        }
+
+        if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
+            return self
+                .hlir_buffers
+                .remove(&NodeIndex::new(*node))
+                .expect("Cannot find input buffer in Metal runtime!");
+        }
+
+        panic!("Cannot find tensor buffer in Metal runtime!");
+    }
+
+    pub fn set_buffer(&mut self, id: impl ToId, buf: Buffer) {
+        let id = id.to_id();
+        self.hlir_buffers.insert(id, buf);
+        self.input_buffer_meta.remove(&id);
     }
 }
 
