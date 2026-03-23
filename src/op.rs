@@ -23,8 +23,8 @@ pub trait Runtime {
     ) -> (Self::ProfileMetric, String);
     /// Allocate a dummy input buffer for a boundary node during per-chunk profiling.
     /// `node_index` is the HLIR node index used in the Input op's `node` field.
-    /// `num_elements` is the number of f32 elements to allocate.
-    fn allocate_dummy_input(&mut self, _node_index: usize, _num_elements: usize) {}
+    /// `num_bytes` is the number of bytes to allocate.
+    fn allocate_dummy_input(&mut self, _node_index: usize, _num_bytes: usize) {}
     /// Check if an HLIR buffer already exists for a given node index.
     fn has_hlir_buffer(&self, _node_index: usize) -> bool {
         false
@@ -39,6 +39,20 @@ pub trait Runtime {
     /// Used by the search to reject NaN-producing graph variants.
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         false
+    }
+    /// Load multiple compiled LLIR graphs, one per bucket combination.
+    /// Each entry is (bucket_indices, representative_dyn_map, stitched_llir).
+    /// The runtime dispatches between them in execute() based on dyn_map values.
+    fn load_llir_buckets(
+        &mut self,
+        _dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_llirs: &[BucketLLIR],
+    ) {
+        if bucket_llirs.len() == 1 {
+            self.load_llir(&bucket_llirs[0].2);
+        } else {
+            panic!("This runtime does not support bucketed compilation");
+        }
     }
 }
 

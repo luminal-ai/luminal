@@ -243,7 +243,7 @@ fn test_scatter_kv_cache_roundtrip() {
     rt = cx.search(rt, 5);
 
     // Print which scatter variant was selected
-    for node in rt.llir_graph.node_weights() {
+    for node in rt.llir_graph().node_weights() {
         if let Some(k) = node.to_dialect::<dyn KernelOp>() {
             if k.kernel_name().contains("catter") {
                 println!("Selected: {}", k.kernel_name());
@@ -351,7 +351,7 @@ fn test_scatter_dual_cache_with_graph_break() {
     rt = cx.search_rng(rt, 5, &mut rng);
 
     // Print selected variants
-    for node in rt.llir_graph.node_weights() {
+    for node in rt.llir_graph().node_weights() {
         if let Some(k) = node.to_dialect::<dyn KernelOp>() {
             if k.kernel_name().contains("catter") {
                 println!("Dual test selected: {}", k.kernel_name());

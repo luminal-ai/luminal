@@ -31,7 +31,7 @@ fn get_end_bound<D: Into<Expression> + Copy>(bound: Bound<D>) -> Expression {
     match bound {
         Bound::Excluded(x) => x.into(),
         Bound::Included(x) => x.into() + 1,
-        Bound::Unbounded => Expression::from(i32::MAX),
+        Bound::Unbounded => Expression::from(i64::MAX),
     }
 }
 
@@ -111,7 +111,7 @@ impl SliceRange for Range<Expression> {
 }
 impl SliceRange for RangeFull {
     fn bounds(&self) -> (Expression, Expression) {
-        (0.into(), Expression::from(i32::MAX))
+        (0.into(), Expression::from(i64::MAX))
     }
 }
 impl<R: SliceRange> SliceRange for (R,) {

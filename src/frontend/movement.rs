@@ -79,6 +79,12 @@ impl GraphTensor {
         self
     }
 
+    /// Flatten all dimensions into a single 1D tensor.
+    pub fn flatten(mut self) -> GraphTensor {
+        self.shape.flatten();
+        self
+    }
+
     //// Split a dim into 2 dims, new dim is placed directly after original dim
     pub fn split_dims(mut self, axis: usize, new_dim_size: impl Into<Expression>) -> GraphTensor {
         self.shape.split_dims(axis, new_dim_size);
@@ -101,6 +107,276 @@ impl GraphTensor {
         );
         self.shape.remove_dim(axis);
         self
+    }
+
+    /// Gather elements along an axis using per-element indices (ONNX GatherElements semantics).
+    ///
+    /// `output[i0,..,ik] = self[i0,..,i_{axis-1}, indices[i0,..,ik], i_{axis+1},..,ik]`
+    ///
+    /// indices must have the same rank as self and the same shape as the output.
+    pub fn gather_elements(self, indexes: GraphTensor, axis: usize) -> GraphTensor {
+        let dims = self.dims();
+        let rank = dims.len();
+        let out_shape: Vec<usize> = indexes
+            .dims()
+            .iter()
+            .map(|d| {
+                d.to_usize()
+                    .expect("gather_elements: index dim must be concrete")
+            })
+            .collect();
+
+        // Row-major strides: stride[i] = prod(dims[i+1..])
+        let strides: Vec<usize> = (0..rank)
+            .map(|i| {
+                dims[i + 1..]
+                    .iter()
+                    .map(|d| d.to_usize().unwrap())
+                    .product()
+            })
+            .collect();
+
+        // Normalize negative indices for axis dim
+        let axis_dim = dims[axis].to_usize().unwrap();
+        let idx_f32 = indexes.cast(DType::F32);
+        let zero = idx_f32
+            .graph()
+            .constant_float(0.0)
+            .expand_rhs(idx_f32.shape);
+        let adj = idx_f32
+            .graph()
+            .constant_float(axis_dim as f32)
+            .expand_rhs(idx_f32.shape);
+        let is_neg = idx_f32.lt(zero).cast(DType::F32);
+        let idx_normalized = (idx_f32 + (is_neg * adj)).cast(DType::Int);
+
+        // Non-axis flat index via iota + flatten_strides
+        let axis_exprs: Vec<Expression> = (0..rank)
+            .map(|d| {
+                if d == axis {
+                    Expression::from(0)
+                } else {
+                    Expression::from('z') * strides[d]
+                }
+            })
+            .collect();
+        let out_shape_expr: Vec<Expression> =
+            out_shape.iter().map(|&s| Expression::from(s)).collect();
+        let non_axis_flat = self
+            .graph()
+            .iota(flatten_strides(&out_shape_expr, &axis_exprs), out_shape);
+
+        // Axis contribution from the runtime index values
+        let stride_tensor = self
+            .graph()
+            .constant(strides[axis])
+            .expand_rhs(idx_normalized.shape);
+        let flat_idx = non_axis_flat + idx_normalized * stride_tensor;
+
+        self.gather(flat_idx)
+    }
+
+    /// Scatter updates into a copy of self at positions specified by per-element indices along an axis.
+    ///
+    /// ONNX ScatterElements semantics:
+    /// `output[i0,..,i_{a-1}, indices[i0,..,ik], i_{a+1},..,ik] = updates[i0,..,ik]`
+    ///
+    /// indices and updates must have the same shape.
+    /// Overlapping writes: last write wins.
+    pub fn scatter_elements(
+        self,
+        indices: GraphTensor,
+        updates: GraphTensor,
+        axis: usize,
+    ) -> GraphTensor {
+        let data_dims = self.dims();
+        let rank = data_dims.len();
+        let idx_shape: Vec<usize> = indices
+            .dims()
+            .iter()
+            .map(|d| {
+                d.to_usize()
+                    .expect("scatter_elements: index dim must be concrete")
+            })
+            .collect();
+
+        // Row-major strides for data
+        let strides: Vec<usize> = (0..rank)
+            .map(|i| {
+                data_dims[i + 1..]
+                    .iter()
+                    .map(|d| d.to_usize().unwrap())
+                    .product()
+            })
+            .collect();
+
+        // Normalize negative indices for axis dim
+        let axis_dim = data_dims[axis].to_usize().unwrap();
+        let idx_f32 = indices.cast(DType::F32);
+        let zero = idx_f32
+            .graph()
+            .constant_float(0.0)
+            .expand_rhs(idx_f32.shape);
+        let adj = idx_f32
+            .graph()
+            .constant_float(axis_dim as f32)
+            .expand_rhs(idx_f32.shape);
+        let is_neg = idx_f32.lt(zero).cast(DType::F32);
+        let idx_normalized = (idx_f32 + (is_neg * adj)).cast(DType::Int);
+
+        // Non-axis flat index via iota + flatten_strides
+        let axis_exprs: Vec<Expression> = (0..rank)
+            .map(|d| {
+                if d == axis {
+                    Expression::from(0)
+                } else {
+                    Expression::from('z') * strides[d]
+                }
+            })
+            .collect();
+        let idx_shape_expr: Vec<Expression> =
+            idx_shape.iter().map(|&s| Expression::from(s)).collect();
+        let non_axis_flat = self.graph().iota(
+            flatten_strides(&idx_shape_expr, &axis_exprs),
+            idx_shape.clone(),
+        );
+
+        // Axis contribution from the runtime index values
+        let stride_tensor = self
+            .graph()
+            .constant(strides[axis])
+            .expand_rhs(idx_normalized.shape);
+        let flat_dest = non_axis_flat + idx_normalized * stride_tensor;
+
+        // Flatten to 1D using materialize + reshape
+        let flat_dest_1d = flat_dest.flatten();
+        let flat_updates = updates.flatten();
+        let flat_data = self.flatten();
+
+        // Use HLIR Scatter: dest[indexes[i]] = src[i]
+        let output_flat = flat_updates.scatter(flat_dest_1d, flat_data);
+
+        // Reshape back to data_shape
+        let data_shape_usize: Vec<usize> =
+            data_dims.iter().map(|d| d.to_usize().unwrap()).collect();
+        let mut result = output_flat;
+        result.shape = ShapeTracker::new(data_shape_usize);
+
+        result
+    }
+
+    /// Scatter updates into a copy of self using multi-dimensional index vectors (ONNX ScatterND semantics).
+    ///
+    /// `indices` has shape [S0, ..., Sq-2, K] where K <= rank(data).
+    /// `updates` has shape [S0, ..., Sq-2, D_K, ..., D_{r-1}].
+    /// For each batch element (s0, ..., sq-2):
+    ///   multi_idx = indices[s0, ..., sq-2, :]
+    ///   output[multi_idx[0], ..., multi_idx[K-1], :, ..] = updates[s0, ..., sq-2, :, ..]
+    pub fn scatter_nd(self, indices: GraphTensor, updates: GraphTensor) -> GraphTensor {
+        let indices = indices.cast(DType::Int);
+        let data_dims = self.dims();
+        let data_rank = data_dims.len();
+        let idx_dims = indices.dims();
+        let idx_rank = idx_dims.len();
+
+        let data_shape: Vec<usize> = data_dims
+            .iter()
+            .map(|d| d.to_usize().expect("scatter_nd: data dim must be concrete"))
+            .collect();
+        let idx_shape: Vec<usize> = idx_dims
+            .iter()
+            .map(|d| {
+                d.to_usize()
+                    .expect("scatter_nd: indices dim must be concrete")
+            })
+            .collect();
+
+        let k = idx_shape[idx_rank - 1]; // last dim of indices = number of index dimensions
+        assert!(k <= data_rank, "scatter_nd: K must be <= data rank");
+
+        // Batch shape = indices shape without last dim: [S0, ..., Sq-2]
+        let batch_shape: Vec<usize> = idx_shape[..idx_rank - 1].to_vec();
+        let batch_numel: usize = batch_shape.iter().product::<usize>().max(1);
+
+        // Trailing shape = data_shape[K..]
+        let trailing_shape: Vec<usize> = data_shape[k..].to_vec();
+        let trailing_numel: usize = trailing_shape.iter().product::<usize>().max(1);
+
+        // Row-major strides for data
+        let data_strides: Vec<usize> = (0..data_rank)
+            .map(|i| data_shape[i + 1..].iter().product::<usize>().max(1))
+            .collect();
+
+        // Flatten batch dims of indices to [batch_numel, K] using materialize + reshape
+        let mut indices_flat = indices;
+        if idx_rank > 2 {
+            indices_flat.shape = ShapeTracker::new(vec![batch_numel, k]);
+        }
+        // indices_flat: [batch_numel, K] or [K] if idx_rank == 1
+
+        // For each k_dim, extract the slice and multiply by stride
+        let mut flat_base: Option<GraphTensor> = None;
+        for (k_dim, &stride) in data_strides.iter().enumerate().take(k) {
+            let idx_k = indices_flat.slice_along(k_dim..k_dim + 1, indices_flat.dims().len() - 1);
+            let idx_k = idx_k.squeeze(idx_k.dims().len() - 1);
+
+            let stride_tensor = self.graph().constant(stride).expand_rhs(idx_k.shape);
+            let contribution = idx_k * stride_tensor;
+
+            flat_base = Some(match flat_base {
+                Some(fb) => fb + contribution,
+                None => contribution,
+            });
+        }
+        let flat_base = flat_base.unwrap();
+
+        let mut full_flat_dest = if trailing_shape.is_empty() || trailing_numel == 1 {
+            flat_base
+        } else {
+            // Expand flat_base to [batch_numel, trailing_numel]
+            let mut base_expanded = flat_base.expand_dim(1, trailing_numel);
+
+            let trailing_rank = trailing_shape.len();
+            for (ti, d) in (k..data_rank).enumerate() {
+                let ar = self.graph().arange(data_shape[d]);
+                let mut ar_shaped = ar;
+                for _ in ti + 1..trailing_rank {
+                    let n = ar_shaped.dims().len();
+                    ar_shaped = ar_shaped.expand_dim(n, 1);
+                }
+                for _ in 0..ti {
+                    ar_shaped = ar_shaped.expand_dim(0, 1);
+                }
+                ar_shaped.shape.expand(trailing_shape.clone());
+                // Flatten trailing dims using materialize + reshape
+                let mut ar_flat = ar_shaped;
+                ar_flat.shape = ShapeTracker::new(vec![trailing_numel]);
+                // Expand to [batch_numel, trailing_numel]
+                ar_flat = ar_flat.expand_dim(0, batch_numel);
+
+                let stride_tensor = self
+                    .graph()
+                    .constant(data_strides[d])
+                    .expand_rhs(ar_flat.shape);
+                base_expanded += ar_flat * stride_tensor;
+            }
+            base_expanded
+        };
+
+        full_flat_dest = full_flat_dest.flatten();
+
+        // Flatten data out
+        let flat_updates = updates.flatten();
+        let flat_data = self.flatten();
+
+        // Use HLIR Scatter: dest[indexes[i]] = src[i]
+        let output_flat = flat_updates.scatter(full_flat_dest, flat_data);
+
+        // Reshape back to data_shape
+        let mut result = output_flat;
+        result.shape = ShapeTracker::new(data_shape);
+
+        result
     }
 
     pub fn gather(self, indexes: GraphTensor) -> GraphTensor {
@@ -256,7 +532,7 @@ impl GraphTensor {
     /// assert_eq!(b.dims(), vec![Expression::from(5), Expression::from(6)]);
     /// ```
     pub fn slice_along(self, slice: impl SliceRange, axis: usize) -> GraphTensor {
-        let mut s = vec![(Expression::from(0), Expression::from(i32::MAX)); axis + 1];
+        let mut s = vec![(Expression::from(0), Expression::from(i64::MAX)); axis + 1];
         s[axis] = slice.bounds();
         self.slice(s)
     }

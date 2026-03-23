@@ -1,6 +1,8 @@
 pub mod utilities;
 
 #[cfg(test)]
+mod bucket_tests;
+#[cfg(test)]
 mod consumed_buffer_tests;
 #[cfg(test)]
 mod model_fuzz;

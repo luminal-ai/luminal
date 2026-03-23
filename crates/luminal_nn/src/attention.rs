@@ -149,8 +149,7 @@ pub fn paged_attention(
 
     // ── Phase 5: Reshape output ──
     // (n_kv_heads, kv_groups, s, head_dim) → (s, n_kv_heads, kv_groups, head_dim)
-    // Force materialization with * 1.0 to make contiguous, then reinterpret shape
-    let mut out = out.permute((2, 0, 1, 3)) * 1.0;
+    let mut out = out.permute((2, 0, 1, 3));
     out.shape = ShapeTracker::new((s, n_heads * head_dim));
 
     (out, k_cache, v_cache)

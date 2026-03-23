@@ -876,7 +876,7 @@ pub fn extract_expr<'a>(
                 Expression::from(name.chars().next().unwrap())
             }
             op => op
-                .parse::<i32>()
+                .parse::<i64>()
                 .map(Expression::from)
                 .or_else(|_| op.replace('"', "").parse::<char>().map(Expression::from))
                 .unwrap_or_else(|_| panic!("unsupported expression op '{op}'")),

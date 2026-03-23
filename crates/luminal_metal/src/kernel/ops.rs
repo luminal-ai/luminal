@@ -57,7 +57,7 @@ fn lower_dynamic_consts(mut code: String) -> String {
     for c in b'a'..=b'y' {
         let symbol = c as char;
         code = code.replace(
-            &format!("*const_{symbol}"),
+            &format!("const_{symbol}"),
             &format!("dyn[{}]", (c - b'a') as usize),
         );
     }

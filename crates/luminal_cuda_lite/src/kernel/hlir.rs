@@ -216,6 +216,8 @@ impl KernelOp for KernelMaxReduce {
             ", const int* dyn_dims"
         };
 
+        let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+
         let kernel = format!(
             "{includes}
 #define WARP_SIZE 32
@@ -234,11 +236,10 @@ extern \"C\" {{
 
         long long in_start = {in_index};
         long long iters = {iters};
-        long long iter_stride = {iter_stride};
 
         {dtype} max_value = NEG_INF_F;
         for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
-            max_value = fmaxf(max_value, in[in_start + i * iter_stride]);
+            max_value = fmaxf(max_value, in[in_start + {iter_stride_of_i}]);
         }}
 
         #pragma unroll
@@ -270,11 +271,7 @@ extern \"C\" {{
             in_index = flatten_strides(&self.out_shape, &self.in_stride).to_kernel(),
             out_index = flatten_strides(&self.out_shape, &self.out_stride).to_kernel(),
             iters = self.iters.to_kernel(),
-            iter_stride = self
-                .iter_stride
-                .substitute('z', Expression::from(1))
-                .simplify()
-                .to_kernel(),
+            iter_stride_of_i = iter_stride_of_i,
         );
 
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
@@ -429,6 +426,8 @@ impl KernelOp for KernelSumReduce {
             ", const int* dyn_dims"
         };
 
+        let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+
         let kernel = format!(
             "{includes}
 #define WARP_SIZE 32
@@ -446,11 +445,10 @@ extern \"C\" {{
 
         long long in_start = {in_index};
         long long iters = {iters};
-        long long iter_stride = {iter_stride};
 
         {dtype} partial = 0;
         for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
-            partial += in_data[in_start + i * iter_stride];
+            partial += in_data[in_start + {iter_stride_of_i}];
         }}
 
         #pragma unroll
@@ -482,11 +480,7 @@ extern \"C\" {{
             in_index = flatten_strides(&self.out_shape, &self.in_stride).to_kernel(),
             out_index = flatten_strides(&self.out_shape, &self.out_stride).to_kernel(),
             iters = self.iters.to_kernel(),
-            iter_stride = self
-                .iter_stride
-                .substitute('z', Expression::from(1))
-                .simplify()
-                .to_kernel(),
+            iter_stride_of_i = iter_stride_of_i,
         );
 
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
@@ -2930,7 +2924,7 @@ pub fn generate_dyn_dims_defines(vars: &FxHashSet<char>) -> (String, Vec<char>) 
                     .iter()
                     .position(|d| d == dim)
                     .expect("Dim must be in global ordering after extension");
-                format!("#define const_{dim} (dyn_dims + {idx})")
+                format!("#define const_{dim} dyn_dims[{idx}]")
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -2942,7 +2936,7 @@ pub fn generate_dyn_dims_defines(vars: &FxHashSet<char>) -> (String, Vec<char>) 
     let defines = sorted_dims
         .iter()
         .enumerate()
-        .map(|(idx, dim)| format!("#define const_{dim} (dyn_dims + {idx})"))
+        .map(|(idx, dim)| format!("#define const_{dim} dyn_dims[{idx}]"))
         .collect::<Vec<_>>()
         .join("\n");
     (defines, sorted_dims)
@@ -2987,6 +2981,7 @@ impl EgglogOp for KernelEmbed {
             Rule::raw("(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
@@ -2995,7 +2990,7 @@ impl EgglogOp for KernelEmbed {
                     (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
                 )
                 (
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids (ICons ?embed_table (INil)))))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
@@ -3005,6 +3000,7 @@ impl EgglogOp for KernelEmbed {
             Rule::raw("(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
@@ -3013,7 +3009,7 @@ impl EgglogOp for KernelEmbed {
                     (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
                 )
                 (
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids (ICons ?embed_table (INil)))))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
@@ -3023,6 +3019,7 @@ impl EgglogOp for KernelEmbed {
             Rule::raw("(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
@@ -3040,6 +3037,7 @@ impl EgglogOp for KernelEmbed {
             Rule::raw("(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))

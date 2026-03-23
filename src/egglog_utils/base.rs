@@ -159,7 +159,7 @@ pub fn expr_to_term(expr: &shape::Expression) -> Term {
     let mut stack = Vec::new();
     for term in expr.terms.read().iter() {
         let t = match term {
-            shape::Term::Num(n) => num(i64(*n as i64)),
+            shape::Term::Num(n) => num(i64(*n)),
             shape::Term::Var(c) => mvar(str(&c.to_string())),
             op => {
                 let a = stack.pop().unwrap();
@@ -443,9 +443,9 @@ pub fn base_expression_egglog() -> String {
     s.register(&mut p);
 
     // ---- Algebraic rewrites ----
-    // Commutativity: (MMul a b) -> (MMul b a)
-    p.add_rule(rewrite("add-comm", add(v("a"), v("b")), add(v("b"), v("a"))).ruleset("expr"));
+    // Commutativity
     p.add_rule(rewrite("mul-comm", mul(v("a"), v("b")), mul(v("b"), v("a"))).ruleset("expr"));
+    p.add_rule(rewrite("add-comm", add(v("a"), v("b")), add(v("b"), v("a"))).ruleset("expr"));
 
     // Constant folding: add
     p.add_rule(
@@ -498,6 +498,19 @@ pub fn base_expression_egglog() -> String {
         ])
         .ruleset("expr"),
     );
+
+    // Cancel common factor in division: (a*b)/(a*c) → b/c
+    p.add_rule(
+        rewrite(
+            "div-cancel-factor",
+            div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
+            div(v("b"), v("c")),
+        )
+        .ruleset("expr"),
+    );
+
+    // Division self-cancel: a/a → 1
+    p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
 
     // Constant folding: ceildiv
     p.add_rule(
@@ -904,7 +917,7 @@ pub fn base_expression_egglog() -> String {
             .ruleset("expr"),
     );
 
-    // RowMajor rules (z-strides: innermost stride is z, each outer stride is z * product_of_inner_dims)
+    // RowMajor rules (z-strides: base stride is MIter/'z', not 1)
     p.add_rule(
         Rule::new()
             .facts(vec![
@@ -915,7 +928,7 @@ pub fn base_expression_egglog() -> String {
             ])
             .action(Action::Union(
                 v("?e"),
-                cons(mul(v("?n_elems"), mvar(str("z"))), rowmajor(v("?other"))),
+                cons(mul(v("?n_elems"), iter()), rowmajor(v("?other"))),
             ))
             .ruleset("expr"),
     );
@@ -923,7 +936,7 @@ pub fn base_expression_egglog() -> String {
         rewrite(
             "rowmajor-base",
             rowmajor(cons(v("?dim"), nil())),
-            cons(mvar(str("z")), nil()),
+            cons(iter(), nil()),
         )
         .ruleset("expr"),
     );

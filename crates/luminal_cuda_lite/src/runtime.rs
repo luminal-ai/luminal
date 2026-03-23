@@ -39,7 +39,7 @@ pub enum CudaInput {
 
 /// Executable operation in the runtime graph.
 /// All operations (including CUDA graphs) are now HostOps.
-struct ExecutableHostOp {
+pub(crate) struct ExecutableHostOp {
     stream: Arc<CudaStream>,
     inputs: Vec<NodeIndex>,
     output: NodeIndex,
@@ -64,29 +64,61 @@ impl Debug for ExecutableHostOp {
     }
 }
 
+/// Per-bucket compiled state. Each bucket holds its own LLIR graph, exec graph,
+/// intermediate buffers, and node mappings. Weights (hlir_buffers) are shared.
+pub(crate) struct CompiledBucket {
+    pub(crate) llir_graph: luminal::graph::LLIRGraph,
+    pub(crate) exec_graph: StableGraph<ExecutableHostOp, (), Directed>,
+    pub(crate) node_to_exec: FxHashMap<NodeIndex, NodeIndex>,
+    pub(crate) buffers: FxHashMap<NodeIndex, CudaSlice<u8>>,
+    pub(crate) cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
+    pub(crate) llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
+    pub(crate) hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
+    pub(crate) output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+    pub(crate) last_dyn_map: FxHashMap<char, usize>,
+    pub(crate) intermediate_buffer_dims: FxHashSet<char>,
+    /// Which bucket index per dim this compilation targets
+    pub(crate) bucket_indices: FxHashMap<char, usize>,
+    /// Whether HLIR pointers have been synced into this bucket's cached_buffer_ptrs
+    pub(crate) hlir_synced: bool,
+}
+
+impl CompiledBucket {
+    fn new() -> Self {
+        CompiledBucket {
+            llir_graph: StableGraph::default(),
+            exec_graph: StableGraph::default(),
+            node_to_exec: FxHashMap::default(),
+            buffers: FxHashMap::default(),
+            cached_buffer_ptrs: FxHashMap::default(),
+            llir_to_hlir: FxHashMap::default(),
+            hlir_to_llir: FxHashMap::default(),
+            output_alias_map: FxHashMap::default(),
+            last_dyn_map: FxHashMap::default(),
+            intermediate_buffer_dims: FxHashSet::default(),
+            bucket_indices: FxHashMap::default(),
+            hlir_synced: false,
+        }
+    }
+}
+
 pub struct CudaRuntime {
+    // Shared state across all buckets
     pub hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
-    pub buffers: FxHashMap<NodeIndex, CudaSlice<u8>>,
-    pub llir_graph: luminal::graph::LLIRGraph,
     cuda_stream: Arc<CudaStream>,
-    exec_graph: StableGraph<ExecutableHostOp, (), Directed>,
-    node_to_exec: FxHashMap<NodeIndex, NodeIndex>,
-    pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
-    last_dyn_map: FxHashMap<char, usize>,
-    intermediate_buffer_dims: FxHashSet<char>,
-    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
-    hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
     changed_hlir: FxHashSet<NodeIndex>,
-    /// Cached buffer pointers to avoid repeated device_ptr() calls (keyed by llir_node)
-    cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
+    pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
     pub last_kernel_stats: Vec<KernelStats>,
     pub last_total_time_us: f64,
     kernel_cache: FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     /// When true, execute() skips input buffer consumption (used during search/profile)
     profiling: bool,
-    /// Alias map: for KernelOps with output_aliases_input(), maps output node → aliased input node.
-    /// Used to resolve cross-CudaGraphOp buffer references.
-    output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+
+    // Per-bucket compiled state
+    compiled_buckets: Vec<CompiledBucket>,
+    active_bucket: usize,
+    /// Bucket definitions per dimension (empty = single-bucket mode)
+    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
 }
 
 impl CudaRuntime {
@@ -101,6 +133,26 @@ impl CudaRuntime {
         let stream = ctx.default_stream();
 
         Ok(Self::initialize(stream))
+    }
+
+    /// Get the active compiled bucket.
+    fn active(&self) -> &CompiledBucket {
+        &self.compiled_buckets[self.active_bucket]
+    }
+
+    /// Get the active compiled bucket mutably.
+    fn active_mut(&mut self) -> &mut CompiledBucket {
+        &mut self.compiled_buckets[self.active_bucket]
+    }
+
+    /// Public access to the active LLIR graph (for tests and diagnostics).
+    pub fn llir_graph(&self) -> &luminal::graph::LLIRGraph {
+        &self.active().llir_graph
+    }
+
+    /// Public access to the active intermediate buffers (for tests and diagnostics).
+    pub fn buffers(&self) -> &FxHashMap<NodeIndex, CudaSlice<u8>> {
+        &self.active().buffers
     }
 
     #[tracing::instrument(skip_all)]
@@ -150,18 +202,20 @@ impl CudaRuntime {
     /// Find the LLIR producing node for an output tensor.
     fn find_producer_node(&self, id: impl ToId) -> NodeIndex {
         let id = id.to_id();
-        let output_id = self
+        let bucket = self.active();
+        let output_id = bucket
             .llir_graph
             .node_indices()
             .find(|n| {
-                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
+                if let Some(Output { node }) = bucket.llir_graph[*n].to_op::<Output>() {
                     *node == id.index()
                 } else {
                     false
                 }
             })
             .expect("Cannot find output tensor!");
-        self.llir_graph
+        bucket
+            .llir_graph
             .neighbors_directed(output_id, Direction::Incoming)
             .next()
             .unwrap()
@@ -170,13 +224,14 @@ impl CudaRuntime {
     /// Follow `output_aliases_input` to find the node whose buffer actually contains
     /// the output data. For in-place ops, data lives in the aliased input's buffer.
     fn follow_aliases(&self, mut node: NodeIndex) -> NodeIndex {
-        while let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn KernelOp>()
+        let bucket = self.active();
+        while let Some(kernel_op) = bucket.llir_graph[node].to_dialect::<dyn KernelOp>()
             && let Some(input_idx) = kernel_op.output_aliases_input()
         {
-            node = self
+            node = bucket
                 .llir_graph
                 .neighbors_directed(node, Direction::Incoming)
-                .sorted_by_key(|n| self.llir_graph.find_edge(*n, node).unwrap())
+                .sorted_by_key(|n| bucket.llir_graph.find_edge(*n, node).unwrap())
                 .nth(input_idx)
                 .expect("output_aliases_input index out of range");
         }
@@ -191,13 +246,14 @@ impl CudaRuntime {
     /// For copy-then-modify ops (like Scatter), this traces through the copy source
     /// to the HLIR input, so the roundtrip correctly swaps the HLIR buffer.
     fn follow_data_lineage(&self, mut node: NodeIndex) -> NodeIndex {
-        while let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn KernelOp>()
+        let bucket = self.active();
+        while let Some(kernel_op) = bucket.llir_graph[node].to_dialect::<dyn KernelOp>()
             && let Some(input_idx) = kernel_op.output_data_input()
         {
-            node = self
+            node = bucket
                 .llir_graph
                 .neighbors_directed(node, Direction::Incoming)
-                .sorted_by_key(|n| self.llir_graph.find_edge(*n, node).unwrap())
+                .sorted_by_key(|n| bucket.llir_graph.find_edge(*n, node).unwrap())
                 .nth(input_idx)
                 .expect("output_data_input index out of range");
         }
@@ -214,10 +270,11 @@ impl CudaRuntime {
 
     fn get_output_data(&self, id: impl ToId) -> Vec<u8> {
         let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
 
         let _span = span!(Level::TRACE, "dtoh").entered();
         // If predecessor is an Input node, data lives in hlir_buffers
-        if let Some(hlir_node) = self.llir_to_hlir.get(&data_id) {
+        if let Some(hlir_node) = bucket.llir_to_hlir.get(&data_id) {
             match self
                 .hlir_buffers
                 .get(hlir_node)
@@ -236,7 +293,8 @@ impl CudaRuntime {
             // Predecessor is a computation node — data is in intermediate buffers
             self.cuda_stream
                 .clone_dtoh(
-                    self.buffers
+                    bucket
+                        .buffers
                         .get(&data_id)
                         .expect("Cannot find tensor in runtime!"),
                 )
@@ -268,38 +326,41 @@ impl CudaRuntime {
         let producer = self.find_producer_node(id);
         let alias_node = self.follow_aliases(producer);
         let lineage_node = self.follow_data_lineage(producer);
+        let bi = self.active_bucket;
 
         // If aliases and lineage agree, data is in-place — just remove the HLIR buffer.
         // If they differ, data is in an intermediate buffer (copy-then-modify) — swap.
         if alias_node == lineage_node {
             // In-place or direct HLIR: remove and return
-            if let Some(hlir_node) = self.llir_to_hlir.get(&lineage_node) {
+            let hlir_node = self.compiled_buckets[bi]
+                .llir_to_hlir
+                .get(&lineage_node)
+                .copied();
+            if let Some(hlir_node) = hlir_node {
                 match self
                     .hlir_buffers
-                    .remove(hlir_node)
+                    .remove(&hlir_node)
                     .expect("Cannot find input tensor in runtime!")
                 {
                     CudaInput::Buffer(buf) => buf,
                     CudaInput::Ptr(p) => panic!("Cannot take raw pointer input (ptr=0x{:x})", p),
                 }
             } else {
-                self.buffers
+                self.compiled_buckets[bi]
+                    .buffers
                     .remove(&lineage_node)
                     .expect("Cannot find tensor in runtime!")
             }
         } else {
             // Copy-then-modify: output data is in alias_node's buffer (intermediate),
             // but we want to extract the lineage HLIR buffer so intermediates stay intact.
-            // Swap: put the intermediate (with correct data) into HLIR, take the HLIR
-            // (stale data) and put it into the intermediate slot, then return the buffer
-            // we put into HLIR (which has the correct data).
-            let hlir_node = self
+            let hlir_node = *self.compiled_buckets[bi]
                 .llir_to_hlir
                 .get(&lineage_node)
                 .expect("output_data_input lineage must reach an HLIR input node");
 
             // Take the intermediate buffer (has the actual output data)
-            let output_buf = self
+            let output_buf = self.compiled_buckets[bi]
                 .buffers
                 .remove(&alias_node)
                 .expect("Cannot find intermediate output buffer in runtime!");
@@ -307,7 +368,7 @@ impl CudaRuntime {
             // Take the HLIR buffer (has stale pre-op data)
             let hlir_buf = match self
                 .hlir_buffers
-                .remove(hlir_node)
+                .remove(&hlir_node)
                 .expect("Cannot find HLIR input buffer in runtime!")
             {
                 CudaInput::Buffer(buf) => buf,
@@ -315,7 +376,9 @@ impl CudaRuntime {
             };
 
             // Put stale HLIR buffer into intermediate slot (keeps allocation alive)
-            self.buffers.insert(alias_node, hlir_buf);
+            self.compiled_buckets[bi]
+                .buffers
+                .insert(alias_node, hlir_buf);
 
             // Return the output buffer (has correct data)
             output_buf
@@ -368,33 +431,35 @@ impl CudaRuntime {
     pub fn swap_output_to_input(&mut self, output_id: impl ToId, input_id: impl ToId) {
         let output_id = output_id.to_id();
         let input_id = input_id.to_id();
+        let bi = self.active_bucket;
 
+        let bucket = &self.compiled_buckets[bi];
         // Find LLIR Output node for output_id
-        let output_llir_node = self
+        let output_llir_node = bucket
             .llir_graph
             .node_indices()
             .find(|n| {
-                self.llir_graph[*n]
+                bucket.llir_graph[*n]
                     .to_op::<Output>()
                     .is_some_and(|o| o.node == output_id.index())
             })
             .expect("Cannot find output node for swap!");
 
         // Get its data-producing predecessor
-        let data_llir_node = self
+        let data_llir_node = bucket
             .llir_graph
             .neighbors_directed(output_llir_node, Direction::Incoming)
             .next()
             .unwrap();
 
         // Get the LLIR node for the input
-        let input_llir_node = *self
+        let input_llir_node = *bucket
             .hlir_to_llir
             .get(&input_id)
             .expect("Cannot find input in LLIR mapping!");
 
         // Swap intermediate buffer <-> input buffer
-        let intermediate_buf = self
+        let intermediate_buf = self.compiled_buckets[bi]
             .buffers
             .get_mut(&data_llir_node)
             .expect("Output not in intermediate buffers");
@@ -409,54 +474,63 @@ impl CudaRuntime {
         }
 
         // Update cached pointer for the input
-        if let CudaInput::Buffer(buf) = &self.hlir_buffers[&input_id] {
-            self.cached_buffer_ptrs
-                .insert(input_llir_node, buf.device_ptr(&self.cuda_stream).0);
-        }
+        let ptr = match &self.hlir_buffers[&input_id] {
+            CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
+            CudaInput::Ptr(p) => *p,
+        };
+        self.compiled_buckets[bi]
+            .cached_buffer_ptrs
+            .insert(input_llir_node, ptr);
     }
 
     /// Free all intermediate buffers to reclaim GPU memory.
     /// They will be re-allocated on the next `execute()` call.
     pub fn free_intermediate_buffers(&mut self) {
-        self.buffers.clear();
-        self.cached_buffer_ptrs.clear();
+        for bucket in &mut self.compiled_buckets {
+            bucket.buffers.clear();
+            bucket.cached_buffer_ptrs.clear();
+        }
     }
 
     #[tracing::instrument(skip_all)]
-    fn allocate_intermediate_buffers(&mut self, dyn_dims: &FxHashMap<char, usize>) {
-        let is_first_alloc = self.buffers.is_empty();
+    fn allocate_intermediate_buffers(
+        bucket: &mut CompiledBucket,
+        stream: &Arc<CudaStream>,
+        dyn_dims: &FxHashMap<char, usize>,
+    ) {
+        let is_first_alloc = bucket.buffers.is_empty();
 
         // Only sync if we might need to free/reallocate buffers
         if is_first_alloc {
-            self.cuda_stream.synchronize().unwrap();
+            stream.synchronize().unwrap();
         }
 
-        self.intermediate_buffer_dims.clear();
+        bucket.intermediate_buffer_dims.clear();
         let mut total_alloc: usize = 0;
         let mut realloc_count: usize = 0;
-        for node in self.llir_graph.node_indices().collect_vec() {
-            if self.llir_graph[node].to_op::<Input>().is_some() {
+        for node in bucket.llir_graph.node_indices().collect_vec() {
+            if bucket.llir_graph[node].to_op::<Input>().is_some() {
                 continue;
             }
-            let needed_bytes = if let Some(op) = self.llir_graph[node].to_dialect::<dyn KernelOp>()
-            {
-                let out_bytes = op.output_bytes();
-                self.intermediate_buffer_dims.extend(out_bytes.dyn_vars());
-                out_bytes.exec(dyn_dims).unwrap()
-            } else if let Some(op) = self.llir_graph[node].to_dialect::<dyn HostOp>() {
-                let out_bytes = op.output_bytes();
-                self.intermediate_buffer_dims.extend(out_bytes.dyn_vars());
-                out_bytes.exec(dyn_dims).unwrap()
-            } else {
-                continue;
-            };
+            let needed_bytes =
+                if let Some(op) = bucket.llir_graph[node].to_dialect::<dyn KernelOp>() {
+                    let out_bytes = op.output_bytes();
+                    bucket.intermediate_buffer_dims.extend(out_bytes.dyn_vars());
+                    out_bytes.exec(dyn_dims).unwrap()
+                } else if let Some(op) = bucket.llir_graph[node].to_dialect::<dyn HostOp>() {
+                    let out_bytes = op.output_bytes();
+                    bucket.intermediate_buffer_dims.extend(out_bytes.dyn_vars());
+                    out_bytes.exec(dyn_dims).unwrap()
+                } else {
+                    continue;
+                };
 
             if needed_bytes == 0 {
                 continue;
             }
 
             // Only allocate/reallocate if we don't have a buffer or existing one is too small
-            let existing_len = self.buffers.get(&node).map(|b| b.len()).unwrap_or(0);
+            let existing_len = bucket.buffers.get(&node).map(|b| b.len()).unwrap_or(0);
             if existing_len >= needed_bytes {
                 continue; // Existing buffer is large enough, reuse it
             }
@@ -464,10 +538,11 @@ impl CudaRuntime {
             // Need to allocate (or reallocate)
             total_alloc += needed_bytes;
             realloc_count += 1;
-            self.buffers
-                .insert(node, self.cuda_stream.alloc_zeros(needed_bytes).unwrap());
-            let ptr = self.buffers[&node].device_ptr(&self.cuda_stream).0;
-            self.cached_buffer_ptrs.insert(node, ptr);
+            bucket
+                .buffers
+                .insert(node, stream.alloc_zeros(needed_bytes).unwrap());
+            let ptr = bucket.buffers[&node].device_ptr(stream).0;
+            bucket.cached_buffer_ptrs.insert(node, ptr);
         }
         let _ = (realloc_count, total_alloc);
     }
@@ -476,32 +551,46 @@ impl CudaRuntime {
     /// CUDA graph building is handled internally by CudaGraphOp on first execution.
     #[tracing::instrument(skip_all)]
     pub fn prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) {
+        let bucket = &mut self.compiled_buckets[self.active_bucket];
         // 1. Allocate intermediate buffers (needed for buffer pointers)
-        if self.buffers.is_empty() {
-            self.last_dyn_map = dyn_map.clone();
-            self.allocate_intermediate_buffers(dyn_map);
+        if bucket.buffers.is_empty() {
+            bucket.last_dyn_map = dyn_map.clone();
+            Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
         }
 
         // 2. Process changed HLIR inputs to get their buffer pointers
-        if !self.changed_hlir.is_empty() {
+        if !self.changed_hlir.is_empty() || !bucket.hlir_synced {
             let to_process: Vec<(NodeIndex, NodeIndex, u64)> = self
                 .changed_hlir
                 .iter()
+                .chain(
+                    // On first sync for this bucket, process ALL hlir keys
+                    if !bucket.hlir_synced {
+                        self.hlir_buffers.keys().collect::<Vec<_>>()
+                    } else {
+                        vec![]
+                    }
+                    .into_iter(),
+                )
                 .filter_map(|hlir_node| {
-                    self.hlir_buffers.get(hlir_node).map(|input| {
-                        let llir_node = self.hlir_to_llir[hlir_node];
-                        let ptr = match input {
-                            CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
-                            CudaInput::Ptr(p) => *p,
-                        };
-                        (*hlir_node, llir_node, ptr)
-                    })
+                    let llir_node = bucket.hlir_to_llir.get(hlir_node)?;
+                    let input = self.hlir_buffers.get(hlir_node)?;
+                    let ptr = match input {
+                        CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
+                        CudaInput::Ptr(p) => *p,
+                    };
+                    Some((*hlir_node, *llir_node, ptr))
                 })
                 .collect();
 
-            for (hlir_node, llir_node, ptr) in to_process {
-                self.cached_buffer_ptrs.insert(llir_node, ptr);
-                self.changed_hlir.remove(&hlir_node);
+            for (_hlir_node, llir_node, ptr) in to_process {
+                bucket.cached_buffer_ptrs.insert(llir_node, ptr);
+            }
+            bucket.hlir_synced = true;
+            // Only clear changed_hlir if there's a single bucket
+            // (multi-bucket: other buckets may still need these changes)
+            if self.compiled_buckets.len() == 1 {
+                self.changed_hlir.clear();
             }
         }
 
@@ -603,23 +692,16 @@ impl Runtime for CudaRuntime {
     fn initialize(stream: Self::CompileArg) -> Self {
         Self {
             hlir_buffers: FxHashMap::default(),
-            buffers: FxHashMap::default(),
             cuda_stream: stream,
-            llir_graph: StableGraph::default(),
-            exec_graph: StableGraph::default(),
-            node_to_exec: FxHashMap::default(),
-            hlir_to_llir: FxHashMap::default(),
-            llir_to_hlir: FxHashMap::default(),
             changed_hlir: FxHashSet::default(),
-            cached_buffer_ptrs: FxHashMap::default(),
             cuda_graph_timings: vec![],
-            last_dyn_map: FxHashMap::default(),
-            intermediate_buffer_dims: FxHashSet::default(),
             last_kernel_stats: vec![],
             last_total_time_us: 0.0,
             kernel_cache: FxHashMap::default(),
             profiling: false,
-            output_alias_map: FxHashMap::default(),
+            compiled_buckets: vec![CompiledBucket::new()],
+            active_bucket: 0,
+            dim_buckets: FxHashMap::default(),
         }
     }
 
@@ -628,19 +710,8 @@ impl Runtime for CudaRuntime {
         // Sync before clearing old data to ensure all operations complete
         let _ = self.cuda_stream.synchronize();
 
-        // exec_graph entries are ExecutableHostOp which are dropped automatically
-
-        // Clear intermediate buffers when loading new graph - they need to be
-        // reallocated and re-registered with the new work_queue
-        self.buffers.clear();
-        self.cached_buffer_ptrs.clear();
-        // Mark all HLIR inputs as changed so their pointers get re-cached in execute
-        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
-        self.exec_graph.clear();
-
         // Sync after clearing all buffers to ensure CUDA resources are freed
         if let Err(e) = self.cuda_stream.synchronize() {
-            // Context may be corrupted from a previous CUDA error — try to recover
             let _ = self.cuda_stream.context().bind_to_thread();
             if self.cuda_stream.synchronize().is_err() {
                 panic!("CUDA context unrecoverable after sync error: {e}");
@@ -650,100 +721,18 @@ impl Runtime for CudaRuntime {
         // Rebind CUDA context to thread after cleanup to ensure valid state
         let _ = self.cuda_stream.context().bind_to_thread();
 
-        let mut exec_graph = StableGraph::default();
-        let mut node_to_exec = FxHashMap::default();
+        let bucket = self.compile_bucket(llir_graph);
+        self.compiled_buckets = vec![bucket];
+        self.active_bucket = 0;
+        self.dim_buckets.clear();
 
-        // Clone llir_graph so we can modify it
-        let mut llir_graph = llir_graph.clone();
-
-        // Compile kernel subgraphs into CudaGraphOps (which implement HostOp)
-        // This adds CudaGraphOp nodes to llir_graph and removes the original kernel nodes.
-        // After this, only HostOps remain in the llir_graph.
-        crate::kernel::kernel_to_host(&mut llir_graph, &self.cuda_stream, &mut self.kernel_cache);
-
-        // Build output alias map: for KernelOps with output_aliases_input(),
-        // map the output node to its aliased input node. This is used to resolve
-        // cross-CudaGraphOp buffer references where the allocated output buffer
-        // is never written to (the kernel writes to the aliased input instead).
-        self.output_alias_map.clear();
-        for node in llir_graph.node_indices() {
-            if let Some(kernel_op) = llir_graph[node].to_dialect::<dyn KernelOp>()
-                && let Some(input_idx) = kernel_op.output_aliases_input()
-            {
-                let alias_target = llir_graph
-                    .edges_directed(node, Direction::Incoming)
-                    .sorted_by_key(|e| e.id())
-                    .map(|e| e.source())
-                    .nth(input_idx);
-                if let Some(target) = alias_target {
-                    self.output_alias_map.insert(node, target);
-                }
-            }
-        }
-
-        // Add host ops
-        {
-            let _span = span!(Level::TRACE, "compile_host_ops").entered();
-            for host_op_node_index in llir_graph.node_indices() {
-                if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
-                    let inputs = llir_graph
-                        .edges_directed(host_op_node_index, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect_vec();
-                    node_to_exec.insert(
-                        host_op_node_index,
-                        exec_graph.add_node(ExecutableHostOp {
-                            stream: Arc::clone(&self.cuda_stream),
-                            inputs,
-                            output: host_op_node_index,
-                            internal: Arc::clone(host_op),
-                        }),
-                    );
-                }
-            }
-        }
-
-        // Add edges
-        for edge in llir_graph.edge_indices() {
-            let (start, end) = llir_graph.edge_endpoints(edge).unwrap();
-            if !node_to_exec.contains_key(&start) || !node_to_exec.contains_key(&end) {
-                continue;
-            }
-            let (exec_start, exec_end) = (node_to_exec[&start], node_to_exec[&end]);
-            if exec_start != exec_end
-                && exec_graph
-                    .edges_connecting(exec_start, exec_end)
-                    .next()
-                    .is_none()
-            {
-                exec_graph.add_edge(exec_start, exec_end, ());
-            }
-        }
-
-        self.exec_graph = exec_graph;
-        self.llir_graph = llir_graph.clone();
-        self.node_to_exec = node_to_exec;
-        self.hlir_to_llir.clear();
-        self.llir_to_hlir.clear();
-        self.changed_hlir.clear();
-        let input_nodes: Vec<_> = self
-            .llir_graph
-            .node_indices()
-            .filter_map(|n| self.llir_graph[n].to_op::<Input>().map(|op| (op.node, n)))
-            .collect_vec();
-        for (hlir_node, llir_node) in input_nodes {
-            self.llir_to_hlir
-                .insert(llir_node, NodeIndex::new(hlir_node));
-            self.hlir_to_llir
-                .insert(NodeIndex::new(hlir_node), llir_node);
-            self.changed_hlir.insert(NodeIndex::new(hlir_node));
-        }
+        // Mark all HLIR inputs as changed so their pointers get re-cached in execute
+        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
 
         // Prebuild CUDA graphs if we have a previous dyn_map (e.g., from search/profile)
-        // This avoids rebuild overhead on first execute after load_llir
-        if !self.last_dyn_map.is_empty() {
-            let dyn_map = self.last_dyn_map.clone();
+        let bucket = &self.compiled_buckets[0];
+        if !bucket.last_dyn_map.is_empty() {
+            let dyn_map = bucket.last_dyn_map.clone();
             self.prebuild_graphs(&dyn_map);
         }
     }
@@ -768,17 +757,23 @@ impl Runtime for CudaRuntime {
 
     fn clear_intermediate_buffers(&mut self) {
         let _ = self.cuda_stream.synchronize();
-        self.buffers.clear();
-        self.cached_buffer_ptrs.clear();
+        for bucket in &mut self.compiled_buckets {
+            bucket.buffers.clear();
+            bucket.cached_buffer_ptrs.clear();
+        }
     }
 
     fn intermediate_buffer_bytes(&self) -> usize {
-        self.buffers.values().map(|b| b.len()).sum()
+        self.compiled_buckets
+            .iter()
+            .map(|b| b.buffers.values().map(|buf| buf.len()).sum::<usize>())
+            .sum()
     }
 
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         let _ = self.cuda_stream.synchronize();
-        for buf in self.buffers.values() {
+        let bucket = self.active();
+        for buf in bucket.buffers.values() {
             let n_bytes = buf.len();
             if n_bytes == 0 || n_bytes % 4 != 0 {
                 continue;
@@ -802,7 +797,10 @@ impl Runtime for CudaRuntime {
         dyn_map: &FxHashMap<char, usize>,
         _trials: usize,
     ) -> (Self::ProfileMetric, String) {
-        self.buffers.clear();
+        // Clear active bucket's buffers before loading new LLIR for profiling
+        if !self.compiled_buckets.is_empty() {
+            self.active_mut().buffers.clear();
+        }
         self.load_llir(llir_graph);
         self.profiling = true;
         let start = std::time::Instant::now();
@@ -856,22 +854,42 @@ impl Runtime for CudaRuntime {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
-        let buffers_empty = self.buffers.is_empty();
-        let dyn_map_len_changed = dyn_map.len() != self.last_dyn_map.len();
+        // Dispatch to correct bucket if multi-bucket mode
+        if self.compiled_buckets.len() > 1 {
+            let idx = self.resolve_bucket(dyn_map);
+            if idx != self.active_bucket {
+                // Free the old bucket's intermediates to avoid holding 2 full sets in GPU memory
+                let old = self.active_bucket;
+                self.compiled_buckets[old].buffers.clear();
+                self.compiled_buckets[old].cached_buffer_ptrs.clear();
+                self.active_bucket = idx;
+                // Mark bucket as needing HLIR sync since it may have missed changes
+                self.compiled_buckets[idx].hlir_synced = false;
+            }
+        }
+
+        let bucket = &mut self.compiled_buckets[self.active_bucket];
+        let buffers_empty = bucket.buffers.is_empty();
+        let dyn_map_len_changed = dyn_map.len() != bucket.last_dyn_map.len();
         let dyn_dims_changed = dyn_map
             .iter()
-            .filter(|(d, _)| self.intermediate_buffer_dims.contains(*d))
-            .any(|(d, v)| self.last_dyn_map.get(d).map(|n| *n != *v).unwrap_or(true));
+            .filter(|(d, _)| bucket.intermediate_buffer_dims.contains(*d))
+            .any(|(d, v)| bucket.last_dyn_map.get(d).map(|n| *n != *v).unwrap_or(true));
         let needs_realloc = buffers_empty || dyn_map_len_changed || dyn_dims_changed;
         if needs_realloc {
-            self.last_dyn_map = dyn_map.clone();
-            self.allocate_intermediate_buffers(dyn_map);
+            bucket.last_dyn_map = dyn_map.clone();
+            Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
         }
         // Cache HLIR input pointers
-        if !self.changed_hlir.is_empty() {
-            for hlir_node in self.changed_hlir.clone() {
-                // Skip HLIR nodes not present in the current LLIR graph (e.g., from other chunks)
-                let Some(&llir_node) = self.hlir_to_llir.get(&hlir_node) else {
+        if !self.changed_hlir.is_empty() || !bucket.hlir_synced {
+            let hlir_nodes: Vec<NodeIndex> = if !bucket.hlir_synced {
+                // First time this bucket is active since HLIR changed — sync all
+                self.hlir_buffers.keys().copied().collect()
+            } else {
+                self.changed_hlir.iter().copied().collect()
+            };
+            for hlir_node in hlir_nodes {
+                let Some(&llir_node) = bucket.hlir_to_llir.get(&hlir_node) else {
                     continue;
                 };
                 let Some(input) = self.hlir_buffers.get(&hlir_node) else {
@@ -881,32 +899,37 @@ impl Runtime for CudaRuntime {
                     CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
                     CudaInput::Ptr(p) => *p,
                 };
-                self.cached_buffer_ptrs.insert(llir_node, ptr);
+                bucket.cached_buffer_ptrs.insert(llir_node, ptr);
             }
-            self.changed_hlir.clear();
+            bucket.hlir_synced = true;
+            // Only clear changed_hlir if single bucket (multi-bucket: others may need it)
+            if self.compiled_buckets.len() == 1 {
+                self.changed_hlir.clear();
+            }
         }
         // Ensure all CUDA graphs are built (handles first execute and any missing graphs)
         self.prebuild_graphs(dyn_map);
 
         let total_start = std::time::Instant::now();
+        let bucket = &self.compiled_buckets[self.active_bucket];
 
-        for exec_node in toposort(&self.exec_graph, None).unwrap() {
-            let exec_op = &self.exec_graph[exec_node];
+        for exec_node in toposort(&bucket.exec_graph, None).unwrap() {
+            let exec_op = &bucket.exec_graph[exec_node];
             trace!("Executing: {:?}", exec_op);
 
             // Build buffer map for the HostOp interface
             let mut buffer_map: FxHashMap<NodeIndex, &CudaSlice<u8>> = FxHashMap::default();
             // Add output buffer
-            if let Some(buf) = self.buffers.get(&exec_op.output) {
+            if let Some(buf) = bucket.buffers.get(&exec_op.output) {
                 buffer_map.insert(exec_op.output, buf);
             }
             // Add input buffers (prefer HLIR weight buffers over intermediate placeholders)
             for inp in exec_op.inputs.iter() {
-                if let Some(hlir_node) = self.llir_to_hlir.get(inp)
+                if let Some(hlir_node) = bucket.llir_to_hlir.get(inp)
                     && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
                 {
                     buffer_map.insert(*inp, buf);
-                } else if let Some(buf) = self.buffers.get(inp) {
+                } else if let Some(buf) = bucket.buffers.get(inp) {
                     buffer_map.insert(*inp, buf);
                 }
             }
@@ -914,28 +937,25 @@ impl Runtime for CudaRuntime {
             let extra_nodes = exec_op.internal.extra_buffer_nodes();
             for extra_node in extra_nodes {
                 if let Entry::Vacant(e) = buffer_map.entry(extra_node) {
-                    if let Some(buf) = self.buffers.get(&extra_node) {
+                    if let Some(buf) = bucket.buffers.get(&extra_node) {
                         e.insert(buf);
-                    } else if let Some(hlir_node) = self.llir_to_hlir.get(&extra_node)
+                    } else if let Some(hlir_node) = bucket.llir_to_hlir.get(&extra_node)
                         && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
                     {
                         e.insert(buf);
                     }
                 }
             }
-            // Resolve output aliases: for KernelOps with output_aliases_input(),
-            // the allocated output buffer is never written — data lives in the aliased
-            // input's buffer. Override the buffer_map entry so cross-CudaGraphOp consumers
-            // read from the correct location.
-            for (&alias_node, &alias_target) in &self.output_alias_map {
+            // Resolve output aliases
+            for (&alias_node, &alias_target) in &bucket.output_alias_map {
                 if let std::collections::hash_map::Entry::Occupied(mut e) =
                     buffer_map.entry(alias_node)
                 {
-                    if let Some(hlir_node) = self.llir_to_hlir.get(&alias_target)
+                    if let Some(hlir_node) = bucket.llir_to_hlir.get(&alias_target)
                         && let Some(CudaInput::Buffer(buf)) = self.hlir_buffers.get(hlir_node)
                     {
                         e.insert(buf);
-                    } else if let Some(buf) = self.buffers.get(&alias_target) {
+                    } else if let Some(buf) = bucket.buffers.get(&alias_target) {
                         e.insert(buf);
                     }
                 }
@@ -968,8 +988,9 @@ impl Runtime for CudaRuntime {
 
         // Populate last_kernel_stats from HostOps that report stats
         self.last_kernel_stats.clear();
-        for exec_node in self.exec_graph.node_indices() {
-            let exec_op = &self.exec_graph[exec_node];
+        let bucket = &self.compiled_buckets[self.active_bucket];
+        for exec_node in bucket.exec_graph.node_indices() {
+            let exec_op = &bucket.exec_graph[exec_node];
             if let Some(name) = exec_op.internal.stats_name() {
                 self.last_kernel_stats.push(KernelStats {
                     name,
@@ -988,40 +1009,48 @@ impl Runtime for CudaRuntime {
             .synchronize()
             .expect("Final sync failed in execute");
 
-        // Consume input buffers: inputs are always consumed after execute, UNLESS
-        // they are directly followed by an Output node (which preserves them for retrieval
-        // and reuse across runs). This means weight tensors must have .persist() to survive.
-        // Skip consumption during profiling/search to preserve inputs across profile iterations.
+        // Consume input buffers
         if self.profiling {
             return;
         }
-        let mut inputs_with_outputs: FxHashSet<NodeIndex> = self
+        let bucket = &self.compiled_buckets[self.active_bucket];
+        let mut inputs_with_outputs: FxHashSet<NodeIndex> = bucket
             .llir_graph
             .node_indices()
-            .filter(|n| self.llir_graph[*n].to_op::<Output>().is_some())
+            .filter(|n| bucket.llir_graph[*n].to_op::<Output>().is_some())
             .filter_map(|output_node| {
-                self.llir_graph
+                bucket
+                    .llir_graph
                     .neighbors_directed(output_node, Direction::Incoming)
                     .next()
-                    .and_then(|pred| self.llir_to_hlir.get(&pred).copied())
+                    .and_then(|pred| bucket.llir_to_hlir.get(&pred).copied())
             })
             .collect();
-        // Also preserve alias targets: if a scatter output has .output(), the aliased
-        // input buffer must survive so remove_buffer can retrieve it.
-        let alias_preserved: Vec<NodeIndex> = self
+        let alias_preserved: Vec<NodeIndex> = bucket
             .llir_graph
             .node_indices()
-            .filter(|n| self.llir_graph[*n].to_op::<Output>().is_some())
+            .filter(|n| bucket.llir_graph[*n].to_op::<Output>().is_some())
             .filter_map(|output_node| {
-                let pred = self
+                let pred = bucket
                     .llir_graph
                     .neighbors_directed(output_node, Direction::Incoming)
                     .next()?;
-                let alias_target = self.output_alias_map.get(&pred)?;
-                self.llir_to_hlir.get(alias_target).copied()
+                let alias_target = bucket.output_alias_map.get(&pred)?;
+                bucket.llir_to_hlir.get(alias_target).copied()
             })
             .collect();
         inputs_with_outputs.extend(alias_preserved);
+
+        // For multi-bucket: also preserve inputs needed by other buckets
+        if self.compiled_buckets.len() > 1 {
+            for (i, other_bucket) in self.compiled_buckets.iter().enumerate() {
+                if i == self.active_bucket {
+                    continue;
+                }
+                // Preserve all HLIR nodes that other buckets reference
+                inputs_with_outputs.extend(other_bucket.hlir_to_llir.keys());
+            }
+        }
 
         let to_consume: Vec<NodeIndex> = self
             .hlir_buffers
@@ -1032,14 +1061,157 @@ impl Runtime for CudaRuntime {
 
         for hlir_node in to_consume {
             self.hlir_buffers.remove(&hlir_node);
-            if let Some(llir_node) = self.hlir_to_llir.get(&hlir_node) {
-                self.cached_buffer_ptrs.remove(llir_node);
+            let bucket = &mut self.compiled_buckets[self.active_bucket];
+            if let Some(llir_node) = bucket.hlir_to_llir.get(&hlir_node) {
+                bucket.cached_buffer_ptrs.remove(llir_node);
             }
         }
+    }
+
+    fn load_llir_buckets(
+        &mut self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_llirs: &[BucketLLIR],
+    ) {
+        // Sync before clearing old data
+        let _ = self.cuda_stream.synchronize();
+        let _ = self.cuda_stream.context().bind_to_thread();
+
+        self.dim_buckets = dim_buckets.clone();
+        self.compiled_buckets.clear();
+
+        for (bucket_indices, representative_dyn_map, llir) in bucket_llirs {
+            let mut bucket = self.compile_bucket(llir);
+            bucket.bucket_indices = bucket_indices.clone();
+            // Eagerly allocate intermediate buffers using the representative dyn_map
+            bucket.last_dyn_map = representative_dyn_map.clone();
+            Self::allocate_intermediate_buffers(
+                &mut bucket,
+                &self.cuda_stream,
+                representative_dyn_map,
+            );
+            self.compiled_buckets.push(bucket);
+        }
+        self.active_bucket = 0;
+
+        // Mark all HLIR inputs as changed so their pointers get re-cached
+        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
     }
 }
 
 impl CudaRuntime {
+    /// Compile a single LLIR graph into a CompiledBucket.
+    fn compile_bucket(&mut self, llir_graph: &LLIRGraph) -> CompiledBucket {
+        let mut bucket = CompiledBucket::new();
+        let mut exec_graph = StableGraph::default();
+        let mut node_to_exec = FxHashMap::default();
+
+        // Clone llir_graph so we can modify it
+        let mut llir_graph = llir_graph.clone();
+
+        // Compile kernel subgraphs into CudaGraphOps (which implement HostOp)
+        crate::kernel::kernel_to_host(&mut llir_graph, &self.cuda_stream, &mut self.kernel_cache);
+
+        // Build output alias map
+        for node in llir_graph.node_indices() {
+            if let Some(kernel_op) = llir_graph[node].to_dialect::<dyn KernelOp>()
+                && let Some(input_idx) = kernel_op.output_aliases_input()
+            {
+                let alias_target = llir_graph
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .map(|e| e.source())
+                    .nth(input_idx);
+                if let Some(target) = alias_target {
+                    bucket.output_alias_map.insert(node, target);
+                }
+            }
+        }
+
+        // Add host ops
+        {
+            let _span = span!(Level::TRACE, "compile_host_ops").entered();
+            for host_op_node_index in llir_graph.node_indices() {
+                if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
+                    let inputs = llir_graph
+                        .edges_directed(host_op_node_index, Direction::Incoming)
+                        .sorted_by_key(|e| e.id())
+                        .map(|e| e.source())
+                        .collect_vec();
+                    node_to_exec.insert(
+                        host_op_node_index,
+                        exec_graph.add_node(ExecutableHostOp {
+                            stream: Arc::clone(&self.cuda_stream),
+                            inputs,
+                            output: host_op_node_index,
+                            internal: Arc::clone(host_op),
+                        }),
+                    );
+                }
+            }
+        }
+
+        // Add edges
+        for edge in llir_graph.edge_indices() {
+            let (start, end) = llir_graph.edge_endpoints(edge).unwrap();
+            if !node_to_exec.contains_key(&start) || !node_to_exec.contains_key(&end) {
+                continue;
+            }
+            let (exec_start, exec_end) = (node_to_exec[&start], node_to_exec[&end]);
+            if exec_start != exec_end
+                && exec_graph
+                    .edges_connecting(exec_start, exec_end)
+                    .next()
+                    .is_none()
+            {
+                exec_graph.add_edge(exec_start, exec_end, ());
+            }
+        }
+
+        bucket.exec_graph = exec_graph;
+        bucket.node_to_exec = node_to_exec;
+
+        // Build HLIR<->LLIR mappings
+        let input_nodes: Vec<_> = llir_graph
+            .node_indices()
+            .filter_map(|n| llir_graph[n].to_op::<Input>().map(|op| (op.node, n)))
+            .collect_vec();
+        for (hlir_node, llir_node) in input_nodes {
+            bucket
+                .llir_to_hlir
+                .insert(llir_node, NodeIndex::new(hlir_node));
+            bucket
+                .hlir_to_llir
+                .insert(NodeIndex::new(hlir_node), llir_node);
+        }
+
+        bucket.llir_graph = llir_graph;
+        bucket.hlir_synced = false;
+        bucket
+    }
+
+    /// Resolve which bucket matches the current dyn_map values.
+    fn resolve_bucket(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+        self.compiled_buckets
+            .iter()
+            .position(|bucket| {
+                self.dim_buckets.iter().all(|(dim, buckets)| {
+                    let val = dyn_map.get(dim).copied().unwrap_or(0);
+                    let bucket_idx = bucket.bucket_indices.get(dim).copied().unwrap_or(0);
+                    buckets
+                        .get(bucket_idx)
+                        .map(|b| b.contains(val))
+                        .unwrap_or(true)
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "No bucket matches dyn_map {:?}. Defined buckets: {:?}",
+                    dyn_map, self.dim_buckets
+                )
+            })
+    }
+
     /// Print execution statistics for the last execution.
     pub fn print_execution_stats(&self) {
         if self.last_kernel_stats.is_empty() {

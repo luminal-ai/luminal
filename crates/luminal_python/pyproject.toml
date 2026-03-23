@@ -1,0 +1,32 @@
+[project]
+name = "luminal_python"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0.2",
+    "torch>=2.10.0",
+    "onnx",
+    "onnxscript"
+]
+
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "src"
+manifest-path = "rust/Cargo.toml"
+
+[dependency-groups]
+dev = [
+    "maturin>=1.0,<2.0",
+    "pytest>=9.0.2",
+    "maturin-import-hook>=0.3.0",
+    "pytest-randomly>=4.0.1",
+    "transformers>=4.40.0",
+    "diffusers>=0.35.0",
+    "onnxsim",
+]

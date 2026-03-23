@@ -337,6 +337,13 @@ impl ShapeTracker {
         self.strides.remove(axis1 + 1);
     }
 
+    /// Flatten all dimensions into a single dimension by iteratively merging.
+    pub fn flatten(&mut self) {
+        while self.dims.len() > 1 {
+            self.merge_dims(0, 1);
+        }
+    }
+
     /// Split a dim into 2 dims, new dim is placed directly after original dim
     pub fn split_dims(&mut self, axis: usize, new_dim_size: impl Into<Expression>) {
         let new_dim_size = new_dim_size.into();

@@ -50,6 +50,7 @@ members = [
     "crates/luminal_metal",
     "crates/luminal_tracing",
     "crates/luminal_bench",
+    "crates/luminal_python/rust",
 ]
 
 [patch.crates-io]

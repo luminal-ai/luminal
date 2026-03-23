@@ -22,3 +22,14 @@ tokenizer.json
 **/.cache
 **/proptest-regressions
 opencode.json
+
+# Python build artifacts
+*.so
+*.pyd
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+uv.lock

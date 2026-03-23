@@ -209,10 +209,21 @@ fn main() {
     }
 
     println!("Compiling...");
-    // Search at s=4, c=4 so the search can see the memory cost of KernelMul
-    // matmul intermediates (which scale linearly with s and would OOM at large s).
-    let search_s = 1;
-    let search_c = 1;
+    // Bucket s=1 (decode) vs s>1 (prefill/mixed). Each bucket gets its own
+    // optimized compilation — decode can select warp-parallel kernels while
+    // prefill can select tiled matmul / cuBLAS.
+    let max_prefill = (tokens_a.len().max(tokens_b.len()) + 16).next_power_of_two();
+    cx.set_dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(16),
+        ],
+    );
+
+    // Dummy data sized for the largest representative (s=16, c=16)
+    let search_s = 16;
+    let search_c = 16;
     cx.set_dim('s', search_s);
     cx.set_dim('c', search_c);
     runtime.set_data(input, vec![1i32; search_s]);

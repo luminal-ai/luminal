@@ -1,0 +1,68 @@
+; Batch-merge: collapse outermost two dims when B is contiguous, A is broadcast
+; [d0, d1, ...] → [d0*d1, ...] via direct union
+;
+; Symmetric case of batch_merge_a_contig:
+;   - B's outermost stride is contiguous: b_stride[0] = b_stride[1] * dim[1]
+;   - A is broadcast on both leading dims: a_stride[0] = 0, a_stride[1] = 0
+;   - Output strides are contiguous on the leading dims
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?sum_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        ; Sum shape has >= 3 dims
+        (= ?sum_shape (ECons ?sd0 (ECons ?sd1 ?rest_sum_shape)))
+        (!= ?rest_sum_shape (ENil))
+
+        ; Mul shape
+        (= ?mul_shape (ECons ?d0 (ECons ?d1 ?rest_mul_shape)))
+
+        ; A strides: broadcast on both leading dims
+        (= ?a_stride (ECons (MNum 0) (ECons (MNum 0) ?rest_as)))
+
+        ; B strides: b_s0 = b_s1 * d1 (contiguous)
+        (= ?b_stride (ECons ?bs0 (ECons ?bs1 ?rest_bs)))
+        (= ?bs0 (MMul ?bs1 ?d1))
+
+        ; Mul output strides: contiguous (os0 = os1 * d1)
+        (= ?mul_out_stride (ECons ?mos0 (ECons ?mos1 ?rest_mos)))
+        (= ?mos0 (MMul ?mos1 ?d1))
+
+        ; Sum input strides: contiguous leading
+        (= ?sum_in_stride (ECons ?sis0 (ECons ?sis1 ?rest_sis)))
+        (= ?sis0 (MMul ?sis1 ?sd1))
+
+        ; Sum output strides: contiguous leading
+        (= ?sum_out_stride (ECons ?sos0 (ECons ?sos1 ?rest_sos)))
+        (= ?sos0 (MMul ?sos1 ?sd1))
+
+        (= ?dt (dtype ?a))
+    )
+    (
+        ; Merged dimensions
+        (let ?new_d (MMul ?d0 ?d1))
+        (let ?new_sd (MMul ?sd0 ?sd1))
+
+        ; Collapsed Mul: merged leading dim, A uses 0, B uses bs1
+        (let ?new_mul (Op (Mul (ECons ?new_d ?rest_mul_shape)
+            (ECons (MNum 0) ?rest_as)
+            (ECons ?bs1 ?rest_bs)
+            (ECons ?mos1 ?rest_mos))
+            (ICons ?a (ICons ?b (INil)))))
+
+        ; Collapsed Sum
+        (let ?new_sum (Op (Sum (ECons ?new_sd ?rest_sum_shape)
+            ?k
+            (ECons ?sis1 ?rest_sis)
+            ?k_stride
+            (ECons ?sos1 ?rest_sos))
+            (ICons ?new_mul (INil))))
+
+        ; Direct union
+        (union ?sum ?new_sum)
+        (set (dtype ?new_mul) ?dt)
+        (set (dtype ?new_sum) ?dt)
+    )
+    :name "batch-collapse merge B-contiguous A-broadcast"
+)

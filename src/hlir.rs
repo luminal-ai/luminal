@@ -1608,6 +1608,7 @@ impl HLIROp for SumReduce {
         let reduced_stride = self.input_shape.strides[self.dim];
         let mut reduced_strides = self.input_shape.strides;
         reduced_strides.remove(self.dim);
+
         format!(
             "(Op (Sum {} {} {} {} {}) {})",
             elist_to_egglog(&reduced_shape.dims),
@@ -1631,7 +1632,18 @@ impl EgglogOp for SumReduce {
         1
     }
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+        vec![
+            dtype_propagation_op(&self.sort()),
+            // Batch-collapse rules: rewrite N-dim Mul+Sum → (N-1)-dim Mul+Sum
+            // so that 2D cuBLAS rules can match. Fires recursively.
+            Rule::raw(include_str!("egglog_utils/matmul_flattening/squeeze.egg")),
+            Rule::raw(include_str!(
+                "egglog_utils/matmul_flattening/batch_merge_a_contig.egg"
+            )),
+            Rule::raw(include_str!(
+                "egglog_utils/matmul_flattening/batch_merge_b_contig.egg"
+            )),
+        ]
     }
     fn extract<'a>(
         &'a self,
