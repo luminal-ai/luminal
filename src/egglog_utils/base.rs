@@ -6,6 +6,7 @@ use crate::shape::{self, ToShape};
 // ---- Sort classes (pub const) ----
 
 pub const IR: SortClass = SortClass::new("IR");
+pub const OP_KIND: SortClass = SortClass::new("OpKind");
 pub const ILIST: SortClass = SortClass::new("IList");
 pub const EXPRESSION: SortClass = SortClass::new("Expression");
 pub const ELIST: SortClass = SortClass::new("EList");
@@ -158,7 +159,7 @@ pub fn expr_to_term(expr: &shape::Expression) -> Term {
     let mut stack = Vec::new();
     for term in expr.terms.read().iter() {
         let t = match term {
-            shape::Term::Num(n) => num(i64(*n as i64)),
+            shape::Term::Num(n) => num(i64(*n)),
             shape::Term::Var(c) => mvar(str(&c.to_string())),
             op => {
                 let a = stack.pop().unwrap();
@@ -368,72 +369,57 @@ impl BaseSorts {
     }
 }
 
-/// Convenience accessors for common op sort patterns.
-pub struct OpSorts;
-
 pub fn dtype(e: Term) -> Term {
     app(&func("dtype", &["inp"]), vec![e])
 }
 
-impl Default for OpSorts {
-    fn default() -> Self {
-        Self::new()
+// ---- Normalized Op helpers ----
+
+/// Build an `(Op kind inputs)` IR term.
+pub fn op_term(kind: Term, inputs: Term) -> Term {
+    Term::App {
+        variant: "Op".to_string(),
+        args: vec![kind, inputs],
     }
 }
 
-impl OpSorts {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Unary op: (shape: EList, inp: IR, strides: EList, out_strides: EList)
-    pub fn unary(&self, name: &str) -> SortDef {
-        sort(
-            IR,
-            name,
-            &[
-                ("shape", ELIST),
-                ("inp", IR),
-                ("strides", ELIST),
-                ("out_strides", ELIST),
-            ],
-        )
-    }
-
-    /// Binary op: (shape: EList, inp_a: IR, a_strides: EList, inp_b: IR, b_strides: EList, out_strides: EList)
-    pub fn binary(&self, name: &str) -> SortDef {
-        sort(
-            IR,
-            name,
-            &[
-                ("shape", ELIST),
-                ("inp_a", IR),
-                ("a_strides", ELIST),
-                ("inp_b", IR),
-                ("b_strides", ELIST),
-                ("out_strides", ELIST),
-            ],
-        )
-    }
-
-    /// Reduce op: (shape: EList, iters: Expression, inp: IR, strides: EList, iter_stride: Expression, out_strides: EList)
-    pub fn reduce(&self, name: &str) -> SortDef {
-        sort(
-            IR,
-            name,
-            &[
-                ("shape", ELIST),
-                ("iters", EXPRESSION),
-                ("inp", IR),
-                ("strides", ELIST),
-                ("iter_stride", EXPRESSION),
-                ("out_strides", ELIST),
-            ],
-        )
-    }
+/// Build an IList from IR terms: `(ICons t1 (ICons t2 (INil)))`.
+pub fn ilist(terms: Vec<Term>) -> Term {
+    terms.into_iter().rev().fold(
+        Term::App {
+            variant: "INil".to_string(),
+            args: vec![],
+        },
+        |tail, head| Term::App {
+            variant: "ICons".to_string(),
+            args: vec![head, tail],
+        },
+    )
 }
 
-pub static OP_SORTS: LazyLock<OpSorts> = LazyLock::new(OpSorts::new);
+/// Construct a normalized Op call from an OpKind SortDef + named args + input terms.
+/// Returns (args, full_op_term) where the op_term is `(Op (XxxKind ...) (ICons ...))`.
+pub fn new_op_call(kind_sort: &SortDef, input_names: &[&str]) -> (Args, Term) {
+    let (mut args, kind_term) = kind_sort.new_call();
+    // Create variables for each input
+    let prefix = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!("inp{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+    };
+    let input_vars: Vec<Term> = input_names
+        .iter()
+        .map(|name| {
+            let var = v(format!("{prefix}_{name}"));
+            args.add(name, var.clone());
+            var
+        })
+        .collect();
+    let inputs_term = ilist(input_vars);
+    args.add("__inputs", inputs_term.clone());
+    let op = op_term(kind_term, inputs_term);
+    (args, op)
+}
 
 /// Generate the egglog program equivalent to `base.egg`.
 ///
@@ -457,9 +443,9 @@ pub fn base_expression_egglog() -> String {
     s.register(&mut p);
 
     // ---- Algebraic rewrites ----
-    // Commutativity: (MMul a b) -> (MMul b a)
-    p.add_rule(rewrite("add-comm", add(v("a"), v("b")), add(v("b"), v("a"))).ruleset("expr"));
+    // Commutativity
     p.add_rule(rewrite("mul-comm", mul(v("a"), v("b")), mul(v("b"), v("a"))).ruleset("expr"));
+    p.add_rule(rewrite("add-comm", add(v("a"), v("b")), add(v("b"), v("a"))).ruleset("expr"));
 
     // Constant folding: add
     p.add_rule(
@@ -512,6 +498,19 @@ pub fn base_expression_egglog() -> String {
         ])
         .ruleset("expr"),
     );
+
+    // Cancel common factor in division: (a*b)/(a*c) → b/c
+    p.add_rule(
+        rewrite(
+            "div-cancel-factor",
+            div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
+            div(v("b"), v("c")),
+        )
+        .ruleset("expr"),
+    );
+
+    // Division self-cancel: a/a → 1
+    p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
 
     // Constant folding: ceildiv
     p.add_rule(
@@ -918,7 +917,7 @@ pub fn base_expression_egglog() -> String {
             .ruleset("expr"),
     );
 
-    // RowMajor rules (z-strides: innermost stride is z, each outer stride is z * product_of_inner_dims)
+    // RowMajor rules (z-strides: base stride is MIter/'z', not 1)
     p.add_rule(
         Rule::new()
             .facts(vec![
@@ -929,7 +928,7 @@ pub fn base_expression_egglog() -> String {
             ])
             .action(Action::Union(
                 v("?e"),
-                cons(mul(v("?n_elems"), mvar(str("z"))), rowmajor(v("?other"))),
+                cons(mul(v("?n_elems"), iter()), rowmajor(v("?other"))),
             ))
             .ruleset("expr"),
     );
@@ -937,7 +936,7 @@ pub fn base_expression_egglog() -> String {
         rewrite(
             "rowmajor-base",
             rowmajor(cons(v("?dim"), nil())),
-            cons(mvar(str("z")), nil()),
+            cons(iter(), nil()),
         )
         .ruleset("expr"),
     );

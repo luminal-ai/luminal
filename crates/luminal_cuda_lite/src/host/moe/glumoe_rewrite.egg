@@ -1,0 +1,128 @@
+; GLUMoE: Match the expert computation subgraph of a Gated MoE (SwiGLU variant).
+;
+; This matches the pattern produced by QwenMoE::forward() starting from the
+; expert gathers through to the final weighted sum, and replaces it with a
+; fused GLUMoE HostOp.
+;
+; Inputs extracted:
+;   ?x            - input activations [s, H] F32
+;   ?topk_idx     - top-k expert indices [s, k] Int (from argsort+slice)
+;   ?topk_vals    - top-k routing values [s, k] F32 (from gather on softmax)
+;   ?gate_up_w    - stacked gate+up expert weights [E, intermediate*2, H] BF16
+;   ?down_w       - stacked down expert weights [E, H, intermediate] BF16
+;
+; The pattern captures:
+;   1. Gate-up expert gather (Iota, Mul, Cast, Iota, Cast, Add, Cast, Gather)
+;   2. Cast BF16→F32 of gathered gate-up weights
+;   3. Gate-up batched matmul (Mul + SumReduce)
+;   4. Gate/Up split via Iota+Gather (slice semantics)
+;   5. SwiGLU: silu(gate) * up
+;   6. Down expert gather (same pattern as gate-up)
+;   7. Cast BF16→F32 of gathered down weights
+;   8. Down batched matmul (Mul + SumReduce)
+;   9. Weighted sum: (down_out * topk_values) summed over k
+;
+; Variables with ? prefix are egglog pattern variables.
+; We use wildcards (?_xxx) for shapes/strides we don't extract.
+
+(rule
+    (
+        ; ===== Gate-up expert gather =====
+        ; t51: Iota for base index (expert_idx * io_gu)
+        (= ?gu_iota_base (Op (Iota ?gu_io ?gu_iota_base_range) (INil)))
+        ; t52: Mul topk_indices * io → base offsets [s, k]
+        (= ?gu_mul_base (Op (Mul ?gu_mul_base_shape ?gu_mul_base_a_stride ?gu_mul_base_b_stride ?gu_mul_base_out_stride) (ICons ?topk_idx (ICons ?gu_iota_base (INil)))))
+        ; t53: Cast to F32
+        (= ?gu_cast_base (Op (Cast ?gu_cast_base_size (F32)) (ICons ?gu_mul_base (INil))))
+        ; t54: Iota for within-expert index
+        (= ?gu_iota_within (Op (Iota (MIter) ?gu_iota_within_range) (INil)))
+        ; t55: Cast within to F32
+        (= ?gu_cast_within (Op (Cast ?gu_cast_within_size (F32)) (ICons ?gu_iota_within (INil))))
+        ; t56: Add base + within → flat gather indices
+        (= ?gu_add_idx (Op (Add ?gu_add_shape ?gu_add_a_stride ?gu_add_b_stride ?gu_add_out_stride) (ICons ?gu_cast_base (ICons ?gu_cast_within (INil)))))
+        ; t57: Cast to Int
+        (= ?gu_cast_idx (Op (Cast ?gu_cast_idx_size (Int)) (ICons ?gu_add_idx (INil))))
+        ; t58: Gather gate_up weights
+        (= ?gu_gathered (Op (Gather ?gu_gather_idx_shape ?gu_gather_idx_stride ?gu_gather_data_shape ?gu_gather_data_stride) (ICons ?gu_cast_idx (ICons ?gate_up_w (INil)))))
+
+        ; ===== Cast BF16→F32 =====
+        ; t59: Cast gathered gate_up to F32
+        (= ?gu_f32 (Op (Cast ?gu_f32_size (F32)) (ICons ?gu_gathered (INil))))
+
+        ; ===== Gate-up batched matmul =====
+        ; t60: Mul x * gathered_gu (broadcast multiply)
+        (= ?gu_matmul_mul (Op (Mul ?gu_matmul_mul_shape ?gu_matmul_a_stride ?gu_matmul_b_stride ?gu_matmul_mul_out_stride) (ICons ?x (ICons ?gu_f32 (INil)))))
+        ; t61: SumReduce over K dimension
+        (= ?gu_matmul (Op (Sum ?gu_matmul_out_shape ?gu_matmul_k ?gu_matmul_in_stride ?gu_matmul_k_stride ?gu_matmul_out_stride) (ICons ?gu_matmul_mul (INil))))
+
+        ; ===== Up slice via Iota+Gather =====
+        ; t62: Iota with complex expression (slicing the "up" half)
+        (= ?up_iota (Op (Iota ?up_iota_expr ?up_iota_range) (INil)))
+        ; t63: Gather to select up portion from matmul result
+        (= ?up_slice (Op (Gather ?up_gather_idx_shape ?up_gather_idx_stride ?up_gather_data_shape ?up_gather_data_stride) (ICons ?up_iota (ICons ?gu_matmul (INil)))))
+
+        ; ===== SwiGLU: silu(gate) * up =====
+        ; t64: Constant(-1)
+        (= ?neg1 (Op (Constant -1.000000) (INil)))
+        ; t65: gate * -1
+        (= ?neg_gate (Op (Mul ?silu_shape1 ?silu_a_stride1 ?silu_b_stride1 ?silu_out_stride1) (ICons ?gu_matmul (ICons ?neg1 (INil)))))
+        ; t66: Constant(log2e)
+        (= ?log2e (Op (Constant 1.442695) (INil)))
+        ; t67: neg_gate * log2e
+        (= ?scaled (Op (Mul ?silu_shape2 ?silu_a_stride2 ?silu_b_stride2 ?silu_out_stride2) (ICons ?neg_gate (ICons ?log2e (INil)))))
+        ; t68: exp2
+        (= ?exp2_val (Op (Exp2 ?silu_shape3 ?silu_in_stride3 ?silu_out_stride3) (ICons ?scaled (INil))))
+        ; t69: Constant(1)
+        (= ?one (Op (Constant 1.000000) (INil)))
+        ; t70: exp2 + 1
+        (= ?plus1 (Op (Add ?silu_shape4 ?silu_a_stride4 ?silu_b_stride4 ?silu_out_stride4) (ICons ?exp2_val (ICons ?one (INil)))))
+        ; t71: recip
+        (= ?sigmoid (Op (Recip ?silu_shape5 ?silu_in_stride5 ?silu_out_stride5) (ICons ?plus1 (INil))))
+        ; t72: gate * sigmoid(gate) = silu(gate)
+        (= ?silu_out (Op (Mul ?silu_shape6 ?silu_a_stride6 ?silu_b_stride6 ?silu_out_stride6) (ICons ?gu_matmul (ICons ?sigmoid (INil)))))
+        ; t73: silu(gate) * up
+        (= ?swiglu_out (Op (Mul ?swiglu_shape ?swiglu_a_stride ?swiglu_b_stride ?swiglu_out_stride) (ICons ?silu_out (ICons ?up_slice (INil)))))
+
+        ; ===== Down expert gather =====
+        ; t74: Iota for base index (expert_idx * io_down)
+        (= ?dn_iota_base (Op (Iota ?dn_io ?dn_iota_base_range) (INil)))
+        ; t75: Mul topk_indices * io_down
+        (= ?dn_mul_base (Op (Mul ?dn_mul_base_shape ?dn_mul_base_a_stride ?dn_mul_base_b_stride ?dn_mul_base_out_stride) (ICons ?topk_idx (ICons ?dn_iota_base (INil)))))
+        ; t76: Cast to F32
+        (= ?dn_cast_base (Op (Cast ?dn_cast_base_size (F32)) (ICons ?dn_mul_base (INil))))
+        ; t77: Iota for within-expert index
+        (= ?dn_iota_within (Op (Iota (MIter) ?dn_iota_within_range) (INil)))
+        ; t78: Cast within to F32
+        (= ?dn_cast_within (Op (Cast ?dn_cast_within_size (F32)) (ICons ?dn_iota_within (INil))))
+        ; t79: Add base + within
+        (= ?dn_add_idx (Op (Add ?dn_add_shape ?dn_add_a_stride ?dn_add_b_stride ?dn_add_out_stride) (ICons ?dn_cast_base (ICons ?dn_cast_within (INil)))))
+        ; t80: Cast to Int
+        (= ?dn_cast_idx (Op (Cast ?dn_cast_idx_size (Int)) (ICons ?dn_add_idx (INil))))
+        ; t81: Gather down weights
+        (= ?dn_gathered (Op (Gather ?dn_gather_idx_shape ?dn_gather_idx_stride ?dn_gather_data_shape ?dn_gather_data_stride) (ICons ?dn_cast_idx (ICons ?down_w (INil)))))
+
+        ; ===== Cast BF16→F32 =====
+        ; t82: Cast gathered down to F32
+        (= ?dn_f32 (Op (Cast ?dn_f32_size (F32)) (ICons ?dn_gathered (INil))))
+
+        ; ===== Down batched matmul =====
+        ; t83: Mul swiglu_out * gathered_down (broadcast multiply)
+        (= ?dn_matmul_mul (Op (Mul ?dn_matmul_mul_shape ?dn_matmul_a_stride ?dn_matmul_b_stride ?dn_matmul_mul_out_stride) (ICons ?swiglu_out (ICons ?dn_f32 (INil)))))
+        ; t84: SumReduce
+        (= ?dn_matmul (Op (Sum ?dn_matmul_out_shape ?dn_matmul_k ?dn_matmul_in_stride ?dn_matmul_k_stride ?dn_matmul_out_stride) (ICons ?dn_matmul_mul (INil))))
+
+        ; ===== Weighted sum over k experts =====
+        ; t85: Mul down_out * topk_values
+        (= ?weighted (Op (Mul ?weighted_shape ?weighted_a_stride ?weighted_b_stride ?weighted_out_stride) (ICons ?dn_matmul (ICons ?topk_vals (INil)))))
+        ; t86: SumReduce over k dimension → [s, H]
+        (= ?output (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
+    )
+    (
+        (let ?glumoe (Op (GLUMoE
+            ?gu_io ?dn_io ?gu_matmul_k ?dn_matmul_k ?output_k
+            ?gu_iota_within_range ?dn_iota_within_range)
+            (ICons ?x (ICons ?topk_idx (ICons ?topk_vals (ICons ?gate_up_w (ICons ?down_w (INil))))))))
+        (union ?output ?glumoe)
+    )
+    :name "GLUMoE fused expert computation"
+)

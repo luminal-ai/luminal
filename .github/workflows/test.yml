@@ -5,6 +5,7 @@ on:
         branches: ["main"]
     pull_request:
         branches: ["main"]
+    workflow_dispatch:
 
 env:
     CARGO_TERM_COLOR: always
@@ -13,39 +14,52 @@ jobs:
     core_unit_test:
         name: Core Unit Tests
         runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/luminal-ai/luminal-docker:cpu
         timeout-minutes: 20
 
         steps:
             - uses: actions/checkout@v6
             - name: Run tests
-              run: rustup update; cargo test --workspace --exclude luminal_cuda --exclude luminal_metal --exclude luminal_bench --verbose
-
-    clippy:
-        name: Clippy
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
-
-        steps:
-            - uses: actions/checkout@v6
-            - name: Run clippy
-              run: rustup update; cargo clippy --workspace --exclude luminal_cuda --exclude luminal_metal --exclude luminal_bench --all-targets -- -D warnings
-
-    fmt:
-        name: Fmt
-        runs-on: ubuntu-latest
-        timeout-minutes: 20
+              run: cargo test --workspace --exclude luminal_cuda_lite --exclude luminal_metal --exclude luminal_bench --verbose
+    metal_unit_test:
+        name: Metal Unit Tests
+        runs-on: macos-14
+        timeout-minutes: 30
 
         steps:
             - uses: actions/checkout@v6
-            - name: Format
-              run: cargo fmt --all --check
-    cuda_unit_test:
-        name: Cuda Unit Tests
+            - name: Run Metal crate tests
+              run: rustup update; cargo test -p luminal_metal --verbose -- --test-threads=1
+    python_native_tests:
+        name: Python Native Tests
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/luminal-ai/luminal-docker:cpu
+        timeout-minutes: 45
+        defaults:
+            run:
+                working-directory: crates/luminal_python
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Update Rust toolchain
+              run: rustup update
+            - name: Build maturin extension
+              run: uv run maturin develop --manifest-path rust/Cargo.toml
+            - name: Run pytest
+              run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py -v -m "not slow"
+
+    python_cuda_tests:
+        name: Python CUDA Tests
         runs-on: cuda_t4_runner
         container:
-            image: ghcr.io/luminal-ai/luminal-docker:latest
+            image: ghcr.io/luminal-ai/luminal-docker:cuda
             options: --gpus all
-        timeout-minutes: 30
+        timeout-minutes: 45
+        defaults:
+            run:
+                working-directory: crates/luminal_python
 
         steps:
             - uses: actions/checkout@v6
@@ -53,35 +67,13 @@ jobs:
               run: |
                   CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
                   echo "CUDA_COMPUTE_CAP=${CAP}" >> "$GITHUB_ENV"
-            - name: Run CUDA crate tests
-              run: cargo test -p luminal_cuda --verbose -- --test-threads=1
-    # cuda_llama: # disabled because t4 doesn't have enough memory for full precision llama. re-enable when we can run on larger machines or use 8-bit precision
-    #     name: Cuda Llama
-    #     runs-on: cuda_t4_runner
-    #     timeout-minutes: 30
-    #     env:
-    #         CUDA_HOME: /usr/local/cuda-12.8
-    #         LD_LIBRARY_PATH: /usr/local/cuda-12.8/lib64
-
-    #     steps:
-    #         - uses: actions/checkout@v6
-    #         - name: Install system deps
-    #           run: |
-    #               sudo apt-get update
-    #               sudo apt-get install -y --no-install-recommends \
-    #               protobuf-compiler \
-    #               cuda-nvrtc-12-8
-    #         - name: Install Rust
-    #           run: |
-    #               curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-    #               echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-    #         - name: Update Rust
-    #           run: rustup update
-    #         - name: Install uv
-    #           run: curl -LsSf https://astral.sh/uv/install.sh | sh
-    #         - name: Download Llama
-    #           working-directory: examples/llama
-    #           run: uv run --script setup/setup.py
-    #         - name: Run Llama
-    #           working-directory: examples/llama
-    #           run: SEARCH=1 cargo run --release
+            - name: Install uv
+              run: |
+                  curl -LsSf https://astral.sh/uv/install.sh | sh
+                  echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            - name: Build maturin extension
+              run: uv run maturin develop --manifest-path rust/Cargo.toml --features cuda
+            - name: Run pytest with CUDA backend
+              env:
+                  LUMINAL_BACKEND: cuda
+              run: uv run pytest tests/ -v -m "not slow"

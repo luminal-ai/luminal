@@ -1,0 +1,139 @@
+; Row-major matmul: C[m,n] = A[m,k] × B[k,n]
+; A[m,k] row-major → expand to [m, n, k] with strides [k, 0, MIter]
+; B[k,n] row-major → permute to [n,k] then expand to [m, n, k] with strides [0, MIter, n]
+;
+; Row-major viewed as column-major (swap trick):
+;   Row-major A[m,k] ≡ column-major [k,m] with lda=k
+;   Row-major B[k,n] ≡ column-major [n,k] with ldb=n
+;   Row-major C[m,n] ≡ column-major [n,m] with ldc=n
+;
+; cuBLAS computes: C_col[n,m] = B_col[n,k] × A_col[k,m]
+; cublasSgemm(OP_N, OP_N, n, m, k, α, B, n, A, k, β, C, n)
+(rule
+    (
+        ; Match Mul node
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+
+        ; Match Sum that reduces the Mul (k dimension)
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        ; Match exactly 2D output shape
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        ; Match exactly 3D strides [m, n, k]
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+
+        ; Assert contiguous k stride on output (required for reduction)
+        (= ?k_stride (MIter))
+
+        ; Assert A has strides [k*MIter, 0, MIter] (row-major A[m,k] broadcast to [m,n,k])
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        ; Assert B has strides [0, MIter, n*MIter] (row-major B[k,n] permuted to [n,k] then broadcast to [m,n,k])
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MIter))
+        (= ?b_k_stride (MMul (MIter) ?n))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+    )
+    (
+        ; For row-major C = A × B with cuBLAS (column-major):
+        ; cublasSgemm(OP_N, OP_N, n, m, k, α, B, n, A, k, β, C, n)
+        (let ?sgemm (Op (cublaslt
+            ?n             ; cuBLAS m = our n (swapped)
+            ?m             ; cuBLAS n = our m (swapped)
+            ?k             ; k unchanged
+            "N"            ; transa = No transpose
+            "N"            ; transb = No transpose
+            ?b_k_stride    ; lda = B's row stride (resolves to n after z→1)
+            ?a_m_stride    ; ldb = A's row stride (resolves to k after z→1)
+            ?n             ; ldc = n (row-major C[m,n] viewed as col-major [n,m])
+            (MNum 1)       ; batch_count = 1
+            (MNum 0)       ; stride_a = 0
+            (MNum 0)       ; stride_b = 0
+            (MNum 0)       ; stride_c = 0
+            ?dt)           ; dtype
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :name "cublaslt row-major x row-major"
+)
+
+; Batched Row-major × Row-major: C[batch,m,n] = A[batch,m,k] × B[batch,k,n]
+; In broadcast [batch, m, n, k] space:
+;   A row-major per batch: a_k_stride=MIter, a_n_stride=0
+;   B row-major per batch: b_n_stride=MIter, b_m_stride=0
+; Leading dimensions may differ from k/n when batch slices are non-contiguous.
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        ; Output shape: [batch, m, n]
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        ; A strides in [batch, m, n, k]
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        ; B strides in [batch, m, n, k]
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        ; A row-major: k=MIter, n=0, m_stride=k*MIter
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        ; B row-major: n=MIter, m=0, k_stride=n*MIter
+        (= ?b_n_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_k_stride (MMul (MIter) ?n))
+
+        ; Uniform batch strides (contiguous per batch, no GQA-style repetition)
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?k ?b_k_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+    )
+    (
+        ; cuBLAS swap: C^T[n,m] = B^T[n,k] × A^T[k,m] per batch
+        ; cublas(OP_N, OP_N, n, m, k, B, lda=b_k_stride, A, ldb=a_m_stride, C, ldc=n)
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "N" "N"
+            ?b_k_stride       ; lda (cuBLAS A = our B, row stride)
+            ?a_m_stride       ; ldb (cuBLAS B = our A, row stride)
+            ?n                ; ldc (contiguous output per batch)
+            ?batch            ; batch_count
+            ?b_batch_stride   ; stride_a (cuBLAS A = our B)
+            ?a_batch_stride   ; stride_b (cuBLAS B = our A)
+            (MMul ?m ?n)      ; stride_c
+            ?dt)
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :name "cublaslt batched row-major × row-major"
+)

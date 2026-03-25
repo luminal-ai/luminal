@@ -8,8 +8,9 @@ edition = "2021"
 [dependencies]
 luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
-luminal_cuda = { path = "../../crates/luminal_cuda" }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 tokenizers = "0.22.2"
+rustc-hash = "2"
 
 # HuggingFace model download
 hf-hub = {version = "0.4", default-features = false, features = ["rustls-tls", "ureq"]}

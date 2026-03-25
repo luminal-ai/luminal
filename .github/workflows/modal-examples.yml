@@ -1,0 +1,41 @@
+name: Modal Examples
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+        types: [opened, synchronize, reopened, ready_for_review]
+    workflow_dispatch:
+
+jobs:
+    modal_example:
+        if: github.event.pull_request.draft != true
+        name: "${{ matrix.example }} (Modal ${{ matrix.gpu.type }})"
+        runs-on: ubuntu-latest
+        environment: Modal
+        timeout-minutes: 70
+        strategy:
+            fail-fast: false
+            matrix:
+                example: [llama, gemma, qwen, qwen3_moe]
+                gpu:
+                    - { type: "A100-80GB" }
+                    # To add more GPUs, just append another entry:
+                    # - { type: "H100" }
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - name: Install Modal
+              run: pip install modal
+            - name: "Run ${{ matrix.example }} on Modal ${{ matrix.gpu.type }}"
+              env:
+                  MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+                  MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+                  EXAMPLE: ${{ matrix.example }}
+                  GPU_TYPE: ${{ matrix.gpu.type }}
+              run: modal run ci/modal_example.py

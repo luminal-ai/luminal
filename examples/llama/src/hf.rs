@@ -9,6 +9,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
 };
+use tracing::info;
 
 /// Index file structure for sharded safetensors models
 #[derive(Deserialize)]
@@ -24,16 +25,22 @@ struct StoredTensor {
 
 /// Downloads model files from HuggingFace and returns the cache directory path.
 pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    info!("Downloading model from HuggingFace: {repo_id}");
     let api = Api::new()?;
     let repo = api.model(repo_id.to_string());
     // Download tokenizer
+    info!("Downloading tokenizer.json...");
     let tokenizer_path = repo.get("tokenizer.json")?;
     let model_dir = tokenizer_path.parent().unwrap().to_path_buf();
+    info!("Model cache directory: {}", model_dir.display());
     // Try to download single shard model first
+    info!("Checking for single-shard model...");
     if repo.get("model.safetensors").is_ok() {
+        info!("Single-shard model downloaded successfully.");
         return Ok(model_dir);
     }
     // Otherwise download sharded model
+    info!("Single shard not found, downloading sharded model index...");
     let index_path = repo.get("model.safetensors.index.json")?;
     // Parse index to find shard files
     let index_content = std::fs::read_to_string(&index_path)?;
@@ -42,10 +49,17 @@ pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::E
     let mut shard_files: Vec<String> = index.weight_map.values().cloned().collect();
     shard_files.sort();
     shard_files.dedup();
+    info!("Found {} shard files to download.", shard_files.len());
     // Download each shard
-    for shard_file in &shard_files {
+    for (i, shard_file) in shard_files.iter().enumerate() {
+        info!(
+            "Downloading shard {}/{}: {shard_file}",
+            i + 1,
+            shard_files.len()
+        );
         repo.get(shard_file)?;
     }
+    info!("All shards downloaded successfully.");
     Ok(model_dir)
 }
 
@@ -91,7 +105,7 @@ pub fn combine_safetensors_to_fp32(
 
     // Determine which shard files to load
     let shard_files: Vec<PathBuf> = if single_shard_path.exists() && !index_path.exists() {
-        println!("Single shard model detected, converting to FP32...");
+        info!("Single shard model detected, converting to FP32...");
         vec![single_shard_path]
     } else if index_path.exists() {
         let index_content = std::fs::read_to_string(&index_path)?;
@@ -101,7 +115,7 @@ pub fn combine_safetensors_to_fp32(
         files.sort();
         files.dedup();
 
-        println!(
+        info!(
             "Loading {} shard files (converting to FP32)...",
             files.len()
         );
@@ -114,7 +128,7 @@ pub fn combine_safetensors_to_fp32(
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
 
     for shard_path in &shard_files {
-        println!(
+        info!(
             "  Loading {}...",
             shard_path.file_name().unwrap().to_string_lossy()
         );
@@ -137,10 +151,10 @@ pub fn combine_safetensors_to_fp32(
         }
     }
 
-    println!("Extracted {} language model tensors", all_tensors.len());
+    info!("Extracted {} language model tensors", all_tensors.len());
 
     // Serialize to combined file
-    println!("Saving combined FP32 model to {}...", output_path.display());
+    info!("Saving combined FP32 model to {}...", output_path.display());
 
     let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
         .iter()
@@ -156,7 +170,7 @@ pub fn combine_safetensors_to_fp32(
     let mut file = File::create(&output_path)?;
     file.write_all(&serialized)?;
 
-    println!("Combined FP32 model saved successfully!");
+    info!("Combined FP32 model saved successfully!");
     Ok(output_path)
 }
 

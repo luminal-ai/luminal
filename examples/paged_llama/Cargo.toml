@@ -1,0 +1,29 @@
+[package]
+name = "paged_llama"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "paged_llama"
+path = "src/main.rs"
+
+[features]
+
+[dependencies]
+luminal = { path = "../.." }
+luminal_nn = { path = "../../crates/luminal_nn" }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
+luminal_tracing = {path="../../crates/luminal_tracing"}
+tokenizers = "0.15.2"
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HuggingFace model download
+hf-hub = {version = "0.4", default-features = false, features = ["rustls-tls", "ureq"]}
+safetensors = "0.7.0"
+serde = {version = "1.0", features = ["derive"]}
+serde_json = "1.0"
+half = {version = "2.7.1", features = ["bytemuck"]}
+bytemuck = "1.24.0"
+memmap2 = "0.9.9"
+rustc-hash = "2.1"

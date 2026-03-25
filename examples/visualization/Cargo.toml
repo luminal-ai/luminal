@@ -7,5 +7,5 @@ edition = "2021"
 
 [dependencies]
 luminal = { path = "../.." }
-luminal_cuda = { path = "../../crates/luminal_cuda" }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 rand = "0.9.2"

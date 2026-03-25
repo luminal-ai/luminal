@@ -11,7 +11,7 @@ use luminal::{
     },
     visualization::{ToDot, ToHtml},
 };
-use luminal_cuda::runtime::CudaRuntime;
+use luminal_cuda_lite::runtime::CudaRuntime;
 
 fn main() {
     // Create a new graph

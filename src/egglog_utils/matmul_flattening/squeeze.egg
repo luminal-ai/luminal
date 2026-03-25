@@ -1,0 +1,60 @@
+; Squeeze: remove outermost dim=1 from Mul+Sum
+; [1, d1, d2, ...] → [d1, d2, ...] via direct union
+;
+; When the outermost dimension of the Sum output is 1, it can always be
+; removed regardless of strides (index 0 contributes 0*stride = 0 to
+; every address). This enables downstream 2D matmul rules (cuBLAS) to match.
+; The rule fires recursively: 4D → 3D → 2D.
+;
+; Direct union is safe because the total element count is preserved
+; (1*N = N) and downstream ops use their own strides to index into the
+; flat buffer, which has the same layout regardless of the leading dim=1.
+
+(rule
+    (
+        ; Match Mul + Sum pattern (Op wrapper syntax)
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?sum_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        ; Sum output shape starts with 1
+        (= ?sum_shape (ECons (MNum 1) ?rest_sum_shape))
+        ; Result must have >= 2 dims (don't collapse below 2D)
+        (!= ?rest_sum_shape (ENil))
+        (= ?rest_sum_len (len ?rest_sum_shape))
+        (>= ?rest_sum_len 2)
+
+        ; Mul shape also starts with 1
+        (= ?mul_shape (ECons (MNum 1) ?rest_mul_shape))
+
+        ; Destructure all stride lists to drop first element
+        (= ?a_stride (ECons ?as0 ?rest_as))
+        (= ?b_stride (ECons ?bs0 ?rest_bs))
+        (= ?mul_out_stride (ECons ?mos0 ?rest_mos))
+        (= ?sum_in_stride (ECons ?sis0 ?rest_sis))
+        (= ?sum_out_stride (ECons ?sos0 ?rest_sos))
+
+        ; Get dtype
+        (= ?dt (dtype ?a))
+    )
+    (
+        ; Create collapsed Mul (drop outermost dim from all lists)
+        (let ?new_mul (Op (Mul ?rest_mul_shape
+            ?rest_as
+            ?rest_bs
+            ?rest_mos)
+            (ICons ?a (ICons ?b (INil)))))
+
+        ; Create collapsed Sum
+        (let ?new_sum (Op (Sum ?rest_sum_shape ?k
+            ?rest_sis ?k_stride ?rest_sos)
+            (ICons ?new_mul (INil))))
+
+        ; Direct union — no wrapper needed
+        (union ?sum ?new_sum)
+
+        ; Propagate dtype
+        (set (dtype ?new_mul) ?dt)
+        (set (dtype ?new_sum) ?dt)
+    )
+    :name "batch-collapse squeeze dim=1"
+)

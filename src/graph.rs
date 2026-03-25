@@ -6,7 +6,7 @@ use crate::{
     egglog_utils::SerializedEGraph,
     op::{EgglogOp, IntoEgglogOp, LLIROp},
 };
-use crate::{hlir::CustomOpHLIR, op::*, prelude::*};
+use crate::{hlir::CustomOpKind, op::*, prelude::*};
 use colored::Colorize;
 use itertools::Itertools;
 use petgraph::{Direction, algo::toposort, stable_graph::StableGraph, visit::EdgeRef};
@@ -23,6 +23,9 @@ use tracing;
 pub type LLIRGraph = StableGraph<LLIROp, ()>;
 pub type HLIRGraph = StableGraph<Box<dyn HLIROp>, ()>;
 
+/// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
+pub type BucketLLIR = (FxHashMap<char, usize>, FxHashMap<char, usize>, LLIRGraph);
+
 /// A group of structurally identical chunks that share the same e-graph.
 #[derive(Debug, Clone)]
 struct ChunkGroup {
@@ -30,6 +33,53 @@ struct ChunkGroup {
     representative: usize,
     /// All chunk indices in this group (including the representative)
     members: Vec<usize>,
+}
+
+/// A bucket for a dynamic dimension, defining a range of valid values.
+/// For an exact value, use `min == max` (zero-length range).
+#[derive(Debug, Clone)]
+pub struct DimBucket {
+    pub min: usize,
+    pub max: usize,
+    representative_override: Option<usize>,
+}
+
+impl DimBucket {
+    /// Create a new bucket covering `[min, max]` inclusive.
+    /// For an exact value, pass `min == max`.
+    pub fn new(min: usize, max: usize) -> Self {
+        assert!(min <= max, "DimBucket min ({min}) must be <= max ({max})");
+        DimBucket {
+            min,
+            max,
+            representative_override: None,
+        }
+    }
+
+    /// Override the representative value used during search profiling.
+    /// Must be within `[min, max]`.
+    pub fn representative(mut self, val: usize) -> Self {
+        assert!(
+            val >= self.min && val <= self.max,
+            "Representative {val} must be in [{}, {}]",
+            self.min,
+            self.max
+        );
+        self.representative_override = Some(val);
+        self
+    }
+
+    /// The representative value used during search profiling.
+    /// Defaults to midpoint `(min + max) / 2`.
+    pub fn representative_value(&self) -> usize {
+        self.representative_override
+            .unwrap_or((self.min + self.max) / 2)
+    }
+
+    /// Check if `val` falls within this bucket's range.
+    pub fn contains(&self, val: usize) -> bool {
+        val >= self.min && val <= self.max
+    }
 }
 
 /// A Luminal compute graph.
@@ -51,6 +101,10 @@ pub struct Graph {
     pub ops: Option<Vec<Arc<Box<dyn EgglogOp>>>>,
     /// Custom ops
     pub custom_ops: Vec<Box<dyn CustomOp>>,
+    /// Bucket definitions per dynamic dimension. Dimensions without buckets use a
+    /// single implicit bucket (current behavior). When set, search compiles a
+    /// separate LLIR per bucket combination and runtime dispatches automatically.
+    pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
 }
 
 impl Graph {
@@ -62,6 +116,31 @@ impl Graph {
     /// Set a runtime dimension
     pub fn set_dim(&mut self, dimension: char, val: usize) {
         self.dyn_map.insert(dimension, val);
+    }
+
+    /// Define buckets for a dynamic dimension.
+    ///
+    /// When buckets are set, `search()` compiles a separate optimized LLIR graph
+    /// for each bucket combination. At runtime, `execute()` dispatches to the
+    /// appropriate compiled graph based on the current `dyn_map` values.
+    ///
+    /// Buckets must not overlap and must cover all values that will be used at runtime.
+    pub fn set_dim_buckets(&mut self, dimension: char, buckets: &[DimBucket]) {
+        // Validate no overlapping ranges
+        for (i, a) in buckets.iter().enumerate() {
+            for b in buckets.iter().skip(i + 1) {
+                assert!(
+                    a.max < b.min || b.max < a.min,
+                    "Overlapping buckets for dim '{}': [{}, {}] and [{}, {}]",
+                    dimension,
+                    a.min,
+                    a.max,
+                    b.min,
+                    b.max,
+                );
+            }
+        }
+        self.dim_buckets.insert(dimension, buckets.to_vec());
     }
 
     /// Create a new tensor with shape S
@@ -150,7 +229,7 @@ impl Graph {
         self.custom_ops.push(Box::new(op));
         let input_ids = inputs.to_ids();
         let id = self.add_op(
-            CustomOpHLIR {
+            CustomOpKind {
                 id: self.custom_ops.len() - 1,
                 dtype,
             },
@@ -248,7 +327,7 @@ impl Graph {
 
         println!(
             "   {:>6}  {} unique groups from {} chunks",
-            "Groups".cyan().bold(),
+            "Graphs".cyan().bold(),
             groups.len(),
             subgraphs.len()
         );
@@ -292,11 +371,128 @@ impl Graph {
         limit: usize,
         rng: &mut G,
     ) -> R {
+        if self.dim_buckets.is_empty() {
+            // No buckets: existing single-search path
+            let stitched =
+                self.search_single(&mut runtime, limit, rng, &self.dyn_map.clone(), None);
+
+            runtime.clear_intermediate_buffers();
+            runtime.load_llir(&stitched);
+            runtime
+        } else {
+            // Bucketed search: compile one LLIR per bucket combination
+            let bucket_combos = self.bucket_combinations();
+            let n_combos = bucket_combos.len();
+            let mut bucket_llirs: Vec<BucketLLIR> = Vec::with_capacity(n_combos);
+
+            for (combo_idx, (bucket_indices, representative_dyn_map)) in
+                bucket_combos.into_iter().enumerate()
+            {
+                let bucket_label = self.format_bucket_label(&bucket_indices);
+                println!(
+                    "   {:>6}  Group {}/{}: {}",
+                    "Search".cyan().bold(),
+                    combo_idx + 1,
+                    n_combos,
+                    bucket_label,
+                );
+
+                let stitched = self.search_single(
+                    &mut runtime,
+                    limit,
+                    rng,
+                    &representative_dyn_map,
+                    Some((combo_idx, n_combos)),
+                );
+                bucket_llirs.push((bucket_indices, representative_dyn_map, stitched));
+            }
+
+            runtime.clear_intermediate_buffers();
+            runtime.load_llir_buckets(&self.dim_buckets, &bucket_llirs);
+            runtime
+        }
+    }
+
+    /// Compute cartesian product of all bucket combinations.
+    /// Returns Vec of (bucket_indices, representative_dyn_map).
+    fn bucket_combinations(&self) -> Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> {
+        let mut dims: Vec<(char, &Vec<DimBucket>)> =
+            self.dim_buckets.iter().map(|(c, b)| (*c, b)).collect();
+        dims.sort_by_key(|(c, _)| *c);
+
+        let mut combos: Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> =
+            vec![(FxHashMap::default(), self.dyn_map.clone())];
+
+        for (dim, buckets) in &dims {
+            let mut new_combos = Vec::new();
+            for (existing_indices, existing_dyn_map) in &combos {
+                for (bucket_idx, bucket) in buckets.iter().enumerate() {
+                    let mut indices = existing_indices.clone();
+                    indices.insert(*dim, bucket_idx);
+                    let mut dyn_map = existing_dyn_map.clone();
+                    dyn_map.insert(*dim, bucket.representative_value());
+                    new_combos.push((indices, dyn_map));
+                }
+            }
+            combos = new_combos;
+        }
+
+        combos
+    }
+
+    /// Format a human-readable label for a bucket combination.
+    fn format_bucket_label(&self, bucket_indices: &FxHashMap<char, usize>) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        let mut dims: Vec<_> = bucket_indices.iter().collect();
+        dims.sort_by_key(|(c, _)| **c);
+        for (dim, &idx) in dims {
+            let bucket = &self.dim_buckets[dim][idx];
+            if bucket.min == bucket.max {
+                parts.push(format!("{}={}", dim, bucket.min));
+            } else {
+                parts.push(format!(
+                    "{}=[{},{}]@{}",
+                    dim,
+                    bucket.min,
+                    bucket.max,
+                    bucket.representative_value()
+                ));
+            }
+        }
+        parts.join(", ")
+    }
+
+    /// Run the genetic search for all chunk groups using the given dyn_map for profiling.
+    /// Returns the stitched LLIR graph.
+    /// `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`, shows an extra
+    /// "Bucket" bar for bucket-level progress and renames the group-level "Bucket" to "Group".
+    fn search_single<R: Runtime, G: rand::Rng>(
+        &self,
+        runtime: &mut R,
+        limit: usize,
+        rng: &mut G,
+        dyn_map: &FxHashMap<char, usize>,
+        bucket_progress: Option<(usize, usize)>,
+    ) -> LLIRGraph {
         let n_chunks = self.subgraph_descriptors.len();
         let n_groups = self.chunk_groups.len();
         let multi_chunk = n_chunks > 1;
         let ops = self.ops.as_ref().unwrap();
         let start = std::time::Instant::now();
+
+        // Label for the group-level "total" bar: "Group" when in bucketed mode, "Bucket" otherwise
+        let group_total_label = if bucket_progress.is_some() {
+            "Group"
+        } else {
+            "Bucket"
+        };
+        // How many progress bar lines we render (for ANSI cursor management)
+        // multi_chunk without buckets: 2 lines (Graph + Bucket)
+        // multi_chunk with buckets: 3 lines (Graph + Group + Bucket)
+        // single chunk without buckets: 1 line (Search)
+        // single chunk with buckets: 2 lines (Search + Bucket)
+        let n_bar_lines =
+            if multi_chunk { 2 } else { 1 } + if bucket_progress.is_some() { 1 } else { 0 };
 
         // Allocate dummy buffers for boundary inputs so groups can be profiled
         for desc in &self.subgraph_descriptors {
@@ -305,9 +501,10 @@ impl Graph {
                     let n_elements = bi
                         .shape
                         .n_elements()
-                        .exec(&self.dyn_map)
+                        .exec(dyn_map)
                         .expect("Failed to resolve boundary input shape");
-                    runtime.allocate_dummy_input(bi.break_node.index(), n_elements);
+                    let n_bytes = n_elements * bi.dtype.bits() / 8;
+                    runtime.allocate_dummy_input(bi.break_node.index(), n_bytes);
                 }
             }
         }
@@ -335,6 +532,50 @@ impl Graph {
                 )
             }
         }
+
+        // Render progress bars. Prints the right number of lines depending on mode.
+        // Returns the number of lines printed (for ANSI cursor management).
+        let render_bars = |n_graphs: usize,
+                           limit: usize,
+                           group_idx: usize,
+                           n_groups: usize,
+                           multi_chunk: bool,
+                           group_total_label: &str,
+                           bucket_progress: Option<(usize, usize)>|
+         -> usize {
+            let mut lines = 0;
+            if multi_chunk {
+                print!(
+                    "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
+                    "Graph".cyan().bold(),
+                    make_bar(n_graphs, limit),
+                );
+                lines += 1;
+                print!(
+                    "\n\x1b[2K  {:>6}  {} {group_idx}/{n_groups}",
+                    group_total_label.cyan().bold(),
+                    make_bar(group_idx, n_groups),
+                );
+                lines += 1;
+            } else {
+                print!(
+                    "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
+                    "Search".cyan().bold(),
+                    make_bar(n_graphs, limit),
+                );
+                lines += 1;
+            }
+            if let Some((bucket_idx, n_buckets)) = bucket_progress {
+                print!(
+                    "\n\x1b[2K  {:>6}  {} {}/{n_buckets}",
+                    "Bucket".cyan().bold(),
+                    make_bar(bucket_idx, n_buckets),
+                    bucket_idx,
+                );
+                lines += 1;
+            }
+            lines
+        };
 
         for (group_idx, group) in self.chunk_groups.iter().enumerate() {
             let egraph = &self.egraphs[group_idx];
@@ -370,12 +611,13 @@ impl Graph {
                         None,
                     );
                     runtime.clear_intermediate_buffers();
-                    let profile = runtime.profile(&graph, &self.dyn_map, Self::TRIALS_PER_PROFILE);
-                    (graph, profile)
+                    let profile = runtime.profile(&graph, dyn_map, Self::TRIALS_PER_PROFILE);
+                    let has_nan = runtime.has_nan_outputs(&graph, dyn_map);
+                    (graph, profile, has_nan)
                 }));
 
                 match result {
-                    Ok((graph, (metric, disp))) => {
+                    Ok((graph, (metric, disp), has_nan)) if !has_nan => {
                         best_genome = genome;
                         best_graph = graph;
                         best_metric = metric;
@@ -383,7 +625,7 @@ impl Graph {
                         n_graphs = 1;
                         break;
                     }
-                    Err(_) => {
+                    Ok(_) | Err(_) => {
                         list_cache.clear();
                         expr_cache.clear();
                         continue;
@@ -400,28 +642,26 @@ impl Graph {
                 };
                 let msg = format!(
                     "   {:>8} {}{multiplier}",
-                    format!("Group {group_idx}").cyan().bold(),
+                    format!("Graph {group_idx}").cyan().bold(),
                     display,
                 );
                 if bars_drawn {
-                    print!("\x1b[1A\r\x1b[2K");
+                    // Move up past existing bar lines to overwrite them
+                    for _ in 1..n_bar_lines {
+                        print!("\x1b[1A");
+                    }
+                    print!("\r\x1b[2K");
                 }
                 println!("{msg}");
-                if multi_chunk {
-                    print!(
-                        "\x1b[2K  {:>6}  {} {n_graphs}/{limit}\n\x1b[2K  {:>6}  {} {group_idx}/{n_groups}",
-                        "Group".cyan().bold(),
-                        make_bar(n_graphs, limit),
-                        "Total".cyan().bold(),
-                        make_bar(group_idx, n_groups)
-                    );
-                } else {
-                    print!(
-                        "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
-                        "Search".cyan().bold(),
-                        make_bar(n_graphs, limit),
-                    );
-                }
+                render_bars(
+                    n_graphs,
+                    limit,
+                    group_idx,
+                    n_groups,
+                    multi_chunk,
+                    group_total_label,
+                    bucket_progress,
+                );
                 std::io::stdout().flush().unwrap();
                 bars_drawn = true;
             }
@@ -444,8 +684,6 @@ impl Graph {
                     list_cache.clear();
                     expr_cache.clear();
 
-                    // Wrap LLIR extraction + profiling in catch_unwind to handle
-                    // panics from invalid genomes, expression simplification, or CUDA errors
                     let profile_result =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             let llir_graph = egglog_to_llir(
@@ -458,32 +696,29 @@ impl Graph {
                                 None,
                             );
                             runtime.clear_intermediate_buffers();
-                            let result = runtime.profile(
-                                &llir_graph,
-                                &self.dyn_map,
-                                Self::TRIALS_PER_PROFILE,
-                            );
-                            (result, llir_graph)
+                            let result =
+                                runtime.profile(&llir_graph, dyn_map, Self::TRIALS_PER_PROFILE);
+                            let has_nan = runtime.has_nan_outputs(&llir_graph, dyn_map);
+                            (result, llir_graph, has_nan)
                         }));
 
                     let ((new_metric, display_metric), llir_graph) = match profile_result {
-                        Ok(result) => result,
-                        Err(_) => {
-                            if multi_chunk {
-                                print!(
-                                    "\x1b[1A\r\x1b[2K  {:>6}  {} {n_graphs}/{limit}\n\x1b[2K  {:>6}  {} {group_idx}/{n_groups}",
-                                    "Group".cyan().bold(),
-                                    make_bar(n_graphs, limit),
-                                    "Total".cyan().bold(),
-                                    make_bar(group_idx, n_groups)
-                                );
-                            } else {
-                                print!(
-                                    "\r\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
-                                    "Search".cyan().bold(),
-                                    make_bar(n_graphs, limit),
-                                );
+                        Ok((result, graph, false)) => (result, graph),
+                        Ok((_, _, true)) | Err(_) => {
+                            // NaN or panic — redraw bars and skip
+                            for _ in 1..n_bar_lines {
+                                print!("\x1b[1A");
                             }
+                            print!("\r\x1b[2K");
+                            render_bars(
+                                n_graphs,
+                                limit,
+                                group_idx,
+                                n_groups,
+                                multi_chunk,
+                                group_total_label,
+                                bucket_progress,
+                            );
                             std::io::stdout().flush().unwrap();
                             continue;
                         }
@@ -498,40 +733,28 @@ impl Graph {
 
                     if new_best {
                         let msg = format!("   {:>6} {display_metric}", "Searched".green().bold());
-                        if multi_chunk {
-                            print!("\x1b[1A\r\x1b[2K");
-                            println!("{msg}");
-                            print!(
-                                "\x1b[2K  {:>6}  {} {n_graphs}/{limit}\n\x1b[2K  {:>6}  {} {group_idx}/{n_groups}",
-                                "Group".cyan().bold(),
-                                make_bar(n_graphs, limit),
-                                "Total".cyan().bold(),
-                                make_bar(group_idx, n_groups)
-                            );
-                        } else {
-                            print!("\r\x1b[2K");
-                            println!("{msg}");
-                            print!(
-                                "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
-                                "Search".cyan().bold(),
-                                make_bar(n_graphs, limit),
-                            );
+                        // Move cursor up to overwrite bars, print new best, re-render bars
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
                         }
-                    } else if multi_chunk {
-                        print!(
-                            "\x1b[1A\r\x1b[2K  {:>6}  {} {n_graphs}/{limit}\n\x1b[2K  {:>6}  {} {group_idx}/{n_groups}",
-                            "Group".cyan().bold(),
-                            make_bar(n_graphs, limit),
-                            "Total".cyan().bold(),
-                            make_bar(group_idx, n_groups)
-                        );
+                        print!("\r\x1b[2K");
+                        println!("{msg}");
                     } else {
-                        print!(
-                            "\r\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
-                            "Search".cyan().bold(),
-                            make_bar(n_graphs, limit),
-                        );
+                        // Just move cursor up to overwrite bars
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
                     }
+                    render_bars(
+                        n_graphs,
+                        limit,
+                        group_idx,
+                        n_groups,
+                        multi_chunk,
+                        group_total_label,
+                        bucket_progress,
+                    );
                     std::io::stdout().flush().unwrap();
                 }
             }
@@ -542,16 +765,23 @@ impl Graph {
 
         // Clear progress bars
         if bars_drawn {
-            if multi_chunk {
-                print!("\x1b[1A\r\x1b[2K\n\x1b[2K\x1b[1A\r");
-            } else {
-                print!("\r\x1b[2K");
+            // Move up to first bar line and clear all bar lines
+            for _ in 1..n_bar_lines {
+                print!("\x1b[1A");
             }
+            print!("\r");
+            for _ in 0..n_bar_lines {
+                println!("\x1b[2K");
+            }
+            // Move back up to where we started
+            for _ in 0..n_bar_lines {
+                print!("\x1b[1A");
+            }
+            print!("\r");
             std::io::stdout().flush().unwrap();
         }
 
-        // Build per-chunk LLIRs: representative uses searched LLIR,
-        // others re-extract from same e-graph/genome with remapped custom op IDs + IO nodes
+        // Build per-chunk LLIRs
         let mut chunk_best_llirs: Vec<Option<LLIRGraph>> = (0..n_chunks).map(|_| None).collect();
 
         for (group_idx, group) in self.chunk_groups.iter().enumerate() {
@@ -587,7 +817,6 @@ impl Graph {
                 chunk_best_llirs[chunk_idx] = Some(llir);
             }
 
-            // Move the representative's LLIR (avoids clone)
             chunk_best_llirs[group.representative] = group_best_llirs[group_idx].take();
         }
 
@@ -597,7 +826,6 @@ impl Graph {
             .map(|(i, opt)| opt.unwrap_or_else(|| panic!("Missing LLIR for chunk {i}")))
             .collect();
 
-        // Stitch chunk LLIRs into a single graph (no-op for single chunk)
         let stitched = stitch_llir_graphs(&chunk_best_llirs, &self.subgraph_descriptors);
 
         println!(
@@ -608,10 +836,7 @@ impl Graph {
             pretty_duration::pretty_duration(&start.elapsed(), None)
         );
 
-        // Clear stale buffers from chunk profiling before loading the final graph
-        runtime.clear_intermediate_buffers();
-        runtime.load_llir(&stitched);
-        runtime
+        stitched
     }
 }
 
@@ -844,7 +1069,7 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
 ///
 /// Returns:
 /// - `node_remap`: maps rep HLIR node indices → target HLIR node indices (for Input/Output nodes)
-/// - `custom_op_id_remap`: maps rep CustomOpHLIR IDs → target CustomOpHLIR IDs
+/// - `custom_op_id_remap`: maps rep CustomOpKind IDs → target CustomOpKind IDs
 fn build_chunk_remaps(
     rep_desc: &SubgraphDescriptor,
     target_desc: &SubgraphDescriptor,
@@ -917,7 +1142,47 @@ fn build_chunk_remaps(
         node_remap.insert(*r, *t);
     }
 
-    // 4. CustomOpHLIR ID remapping: match positionally by sorted HLIR node index
+    // 4. Internal Output nodes: Output nodes may reference internal computation nodes
+    //    (e.g., scatter results marked with .output()). These need remapping too.
+    //    Match positionally by sorted `node` value, skipping those already remapped.
+    let rep_output_refs: Vec<usize> = rep_desc
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            hlir_graph
+                .node_weight(*n)
+                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Output>())
+                .map(|o| o.node)
+        })
+        .filter(|n| !node_remap.contains_key(n))
+        .sorted()
+        .collect();
+    let target_output_refs: Vec<usize> = target_desc
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            hlir_graph
+                .node_weight(*n)
+                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Output>())
+                .map(|o| o.node)
+        })
+        .filter(|n| !node_remap.values().any(|v| v == n))
+        .sorted()
+        .collect();
+    assert_eq!(
+        rep_output_refs.len(),
+        target_output_refs.len(),
+        "Internal Output node count mismatch: rep has {}, target has {}",
+        rep_output_refs.len(),
+        target_output_refs.len()
+    );
+    for (r, t) in rep_output_refs.iter().zip(&target_output_refs) {
+        if r != t {
+            node_remap.insert(*r, *t);
+        }
+    }
+
+    // 5. CustomOpKind ID remapping: match positionally by sorted HLIR node index
     let mut custom_op_id_remap: FxHashMap<usize, usize> = FxHashMap::default();
     let rep_custom_ops: Vec<usize> = rep_desc
         .nodes
@@ -925,7 +1190,7 @@ fn build_chunk_remaps(
         .filter_map(|n| {
             hlir_graph
                 .node_weight(*n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::CustomOpHLIR>())
+                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::CustomOpKind>())
                 .map(|op| op.id)
         })
         .sorted()
@@ -936,7 +1201,7 @@ fn build_chunk_remaps(
         .filter_map(|n| {
             hlir_graph
                 .node_weight(*n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::CustomOpHLIR>())
+                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::CustomOpKind>())
                 .map(|op| op.id)
         })
         .sorted()
@@ -944,7 +1209,7 @@ fn build_chunk_remaps(
     assert_eq!(
         rep_custom_ops.len(),
         target_custom_ops.len(),
-        "CustomOpHLIR count mismatch: rep has {}, target has {}",
+        "CustomOpKind count mismatch: rep has {}, target has {}",
         rep_custom_ops.len(),
         target_custom_ops.len()
     );
@@ -1212,31 +1477,31 @@ mod tests {
 
     #[test]
     fn test_hash_egglog_normalized_custom_op_id() {
-        // CustomOpHLIR lines differ only in the integer ID (layer index)
+        // CustomOpKind lines differ only in the integer ID (layer index)
         let text_a = r#"(let t0 (Input 441 "boundary" (F32)))
-(let t1 (CustomOpHLIR (ICons t74 (ICons t120 (ICons t28 (INil)))) 1 (F32)))
+(let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
 (let t2 (Output t1 585))
 "#;
         let text_b = r#"(let t0 (Input 585 "boundary" (F32)))
-(let t1 (CustomOpHLIR (ICons t74 (ICons t120 (ICons t28 (INil)))) 2 (F32)))
+(let t1 (Op (CustomOpKind 2 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
 (let t2 (Output t1 729))
 "#;
         assert_eq!(
             hash_egglog_normalized(text_a),
             hash_egglog_normalized(text_b),
-            "CustomOpHLIR with different IDs should hash the same"
+            "CustomOpKind with different IDs should hash the same"
         );
     }
 
     #[test]
     fn test_hash_egglog_normalized_custom_op_different_structure() {
-        // CustomOpHLIR lines with different input lists should hash differently
-        let text_a = "(let t1 (CustomOpHLIR (ICons t74 (ICons t120 (INil))) 1 (F32)))\n";
-        let text_b = "(let t1 (CustomOpHLIR (ICons t74 (ICons t99 (INil))) 1 (F32)))\n";
+        // CustomOpKind lines with different input lists should hash differently
+        let text_a = "(let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t120 (INil)))))\n";
+        let text_b = "(let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t99 (INil)))))\n";
         assert_ne!(
             hash_egglog_normalized(text_a),
             hash_egglog_normalized(text_b),
-            "CustomOpHLIR with different input lists should hash differently"
+            "CustomOpKind with different input lists should hash differently"
         );
     }
 }
