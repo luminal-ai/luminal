@@ -86,6 +86,60 @@ impl MetalRuntime {
             .unwrap()
     }
 
+    fn follow_aliases(&self, mut node: NodeIndex) -> NodeIndex {
+        loop {
+            let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() else {
+                break;
+            };
+            let Some(input_idx) = kernel_op.output_aliases_input() else {
+                break;
+            };
+            node = self
+                .llir_graph
+                .neighbors_directed(node, Direction::Incoming)
+                .sorted_by_key(|n| self.llir_graph.find_edge(*n, node).unwrap())
+                .nth(input_idx)
+                .expect("output_aliases_input index out of range");
+        }
+        node
+    }
+
+    fn follow_data_lineage(&self, mut node: NodeIndex) -> NodeIndex {
+        loop {
+            let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() else {
+                break;
+            };
+            let Some(input_idx) = kernel_op.output_data_input() else {
+                break;
+            };
+            node = self
+                .llir_graph
+                .neighbors_directed(node, Direction::Incoming)
+                .sorted_by_key(|n| self.llir_graph.find_edge(*n, node).unwrap())
+                .nth(input_idx)
+                .expect("output_data_input index out of range");
+        }
+        node
+    }
+
+    fn resolve_data_node(&self, id: impl ToId) -> NodeIndex {
+        let producer = self.find_producer_node(id);
+        self.follow_aliases(producer)
+    }
+
+    fn resolved_buffer(&self, data_id: NodeIndex) -> &Buffer {
+        self.buffers
+            .get(&data_id)
+            .or_else(|| {
+                if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
+                    self.hlir_buffers.get(&NodeIndex::new(*node))
+                } else {
+                    None
+                }
+            })
+            .expect("Cannot find tensor in runtime!")
+    }
+
     fn fuse_matmuls(llir_graph: &LLIRGraph) -> LLIRGraph {
         let mut graph = llir_graph.clone();
         let planner = MetalMatmulPlanner;
@@ -183,44 +237,31 @@ impl MetalRuntime {
 
     pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
         let id = id.to_id();
-        self.input_data.insert(id, data.into());
+        let data = data.into();
+        self.input_data.insert(id, data.clone());
         let version = self.next_input_version;
         self.next_input_version = self.next_input_version.wrapping_add(1);
         self.input_versions.insert(id, version);
+
+        if let Some(dtype) = self.llir_input_dtype(id) {
+            let spec = Self::input_buffer_spec(&data, dtype);
+            match self.hlir_buffers.get(&id) {
+                Some(buffer) if buffer.length() == spec.bytes => {
+                    self.write_input_buffer_contents(buffer, &data, dtype);
+                }
+                _ => {
+                    let buffer = self.create_input_buffer(&data, dtype);
+                    self.hlir_buffers.insert(id, buffer);
+                }
+            }
+            self.input_buffer_meta
+                .insert(id, InputBufferMeta { spec, version });
+        }
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
-        let id = id.to_id();
-        let output_id = self
-            .llir_graph
-            .node_indices()
-            .find(|n| {
-                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
-                    *node == id.index()
-                } else {
-                    false
-                }
-            })
-            .expect("Cannot find output tensor!");
-
-        let data_id = self
-            .llir_graph
-            .neighbors_directed(output_id, Direction::Incoming)
-            .next()
-            .unwrap();
-
-        let buffer = self
-            .buffers
-            .get(&data_id)
-            .or_else(|| {
-                // If data_id is an Input node, get from hlir_buffers
-                if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
-                    self.hlir_buffers.get(&NodeIndex::new(*node))
-                } else {
-                    None
-                }
-            })
-            .expect("Cannot find tensor in runtime!");
+        let data_id = self.resolve_data_node(id);
+        let buffer = self.resolved_buffer(data_id);
         let dtype = self
             .node_dtypes
             .get(&data_id)
@@ -260,19 +301,42 @@ impl MetalRuntime {
     }
 
     pub fn remove_buffer(&mut self, id: impl ToId) -> Buffer {
-        let data_id = self.find_producer_node(id);
-        if let Some(buf) = self.buffers.remove(&data_id) {
-            return buf;
-        }
+        let producer = self.find_producer_node(id);
+        let alias_node = self.follow_aliases(producer);
+        let lineage_node = self.follow_data_lineage(producer);
 
-        if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
+        if alias_node == lineage_node {
+            if let Some(Input { node, .. }) = self.llir_graph[lineage_node].to_op::<Input>() {
+                return self
+                    .hlir_buffers
+                    .remove(&NodeIndex::new(*node))
+                    .expect("Cannot find input buffer in Metal runtime!");
+            }
+
             return self
-                .hlir_buffers
-                .remove(&NodeIndex::new(*node))
-                .expect("Cannot find input buffer in Metal runtime!");
+                .buffers
+                .remove(&lineage_node)
+                .expect("Cannot find tensor buffer in Metal runtime!");
         }
 
-        panic!("Cannot find tensor buffer in Metal runtime!");
+        let hlir_node = if let Some(Input { node, .. }) = self.llir_graph[lineage_node].to_op::<Input>()
+        {
+            NodeIndex::new(*node)
+        } else {
+            panic!("output_data_input lineage must reach an HLIR input node");
+        };
+
+        let output_buf = self
+            .buffers
+            .remove(&alias_node)
+            .expect("Cannot find intermediate output buffer in Metal runtime!");
+        let hlir_buf = self
+            .hlir_buffers
+            .remove(&hlir_node)
+            .expect("Cannot find HLIR input buffer in Metal runtime!");
+
+        self.buffers.insert(alias_node, hlir_buf);
+        output_buf
     }
 
     pub fn set_buffer(&mut self, id: impl ToId, buf: Buffer) {
@@ -534,6 +598,47 @@ impl MetalRuntime {
         }
     }
 
+    fn llir_input_dtype(&self, id: NodeIndex) -> Option<DType> {
+        self.llir_graph.node_indices().find_map(|node| {
+            self.llir_graph[node]
+                .to_op::<Input>()
+                .filter(|inp| NodeIndex::new(inp.node) == id)
+                .map(|inp| inp.dtype)
+        })
+    }
+
+    fn write_input_buffer_contents(&self, buffer: &Buffer, data: &NativeData, dtype: DType) {
+        unsafe {
+            match dtype {
+                DType::F32 => {
+                    let values: Vec<f32> = (0..data.len()).map(|i| data.f32(i)).collect();
+                    std::ptr::copy_nonoverlapping(
+                        values.as_ptr() as *const u8,
+                        buffer.contents() as *mut u8,
+                        std::mem::size_of_val(values.as_slice()),
+                    );
+                }
+                DType::F16 => {
+                    let values: Vec<f16> = (0..data.len()).map(|i| data.f16(i)).collect();
+                    std::ptr::copy_nonoverlapping(
+                        values.as_ptr() as *const u8,
+                        buffer.contents() as *mut u8,
+                        std::mem::size_of_val(values.as_slice()),
+                    );
+                }
+                DType::Int => {
+                    let values: Vec<i32> = (0..data.len()).map(|i| data.i32(i)).collect();
+                    std::ptr::copy_nonoverlapping(
+                        values.as_ptr() as *const u8,
+                        buffer.contents() as *mut u8,
+                        std::mem::size_of_val(values.as_slice()),
+                    );
+                }
+                unsupported => panic!("Metal input dtype {unsupported:?} is not supported yet"),
+            }
+        }
+    }
+
     fn ensure_input_buffer(&mut self, id: NodeIndex, data: &NativeData, dtype: DType) {
         let version = self.input_versions.get(&id).copied().unwrap_or(0);
         let spec = Self::input_buffer_spec(data, dtype);
@@ -543,8 +648,15 @@ impl MetalRuntime {
             }
         }
 
-        let buffer = self.create_input_buffer(data, dtype);
-        self.hlir_buffers.insert(id, buffer);
+        match self.hlir_buffers.get(&id) {
+            Some(buffer) if buffer.length() == spec.bytes => {
+                self.write_input_buffer_contents(buffer, data, dtype);
+            }
+            _ => {
+                let buffer = self.create_input_buffer(data, dtype);
+                self.hlir_buffers.insert(id, buffer);
+            }
+        }
         self.input_buffer_meta
             .insert(id, InputBufferMeta { spec, version });
     }

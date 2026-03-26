@@ -1011,3 +1011,28 @@ fn test_scatter_all_positions() {
     let out = rt.get_f32(result);
     assert_close(&out, &[10.0, 20.0, 30.0, 40.0], 0.001);
 }
+
+#[test]
+fn test_scatter_buffer_roundtrip() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(2);
+    let indexes = cx.tensor(2).as_dtype(DType::Int);
+    let dest = cx.tensor(5);
+    let result = src.scatter(indexes, dest).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[10.0, 20.0]);
+    rt.set_data(indexes, &[1.0, 3.0]);
+    rt.set_data(dest, &[0.0, 0.0, 0.0, 0.0, 0.0]);
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let cache_buf = rt.remove_buffer(result);
+    rt.set_buffer(dest, cache_buf);
+    rt.execute(&cx.dyn_map);
+
+    let out = rt.get_f32(result);
+    assert_close(&out, &[0.0, 10.0, 0.0, 20.0, 0.0], 0.001);
+}
