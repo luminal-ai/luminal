@@ -1,4 +1,4 @@
-"""CompiledModel wrapper for the Rust OnnxGraphResult."""
+"""CompiledModel wrapper for the Rust CompiledGraph."""
 
 from typing import List
 
@@ -6,22 +6,22 @@ import torch
 
 
 class CompiledModel:
-    """Wrapper around OnnxGraphResult that handles PyTorch tensor conversion."""
+    """Wrapper around CompiledGraph that handles PyTorch tensor conversion."""
 
     def __init__(self, graph_result):
-        """Initialize with a compiled OnnxGraphResult from Rust.
+        """Initialize with a compiled CompiledGraph from Rust.
 
         Args:
-            graph_result: The OnnxGraphResult from luminal_python.process_onnx()
+            graph_result: The CompiledGraph from luminal_python.process_onnx() or compile_pt2()
         """
         self._graph = graph_result
         self._input_names = graph_result.input_names
         self._output_names = graph_result.output_names
         self._output_shapes = graph_result.output_shapes
-        self._has_dynamic_dims = graph_result.has_dynamic_dims
+        self._has_dynamic_dims = getattr(graph_result, 'has_dynamic_dims', False)
 
     def set_dim(self, param_name: str, value: int) -> None:
-        """Set a dynamic dimension value by its ONNX param name."""
+        """Set a dynamic dimension value by its param name."""
         self._graph.set_dim(param_name, value)
 
     @property
@@ -39,7 +39,7 @@ class CompiledModel:
             *inputs: PyTorch tensors matching the model's input signature
 
         Returns:
-            List of PyTorch tensors containing the model outputs
+            Tuple of PyTorch tensors containing the model outputs
         """
         if len(inputs) != len(self._input_names):
             raise ValueError(
@@ -47,6 +47,11 @@ class CompiledModel:
             )
 
         input_device = inputs[0].device if inputs else torch.device("cpu")
+
+        # Auto-detect dynamic dims from input shapes
+        if self._has_dynamic_dims:
+            input_shapes = [list(t.shape) for t in inputs]
+            self._graph.auto_set_dims_from_input_shapes(input_shapes)
 
         # Set input data
         for name, tensor in zip(self._input_names, inputs):

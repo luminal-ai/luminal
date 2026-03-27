@@ -327,7 +327,7 @@ impl Graph {
 
         println!(
             "   {:>6}  {} unique groups from {} chunks",
-            "Groups".cyan().bold(),
+            "Graphs".cyan().bold(),
             groups.len(),
             subgraphs.len()
         );
@@ -390,7 +390,7 @@ impl Graph {
             {
                 let bucket_label = self.format_bucket_label(&bucket_indices);
                 println!(
-                    "   {:>6}  Bucket {}/{}: {}",
+                    "   {:>6}  Group {}/{}: {}",
                     "Search".cyan().bold(),
                     combo_idx + 1,
                     n_combos,
@@ -465,7 +465,7 @@ impl Graph {
     /// Run the genetic search for all chunk groups using the given dyn_map for profiling.
     /// Returns the stitched LLIR graph.
     /// `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`, shows an extra
-    /// "Total" bar for bucket-level progress and renames the group-level "Total" to "Bucket".
+    /// "Bucket" bar for bucket-level progress and renames the group-level "Bucket" to "Group".
     fn search_single<R: Runtime, G: rand::Rng>(
         &self,
         runtime: &mut R,
@@ -480,17 +480,17 @@ impl Graph {
         let ops = self.ops.as_ref().unwrap();
         let start = std::time::Instant::now();
 
-        // Label for the group-level "total" bar: "Bucket" when in bucketed mode, "Total" otherwise
+        // Label for the group-level "total" bar: "Group" when in bucketed mode, "Bucket" otherwise
         let group_total_label = if bucket_progress.is_some() {
-            "Bucket"
+            "Group"
         } else {
-            "Total"
+            "Bucket"
         };
         // How many progress bar lines we render (for ANSI cursor management)
-        // multi_chunk without buckets: 2 lines (Group + Total)
-        // multi_chunk with buckets: 3 lines (Group + Bucket + Total)
+        // multi_chunk without buckets: 2 lines (Graph + Bucket)
+        // multi_chunk with buckets: 3 lines (Graph + Group + Bucket)
         // single chunk without buckets: 1 line (Search)
-        // single chunk with buckets: 2 lines (Search + Total)
+        // single chunk with buckets: 2 lines (Search + Bucket)
         let n_bar_lines =
             if multi_chunk { 2 } else { 1 } + if bucket_progress.is_some() { 1 } else { 0 };
 
@@ -547,7 +547,7 @@ impl Graph {
             if multi_chunk {
                 print!(
                     "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
-                    "Group".cyan().bold(),
+                    "Graph".cyan().bold(),
                     make_bar(n_graphs, limit),
                 );
                 lines += 1;
@@ -568,7 +568,7 @@ impl Graph {
             if let Some((bucket_idx, n_buckets)) = bucket_progress {
                 print!(
                     "\n\x1b[2K  {:>6}  {} {}/{n_buckets}",
-                    "Total".cyan().bold(),
+                    "Bucket".cyan().bold(),
                     make_bar(bucket_idx, n_buckets),
                     bucket_idx,
                 );
@@ -642,7 +642,7 @@ impl Graph {
                 };
                 let msg = format!(
                     "   {:>8} {}{multiplier}",
-                    format!("Group {group_idx}").cyan().bold(),
+                    format!("Graph {group_idx}").cyan().bold(),
                     display,
                 );
                 if bars_drawn {

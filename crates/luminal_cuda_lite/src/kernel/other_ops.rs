@@ -212,6 +212,10 @@ extern \"C\" {{
         n_outputs * self.iters + n_outputs
     }
 
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
     fn kernel_name(&self) -> &'static str {
         "MeanReduce"
     }
@@ -553,6 +557,10 @@ extern \"C\" {{
         Some(0) // output aliases dest (input 0)
     }
 
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
     fn kernel_name(&self) -> &'static str {
         "ScatterNoCopy"
     }
@@ -835,6 +843,10 @@ extern \"C\" {{
         self.output_size() * self.k_dim * 2
     }
 
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
     fn kernel_name(&self) -> &'static str {
         "BatchMatVec"
     }
@@ -896,6 +908,9 @@ impl EgglogOp for KernelBatchMatMul {
 
                     ; k_stride must be contiguous in the Sum output
                     (= ?k_stride (MIter))
+
+                    ; K must be > 1 (K=1 is a degenerate outer product, not a real matmul)
+                    (!= ?k (MNum 1))
 
                     ; Get A's and B's k-dimension strides (no contiguity requirement)
                     (= ?a_k_stride (nth_from_end ?a_stride 1))
@@ -1101,6 +1116,10 @@ extern \"C\" {{
 
     fn flops(&self) -> Expression {
         self.output_size() * self.k_dim * 2
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
     }
 
     fn kernel_name(&self) -> &'static str {

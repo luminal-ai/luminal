@@ -17,6 +17,13 @@ protobuf = "~3.4"
 rustc-hash = "2.1.1"
 luminal = {path= "../../.."}
 luminal_cuda_lite = {path="../../luminal_cuda_lite", optional = true}
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = "2"
+anyhow = "1"
+memmap2 = "0.9"
+safetensors = "0.5"
+half = "2"
 
 [dependencies.pyo3]
 version = "0.28.0"

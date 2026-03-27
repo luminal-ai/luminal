@@ -8,7 +8,8 @@ dependencies = [
     "numpy>=2.0.2",
     "torch>=2.10.0",
     "onnx",
-    "onnxscript"
+    "onnxscript",
+    "safetensors",
 ]
 
 
@@ -19,6 +20,11 @@ build-backend = "maturin"
 [tool.maturin]
 python-source = "src"
 manifest-path = "rust/Cargo.toml"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that download large models or require pre-generated artifacts",
+]
 
 [dependency-groups]
 dev = [

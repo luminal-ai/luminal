@@ -673,3 +673,78 @@ find its weight input buffer.
 for one-shot user inputs, but weights must survive across calls. Always call `.persist()` on
 tensors that should outlive a single execution. In the ONNX pipeline, the distinction is clear:
 `input_names` (user-provided data per step) vs everything else (weights/constants loaded once).
+
+---
+
+## 2026-03-20 — PT2 CUDA Search Rejects All Candidates: Integer Buffers Misinterpreted as Float NaN
+
+### What the symptom was
+
+`test_hf_llama_tiny` on CUDA via PT2 failed with:
+`pyo3_runtime.PanicException: Failed to find a viable initial genome for group 0 after 100 attempts`
+
+The search tried 100 different egglog rewrites and ALL were rejected by the `has_nan_outputs` check.
+
+### What the actual root cause was
+
+**Two issues, both required to fix:**
+
+1. **Integer buffers misinterpreted as float in NaN check.** `has_nan_outputs` in
+   `luminal_cuda_lite/src/runtime.rs` checks ALL `self.buffers` by reinterpreting raw bytes
+   as `f32` and calling `is_nan()`. The PT2-translated graph has integer intermediate
+   buffers (from `arange`, `cast(Int)`, integer arithmetic for embedding index computation).
+   Certain valid `i32` bit patterns (e.g., large integers from `token_id * hidden_dim`)
+   have exponent=0xFF and non-zero mantissa when reinterpreted as f32 — matching the
+   IEEE 754 NaN pattern. This caused false NaN rejections for EVERY candidate genome.
+
+2. **Real weights/constants loaded before search contain -inf.** The PT2 path loaded real
+   safetensors weights and model constants (including the causal attention mask with `-inf`
+   values) BEFORE the search. While the ONNX path also loads real initializer data before
+   search, the PT2 graph's different structure (more explicit integer operations) made the
+   integer NaN false-positive the blocking issue.
+
+### Why it was hard to find
+
+- The original plan diagnosed this as the same zero-dummy-data bug fixed on 2026-03-18.
+  Changing `0.0` to `1.0` was insufficient because the root cause was different.
+- `has_nan_outputs` checking ALL intermediate buffers (not just outputs) masked the real
+  issue — the NaN was in integer index-computation buffers, not in the model's float outputs.
+- The ONNX-translated graph didn't have this problem because it doesn't produce as many
+  integer intermediate buffers (ONNX embedding uses different ops).
+- The NaN pattern was identical across all 100 search attempts, which was the key clue:
+  it was deterministic and independent of egglog rewrite choices, pointing to input data
+  or buffer interpretation rather than graph optimization issues.
+
+### The fix
+
+Four changes:
+
+1. **`luminal_cuda_lite/src/kernel/mod.rs`** (`KernelOp` trait): Added `output_dtype()`
+   method with default `DType::F32`. Each kernel now reports its actual output dtype.
+
+2. **`luminal_cuda_lite/src/kernel/hlir.rs`** and **`other_ops.rs`**: Overrode
+   `output_dtype()` in all kernels with a `dtype` field (returns `self.dtype`), plus
+   special cases: `KernelIota` → `DType::Int`, `KernelLessThan` → `DType::Bool`,
+   `KernelCast` → `self.out_dtype`.
+
+3. **`luminal_cuda_lite/src/runtime.rs`** (`has_nan_outputs`): Replaced fragile
+   `format!("{:?}").contains("dtype: Int")` string matching with proper
+   `op.to_dialect::<dyn KernelOp>().output_dtype()` check. Only F32 buffers are
+   checked for NaN; integer and bool buffers are skipped.
+
+4. **`rust/src/pt2_compiled_model.rs`** (`init_cuda_runtime`): Set ALL input nodes
+   (weights, constants, user inputs) to `vec![1.0f32; n_elements]` before search via
+   new `set_all_inputs_dummy_cuda` function, then reload real data after search.
+   This prevents any -inf values from the causal mask from polluting intermediate
+   float computations during profiling.
+
+### General principle
+
+**Never reinterpret integer buffer bytes as float for NaN checking.** When a graph has
+mixed-dtype operations (float model computation + integer index computation), raw byte
+buffers from integer kernels contain valid i32 values that look like NaN when cast to f32.
+The search's `has_nan_outputs` must be dtype-aware — use the kernel's `output_dtype()`
+method rather than string-matching on Debug output. Additionally, when diagnosing "all
+candidates rejected" during search, check whether the rejection is from actual float NaN
+or from dtype misinterpretation — the key diagnostic is whether the NaN pattern is
+identical across all attempts (dtype issue) vs varying (actual numerical issue).

@@ -25,26 +25,27 @@ use crate::{
 };
 
 #[pyclass(unsendable)]
-pub struct OnnxGraphResult {
-    pub context: Graph,
+pub struct CompiledGraph {
+    pub graph: Graph,
     pub runtime: RuntimeBackend,
     pub tensor_ids: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
+    pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
 
-impl OnnxGraphResult {
+impl CompiledGraph {
     pub fn parse_graph(
         model: ModelProto,
         model_directory: &Path,
         backend: &str,
-    ) -> Result<OnnxGraphResult, String> {
+    ) -> Result<CompiledGraph, String> {
         let _span = span!(Level::TRACE, "Onnx Graphing Parsing").entered();
         let onnx_graph = &model.graph;
-        let mut context = Graph::new();
+        let mut cx = Graph::new();
         // We will need to track the tensors we allocate so we can match up inputs and outputs in the graph
         let mut tensors: HashMap<String, GraphTensor> = HashMap::new();
 
@@ -84,13 +85,13 @@ impl OnnxGraphResult {
                     trace!("Input {} skipped because it is empty", input.name.clone());
                     continue;
                 }
-                let tensor = context.named_tensor(input.name.clone(), shape);
+                let tensor = cx.named_tensor(input.name.clone(), shape);
                 trace!("Input {} added to tensors", input.name.clone());
                 tensors.insert(input.name.clone(), tensor);
                 continue;
             }
             // Always F32: Python runtime always sends float32 data via .float().numpy()
-            let tensor = context.named_tensor(input.name.clone(), shape_exprs);
+            let tensor = cx.named_tensor(input.name.clone(), shape_exprs);
             trace!("Input {} added to tensors", input.name.clone());
             tensors.insert(input.name.clone(), tensor);
         }
@@ -102,7 +103,7 @@ impl OnnxGraphResult {
                 if shape.is_empty() {
                     shape = vec![1];
                 }
-                let tensor = context.named_tensor(init.name.clone(), shape);
+                let tensor = cx.named_tensor(init.name.clone(), shape);
                 tensors.insert(init.name.clone(), tensor);
             }
         }
@@ -138,7 +139,7 @@ impl OnnxGraphResult {
         process_onnx_nodes(
             &onnx_graph.node,
             &mut tensors,
-            &mut context,
+            &mut cx,
             &mut weight_data,
             &mut known_values,
             &mut shape_exprs,
@@ -208,7 +209,7 @@ impl OnnxGraphResult {
                             .values()
                             .find(|&&ch| Expression::from(ch) == *expr)
                         {
-                            context.set_dim(*ch, *concrete);
+                            cx.set_dim(*ch, *concrete);
                         }
                     }
                 }
@@ -233,20 +234,20 @@ impl OnnxGraphResult {
 
         let rt = match backend {
             #[cfg(feature = "cuda")]
-            "cuda" => OnnxGraphResult::build_cuda_backend(
+            "cuda" => CompiledGraph::build_cuda_backend(
                 onnx_graph,
                 model_directory,
                 &mut tensors,
                 &mut weight_data,
-                &mut context,
+                &mut cx,
                 &input_tensor_names,
             )?,
-            "native" => OnnxGraphResult::build_native_backend(
+            "native" => CompiledGraph::build_native_backend(
                 onnx_graph,
                 model_directory,
                 &mut tensors,
                 &mut weight_data,
-                &mut context,
+                &mut cx,
                 &input_tensor_names,
             )?,
             _ => {
@@ -257,14 +258,27 @@ impl OnnxGraphResult {
             }
         };
 
-        Ok(OnnxGraphResult {
-            context,
+        // Build input_shape_exprs for user inputs (needed for auto-dim detection)
+        let input_shape_exprs: Vec<Vec<Expression>> = input_names
+            .iter()
+            .map(|name| {
+                if let Some(&gt) = tensors.get(name) {
+                    gt.dims()
+                } else {
+                    vec![]
+                }
+            })
+            .collect();
+
+        Ok(CompiledGraph {
+            graph: cx,
             runtime: rt,
             tensor_ids,
             input_names,
             output_names,
             output_shapes,
             output_shape_exprs,
+            input_shape_exprs,
             dim_param_map,
         })
     }
@@ -391,7 +405,7 @@ impl OnnxGraphResult {
 }
 
 #[pymethods]
-impl OnnxGraphResult {
+impl CompiledGraph {
     /// Get the list of input tensor names.
     #[getter]
     fn input_names(&self) -> Vec<String> {
@@ -434,7 +448,7 @@ impl OnnxGraphResult {
         self.dim_param_map.keys().cloned().collect()
     }
 
-    /// Set a dynamic dimension value by its ONNX param name (e.g. "seq_len").
+    /// Set a dynamic dimension value by its param name (e.g. "seq_len").
     fn set_dim(&mut self, param_name: &str, value: usize) -> PyResult<()> {
         let ch = self.dim_param_map.get(param_name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -443,14 +457,31 @@ impl OnnxGraphResult {
                 self.dim_param_map.keys().collect::<Vec<_>>()
             ))
         })?;
-        self.context.set_dim(*ch, value);
+        self.graph.set_dim(*ch, value);
         Ok(())
+    }
+
+    /// Auto-detect and set dynamic dimensions from input tensor shapes.
+    /// For each user input, matches the concrete shape against its symbolic
+    /// shape expressions and sets the corresponding dyn_map entries.
+    fn auto_set_dims_from_input_shapes(&mut self, input_shapes: Vec<Vec<usize>>) {
+        for (shape_exprs, shape) in self.input_shape_exprs.iter().zip(input_shapes.iter()) {
+            for (dim_expr, &dim_val) in shape_exprs.iter().zip(shape.iter()) {
+                // Check if this expression is a bare symbolic variable
+                let terms = dim_expr.terms.read();
+                if terms.len() == 1
+                    && let luminal::shape::Term::Var(c) = terms[0]
+                {
+                    self.graph.set_dim(c, dim_val);
+                }
+            }
+        }
     }
 
     /// Resolve output shapes using current dynamic dimension values.
     /// Returns concrete shapes after substituting all symbolic dims.
     fn resolve_output_shapes(&self) -> PyResult<Vec<Vec<usize>>> {
-        let dyn_map = &self.context.dyn_map;
+        let dyn_map = &self.graph.dyn_map;
         let mut result = Vec::new();
         for shape_exprs in &self.output_shape_exprs {
             let shape: Vec<usize> = shape_exprs
@@ -480,12 +511,12 @@ impl OnnxGraphResult {
 
     /// Execute the graph.
     fn run(&mut self) {
-        self.runtime.execute(&self.context.dyn_map);
+        self.runtime.execute(&self.graph.dyn_map);
     }
 
     /// Return the HLIR graph as a DOT string for visualization.
     fn to_dot(&self) -> PyResult<String> {
-        self.context.graph.to_dot().map_err(|e| {
+        self.graph.graph.to_dot().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("DOT generation failed: {e}"))
         })
     }
