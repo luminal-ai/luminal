@@ -770,14 +770,27 @@ impl Runtime for CudaRuntime {
             .sum()
     }
 
-    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
+    fn has_nan_outputs(&self, llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         let _ = self.cuda_stream.synchronize();
         let bucket = self.active();
-        for buf in bucket.buffers.values() {
+        for (node_id, buf) in &bucket.buffers {
             let n_bytes = buf.len();
             if n_bytes == 0 || n_bytes % 4 != 0 {
                 continue;
             }
+            // Determine buffer dtype from the producing LLIR node's kernel op.
+            // Only check F32 buffers for NaN; integer/bool buffers have no NaN concept
+            // and their bit patterns can produce false positives when reinterpreted as f32.
+            let is_float = llir_graph
+                .node_weight(*node_id)
+                .and_then(|op| op.to_dialect::<dyn KernelOp>())
+                .map(|k| matches!(k.output_dtype(), DType::F32))
+                .unwrap_or(true); // default to float check if node not found
+
+            if !is_float {
+                continue;
+            }
+
             let host_bytes: Vec<u8> = match self.cuda_stream.clone_dtoh(buf) {
                 Ok(v) => v,
                 Err(_) => continue,

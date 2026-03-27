@@ -183,6 +183,13 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// Returns the output buffer size in bytes (accounts for dtype).
     fn output_bytes(&self) -> Expression;
 
+    /// Returns the DType of this kernel's output buffer.
+    /// Used by has_nan_outputs to interpret buffer bytes correctly.
+    /// Default: F32 (most kernels output float).
+    fn output_dtype(&self) -> DType {
+        DType::F32
+    }
+
     /// Returns the number of bytes this kernel will load from global memory.
     fn bytes_loaded(&self) -> Expression {
         0.into()

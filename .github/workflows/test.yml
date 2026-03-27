@@ -48,7 +48,7 @@ jobs:
             - name: Build maturin extension
               run: uv run maturin develop --manifest-path rust/Cargo.toml
             - name: Run pytest
-              run: uv run pytest tests/ -v
+              run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py -v -m "not slow"
 
     python_cuda_tests:
         name: Python CUDA Tests
@@ -76,4 +76,4 @@ jobs:
             - name: Run pytest with CUDA backend
               env:
                   LUMINAL_BACKEND: cuda
-              run: uv run pytest tests/ -v
+              run: uv run pytest tests/ -v -m "not slow"

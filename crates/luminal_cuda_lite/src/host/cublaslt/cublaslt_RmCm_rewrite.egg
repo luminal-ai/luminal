@@ -30,14 +30,14 @@
         ; Assert contiguous k stride on output (required for reduction)
         (= ?k_stride (MIter))
 
-        ; Assert A has strides [*, 0, MIter] (row-major A[m,k] broadcast to [m,n,k])
-        ; a_m_stride is the leading dimension (may contain MIter factor)
+        ; Assert A has strides [k*MIter, 0, MIter] (row-major A[m,k] broadcast to [m,n,k])
+        (= ?a_m_stride (MMul (MIter) ?k))
         (= ?a_n_stride (MNum 0))
         (= ?a_k_stride (MIter))
 
-        ; Assert B has strides [0, *, MIter] (column-major B[k,n] broadcast to [m,n,k])
+        ; Assert B has strides [0, k*MIter, MIter] (column-major B[k,n] broadcast to [m,n,k])
         (= ?b_m_stride (MNum 0))
-        ; b_n_stride is the leading dimension (may contain MIter factor)
+        (= ?b_n_stride (MMul (MIter) ?k))
         (= ?b_k_stride (MIter))
 
         (= ?dt (dtype ?a))
@@ -95,13 +95,15 @@
 
         (= ?k_stride (MIter))
 
-        ; A row-major: k=MIter, n=0
+        ; A row-major: k=MIter, n=0, m_stride=k*MIter
         (= ?a_k_stride (MIter))
         (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
 
-        ; B column-major: k=MIter, m=0
+        ; B column-major: k=MIter, m=0, n_stride=k*MIter
         (= ?b_k_stride (MIter))
         (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
 
         ; Uniform batch strides (contiguous per batch)
         (= ?a_batch_stride (MMul ?m ?a_m_stride))
