@@ -1,5 +1,7 @@
+mod block;
 mod matmul;
 mod ops;
+pub use block::*;
 pub use matmul::*;
 pub use ops::*;
 

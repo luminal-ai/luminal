@@ -319,12 +319,12 @@ impl MetalRuntime {
                 .expect("Cannot find tensor buffer in Metal runtime!");
         }
 
-        let hlir_node = if let Some(Input { node, .. }) = self.llir_graph[lineage_node].to_op::<Input>()
-        {
-            NodeIndex::new(*node)
-        } else {
-            panic!("output_data_input lineage must reach an HLIR input node");
-        };
+        let hlir_node =
+            if let Some(Input { node, .. }) = self.llir_graph[lineage_node].to_op::<Input>() {
+                NodeIndex::new(*node)
+            } else {
+                panic!("output_data_input lineage must reach an HLIR input node");
+            };
 
         let output_buf = self
             .buffers
