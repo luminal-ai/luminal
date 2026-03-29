@@ -16,14 +16,15 @@ impl Add for GraphTensor {
             "Dtypes must match to add tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Add {
-                input_shapes: vec![self.shape, rhs.shape],
+                input_shapes: vec![self.shape.clone(), rhs.shape.clone()],
                 ..Default::default()
             },
             &[self.id, rhs.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 }
 
@@ -40,7 +41,7 @@ where
     GraphTensor: Add<T, Output = GraphTensor>,
 {
     fn add_assign(&mut self, rhs: T) {
-        *self = *self + rhs;
+        *self = self.clone() + rhs;
     }
 }
 
@@ -65,7 +66,7 @@ where
     GraphTensor: Sub<T, Output = GraphTensor>,
 {
     fn sub_assign(&mut self, rhs: T) {
-        *self = *self - rhs;
+        *self = self.clone() - rhs;
     }
 }
 
@@ -78,14 +79,15 @@ impl Mul for GraphTensor {
             "Dtypes must match to multiply tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Mul {
-                input_shapes: vec![self.shape, rhs.shape],
+                input_shapes: vec![self.shape.clone(), rhs.shape.clone()],
                 ..Default::default()
             },
             &[self.id, rhs.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 }
 
@@ -102,7 +104,7 @@ where
     GraphTensor: Mul<T, Output = GraphTensor>,
 {
     fn mul_assign(&mut self, rhs: T) {
-        *self = *self * rhs;
+        *self = self.clone() * rhs;
     }
 }
 
@@ -129,7 +131,7 @@ where
     GraphTensor: Div<T, Output = GraphTensor>,
 {
     fn div_assign(&mut self, rhs: T) {
-        *self = *self / rhs;
+        *self = self.clone() / rhs;
     }
 }
 
@@ -143,14 +145,15 @@ impl Rem<GraphTensor> for GraphTensor {
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             Mod {
-                input_shapes: vec![self.shape, rhs.shape],
+                input_shapes: vec![self.shape.clone(), rhs.shape.clone()],
                 ..Default::default()
             },
             &[self.id, rhs.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 }
 
@@ -159,7 +162,7 @@ where
     GraphTensor: Rem<T, Output = GraphTensor>,
 {
     fn rem_assign(&mut self, rhs: T) {
-        *self = *self % rhs;
+        *self = self.clone() % rhs;
     }
 }
 
@@ -167,11 +170,8 @@ impl Add<f32> for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: f32) -> Self::Output {
-        self + self
-            .graph()
-            .constant_float(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant_float(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self + c
     }
 }
 
@@ -179,11 +179,8 @@ impl<S: Into<Expression>> Add<S> for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: S) -> Self::Output {
-        self + self
-            .graph()
-            .constant(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self + c
     }
 }
 
@@ -191,11 +188,8 @@ impl Sub<f32> for GraphTensor {
     type Output = GraphTensor;
 
     fn sub(self, rhs: f32) -> Self::Output {
-        self - self
-            .graph()
-            .constant_float(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant_float(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self - c
     }
 }
 
@@ -203,11 +197,8 @@ impl<S: Into<Expression>> Sub<S> for GraphTensor {
     type Output = GraphTensor;
 
     fn sub(self, rhs: S) -> Self::Output {
-        self - self
-            .graph()
-            .constant(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self - c
     }
 }
 
@@ -215,11 +206,8 @@ impl Mul<f32> for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: f32) -> Self::Output {
-        self * self
-            .graph()
-            .constant_float(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant_float(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self * c
     }
 }
 
@@ -227,11 +215,8 @@ impl<S: Into<Expression>> Mul<S> for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: S) -> Self::Output {
-        self * self
-            .graph()
-            .constant(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self * c
     }
 }
 
@@ -240,11 +225,8 @@ impl Div<f32> for GraphTensor {
     type Output = GraphTensor;
 
     fn div(self, rhs: f32) -> Self::Output {
-        self * self
-            .graph()
-            .constant_float(rhs.recip())
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant_float(rhs.recip()).cast(self.dtype).expand_rhs(self.shape.clone());
+        self * c
     }
 }
 
@@ -252,11 +234,8 @@ impl<S: Into<Expression>> Div<S> for GraphTensor {
     type Output = GraphTensor;
 
     fn div(self, rhs: S) -> Self::Output {
-        self / self
-            .graph()
-            .constant(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self / c
     }
 }
 
@@ -264,11 +243,8 @@ impl Rem<f32> for GraphTensor {
     type Output = GraphTensor;
 
     fn rem(self, rhs: f32) -> Self::Output {
-        self % self
-            .graph()
-            .constant_float(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant_float(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self % c
     }
 }
 
@@ -276,11 +252,8 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
     type Output = GraphTensor;
 
     fn rem(self, rhs: S) -> Self::Output {
-        self % self
-            .graph()
-            .constant(rhs)
-            .cast(self.dtype)
-            .expand_rhs(self.shape)
+        let c = self.graph().constant(rhs).cast(self.dtype).expand_rhs(self.shape.clone());
+        self % c
     }
 }
 
@@ -294,19 +267,17 @@ impl GraphTensor {
             "Dtypes must match to compare tensors. Got {:?} and {:?}",
             self.dtype, rhs.dtype
         );
+        let out_shape = self.shape.clone().contiguous().with_element_bits(DType::Bool.bits());
         let new_id = self.graph().add_op(
             LessThan {
-                input_shapes: vec![self.shape, rhs.shape],
+                input_shapes: vec![self.shape.clone(), rhs.shape.clone()],
                 ..Default::default()
             },
             &[self.id, rhs.id],
         );
-        // Comparison operations always output Bool
         GraphTensor::from_id(
             new_id,
-            self.shape
-                .contiguous()
-                .with_element_bits(DType::Bool.bits()),
+            out_shape,
             self.graph_ref,
             DType::Bool,
         )
@@ -329,7 +300,7 @@ impl GraphTensor {
 
     /// Not equal
     pub fn ne(self, rhs: GraphTensor) -> GraphTensor {
-        self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)
+        self.clone().lt(rhs.clone()).cast(DType::F32) + self.gt(rhs).cast(DType::F32)
     }
 
     /// Equal
@@ -350,12 +321,14 @@ impl GraphTensor {
 
     /// Take the elementwise maximum of two tensors
     pub fn maximum(self, rhs: GraphTensor) -> GraphTensor {
-        (self.lt(rhs).cast(self.dtype) * rhs) + (rhs.le(self).cast(self.dtype) * self)
+        let dtype = self.dtype;
+        (self.clone().lt(rhs.clone()).cast(dtype) * rhs.clone()) + (rhs.le(self.clone()).cast(dtype) * self)
     }
 
     /// Take the elementwise maximum of a tensor and a float
     pub fn maximum_f32(self, rhs: f32) -> GraphTensor {
-        self.maximum(self.graph().constant_float(rhs).expand_rhs(self.shape))
+        let c = self.graph().constant_float(rhs).expand_rhs(self.shape.clone());
+        self.maximum(c)
     }
 
     /// Take the elementwise minimum of two tensors
@@ -379,7 +352,7 @@ impl GraphTensor {
             self.dtype, other.dtype,
             "self and other need to be the same dtype!"
         );
-        (cond.cast(self.dtype) * self) + ((1.0 - cond.cast(DType::F32)).cast(other.dtype) * other)
+        (cond.clone().cast(self.dtype) * self) + ((1.0 - cond.cast(DType::F32)).cast(other.dtype) * other)
     }
 }
 
@@ -444,7 +417,7 @@ pub(super) mod tests {
         let mut cx = Graph::new();
         let a = cx.tensor(a_shape.clone());
         let b = cx.tensor(b_shape.clone());
-        let c = func(a, b).output();
+        let c = func(a.clone(), b.clone()).output();
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
@@ -680,8 +653,8 @@ pub(super) mod tests {
             27,
             |a, b| {
                 // gt() returns Bool, cast to F32 for cond which expects F32
-                let cond = a
-                    .gt(b.graph().constant_float(0.0).expand_rhs(a.shape))
+                let cond = a.clone()
+                    .gt(b.graph().constant_float(0.0).expand_rhs(a.shape.clone()))
                     .cast(crate::dtype::DType::F32);
                 a.cond(cond, b)
             },

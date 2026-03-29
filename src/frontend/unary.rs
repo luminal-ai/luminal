@@ -74,26 +74,28 @@ impl Neg for GraphTensor {
 impl GraphTensor {
     /// Base 2 log
     pub fn log2(self) -> GraphTensor {
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Log2 {
-                input_shape: self.shape,
+                input_shape: self.shape.clone(),
                 ..Default::default()
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// Base 2 exp
     pub fn exp2(self) -> GraphTensor {
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Exp2 {
-                input_shape: self.shape,
+                input_shape: self.shape.clone(),
                 ..Default::default()
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// Natural exp
@@ -108,26 +110,28 @@ impl GraphTensor {
 
     /// Take the reciprocal of each element
     pub fn reciprocal(self) -> GraphTensor {
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Recip {
-                input_shape: self.shape,
+                input_shape: self.shape.clone(),
                 ..Default::default()
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// The sin(x) function
     pub fn sin(self) -> GraphTensor {
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Sin {
-                input_shape: self.shape,
+                input_shape: self.shape.clone(),
                 ..Default::default()
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// The cos(x) function
@@ -137,29 +141,31 @@ impl GraphTensor {
 
     /// Square every element in the tensor
     pub fn square(self) -> GraphTensor {
-        self * self
+        self.clone() * self
     }
 
     /// The square root function
     pub fn sqrt(self) -> GraphTensor {
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::Sqrt {
-                input_shape: self.shape,
+                input_shape: self.shape.clone(),
                 ..Default::default()
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 
     pub fn graph_break(self) -> GraphTensor {
+        let out_shape = self.shape.clone().contiguous();
         let new_id = self.graph().add_op(
             crate::hlir::GraphBreak {
-                input_shape: self.shape,
+                input_shape: self.shape.clone(),
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(new_id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// Scale so std is 1.0
@@ -167,20 +173,22 @@ impl GraphTensor {
     where
         GraphTensor: Add<T, Output = GraphTensor>,
     {
-        (self * self)
+        let shape = self.shape.clone();
+        (self.clone() * self.clone())
             .mean(axes.to_axes())
             .add(epsilon)
             .sqrt()
             .reciprocal()
-            .expand_to_shape_on_axes(self.shape, axes)
+            .expand_to_shape_on_axes(shape.clone(), axes)
             .mul(self)
     }
 
     /// Center so mean is 0.0
     pub fn mean_norm(self, axes: impl ToAxes) -> GraphTensor {
-        self - self
+        let shape = self.shape.clone();
+        self.clone() - self.clone()
             .mean(axes.to_axes())
-            .expand_to_shape_on_axes(self.shape, axes)
+            .expand_to_shape_on_axes(shape, axes)
     }
 
     /// Applies a layer norm along an axis
@@ -193,48 +201,55 @@ impl GraphTensor {
 
     /// Normalize the tensor along `axes` using an Lp norm.
     pub fn normalize(self, p: f32, axes: impl ToAxes, epsilon: f32) -> GraphTensor {
-        let norm = self.abs().pow(p).sum(axes.to_axes()).pow(1.0 / p);
+        let shape = self.shape.clone();
+        let norm = self.clone().abs().pow(p).sum(axes.to_axes()).pow(1.0 / p);
         self / norm
             .maximum_f32(epsilon)
-            .expand_to_shape_on_axes(self.shape, axes)
+            .expand_to_shape_on_axes(shape, axes)
     }
 
     /// Applies a softmax function along an axis
     pub fn softmax(self, axes: impl ToAxes) -> GraphTensor {
-        let m = self
-            - self
+        let shape = self.shape.clone();
+        let m = self.clone()
+            - self.clone()
                 .max(axes.to_axes())
-                .expand_to_shape_on_axes(self.shape, axes.to_axes());
+                .expand_to_shape_on_axes(shape.clone(), axes.to_axes());
         let exp = m.exp();
-        exp / exp
+        exp.clone() / exp
             .sum(axes.to_axes())
-            .expand_to_shape_on_axes(self.shape, axes)
+            .expand_to_shape_on_axes(shape, axes)
     }
 
     /// Applies a log softmax function along an axis
     pub fn log_softmax(self, axes: impl ToAxes) -> GraphTensor {
-        let m = self
-            - self
+        let shape = self.shape.clone();
+        let m = self.clone()
+            - self.clone()
                 .max(axes.to_axes())
-                .expand_to_shape_on_axes(self.shape, axes.to_axes());
-        m - m
+                .expand_to_shape_on_axes(shape.clone(), axes.to_axes());
+        let m_shape = m.shape.clone();
+        m.clone() - m
             .exp()
             .sum(axes.to_axes())
             .log()
-            .expand_to_shape_on_axes(m.shape, axes)
+            .expand_to_shape_on_axes(m_shape, axes)
     }
 
     /// Get the indicies of the max elements along an axis
     pub fn argmax(self, axis: usize) -> GraphTensor {
         // Get one-hot along last dimension
-        let x_equal = self
-            .eq(self.max(axis).expand_dim(axis, self.dims()[axis]))
+        let dims = self.dims();
+        let shape = self.shape.clone();
+        let n_dims = self.shape.len();
+        let x_equal = self.clone()
+            .eq(self.clone().max(axis).expand_dim(axis, dims[axis]))
             .cast(DType::Int);
         // Create index arange for last dimension
-        let r = self.graph().arange(self.dims()[axis]);
-        let axes = (0..self.shape.len()).filter(|i| *i != axis).collect_vec();
+        let r = self.graph().arange(dims[axis]);
+        let axes = (0..n_dims).filter(|i| *i != axis).collect_vec();
         // Multiply one-hot by expanded index arange
-        (x_equal * r.expand_to_shape_on_axes(self.shape, axes)).max(axis)
+        (x_equal * r.expand_to_shape_on_axes(shape, axes)).max(axis)
     }
 
     /// Get the indices of the min elements along an axis
@@ -255,11 +270,12 @@ impl GraphTensor {
             .into_iter()
             .map(|i| self.dims()[i])
             .product::<Expression>();
-        let mean = self
+        let shape = self.shape.clone();
+        let mean = self.clone()
             .mean(axes.to_axes())
-            .expand_to_shape_on_axes(self.shape, axes.to_axes());
+            .expand_to_shape_on_axes(shape, axes.to_axes());
         let centered = self - mean;
-        (centered * centered).sum(axes) / (n - correction)
+        (centered.clone() * centered).sum(axes) / (n - correction)
     }
 
     /// Compute the sample standard deviation along axes
@@ -274,12 +290,12 @@ impl GraphTensor {
 
     /// Take the absolute value
     pub fn abs(self) -> GraphTensor {
-        self.relu() + (-self).relu()
+        self.clone().relu() + (-self).relu()
     }
 
     /// Get the sign of each element, '1' for positive and '-1' for negative
     pub fn sign(self) -> GraphTensor {
-        self / (self.abs() + 1e-10)
+        self.clone() / (self.abs() + 1e-10)
     }
 
     /// The Rectified Linear Unit activation function
@@ -295,7 +311,7 @@ impl GraphTensor {
 
     /// The swish (aka silu) activation function
     pub fn swish(self) -> GraphTensor {
-        self * self.sigmoid()
+        self.clone() * self.sigmoid()
     }
 
     /// The silu (aka swish) activation function
@@ -310,27 +326,28 @@ impl GraphTensor {
 
     /// The leaky relu activation function
     pub fn leaky_relu(self, neg_slope: f32) -> GraphTensor {
-        self.relu() - (self * -neg_slope).relu()
+        self.clone().relu() - (self * -neg_slope).relu()
     }
 
     /// The Gaussian Error Linear Unit activation function
     #[allow(clippy::excessive_precision)]
     pub fn gelu(self) -> GraphTensor {
         // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
-        0.5 * self * (1. + (0.7978845608 * self * (1. + 0.044715 * self * self)).tanh())
+        0.5 * self.clone() * (1. + (0.7978845608 * self.clone() * (1. + 0.044715 * self.clone() * self)).tanh())
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis
     pub fn argsort(self, axis: usize, descending: bool) -> GraphTensor {
         // Compare all elements with all other elements by making an axis
-        let ax_size = self.dims()[axis];
-        let a = self.expand_dim(axis + 1, ax_size) + 0.0;
-        let b = self.expand_dim(axis, ax_size) + 1e-9;
+        let dims = self.dims();
+        let ax_size = dims[axis];
+        let a = self.clone().expand_dim(axis + 1, ax_size) + 0.0;
+        let b = self.clone().expand_dim(axis, ax_size) + 1e-9;
         let cmp = if descending { a.gt(b) } else { a.lt(b) };
         // ind[j] = rank of element j (how many elements are smaller/larger)
         let ranks = (cmp.cast(DType::F32) + 0.0).sum(axis).cast(DType::Int);
         // Scatter original indices into rank positions to get sort indices
-        scatter_ranks_to_sort_indices(ranks, self.dims(), axis, self.graph())
+        scatter_ranks_to_sort_indices(ranks, dims, axis, self.graph())
     }
 
     /// Stable argsort: like `argsort`, but breaks ties by original index
@@ -344,8 +361,8 @@ impl GraphTensor {
         exp_dims.insert(axis, ax_size);
 
         // Pairwise value tensors (* 1.0 forces materialization to avoid stride issues)
-        let a_val = self.expand_dim(axis + 1, ax_size) * 1.0;
-        let b_val = self.expand_dim(axis, ax_size) * 1.0;
+        let a_val = self.clone().expand_dim(axis + 1, ax_size) * 1.0;
+        let b_val = self.clone().expand_dim(axis, ax_size) * 1.0;
 
         // Index tensors for tiebreaking
         let mut iota_a = self.graph().arange(ax_size).cast(DType::F32);
@@ -368,12 +385,12 @@ impl GraphTensor {
         // ascending:  rank[j] = count of i where (x[i] < x[j]) || (x[i]==x[j] && i < j)
         // descending: rank[j] = count of i where (x[i] > x[j]) || (x[i]==x[j] && i < j)
         let primary = if descending {
-            a_val.gt(b_val)
+            a_val.clone().gt(b_val.clone())
         } else {
-            a_val.lt(b_val)
+            a_val.clone().lt(b_val.clone())
         };
         let idx_cmp = iota_a.lt(iota_b);
-        let not_lt = 1.0 - a_val.lt(b_val).cast(DType::F32);
+        let not_lt = 1.0 - a_val.clone().lt(b_val.clone()).cast(DType::F32);
         let not_gt = 1.0 - a_val.gt(b_val).cast(DType::F32);
         let val_eq = not_lt * not_gt;
         let cmp = primary.cast(DType::F32) + val_eq * idx_cmp.cast(DType::F32);
@@ -385,7 +402,7 @@ impl GraphTensor {
 
     /// Sort the tensor along a certian axis
     pub fn sort(self, axis: usize, descending: bool) -> GraphTensor {
-        self.gather(self.argsort(axis, descending))
+        self.clone().gather(self.argsort(axis, descending))
     }
 
     /// Sort and retrieve top-k **indexes**
@@ -395,7 +412,7 @@ impl GraphTensor {
 
     /// Sort and retrieve top-k **values** (largest first)
     pub fn topk_values(self, k: usize, axis: usize) -> GraphTensor {
-        let top_k_idx = self.topk_indexes(k, axis);
+        let top_k_idx = self.clone().topk_indexes(k, axis);
         self.gather_elements(top_k_idx, axis)
     }
 
@@ -499,7 +516,7 @@ pub(super) mod tests {
             .collect_vec();
         let mut cx = Graph::new();
         let a = cx.tensor(shape.clone());
-        let b = func(a).output();
+        let b = func(a.clone()).output();
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);

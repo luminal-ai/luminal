@@ -93,7 +93,6 @@ impl GraphTensor {
 
     /// add a new dimension of size 1 at the specified place
     pub fn unsqueeze(mut self, dim: usize) -> GraphTensor {
-        assert!(self.shape.len() < 10, "Shape is maxed out at 10 dimensions");
         self.shape.expand_dim(dim, 1);
         self
     }
@@ -139,15 +138,16 @@ impl GraphTensor {
         // Normalize negative indices for axis dim
         let axis_dim = dims[axis].to_usize().unwrap();
         let idx_f32 = indexes.cast(DType::F32);
+        let idx_shape_st = idx_f32.shape.clone();
         let zero = idx_f32
             .graph()
             .constant_float(0.0)
-            .expand_rhs(idx_f32.shape);
+            .expand_rhs(idx_shape_st.clone());
         let adj = idx_f32
             .graph()
             .constant_float(axis_dim as f32)
-            .expand_rhs(idx_f32.shape);
-        let is_neg = idx_f32.lt(zero).cast(DType::F32);
+            .expand_rhs(idx_shape_st);
+        let is_neg = idx_f32.clone().lt(zero).cast(DType::F32);
         let idx_normalized = (idx_f32 + (is_neg * adj)).cast(DType::Int);
 
         // Non-axis flat index via iota + flatten_strides
@@ -170,7 +170,7 @@ impl GraphTensor {
         let stride_tensor = self
             .graph()
             .constant(strides[axis])
-            .expand_rhs(idx_normalized.shape);
+            .expand_rhs(idx_normalized.shape.clone());
         let flat_idx = non_axis_flat + idx_normalized * stride_tensor;
 
         self.gather(flat_idx)
@@ -213,15 +213,16 @@ impl GraphTensor {
         // Normalize negative indices for axis dim
         let axis_dim = data_dims[axis].to_usize().unwrap();
         let idx_f32 = indices.cast(DType::F32);
+        let idx_shape_st = idx_f32.shape.clone();
         let zero = idx_f32
             .graph()
             .constant_float(0.0)
-            .expand_rhs(idx_f32.shape);
+            .expand_rhs(idx_shape_st.clone());
         let adj = idx_f32
             .graph()
             .constant_float(axis_dim as f32)
-            .expand_rhs(idx_f32.shape);
-        let is_neg = idx_f32.lt(zero).cast(DType::F32);
+            .expand_rhs(idx_shape_st);
+        let is_neg = idx_f32.clone().lt(zero).cast(DType::F32);
         let idx_normalized = (idx_f32 + (is_neg * adj)).cast(DType::Int);
 
         // Non-axis flat index via iota + flatten_strides
@@ -245,7 +246,7 @@ impl GraphTensor {
         let stride_tensor = self
             .graph()
             .constant(strides[axis])
-            .expand_rhs(idx_normalized.shape);
+            .expand_rhs(idx_normalized.shape.clone());
         let flat_dest = non_axis_flat + idx_normalized * stride_tensor;
 
         // Flatten to 1D using materialize + reshape
@@ -317,11 +318,11 @@ impl GraphTensor {
         // For each k_dim, extract the slice and multiply by stride
         let mut flat_base: Option<GraphTensor> = None;
         for (k_dim, &stride) in data_strides.iter().enumerate().take(k) {
-            let idx_k = indices_flat.slice_along(k_dim..k_dim + 1, indices_flat.dims().len() - 1);
-            let idx_k = idx_k.squeeze(idx_k.dims().len() - 1);
+            let idx_k = indices_flat.clone().slice_along(k_dim..k_dim + 1, indices_flat.dims().len() - 1);
+            let idx_k_squeezed = idx_k.clone().squeeze(idx_k.dims().len() - 1);
 
-            let stride_tensor = self.graph().constant(stride).expand_rhs(idx_k.shape);
-            let contribution = idx_k * stride_tensor;
+            let stride_tensor = self.graph().constant(stride).expand_rhs(idx_k_squeezed.shape.clone());
+            let contribution = idx_k_squeezed * stride_tensor;
 
             flat_base = Some(match flat_base {
                 Some(fb) => fb + contribution,
@@ -357,7 +358,7 @@ impl GraphTensor {
                 let stride_tensor = self
                     .graph()
                     .constant(data_strides[d])
-                    .expand_rhs(ar_flat.shape);
+                    .expand_rhs(ar_flat.shape.clone());
                 base_expanded += ar_flat * stride_tensor;
             }
             base_expanded
@@ -385,14 +386,15 @@ impl GraphTensor {
             DType::Int,
             "Gather indexes must have an integer dtype!"
         );
+        let out_shape = indexes.shape.clone().contiguous();
         let id = self.graph().add_op(
             Gather {
-                input_shapes: vec![indexes.shape, self.shape],
+                input_shapes: vec![indexes.shape.clone(), self.shape.clone()],
                 ..Default::default()
             },
             &[indexes.id, self.id],
         );
-        GraphTensor::from_id(id, indexes.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// Scatter self (src) into dest at flat 1D positions given by indexes.
@@ -403,6 +405,7 @@ impl GraphTensor {
             DType::Int,
             "Scatter indexes must have an integer dtype!"
         );
+        let out_shape = dest.shape.clone().contiguous();
         let id = self.graph().add_op(
             Scatter {
                 dest_shape: dest.shape.dims.to_vec(),
@@ -413,7 +416,7 @@ impl GraphTensor {
             },
             &[dest.id, indexes.id, self.id],
         );
-        GraphTensor::from_id(id, dest.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(id, out_shape, self.graph_ref, self.dtype)
     }
 
     /// Extracts sliding local windows from an input tensor.
@@ -568,10 +571,12 @@ impl GraphTensor {
     pub fn pad(self, padding: impl ToPad, elem: f32) -> GraphTensor {
         let mut padding = padding.to_pad_vec();
         padding.extend(vec![(0.into(), 0.into()); self.shape.len() - padding.len()]); // Make sure we have a padding per dim
+        let dims = self.dims();
+        let dtype = self.dtype;
         let mut index_expressions = vec![];
         let mut phys_size = Expression::from(1);
         let mut new_dims = vec![];
-        for (dim, (start, end)) in self.dims().into_iter().zip(&padding).rev() {
+        for (dim, (start, end)) in dims.iter().copied().zip(&padding).rev() {
             let mut ind = Expression::from('z');
             if *start != 0 {
                 ind = (ind - *start).max(0);
@@ -587,10 +592,11 @@ impl GraphTensor {
         index_expressions.reverse();
         let index_expression = flatten_strides(&new_dims, &index_expressions);
         // get indexed tensor
-        let new_tensor = self.gather(self.graph().iota(index_expression, new_dims.clone()));
+        let iota = self.graph().iota(index_expression, new_dims.clone());
+        let new_tensor = self.clone().gather(iota);
         // mask out padded elements
         let mut mask_expressions = vec![];
-        for ((start, end), dim) in padding.into_iter().zip(self.dims()) {
+        for ((start, end), dim) in padding.into_iter().zip(dims) {
             let mut mask = Expression::from(1);
             if start != 0 {
                 mask *= Expression::from('z').gte(start);
@@ -612,8 +618,8 @@ impl GraphTensor {
         let mask = self
             .graph()
             .iota(mask_expression, new_dims)
-            .cast(self.dtype);
-        let masked = new_tensor * mask;
+            .cast(dtype);
+        let masked = new_tensor * mask.clone();
         if elem == 0.0 {
             masked
         } else {
@@ -637,8 +643,10 @@ impl GraphTensor {
     /// Concat along an existing dimension
     pub fn concat_along(self, rhs: GraphTensor, axis: usize) -> GraphTensor {
         // Pad and add
-        self.pad_along(0, rhs.dims()[axis], axis, 0.)
-            + rhs.pad_along(self.dims()[axis], 0, axis, 0.)
+        let rhs_dim = rhs.dims()[axis];
+        let self_dim = self.dims()[axis];
+        self.pad_along(0, rhs_dim, axis, 0.)
+            + rhs.pad_along(self_dim, 0, axis, 0.)
     }
 }
 
@@ -898,7 +906,7 @@ mod tests {
     fn test_unsqueeze() {
         let mut cx = Graph::new();
         let inp = cx.tensor((2, 2, 3));
-        let out1 = inp.unsqueeze(1);
+        let out1 = inp.clone().unsqueeze(1);
         let out2 = inp.unsqueeze(3);
         assert_eq!(out1.dims(), &[2, 1, 2, 3]);
         assert_eq!(out2.dims(), &[2, 2, 3, 1]);
@@ -932,7 +940,7 @@ mod tests {
         );
         test_unary(
             (4, 10),
-            |a| a.concat_along(a, 0),
+            |a| a.clone().concat_along(a, 0),
             |a| Tensor::cat(&[a.clone(), a], 0).unwrap(),
         );
     }
@@ -942,12 +950,12 @@ mod tests {
         let mut cx = Graph::new();
         let data = cx.tensor((2, 3));
         let indexes = cx.tensor(4).as_dtype(DType::Int);
-        let gathered = data.gather(indexes).output();
+        let gathered = data.clone().gather(indexes.clone()).output();
         // Inverse permutation via scatter: scatter arange at perm positions into zeros
         let perm = cx.tensor(6).as_dtype(DType::Int);
         let values = cx.arange(6);
         let zeros = cx.iota(Expression::from(0usize), 6);
-        let inv = values.scatter(perm, zeros).cast(DType::F32).output();
+        let inv = values.clone().scatter(perm.clone(), zeros.clone()).cast(DType::F32).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
         rt.set_data(data.id, vec![0., 1., 2., 3., 4., 5.]);
@@ -964,7 +972,7 @@ mod tests {
         let src = cx.tensor(3);
         let indexes = cx.tensor(3).as_dtype(DType::Int);
         let dest = cx.tensor(5);
-        let result = src.scatter(indexes, dest).output();
+        let result = src.clone().scatter(indexes.clone(), dest.clone()).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
         rt.set_data(src.id, vec![10., 20., 30.]);
@@ -980,7 +988,7 @@ mod tests {
         let src = cx.tensor(1);
         let indexes = cx.tensor(1).as_dtype(DType::Int);
         let dest = cx.tensor(5);
-        let result = src.scatter(indexes, dest).output();
+        let result = src.clone().scatter(indexes.clone(), dest.clone()).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
         rt.set_data(src.id, vec![99.]);
@@ -996,7 +1004,7 @@ mod tests {
         let src = cx.tensor(4);
         let indexes = cx.tensor(4).as_dtype(DType::Int);
         let dest = cx.tensor(4);
-        let result = src.scatter(indexes, dest).output();
+        let result = src.clone().scatter(indexes.clone(), dest.clone()).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
         rt.set_data(src.id, vec![40., 30., 20., 10.]);
@@ -1010,7 +1018,7 @@ mod tests {
     fn test_repeat_is_view_only() {
         let mut cx = Graph::new();
         let a = cx.tensor((2, 3));
-        let repeated = a.repeat((2, 2));
+        let repeated = a.clone().repeat((2, 2));
 
         assert_eq!(repeated.id, a.id);
         assert_eq!(
@@ -1023,7 +1031,7 @@ mod tests {
     fn test_repeat_runtime_values() {
         let mut cx = Graph::new();
         let a = cx.tensor((2, 3));
-        let repeated = (a.repeat((2, 2)) * 1.0).output();
+        let repeated = (a.clone().repeat((2, 2)) * 1.0).output();
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);

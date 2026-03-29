@@ -4,14 +4,14 @@ use crate::prelude::*;
 impl GraphTensor {
     /// Reduce a dimension of the tensor by summing all elements along that axis.
     pub fn sum(self, axes: impl ToAxes) -> GraphTensor {
-        let (mut shape, mut id) = (self.shape, self.id);
+        let (mut shape, mut id) = (self.shape.clone(), self.id);
         // Sum reduce each dimension
         let mut axes = axes.to_axes();
         for dim in 0..axes.len() {
             id = self.graph().add_op(
                 SumReduce {
                     dim: axes[dim],
-                    input_shape: shape,
+                    input_shape: shape.clone(),
                     ..Default::default()
                 },
                 &[id],
@@ -30,14 +30,14 @@ impl GraphTensor {
 
     /// Reduce a dimension of the tensor by taking the maximum of all elements along that axis.
     pub fn max(self, axes: impl ToAxes) -> GraphTensor {
-        let (mut shape, mut id) = (self.shape, self.id);
+        let (mut shape, mut id) = (self.shape.clone(), self.id);
         // Max reduce each dimension
         let mut axes = axes.to_axes();
         for dim in 0..axes.len() {
             id = self.graph().add_op(
                 MaxReduce {
                     dim: axes[dim],
-                    input_shape: shape,
+                    input_shape: shape.clone(),
                     ..Default::default()
                 },
                 &[id],

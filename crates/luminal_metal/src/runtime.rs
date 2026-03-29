@@ -181,6 +181,13 @@ impl MetalRuntime {
             })
             .unwrap_or(DType::F32);
 
+        // Safety: Metal may return a nil pointer for zero-length buffers.
+        // Passing a null pointer to std::slice::from_raw_parts is UB even
+        // with len == 0, so short-circuit here for all dtype arms.
+        if buffer.length() == 0 {
+            return Vec::new();
+        }
+
         unsafe {
             match dtype {
                 DType::F16 => {

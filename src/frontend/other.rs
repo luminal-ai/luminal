@@ -78,10 +78,10 @@ impl Graph {
     /// Stack tensors along a new dimension
     pub fn stack(&mut self, tensors: &[GraphTensor], axis: usize) -> GraphTensor {
         assert!(!tensors.is_empty(), "Cannot stack empty tensor list");
-        let first = tensors[0].unsqueeze(axis);
+        let first = tensors[0].clone().unsqueeze(axis);
         tensors[1..]
             .iter()
-            .fold(first, |acc, t| acc.concat_along(t.unsqueeze(axis), axis))
+            .fold(first, |acc, t| acc.concat_along(t.clone().unsqueeze(axis), axis))
     }
 }
 
@@ -93,7 +93,7 @@ impl GraphTensor {
         let id = self
             .graph()
             .add_op(Cast(self.shape.n_physical_elements(), dtype), &[self.id]);
-        let mut shape = self.shape;
+        let mut shape = self.shape.clone();
         shape.element_stride_bits = dtype.bits();
         GraphTensor::from_id(id, shape, self.graph_ref, dtype)
     }
@@ -205,7 +205,7 @@ mod tests {
         let a = cx.tensor((2, 3));
         let b = cx.tensor((2, 3));
         let c = cx.tensor((2, 3));
-        let stacked = cx.stack(&[a, b, c], 0).output();
+        let stacked = cx.stack(&[a.clone(), b.clone(), c.clone()], 0).output();
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
