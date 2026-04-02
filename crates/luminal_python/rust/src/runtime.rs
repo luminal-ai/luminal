@@ -63,8 +63,6 @@ impl RuntimeBackend {
 /// 1. Call `prepare_cuda` to get the runtime
 /// 2. Set data on the runtime using `rt.set_data(node_id, data)`
 /// 3. Call `finalize_cuda` to run profiling with data available
-///
-
 #[cfg(feature = "cuda")]
 pub fn prepare_cuda(context: &mut Graph) -> Result<(CudaRuntime, Arc<CudaStream>), String> {
     let cuda_ctx =
@@ -80,12 +78,4 @@ pub fn prepare_cuda(context: &mut Graph) -> Result<(CudaRuntime, Arc<CudaStream>
 pub fn finalize_cuda(context: &mut Graph, rt: CudaRuntime) -> RuntimeBackend {
     let optimized_rt = context.search(rt, 10);
     RuntimeBackend::Cuda(Box::new(optimized_rt))
-}
-
-/// Initialize a native (CPU) runtime using single-phase approach.
-/// NativeRuntime validates Input nodes, so we must search first, then set data.
-pub fn initialize_native(context: &mut Graph) -> Result<RuntimeBackend, String> {
-    context.build_search_space::<NativeRuntime>();
-    let rt = context.search(NativeRuntime::default(), 10);
-    Ok(RuntimeBackend::Native(rt))
 }

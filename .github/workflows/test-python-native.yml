@@ -1,0 +1,28 @@
+name: Test Python Native
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+jobs:
+    python_native_tests:
+        name: Python Native Tests
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/luminal-ai/luminal-docker:cpu
+        timeout-minutes: 45
+        defaults:
+            run:
+                working-directory: crates/luminal_python
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Update Rust toolchain
+              run: rustup update
+            - name: Build maturin extension
+              run: uv run maturin develop --manifest-path rust/Cargo.toml
+            - name: Run pytest
+              run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py -v -m "not slow"

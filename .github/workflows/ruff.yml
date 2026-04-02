@@ -1,0 +1,23 @@
+name: Ruff
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+jobs:
+    ruff:
+        name: Ruff
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@v6
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - uses: pre-commit/action@v3.0.1
+              with:
+                  extra_args: ruff-check --all-files

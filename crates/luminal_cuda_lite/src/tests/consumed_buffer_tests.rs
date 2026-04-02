@@ -244,10 +244,10 @@ fn test_scatter_kv_cache_roundtrip() {
 
     // Print which scatter variant was selected
     for node in rt.llir_graph().node_weights() {
-        if let Some(k) = node.to_dialect::<dyn KernelOp>() {
-            if k.kernel_name().contains("catter") {
-                println!("Selected: {}", k.kernel_name());
-            }
+        if let Some(k) = node.to_dialect::<dyn KernelOp>()
+            && k.kernel_name().contains("catter")
+        {
+            println!("Selected: {}", k.kernel_name());
         }
     }
 
@@ -352,10 +352,10 @@ fn test_scatter_dual_cache_with_graph_break() {
 
     // Print selected variants
     for node in rt.llir_graph().node_weights() {
-        if let Some(k) = node.to_dialect::<dyn KernelOp>() {
-            if k.kernel_name().contains("catter") {
-                println!("Dual test selected: {}", k.kernel_name());
-            }
+        if let Some(k) = node.to_dialect::<dyn KernelOp>()
+            && k.kernel_name().contains("catter")
+        {
+            println!("Dual test selected: {}", k.kernel_name());
         }
     }
 

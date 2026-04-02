@@ -1,0 +1,30 @@
+name: CUDA Clippy
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+jobs:
+    cuda_clippy:
+        name: CUDA Clippy
+        runs-on: cuda_t4_runner
+        container:
+            image: ghcr.io/luminal-ai/luminal-docker:cuda
+            options: --gpus all
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Mark workspace as safe for git
+              run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - name: Update Rust toolchain
+              run: rustup update
+            - uses: pre-commit/action@v3.0.1
+              with:
+                  extra_args: cargo-clippy --all-files

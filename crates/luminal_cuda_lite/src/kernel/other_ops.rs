@@ -1,14 +1,11 @@
 use std::sync::Arc;
 
 use crate::{
-    cuda_dtype,
+    compile_module_image_for_current_device, cuda_dtype,
     kernel::KernelOp,
-    kernel::hlir::{compile_kernel, dtype_includes, generate_dyn_dims_defines},
+    kernel::hlir::{dtype_includes, generate_dyn_dims_defines, kernel_rewrite},
 };
-use cudarc::{
-    driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream},
-    nvrtc::{CompileOptions, compile_ptx},
-};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use itertools::Itertools;
 use luminal::{
     egglog_utils::{
@@ -25,6 +22,9 @@ pub type Ops = (
     KernelBatchMatVec,
     KernelBatchMatMul,
     KernelScatterNoCopy,
+    KernelSoftmax,
+    KernelExp,
+    KernelSigmoid,
 );
 
 #[derive(Default, Debug, Clone)]
@@ -172,7 +172,7 @@ extern \"C\" {{
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
             (module.clone(), func.clone())
         } else {
-            let ptx = compile_kernel(&kernel, &[self.dtype]);
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let func = module.load_function("reduce_mean_k").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
@@ -443,7 +443,8 @@ extern \"C\" {{
         let (module, func) = if let Some((module, func)) = compile_cache.get(&scatter_kernel) {
             (module.clone(), func.clone())
         } else {
-            let ptx = compile_kernel(&scatter_kernel, &[self.dtype]);
+            let ptx =
+                compile_module_image_for_current_device(stream.context(), &scatter_kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let func = module.load_function("scatter_nocopy").unwrap();
             compile_cache.insert(scatter_kernel.clone(), (module.clone(), func.clone()));
@@ -802,7 +803,7 @@ extern \"C\" {{
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
             (module.clone(), func.clone())
         } else {
-            let ptx = compile_ptx(&kernel).unwrap();
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let func = module.load_function("batch_matvec").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
@@ -1079,7 +1080,7 @@ extern \"C\" {{
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
             (module.clone(), func.clone())
         } else {
-            let ptx = compile_ptx(&kernel).unwrap();
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let func = module.load_function("batch_matmul").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
@@ -1153,6 +1154,7 @@ impl EgglogOp for KernelSoftmax {
                 ("out_strides", ELIST),
                 ("reduce_dim", EXPRESSION),
                 ("reduce_stride", EXPRESSION),
+                ("dtype", DTYPE),
             ],
         )
     }
@@ -1162,8 +1164,24 @@ impl EgglogOp for KernelSoftmax {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        // No rewrite rules yet - this op is not in the Ops tuple.
-        vec![]
+        vec![
+            kernel_rewrite::<luminal::hlir::Softmax, Self>(),
+            // Also add a direct rewrite that assumes F32 dtype, in case dtype
+            // propagation hasn't reached the Softmax node yet.
+            Rule::raw(
+                "(rule
+                (
+                    (= ?sm (Op (Softmax ?shape ?in_strides ?out_strides ?reduce_dim ?reduce_stride) ?inputs))
+                )
+                (
+                    (let ?ksm (Op (KernelSoftmax ?shape ?in_strides ?out_strides ?reduce_dim ?reduce_stride (F32)) ?inputs))
+                    (union ?sm ?ksm)
+                    (set (dtype ?ksm) (F32))
+                )
+                :name \"softmax-to-kernel-f32\"
+            )",
+            ),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1178,16 +1196,21 @@ impl EgglogOp for KernelSoftmax {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let in_stride =
+            extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap();
+        let out_stride =
+            extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
+        let reduce_dim = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+        let reduce_stride = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
         (
             LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                in_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                reduce_dim: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                reduce_stride: extract_expr(egraph, kind_children[4], expr_cache).unwrap(),
+                out_shape,
+                in_stride,
+                out_stride,
+                reduce_dim,
+                reduce_stride,
             })),
             input_enodes,
         )
@@ -1331,7 +1354,7 @@ extern \"C\" {{
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
             (module.clone(), func.clone())
         } else {
-            let ptx = compile_ptx(&kernel).unwrap();
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let func = module.load_function("fused_softmax").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
@@ -1374,5 +1397,372 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "Softmax"
+    }
+}
+
+// KernelExp: native exp (uses expf instead of exp2f * constant)
+// Single-kernel alternative to the 3-kernel Constant+Mul+Exp2 path.
+// Improves numerical precision by avoiding the truncated log2(e) constant.
+
+#[derive(Default, Debug, Clone)]
+pub struct KernelExp {
+    shape: Vec<Expression>,
+    in_strides: Vec<Expression>,
+    out_strides: Vec<Expression>,
+    dtype: DType,
+}
+
+impl EgglogOp for KernelExp {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelExp",
+            &[
+                ("shape", ELIST),
+                ("strides", ELIST),
+                ("out_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        1
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![
+            // Match Exp2(Mul(x, log2e_constant)) directly.
+            // This matches the pattern created by frontend exp() = (self * (1/ln(2))).exp2()
+            Rule::raw(
+                "(rule
+                (
+                    (= ?mul (Op (Mul ?shape ?x_stride ?const_stride ?inter_stride) (ICons ?x (ICons ?exp_const (INil)))))
+                    (= ?exp2 (Op (Exp2 ?shape ?inter_stride ?out_stride) (ICons ?mul (INil))))
+                    (= ?dt (dtype ?x))
+                    (= ?cv (Op (Constant ?val) (INil)))
+                    (= ?exp_const ?cv)
+                    (> ?val 1.44)
+                    (< ?val 1.45)
+                )
+                (
+                    (let ?kexp (Op (KernelExp ?shape ?x_stride ?out_stride ?dt) (ICons ?x (INil))))
+                    (union ?exp2 ?kexp)
+                    (set (dtype ?kexp) ?dt)
+                )
+                :name \"direct-exp-fusion\"
+            )",
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                in_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                out_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                dtype: extract_dtype(egraph, kind_children[3]),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelExp {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.in_strides.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.out_strides.iter().flat_map(|e| e.dyn_vars()))
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n_elements = self
+            .shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_kernel();
+        let out_idx = flatten_strides(&self.shape, &self.out_strides).to_kernel();
+        let in_idx = flatten_strides(&self.shape, &self.in_strides).to_kernel();
+        let kernel = format!(
+            "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void exp_k({dtype} *out, const {dtype} *in{dyn_dims_param}) {{
+        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (const_z >= {n_elements}) return;
+        out[{out_idx}] = expf(in[{in_idx}]);
+    }}
+}}"
+        );
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("exp_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+        let out_size = self.shape.iter().copied().product::<Expression>();
+        (
+            func,
+            module,
+            kernel,
+            (out_size.ceil_div(128), 1.into(), 1.into()),
+            (out_size.min(128), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.shape.iter().copied().product()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        self.shape.iter().copied().product()
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "Exp"
+    }
+}
+
+// KernelSigmoid: fused sigmoid = 1/(1+exp(-x))
+// Single-kernel alternative to the 5-kernel Neg+Exp+Const+Add+Recip path.
+
+#[derive(Default, Debug, Clone)]
+pub struct KernelSigmoid {
+    shape: Vec<Expression>,
+    in_strides: Vec<Expression>,
+    out_strides: Vec<Expression>,
+    dtype: DType,
+}
+
+impl EgglogOp for KernelSigmoid {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelSigmoid",
+            &[
+                ("shape", ELIST),
+                ("strides", ELIST),
+                ("out_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        1
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![
+            // Match the HLIR pattern directly: Recip(Add(Exp2(Mul(Mul(x, -1), log2e)), 1))
+            Rule::raw(
+                "(rule
+                (
+                    (= ?neg1 (Op (Constant ?nv) (INil)))
+                    (< ?nv -0.99)
+                    (> ?nv -1.01)
+                    (= ?neg_x (Op (Mul ?shape ?x_stride ?neg_stride ?neg_out_stride) (ICons ?x (ICons ?neg1 (INil)))))
+                    (= ?log2e (Op (Constant ?lv) (INil)))
+                    (> ?lv 1.44)
+                    (< ?lv 1.45)
+                    (= ?scaled (Op (Mul ?shape ?neg_out_stride ?log2e_stride ?scaled_stride) (ICons ?neg_x (ICons ?log2e (INil)))))
+                    (= ?exp2 (Op (Exp2 ?shape ?scaled_stride ?exp_stride) (ICons ?scaled (INil))))
+                    (= ?one (Op (Constant ?ov) (INil)))
+                    (> ?ov 0.99)
+                    (< ?ov 1.01)
+                    (= ?plus_one (Op (Add ?shape ?exp_stride ?one_stride ?add_stride) (ICons ?exp2 (ICons ?one (INil)))))
+                    (= ?sig_out (Op (Recip ?shape ?add_stride ?out_stride) (ICons ?plus_one (INil))))
+                    (= ?dt (dtype ?x))
+                )
+                (
+                    (let ?ksig (Op (KernelSigmoid ?shape ?x_stride ?out_stride ?dt) (ICons ?x (INil))))
+                    (union ?sig_out ?ksig)
+                    (set (dtype ?ksig) ?dt)
+                )
+                :name \"direct-sigmoid-fusion\"
+            )",
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                in_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                out_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                dtype: extract_dtype(egraph, kind_children[3]),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelSigmoid {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.in_strides.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.out_strides.iter().flat_map(|e| e.dyn_vars()))
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n_elements = self
+            .shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_kernel();
+        let out_idx = flatten_strides(&self.shape, &self.out_strides).to_kernel();
+        let in_idx = flatten_strides(&self.shape, &self.in_strides).to_kernel();
+        let kernel = format!(
+            "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void sigmoid_k({dtype} *out, const {dtype} *in{dyn_dims_param}) {{
+        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (const_z >= {n_elements}) return;
+        out[{out_idx}] = 1.0f / (1.0f + expf(-in[{in_idx}]));
+    }}
+}}"
+        );
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("sigmoid_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+        let out_size = self.shape.iter().copied().product::<Expression>();
+        (
+            func,
+            module,
+            kernel,
+            (out_size.ceil_div(128), 1.into(), 1.into()),
+            (out_size.min(128), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.shape.iter().copied().product()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        // neg + exp + add + recip = ~4 ops per element
+        self.shape.iter().copied().product::<Expression>() * 4
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "Sigmoid"
     }
 }

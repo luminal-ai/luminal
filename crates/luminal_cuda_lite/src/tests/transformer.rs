@@ -173,6 +173,7 @@ fn swiglu_mlp_ref(
 }
 
 /// CPU reference for one transformer layer
+#[allow(clippy::too_many_arguments)]
 fn transformer_layer_ref(
     x: &candle_core::Tensor,
     attn_norm_w: &candle_core::Tensor,

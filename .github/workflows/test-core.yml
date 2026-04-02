@@ -1,0 +1,24 @@
+name: Test Core
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    core_unit_test:
+        name: Core Unit Tests
+        runs-on: ubuntu-latest
+        container:
+            image: ghcr.io/luminal-ai/luminal-docker:cpu
+        timeout-minutes: 20
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Run tests
+              run: cargo test --workspace --exclude luminal_cuda_lite --exclude luminal_metal --exclude luminal_bench --verbose

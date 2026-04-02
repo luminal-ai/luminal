@@ -1111,7 +1111,7 @@ class PowTestModel(torch.nn.Module):
         self.register_buffer("weight", torch.rand((5, 5)) + 1.0)  # positive exponents
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x ** self.weight
+        return x**self.weight
 
 
 class PowByConstantModel(torch.nn.Module):
@@ -1119,7 +1119,7 @@ class PowByConstantModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         constant = torch.tensor([2.0, 3.0, 0.5]).to(x.device)
-        return x ** constant
+        return x**constant
 
 
 # ========== Where Node Test Models ==========
@@ -1709,9 +1709,7 @@ class RotaryEmbeddingModel(torch.nn.Module):
 
     def __init__(self, head_dim: int = 8, max_seq_len: int = 16) -> None:
         super().__init__()
-        inv_freq = 1.0 / (
-            10000 ** (torch.arange(0, head_dim, 2).float() / head_dim)
-        )
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
         t = torch.arange(max_seq_len).float()
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
@@ -1772,12 +1770,26 @@ class CausalSelfAttentionModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
-        q = self.q_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.q_proj(x)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        k = (
+            self.k_proj(x)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            self.v_proj(x)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1) * -1e9
+        mask = (
+            torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1) * -1e9
+        )
         scores = scores + mask
         attn = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)

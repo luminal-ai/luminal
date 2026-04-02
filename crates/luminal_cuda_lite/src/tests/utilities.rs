@@ -235,6 +235,7 @@ pub fn test_unary_cuda<T: TestDType>(
 /// Base binary test function with input generators
 /// Generic over dtype T - comparison happens in native precision.
 /// Requires explicit rtol and atol tolerances (as f32, converted to T internally).
+#[allow(clippy::too_many_arguments)]
 pub fn test_binary_cuda<T: TestDType>(
     a_shape: impl ToShape,
     b_shape: impl ToShape,
@@ -410,6 +411,7 @@ pub fn gen_slice_range(
 /// produce incorrect computation.
 ///
 /// `setup_inputs` is called for each genome's fresh runtime to load input data.
+#[allow(clippy::too_many_arguments)]
 pub fn fuzz_genomes<T: TestDType>(
     cx: &Graph,
     stream: &Arc<cudarc::driver::CudaStream>,

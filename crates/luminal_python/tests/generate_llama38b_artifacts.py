@@ -8,7 +8,6 @@ Produces:
     tests/llama38b_ref_logits.pt — reference logits for input_ids=[1,2,3,4]
 """
 
-import os
 from pathlib import Path
 
 import torch

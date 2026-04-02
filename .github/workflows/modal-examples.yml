@@ -5,12 +5,16 @@ on:
         branches: ["main"]
     pull_request:
         branches: ["main"]
-        types: [opened, synchronize, reopened, ready_for_review]
+        types: [labeled, synchronize]
     workflow_dispatch:
 
 jobs:
     modal_example:
-        if: github.event.pull_request.draft != true
+        if: >-
+            github.event_name == 'push'
+            || github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'pull_request'
+                && contains(github.event.pull_request.labels.*.name, 'modal-ready'))
         name: "${{ matrix.example }} (Modal ${{ matrix.gpu.type }})"
         runs-on: ubuntu-latest
         environment: Modal

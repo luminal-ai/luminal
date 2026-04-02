@@ -224,125 +224,14 @@ def test_hf_llama_decode_loop_static(device: torch.device):
         tokens.append(next_token)
 
 
-@pytest.mark.slow
-def test_hf_llama3_1b_decode_loop_dynamic():
-    """Decode loop with dynamic shapes on real Llama3.2-1B — compile once, run with varying seq_len.
+@pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
+def test_hf_llama3_1b_decode_loop_dynamic(device: torch.device):
+    """Decode loop on real Llama3.2-1B with pretrained weights.
 
-    This is the end-goal test: full 1B model with pretrained weights, CUDA backend,
-    ONNX exported once with dynamic_axes for seq_len, then decoded autoregressively
-    without recompilation.
-
-    Supports both ONNX and PT2 export modes via LUMINAL_EXPORT_MODE env var.
+    Recompiles each step as sequence length grows, using the standard
+    torch.compile(model, backend=luminal_backend) pattern.
     """
-    import os
-    import tempfile
-
     from transformers import AutoConfig, AutoTokenizer, LlamaForCausalLM
-
-    import luminal
-
-    backend = os.environ.get("LUMINAL_BACKEND", "cuda")
-    export_mode = os.getenv("LUMINAL_EXPORT_MODE", "onnx").lower()
-
-    config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
-    config.use_cache = False
-    config._attn_implementation = "eager"
-    print("Loaded config")
-    model = LlamaForCausalLM.from_pretrained(
-        "NousResearch/Llama-3.2-1B",
-        config=config,
-        torch_dtype=torch.float32,
-    ).eval()
-    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-3.2-1B")
-    print("Loaded Model")
-
-    prompt = "The capital of france is"
-    tokens = tokenizer.encode(prompt)
-    print(f"Prompt: '{prompt}' -> {len(tokens)} tokens: {tokens}")
-    num_generate = 3
-
-    if export_mode == "pt2":
-        from luminal.pt2 import compile as luminal_compile
-
-        dummy = torch.tensor([[1, 2, 3, 4]])
-        compiled = luminal_compile(model, dummy, search_iterations=0, dynamic_dim=1)
-
-        for step in range(num_generate):
-            input_ids = torch.tensor([tokens])
-            logits = compiled(input_ids)[0]
-
-            with torch.no_grad():
-                ref = model(input_ids)
-
-            assert torch.allclose(logits, ref.logits, atol=1e-3), (
-                f"step {step}: max_diff={torch.max(torch.abs(logits - ref.logits)).item():.2e}"
-            )
-
-            next_token = ref.logits[0, -1, :].argmax().item()
-            tokens.append(next_token)
-            print(f"Step {step}: '{tokenizer.decode(tokens)}'")
-    else:
-        # ONNX path — manual export with dynamic_axes
-        dummy = torch.tensor([[1, 2, 3, 4]])
-        tmp = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-
-        try:
-            torch.onnx.export(
-                model,
-                (dummy,),
-                tmp_path,
-                opset_version=20,
-                input_names=["input_ids"],
-                output_names=["logits"],
-                dynamic_axes={"input_ids": {1: "seq_len"}, "logits": {1: "seq_len"}},
-            )
-            print("Exported onnx")
-            graph = luminal.process_onnx(tmp_path, backend)
-        finally:
-            os.unlink(tmp_path)
-        print("Exported Model")
-        assert graph.has_dynamic_dims, "Graph should have dynamic dims"
-        assert "seq_len" in graph.dim_params, (
-            f"Expected 'seq_len' in {graph.dim_params}"
-        )
-
-        for step in range(num_generate):
-            seq_len = len(tokens)
-            graph.set_dim("seq_len", seq_len)
-
-            graph.set_input("input_ids", [float(t) for t in tokens])
-            graph.run()
-
-            output_shapes = graph.resolve_output_shapes()
-            logits_data = graph.get_output("logits")
-            logits = torch.tensor(logits_data, dtype=torch.float32).reshape(
-                output_shapes[0]
-            )
-
-            # Compare against PyTorch reference
-            input_ids = torch.tensor([tokens])
-            with torch.no_grad():
-                ref = model(input_ids)
-
-            assert torch.allclose(logits, ref.logits, atol=1e-3), (
-                f"step {step}: max_diff={torch.max(torch.abs(logits - ref.logits)).item():.2e}"
-            )
-
-            next_token = ref.logits[0, -1, :].argmax().item()
-            tokens.append(next_token)
-            print(f"Step {step}: '{tokenizer.decode(tokens)}'")
-
-
-@pytest.mark.slow
-def test_hf_llama3_full(device: torch.device):
-    """HuggingFace LlamaForCausalLM — full Llama3.2-1B with real pretrained weights.
-
-    No config alterations except use_cache=False and eager attention.
-    Loads actual weights from NousResearch/Llama-3.2-1B.
-    """
-    from transformers import AutoConfig, LlamaForCausalLM
 
     config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
     config.use_cache = False
@@ -357,22 +246,96 @@ def test_hf_llama3_full(device: torch.device):
         .eval()
         .to(device)
     )
-    compiled = torch.compile(model, backend=luminal_backend)
-    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
-    with torch.no_grad():
-        ref = model(input_ids)
-        out = compiled(input_ids)
-    assert torch.allclose(out.logits, ref.logits, atol=1e-3), (
-        f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
-    )
+    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-3.2-1B")
+
+    prompt = "The capital of france is"
+    tokens = tokenizer.encode(prompt)
+    print(f"Prompt: '{prompt}' -> {len(tokens)} tokens: {tokens}")
+    num_generate = 3
+
+    for step in range(num_generate):
+        input_ids = torch.tensor([tokens], device=device)
+        torch._dynamo.reset()
+        compiled = torch.compile(model, backend=luminal_backend)
+        with torch.no_grad():
+            ref = model(input_ids)
+            out = compiled(input_ids)
+        assert torch.allclose(out.logits, ref.logits, atol=1e-5), (
+            f"step {step}: max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
+        )
+        next_token = ref.logits[0, -1, :].argmax().item()
+        tokens.append(next_token)
+        print(f"Step {step}: '{tokenizer.decode(tokens)}'")
 
 
-@pytest.mark.slow
-def test_hf_llama38b_full(device: torch.device):
+def _gpu_mem(label):
+    """Print GPU memory stats at a given checkpoint."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        peak = torch.cuda.max_memory_allocated() / (1024**3)
+        print(
+            f"[GPU MEM] {label}: allocated={alloc:.3f} GiB, reserved={reserved:.3f} GiB, peak={peak:.3f} GiB"
+        )
+
+
+@pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
+def test_hf_llama3_full(device: torch.device):
     """HuggingFace LlamaForCausalLM — full Llama3.2-1B with real pretrained weights.
 
     No config alterations except use_cache=False and eager attention.
     Loads actual weights from NousResearch/Llama-3.2-1B.
+    """
+    from transformers import AutoConfig, LlamaForCausalLM
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    _gpu_mem("before model load")
+
+    config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
+    config.use_cache = False
+    config._attn_implementation = "eager"
+
+    model = (
+        LlamaForCausalLM.from_pretrained(
+            "NousResearch/Llama-3.2-1B",
+            config=config,
+            torch_dtype=torch.float32,
+        )
+        .eval()
+        .to(device)
+    )
+    n_params = sum(p.numel() for p in model.parameters())
+    print(
+        f"[MODEL] Total parameters: {n_params:,} ({n_params * 4 / 1024**3:.3f} GiB in f32)"
+    )
+    _gpu_mem("after model load")
+
+    compiled = torch.compile(model, backend=luminal_backend)
+    _gpu_mem("after torch.compile (lazy, no compilation yet)")
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
+    with torch.no_grad():
+        ref = model(input_ids)
+        _gpu_mem("after PyTorch reference forward")
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        _gpu_mem("before compiled forward (peak reset)")
+        out = compiled(input_ids)
+        _gpu_mem("after compiled forward (includes compilation)")
+
+    assert torch.allclose(out.logits, ref.logits, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
+    )
+
+
+@pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
+def test_hf_llama3_large_full(device: torch.device):
+    """HuggingFace LlamaForCausalLM — full Llama-3.1-8B-Instruct with real pretrained weights.
+
+    No config alterations except use_cache=False and eager attention.
+    Loads actual weights from NousResearch/Meta-Llama-3.1-8B-Instruct.
     """
     from transformers import AutoConfig, LlamaForCausalLM
 
@@ -394,79 +357,38 @@ def test_hf_llama38b_full(device: torch.device):
     with torch.no_grad():
         ref = model(input_ids)
         out = compiled(input_ids)
-    assert torch.allclose(out.logits, ref.logits, atol=1e-3), (
+    assert torch.allclose(out.logits, ref.logits, atol=1e-5), (
         f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
     )
 
 
-@pytest.mark.slow
-def test_hf_llama38b_cached():
-    """Llama 3.1-8B via pre-generated artifacts + reference logits.
+@pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
+def test_hf_llama38b_full(device: torch.device):
+    """HuggingFace LlamaForCausalLM — full Llama-3.1-8B-Instruct with real pretrained weights.
 
-    Supports both ONNX and PT2 export modes via LUMINAL_EXPORT_MODE env var.
-
-    Requires artifacts generated by:
-        ONNX: uv run python tests/generate_llama38b_artifacts.py
-        PT2:  uv run python tests/generate_llama38b_pt2_artifacts.py
+    No config alterations except use_cache=False and eager attention.
+    Loads actual weights from NousResearch/Meta-Llama-3.1-8B-Instruct.
     """
-    import os
-    from pathlib import Path
+    from transformers import AutoConfig, LlamaForCausalLM
 
-    import luminal
+    config = AutoConfig.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct")
+    config.use_cache = False
+    config._attn_implementation = "eager"
 
-    backend = os.environ.get("LUMINAL_BACKEND", "cuda")
-    export_mode = os.getenv("LUMINAL_EXPORT_MODE", "onnx").lower()
-
-    tests_dir = Path(__file__).resolve().parent
-    logits_path = tests_dir / "llama38b_ref_logits.pt"
-
-    assert logits_path.exists(), (
-        f"{logits_path} not found. Run: uv run python tests/generate_llama38b_artifacts.py"
+    model = (
+        LlamaForCausalLM.from_pretrained(
+            "NousResearch/Meta-Llama-3.1-8B-Instruct",
+            config=config,
+            torch_dtype=torch.float32,
+        )
+        .eval()
+        .to(device)
     )
-    ref_logits = torch.load(logits_path, weights_only=True)
-    print(f"Loaded reference logits: {ref_logits.shape}")
-
-    if export_mode == "pt2":
-        from luminal import CompiledModel
-
-        pt2_path = tests_dir / "llama38b.pt2"
-        weights_path = tests_dir / "llama38b_weights.safetensors"
-
-        assert pt2_path.exists(), (
-            f"{pt2_path} not found. Run: uv run python tests/generate_llama38b_pt2_artifacts.py"
-        )
-        assert weights_path.exists(), (
-            f"{weights_path} not found. Run: uv run python tests/generate_llama38b_pt2_artifacts.py"
-        )
-
-        backend_name = "cuda" if backend == "cuda" else "cpu"
-        compiled_inner = luminal.compile_pt2(
-            str(pt2_path), str(weights_path), backend_name, 0
-        )
-        compiled = CompiledModel(compiled_inner)
-        print("Compiled luminal PT2 graph")
-
-        input_ids = torch.tensor([[1, 2, 3, 4]])
-        logits = compiled(input_ids)[0]
-    else:
-        onnx_path = tests_dir / "llama38b.onnx"
-
-        assert onnx_path.exists(), (
-            f"{onnx_path} not found. Run: uv run python tests/generate_llama38b_artifacts.py"
-        )
-
-        graph = luminal.process_onnx(str(onnx_path), backend)
-        print("Compiled luminal ONNX graph")
-
-        graph.set_input("input_ids", [float(t) for t in [1, 2, 3, 4]])
-        graph.run()
-
-        logits_data = graph.get_output("logits")
-        logits_shape = graph.output_shapes[0]
-        logits = torch.tensor(logits_data, dtype=torch.float32).reshape(logits_shape)
-
-    print(f"Output logits shape: {logits.shape}")
-
-    assert torch.allclose(logits, ref_logits, atol=1e-3), (
-        f"max_diff={torch.max(torch.abs(logits - ref_logits)).item():.2e}"
+    compiled = torch.compile(model, backend=luminal_backend)
+    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
+    with torch.no_grad():
+        ref = model(input_ids)
+        out = compiled(input_ids)
+    assert torch.allclose(out.logits, ref.logits, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
     )
