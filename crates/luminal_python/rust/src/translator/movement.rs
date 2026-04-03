@@ -432,7 +432,10 @@ impl<'a> Translator<'a> {
 
     pub(crate) fn translate_split(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
-        let split_size = self.get_int_arg(node, 1)? as usize;
+
+        // Check if arg 1 is a list of sizes (split_with_sizes) or a single int (split)
+        let is_sizes_list = node.inputs[1].arg.as_ints().is_some();
+
         let dim = if node.inputs.len() > 2 {
             self.get_int_arg(node, 2).unwrap_or(0)
         } else {
@@ -455,20 +458,336 @@ impl<'a> Translator<'a> {
                         .collect()
                 });
 
-            // Store each chunk under its output name
-            for (i, out_name) in output_names.iter().enumerate() {
-                let start = i * split_size;
-                let end = ((i + 1) * split_size).min(total);
-                if start < total {
-                    let chunk = a.slice_along(start..end, dim);
-                    self.tensors.insert(out_name.clone(), chunk);
+            if is_sizes_list {
+                // split_with_sizes: arg 1 is a list of sizes
+                let sizes = self.get_ints_arg(node, 1)?;
+                let mut start = 0usize;
+                for (i, out_name) in output_names.iter().enumerate() {
+                    let chunk_size = sizes[i] as usize;
+                    let end = start + chunk_size;
+                    if start < total && chunk_size > 0 {
+                        let chunk = a.slice_along(start..end, dim);
+                        self.tensors.insert(out_name.clone(), chunk);
+                    }
+                    start = end;
                 }
+                Ok(a.slice_along(0..(sizes[0] as usize).min(total), dim))
+            } else {
+                // split: arg 1 is a single chunk size
+                let split_size = self.get_int_arg(node, 1)? as usize;
+                for (i, out_name) in output_names.iter().enumerate() {
+                    let start = i * split_size;
+                    let end = ((i + 1) * split_size).min(total);
+                    if start < total {
+                        let chunk = a.slice_along(start..end, dim);
+                        self.tensors.insert(out_name.clone(), chunk);
+                    }
+                }
+                Ok(a.slice_along(0..split_size.min(total), dim))
             }
-
-            // Return the first chunk
-            Ok(a.slice_along(0..split_size.min(total), dim))
         } else {
+            let split_size = self.get_int_arg(node, 1)? as usize;
             Ok(a.slice_along(0..split_size, dim))
         }
+    }
+
+    // --- Shape / View / Movement ops ---
+
+    pub(crate) fn translate_flatten(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let start = self.get_int_arg(node, 1).unwrap_or(0);
+        let end = self.get_int_arg(node, 2).unwrap_or(-1);
+        let ndim = a.shape.len();
+        let start = normalize_dim(start, ndim);
+        let end = normalize_dim(end, ndim);
+        let dims = a.dims();
+        let mut new_shape: Vec<Expression> = dims[..start].to_vec();
+        let flat_size = dims[start..=end]
+            .iter()
+            .fold(Expression::from(1usize), |acc, d| acc * *d);
+        new_shape.push(flat_size);
+        new_shape.extend_from_slice(&dims[end + 1..]);
+        Ok(reshape_tensor(a, new_shape))
+    }
+
+    pub(crate) fn translate_unflatten(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let dim = self.get_int_arg(node, 1)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let sizes = self.get_ints_arg(node, 2)?;
+        let dims = a.dims();
+        let mut new_shape: Vec<Expression> = dims[..dim].to_vec();
+        // Resolve -1 in unflatten sizes
+        let neg1_idx = sizes.iter().position(|&s| s == -1);
+        if let Some(idx) = neg1_idx {
+            let dim_val = dims[dim];
+            let known_product: i64 = sizes
+                .iter()
+                .filter(|&&s| s != -1)
+                .product();
+            for (i, &s) in sizes.iter().enumerate() {
+                if i == idx {
+                    new_shape.push(dim_val / Expression::from(known_product as usize));
+                } else {
+                    new_shape.push(Expression::from(s as usize));
+                }
+            }
+        } else {
+            for &s in &sizes {
+                new_shape.push(Expression::from(s as usize));
+            }
+        }
+        new_shape.extend_from_slice(&dims[dim + 1..]);
+        Ok(reshape_tensor(a, new_shape))
+    }
+
+    pub(crate) fn translate_reshape_as(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let other = self.get_input_tensor(node, 1)?;
+        let target_shape = other.dims().to_vec();
+        Ok(reshape_tensor(a, target_shape))
+    }
+
+    pub(crate) fn translate_movedim(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let ndim = a.shape.len();
+
+        // Can be single int or list of ints
+        let source: Vec<usize> = if let Ok(s) = self.get_int_arg(node, 1) {
+            vec![normalize_dim(s, ndim)]
+        } else {
+            self.get_ints_arg(node, 1)?
+                .iter()
+                .map(|&d| normalize_dim(d, ndim))
+                .collect()
+        };
+        let dest: Vec<usize> = if let Ok(d) = self.get_int_arg(node, 2) {
+            vec![normalize_dim(d, ndim)]
+        } else {
+            self.get_ints_arg(node, 2)?
+                .iter()
+                .map(|&d| normalize_dim(d, ndim))
+                .collect()
+        };
+
+        // Build permutation
+        let mut perm: Vec<usize> = Vec::with_capacity(ndim);
+        // Start with dims not in source, then insert source dims at dest positions
+        let mut order: Vec<Option<usize>> = vec![None; ndim];
+        for (&s, &d) in source.iter().zip(dest.iter()) {
+            order[d] = Some(s);
+        }
+        let remaining: Vec<usize> = (0..ndim)
+            .filter(|i| !source.contains(i))
+            .collect();
+        let mut rem_idx = 0;
+        for i in 0..ndim {
+            if let Some(s) = order[i] {
+                perm.push(s);
+            } else {
+                perm.push(remaining[rem_idx]);
+                rem_idx += 1;
+            }
+        }
+        Ok(a.permute(perm))
+    }
+
+    pub(crate) fn translate_narrow(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let dim = self.get_int_arg(node, 1)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let start = self.get_int_arg(node, 2)? as usize;
+        let length = self.get_int_arg(node, 3)? as usize;
+        Ok(a.slice_along(start..start + length, dim))
+    }
+
+    pub(crate) fn translate_chunk(&mut self, node: &Node) -> Result<()> {
+        let a = self.get_input_tensor(node, 0)?;
+        let chunks = self.get_int_arg(node, 1)? as usize;
+        let dim = self.get_int_arg(node, 2).unwrap_or(0);
+        let dim = normalize_dim(dim, a.shape.len());
+        let dim_size = a.dims()[dim]
+            .to_usize()
+            .ok_or_else(|| anyhow::anyhow!("chunk requires concrete dim size"))?;
+        let chunk_size = (dim_size + chunks - 1) / chunks;
+
+        if let Some(tensors) = node.outputs[0].as_tensors.as_ref() {
+            let mut start = 0;
+            for t in tensors.iter() {
+                let end = (start + chunk_size).min(dim_size);
+                if start < dim_size {
+                    let chunk = a.slice_along(start..end, dim);
+                    self.tensors.insert(t.name.clone(), chunk);
+                }
+                start = end;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn translate_unbind(&mut self, node: &Node) -> Result<()> {
+        let a = self.get_input_tensor(node, 0)?;
+        let dim = self.get_int_arg(node, 1).unwrap_or(0);
+        let dim = normalize_dim(dim, a.shape.len());
+
+        if let Some(tensors) = node.outputs[0].as_tensors.as_ref() {
+            for (i, t) in tensors.iter().enumerate() {
+                let sliced = a.slice_along(i..i + 1, dim).squeeze(dim);
+                self.tensors.insert(t.name.clone(), sliced);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn translate_constant_pad_nd(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let pad_list = self.get_ints_arg(node, 1)?;
+        let value = self.get_float_arg(node, 2).unwrap_or(0.0) as f32;
+        let ndim = a.shape.len();
+        let mut result = a;
+        for i in 0..pad_list.len() / 2 {
+            let dim = ndim - 1 - i;
+            let left = pad_list[i * 2] as usize;
+            let right = pad_list[i * 2 + 1] as usize;
+            if left > 0 || right > 0 {
+                result = result.pad_along(left, right, dim, value);
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn translate_repeat(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let repeats = self.get_ints_arg(node, 1)?;
+        let repeats_usize: Vec<usize> = repeats.iter().map(|&r| r as usize).collect();
+        Ok(a.repeat(repeats_usize))
+    }
+
+    pub(crate) fn translate_fill(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let val = self.get_float_arg(node, 1)? as f32;
+        Ok(self.graph.constant_float(val).expand_rhs(a.shape))
+    }
+
+    pub(crate) fn translate_broadcast_to(&mut self, node: &Node) -> Result<GraphTensor> {
+        let mut a = self.get_input_tensor(node, 0)?;
+        let target = self.get_ints_arg(node, 1)?;
+        let target_exprs: Vec<Expression> = target
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                if s == -1 {
+                    a.shape.dims[i]
+                } else {
+                    Expression::from(s as usize)
+                }
+            })
+            .collect();
+        // Unsqueeze leading dims if needed
+        while a.shape.len() < target_exprs.len() {
+            a = a.unsqueeze(0);
+        }
+        a.shape.expand(target_exprs);
+        Ok(a)
+    }
+
+    pub(crate) fn translate_broadcast_tensors(&mut self, node: &Node) -> Result<()> {
+        // Collect all input tensors
+        let tensors: Vec<GraphTensor> =
+            if let Some(names) = node.inputs[0].arg.as_tensors() {
+                names
+                    .iter()
+                    .map(|n| self.get_tensor(&n.name))
+                    .collect::<Result<_>>()?
+            } else {
+                let mut ts = Vec::new();
+                for input in &node.inputs {
+                    if let Some(name) = input.arg.as_tensor_name() {
+                        if let Ok(t) = self.get_tensor(name) {
+                            ts.push(t);
+                        }
+                    }
+                }
+                ts
+            };
+
+        if tensors.is_empty() {
+            anyhow::bail!("broadcast_tensors: no tensor inputs found");
+        }
+
+        // Find max ndim
+        let max_ndim = tensors.iter().map(|t| t.shape.len()).max().unwrap();
+        // Compute broadcast shape
+        let mut broadcast_shape: Vec<Expression> = vec![Expression::from(1usize); max_ndim];
+        for t in &tensors {
+            let offset = max_ndim - t.shape.len();
+            for (i, d) in t.dims().iter().enumerate() {
+                let bi = offset + i;
+                if broadcast_shape[bi].to_usize() == Some(1) {
+                    broadcast_shape[bi] = *d;
+                }
+            }
+        }
+
+        // Broadcast each tensor and store
+        if let Some(out_tensors) = node.outputs[0].as_tensors.as_ref() {
+            for (i, t) in tensors.into_iter().enumerate() {
+                let mut expanded = t;
+                while expanded.shape.len() < max_ndim {
+                    expanded = expanded.unsqueeze(0);
+                }
+                expanded.shape.expand(broadcast_shape.clone());
+                if i < out_tensors.len() {
+                    self.tensors
+                        .insert(out_tensors[i].name.clone(), expanded);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn translate_hsplit(&mut self, node: &Node) -> Result<()> {
+        let a = self.get_input_tensor(node, 0)?;
+        let sections = self.get_int_arg(node, 1)? as usize;
+        let dim = if a.shape.len() == 1 { 0 } else { 1 };
+        self.split_equal_sections(a, sections, dim, node)
+    }
+
+    pub(crate) fn translate_vsplit(&mut self, node: &Node) -> Result<()> {
+        let a = self.get_input_tensor(node, 0)?;
+        let sections = self.get_int_arg(node, 1)? as usize;
+        self.split_equal_sections(a, sections, 0, node)
+    }
+
+    pub(crate) fn translate_dsplit(&mut self, node: &Node) -> Result<()> {
+        let a = self.get_input_tensor(node, 0)?;
+        let sections = self.get_int_arg(node, 1)? as usize;
+        self.split_equal_sections(a, sections, 2, node)
+    }
+
+    fn split_equal_sections(
+        &mut self,
+        a: GraphTensor,
+        sections: usize,
+        dim: usize,
+        node: &Node,
+    ) -> Result<()> {
+        let dim_size = a.dims()[dim]
+            .to_usize()
+            .ok_or_else(|| anyhow::anyhow!("split requires concrete dim size"))?;
+        let chunk_size = dim_size / sections;
+        if let Some(tensors) = node.outputs[0].as_tensors.as_ref() {
+            for (i, t) in tensors.iter().enumerate() {
+                let start = i * chunk_size;
+                let end = if i == sections - 1 {
+                    dim_size
+                } else {
+                    start + chunk_size
+                };
+                let chunk = a.slice_along(start..end, dim);
+                self.tensors.insert(t.name.clone(), chunk);
+            }
+        }
+        Ok(())
     }
 }

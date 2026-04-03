@@ -5,6 +5,7 @@ use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
 use super::Translator;
+use super::reduction::concrete_numel;
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_node(&mut self, node: &Node) -> Result<()> {
@@ -393,6 +394,70 @@ impl<'a> Translator<'a> {
             }
             "torch.ops.aten.amin.default" => self.translate_reduction(node, ReductionOp::Min)?,
 
+            // Single-output reduction ops
+            "torch.ops.aten.argmax.default" => self.translate_argmax(node)?,
+            "torch.ops.aten.argmin.default" => self.translate_argmin(node)?,
+            "torch.ops.aten.prod.default" | "torch.ops.aten.prod.dim_int" => {
+                self.translate_prod(node)?
+            }
+            "torch.ops.aten.argsort.default" | "torch.ops.aten.argsort.stable" => {
+                self.translate_argsort_op(node)?
+            }
+            "torch.ops.aten.log_softmax.int" | "torch.ops.aten._log_softmax.default" => {
+                self.translate_log_softmax(node)?
+            }
+            "torch.ops.aten.all.default" | "torch.ops.aten.all.dim" => {
+                self.translate_all(node)?
+            }
+            "torch.ops.aten.any.default" | "torch.ops.aten.any.dim" => {
+                self.translate_any(node)?
+            }
+            "torch.ops.aten.count_nonzero.default"
+            | "torch.ops.aten.count_nonzero.dim_IntList" => self.translate_count_nonzero(node)?,
+            "torch.ops.aten.nansum.default" => self.translate_nansum(node)?,
+            "torch.ops.aten.nanmean.default" => self.translate_nanmean(node)?,
+            "torch.ops.aten.logsumexp.default" => self.translate_logsumexp(node)?,
+            "torch.ops.aten.sum_to_size.default" => self.translate_sum_to_size(node)?,
+            "torch.ops.aten.std.correction" | "torch.ops.aten.std.default" => {
+                self.translate_std_op(node)?
+            }
+            "torch.ops.aten.var.correction" | "torch.ops.aten.var.default" => {
+                self.translate_var_op(node)?
+            }
+            "torch.ops.aten.median.default" | "torch.ops.aten.median.dim" => {
+                self.translate_median(node)?
+            }
+            "torch.ops.aten.msort.default" => {
+                let a = self.get_input_tensor(node, 0)?;
+                a.sort(0, false)
+            }
+
+            // Multi-output reduction ops
+            "torch.ops.aten.sort.default" | "torch.ops.aten.sort.stable" => {
+                self.translate_sort_op(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.max.dim" | "torch.ops.aten.min.dim" => {
+                self.translate_max_min_dim(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.std_mean.correction" | "torch.ops.aten.std_mean.default" => {
+                self.translate_std_mean(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.var_mean.correction" | "torch.ops.aten.var_mean.default" => {
+                self.translate_var_mean(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.aminmax.default" => {
+                self.translate_aminmax(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.kthvalue.default" => {
+                self.translate_kthvalue(node)?;
+                return Ok(());
+            }
+
             // Gather (axis-aware)
             "torch.ops.aten.gather.default" => self.translate_gather(node)?,
 
@@ -411,8 +476,35 @@ impl<'a> Translator<'a> {
             }
 
             // Split
-            "torch.ops.aten.split.Tensor" | "torch.ops.aten.split_with_sizes.default" => {
-                self.translate_split(node)?
+            "torch.ops.aten.split.Tensor"
+            | "torch.ops.aten.split_with_sizes.default"
+            | "torch.ops.aten.unsafe_split.Tensor"
+            | "torch.ops.aten.split_with_sizes_copy.default" => self.translate_split(node)?,
+
+            // Chunk
+            "torch.ops.aten.chunk.default" | "torch.ops.aten.unsafe_chunk.default" => {
+                self.translate_chunk(node)?;
+                return Ok(());
+            }
+
+            // Unbind
+            "torch.ops.aten.unbind.int" | "torch.ops.aten.unbind_copy.int" => {
+                self.translate_unbind(node)?;
+                return Ok(());
+            }
+
+            // Directional splits
+            "torch.ops.aten.dsplit.int" | "torch.ops.aten.dsplit.array" => {
+                self.translate_dsplit(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.hsplit.int" => {
+                self.translate_hsplit(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.vsplit.int" => {
+                self.translate_vsplit(node)?;
+                return Ok(());
             }
 
             // One-hot
@@ -432,6 +524,65 @@ impl<'a> Translator<'a> {
                 a % b
             }
 
+            // Shape / View / Movement ops
+            "torch.ops.aten.flatten.using_ints" => self.translate_flatten(node)?,
+            "torch.ops.aten.unflatten.int" => self.translate_unflatten(node)?,
+            "torch.ops.aten.ravel.default" => {
+                let a = self.get_input_tensor(node, 0)?;
+                a.flatten()
+            }
+            "torch.ops.aten.view_as.default" | "torch.ops.aten.reshape_as.default" => {
+                self.translate_reshape_as(node)?
+            }
+            "torch.ops.aten.movedim.intlist" | "torch.ops.aten.movedim.int" => {
+                self.translate_movedim(node)?
+            }
+            "torch.ops.aten.atleast_1d.default" => {
+                let a = self.get_input_tensor(node, 0)?;
+                if a.shape.len() == 0 {
+                    a.unsqueeze(0)
+                } else {
+                    a
+                }
+            }
+            "torch.ops.aten.atleast_2d.default" => {
+                let a = self.get_input_tensor(node, 0)?;
+                match a.shape.len() {
+                    0 => a.unsqueeze(0).unsqueeze(0),
+                    1 => a.unsqueeze(0),
+                    _ => a,
+                }
+            }
+            "torch.ops.aten.atleast_3d.default" => {
+                let a = self.get_input_tensor(node, 0)?;
+                match a.shape.len() {
+                    0 => a.unsqueeze(0).unsqueeze(0).unsqueeze(0),
+                    1 => a.unsqueeze(0).unsqueeze(2),
+                    2 => a.unsqueeze(2),
+                    _ => a,
+                }
+            }
+            "torch.ops.aten.narrow.default"
+            | "torch.ops.aten.narrow_copy.default"
+            | "torch.ops.aten.narrow.Tensor" => self.translate_narrow(node)?,
+            "torch.ops.aten.constant_pad_nd.default" => self.translate_constant_pad_nd(node)?,
+            "torch.ops.aten.repeat.default" | "torch.ops.aten.tile.default" => {
+                self.translate_repeat(node)?
+            }
+            "torch.ops.aten.fill.Scalar" | "torch.ops.aten.fill.Tensor" => {
+                self.translate_fill(node)?
+            }
+            "torch.ops.aten.broadcast_to.default" => self.translate_broadcast_to(node)?,
+            "torch.ops.aten.broadcast_tensors.default" => {
+                self.translate_broadcast_tensors(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.mT.default" => {
+                let a = self.get_input_tensor(node, 0)?;
+                let n = a.shape.len();
+                a.transpose(n - 2, n - 1)
+            }
+
             other => {
                 bail!("Unsupported ATen op: {other}");
             }
@@ -442,15 +593,6 @@ impl<'a> Translator<'a> {
         }
         Ok(())
     }
-}
-
-/// Compute total element count, returning an error if any dimension is symbolic.
-fn concrete_numel(a: &GraphTensor) -> Result<usize> {
-    a.dims().iter().try_fold(1usize, |acc, d| {
-        d.to_usize().map(|v| acc * v).ok_or_else(|| {
-            anyhow::anyhow!("Full reduction requires concrete dimensions, got symbolic dim")
-        })
-    })
 }
 
 impl<'a> Translator<'a> {
