@@ -37,8 +37,8 @@ lru = "0.16.2"
 edition = "2024"
 
 [dev-dependencies]
-candle-core = "0.9.2-alpha.1"
-candle-nn = "0.9.2-alpha.1"
+candle-core = "0.9.2"
+candle-nn = "0.9.2"
 ordered-float = "5.1.0"
 proptest = "1.9.0"
 
@@ -54,4 +54,4 @@ members = [
 ]
 
 [patch.crates-io]
-candle-kernels = { git = "https://github.com/asglover/candle.git", branch = "fix/disable-bf16-wmma-pre-ampere" }
+candle-kernels = { git = "https://github.com/huggingface/candle.git", rev = "a0dbd8b8aef6bde9adca3e8ad90791609d64974b" }

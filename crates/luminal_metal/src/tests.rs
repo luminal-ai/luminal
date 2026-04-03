@@ -165,6 +165,7 @@ fn swiglu_mlp_ref(
     (gate * up).unwrap().matmul(&w_down.t().unwrap()).unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transformer_layer_ref(
     x: &CandleTensor,
     attn_norm_w: &CandleTensor,

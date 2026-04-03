@@ -12,6 +12,7 @@ use luminal::{
 };
 
 use crate::{
+    compile_module_image_for_current_device,
     cudarc::{
         cublas::sys::cublasOperation_t,
         cublaslt::{
@@ -30,7 +31,6 @@ use crate::{
         driver::{
             CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
         },
-        nvrtc::{CompileOptions, compile_ptx_with_opts},
     },
     host::HostOp,
 };
@@ -146,17 +146,7 @@ extern "C" __global__ void swiglu_bf16(unsigned long long gate_up_ptr, unsigned 
     }
 }
 "#;
-            let ptx = compile_ptx_with_opts(
-                src,
-                CompileOptions {
-                    include_paths: vec![
-                        "/usr/local/cuda/include".to_string(),
-                        "/usr/include".to_string(),
-                    ],
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            let ptx = compile_module_image_for_current_device(stream.context(), src).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let f32_to_bf16 = module.load_function("f32_to_bf16").unwrap();
             let swiglu = module.load_function("swiglu_bf16").unwrap();

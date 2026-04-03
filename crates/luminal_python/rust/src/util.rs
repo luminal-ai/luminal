@@ -434,18 +434,6 @@ pub fn load_initializer_as_f32(init: &onnx_protobuf::TensorProto) -> Option<Vec<
     }
 }
 
-/// Transpose weight data from [rows, cols] to [cols, rows] row-major layout
-#[cfg(feature = "cuda")]
-pub fn transpose_weight_data(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
-    let mut transposed = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            transposed[c * rows + r] = data[r * cols + c];
-        }
-    }
-    transposed
-}
-
 /// Get an integer attribute from a node, with a default value
 pub fn get_int_attr(node: &NodeProto, name: &str, default: i64) -> i64 {
     for attr in &node.attribute {

@@ -1,18 +1,23 @@
 """Test configuration."""
 
+import os
+
 # Enable automatic Rust rebuilds during test development
 try:
     import maturin_import_hook
+    from maturin_import_hook.settings import MaturinSettings
 
-    maturin_import_hook.install()
+    backend = os.getenv("LUMINAL_BACKEND", "native").lower()
+    settings = MaturinSettings(features=["cuda"]) if backend == "cuda" else None
+    maturin_import_hook.install(settings=settings)
 except ImportError:
     pass  # Hook not available, rebuilds will be manual
-
-import os
 
 import pytest
 import torch
 import torch._dynamo
+
+torch.set_float32_matmul_precision("highest")
 
 
 @pytest.fixture

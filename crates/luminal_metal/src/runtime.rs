@@ -1,5 +1,3 @@
-#![allow(unexpected_cfgs)]
-
 use crate::kernel::{
     MatmulDescriptor, MetalKernelOp, MetalMatmul, MetalMatmulPlanner, DYN_SLOT_COUNT,
 };

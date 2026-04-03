@@ -254,6 +254,7 @@ impl Graph {
         if subgraphs.len() <= 1 {
             let (program, root) = hlir_to_egglog(self);
             self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
+
             self.chunk_groups = vec![ChunkGroup {
                 representative: 0,
                 members: vec![0],
@@ -579,7 +580,6 @@ impl Graph {
 
         for (group_idx, group) in self.chunk_groups.iter().enumerate() {
             let egraph = &self.egraphs[group_idx];
-
             let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
             let mut list_cache = FxHashMap::default();
             let mut expr_cache = FxHashMap::default();

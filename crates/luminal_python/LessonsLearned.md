@@ -340,7 +340,7 @@ with matching shape tracker dimensions.
 
 ---
 
-## Bug: TopK values wrong on CUDA (gather_elements with sliced non-contiguous indices)
+## 2026-03-05 — TopK Values Wrong on CUDA (gather_elements with sliced non-contiguous indices)
 
 1. **Symptom**: `test_topk_values` failed on CUDA — rows 0-1 were correct but rows 2+ returned
    the value at column 0 of each row (all three top-k positions got the same value).
@@ -748,3 +748,11 @@ method rather than string-matching on Debug output. Additionally, when diagnosin
 candidates rejected" during search, check whether the rejection is from actual float NaN
 or from dtype misinterpretation — the key diagnostic is whether the NaN pattern is
 identical across all attempts (dtype issue) vs varying (actual numerical issue).
+
+## 2026-03-25 — KernelExp/KernelSigmoid: Fused CUDA Kernels for Precision
+
+1. **Symptom**: `test_hf_llama3_full` (16-layer Llama-3.2-1B) had ~1e-4 max diff vs PyTorch.
+2. **Root cause**: `exp(x)` was computed as `exp2(x * 1.442695)` — the constant truncated by `{:.6}` format + extra multiply adds rounding. Sigmoid was 5 separate kernels. SumReduce had naive accumulation.
+3. **Why hard**: Per-operation error was ~1e-7 but compounded over 16 layers × ~25 extra materializations. The egglog `Exp` rewrite depends on exact constant format matching.
+4. **Fix**: Added `KernelExp` (uses `expf()`), `KernelSigmoid` (uses `1/(1+expf(-x))`), and Kahan summation in SumReduce. Each uses both `kernel_rewrite` and a direct egglog pattern match with range checks (e.g., `(> ?val 1.44) (< ?val 1.45)`) to bypass constant format dependency.
+5. **Principle**: When decomposed CUDA kernel chains cause precision loss, add fused kernels via `kernel_rewrite`. For robustness, add BOTH the logical-op rewrite path AND a direct HLIR pattern match — the constant format in egglog can be fragile.

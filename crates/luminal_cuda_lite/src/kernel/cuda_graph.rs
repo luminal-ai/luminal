@@ -425,7 +425,7 @@ mod tests {
     fn test_raw_function_extraction() {
         let Ok(ctx) = CudaContext::new(0) else { return };
         let kernel_src = r#"extern "C" __global__ void test_kernel(float* out) { out[0] = 1.0f; }"#;
-        let Ok(ptx) = cudarc::nvrtc::compile_ptx(kernel_src) else {
+        let Ok(ptx) = crate::compile_module_image_for_current_device(&ctx, kernel_src) else {
             return;
         };
         let module = ctx.load_module(ptx).unwrap();
@@ -448,7 +448,7 @@ mod tests {
         use cudarc::driver::{CudaSlice, DevicePtr};
         let Ok(ctx) = CudaContext::new(0) else { return };
         let kernel_src = r#"extern "C" __global__ void test_kernel(float* out, float* in1) { if (threadIdx.x == 0) out[0] = in1[0] + 1.0f; }"#;
-        let Ok(ptx) = cudarc::nvrtc::compile_ptx(kernel_src) else {
+        let Ok(ptx) = crate::compile_module_image_for_current_device(&ctx, kernel_src) else {
             return;
         };
         let module = ctx.load_module(ptx).unwrap();

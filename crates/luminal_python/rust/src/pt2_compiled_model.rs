@@ -1,19 +1,15 @@
-use luminal::graph::Graph as LuminalGraph;
 use luminal::prelude::*;
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-#[cfg(feature = "cuda")]
-use luminal_cuda_lite::cudarc::driver::CudaContext;
-#[cfg(feature = "cuda")]
-use luminal_cuda_lite::runtime::CudaRuntime;
-
-use crate::compiled_graph::CompiledGraph;
+use crate::compiled_graph::{CompiledGraph, GraphTranslation, WeightData};
 use crate::pt2_parser;
 use crate::pt2_schema;
-use crate::runtime::RuntimeBackend;
 use crate::translator;
 use crate::util::DimParamMap;
+
+/// Pre-loaded weight/constant data paired with tensor sizes.
+type PreloadResult = (Vec<(String, Vec<f32>)>, HashMap<String, usize>);
 
 fn resolve_dim_sizes(
     sizes: &[pt2_schema::DimSize],
@@ -39,32 +35,55 @@ fn resolve_dim_sizes(
 }
 
 #[pyfunction]
-pub fn compile_pt2(
+#[pyo3(signature = (pt2_path, weights_path, backend, search_iters, weight_device_ptrs=None))]
+pub fn process_pt2(
     pt2_path: &str,
     weights_path: &str,
     backend: &str,
     search_iters: usize,
+    weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
 ) -> PyResult<CompiledGraph> {
-    compile_pt2_inner(pt2_path, weights_path, backend, search_iters)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
+    compile_pt2(
+        pt2_path,
+        weights_path,
+        backend,
+        search_iters,
+        weight_device_ptrs.unwrap_or_default(),
+    )
+    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
 }
 
-fn compile_pt2_inner(
+fn compile_pt2(
     pt2_path: &str,
     weights_path: &str,
     backend: &str,
     search_iters: usize,
+    weight_device_ptrs: HashMap<String, (u64, usize)>,
 ) -> anyhow::Result<CompiledGraph> {
+    let (translation, mut weights) = translate_pt2(pt2_path, weights_path)?;
+    weights.device_ptrs = weight_device_ptrs;
+
+    CompiledGraph::parse_graph(translation, weights, backend, search_iters)
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Translate a PT2 exported model into a format-neutral GraphTranslation + WeightData.
+pub fn translate_pt2(
+    pt2_path: &str,
+    weights_path: &str,
+) -> anyhow::Result<(GraphTranslation, WeightData)> {
     let parsed = pt2_parser::parse_pt2(pt2_path)?;
     let translated = translator::translate(&parsed)?;
     let mut graph = translated.graph;
 
+    // Set initial dynamic dim values from symbol ranges
     for (sym_name, c) in &translated.sym_map.sym_to_char {
         if let Some(rc) = translated.sym_map.ranges.get(sym_name) {
             graph.set_dim(*c, rc.min_val as usize);
         }
     }
 
+    // Compute shape expressions from PT2 tensor metadata
     let output_shape_exprs: Vec<Vec<Expression>> = translated
         .output_ids
         .iter()
@@ -98,45 +117,6 @@ fn compile_pt2_inner(
         })
         .collect();
 
-    let user_input_sizes: Vec<(NodeIndex, usize)> = translated
-        .user_input_ids
-        .iter()
-        .map(|(name, id)| {
-            let meta = parsed.tensor_meta(name);
-            let n_elements = meta
-                .map(|m| {
-                    m.sizes
-                        .iter()
-                        .map(|s| s.hint().unwrap_or(1) as usize)
-                        .product()
-                })
-                .unwrap_or(1);
-            (*id, n_elements)
-        })
-        .collect();
-
-    let runtime = match backend {
-        "cpu" | "native" => {
-            graph.build_search_space::<NativeRuntime>();
-            let mut rt = graph.search(NativeRuntime::default(), search_iters);
-            if !weights_path.is_empty() {
-                load_safetensors_native(&mut rt, &graph, weights_path)?;
-            }
-            load_constants_native(&mut rt, &graph, &parsed)?;
-            RuntimeBackend::Native(rt)
-        }
-        "cuda" | "gpu" => init_cuda_runtime(
-            &mut graph,
-            weights_path,
-            &parsed,
-            &user_input_sizes,
-            search_iters,
-        )?,
-        other => {
-            anyhow::bail!("Unknown backend: {other}. Use 'cpu' or 'cuda'.");
-        }
-    };
-
     // Build tensor_ids from user inputs and outputs
     let mut tensor_ids: HashMap<String, NodeIndex> = HashMap::new();
     for (name, id) in &translated.user_input_ids {
@@ -146,80 +126,90 @@ fn compile_pt2_inner(
         tensor_ids.insert(name.clone(), *id);
     }
 
-    // Resolve concrete output shapes
-    let output_shapes: Vec<Vec<usize>> = output_shape_exprs
-        .iter()
-        .map(|exprs| exprs.iter().map(|e| e.to_usize().unwrap_or(1)).collect())
-        .collect();
+    // Pre-load weights and compute tensor sizes for CUDA dummy data
+    let mut weights: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut tensor_sizes: HashMap<String, usize> = HashMap::new();
 
-    // Build dim_param_map from sym_map
+    // Load safetensors weights
+    if !weights_path.is_empty() {
+        let (st_weights, st_sizes) = preload_safetensors(&graph, weights_path)?;
+        weights.extend(st_weights);
+        tensor_sizes.extend(st_sizes);
+    }
+
+    // Load PT2 constants from ZIP archive
+    let (const_weights, const_sizes) = preload_constants(&graph, &parsed)?;
+    weights.extend(const_weights);
+    tensor_sizes.extend(const_sizes);
+
+    // Add tensor sizes from PT2 metadata for parameters/buffers not in safetensors
+    // (covers case when weights are loaded via device pointers after compilation)
+    for input_kind in parsed.classify_inputs() {
+        let (graph_name, original_name) = match &input_kind {
+            pt2_parser::InputKind::Parameter {
+                graph_name,
+                original_name,
+            } => (graph_name.as_str(), original_name.as_str()),
+            pt2_parser::InputKind::Buffer {
+                graph_name,
+                original_name,
+            } => (graph_name.as_str(), original_name.as_str()),
+            pt2_parser::InputKind::UserInput { .. } => continue,
+        };
+        // Always use authoritative sizes from model.json tensor_meta,
+        // even if preload_constants inserted a different (possibly stripped) size.
+        if let Some(meta) = parsed.tensor_meta(graph_name) {
+            let n: usize = meta
+                .sizes
+                .iter()
+                .map(|s| s.hint().unwrap_or(1) as usize)
+                .product();
+            tensor_sizes.insert(original_name.to_string(), n);
+        }
+    }
+
+    // Add user input sizes
+    for (name, _id) in &translated.user_input_ids {
+        if !tensor_sizes.contains_key(name)
+            && let Some(meta) = parsed.tensor_meta(name)
+        {
+            let n: usize = meta
+                .sizes
+                .iter()
+                .map(|s| s.hint().unwrap_or(1) as usize)
+                .product();
+            tensor_sizes.insert(name.clone(), n);
+        }
+    }
+
     let dim_param_map: DimParamMap = translated.sym_map.sym_to_char;
 
-    Ok(CompiledGraph {
+    let translation = GraphTranslation {
         graph,
-        runtime,
         tensor_ids,
         input_names,
         output_names,
-        output_shapes,
         output_shape_exprs,
         input_shape_exprs,
         dim_param_map,
-    })
-}
+    };
 
-#[cfg(feature = "cuda")]
-fn init_cuda_runtime(
-    graph: &mut LuminalGraph,
-    weights_path: &str,
-    parsed: &pt2_parser::ParsedPT2,
-    user_input_sizes: &[(NodeIndex, usize)],
-    search_iters: usize,
-) -> anyhow::Result<RuntimeBackend> {
-    let cuda_ctx =
-        CudaContext::new(0).map_err(|e| anyhow::anyhow!("CUDA context init failed: {e}"))?;
-    let stream = cuda_ctx.default_stream();
+    let weight_data = WeightData {
+        weights,
+        tensor_sizes,
+        device_ptrs: HashMap::new(),
+    };
 
-    graph.build_search_space::<CudaRuntime>();
-    let mut rt = CudaRuntime::initialize(stream);
-
-    // Phase 1: Set ALL input nodes to safe dummy data (1.0) for search profiling.
-    // Real weights/constants may contain -inf (e.g. causal attention mask) which
-    // produce NaN in intermediate computations (e.g. -inf - (-inf) = NaN in softmax
-    // decomposition), causing the search's has_nan_outputs check to reject ALL
-    // candidates. We load real data only AFTER the search completes.
-    set_all_inputs_dummy_cuda(&mut rt, graph, weights_path, parsed, user_input_sizes)?;
-
-    let mut rt = graph.search(rt, search_iters);
-
-    if !weights_path.is_empty() {
-        load_safetensors_cuda(&mut rt, graph, weights_path)?;
-    }
-    load_constants_cuda(&mut rt, graph, parsed)?;
-
-    Ok(RuntimeBackend::Cuda(Box::new(rt)))
-}
-
-#[cfg(not(feature = "cuda"))]
-fn init_cuda_runtime(
-    _graph: &mut LuminalGraph,
-    _weights_path: &str,
-    _parsed: &pt2_parser::ParsedPT2,
-    _user_input_sizes: &[(NodeIndex, usize)],
-    _search_iters: usize,
-) -> anyhow::Result<RuntimeBackend> {
-    anyhow::bail!("CUDA support not compiled. Rebuild with --features cuda")
+    Ok((translation, weight_data))
 }
 
 // ---------------------------------------------------------------------------
-// Weight loading
+// Weight pre-loading helpers
 // ---------------------------------------------------------------------------
 
-fn load_safetensors_impl(
-    cx: &LuminalGraph,
-    file_path: &str,
-    mut set_data: impl FnMut(NodeIndex, Vec<f32>),
-) -> anyhow::Result<()> {
+/// Pre-load all safetensors weights that match Input nodes in the graph.
+/// Returns (weight data, tensor sizes for all tensors in the file).
+fn preload_safetensors(graph: &Graph, file_path: &str) -> anyhow::Result<PreloadResult> {
     use memmap2::MmapOptions;
     use safetensors::SafeTensors;
     use std::fs::File;
@@ -229,94 +219,77 @@ fn load_safetensors_impl(
     let st = SafeTensors::deserialize(&mmap)
         .map_err(|e| anyhow::anyhow!("SafeTensors deserialize error: {e}"))?;
 
-    for node in cx.graph.node_indices() {
-        if let Some(input) = (*cx.graph[node])
+    let mut weights = Vec::new();
+    let mut sizes = HashMap::new();
+
+    // Get sizes for ALL tensors in the file (for dummy data allocation)
+    for (name, info) in st.tensors() {
+        let n: usize = info.shape().iter().product();
+        sizes.insert(name.to_string(), n);
+    }
+
+    // Load weight data for Input nodes that match safetensors tensor names
+    for node_id in graph.graph.node_indices() {
+        if let Some(input) = (*graph.graph[node_id])
             .as_any()
             .downcast_ref::<luminal::hlir::Input>()
             && let Ok(tensor) = st.tensor(&input.label)
         {
             let f32s = bytes_to_f32(tensor.data(), safetensors_dtype_to_pt2(tensor.dtype()));
-            set_data(node, f32s);
+            weights.push((input.label.clone(), f32s));
         }
     }
 
-    Ok(())
+    Ok((weights, sizes))
 }
 
-fn load_safetensors_native(
-    rt: &mut NativeRuntime,
-    cx: &LuminalGraph,
-    file_path: &str,
-) -> anyhow::Result<()> {
-    load_safetensors_impl(cx, file_path, |node, data| rt.set_data(node, data))
-}
-
-#[cfg(feature = "cuda")]
-fn load_safetensors_cuda(
-    rt: &mut CudaRuntime,
-    cx: &LuminalGraph,
-    file_path: &str,
-) -> anyhow::Result<()> {
-    load_safetensors_impl(cx, file_path, |node, data| rt.set_data(node, data))
-}
-
-/// Set ALL input nodes to dummy 1.0 data for safe CUDA search profiling.
-#[cfg(feature = "cuda")]
-fn set_all_inputs_dummy_cuda(
-    rt: &mut CudaRuntime,
-    cx: &LuminalGraph,
-    weights_path: &str,
+/// Pre-load all PT2 constants from the ZIP archive.
+/// Returns (constant data, tensor sizes for all constants).
+fn preload_constants(
+    _graph: &Graph,
     parsed: &pt2_parser::ParsedPT2,
-    user_input_sizes: &[(NodeIndex, usize)],
-) -> anyhow::Result<()> {
-    use memmap2::MmapOptions;
-    use safetensors::SafeTensors;
-    use std::fs::File;
+) -> anyhow::Result<PreloadResult> {
+    let constants_config = match &parsed.constants_config {
+        Some(c) => c,
+        None => return Ok((Vec::new(), HashMap::new())),
+    };
 
-    let mut label_sizes: HashMap<String, usize> = HashMap::new();
+    let mut weights = Vec::new();
+    let mut sizes = HashMap::new();
 
-    if !weights_path.is_empty() {
-        let f = File::open(weights_path)?;
-        let mmap = unsafe { MmapOptions::new().map(&f)? };
-        let st = SafeTensors::deserialize(&mmap)
-            .map_err(|e| anyhow::anyhow!("SafeTensors deserialize error: {e}"))?;
-        for (name, info) in st.tensors() {
-            let n: usize = info.shape().iter().product();
-            label_sizes.insert(name.to_string(), n);
-        }
-    }
+    for (name, entry) in &constants_config.config {
+        let n: usize = entry
+            .tensor_meta
+            .sizes
+            .iter()
+            .map(|s| s.hint().unwrap_or(1) as usize)
+            .product();
+        sizes.insert(name.clone(), n);
 
-    if let Some(cc) = &parsed.constants_config {
-        for (name, entry) in &cc.config {
-            let n: usize = entry
-                .tensor_meta
-                .sizes
-                .iter()
-                .map(|s| s.hint().unwrap_or(1) as usize)
-                .product();
-            label_sizes.insert(name.clone(), n);
-        }
-    }
-
-    for node_id in cx.graph.node_indices() {
-        if let Some(input) = (*cx.graph[node_id])
-            .as_any()
-            .downcast_ref::<luminal::hlir::Input>()
-        {
-            if let Some(&n) = label_sizes.get(&input.label) {
-                if n > 0 {
-                    rt.set_data(node_id, vec![1.0f32; n]);
-                }
+        let raw_bytes = match pt2_parser::read_constant_bytes(
+            &parsed.pt2_path,
+            &parsed.archive_prefix,
+            entry,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[luminal] Warning: failed to load constant '{}': {:#}",
+                    name, e
+                );
+                continue;
             }
-        }
+        };
+        let f32_data = bytes_to_f32(&raw_bytes, entry.tensor_meta.dtype);
+        weights.push((name.clone(), f32_data));
     }
 
-    for &(id, n_elements) in user_input_sizes {
-        rt.set_data(id, vec![1.0f32; n_elements]);
-    }
-
-    Ok(())
+    Ok((weights, sizes))
 }
+
+// ---------------------------------------------------------------------------
+// Byte conversion helpers
+// ---------------------------------------------------------------------------
 
 /// Convert safetensors Dtype to PT2 dtype number.
 fn safetensors_dtype_to_pt2(dtype: safetensors::Dtype) -> u32 {
@@ -380,61 +353,4 @@ fn bytes_to_f32(bytes: &[u8], dtype: u32) -> Vec<f32> {
                 .collect()
         }
     }
-}
-
-fn load_constants_impl(
-    cx: &LuminalGraph,
-    parsed: &pt2_parser::ParsedPT2,
-    mut set_data: impl FnMut(NodeIndex, Vec<f32>),
-) -> anyhow::Result<()> {
-    let constants_config = match &parsed.constants_config {
-        Some(c) => c,
-        None => return Ok(()),
-    };
-
-    for (name, entry) in &constants_config.config {
-        let raw_bytes = match pt2_parser::read_constant_bytes(
-            &parsed.pt2_path,
-            &parsed.archive_prefix,
-            entry,
-        ) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "[luminal] Warning: failed to load constant '{}': {:#}",
-                    name, e
-                );
-                continue;
-            }
-        };
-        let f32_data = bytes_to_f32(&raw_bytes, entry.tensor_meta.dtype);
-
-        for node_id in cx.graph.node_indices() {
-            if let Some(input) = (*cx.graph[node_id])
-                .as_any()
-                .downcast_ref::<luminal::hlir::Input>()
-                && input.label == *name
-            {
-                set_data(node_id, f32_data.clone());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn load_constants_native(
-    rt: &mut NativeRuntime,
-    cx: &LuminalGraph,
-    parsed: &pt2_parser::ParsedPT2,
-) -> anyhow::Result<()> {
-    load_constants_impl(cx, parsed, |node, data| rt.set_data(node, data))
-}
-
-#[cfg(feature = "cuda")]
-fn load_constants_cuda(
-    rt: &mut CudaRuntime,
-    cx: &LuminalGraph,
-    parsed: &pt2_parser::ParsedPT2,
-) -> anyhow::Result<()> {
-    load_constants_impl(cx, parsed, |node, data| rt.set_data(node, data))
 }
