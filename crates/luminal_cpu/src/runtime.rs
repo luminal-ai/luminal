@@ -4,13 +4,14 @@ use luminal::{
     dtype::DType,
     graph::LLIRGraph,
     hlir::{Input, NativeData, Output},
-    op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
+    op::{Runtime},
     prelude::{
-        petgraph::{algo::toposort, prelude::StableGraph, visit::EdgeRef, Direction},
-        FxHashMap, NodeIndex, ToId,
+        FxHashMap, NodeIndex, ToId, petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef}
     },
 };
 use std::time::Instant;
+
+use crate::kernel::{CpuKernelOp, CpuMatmul, CpuMatmulDescriptor};
 
 // ---------------------------------------------------------------------------------------------------
 // CpuRuntime
@@ -37,6 +38,76 @@ pub struct CpuRuntime {
 // ---------------------------------------------------------------------------------------------------
 // Private helpers 
 // ---------------------------------------------------------------------------------------------------
+impl CpuRuntime {
+    /// Walk the LLIR graph and fuse every (CpuMul -> CpuSumReduce) pairs that
+    /// match the plain 2-D matmul pattern into a single CpuMatMul Node
+    fn fuse_matmuls(llir_graph: &LLIRGraph) -> LLIRGraph {
+        let mut graph = llir_graph.clone();
+        let mut rewrites = Vec::new();
+
+        for sum_node in graph.node_indices().collect::<Vec<_>> () {
+            let Some(sum_info) = graph[sum_node].to_dialect::<dyn CpuKernelOp>().and_then(|op| op.sum_reduce_info())
+            else {
+                continue;
+            };
+
+            // Must have exactly one incoming edge
+            let input_edges: Vec<_> = graph.edges_directed(sum_node, Direction::Incoming).sorted_by_key(|e| e.id()).map(|e| e.source()).collect();
+            if input_edges.len() != 1 {
+                continue;
+            }
+
+            let mul_node = input_edges[0];
+            // That one input must be CpuMul
+            let Some(mul_info) = graph[mul_node].to_dialect::<dyn CpuKernelOp>().and_then(|op| op.mul_info())
+            else {
+                continue;
+            };
+
+            // Shape must match the plain 2-D matmul pattern
+            let Some(desc) = CpuMatmulDescriptor::from_mul_and_sum(&mul_info, &sum_info) else {
+                continue;
+            };
+
+            let mul_inputs: Vec<_> = graph.edges_directed(mul_node, Direction::Incoming).sorted_by_key(|e| e.id()).map(|e| e.source()).collect();
+            if mul_inputs.len() != 2 {
+                continue;
+            }
+
+            rewrites.push((sum_node, mul_node, mul_inputs, desc));
+        }
+
+        // Apply rewrites
+        for (sum_node, mul_node, mul_inputs, desc) in rewrites {
+            graph[sum_node] = luminal::op::LLIROp::new::<dyn CpuKernelOp>(Box::new(CpuMatmul {
+                m: desc.m,
+                n: desc.n,
+                k: desc.k,
+                lda: desc.lda,
+                ldb: desc.ldb,
+                ldd: desc.ldd,
+            }));
+            graph.remove_node(mul_node);
+            graph.add_edge(mul_inputs[0], sum_node, ());
+            graph.add_edge(mul_inputs[1], sum_node, ());
+        }
+
+        graph
+    }
+
+    /// Widen any typed input slice to f32
+    fn to_f32(data: &NativeData, dtype: DType) -> Vec<f32> {
+        match dtype {
+            DType::F32 => (0..data.len()).map(|i| data.f32(i)).collect(),
+            DType::F16 => (0..data.len()).map(|i| data.f16(i).to_f32()).collect(),
+            DType::Int => (0..data.len()).map(|i| data.i32(i) as f32).collect(),
+            other => panic!("CpuRuntime: unsupported input dtype {other:?}"),
+        }
+    }
+}
+
+
+
 
 // ---------------------------------------------------------------------------------------------------
 // Public API
@@ -83,10 +154,10 @@ impl CpuRuntime {
             if self.llir_graph[node].to_op::<Input>().is_some() {
                 continue;
             }
-            // if let Some(op) = self.llir_graph[node].to_dialect::() {
-            //     let size = op.output_size().exec(dyn_map).unwrap_or(0);
-            //     self.buffers.insert(node, vec![0.0f32; size]);
-            // }
+            if let Some(op) = self.llir_graph[node].to_dialect::<dyn CpuKernelOp>() {
+                let size = op.output_size().exec(dyn_map).unwrap_or(0);
+                self.buffers.insert(node, vec![0.0f32; size]);
+            }
         }
     }
 
@@ -97,4 +168,146 @@ impl CpuRuntime {
             self.llir_graph[n].to_dialect::<dyn CpuKernelOp>().is_some_and(|op| op.is_matmul())
         })
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Runtime trait impl
+// ---------------------------------------------------------------------------------------------------
+impl Runtime for CpuRuntime {
+    type Ops = crate::kernel::CpuOps;
+    type CompileArg = ();
+    type ExecReturn = ();
+    type ProfileMetric = std::time::Duration;
+
+    fn initialize(arg: Self::CompileArg) -> Self {
+        Self { input_data: FxHashMap::default(), hlir_buffers: FxHashMap::default(), buffers: FxHashMap::default(), llir_graph: StableGraph::default(), node_dtypes: FxHashMap::default() }
+    }
+
+    /// Called by cx.search() when the best LLIR graph has been chosen.
+    fn load_llir(&mut self, llir_graph: &LLIRGraph) {
+        // Reset all derived state
+        self.buffers.clear();
+        self.hlir_buffers.clear();
+        self.node_dtypes.clear();
+
+        self.llir_graph = Self::fuse_matmuls(llir_graph);
+
+        let topo_order = toposort(&self.llir_graph, None).expect("LLIR graph has cycles!");
+
+        for node in topo_order {
+            // --- Input Nodes -----------------------------
+            if let Some(input) = self.llir_graph[node].to_op::<Input>() {
+                self.node_dtypes.insert(node, input.dtype);
+                let hlir_id = NodeIndex::new(input.node);
+                if let Some(data) = self.input_data.get(&hlir_id) {
+                    let buf = Self::to_f32(data, input.dtype);
+                    self.hlir_buffers.insert(hlir_id, buf);
+                }
+                continue;
+            }
+
+            // --- Output NOdes ----------------------------
+            if self.llir_graph[node].to_op::<Output>().is_some() {
+                continue;
+            }
+
+            // --- Kernel node - record the output dtype ----------------------------
+            if let Some(op) = self.llir_graph[node].to_dialect::<dyn CpuKernelOp>() {
+                let input_nodes: Vec<_> = self.llir_graph.edges_directed(node, Direction::Incoming).sorted_by_key(|e| e.id()).map(|e| e.source()).collect();
+                let input_dtypes: Vec<DType> = input_nodes.iter().map(|n| {
+                    self.node_dtypes.get(n).copied().unwrap_or_else(|| panic!("Missing dtype for node {n:?}"))
+                }).collect();
+
+                let out_dtype = op.infer_output_dtype(&input_dtypes);
+                self.node_dtypes.insert(node, out_dtype);
+            }
+        }
+    }
+
+    /// Run the whole graph once.
+    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+        // Build lookup: LLIR Input Node -> HLIR node index
+        let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
+            .llir_graph
+            .node_indices()
+            .filter_map(|n| {
+                if let Some(Input { node, .. }) = self.llir_graph[n].to_op::<Input>() {
+                    Some((n, NodeIndex::new(*node)))
+                } else {
+                    None
+                }
+            }).collect();
+
+        let topo_order = toposort(&self.llir_graph, None).expect("LLIR graph has cycles!");
+
+        for node in topo_order {
+            // Skip bookkeeping node
+            if self.llir_graph[node].to_op::<Input>().is_some() || self.llir_graph[node].to_op::<Output>().is_some() {
+                continue;
+            }
+
+            let Some(op) = self.llir_graph[node].to_dialect::<dyn CpuKernelOp>() else {
+                continue;
+            };
+
+            // Collect input slices in edge-insertion order
+            let input_nodes: Vec<NodeIndex> = self
+                .llir_graph
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|e| e.id())
+                .map(|e| e.source())
+                .collect();
+
+            let input_vecs: Vec<(Vec<f32>, DType)> = input_nodes
+                .iter()
+                .map(|&n| {
+                    let dtype = self.node_dtypes.get(&n).copied().unwrap_or(DType::F32);
+                    let data = if let Some(hlir_id) = llir_to_hlir.get(&n) {
+                        self.hlir_buffers
+                            .get(hlir_id)
+                            .expect("Input buffer not found!")
+                            .clone()
+                    } else {
+                        self.buffers
+                            .get(&n)
+                            .expect("Intermediate buffer not found!")
+                            .clone()
+                    };
+                    (data, dtype)
+                }).collect();
+
+            // Build the slice refs for process()
+            let input_refs: Vec<(&[f32], DType)> = input_vecs
+                .iter()
+                .map(|(v, dt)| (v.as_slice(), *dt))
+                .collect();
+
+            let result = op.process(&input_refs, dyn_map);
+            
+            // Write result into the pre-allocated buffer
+            self.buffers.insert(node, result);
+
+        }
+    }
+
+    fn profile(
+            &mut self,
+            llir_graph: &LLIRGraph,
+            dyn_map: &FxHashMap<char, usize>,
+            trials: usize,
+        ) -> (Self::ProfileMetric, String) {
+        self.load_llir(llir_graph);
+        self.allocate_intermediate_buffers(dyn_map);
+
+        let trials = trials.max(1);
+        let mut total = std::time::Duration::default();
+        for _ in 0..trials {
+            let t = Instant::now();
+            self.execute(dyn_map);
+            total += t.elapsed();
+        }
+        total /= trials as u32;
+        (total, format!("{:.2?}", total))
+    }
+
 }

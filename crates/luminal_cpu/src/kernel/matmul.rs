@@ -52,7 +52,7 @@ impl CpuMatmulDescriptor {
 // This is the fused mode that replaces Mul+SumReduce in the LLIR graph
 // It uses the 'matrixmultiply' crate for a well-optimized BLAS-like sgemm
 // ---------------------------------------------------------------------------------------------------
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CpuMatmul {
     pub m: Expression,
     pub n: Expression,

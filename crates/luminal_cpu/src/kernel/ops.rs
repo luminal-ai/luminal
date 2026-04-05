@@ -418,7 +418,7 @@ impl EgglogOp for CpuIota {
             egraph: &'a SerializedEGraph,
             kind_children: &[&'a ENodeId],
             input_enodes: Vec<&'a ENodeId>,
-            list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+            _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
         use luminal::egglog_utils::extract_expr;
