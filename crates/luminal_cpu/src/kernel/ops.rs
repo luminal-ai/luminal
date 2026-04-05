@@ -1,18 +1,16 @@
 use std::{f32, usize};
 
-use super::{CpuKernelOp, CpuMulInfo, CpuSumReduceInfo};
-use candle_core::cpu;
+use super::{CpuKernelOp, CpuSumReduceInfo};
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, app, eq, rule, sort, union, v}, base::{DTYPE, ELIST, EXPRESSION, F64, IR, SORTS, dtype, new_op_call, op_term}
+        SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, eq, rule, sort, union, v}, base::{ELIST, EXPRESSION, F64, IR, dtype, new_op_call, op_term}
     },
     hlir::{
-        Add, Constant, Gather, Input, Iota, LessThan, MaxReduce, Mod, Mul, SumReduce, binary_sort, reduce_sort, unary_sort
+        Constant, Gather, Iota, MaxReduce, SumReduce, binary_sort, reduce_sort, unary_sort
     },
     op::*,
-    prelude::{egglog::sort::Sort, *},
-    shape::flatten_strides,
+    prelude::*,
 };
 
 // ---------------------------------------------------------------------------------------------------
@@ -504,4 +502,33 @@ impl CpuKernelOp for CpuGather {
         (0..n).map(|i| src[indexes[i] as usize]).collect()
     }
 }
+
+
+// ---------------------------------------------------------------------------------------------------
+// mul_info() override on CpuMul
+// ---------------------------------------------------------------------------------------------------
+// impl CpuKernelOp for CpuMul {
+//     // Re-declare a required methods do Rust doesn't complain about a partial override
+
+//     fn output_size(&self) -> Expression {
+//         self.shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+//     }
+
+//     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
+//         let a = inputs[0].0;
+//         let b = inputs[1].0;
+//         let n = resolve(&self.output_size(), dyn_map);
+//         (0..n).map(|i| a[i] * b [i]).collect()
+//     }
+
+//     fn mul_info(&self) -> Option<CpuMulInfo> {
+//         Some(CpuMulInfo {
+//             shape: self.shape.clone(),
+//             a_strides: self.a_strides.clone(),
+//             b_strides: self.b_strides.clone(),
+//             output_strides: self.output_strides.clone(),
+//         })
+//     }
+// }
+
 
