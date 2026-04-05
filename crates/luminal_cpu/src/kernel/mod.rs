@@ -68,12 +68,12 @@ pub type CpuOps = (
     CpuSin,
     CpuSqrt,
     CpuRecip,
-    // CpuSumReduce,
-    // CpuMaxReduce,
-    // CpuConstant,
-    // CpuIota,
-    // CpuGather,
-    // CpuMatmul,
+    CpuSumReduce,
+    CpuMaxReduce,
+    CpuConstant,
+    CpuIota,
+    CpuGather,
+    CpuMatmul,
 );
 
 // Glue macro to Luminal's op

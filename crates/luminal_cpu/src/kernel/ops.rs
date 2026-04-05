@@ -7,7 +7,7 @@ use luminal::{
         SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, app, eq, rule, sort, union, v}, base::{DTYPE, ELIST, EXPRESSION, F64, IR, SORTS, dtype, new_op_call, op_term}
     },
     hlir::{
-        Add, Constant, Gather, Iota, LessThan, MaxReduce, Mod, Mul, SumReduce, binary_sort, reduce_sort, unary_sort
+        Add, Constant, Gather, Input, Iota, LessThan, MaxReduce, Mod, Mul, SumReduce, binary_sort, reduce_sort, unary_sort
     },
     op::*,
     prelude::{egglog::sort::Sort, *},
@@ -191,5 +191,79 @@ cpu_binary_op!(CpuMul, "CpuMul", |a: f32, b: f32| a * b);
 cpu_binary_op!(CpuMod, "CpuMod", |a: f32, b: f32| a % b);
 cpu_binary_op!(CpuLessThan, "CpuLessThan", |a: f32, b: f32| if a < b { 1.0 } else { 0.0 });
 
+// ---------------------------------------------------------------------------------------------------
+// CpuSumReduce
+// ---------------------------------------------------------------------------------------------------
+#[derive(Debug, Default, Clone)]
+pub struct CpuSumReduce {
+    shape: Vec<Expression>,
+    strides: Vec<Expression>,
+    pub iters: Expression,
+    iter_strides: Expression,
+}
 
+impl EgglogOp for CpuSumReduce {
+    fn sort(&self) -> SortDef{ reduce_sort("CpuSumReduce") }
 
+    fn rewrites(&self) -> Vec<Rule> {
+        let (args, hlir_match) = new_op_call(&SumReduce::default().sort(), &["inp"]);
+        let cpu_op = op_term(call_sort_from_args(&self.sort(), &args), args["__inputs"].clone());
+        let dt = v("?__dt");
+        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp"].clone())))]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+            &'a self,
+            egraph: &'a SerializedEGraph,
+            kind_children: &[&'a ENodeId],
+            input_enodes: Vec<&'a ENodeId>,
+            list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+            expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+        ) -> (LLIROp, Vec<&'a ENodeId>) {
+        use luminal::egglog_utils::{extract_expr, extract_expr_list};
+        (
+            LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
+                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
+                iters: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
+                iter_strides: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl CpuKernelOp for CpuSumReduce {
+    fn output_size(&self) -> Expression {
+        self.shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+    }
+
+    fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
+        let input = inputs[0].0;
+        let n_out = resolve(&self.output_size(), dyn_map);
+        let iters = resolve(&self.iters, dyn_map);
+
+        let mut out = vec![0.0f32; n_out];
+        for out_idx in 0..n_out {
+            let mut acc = 0.0f32;
+            for k in 0..iters {
+                acc += input[out_idx * iters + k];
+            }
+            out[out_idx] = acc;
+        }
+        out
+    }
+
+    fn sum_reduce_info(&self) -> Option<CpuSumReduceInfo> {
+        Some(CpuSumReduceInfo {
+            shape: self.shape.clone(),
+            strides: self.strides.clone(),
+            iters: self.iters.clone(),
+            iter_strides: self.iter_strides.clone(),
+        })
+    }
+}
