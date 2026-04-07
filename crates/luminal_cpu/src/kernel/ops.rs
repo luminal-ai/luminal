@@ -284,7 +284,7 @@ impl EgglogOp for CpuMaxReduce {
 
     fn rewrites(&self) -> Vec<luminal::egglog_utils::api::Rule> {
         let (args, hlir_match) = new_op_call(&MaxReduce::default().sort(), &["inp"]);
-        let cpu_op = op_term(call_sort_from_args(&self.sort(), &args), args["__input"].clone());
+        let cpu_op = op_term(call_sort_from_args(&self.sort(), &args), args["__inputs"].clone());
         let dt = v("?__dt");
         vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp"].clone())))    ]
     }
