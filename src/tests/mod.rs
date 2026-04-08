@@ -20,8 +20,8 @@ proptest! {
         let g = cx.tensor(3);
         let e = cx.tensor(3);
 
-        let a = (b * c + g).output();
-        let d = (b * c / e).sin().output();
+        let a = (b.clone() * c.clone() + g.clone()).output();
+        let d = (b.clone() * c.clone() / e.clone()).sin().output();
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
@@ -55,7 +55,7 @@ proptest! {
         let b = cx.tensor((m, k));
         let c = cx.tensor((k, n));
 
-        let a = b.matmul(c).output();
+        let a = b.clone().matmul(c.clone()).output();
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
@@ -80,7 +80,7 @@ proptest! {
     fn test_shapes(values in proptest::collection::vec(-2.0f32..2.0, 4)) {
         let mut cx = Graph::new();
         let a = cx.tensor((2, 2));
-        let b = (a.permute((1, 0)) * 1.0).output();
+        let b = (a.clone().permute((1, 0)) * 1.0).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
         rt.set_data(a.id, values.clone());
@@ -95,9 +95,9 @@ proptest! {
         prop_assume!(values.len() >= rows * cols);
         let mut cx = Graph::new();
         let a = cx.tensor((rows, cols));
-        let kth_largest = a.gather(a.topk_indexes(k, 1).slice((.., (k - 1)..k)).squeeze(1));
-        let mask = a.ge(kth_largest.expand_dim(1, cols)).cast(crate::dtype::DType::F32);
-        let filtered = (a * mask).output();
+        let kth_largest = a.clone().gather(a.clone().topk_indexes(k, 1).slice((.., (k - 1)..k)).squeeze(1));
+        let mask = a.clone().ge(kth_largest.expand_dim(1, cols)).cast(crate::dtype::DType::F32);
+        let filtered = (a.clone() * mask).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
         let values = values.into_iter().take(rows * cols).collect::<Vec<f32>>();
@@ -332,7 +332,7 @@ fn fuzz_test_genome_execution() {
     let mut cx = Graph::new();
     let a = cx.tensor((2, 3));
     let b = cx.tensor((2, 3));
-    let c = (a + b).relu().output();
+    let c = (a.clone() + b.clone()).relu().output();
 
     cx.build_search_space::<NativeRuntime>();
     let egraph = cx.egraph().unwrap();
@@ -435,7 +435,7 @@ fn fuzz_test_genome_execution() {
 fn test_inputs_consumed_after_execute() {
     let mut cx = Graph::new();
     let a = cx.tensor(3);
-    let _b = (a * 2.0).output();
+    let _b = (a.clone() * 2.0).output();
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
@@ -449,8 +449,8 @@ fn test_passthrough_preserves_weights() {
     let mut cx = Graph::new();
     let w = cx.tensor(3);
     let x = cx.tensor(3);
-    let y = (w * x).output();
-    w.persist();
+    let y = (w.clone() * x.clone()).output();
+    w.clone().persist();
 
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
@@ -473,7 +473,7 @@ fn test_passthrough_preserves_weights() {
 fn test_only_outputs_remain() {
     let mut cx = Graph::new();
     let a = cx.tensor(3);
-    let _b = (a * 2.0).output();
+    let _b = (a.clone() * 2.0).output();
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);

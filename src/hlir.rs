@@ -1603,11 +1603,11 @@ impl Display for SumReduce {
 }
 impl HLIROp for SumReduce {
     fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        let mut reduced_shape = self.input_shape;
+        let mut reduced_shape = self.input_shape.clone();
         reduced_shape.remove_dim(self.dim);
         let reduced_dim = self.input_shape.dims[self.dim];
         let reduced_stride = self.input_shape.strides[self.dim];
-        let mut reduced_strides = self.input_shape.strides;
+        let mut reduced_strides = self.input_shape.strides.clone();
         reduced_strides.remove(self.dim);
 
         format!(
@@ -1732,11 +1732,11 @@ impl Display for MaxReduce {
 }
 impl HLIROp for MaxReduce {
     fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
-        let mut reduced_shape = self.input_shape;
+        let mut reduced_shape = self.input_shape.clone();
         reduced_shape.remove_dim(self.dim);
         let reduced_dim = self.input_shape.dims[self.dim];
         let reduced_stride = self.input_shape.strides[self.dim];
-        let mut reduced_strides = self.input_shape.strides;
+        let mut reduced_strides = self.input_shape.strides.clone();
         reduced_strides.remove(self.dim);
         format!(
             "(Op (Max {} {} {} {} {}) {})",

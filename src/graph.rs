@@ -190,10 +190,10 @@ impl Graph {
     /// # let mut cx = Graph::new();
     /// let a = cx.tensor(3);
     /// let b_id = cx.add_op(
-    ///     luminal::hlir::Mul { input_shapes: vec![a.shape, a.shape], ..Default::default() },
+    ///     luminal::hlir::Mul { input_shapes: vec![a.shape.clone(), a.shape.clone()], ..Default::default() },
     ///     &[a.id],
     /// );
-    /// let b = GraphTensor::from_id(b_id, a.shape, a.graph(), a.dtype);
+    /// let b = GraphTensor::from_id(b_id, a.shape.clone(), a.graph(), a.dtype);
     /// ```
     pub fn add_op<O: HLIROp + 'static>(&mut self, op: O, inputs: &[NodeIndex]) -> NodeIndex {
         let id = self.graph.add_node(Box::new(op));
@@ -1009,7 +1009,7 @@ pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
             if bi + 1 == chunk_idx {
                 // This break feeds into this chunk
                 // Get shape from the GraphBreak op itself
-                let shape = graph.get_op::<crate::hlir::GraphBreak>(brk).input_shape;
+                let shape = graph.get_op::<crate::hlir::GraphBreak>(brk).input_shape.clone();
                 // Get dtype from the predecessor
                 let pred = graph
                     .graph

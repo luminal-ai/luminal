@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap;
 /// let c = a + b;
 /// // The graph `cx` now has `a` and `b` loading nodes, and an add node resulting in `c`
 /// ```
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct GraphTensor {
     pub id: NodeIndex,
     pub graph_ref: *mut Graph,
@@ -26,7 +26,7 @@ pub struct GraphTensor {
 
 impl From<&GraphTensor> for GraphTensor {
     fn from(value: &GraphTensor) -> Self {
-        *value
+        value.clone()
     }
 }
 
@@ -65,7 +65,7 @@ impl GraphTensor {
             },
             &[self.id],
         );
-        *self
+        self.clone()
     }
 
     /// Required bytes to store this tensor's physical elements. Rounds up to nearest byte.
@@ -78,7 +78,7 @@ impl GraphTensor {
     /// Input node's GraphTensor (not the Output node).
     pub fn persist(&self) -> GraphTensor {
         self.output();
-        *self
+        self.clone()
     }
 
     pub fn dims(&self) -> Vec<Expression> {
@@ -139,7 +139,7 @@ impl GraphTensor {
 impl Debug for GraphTensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Print the shape
-        let mut shape = self.shape;
+        let mut shape = self.shape.clone();
         shape.resolve_dyn_dims(&self.graph().dyn_map);
         let shape = shape.shape_usize();
         writeln!(f, "Tensor with Shape: {shape:?}")

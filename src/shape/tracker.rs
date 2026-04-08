@@ -2,16 +2,16 @@ use std::fmt::Display;
 
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
-use tinyvec::ArrayVec;
+use tinyvec::TinyVec;
 
 use crate::prelude::*;
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
 pub struct ShapeTracker {
-    pub dims: ArrayVec<[Expression; 10]>,
-    pub strides: ArrayVec<[Expression; 10]>,
+    pub dims: TinyVec<[Expression; 10]>,
+    pub strides: TinyVec<[Expression; 10]>,
     /// Bits per element in memory storage. Controls byte-size computation.
     /// Defaults to 32 (F32). Set from dtype.bits() at tensor creation.
     pub element_stride_bits: usize,
@@ -193,6 +193,12 @@ impl ShapeTracker {
 
         // Loop through all dims in reverse order
         for (d, s) in self.dims.iter().zip(&self.strides).rev() {
+            // Guard: a zero-sized dimension would cause symbolic div/mod by
+            // zero, panicking the expression simplifier. Return a safe
+            // sentinel (index 0) for degenerate zero-element tensors.
+            if d.to_usize() == Some(0) {
+                return 0.into();
+            }
             // Don't include fake dimensions in the index expression
             if *s == 0 {
                 current_elem_size *= d;
@@ -242,13 +248,14 @@ impl ShapeTracker {
 
     /// The number of elements in this tensor, including padding and mask
     pub fn n_elements(&self) -> Expression {
-        self.dims.into_iter().product::<Expression>().max(1)
+        self.dims.iter().copied().product::<Expression>().max(1)
     }
 
     /// The number of elements in this tensor, not including pads and mask
     pub fn n_physical_elements(&self) -> Expression {
         self.dims
-            .into_iter()
+            .iter()
+            .copied()
             .zip(&self.strides)
             .filter(|(_, s)| **s != 0)
             .map(|(s, _)| s)
@@ -279,10 +286,11 @@ impl ShapeTracker {
     }
 
     /// Create a contiguous version, preserving element_stride_bits
-    pub fn contiguous(self) -> Self {
+    pub fn contiguous(&self) -> Self {
         Self::new_with_element_bits(
             self.dims
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|i| i.simplify())
                 .collect::<Vec<_>>(),
             self.element_stride_bits,
