@@ -149,6 +149,7 @@ pub type HLIROps = (
     Scatter,
     SumReduce,
     MaxReduce,
+    Softmax,
 );
 
 #[derive(Default, Debug, Clone)]
@@ -1832,6 +1833,160 @@ impl NativeOp for MaxReduce {
                 .collect(),
             ),
             NativeData::Bool(_) => panic!("Cannot max-reduce Bool tensors"),
+        }
+    }
+}
+
+// Fused Softmax: softmax(x, axis) = exp(x - max(x)) / sum(exp(x - max(x)))
+// A single HLIR op that replaces the 6-op decomposed chain.
+// On CUDA, KernelSoftmax provides a fused 3-pass kernel.
+// On native, NativeOp implements softmax directly.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Softmax {
+    pub axis: usize,
+    pub input_shape: ShapeTracker,
+    // Extracted fields (populated during egglog extraction, used by NativeOp)
+    pub shape: Vec<Expression>,
+    pub in_strides: Vec<Expression>,
+    pub reduce_dim: Expression,
+    pub reduce_stride: Expression,
+}
+impl Display for Softmax {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Softmax(axis={})", self.axis)
+    }
+}
+
+/// Sort for Softmax: (shape, in_strides, out_strides, reduce_dim, reduce_stride)
+pub fn softmax_sort(name: &str) -> SortDef {
+    sort(
+        OP_KIND,
+        name,
+        &[
+            ("shape", ELIST),
+            ("in_strides", ELIST),
+            ("out_strides", ELIST),
+            ("reduce_dim", EXPRESSION),
+            ("reduce_stride", EXPRESSION),
+        ],
+    )
+}
+
+impl HLIROp for Softmax {
+    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
+        let reduce_dim = self.input_shape.dims[self.axis];
+        let reduce_stride = self.input_shape.strides[self.axis];
+        format!(
+            "(Op (Softmax {} {} {} {} {}) {})",
+            elist_to_egglog(&self.input_shape.dims),
+            elist_to_egglog(&self.input_shape.strides),
+            elist_to_egglog(&self.input_shape.contiguous().strides),
+            reduce_dim.to_egglog(),
+            reduce_stride.to_egglog(),
+            ilist_egglog(&[&inputs[0].1]),
+        )
+    }
+}
+
+impl EgglogOp for Softmax {
+    fn sort(&self) -> SortDef {
+        softmax_sort("Softmax")
+    }
+    fn cleanup(&self) -> bool {
+        true
+    }
+    fn n_inputs(&self) -> usize {
+        1
+    }
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_propagation_op(&self.sort())]
+    }
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let in_strides =
+            extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap();
+        let reduce_dim = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+        let reduce_stride = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
+        (
+            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+                axis: 0,
+                input_shape: ShapeTracker::default(),
+                shape,
+                in_strides,
+                reduce_dim,
+                reduce_stride,
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl NativeOp for Softmax {
+    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+        match inputs[0] {
+            NativeData::F32(a) => {
+                // Use extracted fields (populated during egglog extraction)
+                let dims: Vec<usize> = self
+                    .shape
+                    .iter()
+                    .map(|d| d.exec(dyn_map).unwrap())
+                    .collect();
+                let n = self.reduce_dim.exec(dyn_map).unwrap();
+                let mut reduce_stride_expr = self.reduce_stride;
+                for (&var, &val) in dyn_map {
+                    reduce_stride_expr =
+                        reduce_stride_expr.substitute(var, Expression::from(val as i32));
+                }
+
+                // Compute row index strides (all dims except last, since softmax is always last-dim)
+                let ndim = dims.len();
+                let out_size: usize = dims.iter().product();
+                let mut out = vec![0.0f32; out_size];
+
+                // Use StridedIterator for the row dimensions
+                let row_ind = StridedIterator::new(
+                    &self.shape[..ndim - 1],
+                    &self.in_strides[..ndim - 1],
+                    dyn_map,
+                );
+
+                for (row_idx, in_base) in row_ind.enumerate() {
+                    // Pass 1: find max
+                    let mut max_val = f32::NEG_INFINITY;
+                    for i in 0..n {
+                        let val = a[in_base + reduce_stride_expr.exec_single_var(i)];
+                        if val > max_val {
+                            max_val = val;
+                        }
+                    }
+
+                    // Pass 2: exp(x - max) and sum
+                    let mut sum = 0.0f32;
+                    let out_base = row_idx * n;
+                    for i in 0..n {
+                        let val =
+                            (a[in_base + reduce_stride_expr.exec_single_var(i)] - max_val).exp();
+                        out[out_base + i] = val;
+                        sum += val;
+                    }
+
+                    // Pass 3: normalize
+                    let inv_sum = 1.0 / sum;
+                    for i in 0..n {
+                        out[out_base + i] *= inv_sum;
+                    }
+                }
+
+                NativeData::F32(out)
+            }
+            _ => panic!("Softmax only supports F32"),
         }
     }
 }

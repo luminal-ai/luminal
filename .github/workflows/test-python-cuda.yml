@@ -1,0 +1,49 @@
+name: Test Python CUDA
+
+on:
+    push:
+        branches: ["main"]
+    pull_request_target:
+        branches: ["main"]
+        types: [labeled, synchronize]
+    workflow_dispatch:
+
+jobs:
+    python_cuda_tests:
+        if: >-
+            github.event_name == 'push'
+            || github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'pull_request_target'
+                && contains(github.event.pull_request.labels.*.name, 'modal-ready'))
+        name: Python CUDA Tests
+        runs-on: ubuntu-latest
+        environment: Modal
+        timeout-minutes: 60
+        defaults:
+            run:
+                working-directory: crates/luminal_python
+
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  ref: ${{ github.event.pull_request.head.sha || github.sha }}
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - name: Install Modal
+              run: pip install modal
+            - name: Run pytest with CUDA backend on Modal
+              env:
+                  MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+                  MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+                  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+              run: modal run modal_pytest_runner.py --gpu A100 --timeout 3300 --profile --profile-output-dir luminal_artifacts/pytest-profiling/github-${{ github.run_id }}-${{ github.run_attempt }} tests/ -v -s -m "not slow"
+            - name: Upload Modal pytest profiling artifacts
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: python-cuda-pytest-profiling-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: crates/luminal_python/luminal_artifacts/pytest-profiling/github-${{ github.run_id }}-${{ github.run_attempt }}
+                  retention-days: 7
+                  if-no-files-found: warn

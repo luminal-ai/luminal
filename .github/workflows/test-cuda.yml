@@ -3,27 +3,35 @@ name: Test CUDA
 on:
     push:
         branches: ["main"]
-    pull_request:
+    pull_request_target:
         branches: ["main"]
+        types: [labeled, synchronize]
     workflow_dispatch:
-
-env:
-    CARGO_TERM_COLOR: always
 
 jobs:
     cuda_unit_test:
+        if: >-
+            github.event_name == 'push'
+            || github.event_name == 'workflow_dispatch'
+            || (github.event_name == 'pull_request_target'
+                && contains(github.event.pull_request.labels.*.name, 'modal-ready'))
         name: Cuda Unit Tests
-        runs-on: cuda_t4_runner
-        container:
-            image: ghcr.io/luminal-ai/luminal-docker:cuda
-            options: --gpus all
+        runs-on: ubuntu-latest
+        environment: Modal
         timeout-minutes: 30
 
         steps:
             - uses: actions/checkout@v6
-            - name: Detect GPU compute capability
-              run: |
-                  CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
-                  echo "CUDA_COMPUTE_CAP=${CAP}" >> "$GITHUB_ENV"
-            - name: Run CUDA crate tests
-              run: cargo test -p luminal_cuda_lite --verbose -- --test-threads=1
+              with:
+                  ref: ${{ github.event.pull_request.head.sha || github.sha }}
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - name: Install Modal
+              run: pip install modal
+            - name: Run CUDA tests on Modal
+              env:
+                  MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+                  MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+              run: modal run ci/modal_cargo_test.py

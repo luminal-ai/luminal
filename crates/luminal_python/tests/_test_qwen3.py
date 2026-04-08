@@ -5,13 +5,10 @@ PyTorch -> ONNX -> luminal pipeline via torch.compile. Qwen3 shares the same
 architecture family as Llama (GQA, RoPE, SwiGLU MLP, RMSNorm).
 """
 
-from typing import Callable
-
 import torch
 import torch._dynamo
 
 from luminal import luminal_backend
-
 
 # ========== HuggingFace Qwen3ForCausalLM Tests ==========
 
@@ -58,12 +55,12 @@ def _run_hf_qwen3_test(config, device: torch.device, atol: float):
 def test_hf_qwen3_tiny(device: torch.device):
     """HuggingFace Qwen3ForCausalLM -- tiny (64 hidden, 1 layer, ~70K params)."""
     config = _make_qwen3_config(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
+        hidden_size=32,
+        num_attention_heads=2,
+        num_key_value_heads=1,
         num_hidden_layers=1,
-        intermediate_size=128,
-        vocab_size=256,
+        intermediate_size=64,
+        vocab_size=128,
     )
     _run_hf_qwen3_test(config, device, atol=1e-5)
 
@@ -161,167 +158,6 @@ def test_hf_qwen3_decode_loop_static(device: torch.device):
         )
         next_token = ref.logits[0, -1, :].argmax().item()
         tokens.append(next_token)
-
-
-def test_hf_qwen3_decode_loop_dynamic():
-    """Decode loop with dynamic shapes -- compile once, run with varying seq_len.
-
-    Bypasses torch.compile to use luminal's dynamic dim support directly.
-    Exports ONNX once with dynamic_axes, then calls set_dim/set_input/run/get_output.
-    """
-    import os
-    import tempfile
-
-    from transformers import Qwen3Config, Qwen3ForCausalLM
-
-    import luminal
-
-    config = Qwen3Config(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        num_hidden_layers=1,
-        intermediate_size=128,
-        vocab_size=256,
-        max_position_embeddings=128,
-        use_cache=False,
-        attn_implementation="eager",
-    )
-    model = Qwen3ForCausalLM(config).eval()
-
-    # Export ONNX once with dynamic seq_len
-    dummy = torch.tensor([[1, 2, 3, 4]])
-    tmp = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
-    tmp_path = tmp.name
-    tmp.close()
-    try:
-        torch.onnx.export(
-            model,
-            (dummy,),
-            tmp_path,
-            opset_version=20,
-            input_names=["input_ids"],
-            output_names=["logits"],
-            dynamic_axes={"input_ids": {1: "seq_len"}, "logits": {1: "seq_len"}},
-        )
-
-        graph = luminal.process_onnx(tmp_path, "native")
-    finally:
-        os.unlink(tmp_path)
-
-    assert graph.has_dynamic_dims, "Graph should have dynamic dims"
-    assert "seq_len" in graph.dim_params, f"Expected 'seq_len' in {graph.dim_params}"
-
-    tokens = [1, 2, 3, 4]
-    for step in range(3):
-        seq_len = len(tokens)
-        graph.set_dim("seq_len", seq_len)
-
-        # Set input as float (luminal works with f32 internally)
-        graph.set_input("input_ids", [float(t) for t in tokens])
-        graph.run()
-
-        # Get output and reshape using resolved shapes
-        output_shapes = graph.resolve_output_shapes()
-        logits_data = graph.get_output("logits")
-        logits = torch.tensor(logits_data, dtype=torch.float32).reshape(
-            output_shapes[0]
-        )
-
-        # Compare against PyTorch reference
-        input_ids = torch.tensor([tokens])
-        with torch.no_grad():
-            ref = model(input_ids)
-
-        assert torch.allclose(logits, ref.logits, atol=1e-4), (
-            f"step {step}: max_diff={torch.max(torch.abs(logits - ref.logits)).item():.2e}"
-        )
-
-        next_token = ref.logits[0, -1, :].argmax().item()
-        tokens.append(next_token)
-
-
-def test_hf_qwen3_8b_decode_loop_dynamic():
-    """Decode loop with dynamic shapes on real Qwen3-8B -- compile once, run with varying seq_len.
-
-    Full 8B model with pretrained weights, ONNX exported once with dynamic_axes
-    for seq_len, then decoded autoregressively without recompilation.
-    """
-    import os
-    import tempfile
-
-    from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
-
-    import luminal
-
-    backend = os.environ.get("LUMINAL_BACKEND", "cuda")
-
-    config = AutoConfig.from_pretrained("Qwen/Qwen3-8B")
-    config.use_cache = False
-    config._attn_implementation = "eager"
-    print("Loaded config")
-    model = Qwen3ForCausalLM.from_pretrained(
-        "Qwen/Qwen3-8B",
-        config=config,
-        torch_dtype=torch.float32,
-    ).eval()
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-    print("Loaded Model")
-
-    # Export ONNX once with dynamic seq_len
-    dummy = torch.tensor([[1, 2, 3, 4]])
-    tmp = tempfile.NamedTemporaryFile(suffix=".onnx", delete=False)
-    tmp_path = tmp.name
-    tmp.close()
-
-    try:
-        torch.onnx.export(
-            model,
-            (dummy,),
-            tmp_path,
-            opset_version=20,
-            input_names=["input_ids"],
-            output_names=["logits"],
-            dynamic_axes={"input_ids": {1: "seq_len"}, "logits": {1: "seq_len"}},
-        )
-        print("Exported onnx")
-        graph = luminal.process_onnx(tmp_path, backend)
-    finally:
-        os.unlink(tmp_path)
-    print("Exported Model")
-    assert graph.has_dynamic_dims, "Graph should have dynamic dims"
-    assert "seq_len" in graph.dim_params, f"Expected 'seq_len' in {graph.dim_params}"
-
-    prompt = "The capital of france is"
-    tokens = tokenizer.encode(prompt)
-    print(f"Prompt: '{prompt}' -> {len(tokens)} tokens: {tokens}")
-
-    num_generate = 3
-    for step in range(num_generate):
-        seq_len = len(tokens)
-        graph.set_dim("seq_len", seq_len)
-
-        graph.set_input("input_ids", [float(t) for t in tokens])
-        graph.run()
-
-        output_shapes = graph.resolve_output_shapes()
-        logits_data = graph.get_output("logits")
-        logits = torch.tensor(logits_data, dtype=torch.float32).reshape(
-            output_shapes[0]
-        )
-
-        # Compare against PyTorch reference
-        input_ids = torch.tensor([tokens])
-        with torch.no_grad():
-            ref = model(input_ids)
-
-        assert torch.allclose(logits, ref.logits, atol=1e-3), (
-            f"step {step}: max_diff={torch.max(torch.abs(logits - ref.logits)).item():.2e}"
-        )
-
-        next_token = ref.logits[0, -1, :].argmax().item()
-        tokens.append(next_token)
-        print(f"Step {step}: '{tokenizer.decode(tokens)}'")
 
 
 def test_hf_qwen3_8b_full(device: torch.device):

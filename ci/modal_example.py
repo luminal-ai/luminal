@@ -4,10 +4,17 @@ import os
 
 example = os.environ.get("EXAMPLE", "llama")
 gpu_type = os.environ.get("GPU_TYPE", "A100-80GB")
+CUDARC_CUDA_VERSION = "12080"
+HF_CACHE_VOLUME_NAME = "luminal-hf-cache-v2"
+HF_CACHE_PATH = "/root/.cache/huggingface"
 
 app = modal.App(f"luminal-ci-{example}")
 
-hf_cache = modal.Volume.from_name("luminal-hf-cache", create_if_missing=True)
+hf_cache = modal.Volume.from_name(
+    HF_CACHE_VOLUME_NAME,
+    create_if_missing=True,
+    version=2,
+)
 
 WORKDIR = "/workspace/luminal"
 
@@ -19,8 +26,13 @@ cuda_image = (
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
     )
-    .env({"PATH": "/root/.cargo/bin:$PATH"})
-    .add_local_dir(".", remote_path=WORKDIR)
+    .env(
+        {
+            "PATH": "/root/.cargo/bin:$PATH",
+            "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
+        }
+    )
+    .add_local_dir(".", remote_path=WORKDIR, copy=True)
 )
 
 
@@ -29,7 +41,7 @@ cuda_image = (
     gpu=gpu_type,
     timeout=3600,  # 60 minutes
     volumes={
-        "/root/.cache/huggingface": hf_cache,
+        HF_CACHE_PATH: hf_cache,
     },
 )
 def run_example(example: str):
@@ -41,7 +53,8 @@ def run_example(example: str):
         cwd=f"{WORKDIR}/examples/{example}",
         env={
             **os.environ,
-            "HF_HOME": "/root/.cache/huggingface",
+            "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
+            "HF_HOME": HF_CACHE_PATH,
         },
         check=True,
     )

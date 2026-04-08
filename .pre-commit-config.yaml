@@ -1,0 +1,38 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.5
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        files: ^crates/luminal_python/.*\.py$
+      - id: ruff-format
+        name: ruff format
+        files: ^crates/luminal_python/.*\.py$
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --exclude luminal_cuda_lite --exclude luminal_metal --exclude luminal_bench --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
+      - id: cargo-clippy-metal
+        name: cargo clippy metal
+        entry: cargo clippy -p luminal_metal --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
+        stages: [manual]
+      - id: cargo-clippy-cuda-lite
+        name: cargo clippy cuda_lite
+        entry: cargo clippy -p luminal_cuda_lite --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$
+        stages: [manual]

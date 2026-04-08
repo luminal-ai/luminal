@@ -1,0 +1,25 @@
+name: Metal Clippy
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    workflow_dispatch:
+
+jobs:
+    metal_clippy:
+        name: Metal Clippy
+        runs-on: macos-14
+        timeout-minutes: 30
+
+        steps:
+            - uses: actions/checkout@v6
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.11"
+            - name: Update Rust toolchain
+              run: rustup update
+            - uses: pre-commit/action@v3.0.1
+              with:
+                  extra_args: --hook-stage manual cargo-clippy-metal --all-files

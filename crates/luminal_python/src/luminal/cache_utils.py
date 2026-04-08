@@ -47,7 +47,10 @@ def _register_cache_serialization(verbose: int = 0):
     except ImportError:
         DynamicCache = None
 
-    if DynamicCache is not None and DynamicCache not in torch.utils._pytree.SUPPORTED_NODES:
+    if (
+        DynamicCache is not None
+        and DynamicCache not in torch.utils._pytree.SUPPORTED_NODES
+    ):
         if verbose:
             print("[luminal] register DynamicCache pytree serialization")
         torch.utils._pytree.register_pytree_node(

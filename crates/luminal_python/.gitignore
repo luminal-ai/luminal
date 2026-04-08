@@ -3,3 +3,4 @@ tests/llama38b_ref_logits.pt
 __pycache__/
 *.pyc
 uv.lock
+.venv

@@ -1,6 +1,5 @@
 from typing import Callable
 
-import pytest
 import torch
 import torch._dynamo
 from test_models import (
