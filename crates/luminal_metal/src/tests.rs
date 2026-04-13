@@ -1,7 +1,4 @@
-use crate::{
-    kernel::{lower_expression_for_metal, MetalEmbed, MetalGather},
-    runtime::MetalRuntime,
-};
+use crate::{kernel::lower_expression_for_metal, runtime::MetalRuntime};
 use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
 use half::f16;
 use luminal::prelude::*;
@@ -1017,75 +1014,9 @@ fn test_scatter_all_positions() {
 }
 
 // ============================================================================
-// Embedding lookup regression: prove the old path was broken
+// Embedding lookup tests
 // ============================================================================
 
-/// Demonstrates that embedding lookups were *silently wrong* before MetalEmbed.
-///
-/// Root cause: MetalMul's MSL kernel declares all inputs as `device float *`.
-/// An i32 token ID of 1 (bytes 0x00000001) read as f32 is ~1.4e-45.
-/// Multiplied by embed_dim (4) it stays ~0, so the computed flat indices are
-/// just arange(0..4) — meaning every token lookup lands on row 0 regardless
-/// of the actual token ID.
-///
-/// This test excludes MetalEmbed to reproduce that broken path and asserts
-/// the output is *wrong*, confirming that MetalEmbed fixes a real bug.
-#[test]
-fn metal_embed_without_fusion_is_wrong() {
-    let vocab_size = 8usize;
-    let embed_dim = 4usize;
-    // Rows 0-7, each with distinct values so row confusion is detectable.
-    let embed_data: Vec<f32> = (0..32).map(|i| i as f32 + 1.0).collect();
-    // Token IDs 1,2,3,4 — all non-zero, so correct output must differ from row 0.
-    let token_data: Vec<i32> = vec![1, 2, 3, 4];
-    let seq_len = token_data.len();
-
-    let mut cx = Graph::default();
-    let token_ids = cx.tensor(seq_len).as_dtype(DType::Int);
-    let embed_table = cx.tensor((vocab_size, embed_dim));
-    let output = embed_table
-        .gather(
-            (token_ids * embed_dim).expand_dim(1, embed_dim)
-                + cx.arange(embed_dim as i32).expand_dim(0, seq_len),
-        )
-        .output();
-
-    // Exclude MetalEmbed — force the old broken path.
-    cx.build_search_space_exclude_ops::<MetalRuntime, MetalEmbed>();
-    let mut rt = MetalRuntime::initialize(());
-    rt.set_data_i32(token_ids, &token_data);
-    rt.set_data(embed_table, &embed_data);
-    rt = cx.search(rt, 5);
-    rt.allocate_intermediate_buffers(&cx.dyn_map);
-    rt.execute(&cx.dyn_map);
-
-    let out = rt.get_f32(output);
-
-    // Build the correct expected output.
-    let mut expected = vec![0.0f32; seq_len * embed_dim];
-    for (i, &tid) in token_data.iter().enumerate() {
-        for j in 0..embed_dim {
-            expected[i * embed_dim + j] = embed_data[tid as usize * embed_dim + j];
-        }
-    }
-
-    // The old path produces the wrong answer.
-    // The exact wrong values are hardware-dependent: MetalMul gives ~0 for each token ID,
-    // so MetalAdd produces float values 0.0, 1.0, 2.0, ... which MetalGather reads as i32.
-    // The i32 bit-pattern of 1.0f32 is 0x3F800000 = 1_065_353_216 — far out of bounds.
-    // Metal returns undefined data for out-of-bounds reads rather than panicking.
-    assert_ne!(
-        out, expected,
-        "expected the old path to give wrong results for non-zero token IDs"
-    );
-}
-
-// ============================================================================
-// Embedding lookup stress tests
-// ============================================================================
-
-/// Run a MetalEmbed correctness test with explicit data.
-/// MetalGather is excluded so MetalEmbed is always the selected kernel.
 fn run_embed_test(vocab_size: usize, embed_dim: usize, token_data: &[i32], embed_data: &[f32]) {
     assert_eq!(embed_data.len(), vocab_size * embed_dim);
     let seq_len = token_data.len();
@@ -1107,7 +1038,7 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, token_data: &[i32], embed
         }
     }
 
-    cx.build_search_space_exclude_ops::<MetalRuntime, MetalGather>();
+    cx.build_search_space::<MetalRuntime>();
     let mut rt = MetalRuntime::initialize(());
     rt.set_data_i32(token_ids, token_data);
     rt.set_data(embed_table, embed_data);
@@ -1144,9 +1075,7 @@ fn metal_embed_boundary_tokens() {
 fn metal_embed_repeated_token() {
     let vocab_size = 32usize;
     let embed_dim = 16usize;
-    let embed_data: Vec<f32> = (0..(vocab_size * embed_dim))
-        .map(|i| -(i as f32))
-        .collect();
+    let embed_data: Vec<f32> = (0..(vocab_size * embed_dim)).map(|i| -(i as f32)).collect();
     let token_data = vec![7i32; 64]; // 64 lookups all to token 7
     run_embed_test(vocab_size, embed_dim, &token_data, &embed_data);
 }

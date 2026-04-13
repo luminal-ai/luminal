@@ -2,7 +2,7 @@ use super::{MetalKernelOp, MetalMatmulFamily, MetalMulInfo, MetalSumReduceInfo};
 use luminal::{
     egglog_utils::{
         api::{app, eq, rule, sort, union, v, Args, Rule, SortDef, Term as EggTerm},
-        base::{dtype, new_op_call, op_term, DTYPE, ELIST, EXPRESSION, F64, IR, OP_SORTS, SORTS},
+        base::{dtype, new_op_call, op_term, DTYPE, ELIST, EXPRESSION, F64, IR, OP_KIND, SORTS},
         SerializedEGraph,
     },
     hlir::{
@@ -1926,6 +1926,8 @@ impl MetalKernelOp for MetalIota {
 pub struct MetalGather {
     out_shape: Vec<Expression>,
     index_stride: Vec<Expression>,
+    // data_stride is extracted but not used in kernel (gathered_index is already flat)
+    #[allow(dead_code)]
     data_stride: Vec<Expression>,
     out_stride: Vec<Expression>,
 }
@@ -2007,6 +2009,8 @@ impl MetalKernelOp for MetalGather {
         input_dtypes: &[DType],
         output_dtype: DType,
     ) -> ComputePipelineState {
+        let index_dtype = input_dtypes.first().copied().unwrap_or(DType::Int);
+        let index_ty = metal_buffer_type(index_dtype);
         let data_dtype = input_dtypes.get(1).copied().unwrap_or(DType::F32);
         let data_ty = metal_buffer_type(data_dtype);
         let out_ty = metal_buffer_type(output_dtype);
@@ -2016,10 +2020,8 @@ impl MetalKernelOp for MetalGather {
             &flatten_strides(&self.out_shape, &self.index_stride),
             "idx",
         );
-        let data_idx = lower_expression_for_metal(
-            &flatten_strides(&self.out_shape, &self.data_stride),
-            "gathered_index",
-        );
+        // gathered_index is already a flat index into the data buffer, no stride computation needed
+        let data_idx = "gathered_index".to_string();
         let gathered_val = metal_copy_value(data_dtype, "data", &data_idx);
 
         let source = format!(
@@ -2028,7 +2030,7 @@ impl MetalKernelOp for MetalGather {
             using namespace metal;
 
             kernel void mkernel(
-                const device int *indexes [[buffer(0)]],
+                const device {index_ty} *indexes [[buffer(0)]],
                 const device {data_ty} *data [[buffer(1)]],
                 device {out_ty} *out [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
@@ -2036,11 +2038,12 @@ impl MetalKernelOp for MetalGather {
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
-                    int gathered_index = indexes[{index_idx}];
+                    int gathered_index = (int)indexes[{index_idx}];
                     out[{out_idx}] = {gathered_val};
                 }}
             }}
             "#,
+            index_ty = index_ty,
             data_ty = data_ty,
             out_ty = out_ty,
             gathered_val = gathered_val,
@@ -2048,6 +2051,11 @@ impl MetalKernelOp for MetalGather {
             n_elements_index = 4u64,
         );
         compile_shader(device, &source, "mkernel")
+    }
+
+    fn infer_output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        // Gather output has the dtype of the data (second input), not the indices (first input)
+        input_dtypes.get(1).copied().unwrap_or(DType::F32)
     }
 
     fn output_size(&self) -> Expression {
@@ -2559,37 +2567,40 @@ impl Default for MetalEmbed {
 impl EgglogOp for MetalEmbed {
     fn sort(&self) -> SortDef {
         sort(
-            IR,
+            OP_KIND,
             "MetalEmbed",
             &[
                 ("batch_shape", ELIST),
-                ("token_ids", IR),
                 ("token_stride", ELIST),
-                ("embed_table", IR),
                 ("out_stride", ELIST),
                 ("embed_dim", EXPRESSION),
             ],
         )
     }
 
+    fn n_inputs(&self) -> usize {
+        2
+    }
+
     fn rewrites(&self) -> Vec<Rule> {
-        // NOTE: Unlike CUDA (which has block ops that pre-create RemoveNthFromEnd nodes),
-        // Metal has no such ops. We must create RemoveNthFromEnd in ACTIONS (not conditions)
-        // so that (saturate expr) in the next iteration evaluates them into concrete ELists.
+        // NOTE: RemoveNthFromEnd nodes must be created in ACTIONS (let), not CONDITIONS.
+        // Metal has no block ops that pre-populate these nodes into the e-graph.
+        // After the rule fires, (saturate expr) evaluates the RemoveNthFromEnd e-classes
+        // to concrete ELists, and MetalEmbed's fields then resolve correctly at extract time.
         vec![
             // Match Gather with Add(Mul(Cast(token_ids), const), Iota) indices
             Rule::raw("(rule
                 (
-                    (= ?gather (Gather ?indices ?idx_shape ?idx_stride ?embed_table ?embed_shape ?embed_stride))
-                    (= ?indices (Add ?add_shape ?mul_result ?mul_stride ?iota_result ?iota_stride ?add_out_stride))
-                    (= ?mul_result (Mul ?mul_shape ?token_ids_cast ?token_cast_stride ?mul_const ?mul_const_stride ?mul_out_stride))
-                    (= ?token_ids_cast (Cast ?token_ids ?cast_size ?cast_dtype))
+                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
+                    (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
+                    (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?me (MetalEmbed ?batch_shape ?token_ids ?token_cast_stride ?embed_table ?out_stride_batch ?embed_dim))
+                    (let ?me (Op (MetalEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?me)
                     (set (dtype ?me) (F32))
                 )
@@ -2598,16 +2609,16 @@ impl EgglogOp for MetalEmbed {
             // Match Gather with Add(Iota, Mul(Cast(token_ids), const)) indices (reversed order)
             Rule::raw("(rule
                 (
-                    (= ?gather (Gather ?indices ?idx_shape ?idx_stride ?embed_table ?embed_shape ?embed_stride))
-                    (= ?indices (Add ?add_shape ?iota_result ?iota_stride ?mul_result ?mul_stride ?add_out_stride))
-                    (= ?mul_result (Mul ?mul_shape ?token_ids_cast ?token_cast_stride ?mul_const ?mul_const_stride ?mul_out_stride))
-                    (= ?token_ids_cast (Cast ?token_ids ?cast_size ?cast_dtype))
+                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
+                    (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
+                    (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?me (MetalEmbed ?batch_shape ?token_ids ?token_cast_stride ?embed_table ?out_stride_batch ?embed_dim))
+                    (let ?me (Op (MetalEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?me)
                     (set (dtype ?me) (F32))
                 )
@@ -2616,15 +2627,15 @@ impl EgglogOp for MetalEmbed {
             // Match Gather with Add(Mul(token_ids, const), Iota) indices (no Cast)
             Rule::raw("(rule
                 (
-                    (= ?gather (Gather ?indices ?idx_shape ?idx_stride ?embed_table ?embed_shape ?embed_stride))
-                    (= ?indices (Add ?add_shape ?mul_result ?mul_stride ?iota_result ?iota_stride ?add_out_stride))
-                    (= ?mul_result (Mul ?mul_shape ?token_ids ?token_stride ?mul_const ?mul_const_stride ?mul_out_stride))
+                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
+                    (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?me (MetalEmbed ?batch_shape ?token_ids ?token_stride ?embed_table ?out_stride_batch ?embed_dim))
+                    (let ?me (Op (MetalEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids (ICons ?embed_table (INil)))))
                     (union ?gather ?me)
                     (set (dtype ?me) (F32))
                 )
@@ -2633,15 +2644,15 @@ impl EgglogOp for MetalEmbed {
             // Match Gather with Add(Iota, Mul(token_ids, const)) indices (reversed, no Cast)
             Rule::raw("(rule
                 (
-                    (= ?gather (Gather ?indices ?idx_shape ?idx_stride ?embed_table ?embed_shape ?embed_stride))
-                    (= ?indices (Add ?add_shape ?iota_result ?iota_stride ?mul_result ?mul_stride ?add_out_stride))
-                    (= ?mul_result (Mul ?mul_shape ?token_ids ?token_stride ?mul_const ?mul_const_stride ?mul_out_stride))
+                    (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
+                    (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
+                    (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?me (MetalEmbed ?batch_shape ?token_ids ?token_stride ?embed_table ?out_stride_batch ?embed_dim))
+                    (let ?me (Op (MetalEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids (ICons ?embed_table (INil)))))
                     (union ?gather ?me)
                     (set (dtype ?me) (F32))
                 )
@@ -2657,28 +2668,38 @@ impl EgglogOp for MetalEmbed {
     fn extract<'a>(
         &'a self,
         egraph: &'a SerializedEGraph,
-        children: &[&'a ENodeId],
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         use luminal::egglog_utils::{extract_expr, extract_expr_list};
         (
             LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
-                batch_shape: extract_expr_list(egraph, children[0], list_cache, expr_cache)
+                batch_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
                     .unwrap(),
-                token_stride: extract_expr_list(egraph, children[2], list_cache, expr_cache)
+                token_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
-                out_stride: extract_expr_list(egraph, children[4], list_cache, expr_cache)
+                out_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
                     .unwrap(),
-                embed_dim: extract_expr(egraph, children[5], expr_cache).unwrap(),
+                embed_dim: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
             })),
-            vec![children[1], children[3]], // token_ids, embed_table
+            input_enodes, // token_ids (or cast token_ids), embed_table
         )
     }
 }
 
 impl MetalKernelOp for MetalEmbed {
-    fn compile(&self, device: &Device) -> ComputePipelineState {
+    fn infer_output_dtype(&self, _input_dtypes: &[luminal::dtype::DType]) -> luminal::dtype::DType {
+        luminal::dtype::DType::F32
+    }
+
+    fn compile(
+        &self,
+        device: &Device,
+        _input_dtypes: &[luminal::dtype::DType],
+        _output_dtype: luminal::dtype::DType,
+    ) -> ComputePipelineState {
         let embed_dim_str = lower_expression_for_metal(&self.embed_dim, "");
         let token_offset = lower_expression_for_metal(
             &flatten_strides(&self.batch_shape, &self.token_stride),
@@ -2695,11 +2716,11 @@ impl MetalKernelOp for MetalEmbed {
             using namespace metal;
 
             kernel void mkernel(
-                device float *out                    [[buffer(0)]],
-                const device int *token_ids          [[buffer(1)]],
-                const device float *embed_table      [[buffer(2)]],
-                device uint &n_elements              [[buffer(3)]],
+                const device int *token_ids          [[buffer(0)]],
+                const device float *embed_table      [[buffer(1)]],
+                device float *out                    [[buffer(2)]],
                 constant int *dyn                    [[buffer({dyn_buffer_index})]],
+                device uint &n_elements              [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -2713,7 +2734,8 @@ impl MetalKernelOp for MetalEmbed {
                 }}
             }}
             "#,
-            dyn_buffer_index = DYN_BUFFER_INDEX
+            dyn_buffer_index = 3u64,
+            n_elements_index = 4u64,
         );
         compile_shader(device, &source, "mkernel")
     }
@@ -2738,11 +2760,11 @@ impl MetalKernelOp for MetalEmbed {
         let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(output), 0);
-        encoder.set_buffer(1, Some(inputs[0]), 0); // token_ids
-        encoder.set_buffer(2, Some(inputs[1]), 0); // embed_table
+        encoder.set_buffer(0, Some(inputs[0]), 0); // token_ids
+        encoder.set_buffer(1, Some(inputs[1]), 0); // embed_table
+        encoder.set_buffer(2, Some(output), 0);
         encoder.set_bytes(
-            3,
+            4,
             std::mem::size_of::<u32>() as u64,
             &n_elements as *const u32 as *const _,
         );
