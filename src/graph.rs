@@ -82,6 +82,58 @@ impl DimBucket {
     }
 }
 
+/// Options for controlling the genetic search algorithm.
+///
+/// Use the builder pattern to configure search parameters:
+/// ```
+/// use luminal::prelude::SearchOptions;
+/// let opts = SearchOptions::new(5)
+///     .generation_size(50)
+///     .mutations(40)
+///     .trials(15);
+/// ```
+#[derive(Debug, Clone)]
+pub struct SearchOptions {
+    /// Maximum number of graphs to evaluate
+    pub limit: usize,
+    /// Number of offspring per generation (default: 30)
+    pub generation_size: usize,
+    /// Number of mutations applied to each offspring (default: 30)
+    pub mutations: usize,
+    /// Number of profiling trials per candidate (default: 10)
+    pub trials: usize,
+}
+
+impl SearchOptions {
+    /// Create new search options with the given limit. Other fields use defaults.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            generation_size: 30,
+            mutations: 30,
+            trials: 10,
+        }
+    }
+
+    /// Set the number of offspring per generation.
+    pub fn generation_size(mut self, generation_size: usize) -> Self {
+        self.generation_size = generation_size;
+        self
+    }
+
+    /// Set the number of mutations per offspring.
+    pub fn mutations(mut self, mutations: usize) -> Self {
+        self.mutations = mutations;
+        self
+    }
+
+    /// Set the number of profiling trials per candidate.
+    pub fn trials(mut self, trials: usize) -> Self {
+        self.trials = trials;
+        self
+    }
+}
+
 /// A Luminal compute graph.
 ///
 /// All computation is represented as a directed acyclic graph.
@@ -333,7 +385,6 @@ impl Graph {
             subgraphs.len()
         );
 
-        // Build e-graphs only for representative chunks
         self.egraphs = groups
             .iter()
             .map(|g| {
@@ -355,27 +406,23 @@ impl Graph {
         self.ops.as_ref()
     }
 
-    const DEFAULT_GENERATION_SIZE: usize = 30;
-    const MUTATIONS_PER_OFFSPRING: usize = 30;
-    const TRIALS_PER_PROFILE: usize = 10;
-
     #[tracing::instrument(skip_all)]
     pub fn search<R: Runtime>(&mut self, runtime: R, limit: usize) -> R {
         let mut rng = rand::rng();
-        self.search_rng(runtime, limit, &mut rng)
+        self.search_options(runtime, SearchOptions::new(limit), &mut rng)
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn search_rng<R: Runtime, G: rand::Rng>(
+    pub fn search_options<R: Runtime, G: rand::Rng>(
         &mut self,
         mut runtime: R,
-        limit: usize,
+        options: SearchOptions,
         rng: &mut G,
     ) -> R {
         if self.dim_buckets.is_empty() {
             // No buckets: existing single-search path
             let stitched =
-                self.search_single(&mut runtime, limit, rng, &self.dyn_map.clone(), None);
+                self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None);
 
             runtime.clear_intermediate_buffers();
             runtime.load_llir(&stitched);
@@ -400,7 +447,7 @@ impl Graph {
 
                 let stitched = self.search_single(
                     &mut runtime,
-                    limit,
+                    &options,
                     rng,
                     &representative_dyn_map,
                     Some((combo_idx, n_combos)),
@@ -470,11 +517,12 @@ impl Graph {
     fn search_single<R: Runtime, G: rand::Rng>(
         &self,
         runtime: &mut R,
-        limit: usize,
+        options: &SearchOptions,
         rng: &mut G,
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
     ) -> LLIRGraph {
+        let limit = options.limit;
         let n_chunks = self.subgraph_descriptors.len();
         let n_groups = self.chunk_groups.len();
         let multi_chunk = n_chunks > 1;
@@ -611,7 +659,7 @@ impl Graph {
                         None,
                     );
                     runtime.clear_intermediate_buffers();
-                    let profile = runtime.profile(&graph, dyn_map, Self::TRIALS_PER_PROFILE);
+                    let profile = runtime.profile(&graph, dyn_map, options.trials);
                     let has_nan = runtime.has_nan_outputs(&graph, dyn_map);
                     (graph, profile, has_nan)
                 }));
@@ -670,8 +718,8 @@ impl Graph {
                 let offspring = extract_generation(
                     egraph,
                     &best_genome,
-                    (limit - n_graphs).min(Self::DEFAULT_GENERATION_SIZE),
-                    Self::MUTATIONS_PER_OFFSPRING,
+                    (limit - n_graphs).min(options.generation_size),
+                    options.mutations,
                     &mut prev_selected,
                     rng,
                 );
@@ -697,7 +745,7 @@ impl Graph {
                             );
                             runtime.clear_intermediate_buffers();
                             let result =
-                                runtime.profile(&llir_graph, dyn_map, Self::TRIALS_PER_PROFILE);
+                                runtime.profile(&llir_graph, dyn_map, options.trials);
                             let has_nan = runtime.has_nan_outputs(&llir_graph, dyn_map);
                             (result, llir_graph, has_nan)
                         }));
@@ -813,7 +861,7 @@ impl Graph {
                     &mut expr_cache,
                     custom_remap,
                 );
-                remap_llir_io_nodes(&mut llir, &node_remap);
+                remap_llir_io_nodes(&mut llir, &node_remap, &self.graph);
                 chunk_best_llirs[chunk_idx] = Some(llir);
             }
 
@@ -1223,17 +1271,27 @@ fn build_chunk_remaps(
 }
 
 /// Apply Input/Output node index remapping to an LLIR graph (in-place modification).
-fn remap_llir_io_nodes(llir: &mut LLIRGraph, node_remap: &FxHashMap<usize, usize>) {
+fn remap_llir_io_nodes(
+    llir: &mut LLIRGraph,
+    node_remap: &FxHashMap<usize, usize>,
+    hlir_graph: &HLIRGraph,
+) {
     // We need to replace nodes in-place. Collect node indices first.
     let node_indices: Vec<NodeIndex> = llir.node_indices().collect();
     for node_idx in node_indices {
         let op = &llir[node_idx];
         let new_op = if let Some(input_op) = op.to_op::<crate::hlir::Input>() {
             if let Some(&new_node) = node_remap.get(&input_op.node) {
+                // Look up the target HLIR Input's label so chunk copies get correct names
+                let new_label = hlir_graph
+                    .node_weight(NodeIndex::new(new_node))
+                    .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Input>())
+                    .map(|inp| inp.label.clone())
+                    .unwrap_or_else(|| input_op.label.clone());
                 Some(LLIROp::new::<crate::hlir::Input>(Box::new(
                     crate::hlir::Input {
                         node: new_node,
-                        label: input_op.label.clone(),
+                        label: new_label,
                         dtype: input_op.dtype,
                     },
                 )))
@@ -1447,7 +1505,7 @@ mod tests {
         assert!(custom_op_remap.is_empty());
 
         // Apply IO remap
-        remap_llir_io_nodes(&mut llir, &node_remap);
+        remap_llir_io_nodes(&mut llir, &node_remap, &hlir_graph);
 
         // Verify remapped nodes
         let mut input_nodes: Vec<(usize, String)> = vec![];

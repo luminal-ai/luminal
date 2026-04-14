@@ -5,7 +5,6 @@
 mod binary;
 mod conv;
 mod dispatch;
-mod matmul;
 mod movement;
 mod reduction;
 mod tensor;
@@ -157,7 +156,6 @@ impl<'a> Translator<'a> {
 
     // --- Helper methods ---
 
-    /// Look up tensor metadata by name, checking subgraph extras first.
     pub(crate) fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
         self.extra_tensor_values
             .get(name)

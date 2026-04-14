@@ -1211,11 +1211,6 @@ impl Runtime for CudaRuntime {
             }
         }
 
-        // Final sync to ensure all operations completed successfully
-        self.cuda_stream
-            .synchronize()
-            .expect("Final sync failed in execute");
-
         // Consume input buffers
         if self.profiling {
             return;

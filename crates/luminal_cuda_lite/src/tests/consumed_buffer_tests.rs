@@ -348,7 +348,7 @@ fn test_scatter_dual_cache_with_graph_break() {
     // Use seeded search for deterministic scatter variant selection.
     // Seed 0 reliably selects Scatter (not ScatterNoCopy) for both caches.
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
-    rt = cx.search_rng(rt, 5, &mut rng);
+    rt = cx.search_options(rt, SearchOptions::new(5), &mut rng);
 
     // Print selected variants
     for node in rt.llir_graph().node_weights() {

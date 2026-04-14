@@ -1544,8 +1544,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -1730,8 +1730,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )

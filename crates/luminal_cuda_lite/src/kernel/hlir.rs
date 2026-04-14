@@ -634,8 +634,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(), // No per-module constants needed
         )
@@ -797,8 +797,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -990,12 +990,13 @@ extern \"C\" {{
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
             (module, func)
         };
+        let out_size = self.out_shape.iter().copied().product::<Expression>();
         (
             func,
             module,
             kernel,
-            (self.out_shape.iter().copied().product(), 1.into(), 1.into()),
-            (1.into(), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -1615,8 +1616,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -1769,8 +1770,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -1923,8 +1924,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -2077,8 +2078,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -2231,8 +2232,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -2392,8 +2393,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -2567,8 +2568,8 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (out_size.ceil_div(128), 1.into(), 1.into()),
-            (out_size.min(128), 1.into(), 1.into()),
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )

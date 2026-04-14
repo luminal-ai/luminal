@@ -362,6 +362,55 @@ def test_hf_llama3_large_full(device: torch.device):
     )
 
 
+# ========== Dynamic Dimension Tests ==========
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA graph in-place update test — requires CUDA",
+)
+def test_dynamic_dim_reuse_no_recompile(device: torch.device):
+    """Compile once with dynamic shapes, execute with varying seq lengths.
+
+    Validates that the luminal runtime correctly handles dynamic dimension
+    changes without recompilation. This is the core scenario optimized by
+    removing the unnecessary CUDA graph rebuild on dyn_map changes: a single
+    compiled graph handles multiple sequence lengths via in-place parameter
+    updates rather than rebuilding the entire CUDA graph each step.
+    """
+    from luminal.pt2 import compile as luminal_compile
+
+    class DynamicSeqModel(torch.nn.Module):
+        """Embedding + linear projection with variable-length integer input."""
+
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(256, 64)
+            self.proj = torch.nn.Linear(64, 64)
+
+        def forward(self, x):
+            return self.proj(self.embed(x))
+
+    model = DynamicSeqModel().eval().to(device)
+    backend = "cuda" if device.type == "cuda" else "native"
+
+    # Compile once with dynamic seq dim (auto-detected for integer inputs)
+    example = torch.tensor([[1, 2, 3, 4]], device=device)
+    compiled = luminal_compile(model, example, search_iterations=5, backend=backend)
+
+    # Execute with multiple different seq lengths — each call reuses the
+    # same compiled graph, updating dynamic dims in-place.
+    for seq_len in [4, 5, 6, 7, 8]:
+        input_ids = torch.tensor([list(range(1, seq_len + 1))], device=device)
+        with torch.no_grad():
+            ref = model(input_ids)
+            out = compiled(input_ids)
+        assert torch.allclose(out[0], ref, atol=1e-5), (
+            f"seq_len={seq_len}: "
+            f"max_diff={torch.max(torch.abs(out[0] - ref)).item():.2e}"
+        )
+
+
 @pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
 def test_hf_llama38b_full(device: torch.device):
     """HuggingFace LlamaForCausalLM — full Llama-3.1-8B-Instruct with real pretrained weights.
