@@ -36,7 +36,7 @@ pub struct BlockSignature {
 }
 
 impl BlockSignature {
-    /// Conservative compatibility check for v1 block fusion.
+    /// Conservative compatibility check for block fusion.
     ///
     /// Scratch usage and barrier requirements are mergeable, so they do not need
     /// to match exactly. The launch geometry and execution-width constraints do.
@@ -80,9 +80,6 @@ impl Default for BlockSignature {
 }
 
 /// Placeholder MegaIR op kinds for the first block-op skeleton.
-///
-/// v1 starts with opaque node capture so we can thread scheduling and lineage
-/// metadata through the lowering pipeline before codegen lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MegaIrOp {
     OpaqueNode {
@@ -163,6 +160,47 @@ pub struct BlockSubgraph {
     pub signature: BlockSignature,
     /// Output size of the region's terminal node.
     pub output_size: Expression,
+}
+
+/// Policy hook for block-subgraph formation.
+///
+/// Different block families can share the same partition driver while varying
+/// seed selection, candidate eligibility, and region-extension constraints.
+pub trait PartitionPolicy {
+    fn is_seed(&self, llir_graph: &LLIRGraph, node: NodeIndex) -> bool;
+    fn is_candidate(&self, llir_graph: &LLIRGraph, node: NodeIndex) -> bool;
+    fn can_extend(
+        &self,
+        llir_graph: &LLIRGraph,
+        region_nodes: &[NodeIndex],
+        next: NodeIndex,
+    ) -> bool;
+}
+
+/// Conservative policy:
+/// - only `MetalBlockOp` nodes
+/// - no alias/data-lineage-sensitive ops
+/// - only linear chains
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConservativeLinearPartitionPolicy;
+
+impl PartitionPolicy for ConservativeLinearPartitionPolicy {
+    fn is_seed(&self, llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
+        is_conservative_candidate(llir_graph, node)
+    }
+
+    fn is_candidate(&self, llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
+        is_conservative_candidate(llir_graph, node)
+    }
+
+    fn can_extend(
+        &self,
+        llir_graph: &LLIRGraph,
+        region_nodes: &[NodeIndex],
+        next: NodeIndex,
+    ) -> bool {
+        can_extend_linear_region(llir_graph, region_nodes, next)
+    }
 }
 
 /// Block-level op interface for future Metal megakernel lowering.
@@ -252,8 +290,6 @@ struct RmsNormMatch {
 }
 
 /// Conservatively identify RMSNorm core chains and replace them with a block op.
-///
-/// This v1 matcher intentionally recognizes only the canonical lowered chain:
 /// `x*x -> sum_reduce -> optional scale -> +eps -> sqrt -> recip -> *x`
 pub fn fuse_rms_norm_blocks(llir_graph: &LLIRGraph) -> LLIRGraph {
     let mut graph = llir_graph.clone();
@@ -293,7 +329,7 @@ pub fn fuse_rms_norm_blocks(llir_graph: &LLIRGraph) -> LLIRGraph {
     graph
 }
 
-/// Greedily partition LLIR into conservative v1 block-fusion candidates.
+/// Greedily partition LLIR into conservative block-fusion candidates.
 ///
 /// This pass is intentionally strict:
 /// - only `MetalBlockOp` nodes are considered
@@ -301,12 +337,19 @@ pub fn fuse_rms_norm_blocks(llir_graph: &LLIRGraph) -> LLIRGraph {
 /// - mixed signatures, branch fan-in/out, and alias-sensitive ops break regions
 /// - the original graph is not modified
 pub fn partition_compatible_block_subgraphs(llir_graph: &LLIRGraph) -> Vec<BlockSubgraph> {
+    partition_block_subgraphs_with_policy(llir_graph, &ConservativeLinearPartitionPolicy)
+}
+
+pub fn partition_block_subgraphs_with_policy(
+    llir_graph: &LLIRGraph,
+    policy: &impl PartitionPolicy,
+) -> Vec<BlockSubgraph> {
     let topo_order = toposort(llir_graph, None).expect("Graph has cycles!");
     let mut visited = FxHashSet::default();
     let mut partitions = Vec::new();
 
     for node in topo_order {
-        if visited.contains(&node) || !is_v1_partition_seed(llir_graph, node) {
+        if visited.contains(&node) || !policy.is_seed(llir_graph, node) {
             continue;
         }
 
@@ -319,7 +362,7 @@ pub fn partition_compatible_block_subgraphs(llir_graph: &LLIRGraph) -> Vec<Block
                 break;
             };
 
-            if visited.contains(&next) || !is_v1_partition_candidate(llir_graph, next) {
+            if visited.contains(&next) || !policy.is_candidate(llir_graph, next) {
                 break;
             }
 
@@ -328,7 +371,7 @@ pub fn partition_compatible_block_subgraphs(llir_graph: &LLIRGraph) -> Vec<Block
                 break;
             };
 
-            if !can_extend_linear_region(llir_graph, &nodes, next) {
+            if !policy.can_extend(llir_graph, &nodes, next) {
                 break;
             }
 
@@ -477,11 +520,7 @@ fn build_block_subgraph(llir_graph: &LLIRGraph, nodes: Vec<NodeIndex>) -> Option
     })
 }
 
-fn is_v1_partition_seed(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
-    is_v1_partition_candidate(llir_graph, node)
-}
-
-fn is_v1_partition_candidate(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
+fn is_conservative_candidate(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
     let Some(op) = llir_graph[node].to_dialect::<dyn MetalBlockOp>() else {
         return false;
     };
@@ -672,6 +711,9 @@ mod tests {
         constant_value: Option<f32>,
     }
 
+    #[derive(Debug, Clone, Copy, Default)]
+    struct SingleNodePolicy;
+
     impl TestBlockOp {
         fn new(name: &'static str) -> Self {
             Self {
@@ -764,6 +806,25 @@ mod tests {
         }
     }
 
+    impl PartitionPolicy for SingleNodePolicy {
+        fn is_seed(&self, llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
+            is_conservative_candidate(llir_graph, node)
+        }
+
+        fn is_candidate(&self, llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
+            is_conservative_candidate(llir_graph, node)
+        }
+
+        fn can_extend(
+            &self,
+            _llir_graph: &LLIRGraph,
+            _region_nodes: &[NodeIndex],
+            _next: NodeIndex,
+        ) -> bool {
+            false
+        }
+    }
+
     fn add_input(graph: &mut LLIRGraph, node: usize) -> NodeIndex {
         graph.add_node(LLIROp::new::<Input>(Box::new(Input {
             node,
@@ -851,6 +912,27 @@ mod tests {
         assert_eq!(partitions.len(), 2);
         assert_eq!(partitions[0].nodes, vec![a]);
         assert_eq!(partitions[1].nodes, vec![b]);
+    }
+
+    #[test]
+    fn partition_policy_can_override_region_growth() {
+        let mut graph = LLIRGraph::default();
+        let inp0 = add_input(&mut graph, 0);
+        let inp1 = add_input(&mut graph, 1);
+        let a = add_block(&mut graph, TestBlockOp::new("BlockA"));
+        let b = add_block(&mut graph, TestBlockOp::new("BlockB"));
+        let c = add_block(&mut graph, TestBlockOp::new("BlockC"));
+
+        graph.add_edge(inp0, a, ());
+        graph.add_edge(inp1, a, ());
+        graph.add_edge(a, b, ());
+        graph.add_edge(inp1, b, ());
+        graph.add_edge(b, c, ());
+        add_output(&mut graph, c, 3);
+
+        let partitions = partition_block_subgraphs_with_policy(&graph, &SingleNodePolicy);
+        let node_groups = partitions.iter().map(|p| p.nodes.clone()).collect_vec();
+        assert_eq!(node_groups, vec![vec![a], vec![b], vec![c]]);
     }
 
     #[test]
