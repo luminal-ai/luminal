@@ -25,6 +25,7 @@ fn dtype_propagation_rule(sort: &SortDef, dtype_source: &str) -> Rule {
         .fact(eq(e.clone(), op_match))
         .fact(eq(dty.clone(), dtype(args[dtype_source].clone())))
         .action(Action::Set(dtype(e), dty))
+        .ruleset("dtype_prop")
 }
 
 /// Helper: build a dtype-from-field rule for a direct IR op.
@@ -34,6 +35,7 @@ fn dtype_from_field_rule(sort: &SortDef, dtype_field: &str) -> Rule {
     Rule::new()
         .fact(eq(e.clone(), op_match))
         .action(Action::Set(dtype(e), args[dtype_field].clone()))
+        .ruleset("dtype_prop")
 }
 
 // --- Dtype helpers for normalized ops (Op OpKind IList) ---
@@ -58,6 +60,7 @@ fn dtype_propagation_op(kind_sort: &SortDef) -> Rule {
         ))
         .fact(eq(dty.clone(), dtype(first_inp)))
         .action(Action::Set(dtype(e), dty))
+        .ruleset("dtype_prop")
 }
 
 /// Dtype from a field on the OpKind (e.g., Cast's dtype field).
@@ -68,6 +71,7 @@ fn dtype_from_kind_field(kind_sort: &SortDef, field_name: &str) -> Rule {
     Rule::new()
         .fact(eq(e.clone(), op_term(kind_term, inputs)))
         .action(Action::Set(dtype(e), args[field_name].clone()))
+        .ruleset("dtype_prop")
 }
 
 /// Fixed dtype for a normalized op (e.g., Iota always Int).
@@ -78,6 +82,7 @@ fn dtype_fixed_op(kind_sort: &SortDef, dtype_sort: &SortDef) -> Rule {
     Rule::new()
         .fact(eq(e.clone(), op_term(kind_term, inputs)))
         .action(Action::Set(dtype(e), dtype_sort.call(())))
+        .ruleset("dtype_prop")
 }
 
 /// Build an IList egglog string from input variable names.

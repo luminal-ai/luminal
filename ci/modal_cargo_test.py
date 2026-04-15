@@ -1,7 +1,6 @@
 import modal
 import subprocess
 import os
-import sys
 
 gpu_type = os.environ.get("GPU_TYPE", "T4")
 CUDARC_CUDA_VERSION = "12080"
@@ -46,8 +45,10 @@ def run_cargo_test():
 
     subprocess.run(
         [
-            "cargo", "test",
-            "-p", "luminal_cuda_lite",
+            "cargo",
+            "test",
+            "-p",
+            "luminal_cuda_lite",
             "--verbose",
             "--",
             "--test-threads=1",

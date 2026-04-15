@@ -8,6 +8,8 @@ from test_models import (
     AddTestModel,
     # And model
     AndTestModel,
+    # Dtype round-trip model
+    SelfAddModel,
     CastBoolToFloatModel,
     # Cast models
     CastDoubleToFloatModel,
@@ -213,9 +215,37 @@ from test_models import (
     WhereWithConstantModel,
     # Xor model
     XorTestModel,
+    # Conv models
+    Conv1dNoPadModel,
+    Conv1dSamePadModel,
+    Conv1dBiasModel,
+    Conv2dNoPadModel,
+    Conv2dSamePadModel,
+    Conv2dBiasModel,
+    Conv2dStrideModel,
+    Conv2dDilationModel,
+    Conv3dSamePadModel,
+    DepthwiseConv1dModel,
+    DepthwiseConv2dModel,
+    DepthwiseMultiplierConv2dModel,
+    GroupedConv2dModel,
+    GroupedConv2dGroups3Model,
+    MambaConvBlockModel,
 )
 
 from luminal import luminal_backend
+
+
+def _compile_for_export_mode(
+    model: torch.nn.Module, export_mode: str | None = None
+) -> Callable:
+    if export_mode is None:
+        return torch.compile(model, backend=luminal_backend)
+    return torch.compile(
+        model,
+        backend=luminal_backend,
+        options={"export_mode": export_mode},
+    )
 
 
 def test_add(device: torch.device):
@@ -416,9 +446,9 @@ def test_transpose_square_matrix(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Constant Node Tests ==========
+# ========== PT2 Constant Node Tests ==========
 # These tests verify the parse_constant_node function in ops_parse.rs
-# which handles ONNX Constant nodes (nodes with embedded data in attributes)
+# which handles PT2 Constant nodes (nodes with embedded data in attributes)
 
 
 def test_constant_scalar_float(device: torch.device):
@@ -541,9 +571,9 @@ def test_constant_multiple_in_graph(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Cast Node Tests ==========
+# ========== PT2 Cast Node Tests ==========
 # These tests verify the parse_cast_node function in ops_parse.rs
-# which handles ONNX Cast nodes (type conversion operations)
+# which handles PT2 Cast nodes (type conversion operations)
 
 
 def test_cast_double_to_float(device: torch.device):
@@ -630,7 +660,7 @@ def test_cast_scalar_value(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Mod Node Tests ==========
+# ========== PT2 Mod Node Tests ==========
 
 
 def test_mod(device: torch.device):
@@ -663,7 +693,7 @@ def test_mod_by_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Floor Node Tests ==========
+# ========== PT2 Floor Node Tests ==========
 
 
 def test_floor(device: torch.device):
@@ -696,7 +726,7 @@ def test_floor_in_expression(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Ceil Node Tests ==========
+# ========== PT2 Ceil Node Tests ==========
 
 
 def test_ceil(device: torch.device):
@@ -729,7 +759,7 @@ def test_ceil_in_expression(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Reshape Node Tests ==========
+# ========== PT2 Reshape Node Tests ==========
 # These tests verify parse_reshape_node and parse_shape_node in ops_parse.rs
 
 
@@ -843,7 +873,7 @@ def test_shape_reshape_view_batch(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Less Node Tests ==========
+# ========== PT2 Less Node Tests ==========
 # These tests verify parse_less_node in ops_parse.rs
 
 
@@ -877,7 +907,7 @@ def test_less_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Equal Node Tests ==========
+# ========== PT2 Equal Node Tests ==========
 # These tests verify parse_equal_node in ops_parse/binary.rs
 
 
@@ -911,7 +941,7 @@ def test_equal_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Gather Node Tests ==========
+# ========== PT2 Gather Node Tests ==========
 # These tests verify parse_gather_node in ops_parse.rs
 
 
@@ -975,7 +1005,7 @@ def test_gather_constant_fold(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Squeeze Node Tests ==========
+# ========== PT2 Squeeze Node Tests ==========
 # These tests verify parse_squeeze_node in ops_parse.rs
 
 
@@ -1029,7 +1059,7 @@ def test_squeeze_in_expression(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX ReduceSum Node Tests ==========
+# ========== PT2 ReduceSum Node Tests ==========
 
 
 def test_reduce_sum_axis0(device: torch.device):
@@ -1104,7 +1134,7 @@ def test_reduce_sum_in_expression(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
 
 
-# ========== ONNX ReduceMax Node Tests ==========
+# ========== PT2 ReduceMax Node Tests ==========
 
 
 def test_reduce_max_axis0(device: torch.device):
@@ -1179,7 +1209,7 @@ def test_reduce_max_in_expression(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
 
 
-# ========== ONNX ReduceMin Node Tests ==========
+# ========== PT2 ReduceMin Node Tests ==========
 # These tests verify parse_reduce_min_node in ops_parse/reduction.rs
 
 
@@ -1255,7 +1285,7 @@ def test_reduce_min_in_expression(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
 
 
-# ========== ONNX ReduceMean Node Tests ==========
+# ========== PT2 ReduceMean Node Tests ==========
 # These tests verify parse_reduce_mean_node in ops_parse/reduction.rs
 
 
@@ -1331,7 +1361,7 @@ def test_reduce_mean_in_expression(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
 
 
-# ========== ONNX Pow Node Tests ==========
+# ========== PT2 Pow Node Tests ==========
 # These tests verify parse_pow_node in ops_parse/binary.rs
 
 
@@ -1365,7 +1395,7 @@ def test_pow_by_constant(device: torch.device):
     assert torch.allclose(output, original, rtol=1e-4, atol=1e-4)
 
 
-# ========== ONNX Where Node Tests ==========
+# ========== PT2 Where Node Tests ==========
 # These tests verify parse_where_node in ops_parse/binary.rs
 
 
@@ -1403,7 +1433,7 @@ def test_where_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Max Node Tests ==========
+# ========== PT2 Max Node Tests ==========
 # These tests verify parse_max_node in ops_parse/binary.rs
 
 
@@ -1427,7 +1457,7 @@ def test_max_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Min Node Tests ==========
+# ========== PT2 Min Node Tests ==========
 # These tests verify parse_min_node in ops_parse/binary.rs
 
 
@@ -1451,7 +1481,7 @@ def test_min_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Concat Node Tests ==========
+# ========== PT2 Concat Node Tests ==========
 # These tests verify parse_concat_node in ops_parse/movement.rs
 
 
@@ -1495,7 +1525,7 @@ def test_concat_in_expression(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX Softmax Node Tests ==========
+# ========== PT2 Softmax Node Tests ==========
 # These tests verify parse_softmax_node in ops_parse/unary.rs
 
 
@@ -1519,7 +1549,7 @@ def test_softmax_dim0(device: torch.device):
     assert torch.allclose(output, original, atol=1e-5)
 
 
-# ========== ONNX LessOrEqual Node Tests ==========
+# ========== PT2 LessOrEqual Node Tests ==========
 
 
 def test_less_or_equal(device: torch.device):
@@ -1542,7 +1572,7 @@ def test_less_or_equal_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX GreaterOrEqual Node Tests ==========
+# ========== PT2 GreaterOrEqual Node Tests ==========
 
 
 def test_greater_or_equal(device: torch.device):
@@ -1565,7 +1595,7 @@ def test_greater_or_equal_with_constant(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Not Node Tests ==========
+# ========== PT2 Not Node Tests ==========
 
 
 def test_not(device: torch.device):
@@ -1578,7 +1608,7 @@ def test_not(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX And Node Tests ==========
+# ========== PT2 And Node Tests ==========
 
 
 def test_and(device: torch.device):
@@ -1591,7 +1621,7 @@ def test_and(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Or Node Tests ==========
+# ========== PT2 Or Node Tests ==========
 
 
 def test_or(device: torch.device):
@@ -1604,7 +1634,7 @@ def test_or(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Xor Node Tests ==========
+# ========== PT2 Xor Node Tests ==========
 
 
 def test_xor(device: torch.device):
@@ -1617,7 +1647,7 @@ def test_xor(device: torch.device):
     assert torch.allclose(output, original)
 
 
-# ========== ONNX Trilu Node Tests ==========
+# ========== PT2 Trilu Node Tests ==========
 
 
 def test_tril(device: torch.device):
@@ -1812,11 +1842,11 @@ def test_mlp_block(device: torch.device):
     assert torch.allclose(output, original, atol=1e-5)
 
 
-# ========== ONNX GatherElements Node Tests ==========
+# ========== PT2 GatherElements Node Tests ==========
 
 
 def test_gather_elements(device: torch.device):
-    """Tests GatherElements op (torch.gather → ONNX GatherElements)."""
+    """Tests GatherElements op (torch.gather → PT2 GatherElements)."""
     model: torch.nn.Module = GatherElementsTestModel().to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((2, 3), device=device)
@@ -1831,18 +1861,18 @@ def test_gather_elements_large(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX Expand Node Tests ==========
+# ========== PT2 Expand Node Tests ==========
 
 
 def test_expand(device: torch.device):
-    """Tests Expand op (tensor.expand → ONNX Expand)."""
+    """Tests Expand op (tensor.expand → PT2 Expand)."""
     model: torch.nn.Module = ExpandTestModel().to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((1, 4), device=device)
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX IsNaN Node Tests ==========
+# ========== PT2 IsNaN Node Tests ==========
 
 
 def test_isnan(device: torch.device):
@@ -1853,29 +1883,29 @@ def test_isnan(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX LayerNormalization Node Tests ==========
+# ========== PT2 LayerNormalization Node Tests ==========
 
 
 def test_layernorm(device: torch.device):
-    """Tests LayerNormalization op (nn.LayerNorm → ONNX LayerNormalization)."""
+    """Tests LayerNormalization op (nn.LayerNorm → PT2 LayerNormalization)."""
     model: torch.nn.Module = LayerNormTestModel().to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((2, 4), device=device)
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
 
 
-# ========== ONNX Gemm Node Tests ==========
+# ========== PT2 Gemm Node Tests ==========
 
 
 def test_gemm(device: torch.device):
-    """Tests Gemm op (nn.Linear → ONNX Gemm)."""
+    """Tests Gemm op (nn.Linear → PT2 Gemm)."""
     model: torch.nn.Module = GemmTestModel().to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((3, 4), device=device)
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
 
 
-# ========== ONNX Erf Node Tests ==========
+# ========== PT2 Erf Node Tests ==========
 
 
 def test_erf(device: torch.device):
@@ -1888,7 +1918,7 @@ def test_erf(device: torch.device):
     assert torch.allclose(output, original, atol=1e-4)
 
 
-# ========== ONNX Slice Node Tests ==========
+# ========== PT2 Slice Node Tests ==========
 
 
 def test_slice_1d(device: torch.device):
@@ -1907,7 +1937,7 @@ def test_slice_2d(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX Split Node Tests ==========
+# ========== PT2 Split Node Tests ==========
 
 
 def test_split(device: torch.device):
@@ -1918,7 +1948,7 @@ def test_split(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX TopK Node Tests ==========
+# ========== PT2 TopK Node Tests ==========
 
 
 def test_topk_values(device: torch.device):
@@ -1937,7 +1967,7 @@ def test_topk_indices(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
-# ========== ONNX OneHot Node Tests ==========
+# ========== PT2 OneHot Node Tests ==========
 
 
 def test_onehot(device: torch.device):
@@ -1984,3 +2014,237 @@ def test_scatter_nd(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+
+
+# ========== Dtype Round-Trip Tests ==========
+
+
+def test_dtype_float16(device: torch.device):
+    """Verify float16 input produces float16 output with correct values."""
+    model: torch.nn.Module = SelfAddModel()
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0], dtype=torch.float16, device=device
+    )
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert output.dtype == torch.float16, f"Expected float16 output, got {output.dtype}"
+    assert torch.allclose(output.float(), original.float())
+
+
+def test_dtype_float32(device: torch.device):
+    """Verify float32 input produces float32 output (baseline)."""
+    model: torch.nn.Module = SelfAddModel()
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0], dtype=torch.float32, device=device
+    )
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert output.dtype == torch.float32, f"Expected float32 output, got {output.dtype}"
+    assert torch.allclose(output, original)
+
+
+# ========== Convolution Tests ==========
+
+
+def _run_conv1d_no_pad(device: torch.device, export_mode: str | None = None):
+    """Conv1d without padding: output length = input - (kernel-1)."""
+    model: torch.nn.Module = Conv1dNoPadModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    x: torch.Tensor = torch.randn(2, 8, 32, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv1d_no_pad(device: torch.device):
+    _run_conv1d_no_pad(device)
+
+
+def test_conv1d_no_pad_pt2(device: torch.device):
+    _run_conv1d_no_pad(device, "pt2")
+
+
+def test_conv1d_same_pad(device: torch.device):
+    """Conv1d with padding=1: output length == input length."""
+    model: torch.nn.Module = Conv1dSamePadModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(2, 8, 32, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv1d_bias(device: torch.device):
+    """Conv1d with bias term."""
+    model: torch.nn.Module = Conv1dBiasModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(2, 8, 32, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def _run_conv2d_no_pad(device: torch.device, export_mode: str | None = None):
+    """Conv2d without padding: output spatial = input - (kernel-1)."""
+    model: torch.nn.Module = Conv2dNoPadModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    x: torch.Tensor = torch.randn(1, 3, 8, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv2d_no_pad(device: torch.device):
+    _run_conv2d_no_pad(device)
+
+
+def test_conv2d_no_pad_pt2(device: torch.device):
+    _run_conv2d_no_pad(device, "pt2")
+
+
+def test_conv2d_same_pad(device: torch.device):
+    """Conv2d with padding=1: output spatial == input spatial."""
+    model: torch.nn.Module = Conv2dSamePadModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(1, 3, 8, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv2d_bias(device: torch.device):
+    """Conv2d with bias term."""
+    model: torch.nn.Module = Conv2dBiasModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(1, 3, 8, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv2d_stride(device: torch.device):
+    """Conv2d with stride=2: output spatial dims halved."""
+    model: torch.nn.Module = Conv2dStrideModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(1, 3, 8, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def _run_conv2d_dilation(device: torch.device, export_mode: str | None = None):
+    """Conv2d with dilation=2 preserves the expected spatial shape and values."""
+    model: torch.nn.Module = Conv2dDilationModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    x: torch.Tensor = torch.randn(2, 8, 17, 19, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv2d_dilation(device: torch.device):
+    _run_conv2d_dilation(device)
+
+
+def test_conv2d_dilation_pt2(device: torch.device):
+    _run_conv2d_dilation(device, "pt2")
+
+
+def _run_conv3d_same_pad(device: torch.device, export_mode: str | None = None):
+    """Conv3d exercises the spatial=3 unfold/permute/split path."""
+    model: torch.nn.Module = Conv3dSamePadModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    x: torch.Tensor = torch.randn(2, 4, 6, 7, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-3)
+
+
+def test_conv3d_same_pad(device: torch.device):
+    _run_conv3d_same_pad(device)
+
+
+def test_conv3d_same_pad_pt2(device: torch.device):
+    _run_conv3d_same_pad(device, "pt2")
+
+
+def test_depthwise_conv1d(device: torch.device):
+    """Depthwise Conv1d with groups=in_channels, as used in Mamba."""
+    model: torch.nn.Module = DepthwiseConv1dModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(2, 16, 32, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_depthwise_conv2d(device: torch.device):
+    """Depthwise Conv2d with groups=in_channels."""
+    model: torch.nn.Module = DepthwiseConv2dModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(1, 8, 8, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def _run_depthwise_multiplier_conv2d(
+    device: torch.device, export_mode: str | None = None
+):
+    """Depthwise Conv2d with multiplier > 1 should preserve both output channels per input channel."""
+    model: torch.nn.Module = DepthwiseMultiplierConv2dModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    x: torch.Tensor = torch.randn(2, 8, 9, 9, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_depthwise_multiplier_conv2d(device: torch.device):
+    _run_depthwise_multiplier_conv2d(device)
+
+
+def test_depthwise_multiplier_conv2d_pt2(device: torch.device):
+    _run_depthwise_multiplier_conv2d(device, "pt2")
+
+
+def test_grouped_conv2d(device: torch.device):
+    """Conv2d with groups=4 (grouped, not depthwise)."""
+    model: torch.nn.Module = GroupedConv2dModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(1, 16, 8, 8, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def _run_grouped_conv2d_groups3_batch4(
+    device: torch.device, export_mode: str | None = None
+):
+    """Grouped Conv2d with groups=3 and batch>1 exercises the pre-pad + slice path."""
+    model: torch.nn.Module = GroupedConv2dGroups3Model().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    x: torch.Tensor = torch.randn(4, 12, 11, 9, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-3)
+
+
+def test_grouped_conv2d_groups3_batch4(device: torch.device):
+    _run_grouped_conv2d_groups3_batch4(device)
+
+
+def test_grouped_conv2d_groups3_batch4_pt2(device: torch.device):
+    _run_grouped_conv2d_groups3_batch4(device, "pt2")
+
+
+def test_mamba_conv_block(device: torch.device):
+    """Minimal Mamba-style block: depthwise Conv1d with causal gating (end-to-end)."""
+    model: torch.nn.Module = MambaConvBlockModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(2, 64, 16, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert torch.allclose(output, original, atol=1e-4)

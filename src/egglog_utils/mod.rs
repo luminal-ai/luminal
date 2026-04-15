@@ -13,8 +13,9 @@ pub mod api;
 pub mod base;
 
 pub const RUN_SCHEDULE: &str = "(run-schedule
-    (repeat 100
+    (repeat 10
         (saturate expr)
+        (saturate dtype_prop)
         (run)
     )
     (saturate expr)
@@ -766,6 +767,8 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
         "F4E2M1" => DType::F4E2M1,
         "F8E4M3" => DType::F8E4M3,
         "F8UE8M0" => DType::F8UE8M0,
+        "I4" => DType::I4,
+        "TF32" => DType::TF32,
         other => panic!("unknown dtype {other}"),
     }
 }

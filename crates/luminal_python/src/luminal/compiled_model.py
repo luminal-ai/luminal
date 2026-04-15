@@ -4,6 +4,9 @@ from typing import List
 
 import torch
 
+from .dtype_util import code_to_torch_dtype
+from .dtype_util import torch_dtype_code as _torch_dtype_code
+
 
 class CompiledModel:
     """Wrapper around CompiledGraph that handles PyTorch tensor conversion."""
@@ -14,7 +17,7 @@ class CompiledModel:
         """Initialize with a compiled CompiledGraph from Rust.
 
         Args:
-            graph_result: The CompiledGraph from luminal_python.process_onnx() or process_pt2()
+            graph_result: The CompiledGraph from luminal_python.process_pt2()
             weight_refs: List of PyTorch tensors to keep alive (prevents GC of shared weights)
             input_names: Override for user input names. If None, uses graph_result.input_names.
             user_indices: When torch.compile lifts model parameters into extra args,
@@ -29,6 +32,14 @@ class CompiledModel:
         self._weight_refs = weight_refs or []
         self._user_indices = user_indices
         self._is_cuda = graph_result.backend == "cuda"
+        # Expected input dtypes from graph (used to convert user inputs)
+        input_dtype_codes = graph_result.input_dtypes
+        self._input_dtypes = [
+            code_to_torch_dtype(input_dtype_codes[i])
+            if i < len(input_dtype_codes)
+            else torch.float32
+            for i in range(len(self._input_names))
+        ]
 
     def set_dim(self, param_name: str, value: int) -> None:
         """Set a dynamic dimension value by its param name."""
@@ -70,44 +81,78 @@ class CompiledModel:
             input_shapes = [list(t.shape) for t in user_inputs]
             self._graph.auto_set_dims_from_input_shapes(input_shapes)
 
-        # Set user input data via pointer (avoids Python list conversion).
+        # Set user input data via pointer.
+        # Convert to the graph's expected dtype so bytes match the Input node's dtype tag.
         # For CUDA inputs, keep references alive so the caching allocator doesn't
         # recycle GPU memory before run() reads the pointers.
         _input_refs = []
-        for name, tensor in zip(self._input_names, user_inputs):
+        for name, tensor, expected_dtype in zip(
+            self._input_names, user_inputs, self._input_dtypes
+        ):
             if self._is_cuda and tensor.is_cuda:
-                t = tensor.detach().contiguous().float()
-                self._graph.set_input_device_ptr(name, t.data_ptr(), t.numel() * 4)
+                t = tensor.detach().contiguous().to(expected_dtype)
+                n_bytes = t.numel() * t.element_size()
+                self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
                 _input_refs.append(t)
             else:
-                t = tensor.detach().cpu().contiguous().float()
-                self._graph.set_input_from_ptr(name, t.data_ptr(), t.numel())
+                t = tensor.detach().cpu().contiguous()
+                n_bytes = t.numel() * t.element_size()
+                dtype_code = _torch_dtype_code(t.dtype)
+                self._graph.set_input_from_ptr(name, t.data_ptr(), n_bytes, dtype_code)
 
-        # Run the graph
-        self._graph.run()
-
-        # Get output shapes — resolve dynamically if needed
+        # Resolve output shapes before run() (needed for pre-allocation).
         if self._has_dynamic_dims:
             output_shapes = self._graph.resolve_output_shapes()
         else:
             output_shapes = self._output_shapes
 
-        # Get outputs and convert back to PyTorch tensors on the same device as inputs.
-        # For CUDA: DtoD copy avoids the DtoH + HtoD round-trip.
-        outputs = []
-        for name, shape in zip(self._output_names, output_shapes):
-            if self._is_cuda and hasattr(self._graph, "copy_output_to_device_ptr"):
-                out = torch.empty(shape, dtype=torch.float32, device=input_device)
-                self._graph.copy_output_to_device_ptr(
-                    name, out.data_ptr(), out.numel() * 4
+        output_dtype_codes = self._graph.output_dtypes
+
+        # CUDA zero-copy path: pre-allocate output tensors and register their device
+        # pointers so the final kernel writes directly into PyTorch's buffer.
+        _use_zero_copy = self._is_cuda and hasattr(self._graph, "set_output_device_ptr")
+        output_tensors = []
+        if _use_zero_copy:
+            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
+                out_dtype = (
+                    code_to_torch_dtype(output_dtype_codes[i])
+                    if i < len(output_dtype_codes)
+                    else torch.float32
                 )
-            else:
+                out = torch.empty(shape, dtype=out_dtype, device=input_device)
+                self._graph.set_output_device_ptr(
+                    name, out.data_ptr(), out.numel() * out.element_size()
+                )
+                output_tensors.append(out)
+
+        # Run the graph
+        self._graph.run()
+
+        # Collect outputs
+        if _use_zero_copy:
+            # For aliased outputs that couldn't be zero-copied, fall back to DtoD copy.
+            for name, out in zip(self._output_names, output_tensors):
+                if not self._graph.output_is_zero_copy(name):
+                    self._graph.copy_output_to_device_ptr(
+                        name, out.data_ptr(), out.numel() * out.element_size()
+                    )
+            outputs = output_tensors
+        else:
+            # Native path: retrieve as f32, then convert to target dtype if needed.
+            outputs = []
+            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
+                out_dtype = (
+                    code_to_torch_dtype(output_dtype_codes[i])
+                    if i < len(output_dtype_codes)
+                    else torch.float32
+                )
                 data = self._graph.get_output(name)
                 out = (
                     torch.tensor(data, dtype=torch.float32)
                     .reshape(tuple(shape))
+                    .to(out_dtype)
                     .to(input_device)
                 )
-            outputs.append(out)
+                outputs.append(out)
 
         return tuple(outputs)

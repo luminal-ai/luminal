@@ -1,15 +1,16 @@
+use luminal::prelude::tracing::warn;
 use luminal::prelude::*;
 use pyo3::prelude::*;
 use std::collections::HashMap;
 
-use crate::compiled_graph::{CompiledGraph, GraphTranslation, WeightData};
-use crate::pt2_parser;
+use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, WeightData};
 use crate::pt2_schema;
 use crate::translator;
-use crate::util::DimParamMap;
+use crate::typed_data::TypedData;
+use crate::{pt2_parser, pt2_util};
 
 /// Pre-loaded weight/constant data paired with tensor sizes.
-type PreloadResult = (Vec<(String, Vec<f32>)>, HashMap<String, usize>);
+type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);
 
 fn resolve_dim_sizes(
     sizes: &[pt2_schema::DimSize],
@@ -83,7 +84,7 @@ pub fn translate_pt2(
         }
     }
 
-    // Compute shape expressions from PT2 tensor metadata
+    // Compute shape expressions and dtypes from PT2 tensor metadata
     let output_shape_exprs: Vec<Vec<Expression>> = translated
         .output_ids
         .iter()
@@ -92,6 +93,17 @@ pub fn translate_pt2(
                 .tensor_meta(name)
                 .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_char))
                 .unwrap_or_default()
+        })
+        .collect();
+
+    let output_dtypes: Vec<DType> = translated
+        .output_ids
+        .iter()
+        .map(|(name, _id)| {
+            parsed
+                .tensor_meta(name)
+                .map(|meta| pt2_util::torch_dtype_int_to_luminal(meta.dtype))
+                .unwrap_or(DType::F32)
         })
         .collect();
 
@@ -127,7 +139,7 @@ pub fn translate_pt2(
     }
 
     // Pre-load weights and compute tensor sizes for CUDA dummy data
-    let mut weights: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut weights: Vec<(String, TypedData)> = Vec::new();
     let mut tensor_sizes: HashMap<String, usize> = HashMap::new();
 
     // Load safetensors weights
@@ -189,6 +201,7 @@ pub fn translate_pt2(
         tensor_ids,
         input_names,
         output_names,
+        output_dtypes,
         output_shape_exprs,
         input_shape_exprs,
         dim_param_map,
@@ -235,8 +248,8 @@ fn preload_safetensors(graph: &Graph, file_path: &str) -> anyhow::Result<Preload
             .downcast_ref::<luminal::hlir::Input>()
             && let Ok(tensor) = st.tensor(&input.label)
         {
-            let f32s = bytes_to_f32(tensor.data(), safetensors_dtype_to_pt2(tensor.dtype()));
-            weights.push((input.label.clone(), f32s));
+            let types = bytes_to_typed(tensor.data(), safetensors_dtype_to_pt2(tensor.dtype()));
+            weights.push((input.label.clone(), types));
         }
     }
 
@@ -273,15 +286,12 @@ fn preload_constants(
         ) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!(
-                    "[luminal] Warning: failed to load constant '{}': {:#}",
-                    name, e
-                );
+                warn!("failed to load constant '{}': {:#}", name, e);
                 continue;
             }
         };
-        let f32_data = bytes_to_f32(&raw_bytes, entry.tensor_meta.dtype);
-        weights.push((name.clone(), f32_data));
+        let typed_data = bytes_to_typed(&raw_bytes, entry.tensor_meta.dtype);
+        weights.push((name.clone(), typed_data));
     }
 
     Ok((weights, sizes))
@@ -308,49 +318,52 @@ fn safetensors_dtype_to_pt2(dtype: safetensors::Dtype) -> u32 {
     }
 }
 
-/// Convert raw bytes to f32 using PT2 dtype numbering.
-fn bytes_to_f32(bytes: &[u8], dtype: u32) -> Vec<f32> {
+/// Convert raw bytes to TypedData using PT2 dtype numbering.
+/// Preserves native byte format for types luminal supports directly (f32, f16, bf16, i32, bool, u8, i8).
+/// Converts i64/f64/i16 to the closest luminal-native representation.
+fn bytes_to_typed(bytes: &[u8], dtype: u32) -> TypedData {
     match dtype {
-        7 => bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-        6 => bytes
-            .chunks_exact(2)
-            .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-        13 => bytes
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-        8 => bytes
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
-            .collect(),
-        5 => bytes
-            .chunks_exact(8)
-            .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
-            .collect(),
-        4 => bytes
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32)
-            .collect(),
-        3 => bytes
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32)
-            .collect(),
-        2 => bytes.iter().map(|&b| (b as i8) as f32).collect(),
-        1 => bytes.iter().map(|&b| b as f32).collect(),
-        12 => bytes
-            .iter()
-            .map(|&b| if b != 0 { 1.0 } else { 0.0 })
-            .collect(),
+        // Types that map directly — preserve raw bytes
+        7 => TypedData::from_raw(bytes.to_vec(), DType::F32),
+        6 => TypedData::from_raw(bytes.to_vec(), DType::F16),
+        13 => TypedData::from_raw(bytes.to_vec(), DType::Bf16),
+        4 => TypedData::from_raw(bytes.to_vec(), DType::Int), // i32
+        1 => TypedData::from_raw(bytes.to_vec(), DType::U8),
+        2 => TypedData::from_raw(bytes.to_vec(), DType::I8),
+        12 => TypedData::from_raw(bytes.to_vec(), DType::Bool),
+
+        // i64 → i32 (truncate, matching luminal's Int type)
+        5 => {
+            let i32s: Vec<i32> = bytes
+                .chunks_exact(8)
+                .map(|b| {
+                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i32
+                })
+                .collect();
+            TypedData::from_i32_vec(i32s)
+        }
+        // f64 → f32 (downcast, luminal has no F64 in practice for most ops)
+        8 => {
+            let f32s: Vec<f32> = bytes
+                .chunks_exact(8)
+                .map(|b| {
+                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
+                })
+                .collect();
+            TypedData::from_f32_vec(f32s)
+        }
+        // i16 → i32 (widen to luminal's Int)
+        3 => {
+            let i32s: Vec<i32> = bytes
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+                .collect();
+            TypedData::from_i32_vec(i32s)
+        }
         _ => {
-            eprintln!("[luminal] Warning: unrecognized dtype {dtype}, interpreting as f32");
-            bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect()
+            let luminal_dtype = pt2_util::torch_dtype_int_to_luminal(dtype);
+            warn!("Unrecognized dtype {dtype}, interpreting as {luminal_dtype:?}");
+            TypedData::from_raw(bytes.to_vec(), luminal_dtype)
         }
     }
 }

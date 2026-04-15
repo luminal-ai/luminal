@@ -1,32 +1,55 @@
 #[cfg(feature = "cuda")]
 use luminal::prelude::tracing::{trace, warn};
-use luminal::{prelude::*, shape::Expression, visualization::ToDot};
+use luminal::{
+    hlir::{NativeData, Output},
+    prelude::*,
+    shape::Expression,
+    visualization::ToDot,
+};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::collections::HashSet;
 
-use crate::{runtime::RuntimeBackend, util::DimParamMap};
+use crate::{runtime::RuntimeBackend, typed_data::TypedData};
 
-/// Common intermediate result from translating a model graph (ONNX or FX).
+/// Maps symbolic dimension parameter names (e.g. "seq_len") to luminal Expression variable chars.
+pub type DimParamMap = HashMap<String, char>;
+
+/// Convert luminal DType to PT2 dtype integer code (for python interop)
+/// Types without a direct Pytorch equivalent map to the closest safe representation
+fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
+    match dtype {
+        DType::U8 => 1,
+        DType::I8 => 2,
+        DType::I16 => 3,
+        DType::Int => 4, // i32
+        DType::U16 => 4, // u16 -> i32 (Pytorch has no u16 in older versions)
+        DType::F16 => 6,
+        DType::F32 | DType::TF32 => 7,
+        DType::F64 => 8,
+        DType::Bool => 12,
+        DType::Bf16 => 13,
+        _ => panic!("luminal_dtype_to_pt2_code: unsupported dtype {:?}", dtype),
+    }
+}
+
+/// Common intermediate result from translating a model graph.
 pub struct GraphTranslation {
     pub graph: Graph,
     pub tensor_ids: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
+    pub output_dtypes: Vec<DType>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
 
-/// Pre-loaded weight data from any model format.
-///
-/// NOTE: Currently assumes all data is F32. When the type system branch lands
-/// with proper multi-dtype support, this struct (and all callers) will need
-/// updating to carry dtype metadata alongside the raw data.
+/// Pre-loaded weight data from any model format (dtype-aware).
 pub struct WeightData {
-    /// (Input node label, f32 data) for weights and constants.
-    pub weights: Vec<(String, Vec<f32>)>,
+    /// (Input node label, typed data) for weights and constants.
+    pub weights: Vec<(String, TypedData)>,
     /// label → element count for ALL Input nodes (for CUDA dummy data sizing).
     pub tensor_sizes: HashMap<String, usize>,
     /// label → (device_ptr, n_bytes) for zero-copy CUDA weight sharing.
@@ -44,15 +67,16 @@ pub struct CompiledGraph {
     pub output_names: Vec<String>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
+    pub output_dtypes: Vec<DType>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
 
 impl CompiledGraph {
-    /// Shared compilation pipeline for both ONNX and FX/PT2 graphs.
+    /// Compilation pipeline for PT2/FX graphs.
     ///
-    /// Takes a format-neutral `GraphTranslation` (produced by `translate_onnx` or
-    /// `translate_pt2`) and `WeightData`, builds the backend, loads weights, and
+    /// Takes a `GraphTranslation` (produced by `translate_pt2`) and `WeightData`,
+    /// builds the backend, loads weights, and
     /// returns a ready-to-execute `CompiledGraph`.
     pub fn parse_graph(
         translation: GraphTranslation,
@@ -66,6 +90,7 @@ impl CompiledGraph {
             input_names,
             output_names,
             output_shape_exprs,
+            output_dtypes,
             input_shape_exprs,
             dim_param_map,
         } = translation;
@@ -119,6 +144,7 @@ impl CompiledGraph {
             output_names,
             output_shapes,
             output_shape_exprs,
+            output_dtypes,
             input_shape_exprs,
             dim_param_map,
         })
@@ -162,14 +188,13 @@ impl CompiledGraph {
         // For weights with device pointers: use them directly (zero-copy).
         // This avoids allocating ~N GB of dummy data during search.
         // The pointers survive search because profiling mode skips buffer consumption,
-        // and persist_hlir_node ensures they survive post-search execution too.
+        // and graph-level .persist() ensures they survive post-search execution too.
         let mut device_ptr_nodes: HashSet<NodeIndex> = HashSet::new();
         let mut matched_count = 0usize;
         let mut missed_labels: Vec<String> = Vec::new();
         for (label, &(ptr, n_bytes)) in device_ptrs {
             if let Some(&node_id) = label_map.get(label) {
                 unsafe { rt.set_device_ptr(node_id, ptr, n_bytes) };
-                rt.persist_hlir_node(node_id);
                 device_ptr_nodes.insert(node_id);
                 matched_count += 1;
             } else {
@@ -218,7 +243,10 @@ impl CompiledGraph {
                     if n > 0 {
                         dummy_total_elements += n;
                         dummy_count += 1;
-                        rt.set_data(node_id, vec![1.0f32; n]);
+                        // Use dtype-aware dummy data: TypedData::ones produces correct
+                        // byte patterns for every dtype (f32, f16, bf16, i32, bool, f8, etc.).
+                        // Must use 1, not 0 — zero inputs cause NaN in many ops.
+                        rt.set_data(node_id, TypedData::ones(n, input.dtype).bytes);
                     }
                 }
             }
@@ -234,22 +262,21 @@ impl CompiledGraph {
         let mut rt = graph.search(rt, search_iters);
 
         // Load real weight data for non-device-ptr weights (constants from PT2 archive, etc.)
-        let mut loaded_weight_elements = 0usize;
+        let mut loaded_weight_bytes = 0usize;
         let mut loaded_weight_count = 0usize;
         for (label, data) in &weight_data.weights {
             if !device_ptrs.contains_key(label) {
                 if let Some(&node_id) = label_map.get(label) {
-                    loaded_weight_elements += data.len();
+                    loaded_weight_bytes += data.n_bytes();
                     loaded_weight_count += 1;
-                    rt.set_data(node_id, data.clone());
+                    rt.set_data(node_id, data.bytes.clone());
                 }
             }
         }
         trace!(
-            "[CUDA BUILD] Post-search weight load: {} weights, {} elements ({:.3} GiB as f32)",
+            "[CUDA BUILD] Post-search weight load: {} weights, {:.3} GiB",
             loaded_weight_count,
-            loaded_weight_elements,
-            (loaded_weight_elements * 4) as f64 / (1024.0 * 1024.0 * 1024.0),
+            loaded_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         );
 
         Ok(RuntimeBackend::Cuda(Box::new(rt)))
@@ -263,11 +290,14 @@ impl CompiledGraph {
         graph.build_search_space::<NativeRuntime>();
         let mut rt = graph.search(NativeRuntime::default(), search_iters);
 
-        // Load weight data after search
+        // Load weight data after search, preserving native dtype.
+        // TypedData -> NativeData conversion (From<TypedData>) handles mapping to the
+        // correct NativeData variant (F32, F16, Bf16, Int, Bool).
         let label_map = CompiledGraph::build_label_map(graph);
         for (label, data) in &weight_data.weights {
             if let Some(&node_id) = label_map.get(label) {
-                rt.set_data(node_id, data.clone());
+                let native: NativeData = data.into();
+                rt.set_data(node_id, native);
             }
         }
 
@@ -281,6 +311,24 @@ impl CompiledGraph {
     #[getter]
     fn input_names(&self) -> Vec<String> {
         self.input_names.clone()
+    }
+
+    /// Get the PT2 dtype codes for all inputs (in order of input_names).
+    #[getter]
+    fn input_dtypes(&self) -> Vec<u32> {
+        self.input_names
+            .iter()
+            .map(|name| {
+                if let Some(&node_id) = self.tensor_ids.get(name)
+                    && let Some(input) = (*self.graph.graph[node_id])
+                        .as_any()
+                        .downcast_ref::<luminal::hlir::Input>()
+                {
+                    return luminal_dtype_to_pt2_code(input.dtype);
+                }
+                7 // default to f32
+            })
+            .collect()
     }
 
     /// Get the list of output tensor names.
@@ -371,25 +419,33 @@ impl CompiledGraph {
         Ok(result)
     }
 
-    /// Set input tensor data by name.
+    /// Set input tensor data by name (f32, for backward compatibility).
     fn set_input(&mut self, name: &str, data: Vec<f32>) -> PyResult<()> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
-        self.runtime.set_data(*node_id, data);
+        self.runtime.set_data_f32(*node_id, data);
         Ok(())
     }
 
-    /// Set input tensor data from a CPU host memory pointer (avoids Python list conversion).
-    /// The pointer must point to contiguous f32 data (from tensor.data_ptr() on a CPU float32 tensor).
-    fn set_input_from_ptr(&mut self, name: &str, ptr: u64, n_elements: usize) -> PyResult<()> {
+    /// Set input tensor data from a CPU host memory pointer (dtype-aware).
+    /// The pointer must point to contiguous data. `n_bytes` is the total byte count.
+    /// `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
+    /// Converts source format to luminal's native format (e.g., i64→i32, f64→f32).
+    fn set_input_from_ptr(
+        &mut self,
+        name: &str,
+        ptr: u64,
+        n_bytes: usize,
+        dtype_code: u32,
+    ) -> PyResult<()> {
         debug_assert!(ptr != 0, "set_input_from_ptr called with null pointer");
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
-        let data: Vec<f32> =
-            unsafe { std::slice::from_raw_parts(ptr as *const f32, n_elements).to_vec() };
-        self.runtime.set_data(*node_id, data);
+        let raw_bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
+        let typed = TypedData::from_pytorch_bytes(raw_bytes, dtype_code);
+        self.runtime.set_data(*node_id, typed);
         Ok(())
     }
 
@@ -416,22 +472,7 @@ impl CompiledGraph {
         Ok(())
     }
 
-    /// Mark an input tensor as persistent (survives execute() calls).
-    /// Call this for weight tensors that should not be consumed after each execution.
-    fn persist_input(&mut self, name: &str) -> PyResult<()> {
-        let _node_id = *self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
-        })?;
-        match &mut self.runtime {
-            #[cfg(feature = "cuda")]
-            RuntimeBackend::Cuda(rt) => rt.persist_hlir_node(_node_id),
-            RuntimeBackend::Native(_) => {} // Native: persist is handled at graph level
-        }
-        Ok(())
-    }
-
-    /// Set a weight tensor from a CUDA device pointer, matching by Input node label.
-    /// Also marks the weight as persistent. For PT2 weights (e.g. "fc1.weight").
+    /// For PT2 weights (e.g. "fc1.weight"). Persistence is handled at graph level via .persist().
     #[cfg(feature = "cuda")]
     fn set_weight_device_ptr(
         &mut self,
@@ -445,7 +486,6 @@ impl CompiledGraph {
         match &mut self.runtime {
             RuntimeBackend::Cuda(rt) => {
                 unsafe { rt.set_device_ptr(node_id, device_ptr, n_bytes) };
-                rt.persist_hlir_node(node_id);
             }
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -456,15 +496,70 @@ impl CompiledGraph {
         Ok(())
     }
 
-    /// Set a weight tensor from a CPU host pointer, matching by Input node label.
-    fn set_weight_from_ptr(&mut self, label: &str, ptr: u64, n_elements: usize) -> PyResult<()> {
+    /// Register an external device pointer for an output tensor (zero-copy output).
+    /// Call before run() — the runtime will write kernel results directly into this buffer.
+    /// For aliased outputs (in-place ops), falls back to DtoD copy; check output_is_zero_copy() after run().
+    #[cfg(feature = "cuda")]
+    fn set_output_device_ptr(
+        &mut self,
+        name: &str,
+        device_ptr: u64,
+        n_bytes: usize,
+    ) -> PyResult<()> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+
+        match &mut self.runtime {
+            RuntimeBackend::Cuda(rt) => {
+                unsafe { rt.set_output_device_ptr(*node_id, device_ptr, n_bytes) };
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "set_output_device_ptr requires CUDA backend",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check whether an output tensor was zero-copied (written directly to the registered pointer).
+    /// Returns false for aliased outputs that need a fallback DtoD copy. Must be called after run().
+    #[cfg(feature = "cuda")]
+    fn output_is_zero_copy(&self, name: &str) -> PyResult<bool> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+
+        match &self.runtime {
+            RuntimeBackend::Cuda(rt) => Ok(rt.output_is_zero_copy(*node_id)),
+            _ => Ok(false),
+        }
+    }
+
+    /// Set a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
+    /// `n_bytes` is the total byte count. `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
+    fn set_weight_from_ptr(
+        &mut self,
+        label: &str,
+        ptr: u64,
+        n_bytes: usize,
+        dtype_code: u32,
+    ) -> PyResult<()> {
         debug_assert!(ptr != 0, "set_weight_from_ptr called with null pointer");
         let &node_id = self.label_map.get(label).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("No Input node with label: {}", label))
         })?;
-        let data: Vec<f32> =
-            unsafe { std::slice::from_raw_parts(ptr as *const f32, n_elements).to_vec() };
-        self.runtime.set_data(node_id, data);
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
+        let typed = TypedData::from_pytorch_bytes(bytes, dtype_code);
+        self.runtime.set_data(node_id, typed);
         Ok(())
     }
 
@@ -480,7 +575,19 @@ impl CompiledGraph {
         })
     }
 
-    /// Get output tensor data by name (copies to host).
+    /// Get the PT2 dtype codes for all outputs (in order).
+    #[getter]
+    fn output_dtypes(&self) -> Vec<u32> {
+        self.output_dtypes
+            .iter()
+            .map(|d| luminal_dtype_to_pt2_code(*d))
+            .collect()
+    }
+
+    /// Get output tensor data by name as f32 (copies to host).
+    /// For native backend: handles any NativeData variant by converting to f32.
+    /// The native runtime may produce NativeData::Int or NativeData::Bool for some ops
+    /// (e.g., Cast chains), so we can't assume NativeData::F32.
     fn get_output(&self, name: &str) -> PyResult<Vec<f32>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -488,7 +595,37 @@ impl CompiledGraph {
                 name
             ))
         })?;
-        Ok(self.runtime.get_f32(*node_id))
+        match &self.runtime {
+            RuntimeBackend::Native(rt) => {
+                let id = *node_id;
+                let output_id = rt
+                    .graph
+                    .node_indices()
+                    .find(|n| {
+                        if let Some(out) = (**rt.graph[*n]).as_any().downcast_ref::<Output>() {
+                            out.node == id.index()
+                        } else {
+                            false
+                        }
+                    })
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "No output node found for tensor: {}",
+                            name
+                        ))
+                    })?;
+                let data = rt.buffers.get(&output_id).ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "No buffer data for output tensor: {}",
+                        name
+                    ))
+                })?;
+                // Convert any NativeData variant to f32
+                Ok((0..data.len()).map(|i| data.f32(i)).collect())
+            }
+            #[cfg(feature = "cuda")]
+            RuntimeBackend::Cuda(rt) => Ok(rt.get_f32(*node_id)),
+        }
     }
 
     /// Copy output tensor data directly to a CUDA device pointer (DtoD).

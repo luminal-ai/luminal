@@ -16,12 +16,8 @@ rm -rf rust/target/wheels rust/target/debug rust/target/release
 uv run maturin develop --manifest-path rust/Cargo.toml
 
 echo ""
-echo "--- 1a: Native + ONNX ---"
+echo "--- 1a: Native backend tests ---"
 uv run pytest $NATIVE_TESTS -v
-
-echo ""
-echo "--- 1b: Native + PT2 ---"
-LUMINAL_EXPORT_MODE=pt2 uv run pytest $NATIVE_TESTS -v
 
 # ── Phase 2: CUDA Backend ───────────────────────────────────
 
@@ -31,12 +27,8 @@ rm -rf rust/target/wheels rust/target/debug rust/target/release
 uv run maturin develop --manifest-path rust/Cargo.toml --features cuda -r
 
 echo ""
-echo "--- 2a: CUDA + ONNX ---"
+echo "--- 2a: CUDA ---"
 RUST_BACKTRACE=1 LUMINAL_BACKEND=cuda uv run pytest $CUDA_TESTS -m "not slow" -v
-
-echo ""
-echo "--- 2b: CUDA + PT2 ---"
-RUST_BACKTRACE=1 LUMINAL_BACKEND=cuda LUMINAL_EXPORT_MODE=pt2 uv run pytest $CUDA_TESTS -m "not slow" -v
 
 echo ""
 echo "=========================================="

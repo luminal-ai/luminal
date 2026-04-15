@@ -24,7 +24,7 @@ consult before writing new egglog rules, CUDA kernels, or optimizer passes.
 ## Testing Best Practices
 
 ### Overview
-The luminal_python crate provides a bridge between PyTorch models and the luminal library via ONNX. Tests should verify this integration end-to-end by testing the actual user workflow: PyTorch model → torch.compile → luminal backend.
+The luminal_python crate provides a bridge between PyTorch models and the luminal library via the PT2 Export pipeline. Tests should verify this integration end-to-end by testing the actual user workflow: PyTorch model → torch.compile → luminal backend.
 
 ### Test Pattern (CORRECT)
 
@@ -67,11 +67,11 @@ class AddTestModel(torch.nn.Module):
 
 ### What NOT to Do
 
-**❌ DO NOT create ONNX files directly in tests:**
+**❌ DO NOT create pt2 files directly in tests:**
 ```python
 # WRONG - bypasses the PyTorch integration
-model_path = create_onnx_model(...)
-graph_result = luminal.process_onnx(model_path, backend='native')
+model_path = create_pt2_model(...)
+graph_result = luminal.process_pt(model_path, backend='native')
 ```
 
 **✓ DO create PyTorch models and use torch.compile:**
@@ -83,16 +83,16 @@ model_compiled = torch.compile(model, backend=luminal_backend)
 
 ### Rationale
 
-- **End-to-end testing**: Tests verify the complete PyTorch → ONNX → luminal pipeline
+- **End-to-end testing**: Tests verify the complete PyTorch → Pt2 → luminal pipeline
 - **User-facing API**: Tests use the same API that users will use (torch.compile)
 - **Correctness**: Comparing compiled vs original PyTorch output ensures correctness
 - **Maintainability**: Consistent pattern across all tests makes the codebase easier to understand
-- **Simplicity**: No manual ONNX file creation, no tempfile cleanup, no numpy comparisons
+- **Simplicity**: No manual Pt2 file creation, no tempfile cleanup, no numpy comparisons
 
 ### Special Cases
 
 **Testing constants:**
-Use inline tensor literals in the forward method - PyTorch exports these as ONNX Constant nodes:
+Use inline tensor literals in the forward method - these are exported as constant tensors:
 ```python
 def forward(self, x: torch.Tensor) -> torch.Tensor:
     constant = torch.tensor([1.0, 2.0, 3.0])
@@ -100,14 +100,14 @@ def forward(self, x: torch.Tensor) -> torch.Tensor:
 ```
 
 **Testing type casts:**
-Use `.to(dtype)` method - PyTorch exports these as ONNX Cast nodes:
+Use `.to(dtype)` method - these are exported as type cast operations:
 ```python
 def forward(self, x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float32)
 ```
 
 **Testing complex operations:**
-Chain operations naturally in PyTorch - ONNX export handles the conversion:
+Chain operations naturally in PyTorch - the export pipeline handles the conversion:
 ```python
 def forward(self, x: torch.Tensor) -> torch.Tensor:
     transposed = x.transpose(0, 1)

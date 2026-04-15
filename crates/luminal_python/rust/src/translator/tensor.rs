@@ -18,139 +18,48 @@ impl<'a> Translator<'a> {
         match positional_args.len() {
             0 => anyhow::bail!("arange: no positional args found"),
             1 => Ok(self.graph.arange(positional_args[0])),
-            _ => Ok(self
+            2 => Ok(self
                 .graph
                 .arange_options(positional_args[0], positional_args[1], 1)),
+            _ => Ok(self.graph.arange_options(
+                positional_args[0],
+                positional_args[1],
+                positional_args[2],
+            )),
         }
     }
 
     pub(crate) fn translate_full(&mut self, node: &Node) -> Result<GraphTensor> {
         let shape = self.get_exprs_arg(node, 0)?;
-        let val = self.get_float_arg(node, 1)? as f32;
-        Ok(self.graph.constant_float(val).expand_rhs(shape))
-    }
-
-    pub(crate) fn translate_zeros(&mut self, node: &Node) -> Result<GraphTensor> {
-        self.translate_constant_fill(node, 0.0)
-    }
-
-    pub(crate) fn translate_ones(&mut self, node: &Node) -> Result<GraphTensor> {
-        self.translate_constant_fill(node, 1.0)
-    }
-
-    pub(crate) fn translate_new_ones(&mut self, node: &Node) -> Result<GraphTensor> {
-        self.translate_constant_fill(node, 1.0)
-    }
-
-    fn translate_constant_fill(&mut self, node: &Node, val: f32) -> Result<GraphTensor> {
-        let output_name = node
-            .outputs
-            .first()
-            .and_then(|o| o.as_tensor.as_ref())
-            .map(|t| t.name.clone())
-            .unwrap_or_default();
-        let meta = self
-            .tensor_meta(&output_name)
-            .context("Missing tensor meta for constant fill output")?;
-        let shape = self.tensor_meta_to_shape(meta)?;
-        if shape.is_empty() {
-            Ok(self.graph.constant_float(val))
+        // fill_value can be float, int, or bool after decomposition
+        let val = if let Ok(f) = self.get_float_arg(node, 1) {
+            f as f32
+        } else if let Ok(b) = self.get_bool_arg(node, 1) {
+            if b { 1.0 } else { 0.0 }
         } else {
-            Ok(self.graph.constant_float(val).expand_rhs(shape))
-        }
+            anyhow::bail!(
+                "full: unsupported fill value type: {:?}",
+                node.inputs.get(1)
+            );
+        };
+        Ok(self.graph.constant_float(val).expand_rhs(shape))
     }
 
     pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {
         let cond = self.get_input_tensor(node, 0)?;
         let x = self.get_input_tensor(node, 1)?;
         let y = self.get_input_tensor(node, 2)?;
+        // Ensure x and y have the same dtype
+        let (x, y) = ensure_same_dtype(x, y);
         // Broadcast all three tensors to a common shape first
         let (cond_b, x_b) = broadcast_binary(cond, x);
         let (cond_bc, y_b) = broadcast_binary(cond_b, y);
         let (x_bc, y_bc) = broadcast_binary(x_b, y_b);
         let c = cond_bc.cast(DType::F32);
+        let x_f = x_bc.cast(DType::F32);
+        let y_f = y_bc.cast(DType::F32);
         let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
-        Ok(c * x_bc + (one - c) * y_bc)
-    }
-
-    pub(crate) fn translate_where_scalar_other(&mut self, node: &Node) -> Result<GraphTensor> {
-        let cond = self.get_input_tensor(node, 0)?;
-        let x = self.get_input_tensor(node, 1)?;
-        let other_val = self.get_float_arg(node, 2)? as f32;
-        // Broadcast cond and x to a common shape
-        let (cond_b, x_b) = broadcast_binary(cond, x);
-        let c = cond_b.cast(DType::F32);
-        let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
-        let other = self.graph.constant_float(other_val).expand_rhs(c.shape);
-        Ok(c * x_b + (one - c) * other)
-    }
-
-    pub(crate) fn translate_diff(&mut self, node: &Node) -> Result<GraphTensor> {
-        let input = self.get_input_tensor(node, 0)?;
-        let dim = if node.inputs.len() > 2 {
-            self.get_int_arg(node, 2).unwrap_or(-1)
-        } else {
-            -1
-        };
-        let dim = normalize_dim(dim, input.shape.len());
-
-        let prepend = if node.inputs.len() > 3 {
-            self.get_input_tensor(node, 3).ok()
-        } else {
-            None
-        };
-
-        let x = if let Some(prep) = prepend {
-            prep.concat_along(input, dim)
-        } else {
-            input
-        };
-
-        let dim_size = x.shape.dims[dim];
-        let front = x.slice_along(Expression::from(1)..dim_size, dim);
-        let back = x.slice_along(Expression::from(0)..dim_size - 1, dim);
-        Ok(front - back)
-    }
-
-    pub(crate) fn translate_tril(&mut self, node: &Node) -> Result<GraphTensor> {
-        self.translate_triangular(node, false)
-    }
-
-    pub(crate) fn translate_triu(&mut self, node: &Node) -> Result<GraphTensor> {
-        self.translate_triangular(node, true)
-    }
-
-    fn translate_triangular(&mut self, node: &Node, upper: bool) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
-        let diagonal = if node.inputs.len() > 1 {
-            self.get_int_arg(node, 1).unwrap_or(0) as i32
-        } else {
-            0
-        };
-        let dims = a.shape.dims;
-        let rows = dims[dims.len() - 2];
-        let cols = dims[dims.len() - 1];
-        let (r_val, c_val) = match (rows.to_usize(), cols.to_usize()) {
-            (Some(r), Some(c)) => (r, c),
-            _ => anyhow::bail!("tril/triu requires concrete matrix dimensions"),
-        };
-        let size = r_val.max(c_val);
-        let mask = if upper {
-            self.graph.triu(size, diagonal)
-        } else {
-            self.graph.tril(size, diagonal)
-        }
-        .cast(DType::F32);
-        let mask = if rows != cols {
-            mask.slice_along(0..r_val, 0).slice_along(0..c_val, 1)
-        } else {
-            mask
-        };
-        let mut mask_expanded = mask;
-        for i in (0..dims.len() - 2).rev() {
-            mask_expanded = mask_expanded.expand_dim(0, dims[i]);
-        }
-        Ok(a * mask_expanded)
+        Ok(c * x_f + (one - c) * y_f)
     }
 
     pub(crate) fn translate_topk(&mut self, node: &Node) -> Result<()> {
@@ -198,21 +107,6 @@ impl<'a> Translator<'a> {
         }
 
         Ok(())
-    }
-
-    pub(crate) fn translate_one_hot(&mut self, node: &Node) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
-        let num_classes = self.get_int_arg(node, 1)? as usize;
-        // one_hot: output[..., i] = 1 if input[...] == i else 0
-        let a_int = a.cast(DType::Int);
-        let classes = self.graph.arange(num_classes);
-        // Expand a to [..., 1] and classes to [..., num_classes]
-        let a_expanded = a_int.expand_dim(a.shape.len(), num_classes);
-        let mut classes_expanded = classes;
-        for d in a.shape.dims.iter().rev() {
-            classes_expanded = classes_expanded.expand_dim(0, *d);
-        }
-        Ok(a_expanded.eq(classes_expanded).cast(DType::Int))
     }
 
     pub(crate) fn translate_wrap_set_grad(&mut self, node: &Node) -> Result<()> {

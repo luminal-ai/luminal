@@ -461,7 +461,8 @@ impl HostOp for CuBlasLt {
             cublasLtMatmulDescDestroy(matmul_desc);
         }
 
-        stream.synchronize()?;
+        // No stream.synchronize() here — CUDA stream ordering guarantees
+        // sequential execution. The runtime syncs once at the end of execute().
         Ok(())
     }
 

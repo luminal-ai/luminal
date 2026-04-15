@@ -29,36 +29,6 @@ impl<'a> Translator<'a> {
         Ok(a)
     }
 
-    pub(crate) fn translate_to_dtype(&mut self, node: &Node) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
-        if let Some(dtype_int) = node.inputs.get(1).and_then(|i| i.arg.as_scalar_type()) {
-            let dtype = torch_dtype_int_to_luminal(dtype_int);
-            Ok(a.cast(dtype))
-        } else if let Some(dtype_int) = node.inputs.get(1).and_then(|i| i.arg.as_int()) {
-            let dtype = torch_dtype_int_to_luminal(dtype_int as u32);
-            Ok(a.cast(dtype))
-        } else {
-            Ok(a)
-        }
-    }
-
-    pub(crate) fn translate_to_dtype_layout(&mut self, node: &Node) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
-        for input in &node.inputs {
-            if input.name == "dtype" {
-                if let Some(dtype_int) = input.arg.as_scalar_type() {
-                    let dtype = torch_dtype_int_to_luminal(dtype_int);
-                    return Ok(a.cast(dtype));
-                }
-                if let Some(dtype_int) = input.arg.as_int() {
-                    let dtype = torch_dtype_int_to_luminal(dtype_int as u32);
-                    return Ok(a.cast(dtype));
-                }
-            }
-        }
-        Ok(a)
-    }
-
     pub(crate) fn translate_layer_norm(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
         let normalized_shape = self.get_ints_arg(node, 1)?;

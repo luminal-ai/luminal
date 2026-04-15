@@ -120,13 +120,17 @@ pub struct CudaRuntime {
     /// Bucket definitions per dimension (empty = single-bucket mode)
     dim_buckets: FxHashMap<char, Vec<DimBucket>>,
 
-    /// HLIR nodes that should never be consumed after execute().
-    /// Used for weight tensors shared via external device pointers.
-    persistent_hlir_nodes: FxHashSet<NodeIndex>,
-
     /// Non-owning CudaSlice wrappers for external device pointers.
     /// ManuallyDrop prevents cuMemFree — the external allocator (e.g. PyTorch) owns the memory.
     external_buffers: FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
+
+    /// Pending output pointer registrations: HLIR output id -> (device_ptr, n_bytes)
+    /// Set by python before execute(), consumed at start of execute()
+    output_ptr_registrations: FxHashMap<NodeIndex, (u64, usize)>,
+
+    /// Non-owning CudaSlice views of external output pointers, keyed by LLIR data node
+    /// ManuallyDrop prevents cuMemFree -- Pytorch owns the memory
+    external_output_buffers: FxHashMap<NodeIndex, std::mem::ManuallyDrop<CudaSlice<u8>>>,
 }
 
 impl CudaRuntime {
@@ -228,9 +232,25 @@ impl CudaRuntime {
         self.changed_hlir.insert(id);
     }
 
-    /// Mark an HLIR node as persistent — its buffer won't be consumed after execute().
-    pub fn persist_hlir_node(&mut self, id: impl ToId) {
-        self.persistent_hlir_nodes.insert(id.to_id());
+    /// Register an external device pointer for an output tensor (zero-copy output).
+    /// The pointer is stored lazily — resolution to LLIR nodes happens in execute().
+    ///
+    /// # Safety
+    /// The device pointer must point to a valid CUDA allocation with at least `n_bytes` bytes,
+    /// and must remain valid through the next execute() call.
+    pub unsafe fn set_output_device_ptr(&mut self, id: impl ToId, device_ptr: u64, n_bytes: usize) {
+        debug_assert!(
+            device_ptr != 0,
+            "set_output_device_ptr called with null pointer"
+        );
+        self.output_ptr_registrations
+            .insert(id.to_id(), (device_ptr, n_bytes));
+    }
+
+    pub fn output_is_zero_copy(&self, id: impl ToId) -> bool {
+        let producer = self.find_producer_node(id);
+        let data_node = self.follow_aliases(producer);
+        self.external_output_buffers.contains_key(&data_node)
     }
 
     /// Find the LLIR producing node for an output tensor.
@@ -388,6 +408,50 @@ impl CudaRuntime {
             .expect("cuMemcpyDtoDAsync failed");
         }
         self.cuda_stream.synchronize().unwrap();
+    }
+
+    /// Resolve pending output pointer registrations into external_output_buffers.
+    /// Called at the start of execute(), after buffer allocation and HLIR sync.
+    fn apply_output_ptr_registrations(&mut self) {
+        // clear stale external output buffers from previous execution
+        self.external_output_buffers.clear();
+
+        if self.output_ptr_registrations.is_empty() {
+            return;
+        }
+
+        // Collect registrations to avoid borrow conflict (drain borrows self mutably,
+        // but find_producer_node/follow_aliases need &self).
+
+        let registrations: Vec<_> = self.output_ptr_registrations.drain().collect();
+
+        for (hlir_id, (device_ptr, n_bytes)) in registrations {
+            // Resolve HLIR output id -> LLIR producer -> follow aliases -> data node
+            let producer = self.find_producer_node(hlir_id);
+            let data_node = self.follow_aliases(producer);
+
+            // If data_node is an HLIR input (aliased output), skip — can't substitute
+            if self.compiled_buckets[self.active_bucket]
+                .llir_to_hlir
+                .contains_key(&data_node)
+            {
+                continue;
+            }
+
+            // Create non-owning CudaSlice view of PyTorch's buffer
+            let slice = unsafe {
+                self.cuda_stream
+                    .upgrade_device_ptr::<u8>(device_ptr, n_bytes)
+            };
+
+            self.external_output_buffers
+                .insert(data_node, std::mem::ManuallyDrop::new(slice));
+
+            // Update cached_buffer_ptrs so CudaGraphOp picks up the new pointer
+            self.compiled_buckets[self.active_bucket]
+                .cached_buffer_ptrs
+                .insert(data_node, device_ptr);
+        }
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
@@ -790,7 +854,8 @@ impl Runtime for CudaRuntime {
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
-            persistent_hlir_nodes: FxHashSet::default(),
+            output_ptr_registrations: FxHashMap::default(),
+            external_output_buffers: FxHashMap::default(),
             external_buffers: FxHashMap::default(),
         }
     }
@@ -1013,6 +1078,9 @@ impl Runtime for CudaRuntime {
         // Ensure all CUDA graphs are built (handles first execute and any missing graphs)
         self.prebuild_graphs(dyn_map);
 
+        // Resolve external output pointer registrations (zero-copy output path)
+        self.apply_output_ptr_registrations();
+
         let total_start = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
 
@@ -1022,8 +1090,11 @@ impl Runtime for CudaRuntime {
 
             // Build buffer map for the HostOp interface
             let mut buffer_map: FxHashMap<NodeIndex, &CudaSlice<u8>> = FxHashMap::default();
-            // Add output buffer
-            if let Some(buf) = bucket.buffers.get(&exec_op.output) {
+
+            // Add output buffer -- prefer external output pointer if registered (zero copy)
+            if let Some(ext) = self.external_output_buffers.get(&exec_op.output) {
+                buffer_map.insert(exec_op.output, &**ext);
+            } else if let Some(buf) = bucket.buffers.get(&exec_op.output) {
                 buffer_map.insert(exec_op.output, buf);
             }
             // Add input buffers (prefer HLIR weight buffers over intermediate placeholders)
@@ -1053,7 +1124,9 @@ impl Runtime for CudaRuntime {
             let extra_nodes = exec_op.internal.extra_buffer_nodes();
             for extra_node in extra_nodes {
                 if let Entry::Vacant(e) = buffer_map.entry(extra_node) {
-                    if let Some(buf) = bucket.buffers.get(&extra_node) {
+                    if let Some(ext) = self.external_output_buffers.get(&extra_node) {
+                        e.insert(&**ext);
+                    } else if let Some(buf) = bucket.buffers.get(&extra_node) {
                         e.insert(buf);
                     } else if let Some(hlir_node) = bucket.llir_to_hlir.get(&extra_node) {
                         match self.hlir_buffers.get(hlir_node) {
@@ -1138,11 +1211,6 @@ impl Runtime for CudaRuntime {
             }
         }
 
-        // Final sync to ensure all operations completed successfully
-        self.cuda_stream
-            .synchronize()
-            .expect("Final sync failed in execute");
-
         // Consume input buffers
         if self.profiling {
             return;
@@ -1190,7 +1258,6 @@ impl Runtime for CudaRuntime {
             .hlir_buffers
             .keys()
             .filter(|hlir_node| !inputs_with_outputs.contains(hlir_node))
-            .filter(|hlir_node| !self.persistent_hlir_nodes.contains(hlir_node))
             .copied()
             .collect();
 

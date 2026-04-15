@@ -66,74 +66,72 @@ impl<'a> Translator<'a> {
             }
             "torch.ops.aten.sigmoid.default" => self.translate_unary_op(node, |a| a.sigmoid())?,
             "torch.ops.aten.relu.default" => self.translate_unary_op(node, |a| a.relu())?,
-            "torch.ops.aten.silu.default" => self.translate_unary_op(node, |a| a.swish())?,
             "torch.ops.aten.tanh.default" => self.translate_unary_op(node, |a| a.tanh())?,
             "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
             "torch.ops.aten.log.default" => self.translate_unary_op(node, |a| a.log())?,
+            "torch.ops.aten.log2.default" => self.translate_unary_op(node, |a| a.log2())?,
+            "torch.ops.aten.exp2.default" => self.translate_unary_op(node, |a| a.exp2())?,
 
             // Cast
             "torch.ops.aten._to_copy.default" => self.translate_to_copy(node)?,
-            "torch.ops.aten.to.dtype" => self.translate_to_dtype(node)?,
-            "torch.ops.aten.to.dtype_layout" => self.translate_to_dtype_layout(node)?,
 
-            // No-op pass-throughs
-            "torch.ops.aten.alias.default"
-            | "torch.ops.aten.detach_.default"
-            | "torch.ops.aten.lift_fresh_copy.default" => self.get_input_tensor(node, 0)?,
-            "torch.ops.aten.dropout.default" => self.get_input_tensor(node, 0)?,
+            // No-op
+            "torch.ops.aten.alias.default" => self.get_input_tensor(node, 0)?,
 
             // Shape ops
-            "torch.ops.aten.view.default"
-            | "torch.ops.aten.reshape.default"
-            | "torch.ops.aten._unsafe_view.default" => self.translate_reshape(node)?,
+            "torch.ops.aten.view.default" => self.translate_reshape(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
-            "torch.ops.aten.transpose.int" => self.translate_transpose(node)?,
-            "torch.ops.aten.t.default" => {
-                let a = self.get_input_tensor(node, 0)?;
-                a.t()
-            }
             "torch.ops.aten.unsqueeze.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let dim = self.get_int_arg(node, 1)?;
                 let dim = normalize_dim(dim, a.shape.len() + 1);
                 a.unsqueeze(dim)
             }
-            "torch.ops.aten.squeeze.dim" | "torch.ops.aten.squeeze.default" => {
+            "torch.ops.aten.squeeze.dims" => {
                 let a = self.get_input_tensor(node, 0)?;
-                if node.inputs.len() > 1 {
-                    let dim = self.get_int_arg(node, 1)?;
-                    let dim = normalize_dim(dim, a.shape.len());
-                    a.squeeze(dim)
-                } else {
-                    let mut result = a;
-                    let dims = a.shape.dims;
-                    let mut offset = 0;
-                    for (i, d) in dims.iter().enumerate() {
-                        if d.to_usize() == Some(1) {
-                            result = result.squeeze(i - offset);
-                            offset += 1;
-                        }
+                let dims = self.get_ints_arg(node, 1)?;
+                let ndim = a.shape.len();
+                let mut sorted_dims: Vec<usize> =
+                    dims.iter().map(|&d| normalize_dim(d, ndim)).collect();
+                sorted_dims.sort();
+                let mut result = a;
+                let mut offset = 0;
+                for d in sorted_dims {
+                    if result.shape.dims[d - offset].to_usize() == Some(1) {
+                        result = result.squeeze(d - offset);
+                        offset += 1;
                     }
-                    result
                 }
+                result
             }
             "torch.ops.aten.expand.default" => self.translate_expand(node)?,
-            "torch.ops.aten.contiguous.default" | "torch.ops.aten.clone.default" => {
+            "torch.ops.aten.clone.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 if !a.shape.is_contiguous() { a + 0.0 } else { a }
             }
 
             // Matmul
-            "torch.ops.aten.mm.default"
-            | "torch.ops.aten.bmm.default"
-            | "torch.ops.aten.matmul.default" => {
+            "torch.ops.aten.mm.default" | "torch.ops.aten.bmm.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
+                let (a, b) = ensure_same_dtype(a, b);
                 a.matmul(b)
             }
 
-            // Linear
-            "torch.ops.aten.linear.default" => self.translate_linear(node)?,
+            // addmm: beta*input + alpha*(mat1 @ mat2)
+            "torch.ops.aten.addmm.default" => {
+                let input = self.get_input_tensor(node, 0)?;
+                let mat1 = self.get_input_tensor(node, 1)?;
+                let mat2 = self.get_input_tensor(node, 2)?;
+                let beta = self.get_float_arg(node, 3).unwrap_or(1.0) as f32;
+                let alpha = self.get_float_arg(node, 4).unwrap_or(1.0) as f32;
+                let mm = mat1.matmul(mat2);
+                let (input, mm) = broadcast_binary(input, mm);
+                input * beta + mm * alpha
+            }
+
+            // Convolution
+            "torch.ops.aten.convolution.default" => self.translate_conv(node)?,
 
             // Reduction ops
             "torch.ops.aten.sum.dim_IntList" => self.translate_reduction(node, ReductionOp::Sum)?,
@@ -142,16 +140,14 @@ impl<'a> Translator<'a> {
 
             // Slice/index ops
             "torch.ops.aten.slice.Tensor" => self.translate_slice(node)?,
-            "torch.ops.aten.select.int" => self.translate_select(node)?,
             "torch.ops.aten.cat.default" => self.translate_cat(node)?,
-            "torch.ops.aten.index_select.default" => self.translate_index_select(node)?,
             "torch.ops.aten.index.Tensor" => self.translate_index_tensor(node)?,
 
             // Embedding
             "torch.ops.aten.embedding.default" => self.translate_embedding(node)?,
 
             // Softmax
-            "torch.ops.aten._softmax.default" | "torch.ops.aten.softmax.int" => {
+            "torch.ops.aten._softmax.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let dim = self.get_int_arg(node, 1)?;
                 let dim = normalize_dim(dim, a.shape.len());
@@ -159,11 +155,10 @@ impl<'a> Translator<'a> {
             }
 
             // LayerNorm
-            "torch.ops.aten.layer_norm.default" => self.translate_layer_norm(node)?,
+            "torch.ops.aten.native_layer_norm.default" => self.translate_layer_norm(node)?,
 
             // Where
             "torch.ops.aten.where.self" => self.translate_where(node)?,
-            "torch.ops.aten.where.ScalarOther" => self.translate_where_scalar_other(node)?,
 
             // Pow
             "torch.ops.aten.pow.Tensor_Scalar" => {
@@ -179,18 +174,12 @@ impl<'a> Translator<'a> {
             }
 
             // Creation ops
-            "torch.ops.aten.arange.default" | "torch.ops.aten.arange.start" => {
-                self.translate_arange(node)?
-            }
+            "torch.ops.aten.arange.start_step" => self.translate_arange(node)?,
             "torch.ops.aten.full.default" => self.translate_full(node)?,
-            "torch.ops.aten.zeros.default" | "torch.ops.aten.zeros_like.default" => {
-                self.translate_zeros(node)?
+            "torch.ops.aten.scalar_tensor.default" => {
+                let val = self.get_float_arg(node, 0)? as f32;
+                self.graph.constant_float(val)
             }
-            "torch.ops.aten.ones.default" | "torch.ops.aten.ones_like.default" => {
-                self.translate_ones(node)?
-            }
-            "torch.ops.aten.new_ones.default" => self.translate_new_ones(node)?,
-
             // Scalar comparisons
             "torch.ops.aten.gt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.gt(s))?,
             "torch.ops.aten.lt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.lt(s))?,
@@ -222,7 +211,7 @@ impl<'a> Translator<'a> {
                 let (a, b) = broadcast_binary(a, b);
                 a.le(b)
             }
-            "torch.ops.aten.__and__.Tensor" | "torch.ops.aten.logical_and.default" => {
+            "torch.ops.aten.bitwise_and.Tensor" | "torch.ops.aten.logical_and.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
@@ -248,9 +237,7 @@ impl<'a> Translator<'a> {
             }
 
             // Clamp
-            "torch.ops.aten.clamp.default" | "torch.ops.aten.clamp_min.default" => {
-                self.translate_clamp(node)?
-            }
+            "torch.ops.aten.clamp.default" => self.translate_clamp(node)?,
 
             // Cumsum
             "torch.ops.aten.cumsum.default" => {
@@ -264,9 +251,6 @@ impl<'a> Translator<'a> {
                 };
                 a.cumsum(dim)
             }
-
-            // Diff
-            "torch.ops.aten.diff.default" => self.translate_diff(node)?,
 
             // Floor / Ceil / Erf (approximations)
             "torch.ops.aten.floor.default" => {
@@ -352,45 +336,12 @@ impl<'a> Translator<'a> {
                 let (a, b) = broadcast_binary(a, b);
                 a.gt(b)
             }
-            "torch.ops.aten.ne.Tensor" => {
-                let a = self.get_input_tensor(node, 0)?;
-                let b = self.get_input_tensor(node, 1)?;
-                let (a, b) = ensure_same_dtype(a, b);
-                let (a, b) = broadcast_binary(a, b);
-                a.ne(b)
-            }
 
-            // Reductions without dim arg (full reduce)
-            // Flatten to [1, N] and reduce axis 1 to avoid multi-step HLIR
-            // that CUDA can't schedule (grid (0,1,1) invalid launch).
-            "torch.ops.aten.sum.default" => {
-                let a = self.get_input_tensor(node, 0)?;
-                let total = concrete_numel(&a)?;
-                let mut flat = a;
-                flat.shape = ShapeTracker::new(vec![1, total]);
-                flat.sum(vec![1])
-            }
-            "torch.ops.aten.mean.default" => {
-                let a = self.get_input_tensor(node, 0)?;
-                let total = concrete_numel(&a)?;
-                let mut flat = a;
-                flat.shape = ShapeTracker::new(vec![1, total]);
-                flat.sum(vec![1]) / total as f32
-            }
-            "torch.ops.aten.max.default" => {
-                let a = self.get_input_tensor(node, 0)?;
-                let total = concrete_numel(&a)?;
-                let mut flat = a;
-                flat.shape = ShapeTracker::new(vec![1, total]);
-                flat.max(vec![1])
-            }
-            "torch.ops.aten.min.default" => {
-                let a = self.get_input_tensor(node, 0)?;
-                let total = concrete_numel(&a)?;
-                let mut flat = a;
-                flat.shape = ShapeTracker::new(vec![1, total]);
-                flat.min(vec![1])
-            }
+            // Full-reduce variants (no dim arg) — handled by translate_reduction fallback
+            "torch.ops.aten.sum.default" => self.translate_reduction(node, ReductionOp::Sum)?,
+            "torch.ops.aten.mean.default" => self.translate_reduction(node, ReductionOp::Mean)?,
+            "torch.ops.aten.max.default" => self.translate_reduction(node, ReductionOp::Max)?,
+            "torch.ops.aten.min.default" => self.translate_reduction(node, ReductionOp::Min)?,
             "torch.ops.aten.amin.default" => self.translate_reduction(node, ReductionOp::Min)?,
 
             // Gather (axis-aware)
@@ -398,11 +349,7 @@ impl<'a> Translator<'a> {
 
             // Scatter ops
             "torch.ops.aten.scatter.src" => self.translate_scatter_src(node)?,
-            "torch.ops.aten.index_put_.default" => self.translate_index_put(node)?,
-
-            // Triangular
-            "torch.ops.aten.tril.default" => self.translate_tril(node)?,
-            "torch.ops.aten.triu.default" => self.translate_triu(node)?,
+            "torch.ops.aten.index_put.default" => self.translate_index_put(node)?,
 
             // TopK — handles its own output storage, returns early
             "torch.ops.aten.topk.default" => {
@@ -411,12 +358,7 @@ impl<'a> Translator<'a> {
             }
 
             // Split
-            "torch.ops.aten.split.Tensor" | "torch.ops.aten.split_with_sizes.default" => {
-                self.translate_split(node)?
-            }
-
-            // One-hot
-            "torch.ops.aten.one_hot.default" => self.translate_one_hot(node)?,
+            "torch.ops.aten.split_with_sizes.default" => self.translate_split_with_sizes(node)?,
 
             // Fmod
             "torch.ops.aten.fmod.Tensor" => {
@@ -425,12 +367,8 @@ impl<'a> Translator<'a> {
                 let (a, b) = broadcast_binary(a, b);
                 a % b
             }
-            "torch.ops.aten.fmod.Scalar" | "torch.ops.aten.remainder.Scalar" => {
-                let a = self.get_input_tensor(node, 0)?;
-                let val = self.get_float_arg(node, 1)? as f32;
-                let b = self.graph.constant_float(val).expand_rhs(a.shape);
-                a % b
-            }
+            // Prod reduction
+            "torch.ops.aten.prod.dim_int" => self.translate_reduction(node, ReductionOp::Prod)?,
 
             other => {
                 bail!("Unsupported ATen op: {other}");
@@ -442,15 +380,6 @@ impl<'a> Translator<'a> {
         }
         Ok(())
     }
-}
-
-/// Compute total element count, returning an error if any dimension is symbolic.
-fn concrete_numel(a: &GraphTensor) -> Result<usize> {
-    a.dims().iter().try_fold(1usize, |acc, d| {
-        d.to_usize().map(|v| acc * v).ok_or_else(|| {
-            anyhow::anyhow!("Full reduction requires concrete dimensions, got symbolic dim")
-        })
-    })
 }
 
 impl<'a> Translator<'a> {
