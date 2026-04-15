@@ -1806,6 +1806,10 @@ impl MetalKernelOp for MetalConstant {
         let thread_groups = MTLSize::new(1, 1, 1);
         encoder.dispatch_thread_groups(thread_groups, thread_group_size);
     }
+
+    fn constant_value(&self) -> Option<f32> {
+        Some(self.value)
+    }
 }
 
 // MetalIota: generates sequence [expr(0), expr(1), ..., expr(range-1)]

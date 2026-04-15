@@ -67,6 +67,10 @@ pub trait MetalKernelOp: EgglogOp {
         0
     }
 
+    fn kernel_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn mul_info(&self) -> Option<MetalMulInfo> {
         None
     }
@@ -92,6 +96,10 @@ pub trait MetalKernelOp: EgglogOp {
     /// such as Scatter that copy dest -> output and then modify output.
     fn output_data_input(&self) -> Option<usize> {
         self.output_aliases_input()
+    }
+
+    fn constant_value(&self) -> Option<f32> {
+        None
     }
 }
 
