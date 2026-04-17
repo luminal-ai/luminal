@@ -32,7 +32,12 @@ def _export_kwargs():
     return kwargs
 
 
-def _save_and_compile(ep_or_path, backend, search_iterations, original_weights=None):
+def _save_and_compile(
+    ep_or_path,
+    backend,
+    original_weights=None,
+    options=None,
+):
     """Compile a PT2 model via Rust, return CompiledModel.
 
     Args:
@@ -63,7 +68,11 @@ def _save_and_compile(ep_or_path, backend, search_iterations, original_weights=N
 
         # Compile with device pointers — search uses actual weight memory (zero-copy)
         compiled = process_pt2(
-            pt2_path, "", backend, search_iterations, weight_device_ptrs
+            pt2_path,
+            "",
+            backend,
+            weight_device_ptrs=weight_device_ptrs,
+            options=options,
         )
 
         # Load CPU weights after compilation
@@ -208,10 +217,14 @@ def compile(
         )
         ep = ep.run_decompositions()
 
-    return _save_and_compile(ep, backend, search_iterations)
+    return _save_and_compile(
+        ep,
+        backend,
+        options={"search_iterations": search_iterations},
+    )
 
 
-def pt2_backend(gm, example_inputs, backend=None):
+def pt2_backend(gm, example_inputs, backend=None, options=None):
     """torch.compile backend using PT2 pipeline.
 
     Usage: torch.compile(model, backend=luminal.pt2.pt2_backend)
@@ -252,7 +265,10 @@ def pt2_backend(gm, example_inputs, backend=None):
 
     try:
         result = _save_and_compile(
-            pt2_path, backend, 10, original_weights=original_weights
+            pt2_path,
+            backend,
+            original_weights=original_weights,
+            options=options,
         )
         return result
     finally:

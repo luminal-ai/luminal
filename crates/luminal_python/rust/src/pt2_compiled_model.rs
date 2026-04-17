@@ -1,6 +1,7 @@
 use luminal::prelude::tracing::warn;
 use luminal::prelude::*;
 use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyDict};
 use std::collections::HashMap;
 
 use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, WeightData};
@@ -11,6 +12,58 @@ use crate::{pt2_parser, pt2_util};
 
 /// Pre-loaded weight/constant data paired with tensor sizes.
 type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompileOptions {
+    search_iterations: usize,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            search_iterations: 10,
+        }
+    }
+}
+
+impl CompileOptions {
+    fn from_py(options: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let mut parsed = Self::default();
+
+        let Some(options) = options else {
+            return Ok(parsed);
+        };
+
+        let options = options.cast::<PyDict>().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("luminal backend options must be a dict")
+        })?;
+
+        for (key, value) in options.iter() {
+            let key = key.extract::<String>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "luminal backend option keys must be strings",
+                )
+            })?;
+
+            match key.as_str() {
+                "search_iterations" => {
+                    parsed.search_iterations = value.extract::<usize>().map_err(|_| {
+                        pyo3::exceptions::PyTypeError::new_err(
+                            "luminal backend option 'search_iterations' must be an integer",
+                        )
+                    })?;
+                }
+                other => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unsupported luminal backend option '{other}'. Supported options: search_iterations",
+                    )));
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+}
 
 fn resolve_dim_sizes(
     sizes: &[pt2_schema::DimSize],
@@ -36,19 +89,20 @@ fn resolve_dim_sizes(
 }
 
 #[pyfunction]
-#[pyo3(signature = (pt2_path, weights_path, backend, search_iters, weight_device_ptrs=None))]
+#[pyo3(signature = (pt2_path, weights_path, backend, weight_device_ptrs=None, options=None))]
 pub fn process_pt2(
     pt2_path: &str,
     weights_path: &str,
     backend: &str,
-    search_iters: usize,
     weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
+    options: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<CompiledGraph> {
+    let options = CompileOptions::from_py(options)?;
     compile_pt2(
         pt2_path,
         weights_path,
         backend,
-        search_iters,
+        &options,
         weight_device_ptrs.unwrap_or_default(),
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
@@ -58,13 +112,13 @@ fn compile_pt2(
     pt2_path: &str,
     weights_path: &str,
     backend: &str,
-    search_iters: usize,
+    options: &CompileOptions,
     weight_device_ptrs: HashMap<String, (u64, usize)>,
 ) -> anyhow::Result<CompiledGraph> {
     let (translation, mut weights) = translate_pt2(pt2_path, weights_path)?;
     weights.device_ptrs = weight_device_ptrs;
 
-    CompiledGraph::parse_graph(translation, weights, backend, search_iters)
+    CompiledGraph::parse_graph(translation, weights, backend, options.search_iterations)
         .map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -365,5 +419,74 @@ fn bytes_to_typed(bytes: &[u8], dtype: u32) -> TypedData {
             warn!("Unrecognized dtype {dtype}, interpreting as {luminal_dtype:?}");
             TypedData::from_raw(bytes.to_vec(), luminal_dtype)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompileOptions;
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use std::sync::Once;
+
+    fn with_python(f: impl FnOnce(Python<'_>)) {
+        static INIT: Once = Once::new();
+        INIT.call_once(Python::initialize);
+        Python::attach(f);
+    }
+
+    #[test]
+    fn compile_options_defaults_apply() {
+        let options = CompileOptions::from_py(None).unwrap();
+        assert_eq!(options.search_iterations, 10);
+    }
+
+    #[test]
+    fn compile_options_dict_overlays_defaults() {
+        with_python(|py| {
+            let options = PyDict::new(py);
+            options.set_item("search_iterations", 3).unwrap();
+
+            let parsed = CompileOptions::from_py(Some(options.as_any())).unwrap();
+            assert_eq!(parsed.search_iterations, 3);
+        });
+    }
+
+    #[test]
+    fn compile_options_reject_unknown_keys() {
+        with_python(|py| {
+            let options = PyDict::new(py);
+            options.set_item("unknown", 1).unwrap();
+
+            let err = CompileOptions::from_py(Some(options.as_any())).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert!(
+                err.to_string()
+                    .contains("Unsupported luminal backend option 'unknown'")
+            );
+        });
+    }
+
+    #[test]
+    fn compile_options_reject_non_dict() {
+        with_python(|py| {
+            let options = 123usize.into_pyobject(py).unwrap();
+
+            let err = CompileOptions::from_py(Some(options.as_any())).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+            assert!(err.to_string().contains("options must be a dict"));
+        });
+    }
+
+    #[test]
+    fn compile_options_reject_bad_search_iterations_type() {
+        with_python(|py| {
+            let options = PyDict::new(py);
+            options.set_item("search_iterations", "fast").unwrap();
+
+            let err = CompileOptions::from_py(Some(options.as_any())).unwrap_err();
+            assert!(err.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+            assert!(err.to_string().contains("search_iterations"));
+        });
     }
 }

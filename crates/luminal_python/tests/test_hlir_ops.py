@@ -1,5 +1,6 @@
 from typing import Callable
 
+import pytest
 import torch
 import torch._dynamo
 from test_models import (
@@ -233,19 +234,96 @@ from test_models import (
     MambaConvBlockModel,
 )
 
+import luminal.pt2 as luminal_pt2
 from luminal import luminal_backend
 
 
-def _compile_for_export_mode(
-    model: torch.nn.Module, export_mode: str | None = None
-) -> Callable:
-    if export_mode is None:
-        return torch.compile(model, backend=luminal_backend)
-    return torch.compile(
+def test_backend_options_forwarded_to_process_pt2(
+    monkeypatch: pytest.MonkeyPatch, device: torch.device
+):
+    captured = {}
+
+    def fake_process_pt2(
+        pt2_path,
+        weights_path,
+        backend,
+        weight_device_ptrs=None,
+        options=None,
+    ):
+        captured["pt2_path"] = pt2_path
+        captured["weights_path"] = weights_path
+        captured["backend"] = backend
+        captured["weight_device_ptrs"] = weight_device_ptrs
+        captured["options"] = options
+        return object()
+
+    monkeypatch.setattr(luminal_pt2, "process_pt2", fake_process_pt2)
+    monkeypatch.setattr(luminal_pt2, "_load_cpu_weights", lambda compiled, weights: None)
+    monkeypatch.setattr(
+        luminal_pt2,
+        "CompiledModel",
+        lambda compiled, weight_refs=None: (lambda x: x + x),
+    )
+
+    model: torch.nn.Module = AddTestModel().to(device)
+    compiled: Callable = torch.compile(
         model,
         backend=luminal_backend,
-        options={"export_mode": export_mode},
+        options={"search_iterations": 3},
     )
+
+    x: torch.Tensor = torch.rand((5, 5), device=device)
+    compiled(x)
+
+    assert captured["weights_path"] == ""
+    assert captured["backend"] == ("cuda" if device.type == "cuda" else "native")
+    assert captured["options"] == {"search_iterations": 3}
+    assert isinstance(captured["weight_device_ptrs"], dict)
+
+
+def test_backend_options_unknown_key_raises(device: torch.device):
+    model: torch.nn.Module = AddTestModel().to(device)
+    compiled: Callable = torch.compile(
+        model,
+        backend=luminal_backend,
+        options={"unknown_option": 1},
+    )
+
+    x: torch.Tensor = torch.rand((5, 5), device=device)
+    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed) as exc_info:
+        compiled(x)
+    assert isinstance(exc_info.value.inner_exception, ValueError)
+    assert "Unsupported luminal backend option" in str(exc_info.value.inner_exception)
+
+
+def test_backend_options_non_dict_raises(device: torch.device):
+    model: torch.nn.Module = AddTestModel().to(device)
+    compiled: Callable = torch.compile(
+        model,
+        backend=luminal_backend,
+        options=["pt2"],
+    )
+
+    x: torch.Tensor = torch.rand((5, 5), device=device)
+    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed) as exc_info:
+        compiled(x)
+    assert isinstance(exc_info.value.inner_exception, TypeError)
+    assert "options must be a dict" in str(exc_info.value.inner_exception)
+
+
+def test_backend_options_bad_search_iterations_type_raises(device: torch.device):
+    model: torch.nn.Module = AddTestModel().to(device)
+    compiled: Callable = torch.compile(
+        model,
+        backend=luminal_backend,
+        options={"search_iterations": "fast"},
+    )
+
+    x: torch.Tensor = torch.rand((5, 5), device=device)
+    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed) as exc_info:
+        compiled(x)
+    assert isinstance(exc_info.value.inner_exception, TypeError)
+    assert "search_iterations" in str(exc_info.value.inner_exception)
 
 
 def test_add(device: torch.device):
@@ -2048,10 +2126,10 @@ def test_dtype_float32(device: torch.device):
 # ========== Convolution Tests ==========
 
 
-def _run_conv1d_no_pad(device: torch.device, export_mode: str | None = None):
+def _run_conv1d_no_pad(device: torch.device):
     """Conv1d without padding: output length = input - (kernel-1)."""
     model: torch.nn.Module = Conv1dNoPadModel().to(device)
-    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.randn(2, 8, 32, device=device)
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
@@ -2060,10 +2138,6 @@ def _run_conv1d_no_pad(device: torch.device, export_mode: str | None = None):
 
 def test_conv1d_no_pad(device: torch.device):
     _run_conv1d_no_pad(device)
-
-
-def test_conv1d_no_pad_pt2(device: torch.device):
-    _run_conv1d_no_pad(device, "pt2")
 
 
 def test_conv1d_same_pad(device: torch.device):
@@ -2086,10 +2160,10 @@ def test_conv1d_bias(device: torch.device):
     assert torch.allclose(output, original, atol=1e-4)
 
 
-def _run_conv2d_no_pad(device: torch.device, export_mode: str | None = None):
+def _run_conv2d_no_pad(device: torch.device):
     """Conv2d without padding: output spatial = input - (kernel-1)."""
     model: torch.nn.Module = Conv2dNoPadModel().to(device)
-    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.randn(1, 3, 8, 8, device=device)
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
@@ -2098,10 +2172,6 @@ def _run_conv2d_no_pad(device: torch.device, export_mode: str | None = None):
 
 def test_conv2d_no_pad(device: torch.device):
     _run_conv2d_no_pad(device)
-
-
-def test_conv2d_no_pad_pt2(device: torch.device):
-    _run_conv2d_no_pad(device, "pt2")
 
 
 def test_conv2d_same_pad(device: torch.device):
@@ -2134,10 +2204,10 @@ def test_conv2d_stride(device: torch.device):
     assert torch.allclose(output, original, atol=1e-4)
 
 
-def _run_conv2d_dilation(device: torch.device, export_mode: str | None = None):
+def _run_conv2d_dilation(device: torch.device):
     """Conv2d with dilation=2 preserves the expected spatial shape and values."""
     model: torch.nn.Module = Conv2dDilationModel().to(device)
-    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.randn(2, 8, 17, 19, device=device)
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
@@ -2148,14 +2218,10 @@ def test_conv2d_dilation(device: torch.device):
     _run_conv2d_dilation(device)
 
 
-def test_conv2d_dilation_pt2(device: torch.device):
-    _run_conv2d_dilation(device, "pt2")
-
-
-def _run_conv3d_same_pad(device: torch.device, export_mode: str | None = None):
+def _run_conv3d_same_pad(device: torch.device):
     """Conv3d exercises the spatial=3 unfold/permute/split path."""
     model: torch.nn.Module = Conv3dSamePadModel().to(device)
-    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.randn(2, 4, 6, 7, 8, device=device)
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
@@ -2164,10 +2230,6 @@ def _run_conv3d_same_pad(device: torch.device, export_mode: str | None = None):
 
 def test_conv3d_same_pad(device: torch.device):
     _run_conv3d_same_pad(device)
-
-
-def test_conv3d_same_pad_pt2(device: torch.device):
-    _run_conv3d_same_pad(device, "pt2")
 
 
 def test_depthwise_conv1d(device: torch.device):
@@ -2190,12 +2252,10 @@ def test_depthwise_conv2d(device: torch.device):
     assert torch.allclose(output, original, atol=1e-4)
 
 
-def _run_depthwise_multiplier_conv2d(
-    device: torch.device, export_mode: str | None = None
-):
+def _run_depthwise_multiplier_conv2d(device: torch.device):
     """Depthwise Conv2d with multiplier > 1 should preserve both output channels per input channel."""
     model: torch.nn.Module = DepthwiseMultiplierConv2dModel().to(device)
-    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.randn(2, 8, 9, 9, device=device)
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
@@ -2204,10 +2264,6 @@ def _run_depthwise_multiplier_conv2d(
 
 def test_depthwise_multiplier_conv2d(device: torch.device):
     _run_depthwise_multiplier_conv2d(device)
-
-
-def test_depthwise_multiplier_conv2d_pt2(device: torch.device):
-    _run_depthwise_multiplier_conv2d(device, "pt2")
 
 
 def test_grouped_conv2d(device: torch.device):
@@ -2220,12 +2276,10 @@ def test_grouped_conv2d(device: torch.device):
     assert torch.allclose(output, original, atol=1e-4)
 
 
-def _run_grouped_conv2d_groups3_batch4(
-    device: torch.device, export_mode: str | None = None
-):
+def _run_grouped_conv2d_groups3_batch4(device: torch.device):
     """Grouped Conv2d with groups=3 and batch>1 exercises the pre-pad + slice path."""
     model: torch.nn.Module = GroupedConv2dGroups3Model().to(device)
-    model_compiled: Callable = _compile_for_export_mode(model, export_mode)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.randn(4, 12, 11, 9, device=device)
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
@@ -2234,10 +2288,6 @@ def _run_grouped_conv2d_groups3_batch4(
 
 def test_grouped_conv2d_groups3_batch4(device: torch.device):
     _run_grouped_conv2d_groups3_batch4(device)
-
-
-def test_grouped_conv2d_groups3_batch4_pt2(device: torch.device):
-    _run_grouped_conv2d_groups3_batch4(device, "pt2")
 
 
 def test_mamba_conv_block(device: torch.device):

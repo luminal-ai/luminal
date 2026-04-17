@@ -64,7 +64,7 @@ def luminal_backend(gm, example_inputs, options=None):
         torch.compile(model, backend=luminal_backend)
     """
     backend = _detect_backend(example_inputs)
-    return _compile_pt2(gm, example_inputs, backend)
+    return _compile_pt2(gm, example_inputs, backend, options=options)
 
 
 # ---------------------------------------------------------------------------
@@ -72,8 +72,8 @@ def luminal_backend(gm, example_inputs, options=None):
 # ---------------------------------------------------------------------------
 
 
-def _compile_pt2(gm, example_inputs, backend):
+def _compile_pt2(gm, example_inputs, backend, options=None):
     """PT2/torch.export path — delegates to pt2.pt2_backend."""
     from .pt2 import pt2_backend
 
-    return pt2_backend(gm, example_inputs, backend=backend)
+    return pt2_backend(gm, example_inputs, backend=backend, options=options)
