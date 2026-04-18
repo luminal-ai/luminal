@@ -663,7 +663,7 @@ pub(super) mod tests {
                 let mut out: Vec<(NotNan<f32>, usize)> =
                     heap.into_iter().map(|std::cmp::Reverse(t)| t).collect();
 
-                out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                out.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                 out.into_iter().map(|(_, i)| i).collect()
             }
             test_unary(

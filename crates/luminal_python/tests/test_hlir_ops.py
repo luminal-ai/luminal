@@ -258,11 +258,13 @@ def test_backend_options_forwarded_to_process_pt2(
         return object()
 
     monkeypatch.setattr(luminal_pt2, "process_pt2", fake_process_pt2)
-    monkeypatch.setattr(luminal_pt2, "_load_cpu_weights", lambda compiled, weights: None)
+    monkeypatch.setattr(
+        luminal_pt2, "_load_cpu_weights", lambda compiled, weights: None
+    )
     monkeypatch.setattr(
         luminal_pt2,
         "CompiledModel",
-        lambda compiled, weight_refs=None: (lambda x: x + x),
+        lambda compiled, weight_refs=None: lambda x: x + x,
     )
 
     model: torch.nn.Module = AddTestModel().to(device)

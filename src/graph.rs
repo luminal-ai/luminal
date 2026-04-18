@@ -724,10 +724,8 @@ impl Graph {
             }
 
             // Track top-N parents for offspring generation
-            let mut parents: Vec<(
-                R::ProfileMetric,
-                crate::egglog_utils::EGraphChoiceSet<'_>,
-            )> = vec![(best_metric.clone(), best_genome.clone())];
+            let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
+                vec![(best_metric.clone(), best_genome.clone())];
 
             while n_graphs < limit {
                 // Generate offspring from all parents, dividing budget evenly
@@ -769,8 +767,7 @@ impl Graph {
                                 None,
                             );
                             runtime.clear_intermediate_buffers();
-                            let result =
-                                runtime.profile(&llir_graph, dyn_map, options.trials);
+                            let result = runtime.profile(&llir_graph, dyn_map, options.trials);
                             let has_nan = runtime.has_nan_outputs(&llir_graph, dyn_map);
                             (result, llir_graph, has_nan)
                         }));
