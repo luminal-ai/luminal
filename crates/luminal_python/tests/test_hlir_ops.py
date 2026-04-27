@@ -248,13 +248,13 @@ def test_backend_options_forwarded_to_process_pt2(
     def fake_process_pt2(
         pt2_path,
         weights_path,
-        backend,
+        factory_capsule,
         weight_device_ptrs=None,
         options=None,
     ):
         captured["pt2_path"] = pt2_path
         captured["weights_path"] = weights_path
-        captured["backend"] = backend
+        captured["factory_capsule"] = factory_capsule
         captured["weight_device_ptrs"] = weight_device_ptrs
         captured["options"] = options
         return object()
@@ -280,7 +280,7 @@ def test_backend_options_forwarded_to_process_pt2(
     compiled(x)
 
     assert captured["weights_path"] == ""
-    assert captured["backend"] == ("cuda" if device.type == "cuda" else "native")
+    assert type(captured["factory_capsule"]).__name__ == "PyCapsule"
     assert captured["options"] == {"search_iterations": 3}
     assert isinstance(captured["weight_device_ptrs"], dict)
 
