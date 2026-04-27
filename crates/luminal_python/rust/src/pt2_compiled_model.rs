@@ -1,7 +1,8 @@
+use luminal::dyn_backend::BackendFactory;
 use luminal::prelude::tracing::warn;
 use luminal::prelude::*;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::{PyAny, PyCapsule, PyCapsuleMethods, PyDict};
 use std::collections::HashMap;
 
 use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, WeightData};
@@ -89,21 +90,55 @@ fn resolve_dim_sizes(
 }
 
 #[pyfunction]
-#[pyo3(signature = (pt2_path, weights_path, backend, weight_device_ptrs=None, options=None))]
+#[pyo3(signature = (pt2_path, weights_path, factory_capsule, weight_device_ptrs=None, options=None))]
 pub fn process_pt2(
     pt2_path: &str,
     weights_path: &str,
-    backend: &str,
+    factory_capsule: &Bound<'_, PyCapsule>,
     weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
     options: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<CompiledGraph> {
     let options = CompileOptions::from_py(options)?;
+    let factory: BackendFactory = {
+        let expected = ::luminal::dyn_backend::BACKEND_FACTORY_CAPSULE_NAME;
+        match factory_capsule.name()? {
+            Some(name) => {
+                // SAFETY: the &CStr is used immediately (for a byte-wise
+                // comparison) and never stored; the capsule is borrowed for
+                // the duration of this function, so the name pointer stays
+                // valid for as long as we read it here.
+                let actual = unsafe { name.as_cstr() };
+                if actual != expected {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "factory_capsule has wrong name: expected {:?}, got {:?}",
+                        expected, actual,
+                    )));
+                }
+            }
+            None => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "factory_capsule has no name; expected \"luminal.backend_factory\"",
+                ));
+            }
+        }
+        let wrapper_ptr = factory_capsule
+            .pointer_checked(Some(expected))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?
+            .as_ptr() as *const *const std::ffi::c_void;
+        let fn_ptr = unsafe { *wrapper_ptr };
+        if fn_ptr.is_null() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "factory_capsule inner function pointer is null",
+            ));
+        }
+        unsafe { std::mem::transmute(fn_ptr) }
+    };
     compile_pt2(
         pt2_path,
         weights_path,
-        backend,
         &options,
         weight_device_ptrs.unwrap_or_default(),
+        factory,
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
 }
@@ -111,14 +146,14 @@ pub fn process_pt2(
 fn compile_pt2(
     pt2_path: &str,
     weights_path: &str,
-    backend: &str,
     options: &CompileOptions,
     weight_device_ptrs: HashMap<String, (u64, usize)>,
+    factory: BackendFactory,
 ) -> anyhow::Result<CompiledGraph> {
     let (translation, mut weights) = translate_pt2(pt2_path, weights_path)?;
     weights.device_ptrs = weight_device_ptrs;
 
-    CompiledGraph::parse_graph(translation, weights, backend, options.search_iterations)
+    CompiledGraph::parse_graph(translation, weights, factory, options.search_iterations)
         .map_err(|e| anyhow::anyhow!(e))
 }
 

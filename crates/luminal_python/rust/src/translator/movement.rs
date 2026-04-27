@@ -6,6 +6,11 @@ use crate::pt2_util::*;
 
 use super::Translator;
 
+const SCATTER_INPUT_ARG: usize = 0;
+const SCATTER_DIM_ARG: usize = 1;
+const SCATTER_INDEX_ARG: usize = 2;
+const SCATTER_VALUE_ARG: usize = 3;
+
 impl<'a> Translator<'a> {
     pub(crate) fn translate_reshape(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
@@ -357,6 +362,29 @@ impl<'a> Translator<'a> {
         let indices = self.get_input_tensor(node, 2)?;
         let src = self.get_input_tensor(node, 3)?;
         Ok(a.scatter_elements(indices.cast(DType::Int), src, dim))
+    }
+
+    pub(crate) fn translate_scatter_value(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let dim = self.get_int_arg(node, SCATTER_DIM_ARG)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let value_arg = &node
+            .inputs
+            .get(SCATTER_VALUE_ARG)
+            .context("scatter.value missing value input")?
+            .arg;
+        let value = if let Some(b) = value_arg.as_bool() {
+            self.graph.constant(if b { 1 } else { 0 }).cast(a.dtype)
+        } else if let Some(i) = value_arg.as_int() {
+            self.graph.constant(i).cast(a.dtype)
+        } else if let Some(f) = value_arg.as_float() {
+            self.graph.constant_float(f as f32).cast(a.dtype)
+        } else {
+            bail!("scatter.value: unsupported scalar argument {:?}", value_arg);
+        }
+        .expand_rhs(indices.shape);
+        Ok(a.scatter_elements(indices.cast(DType::Int), value, dim))
     }
 
     pub(crate) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {

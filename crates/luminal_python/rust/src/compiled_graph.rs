@@ -1,17 +1,13 @@
-#[cfg(feature = "cuda")]
-use luminal::prelude::tracing::{trace, warn};
 use luminal::{
-    hlir::{NativeData, Output},
+    dyn_backend::{BackendCompileArgs, BackendFactory, DynBackend},
     prelude::*,
     shape::Expression,
     visualization::ToDot,
 };
 use pyo3::prelude::*;
 use std::collections::HashMap;
-#[cfg(feature = "cuda")]
-use std::collections::HashSet;
 
-use crate::{runtime::RuntimeBackend, typed_data::TypedData};
+use crate::typed_data::TypedData;
 
 /// Maps symbolic dimension parameter names (e.g. "seq_len") to luminal Expression variable chars.
 pub type DimParamMap = HashMap<String, char>;
@@ -59,7 +55,7 @@ pub struct WeightData {
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     pub graph: Graph,
-    pub runtime: RuntimeBackend,
+    pub runtime: Box<dyn DynBackend>,
     pub tensor_ids: HashMap<String, NodeIndex>,
     /// Cached label → NodeIndex map for O(1) lookups in set_weight_* methods.
     label_map: HashMap<String, NodeIndex>,
@@ -76,12 +72,12 @@ impl CompiledGraph {
     /// Compilation pipeline for PT2/FX graphs.
     ///
     /// Takes a `GraphTranslation` (produced by `translate_pt2`) and `WeightData`,
-    /// builds the backend, loads weights, and
+    /// builds the backend via the global registry, loads weights, and
     /// returns a ready-to-execute `CompiledGraph`.
     pub fn parse_graph(
         translation: GraphTranslation,
         weight_data: WeightData,
-        backend: &str,
+        factory: BackendFactory,
         search_iters: usize,
     ) -> Result<CompiledGraph, String> {
         let GraphTranslation {
@@ -95,37 +91,21 @@ impl CompiledGraph {
             dim_param_map,
         } = translation;
 
-        let rt = match backend {
-            #[cfg(feature = "cuda")]
-            "cuda" | "gpu" => {
-                CompiledGraph::build_cuda_backend(&mut graph, &weight_data, search_iters)?
-            }
-            "native" | "cpu" => {
-                CompiledGraph::build_native_backend(&mut graph, &weight_data, search_iters)?
-            }
-            _ => {
-                #[cfg(feature = "cuda")]
-                {
-                    return Err(format!(
-                        "Invalid backend '{}'. Must be 'native' or 'cuda'",
-                        backend
-                    ));
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    if backend == "cuda" {
-                        return Err(
-                            "CUDA backend requested, but this luminal extension was built without the `cuda` feature. Rebuild with `maturin develop --features cuda -r` or use backend='native'."
-                                .to_string(),
-                        );
-                    }
-                    return Err(format!(
-                        "Invalid backend '{}'. This build only supports 'native'. Rebuild with the `cuda` feature to enable 'cuda'.",
-                        backend
-                    ));
-                }
-            }
+        // Build compile args from WeightData (convert TypedData -> raw bytes + dtype)
+        let compile_args = BackendCompileArgs {
+            search_iters,
+            weights: weight_data
+                .weights
+                .iter()
+                .map(|(label, td)| (label.clone(), td.bytes.clone(), td.dtype))
+                .collect(),
+            tensor_sizes: weight_data.tensor_sizes,
+            device_ptrs: weight_data.device_ptrs,
         };
+
+        // Create backend via the factory directly
+        let rt =
+            luminal::dyn_backend::compile_backend_from_factory(factory, &mut graph, compile_args)?;
 
         // Resolve concrete output shapes from expressions
         let output_shapes: Vec<Vec<usize>> = output_shape_exprs
@@ -133,7 +113,7 @@ impl CompiledGraph {
             .map(|exprs| exprs.iter().map(|e| e.to_usize().unwrap_or(1)).collect())
             .collect();
 
-        let label_map = CompiledGraph::build_label_map(&graph);
+        let label_map = luminal::dyn_backend::build_label_map(&graph);
 
         Ok(CompiledGraph {
             graph,
@@ -148,160 +128,6 @@ impl CompiledGraph {
             input_shape_exprs,
             dim_param_map,
         })
-    }
-
-    /// Build a label → NodeIndex map for all Input nodes in the graph.
-    /// Used for efficient weight loading by label matching.
-    fn build_label_map(graph: &Graph) -> HashMap<String, NodeIndex> {
-        graph
-            .graph
-            .node_indices()
-            .filter_map(|node_id| {
-                (*graph.graph[node_id])
-                    .as_any()
-                    .downcast_ref::<luminal::hlir::Input>()
-                    .map(|input| (input.label.clone(), node_id))
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "cuda")]
-    fn build_cuda_backend(
-        graph: &mut Graph,
-        weight_data: &WeightData,
-        search_iters: usize,
-    ) -> Result<RuntimeBackend, String> {
-        let device_ptrs = &weight_data.device_ptrs;
-        use luminal_cuda_lite::cudarc::driver::CudaContext;
-        use luminal_cuda_lite::runtime::CudaRuntime;
-
-        let cuda_ctx = CudaContext::new(0).map_err(|e| format!("CUDA context init failed: {e}"))?;
-        let stream = cuda_ctx.default_stream();
-
-        graph.build_search_space::<CudaRuntime>();
-
-        let mut rt = CudaRuntime::initialize(stream);
-
-        // Build label → NodeIndex map for device pointer matching.
-        let label_map = CompiledGraph::build_label_map(graph);
-
-        // For weights with device pointers: use them directly (zero-copy).
-        // This avoids allocating ~N GB of dummy data during search.
-        // The pointers survive search because profiling mode skips buffer consumption,
-        // and graph-level .persist() ensures they survive post-search execution too.
-        let mut device_ptr_nodes: HashSet<NodeIndex> = HashSet::new();
-        let mut matched_count = 0usize;
-        let mut missed_labels: Vec<String> = Vec::new();
-        for (label, &(ptr, n_bytes)) in device_ptrs {
-            if let Some(&node_id) = label_map.get(label) {
-                unsafe { rt.set_device_ptr(node_id, ptr, n_bytes) };
-                device_ptr_nodes.insert(node_id);
-                matched_count += 1;
-            } else {
-                missed_labels.push(label.clone());
-            }
-        }
-        let total_device_bytes: usize = device_ptrs.values().map(|(_, n)| *n).sum();
-        trace!(
-            "[CUDA BUILD] Device pointers: {} matched, {} missed out of {} total ({:.3} GiB)",
-            matched_count,
-            missed_labels.len(),
-            device_ptrs.len(),
-            total_device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-        if !missed_labels.is_empty() {
-            warn!(
-                "[CUDA BUILD] {} device-ptr labels did not match any Input node (first 10): {:?}",
-                missed_labels.len(),
-                &missed_labels[..missed_labels.len().min(10)]
-            );
-            let available: Vec<&String> = label_map.keys().take(10).collect();
-            warn!(
-                "[CUDA BUILD] Available label_map keys (first 10): {:?}",
-                available
-            );
-        }
-
-        // Set dummy 1.0 data for remaining Input nodes (user inputs, constants without
-        // device pointers) for safe search profiling.
-        // IMPORTANT: Must use 1.0, NOT 0.0. Zero inputs cause NaN in many ops:
-        //   - fmod(0, 0) = NaN  (Mod)
-        //   - recip(0) = inf → weight * inf = NaN  (Div)
-        //   - log(0) = -inf  (Pow)
-        //   - chain ops with zero produce NaN  (Erf)
-        let mut dummy_total_elements = 0usize;
-        let mut dummy_count = 0usize;
-        for node_id in graph.graph.node_indices() {
-            if device_ptr_nodes.contains(&node_id) {
-                continue;
-            }
-            if let Some(input) = (*graph.graph[node_id])
-                .as_any()
-                .downcast_ref::<luminal::hlir::Input>()
-            {
-                if let Some(&n) = weight_data.tensor_sizes.get(&input.label) {
-                    if n > 0 {
-                        dummy_total_elements += n;
-                        dummy_count += 1;
-                        // Use dtype-aware dummy data: TypedData::ones produces correct
-                        // byte patterns for every dtype (f32, f16, bf16, i32, bool, f8, etc.).
-                        // Must use 1, not 0 — zero inputs cause NaN in many ops.
-                        rt.set_data(node_id, TypedData::ones(n, input.dtype).bytes);
-                    }
-                }
-            }
-        }
-        trace!(
-            "[CUDA BUILD] Dummy data: {} nodes, {} elements ({:.3} GiB as f32)",
-            dummy_count,
-            dummy_total_elements,
-            (dummy_total_elements * 4) as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        // Search (device-pointer weights are used directly; dummy data for the rest)
-        let mut rt = graph.search(rt, search_iters);
-
-        // Load real weight data for non-device-ptr weights (constants from PT2 archive, etc.)
-        let mut loaded_weight_bytes = 0usize;
-        let mut loaded_weight_count = 0usize;
-        for (label, data) in &weight_data.weights {
-            if !device_ptrs.contains_key(label) {
-                if let Some(&node_id) = label_map.get(label) {
-                    loaded_weight_bytes += data.n_bytes();
-                    loaded_weight_count += 1;
-                    rt.set_data(node_id, data.bytes.clone());
-                }
-            }
-        }
-        trace!(
-            "[CUDA BUILD] Post-search weight load: {} weights, {:.3} GiB",
-            loaded_weight_count,
-            loaded_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        Ok(RuntimeBackend::Cuda(Box::new(rt)))
-    }
-
-    fn build_native_backend(
-        graph: &mut Graph,
-        weight_data: &WeightData,
-        search_iters: usize,
-    ) -> Result<RuntimeBackend, String> {
-        graph.build_search_space::<NativeRuntime>();
-        let mut rt = graph.search(NativeRuntime::default(), search_iters);
-
-        // Load weight data after search, preserving native dtype.
-        // TypedData -> NativeData conversion (From<TypedData>) handles mapping to the
-        // correct NativeData variant (F32, F16, Bf16, Int, Bool).
-        let label_map = CompiledGraph::build_label_map(graph);
-        for (label, data) in &weight_data.weights {
-            if let Some(&node_id) = label_map.get(label) {
-                let native: NativeData = data.into();
-                rt.set_data(node_id, native);
-            }
-        }
-
-        Ok(RuntimeBackend::Native(rt))
     }
 }
 
@@ -349,10 +175,22 @@ impl CompiledGraph {
         self.tensor_ids.keys().cloned().collect()
     }
 
-    /// Get the name of the active backend (native or cuda).
+    /// Get the name of the active backend.
     #[getter]
-    fn backend(&self) -> &'static str {
+    fn backend(&self) -> &str {
         self.runtime.name()
+    }
+
+    /// The device type this backend operates on (e.g. "cpu", "cuda").
+    #[getter]
+    fn device_type(&self) -> &str {
+        self.runtime.device_type()
+    }
+
+    /// Whether the active backend supports device pointer operations (zero-copy GPU I/O).
+    #[getter]
+    fn supports_device_ptrs(&self) -> bool {
+        self.runtime.supports_device_ptrs()
     }
 
     /// Whether this graph has dynamic (symbolic) dimensions.
@@ -445,91 +283,83 @@ impl CompiledGraph {
         })?;
         let raw_bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
         let typed = TypedData::from_pytorch_bytes(raw_bytes, dtype_code);
-        self.runtime.set_data(*node_id, typed);
+        self.runtime
+            .set_data_bytes(*node_id, typed.bytes, typed.dtype);
         Ok(())
     }
 
-    /// Set input from a CUDA device pointer. Zero-copy on device.
-    /// The pointer must be a valid CUDA device allocation with at least n_bytes bytes.
-    #[cfg(feature = "cuda")]
+    /// Set input from a device pointer. Zero-copy on device.
+    /// The pointer must be a valid device allocation with at least n_bytes bytes.
+    /// Requires a GPU backend (e.g. CUDA).
     fn set_input_device_ptr(
         &mut self,
         name: &str,
         device_ptr: u64,
         n_bytes: usize,
     ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_input_device_ptr requires a GPU backend",
+            ));
+        }
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
-        match &mut self.runtime {
-            RuntimeBackend::Cuda(rt) => unsafe { rt.set_device_ptr(*node_id, device_ptr, n_bytes) },
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "set_input_device_ptr requires CUDA backend",
-                ));
-            }
-        }
+        unsafe { self.runtime.set_device_ptr(*node_id, device_ptr, n_bytes) };
         Ok(())
     }
 
-    /// For PT2 weights (e.g. "fc1.weight"). Persistence is handled at graph level via .persist().
-    #[cfg(feature = "cuda")]
+    /// Set a weight from a device pointer (e.g. "fc1.weight"). Zero-copy on device.
+    /// Requires a GPU backend.
     fn set_weight_device_ptr(
         &mut self,
         label: &str,
         device_ptr: u64,
         n_bytes: usize,
     ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_weight_device_ptr requires a GPU backend",
+            ));
+        }
         let &node_id = self.label_map.get(label).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("No Input node with label: {}", label))
         })?;
-        match &mut self.runtime {
-            RuntimeBackend::Cuda(rt) => {
-                unsafe { rt.set_device_ptr(node_id, device_ptr, n_bytes) };
-            }
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "set_weight_device_ptr requires CUDA backend",
-                ));
-            }
-        }
+        unsafe { self.runtime.set_device_ptr(node_id, device_ptr, n_bytes) };
         Ok(())
     }
 
     /// Register an external device pointer for an output tensor (zero-copy output).
     /// Call before run() — the runtime will write kernel results directly into this buffer.
     /// For aliased outputs (in-place ops), falls back to DtoD copy; check output_is_zero_copy() after run().
-    #[cfg(feature = "cuda")]
+    /// Requires a GPU backend.
     fn set_output_device_ptr(
         &mut self,
         name: &str,
         device_ptr: u64,
         n_bytes: usize,
     ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_output_device_ptr requires a GPU backend",
+            ));
+        }
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
             ))
         })?;
-
-        match &mut self.runtime {
-            RuntimeBackend::Cuda(rt) => {
-                unsafe { rt.set_output_device_ptr(*node_id, device_ptr, n_bytes) };
-            }
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "set_output_device_ptr requires CUDA backend",
-                ));
-            }
-        }
-
+        unsafe {
+            self.runtime
+                .set_output_device_ptr(*node_id, device_ptr, n_bytes)
+        };
         Ok(())
     }
 
     /// Check whether an output tensor was zero-copied (written directly to the registered pointer).
-    /// Returns false for aliased outputs that need a fallback DtoD copy. Must be called after run().
-    #[cfg(feature = "cuda")]
+    /// Returns false for aliased outputs that need a fallback DtoD copy, or if no GPU backend.
+    /// Must be called after run().
     fn output_is_zero_copy(&self, name: &str) -> PyResult<bool> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -537,11 +367,7 @@ impl CompiledGraph {
                 name
             ))
         })?;
-
-        match &self.runtime {
-            RuntimeBackend::Cuda(rt) => Ok(rt.output_is_zero_copy(*node_id)),
-            _ => Ok(false),
-        }
+        Ok(self.runtime.output_is_zero_copy(*node_id))
     }
 
     /// Set a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
@@ -559,7 +385,8 @@ impl CompiledGraph {
         })?;
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
         let typed = TypedData::from_pytorch_bytes(bytes, dtype_code);
-        self.runtime.set_data(node_id, typed);
+        self.runtime
+            .set_data_bytes(node_id, typed.bytes, typed.dtype);
         Ok(())
     }
 
@@ -585,9 +412,6 @@ impl CompiledGraph {
     }
 
     /// Get output tensor data by name as f32 (copies to host).
-    /// For native backend: handles any NativeData variant by converting to f32.
-    /// The native runtime may produce NativeData::Int or NativeData::Bool for some ops
-    /// (e.g., Cast chains), so we can't assume NativeData::F32.
     fn get_output(&self, name: &str) -> PyResult<Vec<f32>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -595,57 +419,50 @@ impl CompiledGraph {
                 name
             ))
         })?;
-        match &self.runtime {
-            RuntimeBackend::Native(rt) => {
-                let id = *node_id;
-                let output_id = rt
-                    .graph
-                    .node_indices()
-                    .find(|n| {
-                        if let Some(out) = (**rt.graph[*n]).as_any().downcast_ref::<Output>() {
-                            out.node == id.index()
-                        } else {
-                            false
-                        }
-                    })
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "No output node found for tensor: {}",
-                            name
-                        ))
-                    })?;
-                let data = rt.buffers.get(&output_id).ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "No buffer data for output tensor: {}",
-                        name
-                    ))
-                })?;
-                // Convert any NativeData variant to f32
-                Ok((0..data.len()).map(|i| data.f32(i)).collect())
-            }
-            #[cfg(feature = "cuda")]
-            RuntimeBackend::Cuda(rt) => Ok(rt.get_f32(*node_id)),
-        }
+        Ok(self.runtime.get_output_f32(*node_id))
     }
 
-    /// Copy output tensor data directly to a CUDA device pointer (DtoD).
-    /// Avoids the DtoH + HtoD round-trip of get_output() + .to(device).
-    #[cfg(feature = "cuda")]
-    fn copy_output_to_device_ptr(&self, name: &str, dest_ptr: u64, n_bytes: usize) -> PyResult<()> {
+    /// Get output tensor data by name as i32 (copies to host).
+    fn get_output_i32(&self, name: &str) -> PyResult<Vec<i32>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
             ))
         })?;
-        match &self.runtime {
-            RuntimeBackend::Cuda(rt) => {
-                unsafe { rt.copy_output_to_device_ptr(*node_id, dest_ptr, n_bytes) };
-                Ok(())
-            }
-            _ => Err(pyo3::exceptions::PyValueError::new_err(
-                "copy_output_to_device_ptr requires CUDA backend",
-            )),
+        Ok(self.runtime.get_output_i32(*node_id))
+    }
+
+    /// Get output tensor data by name as bool (copies to host).
+    fn get_output_bool(&self, name: &str) -> PyResult<Vec<bool>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_bool(*node_id))
+    }
+
+    /// Copy output tensor data directly to a device pointer (DtoD).
+    /// Avoids the DtoH + HtoD round-trip of get_output() + .to(device).
+    /// Requires a GPU backend.
+    fn copy_output_to_device_ptr(&self, name: &str, dest_ptr: u64, n_bytes: usize) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "copy_output_to_device_ptr requires a GPU backend",
+            ));
         }
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        unsafe {
+            self.runtime
+                .copy_output_to_device_ptr(*node_id, dest_ptr, n_bytes)
+        };
+        Ok(())
     }
 }

@@ -119,6 +119,90 @@ pub fn binary_sort(name: &str) -> SortDef {
     )
 }
 
+/// Generate egglog rewrite rules that union a small rolled `body=1, trips=N`
+/// single-binary-op loop with its fully-unrolled equivalent in the same
+/// eclass. Both representations coexist; the cost-based extractor picks
+/// whichever one downstream patterns prefer — the unrolled form when fusions
+/// (e.g. GLUMoE GemmaGELU, KernelExp's `direct-exp-fusion`) match through
+/// the flat chain, the rolled form otherwise. Without these unions, rolling
+/// a tiny chain blocks the fusion entirely and the extracted graph is
+/// strictly worse than not rolling.
+///
+/// **Register in both `EgglogOp::early_rewrites()` AND `rewrites()`.** The
+/// driver feeds `early_rewrites` into the early-stage program only and
+/// `rewrites` into the full-stage program only; we need the unrolled chain
+/// visible in both stages so early-stage fusion patterns (GLUMoE) AND
+/// full-stage kernel rewrites (`direct-exp-fusion`) can both match it.
+///
+/// Generates 2 rules per iter count (state at body input position 0 vs 1)
+/// for every `n_iters` in `2..=max_trips`. Larger trips stay rolled-only —
+/// real transformer-block rolls are body ≫ 1 anyway, and carrying both
+/// forms beyond a small N adds search-time cost without an upside.
+///
+/// Each rule matches the rolled shape `LoopEnd(body)` where `body` is the
+/// binary op consuming `LoopStart(initial)` and `LoopInput(s0..s_{N-1})`,
+/// and unions `LoopEnd` with the chain
+///   `u0 = <kind>(initial, s0); u1 = <kind>(u0, s1); … u_{N-1}`.
+/// (or symmetric for state at position 1.)
+pub fn binary_op_unroll_rules(op_kind: &str, max_trips: usize) -> Vec<Rule> {
+    let mut rules = Vec::with_capacity((max_trips.saturating_sub(1)) * 2);
+    for n_iters in 2..=max_trips {
+        for state_pos in 0..2 {
+            rules.push(binary_op_unroll_rule(op_kind, n_iters, state_pos));
+        }
+    }
+    rules
+}
+
+fn binary_op_unroll_rule(op_kind: &str, n_iters: usize, state_pos: usize) -> Rule {
+    // Swap (state, per_iter) → (input0, input1) by `state_pos`. Both the
+    // body match pattern and the unrolled chain bodies follow this mapping
+    // so a/b stride positions stay aligned.
+    debug_assert!(state_pos < 2);
+    let order = |state: &str, per_iter: &str| -> String {
+        if state_pos == 0 {
+            format!("(ICons {state} (ICons {per_iter} (INil)))")
+        } else {
+            format!("(ICons {per_iter} (ICons {state} (INil)))")
+        }
+    };
+    let li_sources = (0..n_iters).rev().fold(String::from("(INil)"), |acc, i| {
+        format!("(ICons ?s{i} {acc})")
+    });
+    let chain = (0..n_iters)
+        .map(|i| {
+            let prev = if i == 0 {
+                "?initial".to_string()
+            } else {
+                format!("?u{}", i - 1)
+            };
+            format!(
+                "                (let ?u{i} (Op ({op_kind} ?sh ?as ?bs ?os) {}))",
+                order(&prev, &format!("?s{i}"))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Rule::raw(format!(
+        "(rule
+            (
+                (= ?ls (LoopStart ?initial ?loop_id ?slot_idx (MNum {n_iters}) ?dt))
+                (= ?li (Op (LoopInput ?loop_id ?stream ?dt) {li_sources}))
+                (= ?body (Op ({op_kind} ?sh ?as ?bs ?os) {body_pat}))
+                (= ?le (LoopEnd ?body ?loop_id ?slot_idx ?dt))
+            )
+            (
+{chain}
+                (union ?le ?u{last})
+            )
+            :ruleset expr
+            :name \"unroll {op_kind} body trips={n_iters} state={state_pos}\"
+        )",
+        body_pat = order("?ls", "?li"),
+        last = n_iters - 1,
+    ))
+}
+
 /// Reduce op kind: (shape: EList, iters: Expression, strides: EList, iter_stride: Expression, out_strides: EList), IList: [inp]
 pub fn reduce_sort(name: &str) -> SortDef {
     sort(
@@ -138,6 +222,12 @@ pub type HLIROps = (
     Input,
     Output,
     CustomOpKind,
+    LoopStart,
+    LoopEnd,
+    LoopInput,
+    LoopInputStatic,
+    LoopOutput,
+    LoopOutputSelect,
     Constant,
     Cast,
     Iota,
@@ -333,6 +423,607 @@ impl HLIROp for CustomOpKind {
 impl NativeOp for CustomOpKind {
     fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
         unimplemented!()
+    }
+}
+
+// --- Loop ops ---------------------------------------------------------------
+//
+// Automatic loop-rolling replaces N unrolled copies of a repeating body with
+// a single body plus structural marker ops. All four ops in one loop share a
+// `loop_id`. `iters` lives on `LoopStart` only; every other op references the
+// same loop via `loop_id`.
+//
+//   LoopStart   — one per loop-carried slot; takes the initial value, yields
+//                 the current iteration's value into the body.
+//   LoopEnd     — mirror of LoopStart; takes the body's final value for the
+//                 slot, yields the post-loop value.
+//   LoopInput   — OpKind (variable-arity). Takes N input tensors (one per
+//                 iteration) and yields the current iteration's tensor.
+//   LoopOutput  — OpKind (variable-arity, sink). Takes the body's value + N
+//                 target tensors; writes body[i] -> target[i] each iteration.
+//
+// Execution semantics and iteration driving live in the runtime compilation
+// step; these ops just carry the structure through HLIR/egglog/LLIR.
+
+#[derive(Default, Debug, Clone)]
+pub struct LoopStart {
+    pub loop_id: usize,
+    pub slot_idx: usize,
+    pub iters: Expression,
+    pub dtype: DType,
+}
+
+impl Display for LoopStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopStart(id={}, slot={}, iters={:?}, {})",
+            self.loop_id, self.slot_idx, self.iters, self.dtype
+        )
+    }
+}
+
+impl EgglogOp for LoopStart {
+    fn sort(&self) -> SortDef {
+        sort(
+            IR,
+            "LoopStart",
+            &[
+                ("inp", IR),
+                ("loop_id", I64),
+                ("slot_idx", I64),
+                ("iters", EXPRESSION),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        _input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let loop_id = egraph.enodes[kind_children[1]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let slot_idx = egraph.enodes[kind_children[2]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let iters = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+        let dtype = extract_dtype(egraph, kind_children[4]);
+        (
+            LLIROp::new::<LoopStart>(Box::new(Self {
+                loop_id,
+                slot_idx,
+                iters,
+                dtype,
+            })),
+            vec![kind_children[0]],
+        )
+    }
+}
+
+impl HLIROp for LoopStart {
+    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(LoopStart {} {} {} {} ({:?}))",
+            inp[0].1,
+            self.loop_id,
+            self.slot_idx,
+            self.iters.to_egglog(),
+            self.dtype,
+        )
+    }
+}
+
+impl NativeOp for LoopStart {
+    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+        unimplemented!("LoopStart is driven by the runtime loop compiler")
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct LoopEnd {
+    pub loop_id: usize,
+    pub slot_idx: usize,
+    pub dtype: DType,
+}
+
+impl Display for LoopEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopEnd(id={}, slot={}, {})",
+            self.loop_id, self.slot_idx, self.dtype
+        )
+    }
+}
+
+impl EgglogOp for LoopEnd {
+    fn sort(&self) -> SortDef {
+        sort(
+            IR,
+            "LoopEnd",
+            &[
+                ("inp", IR),
+                ("loop_id", I64),
+                ("slot_idx", I64),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        _input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let loop_id = egraph.enodes[kind_children[1]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let slot_idx = egraph.enodes[kind_children[2]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let dtype = extract_dtype(egraph, kind_children[3]);
+        (
+            LLIROp::new::<LoopEnd>(Box::new(Self {
+                loop_id,
+                slot_idx,
+                dtype,
+            })),
+            vec![kind_children[0]],
+        )
+    }
+}
+
+impl HLIROp for LoopEnd {
+    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(LoopEnd {} {} {} ({:?}))",
+            inp[0].1, self.loop_id, self.slot_idx, self.dtype,
+        )
+    }
+}
+
+impl NativeOp for LoopEnd {
+    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+        unimplemented!("LoopEnd is driven by the runtime loop compiler")
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct LoopInput {
+    pub loop_id: usize,
+    pub stream_id: usize,
+    pub dtype: DType,
+}
+
+impl Display for LoopInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopInput(id={}, stream={}, {})",
+            self.loop_id, self.stream_id, self.dtype
+        )
+    }
+}
+
+impl EgglogOp for LoopInput {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "LoopInput",
+            &[("loop_id", I64), ("stream_id", I64), ("dtype", DTYPE)],
+        )
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    }
+
+    fn early_rewrites(&self) -> Vec<Rule> {
+        // Declare the `identical_inputs` relation and the three-way unification
+        // chain between `LoopInput`, `LoopInputStatic`, and an inlined source.
+        // Running in Stage 1 alongside fusion rules (e.g. GLUMoE) so that
+        // fusion patterns that expect raw op kinds at boundary positions can
+        // match via the unioned eclass.
+        vec![Rule::raw(
+            r#"
+            (relation identical_inputs (IList))
+
+            ; All four rules live in the `expr` ruleset, which the early/full
+            ; schedules saturate each iteration. Default-ruleset scheduling
+            ; only runs each rule once per outer step, which is not enough to
+            ; propagate `identical_inputs` through an N-element IList.
+
+            ; Base: single-element list is trivially identical.
+            (rule ((= ?l (ICons ?x (INil))))
+                  ((identical_inputs ?l))
+                  :ruleset expr
+                  :name "identical_inputs base")
+
+            ; Inductive: head equals next-head, and the tail starting at next-head is identical.
+            (rule ((= ?l (ICons ?x (ICons ?x ?tail)))
+                   (identical_inputs (ICons ?x ?tail)))
+                  ((identical_inputs ?l))
+                  :ruleset expr
+                  :name "identical_inputs ind")
+
+            ; LoopInput with an identical IList is equivalent to LoopInputStatic over a single copy.
+            (rule ((= ?e (Op (LoopInput ?id ?stream ?dt) (ICons ?x ?cont)))
+                   (identical_inputs (ICons ?x ?cont)))
+                  ((let ?static (Op (LoopInputStatic ?id ?stream ?dt) (ICons ?x (INil))))
+                   (union ?e ?static))
+                  :ruleset expr
+                  :name "LoopInput to LoopInputStatic")
+
+            ; LoopInputStatic is equivalent to its single inner value — collapses the boundary
+            ; wrapper for pattern-matching and extraction purposes.
+            (rule ((= ?e (Op (LoopInputStatic ?id ?stream ?dt) (ICons ?x (INil)))))
+                  ((union ?e ?x))
+                  :ruleset expr
+                  :name "LoopInputStatic inline")
+            "#,
+        )]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let loop_id = egraph.enodes[kind_children[0]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let stream_id = egraph.enodes[kind_children[1]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let dtype = extract_dtype(egraph, kind_children[2]);
+        (
+            LLIROp::new::<LoopInput>(Box::new(Self {
+                loop_id,
+                stream_id,
+                dtype,
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl HLIROp for LoopInput {
+    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(Op (LoopInput {} {} ({:?})) {})",
+            self.loop_id,
+            self.stream_id,
+            self.dtype,
+            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+        )
+    }
+}
+
+impl NativeOp for LoopInput {
+    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+        unimplemented!("LoopInput is driven by the runtime loop compiler")
+    }
+}
+
+/// Iteration-independent boundary input: the same value flows into every
+/// iteration of a loop. Structurally a `LoopInput` whose per-iteration
+/// sources have all been proven equal (via the `identical_inputs` egglog
+/// relation) collapses into `LoopInputStatic` with a single-element IList,
+/// and that in turn collapses via a further rewrite into just its inner
+/// value — so egglog search can explore any of the three representations.
+/// At unroll time `LoopInputStatic` lowers to a plain edge: every cloned
+/// body node in every iteration references the single shared source.
+#[derive(Default, Debug, Clone)]
+pub struct LoopInputStatic {
+    pub loop_id: usize,
+    pub stream_id: usize,
+    pub dtype: DType,
+}
+
+impl Display for LoopInputStatic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopInputStatic(id={}, stream={}, {})",
+            self.loop_id, self.stream_id, self.dtype
+        )
+    }
+}
+
+impl EgglogOp for LoopInputStatic {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "LoopInputStatic",
+            &[("loop_id", I64), ("stream_id", I64), ("dtype", DTYPE)],
+        )
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let loop_id = egraph.enodes[kind_children[0]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let stream_id = egraph.enodes[kind_children[1]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let dtype = extract_dtype(egraph, kind_children[2]);
+        (
+            LLIROp::new::<LoopInputStatic>(Box::new(Self {
+                loop_id,
+                stream_id,
+                dtype,
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl HLIROp for LoopInputStatic {
+    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(Op (LoopInputStatic {} {} ({:?})) {})",
+            self.loop_id,
+            self.stream_id,
+            self.dtype,
+            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+        )
+    }
+}
+
+impl NativeOp for LoopInputStatic {
+    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+        unimplemented!("LoopInputStatic is driven by the runtime loop compiler")
+    }
+}
+
+/// Marker for the per-iter output stream of a rolled loop. Mirrors `LoopInput`
+/// in reverse: a single body producer (one incoming edge) feeds the marker, and
+/// `LoopOutputSelect(i)` nodes hang off it to pluck iteration `i`'s value for
+/// downstream consumers (any post-region op — `Output` HLIR, downstream
+/// computation, etc.).
+#[derive(Default, Debug, Clone)]
+pub struct LoopOutput {
+    pub loop_id: usize,
+    pub stream_id: usize,
+    pub dtype: DType,
+}
+
+impl Display for LoopOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopOutput(id={}, stream={}, {})",
+            self.loop_id, self.stream_id, self.dtype
+        )
+    }
+}
+
+impl EgglogOp for LoopOutput {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "LoopOutput",
+            &[("loop_id", I64), ("stream_id", I64), ("dtype", DTYPE)],
+        )
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let loop_id = egraph.enodes[kind_children[0]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let stream_id = egraph.enodes[kind_children[1]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let dtype = extract_dtype(egraph, kind_children[2]);
+        (
+            LLIROp::new::<LoopOutput>(Box::new(Self {
+                loop_id,
+                stream_id,
+                dtype,
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl HLIROp for LoopOutput {
+    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(Op (LoopOutput {} {} ({:?})) {})",
+            self.loop_id,
+            self.stream_id,
+            self.dtype,
+            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+        )
+    }
+}
+
+impl NativeOp for LoopOutput {
+    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+        unimplemented!("LoopOutput is driven by the runtime loop compiler")
+    }
+}
+
+/// Per-iteration extractor for a `LoopOutput` stream. Mirrors a per-iter
+/// `LoopInput` source slot in reverse: every cross-region edge that originally
+/// went from iteration `i`'s body producer to a post-region consumer is
+/// rewired through `LoopOutputSelect { iter: i, ... }`. At unroll time
+/// `Select(i)` lowers to the iter-`i` body clone's producer; at collapse time
+/// every Select lowers to iter-0's producer.
+#[derive(Default, Debug, Clone)]
+pub struct LoopOutputSelect {
+    pub loop_id: usize,
+    pub stream_id: usize,
+    pub iter: usize,
+    pub dtype: DType,
+}
+
+impl Display for LoopOutputSelect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "LoopOutputSelect(id={}, stream={}, iter={}, {})",
+            self.loop_id, self.stream_id, self.iter, self.dtype
+        )
+    }
+}
+
+impl EgglogOp for LoopOutputSelect {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "LoopOutputSelect",
+            &[
+                ("loop_id", I64),
+                ("stream_id", I64),
+                ("iter", I64),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let loop_id = egraph.enodes[kind_children[0]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let stream_id = egraph.enodes[kind_children[1]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let iter = egraph.enodes[kind_children[2]]
+            .0
+            .replace("\"", "")
+            .parse::<usize>()
+            .unwrap();
+        let dtype = extract_dtype(egraph, kind_children[3]);
+        (
+            LLIROp::new::<LoopOutputSelect>(Box::new(Self {
+                loop_id,
+                stream_id,
+                iter,
+                dtype,
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl HLIROp for LoopOutputSelect {
+    fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(Op (LoopOutputSelect {} {} {} ({:?})) {})",
+            self.loop_id,
+            self.stream_id,
+            self.iter,
+            self.dtype,
+            list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
+        )
+    }
+}
+
+impl NativeOp for LoopOutputSelect {
+    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+        unimplemented!("LoopOutputSelect is driven by the runtime loop compiler")
     }
 }
 
@@ -552,28 +1243,6 @@ impl NativeOp for Cast {
             }),
             other => unimplemented!("Cast to {other} is not yet supported in native interpreter"),
         }
-    }
-}
-
-/// Graph break for chunking search graphs
-#[derive(Clone, PartialEq, Default)]
-pub struct GraphBreak {
-    pub input_shape: ShapeTracker,
-}
-impl Debug for GraphBreak {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GraphBreak")
-    }
-}
-impl Display for GraphBreak {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GraphBreak")
-    }
-}
-
-impl HLIROp for GraphBreak {
-    fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
-        panic!("Cannot turn GraphBreak into egglog op!");
     }
 }
 
@@ -1009,7 +1678,12 @@ impl EgglogOp for Add {
         2
     }
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+        let mut r = vec![dtype_propagation_op(&self.sort())];
+        r.extend(self.early_rewrites());
+        r
+    }
+    fn early_rewrites(&self) -> Vec<Rule> {
+        binary_op_unroll_rules("Add", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -1094,7 +1768,12 @@ impl EgglogOp for Mul {
         2
     }
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+        let mut r = vec![dtype_propagation_op(&self.sort())];
+        r.extend(self.early_rewrites());
+        r
+    }
+    fn early_rewrites(&self) -> Vec<Rule> {
+        binary_op_unroll_rules("Mul", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -1179,7 +1858,12 @@ impl EgglogOp for Mod {
         2
     }
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+        let mut r = vec![dtype_propagation_op(&self.sort())];
+        r.extend(self.early_rewrites());
+        r
+    }
+    fn early_rewrites(&self) -> Vec<Rule> {
+        binary_op_unroll_rules("Mod", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -1264,8 +1948,13 @@ impl EgglogOp for LessThan {
         2
     }
     fn rewrites(&self) -> Vec<Rule> {
-        // Comparison operations always output Bool
-        vec![dtype_fixed_op(&self.sort(), &SORTS.bool_dt)]
+        // Comparisons output Bool, not the input dtype.
+        let mut r = vec![dtype_fixed_op(&self.sort(), &SORTS.bool_dt)];
+        r.extend(self.early_rewrites());
+        r
+    }
+    fn early_rewrites(&self) -> Vec<Rule> {
+        binary_op_unroll_rules("LessThan", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -2198,6 +2887,10 @@ impl Runtime for NativeRuntime {
         _: usize,
     ) -> (Self::ProfileMetric, String) {
         (0, "0 ms".to_string())
+    }
+
+    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
+        metrics.iter().copied().sum()
     }
 
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {

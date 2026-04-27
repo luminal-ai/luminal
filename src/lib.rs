@@ -1,4 +1,5 @@
 pub mod dtype;
+pub mod dyn_backend;
 pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;

@@ -301,9 +301,8 @@ fn test_scatter_kv_cache_roundtrip() {
 }
 
 /// Test scatter with TWO cache buffers and dual outputs (closer to llama K+V pattern).
-/// Also verifies graph_break interaction.
 #[test]
-fn test_scatter_dual_cache_with_graph_break() {
+fn test_scatter_dual_cache() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
     let stream = ctx.default_stream();

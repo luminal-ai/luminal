@@ -28,7 +28,7 @@ uv run maturin develop --manifest-path rust/Cargo.toml --features cuda -r
 
 echo ""
 echo "--- 2a: CUDA ---"
-RUST_BACKTRACE=1 LUMINAL_BACKEND=cuda uv run pytest $CUDA_TESTS -m "not slow" -v
+RUST_BACKTRACE=1 LUMINAL_TEST_DEVICE=cuda uv run pytest $CUDA_TESTS -m "not slow" -v
 
 echo ""
 echo "=========================================="

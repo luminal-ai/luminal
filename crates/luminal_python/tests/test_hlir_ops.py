@@ -216,6 +216,7 @@ from test_models import (
     WhereWithConstantModel,
     # Xor model
     XorTestModel,
+    ArgsortStableDuplicatesModel,
     # Conv models
     Conv1dNoPadModel,
     Conv1dSamePadModel,
@@ -232,6 +233,7 @@ from test_models import (
     GroupedConv2dModel,
     GroupedConv2dGroups3Model,
     MambaConvBlockModel,
+    TinyMoERoutingModel,
 )
 
 import luminal.pt2 as luminal_pt2
@@ -2026,6 +2028,54 @@ def test_split(device: torch.device):
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand(3, 4, device=device)
     assert torch.allclose(model_compiled(x), model(x))
+
+
+# ========== Argsort / MoE Routing Tests ==========
+
+
+def test_argsort_stable_duplicates(device: torch.device):
+    """Duplicate values should follow stable lower-index-first tie-breaking."""
+    model: torch.nn.Module = ArgsortStableDuplicatesModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor(
+        [[2.0, 1.0, 1.0, 3.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert output.dtype == torch.int32
+    assert torch.equal(output, original.to(torch.int32))
+
+
+def test_tiny_moe_routing(device: torch.device):
+    """Focused proof for build MoE routing support."""
+    model: torch.nn.Module = TinyMoERoutingModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    scores = torch.tensor(
+        [[0.1, 0.9, 0.4, 0.7], [0.6, -0.8, 0.95, 0.2]],
+        dtype=torch.float32,
+        device=device,
+    )
+
+    expected = model(scores)
+    output = model_compiled(scores)
+
+    expected_dtypes = (
+        torch.int32,
+        torch.float32,
+        torch.int32,
+        torch.bool,
+        torch.int32,
+        torch.float32,
+    )
+    for actual, eager, expected_dtype in zip(output, expected, expected_dtypes):
+        assert actual.dtype == expected_dtype
+        eager = eager.to(actual.dtype)
+        if actual.dtype.is_floating_point:
+            assert torch.allclose(actual, eager)
+        else:
+            assert torch.equal(actual, eager)
 
 
 # ========== PT2 TopK Node Tests ==========

@@ -10,7 +10,7 @@ use itertools::Itertools;
 use luminal::{
     egglog_utils::{
         api::{Rule, SortDef, sort},
-        base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
+        base::{DTYPE, ELIST, EXPRESSION, OP_KIND, STRING},
         extract_dtype, extract_expr, extract_expr_list,
     },
     op::*,
@@ -25,6 +25,7 @@ pub type Ops = (
     KernelSoftmax,
     KernelExp,
     KernelSigmoid,
+    KernelFusedElementwise,
 );
 
 #[derive(Default, Debug, Clone)]
@@ -1764,5 +1765,285 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "Sigmoid"
+    }
+}
+
+/// A unary math function that can appear inside a fused elementwise kernel.
+/// Each variant has a stable string name (used both as the egglog token in
+/// the rule-generated ops string and as the `kernel_name()` of the source
+/// unary kernel op).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnaryFn {
+    Sin,
+    Sqrt,
+    Exp2,
+    Log2,
+    Recip,
+}
+
+impl UnaryFn {
+    pub fn name(self) -> &'static str {
+        match self {
+            UnaryFn::Sin => "Sin",
+            UnaryFn::Sqrt => "Sqrt",
+            UnaryFn::Exp2 => "Exp2",
+            UnaryFn::Log2 => "Log2",
+            UnaryFn::Recip => "Recip",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "Sin" => UnaryFn::Sin,
+            "Sqrt" => UnaryFn::Sqrt,
+            "Exp2" => UnaryFn::Exp2,
+            "Log2" => UnaryFn::Log2,
+            "Recip" => UnaryFn::Recip,
+            _ => panic!("invalid UnaryFn name: {name}"),
+        }
+    }
+}
+
+/// An LLIR-only op created by fusing a chain of unary elementwise kernels.
+/// Only fires when every op in the chain shares the same stride pattern,
+/// so reads and writes use a single `strides` field.
+///
+/// The `ops` sequence is carried as a comma-separated egglog `String`
+/// (e.g. `"Sin,Sqrt,Exp2"`) — it's pure codegen metadata that egglog never
+/// reasons about, and `String` is a primitive sort, so this avoids
+/// introducing a new datatype/sort just to carry the list.
+#[derive(Default, Debug, Clone)]
+pub struct KernelFusedElementwise {
+    shape: Vec<Expression>,
+    strides: Vec<Expression>,
+    ops: Vec<UnaryFn>,
+    dtype: DType,
+}
+
+impl KernelFusedElementwise {
+    pub fn ops(&self) -> &[UnaryFn] {
+        &self.ops
+    }
+}
+
+impl EgglogOp for KernelFusedElementwise {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelFusedElementwise",
+            &[
+                ("shape", ELIST),
+                ("strides", ELIST),
+                ("ops", STRING),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        1
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        let unaries = [
+            ("KernelSin", UnaryFn::Sin),
+            ("KernelSqrt", UnaryFn::Sqrt),
+            ("KernelExp2", UnaryFn::Exp2),
+            ("KernelLog2", UnaryFn::Log2),
+            ("KernelRecip", UnaryFn::Recip),
+        ];
+        let mut rules = Vec::with_capacity(unaries.len() * unaries.len() + unaries.len());
+
+        // Pair fusion: two adjacent pure-elementwise unaries -> Fused[a, b].
+        for (a_name, a_fn) in unaries {
+            for (b_name, b_fn) in unaries {
+                let (a_str, b_str) = (a_fn.name(), b_fn.name());
+                rules.push(Rule::raw(format!(
+                    "(rule
+                        (
+                            (= ?a (Op ({a_name} ?shape ?strides ?strides ?dt) (ICons ?inp (INil))))
+                            (= ?b (Op ({b_name} ?shape ?strides ?strides ?dt) (ICons ?a (INil))))
+                        )
+                        (
+                            (let ?fused (Op (KernelFusedElementwise ?shape ?strides
+                                \"{a_str},{b_str}\" ?dt)
+                                (ICons ?inp (INil))))
+                            (union ?b ?fused)
+                        )
+                        :name \"fuse-{a_name}-{b_name}\"
+                    )"
+                )));
+            }
+        }
+
+        // Chain extend: Fused[ops] -> unary -> Fused[ops + \",<new>\"]. One
+        // rule per outer unary. `+` is the builtin variadic string concat,
+        // so this is O(1) per firing and handles chains of any length
+        // without recursion.
+        for (b_name, b_fn) in unaries {
+            let b_str = b_fn.name();
+            rules.push(Rule::raw(format!(
+                "(rule
+                    (
+                        (= ?fused (Op (KernelFusedElementwise ?shape ?strides ?ops ?dt)
+                            (ICons ?inp (INil))))
+                        (= ?next (Op ({b_name} ?shape ?strides ?strides ?dt)
+                            (ICons ?fused (INil))))
+                    )
+                    (
+                        (let ?new_ops (+ ?ops \",{b_str}\"))
+                        (let ?new_fused (Op (KernelFusedElementwise ?shape ?strides ?new_ops ?dt)
+                            (ICons ?inp (INil))))
+                        (union ?next ?new_fused)
+                    )
+                    :name \"extend-Fused-{b_name}\"
+                )"
+            )));
+        }
+
+        rules
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        // The `ops` field is a String enode; its label is the quoted
+        // literal (e.g. `"Sin,Sqrt"`), so strip the quotes and split.
+        let ops_str = egraph.enodes[kind_children[2]].0.replace('"', "");
+        let ops = if ops_str.is_empty() {
+            Vec::new()
+        } else {
+            ops_str.split(',').map(UnaryFn::from_name).collect()
+        };
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                ops,
+                dtype: extract_dtype(egraph, kind_children[3]),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelFusedElementwise {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.strides.iter().flat_map(|e| e.dyn_vars()))
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n_elements = self
+            .shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_kernel();
+        let idx = flatten_strides(&self.shape, &self.strides).to_kernel();
+        let ops_body = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                UnaryFn::Sin => "val = sinf(val);",
+                UnaryFn::Sqrt => "val = sqrtf(val);",
+                UnaryFn::Exp2 => "val = exp2f(val);",
+                UnaryFn::Log2 => "val = log2f(val);",
+                UnaryFn::Recip => "val = 1.0f / val;",
+            })
+            .collect::<Vec<_>>()
+            .join("\n        ");
+        let kernel = format!(
+            "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void fused_elementwise_k({dtype} *out, const {dtype} *in{dyn_dims_param}) {{
+        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (const_z >= {n_elements}) return;
+        long long idx = {idx};
+        {dtype} val = in[idx];
+        {ops_body}
+        out[idx] = val;
+    }}
+}}"
+        );
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("fused_elementwise_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+        let out_size = self.shape.iter().copied().product::<Expression>();
+        (
+            func,
+            module,
+            kernel,
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.shape.iter().copied().product()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        self.output_size() * (self.ops.len() as i32)
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "FusedElementwise"
     }
 }

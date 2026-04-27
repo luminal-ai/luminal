@@ -152,16 +152,6 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
-    pub fn graph_break(self) -> GraphTensor {
-        let new_id = self.graph().add_op(
-            crate::hlir::GraphBreak {
-                input_shape: self.shape,
-            },
-            &[self.id],
-        );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
-    }
-
     /// Scale so std is 1.0
     pub fn std_norm<T>(self, axes: impl ToAxes, epsilon: T) -> GraphTensor
     where

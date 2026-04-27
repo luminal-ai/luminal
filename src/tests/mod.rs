@@ -485,3 +485,56 @@ fn test_only_outputs_remain() {
         .count();
     assert_eq!(rt.buffers.len(), output_count);
 }
+
+fn build_repeated_block_graph(
+    layers: usize,
+    width: usize,
+) -> (Graph, NodeIndex, Vec<NodeIndex>, NodeIndex) {
+    let mut cx = Graph::new();
+    let x = cx.tensor(width);
+    let mut state = x;
+    let mut weight_nodes = Vec::with_capacity(layers * 2);
+    for i in 0..layers {
+        let w = cx.named_tensor(format!("w_{i}"), width);
+        let b = cx.named_tensor(format!("b_{i}"), width);
+        weight_nodes.push(w.id);
+        weight_nodes.push(b.id);
+        state = ((state * w) + b).sin();
+    }
+    let y = state.output();
+    (cx, x.id, weight_nodes, y.id)
+}
+
+fn repeated_block_reference(layers: usize, input: &[f32], weights: &[Vec<f32>]) -> Vec<f32> {
+    let mut state = input.to_vec();
+    for i in 0..layers {
+        let w = &weights[i * 2];
+        let b = &weights[i * 2 + 1];
+        for ((s, wi), bi) in state.iter_mut().zip(w.iter()).zip(b.iter()) {
+            *s = (*s * *wi + *bi).sin();
+        }
+    }
+    state
+}
+
+#[test]
+fn integration_auto_loop_rolling_matches_reference_native_runtime() {
+    let layers = 12;
+    let width = 16;
+    let input = random_vec(width);
+    let weights: Vec<Vec<f32>> = (0..layers * 2).map(|_| random_vec(width)).collect();
+
+    let reference = repeated_block_reference(layers, &input, &weights);
+
+    let (mut graph, input_id, weight_ids, output_id) = build_repeated_block_graph(layers, width);
+    graph.build_search_space::<NativeRuntime>();
+    let mut rt = graph.search(NativeRuntime::default(), 1);
+    rt.set_data(input_id, input);
+    for (node, data) in weight_ids.iter().zip(weights.iter()) {
+        rt.set_data(*node, data.clone());
+    }
+    rt.execute(&graph.dyn_map);
+    let out = rt.get_f32(output_id);
+
+    assert_close(&reference, out);
+}

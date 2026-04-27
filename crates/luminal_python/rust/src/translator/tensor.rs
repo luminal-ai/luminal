@@ -6,6 +6,27 @@ use crate::pt2_util::*;
 
 use super::Translator;
 
+const FULL_SHAPE_ARG: usize = 0;
+const FULL_VALUE_ARG: usize = 1;
+
+const FULL_LIKE_INPUT_ARG: usize = 0;
+const FULL_LIKE_VALUE_ARG: usize = 1;
+
+const TOPK_INPUT_ARG: usize = 0;
+const TOPK_K_ARG: usize = 1;
+const TOPK_DIM_ARG: usize = 2;
+
+const SORT_INPUT_ARG: usize = 0;
+const SORT_DIM_ARG: usize = 1;
+const SORT_DESCENDING_ARG: usize = 2;
+
+const WHERE_COND_ARG: usize = 0;
+const WHERE_X_ARG: usize = 1;
+const WHERE_OTHER_ARG: usize = 2;
+
+const TRIANGULAR_INPUT_ARG: usize = 0;
+const TRIANGULAR_DIAGONAL_ARG: usize = 1;
+
 impl<'a> Translator<'a> {
     pub(crate) fn translate_arange(&mut self, node: &Node) -> Result<GraphTensor> {
         let positional_args: Vec<Expression> = node
@@ -30,19 +51,55 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_full(&mut self, node: &Node) -> Result<GraphTensor> {
-        let shape = self.get_exprs_arg(node, 0)?;
+        let shape = self.get_exprs_arg(node, FULL_SHAPE_ARG)?;
         // fill_value can be float, int, or bool after decomposition
-        let val = if let Ok(f) = self.get_float_arg(node, 1) {
+        let val = if let Ok(f) = self.get_float_arg(node, FULL_VALUE_ARG) {
             f as f32
-        } else if let Ok(b) = self.get_bool_arg(node, 1) {
+        } else if let Ok(b) = self.get_bool_arg(node, FULL_VALUE_ARG) {
             if b { 1.0 } else { 0.0 }
         } else {
             anyhow::bail!(
                 "full: unsupported fill value type: {:?}",
-                node.inputs.get(1)
+                node.inputs.get(FULL_VALUE_ARG)
             );
         };
-        Ok(self.graph.constant_float(val).expand_rhs(shape))
+        let dtype = self.output_meta_dtype(node)?;
+        let value = self.graph.constant_float(val).cast(dtype);
+        Ok(if shape.is_empty() {
+            value
+        } else {
+            value.expand_rhs(shape)
+        })
+    }
+
+    pub(crate) fn translate_full_like(&mut self, node: &Node) -> Result<GraphTensor> {
+        let reference = self.get_input_tensor(node, FULL_LIKE_INPUT_ARG)?;
+        let val = if let Ok(f) = self.get_float_arg(node, FULL_LIKE_VALUE_ARG) {
+            f as f32
+        } else if let Ok(b) = self.get_bool_arg(node, FULL_LIKE_VALUE_ARG) {
+            if b { 1.0 } else { 0.0 }
+        } else {
+            anyhow::bail!(
+                "full_like: unsupported fill value type: {:?}",
+                node.inputs.get(FULL_LIKE_VALUE_ARG)
+            );
+        };
+        let dtype = self.output_meta_dtype(node)?;
+        let value = self.graph.constant_float(val).cast(dtype);
+        Ok(value.expand_rhs(reference.shape))
+    }
+
+    fn output_meta_dtype(&self, node: &Node) -> Result<DType> {
+        let output_name = node
+            .outputs
+            .first()
+            .and_then(|o| o.as_tensor.as_ref())
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let meta = self
+            .tensor_meta(&output_name)
+            .context("Missing tensor meta for output dtype")?;
+        Ok(torch_dtype_int_to_luminal(meta.dtype))
     }
 
     pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -62,11 +119,64 @@ impl<'a> Translator<'a> {
         Ok(c * x_f + (one - c) * y_f)
     }
 
+    pub(crate) fn translate_where_scalar_other(&mut self, node: &Node) -> Result<GraphTensor> {
+        let cond = self.get_input_tensor(node, WHERE_COND_ARG)?;
+        let x = self.get_input_tensor(node, WHERE_X_ARG)?;
+        let other_val = self.get_float_arg(node, WHERE_OTHER_ARG)? as f32;
+        // Broadcast cond and x to a common shape
+        let (cond_b, x_b) = broadcast_binary(cond, x);
+        let c = cond_b.cast(DType::F32);
+        let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
+        let other = self.graph.constant_float(other_val).expand_rhs(c.shape);
+        Ok(c * x_b + (one - c) * other)
+    }
+
+    pub(crate) fn translate_tril(&mut self, node: &Node) -> Result<GraphTensor> {
+        self.translate_triangular(node, false)
+    }
+
+    pub(crate) fn translate_triu(&mut self, node: &Node) -> Result<GraphTensor> {
+        self.translate_triangular(node, true)
+    }
+
+    fn translate_triangular(&mut self, node: &Node, upper: bool) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, TRIANGULAR_INPUT_ARG)?;
+        let diagonal = if node.inputs.len() > TRIANGULAR_DIAGONAL_ARG {
+            self.get_int_arg(node, TRIANGULAR_DIAGONAL_ARG).unwrap_or(0) as i32
+        } else {
+            0
+        };
+        let dims = a.shape.dims;
+        let rows = dims[dims.len() - 2];
+        let cols = dims[dims.len() - 1];
+        let (r_val, c_val) = match (rows.to_usize(), cols.to_usize()) {
+            (Some(r), Some(c)) => (r, c),
+            _ => anyhow::bail!("tril/triu requires concrete matrix dimensions"),
+        };
+        let size = r_val.max(c_val);
+        let mask = if upper {
+            self.graph.triu(size, diagonal)
+        } else {
+            self.graph.tril(size, diagonal)
+        }
+        .cast(DType::F32);
+        let mask = if rows != cols {
+            mask.slice_along(0..r_val, 0).slice_along(0..c_val, 1)
+        } else {
+            mask
+        };
+        let mut mask_expanded = mask;
+        for i in (0..dims.len() - 2).rev() {
+            mask_expanded = mask_expanded.expand_dim(0, dims[i]);
+        }
+        Ok(a * mask_expanded)
+    }
+
     pub(crate) fn translate_topk(&mut self, node: &Node) -> Result<()> {
-        let a = self.get_input_tensor(node, 0)?;
-        let k = self.get_int_arg(node, 1)? as usize;
-        let dim = if node.inputs.len() > 2 {
-            self.get_int_arg(node, 2).unwrap_or(-1)
+        let a = self.get_input_tensor(node, TOPK_INPUT_ARG)?;
+        let k = self.get_int_arg(node, TOPK_K_ARG)? as usize;
+        let dim = if node.inputs.len() > TOPK_DIM_ARG {
+            self.get_int_arg(node, TOPK_DIM_ARG).unwrap_or(-1)
         } else {
             -1
         };
@@ -86,13 +196,10 @@ impl<'a> Translator<'a> {
                 None
             };
 
-        // Use full argsort then slice, rather than topk_indexes/topk_values directly.
-        // This avoids a CUDA gather kernel bug when data and index shapes differ
-        // along the gather axis (topk_indexes returns a sliced tensor).
-        let full_argsort = a.argsort(dim, true);
+        // Build top-k outputs from a full stable argsort, then slice to k.
+        let full_argsort = a.stable_argsort(dim, true);
 
-        // Only build each branch when its output is consumed.
-        // Dead nodes in the graph can confuse the CUDA optimizer.
+        // Only build the outputs that are consumed.
         if let Some(val_name) = values_name
             && !val_name.is_empty()
         {
@@ -100,9 +207,53 @@ impl<'a> Translator<'a> {
             self.tensors.insert(val_name, values);
         }
         if let Some(idx_name) = indices_name {
-            // Materialize Int indices as F32 with `* 1.0` to force a contiguous copy.
-            // Without this, CUDA can't correctly read the sliced Int view.
+            // Materialize the sliced indices through a copy before storing them.
             let indices = full_argsort.slice_along(..k, dim) * 1.0;
+            self.tensors.insert(idx_name, indices);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn translate_sort(&mut self, node: &Node) -> Result<()> {
+        let a = self.get_input_tensor(node, SORT_INPUT_ARG)?;
+        let dim = if node.inputs.len() > SORT_DIM_ARG {
+            self.get_int_arg(node, SORT_DIM_ARG).unwrap_or(-1)
+        } else {
+            -1
+        };
+        let descending = if node.inputs.len() > SORT_DESCENDING_ARG {
+            self.get_bool_arg(node, SORT_DESCENDING_ARG)
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let dim = normalize_dim(dim, a.shape.len());
+
+        // Determine output names (sort returns (values, indices))
+        let values_name = node
+            .outputs
+            .first()
+            .and_then(|o| o.as_tensor.as_ref().map(|t| t.name.clone()));
+        let indices_name =
+            if let Some(ts) = node.outputs.first().and_then(|o| o.as_tensors.as_ref()) {
+                ts.get(1).map(|t| t.name.clone())
+            } else if node.outputs.len() > 1 {
+                node.outputs[1].as_tensor.as_ref().map(|t| t.name.clone())
+            } else {
+                None
+            };
+
+        let full_argsort = a.stable_argsort(dim, descending);
+
+        if let Some(val_name) = values_name
+            && !val_name.is_empty()
+        {
+            let values = a.gather_elements(full_argsort, dim);
+            self.tensors.insert(val_name, values);
+        }
+        if let Some(idx_name) = indices_name {
+            let indices = full_argsort * 1.0;
             self.tensors.insert(idx_name, indices);
         }
 

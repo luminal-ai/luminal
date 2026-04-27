@@ -32,6 +32,7 @@ use crate::{
         driver::{CudaSlice, CudaStream, DevicePtr},
     },
     host::{HostOp, cublas::parse_cublas_op},
+    try_create_cublaslt,
 };
 
 #[derive(Debug)]
@@ -248,6 +249,19 @@ fn dtype_to_cuda_types(dtype: DType) -> (cudaDataType, cublasComputeType_t, cuda
     }
 }
 
+impl CuBlasLt {
+    fn get_cublaslt(&self, stream: &Arc<CudaStream>) -> anyhow::Result<Arc<CudaBlasLT>> {
+        if let Some(cublaslt) = self.cublaslt.get() {
+            return Ok(cublaslt.clone());
+        }
+        let created = try_create_cublaslt(stream.clone()).map_err(|message| {
+            anyhow::anyhow!("cuBLASLt unavailable on this machine: {message}")
+        })?;
+        let _ = self.cublaslt.set(created.clone());
+        Ok(created)
+    }
+}
+
 impl HostOp for CuBlasLt {
     fn execute(
         &self,
@@ -324,9 +338,7 @@ impl HostOp for CuBlasLt {
         )
         .entered();
 
-        let cublaslt = self
-            .cublaslt
-            .get_or_init(|| Arc::new(CudaBlasLT::new(stream.clone()).unwrap()));
+        let cublaslt = self.get_cublaslt(stream)?;
 
         let mut matmul_desc: cublasLtMatmulDesc_t = std::ptr::null_mut();
         let mut a_desc: cublasLtMatrixLayout_t = std::ptr::null_mut();

@@ -77,11 +77,12 @@ impl<'a> Translator<'a> {
         let output_names = self.parsed.output_names();
         for name in &output_names {
             let tensor = self.get_tensor(name)?;
-            // Cast non-float outputs (Bool, Int) to F32 for the runtime.
-            // Preserve F16/BF16/F32 as-is to avoid corrupting half-precision models.
-            let tensor = match tensor.dtype {
-                DType::Bool | DType::Int => tensor.cast(DType::F32) + 0.0,
-                _ => tensor + 0.0,
+            let tensor = if tensor.dtype == DType::Bool {
+                tensor.cast(DType::Int).cast(DType::Bool)
+            } else if tensor.dtype == DType::Int {
+                tensor
+            } else {
+                tensor + 0.0
             };
             tensor.output();
             self.output_ids.push((name.clone(), tensor.id));
@@ -154,6 +155,12 @@ impl<'a> Translator<'a> {
     }
 
     // --- Helper methods ---
+
+    pub(crate) fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
+        self.extra_tensor_values
+            .get(name)
+            .or_else(|| self.parsed.tensor_meta(name))
+    }
 
     pub(crate) fn get_tensor(&self, name: &str) -> Result<GraphTensor> {
         self.tensors

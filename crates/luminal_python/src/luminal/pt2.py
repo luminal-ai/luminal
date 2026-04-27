@@ -14,7 +14,7 @@ import torch
 
 from .compiled_model import CompiledModel
 from .luminal import process_pt2
-from .main import _collect_weight_pointers, _detect_backend, _load_cpu_weights
+from .main import _collect_weight_pointers, _detect_factory_capsule, _load_cpu_weights
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,7 +34,7 @@ def _export_kwargs():
 
 def _save_and_compile(
     ep_or_path,
-    backend,
+    factory,
     original_weights=None,
     options=None,
 ):
@@ -43,6 +43,7 @@ def _save_and_compile(
     Args:
         ep_or_path: Either an ExportedProgram (will be saved to a temp file) or
             a path to an already-saved .pt2 file.
+        factory: PyCapsule wrapping the BackendFactory to use.
         original_weights: Optional dict mapping state_dict key -> original PyTorch tensor.
             When provided, device pointers are taken from these tensors instead of
             ep.state_dict (which torch.export may have cloned), enabling true zero-copy
@@ -63,14 +64,14 @@ def _save_and_compile(
 
         # Collect weight pointers for Rust (avoids duplicate GPU buffer allocation)
         keep_alive, weight_device_ptrs, cpu_weights = _collect_weight_pointers(
-            weight_source, backend
+            weight_source
         )
 
         # Compile with device pointers — search uses actual weight memory (zero-copy)
         compiled = process_pt2(
             pt2_path,
             "",
-            backend,
+            factory,
             weight_device_ptrs=weight_device_ptrs,
             options=options,
         )
@@ -145,7 +146,7 @@ def compile(
     model,
     example_input,
     search_iterations=25,
-    backend=None,
+    factory=None,
     export_kwargs=None,
     dynamic_dim=None,
 ):
@@ -155,7 +156,7 @@ def compile(
         model: A PyTorch nn.Module.
         example_input: Example input tensor(s) for tracing.
         search_iterations: Number of optimization search iterations.
-        backend: "native" or "cuda". Auto-detected if None.
+        factory: PyCapsule wrapping a BackendFactory. Auto-detected if None.
         export_kwargs: Extra kwargs passed to torch.export.export.
         dynamic_dim: Which input dimension to make dynamic.
 
@@ -165,10 +166,8 @@ def compile(
     if dynamic_dim is None:
         dynamic_dim = "auto"
 
-    if backend is None:
-        backend = os.environ.get("LUMINAL_BACKEND", None)
-        if backend is None:
-            backend = "cuda" if torch.cuda.is_available() else "native"
+    if factory is None:
+        factory = _detect_factory_capsule([example_input])
 
     kwargs = export_kwargs or {}
     extra = _export_kwargs()
@@ -219,20 +218,20 @@ def compile(
 
     return _save_and_compile(
         ep,
-        backend,
+        factory,
         options={"search_iterations": search_iterations},
     )
 
 
-def pt2_backend(gm, example_inputs, backend=None, options=None):
+def pt2_backend(gm, example_inputs, factory=None, options=None):
     """torch.compile backend using PT2 pipeline.
 
-    Usage: torch.compile(model, backend=luminal.pt2.pt2_backend)
+    Usage: torch.compile(model, backend=luminal.register_backend(capsule))
     """
     import gc
 
-    if backend is None:
-        backend = _detect_backend(example_inputs)
+    if factory is None:
+        factory = _detect_factory_capsule(example_inputs)
 
     gm = gm.eval()
     gm, user_inputs, original_weights = _reinternalize_lifted_params(gm, example_inputs)
@@ -266,7 +265,7 @@ def pt2_backend(gm, example_inputs, backend=None, options=None):
     try:
         result = _save_and_compile(
             pt2_path,
-            backend,
+            factory,
             original_weights=original_weights,
             options=options,
         )

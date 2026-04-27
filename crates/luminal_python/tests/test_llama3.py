@@ -392,11 +392,11 @@ def test_dynamic_dim_reuse_no_recompile(device: torch.device):
             return self.proj(self.embed(x))
 
     model = DynamicSeqModel().eval().to(device)
-    backend = "cuda" if device.type == "cuda" else "native"
 
-    # Compile once with dynamic seq dim (auto-detected for integer inputs)
+    # Compile once with dynamic seq dim (auto-detected for integer inputs).
+    # Factory capsule is auto-detected from example.device.
     example = torch.tensor([[1, 2, 3, 4]], device=device)
-    compiled = luminal_compile(model, example, search_iterations=5, backend=backend)
+    compiled = luminal_compile(model, example, search_iterations=5)
 
     # Execute with multiple different seq lengths — each call reuses the
     # same compiled graph, updating dynamic dims in-place.
