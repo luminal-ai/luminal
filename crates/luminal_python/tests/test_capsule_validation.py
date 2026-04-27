@@ -25,10 +25,10 @@ def _new_capsule(name: bytes):
 def test_process_pt2_rejects_capsule_with_wrong_name():
     bogus = _new_capsule(b"not.luminal.backend_factory")
     with pytest.raises(ValueError, match="luminal.backend_factory"):
-        process_pt2("/dev/null", "/dev/null", 0, bogus, None)
+        process_pt2("/dev/null", "/dev/null", bogus, None)
 
 
 def test_process_pt2_rejects_capsule_with_no_name():
     unnamed = _new_capsule(None)
     with pytest.raises(ValueError, match="luminal.backend_factory"):
-        process_pt2("/dev/null", "/dev/null", 0, unnamed, None)
+        process_pt2("/dev/null", "/dev/null", unnamed, None)
