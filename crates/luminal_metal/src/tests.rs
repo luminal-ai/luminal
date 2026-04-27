@@ -961,7 +961,7 @@ fn test_scatter_basic() {
     cx.build_search_space::<MetalRuntime>();
     let mut rt = MetalRuntime::initialize(());
     rt.set_data(src, &[10.0, 20.0, 30.0]);
-    rt.set_data(indexes, &[1.0, 3.0, 4.0]);
+    rt.set_data_i32(indexes, &[1i32, 3, 4]);
     rt.set_data(dest, &[0.0, 0.0, 0.0, 0.0, 0.0]);
     rt = cx.search(rt, 1);
     rt.allocate_intermediate_buffers(&cx.dyn_map);
@@ -982,7 +982,7 @@ fn test_scatter_into_nonzero_dest() {
     cx.build_search_space::<MetalRuntime>();
     let mut rt = MetalRuntime::initialize(());
     rt.set_data(src, &[99.0]);
-    rt.set_data(indexes, &[2f32]);
+    rt.set_data_i32(indexes, &[2i32]);
     rt.set_data(dest, &[1.0, 2.0, 3.0, 4.0, 5.0]);
     rt = cx.search(rt, 1);
     rt.allocate_intermediate_buffers(&cx.dyn_map);
@@ -1003,7 +1003,7 @@ fn test_scatter_all_positions() {
     cx.build_search_space::<MetalRuntime>();
     let mut rt = MetalRuntime::initialize(());
     rt.set_data(src, &[40.0, 30.0, 20.0, 10.0]);
-    rt.set_data(indexes, &[3.0, 2.0, 1.0, 0.0]);
+    rt.set_data_i32(indexes, &[3i32, 2, 1, 0]);
     rt.set_data(dest, &[1.0, 2.0, 3.0, 4.0]);
     rt = cx.search(rt, 1);
     rt.allocate_intermediate_buffers(&cx.dyn_map);
@@ -1011,4 +1011,142 @@ fn test_scatter_all_positions() {
 
     let out = rt.get_f32(result);
     assert_close(&out, &[10.0, 20.0, 30.0, 40.0], 0.001);
+}
+
+// ============================================================================
+// Embedding lookup tests
+// ============================================================================
+
+fn run_embed_test(vocab_size: usize, embed_dim: usize, token_data: &[i32], embed_data: &[f32]) {
+    assert_eq!(embed_data.len(), vocab_size * embed_dim);
+    let seq_len = token_data.len();
+
+    let mut cx = Graph::default();
+    let token_ids = cx.tensor(seq_len).as_dtype(DType::Int);
+    let embed_table = cx.tensor((vocab_size, embed_dim));
+    let output = embed_table
+        .gather(
+            (token_ids * embed_dim).expand_dim(1, embed_dim)
+                + cx.arange(embed_dim as i32).expand_dim(0, seq_len),
+        )
+        .output();
+
+    let mut expected = vec![0.0f32; seq_len * embed_dim];
+    for (i, &tid) in token_data.iter().enumerate() {
+        for j in 0..embed_dim {
+            expected[i * embed_dim + j] = embed_data[tid as usize * embed_dim + j];
+        }
+    }
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data_i32(token_ids, token_data);
+    rt.set_data(embed_table, embed_data);
+    rt = cx.search(rt, 5);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(rt.get_f32(output).as_slice(), &expected, 1e-5);
+}
+
+#[test]
+fn metal_embed_basic() {
+    // 8 tokens × 4 dims, token ids [0, 2, 5, 7]
+    let embed_data: Vec<f32> = (0..32).map(|i| i as f32 + 1.0).collect();
+    run_embed_test(8, 4, &[0, 2, 5, 7], &embed_data);
+}
+
+/// First token (id 0) and last token (id vocab_size-1) — boundary rows of the table.
+#[test]
+fn metal_embed_boundary_tokens() {
+    let vocab_size = 16usize;
+    let embed_dim = 8usize;
+    let embed_data: Vec<f32> = (0..(vocab_size * embed_dim)).map(|i| i as f32).collect();
+    run_embed_test(
+        vocab_size,
+        embed_dim,
+        &[0, (vocab_size - 1) as i32, 0, (vocab_size - 1) as i32],
+        &embed_data,
+    );
+}
+
+/// All tokens in the sequence are the same id — tests the repeated-token case.
+#[test]
+fn metal_embed_repeated_token() {
+    let vocab_size = 32usize;
+    let embed_dim = 16usize;
+    let embed_data: Vec<f32> = (0..(vocab_size * embed_dim)).map(|i| -(i as f32)).collect();
+    let token_data = vec![7i32; 64]; // 64 lookups all to token 7
+    run_embed_test(vocab_size, embed_dim, &token_data, &embed_data);
+}
+
+/// Single-token sequence — the minimal case.
+#[test]
+fn metal_embed_single_token() {
+    let vocab_size = 4usize;
+    let embed_dim = 8usize;
+    let embed_data: Vec<f32> = (0..32).map(|i| i as f32 * 0.5).collect();
+    run_embed_test(vocab_size, embed_dim, &[3], &embed_data);
+}
+
+/// Single-element embedding vector (embed_dim = 1) — edge case for the inner loop.
+#[test]
+fn metal_embed_dim_one() {
+    let vocab_size = 16usize;
+    let embed_dim = 1usize;
+    let embed_data: Vec<f32> = (0..vocab_size).map(|i| i as f32 * 10.0).collect();
+    run_embed_test(vocab_size, embed_dim, &[0, 3, 7, 15, 1], &embed_data);
+}
+
+/// Non-power-of-2 dimensions — exercises integer div/mod on odd thread counts.
+#[test]
+fn metal_embed_non_power_of_two() {
+    let vocab_size = 13usize;
+    let embed_dim = 7usize;
+    let embed_data: Vec<f32> = (0..(vocab_size * embed_dim))
+        .map(|i| i as f32 + 0.1)
+        .collect();
+    run_embed_test(vocab_size, embed_dim, &[0, 6, 12, 3, 9], &embed_data);
+}
+
+/// LLM-scale stress test: 32 k vocab, 512-dim embeddings, 128 tokens.
+/// Exercises large buffers and verifies the kernel handles >1M output elements.
+#[test]
+fn metal_embed_llm_scale() {
+    let vocab_size = 32_768usize;
+    let embed_dim = 512usize;
+    let seq_len = 128usize;
+
+    let embed_data: Vec<f32> = (0..(vocab_size * embed_dim))
+        .map(|i| (i % 1000) as f32 * 0.001)
+        .collect();
+    let token_data: Vec<i32> = (0..seq_len as i32)
+        .map(|i| (i * 257) % vocab_size as i32) // prime-stride walk across vocab
+        .collect();
+
+    run_embed_test(vocab_size, embed_dim, &token_data, &embed_data);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    #[test]
+    fn metal_embed_proptest(
+        vocab_size in 4usize..64,
+        embed_dim in 4usize..32,
+        seq_len in 1usize..16,
+        token_data in proptest::collection::vec(0i32..16, 1..16),
+        embed_vals in proptest::collection::vec(-1.0f32..1.0, 1..2048),
+    ) {
+        prop_assume!(token_data.len() >= seq_len);
+        prop_assume!(embed_vals.len() >= vocab_size * embed_dim);
+
+        let token_data: Vec<i32> = token_data.into_iter()
+            .take(seq_len)
+            .map(|t| t % vocab_size as i32)
+            .collect();
+        let embed_data: Vec<f32> = embed_vals.into_iter().take(vocab_size * embed_dim).collect();
+
+        run_embed_test(vocab_size, embed_dim, &token_data, &embed_data);
+    }
 }

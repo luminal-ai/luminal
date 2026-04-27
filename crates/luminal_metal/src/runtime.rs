@@ -136,6 +136,11 @@ impl MetalRuntime {
         self.input_data.insert(id.to_id(), data.into());
     }
 
+    pub fn set_data_i32(&mut self, id: impl ToId, data: &[i32]) {
+        self.input_data
+            .insert(id.to_id(), NativeData::Int(data.to_vec()));
+    }
+
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
         let id = id.to_id();
         let output_id = self
