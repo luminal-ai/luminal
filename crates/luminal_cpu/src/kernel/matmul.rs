@@ -34,10 +34,10 @@ impl CpuMatmulDescriptor {
             && mul_info.shape[2] == sum_info.iters
             && mul_info.a_strides[1] == zero
             && mul_info.a_strides[2] == z
-            && mul_info.b_strides[1] == zero
-            && mul_info.b_strides[2] == z
+            && mul_info.b_strides[0] == zero
+            && mul_info.b_strides[1] == z
             && sum_info.strides[1] == z
-            && sum_info.iter_strides == z;
+            && sum_info.iter_stride == z;
 
         if !ok { return None; }
 
@@ -154,7 +154,7 @@ mod tests {
             shape:       vec![Expression::from(4), Expression::from(8)],
             strides:     vec![Expression::from('z') * 8, Expression::from('z')],
             iters:       Expression::from(16),
-            iter_strides: Expression::from('z'),
+            iter_stride: Expression::from('z'),
         };
  
         let desc = CpuMatmulDescriptor::from_mul_and_sum(&mul, &sum).unwrap();
@@ -188,7 +188,7 @@ mod tests {
             shape:       vec![Expression::from(2), Expression::from(4)],
             strides:     vec![Expression::from('z') * 4, Expression::from('z')],
             iters:       Expression::from(8),
-            iter_strides: Expression::from('z'),
+            iter_stride: Expression::from('z'),
         };
         assert!(CpuMatmulDescriptor::from_mul_and_sum(&mul, &sum).is_none());
     }

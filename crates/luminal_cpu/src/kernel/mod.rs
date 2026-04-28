@@ -52,7 +52,7 @@ pub struct CpuSumReduceInfo {
     pub shape: Vec<Expression>,
     pub strides: Vec<Expression>,
     pub iters: Expression,
-    pub iter_strides: Expression,
+    pub iter_stride: Expression,
 }
 
 // ---------------------------------------------------------------------------------------------------

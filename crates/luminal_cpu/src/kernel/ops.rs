@@ -4,7 +4,7 @@ use super::{CpuKernelOp, CpuSumReduceInfo};
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, eq, rule, sort, union, v}, base::{ELIST, EXPRESSION, F64, IR, dtype, new_op_call, op_term}
+        SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, app, eq, rule, sort, union, v}, base::{ELIST, EXPRESSION, F64, IR, SORTS, dtype, new_op_call, op_term}
     },
     hlir::{
         Constant, Gather, Iota, MaxReduce, SumReduce, binary_sort, reduce_sort, unary_sort
@@ -193,12 +193,25 @@ cpu_binary_op!(CpuLessThan, "CpuLessThan", |a: f32, b: f32| if a < b { 1.0 } els
 // ---------------------------------------------------------------------------------------------------
 // CpuSumReduce
 // ---------------------------------------------------------------------------------------------------
+fn compute_in_start(gid: usize, out_shape: &[usize], in_strides: &[usize]) -> usize {
+    let ndim = out_shape.len();
+    let mut remaining = gid;
+    let mut offset = 0usize;
+    for d in (0..ndim).rev() {
+        let coord = remaining % out_shape[d];
+        remaining /= out_shape[d];
+        offset += coord * in_strides[d];
+    }
+    offset
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CpuSumReduce {
-    shape: Vec<Expression>,
-    strides: Vec<Expression>,
+    out_shape: Vec<Expression>,
     pub iters: Expression,
-    iter_strides: Expression,
+    in_strides: Vec<Expression>,
+    iter_stride: Expression,
+    out_stride: Vec<Expression>,
 }
 
 impl EgglogOp for CpuSumReduce {
@@ -226,10 +239,11 @@ impl EgglogOp for CpuSumReduce {
         use luminal::egglog_utils::{extract_expr, extract_expr_list};
         (
             LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
-                iters: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
-                iter_strides: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
+                in_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
+                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap(),
             })),
             input_enodes,
         )
@@ -238,7 +252,7 @@ impl EgglogOp for CpuSumReduce {
 
 impl CpuKernelOp for CpuSumReduce {
     fn output_size(&self) -> Expression {
-        self.shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+        self.out_shape.iter().cloned().product::<Expression>().max(Expression::from(1))
     }
 
     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
@@ -246,23 +260,33 @@ impl CpuKernelOp for CpuSumReduce {
         let n_out = resolve(&self.output_size(), dyn_map);
         let iters = resolve(&self.iters, dyn_map);
 
+        let in_strides: Vec<usize> = self.in_strides.iter().map(|e| resolve(e, dyn_map)).collect();
+        let out_shape: Vec<usize> = self.out_shape.iter().map(|e| resolve(e, dyn_map)).collect();
+
+        let iter_stride = {
+            let mut m = dyn_map.clone();
+            m.insert('z', 1);
+            self.iter_stride.exec(&m).unwrap_or(1)
+        };
+
         let mut out = vec![0.0f32; n_out];
-        for out_idx in 0..n_out {
+        for gid in 0..n_out {
+            let in_start = compute_in_start(gid, &out_shape, &in_strides);
             let mut acc = 0.0f32;
-            for k in 0..iters {
-                acc += input[out_idx * iters + k];
+            for i in 0..iters {
+                acc += input[in_start + i * iter_stride];
             }
-            out[out_idx] = acc;
+            out[gid] = acc;
         }
         out
     }
 
     fn sum_reduce_info(&self) -> Option<CpuSumReduceInfo> {
         Some(CpuSumReduceInfo {
-            shape: self.shape.clone(),
-            strides: self.strides.clone(),
-            iters: self.iters.clone(),
-            iter_strides: self.iter_strides.clone(),
+            shape: self.out_shape.clone(),
+            strides: self.out_stride.clone(),
+            iters: self.iters,
+            iter_stride: self.iter_stride,
         })
     }
 }
@@ -273,10 +297,11 @@ impl CpuKernelOp for CpuSumReduce {
 // ---------------------------------------------------------------------------------------------------
 #[derive(Debug, Default, Clone)]
 pub struct CpuMaxReduce {
-    shape: Vec<Expression>,
-    strides: Vec<Expression>,
+    out_shape: Vec<Expression>,
     iters: Expression,
-    iter_strides: Expression,
+    in_strides: Vec<Expression>,
+    iter_stride: Expression,
+    out_stride: Vec<Expression>,
 }
 
 impl EgglogOp for CpuMaxReduce {
@@ -304,10 +329,11 @@ impl EgglogOp for CpuMaxReduce {
         use luminal::egglog_utils::{extract_expr, extract_expr_list};
         (
             LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
-                iters: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
-                iter_strides: extract_expr(egraph, kind_children[3], expr_cache).unwrap()
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
+                in_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
+                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap(),
             })),
             input_enodes,
         )
@@ -316,7 +342,7 @@ impl EgglogOp for CpuMaxReduce {
 
 impl CpuKernelOp for CpuMaxReduce {
     fn output_size(&self) -> Expression {
-        self.shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+        self.out_shape.iter().cloned().product::<Expression>().max(Expression::from(1))
     }
 
     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
@@ -324,8 +350,18 @@ impl CpuKernelOp for CpuMaxReduce {
         let n_out = resolve(&self.output_size(), dyn_map);
         let iters = resolve(&self.iters, dyn_map);
 
-        (0..n_out).map(|out_idx| {
-            (0..iters).map(|k| input[out_idx * iters + k]).fold(f32::NEG_INFINITY, f32::max)
+        let in_strides: Vec<usize> = self.in_strides.iter().map(|e| resolve(e, dyn_map)).collect();
+        let out_shape: Vec<usize> = self.out_shape.iter().map(|e| resolve(e, dyn_map)).collect();
+
+        let iter_stride = {
+            let mut m = dyn_map.clone();
+            m.insert('z', 1);
+            self.iter_stride.exec(&m).unwrap_or(1)
+        };
+
+        (0..n_out).map(|gid| {
+            let in_start = compute_in_start(gid, &out_shape, &in_strides);
+            (0..iters).map(|i| input[in_start + i * iter_stride]).fold(f32::NEG_INFINITY, f32::max)
         }).collect()
     }
 }
@@ -337,18 +373,17 @@ impl CpuKernelOp for CpuMaxReduce {
 #[derive(Debug, Default, Clone)]
 pub struct CpuConstant {
     value: f32,
-    size: Expression,
 }
 
 impl EgglogOp for CpuConstant {
     fn sort(&self) -> SortDef {
-        sort(IR, "CpuConstant", &[("value", F64), ("size", EXPRESSION)])
+        sort(IR, "CpuConstant", &[("value", F64)])
     }
 
     fn rewrites(&self) -> Vec<Rule> {
         let (args, hlir_match) = new_op_call(&Constant::default().sort(), &[]);
         let cpu_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(hlir_match, cpu_op.clone()))]
+        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), app(&SORTS.f32_dt, vec![]))]
     }
 
     fn cleanup(&self) -> bool {
@@ -363,29 +398,21 @@ impl EgglogOp for CpuConstant {
             _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::{extract_expr};
-        (
-            LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
-                value: egraph.enodes[kind_children[0]]
-                .0
-                .replace("\"", "")
-                .parse::<f32>()
-                .unwrap(),
-                size: extract_expr(egraph, kind_children[1], expr_cache).unwrap()
-            })),
-            input_enodes,
-        )
+            let value = egraph.enodes[kind_children[0]].0.replace('"', "").parse::<f32>().unwrap_or(0.0);
+            (
+                LLIROp::new::<dyn CpuKernelOp>(Box::new(Self { value })),
+                vec![],
+            )
     }
 }
 
 impl CpuKernelOp for CpuConstant {
     fn output_size(&self) -> Expression {
-        self.size.clone()
+        Expression::from(1)
     }
 
-    fn process(&self, _inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
-        let n = resolve(&self.size, dyn_map);
-        vec![self.value; n]
+    fn process(&self, _inputs: &[(&[f32], DType)], _dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
+        vec![self.value]
     }
 }
 
@@ -395,18 +422,19 @@ impl CpuKernelOp for CpuConstant {
 // ---------------------------------------------------------------------------------------------------
 #[derive(Debug, Default, Clone)]
 pub struct CpuIota {
-    size: Expression,
+    expr: Expression,
+    range: Expression,
 }
 
 impl EgglogOp for CpuIota {
     fn sort(&self) -> SortDef {
-        sort(IR, "CpuIota", &[("size", EXPRESSION)])
+        sort(IR, "CpuIota", &[("expr", EXPRESSION), ("range", EXPRESSION)])
     }
 
     fn rewrites(&self) -> Vec<Rule> {
         let (args, hlir_match) = new_op_call(&Iota::default().sort(), &[]);
         let cpu_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(hlir_match, cpu_op.clone()))]
+        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), app(&SORTS.int_dt, vec![]))]
     }
 
     fn cleanup(&self) -> bool {
@@ -417,28 +445,37 @@ impl EgglogOp for CpuIota {
             &'a self,
             egraph: &'a SerializedEGraph,
             kind_children: &[&'a ENodeId],
-            input_enodes: Vec<&'a ENodeId>,
+            _input_enodes: Vec<&'a ENodeId>,
             _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
         use luminal::egglog_utils::extract_expr;
         (
             LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
-                size: extract_expr(egraph, kind_children[0], expr_cache).unwrap()
+                expr: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
+                range: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
             })),
-            input_enodes,
+            vec![],
         )
     }
 }
 
 impl CpuKernelOp for CpuIota {
     fn output_size(&self) -> Expression {
-        self.size.clone()
+        self.range.clone()
+    }
+
+    fn infer_output_dtype(&self, _: &[DType]) -> DType {
+        DType::Int
     }
 
     fn process(&self, _inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
-        let n = resolve(&self.size, dyn_map);
-        (0..n).map(|i| i as f32).collect()
+        let n = resolve(&self.range, dyn_map);
+        (0..n).map(|i| {
+            let mut m = dyn_map.clone();
+            m.insert('z', i);
+            self.expr.exec(&m).unwrap_or(i)as f32
+        }).collect()
     }
 }
 
@@ -448,23 +485,40 @@ impl CpuKernelOp for CpuIota {
 // ---------------------------------------------------------------------------------------------------
 #[derive(Debug, Default, Clone)]
 pub struct CpuGather {
-    index_shape: Vec<Expression>,
-    src_shape: Vec<Expression>,
+    out_shape: Vec<Expression>,
+    index_stride: Vec<Expression>,
+    data_stride: Vec<Expression>,
+    out_stride: Vec<Expression>
 }
 
 impl EgglogOp for CpuGather {
     fn sort(&self) -> SortDef {
         sort(IR, "CpuGather", &[
-            ("inp", IR), ("indexes", IR),
-            ("index_shape", ELIST), ("src_shape", ELIST),
+            ("out_shape", ELIST),
+            ("indexes", IR),
+            ("index_strides", ELIST),
+            ("data", IR),
+            ("data_strides", ELIST),
+            ("out_strides", ELIST),
         ])
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        let (args, hlir_match) = new_op_call(&Gather::default().sort(), &["inp", "indexes"]);
-        let cpu_op = op_term(call_sort_from_args(&self.sort(), &args), args["__inputs"].clone());
+        let (gather_args, gather_match) = new_op_call(&Gather::default().sort(), &["indexes", "data"]);
+
+        let out_strides = SORTS.row_major.call([("list".to_string(), gather_args["index_shape"].clone())]);
         let dt = v("?__dt");
-        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp"].clone())))]
+
+        let cpu_args = [
+            ("out_shape".to_string(), gather_args["index_shape"].clone()),
+            ("indexes".to_string(),       gather_args["indexes"].clone()),
+            ("index_strides".to_string(), gather_args["index_strides"].clone()),
+            ("data".to_string(),          gather_args["data"].clone()),
+            ("data_strides".to_string(),  gather_args["data_strides"].clone()),
+            ("out_strides".to_string(),   out_strides),
+        ];
+        let cpu_op = self.sort().call(cpu_args);
+        vec![rule(union(gather_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(gather_args["data"].clone())))]
     }
 
     fn cleanup(&self) -> bool {
@@ -475,31 +529,33 @@ impl EgglogOp for CpuGather {
             &'a self,
             egraph: &'a SerializedEGraph,
             kind_children: &[&'a ENodeId],
-            input_enodes: Vec<&'a ENodeId>,
+            _input_enodes: Vec<&'a ENodeId>,
             list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
         use luminal::egglog_utils::extract_expr_list;
         (
             LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
-                index_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                src_shape: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
+                out_shape:    extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                index_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
+                data_stride:  extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap(),
+                out_stride:   extract_expr_list(egraph, kind_children[5], list_cache, expr_cache).unwrap(),
             })),
-            input_enodes,
+            vec![kind_children[1], kind_children[3]],
         )
     }
 }
 
 impl CpuKernelOp for CpuGather {
     fn output_size(&self) -> Expression {
-        self.index_shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+        self.out_shape.iter().cloned().product::<Expression>().max(Expression::from(1))
     }
 
     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
-        let src = inputs[0].0;
-        let indexes = inputs[1].0;
+        let indexes = inputs[0].0;
+        let data = inputs[1].0;
         let n = resolve(&self.output_size(), dyn_map);
-        (0..n).map(|i| src[indexes[i] as usize]).collect()
+        (0..n).map(|i| data[indexes[i] as usize]).collect()
     }
 }
 
