@@ -507,33 +507,41 @@ fn cpu_softmax_batch() {
 
 #[test]
 fn cpu_rms_norm() {
-    // RMSNorm(x, w) = x / sqrt(mean(x²) + ε) * w
-    // Exercises: Mul, SumReduce, Sqrt, Recip, and element-wise Mul
     const SEQ: usize = 4;
     const DIM: usize = 8;
+    const EPS: f32 = 1e-5;
 
     let mut cx = Graph::default();
     let x = cx.tensor((SEQ, DIM));
-    let w = cx.tensor(DIM);
-    let out = x.std_norm(x.shape.last_axis(), 1e-5)
-               .matmul(w.expand_lhs(&[SEQ]))
-               .output();
+    let w = cx.tensor((SEQ, DIM));
+
+    // Manual RMSNorm from primitives:
+    // 1. x² summed over dim axis → [SEQ]
+    // 2. mean = sum / DIM
+    // 3. rms = 1 / sqrt(mean + eps)   → [SEQ]
+    // 4. out = x * rms_expanded * w
+    let x_sq    = (x * x).sum(1);
+    let mean_sq = x_sq * (1.0 / DIM as f32);
+    let rms     = (mean_sq + EPS).sqrt().reciprocal();
+    let out     = (x * rms.expand_rhs(&[DIM]) * w).output();
 
     cx.build_search_space::<CpuRuntime>();
     let mut rt = CpuRuntime::initialize(());
     let x_data = seeded(SEQ * DIM, 1.0, -0.5);
-    let w_data = seeded(DIM, 0.5, 0.75);
+    let w_data = seeded(SEQ * DIM, 0.5, 0.75);
     rt.set_data(x, x_data.clone());
     rt.set_data(w, w_data.clone());
     let rt = run(&mut cx, rt);
 
     let result = rt.get_f32(out);
 
-    // Compute reference row-by-row
     let mut expected = Vec::with_capacity(SEQ * DIM);
     for row in 0..SEQ {
-        let row_data = &x_data[row * DIM..(row + 1) * DIM];
-        expected.extend_from_slice(&ref_rms_norm(row_data, &w_data, 1e-5));
+        let row_x = &x_data[row * DIM..(row + 1) * DIM];
+        let row_w = &w_data[row * DIM..(row + 1) * DIM];
+        let mean_sq: f32 = row_x.iter().map(|v| v * v).sum::<f32>() / DIM as f32;
+        let rms = 1.0 / (mean_sq + EPS).sqrt();
+        expected.extend(row_x.iter().zip(row_w).map(|(xi, wi)| xi * rms * wi));
     }
 
     assert_close(&result, &expected, 1e-4);

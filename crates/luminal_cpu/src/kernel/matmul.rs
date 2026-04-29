@@ -98,12 +98,15 @@ impl CpuKernelOp for CpuMatmul {
     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
         assert_eq!(inputs.len(), 2, "CpuMatmul expected exactly 2 inputs");
 
-        let m = self.m.exec(dyn_map).expect("CpuMatmul: m unresolved") as usize;
-        let n = self.n.exec(dyn_map).expect("CpuMatmul: n unresolved") as usize;
-        let k = self.k.exec(dyn_map).expect("CpuMatmul: k unresolved") as usize;
-        let lda = self.lda.exec(dyn_map).expect("CpuMatmul: lda unresolved") as usize;
-        let ldb = self.ldb.exec(dyn_map).expect("CpuMatmul: ldb unresolved") as usize;
-        let ldd = self.ldd.exec(dyn_map).expect("CpuMatmul: ldd unresolved") as usize;
+        let mut map = dyn_map.clone();
+        map.entry('z').or_insert(1);
+
+        let m = self.m.exec(&map).expect("CpuMatmul: m unresolved") as usize;
+        let n = self.n.exec(&map).expect("CpuMatmul: n unresolved") as usize;
+        let k = self.k.exec(&map).expect("CpuMatmul: k unresolved") as usize;
+        let lda = self.lda.exec(&map).expect("CpuMatmul: lda unresolved") as usize;
+        let ldb = self.ldb.exec(&map).expect("CpuMatmul: ldb unresolved") as usize;
+        let ldd = self.ldd.exec(&map).expect("CpuMatmul: ldd unresolved") as usize;
 
         let a = inputs[0].0;
         let b = inputs[1].0;

@@ -1,6 +1,6 @@
 use std::{f32, usize};
 
-use super::{CpuKernelOp, CpuSumReduceInfo};
+use super::{CpuKernelOp, CpuSumReduceInfo, CpuMulInfo};
 use luminal::{
     dtype::DType,
     egglog_utils::{
@@ -10,7 +10,7 @@ use luminal::{
         Constant, Gather, Iota, MaxReduce, SumReduce, binary_sort, reduce_sort, unary_sort
     },
     op::*,
-    prelude::*,
+    prelude::*, shape,
 };
 
 // ---------------------------------------------------------------------------------------------------
@@ -102,8 +102,10 @@ macro_rules! cpu_unary_ops {
             ) -> Vec<f32> {
                 let input = inputs[0].0;
                 let n = resolve(&self.output_size(), dyn_map);
+                let shape: Vec<usize> = self.shape.iter().map(|e| resolve(e, dyn_map)).collect();
+                let in_strides: Vec<usize> = self.input_strides.iter().map(|e| resolve(e, dyn_map)).collect();
                 let f: fn(f32) -> f32 = $compute;
-                (0..n).map(|i| f(input[i])).collect()
+                (0..n).map(|i| f(input[strided_index(i, &shape, &in_strides)])).collect()
             }
         }
     };
@@ -166,8 +168,23 @@ macro_rules! cpu_binary_op {
                 let a = inputs[0].0;
                 let b = inputs[1].0;
                 let n = resolve(&self.output_size(), dyn_map);
+
+                let shape: Vec<usize> = self.shape.iter()
+                    .map(|e| resolve(e, dyn_map))
+                    .collect();
+                let a_strides: Vec<usize> = self.a_strides.iter()
+                    .map(|e| resolve(e, dyn_map))
+                    .collect();
+                let b_strides: Vec<usize> = self.b_strides.iter()
+                    .map(|e| resolve(e, dyn_map))
+                    .collect();
+
                 let f: fn(f32, f32) -> f32 = $compute;
-                (0..n).map(|i| f(a[i], b[i])).collect()
+                (0..n).map(|i| {
+                    let ai = strided_index(i, &shape, &a_strides);
+                    let bi = strided_index(i, &shape, &b_strides);
+                    f(a[ai], b[bi])
+                }).collect()
             }
         }
     };
@@ -186,9 +203,20 @@ cpu_unary_ops!(CpuRecip, "CpuRecip", |x: f32| 1.0 / x);
 // Binary ops (macro instantiations)
 // ---------------------------------------------------------------------------------------------------
 cpu_binary_op!(CpuAdd, "CpuAdd", |a: f32, b: f32| a + b);
-cpu_binary_op!(CpuMul, "CpuMul", |a: f32, b: f32| a * b);
 cpu_binary_op!(CpuMod, "CpuMod", |a: f32, b: f32| a % b);
 cpu_binary_op!(CpuLessThan, "CpuLessThan", |a: f32, b: f32| if a < b { 1.0 } else { 0.0 });
+
+fn strided_index(i: usize, shape: &[usize], strides: &[usize]) -> usize {
+    let ndim = shape.len();
+    let mut remaining = i;
+    let mut idx = 0usize;
+    for d in (0..ndim).rev() {
+        let coord = if shape[d] > 0 { remaining % shape[d] } else { 0 };
+        remaining /= shape[d].max(1);
+        idx += coord * strides[d];
+    }
+    idx
+}
 
 // ---------------------------------------------------------------------------------------------------
 // CpuSumReduce
@@ -548,43 +576,114 @@ impl EgglogOp for CpuGather {
 
 impl CpuKernelOp for CpuGather {
     fn output_size(&self) -> Expression {
-        self.out_shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+        let n_queries = self.out_shape.iter().cloned().product::<Expression>().max(Expression::from(1));
+        let dim_expr = self.data_stride.first().cloned().unwrap_or(Expression::from(1));
+        n_queries * dim_expr
     }
 
     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
         let indexes = inputs[0].0;
         let data = inputs[1].0;
-        let n = resolve(&self.output_size(), dyn_map);
-        (0..n).map(|i| data[indexes[i] as usize]).collect()
+        let n_queries = resolve(self.out_shape.first().unwrap_or(&Expression::from(1)), dyn_map);
+
+        let dim = {
+            let mut m = dyn_map.clone();
+            m.insert('z', 1);
+            self.data_stride.first().and_then(|e| e.exec(&m)).unwrap_or(1)
+        };
+
+        let mut out = vec![0.0f32; n_queries * dim];
+        for q in 0..n_queries {
+            let gathered_row = indexes[q] as usize;
+            let data_base = {
+                let mut m = dyn_map.clone();
+                m.insert('z', gathered_row);
+                self.data_stride.first().and_then(|e| e.exec(&m)).unwrap_or(gathered_row * dim)
+            };
+
+            for col in 0..dim {
+                out[q * dim + col] = data[data_base + col];
+            }
+        }
+        out
     }
 }
 
 
 // ---------------------------------------------------------------------------------------------------
-// mul_info() override on CpuMul
+// CpuMul
 // ---------------------------------------------------------------------------------------------------
-// impl CpuKernelOp for CpuMul {
-//     // Re-declare a required methods do Rust doesn't complain about a partial override
+#[derive(Debug, Default, Clone)]
+pub struct CpuMul {
+    pub shape: Vec<Expression>,
+    pub a_strides: Vec<Expression>,
+    pub b_strides: Vec<Expression>,
+    pub output_strides: Vec<Expression>,
+}
 
-//     fn output_size(&self) -> Expression {
-//         self.shape.iter().cloned().product::<Expression>().max(Expression::from(1))
-//     }
+impl EgglogOp for CpuMul {
+    fn sort(&self) -> SortDef {
+        binary_sort("CpuMul")
+    }
 
-//     fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
-//         let a = inputs[0].0;
-//         let b = inputs[1].0;
-//         let n = resolve(&self.output_size(), dyn_map);
-//         (0..n).map(|i| a[i] * b [i]).collect()
-//     }
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![binary_dtype_rewrite(&binary_sort("Mul"), &self.sort())]
+    }
 
-//     fn mul_info(&self) -> Option<CpuMulInfo> {
-//         Some(CpuMulInfo {
-//             shape: self.shape.clone(),
-//             a_strides: self.a_strides.clone(),
-//             b_strides: self.b_strides.clone(),
-//             output_strides: self.output_strides.clone(),
-//         })
-//     }
-// }
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+            &'a self,
+            egraph: &'a SerializedEGraph,
+            kind_children: &[&'a ENodeId],
+            input_enodes: Vec<&'a ENodeId>,
+            list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+            expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+        ) -> (LLIROp, Vec<&'a ENodeId>) {
+        use luminal::egglog_utils::extract_expr_list;
+        (
+            LLIROp::new::<dyn  CpuKernelOp>(Box::new(Self {
+                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
+                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
+                output_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap(),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl CpuKernelOp for CpuMul {
+    // Re-declare a required methods do Rust doesn't complain about a partial override
+
+    fn output_size(&self) -> Expression {
+        self.shape.iter().cloned().product::<Expression>().max(Expression::from(1))
+    }
+
+    fn process(&self, inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
+        let a = inputs[0].0;
+        let b = inputs[1].0;
+        let n = resolve(&self.output_size(), dyn_map);
+        
+        let shape:Vec<usize> = self.shape.iter().map(|e| resolve(e, dyn_map)).collect();
+        let a_strides: Vec<usize> = self.a_strides.iter().map(|e| resolve(e, dyn_map)).collect();
+        let b_strides: Vec<usize> = self.b_strides.iter().map(|e| resolve(e, dyn_map)).collect();
+
+        (0..n).map(|i| {
+            a[strided_index(i, &shape, &a_strides)] * b[strided_index(i, &shape, &b_strides)]
+        }).collect()
+    }
+
+    fn mul_info(&self) -> Option<CpuMulInfo> {
+        Some(CpuMulInfo {
+            shape: self.shape.clone(),
+            a_strides: self.a_strides.clone(),
+            b_strides: self.b_strides.clone(),
+            output_strides: self.output_strides.clone(),
+        })
+    }
+}
 
 
