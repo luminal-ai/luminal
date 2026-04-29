@@ -300,7 +300,7 @@ fn test_mini_transformer_two_layers() {
     let input = cx.tensor((SEQ, HIDDEN));
     let layer1 = MiniTransformerLayer::init(&mut cx);
     let layer2 = MiniTransformerLayer::init(&mut cx);
-    let x = layer1.forward(input).graph_break();
+    let x = layer1.forward(input);
     let out = layer2.forward(x).output();
 
     cx.build_search_space::<CudaRuntime>();
@@ -507,4 +507,33 @@ fn test_swiglu_mlp_cuda() {
     let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
 
     assert_close(&result, &expected, 1e-3, 1e-3);
+}
+
+/// Body=1, trips=3 chain of scalar Muls plus a residual back to the
+/// chain's initial value. Auto-rolling sees this as a state-carrying loop
+/// with state at input position 0; the rolled HLIR must round-trip through
+/// egglog (rolled body Mul + LoopStart/LoopInput/LoopEnd markers) and
+/// `unroll_loops_in_llir` must reconstruct the flat 3-mul chain plus
+/// rewire the residual edge to reference the chain's initial input
+/// (outside the body) — not a per-iter clone.
+#[test]
+fn test_rolled_chained_scalar_muls() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let mut cx = Graph::default();
+    let x = cx.tensor((1, 4, 32));
+    let chained = ((x * 2.0_f32) * 3.0_f32) * 5.0_f32;
+    let out = (chained + x).output();
+
+    cx.build_search_space::<CudaRuntime>();
+    let mut rt = CudaRuntime::initialize(stream);
+    let x_data = random_f32_vec(4 * 32, 101, -0.5, 0.5);
+    rt.set_data(x, x_data.clone());
+    rt = cx.search(rt, 3);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(out);
+    let expected: Vec<f32> = x_data.iter().map(|v| v * 2.0 * 3.0 * 5.0 + v).collect();
+    assert_close(&result, &expected, 1e-5, 1e-5);
 }

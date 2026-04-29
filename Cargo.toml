@@ -32,6 +32,7 @@ pretty-duration = "0.1.1"
 anyhow = "1.0"
 graphviz-rust = { version = "0.9", default-features = false}
 lru = "0.16.2"
+rayon = "1.10"
 
 [workspace.package]
 edition = "2024"

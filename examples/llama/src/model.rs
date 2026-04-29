@@ -159,7 +159,8 @@ impl Llama {
                 kv_cache.v_caches[i],
                 kv_cache.max_seq,
             );
-            x = x_new.graph_break();
+            x = x_new;
+            //x = x_new.graph_break();
             cache_outputs.push((k_out, v_out));
         }
         let logits = self.lm_norm.forward(x).matmul(self.lm_head.t());

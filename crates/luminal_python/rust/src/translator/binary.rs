@@ -12,6 +12,7 @@ impl<'a> Translator<'a> {
         let arg1 = &node.inputs[1].arg;
         if let Some(name) = arg1.as_tensor_name() {
             let b = self.get_tensor(name)?;
+            let (a, b) = ensure_same_dtype(a, b);
             let (a, b) = broadcast_binary(a, b);
             Ok(match op {
                 BinaryOp::Add => a + b,

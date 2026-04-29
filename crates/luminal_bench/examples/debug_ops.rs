@@ -106,13 +106,13 @@ impl Case {
         let out = match self {
             Case::Mul => {
                 let x = cx.tensor(size);
-                x.clone() * x
+                x * x
             }
             Case::Sigmoid => cx.tensor(size).sigmoid(),
             Case::Tanh => cx.tensor(size).tanh(),
             Case::GeluInner => {
                 let x = cx.tensor(size);
-                (0.797_884_560_8_f32 * x.clone() * (1. + 0.044_715_f32 * x.clone() * x)).tanh()
+                (0.797_884_6_f32 * x * (1. + 0.044_715_f32 * x * x)).tanh()
             }
             Case::Gelu => cx.tensor(size).gelu(),
             Case::LayerNorm => {
@@ -447,10 +447,10 @@ where
         if let Some(ref backend) = backend_analysis {
             print_lowering_analysis(backend);
         }
-    } else if !args.inspect_ops.is_empty() {
-        if let Some(ref backend) = backend_analysis {
-            print_lowering_analysis(backend);
-        }
+    } else if !args.inspect_ops.is_empty()
+        && let Some(ref backend) = backend_analysis
+    {
+        print_lowering_analysis(backend);
     }
 
     // Trace facts for explicit variables.

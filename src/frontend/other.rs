@@ -105,6 +105,9 @@ impl GraphTensor {
         if let Some(gmem) = self.graph().try_get_op_mut::<Input>(self.id) {
             gmem.dtype = dtype;
         }
+        if let Some((_, d)) = self.graph().input_meta.get_mut(&self.id) {
+            *d = dtype;
+        }
         self
     }
 }

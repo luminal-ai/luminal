@@ -14,7 +14,85 @@ import torch
 
 from .compiled_model import CompiledModel
 from .luminal import process_pt2
-from .main import _collect_weight_pointers, _detect_backend, _load_cpu_weights
+from .main import _collect_weight_pointers, _detect_factory_capsule, _load_cpu_weights
+
+# ---------------------------------------------------------------------------
+# DynamicCache <> pytree registration
+#
+# Without this, torch.export.export raises when handed an HF model that
+# returns CausalLMOutputWithPast(past_key_values=DynamicCache(...)), which
+# is every model with use_cache=True. The registration mirrors the one in
+# transformers.integrations.executorch.register_dynamic_cache_export_support
+# — same dict-based flatten (key_cache / value_cache lists), same replay via
+# cache.update(k, v, idx), and the matching torch.fx._pytree spec for FX
+# graphs. Done at module import so both entry points (pt2_backend via
+# torch.compile and the direct compile() call) get it for free.
+# ---------------------------------------------------------------------------
+
+
+def _get_cache_dict(cache):
+    """Flatten a DynamicCache to a dict of parallel key/value lists."""
+    return {
+        "key_cache": [layer.keys for layer in cache.layers if layer.keys is not None],
+        "value_cache": [
+            layer.values for layer in cache.layers if layer.values is not None
+        ],
+    }
+
+
+def _flatten_dynamic_cache(cache):
+    return torch.utils._pytree._dict_flatten(_get_cache_dict(cache))
+
+
+def _flatten_with_keys_dynamic_cache(cache):
+    return torch.utils._pytree._dict_flatten_with_keys(_get_cache_dict(cache))
+
+
+def _unflatten_dynamic_cache(values, context):
+    from transformers.cache_utils import DynamicCache
+
+    dictionary = torch.utils._pytree._dict_unflatten(values, context)
+    cache = DynamicCache()
+    key_list = dictionary.get("key_cache", [])
+    value_list = dictionary.get("value_cache", [])
+    for idx in range(max(len(key_list), len(value_list))):
+        k = key_list[idx] if idx < len(key_list) else None
+        v = value_list[idx] if idx < len(value_list) else None
+        cache.update(k, v, idx)
+    return cache
+
+
+def _register_cache_serialization():
+    """Register DynamicCache with both torch.utils._pytree and torch.fx._pytree.
+
+    Idempotent: a second call is a no-op. Silently skipped if transformers is
+    not installed.
+    """
+    try:
+        from transformers.cache_utils import DynamicCache
+    except ImportError:
+        return
+
+    if DynamicCache in torch.utils._pytree.SUPPORTED_NODES:
+        return
+
+    torch.utils._pytree.register_pytree_node(
+        DynamicCache,
+        _flatten_dynamic_cache,
+        _unflatten_dynamic_cache,
+        serialized_type_name=f"{DynamicCache.__module__}.{DynamicCache.__name__}",
+        flatten_with_keys_fn=_flatten_with_keys_dynamic_cache,
+    )
+    torch.fx._pytree.register_pytree_flatten_spec(
+        DynamicCache,
+        lambda cache, spec: torch.fx._pytree._dict_flatten_spec(
+            _get_cache_dict(cache), spec
+        ),
+    )
+
+
+_register_cache_serialization()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -32,12 +110,13 @@ def _export_kwargs():
     return kwargs
 
 
-def _save_and_compile(ep_or_path, backend, search_iterations, original_weights=None):
+def _save_and_compile(ep_or_path, factory, search_iterations, original_weights=None):
     """Compile a PT2 model via Rust, return CompiledModel.
 
     Args:
         ep_or_path: Either an ExportedProgram (will be saved to a temp file) or
             a path to an already-saved .pt2 file.
+        factory: PyCapsule wrapping the BackendFactory to use.
         original_weights: Optional dict mapping state_dict key -> original PyTorch tensor.
             When provided, device pointers are taken from these tensors instead of
             ep.state_dict (which torch.export may have cloned), enabling true zero-copy
@@ -58,12 +137,12 @@ def _save_and_compile(ep_or_path, backend, search_iterations, original_weights=N
 
         # Collect weight pointers for Rust (avoids duplicate GPU buffer allocation)
         keep_alive, weight_device_ptrs, cpu_weights = _collect_weight_pointers(
-            weight_source, backend
+            weight_source
         )
 
         # Compile with device pointers — search uses actual weight memory (zero-copy)
         compiled = process_pt2(
-            pt2_path, "", backend, search_iterations, weight_device_ptrs
+            pt2_path, "", search_iterations, factory, weight_device_ptrs
         )
 
         # Load CPU weights after compilation
@@ -136,7 +215,7 @@ def compile(
     model,
     example_input,
     search_iterations=25,
-    backend=None,
+    factory=None,
     export_kwargs=None,
     dynamic_dim=None,
 ):
@@ -146,7 +225,7 @@ def compile(
         model: A PyTorch nn.Module.
         example_input: Example input tensor(s) for tracing.
         search_iterations: Number of optimization search iterations.
-        backend: "native" or "cuda". Auto-detected if None.
+        factory: PyCapsule wrapping a BackendFactory. Auto-detected if None.
         export_kwargs: Extra kwargs passed to torch.export.export.
         dynamic_dim: Which input dimension to make dynamic.
 
@@ -156,10 +235,8 @@ def compile(
     if dynamic_dim is None:
         dynamic_dim = "auto"
 
-    if backend is None:
-        backend = os.environ.get("LUMINAL_BACKEND", None)
-        if backend is None:
-            backend = "cuda" if torch.cuda.is_available() else "native"
+    if factory is None:
+        factory = _detect_factory_capsule([example_input])
 
     kwargs = export_kwargs or {}
     extra = _export_kwargs()
@@ -193,6 +270,7 @@ def compile(
                     dynamic_shapes=dynamic_shapes,
                     **extra,
                 )
+                ep = ep.run_decompositions()
                 break
             except Exception:
                 continue
@@ -205,24 +283,26 @@ def compile(
             dynamic_shapes=None,
             **extra,
         )
+        ep = ep.run_decompositions()
 
-    return _save_and_compile(ep, backend, search_iterations)
+    return _save_and_compile(ep, factory, search_iterations)
 
 
-def pt2_backend(gm, example_inputs, backend=None):
+def pt2_backend(gm, example_inputs, factory=None):
     """torch.compile backend using PT2 pipeline.
 
-    Usage: torch.compile(model, backend=luminal.pt2.pt2_backend)
+    Usage: torch.compile(model, backend=luminal.register_backend(capsule))
     """
     import gc
 
-    if backend is None:
-        backend = _detect_backend(example_inputs)
+    if factory is None:
+        factory = _detect_factory_capsule(example_inputs)
 
     gm = gm.eval()
     gm, user_inputs, original_weights = _reinternalize_lifted_params(gm, example_inputs)
 
     ep = torch.export.export(gm, tuple(user_inputs), **_export_kwargs())
+    ep = ep.run_decompositions()
 
     # When using shared memory (original_weights), strip large weight buffers from
     # the EP before saving.  The Rust side uses device pointers for these weights,
@@ -249,7 +329,7 @@ def pt2_backend(gm, example_inputs, backend=None):
 
     try:
         result = _save_and_compile(
-            pt2_path, backend, 10, original_weights=original_weights
+            pt2_path, factory, 10, original_weights=original_weights
         )
         return result
     finally:

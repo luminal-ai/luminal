@@ -6,15 +6,16 @@ use rand::Rng;
 use rustc_hash::FxHashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::{str, sync::Arc};
+use std::{str, sync::Arc, time::Duration};
 use tracing::trace;
 
 pub mod api;
 pub mod base;
 
 pub const RUN_SCHEDULE: &str = "(run-schedule
-    (repeat 100
+    (repeat 10
         (saturate expr)
+        (saturate dtype_prop)
         (run)
     )
     (saturate expr)
@@ -111,24 +112,64 @@ pub fn early_egglog(
     ops: &[Arc<Box<dyn EgglogOp>>],
     cleanup: bool,
 ) -> String {
+    let parts = OpTextParts::new(ops, cleanup);
+    early_egglog_with(program, root, &parts)
+}
+
+pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool) -> String {
+    let parts = OpTextParts::new(ops, cleanup);
+    full_egglog_with(program, &parts)
+}
+
+/// Pre-computed per-op text fragments. `run_egglog` calls early + full back
+/// to back with identical `ops`; materialising all op-derived strings once
+/// up front means callers that want to drive multiple egglog runs in parallel
+/// only need to share `&str` references and never touch the non-Send trait
+/// objects in `ops`.
+pub struct OpTextParts {
+    op_defs: String,
+    cleanups: String,
+    early_rewrites: String,
+    full_rewrites: String,
+}
+
+impl OpTextParts {
+    pub fn new(ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool) -> Self {
+        Self {
+            op_defs: op_defs_string(ops),
+            cleanups: if cleanup {
+                op_cleanups_string(ops)
+            } else {
+                String::new()
+            },
+            early_rewrites: ops
+                .iter()
+                .flat_map(|o| o.early_rewrites())
+                .map(|r| r.to_egglog_string())
+                .join("\n"),
+            full_rewrites: ops
+                .iter()
+                .flat_map(|o| o.rewrites())
+                .map(|r| r.to_egglog_string())
+                .join("\n"),
+        }
+    }
+}
+
+fn early_egglog_with(program: &str, root: &str, parts: &OpTextParts) -> String {
     [
         base::base_expression_egglog(),
-        op_defs_string(ops),
-        ops.iter()
-            .flat_map(|o| o.early_rewrites())
-            .map(|r| r.to_egglog_string())
-            .join("\n"),
-        if cleanup {
-            op_cleanups_string(ops)
-        } else {
-            "".to_string()
-        },
+        parts.op_defs.clone(),
+        parts.early_rewrites.clone(),
+        parts.cleanups.clone(),
         base::base_cleanup_egglog(),
         program.to_string(),
         format!(
             "(run-schedule
-                (saturate expr)
-                (run)
+                (repeat 6
+                    (saturate expr)
+                    (run)
+                )
                 (saturate base_cleanup)
             )
             (extract {root})"
@@ -137,20 +178,13 @@ pub fn early_egglog(
     .join("\n")
 }
 
-pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool) -> String {
+fn full_egglog_with(program: &str, parts: &OpTextParts) -> String {
     [
         base::base_expression_egglog(),
-        op_defs_string(ops),
-        if cleanup {
-            op_cleanups_string(ops)
-        } else {
-            "".to_string()
-        },
+        parts.op_defs.clone(),
+        parts.cleanups.clone(),
         base::base_cleanup_egglog(),
-        ops.iter()
-            .flat_map(|o| o.rewrites())
-            .map(|r| r.to_egglog_string())
-            .join("\n"),
+        parts.full_rewrites.clone(),
         program.to_string(),
         RUN_SCHEDULE.to_string(),
     ]
@@ -159,8 +193,7 @@ pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool)
 
 use crate::{
     dtype::DType,
-    graph::{Graph, LLIRGraph, SubgraphDescriptor},
-    hlir::{Input, Output},
+    graph::{Graph, LLIRGraph},
     op::{CustomOp, EgglogOp},
     prelude::FxHashMap,
     shape::Expression,
@@ -176,6 +209,20 @@ pub struct SerializedEGraph {
     pub eclasses: FxHashMap<ClassId, (String, Vec<NodeId>)>,
     pub node_to_class: FxHashMap<NodeId, ClassId>,
     pub roots: Vec<ClassId>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EgglogStageReport {
+    pub num_matches_per_rule: FxHashMap<String, usize>,
+    pub search_and_apply_time_per_rule: FxHashMap<String, Duration>,
+    pub total_time: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EgglogRunReport {
+    pub early: EgglogStageReport,
+    pub full: EgglogStageReport,
+    pub total_time: Duration,
 }
 
 impl SerializedEGraph {
@@ -319,11 +366,17 @@ pub fn hash_egglog_normalized(text: &str) -> u64 {
     for line in text.lines() {
         if line.contains("(Input ") {
             // Format: (let tN (Input NODE "LABEL" (DTYPE)))
-            // Strip the node index and label, keep only the dtype.
+            // Strip the node index and label identity, but preserve whether this
+            // is a synthetic boundary input or a real graph input.
             // The dtype is the last parenthesized token, e.g. "(F32)".
             if let Some(dtype_start) = line.rfind(" (") {
                 let dtype = &line[dtype_start + 1..];
-                ("INPUT", dtype).hash(&mut hasher);
+                let kind = if line.contains("\"boundary\"") {
+                    "BOUNDARY_INPUT"
+                } else {
+                    "REAL_INPUT"
+                };
+                (kind, dtype).hash(&mut hasher);
             } else {
                 line.hash(&mut hasher);
             }
@@ -390,8 +443,10 @@ pub fn hlir_to_egglog(graph: &Graph) -> (String, String) {
 
     // 2. Map <node-id> → <egglog var name>
     let mut names: HashMap<NodeIndex, String> = HashMap::new();
-    let mut out = String::new();
+    // Pre-size output to avoid growth reallocations; ops emit ~100-200 chars each.
+    let mut out = String::with_capacity(topo_order.len() * 160);
 
+    use std::fmt::Write;
     let mut curr_id = 0;
     for n in topo_order {
         let sources: Vec<(NodeIndex, String)> = graph
@@ -400,7 +455,9 @@ pub fn hlir_to_egglog(graph: &Graph) -> (String, String) {
             .map(|src| (src, names[&src].clone()))
             .collect_vec();
         let code = graph[n].to_egglog(&sources);
-        out.push_str(&format!("(let t{curr_id} {code})\n"));
+        // write!() into the existing buffer skips the intermediate String
+        // that format! would otherwise allocate for each node.
+        let _ = writeln!(out, "(let t{curr_id} {code})");
         names.insert(n, format!("t{curr_id}"));
         curr_id += 1;
     }
@@ -413,142 +470,9 @@ pub fn hlir_to_egglog(graph: &Graph) -> (String, String) {
     let mut root = names[0].clone();
     for node in names.into_iter().skip(1) {
         curr_id += 1;
-        out.push_str(&format!("(let t{curr_id} (OutputJoin {root} {node}))\n"));
+        let _ = writeln!(out, "(let t{curr_id} (OutputJoin {root} {node}))");
         root = format!("t{curr_id}");
     }
-    (out.replace("(MVar \"z\")", "(MIter)"), root)
-}
-
-/// Convert a subgraph of the HLIR to egglog, injecting synthetic Input/Output
-/// nodes at graph break boundaries.
-pub fn hlir_subgraph_to_egglog(graph: &Graph, subgraph: &SubgraphDescriptor) -> (String, String) {
-    use std::cmp::Reverse;
-    use std::collections::{BinaryHeap, HashMap};
-
-    let mut names: HashMap<NodeIndex, String> = HashMap::new();
-    let mut out = String::new();
-    let mut curr_id = 0;
-
-    // Emit synthetic Input nodes for boundary inputs
-    for boundary in &subgraph.boundary_inputs {
-        let var_name = format!("t{curr_id}");
-        let code = format!(
-            "(Input {} \"boundary\" ({:?}))",
-            boundary.break_node.index(),
-            boundary.dtype
-        );
-        out.push_str(&format!("(let {var_name} {code})\n"));
-        // Map the GraphBreak node to this synthetic Input variable.
-        // When downstream nodes reference the GraphBreak as a source, they'll use this.
-        names.insert(boundary.break_node, var_name);
-        curr_id += 1;
-    }
-
-    // Topo-order only the nodes in this subgraph
-    // Build sub-indeg map restricted to subgraph nodes
-    let mut indeg: HashMap<NodeIndex, usize> = HashMap::new();
-    for &n in &subgraph.nodes {
-        let count = graph
-            .graph
-            .neighbors_directed(n, Direction::Incoming)
-            .filter(|pred| subgraph.nodes.contains(pred))
-            .count();
-        indeg.insert(n, count);
-    }
-
-    let mut ready: BinaryHeap<(Reverse<usize>, NodeIndex)> = BinaryHeap::new();
-    for (&n, &d) in &indeg {
-        if d == 0 {
-            ready.push((Reverse(n.index()), n));
-        }
-    }
-
-    let mut topo_order: Vec<NodeIndex> = Vec::with_capacity(indeg.len());
-    while let Some((_, n)) = ready.pop() {
-        topo_order.push(n);
-        for succ in graph.graph.neighbors_directed(n, Direction::Outgoing) {
-            if let Some(e) = indeg.get_mut(&succ) {
-                *e -= 1;
-                if *e == 0 {
-                    ready.push((Reverse(succ.index()), succ));
-                }
-            }
-        }
-    }
-
-    // Convert each node in topological order to egglog
-    for n in topo_order {
-        let sources: Vec<(NodeIndex, String)> = graph
-            .get_sources(n)
-            .into_iter()
-            .map(|src| {
-                let name = names
-                    .get(&src)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("Missing egglog name for node {:?}", src));
-                (src, name)
-            })
-            .collect_vec();
-        let code = graph.graph[n].to_egglog(&sources);
-        out.push_str(&format!("(let t{curr_id} {code})\n"));
-        names.insert(n, format!("t{curr_id}"));
-        curr_id += 1;
-    }
-
-    // Emit synthetic Output nodes for boundary outputs
-    for &brk in &subgraph.boundary_outputs {
-        // The predecessor of the GraphBreak is the actual producer
-        let pred = graph
-            .graph
-            .neighbors_directed(brk, Direction::Incoming)
-            .next()
-            .expect("GraphBreak must have exactly one input");
-        let pred_name = names.get(&pred).cloned().unwrap_or_else(|| {
-            panic!(
-                "Missing egglog name for boundary output predecessor {:?}",
-                pred
-            )
-        });
-        let code = format!("(Output {} {})", pred_name, brk.index());
-        out.push_str(&format!("(let t{curr_id} {code})\n"));
-        names.insert(brk, format!("t{curr_id}"));
-        curr_id += 1;
-    }
-
-    // Join outputs: real outputs (nodes with no outgoing edges within the subgraph)
-    // plus boundary outputs
-    let mut output_names: Vec<String> = vec![];
-
-    // Boundary outputs
-    for &brk in &subgraph.boundary_outputs {
-        if let Some(name) = names.get(&brk) {
-            output_names.push(name.clone());
-        }
-    }
-
-    // Real outputs: only actual Output HLIR ops that exist in this subgraph
-    // (not arbitrary nodes that happen to have no subgraph successors)
-    for &n in &subgraph.nodes {
-        if graph.try_get_op::<Output>(n).is_some() {
-            if let Some(name) = names.get(&n) {
-                output_names.push(name.clone());
-            }
-        }
-    }
-
-    if output_names.is_empty() {
-        // Fallback: use the last node added
-        output_names.push(format!("t{}", curr_id - 1));
-    }
-
-    // Join with OutputJoin
-    let mut root = output_names[0].clone();
-    for node in output_names.into_iter().skip(1) {
-        curr_id += 1;
-        out.push_str(&format!("(let t{curr_id} (OutputJoin {root} {node}))\n"));
-        root = format!("t{curr_id}");
-    }
-
     (out.replace("(MVar \"z\")", "(MIter)"), root)
 }
 
@@ -588,41 +512,34 @@ fn termdag_to_egglog(td: &egglog::TermDag, root: egglog::TermId) -> (String, Str
     (out.replace("(MVar \"z\")", "(MIter)"), format!("t{root}"))
 }
 
-#[tracing::instrument(skip_all)]
-pub fn run_egglog(
-    program: &str,
-    root: &str,
-    ops: &[Arc<Box<dyn EgglogOp>>],
-    cleanup: bool,
-) -> Result<SerializedEGraph, egglog::Error> {
-    let start = std::time::Instant::now();
-    let code = early_egglog(program, root, ops, cleanup);
-    let mut egraph = egglog::EGraph::default();
-    let commands = egraph.parser.get_program_from_string(None, &code)?;
-    let outputs = egraph.run_program(commands)?;
-    let CommandOutput::ExtractBest(termdag, _cost, term) = outputs.last().unwrap() else {
-        panic!();
-    };
-    let (program, root) = termdag_to_egglog(termdag, termdag.lookup(term));
-    let code = full_egglog(&program, ops, cleanup);
-    let mut egraph = egglog::EGraph::default();
-    let commands = egraph.parser.get_program_from_string(None, &code)?;
-    trace!("{}", "Egglog running...".green());
-    let _outputs = egraph.run_program(commands)?;
-    trace!("{}", "---- Egglog Rule Matches ----".green());
+fn stage_report(egraph: &egglog::EGraph, total_time: Duration) -> EgglogStageReport {
     let run_report = egraph.get_overall_run_report();
+    EgglogStageReport {
+        num_matches_per_rule: run_report
+            .num_matches_per_rule
+            .iter()
+            .map(|(name, matches)| (name.to_string(), *matches))
+            .collect(),
+        search_and_apply_time_per_rule: run_report
+            .search_and_apply_time_per_rule
+            .iter()
+            .map(|(name, elapsed)| (name.to_string(), *elapsed))
+            .collect(),
+        total_time,
+    }
+}
+
+fn trace_stage_report(header: &str, report: &EgglogStageReport) {
+    trace!("{}", header.green());
     trace!(
         "{}",
-        run_report
+        report
             .num_matches_per_rule
             .iter()
             .filter(|(k, _)| !k.contains("("))
             .map(|(k, v)| format!(
                 "{k}: {v} ({})",
-                pretty_duration::pretty_duration(
-                    &run_report.search_and_apply_time_per_rule[k],
-                    None
-                )
+                pretty_duration::pretty_duration(&report.search_and_apply_time_per_rule[k], None)
             ))
             .join("\n")
             .green()
@@ -630,11 +547,73 @@ pub fn run_egglog(
     trace!(
         "{}",
         format!(
-            "---- Egglog Took {} ----",
-            pretty_duration::pretty_duration(&start.elapsed(), None).bold()
+            "---- {} Took {} ----",
+            header,
+            pretty_duration::pretty_duration(&report.total_time, None).bold()
         )
         .green()
     );
+}
+
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with_report(
+    program: &str,
+    root: &str,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+    cleanup: bool,
+) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    let op_parts = OpTextParts::new(ops, cleanup);
+    run_egglog_with_report_parts(program, root, &op_parts)
+}
+
+/// Same as [`run_egglog_with_report`], but takes pre-computed [`OpTextParts`].
+/// Useful when a caller runs many egglog invocations with the same op set
+/// and wants to factor the op-derived text work out of a parallel loop.
+/// Takes only `&str` / `&OpTextParts` inputs so the whole function is `Send`.
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with_report_parts(
+    program: &str,
+    root: &str,
+    op_parts: &OpTextParts,
+) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    let total_start = std::time::Instant::now();
+
+    let early_start = std::time::Instant::now();
+    let code = early_egglog_with(program, root, op_parts);
+    let mut egraph = egglog::EGraph::default();
+    let commands = egraph.parser.get_program_from_string(None, &code)?;
+    let outputs = egraph.run_program(commands)?;
+    let early_report = stage_report(&egraph, early_start.elapsed());
+
+    let CommandOutput::ExtractBest(termdag, _cost, term) = outputs.last().unwrap() else {
+        panic!();
+    };
+    let (program, root) = termdag_to_egglog(termdag, termdag.lookup(term));
+
+    let full_start = std::time::Instant::now();
+    let code = full_egglog_with(&program, op_parts);
+    let mut egraph = egglog::EGraph::default();
+    let commands = egraph.parser.get_program_from_string(None, &code)?;
+    trace!("{}", "Egglog running...".green());
+    let _outputs = egraph.run_program(commands)?;
+    let full_report = stage_report(&egraph, full_start.elapsed());
+    trace_stage_report("---- Egglog Early Rule Matches ----", &early_report);
+    trace_stage_report("---- Egglog Full Rule Matches ----", &full_report);
+
+    let run_report = EgglogRunReport {
+        early: early_report,
+        full: full_report,
+        total_time: total_start.elapsed(),
+    };
+    trace!(
+        "{}",
+        format!(
+            "---- Egglog Total Took {} ----",
+            pretty_duration::pretty_duration(&run_report.total_time, None).bold()
+        )
+        .green()
+    );
+
     let (sort, value) = egraph.eval_expr(&var!(root))?;
     let s = egraph.serialize(egglog::SerializeConfig {
         root_eclasses: vec![(sort, value)],
@@ -719,7 +698,28 @@ pub fn run_egglog(
         "No valid graphs present in the e-graph!"
     );
 
-    Ok(egraph)
+    Ok((egraph, run_report))
+}
+
+#[tracing::instrument(skip_all)]
+pub fn run_egglog(
+    program: &str,
+    root: &str,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+    cleanup: bool,
+) -> Result<SerializedEGraph, egglog::Error> {
+    run_egglog_with_report(program, root, ops, cleanup).map(|(egraph, _)| egraph)
+}
+
+/// Same as [`run_egglog`] but takes pre-computed [`OpTextParts`], so the
+/// whole function is `Send`. Used by the parallel grouped-egraphs build.
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with(
+    program: &str,
+    root: &str,
+    op_parts: &OpTextParts,
+) -> Result<SerializedEGraph, egglog::Error> {
+    run_egglog_with_report_parts(program, root, op_parts).map(|(egraph, _)| egraph)
 }
 
 pub fn extract_expr_list<'a>(
@@ -766,6 +766,8 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
         "F4E2M1" => DType::F4E2M1,
         "F8E4M3" => DType::F8E4M3,
         "F8UE8M0" => DType::F8UE8M0,
+        "I4" => DType::I4,
+        "TF32" => DType::TF32,
         other => panic!("unknown dtype {other}"),
     }
 }
@@ -1102,10 +1104,33 @@ pub fn egglog_to_llir<'a>(
     expr_cache: &mut FxHashMap<&'a NodeId, Expression>,
     custom_op_id_remap: Option<&FxHashMap<usize, usize>>,
 ) -> LLIRGraph {
+    egglog_to_llir_from_root(
+        egraph,
+        choices,
+        ops,
+        custom_ops,
+        list_cache,
+        expr_cache,
+        custom_op_id_remap,
+        &egraph.roots[0],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn egglog_to_llir_from_root<'a>(
+    egraph: &'a SerializedEGraph,
+    choices: EGraphChoiceSet<'a>,
+    ops: &'a Vec<Arc<Box<dyn EgglogOp>>>,
+    custom_ops: &[Box<dyn CustomOp>],
+    list_cache: &mut FxHashMap<&'a NodeId, Vec<Expression>>,
+    expr_cache: &mut FxHashMap<&'a NodeId, Expression>,
+    custom_op_id_remap: Option<&FxHashMap<usize, usize>>,
+    root_class: &ClassId,
+) -> LLIRGraph {
     // Make reachability set from root
     let mut reachable = FxHashSet::default();
-    reachable.insert(choices[&egraph.roots[0]]);
-    let mut reachability_stack = vec![choices[&egraph.roots[0]]];
+    reachable.insert(choices[root_class]);
+    let mut reachability_stack = vec![choices[root_class]];
     while let Some(r) = reachability_stack.pop() {
         for ch in &egraph.enodes[r].1 {
             if egraph.eclasses[ch].0.contains("IR") || egraph.eclasses[ch].0.contains("IList") {
@@ -1226,135 +1251,10 @@ pub fn egglog_to_llir<'a>(
     //     )
     //     .unwrap();
     // }
+    // Loop markers (LoopStart/End/Input/InputStatic/Output) are intentionally
+    // preserved here — `crate::graph::collapse_loops_to_first_iter` produces
+    // a single-iteration LLIR for fast per-candidate profiling, and the full
+    // `crate::graph::unroll_loops_in_llir` runs once on the chosen best LLIR
+    // before it is loaded into the runtime.
     graph
-}
-
-/// Merge multiple per-chunk LLIR graphs into a single LLIR graph,
-/// resolving boundary Input/Output nodes at graph break boundaries.
-pub fn stitch_llir_graphs(
-    chunk_llirs: &[LLIRGraph],
-    descriptors: &[SubgraphDescriptor],
-) -> LLIRGraph {
-    use petgraph::stable_graph::NodeIndex;
-
-    let mut merged = LLIRGraph::default();
-
-    // Collect the set of boundary break_node indices for matching
-    let mut boundary_output_set: FxHashSet<usize> = FxHashSet::default();
-    let mut boundary_input_set: FxHashSet<usize> = FxHashSet::default();
-    for desc in descriptors {
-        for brk in &desc.boundary_outputs {
-            boundary_output_set.insert(brk.index());
-        }
-        for bi in &desc.boundary_inputs {
-            boundary_input_set.insert(bi.break_node.index());
-        }
-    }
-
-    // Per-chunk node mapping: old NodeIndex -> new NodeIndex in merged graph
-    let mut node_maps: Vec<FxHashMap<NodeIndex, NodeIndex>> = Vec::with_capacity(chunk_llirs.len());
-
-    // Track boundary producers: break_node_index -> new NodeIndex of the actual producer
-    let mut boundary_producers: FxHashMap<usize, NodeIndex> = FxHashMap::default();
-
-    // Track real Input node deduplication: Input.node -> new NodeIndex
-    let mut real_inputs: FxHashMap<usize, NodeIndex> = FxHashMap::default();
-
-    for (_chunk_idx, chunk_graph) in chunk_llirs.iter().enumerate() {
-        let mut this_map: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
-
-        // Pass 1: Add all non-boundary nodes
-        for old_node in chunk_graph.node_indices() {
-            let op = &chunk_graph[old_node];
-
-            // Check if this is a boundary Output
-            if let Some(output_op) = op.to_op::<Output>() {
-                if boundary_output_set.contains(&output_op.node) {
-                    // Skip — will resolve in pass 2
-                    continue;
-                }
-            }
-
-            // Check if this is a boundary Input
-            if let Some(input_op) = op.to_op::<Input>() {
-                if boundary_input_set.contains(&input_op.node) {
-                    // Skip — will resolve in pass 2
-                    continue;
-                }
-
-                // Check if this is a real Input that was already added (dedup)
-                if let Some(&existing) = real_inputs.get(&input_op.node) {
-                    this_map.insert(old_node, existing);
-                    continue;
-                }
-            }
-
-            let new_node = merged.add_node(op.clone());
-            this_map.insert(old_node, new_node);
-
-            // Track real inputs for deduplication
-            if let Some(input_op) = op.to_op::<Input>() {
-                real_inputs.insert(input_op.node, new_node);
-            }
-        }
-
-        // Pass 2: Resolve boundary Output nodes (record the producer)
-        for old_node in chunk_graph.node_indices() {
-            let op = &chunk_graph[old_node];
-            if let Some(output_op) = op.to_op::<Output>() {
-                if boundary_output_set.contains(&output_op.node) {
-                    // Find the predecessor (the actual producer)
-                    let pred = chunk_graph
-                        .neighbors_directed(old_node, petgraph::Direction::Incoming)
-                        .next()
-                        .expect("Boundary Output must have exactly one input");
-                    if let Some(&producer_new) = this_map.get(&pred) {
-                        boundary_producers.insert(output_op.node, producer_new);
-                    } else {
-                        eprintln!(
-                            "[stitch] WARNING: chunk {}: boundary Output node={} predecessor {:?} not in this_map!",
-                            _chunk_idx,
-                            output_op.node,
-                            pred.index()
-                        );
-                    }
-                }
-            }
-        }
-
-        // Pass 2b: Resolve boundary Input nodes (map to producer from prior chunk)
-        for old_node in chunk_graph.node_indices() {
-            let op = &chunk_graph[old_node];
-            if let Some(input_op) = op.to_op::<Input>() {
-                if boundary_input_set.contains(&input_op.node) {
-                    if let Some(&producer) = boundary_producers.get(&input_op.node) {
-                        this_map.insert(old_node, producer);
-                    } else {
-                        eprintln!(
-                            "[stitch] WARNING: chunk {}: boundary Input node={} has no producer in boundary_producers!",
-                            _chunk_idx, input_op.node
-                        );
-                        eprintln!(
-                            "[stitch]   available producers: {:?}",
-                            boundary_producers.keys().collect::<Vec<_>>()
-                        );
-                    }
-                }
-            }
-        }
-
-        // Pass 3: Add edges (preserving duplicate edges for ops like x*x)
-        for edge in chunk_graph.edge_indices() {
-            let (src, dst) = chunk_graph.edge_endpoints(edge).unwrap();
-            if let (Some(&new_src), Some(&new_dst)) = (this_map.get(&src), this_map.get(&dst)) {
-                if new_src != new_dst {
-                    merged.add_edge(new_src, new_dst, ());
-                }
-            }
-        }
-
-        node_maps.push(this_map);
-    }
-
-    merged
 }

@@ -7,7 +7,7 @@ Produces:
     tests/llama38b.pt2                  — torch.export of Llama 3.1-8B
     tests/llama38b_weights.safetensors  — model weights
     tests/llama38b_ref_logits.pt        — reference logits for input_ids=[1,2,3,4]
-                                          (shared with ONNX artifact script)
+                                          (shared with PT2 artifact script)
 """
 
 from pathlib import Path
@@ -36,7 +36,7 @@ def main():
         torch_dtype=torch.float32,
     ).eval()
 
-    # Generate reference logits (shared with ONNX artifact script)
+    # Generate reference logits (shared with PT2 artifact script)
     if not LOGITS_PATH.exists():
         print("Computing reference logits...")
         with torch.no_grad():

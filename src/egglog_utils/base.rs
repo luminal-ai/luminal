@@ -232,6 +232,8 @@ pub struct BaseSorts {
     pub bf16_dt: SortDef,
     pub int_dt: SortDef,
     pub bool_dt: SortDef,
+    pub i4_dt: SortDef,
+    pub tf32_dt: SortDef,
     // Egglog builtin primitives (for term construction only)
     pub p_add: SortDef,
     pub p_sub: SortDef,
@@ -310,6 +312,8 @@ impl BaseSorts {
             bf16_dt: sort(DTYPE, "Bf16", &[]),
             int_dt: sort(DTYPE, "Int", &[]),
             bool_dt: sort(DTYPE, "Bool", &[]),
+            i4_dt: sort(DTYPE, "I4", &[]),
+            tf32_dt: sort(DTYPE, "TF32", &[]),
             p_add: func("+", &["a", "b"]),
             p_sub: func("-", &["a", "b"]),
             p_mul: func("*", &["a", "b"]),
@@ -363,6 +367,8 @@ impl BaseSorts {
             &self.bf16_dt,
             &self.int_dt,
             &self.bool_dt,
+            &self.i4_dt,
+            &self.tf32_dt,
         ] {
             p.add_sort(s);
         }
@@ -436,6 +442,7 @@ pub fn base_expression_egglog() -> String {
 
     // Rulesets
     p.add_ruleset("expr");
+    p.add_ruleset("dtype_prop");
     p.add_ruleset("cleanup");
     p.add_ruleset("early");
 

@@ -152,16 +152,6 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
-    pub fn graph_break(self) -> GraphTensor {
-        let new_id = self.graph().add_op(
-            crate::hlir::GraphBreak {
-                input_shape: self.shape,
-            },
-            &[self.id],
-        );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
-    }
-
     /// Scale so std is 1.0
     pub fn std_norm<T>(self, axes: impl ToAxes, epsilon: T) -> GraphTensor
     where
@@ -663,7 +653,7 @@ pub(super) mod tests {
                 let mut out: Vec<(NotNan<f32>, usize)> =
                     heap.into_iter().map(|std::cmp::Reverse(t)| t).collect();
 
-                out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                out.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 out.into_iter().map(|(_, i)| i).collect()
             }
             test_unary(

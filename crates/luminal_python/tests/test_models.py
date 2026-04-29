@@ -3,6 +3,13 @@
 import torch
 
 
+class SelfAddModel(torch.nn.Module):
+    """Adds input to itself (x + x). Preserves input dtype."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + x
+
+
 class AddTestModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -145,7 +152,7 @@ class TransposeInExpressionModel(torch.nn.Module):
 
 
 # ========== Constant Node Test Models ==========
-# These models test ONNX Constant node handling via inline tensor literals
+# These models test PT2 Constant node handling via inline tensor literals
 
 
 class ConstantScalarFloatModel(torch.nn.Module):
@@ -284,7 +291,7 @@ class ConstantMultipleInGraphModel(torch.nn.Module):
 
 
 # ========== Cast Node Test Models ==========
-# These models test ONNX Cast node handling via .to(dtype) method
+# These models test PT2 Cast node handling via .to(dtype) method
 
 
 class CastDoubleToFloatModel(torch.nn.Module):
@@ -387,7 +394,7 @@ class ModTestModel(torch.nn.Module):
 
 
 class ModByConstantModel(torch.nn.Module):
-    """Tests modulo with an inline constant tensor (ONNX Constant node)."""
+    """Tests modulo with an inline constant tensor (PT2 Constant node)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -446,7 +453,7 @@ class CeilInExpressionModel(torch.nn.Module):
 
 
 # ========== Reshape Node Test Models ==========
-# These models test ONNX Reshape node handling in ops_parse.rs
+# These models test PT2 Reshape node handling in ops_parse.rs
 
 
 class ReshapeToFlatModel(torch.nn.Module):
@@ -534,7 +541,7 @@ class ShapeReshapeKeepBatchModel(torch.nn.Module):
 
 
 # ========== Less Node Test Models ==========
-# These models test ONNX Less node handling in ops_parse.rs
+# These models test PT2 Less node handling in ops_parse.rs
 
 
 class LessTestModel(torch.nn.Module):
@@ -560,7 +567,7 @@ class LessBroadcastModel(torch.nn.Module):
 
 
 class LessWithConstantModel(torch.nn.Module):
-    """Tests less-than against an inline constant (ONNX Constant + Less nodes)."""
+    """Tests less-than against an inline constant (PT2 Constant + Less nodes)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         constant = torch.tensor([0.25, 0.5, 0.75]).to(x.device)
@@ -568,7 +575,7 @@ class LessWithConstantModel(torch.nn.Module):
 
 
 # ========== Gather Node Test Models ==========
-# These models test ONNX Gather node handling in ops_parse.rs
+# These models test PT2 Gather node handling in ops_parse.rs
 
 
 class Gather1DModel(torch.nn.Module):
@@ -621,7 +628,7 @@ class GatherNegativeIndicesModel(torch.nn.Module):
 
 
 class GatherConstantFoldModel(torch.nn.Module):
-    """Tests Gather constant folding: both data and indices are ONNX Constant nodes."""
+    """Tests Gather constant folding: both data and indices are PT2 Constant nodes."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         data = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0]).to(x.device)
@@ -630,7 +637,7 @@ class GatherConstantFoldModel(torch.nn.Module):
 
 
 # ========== Squeeze Node Test Models ==========
-# These models test ONNX Squeeze node handling in ops_parse.rs
+# These models test PT2 Squeeze node handling in ops_parse.rs
 
 
 class SqueezeAxisModel(torch.nn.Module):
@@ -1140,7 +1147,7 @@ class MaxTestModel(torch.nn.Module):
 
 
 class MaxWithConstantModel(torch.nn.Module):
-    """Tests element-wise maximum against an inline constant (ONNX Max + Constant nodes)."""
+    """Tests element-wise maximum against an inline constant (PT2 Max + Constant nodes)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         constant = torch.tensor([0.2, 0.4, 0.6, 0.8, 1.0]).to(x.device)
@@ -1162,7 +1169,7 @@ class MinTestModel(torch.nn.Module):
 
 
 class MinWithConstantModel(torch.nn.Module):
-    """Tests element-wise minimum against an inline constant (ONNX Min + Constant nodes)."""
+    """Tests element-wise minimum against an inline constant (PT2 Min + Constant nodes)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         constant = torch.tensor([0.2, 0.4, 0.6, 0.8, 1.0]).to(x.device)
@@ -1288,7 +1295,7 @@ class LessOrEqualTestModel(torch.nn.Module):
 
 
 class LessOrEqualWithConstantModel(torch.nn.Module):
-    """Tests less-than-or-equal against an inline constant (ONNX Constant + LessOrEqual nodes)."""
+    """Tests less-than-or-equal against an inline constant (PT2 Constant + LessOrEqual nodes)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         constant = torch.tensor([0.25, 0.5, 0.75]).to(x.device)
@@ -1310,7 +1317,7 @@ class GreaterOrEqualTestModel(torch.nn.Module):
 
 
 class GreaterOrEqualWithConstantModel(torch.nn.Module):
-    """Tests greater-than-or-equal against an inline constant (ONNX Constant + GreaterOrEqual nodes)."""
+    """Tests greater-than-or-equal against an inline constant (PT2 Constant + GreaterOrEqual nodes)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         constant = torch.tensor([0.25, 0.5, 0.75]).to(x.device)
@@ -1432,7 +1439,7 @@ class GreaterTestModel(torch.nn.Module):
 
 
 class GreaterWithConstantModel(torch.nn.Module):
-    """Tests greater-than against a scalar constant (ONNX Greater + Constant nodes)."""
+    """Tests greater-than against a scalar constant (PT2 Greater + Constant nodes)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x > 0.5).to(torch.float32)
@@ -1509,7 +1516,7 @@ class MLPBlockModel(torch.nn.Module):
 
 
 class GatherElementsTestModel(torch.nn.Module):
-    """Tests element-wise gather along axis=1 using torch.gather (→ ONNX GatherElements)."""
+    """Tests element-wise gather along axis=1 using torch.gather (→ PT2 GatherElements)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         idx = torch.tensor([[0, 1, 1], [1, 0, 0]], device=x.device)
@@ -1530,7 +1537,7 @@ class GatherElementsLargeTestModel(torch.nn.Module):
 
 
 class ExpandTestModel(torch.nn.Module):
-    """Tests broadcasting a (1, 4) tensor to (3, 4) via .expand() (→ ONNX Expand)."""
+    """Tests broadcasting a (1, 4) tensor to (3, 4) via .expand() (→ PT2 Expand)."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x.expand(3, 4)
@@ -1550,7 +1557,7 @@ class IsNaNTestModel(torch.nn.Module):
 
 
 class LayerNormTestModel(torch.nn.Module):
-    """Tests nn.LayerNorm which exports as ONNX LayerNormalization."""
+    """Tests nn.LayerNorm which exports as PT2 LayerNormalization."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -1564,7 +1571,7 @@ class LayerNormTestModel(torch.nn.Module):
 
 
 class GemmTestModel(torch.nn.Module):
-    """Tests Gemm: nn.Linear exports as ONNX Gemm (weight transposed)."""
+    """Tests Gemm: nn.Linear exports as PT2 Gemm (weight transposed)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -1588,14 +1595,14 @@ class ErfTestModel(torch.nn.Module):
 
 
 class SliceTestModel(torch.nn.Module):
-    """Tests ONNX Slice: slice axis 0 from index 1 to 3."""
+    """Tests PT2 Slice: slice axis 0 from index 1 to 3."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x[1:3]
 
 
 class SliceMultiAxisTestModel(torch.nn.Module):
-    """Tests ONNX Slice along multiple axes: x[1:3, 0:2]."""
+    """Tests PT2 Slice along multiple axes: x[1:3, 0:2]."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x[1:3, 0:2]
@@ -1610,6 +1617,73 @@ class SplitTestModel(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = torch.split(x, 2, dim=1)
         return a + b
+
+
+# ========== Argsort / MoE Routing Test Models ==========
+
+
+class ArgsortStableDuplicatesModel(torch.nn.Module):
+    """Tests deterministic duplicate ordering for exported argsort."""
+
+    SORT_DIM = 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.argsort(x, dim=self.SORT_DIM)
+
+
+class TinyMoERoutingModel(torch.nn.Module):
+    """Minimal deterministic MoE-style routing proof for PT2/native and CUDA."""
+
+    TOP_K = 2
+    ROUTING_DIM = -1
+    ZERO_FILL = 0.0
+    DISPATCH_ON = 1
+    GROUP_SIZE = 2
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer(
+            "expert_scale",
+            torch.tensor([1.5, -0.5, 2.0, 0.25], dtype=torch.float32),
+        )
+
+    def forward(
+        self, scores: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        topk_values, topk_indices = torch.topk(scores, self.TOP_K, dim=self.ROUTING_DIM)
+        regroup_order = torch.argsort(topk_indices, dim=self.ROUTING_DIM)
+        routed_indices = torch.gather(topk_indices, self.ROUTING_DIM, regroup_order)
+        routed_values = torch.gather(topk_values, self.ROUTING_DIM, regroup_order)
+
+        expert_scale = self.expert_scale.unsqueeze(0).expand(scores.shape[0], -1)
+        gathered_scale = torch.gather(expert_scale, self.ROUTING_DIM, routed_indices)
+        weighted = routed_values * gathered_scale
+
+        inactive_mask = torch.bitwise_not(weighted > 0)
+        masked_values = weighted.masked_fill(inactive_mask, self.ZERO_FILL)
+
+        slots = torch.zeros_like(routed_indices).scatter(
+            self.ROUTING_DIM, regroup_order, self.DISPATCH_ON
+        )
+        active_slots = torch.bitwise_not(inactive_mask).to(slots.dtype)
+        dispatch = slots * active_slots
+        group_ids = torch.floor_divide(routed_indices, self.GROUP_SIZE)
+        routing_sign = torch.sign(masked_values)
+        return (
+            routed_indices,
+            masked_values,
+            dispatch,
+            inactive_mask,
+            group_ids,
+            routing_sign,
+        )
 
 
 # ========== TopK Node Test Models ==========
@@ -1684,7 +1758,7 @@ class ScatterNDTestModel(torch.nn.Module):
 class RMSNormModel(torch.nn.Module):
     """Tests RMS normalization: x * rsqrt(mean(x^2) + eps) * weight.
 
-    ONNX ops: Pow, ReduceMean, Add, Sqrt, Reciprocal, Mul.
+    PT2 ops: Pow, ReduceMean, Add, Sqrt, Reciprocal, Mul.
     Input: (1, 4, 32) -> Output: (1, 4, 32).
     """
 
@@ -1703,7 +1777,7 @@ class RotaryEmbeddingModel(torch.nn.Module):
     """Tests rotary position embeddings (RoPE) using rotate-half approach.
 
     Precomputes cos/sin caches as buffers; at runtime: slice, split halves, rotate.
-    ONNX ops: Slice, Unsqueeze, Mul, Sub, Add, Concat.
+    PT2 ops: Slice, Unsqueeze, Mul, Sub, Add, Concat.
     Input: (1, 4, 4, 8) [batch, seq, heads, head_dim] -> Output: same shape.
     """
 
@@ -1732,7 +1806,7 @@ class RotaryEmbeddingModel(torch.nn.Module):
 class SwiGLUMLPModel(torch.nn.Module):
     """Tests SwiGLU MLP: down_proj(silu(gate_proj(x)) * up_proj(x)).
 
-    silu(x) = x * sigmoid(x), decomposes to Sigmoid+Mul in ONNX.
+    silu(x) = x * sigmoid(x), decomposes to Sigmoid+Mul in PT2.
     Input: (1, 4, 32) -> Output: (1, 4, 32).
     """
 
@@ -1823,3 +1897,307 @@ class LlamaTransformerBlockModel(torch.nn.Module):
         h = x + self.attn(self.input_norm(x))
         out = h + self.mlp(self.post_attn_norm(h))
         return out
+
+
+# ---------------------------------------------------------------------------
+# Convolution models
+# ---------------------------------------------------------------------------
+
+
+class Conv1dNoPadModel(torch.nn.Module):
+    """Conv1d with no padding: output length shrinks by (kernel-1)."""
+
+    KERNEL_SIZE = 3
+    PADDING = 0
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv1d(
+            8, 16, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv1dSamePadModel(torch.nn.Module):
+    """Conv1d with same-size padding (output length == input length)."""
+
+    KERNEL_SIZE = 3
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv1d(
+            8, 16, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv1dBiasModel(torch.nn.Module):
+    """Conv1d with bias."""
+
+    KERNEL_SIZE = 3
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv1d(
+            8, 16, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv2dNoPadModel(torch.nn.Module):
+    """Conv2d with no padding: output spatial dims shrink by (kernel-1)."""
+
+    KERNEL_SIZE = 3
+    PADDING = 0
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            3, 16, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv2dSamePadModel(torch.nn.Module):
+    """Conv2d with same-size padding."""
+
+    KERNEL_SIZE = 3
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            3, 16, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv2dBiasModel(torch.nn.Module):
+    """Conv2d with bias."""
+
+    KERNEL_SIZE = 3
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            3, 16, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=True
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv2dStrideModel(torch.nn.Module):
+    """Conv2d with stride=2 (output dims halved)."""
+
+    KERNEL_SIZE = 3
+    STRIDE = 2
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            3,
+            16,
+            kernel_size=self.KERNEL_SIZE,
+            stride=self.STRIDE,
+            padding=self.PADDING,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv2dDilationModel(torch.nn.Module):
+    """Conv2d with dilation=2 and padding chosen to preserve spatial size."""
+
+    KERNEL_SIZE = 3
+    DILATION = 2
+    PADDING = 2
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            8,
+            16,
+            kernel_size=self.KERNEL_SIZE,
+            dilation=self.DILATION,
+            padding=self.PADDING,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Conv3dSamePadModel(torch.nn.Module):
+    """Conv3d with padding=1 to preserve spatial dimensions."""
+
+    KERNEL_SIZE = 3
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv3d(
+            4, 8, kernel_size=self.KERNEL_SIZE, padding=self.PADDING, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class DepthwiseConv1dModel(torch.nn.Module):
+    """Depthwise Conv1d as used in Mamba (groups == in_channels)."""
+
+    KERNEL_SIZE = 4
+    GROUPS = 16
+    PADDING = 3
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv1d(
+            16,
+            16,
+            kernel_size=self.KERNEL_SIZE,
+            groups=self.GROUPS,
+            padding=self.PADDING,
+            bias=True,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Causal truncation: keep only the first L positions
+        return self.conv(x)[:, :, : x.shape[2]]
+
+
+class DepthwiseConv2dModel(torch.nn.Module):
+    """Depthwise Conv2d (groups == in_channels)."""
+
+    KERNEL_SIZE = 3
+    GROUPS = 8
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            8,
+            8,
+            kernel_size=self.KERNEL_SIZE,
+            groups=self.GROUPS,
+            padding=self.PADDING,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class DepthwiseMultiplierConv2dModel(torch.nn.Module):
+    """Depthwise Conv2d with channel multiplier 2 (out_channels = 2 * in_channels)."""
+
+    KERNEL_SIZE = 3
+    GROUPS = 8
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            8,
+            16,
+            kernel_size=self.KERNEL_SIZE,
+            groups=self.GROUPS,
+            padding=self.PADDING,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class GroupedConv2dModel(torch.nn.Module):
+    """Conv2d with groups=4 (not depthwise, but grouped)."""
+
+    KERNEL_SIZE = 3
+    GROUPS = 4
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            16,
+            32,
+            kernel_size=self.KERNEL_SIZE,
+            groups=self.GROUPS,
+            padding=self.PADDING,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class GroupedConv2dGroups3Model(torch.nn.Module):
+    """Conv2d with groups=3 and ch_per_group=4."""
+
+    KERNEL_SIZE = 3
+    GROUPS = 3
+    PADDING = 1
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            12,
+            12,
+            kernel_size=self.KERNEL_SIZE,
+            groups=self.GROUPS,
+            padding=self.PADDING,
+            bias=False,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class MambaConvBlockModel(torch.nn.Module):
+    """Minimal Mamba-style SSM block: Linear -> split -> depthwise Conv1d -> SiLU gate -> Linear.
+
+    This is the core conv pattern used in Mamba / Mamba-2 models.
+    """
+
+    def __init__(self, d_model: int = 16, d_conv: int = 4, expand: int = 2) -> None:
+        super().__init__()
+        d_inner = d_model * expand
+        groups = d_inner
+        padding = d_conv - 1
+        self.in_proj = torch.nn.Linear(d_model, d_inner * 2, bias=False)
+        self.conv1d = torch.nn.Conv1d(
+            d_inner,
+            d_inner,
+            d_conv,
+            groups=groups,
+            padding=padding,
+            bias=True,
+        )
+        self.out_proj = torch.nn.Linear(d_inner, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, seq_len, _ = x.shape
+        xz = self.in_proj(x)
+        x_part, z = xz.chunk(2, dim=-1)
+        x_part = self.conv1d(x_part.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
+        return self.out_proj(
+            torch.nn.functional.silu(x_part) * torch.nn.functional.silu(z)
+        )

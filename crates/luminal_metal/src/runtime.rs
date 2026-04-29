@@ -234,6 +234,10 @@ impl Runtime for MetalRuntime {
         }
     }
 
+    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
+        metrics.iter().copied().sum()
+    }
+
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.pipelines.clear();

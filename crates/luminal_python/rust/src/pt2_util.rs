@@ -16,6 +16,7 @@ pub enum ReductionOp {
     Mean,
     Max,
     Min,
+    Prod,
 }
 
 /// Normalize a potentially negative dimension index.

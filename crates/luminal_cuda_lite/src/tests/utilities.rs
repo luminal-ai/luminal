@@ -468,7 +468,7 @@ pub fn fuzz_genomes<T: TestDType>(
 
             let mut list_cache = FxHashMap::default();
             let mut expr_cache = FxHashMap::default();
-            let llir_graph = egglog_to_llir(
+            let mut llir_graph = egglog_to_llir(
                 egraph,
                 genome.clone(),
                 ops,
@@ -477,6 +477,12 @@ pub fn fuzz_genomes<T: TestDType>(
                 &mut expr_cache,
                 None,
             );
+            // Same finalization as `Graph::search` performs on the chosen
+            // best LLIR: collapse the rolled body's loop markers into a
+            // fully-unrolled LLIR. The runtime cannot execute LoopStart /
+            // LoopEnd / LoopInput / LoopOutput markers — they exist only as
+            // a search-time scaffold the auto-roll prepass introduces.
+            unroll_loops_in_llir(&mut llir_graph);
 
             let mut rt = CudaRuntime::initialize(stream.clone());
             rt.load_llir(&llir_graph);

@@ -653,4 +653,53 @@ mod tests {
         }
         assert_close(&rt.get_f32(output), &expected, 1e-2, 1e-2);
     }
+
+    /// Test that CUDA graphs produce correct results when dynamic dimensions
+    /// change incrementally across many executions (simulating a decode loop
+    /// where position offset increments each step).
+    #[test]
+    fn test_cuda_graph_incremental_dim_changes() {
+        let Some(stream) = get_cuda_stream() else {
+            return;
+        };
+        let mut cx = Graph::default();
+        let a = cx.tensor('s');
+        let b = cx.tensor('s');
+        let c = ((a + b) * a).output();
+
+        let initial_size = 128;
+        cx.set_dim('s', initial_size);
+        let mut rt = CudaRuntime::initialize(stream);
+        let data_a = random_f32_vec(initial_size, 42, -0.5, 0.5);
+        let data_b = random_f32_vec(initial_size, 43, -0.5, 0.5);
+        rt.set_data(a, data_a.clone());
+        rt.set_data(b, data_b.clone());
+        cx.build_search_space::<CudaRuntime>();
+        rt = cx.search(rt, 5);
+
+        // Initial execution
+        rt.execute(&cx.dyn_map);
+        let eps = dtype_epsilon(luminal::dtype::DType::F32);
+        let tol = eps * TOLERANCE_SAFETY_FACTOR;
+        let expected: Vec<f32> = data_a
+            .iter()
+            .zip(&data_b)
+            .map(|(a, b)| (a + b) * a)
+            .collect();
+        assert_close(&rt.get_f32(c), &expected, tol, tol);
+
+        // Incrementally change the dynamic dimension 10 times,
+        // simulating decode steps where position offset grows.
+        for step in 1..=10usize {
+            let size = initial_size + step;
+            cx.set_dim('s', size);
+            let da = random_f32_vec(size, 100 + step as u64, -0.5, 0.5);
+            let db = random_f32_vec(size, 200 + step as u64, -0.5, 0.5);
+            rt.set_data(a, da.clone());
+            rt.set_data(b, db.clone());
+            rt.execute(&cx.dyn_map);
+            let expected: Vec<f32> = da.iter().zip(&db).map(|(a, b)| (a + b) * a).collect();
+            assert_close(&rt.get_f32(c), &expected, tol, tol);
+        }
+    }
 }

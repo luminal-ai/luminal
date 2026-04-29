@@ -57,15 +57,35 @@ impl GraphTensor {
         self.graph().get_op_mut::<Input>(self.id).label = name.to_string();
     }
 
-    /// Mark this tensor as an output
+    /// Mark this tensor as an output.
+    /// If the tensor has non-contiguous strides (e.g. from transpose + merge_dims),
+    /// inserts a gather to materialize contiguous data before the output node.
     pub fn output(&self) -> GraphTensor {
+        let source = if self.shape.is_contiguous() {
+            *self
+        } else {
+            // Insert gather to make physically contiguous
+            let dims = self.dims();
+            let total = dims.iter().copied().reduce(|a, b| a * b).unwrap();
+            let idx_expr = self.shape.index_expression();
+            let idx = self.graph().iota(idx_expr, total);
+            let mut gathered = self.gather(idx);
+            gathered.shape = ShapeTracker::new(dims);
+            gathered
+        };
+        self.output_raw(source)
+    }
+
+    /// Mark a tensor as an output without any contiguous materialization.
+    /// Used internally by graph_break and persist.
+    fn output_raw(&self, source: GraphTensor) -> GraphTensor {
         self.graph().add_op(
             Output {
-                node: self.id.index(),
+                node: source.id.index(),
             },
-            &[self.id],
+            &[source.id],
         );
-        *self
+        source
     }
 
     /// Required bytes to store this tensor's physical elements. Rounds up to nearest byte.
@@ -77,7 +97,7 @@ impl GraphTensor {
     /// so the buffer is not consumed after execute(), but returns the original
     /// Input node's GraphTensor (not the Output node).
     pub fn persist(&self) -> GraphTensor {
-        self.output();
+        self.output_raw(*self);
         *self
     }
 

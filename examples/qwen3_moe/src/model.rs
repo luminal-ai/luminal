@@ -186,7 +186,7 @@ impl Qwen3MoE {
                 kv_cache.v_caches[i],
                 kv_cache.max_seq,
             );
-            x = x_new.graph_break();
+            x = x_new;
             cache_outputs.push((k_out, v_out));
         }
         let logits = self.lm_norm.forward(x).matmul(self.lm_head.t());
@@ -239,7 +239,6 @@ impl Qwen3MoELayer {
         let (attn_out, k_cache_out, v_cache_out) =
             attention(q_rope, k_rope, v, k_cache_in, v_cache_in, max_seq);
         x += attn_out.matmul(self.o_proj.t());
-        x = x.graph_break();
 
         // MoE FFN
         let x_mlp = self.mlp_rms.forward(x);
@@ -264,8 +263,7 @@ impl QwenMoE {
         let row_offsets = x
             .graph()
             .iota(Expression::from('z') / k_expr * e_dim, top_k_indices.dims());
-        let routing_flat_idx =
-            (row_offsets.cast(DType::F32) + top_k_indices.cast(DType::F32)).cast(DType::Int);
+        let routing_flat_idx = row_offsets + top_k_indices;
         let top_k_values = routing_weights.gather(routing_flat_idx);
 
         // 4. Gather gate_up expert weights → [s, k, intermediate*2, H]
@@ -303,18 +301,18 @@ fn gather_experts(
 ) -> GraphTensor {
     let (_, d1, d2) = weights.dims3();
     let io = d1 * d2;
-    let base = (top_k_indices * io).cast(DType::F32);
-    let within = graph_source
-        .graph()
-        .iota(Expression::from('z'), (d1, d2))
-        .cast(DType::F32);
+    // Keep expert gather indices in Int all the way through. Routing them through
+    // F32 loses exactness once the flat offsets exceed 2^24, which Qwen's expert
+    // tensors do at realistic hidden sizes.
+    let base = top_k_indices * io;
+    let within = graph_source.graph().iota(Expression::from('z'), (d1, d2));
     let n_base = base.dims().len();
     let exp_base = base.expand_dim(n_base, d1).expand_dim(n_base + 1, d2);
     let mut exp_within = within;
     for (i, dim) in base.dims().iter().enumerate() {
         exp_within = exp_within.expand_dim(i, *dim);
     }
-    let expert_flat_idx = (exp_base + exp_within).cast(DType::Int);
+    let expert_flat_idx = exp_base + exp_within;
     weights.gather(expert_flat_idx)
 }
 

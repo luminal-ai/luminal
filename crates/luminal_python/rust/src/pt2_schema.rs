@@ -77,6 +77,7 @@ pub enum Argument {
     SymInts(SymIntsArg),
     SymInt(SymIntArg),
     Expr(ExprArg),
+    #[allow(dead_code)]
     ScalarType(ScalarTypeArg),
     Tensors(TensorsArg),
     OptionalTensors(OptionalTensorsArg),
@@ -168,6 +169,7 @@ pub struct NoneArg {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct ScalarTypeArg {
     pub as_scalar_type: u32,
 }
@@ -224,6 +226,7 @@ impl Argument {
         }
     }
 
+    #[allow(dead_code)]
     pub fn as_scalar_type(&self) -> Option<u32> {
         match self {
             Argument::ScalarType(s) => Some(s.as_scalar_type),

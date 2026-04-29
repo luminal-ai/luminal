@@ -186,7 +186,7 @@ class TestRunner:
         env = os.environ.copy()
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = f"{SRC_PATH}:{existing}" if existing else SRC_PATH
-        env["LUMINAL_BACKEND"] = "cuda"
+        env["LUMINAL_TEST_DEVICE"] = "cuda"
         env["UV_PROJECT_ENVIRONMENT"] = VENV_PATH
         env["MATURIN_PEP517_ARGS"] = "--features cuda --profile release"
         env["CUDARC_CUDA_VERSION"] = CUDARC_CUDA_VERSION

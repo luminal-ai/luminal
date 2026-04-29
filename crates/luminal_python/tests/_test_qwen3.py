@@ -1,7 +1,7 @@
 """Qwen3-8B HuggingFace model integration tests.
 
 Tests progressively larger HuggingFace Qwen3ForCausalLM configs through the
-PyTorch -> ONNX -> luminal pipeline via torch.compile. Qwen3 shares the same
+PyTorch -> PT2 -> luminal pipeline via torch.compile. Qwen3 shares the same
 architecture family as Llama (GQA, RoPE, SwiGLU MLP, RMSNorm).
 """
 
