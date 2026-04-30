@@ -28,7 +28,7 @@ pub struct CpuRuntime {
     // f32 buffers for every intermediate / output LLIR node.
     pub buffers: FxHashMap<NodeIndex, Vec<f32>>,
 
-    // The LLIR graph after fuse_matmuls()
+    // The LLIR graph
     llir_graph: LLIRGraph,
 
     // Inferred dtype per LLIR node (used for get_f32 / type-checking).
@@ -39,62 +39,6 @@ pub struct CpuRuntime {
 // Private helpers 
 // ---------------------------------------------------------------------------------------------------
 impl CpuRuntime {
-    /// Walk the LLIR graph and fuse every (CpuMul -> CpuSumReduce) pairs that
-    /// match the plain 2-D matmul pattern into a single CpuMatMul Node
-    fn fuse_matmuls(llir_graph: &LLIRGraph) -> LLIRGraph {
-        let mut graph = llir_graph.clone();
-        let mut rewrites = Vec::new();
-
-        for sum_node in graph.node_indices().collect::<Vec<_>> () {
-            let Some(sum_info) = graph[sum_node].to_dialect::<dyn CpuKernelOp>().and_then(|op| op.sum_reduce_info())
-            else {
-                continue;
-            };
-
-            // Must have exactly one incoming edge
-            let input_edges: Vec<_> = graph.edges_directed(sum_node, Direction::Incoming).sorted_by_key(|e| e.id()).map(|e| e.source()).collect();
-            if input_edges.len() != 1 {
-                continue;
-            }
-
-            let mul_node = input_edges[0];
-            // That one input must be CpuMul
-            let Some(mul_info) = graph[mul_node].to_dialect::<dyn CpuKernelOp>().and_then(|op| op.mul_info())
-            else {
-                continue;
-            };
-
-            // Shape must match the plain 2-D matmul pattern
-            let Some(desc) = CpuMatmulDescriptor::from_mul_and_sum(&mul_info, &sum_info) else {
-                continue;
-            };
-
-            let mul_inputs: Vec<_> = graph.edges_directed(mul_node, Direction::Incoming).sorted_by_key(|e| e.id()).map(|e| e.source()).collect();
-            if mul_inputs.len() != 2 {
-                continue;
-            }
-
-            rewrites.push((sum_node, mul_node, mul_inputs, desc));
-        }
-
-        // Apply rewrites
-        for (sum_node, mul_node, mul_inputs, desc) in rewrites {
-            graph[sum_node] = luminal::op::LLIROp::new::<dyn CpuKernelOp>(Box::new(CpuMatmul {
-                m: desc.m,
-                n: desc.n,
-                k: desc.k,
-                lda: desc.lda,
-                ldb: desc.ldb,
-                ldd: desc.ldd,
-            }));
-            graph.remove_node(mul_node);
-            graph.add_edge(mul_inputs[0], sum_node, ());
-            graph.add_edge(mul_inputs[1], sum_node, ());
-        }
-
-        graph
-    }
-
     /// Widen any typed input slice to f32
     fn to_f32(data: &NativeData, dtype: DType) -> Vec<f32> {
         match dtype {
@@ -190,7 +134,7 @@ impl Runtime for CpuRuntime {
         self.hlir_buffers.clear();
         self.node_dtypes.clear();
 
-        self.llir_graph = Self::fuse_matmuls(llir_graph);
+        self.llir_graph = llir_graph.clone();
 
         let topo_order = toposort(&self.llir_graph, None).expect("LLIR graph has cycles!");
 

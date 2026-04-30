@@ -1,5 +1,7 @@
 use super::{CpuKernelOp, CpuMulInfo, CpuSumReduceInfo};
-use luminal::{dtype::DType, op::EgglogOp, prelude::*};
+use luminal::{dtype::DType, egglog_utils::{
+    SerializedEGraph, api::{Rule, SortDef, eq, rule, sort, union, v}, base::{EXPRESSION, IR, dtype, iter, new_op_call, op_term}
+}, op::*, prelude::*};
 use matrixmultiply::sgemm;
 
 
@@ -49,8 +51,7 @@ impl CpuMatmulDescriptor {
 // ---------------------------------------------------------------------------------------------------
 // CpuMatmul op
 // 
-// This is the fused mode that replaces Mul+SumReduce in the LLIR graph
-// It uses the 'matrixmultiply' crate for a well-optimized BLAS-like sgemm
+// The rewrite fires when egglog sees CPUSumReduce.
 // ---------------------------------------------------------------------------------------------------
 #[derive(Debug, Clone, Default)]
 pub struct CpuMatmul {
@@ -64,25 +65,91 @@ pub struct CpuMatmul {
 
 impl EgglogOp for CpuMatmul {
     fn sort(&self) -> luminal::egglog_utils::api::SortDef {
-        // CpuMatmul is injected by fuse_matmuls, not via egglog rewrites,
-        // so we can return placeholder sort.
-        luminal::hlir::reduce_sort("CpuMatmul")
+        sort(IR, "CpuMatmul", &[
+            ("m", EXPRESSION),
+            ("n", EXPRESSION),
+            ("k", EXPRESSION),
+            ("lhs", IR),
+            ("lda", EXPRESSION),
+            ("rhs", IR),
+            ("ldb", EXPRESSION),
+            ("ldd", EXPRESSION),
+        ])
     }
     fn rewrites(&self) -> Vec<luminal::egglog_utils::api::Rule> {
-        vec![]
+        let sum_sort = super::ops::CpuSumReduce::default().sort();
+        let mul_sort = super::ops::CpuMul::default().sort();
+        let matmul_sort = self.sort();
+
+        let (sum_args, sum_match) = new_op_call(&sum_sort, &["inp"]);
+        let (mul_args, mul_match) = new_op_call(&mul_sort, &["lhs", "rhs"]);
+
+        let matmul_args = [
+            ("m".to_string(),   sum_args["out_shape"].clone()), 
+            ("n".to_string(),   sum_args["out_shape"].clone()),
+            ("k".to_string(),   sum_args["iters"].clone()),
+            ("lhs".to_string(), mul_args["lhs"].clone()),
+            ("lda".to_string(), mul_args["a_strides"].clone()), 
+            ("rhs".to_string(), mul_args["rhs"].clone()),
+            ("ldb".to_string(), mul_args["b_strides"].clone()), 
+            ("ldd".to_string(), sum_args["out_stride"].clone()),
+        ];
+        let matmul_op = op_term(matmul_sort.call(matmul_args), mul_args["__inputs"].clone());
+
+        let dt = v("?__dt");
+        vec![
+            rule(union(sum_match, matmul_op.clone())).fact(eq(mul_match, sum_args["inp"].clone())).set(dtype(matmul_op), dt.clone()).fact(eq(dt, dtype(mul_args["lhs"].clone())))
+        ]
     }
     fn cleanup(&self) -> bool {
         false
     }
     fn extract<'a>(
             &'a self,
-            _egraph: &'a SerializedEGraph,
-            _kind_children: &[&'a ENodeId],
-            _input_enodes: Vec<&'a ENodeId>,
-            _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-            _expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+            egraph: &'a SerializedEGraph,
+            kind_children: &[&'a ENodeId],
+            input_enodes: Vec<&'a ENodeId>,
+            list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+            expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (luminal::op::LLIROp, Vec<&'a ENodeId>) {
-        panic!("CpuMatmul::extract should never be called")
+        use luminal::egglog_utils::{extract_expr, extract_expr_list};
+
+        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let iters = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+        let a_strides = extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap();
+        let b_strides = extract_expr_list(egraph, kind_children[6], list_cache, expr_cache).unwrap();
+        let out_strides = extract_expr_list(egraph, kind_children[7], list_cache, expr_cache).unwrap();
+
+        let zero = Expression::from(0);
+        let z = Expression::from('z');
+
+        let valid = out_shape.len() == 2
+            && a_strides.len() == 3
+            && b_strides.len() >= 3
+            && out_strides.len() >=2
+            && a_strides[1] == zero
+            && a_strides[2] == z
+            && b_strides[0] == zero
+            && b_strides[1] == z
+            && out_strides[1] == z;
+
+        if !valid {
+            panic!("CpuMatmul::extract: stride pattern is not a plain 2D matmul");
+        }
+
+        let matmul = CpuMatmul {
+            m: out_shape[0].clone(),
+            n: out_shape[1].clone(),
+            k: iters,
+            lda: a_strides[0].clone(),
+            ldb: b_strides[2].clone(),
+            ldd: out_strides[0].clone(),
+        };
+
+        (
+            LLIROp::new::<dyn CpuKernelOp>(Box::new(matmul)),
+            input_enodes,
+        )
     }
 }
 
