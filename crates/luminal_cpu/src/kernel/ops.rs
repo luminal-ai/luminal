@@ -10,7 +10,7 @@ use luminal::{
         Constant, Gather, Iota, MaxReduce, SumReduce, binary_sort, reduce_sort, unary_sort
     },
     op::*,
-    prelude::*, shape,
+    prelude::*, shape::flatten_strides,
 };
 
 // ---------------------------------------------------------------------------------------------------
@@ -41,6 +41,12 @@ fn binary_dtype_rewrite(hlir_sort: &SortDef, cpu_sort: &SortDef) -> Rule {
 fn resolve(expr: &Expression, dyn_map: &FxHashMap<char, usize>) -> usize {
     let mut map = dyn_map.clone();
     map.entry('z').or_insert(1);
+    expr.exec(&map).unwrap_or(0)
+}
+
+fn eval_at(expr: &Expression, i: usize, dyn_map: &FxHashMap<char, usize>) -> usize {
+    let mut map = dyn_map.clone();
+    map.insert('z', i);
     expr.exec(&map).unwrap_or(0)
 }
 
@@ -102,10 +108,10 @@ macro_rules! cpu_unary_ops {
             ) -> Vec<f32> {
                 let input = inputs[0].0;
                 let n = resolve(&self.output_size(), dyn_map);
-                let shape: Vec<usize> = self.shape.iter().map(|e| resolve(e, dyn_map)).collect();
-                let in_strides: Vec<usize> = self.input_strides.iter().map(|e| resolve(e, dyn_map)).collect();
+
+                let index_expr = flatten_strides(&self.shape, &self.input_strides);
                 let f: fn(f32) -> f32 = $compute;
-                (0..n).map(|i| f(input[strided_index(i, &shape, &in_strides)])).collect()
+                (0..n).map(|i| f(input[eval_at(&index_expr, i, dyn_map)])).collect()
             }
         }
     };
@@ -169,21 +175,12 @@ macro_rules! cpu_binary_op {
                 let b = inputs[1].0;
                 let n = resolve(&self.output_size(), dyn_map);
 
-                let shape: Vec<usize> = self.shape.iter()
-                    .map(|e| resolve(e, dyn_map))
-                    .collect();
-                let a_strides: Vec<usize> = self.a_strides.iter()
-                    .map(|e| resolve(e, dyn_map))
-                    .collect();
-                let b_strides: Vec<usize> = self.b_strides.iter()
-                    .map(|e| resolve(e, dyn_map))
-                    .collect();
+                let a_expr = flatten_strides(&self.shape, &self.a_strides);
+                let b_expr = flatten_strides(&self.shape, &self.b_strides);
 
                 let f: fn(f32, f32) -> f32 = $compute;
                 (0..n).map(|i| {
-                    let ai = strided_index(i, &shape, &a_strides);
-                    let bi = strided_index(i, &shape, &b_strides);
-                    f(a[ai], b[bi])
+                    f(a[eval_at(&a_expr, i, dyn_map)], b[eval_at(&b_expr, i, dyn_map)])
                 }).collect()
             }
         }
@@ -206,33 +203,10 @@ cpu_binary_op!(CpuAdd, "CpuAdd", |a: f32, b: f32| a + b);
 cpu_binary_op!(CpuMod, "CpuMod", |a: f32, b: f32| a % b);
 cpu_binary_op!(CpuLessThan, "CpuLessThan", |a: f32, b: f32| if a < b { 1.0 } else { 0.0 });
 
-fn strided_index(i: usize, shape: &[usize], strides: &[usize]) -> usize {
-    let ndim = shape.len();
-    let mut remaining = i;
-    let mut idx = 0usize;
-    for d in (0..ndim).rev() {
-        let coord = if shape[d] > 0 { remaining % shape[d] } else { 0 };
-        remaining /= shape[d].max(1);
-        idx += coord * strides[d];
-    }
-    idx
-}
 
 // ---------------------------------------------------------------------------------------------------
 // CpuSumReduce
 // ---------------------------------------------------------------------------------------------------
-fn compute_in_start(gid: usize, out_shape: &[usize], in_strides: &[usize]) -> usize {
-    let ndim = out_shape.len();
-    let mut remaining = gid;
-    let mut offset = 0usize;
-    for d in (0..ndim).rev() {
-        let coord = remaining % out_shape[d];
-        remaining /= out_shape[d];
-        offset += coord * in_strides[d];
-    }
-    offset
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct CpuSumReduce {
     out_shape: Vec<Expression>,
@@ -288,21 +262,17 @@ impl CpuKernelOp for CpuSumReduce {
         let n_out = resolve(&self.output_size(), dyn_map);
         let iters = resolve(&self.iters, dyn_map);
 
-        let in_strides: Vec<usize> = self.in_strides.iter().map(|e| resolve(e, dyn_map)).collect();
-        let out_shape: Vec<usize> = self.out_shape.iter().map(|e| resolve(e, dyn_map)).collect();
+        let in_strides_expr = flatten_strides(&self.out_shape, &self.in_strides);
 
-        let iter_stride = {
-            let mut m = dyn_map.clone();
-            m.insert('z', 1);
-            self.iter_stride.exec(&m).unwrap_or(1)
-        };
+        let iter_stride_expr = self.iter_stride.clone();
 
         let mut out = vec![0.0f32; n_out];
         for gid in 0..n_out {
-            let in_start = compute_in_start(gid, &out_shape, &in_strides);
+            let in_start = eval_at(&in_strides_expr, gid, dyn_map);
             let mut acc = 0.0f32;
             for i in 0..iters {
-                acc += input[in_start + i * iter_stride];
+                let step = eval_at(&iter_stride_expr, i, dyn_map);
+                acc += input[in_start + step];
             }
             out[gid] = acc;
         }
@@ -378,18 +348,15 @@ impl CpuKernelOp for CpuMaxReduce {
         let n_out = resolve(&self.output_size(), dyn_map);
         let iters = resolve(&self.iters, dyn_map);
 
-        let in_strides: Vec<usize> = self.in_strides.iter().map(|e| resolve(e, dyn_map)).collect();
-        let out_shape: Vec<usize> = self.out_shape.iter().map(|e| resolve(e, dyn_map)).collect();
-
-        let iter_stride = {
-            let mut m = dyn_map.clone();
-            m.insert('z', 1);
-            self.iter_stride.exec(&m).unwrap_or(1)
-        };
+        let in_start_expr = flatten_strides(&self.out_shape, &self.in_strides);
+        let iter_stride_expr = self.iter_stride.clone();
 
         (0..n_out).map(|gid| {
-            let in_start = compute_in_start(gid, &out_shape, &in_strides);
-            (0..iters).map(|i| input[in_start + i * iter_stride]).fold(f32::NEG_INFINITY, f32::max)
+            let in_start = eval_at(&in_start_expr, gid, dyn_map);
+            (0..iters).map(|i| {
+                let step = eval_at(&iter_stride_expr, i, dyn_map);
+                input[in_start + step]
+            }).fold(f32::NEG_INFINITY, f32::max)
         }).collect()
     }
 }
@@ -499,11 +466,7 @@ impl CpuKernelOp for CpuIota {
 
     fn process(&self, _inputs: &[(&[f32], DType)], dyn_map: &FxHashMap<char, usize>) -> Vec<f32> {
         let n = resolve(&self.range, dyn_map);
-        (0..n).map(|i| {
-            let mut m = dyn_map.clone();
-            m.insert('z', i);
-            self.expr.exec(&m).unwrap_or(i)as f32
-        }).collect()
+        (0..n).map(|i| eval_at(&self.expr, i, dyn_map) as f32).collect()
     }
 }
 
@@ -586,20 +549,15 @@ impl CpuKernelOp for CpuGather {
         let data = inputs[1].0;
         let n_queries = resolve(self.out_shape.first().unwrap_or(&Expression::from(1)), dyn_map);
 
-        let dim = {
-            let mut m = dyn_map.clone();
-            m.insert('z', 1);
-            self.data_stride.first().and_then(|e| e.exec(&m)).unwrap_or(1)
-        };
+        let dim = self.data_stride.first().map(|e| eval_at(e, 1, dyn_map)).unwrap_or(1);
+
+        let index_expr = flatten_strides(&self.out_shape, &self.index_stride);
 
         let mut out = vec![0.0f32; n_queries * dim];
         for q in 0..n_queries {
-            let gathered_row = indexes[q] as usize;
-            let data_base = {
-                let mut m = dyn_map.clone();
-                m.insert('z', gathered_row);
-                self.data_stride.first().and_then(|e| e.exec(&m)).unwrap_or(gathered_row * dim)
-            };
+            let index_ops = eval_at(&index_expr, q, dyn_map);
+            let gathered_row = indexes[index_ops] as usize;
+            let data_base = self.data_stride.first().map(|e| eval_at(e, gathered_row, dyn_map)).unwrap_or(gathered_row * dim);
 
             for col in 0..dim {
                 out[q * dim + col] = data[data_base + col];
@@ -667,12 +625,11 @@ impl CpuKernelOp for CpuMul {
         let b = inputs[1].0;
         let n = resolve(&self.output_size(), dyn_map);
         
-        let shape:Vec<usize> = self.shape.iter().map(|e| resolve(e, dyn_map)).collect();
-        let a_strides: Vec<usize> = self.a_strides.iter().map(|e| resolve(e, dyn_map)).collect();
-        let b_strides: Vec<usize> = self.b_strides.iter().map(|e| resolve(e, dyn_map)).collect();
+        let a_expr = flatten_strides(&self.shape, &self.a_strides);
+        let b_expr = flatten_strides(&self.shape, &self.b_strides);
 
         (0..n).map(|i| {
-            a[strided_index(i, &shape, &a_strides)] * b[strided_index(i, &shape, &b_strides)]
+            a[eval_at(&a_expr, i, dyn_map)] * b[eval_at(&b_expr, i, dyn_map)]
         }).collect()
     }
 
