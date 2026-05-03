@@ -972,12 +972,18 @@ impl Graph {
 
     #[tracing::instrument(skip_all)]
     pub fn build_search_space<Rt: Runtime + 'static>(&mut self) {
-        self.run_auto_loop_rolling_prepass();
+        if std::env::var("LUMINAL_DISABLE_LOOP_ROLLING").is_err() {
+            self.run_auto_loop_rolling_prepass();
+        }
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>()
+            && std::env::var("LUMINAL_DISABLE_CLEANUP").is_err();
 
         let (program, root) = hlir_to_egglog(self);
+        if std::env::var("LUMINAL_DUMP_HLIR_PROGRAM").is_ok() {
+            eprintln!("=== HLIR program (root={root}) ===\n{program}");
+        }
         self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
         self.ops = Some(ops);
     }

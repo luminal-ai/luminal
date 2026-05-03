@@ -184,7 +184,20 @@ impl CudaRuntime {
                         let dev = f32s.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);
                     }
-                    safetensors::Dtype::U8 | safetensors::Dtype::BF16 | safetensors::Dtype::F16 => {
+                    safetensors::Dtype::U8
+                    | safetensors::Dtype::I8
+                    | safetensors::Dtype::BF16
+                    | safetensors::Dtype::F16
+                    | safetensors::Dtype::F8_E4M3
+                    | safetensors::Dtype::F8_E5M2
+                    | safetensors::Dtype::F8_E8M0
+                    | safetensors::Dtype::F6_E2M3
+                    | safetensors::Dtype::F6_E3M2
+                    | safetensors::Dtype::F4 => {
+                        // Sub-byte / byte-sized dtypes whose payload is the
+                        // raw on-disk bytes; the HLIR Input's declared dtype
+                        // (e.g. set via `as_dtype(F4E2M1)`) tells downstream
+                        // kernels how to interpret them.
                         let bytes = tensor.data();
                         let dev = bytes.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);

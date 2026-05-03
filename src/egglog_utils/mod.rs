@@ -13,7 +13,7 @@ pub mod api;
 pub mod base;
 
 pub const RUN_SCHEDULE: &str = "(run-schedule
-    (repeat 10
+    (repeat 30
         (saturate expr)
         (saturate dtype_prop)
         (run)
@@ -693,10 +693,34 @@ pub fn run_egglog_with_report_parts(
     egraph
         .node_to_class
         .retain(|n, _| egraph.enodes.contains_key(n));
-    assert!(
-        egraph.roots.iter().all(|c| egraph.eclasses.contains_key(c)),
-        "No valid graphs present in the e-graph!"
-    );
+    let missing: Vec<&ClassId> = egraph
+        .roots
+        .iter()
+        .filter(|c| !egraph.eclasses.contains_key(c))
+        .collect();
+    if !missing.is_empty() {
+        // The cleanup ruleset deletes every HLIR op marked `cleanup() == true`.
+        // If a kernel rewrite never fired for a particular HLIR op, its eclass
+        // becomes empty after cleanup; that empty eclass cascades upward to
+        // any consumer, eventually reaching a graph output. The most common
+        // cause is the inner repeat count of `RUN_SCHEDULE` being too small
+        // for the depth of op chain in question — so kernel rewrites simply
+        // hadn't propagated dtype information / fired all their unifications
+        // before cleanup ran. Bumping the repeat count usually fixes it.
+        eprintln!(
+            "No valid graphs present in the e-graph! \
+             {} of {} root eclasses are empty after cleanup. \
+             This usually means some HLIR op had no kernel rewrite fire before \
+             the cleanup ruleset deleted it; try increasing the inner repeat \
+             count in `egglog_utils::RUN_SCHEDULE`.",
+            missing.len(),
+            egraph.roots.len(),
+        );
+        for c in &missing {
+            eprintln!("  empty root eclass: {c:?}");
+        }
+        panic!("No valid graphs present in the e-graph!");
+    }
 
     Ok((egraph, run_report))
 }
@@ -764,9 +788,17 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
         "Int" => DType::Int,
         "Bool" => DType::Bool,
         "F4E2M1" => DType::F4E2M1,
+        "F6E2M3" => DType::F6E2M3,
+        "F6E3M2" => DType::F6E3M2,
         "F8E4M3" => DType::F8E4M3,
+        "F8E5M2" => DType::F8E5M2,
         "F8UE8M0" => DType::F8UE8M0,
         "I4" => DType::I4,
+        "U4" => DType::U4,
+        "I8" => DType::I8,
+        "U8" => DType::U8,
+        "I16" => DType::I16,
+        "U16" => DType::U16,
         "TF32" => DType::TF32,
         other => panic!("unknown dtype {other}"),
     }
