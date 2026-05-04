@@ -7,18 +7,6 @@ edition = "2021"
 name = "yolo_v11"
 path = "src/main.rs"
 
-[[bin]]
-name = "yolo_v11_tiny"
-path = "src/main_tiny.rs"
-
-[[bin]]
-name = "yolo_v11_egglog_debug"
-path = "src/main_egglog_debug.rs"
-
-[[bin]]
-name = "yolo_v11_conv_probe"
-path = "src/main_conv_probe.rs"
-
 [features]
 
 [dependencies]
@@ -37,3 +25,4 @@ bytemuck = "1.24.0"
 memmap2 = "0.9.9"
 rustc-hash = "2.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ureq = "2"

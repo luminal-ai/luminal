@@ -5,10 +5,9 @@
 //!   * width_mult = 0.25, depth_mult = 0.5, max_channels = 1024
 //!   * COCO classes (nc = 80), reg_max = 16, three detection scales (8, 16, 32 strides)
 //!
-//! Weights are loaded from a fused `weights.safetensors` produced by the
-//! `python/reference.py` script. The script folds Conv + BatchNorm into a
-//! single bias-augmented Conv2d (so this model expects only `conv.weight` and
-//! `conv.bias` per Conv block).
+//! Weights are loaded from a fused `weights.safetensors` artifact. The export
+//! folds Conv + BatchNorm into a single bias-augmented Conv2d, so this model
+//! expects only `conv.weight` and `conv.bias` per Conv block.
 //!
 //! Feature map shapes for a 640x640 input (NCHW, batch=1):
 //!   layer 4 -> (1, 128, 80, 80)   (P3 features for the head, after concat layer 15)

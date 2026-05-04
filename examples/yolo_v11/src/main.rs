@@ -1,7 +1,7 @@
 mod model;
 
 use std::{
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     process,
     time::Instant,
@@ -15,6 +15,10 @@ use model::*;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const ARTIFACT_DIR: &str = "examples/yolo_v11/artifacts";
+const WEIGHTS_URL: &str =
+    "https://github.com/luminal-ai/luminal/releases/download/yolo-v11n/weights.safetensors";
+const SAMPLE_IMAGE_URL: &str =
+    "https://github.com/ultralytics/assets/releases/download/v0.0.0/bus.jpg";
 const CONF_THRES: f32 = 0.25;
 const IOU_THRES: f32 = 0.45;
 const MAX_DET: usize = 300;
@@ -51,7 +55,7 @@ fn print_usage() {
          Positional form is also supported:\n\
          cargo run --release -p yolo_v11 --bin yolo_v11 -- <image.jpg|image.png> <annotated.png>\n\
          \n\
-         If no image is supplied, the example uses examples/yolo_v11/artifacts/bus.jpg."
+         If no image is supplied, the example uses examples/yolo_v11/artifacts/bus.jpg and downloads it if needed."
     );
 }
 
@@ -99,10 +103,7 @@ fn cli_args(artifact_dir: &Path) -> CliArgs {
         panic!("Too many positional arguments; expected at most <input> <output>");
     }
 
-    let image_path = image_path.or_else(|| {
-        let default_image = artifact_dir.join("bus.jpg");
-        default_image.exists().then_some(default_image)
-    });
+    let image_path = image_path.or_else(|| Some(artifact_dir.join("bus.jpg")));
     let annotated_path = annotated_path.unwrap_or_else(|| artifact_dir.join("annotated.png"));
 
     CliArgs {
@@ -115,6 +116,50 @@ fn next_cli_path(args: &mut impl Iterator<Item = std::ffi::OsString>, flag: &str
     args.next()
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{flag} requires a path"))
+}
+
+fn ensure_downloaded(path: &Path, url: &str, label: &str) {
+    if path.exists() {
+        return;
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("Failed to create {}: {e}", parent.display()));
+    }
+
+    let tmp_path = download_temp_path(path);
+    let _ = fs::remove_file(&tmp_path);
+
+    println!("Downloading {label}: {url}");
+    println!("  -> {}", path.display());
+
+    let response = ureq::get(url)
+        .set("User-Agent", "luminal-yolo-v11-example")
+        .call()
+        .unwrap_or_else(|e| panic!("Failed to download {label} from {url}: {e}"));
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(&tmp_path)
+        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", tmp_path.display()));
+    io::copy(&mut reader, &mut file)
+        .unwrap_or_else(|e| panic!("Failed to write {}: {e}", tmp_path.display()));
+    file.sync_all()
+        .unwrap_or_else(|e| panic!("Failed to sync {}: {e}", tmp_path.display()));
+    fs::rename(&tmp_path, path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to move {} to {}: {e}",
+            tmp_path.display(),
+            path.display()
+        )
+    });
+}
+
+fn download_temp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    path.with_file_name(format!("{file_name}.download"))
 }
 
 fn preprocess_image(path: &Path) -> (Vec<f32>, LetterboxMeta) {
@@ -225,33 +270,25 @@ fn main() {
         .with(luminal_filter())
         .init();
 
-    let search_graphs = 1usize;
-    println!(
-        "NOTE: the full YOLO v11n graph is large (~2200 HLIR nodes). The current\n\
-         luminal_cuda_lite e-graph rewrite phase can take many minutes to converge\n\
-         on this many nodes. If you want a fast smoke-test, run `yolo_v11_tiny`\n\
-         instead, which compiles only the first three layers."
-    );
-
     let cwd = std::env::current_dir().unwrap();
     let artifact_dir = cwd.join(ARTIFACT_DIR);
-    println!("Using artifact directory: {}", artifact_dir.display());
-
     let weights_path = artifact_dir.join("weights.safetensors");
     let cli = cli_args(&artifact_dir);
     let image_path = cli.image_path.clone();
+    let search_graphs = 1usize;
 
-    assert!(
-        weights_path.exists(),
-        "Missing {:?}; run python/reference.py first",
-        weights_path
-    );
+    println!("Using artifact directory: {}", artifact_dir.display());
+
+    ensure_downloaded(&weights_path, WEIGHTS_URL, "YOLO v11n Luminal weights");
 
     let image_path = image_path.unwrap_or_else(|| {
         panic!(
             "No input image supplied and default image is missing; pass --input <image.jpg|image.png>"
         )
     });
+    if image_path == artifact_dir.join("bus.jpg") {
+        ensure_downloaded(&image_path, SAMPLE_IMAGE_URL, "sample image");
+    }
     assert!(
         image_path.exists(),
         "Image path does not exist: {}",

@@ -7,15 +7,14 @@ End-to-end Object detection demo running the Ultralytics yolo11n model on the
 
 ```
 examples/yolo_v11/
-├── Cargo.toml              # Rust crate (binaries: yolo_v11, yolo_v11_tiny)
+├── Cargo.toml              # Rust crate (binary: yolo_v11)
 ├── src/
-│   ├── main.rs             # Full forward + reference comparison + greedy detections
-│   ├── main_tiny.rs        # Smoke-test for the first three layers (Conv, Conv, C3k2)
+│   ├── main.rs             # Full forward, NMS, and annotated image output
 │   └── model.rs            # YOLO v11n architecture in luminal IR
 ├── python/
 │   ├── reference.py        # PyTorch eager reference + weight prep
 │   └── luminal_example.py  # torch.compile(..., backend=luminal_backend) demo
-└── artifacts/              # Produced by python/reference.py (gitignored)
+└── artifacts/              # Downloaded/generated artifacts (gitignored)
     ├── bus.jpg
     ├── reference_input.bin
     ├── reference_output.bin
@@ -25,22 +24,9 @@ examples/yolo_v11/
 
 ## Quick start
 
-1. **Generate reference data + fused weights** (PyTorch + Ultralytics):
+1. **Run the Rust example** (CUDA, e.g. on a GH200 / H100):
 
    ```bash
-   pip install ultralytics torch opencv-python-headless
-   python examples/yolo_v11/python/reference.py
-   ```
-
-   This downloads `yolo11n.pt`, fuses Conv + BN, runs the eager forward on a
-   bundled bus image, and writes `examples/yolo_v11/artifacts/`.
-
-2. **Run the Rust example** (CUDA, e.g. on a GH200 / H100):
-
-   ```bash
-   # Quick smoke test (first three layers, compiles in ~3s)
-   cargo run --release -p yolo_v11 --bin yolo_v11_tiny
-
    # Full model on the default bus.jpg sample
    cargo run --release -p yolo_v11 --bin yolo_v11
 
@@ -51,9 +37,8 @@ examples/yolo_v11/
    cargo run --release -p yolo_v11 --bin yolo_v11 -- /path/to/image.jpg /tmp/yolo_annotated.png
    ```
 
-   `yolo_v11_tiny` loads `weights.safetensors`, runs only `model[0]`, `model[1]`,
-   and `model[2]`, and reports the (1, 64, 160, 160) intermediate. This output
-   matches PyTorch's eager forward exactly (within f32 rounding).
+   On first run, the binary downloads `weights.safetensors` and the default
+   `bus.jpg` sample into `examples/yolo_v11/artifacts/` if they are missing.
 
    `yolo_v11` builds the entire YOLO v11n graph and the Detect head, preprocesses
    a JPEG/PNG with a Rust implementation of the 640x640 Ultralytics-style
@@ -65,6 +50,16 @@ examples/yolo_v11/
 
    The direct image path may differ slightly from Python/OpenCV preprocessing
    because it uses Rust image decoding and resizing.
+
+2. **(Optional) Regenerate reference data + fused weights** (PyTorch + Ultralytics):
+
+   ```bash
+   pip install ultralytics torch opencv-python-headless
+   python examples/yolo_v11/python/reference.py
+   ```
+
+   This downloads `yolo11n.pt`, fuses Conv + BN, runs the eager forward on a
+   bundled bus image, and writes `examples/yolo_v11/artifacts/`.
 
 3. **(Optional) Run the Python compiled-model example**:
 
@@ -108,9 +103,6 @@ becomes the dominant cost. On a Grace-Hopper class machine this phase can
 take >10 minutes (using ~30+ GB of host RAM in the egglog tables) before the
 search and execution finally proceed.
 
-If you only want to verify the model is wired up correctly, prefer
-`yolo_v11_tiny` — it compiles in seconds and exercises the same code paths
-(Conv2d, depthwise, bias, SiLU, slicing, residuals, concat, C3k2). The full
-model is mathematically identical and the Python torch.compile path
-(`crates/luminal_python/tests/test_yolo_v11.py`) is a useful alternative
-because the pt2 export decomposes the graph slightly differently.
+The Python torch.compile path (`crates/luminal_python/tests/test_yolo_v11.py`)
+is a useful alternative because the pt2 export decomposes the graph slightly
+differently.
