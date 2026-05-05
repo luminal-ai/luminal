@@ -22,7 +22,7 @@ from modal.volume import FileEntryType
 
 app = modal.App("luminal-tests")
 
-DEFAULT_TIMEOUT = 30 * 60
+DEFAULT_TIMEOUT = 120 * 60
 CUDARC_CUDA_VERSION = "12080"
 LOCAL_PROJECT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = "/root/luminal/crates/luminal_python"
@@ -168,6 +168,26 @@ def _cleanup_remote_profile_artifacts(run_id: str) -> None:
         return
 
 
+def _build_cuda_extension(env: dict[str, str]) -> None:
+    cmd = [
+        "uv",
+        "run",
+        "--project",
+        PROJECT_DIR,
+        "--group",
+        "dev",
+        "maturin",
+        "develop",
+        "--manifest-path",
+        f"{PROJECT_DIR}/rust/Cargo.toml",
+        "--features",
+        "cuda",
+        "--profile",
+        "release",
+    ]
+    subprocess.run(cmd, env=env, cwd=PROJECT_DIR, check=True)
+
+
 @app.cls(image=image, timeout=DEFAULT_TIMEOUT)
 class TestRunner:
     @modal.method()
@@ -194,6 +214,8 @@ class TestRunner:
         if pytest_addopts:
             env["PYTEST_ADDOPTS"] = pytest_addopts
 
+        _build_cuda_extension(env)
+
         original_svg_requested = _has_pytest_flag(pytest_args, "--profile-svg")
         dot_available = shutil.which("dot") is not None
         sanitized_pytest_args = [
@@ -218,8 +240,6 @@ class TestRunner:
             PROJECT_DIR,
             "--group",
             "dev",
-            "--reinstall-package",
-            "luminal_python",
             "python",
             "-m",
             "pytest",
@@ -300,7 +320,7 @@ def _parse_cli_args(
     parser.add_argument(
         "--timeout",
         type=int,
-        help="Optional Modal execution timeout in seconds. Defaults to 1800 seconds.",
+        help="Optional Modal execution timeout in seconds. Defaults to 7200 seconds.",
     )
     parser.add_argument(
         "--profile",
