@@ -11,7 +11,7 @@ use luminal::{
 };
 use std::time::Instant;
 
-use crate::kernel::{CpuKernelOp, CpuMatmul, CpuMatmulDescriptor};
+use crate::kernel::CpuKernelOp;
 
 // ---------------------------------------------------------------------------------------------------
 // CpuRuntime
@@ -123,7 +123,7 @@ impl Runtime for CpuRuntime {
     type ExecReturn = ();
     type ProfileMetric = std::time::Duration;
 
-    fn initialize(arg: Self::CompileArg) -> Self {
+    fn initialize(_arg: Self::CompileArg) -> Self {
         Self { input_data: FxHashMap::default(), hlir_buffers: FxHashMap::default(), buffers: FxHashMap::default(), llir_graph: StableGraph::default(), node_dtypes: FxHashMap::default() }
     }
 

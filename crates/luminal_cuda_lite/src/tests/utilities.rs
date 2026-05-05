@@ -448,7 +448,7 @@ pub fn fuzz_genomes<T: TestDType>(
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(7777));
     let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
 
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(egraph, &mut rng, ops);
     prev_selected.insert(hash_choice_set(&initial));
 
     let mut base = initial;

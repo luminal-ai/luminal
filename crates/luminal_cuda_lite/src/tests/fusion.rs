@@ -18,7 +18,7 @@ fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
 
     let mut all_names = Vec::new();
     for _ in 0..50 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
+        let choices = random_initial_choice(egraph, &mut rand::rng(), ops);
         let mut list_cache = Default::default();
         let mut expr_cache = Default::default();
         let llir = egglog_to_llir(
@@ -53,7 +53,7 @@ fn extract_all_fused_configs(cx: &mut Graph) -> Vec<Vec<UnaryFn>> {
 
     let mut all_configs: Vec<Vec<UnaryFn>> = Vec::new();
     for _ in 0..200 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
+        let choices = random_initial_choice(egraph, &mut rand::rng(), ops);
         let mut list_cache = Default::default();
         let mut expr_cache = Default::default();
         let llir = egglog_to_llir(

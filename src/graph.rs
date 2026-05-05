@@ -1188,7 +1188,7 @@ impl Graph {
             if init_attempts > 100 {
                 panic!("Failed to find a viable initial genome after 100 attempts");
             }
-            let genome = random_initial_choice(egraph, rng);
+            let genome = random_initial_choice(egraph, rng, ops);
             prev_selected.insert(hash_choice_set(&genome));
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

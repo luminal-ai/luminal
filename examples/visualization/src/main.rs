@@ -50,7 +50,7 @@ fn main() {
     let s_egraph = SerializedEGraph::new(&egglog_obj, vec![(sort, value)]);
     let example_llir_graph = egglog_to_llir(
         &s_egraph,
-        random_initial_choice(&s_egraph, &mut rand::rng()),
+        random_initial_choice(&s_egraph, &mut rand::rng(), &ops),
         &ops,
         &[],
         &mut FxHashMap::default(),

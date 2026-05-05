@@ -1,7 +1,7 @@
 use super::{CpuKernelOp, CpuMulInfo, CpuSumReduceInfo};
 use luminal::{dtype::DType, egglog_utils::{
-    SerializedEGraph, api::{Rule, SortDef, eq, rule, sort, union, v}, base::{EXPRESSION, IR, dtype, iter, new_op_call, op_term}
-}, op::*, prelude::*};
+    SerializedEGraph, api::{eq, rule, sort, union, v}, base::{EXPRESSION, IR, OP_KIND, cons, dtype, expr_to_term, iter, mul as expr_mul, new_op_call, nil, op_term}
+}, hlir::{Mul, SumReduce}, op::*, prelude::*};
 use matrixmultiply::sgemm;
 
 
@@ -51,7 +51,7 @@ impl CpuMatmulDescriptor {
 // ---------------------------------------------------------------------------------------------------
 // CpuMatmul op
 // 
-// The rewrite fires when egglog sees CPUSumReduce.
+// The rewrite matches HLIR Mul + Sum (same shapes as CpuMul/CpuSumReduce lowering).
 // ---------------------------------------------------------------------------------------------------
 #[derive(Debug, Clone, Default)]
 pub struct CpuMatmul {
@@ -65,7 +65,7 @@ pub struct CpuMatmul {
 
 impl EgglogOp for CpuMatmul {
     fn sort(&self) -> luminal::egglog_utils::api::SortDef {
-        sort(IR, "CpuMatmul", &[
+        sort(OP_KIND, "CpuMatmul", &[
             ("m", EXPRESSION),
             ("n", EXPRESSION),
             ("k", EXPRESSION),
@@ -77,73 +77,95 @@ impl EgglogOp for CpuMatmul {
         ])
     }
     fn rewrites(&self) -> Vec<luminal::egglog_utils::api::Rule> {
-        let sum_sort = super::ops::CpuSumReduce::default().sort();
-        let mul_sort = super::ops::CpuMul::default().sort();
+        let sum_sort = SumReduce::default().sort();
+        let mul_sort = Mul::default().sort();
         let matmul_sort = self.sort();
 
         let (sum_args, sum_match) = new_op_call(&sum_sort, &["inp"]);
         let (mul_args, mul_match) = new_op_call(&mul_sort, &["lhs", "rhs"]);
 
         let matmul_args = [
-            ("m".to_string(),   sum_args["out_shape"].clone()), 
-            ("n".to_string(),   sum_args["out_shape"].clone()),
-            ("k".to_string(),   sum_args["iters"].clone()),
+            ("m".to_string(), v("?mm")),
+            ("n".to_string(), v("?nn")),
+            ("k".to_string(), sum_args["iters"].clone()),
             ("lhs".to_string(), mul_args["lhs"].clone()),
-            ("lda".to_string(), mul_args["a_strides"].clone()), 
+            ("lda".to_string(), v("?lda")),
             ("rhs".to_string(), mul_args["rhs"].clone()),
-            ("ldb".to_string(), mul_args["b_strides"].clone()), 
-            ("ldd".to_string(), sum_args["out_stride"].clone()),
+            ("ldb".to_string(), v("?ldb")),
+            ("ldd".to_string(), v("?ldd")),
         ];
         let matmul_op = op_term(matmul_sort.call(matmul_args), mul_args["__inputs"].clone());
 
+        // HLIR egglog replaces (MVar "z") with (MIter); rules must use the same.
+        let elt = iter();
+        let zero = expr_to_term(&Expression::from(0));
         let dt = v("?__dt");
         vec![
-            rule(union(sum_match, matmul_op.clone())).fact(eq(mul_match, sum_args["inp"].clone())).set(dtype(matmul_op), dt.clone()).fact(eq(dt, dtype(mul_args["lhs"].clone())))
+            rule(union(sum_match, matmul_op.clone()))
+                .fact(eq(
+                    sum_args["shape"].clone(),
+                    cons(v("?mm"), cons(v("?nn"), nil())),
+                ))
+                // Match CpuMatmulDescriptor::from_mul_and_sum stride pattern (2D gemm only).
+                .fact(eq(
+                    mul_args["a_strides"].clone(),
+                    cons(v("?lda"), cons(zero.clone(), cons(elt.clone(), nil()))),
+                ))
+                .fact(eq(
+                    mul_args["b_strides"].clone(),
+                    cons(zero.clone(), cons(elt.clone(), cons(v("?ldb"), nil()))),
+                ))
+                .fact(eq(
+                    sum_args["out_strides"].clone(),
+                    cons(v("?ldd"), cons(elt.clone(), nil())),
+                ))
+                // Sum "strides" = input 3D strides with k dim removed: [n*k*MIter, k*MIter].
+                .fact(eq(
+                    sum_args["strides"].clone(),
+                    cons(
+                        v("?cpu_mm_s0"),
+                        cons(expr_mul(sum_args["iters"].clone(), elt.clone()), nil()),
+                    ),
+                ))
+                .fact(eq(sum_args["iter_stride"].clone(), elt.clone()))
+                .fact(eq(mul_match, sum_args["inp"].clone()))
+                .set(dtype(matmul_op), dt.clone())
+                .fact(eq(dt, dtype(mul_args["lhs"].clone()))),
         ]
     }
     fn cleanup(&self) -> bool {
         false
     }
+
+    fn llir_extract_priority(&self) -> i32 {
+        1
+    }
+
     fn extract<'a>(
             &'a self,
             egraph: &'a SerializedEGraph,
             kind_children: &[&'a ENodeId],
             input_enodes: Vec<&'a ENodeId>,
-            list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+            _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (luminal::op::LLIROp, Vec<&'a ENodeId>) {
-        use luminal::egglog_utils::{extract_expr, extract_expr_list};
+        use luminal::egglog_utils::extract_expr;
 
-        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-        let iters = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-        let a_strides = extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap();
-        let b_strides = extract_expr_list(egraph, kind_children[6], list_cache, expr_cache).unwrap();
-        let out_strides = extract_expr_list(egraph, kind_children[7], list_cache, expr_cache).unwrap();
-
-        let zero = Expression::from(0);
-        let z = Expression::from('z');
-
-        let valid = out_shape.len() == 2
-            && a_strides.len() == 3
-            && b_strides.len() >= 3
-            && out_strides.len() >=2
-            && a_strides[1] == zero
-            && a_strides[2] == z
-            && b_strides[0] == zero
-            && b_strides[1] == z
-            && out_strides[1] == z;
-
-        if !valid {
-            panic!("CpuMatmul::extract: stride pattern is not a plain 2D matmul");
-        }
+        // OpKind order: m, n, k, lhs, lda, rhs, ldb, ldd (IR slots are not Expression trees).
+        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
+        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
+        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+        let lda = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
+        let ldb = extract_expr(egraph, kind_children[6], expr_cache).unwrap();
+        let ldd = extract_expr(egraph, kind_children[7], expr_cache).unwrap();
 
         let matmul = CpuMatmul {
-            m: out_shape[0].clone(),
-            n: out_shape[1].clone(),
-            k: iters,
-            lda: a_strides[0].clone(),
-            ldb: b_strides[2].clone(),
-            ldd: out_strides[0].clone(),
+            m,
+            n,
+            k,
+            lda,
+            ldb,
+            ldd,
         };
 
         (
