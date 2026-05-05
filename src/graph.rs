@@ -172,7 +172,7 @@ pub struct SearchOptions {
     pub generation_size: usize,
     /// Number of mutations applied to each offspring (default: 30)
     pub mutations: usize,
-    /// Number of profiling trials per candidate (default: 10)
+    /// Number of profiling trials per candidate (default: 3)
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
@@ -191,7 +191,7 @@ impl SearchOptions {
             limit,
             generation_size: 30,
             mutations: 30,
-            trials: 10,
+            trials: 3,
             keep_best: 1,
             profile_timeout: None,
             group_timeout: None,
