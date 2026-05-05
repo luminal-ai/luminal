@@ -13,4 +13,4 @@ matrixmultiply = "0.3"
 
 [[example]]
 name = "cpu"
-path = "examples/src/main.rs"
+path = "src/main.rs"
