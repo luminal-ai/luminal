@@ -224,8 +224,9 @@ impl EgglogOp for GLUMoE {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
-            "(rule
+        vec![
+            Rule::raw(
+                "(rule
                 (
                     (= ?e (Op (GLUMoE ?gu_io ?dn_io ?gu_matmul_k ?dn_matmul_k ?output_k ?gu_within_range ?dn_within_range ?mode) ?inputs))
                 )
@@ -234,15 +235,13 @@ impl EgglogOp for GLUMoE {
                 )
                 :ruleset dtype_prop
             )",
-        )]
+            ),
+            Rule::raw(include_str!["glumoe_rewrite.egg"]),
+        ]
     }
 
     fn n_inputs(&self) -> usize {
         6
-    }
-
-    fn early_rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(include_str!["glumoe_rewrite.egg"])]
     }
 
     fn extract<'a>(

@@ -18,7 +18,7 @@ jobs:
         name: Python CUDA Tests
         runs-on: ubuntu-latest
         environment: Modal
-        timeout-minutes: 60
+        timeout-minutes: 270
         defaults:
             run:
                 working-directory: crates/luminal_python
@@ -38,7 +38,7 @@ jobs:
                   MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
                   MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
                   HF_TOKEN: ${{ secrets.HF_TOKEN }}
-              run: modal run modal_pytest_runner.py --gpu A100 --timeout 3300 --profile --profile-output-dir luminal_artifacts/pytest-profiling/github-${{ github.run_id }}-${{ github.run_attempt }} tests/ -v -s -m "not slow"
+              run: modal run modal_pytest_runner.py --gpu A100 --timeout 14400 --profile --profile-output-dir luminal_artifacts/pytest-profiling/github-${{ github.run_id }}-${{ github.run_attempt }} tests/ -v -s -m "not slow"
             - name: Upload Modal pytest profiling artifacts
               if: always()
               uses: actions/upload-artifact@v4

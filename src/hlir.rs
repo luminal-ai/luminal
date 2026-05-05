@@ -128,11 +128,9 @@ pub fn binary_sort(name: &str) -> SortDef {
 /// a tiny chain blocks the fusion entirely and the extracted graph is
 /// strictly worse than not rolling.
 ///
-/// **Register in both `EgglogOp::early_rewrites()` AND `rewrites()`.** The
-/// driver feeds `early_rewrites` into the early-stage program only and
-/// `rewrites` into the full-stage program only; we need the unrolled chain
-/// visible in both stages so early-stage fusion patterns (GLUMoE) AND
-/// full-stage kernel rewrites (`direct-exp-fusion`) can both match it.
+/// Register these in `EgglogOp::rewrites()`. The driver feeds this normal
+/// rewrite set into the single egglog run, so the unrolled chain is visible to
+/// fusion patterns (GLUMoE) and kernel rewrites (`direct-exp-fusion`).
 ///
 /// Generates 2 rules per iter count (state at body input position 0 vs 1)
 /// for every `n_iters` in `2..=max_trips`. Larger trips stay rolled-only —
@@ -652,23 +650,21 @@ impl EgglogOp for LoopInput {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
-    }
-
-    fn early_rewrites(&self) -> Vec<Rule> {
         // Declare the `identical_inputs` relation and the three-way unification
         // chain between `LoopInput`, `LoopInputStatic`, and an inlined source.
-        // Running in Stage 1 alongside fusion rules (e.g. GLUMoE) so that
-        // fusion patterns that expect raw op kinds at boundary positions can
-        // match via the unioned eclass.
-        vec![Rule::raw(
-            r#"
+        // Running alongside fusion rules (e.g. GLUMoE) so that fusion patterns
+        // that expect raw op kinds at boundary positions can match via the
+        // unioned eclass.
+        vec![
+            dtype_from_kind_field(&self.sort(), "dtype"),
+            Rule::raw(
+                r#"
             (relation identical_inputs (IList))
 
-            ; All four rules live in the `expr` ruleset, which the early/full
-            ; schedules saturate each iteration. Default-ruleset scheduling
-            ; only runs each rule once per outer step, which is not enough to
-            ; propagate `identical_inputs` through an N-element IList.
+            ; All four rules live in the `expr` ruleset, which the schedule
+            ; saturates each iteration. Default-ruleset scheduling only runs
+            ; each rule once per outer step, which is not enough to propagate
+            ; `identical_inputs` through an N-element IList.
 
             ; Base: single-element list is trivially identical.
             (rule ((= ?l (ICons ?x (INil))))
@@ -698,7 +694,8 @@ impl EgglogOp for LoopInput {
                   :ruleset expr
                   :name "LoopInputStatic inline")
             "#,
-        )]
+            ),
+        ]
     }
 
     fn extract<'a>(
@@ -1679,11 +1676,8 @@ impl EgglogOp for Add {
     }
     fn rewrites(&self) -> Vec<Rule> {
         let mut r = vec![dtype_propagation_op(&self.sort())];
-        r.extend(self.early_rewrites());
+        r.extend(binary_op_unroll_rules("Add", 4));
         r
-    }
-    fn early_rewrites(&self) -> Vec<Rule> {
-        binary_op_unroll_rules("Add", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -1769,11 +1763,8 @@ impl EgglogOp for Mul {
     }
     fn rewrites(&self) -> Vec<Rule> {
         let mut r = vec![dtype_propagation_op(&self.sort())];
-        r.extend(self.early_rewrites());
+        r.extend(binary_op_unroll_rules("Mul", 4));
         r
-    }
-    fn early_rewrites(&self) -> Vec<Rule> {
-        binary_op_unroll_rules("Mul", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -1859,11 +1850,8 @@ impl EgglogOp for Mod {
     }
     fn rewrites(&self) -> Vec<Rule> {
         let mut r = vec![dtype_propagation_op(&self.sort())];
-        r.extend(self.early_rewrites());
+        r.extend(binary_op_unroll_rules("Mod", 4));
         r
-    }
-    fn early_rewrites(&self) -> Vec<Rule> {
-        binary_op_unroll_rules("Mod", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -1950,11 +1938,8 @@ impl EgglogOp for LessThan {
     fn rewrites(&self) -> Vec<Rule> {
         // Comparisons output Bool, not the input dtype.
         let mut r = vec![dtype_fixed_op(&self.sort(), &SORTS.bool_dt)];
-        r.extend(self.early_rewrites());
+        r.extend(binary_op_unroll_rules("LessThan", 4));
         r
-    }
-    fn early_rewrites(&self) -> Vec<Rule> {
-        binary_op_unroll_rules("LessThan", 4)
     }
     fn extract<'a>(
         &'a self,
@@ -2043,6 +2028,12 @@ impl EgglogOp for Gather {
     fn rewrites(&self) -> Vec<Rule> {
         // Gather inherits dtype from second input (data), not first (indexes).
         // Use a custom rule instead of the generic first-input propagation.
+        // **Must be in `dtype_prop` ruleset** — without it, Gather dtype
+        // propagation only advances one Gather per `(run)` iteration of
+        // the schedule, so deep stacks of Gathers (e.g. YOLO's per-conv
+        // padding gathers + per-concat make_contiguous gathers) leave the
+        // outermost Gathers with no dtype set, which in turn blocks the
+        // KernelGather kernel-rewrite from firing.
         let (_, kind_term) = self.sort().new_call();
         let e = v("__e");
         let indexes = v("__indexes");
@@ -2068,7 +2059,8 @@ impl EgglogOp for Gather {
                     ),
                 ))
                 .fact(eq(dty.clone(), dtype(data)))
-                .action(Action::Set(dtype(e), dty)),
+                .action(Action::Set(dtype(e), dty))
+                .ruleset("dtype_prop"),
         ]
     }
     fn extract<'a>(
@@ -2217,7 +2209,8 @@ impl EgglogOp for Scatter {
                     ),
                 ))
                 .fact(eq(dty.clone(), dtype(src)))
-                .action(Action::Set(dtype(e), dty)),
+                .action(Action::Set(dtype(e), dty))
+                .ruleset("dtype_prop"),
         ]
     }
     fn extract<'a>(
@@ -2885,6 +2878,7 @@ impl Runtime for NativeRuntime {
         _: &LLIRGraph,
         _: &FxHashMap<char, usize>,
         _: usize,
+        _: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
         (0, "0 ms".to_string())
     }

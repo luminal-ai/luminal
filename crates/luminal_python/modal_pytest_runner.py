@@ -22,7 +22,7 @@ from modal.volume import FileEntryType
 
 app = modal.App("luminal-tests")
 
-DEFAULT_TIMEOUT = 30 * 60
+DEFAULT_TIMEOUT = 4 * 60 * 60
 CUDARC_CUDA_VERSION = "12080"
 LOCAL_PROJECT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = "/root/luminal/crates/luminal_python"
@@ -168,6 +168,37 @@ def _cleanup_remote_profile_artifacts(run_id: str) -> None:
         return
 
 
+def _build_cuda_extension(env: dict[str, str]) -> None:
+    cmd = [
+        "uv",
+        "run",
+        "--project",
+        PROJECT_DIR,
+        "--group",
+        "dev",
+        "maturin",
+        "develop",
+        "--manifest-path",
+        f"{PROJECT_DIR}/rust/Cargo.toml",
+        "--features",
+        "cuda",
+        "--profile",
+        "release",
+    ]
+    subprocess.run(cmd, env=env, cwd=PROJECT_DIR, check=True)
+
+
+def _effective_timeout(timeout: int) -> int:
+    if os.environ.get("GITHUB_ACTIONS") == "true" and timeout < DEFAULT_TIMEOUT:
+        print(
+            f"Using Modal timeout {DEFAULT_TIMEOUT}s instead of requested "
+            f"{timeout}s in GitHub Actions.",
+            file=sys.stderr,
+        )
+        return DEFAULT_TIMEOUT
+    return timeout
+
+
 @app.cls(image=image, timeout=DEFAULT_TIMEOUT)
 class TestRunner:
     @modal.method()
@@ -194,6 +225,8 @@ class TestRunner:
         if pytest_addopts:
             env["PYTEST_ADDOPTS"] = pytest_addopts
 
+        _build_cuda_extension(env)
+
         original_svg_requested = _has_pytest_flag(pytest_args, "--profile-svg")
         dot_available = shutil.which("dot") is not None
         sanitized_pytest_args = [
@@ -218,8 +251,6 @@ class TestRunner:
             PROJECT_DIR,
             "--group",
             "dev",
-            "--reinstall-package",
-            "luminal_python",
             "python",
             "-m",
             "pytest",
@@ -285,7 +316,7 @@ class TestRunner:
 
 def _parse_cli_args(
     cli_args: tuple[str, ...],
-) -> tuple[str, int | None, bool, str | None, list[str]]:
+) -> tuple[str, int, bool, str | None, list[str]]:
     parser = argparse.ArgumentParser(
         prog="modal run modal_pytest_runner.py",
         add_help=False,
@@ -300,7 +331,8 @@ def _parse_cli_args(
     parser.add_argument(
         "--timeout",
         type=int,
-        help="Optional Modal execution timeout in seconds. Defaults to 1800 seconds.",
+        default=DEFAULT_TIMEOUT,
+        help="Modal execution timeout in seconds. Defaults to %(default)s seconds.",
     )
     parser.add_argument(
         "--profile",
@@ -334,11 +366,11 @@ def main(*cli_args: str):
     )
     profile_enabled = _profiling_enabled(cli_profile, pytest_args)
     pytest_addopts = os.environ.get("PYTEST_ADDOPTS", "")
+    timeout = _effective_timeout(timeout)
     runner_options = {"gpu": gpu}
     hf_token_secret = _hf_token_secret()
     runner_volumes = {HF_CACHE_PATH: HF_CACHE_VOLUME}
-    if timeout is not None:
-        runner_options["timeout"] = timeout
+    runner_options["timeout"] = timeout
     if profile_enabled:
         runner_volumes[PROFILE_VOLUME_PATH] = PROFILE_VOLUME
     runner_options["volumes"] = runner_volumes

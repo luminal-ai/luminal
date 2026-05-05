@@ -657,9 +657,9 @@ pub fn kernel_to_host(
 
     let kernel_subgraphs = partition_marked_convex(llir_graph, &kernel_ops_in_graph).unwrap();
     // Compute the set of FS / FE / FusedX nodes globally absorbed by some
-    // FusionEnd in the LLIR. Used by `build_compile_units` to suppress the
-    // identity-memcpy fallback for shared FS leaves whose consumers live
-    // in a different convex subgraph than the FS itself.
+    // FusionEnd in the LLIR. Used by `build_compile_units` to suppress
+    // standalone marker compile units for shared FS leaves whose consumers
+    // live in a different convex subgraph than the FS itself.
     let globally_absorbed = region_codegen::globally_absorbed_markers(llir_graph);
 
     // Track which kernel node belongs to which CudaGraphOp (for later edge creation)

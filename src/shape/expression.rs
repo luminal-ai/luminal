@@ -461,9 +461,12 @@ impl Expression {
         if rhs == self {
             return false.into();
         }
-        if let Term::Num(n) = rhs.terms.read()[0] {
-            if self.terms.read()[self.terms.read().len() - 1] == Term::Mod
-                && self.terms.read()[0] == Term::Num(n)
+        if let Some(n) = rhs.as_num() {
+            let self_terms = self.terms.read();
+            if self_terms.len() >= 3
+                && self_terms.last() == Some(&Term::Mod)
+                && self_terms.first() == Some(&Term::Num(n))
+                && is_valid_rpn_expression(&self_terms[1..self_terms.len() - 1])
             {
                 return true.into();
             }
@@ -633,6 +636,22 @@ impl Expression {
             }
         }
     }
+}
+
+fn is_valid_rpn_expression(terms: &[Term]) -> bool {
+    let mut depth = 0usize;
+    for term in terms {
+        match term {
+            Term::Num(_) | Term::Var(_) => depth += 1,
+            _ => {
+                if depth < 2 {
+                    return false;
+                }
+                depth -= 1;
+            }
+        }
+    }
+    depth == 1
 }
 
 impl From<Term> for Expression {
@@ -1101,6 +1120,17 @@ mod tests {
     #[test]
     fn test_merge_dim_simplifications() {
         assert!((((expr('z') / 3) * 3) + (expr('z') % 3)).simplify().len() == 1);
+    }
+
+    #[test]
+    fn test_lt_mod_shortcut_requires_literal_bound() {
+        let z = expr('z');
+        let range = expr(651) / 4; // 162
+        let upper = expr(1) + (expr(643) / 4); // 161, but not a literal expression
+        let mask = (z % range).lt(upper);
+
+        assert_eq!(mask.exec_single_var_checked(160), Some(1));
+        assert_eq!(mask.exec_single_var_checked(161), Some(0));
     }
 
     #[test]

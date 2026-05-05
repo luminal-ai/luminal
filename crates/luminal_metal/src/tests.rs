@@ -250,6 +250,23 @@ fn dynamic_dim_sum_reduce_runs() {
     assert_close(&out, &[9.0, 12.0], 0.001);
 }
 
+#[test]
+fn metal_int_arithmetic_preserves_large_values() {
+    let mut cx = Graph::default();
+    let token = cx.tensor(1).as_dtype(DType::Int);
+    let large_index = (token * 1024) + 123;
+    let mod_output = (large_index % 65_537).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(token, &[16_385i32]);
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(rt.get_f32(mod_output), vec![891.0]);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(5))]
 
@@ -972,6 +989,28 @@ fn test_scatter_basic() {
 }
 
 #[test]
+fn test_gather_noncontiguous_data_uses_data_shape() {
+    let mut cx = Graph::default();
+    let input = cx.tensor((4, 3));
+    let data = input.transpose(0, 1);
+    let indexes = cx.tensor((2, 2)).as_dtype(DType::Int);
+    let out = data.gather(indexes).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(
+        input,
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0],
+    );
+    rt.set_data(indexes, &[0.0, 3.0, 4.0, 7.0]);
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &[0.0, 9.0, 1.0, 10.0], 0.001);
+}
+
+#[test]
 fn test_scatter_into_nonzero_dest() {
     let mut cx = Graph::default();
     let src = cx.tensor(1);
@@ -1011,4 +1050,22 @@ fn test_scatter_all_positions() {
 
     let out = rt.get_f32(result);
     assert_close(&out, &[10.0, 20.0, 30.0, 40.0], 0.001);
+}
+
+#[test]
+fn test_gather_preserves_data_dtype() {
+    let mut cx = Graph::default();
+    let data = cx.tensor(2);
+    let indexes = cx.tensor(1).as_dtype(DType::Int);
+    let out = data.gather(indexes).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(data, &[1.25, 2.5]);
+    rt.set_data(indexes, &[1.0]);
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &[2.5], 0.001);
 }

@@ -64,6 +64,7 @@
         (union ?sum ?sgemm)
         (set (dtype ?sgemm) ?dt)
     )
+    :ruleset matmul_backend
     :name "cublaslt row-major × column-major"
 )
 
@@ -129,5 +130,6 @@
         (union ?sum ?sgemm)
         (set (dtype ?sgemm) ?dt)
     )
+    :ruleset matmul_backend
     :name "cublaslt batched row-major × column-major"
 )

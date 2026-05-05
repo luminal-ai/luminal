@@ -53,7 +53,9 @@ fn main() {
     }
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space_with_options::<CudaRuntime>(
+        BuildSearchSpaceOptions::new().max_memory_mib(500),
+    );
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);

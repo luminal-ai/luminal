@@ -304,6 +304,7 @@ impl EgglogOp for KernelScatterNoCopy {
                         (union ?scatter ?nocopy)
                         (set (dtype ?nocopy) ?dty)
                     )
+                    :ruleset buffer_reuse
                     :name \"scatter to scatter-no-copy\"
                 )",
             ),
@@ -313,6 +314,7 @@ impl EgglogOp for KernelScatterNoCopy {
                     ((= ?cb (ConsumedBuffer ?a))
                      (= ?dt (dtype ?a)))
                     ((set (dtype ?cb) ?dt))
+                    :ruleset dtype_prop
                     :name \"consumed-buffer-dtype\"
                 )",
             ),
@@ -659,6 +661,7 @@ impl EgglogOp for KernelBatchMatVec {
                     (union ?sum ?bmv)
                     (set (dtype ?bmv) (F32))
                 )
+                :ruleset matmul_backend
                 :name \"batch mat-vec\"
             )"
         )]
@@ -939,6 +942,7 @@ impl EgglogOp for KernelBatchMatMul {
                     (union ?sum ?bmm)
                     (set (dtype ?bmm) (F32))
                 )
+                :ruleset matmul_backend
                 :name \"batch matmul\"
             )"
         )]
@@ -1178,6 +1182,7 @@ impl EgglogOp for KernelSoftmax {
                     (union ?sm ?ksm)
                     (set (dtype ?ksm) (F32))
                 )
+                :ruleset kernel_lower
                 :name \"softmax-to-kernel-f32\"
             )",
             ),
@@ -1450,6 +1455,7 @@ impl EgglogOp for KernelExp {
                     (union ?exp2 ?kexp)
                     (set (dtype ?kexp) ?dt)
                 )
+                :ruleset direct_kernel
                 :name \"direct-exp-fusion\"
             )",
             ),
@@ -1611,9 +1617,17 @@ impl EgglogOp for KernelSigmoid {
 
     fn rewrites(&self) -> Vec<Rule> {
         vec![
-            // Match the HLIR pattern directly: Recip(Add(Exp2(Mul(Mul(x, -1), log2e)), 1))
+            // Stage the HLIR sigmoid pattern through a small marker so repeated
+            // default passes do not re-run one large join over every Mul/Add/Recip.
             Rule::raw(
-                "(rule
+                "(datatype*
+                    (KernelSigmoidScaledState
+                        (MkKernelSigmoidScaledState IR EList EList DType)
+                    )
+                )
+                (function kernel_sigmoid_scaled (IR) KernelSigmoidScaledState :merge new)
+
+                (rule
                 (
                     (= ?neg1 (Op (Constant ?nv) (INil)))
                     (< ?nv -0.99)
@@ -1623,19 +1637,33 @@ impl EgglogOp for KernelSigmoid {
                     (> ?lv 1.44)
                     (< ?lv 1.45)
                     (= ?scaled (Op (Mul ?shape ?neg_out_stride ?log2e_stride ?scaled_stride) (ICons ?neg_x (ICons ?log2e (INil)))))
+                    (= ?dt (dtype ?x))
+                )
+                (
+                    (set (kernel_sigmoid_scaled ?scaled)
+                        (MkKernelSigmoidScaledState ?x ?shape ?x_stride ?dt))
+                )
+                :ruleset direct_kernel
+                :name \"direct-sigmoid-scaled-marker\"
+            )
+
+                (rule
+                (
+                    (= ?scaled_state (kernel_sigmoid_scaled ?scaled))
+                    (= ?scaled_state (MkKernelSigmoidScaledState ?x ?shape ?x_stride ?dt))
                     (= ?exp2 (Op (Exp2 ?shape ?scaled_stride ?exp_stride) (ICons ?scaled (INil))))
                     (= ?one (Op (Constant ?ov) (INil)))
                     (> ?ov 0.99)
                     (< ?ov 1.01)
                     (= ?plus_one (Op (Add ?shape ?exp_stride ?one_stride ?add_stride) (ICons ?exp2 (ICons ?one (INil)))))
                     (= ?sig_out (Op (Recip ?shape ?add_stride ?out_stride) (ICons ?plus_one (INil))))
-                    (= ?dt (dtype ?x))
                 )
                 (
                     (let ?ksig (Op (KernelSigmoid ?shape ?x_stride ?out_stride ?dt) (ICons ?x (INil))))
                     (union ?sig_out ?ksig)
                     (set (dtype ?ksig) ?dt)
                 )
+                :ruleset direct_kernel
                 :name \"direct-sigmoid-fusion\"
             )",
             ),

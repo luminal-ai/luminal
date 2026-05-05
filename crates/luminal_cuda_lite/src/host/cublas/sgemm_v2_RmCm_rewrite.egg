@@ -68,5 +68,6 @@
         (union ?sum ?sgemm)
         (set (dtype ?sgemm) (F32))
     )
+    :ruleset matmul_backend
     :name "cublas sgemm row-major × column-major"
 )

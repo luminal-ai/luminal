@@ -1,6 +1,7 @@
 pub mod dyn_backend;
 pub mod host;
 pub mod kernel;
+mod memory_analysis;
 pub mod runtime;
 use std::{
     ffi::{CStr, CString},

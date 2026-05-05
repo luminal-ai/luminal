@@ -282,6 +282,8 @@ impl Runtime for MetalRuntime {
                 let pipeline = kernel_op.compile(&self.device, &input_dtypes, output_dtype);
                 self.node_dtypes.insert(node, output_dtype);
                 self.pipelines.insert(node, pipeline);
+            } else {
+                panic!("Metal runtime cannot execute unlowered LLIR node {node:?}");
             }
         }
     }
@@ -292,6 +294,7 @@ impl Runtime for MetalRuntime {
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
+        _timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
         self.load_llir(llir_graph);
         self.allocate_intermediate_buffers(dyn_map);

@@ -27,70 +27,7 @@ use luminal::{
     prelude::*,
 };
 
-use crate::{
-    compile_module_image_for_current_device, cuda_dtype,
-    kernel::KernelOp,
-    kernel::hlir::{dtype_includes, generate_dyn_dims_defines},
-};
-
-/// Identity-memcpy kernel used as a *fallback* when a FusionStart or
-/// FusionEnd reaches `kernel_to_host`'s compile loop standalone (i.e.,
-/// region detection didn't sweep it into a `CompileUnit::Region`). The
-/// fast path is region collapse, but model-fuzz extraction sometimes
-/// produces LLIR shapes the detector doesn't catch; this keeps
-/// execution correct in those cases.
-#[allow(clippy::type_complexity)]
-fn compile_identity_kernel(
-    stream: &Arc<CudaStream>,
-    compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    kernel_name: &str,
-    shape: &[Expression],
-    strides: &[Expression],
-    dtype: DType,
-) -> CompileOut {
-    let vars = shape
-        .iter()
-        .flat_map(|e| e.dyn_vars())
-        .chain(strides.iter().flat_map(|e| e.dyn_vars()))
-        .collect::<FxHashSet<_>>();
-    let cuda_ty = cuda_dtype(dtype);
-    let includes = dtype_includes(&[dtype]);
-    let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
-    let dyn_dims_param = if vars.is_empty() {
-        ""
-    } else {
-        ", const int* dyn_dims"
-    };
-    let n_elements = shape.iter().copied().product::<Expression>().to_kernel();
-    let idx = flatten_strides(shape, strides).to_kernel();
-    let kernel = format!(
-        "{includes}\n{dyn_defines}\nextern \"C\" {{\n\
-         \x20   __global__ void {kernel_name}({cuda_ty} *out, const {cuda_ty} *in{dyn_dims_param}) {{\n\
-         \x20       long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-         \x20       if (const_z >= {n_elements}) return;\n\
-         \x20       out[{idx}] = in[{idx}];\n\
-         \x20   }}\n}}"
-    );
-    let (module, func) = if let Some((m, f)) = compile_cache.get(&kernel) {
-        (m.clone(), f.clone())
-    } else {
-        let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-        let module = stream.context().load_module(ptx).unwrap();
-        let func = module.load_function(kernel_name).unwrap();
-        compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-        (module, func)
-    };
-    let out_size = shape.iter().copied().product::<Expression>();
-    (
-        func,
-        module,
-        kernel,
-        (out_size.ceil_div(256), 1.into(), 1.into()),
-        (out_size.min(256), 1.into(), 1.into()),
-        0.into(),
-        FxHashMap::default(),
-    )
-}
+use crate::kernel::KernelOp;
 
 pub type Ops = (FusionStart, FusionEnd);
 
@@ -159,17 +96,10 @@ impl EgglogOp for FusionStart {
 impl KernelOp for FusionStart {
     fn compile(
         &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+        _stream: &Arc<CudaStream>,
+        _compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> CompileOut {
-        compile_identity_kernel(
-            stream,
-            compile_cache,
-            "fusion_start_k",
-            &self.shape,
-            &self.strides,
-            self.dtype,
-        )
+        unreachable!("FusionStart must be compiled through fusion region codegen")
     }
     fn output_size(&self) -> Expression {
         self.shape.iter().copied().product()
@@ -250,7 +180,7 @@ impl EgglogOp for FusionEnd {
                         (let ?fu2 (Op ({fo2} ?shape ?s ?s ?dt) (ICons ?fu1 (INil))))
                         (let ?fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?fu2 (INil))))
                         (union ?u2 ?fe)
-                     ) :name \"pair-fuse-U-U-{ki1}-{ko2}\")"
+                     ) :ruleset fusion_pair :name \"pair-fuse-U-U-{ki1}-{ko2}\")"
                 )));
             }
         }
@@ -271,7 +201,7 @@ impl EgglogOp for FusionEnd {
                         (let ?fu (Op ({fu} ?shape ?o_s ?o_s ?dt) (ICons ?fbin (INil))))
                         (let ?fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fu (INil))))
                         (union ?u ?fe)
-                     ) :name \"pair-fuse-B-U-{lb}-{ku}\")"
+                     ) :ruleset fusion_pair :name \"pair-fuse-B-U-{lb}-{ku}\")"
                 )));
             }
         }
@@ -294,7 +224,7 @@ impl EgglogOp for FusionEnd {
                                        (ICons ?fu (ICons ?fs_b (INil)))))
                         (let ?fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                         (union ?bin ?fe)
-                     ) :name \"pair-fuse-U-B-lhs-{ku}-{lb}\")"
+                     ) :ruleset fusion_pair :name \"pair-fuse-U-B-lhs-{ku}-{lb}\")"
                 )));
                 rules.push(Rule::raw(format!(
                     "(rule (
@@ -309,7 +239,7 @@ impl EgglogOp for FusionEnd {
                                        (ICons ?fs_a (ICons ?fu (INil)))))
                         (let ?fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                         (union ?bin ?fe)
-                     ) :name \"pair-fuse-U-B-rhs-{ku}-{lb}\")"
+                     ) :ruleset fusion_pair :name \"pair-fuse-U-B-rhs-{ku}-{lb}\")"
                 )));
             }
         }
@@ -333,7 +263,7 @@ impl EgglogOp for FusionEnd {
                                        (ICons ?fbi (ICons ?fs_c (INil)))))
                         (let ?fe (Op (FusionEnd ?shape ?oo_s ?dt) (ICons ?fbo (INil))))
                         (union ?bo ?fe)
-                     ) :name \"pair-fuse-B-B-lhs-{lbi}-{lbo}\")"
+                     ) :ruleset fusion_pair :name \"pair-fuse-B-B-lhs-{lbi}-{lbo}\")"
                 )));
                 rules.push(Rule::raw(format!(
                     "(rule (
@@ -351,7 +281,7 @@ impl EgglogOp for FusionEnd {
                                        (ICons ?fs_c (ICons ?fbi (INil)))))
                         (let ?fe (Op (FusionEnd ?shape ?oo_s ?dt) (ICons ?fbo (INil))))
                         (union ?bo ?fe)
-                     ) :name \"pair-fuse-B-B-rhs-{lbi}-{lbo}\")"
+                     ) :ruleset fusion_pair :name \"pair-fuse-B-B-rhs-{lbi}-{lbo}\")"
                 )));
             }
         }
@@ -366,7 +296,7 @@ impl EgglogOp for FusionEnd {
                     (let ?fu (Op ({fu} ?shape ?s ?s ?dt) (ICons ?inner (INil))))
                     (let ?new_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?fu (INil))))
                     (union ?u ?new_fe)
-                 ) :name \"grow-FE-U-{ku}\")"
+                 ) :ruleset fusion_grow :name \"grow-FE-U-{ku}\")"
             )));
         }
 
@@ -383,7 +313,7 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?inner_a (ICons ?fs_b (INil)))))
                     (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                     (union ?bin ?new_fe)
-                 ) :name \"grow-FE-B-lhs-{lb}\")"
+                 ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{lb}\")"
             )));
             rules.push(Rule::raw(format!(
                 "(rule (
@@ -396,7 +326,7 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?fs_a (ICons ?inner_b (INil)))))
                     (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                     (union ?bin ?new_fe)
-                 ) :name \"grow-FE-B-rhs-{lb}\")"
+                 ) :ruleset fusion_grow :name \"grow-FE-B-rhs-{lb}\")"
             )));
         }
 
@@ -420,7 +350,7 @@ impl EgglogOp for FusionEnd {
                     (union ?bin ?new_fe)
                     (subsume (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                     (subsume (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                 ) :name \"merge-FE-FE-{lb}\")"
+                 ) :ruleset fusion_merge :name \"merge-FE-FE-{lb}\")"
             )));
         }
 
@@ -460,17 +390,10 @@ impl EgglogOp for FusionEnd {
 impl KernelOp for FusionEnd {
     fn compile(
         &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+        _stream: &Arc<CudaStream>,
+        _compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> CompileOut {
-        compile_identity_kernel(
-            stream,
-            compile_cache,
-            "fusion_end_k",
-            &self.shape,
-            &self.strides,
-            self.dtype,
-        )
+        unreachable!("FusionEnd must be compiled through fusion region codegen")
     }
     fn output_size(&self) -> Expression {
         self.shape.iter().copied().product()

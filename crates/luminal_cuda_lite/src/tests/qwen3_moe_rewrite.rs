@@ -3,10 +3,7 @@ use luminal::{dtype::DType, prelude::*, shape::Expression};
 
 use super::utilities::{assert_close, get_cuda_stream, random_f32_vec};
 use crate::{
-    host::{
-        HostOp,
-        moe::{GLUMoE, GLUMoEMode},
-    },
+    host::moe::{GLUMoE, GLUMoEMode},
     runtime::CudaRuntime,
 };
 
@@ -176,10 +173,9 @@ fn gemma_gelu(x: GraphTensor) -> GraphTensor {
 }
 
 fn glumoe_modes(rt: &CudaRuntime) -> Vec<GLUMoEMode> {
-    rt.llir_graph()
-        .node_weights()
-        .filter_map(|node| {
-            let op = node.to_dialect::<dyn HostOp>()?;
+    rt.host_ops()
+        .into_iter()
+        .filter_map(|op| {
             op.as_any()
                 .downcast_ref::<GLUMoE>()
                 .map(|glumoe| glumoe.mode)

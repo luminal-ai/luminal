@@ -1,7 +1,7 @@
 //! Fuzz tests for model-architecture-specific subgraphs (Llama, Gemma, Qwen).
 //!
 //! Tests many random e-graph extraction variants (genomes) against a candle CPU
-//! reference to catch incorrect HLIR kernel fallback rewrites.
+//! reference to catch incorrect HLIR kernel rewrites.
 
 use luminal::prelude::*;
 
@@ -401,7 +401,7 @@ mod llama {
         fuzz_mlp(7, HIDDEN, INTERMEDIATE, 400);
     }
 
-    /// Force HLIR-only (no block ops) to specifically test the fallback path.
+    /// Force HLIR-only (no block ops) to specifically test that extraction path.
     #[test]
     fn fuzz_llama_mlp_hlir_only() {
         fuzz_mlp_hlir_only(SEQ, HIDDEN, INTERMEDIATE, 450);
@@ -568,7 +568,7 @@ mod gemma {
         fuzz_mlp(1, HIDDEN, INTERMEDIATE, 900);
     }
 
-    /// Force HLIR-only to test fallback path with Gemma dimensions.
+    /// Force HLIR-only to test that extraction path with Gemma dimensions.
     #[test]
     fn fuzz_gemma_mlp_hlir_only() {
         fuzz_mlp_hlir_only(SEQ, HIDDEN, INTERMEDIATE, 950);
@@ -677,7 +677,7 @@ mod qwen {
         fuzz_mlp(7, HIDDEN, INTERMEDIATE, 1500);
     }
 
-    /// Force HLIR-only to test fallback path with Qwen dimensions.
+    /// Force HLIR-only to test that extraction path with Qwen dimensions.
     #[test]
     fn fuzz_qwen_mlp_hlir_only() {
         fuzz_mlp_hlir_only(SEQ, HIDDEN, INTERMEDIATE, 1550);

@@ -8,7 +8,7 @@ use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use itertools::Itertools;
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, app, eq, rule, set, sort, union, v},
+        api::{Rule, SortDef, Term, app, eq, rule, set, sort, union, v},
         base::{DTYPE, ELIST, EXPRESSION, F64, OP_KIND, SORTS, dtype, ilist, op_term},
         extract_dtype, extract_expr, extract_expr_list,
     },
@@ -79,7 +79,48 @@ pub fn kernel_rewrite<H: Default + EgglogOp, L: Default + EgglogOp>() -> Rule {
     args.add("dtype", dt.clone());
     let llir_kind_term = llir.call(&args);
     let llir_op = op_term(llir_kind_term, inputs);
-    rule(union(hlir_op.clone(), llir_op)).fact(eq(dt, dtype(hlir_op)))
+    rule(union(hlir_op.clone(), llir_op))
+        .fact(eq(dt, dtype(hlir_op)))
+        .ruleset("kernel_lower")
+}
+
+/// Build a kernel rewrite for ops whose kernel dtype must match the first input.
+///
+/// This avoids extracting stale/conflicting dtype facts from the output e-class
+/// after backend alternatives have been unioned into it.
+fn kernel_rewrite_from_first_input<H: Default + EgglogOp, L: Default + EgglogOp>() -> Rule {
+    let hlir = H::default().sort();
+    let llir = L::default().sort();
+    let (mut args, hlir_kind_term) = hlir.new_call();
+    let first_inp = v("?__first_inp");
+    let tail = v("?__tail");
+    let inputs = Term::App {
+        variant: "ICons".to_string(),
+        args: vec![first_inp.clone(), tail],
+    };
+    let hlir_op = op_term(hlir_kind_term, inputs.clone());
+    let dt = v("?__dt");
+    args.add("dtype", dt.clone());
+    let llir_kind_term = llir.call(&args);
+    let llir_op = op_term(llir_kind_term, inputs);
+    rule(union(hlir_op, llir_op))
+        .fact(eq(dt, dtype(first_inp)))
+        .ruleset("kernel_lower")
+}
+
+fn dtype_for_ir_enode(egraph: &SerializedEGraph, ir_node: &ENodeId) -> Option<DType> {
+    let ir_class = egraph.node_to_class.get(ir_node)?;
+    let dtype_node = egraph.enodes.iter().find_map(|(node, (label, children))| {
+        (label == "dtype" && children.first() == Some(ir_class)).then_some(node)
+    })?;
+    let dtype_class = egraph.node_to_class.get(dtype_node)?;
+    egraph.eclasses.get(dtype_class)?.1.iter().find_map(|node| {
+        match egraph.enodes.get(node)?.0.as_str() {
+            "F32" | "F16" | "Bf16" | "Int" | "Bool" | "F4E2M1" | "F8E4M3" | "F8UE8M0" | "I4"
+            | "TF32" => Some(extract_dtype(egraph, node)),
+            _ => None,
+        }
+    })
 }
 
 #[derive(Default, Debug, Clone)]
@@ -700,7 +741,7 @@ impl EgglogOp for KernelMul {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![kernel_rewrite::<Mul, Self>()]
+        vec![kernel_rewrite_from_first_input::<Mul, Self>()]
     }
 
     fn cleanup(&self) -> bool {
@@ -715,17 +756,45 @@ impl EgglogOp for KernelMul {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let mut out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let mut a_stride =
+            extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap();
+        let mut b_stride =
+            extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
+        let mut out_stride =
+            extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap();
+        // Some e-graph paths (length-changing rewrites such as `merge_dims`
+        // or `RemoveNthFromEnd`) leave a Mul kind enode whose shape and
+        // strides children are extracted to different lengths under the
+        // first-enode walk. The `enforce_consistent_first_kind_enodes`
+        // pass in `src/egglog_utils/mod.rs` repairs this where it can,
+        // but a handful of eclasses have *no* consistent variant in any
+        // of their stride sub-eclasses. For those we truncate to the
+        // SHORTEST length here so `flatten_strides` is structurally
+        // satisfied — the resulting kernel is numerically wrong for that
+        // candidate but harmless for the search, which profiles many
+        // candidates and steers toward the consistent ones.
+        let n = out_shape
+            .len()
+            .min(a_stride.len())
+            .min(b_stride.len())
+            .min(out_stride.len());
+        out_shape.truncate(n);
+        a_stride.truncate(n);
+        b_stride.truncate(n);
+        out_stride.truncate(n);
+        let dtype = input_enodes
+            .first()
+            .and_then(|node| dtype_for_ir_enode(egraph, node))
+            .unwrap_or_else(|| extract_dtype(egraph, kind_children[4]));
         (
             LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                a_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                b_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[4]),
+                out_shape,
+                a_stride,
+                b_stride,
+                out_stride,
+                dtype,
             })),
             input_enodes,
         )
@@ -865,13 +934,29 @@ impl EgglogOp for KernelGather {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        // Match HLIR Gather (now in Op format) and rewrite to KernelGather
+        // Match HLIR Gather (now in Op format) and rewrite to KernelGather.
+        // Mirror the IList pattern used by `Gather`'s own dtype propagation
+        // rule (`src/hlir.rs`): use a `?__tail` variable instead of a
+        // strict `(INil)` so we don't accidentally fail to match against a
+        // Gather Op whose IList tail eclass has been merged with another
+        // chain by some unrelated egglog union. Without this the kernel
+        // rewrite is silently skipped for some Gathers in deep models
+        // (e.g. YOLO's stacked make_contiguous chains).
         let hlir_gather = luminal::hlir::Gather::default().sort();
         let (gather_args, gather_kind_term) = hlir_gather.new_call();
-        // HLIR Gather inputs: [indexes, data] (n_inputs=2)
         let indexes = v("?__indexes");
         let data = v("?__data");
-        let gather_inputs = ilist(vec![indexes.clone(), data.clone()]);
+        let tail = v("?__tail");
+        let gather_inputs = Term::App {
+            variant: "ICons".to_string(),
+            args: vec![
+                indexes.clone(),
+                Term::App {
+                    variant: "ICons".to_string(),
+                    args: vec![data.clone(), tail],
+                },
+            ],
+        };
         let gather_op = op_term(gather_kind_term, gather_inputs);
 
         let out_strides = SORTS
@@ -894,7 +979,11 @@ impl EgglogOp for KernelGather {
         ];
         let kernel_kind_term = self.sort().call(kernel_kind_args);
         let kernel_op = op_term(kernel_kind_term, ilist(vec![indexes, data.clone()]));
-        vec![rule(union(gather_op, kernel_op)).fact(eq(dt, dtype(data)))]
+        vec![
+            rule(union(gather_op, kernel_op))
+                .fact(eq(dt, dtype(data)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1129,7 +1218,11 @@ impl EgglogOp for KernelScatter {
         ];
         let kernel_kind_term = self.sort().call(kernel_kind_args);
         let kernel_op = op_term(kernel_kind_term, ilist(vec![dest, indexes, src.clone()]));
-        vec![rule(union(scatter_op, kernel_op)).fact(eq(dt, dtype(src)))]
+        vec![
+            rule(union(scatter_op, kernel_op))
+                .fact(eq(dt, dtype(src)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1386,7 +1479,8 @@ impl EgglogOp for KernelIota {
         let kernel_op = op_term(kernel_kind, hlir_inputs);
         vec![
             rule(union(hlir_op, kernel_op.clone()))
-                .set(dtype(kernel_op), app(&SORTS.int_dt, vec![])),
+                .set(dtype(kernel_op), app(&SORTS.int_dt, vec![]))
+                .ruleset("kernel_lower"),
         ]
     }
 
@@ -2471,7 +2565,11 @@ impl EgglogOp for KernelLessThan {
         args.add("dtype", dt.clone());
         let kernel_kind_term = self.sort().call(&args);
         let kernel_op = op_term(kernel_kind_term, hlir_inputs);
-        vec![rule(union(hlir_op, kernel_op)).fact(eq(dt, dtype(inp_a)))]
+        vec![
+            rule(union(hlir_op, kernel_op))
+                .fact(eq(dt, dtype(inp_a)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -2628,7 +2726,8 @@ impl EgglogOp for KernelConstant {
         let kernel_op = op_term(kernel_kind, hlir_inputs);
         vec![
             rule(union(hlir_op, kernel_op.clone()))
-                .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![])),
+                .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![]))
+                .ruleset("kernel_lower"),
         ]
     }
 
@@ -2770,7 +2869,11 @@ impl EgglogOp for KernelCast {
         cast_args.add("src_dtype", out_dty);
         let kernel_kind_term = self.sort().call(&cast_args);
         let kernel_op = op_term(kernel_kind_term, cast_inputs);
-        vec![rule(union(cast_op, kernel_op)).fact(eq(in_dty, dtype(inp)))]
+        vec![
+            rule(union(cast_op, kernel_op))
+                .fact(eq(in_dty, dtype(inp)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -3024,6 +3127,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with cast mul\"
             )"),
             // Match Gather with Add(Iota, Mul(Cast(token_ids), const)) indices (reversed order)
@@ -3043,6 +3147,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with cast mul reversed\"
             )"),
             // Match Gather with Add(Mul(token_ids, const), Iota) indices (no Cast)
@@ -3061,6 +3166,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with mul\"
             )"),
             // Match Gather with Add(Iota, Mul(token_ids, const)) indices (reversed order, no Cast)
@@ -3079,6 +3185,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with mul reversed\"
             )"),
         ]

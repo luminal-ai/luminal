@@ -12,6 +12,19 @@ pub trait Runtime {
     type CompileArg;
     type ExecReturn;
     type ProfileMetric: PartialOrd + Clone + Debug;
+    /// Backend-provided egglog layers that run after the normal full-egraph
+    /// cleanup schedule. Core keeps this empty; runtimes can use it for
+    /// backend-specific analyses and cleanup passes without adding those rules
+    /// to Luminal core.
+    fn late_egglog_passes(
+        _ops: &[Arc<Box<dyn EgglogOp>>],
+        _options: &crate::graph::BuildSearchSpaceOptions,
+    ) -> Vec<crate::egglog_utils::LateEgglogPass>
+    where
+        Self: Sized,
+    {
+        vec![]
+    }
     fn initialize(arg: Self::CompileArg) -> Self;
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn;
@@ -20,6 +33,7 @@ pub trait Runtime {
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
+        timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String);
     /// Aggregate multiple profile metrics into one comparable metric.
     /// Used for regionalized profiling where one candidate maps to multiple LLIR regions.
@@ -29,8 +43,6 @@ pub trait Runtime {
             .unwrap_or_else(|| panic!("aggregate_profile_metrics called with empty metrics"))
             .clone()
     }
-    /// Optional per-candidate profiling timeout used by search.
-    fn set_profile_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
     /// Allocate a dummy input buffer for a boundary node during per-chunk profiling.
     /// `node_index` is the HLIR node index used in the Input op's `node` field.
     /// `num_bytes` is the number of bytes to allocate.
@@ -49,6 +61,21 @@ pub trait Runtime {
     /// Used by the search to reject NaN-producing graph variants.
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         false
+    }
+    /// Estimate intermediate memory for a selected graph in the cleaned e-graph.
+    ///
+    /// This is intentionally optional because memory accounting is runtime
+    /// specific: backends decide which IR nodes allocate buffers and how dtype
+    /// storage is represented.
+    fn estimate_graph_memory<'a>(
+        _egraph: &'a SerializedEGraph,
+        _choices: &crate::egglog_utils::EGraphChoiceSet<'a>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> Option<usize>
+    where
+        Self: Sized,
+    {
+        None
     }
     /// Load multiple compiled LLIR graphs, one per bucket combination.
     /// Each entry is (bucket_indices, representative_dyn_map, stitched_llir).
@@ -170,9 +197,6 @@ impl std::fmt::Display for ExecutionStats {
 pub trait EgglogOp: Debug {
     fn sort(&self) -> crate::egglog_utils::api::SortDef;
     fn rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
-        vec![]
-    }
-    fn early_rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
         vec![]
     }
     fn cleanup(&self) -> bool;
