@@ -33,6 +33,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::time::Instant;
 
+use luminal::graph::BuildSearchSpaceOptions;
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -90,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_status(width: usize, height: usize, steps: usize) {
-    let image_seq_len = (height / 8) * (width / 8);
+    let image_seq_len = (height / 16) * (width / 16);
     let cfg = SchedulerConfig::default();
     let mu = compute_mu(&cfg, image_seq_len);
     let (sigmas, timesteps) = make_schedule(&cfg, steps, mu);
@@ -99,11 +100,10 @@ fn print_status(width: usize, height: usize, steps: usize) {
     println!("timesteps: {:?}", round(&timesteps, 2));
     println!("\nStatus:");
     println!("  scheduler:        ✅ tested vs diffusers");
-    println!("  hf loader:        ✅ F8/F4/F6 dtypes");
-    println!("  NVFP4 dequant:    ✅ HLIR pattern + cuda round-trip test");
-    println!("  VAE decoder:      ✅ end-to-end vs real weights (set VAE_TEST=1)");
-    println!("  text encoder:     ✅ Mistral3 text branch (set TEXT_TEST=1)");
-    println!("  transformer:      ✅ Flux2Transformer2DModel (graph builds)");
+    println!("  hf loader:        ✅ F8/F4/F6 dtypes (transformer is plain BF16, no NVFP4 path)");
+    println!("  VAE decoder:      ✅ runs end-to-end up to ~128² (set VAE_TEST=1)");
+    println!("  text encoder:     ⚠ graph builds, not validated (set TEXT_TEST=1, needs 48 GB)");
+    println!("  transformer:      ⚠ graph builds, never run (needs 64 GB shards)");
     println!("  full pipeline:    ⚠ requires ≈110 GB downloads (set FULL=1)");
 }
 
@@ -123,7 +123,9 @@ fn run_vae_only(width: usize, height: usize) -> Result<(), Box<dyn std::error::E
     let latent = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
     let decoder = VaeDecoder::new(&mut cx);
     let out = decoder.forward(latent).output();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space_with_options::<CudaRuntime>(
+        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("VAE_MEM_GIB", 32)),
+    );
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -197,7 +199,9 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
     let pos_ids = cx.named_tensor("__pos_ids", text_len).as_dtype(DType::Int);
     let encoder = text_encoder::Mistral3TextEncoder::init(&mut cx);
     let features = encoder.forward(input_ids, pos_ids).output();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space_with_options::<CudaRuntime>(
+        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("TEXT_MEM_GIB", 16)),
+    );
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -246,9 +250,21 @@ fn run_full_pipeline(
     steps: usize,
     guidance: f32,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // VAE latent grid: (LATENT_CHANNELS=32, h_lat, w_lat)
     let h_lat = height / VAE_DOWNSAMPLE;
     let w_lat = width / VAE_DOWNSAMPLE;
-    let s_img = h_lat * w_lat;
+    // Transformer "pack" grid: (IN_CHANNELS=128, h_pack, w_pack) = (32*4, h_lat/2, w_lat/2).
+    // The diffusers pipeline folds 2×2 spatial pixels into the channel axis
+    // before the transformer (`_patchify_latents`) and undoes it after
+    // (`_unpatchify_latents`), so the transformer sees `(S_img, 128)` tokens
+    // where `S_img = (H/16) * (W/16)`.
+    assert!(
+        h_lat.is_multiple_of(2) && w_lat.is_multiple_of(2),
+        "WIDTH and HEIGHT must be multiples of 16 (got {width}x{height})",
+    );
+    let h_pack = h_lat / 2;
+    let w_pack = w_lat / 2;
+    let s_img = h_pack * w_pack;
     let s_txt = text_len();
 
     // ── 1. TEXT ENCODE ─────────────────────────────────────────────────────────
@@ -275,7 +291,9 @@ fn run_full_pipeline(
     println!("  scheduler: mu={mu:.4}, {} steps", timesteps.len());
 
     // Pre-compute RoPE tables (host-side; these are constant per resolution).
-    let (rope_cos, rope_sin) = transformer::build_rope_tables(s_txt, h_lat, w_lat);
+    // Grid is the post-pack `(h_pack, w_pack)`, matching what the transformer
+    // and diffusers' `_prepare_latent_ids` see.
+    let (rope_cos, rope_sin) = transformer::build_rope_tables(s_txt, h_pack, w_pack);
     let s_total = s_txt + s_img;
     assert_eq!(rope_cos.len(), s_total * transformer::HEAD_DIM);
 
@@ -300,7 +318,9 @@ fn run_full_pipeline(
         .output();
 
     println!("Building search space (this is the long step — many minutes for the full DiT)...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space_with_options::<CudaRuntime>(
+        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("TX_MEM_GIB", 32)),
+    );
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -363,30 +383,150 @@ fn run_full_pipeline(
     // ── 3. VAE DECODE ──────────────────────────────────────────────────────────
     println!("\n[3/3] Decoding latent through VAE...");
     let vae_path = hf::fetch_vae()?;
+
+    // Convert the diffusion output `(S_img, 128)` to the VAE's input shape
+    // `(32, h_lat, w_lat)` on the host. Mirrors the diffusers pipeline:
+    //   1. _unpack_latents_with_ids: (S_img, 128) -> (128, h_pack, w_pack)
+    //   2. BN inverse:               x = x * bn_std + bn_mean   (per-channel)
+    //   3. _unpatchify_latents:      (128, h_pack, w_pack) -> (32, h_lat, w_lat)
+    let bn_mean = read_safetensors_f32(&vae_path, "bn.running_mean")?;
+    let bn_var = read_safetensors_f32(&vae_path, "bn.running_var")?;
+    assert_eq!(bn_mean.len(), transformer::IN_CHANNELS);
+    assert_eq!(bn_var.len(), transformer::IN_CHANNELS);
+    const BN_EPS: f32 = 1e-4; // matches vae/config.json batch_norm_eps=0.0001
+    let bn_std: Vec<f32> = bn_var.iter().map(|v| (v + BN_EPS).sqrt()).collect();
+
+    let unpacked = unpack_packed_host(
+        &latent,
+        transformer::IN_CHANNELS,
+        h_pack,
+        w_pack,
+    );
+    let denormed = bn_inverse_host(&unpacked, &bn_mean, &bn_std, transformer::IN_CHANNELS);
+    let vae_input = unpatchify_host(&denormed, LATENT_CHANNELS, h_pack, w_pack);
+    assert_eq!(vae_input.len(), LATENT_CHANNELS * h_lat * w_lat);
+
     let mut cx = Graph::default();
-    // Reshape latent from (S_img, IN_CHANNELS) flat to (LATENT_CHANNELS, h_lat, w_lat).
-    // The transformer uses patch_size=1 with in_channels=128, but the VAE
-    // emits LATENT_CHANNELS=32 with 4× internal patching that the transformer
-    // sees as 32 * 2 * 2 = 128. So the transformer's (S_img, 128) needs to
-    // be unpatched into (32, 2*h_lat, 2*w_lat). For now we treat the
-    // transformer as already producing (32, h_lat, w_lat) — caller must
-    // reshape if the patching layout differs.
     let latent_in = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
     let decoder = VaeDecoder::new(&mut cx);
     let out = decoder.forward(latent_in).output();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space_with_options::<CudaRuntime>(
+        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("VAE_MEM_GIB", 32)),
+    );
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
     runtime.load_safetensors(&cx, vae_path.to_str().unwrap());
-    runtime.set_data(latent_in, latent);
+    runtime.set_data(latent_in, vae_input);
     runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
     runtime.execute(&cx.dyn_map);
     let img = runtime.get_f32(out);
     save_png("out.png", &img, width, height)?;
     println!("Wrote out.png");
     Ok(())
+}
+
+// =============================================================================
+// Host-side pipeline glue: pack/unpack/BN/unpatchify between the transformer
+// and the VAE. These mirror diffusers' Flux2Pipeline static methods exactly.
+// =============================================================================
+
+/// Inverse of `_pack_latents`: `(S_img, C) -> (C, h_pack, w_pack)` row-major.
+fn unpack_packed_host(packed: &[f32], c: usize, h_pack: usize, w_pack: usize) -> Vec<f32> {
+    let s_img = h_pack * w_pack;
+    assert_eq!(packed.len(), s_img * c);
+    let mut out = vec![0.0_f32; c * s_img];
+    for hi in 0..h_pack {
+        for wi in 0..w_pack {
+            let token = hi * w_pack + wi;
+            for ci in 0..c {
+                out[ci * s_img + token] = packed[token * c + ci];
+            }
+        }
+    }
+    out
+}
+
+/// `latent[c, *] = latent[c, *] * std[c] + mean[c]`. In-place by-copy.
+fn bn_inverse_host(latent: &[f32], mean: &[f32], std: &[f32], c: usize) -> Vec<f32> {
+    let hw = latent.len() / c;
+    assert_eq!(mean.len(), c);
+    assert_eq!(std.len(), c);
+    let mut out = vec![0.0_f32; latent.len()];
+    for ci in 0..c {
+        let m = mean[ci];
+        let s = std[ci];
+        for i in 0..hw {
+            out[ci * hw + i] = latent[ci * hw + i] * s + m;
+        }
+    }
+    out
+}
+
+/// `_unpatchify_latents`: `(C*4, h_pack, w_pack) -> (C, 2*h_pack, 2*w_pack)`.
+///
+/// Diffusers does:
+/// ```python
+/// latents.reshape(B, C, 2, 2, H, W).permute(0, 1, 4, 2, 5, 3).reshape(B, C, 2H, 2W)
+/// ```
+/// So input channel `c*4 + ph*2 + pw` (with ph, pw in {0,1}) maps to output
+/// position `(c, hi*2 + ph, wi*2 + pw)`.
+fn unpatchify_host(packed: &[f32], c_out: usize, h_pack: usize, w_pack: usize) -> Vec<f32> {
+    assert_eq!(packed.len(), c_out * 4 * h_pack * w_pack);
+    let h_lat = h_pack * 2;
+    let w_lat = w_pack * 2;
+    let mut out = vec![0.0_f32; c_out * h_lat * w_lat];
+    for c in 0..c_out {
+        for ph in 0..2 {
+            for pw in 0..2 {
+                let in_c = c * 4 + ph * 2 + pw;
+                for hi in 0..h_pack {
+                    for wi in 0..w_pack {
+                        let in_idx = in_c * h_pack * w_pack + hi * w_pack + wi;
+                        let out_h = hi * 2 + ph;
+                        let out_w = wi * 2 + pw;
+                        let out_idx = c * h_lat * w_lat + out_h * w_lat + out_w;
+                        out[out_idx] = packed[in_idx];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read one F32 tensor by name from a single-file safetensors archive.
+fn read_safetensors_f32(
+    path: &std::path::Path,
+    name: &str,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes)?;
+    let header_len = u64::from_le_bytes(header_len_bytes) as usize;
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)?;
+    let info = header
+        .get(name)
+        .ok_or_else(|| format!("safetensors: tensor '{name}' not found in {path:?}"))?;
+    let dtype = info["dtype"].as_str().unwrap_or("");
+    if dtype != "F32" {
+        return Err(format!("safetensors: tensor '{name}' has dtype {dtype}, want F32").into());
+    }
+    let offsets = &info["data_offsets"];
+    let start = offsets[0].as_u64().unwrap();
+    let end = offsets[1].as_u64().unwrap();
+    let n_bytes = (end - start) as usize;
+    file.seek(SeekFrom::Start(8 + header_len as u64 + start))?;
+    let mut buf = vec![0u8; n_bytes];
+    file.read_exact(&mut buf)?;
+    Ok(buf
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 fn save_png(path: &str, chw: &[f32], w: usize, h: usize) -> Result<(), Box<dyn std::error::Error>> {

@@ -126,6 +126,13 @@ fn conv2d_bias(
     let flat = permuted.merge_dims(0, 1); // (H_out*W_out, C_in, K, K)
     let flat = flat.merge_dims(2, 3); // (H_out*W_out, C_in, K*K)
     let flat = flat.merge_dims(1, 2); // (H_out*W_out, C_in*K*K)
+    // Materialize the unfold view to a contiguous (H_out*W_out, C_in*K*K)
+    // tensor before the matmul. Without this barrier, the unfold's
+    // broadcast/permuted strides leak into the matmul's input pattern,
+    // which prevents the cublaslt egg rule from matching and forces the
+    // search to fall back to broadcast-Mul + SumReduce — generating an
+    // (M, K, N) intermediate that OOMs at typical VAE resolutions.
+    let flat = flat * 1.0_f32;
 
     // (H_out*W_out, C_in*K*K) @ (C_in*K*K, C_out) = (H_out*W_out, C_out).
     let mut out = flat.matmul(weight.t());
