@@ -84,27 +84,43 @@ pub fn kernel_rewrite<H: Default + EgglogOp, L: Default + EgglogOp>() -> Rule {
         .ruleset("kernel_lower")
 }
 
-/// Same as `kernel_rewrite` but also emits a fallback rule that fires
-/// unconditionally and assigns dtype = F32. Use this for ops where dtype
-/// propagation can fail to reach the operands (typically because they're
-/// fed by index-only sub-graphs whose dtype isn't set), so the kernel
-/// alternative is always available even when the dtype-propagation rule
-/// hasn't fired. Safe for ops that always operate on F32 data in our
-/// runtime (e.g. Mul/Add/Sum/MaxReduce inside conv/attention paths).
-pub fn kernel_rewrite_with_f32_fallback<H: Default + EgglogOp, L: Default + EgglogOp>() -> Vec<Rule>
-{
-    let mut rules = vec![kernel_rewrite::<H, L>()];
-    // Fallback: force dtype = F32 unconditionally.
+/// Build a kernel rewrite for ops whose kernel dtype must match the first input.
+///
+/// This avoids extracting stale/conflicting dtype facts from the output e-class
+/// after backend alternatives have been unioned into it.
+fn kernel_rewrite_from_first_input<H: Default + EgglogOp, L: Default + EgglogOp>() -> Rule {
     let hlir = H::default().sort();
     let llir = L::default().sort();
     let (mut args, hlir_kind_term) = hlir.new_call();
-    let inputs = v("?__inputs");
+    let first_inp = v("?__first_inp");
+    let tail = v("?__tail");
+    let inputs = Term::App {
+        variant: "ICons".to_string(),
+        args: vec![first_inp.clone(), tail],
+    };
     let hlir_op = op_term(hlir_kind_term, inputs.clone());
-    args.add("dtype", SORTS.f32_dt.call(()));
+    let dt = v("?__dt");
+    args.add("dtype", dt.clone());
     let llir_kind_term = llir.call(&args);
     let llir_op = op_term(llir_kind_term, inputs);
-    rules.push(rule(union(hlir_op, llir_op)));
-    rules
+    rule(union(hlir_op, llir_op))
+        .fact(eq(dt, dtype(first_inp)))
+        .ruleset("kernel_lower")
+}
+
+fn dtype_for_ir_enode(egraph: &SerializedEGraph, ir_node: &ENodeId) -> Option<DType> {
+    let ir_class = egraph.node_to_class.get(ir_node)?;
+    let dtype_node = egraph.enodes.iter().find_map(|(node, (label, children))| {
+        (label == "dtype" && children.first() == Some(ir_class)).then_some(node)
+    })?;
+    let dtype_class = egraph.node_to_class.get(dtype_node)?;
+    egraph.eclasses.get(dtype_class)?.1.iter().find_map(|node| {
+        match egraph.enodes.get(node)?.0.as_str() {
+            "F32" | "F16" | "Bf16" | "Int" | "Bool" | "F4E2M1" | "F8E4M3" | "F8UE8M0" | "I4"
+            | "TF32" => Some(extract_dtype(egraph, node)),
+            _ => None,
+        }
+    })
 }
 
 #[derive(Default, Debug, Clone)]
@@ -725,7 +741,7 @@ impl EgglogOp for KernelMul {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![kernel_rewrite::<Mul, Self>()]
+        vec![kernel_rewrite_from_first_input::<Mul, Self>()]
     }
 
     fn cleanup(&self) -> bool {
@@ -768,13 +784,17 @@ impl EgglogOp for KernelMul {
         a_stride.truncate(n);
         b_stride.truncate(n);
         out_stride.truncate(n);
+        let dtype = input_enodes
+            .first()
+            .and_then(|node| dtype_for_ir_enode(egraph, node))
+            .unwrap_or_else(|| extract_dtype(egraph, kind_children[4]));
         (
             LLIROp::new::<dyn KernelOp>(Box::new(Self {
                 out_shape,
                 a_stride,
                 b_stride,
                 out_stride,
-                dtype: extract_dtype(egraph, kind_children[4]),
+                dtype,
             })),
             input_enodes,
         )

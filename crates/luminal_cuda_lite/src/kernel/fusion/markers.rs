@@ -27,70 +27,7 @@ use luminal::{
     prelude::*,
 };
 
-use crate::{
-    compile_module_image_for_current_device, cuda_dtype,
-    kernel::KernelOp,
-    kernel::hlir::{dtype_includes, generate_dyn_dims_defines},
-};
-
-/// Identity-memcpy kernel used as a *fallback* when a FusionStart or
-/// FusionEnd reaches `kernel_to_host`'s compile loop standalone (i.e.,
-/// region detection didn't sweep it into a `CompileUnit::Region`). The
-/// fast path is region collapse, but model-fuzz extraction sometimes
-/// produces LLIR shapes the detector doesn't catch; this keeps
-/// execution correct in those cases.
-#[allow(clippy::type_complexity)]
-fn compile_identity_kernel(
-    stream: &Arc<CudaStream>,
-    compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    kernel_name: &str,
-    shape: &[Expression],
-    strides: &[Expression],
-    dtype: DType,
-) -> CompileOut {
-    let vars = shape
-        .iter()
-        .flat_map(|e| e.dyn_vars())
-        .chain(strides.iter().flat_map(|e| e.dyn_vars()))
-        .collect::<FxHashSet<_>>();
-    let cuda_ty = cuda_dtype(dtype);
-    let includes = dtype_includes(&[dtype]);
-    let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
-    let dyn_dims_param = if vars.is_empty() {
-        ""
-    } else {
-        ", const int* dyn_dims"
-    };
-    let n_elements = shape.iter().copied().product::<Expression>().to_kernel();
-    let idx = flatten_strides(shape, strides).to_kernel();
-    let kernel = format!(
-        "{includes}\n{dyn_defines}\nextern \"C\" {{\n\
-         \x20   __global__ void {kernel_name}({cuda_ty} *out, const {cuda_ty} *in{dyn_dims_param}) {{\n\
-         \x20       long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-         \x20       if (const_z >= {n_elements}) return;\n\
-         \x20       out[{idx}] = in[{idx}];\n\
-         \x20   }}\n}}"
-    );
-    let (module, func) = if let Some((m, f)) = compile_cache.get(&kernel) {
-        (m.clone(), f.clone())
-    } else {
-        let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-        let module = stream.context().load_module(ptx).unwrap();
-        let func = module.load_function(kernel_name).unwrap();
-        compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-        (module, func)
-    };
-    let out_size = shape.iter().copied().product::<Expression>();
-    (
-        func,
-        module,
-        kernel,
-        (out_size.ceil_div(256), 1.into(), 1.into()),
-        (out_size.min(256), 1.into(), 1.into()),
-        0.into(),
-        FxHashMap::default(),
-    )
-}
+use crate::kernel::KernelOp;
 
 pub type Ops = (FusionStart, FusionEnd);
 
@@ -159,17 +96,10 @@ impl EgglogOp for FusionStart {
 impl KernelOp for FusionStart {
     fn compile(
         &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+        _stream: &Arc<CudaStream>,
+        _compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> CompileOut {
-        compile_identity_kernel(
-            stream,
-            compile_cache,
-            "fusion_start_k",
-            &self.shape,
-            &self.strides,
-            self.dtype,
-        )
+        unreachable!("FusionStart must be compiled through fusion region codegen")
     }
     fn output_size(&self) -> Expression {
         self.shape.iter().copied().product()
@@ -460,17 +390,10 @@ impl EgglogOp for FusionEnd {
 impl KernelOp for FusionEnd {
     fn compile(
         &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+        _stream: &Arc<CudaStream>,
+        _compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     ) -> CompileOut {
-        compile_identity_kernel(
-            stream,
-            compile_cache,
-            "fusion_end_k",
-            &self.shape,
-            &self.strides,
-            self.dtype,
-        )
+        unreachable!("FusionEnd must be compiled through fusion region codegen")
     }
     fn output_size(&self) -> Expression {
         self.shape.iter().copied().product()

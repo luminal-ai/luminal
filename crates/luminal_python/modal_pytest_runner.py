@@ -22,7 +22,7 @@ from modal.volume import FileEntryType
 
 app = modal.App("luminal-tests")
 
-DEFAULT_TIMEOUT = 120 * 60
+DEFAULT_TIMEOUT = 4 * 60 * 60
 CUDARC_CUDA_VERSION = "12080"
 LOCAL_PROJECT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = "/root/luminal/crates/luminal_python"
@@ -305,7 +305,7 @@ class TestRunner:
 
 def _parse_cli_args(
     cli_args: tuple[str, ...],
-) -> tuple[str, int | None, bool, str | None, list[str]]:
+) -> tuple[str, int, bool, str | None, list[str]]:
     parser = argparse.ArgumentParser(
         prog="modal run modal_pytest_runner.py",
         add_help=False,
@@ -320,7 +320,8 @@ def _parse_cli_args(
     parser.add_argument(
         "--timeout",
         type=int,
-        help="Optional Modal execution timeout in seconds. Defaults to 7200 seconds.",
+        default=DEFAULT_TIMEOUT,
+        help="Modal execution timeout in seconds. Defaults to %(default)s seconds.",
     )
     parser.add_argument(
         "--profile",
@@ -357,8 +358,7 @@ def main(*cli_args: str):
     runner_options = {"gpu": gpu}
     hf_token_secret = _hf_token_secret()
     runner_volumes = {HF_CACHE_PATH: HF_CACHE_VOLUME}
-    if timeout is not None:
-        runner_options["timeout"] = timeout
+    runner_options["timeout"] = timeout
     if profile_enabled:
         runner_volumes[PROFILE_VOLUME_PATH] = PROFILE_VOLUME
     runner_options["volumes"] = runner_volumes

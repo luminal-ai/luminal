@@ -93,9 +93,8 @@ pub(crate) enum CompileUnit {
 /// (one whose e-graph congruence-deduplicated it across multiple
 /// regions) into a different subgraph than the FE that absorbs it.
 /// Without this global view, `build_compile_units` running on the FS's
-/// subgraph would not see any FE walking back to the FS, would emit the
-/// FS as `CompileUnit::Single`, and the markers' identity-memcpy
-/// fallback would compile and launch — pure overhead at runtime.
+/// subgraph would not see any FE walking back to the FS and would emit the
+/// FS as `CompileUnit::Single`; marker standalone compilation is not supported.
 pub(crate) fn globally_absorbed_markers(llir_graph: &LLIRGraph) -> FxHashSet<NodeIndex> {
     let name_of = |idx: NodeIndex| -> Option<&'static str> {
         llir_graph
@@ -196,11 +195,10 @@ pub(crate) fn build_compile_units(
                         // Non-marker, non-FusedX predecessor inside what
                         // we thought was a region. Shouldn't happen with
                         // the current rules; treat conservatively: do
-                        // not absorb — let the kernel_to_host single
-                        // path handle it. This means the region is
+                        // not absorb it. This means the region is
                         // malformed and we likely should not have a
-                        // region at all. Caller will see incomplete
-                        // interior; the safer thing is to fall back.
+                        // region at all; caller will see incomplete
+                        // interior.
                     }
                 }
             }
@@ -253,11 +251,10 @@ pub(crate) fn build_compile_units(
     // FE nodes with their RegionUnit and skipping anything absorbed —
     // either by a region in *this* subgraph (`absorbed`) or by any
     // region anywhere in the LLIR (`globally_absorbed`). Skipping the
-    // latter prevents the identity-memcpy fallback from firing on
-    // shared FS markers whose consumers live in other convex subgraphs:
+    // latter prevents shared FS markers whose consumers live in other
+    // convex subgraphs from being emitted as standalone compile units:
     // those FSes are absorbed by some other region, and the consuming
-    // region reads from FS's external producer, so the FS never needs
-    // its own kernel.
+    // region reads from FS's external producer.
     let mut units: Vec<CompileUnit> = Vec::new();
     for &node in topo_order {
         if let Some(region) = regions.remove(&node) {
