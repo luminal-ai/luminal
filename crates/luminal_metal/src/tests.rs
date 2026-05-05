@@ -1,8 +1,16 @@
 use crate::{kernel::lower_expression_for_metal, runtime::MetalRuntime};
 use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
-use half::f16;
+use half::{bf16, f16};
 use luminal::prelude::*;
 use proptest::prelude::*;
+use safetensors::{tensor::TensorView, Dtype as SafeDType};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static SAFETENSORS_TEST_FILE_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(
@@ -24,6 +32,32 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             rel_err
         );
     }
+}
+
+fn bytes_of<T: bytemuck::NoUninit>(values: &[T]) -> Vec<u8> {
+    bytemuck::cast_slice(values).to_vec()
+}
+
+fn write_test_safetensors(tensors: &[(&str, SafeDType, Vec<usize>, Vec<u8>)]) -> PathBuf {
+    let tensor_views: HashMap<String, TensorView<'_>> = tensors
+        .iter()
+        .map(|(name, dtype, shape, data)| {
+            (
+                (*name).to_string(),
+                TensorView::new(*dtype, shape.clone(), data).unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::serialize(&tensor_views, None).unwrap();
+    let id = SAFETENSORS_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "luminal_metal_runtime_{}_{}.safetensors",
+        std::process::id(),
+        id
+    ));
+    std::fs::write(&path, serialized).unwrap();
+    path
 }
 
 const TRANSFORMER_SEQ: usize = 4;
@@ -986,6 +1020,131 @@ fn test_scatter_basic() {
 
     let out = rt.get_f32(result);
     assert_close(&out, &[0.0, 10.0, 0.0, 20.0, 30.0], 0.001);
+}
+
+#[test]
+fn test_scatter_buffer_roundtrip() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(1);
+    let indexes = cx.tensor(1).as_dtype(DType::Int);
+    let cache = cx.tensor(4).persist();
+    let cache_out = src.scatter(indexes, cache);
+    let read = cache_out.output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[0.0]);
+    rt.set_data(indexes, &[0.0]);
+    rt.set_zeros(cache, 4 * std::mem::size_of::<f32>());
+    rt = cx.search(rt, 1);
+
+    for (pos, value, expected) in [
+        (0, 10.0, [10.0, 0.0, 0.0, 0.0]),
+        (1, 20.0, [10.0, 20.0, 0.0, 0.0]),
+        (2, 30.0, [10.0, 20.0, 30.0, 0.0]),
+    ] {
+        rt.set_data(src, &[value]);
+        rt.set_data(indexes, &[pos as f32]);
+        rt.allocate_intermediate_buffers(&cx.dyn_map);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(read), &expected, 0.001);
+
+        let updated_cache = rt.remove_buffer(cache_out);
+        rt.set_buffer(cache, updated_cache);
+    }
+}
+
+#[test]
+fn test_load_safetensors_f32_survives_search_and_overrides_input_data() {
+    let mut cx = Graph::default();
+    let weights = cx.named_tensor("weights", 3);
+    let bias = cx.named_tensor("bias", 3);
+    let out = (weights + bias).output();
+
+    let weight_values = [1.25f32, -2.5, 4.0];
+    let tensors = [("weights", SafeDType::F32, vec![3], bytes_of(&weight_values))];
+    let path = write_test_safetensors(&tensors);
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(weights, &[99.0, 99.0, 99.0]);
+    rt.set_data(bias, &[0.5, 1.0, -1.5]);
+    rt.load_safetensors(&cx, path.to_str().unwrap());
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &[1.75, -1.5, 2.5], 0.001);
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn test_load_safetensors_converts_supported_float_dtypes() {
+    let mut cx = Graph::default();
+    let f16_to_f32 = cx.named_tensor("f16_to_f32", 2);
+    let bf16_to_f32 = cx.named_tensor("bf16_to_f32", 2);
+    let f16_to_f16 = cx.named_tensor("f16_to_f16", 2).as_dtype(DType::F16);
+    let f32_to_f16 = cx.named_tensor("f32_to_f16", 2).as_dtype(DType::F16);
+    let bf16_to_f16 = cx.named_tensor("bf16_to_f16", 2).as_dtype(DType::F16);
+
+    let f16_to_f32_out = (f16_to_f32 + 0.0).output();
+    let bf16_to_f32_out = (bf16_to_f32 + 0.0).output();
+    let f16_to_f16_out = f16_to_f16.cast(DType::F32).output();
+    let f32_to_f16_out = f32_to_f16.cast(DType::F32).output();
+    let bf16_to_f16_out = bf16_to_f16.cast(DType::F32).output();
+
+    let f16_to_f32_values = [f16::from_f32(1.5), f16::from_f32(-2.25)];
+    let bf16_to_f32_values = [bf16::from_f32(3.5), bf16::from_f32(-4.25)];
+    let f16_to_f16_values = [f16::from_f32(5.5), f16::from_f32(-6.25)];
+    let f32_to_f16_values = [7.5f32, -8.25];
+    let bf16_to_f16_values = [bf16::from_f32(9.5), bf16::from_f32(-10.25)];
+    let tensors = [
+        (
+            "f16_to_f32",
+            SafeDType::F16,
+            vec![2],
+            bytes_of(&f16_to_f32_values),
+        ),
+        (
+            "bf16_to_f32",
+            SafeDType::BF16,
+            vec![2],
+            bytes_of(&bf16_to_f32_values),
+        ),
+        (
+            "f16_to_f16",
+            SafeDType::F16,
+            vec![2],
+            bytes_of(&f16_to_f16_values),
+        ),
+        (
+            "f32_to_f16",
+            SafeDType::F32,
+            vec![2],
+            bytes_of(&f32_to_f16_values),
+        ),
+        (
+            "bf16_to_f16",
+            SafeDType::BF16,
+            vec![2],
+            bytes_of(&bf16_to_f16_values),
+        ),
+    ];
+    let path = write_test_safetensors(&tensors);
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.load_safetensors(&cx, path.to_str().unwrap());
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(f16_to_f32_out), &[1.5, -2.25], 0.001);
+    assert_close(&rt.get_f32(bf16_to_f32_out), &[3.5, -4.25], 0.001);
+    assert_close(&rt.get_f32(f16_to_f16_out), &[5.5, -6.25], 0.001);
+    assert_close(&rt.get_f32(f32_to_f16_out), &[7.5, -8.25], 0.001);
+    assert_close(&rt.get_f32(bf16_to_f16_out), &[9.5, -10.25], 0.001);
+    std::fs::remove_file(path).ok();
 }
 
 #[test]

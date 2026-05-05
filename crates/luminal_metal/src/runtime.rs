@@ -1,11 +1,11 @@
 use crate::kernel::{
     MatmulDescriptor, MetalKernelOp, MetalMatmul, MetalMatmulPlanner, DYN_SLOT_COUNT,
 };
-use half::f16;
+use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
     dtype::DType,
-    graph::LLIRGraph,
+    graph::{Graph, LLIRGraph},
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
@@ -13,9 +13,11 @@ use luminal::{
         FxHashMap, NodeIndex, ToId,
     },
 };
+use memmap2::MmapOptions;
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
 use objc::runtime::Object;
-use std::time::Duration;
+use safetensors::{Dtype as SafeDType, SafeTensors};
+use std::{fs::File, time::Duration};
 
 pub struct MetalRuntime {
     device: Device,
@@ -37,6 +39,89 @@ pub struct MetalRuntime {
 }
 
 impl MetalRuntime {
+    fn input_dtype(&self, id: NodeIndex) -> Option<DType> {
+        self.llir_graph.node_indices().find_map(|node| {
+            self.llir_graph[node]
+                .to_op::<Input>()
+                .and_then(|input| (input.node == id.index()).then_some(input.dtype))
+        })
+    }
+
+    fn output_data_node(&self, id: NodeIndex) -> NodeIndex {
+        let output_id = self
+            .llir_graph
+            .node_indices()
+            .find(|n| {
+                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
+                    *node == id.index()
+                } else {
+                    false
+                }
+            })
+            .expect("Cannot find output tensor!");
+
+        self.llir_graph
+            .neighbors_directed(output_id, Direction::Incoming)
+            .next()
+            .unwrap()
+    }
+
+    fn buffer_from_slice<T>(&self, values: &[T]) -> Buffer {
+        self.device.new_buffer_with_data(
+            values.as_ptr() as *const _,
+            std::mem::size_of_val(values) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    fn buffer_from_safetensor(
+        &self,
+        tensor: &safetensors::tensor::TensorView<'_>,
+        dtype: DType,
+    ) -> Buffer {
+        match (tensor.dtype(), dtype) {
+            (SafeDType::F32, DType::F32) | (SafeDType::F16, DType::F16) => {
+                let data = tensor.data();
+                self.device.new_buffer_with_data(
+                    data.as_ptr() as *const _,
+                    data.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
+            (SafeDType::F16, DType::F32) => {
+                let values: Vec<f32> = bytemuck::cast_slice::<u8, f16>(tensor.data())
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (SafeDType::BF16, DType::F32) => {
+                let values: Vec<f32> = bytemuck::cast_slice::<u8, bf16>(tensor.data())
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (SafeDType::F32, DType::F16) => {
+                let values: Vec<f16> = bytemuck::cast_slice::<u8, f32>(tensor.data())
+                    .iter()
+                    .map(|v| f16::from_f32(*v))
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (SafeDType::BF16, DType::F16) => {
+                let values: Vec<f16> = bytemuck::cast_slice::<u8, bf16>(tensor.data())
+                    .iter()
+                    .map(|v| f16::from_f32(v.to_f32()))
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (tensor_dtype, dtype) => {
+                panic!("Cannot load safetensor dtype {tensor_dtype:?} into Metal dtype {dtype:?}")
+            }
+        }
+    }
+
     fn fuse_matmuls(llir_graph: &LLIRGraph) -> LLIRGraph {
         let mut graph = llir_graph.clone();
         let planner = MetalMatmulPlanner;
@@ -132,29 +217,74 @@ impl MetalRuntime {
             .collect()
     }
 
+    pub fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
+        let f = File::open(file_path).unwrap();
+        let mmap = unsafe { MmapOptions::new().map(&f).unwrap() };
+        let st = SafeTensors::deserialize(&mmap).unwrap();
+
+        for node in cx.graph.node_indices() {
+            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>() {
+                if let Ok(tensor) = st.tensor(&input.label) {
+                    let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
+                    self.input_data.remove(&node);
+                    self.hlir_buffers.insert(node, buffer);
+                }
+            }
+        }
+    }
+
     pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
-        self.input_data.insert(id.to_id(), data.into());
+        let id = id.to_id();
+        let data = data.into();
+        if let Some(dtype) = self.input_dtype(id) {
+            let buffer = self.create_input_buffer(&data, dtype);
+            self.hlir_buffers.insert(id, buffer);
+        }
+        self.input_data.insert(id, data);
+    }
+
+    pub fn set_zeros(&mut self, id: impl ToId, num_bytes: usize) {
+        let id = id.to_id();
+        let buffer = self
+            .device
+            .new_buffer(num_bytes as u64, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            std::ptr::write_bytes(buffer.contents(), 0, num_bytes);
+        }
+        self.input_data.remove(&id);
+        self.hlir_buffers.insert(id, buffer);
+    }
+
+    pub fn remove_buffer(&mut self, id: impl ToId) -> Buffer {
+        let data_id = self.output_data_node(id.to_id());
+
+        if let Some(buffer) = self.buffers.remove(&data_id) {
+            let replacement = self
+                .device
+                .new_buffer(buffer.length(), MTLResourceOptions::StorageModeShared);
+            self.buffers.insert(data_id, replacement);
+            return buffer;
+        }
+
+        if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
+            return self
+                .hlir_buffers
+                .get(&NodeIndex::new(*node))
+                .expect("Cannot find input tensor in runtime!")
+                .to_owned();
+        }
+
+        panic!("Cannot find tensor in runtime!");
+    }
+
+    pub fn set_buffer(&mut self, id: impl ToId, buffer: Buffer) {
+        let id = id.to_id();
+        self.input_data.remove(&id);
+        self.hlir_buffers.insert(id, buffer);
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
-        let id = id.to_id();
-        let output_id = self
-            .llir_graph
-            .node_indices()
-            .find(|n| {
-                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
-                    *node == id.index()
-                } else {
-                    false
-                }
-            })
-            .expect("Cannot find output tensor!");
-
-        let data_id = self
-            .llir_graph
-            .neighbors_directed(output_id, Direction::Incoming)
-            .next()
-            .unwrap();
+        let data_id = self.output_data_node(id.to_id());
 
         let buffer = self
             .buffers
@@ -242,7 +372,6 @@ impl Runtime for MetalRuntime {
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.pipelines.clear();
         self.buffers.clear();
-        self.hlir_buffers.clear();
         self.node_dtypes.clear();
         self.llir_graph = Self::fuse_matmuls(llir_graph);
 
