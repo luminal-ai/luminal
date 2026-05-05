@@ -123,9 +123,20 @@ fn run_vae_only(width: usize, height: usize) -> Result<(), Box<dyn std::error::E
     let latent = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
     let decoder = VaeDecoder::new(&mut cx);
     let out = decoder.forward(latent).output();
-    cx.build_search_space_with_options::<CudaRuntime>(
-        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("VAE_MEM_GIB", 32)),
-    );
+    // Memory-budget enforcement is opt-in here. The estimator
+    // (`memory_analysis::estimate_graph_memory_bytes`) sums every node's
+    // output bytes — including views — across the whole graph rather
+    // than computing peak live memory. For the conv-heavy decoder this
+    // sum runs into the hundreds of GiB even at 256² where real peak
+    // memory is only a few GiB, so any reasonable budget rejects all
+    // candidates. Set `VAE_MEM_GIB` to opt in if you need it.
+    if let Ok(g) = std::env::var("VAE_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+        cx.build_search_space_with_options::<CudaRuntime>(
+            BuildSearchSpaceOptions::new().max_memory_gib(g),
+        );
+    } else {
+        cx.build_search_space::<CudaRuntime>();
+    }
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();

@@ -131,7 +131,19 @@ fn conv2d_bias(
     // broadcast/permuted strides leak into the matmul's input pattern,
     // which prevents the cublaslt egg rule from matching and forces the
     // search to fall back to broadcast-Mul + SumReduce — generating an
-    // (M, K, N) intermediate that OOMs at typical VAE resolutions.
+    // (M, K, N) intermediate that OOMs even at 128².
+    //
+    // KNOWN LIMITATION: Even with this barrier, search is still allowed
+    // to randomly select the broadcast-Mul + SumReduce path for any one
+    // of the ~30 matmuls in the decoder, because the conditional
+    // KernelMul cleanup rule in `cublaslt/mod.rs` doesn't always remove
+    // it. At 128² VAE this works (search finds a viable genome within
+    // ~100 attempts; peak ~12 GiB). At 256²+ a single bad pick on the
+    // C_in=512 / C_out=512 layer creates a 38 GB intermediate, and 100
+    // random initial genomes all OOM. End-to-end at the actual Flux 2
+    // 1024² resolution requires a real `KernelConv2D` op in
+    // luminal_cuda_lite that fuses unfold+matmul+bias into one kernel
+    // (no intermediate matrix). That's the next piece of work.
     let flat = flat * 1.0_f32;
 
     // (H_out*W_out, C_in*K*K) @ (C_in*K*K, C_out) = (H_out*W_out, C_out).
