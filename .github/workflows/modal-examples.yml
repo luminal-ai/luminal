@@ -22,7 +22,7 @@ jobs:
         strategy:
             fail-fast: false
             matrix:
-                example: [llama, gemma, qwen, qwen3_moe]
+                example: [llama, gemma, qwen, qwen3_moe, gemma4_moe, whisper]
                 gpu:
                     - { type: "A100-80GB" }
                     # To add more GPUs, just append another entry:

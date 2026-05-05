@@ -118,12 +118,27 @@ def test_kv_cache_growing_r1_mla(device: torch.device):
     torch._dynamo.config.cache_size_limit = NUM_DECODE_STEPS + 2
     torch._dynamo.config.automatic_dynamic_shapes = False
 
+    # Release any memory accumulated by previous tests in the same pytest
+    # process — full-width R1 instantiation needs ~3 GB and the test runner's
+    # GPU is shared with ~230 prior tests' allocations.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     config = AutoConfig.from_pretrained("deepseek-ai/DeepSeek-R1")
     config.num_hidden_layers = 1
     # first_k_dense_replace=3 (default) makes the 1 layer dense, so we avoid
     # the 256-expert MoE path and the associated memory pressure.
     config._attn_implementation = "eager"
     config.torch_dtype = torch.float32
+    # Aggressively shrink the embedding / LM head / FFN dimensions while
+    # preserving the MLA-specific knobs that the test is actually exercising
+    # (q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim).
+    # Full R1 has vocab=129280, intermediate=18432, hidden=7168 — at fp32 the
+    # embedding + LM head alone is ~3.5 GB, which OOMs the 40 GB test runner
+    # after prior tests' allocations. The MLA path is unchanged at vocab=256.
+    config.vocab_size = 256
+    config.intermediate_size = 512
+    config.max_position_embeddings = 128
     model = DeepseekV3ForCausalLM(config).eval().to(dtype=torch.float32, device=device)
     compiled = torch.compile(model, backend=luminal_backend)
 

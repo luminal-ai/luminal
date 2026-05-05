@@ -5,12 +5,19 @@
 ;   mode=1: Gemma-style GELU (gate * sigmoid(1.595769 * gate * (1 + 0.044715 * gate^2)))
 ;
 ; To keep matching fast, we stage through marker states:
-;   1) Shared gate-up matmul marker
-;   2) Activation marker (separate swiglu / gemma_gelu paths)
-;   3) Down matmul marker (separate swiglu / gemma_gelu paths)
-;   4) Final GLUMoE fusion (separate swiglu / gemma_gelu rules)
+;   1) Shared expert index/gather markers
+;   2) Shared gate-up matmul marker
+;   3) Activation marker (separate swiglu / gemma_gelu paths)
+;   4) Down matmul marker (separate swiglu / gemma_gelu paths)
+;   5) Final GLUMoE fusion (separate swiglu / gemma_gelu rules)
 
 (datatype*
+    (GLUMoEExpertIndexState
+        (MkGLUMoEExpertIndexState Expression Expression IR)
+    )
+    (GLUMoEExpertGatherState
+        (MkGLUMoEExpertGatherState Expression Expression IR IR)
+    )
     (GLUMoEGateUpState
         (MkGLUMoEGateUpState Expression Expression Expression IR IR IR)
     )
@@ -28,6 +35,8 @@
     )
 )
 
+(function glumoe_expert_index (IR) GLUMoEExpertIndexState :merge new)
+(function glumoe_expert_gather (IR) GLUMoEExpertGatherState :merge new)
 (function glumoe_gate_up (IR) GLUMoEGateUpState :merge new)
 (function glumoe_swiglu (IR) GLUMoESwiGLUState :merge new)
 (function glumoe_gemma_gelu (IR) GLUMoEGemmaGELUState :merge new)
@@ -36,17 +45,38 @@
 
 (rule
     (
-        ; ===== Gate-up expert gather =====
-        (= ?gu_iota_base (Op (Iota ?gu_io ?gu_iota_base_range) (INil)))
-        (= ?gu_mul_base (Op (Mul ?gu_mul_base_shape ?gu_mul_base_a_stride ?gu_mul_base_b_stride ?gu_mul_base_out_stride) (ICons ?topk_idx (ICons ?gu_iota_base (INil)))))
-        (= ?gu_iota_within (Op (Iota (MIter) ?gu_iota_within_range) (INil)))
-        (= ?gu_add_idx (Op (Add ?gu_add_shape ?gu_add_a_stride ?gu_add_b_stride ?gu_add_out_stride) (ICons ?gu_mul_base (ICons ?gu_iota_within (INil)))))
-        (= ?gu_gathered (Op (Gather ?gu_gather_idx_shape ?gu_gather_idx_stride ?gu_gather_data_shape ?gu_gather_data_stride) (ICons ?gu_add_idx (ICons ?gate_up_w (INil)))))
+        (= ?iota_base (Op (Iota ?io ?iota_base_range) (INil)))
+        (= ?mul_base (Op (Mul ?mul_base_shape ?mul_base_a_stride ?mul_base_b_stride ?mul_base_out_stride) (ICons ?topk_idx (ICons ?iota_base (INil)))))
+        (= ?iota_within (Op (Iota (MIter) ?iota_within_range) (INil)))
+        (= ?add_idx (Op (Add ?add_shape ?add_a_stride ?add_b_stride ?add_out_stride) (ICons ?mul_base (ICons ?iota_within (INil)))))
+    )
+    (
+        (set (glumoe_expert_index ?add_idx)
+            (MkGLUMoEExpertIndexState ?io ?iota_within_range ?topk_idx))
+    )
+    :ruleset glumoe
+    :name "GLUMoE expert index marker"
+)
 
-        ; ===== Cast BF16→F32 =====
-        (= ?gu_f32 (Op (Cast ?gu_f32_size (F32)) (ICons ?gu_gathered (INil))))
+(rule
+    (
+        (= ?index_state (glumoe_expert_index ?idx))
+        (= ?index_state (MkGLUMoEExpertIndexState ?io ?within_range ?topk_idx))
+        (= ?gathered (Op (Gather ?gather_idx_shape ?gather_idx_stride ?gather_data_shape ?gather_data_stride) (ICons ?idx (ICons ?weights (INil)))))
+        (= ?f32 (Op (Cast ?f32_size (F32)) (ICons ?gathered (INil))))
+    )
+    (
+        (set (glumoe_expert_gather ?f32)
+            (MkGLUMoEExpertGatherState ?io ?within_range ?topk_idx ?weights))
+    )
+    :ruleset glumoe
+    :name "GLUMoE expert gather marker"
+)
 
-        ; ===== Gate-up batched matmul =====
+(rule
+    (
+        (= ?gather_state (glumoe_expert_gather ?gu_f32))
+        (= ?gather_state (MkGLUMoEExpertGatherState ?gu_io ?gu_iota_within_range ?topk_idx ?gate_up_w))
         (= ?gu_matmul_mul (Op (Mul ?gu_matmul_mul_shape ?gu_matmul_a_stride ?gu_matmul_b_stride ?gu_matmul_mul_out_stride) (ICons ?x (ICons ?gu_f32 (INil)))))
         (= ?gu_matmul (Op (Sum ?gu_matmul_out_shape ?gu_matmul_k ?gu_matmul_in_stride ?gu_matmul_k_stride ?gu_matmul_out_stride) (ICons ?gu_matmul_mul (INil))))
     )
@@ -54,6 +84,7 @@
         (set (glumoe_gate_up ?gu_matmul)
             (MkGLUMoEGateUpState ?gu_io ?gu_matmul_k ?gu_iota_within_range ?x ?topk_idx ?gate_up_w))
     )
+    :ruleset glumoe
     :name "GLUMoE gate-up matmul marker"
 )
 
@@ -80,6 +111,7 @@
     (
         (set (glumoe_swiglu ?swiglu_out) (MkGLUMoESwiGLUState ?gate_up_state))
     )
+    :ruleset glumoe
     :name "GLUMoE swiglu marker"
 )
 
@@ -113,6 +145,7 @@
     (
         (set (glumoe_gemma_gelu ?gemma_out) (MkGLUMoEGemmaGELUState ?gate_up_state))
     )
+    :ruleset glumoe
     :name "GLUMoE gemma gelu marker"
 )
 
@@ -122,12 +155,8 @@
         (= ?swiglu_state (glumoe_swiglu ?swiglu_out))
         (= ?swiglu_state (MkGLUMoESwiGLUState ?gate_up_state))
 
-        (= ?dn_iota_base (Op (Iota ?dn_io ?dn_iota_base_range) (INil)))
-        (= ?dn_mul_base (Op (Mul ?dn_mul_base_shape ?dn_mul_base_a_stride ?dn_mul_base_b_stride ?dn_mul_base_out_stride) (ICons ?topk_idx (ICons ?dn_iota_base (INil)))))
-        (= ?dn_iota_within (Op (Iota (MIter) ?dn_iota_within_range) (INil)))
-        (= ?dn_add_idx (Op (Add ?dn_add_shape ?dn_add_a_stride ?dn_add_b_stride ?dn_add_out_stride) (ICons ?dn_mul_base (ICons ?dn_iota_within (INil)))))
-        (= ?dn_gathered (Op (Gather ?dn_gather_idx_shape ?dn_gather_idx_stride ?dn_gather_data_shape ?dn_gather_data_stride) (ICons ?dn_add_idx (ICons ?down_w (INil)))))
-        (= ?dn_f32 (Op (Cast ?dn_f32_size (F32)) (ICons ?dn_gathered (INil))))
+        (= ?gather_state (glumoe_expert_gather ?dn_f32))
+        (= ?gather_state (MkGLUMoEExpertGatherState ?dn_io ?dn_iota_within_range ?topk_idx ?down_w))
         (= ?dn_matmul_mul (Op (Mul ?dn_matmul_mul_shape ?dn_matmul_a_stride ?dn_matmul_b_stride ?dn_matmul_mul_out_stride) (ICons ?swiglu_out (ICons ?dn_f32 (INil)))))
         (= ?dn_matmul (Op (Sum ?dn_matmul_out_shape ?dn_matmul_k ?dn_matmul_in_stride ?dn_matmul_k_stride ?dn_matmul_out_stride) (ICons ?dn_matmul_mul (INil))))
     )
@@ -135,6 +164,7 @@
         (set (glumoe_swiglu_down ?dn_matmul)
             (MkGLUMoESwiGLUDownState ?dn_io ?dn_matmul_k ?dn_iota_within_range ?swiglu_state ?topk_idx ?down_w))
     )
+    :ruleset glumoe
     :name "GLUMoE swiglu down marker"
 )
 
@@ -144,12 +174,8 @@
         (= ?gemma_state (glumoe_gemma_gelu ?gemma_out))
         (= ?gemma_state (MkGLUMoEGemmaGELUState ?gate_up_state))
 
-        (= ?dn_iota_base (Op (Iota ?dn_io ?dn_iota_base_range) (INil)))
-        (= ?dn_mul_base (Op (Mul ?dn_mul_base_shape ?dn_mul_base_a_stride ?dn_mul_base_b_stride ?dn_mul_base_out_stride) (ICons ?topk_idx (ICons ?dn_iota_base (INil)))))
-        (= ?dn_iota_within (Op (Iota (MIter) ?dn_iota_within_range) (INil)))
-        (= ?dn_add_idx (Op (Add ?dn_add_shape ?dn_add_a_stride ?dn_add_b_stride ?dn_add_out_stride) (ICons ?dn_mul_base (ICons ?dn_iota_within (INil)))))
-        (= ?dn_gathered (Op (Gather ?dn_gather_idx_shape ?dn_gather_idx_stride ?dn_gather_data_shape ?dn_gather_data_stride) (ICons ?dn_add_idx (ICons ?down_w (INil)))))
-        (= ?dn_f32 (Op (Cast ?dn_f32_size (F32)) (ICons ?dn_gathered (INil))))
+        (= ?gather_state (glumoe_expert_gather ?dn_f32))
+        (= ?gather_state (MkGLUMoEExpertGatherState ?dn_io ?dn_iota_within_range ?topk_idx ?down_w))
         (= ?dn_matmul_mul (Op (Mul ?dn_matmul_mul_shape ?dn_matmul_a_stride ?dn_matmul_b_stride ?dn_matmul_mul_out_stride) (ICons ?gemma_out (ICons ?dn_f32 (INil)))))
         (= ?dn_matmul (Op (Sum ?dn_matmul_out_shape ?dn_matmul_k ?dn_matmul_in_stride ?dn_matmul_k_stride ?dn_matmul_out_stride) (ICons ?dn_matmul_mul (INil))))
     )
@@ -157,6 +183,7 @@
         (set (glumoe_gemma_down ?dn_matmul)
             (MkGLUMoEGemmaDownState ?dn_io ?dn_matmul_k ?dn_iota_within_range ?gemma_state ?topk_idx ?down_w))
     )
+    :ruleset glumoe
     :name "GLUMoE gemma down marker"
 )
 
@@ -177,7 +204,10 @@
             ?gu_within_range ?dn_within_range (MNum 0))
             (ICons ?x (ICons ?topk_idx (ICons ?topk_vals (ICons ?gate_up_w (ICons ?down_w (ICons ?topk_vals (INil)))))))))
         (union ?output ?glumoe)
+        (subsume (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
+        (subsume (Op (KernelSum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride (F32)) (ICons ?weighted (INil))))
     )
+    :ruleset glumoe
     :name "GLUMoE fused expert computation (swiglu)"
 )
 
@@ -208,6 +238,9 @@
             ?gu_within_range ?dn_within_range (MNum 1))
             (ICons ?x (ICons ?topk_idx (ICons ?topk_vals (ICons ?gate_up_w (ICons ?down_w (ICons ?per_expert_scale (INil)))))))))
         (union ?output ?glumoe)
+        (subsume (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
+        (subsume (Op (KernelSum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride (F32)) (ICons ?weighted (INil))))
     )
+    :ruleset glumoe
     :name "GLUMoE fused expert computation (gemma_gelu)"
 )

@@ -1,6 +1,6 @@
 use crate::egglog_utils::{
-    egglog_to_llir, extract_generation, hash_choice_set, hlir_to_egglog, random_initial_choice,
-    run_egglog,
+    count_choice_sets_up_to, egglog_to_llir, extract_generation, hash_choice_set, hlir_to_egglog,
+    random_initial_choice, run_egglog_with_late_passes,
 };
 use crate::{
     egglog_utils::SerializedEGraph,
@@ -119,6 +119,40 @@ impl DimBucket {
     }
 }
 
+/// Options for building an e-graph search space.
+///
+/// These options are attached to the built search space and used by search.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildSearchSpaceOptions {
+    /// Optional maximum runtime-specific intermediate memory, in bytes.
+    ///
+    /// Runtimes that support memory estimates can use this to reject candidate
+    /// graphs before profiling them.
+    pub max_memory_bytes: Option<usize>,
+}
+
+impl BuildSearchSpaceOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set a maximum intermediate memory budget in bytes.
+    pub fn max_memory_bytes(mut self, max_memory_bytes: usize) -> Self {
+        self.max_memory_bytes = Some(max_memory_bytes);
+        self
+    }
+
+    /// Set a maximum intermediate memory budget in MiB.
+    pub fn max_memory_mib(self, max_memory_mib: usize) -> Self {
+        self.max_memory_bytes(max_memory_mib.saturating_mul(1024 * 1024))
+    }
+
+    /// Set a maximum intermediate memory budget in GiB.
+    pub fn max_memory_gib(self, max_memory_gib: usize) -> Self {
+        self.max_memory_bytes(max_memory_gib.saturating_mul(1024 * 1024 * 1024))
+    }
+}
+
 /// Options for controlling the genetic search algorithm.
 ///
 /// Use the builder pattern to configure search parameters:
@@ -231,6 +265,7 @@ pub struct Graph {
     /// Stored as plain data so it survives cross-binary type identity mismatches
     /// when external backend plugins are compiled separately.
     pub input_meta: FxHashMap<NodeIndex, (String, DType)>,
+    search_space_max_memory_bytes: Option<usize>,
 }
 
 impl Graph {
@@ -972,18 +1007,63 @@ impl Graph {
 
     #[tracing::instrument(skip_all)]
     pub fn build_search_space<Rt: Runtime + 'static>(&mut self) {
+        self.build_search_space_with_options::<Rt>(BuildSearchSpaceOptions::default());
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn build_search_space_with_max_memory<Rt: Runtime + 'static>(
+        &mut self,
+        max_memory_bytes: usize,
+    ) {
+        self.build_search_space_with_options::<Rt>(
+            BuildSearchSpaceOptions::default().max_memory_bytes(max_memory_bytes),
+        );
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn build_search_space_with_options<Rt: Runtime + 'static>(
+        &mut self,
+        options: BuildSearchSpaceOptions,
+    ) {
         self.run_auto_loop_rolling_prepass();
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let late_passes = Rt::late_egglog_passes(&ops, &options);
 
         let (program, root) = hlir_to_egglog(self);
-        self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
+        self.egraphs = vec![
+            run_egglog_with_late_passes(&program, &root, &ops, cleanup_hlir, &late_passes).unwrap(),
+        ];
         self.ops = Some(ops);
+        self.search_space_max_memory_bytes = options.max_memory_bytes;
     }
 
     #[tracing::instrument(skip_all)]
     pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(&mut self) {
+        self.build_search_space_exclude_ops_with_options::<Rt, Ex>(
+            BuildSearchSpaceOptions::default(),
+        );
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn build_search_space_exclude_ops_with_max_memory<
+        Rt: Runtime + 'static,
+        Ex: IntoEgglogOp,
+    >(
+        &mut self,
+        max_memory_bytes: usize,
+    ) {
+        self.build_search_space_exclude_ops_with_options::<Rt, Ex>(
+            BuildSearchSpaceOptions::default().max_memory_bytes(max_memory_bytes),
+        );
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn build_search_space_exclude_ops_with_options<Rt: Runtime + 'static, Ex: IntoEgglogOp>(
+        &mut self,
+        options: BuildSearchSpaceOptions,
+    ) {
         self.run_auto_loop_rolling_prepass();
         let exclude_ops = Ex::into_vec()
             .into_iter()
@@ -993,10 +1073,14 @@ impl Graph {
         ops.retain(|o| !exclude_ops.contains(&o.sort().name));
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let late_passes = Rt::late_egglog_passes(&ops, &options);
 
         let (program, root) = hlir_to_egglog(self);
-        self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
+        self.egraphs = vec![
+            run_egglog_with_late_passes(&program, &root, &ops, cleanup_hlir, &late_passes).unwrap(),
+        ];
         self.ops = Some(ops);
+        self.search_space_max_memory_bytes = options.max_memory_bytes;
     }
 
     /// Get a reference to the first e-graph search space (if built)
@@ -1022,7 +1106,6 @@ impl Graph {
         options: SearchOptions,
         rng: &mut G,
     ) -> R {
-        runtime.set_profile_timeout(options.profile_timeout);
         if self.dim_buckets.is_empty() {
             // No buckets: existing single-search path
             let stitched =
@@ -1030,7 +1113,6 @@ impl Graph {
 
             runtime.clear_intermediate_buffers();
             runtime.load_llir(&stitched);
-            runtime.set_profile_timeout(None);
             runtime
         } else {
             // Bucketed search: compile one LLIR per bucket combination
@@ -1062,7 +1144,6 @@ impl Graph {
 
             runtime.clear_intermediate_buffers();
             runtime.load_llir_buckets(&self.dim_buckets, &bucket_llirs);
-            runtime.set_profile_timeout(None);
             runtime
         }
     }
@@ -1134,6 +1215,7 @@ impl Graph {
         let limit = options.limit;
         let ops = self.ops.as_ref().unwrap();
         let egraph = &self.egraphs[0];
+        let search_limit = count_choice_sets_up_to(egraph, limit);
         let start = std::time::Instant::now();
 
         // Bar layout: one Search bar, plus an optional Bucket bar.
@@ -1186,10 +1268,20 @@ impl Graph {
         loop {
             init_attempts += 1;
             if init_attempts > 100 {
+                if let Some(max_memory_bytes) = self.search_space_max_memory_bytes {
+                    panic!(
+                        "Failed to find a viable initial genome under memory limit {} after 100 attempts",
+                        format_memory_bytes(max_memory_bytes)
+                    );
+                }
                 panic!("Failed to find a viable initial genome after 100 attempts");
             }
             let genome = random_initial_choice(egraph, rng, ops);
             prev_selected.insert(hash_choice_set(&genome));
+            let memory_bytes = self.candidate_memory_bytes::<R>(egraph, &genome, &profile_dyn_map);
+            if self.exceeds_memory_limit(memory_bytes) {
+                continue;
+            }
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut graph = egglog_to_llir(
@@ -1207,10 +1299,18 @@ impl Graph {
                 // unrolled graph size.
                 collapse_loops_to_first_iter(&mut graph);
                 runtime.clear_intermediate_buffers();
-                let (rep_metric, rep_display) =
-                    runtime.profile(&graph, &profile_dyn_map, options.trials);
+                let (rep_metric, rep_display) = runtime.profile(
+                    &graph,
+                    &profile_dyn_map,
+                    options.trials,
+                    options.profile_timeout,
+                );
                 let has_nan = runtime.has_nan_outputs(&graph, &profile_dyn_map);
-                (rep_metric, rep_display, has_nan)
+                (
+                    rep_metric,
+                    append_memory_display(rep_display, memory_bytes),
+                    has_nan,
+                )
             }));
 
             match result {
@@ -1238,14 +1338,14 @@ impl Graph {
         // Print initial result and progress
         let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
         println!("{msg}");
-        render_bars(n_graphs, limit, bucket_progress);
+        render_bars(n_graphs, search_limit, bucket_progress);
         std::io::stdout().flush().unwrap();
 
         // Track top-N parents for offspring generation
         let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
             vec![(best_metric.clone(), best_genome.clone())];
 
-        while n_graphs < limit {
+        while n_graphs < search_limit {
             if options
                 .group_timeout
                 .is_some_and(|timeout| group_start.elapsed() >= timeout)
@@ -1254,7 +1354,7 @@ impl Graph {
             }
 
             // Generate offspring from all parents, dividing budget evenly
-            let budget = (limit - n_graphs).min(options.generation_size);
+            let budget = (search_limit - n_graphs).min(options.generation_size);
             let per_parent = budget.div_ceil(parents.len());
             let mut all_offspring = Vec::new();
             for (_, parent_genome) in &parents {
@@ -1285,6 +1385,17 @@ impl Graph {
                 n_graphs += 1;
                 list_cache.clear();
                 expr_cache.clear();
+                let memory_bytes =
+                    self.candidate_memory_bytes::<R>(egraph, &genome, &profile_dyn_map);
+                if self.exceeds_memory_limit(memory_bytes) {
+                    for _ in 1..n_bar_lines {
+                        print!("\x1b[1A");
+                    }
+                    print!("\r\x1b[2K");
+                    render_bars(n_graphs, search_limit, bucket_progress);
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                }
 
                 let profile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut llir_graph = egglog_to_llir(
@@ -1300,10 +1411,18 @@ impl Graph {
                     // before profiling — see initial-genome path.
                     collapse_loops_to_first_iter(&mut llir_graph);
                     runtime.clear_intermediate_buffers();
-                    let (rep_metric, rep_display) =
-                        runtime.profile(&llir_graph, &profile_dyn_map, options.trials);
+                    let (rep_metric, rep_display) = runtime.profile(
+                        &llir_graph,
+                        &profile_dyn_map,
+                        options.trials,
+                        options.profile_timeout,
+                    );
                     let has_nan = runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
-                    (rep_metric, rep_display, has_nan)
+                    (
+                        rep_metric,
+                        append_memory_display(rep_display, memory_bytes),
+                        has_nan,
+                    )
                 }));
 
                 let (new_metric, display_metric) = match profile_result {
@@ -1316,7 +1435,7 @@ impl Graph {
                             print!("\x1b[1A");
                         }
                         print!("\r\x1b[2K");
-                        render_bars(n_graphs, limit, bucket_progress);
+                        render_bars(n_graphs, search_limit, bucket_progress);
                         std::io::stdout().flush().unwrap();
                         continue;
                     }
@@ -1359,7 +1478,7 @@ impl Graph {
                     }
                     print!("\r\x1b[2K");
                 }
-                render_bars(n_graphs, limit, bucket_progress);
+                render_bars(n_graphs, search_limit, bucket_progress);
                 std::io::stdout().flush().unwrap();
             }
         }
@@ -1400,6 +1519,29 @@ impl Graph {
         );
 
         stitched
+    }
+
+    fn candidate_memory_bytes<'a, R: Runtime + 'static>(
+        &self,
+        egraph: &'a SerializedEGraph,
+        genome: &crate::egglog_utils::EGraphChoiceSet<'a>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Option<usize> {
+        let memory_bytes = R::estimate_graph_memory(egraph, genome, dyn_map);
+        if self.search_space_max_memory_bytes.is_some() && memory_bytes.is_none() {
+            panic!(
+                "{} cannot enforce build_search_space max_memory_bytes because it did not estimate candidate memory",
+                std::any::type_name::<R>()
+            );
+        }
+        memory_bytes
+    }
+
+    fn exceeds_memory_limit(&self, memory_bytes: Option<usize>) -> bool {
+        match (self.search_space_max_memory_bytes, memory_bytes) {
+            (Some(max_memory_bytes), Some(memory_bytes)) => memory_bytes > max_memory_bytes,
+            _ => false,
+        }
     }
 }
 
@@ -1465,6 +1607,29 @@ fn stable_toposort_by_node_index(graph: &HLIRGraph) -> Option<Vec<NodeIndex>> {
     }
 
     (ordered.len() == graph.node_count()).then_some(ordered)
+}
+
+fn append_memory_display(display: String, memory_bytes: Option<usize>) -> String {
+    let Some(bytes) = memory_bytes else {
+        return display;
+    };
+    format!("{display} | MEM: {}", format_memory_bytes(bytes))
+}
+
+fn format_memory_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
+    }
 }
 
 struct RollingHash64 {
@@ -2350,6 +2515,54 @@ mod tests {
     use super::*;
     use crate::egglog_utils::hash_egglog_normalized;
     use crate::tests::{assert_close, random_vec};
+
+    #[derive(Default)]
+    struct TestMemoryRuntime;
+
+    impl Runtime for TestMemoryRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            (0, "0 ms".to_string())
+        }
+
+        fn estimate_graph_memory<'a>(
+            _: &'a SerializedEGraph,
+            _: &crate::egglog_utils::EGraphChoiceSet<'a>,
+            _: &FxHashMap<char, usize>,
+        ) -> Option<usize> {
+            Some(1)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "under memory limit 0 B")]
+    fn build_search_space_max_memory_rejects_candidates() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+        cx.build_search_space_with_options::<TestMemoryRuntime>(
+            BuildSearchSpaceOptions::new().max_memory_bytes(0),
+        );
+
+        let _ = cx.search(TestMemoryRuntime, 1);
+    }
 
     #[test]
     fn test_hash_egglog_normalized_same_structure() {

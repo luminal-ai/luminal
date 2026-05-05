@@ -79,7 +79,9 @@ pub fn kernel_rewrite<H: Default + EgglogOp, L: Default + EgglogOp>() -> Rule {
     args.add("dtype", dt.clone());
     let llir_kind_term = llir.call(&args);
     let llir_op = op_term(llir_kind_term, inputs);
-    rule(union(hlir_op.clone(), llir_op)).fact(eq(dt, dtype(hlir_op)))
+    rule(union(hlir_op.clone(), llir_op))
+        .fact(eq(dt, dtype(hlir_op)))
+        .ruleset("kernel_lower")
 }
 
 #[derive(Default, Debug, Clone)]
@@ -894,7 +896,11 @@ impl EgglogOp for KernelGather {
         ];
         let kernel_kind_term = self.sort().call(kernel_kind_args);
         let kernel_op = op_term(kernel_kind_term, ilist(vec![indexes, data.clone()]));
-        vec![rule(union(gather_op, kernel_op)).fact(eq(dt, dtype(data)))]
+        vec![
+            rule(union(gather_op, kernel_op))
+                .fact(eq(dt, dtype(data)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1129,7 +1135,11 @@ impl EgglogOp for KernelScatter {
         ];
         let kernel_kind_term = self.sort().call(kernel_kind_args);
         let kernel_op = op_term(kernel_kind_term, ilist(vec![dest, indexes, src.clone()]));
-        vec![rule(union(scatter_op, kernel_op)).fact(eq(dt, dtype(src)))]
+        vec![
+            rule(union(scatter_op, kernel_op))
+                .fact(eq(dt, dtype(src)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1386,7 +1396,8 @@ impl EgglogOp for KernelIota {
         let kernel_op = op_term(kernel_kind, hlir_inputs);
         vec![
             rule(union(hlir_op, kernel_op.clone()))
-                .set(dtype(kernel_op), app(&SORTS.int_dt, vec![])),
+                .set(dtype(kernel_op), app(&SORTS.int_dt, vec![]))
+                .ruleset("kernel_lower"),
         ]
     }
 
@@ -2471,7 +2482,11 @@ impl EgglogOp for KernelLessThan {
         args.add("dtype", dt.clone());
         let kernel_kind_term = self.sort().call(&args);
         let kernel_op = op_term(kernel_kind_term, hlir_inputs);
-        vec![rule(union(hlir_op, kernel_op)).fact(eq(dt, dtype(inp_a)))]
+        vec![
+            rule(union(hlir_op, kernel_op))
+                .fact(eq(dt, dtype(inp_a)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -2628,7 +2643,8 @@ impl EgglogOp for KernelConstant {
         let kernel_op = op_term(kernel_kind, hlir_inputs);
         vec![
             rule(union(hlir_op, kernel_op.clone()))
-                .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![])),
+                .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![]))
+                .ruleset("kernel_lower"),
         ]
     }
 
@@ -2770,7 +2786,11 @@ impl EgglogOp for KernelCast {
         cast_args.add("src_dtype", out_dty);
         let kernel_kind_term = self.sort().call(&cast_args);
         let kernel_op = op_term(kernel_kind_term, cast_inputs);
-        vec![rule(union(cast_op, kernel_op)).fact(eq(in_dty, dtype(inp)))]
+        vec![
+            rule(union(cast_op, kernel_op))
+                .fact(eq(in_dty, dtype(inp)))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -3024,6 +3044,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with cast mul\"
             )"),
             // Match Gather with Add(Iota, Mul(Cast(token_ids), const)) indices (reversed order)
@@ -3043,6 +3064,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with cast mul reversed\"
             )"),
             // Match Gather with Add(Mul(token_ids, const), Iota) indices (no Cast)
@@ -3061,6 +3083,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with mul\"
             )"),
             // Match Gather with Add(Iota, Mul(token_ids, const)) indices (reversed order, no Cast)
@@ -3079,6 +3102,7 @@ impl EgglogOp for KernelEmbed {
                     (union ?gather ?ke)
                     (set (dtype ?ke) (F32))
                 )
+                :ruleset kernel_specialize
                 :name \"kernel embed with mul reversed\"
             )"),
         ]

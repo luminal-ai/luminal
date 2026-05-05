@@ -2201,3 +2201,82 @@ class MambaConvBlockModel(torch.nn.Module):
         return self.out_proj(
             torch.nn.functional.silu(x_part) * torch.nn.functional.silu(z)
         )
+
+
+class BitwiseOrTestModel(torch.nn.Module):
+    """Tests bitwise_or on boolean tensors — the pattern Gemma-style models
+    emit when fusing sliding-window and full-attention masks
+    (`mask = sliding_mask | full_mask`)."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a | b
+
+
+class GroupedMMFallbackTestModel(torch.nn.Module):
+    """Tests transformers::grouped_mm_fallback — the per-expert batched
+    matmul HF MoE models emit (DeepSeek-V2, Qwen-MoE, Mixtral, etc.).
+
+    Calls the registered custom_op directly with shapes that match a
+    realistic MoE expert dispatch: input is `(S, K)` of tokens already
+    sorted by expert, weight is `(G, K, N)` per-expert weights, offs is
+    `(G,)` cumulative token counts.
+    """
+
+    def forward(
+        self, input: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.ops.transformers.grouped_mm_fallback(input, weight, offs)
+
+
+class BoolMaskAssignIntModel(torch.nn.Module):
+    """`x[mask] = scalar` on integer data with a Bool-dtype mask whose shape
+    matches `x`.
+
+    PyTorch decomposes this to `aten.index_put_(x, [mask], scalar)`. The
+    correct lowering is `where(mask, scalar, x)` — NOT a scatter into Int(mask)
+    positions. Pre-fix, the compiled output silently corrupted row 0 of `x`
+    even when the mask was all-False (the silent-data-corruption case driven
+    by Gemma-4's multimodal_mask path).
+    """
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        out = x.clone()
+        out[mask] = 99
+        return out
+
+
+class BoolMaskAssignFloatModel(torch.nn.Module):
+    """Same as BoolMaskAssignIntModel but with float data + a float scalar.
+
+    Verifies the `where` blend works for non-integer dtypes too.
+    """
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        out = x.clone()
+        out[mask] = 7.5
+        return out
+
+
+class BoolMaskAssign3DModel(torch.nn.Module):
+    """Multi-dimensional `x[mask] = scalar` — Bool mask shape must match `x`'s
+    full shape, not just be 1D. Catches regressions where the bool-mask
+    detection only works at one specific rank.
+    """
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        out = x.clone()
+        out[mask] = -1.0
+        return out
+
+
+class IntIndexAssignScalarModel(torch.nn.Module):
+    """`x[indices] = scalar_tensor` with a rank-1 index tensor and a 0-D
+    scalar value. After PT2 decomposition this hits the scatter path with a
+    scalar src; the lowering must broadcast the scalar across all indexed
+    positions (zero-stride padding in `GraphTensor::scatter`).
+    """
+
+    def forward(self, x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        out = x.clone()
+        out[indices] = 42.0
+        return out

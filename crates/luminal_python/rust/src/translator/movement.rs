@@ -396,14 +396,44 @@ impl<'a> Translator<'a> {
         let values = self.get_input_tensor(node, 2)?;
 
         if index_names.len() == 1 {
-            let indices = self.get_tensor(&index_names[0].name)?.cast(DType::Int);
-            // scatter_nd expects indices of shape [batch, K] where K = number of index dims.
-            // PT2's index_put gives 1D indices [batch]; reshape to [batch, 1].
-            let indices = if indices.shape.len() == 1 {
-                indices.expand_dim(1, Expression::from(1usize))
-            } else {
-                indices
-            };
+            let idx_tensor = self.get_tensor(&index_names[0].name)?;
+
+            // Boolean-mask index_put: when the only index is a Bool tensor whose
+            // shape matches the data tensor, PyTorch semantics are
+            //   data[mask] = value   ↔   where(mask, value, data)
+            // NOT a scatter into positions. Casting the Bool mask to Int and
+            // feeding it to scatter_nd would reinterpret True/False as row
+            // indices 1/0 and silently corrupt the data. Reproducer:
+            //   x = arange(16).reshape(4, 4); mask = zeros(4, 4, dtype=bool)
+            //   y = x.clone(); y[mask] = 99   # eager: y == x (no-op)
+            // Pre-fix the compiled graph wrote 99 to row 0; this branch
+            // ensures the bool-mask path lowers to a where-blend instead.
+            if idx_tensor.dtype == DType::Bool && idx_tensor.shape.dims == a.shape.dims {
+                // Broadcast the (often scalar) value tensor to match data shape,
+                // then blend by mask. Cast mask to data's dtype for the arithmetic
+                // so this works for both integer and float data.
+                let mask_f = idx_tensor.cast(a.dtype);
+                let values_b = values.cast(a.dtype).expand_rhs(a.shape);
+                // Implements where(mask, value, a) as
+                //     a*(1 - mask) + value*mask
+                // — works without a dedicated cond op for any numeric dtype.
+                let one = self
+                    .graph
+                    .constant_float(1.0)
+                    .cast(a.dtype)
+                    .expand_rhs(a.shape);
+                return Ok(a * (one - mask_f) + values_b * mask_f);
+            }
+
+            // Integer-index scatter: index_put with indices=[idx_tensor] writes
+            // into dim 0 of `a` at every position named in idx_tensor (flattened),
+            // broadcasting values across the trailing dims of `a`. idx_tensor can
+            // be ANY shape — its whole shape is "batch dims" in scatter_nd terms,
+            // and K is always 1 (number of dims we're indexing into). Always pad
+            // a trailing size-1 dim so the rank-1 and rank-N cases share a path.
+            let indices = idx_tensor.cast(DType::Int);
+            let new_last = indices.shape.len();
+            let indices = indices.expand_dim(new_last, Expression::from(1usize));
             Ok(a.scatter_nd(indices, values))
         } else {
             bail!("index_put with multiple index tensors not yet supported");

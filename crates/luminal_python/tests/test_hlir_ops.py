@@ -1636,6 +1636,21 @@ def test_or(device: torch.device):
     assert torch.allclose(output, original)
 
 
+def test_bitwise_or(device: torch.device):
+    """Test bitwise_or on boolean tensors. PyTorch's `a | b` on Bool tensors
+    emits `aten.bitwise_or.Tensor`, NOT `aten.logical_or.default` — Gemma-style
+    sliding+full attention mask fusion takes this path."""
+    from test_models import BitwiseOrTestModel
+
+    model: torch.nn.Module = BitwiseOrTestModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    a = torch.tensor([True, False, True, False, True, True], device=device)
+    b = torch.tensor([False, True, True, False, False, True], device=device)
+    original = model(a, b)
+    output = model_compiled(a, b)
+    assert torch.equal(output, original)
+
+
 # ========== PT2 Xor Node Tests ==========
 
 
@@ -2064,6 +2079,261 @@ def test_scatter_nd(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+
+
+# ========== Bool-mask index_put correctness tests ==========
+#
+# `x[bool_mask] = scalar` is semantically `where(mask, scalar, x)`, NOT a
+# scatter into Int(mask) positions. Pre-fix, the translator cast the Bool
+# mask to Int and routed through scatter_nd, reinterpreting True/False as
+# row indices 1/0 and silently corrupting `x`. Each variant below exercises
+# a different mask configuration; together they would catch any regression
+# in the bool-mask blend path.
+
+
+def _check_bool_mask(
+    device: torch.device, model_cls, x: torch.Tensor, mask: torch.Tensor
+):
+    """Shared body: compile, run eager + compiled, assert exact equality."""
+    from test_models import (
+        BoolMaskAssign3DModel,
+        BoolMaskAssignFloatModel,
+        BoolMaskAssignIntModel,
+    )
+
+    _ = (BoolMaskAssign3DModel, BoolMaskAssignFloatModel, BoolMaskAssignIntModel)
+    model: torch.nn.Module = model_cls().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    original: torch.Tensor = model(x, mask)
+    output: torch.Tensor = model_compiled(x, mask)
+    # Bit-equal (not allclose) — the lowering should produce identical
+    # results to eager for bool-mask blends.
+    assert torch.equal(output, original), (
+        f"bool-mask index_put mismatch:\n"
+        f"  mask = {mask.flatten().tolist()}\n"
+        f"  eager = {original.flatten().tolist()}\n"
+        f"  out   = {output.flatten().tolist()}"
+    )
+
+
+def test_bool_mask_index_put_all_false(device: torch.device):
+    """All-False mask must be a no-op. Pre-fix this *silently* corrupted row 0
+    — the regression that drove the Gemma-4 ~30-magnitude logits drift."""
+    from test_models import BoolMaskAssignIntModel
+
+    x = torch.arange(16, device=device, dtype=torch.long).reshape(4, 4)
+    mask = torch.zeros(4, 4, dtype=torch.bool, device=device)
+    _check_bool_mask(device, BoolMaskAssignIntModel, x, mask)
+
+
+def test_bool_mask_index_put_one_true(device: torch.device):
+    """Single True position — only that position should change."""
+    from test_models import BoolMaskAssignIntModel
+
+    x = torch.arange(16, device=device, dtype=torch.long).reshape(4, 4)
+    mask = torch.zeros(4, 4, dtype=torch.bool, device=device)
+    mask[1, 2] = True
+    _check_bool_mask(device, BoolMaskAssignIntModel, x, mask)
+
+
+def test_bool_mask_index_put_many_true(device: torch.device):
+    """Multiple scattered True positions — each should be replaced independently."""
+    from test_models import BoolMaskAssignIntModel
+
+    x = torch.arange(16, device=device, dtype=torch.long).reshape(4, 4)
+    mask = torch.tensor(
+        [
+            [True, False, False, True],
+            [False, False, True, False],
+            [True, False, False, False],
+            [False, True, False, True],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    _check_bool_mask(device, BoolMaskAssignIntModel, x, mask)
+
+
+def test_bool_mask_index_put_all_true(device: torch.device):
+    """All-True mask — every element should become the scalar value."""
+    from test_models import BoolMaskAssignIntModel
+
+    x = torch.arange(16, device=device, dtype=torch.long).reshape(4, 4)
+    mask = torch.ones(4, 4, dtype=torch.bool, device=device)
+    _check_bool_mask(device, BoolMaskAssignIntModel, x, mask)
+
+
+def test_bool_mask_index_put_float(device: torch.device):
+    """Float data + float scalar value. Verifies the where-blend works for
+    non-integer dtypes — the blend formula `a*(1-mask) + value*mask` casts
+    mask to data's dtype, so dtype-specific paths must compose correctly."""
+    from test_models import BoolMaskAssignFloatModel
+
+    x = torch.arange(20, device=device, dtype=torch.float32).reshape(4, 5)
+    mask = torch.tensor(
+        [
+            [True, False, False, True, False],
+            [False, True, False, False, True],
+            [True, True, False, False, False],
+            [False, False, False, True, True],
+        ],
+        dtype=torch.bool,
+        device=device,
+    )
+    model = BoolMaskAssignFloatModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    original = model(x, mask)
+    output = compiled(x, mask)
+    assert torch.allclose(output, original)
+
+
+def test_bool_mask_index_put_3d(device: torch.device):
+    """3-D `x` with a 3-D bool mask of matching shape. Catches regressions
+    where the bool-mask detection only works at one specific rank — the
+    `idx_tensor.shape.dims == a.shape.dims` check has to handle arbitrary
+    ranks, not just 2-D."""
+    from test_models import BoolMaskAssign3DModel
+
+    x = torch.arange(24, device=device, dtype=torch.float32).reshape(2, 3, 4)
+    mask = torch.zeros(2, 3, 4, dtype=torch.bool, device=device)
+    mask[0, 1, 2] = True
+    mask[1, 0, 0] = True
+    mask[1, 2, 3] = True
+    model = BoolMaskAssign3DModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    original = model(x, mask)
+    output = compiled(x, mask)
+    assert torch.allclose(output, original)
+
+
+def test_int_index_put_scalar_src(device: torch.device):
+    """`x[indices] = scalar` with int indices: the scatter path receives a
+    scalar src against a 1D index tensor. Pre-fix `GraphTensor::scatter`
+    panicked at `flatten_strides` (rank mismatch: index_shape=[2],
+    src_strides=[]). With the zero-stride padding the scalar broadcasts
+    across all indexed positions correctly."""
+    from test_models import IntIndexAssignScalarModel
+
+    x = torch.arange(20, device=device, dtype=torch.float32).reshape(5, 4)
+    indices = torch.tensor([0, 3], device=device, dtype=torch.long)
+    model = IntIndexAssignScalarModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    original = model(x, indices)
+    output = compiled(x, indices)
+    assert torch.allclose(output, original)
+
+
+def test_grouped_mm_fallback(device: torch.device):
+    """Tests transformers::grouped_mm_fallback — the per-expert batched matmul
+    used by HF MoE forward passes (DeepSeek-V2/V3, Qwen2/3-MoE, Mixtral, ...).
+
+    Importing transformers.integrations.moe registers the custom_op via
+    `torch.library.custom_op("transformers::grouped_mm_fallback", ...)`. After
+    import, `torch.ops.transformers.grouped_mm_fallback` is callable directly.
+    """
+    # Side-effect import: registers the custom_op via torch.library.custom_op.
+    # The name itself isn't referenced — ruff's F401 must be suppressed.
+    import transformers.integrations.moe  # noqa: F401
+    from test_models import GroupedMMFallbackTestModel
+
+    model: torch.nn.Module = GroupedMMFallbackTestModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    # 2 experts, 4 tokens, K=8, N=16. Tokens [0,1] go to expert 0, [2,3] to expert 1.
+    g, s, k, n = 2, 4, 8, 16
+    input = torch.randn(s, k, device=device)
+    weight = torch.randn(g, k, n, device=device)
+    offs = torch.tensor([2, 4], device=device, dtype=torch.int32)
+    original: torch.Tensor = model(input, weight, offs)
+    output: torch.Tensor = model_compiled(input, weight, offs)
+    assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_grouped_mm_fallback_routing_invariance(device: torch.device):
+    """The MoE forest, not just the trees: one compile must correctly handle
+    *any* routing pattern at the same shape.
+
+    `translate_grouped_mm` is correct only if `offs` flows through as a runtime
+    tensor — the gate's top-k decision varies per token batch, and the same
+    compiled graph has to dispatch tokens to the right experts for whatever
+    `offs` arrives at execution. If our lowering accidentally specialized on a
+    particular `offs` value (baking in expert assignments), `compiled(input_b,
+    weight, offs_b)` would either silently produce wrong-expert output or
+    trigger a recompile.
+
+    This test asserts three things at once:
+      (a) Different `offs` (= different routing) doesn't trigger a recompile.
+      (b) `offs` appears as an FX graph node, not a baked constant.
+      (c) The same compiled graph produces correct output for both routings,
+          and outputs *differ* between routings (else the test is moot).
+    """
+    import transformers.integrations.moe  # noqa: F401
+    from test_models import GroupedMMFallbackTestModel
+
+    g, s, k, n = 2, 4, 8, 16
+
+    # Wrap luminal_backend to capture the FX graph(s) dynamo hands us.
+    captured = []
+
+    def capturing_backend(gm, example_inputs):
+        captured.append(gm)
+        return luminal_backend(gm, example_inputs)
+
+    model = GroupedMMFallbackTestModel().to(device)
+    compiled = torch.compile(model, backend=capturing_backend)
+
+    # Same shapes, different data → different routing patterns.
+    weight = torch.randn(g, k, n, device=device)
+    input_a = torch.randn(s, k, device=device)
+    input_b = torch.randn(s, k, device=device)
+    # offs[i] = cumulative tokens through expert i. Different routings:
+    #   offs_a: 1 token to expert 0, 3 to expert 1
+    #   offs_b: 3 tokens to expert 0, 1 to expert 1
+    offs_a = torch.tensor([1, 4], device=device, dtype=torch.int32)
+    offs_b = torch.tensor([3, 4], device=device, dtype=torch.int32)
+
+    with torch.no_grad():
+        ref_a = model(input_a, weight, offs_a)
+        out_a = compiled(input_a, weight, offs_a)
+        n_compiles_after_first = len(captured)
+
+        ref_b = model(input_b, weight, offs_b)
+        out_b = compiled(input_b, weight, offs_b)
+
+    # (a) No recompile between distinct routings.
+    assert len(captured) == n_compiles_after_first, (
+        f"Different routings triggered a recompile: "
+        f"{n_compiles_after_first} → {len(captured)}"
+    )
+
+    # (b) offs is an FX graph node, not a baked constant.
+    grouped_nodes = [
+        node for node in captured[0].graph.nodes if "grouped_mm" in str(node.target)
+    ]
+    assert len(grouped_nodes) == 1, (
+        f"Expected exactly one grouped_mm node, got {len(grouped_nodes)}"
+    )
+    grouped_node = grouped_nodes[0]
+    # transformers::grouped_mm_fallback emits offs as a kwarg; aten._grouped_mm
+    # may emit it as a positional. Accept either.
+    offs_arg = grouped_node.kwargs.get("offs")
+    if offs_arg is None and len(grouped_node.args) > 2:
+        offs_arg = grouped_node.args[2]
+    assert hasattr(offs_arg, "op"), (
+        f"offs argument should be an FX graph node, got {offs_arg!r} "
+        f"({type(offs_arg).__name__}) — looks baked as constant"
+    )
+
+    # (c) Both routings produce correct output, and outputs differ.
+    assert torch.allclose(out_a, ref_a, atol=1e-4), (
+        f"routing A: max_diff={torch.max(torch.abs(out_a - ref_a)).item():.2e}"
+    )
+    assert torch.allclose(out_b, ref_b, atol=1e-4), (
+        f"routing B: max_diff={torch.max(torch.abs(out_b - ref_b)).item():.2e}"
+    )
+    assert not torch.allclose(out_a, out_b, atol=1e-3), (
+        "Outputs of routing A and B should differ — otherwise routing isn't "
+        "actually being exercised."
+    )
 
 
 # ========== Dtype Round-Trip Tests ==========

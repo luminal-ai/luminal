@@ -102,6 +102,21 @@ fn metal_copy_value(dtype: DType, buffer: &str, index: &str) -> String {
     }
 }
 
+fn metal_binary_op_values(
+    output_dtype: DType,
+    a_dtype: DType,
+    b_dtype: DType,
+    a_idx: &str,
+    b_idx: &str,
+) -> (String, String) {
+    let read: fn(DType, &str, &str) -> String = if output_dtype == DType::Int {
+        metal_copy_value
+    } else {
+        metal_numeric_read
+    };
+    (read(a_dtype, "a", a_idx), read(b_dtype, "b", b_idx))
+}
+
 fn call_sort_from_args(sort: &SortDef, args: &Args) -> EggTerm {
     let mut filtered_args = Args::new();
     for field in &sort.fields {
@@ -120,6 +135,7 @@ fn unary_dtype_rewrite(hlir_sort: &SortDef, metal_sort: &SortDef) -> Rule {
     rule(union(hlir_match, metal_op.clone()))
         .set(dtype(metal_op), dt.clone())
         .fact(eq(dt, dtype(args["inp"].clone())))
+        .ruleset("kernel_lower")
 }
 
 fn binary_dtype_rewrite(hlir_sort: &SortDef, metal_sort: &SortDef) -> Rule {
@@ -132,6 +148,7 @@ fn binary_dtype_rewrite(hlir_sort: &SortDef, metal_sort: &SortDef) -> Rule {
     rule(union(hlir_match, metal_op.clone()))
         .set(dtype(metal_op), dt.clone())
         .fact(eq(dt, dtype(args["inp_a"].clone())))
+        .ruleset("kernel_lower")
 }
 
 // ============================================================================
@@ -370,7 +387,8 @@ impl EgglogOp for MetalAdd {
         vec![
             binary_dtype_rewrite(&Add::default().sort(), &self.sort()),
             rule(union(hlir_match2, metal_op2.clone()))
-                .set(dtype(metal_op2), app(&SORTS.f32_dt, vec![])),
+                .set(dtype(metal_op2), app(&SORTS.f32_dt, vec![]))
+                .ruleset("kernel_lower"),
         ]
     }
 
@@ -423,8 +441,7 @@ impl MetalKernelOp for MetalAdd {
         let a_idx = lower_expression_for_metal(&a_index, "idx");
         let b_idx = lower_expression_for_metal(&b_index, "idx");
         let out_idx = lower_expression_for_metal(&out_index, "idx");
-        let a_val = metal_numeric_read(a_dtype, "a", &a_idx);
-        let b_val = metal_numeric_read(b_dtype, "b", &b_idx);
+        let (a_val, b_val) = metal_binary_op_values(output_dtype, a_dtype, b_dtype, &a_idx, &b_idx);
         let out_val = metal_numeric_write(output_dtype, &format!("({a_val}) + ({b_val})"));
 
         let source = format!(
@@ -556,8 +573,7 @@ impl MetalKernelOp for MetalMul {
         let a_idx = lower_expression_for_metal(&a_index, "idx");
         let b_idx = lower_expression_for_metal(&b_index, "idx");
         let out_idx = lower_expression_for_metal(&out_index, "idx");
-        let a_val = metal_numeric_read(a_dtype, "a", &a_idx);
-        let b_val = metal_numeric_read(b_dtype, "b", &b_idx);
+        let (a_val, b_val) = metal_binary_op_values(output_dtype, a_dtype, b_dtype, &a_idx, &b_idx);
         let out_val = metal_numeric_write(output_dtype, &format!("({a_val}) * ({b_val})"));
 
         let source = format!(
@@ -699,9 +715,13 @@ impl MetalKernelOp for MetalMod {
         let a_idx = lower_expression_for_metal(&a_index, "idx");
         let b_idx = lower_expression_for_metal(&b_index, "idx");
         let out_idx = lower_expression_for_metal(&out_index, "idx");
-        let a_val = metal_numeric_read(a_dtype, "a", &a_idx);
-        let b_val = metal_numeric_read(b_dtype, "b", &b_idx);
-        let out_val = metal_numeric_write(output_dtype, &format!("fmod({a_val}, {b_val})"));
+        let (a_val, b_val) = metal_binary_op_values(output_dtype, a_dtype, b_dtype, &a_idx, &b_idx);
+        let out_expr = if output_dtype == DType::Int {
+            format!("({a_val}) % ({b_val})")
+        } else {
+            format!("fmod({a_val}, {b_val})")
+        };
+        let out_val = metal_numeric_write(output_dtype, &out_expr);
 
         let source = format!(
             r#"
@@ -1720,7 +1740,8 @@ impl EgglogOp for MetalConstant {
         let (args, const_match) = new_op_call(&Constant::default().sort(), &[]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
         vec![rule(union(const_match, metal_op.clone()))
-            .set(dtype(metal_op), app(&SORTS.f32_dt, vec![]))]
+            .set(dtype(metal_op), app(&SORTS.f32_dt, vec![]))
+            .ruleset("kernel_lower")]
     }
 
     fn cleanup(&self) -> bool {
@@ -1828,7 +1849,8 @@ impl EgglogOp for MetalIota {
         let (args, iota_match) = new_op_call(&Iota::default().sort(), &[]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
         vec![rule(union(iota_match, metal_op.clone()))
-            .set(dtype(metal_op), app(&SORTS.int_dt, vec![]))]
+            .set(dtype(metal_op), app(&SORTS.int_dt, vec![]))
+            .ruleset("kernel_lower")]
     }
 
     fn cleanup(&self) -> bool {
@@ -1924,6 +1946,7 @@ impl MetalKernelOp for MetalIota {
 pub struct MetalGather {
     out_shape: Vec<Expression>,
     index_stride: Vec<Expression>,
+    data_shape: Vec<Expression>,
     data_stride: Vec<Expression>,
     out_stride: Vec<Expression>,
 }
@@ -1938,6 +1961,7 @@ impl EgglogOp for MetalGather {
                 ("indexes", IR),
                 ("index_strides", ELIST),
                 ("data", IR),
+                ("data_shape", ELIST),
                 ("data_strides", ELIST),
                 ("out_strides", ELIST),
             ],
@@ -1959,6 +1983,7 @@ impl EgglogOp for MetalGather {
                 gather_args["index_strides"].clone(),
             ),
             ("data".to_string(), gather_args["data"].clone()),
+            ("data_shape".to_string(), gather_args["data_shape"].clone()),
             (
                 "data_strides".to_string(),
                 gather_args["data_strides"].clone(),
@@ -1968,7 +1993,8 @@ impl EgglogOp for MetalGather {
         let metal_op = self.sort().call(metal_args);
         vec![rule(union(gather_match, metal_op.clone()))
             .set(dtype(metal_op), dt.clone())
-            .fact(eq(dt, dtype(gather_args["data"].clone())))]
+            .fact(eq(dt, dtype(gather_args["data"].clone())))
+            .ruleset("kernel_lower")]
     }
 
     fn cleanup(&self) -> bool {
@@ -1989,9 +2015,10 @@ impl EgglogOp for MetalGather {
                 out_shape: extract_expr_list(egraph, children[0], list_cache, expr_cache).unwrap(),
                 index_stride: extract_expr_list(egraph, children[2], list_cache, expr_cache)
                     .unwrap(),
-                data_stride: extract_expr_list(egraph, children[4], list_cache, expr_cache)
+                data_shape: extract_expr_list(egraph, children[4], list_cache, expr_cache).unwrap(),
+                data_stride: extract_expr_list(egraph, children[5], list_cache, expr_cache)
                     .unwrap(),
-                out_stride: extract_expr_list(egraph, children[5], list_cache, expr_cache).unwrap(),
+                out_stride: extract_expr_list(egraph, children[6], list_cache, expr_cache).unwrap(),
             })),
             vec![children[1], children[3]],
         )
@@ -2015,7 +2042,7 @@ impl MetalKernelOp for MetalGather {
             "idx",
         );
         let data_idx = lower_expression_for_metal(
-            &flatten_strides(&self.out_shape, &self.data_stride),
+            &flatten_strides(&self.data_shape, &self.data_stride),
             "gathered_index",
         );
         let gathered_val = metal_copy_value(data_dtype, "data", &data_idx);
@@ -2054,6 +2081,10 @@ impl MetalKernelOp for MetalGather {
             .cloned()
             .product::<Expression>()
             .max(Expression::from(1))
+    }
+
+    fn infer_output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        input_dtypes.get(1).copied().unwrap_or(DType::F32)
     }
 
     fn encode(
@@ -2179,7 +2210,8 @@ impl EgglogOp for MetalScatter {
         let metal_op = self.sort().call(metal_args);
         vec![rule(union(scatter_match, metal_op.clone()))
             .set(dtype(metal_op), dt.clone())
-            .fact(eq(dt, dtype(scatter_args["src"].clone())))]
+            .fact(eq(dt, dtype(scatter_args["src"].clone())))
+            .ruleset("kernel_lower")]
     }
 
     fn cleanup(&self) -> bool {
@@ -2408,7 +2440,9 @@ impl EgglogOp for MetalCast {
     fn rewrites(&self) -> Vec<Rule> {
         let (args, cast_match) = new_op_call(&Cast::default().sort(), &["inp"]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(cast_match, metal_op.clone())).set(dtype(metal_op), args["dtype"].clone())]
+        vec![rule(union(cast_match, metal_op.clone()))
+            .set(dtype(metal_op), args["dtype"].clone())
+            .ruleset("kernel_lower")]
     }
 
     fn cleanup(&self) -> bool {

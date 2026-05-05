@@ -10,12 +10,13 @@ use luminal_tracing::schema::{
 use uuid::Uuid;
 
 pub mod cuda_graph;
+pub mod fusion;
 pub mod hlir;
 pub mod other_ops;
 
 pub use cuda_graph::*;
 
-pub type Ops = (hlir::Ops, other_ops::Ops);
+pub type Ops = (hlir::Ops, other_ops::Ops, fusion::Ops);
 
 /// Build a mapping from interned string IDs to their string values for a given sequence.
 fn build_interned_strings(trace: &schema::Trace) -> std::collections::HashMap<(u32, u64), String> {

@@ -403,13 +403,24 @@ impl GraphTensor {
             DType::Int,
             "Scatter indexes must have an integer dtype!"
         );
+        // Pad src_strides with leading zero-strides when src has lower rank
+        // than indexes. A zero stride reads the same src element at every
+        // index position — matches PyTorch's broadcast semantics for
+        // `x[idx] = scalar`. Without this, KernelScatter::compile calls
+        // flatten_strides(index_shape, src_strides) with mismatched lengths
+        // and panics with `assertion `left == right` failed, left: 1 right: 0`.
+        let mut src_strides = self.shape.strides.to_vec();
+        let target_rank = indexes.shape.dims.len();
+        while src_strides.len() < target_rank {
+            src_strides.insert(0, Expression::from(0));
+        }
         let id = self.graph().add_op(
             Scatter {
                 dest_shape: dest.shape.dims.to_vec(),
                 dest_strides: dest.shape.strides.to_vec(),
                 index_shape: indexes.shape.dims.to_vec(),
                 index_strides: indexes.shape.strides.to_vec(),
-                src_strides: self.shape.strides.to_vec(),
+                src_strides,
             },
             &[dest.id, indexes.id, self.id],
         );

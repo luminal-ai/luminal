@@ -26,6 +26,7 @@ use crate::{
     kernel::{
         CudaFunctionExt, CudaGraphExecHandle, CudaGraphHandle, KernelOp, create_cuda_event,
         destroy_cuda_event,
+        fusion::region_codegen::{self, CompileUnit},
         hlir::{clear_global_dyn_dims, get_global_dyn_dims, set_global_dyn_dims},
     },
     runtime::partition_marked_convex,
@@ -655,6 +656,11 @@ pub fn kernel_to_host(
     }
 
     let kernel_subgraphs = partition_marked_convex(llir_graph, &kernel_ops_in_graph).unwrap();
+    // Compute the set of FS / FE / FusedX nodes globally absorbed by some
+    // FusionEnd in the LLIR. Used by `build_compile_units` to suppress the
+    // identity-memcpy fallback for shared FS leaves whose consumers live
+    // in a different convex subgraph than the FS itself.
+    let globally_absorbed = region_codegen::globally_absorbed_markers(llir_graph);
 
     // Track which kernel node belongs to which CudaGraphOp (for later edge creation)
     let mut kernel_to_cuda_graph: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
@@ -689,45 +695,98 @@ pub fn kernel_to_host(
             set_global_dyn_dims(global_dyn_dims.clone());
         }
 
-        // Compile all kernels with global ordering for correct dyn_dims indices
-        let mut kernels = Vec::with_capacity(topo_order.len());
-        for kernel_node_idx in &topo_order {
-            let kernel_op_ref = llir_graph[*kernel_node_idx]
-                .to_dialect::<dyn KernelOp>()
-                .unwrap();
+        // Group the topo order into compile units: each FusionEnd-rooted
+        // region collapses to a single CompileUnit::Region (one fused
+        // CUDA kernel for the whole DAG); everything else stays as
+        // CompileUnit::Single (the existing per-op compile path).
+        let compile_units =
+            region_codegen::build_compile_units(&topo_order, llir_graph, &globally_absorbed);
 
-            let (kernel_function, _, _kernel_str, grid, block, shared_mem, constants) =
-                kernel_op_ref.compile(cuda_stream, kernel_cache);
+        // Compile all units with global ordering for correct dyn_dims indices
+        let mut kernels = Vec::with_capacity(compile_units.len());
+        for unit in &compile_units {
+            match unit {
+                CompileUnit::Single(kernel_node_idx) => {
+                    let kernel_op_ref = llir_graph[*kernel_node_idx]
+                        .to_dialect::<dyn KernelOp>()
+                        .unwrap();
 
-            // Collect inputs from graph edges
-            let mut inputs: Vec<NodeIndex> = llir_graph
-                .edges_directed(*kernel_node_idx, Direction::Incoming)
-                .sorted_by_key(|e| e.id())
-                .map(|e| e.source())
-                .collect_vec();
+                    let (kernel_function, _, _kernel_str, grid, block, shared_mem, constants) =
+                        kernel_op_ref.compile(cuda_stream, kernel_cache);
 
-            // Collect buffer nodes and sizes
-            // Only add kernel nodes with non-zero output size (MegakernelOps have size 0)
-            let output_size = kernel_op_ref.output_size();
-            if output_size.exec(&FxHashMap::default()).unwrap_or(1) != 0 {
-                all_buffer_nodes.insert(*kernel_node_idx);
-                all_buffer_sizes.insert(*kernel_node_idx, output_size);
+                    // Collect inputs from graph edges
+                    let inputs: Vec<NodeIndex> = llir_graph
+                        .edges_directed(*kernel_node_idx, Direction::Incoming)
+                        .sorted_by_key(|e| e.id())
+                        .map(|e| e.source())
+                        .collect_vec();
+
+                    // Collect buffer nodes and sizes
+                    // Only add kernel nodes with non-zero output size (MegakernelOps have size 0)
+                    let output_size = kernel_op_ref.output_size();
+                    if output_size.exec(&FxHashMap::default()).unwrap_or(1) != 0 {
+                        all_buffer_nodes.insert(*kernel_node_idx);
+                        all_buffer_sizes.insert(*kernel_node_idx, output_size);
+                    }
+                    all_buffer_nodes.extend(inputs.iter().copied());
+
+                    let kernel_op: Arc<Box<dyn KernelOp>> = Arc::clone(kernel_op_ref);
+
+                    kernels.push(CompiledKernel::new(
+                        *kernel_node_idx,
+                        kernel_function,
+                        grid,
+                        block,
+                        shared_mem,
+                        inputs,
+                        kernel_op.clone(),
+                        constants,
+                        kernel_op.kernel_name(),
+                    ));
+                }
+                CompileUnit::Region(region) => {
+                    // Generate one fused CUDA kernel for the whole region.
+                    let compiled = region_codegen::compile_region(
+                        region,
+                        llir_graph,
+                        cuda_stream,
+                        kernel_cache,
+                    );
+
+                    // The region's CompiledKernel is keyed on the FE node
+                    // (so FE provides trait methods like output_size /
+                    // build_params) but its `inputs` are the external
+                    // producers, not FE's literal LLIR predecessors —
+                    // those are interior FusedX nodes that don't exist
+                    // as buffer-bearing nodes from the host's view.
+                    let fe_op_ref = llir_graph[region.fe_node]
+                        .to_dialect::<dyn KernelOp>()
+                        .unwrap();
+
+                    let inputs: Vec<NodeIndex> = region.external_inputs.clone();
+
+                    let output_size = fe_op_ref.output_size();
+                    if output_size.exec(&FxHashMap::default()).unwrap_or(1) != 0 {
+                        all_buffer_nodes.insert(region.fe_node);
+                        all_buffer_sizes.insert(region.fe_node, output_size);
+                    }
+                    all_buffer_nodes.extend(inputs.iter().copied());
+
+                    let kernel_op: Arc<Box<dyn KernelOp>> = Arc::clone(fe_op_ref);
+
+                    kernels.push(CompiledKernel::new(
+                        region.fe_node,
+                        compiled.function,
+                        compiled.grid,
+                        compiled.block,
+                        compiled.shared_mem,
+                        inputs,
+                        kernel_op,
+                        compiled.constants,
+                        "FusedRegion",
+                    ));
+                }
             }
-            all_buffer_nodes.extend(inputs.iter().copied());
-
-            let kernel_op: Arc<Box<dyn KernelOp>> = Arc::clone(kernel_op_ref);
-
-            kernels.push(CompiledKernel::new(
-                *kernel_node_idx,
-                kernel_function,
-                grid,
-                block,
-                shared_mem,
-                inputs,
-                kernel_op.clone(),
-                constants,
-                kernel_op.kernel_name(),
-            ));
         }
 
         // Get the possibly-extended global ordering (kernels may have discovered new dims)
@@ -820,22 +879,41 @@ pub fn kernel_to_host(
         }
     }
 
-    // Add collected edges (deduplicate), skipping back-edges to preserve DAG property
+    // Add each cross-CudaGraphOp dep edge iff it would carry new ordering
+    // information without closing a cycle. The previous topo-position gate
+    // ("skip when src_pos >= dst_pos") was too coarse: it dropped edges
+    // whose src happened to land later in the toposort than their dst even
+    // when no path dst→src actually existed, leaving consumers free to run
+    // before the producer wrote their input buffer (wrong outputs); and it
+    // also added edges that were already implied by an existing src→dst
+    // path (extra serialization, no new info).
     let edges_to_add: FxHashSet<(NodeIndex, NodeIndex)> = edges_to_add.into_iter().collect();
-    let topo = toposort(&*llir_graph, None).unwrap();
-    let mut topo_pos: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-    for (i, n) in topo.iter().enumerate() {
-        topo_pos.insert(*n, i);
-    }
+    use petgraph::algo::has_path_connecting;
     for (src, dst) in edges_to_add {
-        // Only add forward edges (src before dst in topo order) to avoid creating cycles
-        let src_pos = topo_pos.get(&src).copied().unwrap_or(usize::MAX);
-        let dst_pos = topo_pos.get(&dst).copied().unwrap_or(usize::MAX);
-        if src_pos >= dst_pos {
-            continue; // Skip back-edges
+        if has_path_connecting(&*llir_graph, src, dst, None) {
+            continue; // already ordered src→dst by some path; edge redundant
         }
-        if !llir_graph.edges_connecting(src, dst).any(|_| true) {
-            llir_graph.add_edge(src, dst, ());
+        if has_path_connecting(&*llir_graph, dst, src, None) {
+            continue; // adding src→dst would close a cycle
+        }
+        llir_graph.add_edge(src, dst, ());
+    }
+
+    // Strip fully-absorbed marker nodes (FusionStart, nested FusionEnd,
+    // FusedX) from the LLIR. Region codegen has already folded them into
+    // a single fused CUDA function anchored at each region's root
+    // FusionEnd; the absorbed nodes have no consumers outside the region
+    // and never need their own buffers. Removing them keeps later
+    // per-execute walks (e.g., `allocate_intermediate_buffers`) from
+    // chewing through dead nodes every decode token.
+    //
+    // Root FusionEnd nodes are NOT in `globally_absorbed` (they were the
+    // walks' starting points), so we keep them — they're the kernel
+    // anchor for the region's compiled kernel.
+    for node in globally_absorbed {
+        // Defensive: only remove if the node still exists.
+        if llir_graph.node_weight(node).is_some() {
+            llir_graph.remove_node(node);
         }
     }
 }

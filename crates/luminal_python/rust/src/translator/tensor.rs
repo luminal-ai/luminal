@@ -102,6 +102,76 @@ impl<'a> Translator<'a> {
         Ok(torch_dtype_int_to_luminal(meta.dtype))
     }
 
+    /// Translate `aten._grouped_mm.default(input, weight, offs)` → `Tensor[S, N]`.
+    ///
+    /// Grouped matmul: `input` is `[S, K]` (tokens sorted by expert), `weight` is
+    /// `[G, K, N]` (per-expert weights), `offs` is `[G]` cumulative token counts.
+    /// Output `[S, N]` where token m (in group g s.t. `offs[g-1] <= m < offs[g]`)
+    /// is multiplied by `weight[g]`.
+    ///
+    /// Implementation:
+    ///   1. Batched matmul across every expert: `[G, S, K] @ [G, K, N] → [G, S, N]`
+    ///      (input broadcast along the G batch dim — matches luminal's 3D@3D pattern
+    ///      so the CUDA optimizer can fuse it into a batched GEMM).
+    ///   2. Build a `[G, S]` group-membership mask from `offs`:
+    ///      `expert_id[m] = Σ_g (offs[g] <= m)`, then `mask[g, m] = (g == expert_id[m])`.
+    ///   3. Multiply `[G, S, N]` result by the broadcast mask and sum over `G`.
+    ///
+    /// `offs` flows through as a runtime tensor — the routing decision is computed
+    /// at execution time by the gate network and the same compiled graph handles
+    /// any routing pattern without recompilation.
+    pub(crate) fn translate_grouped_mm(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let weight = self.get_input_tensor(node, 1)?;
+        let offs = self.get_input_tensor(node, 2)?;
+
+        anyhow::ensure!(
+            input.shape.len() == 2,
+            "_grouped_mm: input must be 2D, got {}D",
+            input.shape.len()
+        );
+        anyhow::ensure!(
+            weight.shape.len() == 3,
+            "_grouped_mm: weight must be 3D, got {}D",
+            weight.shape.len()
+        );
+        anyhow::ensure!(
+            offs.shape.len() == 1,
+            "_grouped_mm: offs must be 1D, got {}D",
+            offs.shape.len()
+        );
+
+        let s = input.shape.dims[0];
+        let g = weight.shape.dims[0];
+        let n = weight.shape.dims[2];
+
+        let input_f = input.cast(DType::F32);
+        let weight_f = weight.cast(DType::F32);
+        let offs_f = offs.cast(DType::F32);
+
+        // Batched matmul over every expert: [G, S, K] @ [G, K, N] → [G, S, N].
+        let input_batched = input_f.expand_dim(0, g);
+        let all_out = input_batched.matmul(weight_f);
+
+        // Group mask [G, S].
+        let s_arange = self.graph.arange(s).cast(DType::F32);
+        let g_arange = self.graph.arange(g).cast(DType::F32);
+        let ge_boundary = s_arange
+            .expand_dim(0, g)
+            .ge(offs_f.expand_dim(1, s))
+            .cast(DType::F32);
+        let expert_id = ge_boundary.sum(0);
+        let mask = g_arange
+            .expand_dim(1, s)
+            .eq(expert_id.expand_dim(0, g))
+            .cast(DType::F32);
+
+        // Apply mask and sum over experts.
+        let out = (all_out * mask.expand_dim(2, n)).sum(0);
+
+        Ok(out.cast(input.dtype))
+    }
+
     pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {
         let cond = self.get_input_tensor(node, 0)?;
         let x = self.get_input_tensor(node, 1)?;

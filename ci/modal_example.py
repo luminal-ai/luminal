@@ -1,6 +1,9 @@
-import modal
-import subprocess
 import os
+import re
+import subprocess
+import sys
+
+import modal
 
 example = os.environ.get("EXAMPLE", "llama")
 gpu_type = os.environ.get("GPU_TYPE", "A100-80GB")
@@ -17,6 +20,79 @@ hf_cache = modal.Volume.from_name(
 )
 
 WORKDIR = "/workspace/luminal"
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+EXPECTED_OUTPUT = {
+    "llama": [
+        "complex system modeled after the structure and function of the human brain",
+    ],
+    "gemma": [
+        "recognize pictures of cats",
+        "little detectives looking for specific features",
+    ],
+    "qwen": [
+        "computational model inspired by the structure and function of the human brain",
+    ],
+    "qwen3_moe": [
+        "The capital of France is Paris",
+    ],
+    "gemma4_moe": [
+        "city of romance, art and culture",
+    ],
+    "whisper": [
+        "ask not what your country can do for you",
+    ],
+}
+
+
+def run_and_capture(command: list[str], *, cwd: str, env: dict[str, str]) -> str:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+
+    chunks = []
+    while True:
+        chunk = process.stdout.read1(4096)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        chunks.append(chunk)
+
+    return_code = process.wait()
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command, output=output)
+    return output
+
+
+def normalize_output(output: str) -> str:
+    output = ANSI_ESCAPE.sub("", output)
+    output = output.replace("\r", "\n")
+    return re.sub(r"\s+", " ", output).casefold()
+
+
+def validate_output(example: str, output: str):
+    expected_phrases = EXPECTED_OUTPUT.get(example)
+    if expected_phrases is None:
+        raise ValueError(f"No expected output phrases configured for example {example!r}")
+
+    normalized_output = normalize_output(output)
+    for phrase in expected_phrases:
+        if normalize_output(phrase) in normalized_output:
+            print(f"\nOutput check passed for {example!r}: found {phrase!r}")
+            return
+
+    expected = "\n  - ".join(expected_phrases)
+    raise AssertionError(
+        f"Output check failed for {example!r}. Expected one of:\n  - {expected}"
+    )
 
 cuda_image = (
     modal.Image.from_registry(
@@ -48,16 +124,17 @@ def run_example(example: str):
     """Build and run a luminal example on a Modal GPU."""
     subprocess.run(["nvidia-smi"], check=True)
 
-    subprocess.run(
+    run_env = {
+        **os.environ,
+        "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
+        "HF_HOME": HF_CACHE_PATH,
+    }
+    output = run_and_capture(
         ["cargo", "run", "--release"],
         cwd=f"{WORKDIR}/examples/{example}",
-        env={
-            **os.environ,
-            "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
-            "HF_HOME": HF_CACHE_PATH,
-        },
-        check=True,
+        env=run_env,
     )
+    validate_output(example, output)
 
     hf_cache.commit()
 
