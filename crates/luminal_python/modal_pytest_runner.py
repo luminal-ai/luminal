@@ -188,6 +188,17 @@ def _build_cuda_extension(env: dict[str, str]) -> None:
     subprocess.run(cmd, env=env, cwd=PROJECT_DIR, check=True)
 
 
+def _effective_timeout(timeout: int) -> int:
+    if os.environ.get("GITHUB_ACTIONS") == "true" and timeout < DEFAULT_TIMEOUT:
+        print(
+            f"Using Modal timeout {DEFAULT_TIMEOUT}s instead of requested "
+            f"{timeout}s in GitHub Actions.",
+            file=sys.stderr,
+        )
+        return DEFAULT_TIMEOUT
+    return timeout
+
+
 @app.cls(image=image, timeout=DEFAULT_TIMEOUT)
 class TestRunner:
     @modal.method()
@@ -355,6 +366,7 @@ def main(*cli_args: str):
     )
     profile_enabled = _profiling_enabled(cli_profile, pytest_args)
     pytest_addopts = os.environ.get("PYTEST_ADDOPTS", "")
+    timeout = _effective_timeout(timeout)
     runner_options = {"gpu": gpu}
     hf_token_secret = _hf_token_secret()
     runner_volumes = {HF_CACHE_PATH: HF_CACHE_VOLUME}
