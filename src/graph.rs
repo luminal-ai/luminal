@@ -282,9 +282,18 @@ impl Graph {
         // blocks + a 2-resnet mid block — all different bodies). Iterate
         // until no more loop regions are found, so each pattern gets
         // rolled exactly once.
+        //
+        // Iteration is opt-in via `LUMINAL_LOOP_ROLL_ITERATE=1`. Multiple
+        // passes can insert loop markers that split fusion regions in
+        // ways the downstream codegen (`region_codegen.rs`) doesn't
+        // handle (FusionStart with no predecessor) for some shapes. The
+        // single-pass default keeps existing examples working; opt in
+        // when the model has multiple distinct repeating patterns and
+        // you've verified codegen still succeeds.
         let before = self.graph.node_count();
+        let iterate = std::env::var("LUMINAL_LOOP_ROLL_ITERATE").is_ok();
+        let max_passes = if iterate { 32 } else { 1 };
         let mut total_passes = 0;
-        let max_passes = 32;
         loop {
             let inserted = self.auto_roll_loops_prepass();
             if inserted == 0 {
@@ -292,11 +301,13 @@ impl Graph {
             }
             total_passes += 1;
             if total_passes >= max_passes {
-                println!(
-                    "   {:>6}  hit max_passes ({}) — stopping rolling prepass",
-                    "Rolled".yellow().bold(),
-                    max_passes,
-                );
+                if iterate {
+                    println!(
+                        "   {:>6}  hit max_passes ({}) — stopping rolling prepass",
+                        "Rolled".yellow().bold(),
+                        max_passes,
+                    );
+                }
                 break;
             }
         }
