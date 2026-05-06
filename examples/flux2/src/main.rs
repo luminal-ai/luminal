@@ -13,12 +13,29 @@
 //!  * `TEXT_TEST=1` — encode the prompt through the Mistral 3 text encoder only
 //!  * `FULL=1`      — full pipeline: text → transformer → VAE
 //!
+//! ## Required env for `FULL=1`
+//!  * `LUMINAL_DISABLE_LOOP_ROLLING=1` — auto-loop-rolling currently
+//!    interacts badly with our `CustomOpKind`-wrapped CUDA kernels. The
+//!    rolling pass succeeds and produces seemingly-valid loop bodies,
+//!    but the resulting graph causes `CUDA_ERROR_ILLEGAL_ADDRESS` on the
+//!    first profile execute. Disabling the rolling makes the pipeline
+//!    run cleanly. Compile time grows with layer count when rolling is
+//!    off, so this is a workaround, not a fix.
+//!  * `FLUX2_NUM_LAYERS` / `FLUX2_NUM_SINGLE_LAYERS` (optional) — override
+//!    the default 8 + 48 transformer block counts. The default count
+//!    overflows the 96 GB GPU because there's no live-range buffer
+//!    reuse in `CudaRuntime::allocate_intermediate_buffers` — every
+//!    intermediate is alive for the whole forward pass. `1 + 1` runs
+//!    the full pipeline end-to-end at 1024² in well under a minute and
+//!    is the right setting for plumbing-validation. Higher counts
+//!    (e.g. `8 + 16`) work but use proportionally more memory.
+//!
 //! ## Memory plan
 //! GPU is 96 GB; transformer (60 GB BF16) + text encoder (33 GB BF16) +
 //! VAE (336 MB) won't all fit. The full pipeline keeps **at most one** large
 //! model resident at a time:
 //!   1. Load text encoder, encode prompt, **drop the runtime** to free 33 GB.
-//!   2. Load transformer, run the 28-step diffusion loop, **drop the runtime**.
+//!   2. Load transformer, run the diffusion loop, **drop the runtime**.
 //!   3. Load VAE, decode, dump PNG.
 
 mod hf;
