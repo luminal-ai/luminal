@@ -80,6 +80,24 @@ use luminal::{dtype::DType, graph::Graph, prelude::*, shape::Expression};
 use luminal_nn::LayerNorm;
 
 // ── architecture constants for `black-forest-labs/FLUX.2-dev` ───────────────
+//
+// `FLUX2_NUM_LAYERS` / `FLUX2_NUM_SINGLE_LAYERS` env vars override the
+// counts at runtime. Reducing them is useful for end-to-end pipeline
+// validation with a much smaller compile-time cost — at the full
+// 8 + 48 layer count the egglog egraph for the transformer can blow
+// past 200 GB of CPU RAM.
+pub fn num_layers() -> usize {
+    std::env::var("FLUX2_NUM_LAYERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+}
+pub fn num_single_layers() -> usize {
+    std::env::var("FLUX2_NUM_SINGLE_LAYERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48)
+}
 pub const NUM_LAYERS: usize = 8;
 pub const NUM_SINGLE_LAYERS: usize = 48;
 pub const NUM_HEADS: usize = 48;
@@ -783,10 +801,10 @@ impl Flux2Transformer {
             cx,
         );
 
-        let transformer_blocks = (0..NUM_LAYERS)
+        let transformer_blocks = (0..num_layers())
             .map(|i| DoubleStreamBlock::new(i, cx))
             .collect();
-        let single_transformer_blocks = (0..NUM_SINGLE_LAYERS)
+        let single_transformer_blocks = (0..num_single_layers())
             .map(|i| SingleStreamBlock::new(i, cx))
             .collect();
 

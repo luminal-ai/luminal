@@ -322,12 +322,24 @@ fn run_full_pipeline(
 
     println!("Building transformer graph...");
     let mut cx = Graph::default();
+    // Inputs that change per diffusion step.
     let latent_in = cx.named_tensor("__latent", (s_img, transformer::IN_CHANNELS));
-    let text_in = cx.named_tensor("__text", (s_txt, text_encoder::OUTPUT_DIM));
-    let cos_in = cx.named_tensor("__rope_cos", (s_total, transformer::HEAD_DIM));
-    let sin_in = cx.named_tensor("__rope_sin", (s_total, transformer::HEAD_DIM));
     let timestep_in = cx.named_tensor("__timestep", 1);
-    let guidance_in = cx.named_tensor("__guidance", 1);
+    // Inputs that are constant across the whole diffusion loop. `.persist()`
+    // marks them as outputs so their buffers survive between successive
+    // `runtime.execute()` calls; without this the runtime treats them as
+    // transient intermediates and a second `execute()` reads freed memory
+    // (manifests as `CUDA_ERROR_ILLEGAL_ADDRESS` on the post-kernel sync).
+    let text_in = cx
+        .named_tensor("__text", (s_txt, text_encoder::OUTPUT_DIM))
+        .persist();
+    let cos_in = cx
+        .named_tensor("__rope_cos", (s_total, transformer::HEAD_DIM))
+        .persist();
+    let sin_in = cx
+        .named_tensor("__rope_sin", (s_total, transformer::HEAD_DIM))
+        .persist();
+    let guidance_in = cx.named_tensor("__guidance", 1).persist();
 
     let model = transformer::Flux2Transformer::init(&mut cx);
     let velocity = model
@@ -431,9 +443,13 @@ fn run_full_pipeline(
     let latent_in = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
     let decoder = VaeDecoder::new(&mut cx);
     let out = decoder.forward(latent_in).output();
-    cx.build_search_space_with_options::<CudaRuntime>(
-        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("VAE_MEM_GIB", 32)),
-    );
+    if let Ok(g) = std::env::var("VAE_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+        cx.build_search_space_with_options::<CudaRuntime>(
+            BuildSearchSpaceOptions::new().max_memory_gib(g),
+        );
+    } else {
+        cx.build_search_space::<CudaRuntime>();
+    }
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();

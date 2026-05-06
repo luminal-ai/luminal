@@ -650,6 +650,47 @@ mod tests {
         }
     }
 
+    /// `matmul_3d_t` at FLUX2 transformer attention shapes:
+    /// (heads=4, seq=8, head_dim=16) @ same^T → (heads, seq, seq).
+    #[test]
+    fn matmul_3d_t_attention_shape_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(99);
+        let (b, m, k) = (4usize, 8usize, 16usize);
+        let n = m;
+        let a_data: Vec<f32> = (0..b * m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..b * n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut expected = vec![0.0_f32; b * m * n];
+        for bi in 0..b {
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut s = 0.0_f32;
+                    for ki in 0..k {
+                        s += a_data[bi * m * k + mi * k + ki]
+                            * b_data[bi * n * k + ni * k + ki];
+                    }
+                    expected[bi * m * n + mi * n + ni] = s;
+                }
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (b, m, k));
+        let bt = cx.named_tensor("b", (b, n, k));
+        let out = luminal_cuda_lite::kernel::matmul_3d_t(a, bt);
+        let ac = a_data.clone();
+        let bc = b_data.clone();
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(bt, bc);
+            },
+            out,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-3, "attn matmul_3d_t mismatch at {i}: got {g}, want {e}");
+        }
+    }
+
     /// `matmul_3d_t`: `A (B, M, K) @ B (B, N, K)ᵀ → (B, M, N)`.
     #[test]
     fn matmul_3d_t_matches_reference() {
