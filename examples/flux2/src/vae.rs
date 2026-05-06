@@ -85,6 +85,18 @@ fn decoder_block_channels(block_idx: usize) -> (usize, usize) {
 ///   * Re-emit the output as a fresh contiguous `(C_out, H_out, W_out)` tensor
 ///     via an explicit gather, so chaining many convs together doesn't drag
 ///     compounding stride patterns through the optimizer.
+/// Pure-HLIR conv2d-with-bias on a `(C_in, H, W)` input. Weights stored as
+/// `(C_out, C_in*K*K)`, bias as `(C_out,)`. Output: `(C_out, H_out, W_out)`.
+///
+/// Uses [`luminal_cuda_lite::kernel::conv2d_bias`] — a direct conv kernel
+/// (one CUDA thread per output element) that skips the unfold-then-matmul
+/// formulation entirely. The historical fallback through unfold + matmul
+/// + bias was correct but materialized an `(H_out*W_out, C_in*K*K)`
+/// intermediate per conv (~600 MB at 256², ~5 GB at 1024²) that summed
+/// across the decoder's ~30 convs blew out of GPU memory at any
+/// production resolution. The direct kernel needs only the input,
+/// weight, bias, and output buffers — no intermediate matrix — so its
+/// memory footprint is linear in the actual conv FLOPs.
 fn conv2d_bias(
     x: GraphTensor,
     weight: GraphTensor,
@@ -93,84 +105,7 @@ fn conv2d_bias(
     stride: usize,
     padding: usize,
 ) -> GraphTensor {
-    let dims = x.dims();
-    assert_eq!(dims.len(), 3, "conv2d_bias expects (C_in, H, W)");
-    let h_in = dims[1].to_usize().expect("h_in must be a static dimension");
-    let w_in = dims[2].to_usize().expect("w_in must be a static dimension");
-
-    let h_out = (h_in + 2 * padding - kernel) / stride + 1;
-    let w_out = (w_in + 2 * padding - kernel) / stride + 1;
-
-    // Pad spatial axes only.
-    let padded = x.pad(
-        vec![
-            (Expression::from(0_usize), Expression::from(0_usize)),
-            (Expression::from(padding), Expression::from(padding)),
-            (Expression::from(padding), Expression::from(padding)),
-        ],
-        0.0,
-    );
-
-    // unfold((1, K, K), (1, S, S), (1, 1, 1)) over (C_in, H+2P, W+2P)
-    // → (C_in, H_out, W_out, 1, K, K).
-    let unfolded = padded.unfold(
-        [1_usize, kernel, kernel],
-        [1_usize, stride, stride],
-        [1_usize, 1_usize, 1_usize],
-    );
-    let unfolded = unfolded.squeeze(3); // (C_in, H_out, W_out, K, K)
-
-    // Move spatial output dims to the front: (H_out, W_out, C_in, K, K).
-    // Then merge the trailing channel × kernel axes into a flat row vector.
-    let permuted = unfolded.permute((1, 2, 0, 3, 4));
-    let flat = permuted.merge_dims(0, 1); // (H_out*W_out, C_in, K, K)
-    let flat = flat.merge_dims(2, 3); // (H_out*W_out, C_in, K*K)
-    let flat = flat.merge_dims(1, 2); // (H_out*W_out, C_in*K*K)
-    // Materialize the unfold view to a contiguous (H_out*W_out, C_in*K*K)
-    // tensor before the matmul. Without this barrier, the unfold's
-    // broadcast/permuted strides leak into the matmul's input pattern,
-    // which prevents the cublaslt egg rule from matching and forces the
-    // search to fall back to broadcast-Mul + SumReduce — generating an
-    // (M, K, N) intermediate that OOMs even at 128².
-    //
-    // KNOWN LIMITATION: Even with this barrier, search is still allowed
-    // to randomly select the broadcast-Mul + SumReduce path for any one
-    // of the ~30 matmuls in the decoder, because the conditional
-    // KernelMul cleanup rule in `cublaslt/mod.rs` doesn't always remove
-    // it. At 128² VAE this works (search finds a viable genome within
-    // ~100 attempts; peak ~12 GiB). At 256²+ a single bad pick on the
-    // C_in=512 / C_out=512 layer creates a 38 GB intermediate, and 100
-    // random initial genomes all OOM. End-to-end at the actual Flux 2
-    // 1024² resolution requires a real `KernelConv2D` op in
-    // luminal_cuda_lite that fuses unfold+matmul+bias into one kernel
-    // (no intermediate matrix). That's the next piece of work.
-    let flat = flat * 1.0_f32;
-
-    // (H_out*W_out, C_in*K*K) @ (C_in*K*K, C_out) = (H_out*W_out, C_out).
-    let mut out = flat.matmul(weight.t());
-    let c_out = out.dims()[1]
-        .to_usize()
-        .expect("c_out must be a static dimension");
-    let n = out.dims()[0];
-    out = out + bias.expand_dim(0, n);
-
-    // Reshape to (C_out, H_out, W_out) via an explicit gather. The matmul
-    // result's natural layout is (H_out*W_out, C_out) row-major; we map each
-    // output position (co, h, w) to source row (h*W_out + w), col co. After
-    // gather we use ordinary `split_dims` to recover the (C, H, W) shape so
-    // the optimizer sees a stock reshape rather than a hand-overridden
-    // tracker.
-    let cx = out.graph();
-    let z = Expression::from('z');
-    let hw_e = Expression::from(h_out * w_out);
-    let c_out_e = Expression::from(c_out);
-    let src = (z % hw_e) * c_out_e + (z / hw_e);
-    let total = c_out * h_out * w_out;
-    let idx = cx.iota(src, total);
-    let result = out.gather(idx); // (total,)
-    result
-        .split_dims(0, h_out * w_out) // (c_out, h_out*w_out)
-        .split_dims(1, w_out) // (c_out, h_out, w_out)
+    luminal_cuda_lite::kernel::conv2d_bias(x, weight, bias, kernel, stride, padding)
 }
 
 /// PyTorch-style GroupNorm on a (C, H, W) tensor.

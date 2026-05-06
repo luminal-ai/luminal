@@ -9,11 +9,13 @@ use luminal_tracing::schema::{
 };
 use uuid::Uuid;
 
+pub mod conv2d;
 pub mod cuda_graph;
 pub mod fusion;
 pub mod hlir;
 pub mod other_ops;
 
+pub use conv2d::{conv2d_bias, Conv2DCustom, Conv2DKernel};
 pub use cuda_graph::*;
 
 pub type Ops = (hlir::Ops, other_ops::Ops, fusion::Ops);
