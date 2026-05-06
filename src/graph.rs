@@ -276,9 +276,31 @@ impl Graph {
     }
 
     fn run_auto_loop_rolling_prepass(&mut self) {
+        // `auto_roll_loops_prepass` finds and rolls ONE best candidate per
+        // call. Many real models have multiple distinct repeating patterns
+        // (e.g. Flux 2 has 8 double-stream blocks + 48 single-stream
+        // blocks + a 2-resnet mid block — all different bodies). Iterate
+        // until no more loop regions are found, so each pattern gets
+        // rolled exactly once.
         let before = self.graph.node_count();
-        let inserted = self.auto_roll_loops_prepass();
-        if inserted == 0 {
+        let mut total_passes = 0;
+        let max_passes = 32;
+        loop {
+            let inserted = self.auto_roll_loops_prepass();
+            if inserted == 0 {
+                break;
+            }
+            total_passes += 1;
+            if total_passes >= max_passes {
+                println!(
+                    "   {:>6}  hit max_passes ({}) — stopping rolling prepass",
+                    "Rolled".yellow().bold(),
+                    max_passes,
+                );
+                break;
+            }
+        }
+        if total_passes == 0 {
             println!(
                 "   {:>6}  no loop regions found (max body={})",
                 "Rolled".cyan().bold(),
