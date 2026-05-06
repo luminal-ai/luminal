@@ -68,7 +68,21 @@ pub const WEIGHT_DTYPE: DType = DType::Bf16;
 // =============================================================================
 
 fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
-    x.matmul(w.cast(x.dtype).t())
+    // Direct mixed-precision kernel: F32 A × BF16 B^T → F32 (M, N), with the
+    // BF16 → F32 conversion happening on each load inside the kernel rather
+    // than as a separate cast op. This keeps the BF16 weight in memory as-is
+    // (a 24 GB → 48 GB cast for the full encoder would not fit on the GPU)
+    // and bypasses the egglog matmul lowering, where the cublaslt 2D rule
+    // doesn't reliably fire for these shapes — see kernel::matmul2d's docs.
+    //
+    // Falls back to the standard `x.matmul(w.cast(x.dtype).t())` lowering
+    // for ranks > 2 (e.g. attention's batched (heads, seq, head_dim) form),
+    // since the custom kernel is only 2D.
+    if x.shape.len() == 2 && w.shape.len() == 2 {
+        luminal_cuda_lite::kernel::linear_no_bias_bf16_w(x, w)
+    } else {
+        x.matmul(w.cast(x.dtype).t())
+    }
 }
 
 fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
@@ -114,12 +128,25 @@ fn apply_rope(x: GraphTensor, pos_ids: GraphTensor, n_heads: usize, theta: f32) 
 /// Standard scaled dot-product attention over `(n_heads, seq_q, head_dim)`,
 /// `(n_heads, seq_k, head_dim)`, `(n_heads, seq_k, head_dim)` with a causal
 /// mask. Returns `(seq_q, n_heads * head_dim)`.
+///
+/// Routes the two batched matmuls through `kernel::matmul_3d_t` /
+/// `matmul_3d` rather than the egglog matmul lowering. The standard path
+/// has the same problem the VAE attention had (cublaslt batched rules
+/// fail to fire reliably; the broadcast Mul + SumReduce fallback creates
+/// a `(n_heads, M, N, K)` intermediate that scales O(seq²) and OOMs at
+/// seq_len ≥ ~256 even with BF16 weights elsewhere).
 fn causal_sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let cx = q.graph();
     let n_heads = q.dims()[0];
     let seq = q.dims()[1];
     let scale = (HEAD_DIM as f32).sqrt().recip();
-    let scores = q.matmul(k.transpose(1, 2)) * scale;
+    // The kernel needs contiguous batches; a `* 1.0` after the upstream
+    // transpose / GQA-expand chain materialises the strided view.
+    let q = q * 1.0_f32;
+    let k = k * 1.0_f32;
+    let v = v * 1.0_f32;
+    // Q @ K^T: (heads, seq, head_dim) @ (heads, seq, head_dim)^T = (heads, seq, seq).
+    let scores = luminal_cuda_lite::kernel::matmul_3d_t(q, k) * scale;
     // Causal mask: positions where k_pos > q_pos are masked.
     let q_pos = cx.arange(seq).cast(DType::F32);
     let k_pos = cx.arange(seq).cast(DType::F32);
@@ -127,7 +154,8 @@ fn causal_sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let mask = mask.cast(DType::F32).expand_dim(0, n_heads);
     let masked = scores + mask * (-1e10_f32);
     let weights = masked.softmax(2);
-    let attn = weights.matmul(v); // (n_heads, seq_q, head_dim)
+    // attn = weights @ v: (heads, seq, seq) @ (heads, seq, head_dim) = (heads, seq, head_dim).
+    let attn = luminal_cuda_lite::kernel::matmul_3d(weights, v);
     attn.transpose(0, 1).merge_dims(1, 2) // (seq_q, n_heads*head_dim)
 }
 

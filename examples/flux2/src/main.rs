@@ -210,9 +210,15 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
     let pos_ids = cx.named_tensor("__pos_ids", text_len).as_dtype(DType::Int);
     let encoder = text_encoder::Mistral3TextEncoder::init(&mut cx);
     let features = encoder.forward(input_ids, pos_ids).output();
-    cx.build_search_space_with_options::<CudaRuntime>(
-        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("TEXT_MEM_GIB", 16)),
-    );
+    // Memory-budget enforcement is opt-in (the estimator over-counts; see
+    // the matching comment in `run_vae_only`). Set `TEXT_MEM_GIB` to opt in.
+    if let Ok(g) = std::env::var("TEXT_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+        cx.build_search_space_with_options::<CudaRuntime>(
+            BuildSearchSpaceOptions::new().max_memory_gib(g),
+        );
+    } else {
+        cx.build_search_space::<CudaRuntime>();
+    }
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -329,9 +335,13 @@ fn run_full_pipeline(
         .output();
 
     println!("Building search space (this is the long step — many minutes for the full DiT)...");
-    cx.build_search_space_with_options::<CudaRuntime>(
-        BuildSearchSpaceOptions::new().max_memory_gib(env_usize("TX_MEM_GIB", 32)),
-    );
+    if let Ok(g) = std::env::var("TX_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+        cx.build_search_space_with_options::<CudaRuntime>(
+            BuildSearchSpaceOptions::new().max_memory_gib(g),
+        );
+    } else {
+        cx.build_search_space::<CudaRuntime>();
+    }
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();

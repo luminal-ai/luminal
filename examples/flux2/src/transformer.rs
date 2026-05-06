@@ -106,10 +106,27 @@ pub const WEIGHT_DTYPE: DType = DType::Bf16;
 // =============================================================================
 
 fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
-    // w is (out, in) BF16. x typically F32. Cast w up before matmul so the
-    // accumulation stays in F32; this matches the dtype convention used by
-    // `examples/gemma4_moe`.
-    x.matmul(w.cast(x.dtype).t())
+    // For 2D inputs we go through `kernel::linear_no_bias_bf16_w`, which
+    // is a direct mixed-precision SGEMM (F32 A × BF16 B^T → F32) that
+    // converts BF16 → F32 on each load instead of materializing a
+    // separate F32 cast tensor. Two reasons we don't use the egglog
+    // matmul lowering for these:
+    //   1. The cublaslt 2D rule fails to fire reliably for some matmul
+    //      shapes (see kernel::matmul2d's docs); even one bad genome
+    //      pick on the broadcast Mul + SumReduce fallback creates an
+    //      `(M, N, K)` intermediate that OOMs the GPU.
+    //   2. Explicitly casting all BF16 weights to F32 first would more
+    //      than double the transformer's working set (~120 GB) and
+    //      wouldn't fit. The kernel keeps weights as BF16 in memory.
+    //
+    // Higher-rank cases (3D batched matmul inside attention) fall
+    // through to the standard matmul lowering — those go through the
+    // separate `matmul_3d` / `matmul_3d_t` helpers in `sdpa` below.
+    if x.shape.len() == 2 && w.shape.len() == 2 {
+        luminal_cuda_lite::kernel::linear_no_bias_bf16_w(x, w)
+    } else {
+        x.matmul(w.cast(x.dtype).t())
+    }
 }
 
 /// Pre-norm RMSNorm over the trailing axis with weight (`scale`); no shift.
@@ -161,25 +178,43 @@ fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor
 
 /// Scaled dot-product attention with NO mask, no causal: standard SDPA.
 /// q, k, v: `(H, S, D)`. Returns `(S, H, D)`.
+///
+/// Routes through the direct batched matmul kernels for the same reason
+/// the text encoder does — see `text_encoder::causal_sdpa` for context.
 fn sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let head_dim = q.dims()[2].to_usize().expect("head_dim must be static");
     let scale = (head_dim as f32).sqrt().recip();
-    let scores = q.matmul(k.transpose(1, 2)) * scale; // (H, S, S)
+    // The kernel needs contiguous batches; materialize the strided views
+    // produced upstream (transpose / split_dims chains).
+    let q = q * 1.0_f32;
+    let k = k * 1.0_f32;
+    let v = v * 1.0_f32;
+    let scores = luminal_cuda_lite::kernel::matmul_3d_t(q, k) * scale; // (H, S, S)
     let attn_w = scores.softmax(2);
-    let attn = attn_w.matmul(v); // (H, S, D)
+    let attn = luminal_cuda_lite::kernel::matmul_3d(attn_w, v); // (H, S, D)
     attn.transpose(0, 1) // (S, H, D)
 }
 
 /// SwiGLU: split `x` along last axis into `(x1, x2)`, return `silu(x1) * x2`.
-/// `x` shape `(..., 2 * mlp_hidden)`.
+/// `x` shape `(..., 2 * mlp_hidden)`. Handles 2D and 3D inputs.
 fn swiglu(x: GraphTensor) -> GraphTensor {
     let dims = x.dims();
     let last = dims[dims.len() - 1].to_usize().expect("static");
     assert!(last % 2 == 0);
     let half = last / 2;
-    let x1 = x.slice((.., .., ..half));
-    let x2 = x.slice((.., .., half..));
-    x1.silu() * x2
+    match dims.len() {
+        2 => {
+            let x1 = x.slice((.., ..half));
+            let x2 = x.slice((.., half..));
+            x1.silu() * x2
+        }
+        3 => {
+            let x1 = x.slice((.., .., ..half));
+            let x2 = x.slice((.., .., half..));
+            x1.silu() * x2
+        }
+        n => panic!("swiglu: unsupported rank {n}"),
+    }
 }
 
 // =============================================================================

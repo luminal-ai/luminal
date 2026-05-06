@@ -18,7 +18,10 @@ pub mod other_ops;
 
 pub use conv2d::{conv2d_bias, Conv2DCustom, Conv2DKernel};
 pub use cuda_graph::*;
-pub use matmul2d::{linear_bias, matmul_2d, matmul_2d_t, Matmul2DCustom, Matmul2DKernel};
+pub use matmul2d::{
+    linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t, matmul_3d, matmul_3d_t,
+    Matmul2DCustom, Matmul2DKernel,
+};
 
 pub type Ops = (hlir::Ops, other_ops::Ops, fusion::Ops);
 

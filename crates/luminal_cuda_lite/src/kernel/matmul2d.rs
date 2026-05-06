@@ -37,20 +37,34 @@ use luminal::{
 use crate::compile_module_image_for_current_device;
 use crate::kernel::KernelOp;
 
-/// Direct F32 2D matmul `(M, K) × {(K, N) | (N, K)} → (M, N)` with optional
-/// per-output-column bias. All shape parameters are static (baked into the
-/// CUDA source via #defines), so each (M, N, K, transpose_b, has_bias)
-/// shape gets its own compiled kernel.
+/// Direct 2D matmul `(M, K) × {(K, N) | (N, K)} → (M, N)` with optional
+/// per-output-column bias and an optional batch axis. A and output are
+/// always F32. B can be F32 or BF16; BF16 is converted to F32 on each
+/// load, which avoids materializing the cast as a separate intermediate
+/// tensor (important for the text encoder / transformer where the F32-
+/// cast weights would not fit in GPU memory). All shape parameters are
+/// static (baked into the CUDA source via #defines).
+///
+/// When `batch > 1` the kernel does `batch` independent 2D matmuls in
+/// parallel: A is `(batch, M, K)`, B is `(batch, *, *)` with the same
+/// per-batch shape, output is `(batch, M, N)`. All three are assumed
+/// contiguous row-major across batches (i.e. `a_batch_stride = M*K`,
+/// `b_batch_stride = K*N` or `N*K` depending on `transpose_b`,
+/// `out_batch_stride = M*N`). Bias does NOT have a batch axis — it's
+/// `(N,)` and broadcast across batches.
 #[derive(Debug, Clone)]
 pub struct Matmul2DKernel {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+    pub batch: usize,
     /// If `true`, B is interpreted as `(N, K)` row-major and accessed as
     /// `B[n][k]` (i.e. `A @ Bᵀ`). If `false`, B is `(K, N)` row-major and
     /// accessed as `B[k][n]` (i.e. `A @ B`).
     pub transpose_b: bool,
     pub has_bias: bool,
+    /// Storage dtype of B. Currently F32 or BF16 are supported.
+    pub weight_dtype: DType,
 }
 
 const TILE: usize = 16;
@@ -82,18 +96,34 @@ impl KernelOp for Matmul2DKernel {
         // We want Bs[ty][tx] = B_effective[k0+ty][b_n_base+tx] where:
         //   transpose_b=false: B is (K, N) row-major → B[(k0+ty)*N + (b_n_base+tx)]
         //   transpose_b=true:  B is (N, K) row-major → B[(b_n_base+tx)*K + (k0+ty)]
-        let b_index = if self.transpose_b {
-            "B[(b_n_base + tx) * K + (k0 + ty)]"
+        // Plus the per-batch offset (`b_batch_off`).
+        let b_index_expr = if self.transpose_b {
+            "b_batch_off + (b_n_base + tx) * K + (k0 + ty)"
         } else {
-            "B[(k0 + ty) * N + (b_n_base + tx)]"
+            "b_batch_off + (k0 + ty) * N + (b_n_base + tx)"
+        };
+        // Convert B's element to float on load. For BF16 we declare B as
+        // `__nv_bfloat16*` and use `__bfloat162float`; for F32 it's a no-op.
+        let (b_param_type, b_load_expr, bf16_include) = match self.weight_dtype {
+            DType::F32 => (
+                "const float* __restrict__ B",
+                format!("B[{b_index_expr}]"),
+                "",
+            ),
+            DType::Bf16 => (
+                "const __nv_bfloat16* __restrict__ B",
+                format!("__bfloat162float(B[{b_index_expr}])"),
+                "#include <cuda_bf16.h>\n",
+            ),
+            other => panic!("Matmul2DKernel: unsupported weight_dtype {other:?}"),
         };
 
         let kernel = format!(
             "
-extern \"C\" __global__ void matmul_2d_kernel(
+{bf16_include}extern \"C\" __global__ void matmul_2d_kernel(
     float* __restrict__ C,
     const float* __restrict__ A,
-    const float* __restrict__ B{bias_param}
+    {b_param_type}{bias_param}
 ) {{
     const int M = {m};
     const int N = {n};
@@ -105,6 +135,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
 
     int bx = blockIdx.x;  // tile column (n)
     int by = blockIdx.y;  // tile row (m)
+    int batch = blockIdx.z; // batch index (0..BATCH-1)
     int tx = threadIdx.x; // 0..TILE-1, output col within tile
     int ty = threadIdx.y; // 0..TILE-1, output row within tile
 
@@ -113,6 +144,11 @@ extern \"C\" __global__ void matmul_2d_kernel(
 
     int a_m_base = by * TILE;
     int b_n_base = bx * TILE;
+
+    // Per-batch base pointer offsets (contiguous row-major across batches).
+    int a_batch_off = batch * (M * K);
+    int b_batch_off = batch * (K * N);
+    int c_batch_off = batch * (M * N);
 
     float acc = 0.0f;
 
@@ -123,7 +159,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
         // Load A tile (TILE, TILE) row-major from A[m, k]: A[(by*TILE+ty)*K + (k0+tx)]
         int a_m = a_m_base + ty;
         int a_k = k0 + tx;
-        As[ty][tx] = (a_m < M && a_k < K) ? A[a_m * K + a_k] : 0.0f;
+        As[ty][tx] = (a_m < M && a_k < K) ? A[a_batch_off + a_m * K + a_k] : 0.0f;
 
         // Load B tile depending on transpose_b
         int b_n_or_k = b_n_base + tx;  // for transpose_b=true this is N; for =false this is N
@@ -133,7 +169,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
         // For transpose_b=false (B is (K,N)): B[k][n] in math = B_storage[k][n] = B[(k0+ty)*N + (b_n_base+tx)]
         bool b_in_bounds = ({transpose_b} ? (b_n_or_k < N && b_k_or_k < K)
                                           : (b_k_or_k < K && b_n_or_k < N));
-        Bs[ty][tx] = b_in_bounds ? {b_index} : 0.0f;
+        Bs[ty][tx] = b_in_bounds ? ({b_load_expr}) : 0.0f;
 
         __syncthreads();
 
@@ -146,7 +182,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
 
     if (m_global < M && n_global < N) {{
         int n = n_global;
-{bias_add}        C[m_global * N + n_global] = acc;
+{bias_add}        C[c_batch_off + m_global * N + n_global] = acc;
     }}
 }}
 ",
@@ -155,9 +191,11 @@ extern \"C\" __global__ void matmul_2d_kernel(
             k = self.k,
             tile = TILE,
             transpose_b = self.transpose_b,
-            b_index = b_index,
+            b_load_expr = b_load_expr,
+            b_param_type = b_param_type,
             bias_param = bias_param,
             bias_add = bias_add,
+            bf16_include = bf16_include,
         );
 
         let (module, func) = if let Some((m, f)) = compile_cache.get(&kernel) {
@@ -179,7 +217,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
             (
                 Expression::from(grid_x),
                 Expression::from(grid_y),
-                Expression::from(1usize),
+                Expression::from(self.batch),
             ),
             (
                 Expression::from(TILE),
@@ -192,7 +230,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
     }
 
     fn output_size(&self) -> Expression {
-        Expression::from(self.m * self.n)
+        Expression::from(self.batch * self.m * self.n)
     }
 
     fn output_bytes(&self) -> Expression {
@@ -204,9 +242,16 @@ extern \"C\" __global__ void matmul_2d_kernel(
     }
 
     fn bytes_loaded(&self) -> Expression {
-        // Each output: K elements from A and K elements from B (plus 1 bias).
-        let per_out = self.k * 2 + if self.has_bias { 1 } else { 0 };
-        Expression::from(self.m * self.n * per_out * 4)
+        // K elements from A (F32) + K elements from B (F32 or BF16) + maybe bias (F32).
+        let b_bytes = match self.weight_dtype {
+            DType::F32 => 4,
+            DType::Bf16 => 2,
+            _ => 4,
+        };
+        let bias_bytes = if self.has_bias { 4 } else { 0 };
+        Expression::from(
+            self.batch * self.m * self.n * (self.k * 4 + self.k * b_bytes + bias_bytes),
+        )
     }
 
     fn bytes_stored(&self) -> Expression {
@@ -215,7 +260,7 @@ extern \"C\" __global__ void matmul_2d_kernel(
 
     fn flops(&self) -> Expression {
         let per_out = self.k * 2 + if self.has_bias { 1 } else { 0 };
-        Expression::from(self.m * self.n * per_out)
+        Expression::from(self.batch * self.m * self.n * per_out)
     }
 
     fn kernel_name(&self) -> &'static str {
@@ -235,68 +280,116 @@ impl CustomOp for Matmul2DCustom {
 
 /// `(M, K) @ (K, N) -> (M, N)` for row-major F32 inputs. No bias.
 pub fn matmul_2d(a: GraphTensor, b: GraphTensor) -> GraphTensor {
-    matmul_2d_inner(a, b, /*transpose_b=*/ false, None)
+    matmul_inner(a, b, /*transpose_b=*/ false, None)
 }
 
 /// `(M, K) @ (N, K)ᵀ -> (M, N)` for row-major F32 inputs. No bias.
 /// Use this for `A @ Bᵀ` where B is stored row-major as `(N, K)` — the
 /// pattern produced by linear / projection layers (`x @ w.t()`).
 pub fn matmul_2d_t(a: GraphTensor, b: GraphTensor) -> GraphTensor {
-    matmul_2d_inner(a, b, /*transpose_b=*/ true, None)
+    matmul_inner(a, b, /*transpose_b=*/ true, None)
 }
 
 /// Linear projection with bias: `(M, K) @ (N, K)ᵀ + bias` where bias is
 /// `(N,)`, row-major F32 throughout.
 pub fn linear_bias(a: GraphTensor, b: GraphTensor, bias: GraphTensor) -> GraphTensor {
-    matmul_2d_inner(a, b, /*transpose_b=*/ true, Some(bias))
+    matmul_inner(a, b, /*transpose_b=*/ true, Some(bias))
 }
 
-fn matmul_2d_inner(
+/// Mixed-precision linear (no bias): `A (F32, M, K) @ B (BF16, N, K)ᵀ → (F32, M, N)`.
+/// B is read directly as BF16 and converted to F32 on each load, so the
+/// caller does NOT need to insert a `.cast(F32)` op on the weight tensor.
+/// This is the right entry point for LLM-style linear projections where
+/// weights are BF16 and explicitly casting them would not fit in memory.
+pub fn linear_no_bias_bf16_w(a: GraphTensor, b_bf16: GraphTensor) -> GraphTensor {
+    matmul_inner(a, b_bf16, /*transpose_b=*/ true, None)
+}
+
+/// Batched matmul: `A (B, M, K) @ B (B, K, N) → (B, M, N)`, all F32 row-major.
+pub fn matmul_3d(a: GraphTensor, b: GraphTensor) -> GraphTensor {
+    matmul_inner(a, b, /*transpose_b=*/ false, None)
+}
+
+/// Batched matmul with B-transpose: `A (B, M, K) @ B (B, N, K)ᵀ → (B, M, N)`.
+pub fn matmul_3d_t(a: GraphTensor, b: GraphTensor) -> GraphTensor {
+    matmul_inner(a, b, /*transpose_b=*/ true, None)
+}
+
+fn matmul_inner(
     a: GraphTensor,
     b: GraphTensor,
     transpose_b: bool,
     bias: Option<GraphTensor>,
 ) -> GraphTensor {
-    assert_eq!(a.dtype, DType::F32, "matmul_2d requires F32 inputs");
-    assert_eq!(b.dtype, DType::F32, "matmul_2d requires F32 inputs");
+    assert_eq!(a.dtype, DType::F32, "matmul requires F32 A");
+    let weight_dtype = b.dtype;
+    assert!(
+        matches!(weight_dtype, DType::F32 | DType::Bf16),
+        "matmul B must be F32 or BF16, got {weight_dtype:?}",
+    );
     let a_dims = a.dims();
     let b_dims = b.dims();
-    assert_eq!(a_dims.len(), 2, "matmul_2d expects 2D A");
-    assert_eq!(b_dims.len(), 2, "matmul_2d expects 2D B");
-    let m = a_dims[0].to_usize().expect("M must be a static dim");
-    let k_a = a_dims[1].to_usize().expect("K (A) must be a static dim");
+    assert_eq!(
+        a_dims.len(),
+        b_dims.len(),
+        "matmul A/B rank mismatch: {} vs {}",
+        a_dims.len(),
+        b_dims.len(),
+    );
+    assert!(
+        a_dims.len() == 2 || a_dims.len() == 3,
+        "matmul expects rank 2 or 3, got rank {}",
+        a_dims.len(),
+    );
+
+    let (batch, a_off) = if a_dims.len() == 3 {
+        let ba = a_dims[0].to_usize().expect("batch dim must be static");
+        let bb = b_dims[0].to_usize().expect("batch dim must be static");
+        assert_eq!(
+            ba, bb,
+            "matmul batch dim mismatch: A batch={ba}, B batch={bb}"
+        );
+        (ba, 1)
+    } else {
+        (1, 0)
+    };
+
+    let m = a_dims[a_off].to_usize().expect("M must be a static dim");
+    let k_a = a_dims[a_off + 1].to_usize().expect("K (A) must be a static dim");
     let (n, k_b) = if transpose_b {
-        // B is (N, K)
-        let n = b_dims[0].to_usize().expect("N must be a static dim");
-        let k = b_dims[1].to_usize().expect("K (B) must be a static dim");
+        // B per-batch is (N, K)
+        let n = b_dims[a_off].to_usize().expect("N must be a static dim");
+        let k = b_dims[a_off + 1].to_usize().expect("K (B) must be a static dim");
         (n, k)
     } else {
-        // B is (K, N)
-        let k = b_dims[0].to_usize().expect("K (B) must be a static dim");
-        let n = b_dims[1].to_usize().expect("N must be a static dim");
+        // B per-batch is (K, N)
+        let k = b_dims[a_off].to_usize().expect("K (B) must be a static dim");
+        let n = b_dims[a_off + 1].to_usize().expect("N must be a static dim");
         (n, k)
     };
-    assert_eq!(k_a, k_b, "matmul_2d K mismatch: A K={k_a}, B K={k_b}");
+    assert_eq!(k_a, k_b, "matmul K mismatch: A K={k_a}, B K={k_b}");
     let k = k_a;
 
     let has_bias = bias.is_some();
     if let Some(bias) = bias {
         let bdims = bias.dims();
-        assert_eq!(bdims.len(), 1, "matmul_2d bias must be 1D");
+        assert_eq!(bdims.len(), 1, "matmul bias must be 1D");
         assert_eq!(
             bdims[0].to_usize().expect("bias dim must be static"),
             n,
-            "matmul_2d bias size must equal N"
+            "matmul bias size must equal N"
         );
-        assert_eq!(bias.dtype, DType::F32, "matmul_2d bias must be F32");
+        assert_eq!(bias.dtype, DType::F32, "matmul bias must be F32");
     }
 
     let kern = Matmul2DKernel {
         m,
         n,
         k,
+        batch,
         transpose_b,
         has_bias,
+        weight_dtype,
     };
     let cx = unsafe { &mut *a.graph_ref };
     let inputs: Vec<GraphTensor> = if let Some(bias) = bias {
@@ -304,5 +397,9 @@ fn matmul_2d_inner(
     } else {
         vec![a, b]
     };
-    cx.custom_op(Matmul2DCustom(kern), inputs, (m, n), DType::F32)
+    if batch == 1 {
+        cx.custom_op(Matmul2DCustom(kern), inputs, (m, n), DType::F32)
+    } else {
+        cx.custom_op(Matmul2DCustom(kern), inputs, (batch, m, n), DType::F32)
+    }
 }

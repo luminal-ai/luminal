@@ -611,6 +611,139 @@ mod tests {
         }
     }
 
+    /// `matmul_3d`: `A (B, M, K) @ B (B, K, N) → (B, M, N)`.
+    #[test]
+    fn matmul_3d_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(20);
+        let (b, m, n, k) = (3usize, 4usize, 5usize, 7usize);
+        let a_data: Vec<f32> = (0..b * m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..b * k * n).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut expected = vec![0.0_f32; b * m * n];
+        for bi in 0..b {
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut s = 0.0_f32;
+                    for ki in 0..k {
+                        s += a_data[bi * m * k + mi * k + ki]
+                            * b_data[bi * k * n + ki * n + ni];
+                    }
+                    expected[bi * m * n + mi * n + ni] = s;
+                }
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (b, m, k));
+        let bt = cx.named_tensor("b", (b, k, n));
+        let out = luminal_cuda_lite::kernel::matmul_3d(a, bt);
+        let ac = a_data.clone();
+        let bc = b_data.clone();
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(bt, bc);
+            },
+            out,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-3, "matmul_3d mismatch at {i}: got {g}, want {e}");
+        }
+    }
+
+    /// `matmul_3d_t`: `A (B, M, K) @ B (B, N, K)ᵀ → (B, M, N)`.
+    #[test]
+    fn matmul_3d_t_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(21);
+        let (b, m, n, k) = (4usize, 5usize, 6usize, 9usize);
+        let a_data: Vec<f32> = (0..b * m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..b * n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut expected = vec![0.0_f32; b * m * n];
+        for bi in 0..b {
+            for mi in 0..m {
+                for ni in 0..n {
+                    let mut s = 0.0_f32;
+                    for ki in 0..k {
+                        s += a_data[bi * m * k + mi * k + ki]
+                            * b_data[bi * n * k + ni * k + ki];
+                    }
+                    expected[bi * m * n + mi * n + ni] = s;
+                }
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (b, m, k));
+        let bt = cx.named_tensor("b", (b, n, k));
+        let out = luminal_cuda_lite::kernel::matmul_3d_t(a, bt);
+        let ac = a_data.clone();
+        let bc = b_data.clone();
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(bt, bc);
+            },
+            out,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!((g - e).abs() < 1e-3, "matmul_3d_t mismatch at {i}: got {g}, want {e}");
+        }
+    }
+
+    /// Mixed-precision linear: `A (F32) @ B (BF16)ᵀ` against a scalar reference.
+    /// Reference uses F32 weights converted bit-for-bit from BF16 input.
+    #[test]
+    fn linear_no_bias_bf16_w_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(16);
+        let (m, n, k) = (4usize, 5usize, 17usize);
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_f32: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        // Quantize B to BF16 by truncating the low 16 bits of the F32 bit pattern,
+        // then keep an F32 copy of those exact values for the reference matmul.
+        let b_bf16_bits: Vec<u16> = b_f32
+            .iter()
+            .map(|x| (x.to_bits() >> 16) as u16)
+            .collect();
+        let b_f32_quant: Vec<f32> = b_bf16_bits
+            .iter()
+            .map(|&u| f32::from_bits((u as u32) << 16))
+            .collect();
+        let mut expected = vec![0.0_f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut s = 0.0_f32;
+                for ki in 0..k {
+                    s += a_data[mi * k + ki] * b_f32_quant[ni * k + ki];
+                }
+                expected[mi * n + ni] = s;
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (m, k));
+        let b = cx.named_tensor("b", (n, k)).as_dtype(DType::Bf16);
+        let out = luminal_cuda_lite::kernel::linear_no_bias_bf16_w(a, b);
+        let ac = a_data.clone();
+        // BF16 buffer: little-endian u16s as raw bytes.
+        let b_bytes: Vec<u8> = b_bf16_bits
+            .iter()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let bb = b_bytes;
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(b, bb);
+            },
+            out,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 5e-3,
+                "linear_no_bias_bf16_w mismatch at {i}: got {g}, want {e}"
+            );
+        }
+    }
+
     /// `linear_bias`: `A @ Bᵀ + bias` against a scalar reference.
     #[test]
     fn linear_bias_matches_reference() {
