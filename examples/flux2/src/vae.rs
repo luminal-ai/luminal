@@ -310,7 +310,7 @@ impl AttnBlock {
     fn forward(&self, x: GraphTensor) -> GraphTensor {
         let dims = x.dims();
         assert_eq!(dims.len(), 3, "AttnBlock expects (C, H, W)");
-        let h = dims[1];
+        let _h = dims[1];
         let w = dims[2];
         let residual = x;
 
@@ -322,22 +322,30 @@ impl AttnBlock {
             NORM_NUM_GROUPS,
             NORM_EPS,
         );
-        // (C, H, W) -> (C, H*W) -> (H*W, C)
-        let merged = normed.merge_dims(1, 2).transpose(0, 1);
+        // (C, H, W) -> (C, H*W) -> (H*W, C). The transpose at the end leaves
+        // a column-major view, which the direct matmul kernels assume away;
+        // `* 1.0` forces a contiguous row-major materialization.
+        let merged = normed.merge_dims(1, 2).transpose(0, 1) * 1.0_f32;
 
-        // Q, K, V — single-head attention as in the diffusers reference.
-        let n = merged.dims()[0];
-        let q = merged.matmul(self.to_q_w.t()) + self.to_q_b.expand_dim(0, n);
-        let k = merged.matmul(self.to_k_w.t()) + self.to_k_b.expand_dim(0, n);
-        let v = merged.matmul(self.to_v_w.t()) + self.to_v_b.expand_dim(0, n);
+        // Q, K, V projections — direct kernel routes around the cublaslt
+        // 2D rule, which silently fails to fire for some of these matmuls
+        // and lets search occasionally pick the broadcast Mul + SumReduce
+        // fallback. At 1024² the bad path on `q @ kᵀ` allocates a
+        // `(HW, HW, C) = (16384, 16384, 512)` ≈ 524 GiB intermediate.
+        let q = luminal_cuda_lite::kernel::linear_bias(merged, self.to_q_w, self.to_q_b);
+        let k = luminal_cuda_lite::kernel::linear_bias(merged, self.to_k_w, self.to_k_b);
+        let v = luminal_cuda_lite::kernel::linear_bias(merged, self.to_v_w, self.to_v_b);
 
         // Standard scaled dot-product attention over the spatial axis.
+        // `q @ kᵀ` with k stored row-major as `(HW, C)`: matmul_2d_t handles
+        // the transpose without materialising k as a separate tensor.
         let scale = (self.channels as f32).sqrt().recip();
-        let scores = q.matmul(k.transpose(0, 1)) * scale;
+        let scores = luminal_cuda_lite::kernel::matmul_2d_t(q, k) * scale;
         let attn_w = scores.softmax(1);
-        let attn = attn_w.matmul(v);
+        // attn_w is (HW, HW) row-major, v is (HW, C) row-major; plain matmul.
+        let attn = luminal_cuda_lite::kernel::matmul_2d(attn_w, v);
 
-        let out = attn.matmul(self.to_out_w.t()) + self.to_out_b.expand_dim(0, n);
+        let out = luminal_cuda_lite::kernel::linear_bias(attn, self.to_out_w, self.to_out_b);
         // (H*W, C) -> (C, H*W) -> (C, H, W)
         let out = out.transpose(0, 1).split_dims(1, w);
         residual + out
@@ -523,6 +531,128 @@ mod tests {
     use super::*;
     use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
     use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    /// `matmul_2d` against a scalar reference: `A (M, K) @ B (K, N) = (M, N)`.
+    #[test]
+    fn matmul_2d_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let (m, n, k) = (5usize, 7usize, 9usize);
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut expected = vec![0.0_f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut s = 0.0_f32;
+                for ki in 0..k {
+                    s += a_data[mi * k + ki] * b_data[ki * n + ni];
+                }
+                expected[mi * n + ni] = s;
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (m, k));
+        let b = cx.named_tensor("b", (k, n));
+        let out = luminal_cuda_lite::kernel::matmul_2d(a, b);
+        let ac = a_data.clone();
+        let bc = b_data.clone();
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(b, bc);
+            },
+            out,
+        );
+        assert_eq!(got.len(), expected.len());
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "matmul_2d mismatch at {i}: got {g}, want {e}"
+            );
+        }
+    }
+
+    /// `matmul_2d_t` against a scalar reference: `A (M, K) @ B (N, K)ᵀ = (M, N)`.
+    #[test]
+    fn matmul_2d_t_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(14);
+        let (m, n, k) = (4usize, 6usize, 11usize);
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut expected = vec![0.0_f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut s = 0.0_f32;
+                for ki in 0..k {
+                    s += a_data[mi * k + ki] * b_data[ni * k + ki];
+                }
+                expected[mi * n + ni] = s;
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (m, k));
+        let b = cx.named_tensor("b", (n, k));
+        let out = luminal_cuda_lite::kernel::matmul_2d_t(a, b);
+        let ac = a_data.clone();
+        let bc = b_data.clone();
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(b, bc);
+            },
+            out,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "matmul_2d_t mismatch at {i}: got {g}, want {e}"
+            );
+        }
+    }
+
+    /// `linear_bias`: `A @ Bᵀ + bias` against a scalar reference.
+    #[test]
+    fn linear_bias_matches_reference() {
+        let mut rng = StdRng::seed_from_u64(15);
+        let (m, n, k) = (3usize, 8usize, 13usize);
+        let a_data: Vec<f32> = (0..m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let b_data: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let bias_data: Vec<f32> = (0..n).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let mut expected = vec![0.0_f32; m * n];
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut s = bias_data[ni];
+                for ki in 0..k {
+                    s += a_data[mi * k + ki] * b_data[ni * k + ki];
+                }
+                expected[mi * n + ni] = s;
+            }
+        }
+        let mut cx = Graph::default();
+        let a = cx.named_tensor("a", (m, k));
+        let b = cx.named_tensor("b", (n, k));
+        let bias = cx.named_tensor("bias", n);
+        let out = luminal_cuda_lite::kernel::linear_bias(a, b, bias);
+        let ac = a_data.clone();
+        let bc = b_data.clone();
+        let bd = bias_data.clone();
+        let got = run_cuda(
+            &mut cx,
+            |r| {
+                r.set_data(a, ac);
+                r.set_data(b, bc);
+                r.set_data(bias, bd);
+            },
+            out,
+        );
+        for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-3,
+                "linear_bias mismatch at {i}: got {g}, want {e}"
+            );
+        }
+    }
 
     fn run_cuda(cx: &mut Graph, set: impl FnOnce(&mut CudaRuntime), out: GraphTensor) -> Vec<f32> {
         // output() may insert a gather to materialize contiguous layout — use
