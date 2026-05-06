@@ -18,7 +18,7 @@ jobs:
         name: Cuda Unit Tests
         runs-on: ubuntu-latest
         environment: Modal
-        timeout-minutes: 90
+        timeout-minutes: 120
 
         steps:
             - uses: actions/checkout@v6

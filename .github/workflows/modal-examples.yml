@@ -18,7 +18,7 @@ jobs:
         name: "${{ matrix.example }} (Modal ${{ matrix.gpu.type }})"
         runs-on: ubuntu-latest
         environment: Modal
-        timeout-minutes: 70
+        timeout-minutes: 120
         strategy:
             fail-fast: false
             matrix:

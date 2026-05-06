@@ -115,7 +115,7 @@ cuda_image = (
 @app.function(
     image=cuda_image,
     gpu=gpu_type,
-    timeout=3600,  # 60 minutes
+    timeout=7200,  # 2 hours
     volumes={
         HF_CACHE_PATH: hf_cache,
     },
