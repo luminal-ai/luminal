@@ -216,7 +216,7 @@ fn egglog_ruleset_declarations() -> String {
 fn egglog_main_cycle_phases(cycle: usize) -> Vec<EgglogSchedulePhase> {
     vec![EgglogSchedulePhase {
         name: format!("cycle {cycle:03} main"),
-        schedule: egglog_main_schedule().to_string(),
+        schedule: egglog_main_schedule(),
     }]
 }
 
@@ -237,12 +237,26 @@ fn egglog_final_phases() -> Vec<EgglogSchedulePhase> {
     ]
 }
 
-fn egglog_main_schedule() -> &'static str {
+fn egglog_main_schedule() -> String {
     // Producer rules create raw alternatives that downstream fusion consumes.
     // Fusion grow/merge only consumes Kernel*/FusionEnd alternatives, so keeping
     // producer discovery saturated before fusion reaches the same fixed point
     // while avoiding repeated expensive pair-discovery scans during growth.
-    "(saturate (seq
+    //
+    // `fusion_pair` is the dominant cost in cycle 001 (>97% of search time on
+    // text encoder, ~80% on transformer) and scales as O(B²·iter) in the
+    // number of binary ops. Set `LUMINAL_NO_FUSION_PAIR=1` to drop it from
+    // the schedule — fusion still runs, just without the pair-fuse seeding
+    // step, so element-wise chains will fall back to per-op kernels but the
+    // big matmul / norm / softmax kernels still get composed via
+    // fusion_grow + fusion_merge on direct_kernel/kernel_lower outputs.
+    let fusion_pair_step = if std::env::var("LUMINAL_NO_FUSION_PAIR").is_ok() {
+        ""
+    } else {
+        "(run fusion_pair)"
+    };
+    format!(
+        "(saturate (seq
         (saturate (seq
             (saturate expr)
             (saturate dtype_prop)
@@ -253,7 +267,7 @@ fn egglog_main_schedule() -> &'static str {
             (run buffer_reuse)
             (run matmul_backend)
             (run glumoe)
-            (run fusion_pair)
+            {fusion_pair_step}
         ))
         (saturate (seq
             (saturate expr)
@@ -262,6 +276,7 @@ fn egglog_main_schedule() -> &'static str {
             (run fusion_merge)
         ))
     ))"
+    )
 }
 
 fn egglog_schedule_program() -> String {

@@ -1824,19 +1824,28 @@ fn collect_state_params(
     }
     let param_count = occurrences[0].boundary_inputs.len();
     let mut state_params = vec![];
+    let debug = std::env::var("LUMINAL_DEBUG_STATE_PARAMS").is_ok()
+        && occurrences.len() >= 4
+        && occurrences[0].nodes.len() >= 30;
 
     for p in 0..param_count {
         let mut is_state = true;
+        let mut reason = "ok";
+        let mut fail_iter = 0;
         for i in 1..occurrences.len() {
             let earlier = &occurrences[i - 1];
             let later = &occurrences[i];
             let val = later.boundary_inputs.get(p).copied();
             let Some(val) = val else {
                 is_state = false;
+                reason = "no boundary input at p";
+                fail_iter = i;
                 break;
             };
             if !earlier.output_nodes.contains(&val) {
                 is_state = false;
+                reason = "val not in earlier.output_nodes";
+                fail_iter = i;
                 break;
             }
             let external_uses: Vec<_> = uses
@@ -1850,10 +1859,14 @@ fn collect_state_params(
                 .unwrap_or_default();
             if external_uses.is_empty() {
                 is_state = false;
+                reason = "no external uses";
+                fail_iter = i;
                 break;
             }
             if graph.externals(Direction::Outgoing).any(|root| root == val) {
                 is_state = false;
+                reason = "val is graph root";
+                fail_iter = i;
                 break;
             }
             if external_uses
@@ -1861,11 +1874,36 @@ fn collect_state_params(
                 .any(|(user, _)| !later.nodes.contains(user))
             {
                 is_state = false;
+                let example = external_uses
+                    .iter()
+                    .find(|(user, _)| !later.nodes.contains(user))
+                    .map(|(u, _)| u.index())
+                    .unwrap_or(usize::MAX);
+                reason = "external use outside later.nodes";
+                fail_iter = i;
+                if debug {
+                    eprintln!(
+                        "       state_params reject p={p} iter={i}: val={} reason={reason} bad_user={}",
+                        val.index(),
+                        example,
+                    );
+                }
                 break;
             }
         }
         if is_state {
             state_params.push(p);
+            if debug {
+                eprintln!(
+                    "       state_params accept p={p} (body={} trips={})",
+                    occurrences[0].nodes.len(),
+                    occurrences.len(),
+                );
+            }
+        } else if debug {
+            eprintln!(
+                "       state_params reject p={p} iter={fail_iter}: reason={reason}",
+            );
         }
     }
     state_params
