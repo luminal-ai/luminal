@@ -301,6 +301,17 @@ pub fn linear_bias(a: GraphTensor, b: GraphTensor, bias: GraphTensor) -> GraphTe
 /// caller does NOT need to insert a `.cast(F32)` op on the weight tensor.
 /// This is the right entry point for LLM-style linear projections where
 /// weights are BF16 and explicitly casting them would not fit in memory.
+///
+/// Note on the HLIR alternative: if this lowered to plain HLIR
+/// `cast(F32→BF16) + matmul + cast(BF16→F32)`, the existing 2D cuBLAS
+/// rule fires correctly for the BF16-input GEMM and unit tests pass. At
+/// flux2 text-encoder scale (~7 projections × 32 layers, M=512 N=15360
+/// K=5120) the search still occasionally picks the broadcast Mul +
+/// SumReduce fallback for at least one projection before the
+/// conditional `KernelMul` cleanup removes it, producing a 40 GB
+/// intermediate that OOMs. Until the cleanup is hardened to run eagerly
+/// (or extraction is pinned to the cublaslt alternative once it
+/// exists), this stays as a custom op.
 pub fn linear_no_bias_bf16_w(a: GraphTensor, b_bf16: GraphTensor) -> GraphTensor {
     matmul_inner(a, b_bf16, /*transpose_b=*/ true, None)
 }
