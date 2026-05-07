@@ -761,8 +761,12 @@ impl CudaRuntime {
 
         // Greedy slot assignment: process ranges in producer order and
         // assign each to the best-fit free slot, falling back to a new
-        // slot if none fits.
-        ranges.sort_by_key(|r| (r.start, r.end));
+        // slot if none fits. Sort with `node` as a tiebreaker so the
+        // resulting slot map is deterministic — `buffer_specs` is a
+        // hash map and iterating it is non-deterministic, which would
+        // otherwise let runs of the same code produce different slot
+        // assignments.
+        ranges.sort_by_key(|r| (r.start, r.end, r.node));
 
         struct SlotState {
             primary: NodeIndex,
@@ -866,6 +870,16 @@ impl CudaRuntime {
                 intermediate_total as f64 / (1024.0 * 1024.0),
                 (1.0 - intermediate_total as f64 / pre_reuse_total.max(1) as f64) * 100.0,
             );
+            if std::env::var("LUMINAL_DEBUG_REUSE_VERBOSE").is_ok() {
+                for r in &ranges {
+                    let primary = primary_for_node[&r.node];
+                    let m = if exclusive.contains(&r.node) { " (excl)" } else { "" };
+                    eprintln!(
+                        "  node {:?}: bytes={} live=[{},{}] -> primary {:?}{}",
+                        r.node, r.bytes, r.start, r.end, primary, m,
+                    );
+                }
+            }
         }
         // Stale entries for nodes that disappeared from buffer_specs:
         // drop them from cached_buffer_ptrs only if they're not still
@@ -1671,84 +1685,200 @@ impl CudaRuntime {
         bucket.exec_graph = exec_graph;
         bucket.node_to_exec = node_to_exec;
 
-        // Exec-graph-level live ranges. For each LLIR intermediate node
-        // (entry in `buffer_specs`) we record `(start_pos, end_pos)`
-        // where positions are the toposort indices of *exec ops*, NOT
-        // LLIR ops:
+        // ── Live-range analysis ────────────────────────────────────────
         //
-        //   * `start_pos` = position of the exec op that produces the
-        //     node — i.e. the op whose `output` is this node, or whose
-        //     `extra_buffer_nodes()` contains it.
-        //   * `end_pos` = max position of any exec op that consumes
-        //     the node (in `inputs` or `extra_buffer_nodes()`). When
-        //     the node has no consumer in the exec graph, end is set
-        //     to `usize::MAX` — the only way to reach it is via
-        //     `get_f32`-style readbacks after `execute()` returns, so
-        //     the buffer must outlive the entire forward pass.
+        // Two-tier ordering: between exec ops we use the exec graph's
+        // toposort; *inside* a `CudaGraphOp` we use that op's own
+        // `kernel_topo_order()`, which is the order in which its
+        // kernels actually execute (the CUDA graph builds them with
+        // `prev_graph_node` as the sole dep, so they're strictly
+        // serialized).
         //
-        // This is intentionally conservative inside a single `CudaGraphOp`:
-        // every kernel inside that op shares one exec position, so
-        // their live ranges all overlap and they each get their own
-        // slot. We give up some intra-CUDA-graph reuse for correctness
-        // — exec-graph topo is what `execute()` actually walks and is
-        // the only ordering we know matches runtime, whereas LLIR-level
-        // toposort can disagree with `kernel_to_host`'s internal kernel
-        // ordering for unconstrained pairs and would let two
-        // simultaneously-live kernels share a slot. Most of the win on
-        // memory-constrained models comes from cross-CudaGraphOp reuse
-        // anyway (e.g. one transformer layer's intermediates dropping
-        // before the next layer's intermediates allocate).
+        // Stitching the two together gives every LLIR intermediate
+        // node a single integer position whose ordering matches real
+        // execution time:
+        //
+        //   * Cross-CudaGraphOp ordering is enforced by the runtime
+        //     stream serializing `runtime.execute()` calls.
+        //   * Intra-CudaGraphOp ordering is enforced by the CUDA graph
+        //     dep chain.
+        //
+        // Two LLIR nodes with non-overlapping `(start, end)` ranges in
+        // this combined position space can therefore safely share a
+        // physical buffer.
         let exec_topo = match toposort(&bucket.exec_graph, None) {
             Ok(t) => t,
             Err(_) => Vec::new(),
         };
-        let exec_pos: FxHashMap<NodeIndex, usize> = exec_topo
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (*n, i))
-            .collect();
-        let mut producer_pos: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-        let mut consumer_max_pos: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-        let mut consumed_by_output_node: FxHashSet<NodeIndex> = FxHashSet::default();
+        let mut llir_pos: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        let mut next_pos: usize = 0;
+        let mut cuda_graph_kernels: FxHashMap<NodeIndex, Vec<NodeIndex>> =
+            FxHashMap::default();
         for &exec_node in &exec_topo {
             let exec_op = &bucket.exec_graph[exec_node];
-            let p = exec_pos[&exec_node];
-            // Producer: this op writes to `output` and to any nodes in
-            // its `extra_buffer_nodes` (kernel outputs inside a
-            // CudaGraphOp). `or_insert` keeps the FIRST producer if a
-            // node somehow appears in multiple ops — shouldn't happen
-            // but defensively we don't overwrite.
-            producer_pos.entry(exec_op.output).or_insert(p);
-            let extras = exec_op.internal.extra_buffer_nodes();
-            for extra in &extras {
-                producer_pos.entry(*extra).or_insert(p);
-            }
-            // Consumer: this op reads from `inputs` and from `extras`
-            // (extras are read-write within the CudaGraphOp).
-            for &inp in &exec_op.inputs {
-                let entry = consumer_max_pos.entry(inp).or_insert(p);
-                *entry = (*entry).max(p);
-            }
-            for extra in extras {
-                let entry = consumer_max_pos.entry(extra).or_insert(p);
-                *entry = (*entry).max(p);
+            // If this exec op is a CudaGraphOp, walk its internal
+            // kernel topo order; otherwise treat the op as a single
+            // position, with its `output` taking that position and any
+            // extras pinned to it too.
+            if let Some(cgo) = exec_op
+                .internal
+                .as_any()
+                .downcast_ref::<crate::kernel::CudaGraphOp>()
+            {
+                let kernels = cgo.kernel_topo_order();
+                cuda_graph_kernels.insert(exec_node, kernels.clone());
+                for k in kernels {
+                    llir_pos.entry(k).or_insert_with(|| {
+                        let p = next_pos;
+                        next_pos += 1;
+                        p
+                    });
+                }
+            } else {
+                let p = next_pos;
+                next_pos += 1;
+                llir_pos.entry(exec_op.output).or_insert(p);
+                for extra in exec_op.internal.extra_buffer_nodes() {
+                    llir_pos.entry(extra).or_insert(p);
+                }
             }
         }
-        // Output nodes (HLIR `Output` markers) are themselves in
-        // `bucket.exec_graph`? Actually not — Output nodes are LLIR
-        // nodes referenced by `output_producers`, not exec ops. So a
-        // node IS user-readable iff its only consumers are these
-        // output_producers entries (i.e. no consumer at all in the
-        // exec graph). We catch that via `consumer_max_pos` being
-        // unset → end = MAX below.
-        let _ = consumed_by_output_node;
+
+        // Now compute consumers. For each exec op, its `inputs` and
+        // `extras` are read from buffer pointers — anyone that's a
+        // producer-position-mapped intermediate has its live_end
+        // bumped to at least the consumer's exec position. If the
+        // consumer is a CudaGraphOp, we want a finer-grained position:
+        // the position of the LAST kernel inside that CudaGraphOp that
+        // reads the buffer.  But CudaGraphOp's `extras` list isn't
+        // ordered, so we just use the position of the LAST kernel in
+        // the CudaGraphOp as a conservative upper bound.
+        let mut exec_op_last_pos: FxHashMap<NodeIndex, usize> =
+            FxHashMap::default();
+        let mut exec_op_first_pos: FxHashMap<NodeIndex, usize> =
+            FxHashMap::default();
+        for &exec_node in &exec_topo {
+            let exec_op = &bucket.exec_graph[exec_node];
+            if let Some(kernels) = cuda_graph_kernels.get(&exec_node) {
+                let positions: Vec<usize> = kernels
+                    .iter()
+                    .filter_map(|k| llir_pos.get(k).copied())
+                    .collect();
+                let first = positions.iter().min().copied();
+                let last = positions.iter().max().copied();
+                if let Some(f) = first {
+                    exec_op_first_pos.insert(exec_node, f);
+                }
+                if let Some(l) = last {
+                    exec_op_last_pos.insert(exec_node, l);
+                }
+            } else {
+                let p = llir_pos.get(&exec_op.output).copied().unwrap_or(0);
+                exec_op_first_pos.insert(exec_node, p);
+                exec_op_last_pos.insert(exec_node, p);
+            }
+        }
+
+        // Build consumer_max_pos in two passes.
+        //
+        // First, the per-kernel refinement: for each kernel inside a
+        // CudaGraphOp, look at its declared LLIR-graph inputs and bump
+        // each input's consumer position up to the kernel's own
+        // position. This is the precise intra-CudaGraphOp consumer
+        // info — kernel B reading kernel A's output bumps A's
+        // consumer pos up to B's pos, NOT to the CudaGraphOp's last
+        // position.
+        //
+        // Then a coarser fallback for `inputs`/`extras` of *non*-
+        // CudaGraphOp ExecOps (and any node we missed): fall back to
+        // that exec op's last position. We iterate this after the
+        // refinement and use `or_insert`-style updates so the precise
+        // intra-graph data wins where we have it.
+        let mut consumer_max_pos: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+
+        // Pass 1: precise per-kernel refinement.
+        for (&exec_node, kernels) in &cuda_graph_kernels {
+            let exec_op = &bucket.exec_graph[exec_node];
+            let cgo = exec_op
+                .internal
+                .as_any()
+                .downcast_ref::<crate::kernel::CudaGraphOp>()
+                .expect("cuda_graph_kernels entry must be a CudaGraphOp");
+            for k_node in kernels {
+                let k_pos = match llir_pos.get(k_node) {
+                    Some(&p) => p,
+                    None => continue,
+                };
+                for input_node in cgo.kernel_inputs(*k_node) {
+                    let entry = consumer_max_pos.entry(input_node).or_insert(k_pos);
+                    *entry = (*entry).max(k_pos);
+                }
+            }
+        }
+
+        // Pass 2: cross-CudaGraphOp inputs/extras (and any input that
+        // happens to be consumed by a non-CudaGraphOp HostOp).
+        for &exec_node in &exec_topo {
+            let exec_op = &bucket.exec_graph[exec_node];
+            // For CudaGraphOps we already accounted for the per-kernel
+            // consumers; skip the coarse pass to avoid bumping those
+            // up to the whole graph's last position.
+            if cuda_graph_kernels.contains_key(&exec_node) {
+                continue;
+            }
+            let consumer_pos = exec_op_last_pos
+                .get(&exec_node)
+                .copied()
+                .unwrap_or(0);
+            for &inp in &exec_op.inputs {
+                let e = consumer_max_pos.entry(inp).or_insert(consumer_pos);
+                *e = (*e).max(consumer_pos);
+            }
+            for extra in exec_op.internal.extra_buffer_nodes() {
+                let e = consumer_max_pos.entry(extra).or_insert(consumer_pos);
+                *e = (*e).max(consumer_pos);
+            }
+        }
+        let _ = exec_op_first_pos;
+
         for (node, _spec) in bucket.buffer_specs.clone() {
-            let start = producer_pos.get(&node).copied().unwrap_or(0);
+            let start = llir_pos.get(&node).copied().unwrap_or(0);
             let end = consumer_max_pos
                 .get(&node)
                 .copied()
                 .unwrap_or(usize::MAX);
             bucket.live_ranges.insert(node, (start, end));
+        }
+
+        if std::env::var("LUMINAL_DEBUG_REUSE").is_ok() {
+            eprintln!(
+                "compile_bucket live ranges: {} buffer_specs nodes, {} CudaGraphOps, max_pos={}",
+                bucket.buffer_specs.len(),
+                cuda_graph_kernels.len(),
+                next_pos.saturating_sub(1),
+            );
+            // Sanity check: are we computing distinct positions for kernel ops?
+            let mut distinct_positions: FxHashSet<usize> = FxHashSet::default();
+            let mut max_live = 0usize;
+            let mut infinite_live = 0usize;
+            let mut zero_consumers = 0usize;
+            for (_n, &(s, e)) in &bucket.live_ranges {
+                distinct_positions.insert(s);
+                if e == usize::MAX {
+                    infinite_live += 1;
+                } else if e == s {
+                    zero_consumers += 1;
+                } else {
+                    max_live = max_live.max(e - s);
+                }
+            }
+            eprintln!(
+                "  distinct producer positions: {}, infinite_live: {}, zero_consumers: {}, max_live: {}",
+                distinct_positions.len(),
+                infinite_live,
+                zero_consumers,
+                max_live,
+            );
         }
 
         bucket.hlir_synced = false;

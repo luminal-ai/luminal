@@ -183,6 +183,37 @@ impl CudaGraphOp {
             state: RefCell::new(state),
         }
     }
+
+    /// LLIR node IDs of every kernel in this CudaGraphOp, in the order
+    /// they execute inside the compiled CUDA graph. This is the
+    /// toposort `kernel_to_host` used at compile time, preserved here
+    /// so the runtime can compute live ranges that match real
+    /// execution order: each kernel in `state.kernels` was added to
+    /// the CUDA graph with `prev_graph_node` as its sole dependency,
+    /// which serializes them.
+    pub fn kernel_topo_order(&self) -> Vec<NodeIndex> {
+        self.state
+            .borrow()
+            .kernels
+            .iter()
+            .map(|k| k.node)
+            .collect()
+    }
+
+    /// Direct LLIR-node inputs of one kernel inside this CudaGraphOp.
+    /// Used by the runtime's live-range pass to refine intra-graph
+    /// consumer positions: a kernel's input can stop being live as
+    /// soon as that specific kernel finishes, not when the whole
+    /// CudaGraphOp finishes.
+    pub fn kernel_inputs(&self, kernel_node: NodeIndex) -> Vec<NodeIndex> {
+        self.state
+            .borrow()
+            .kernels
+            .iter()
+            .find(|k| k.node == kernel_node)
+            .map(|k| k.inputs.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl std::fmt::Debug for CudaGraphOp {
