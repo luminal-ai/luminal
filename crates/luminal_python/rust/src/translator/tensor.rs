@@ -72,6 +72,99 @@ impl<'a> Translator<'a> {
         })
     }
 
+    /// Lower `aten.histc.default` for the integer-bincount case.
+    ///
+    /// Qwen3-MoE's expert-balance layer calls
+    /// `torch.histc(expert_ids.int(), bins=K, min=0, max=K-1)` to count how
+    /// many tokens were routed to each expert. With those args every
+    /// integer value `i ∈ [0, K-1]` maps to exactly bin `i`, and the result
+    /// is equivalent to `torch.bincount`. We implement that case as a
+    /// broadcast equality + sum:
+    ///
+    ///   counts[b] = sum_i (input[i] == b + min)   for b in [0, bins)
+    ///
+    /// More general histc bin widths (`bins != max - min + 1`, or
+    /// non-integer values that span fractional bins) are not supported
+    /// today — the equality path would silently drop them. We bail rather
+    /// than produce wrong counts.
+    pub(crate) fn translate_histc(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let bins_i64: i64 = self
+            .get_int_arg(node, 1)
+            .context("histc: missing `bins` arg (#1)")?;
+        // `min`/`max` are float kwargs (default 0.0 each, which means
+        // "auto-pick from input"); for the qwen3-moe call they're always
+        // integers passed as floats.
+        let min = self.get_float_arg(node, 2).unwrap_or(0.0);
+        let max = self.get_float_arg(node, 3).unwrap_or(0.0);
+
+        anyhow::ensure!(
+            input.shape.len() == 1,
+            "histc: only 1D input is supported, got {}D",
+            input.shape.len()
+        );
+        anyhow::ensure!(
+            bins_i64 > 0,
+            "histc: bins must be positive, got {}",
+            bins_i64
+        );
+        // Bincount-equivalent case: one integer value per bin.
+        anyhow::ensure!(
+            (max - min - (bins_i64 - 1) as f64).abs() < 1e-6,
+            "histc: only the bincount-equivalent case (bins == max - min + 1) is \
+             supported; got bins={}, min={}, max={}. Other cases would need a \
+             general bin-width / right-edge-inclusion implementation.",
+            bins_i64,
+            min,
+            max,
+        );
+
+        let bins_u = bins_i64 as usize;
+        let n = input.shape.dims[0];
+
+        // arange(bins) [bins] → cast to input dtype, optionally shift by min,
+        // broadcast to [bins, N], compare for equality with input broadcast.
+        let mut bins_arange = self.graph.arange(Expression::from(bins_u));
+        if min != 0.0 {
+            // `min` is non-zero (uncommon in the qwen3-moe path but legal)
+            // — shift the comparison values to start at min.
+            let min_i = min as i64;
+            let shift = self
+                .graph
+                .constant_float(min_i as f32)
+                .cast(bins_arange.dtype)
+                .expand_rhs(bins_arange.shape);
+            bins_arange = bins_arange + shift;
+        }
+        let bins_expanded = bins_arange
+            .cast(input.dtype)
+            .expand_dim(1, n);
+        let input_expanded = input.expand_dim(0, Expression::from(bins_u));
+        let matches = input_expanded.eq(bins_expanded); // Bool [bins, N]
+
+        let out_dtype = self.output_meta_dtype(node)?;
+        Ok(matches.cast(out_dtype).sum(1))
+    }
+
+    /// Lower `aten.empty.memory_format` and `aten.empty_permuted.default`.
+    ///
+    /// Both allocate an uninitialised tensor; the caller is responsible for
+    /// writing into it. We materialise zeros instead — luminal has no
+    /// "uninitialised" notion, and PyTorch's contract on `empty` outputs is
+    /// undefined for any read prior to a write, so a zero-fill is sound.
+    /// `aten.empty_permuted` additionally takes a `physical_layout` arg
+    /// (the storage permutation); for a zero-filled tensor that's a no-op.
+    pub(crate) fn translate_empty(&mut self, node: &Node) -> Result<GraphTensor> {
+        let shape = self.get_exprs_arg(node, FULL_SHAPE_ARG)?;
+        let dtype = self.output_meta_dtype(node)?;
+        let zero = self.graph.constant_float(0.0).cast(dtype);
+        Ok(if shape.is_empty() {
+            zero
+        } else {
+            zero.expand_rhs(shape)
+        })
+    }
+
     pub(crate) fn translate_full_like(&mut self, node: &Node) -> Result<GraphTensor> {
         let reference = self.get_input_tensor(node, FULL_LIKE_INPUT_ARG)?;
         let val = if let Ok(f) = self.get_float_arg(node, FULL_LIKE_VALUE_ARG) {
