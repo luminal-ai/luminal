@@ -850,9 +850,52 @@ impl CudaRuntime {
                 .map(|b| b.len())
                 .unwrap_or(0);
             if existing < needed {
-                bucket
-                    .buffers
-                    .insert(slot.primary, stream.alloc_zeros(needed).unwrap());
+                let buf = stream.alloc_zeros(needed).unwrap_or_else(|e| {
+                    // Surface which kernel's buffer overflowed and a
+                    // top-of-the-list ranking so we can see if the
+                    // failing one is an outlier or part of a broader
+                    // pattern (e.g. broadcast Mul intermediate vs.
+                    // legitimate weight buffer).
+                    let dtype = bucket
+                        .buffer_specs
+                        .get(&slot.primary)
+                        .map(|s| format!("{:?}", s.dtype))
+                        .unwrap_or_else(|| "?".to_string());
+                    let mut all: Vec<(NodeIndex, usize, String)> = slots
+                        .iter()
+                        .map(|s| {
+                            let dt = bucket
+                                .buffer_specs
+                                .get(&s.primary)
+                                .map(|spec| format!("{:?}", spec.dtype))
+                                .unwrap_or_else(|| "?".to_string());
+                            (s.primary, s.max_size, dt)
+                        })
+                        .collect();
+                    all.sort_by_key(|(_, sz, _)| std::cmp::Reverse(*sz));
+                    let top: Vec<String> = all
+                        .iter()
+                        .take(5)
+                        .map(|(n, sz, dt)| {
+                            format!(
+                                "node={} size={:.2}GB dtype={}",
+                                n.index(),
+                                *sz as f64 / (1024.0 * 1024.0 * 1024.0),
+                                dt,
+                            )
+                        })
+                        .collect();
+                    panic!(
+                        "alloc_zeros({} bytes ≈ {:.2} GB) for slot primary node={} dtype={} failed: {}\n  top-5 buffers (slot.max_size):\n    {}",
+                        needed,
+                        needed as f64 / (1024.0 * 1024.0 * 1024.0),
+                        slot.primary.index(),
+                        dtype,
+                        e,
+                        top.join("\n    "),
+                    );
+                });
+                bucket.buffers.insert(slot.primary, buf);
                 total_alloc += needed;
             }
         }
