@@ -52,6 +52,9 @@ struct RollingSearchDiagnostics {
     rejected_zero_state_params: usize,
     best_rejected: Option<RollingRejectedCandidate>,
     top_runs: Vec<String>,
+    /// Every discovered run, dumped via `LUMINAL_DEBUG_ROLLING=1`.
+    /// Each entry mirrors the `summary` format used for `top_runs`.
+    all_runs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -716,6 +719,14 @@ impl Graph {
         for run in report.diagnostics.top_runs.iter().take(5) {
             println!("   {:>6}  run: {}", "Rolled".yellow().bold(), run);
         }
+        // Verbose dump of every discovered run with its savings so we
+        // can see why a logically-correct rolling target gets rejected
+        // (e.g. state_params=0). Gated on `LUMINAL_DEBUG_ROLLING=1`.
+        if std::env::var("LUMINAL_DEBUG_ROLLING").is_ok() {
+            for (i, run) in report.diagnostics.all_runs.iter().enumerate() {
+                println!("   {:>6}  run[{}]: {}", "Rolled".dimmed(), i, run);
+            }
+        }
         if candidate.occurrences.len() < 2 {
             return 0;
         }
@@ -868,8 +879,9 @@ impl Graph {
                     starts.iter().copied().take(4).collect::<Vec<_>>()
                 );
                 if occs.len() >= 20 && diagnostics.top_runs.len() < 16 {
-                    diagnostics.top_runs.push(summary);
+                    diagnostics.top_runs.push(summary.clone());
                 }
+                diagnostics.all_runs.push(summary);
 
                 let state_params = collect_state_params(&occs, &uses, &self.graph);
                 if state_params.is_empty() {
