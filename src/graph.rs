@@ -1396,7 +1396,35 @@ impl Graph {
                     n_graphs = 1;
                     break;
                 }
-                Ok(_) | Err(_) => {
+                Ok((_, _, true)) => {
+                    if std::env::var("LUMINAL_DEBUG_INIT_GENOME").is_ok() {
+                        eprintln!("  init genome attempt {}: rejected (NaN outputs)", init_attempts);
+                    }
+                    if options
+                        .group_timeout
+                        .is_some_and(|timeout| group_start.elapsed() >= timeout)
+                    {
+                        panic!("Failed to find a viable initial genome before timeout");
+                    }
+                    list_cache.clear();
+                    expr_cache.clear();
+                    continue;
+                }
+                Err(payload) => {
+                    if std::env::var("LUMINAL_DEBUG_INIT_GENOME").is_ok() {
+                        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                            (*s).to_string()
+                        } else if let Some(s) = payload.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "<non-string panic>".to_string()
+                        };
+                        eprintln!(
+                            "  init genome attempt {}: panic = {}",
+                            init_attempts,
+                            msg.chars().take(160).collect::<String>(),
+                        );
+                    }
                     if options
                         .group_timeout
                         .is_some_and(|timeout| group_start.elapsed() >= timeout)

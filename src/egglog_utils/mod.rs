@@ -245,15 +245,31 @@ fn egglog_main_schedule() -> String {
     //
     // `fusion_pair` is the dominant cost in cycle 001 (>97% of search time on
     // text encoder, ~80% on transformer) and scales as O(B²·iter) in the
-    // number of binary ops. Set `LUMINAL_NO_FUSION_PAIR=1` to drop it from
-    // the schedule — fusion still runs, just without the pair-fuse seeding
-    // step, so element-wise chains will fall back to per-op kernels but the
-    // big matmul / norm / softmax kernels still get composed via
-    // fusion_grow + fusion_merge on direct_kernel/kernel_lower outputs.
-    let fusion_pair_step = if std::env::var("LUMINAL_NO_FUSION_PAIR").is_ok() {
+    // number of binary ops.
+    //
+    // - `LUMINAL_NO_FUSION_PAIR=1` drops only the pair-fuse seeding. fusion_grow
+    //   and fusion_merge still run, but with nothing to consume.
+    // - `LUMINAL_NO_FUSION=1` drops *all three* fusion phases. The graph stays
+    //   as un-fused `KernelX` ops — each element-wise op becomes its own kernel
+    //   launch. Slower per-step (more launch overhead, no register-resident
+    //   fusion), but `cycle 001` is fast and the egraph stays small. This is
+    //   the correct setting when fusion's combinatorial growth blows up RAM
+    //   (e.g. flux2 8+48 transformer hits 500 GB RSS in fusion_pair).
+    let no_fusion = std::env::var("LUMINAL_NO_FUSION").is_ok();
+    let fusion_pair_step = if no_fusion || std::env::var("LUMINAL_NO_FUSION_PAIR").is_ok() {
         ""
     } else {
         "(run fusion_pair)"
+    };
+    let fusion_grow_step = if no_fusion {
+        ""
+    } else {
+        "(run fusion_grow)"
+    };
+    let fusion_merge_step = if no_fusion {
+        ""
+    } else {
+        "(run fusion_merge)"
     };
     format!(
         "(saturate (seq
@@ -272,8 +288,8 @@ fn egglog_main_schedule() -> String {
         (saturate (seq
             (saturate expr)
             (saturate dtype_prop)
-            (run fusion_grow)
-            (run fusion_merge)
+            {fusion_grow_step}
+            {fusion_merge_step}
         ))
     ))"
     )
