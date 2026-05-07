@@ -136,9 +136,7 @@ impl<'a> Translator<'a> {
                 .expand_rhs(bins_arange.shape);
             bins_arange = bins_arange + shift;
         }
-        let bins_expanded = bins_arange
-            .cast(input.dtype)
-            .expand_dim(1, n);
+        let bins_expanded = bins_arange.cast(input.dtype).expand_dim(1, n);
         let input_expanded = input.expand_dim(0, Expression::from(bins_u));
         let matches = input_expanded.eq(bins_expanded); // Bool [bins, N]
 
@@ -331,10 +329,7 @@ impl<'a> Translator<'a> {
         let out_dtype = x.dtype;
         // Build a tensor for the scalar `other` matching `x`'s shape so we
         // can route through the shared where_formula helper.
-        let other = self
-            .graph
-            .constant_float(other_val)
-            .expand_rhs(x.shape);
+        let other = self.graph.constant_float(other_val).expand_rhs(x.shape);
         Ok(self.where_formula(cond, x, other, out_dtype))
     }
 

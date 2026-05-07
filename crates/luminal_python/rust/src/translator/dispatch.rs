@@ -191,8 +191,9 @@ impl<'a> Translator<'a> {
             // PyTorch's side, and downstream writes overwrite our zeros.
             // Qwen3MoE's MoE block uses `empty_permuted` to allocate the
             // expert-output staging tensor before scatter-adding into it.
-            "torch.ops.aten.empty.memory_format"
-            | "torch.ops.aten.empty_permuted.default" => self.translate_empty(node)?,
+            "torch.ops.aten.empty.memory_format" | "torch.ops.aten.empty_permuted.default" => {
+                self.translate_empty(node)?
+            }
             // Qwen3-MoE's expert-balance counts tokens-per-expert via histc.
             "torch.ops.aten.histc.default" => self.translate_histc(node)?,
 
