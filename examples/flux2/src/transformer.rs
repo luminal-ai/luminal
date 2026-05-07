@@ -838,6 +838,18 @@ impl Flux2Transformer {
     /// runtime; the caller is responsible for the `* 1000` scaling that
     /// diffusers does in its forward.
     fn embed_time(&self, timestep: GraphTensor, guidance: GraphTensor) -> GraphTensor {
+        // Diffusers' Flux2Transformer2DModel.forward multiplies its
+        // timestep + guidance inputs by 1000 before passing them to
+        // `time_guidance_embed`. The pipeline upstream divides the raw
+        // scheduler timestep by 1000 to give the transformer a 0..1
+        // scalar; the transformer multiplies it back to 0..1000 here so
+        // the sin/cos `time_proj` argument range matches what the
+        // model was trained on.
+        //
+        // Our `main.rs` feeds the same 0..1 sigma scalar (matching the
+        // pipeline-level interface) and we mirror the *1000 here.
+        let timestep = timestep * 1000.0_f32;
+        let guidance = guidance * 1000.0_f32;
         let t_proj = timesteps_proj(timestep, TIMESTEP_GUIDANCE_CHANNELS);
         let t1 = linear_no_bias(t_proj, self.time_t1_w).silu();
         let t_emb = linear_no_bias(t1, self.time_t2_w);
@@ -869,27 +881,58 @@ impl Flux2Transformer {
         timestep: GraphTensor,
         guidance: GraphTensor,
     ) -> GraphTensor {
+        self.forward_with_internals(latent, text_embed, rope_cos, rope_sin, timestep, guidance)
+            .0
+    }
+
+    /// Same as `forward` but also returns a Vec<(name, GraphTensor)> of
+    /// intermediate values for numerics-comparison against diffusers'
+    /// `dump_transformer_internals.py`. Names match the diffusers
+    /// dump's `tx_*` keys.
+    pub fn forward_with_internals(
+        &self,
+        latent: GraphTensor,
+        text_embed: GraphTensor,
+        rope_cos: GraphTensor,
+        rope_sin: GraphTensor,
+        timestep: GraphTensor,
+        guidance: GraphTensor,
+    ) -> (GraphTensor, Vec<(String, GraphTensor)>) {
+        let mut dumps: Vec<(String, GraphTensor)> = Vec::new();
         let temb = self.embed_time(timestep, guidance);
+        dumps.push(("temb".into(), temb));
 
         let mod_img = modulation(temb, self.mod_img);
         let mod_txt = modulation(temb, self.mod_txt);
         let mod_single = modulation(temb, self.mod_single);
+        dumps.push(("mod_img".into(), mod_img));
+        dumps.push(("mod_txt".into(), mod_txt));
+        dumps.push(("mod_single".into(), mod_single));
 
         let mut img = linear_no_bias(latent, self.x_embedder);
         let mut txt = linear_no_bias(text_embed, self.context_embedder);
+        dumps.push(("x_embedded".into(), img));
+        dumps.push(("context_embedded".into(), txt));
 
-        for block in &self.transformer_blocks {
+        for (idx, block) in self.transformer_blocks.iter().enumerate() {
             let (i, t) = block.forward(img, txt, mod_img, mod_txt, rope_cos, rope_sin);
             img = i;
             txt = t;
+            if idx < 3 {
+                dumps.push((format!("after_double_{idx}_img"), img));
+                dumps.push((format!("after_double_{idx}_txt"), txt));
+            }
         }
 
         let s_img = img.dims()[0].to_usize().expect("S_img static");
         let s_txt = txt.dims()[0].to_usize().expect("S_txt static");
         let mut hidden = txt.concat_along(img, 0); // (S_txt + S_img, HIDDEN)
 
-        for block in &self.single_transformer_blocks {
+        for (idx, block) in self.single_transformer_blocks.iter().enumerate() {
             hidden = block.forward(hidden, mod_single, rope_cos, rope_sin);
+            if idx < 3 {
+                dumps.push((format!("after_single_{idx}"), hidden));
+            }
         }
 
         // Drop text prefix.
@@ -904,7 +947,7 @@ impl Flux2Transformer {
         let normed = layernorm_noaffine(img, RMS_EPS);
         let modulated = ada_modulate(normed, scale, shift);
 
-        linear_no_bias(modulated, self.proj_out)
+        (linear_no_bias(modulated, self.proj_out), dumps)
     }
 }
 

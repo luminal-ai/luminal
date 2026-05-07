@@ -490,9 +490,17 @@ fn run_full_pipeline(
     let guidance_in = cx.named_tensor("__guidance", 1).persist();
 
     let model = transformer::Flux2Transformer::init(&mut cx);
-    let velocity = model
-        .forward(latent_in, text_in, cos_in, sin_in, timestep_in, guidance_in)
-        .output();
+    let (vel_raw, internals) = model.forward_with_internals(
+        latent_in, text_in, cos_in, sin_in, timestep_in, guidance_in,
+    );
+    let velocity = vel_raw.output();
+    // Promote each internal to a graph output so we can read its
+    // value via `runtime.get_f32` after execute, and compare to
+    // diffusers' matching `tx_*` dump.
+    let internal_outputs: Vec<(String, GraphTensor)> = internals
+        .into_iter()
+        .map(|(name, t)| (name, t.output()))
+        .collect();
 
     println!("Building search space (this is the long step — many minutes for the full DiT)...");
     if let Ok(g) = std::env::var("TX_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
@@ -555,6 +563,22 @@ fn run_full_pipeline(
                 &v[..s_img * transformer::IN_CHANNELS],
                 &[1, s_img, transformer::IN_CHANNELS],
             );
+            // Dump the same `tx_*` intermediates diffusers'
+            // `dump_transformer_internals.py` captures, so
+            // `compare_refs.py` can show exactly which stage
+            // diverges.
+            if std::env::var("DUMP_REFS").is_ok() {
+                for (name, gt) in &internal_outputs {
+                    let buf = runtime.get_f32(*gt);
+                    let dims = gt.dims();
+                    let shape: Vec<usize> = dims
+                        .iter()
+                        .map(|d| d.to_usize().expect("static dim"))
+                        .collect();
+                    let n_elems: usize = shape.iter().product();
+                    dump_ref(&format!("tx_{name}"), &buf[..n_elems], &shape);
+                }
+            }
         }
         // Euler integrate: latent += (sigma_next - sigma) * v
         euler_step(&mut latent, &v, sigmas[i], sigmas[i + 1]);
