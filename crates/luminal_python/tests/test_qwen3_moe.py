@@ -34,6 +34,7 @@ from luminal import luminal_backend
 #  Helpers
 # ────────────────────────────────────────────────────────────────────────
 
+
 def _make_qwen3_moe_config(
     hidden_size: int,
     num_attention_heads: int,
@@ -90,6 +91,7 @@ def _run_hf_qwen3_moe_test(config, device: torch.device, atol: float):
 # ────────────────────────────────────────────────────────────────────────
 #  Tests — progressively larger configs
 # ────────────────────────────────────────────────────────────────────────
+
 
 def test_hf_qwen3_moe_tiny(device: torch.device):
     """HuggingFace Qwen3MoeForCausalLM — tiny: 2 experts, top-1 routing.
