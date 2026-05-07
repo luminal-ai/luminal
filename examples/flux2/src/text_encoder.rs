@@ -156,7 +156,13 @@ fn causal_sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let weights = masked.softmax(2);
     // attn = weights @ v: (heads, seq, seq) @ (heads, seq, head_dim) = (heads, seq, head_dim).
     let attn = luminal_cuda_lite::kernel::matmul_3d(weights, v);
-    attn.transpose(0, 1).merge_dims(1, 2) // (seq_q, n_heads*head_dim)
+    // `transpose(0, 1).merge_dims(1, 2)` produces the merge_dims
+    // non-contiguous K stride `(((z/HEAD_DIM)*HEAD_DIM)*SEQ)+(z%HEAD_DIM)`.
+    // The cublaslt 2D rule requires `K stride = MIter` (contiguous), so
+    // without forcing materialization here the downstream o_proj matmul
+    // falls through to a broadcast Mul whose `(SEQ, HIDDEN, KV_DIM)`
+    // intermediate is ~20 GB BF16 and OOMs the GPU during search.
+    attn.transpose(0, 1).merge_dims(1, 2) * 1.0_f32 // (seq_q, n_heads*head_dim)
 }
 
 // =============================================================================

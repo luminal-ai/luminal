@@ -68,6 +68,11 @@ impl Debug for ExecutableHostOp {
 pub(crate) struct BufferSpec {
     bytes: Expression,
     dtype: DType,
+    /// LLIR op `Debug` snippet captured at compile_bucket time, only
+    /// populated when `LUMINAL_DEBUG_ALLOC=1`. Used by the
+    /// `alloc_zeros` OOM diagnostic to identify which kernel produced
+    /// a runaway intermediate (shape/strides are in the Debug print).
+    op_debug: Option<String>,
 }
 
 /// Per-bucket compiled state. Each bucket holds its own executable graph,
@@ -861,28 +866,40 @@ impl CudaRuntime {
                         .get(&slot.primary)
                         .map(|s| format!("{:?}", s.dtype))
                         .unwrap_or_else(|| "?".to_string());
-                    let mut all: Vec<(NodeIndex, usize, String)> = slots
+                    let mut all: Vec<(NodeIndex, usize, String, String)> = slots
                         .iter()
                         .map(|s| {
-                            let dt = bucket
-                                .buffer_specs
-                                .get(&s.primary)
-                                .map(|spec| format!("{:?}", spec.dtype))
+                            let spec = bucket.buffer_specs.get(&s.primary);
+                            let dt = spec
+                                .map(|sp| format!("{:?}", sp.dtype))
                                 .unwrap_or_else(|| "?".to_string());
-                            (s.primary, s.max_size, dt)
+                            let op = spec
+                                .and_then(|sp| sp.op_debug.clone())
+                                .unwrap_or_default();
+                            (s.primary, s.max_size, dt, op)
                         })
                         .collect();
-                    all.sort_by_key(|(_, sz, _)| std::cmp::Reverse(*sz));
+                    all.sort_by_key(|(_, sz, _, _)| std::cmp::Reverse(*sz));
                     let top: Vec<String> = all
                         .iter()
                         .take(5)
-                        .map(|(n, sz, dt)| {
-                            format!(
-                                "node={} size={:.2}GB dtype={}",
-                                n.index(),
-                                *sz as f64 / (1024.0 * 1024.0 * 1024.0),
-                                dt,
-                            )
+                        .map(|(n, sz, dt, op)| {
+                            if op.is_empty() {
+                                format!(
+                                    "node={} size={:.2}GB dtype={}",
+                                    n.index(),
+                                    *sz as f64 / (1024.0 * 1024.0 * 1024.0),
+                                    dt,
+                                )
+                            } else {
+                                format!(
+                                    "node={} size={:.2}GB dtype={}\n      op: {}",
+                                    n.index(),
+                                    *sz as f64 / (1024.0 * 1024.0 * 1024.0),
+                                    dt,
+                                    op,
+                                )
+                            }
                         })
                         .collect();
                     panic!(
@@ -1637,11 +1654,17 @@ impl CudaRuntime {
                         });
                 let allocated = !is_marker || has_external_consumer;
                 if allocated {
+                    let op_debug = if std::env::var("LUMINAL_DEBUG_ALLOC").is_ok() {
+                        Some(format!("{:?}", llir_graph[node]).chars().take(220).collect::<String>())
+                    } else {
+                        None
+                    };
                     bucket.buffer_specs.insert(
                         node,
                         BufferSpec {
                             bytes: kernel_op.output_bytes(),
                             dtype: kernel_op.output_dtype(),
+                            op_debug,
                         },
                     );
                 }
@@ -1660,11 +1683,17 @@ impl CudaRuntime {
             }
 
             if let Some(host_op) = llir_graph[node].to_dialect::<dyn HostOp>() {
+                let op_debug = if std::env::var("LUMINAL_DEBUG_ALLOC").is_ok() {
+                    Some(format!("{:?}", llir_graph[node]).chars().take(220).collect::<String>())
+                } else {
+                    None
+                };
                 bucket.buffer_specs.insert(
                     node,
                     BufferSpec {
                         bytes: host_op.output_bytes(),
                         dtype: DType::F32,
+                        op_debug,
                     },
                 );
             }
