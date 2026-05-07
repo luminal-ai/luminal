@@ -413,7 +413,18 @@ fn run_full_pipeline(
     let s_txt = text_len();
 
     // ── 1. TEXT ENCODE ─────────────────────────────────────────────────────────
-    let text_features = run_text_encoder(prompt)?;
+    let text_features = if std::env::var("LOAD_REF_TEXT").is_ok() {
+        // Numerics-bisect: substitute diffusers' exact prompt_embeds for
+        // ours so divergence in the downstream transformer can be
+        // attributed to the transformer itself, not text-encoder drift.
+        load_ref(
+            "prompt_embeds",
+            s_txt * text_encoder::OUTPUT_DIM,
+        )
+        .expect("LOAD_REF_TEXT=1 set but reference/prompt_embeds.bin missing or wrong size")
+    } else {
+        run_text_encoder(prompt)?
+    };
     assert_eq!(text_features.len(), s_txt * text_encoder::OUTPUT_DIM);
 
     // ── 2. DIFFUSION LOOP ──────────────────────────────────────────────────────
@@ -515,11 +526,16 @@ fn run_full_pipeline(
     runtime.set_data(text_in, text_features);
     runtime.set_data(cos_in, rope_cos);
     runtime.set_data(sin_in, rope_sin);
-    runtime.set_data(guidance_in, vec![guidance * 1000.0]);
+    // Match diffusers' transformer call signature:
+    //   `timestep=timestep / 1000` (0..1 range, sigma-like)
+    //   `guidance=guidance` (raw guidance_scale, e.g. 2.5)
+    // The previous code multiplied both by 1000, making the
+    // `timesteps_proj` argument saturate.
+    runtime.set_data(guidance_in, vec![guidance]);
 
     // First-step dummy values so search() has shapes/data to profile against.
     runtime.set_data(latent_in, latent.clone());
-    runtime.set_data(timestep_in, vec![timesteps[0] * 1000.0]);
+    runtime.set_data(timestep_in, vec![timesteps[0] / 1000.0]);
 
     println!("Compiling transformer (search)...");
     let t0 = Instant::now();
@@ -530,7 +546,7 @@ fn run_full_pipeline(
     for (i, &t) in timesteps.iter().enumerate() {
         let step_start = Instant::now();
         runtime.set_data(latent_in, latent.clone());
-        runtime.set_data(timestep_in, vec![t * 1000.0]);
+        runtime.set_data(timestep_in, vec![t / 1000.0]);
         runtime.execute(&cx.dyn_map);
         let v = runtime.get_f32(velocity);
         if i == 0 {
