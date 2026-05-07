@@ -12,6 +12,67 @@ use crate::typed_data::TypedData;
 /// Maps symbolic dimension parameter names (e.g. "seq_len") to luminal Expression variable chars.
 pub type DimParamMap = HashMap<String, char>;
 
+/// Recover a single-variable dim's variable value from an observed runtime size.
+///
+/// Returns `Some((var, value))` when the expression contains exactly one
+/// variable, is affine in that variable, and `value` round-trips through
+/// `exec_single_var_checked` to reproduce `dim_val`. Returns `None` otherwise
+/// — multi-variable expressions, non-affine forms, slope==0, and inversions
+/// that don't divide cleanly are all rejected so we never write a wrong
+/// guess into `dyn_map`.
+fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(char, usize)> {
+    use luminal::shape::Term;
+    let terms = expr.terms.read();
+
+    // Identify the unique variable, if any.
+    let mut var: Option<char> = None;
+    for t in terms.iter() {
+        if let Term::Var(c) = t {
+            match var {
+                None => var = Some(*c),
+                Some(existing) if existing == *c => {}
+                Some(_) => return None, // multi-var — bail out
+            }
+        }
+    }
+    let var = var?;
+
+    // Bare-var fast path — terms is exactly `[Var]`.
+    if terms.len() == 1 {
+        return Some((var, dim_val));
+    }
+
+    // Probe two points to recover slope/intercept of an assumed affine form
+    // `f(x) = slope*x + intercept`. We use 2 and 3 (luminal's default
+    // dynamic-dim min is 2, and 3 keeps the inputs small in case the
+    // expression includes a multiplication that could overflow at scale).
+    drop(terms);
+    let f2 = expr.exec_single_var_checked(2)? as i64;
+    let f3 = expr.exec_single_var_checked(3)? as i64;
+    let slope = f3 - f2;
+    if slope == 0 {
+        return None;
+    }
+    let intercept = f2 - 2 * slope;
+    let target = dim_val as i64 - intercept;
+    if slope == 0 || target % slope != 0 {
+        return None;
+    }
+    let candidate = target / slope;
+    if candidate < 0 {
+        return None;
+    }
+    let candidate = candidate as usize;
+
+    // Verify by re-evaluating with the candidate value. Catches non-affine
+    // forms whose probe points happen to be collinear (e.g. `min(s, 100)`
+    // would look affine for s ∈ {2, 3} but flatten beyond 100).
+    if expr.exec_single_var_checked(candidate)? != dim_val {
+        return None;
+    }
+    Some((var, candidate))
+}
+
 /// Convert luminal DType to PT2 dtype integer code (for python interop)
 /// Types without a direct Pytorch equivalent map to the closest safe representation
 fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
@@ -219,17 +280,27 @@ impl CompiledGraph {
     }
 
     /// Auto-detect and set dynamic dimensions from input tensor shapes.
-    /// For each user input, matches the concrete shape against its symbolic
-    /// shape expressions and sets the corresponding dyn_map entries.
+    ///
+    /// For each user input we walk the symbolic shape expressions side-by-side
+    /// with the concrete sizes Dynamo handed us at runtime and try to recover
+    /// each unbound variable's value. Two cases are handled:
+    ///
+    ///   * Bare-variable dim (`s`): set directly from the size.
+    ///   * Single-variable affine dim (`a*s + b`): solve `s = (size - b)/a`
+    ///     by sampling the expression at two probe points to extract the
+    ///     slope, recovering the intercept, and verifying that plugging the
+    ///     recovered value back through `exec_single_var_checked` reproduces
+    ///     the observed size. The verification step rejects everything
+    ///     non-affine (`s*s`, `min(s, 8)`, etc.) without committing a wrong
+    ///     guess to `dyn_map`.
+    ///
+    /// Multi-variable dims are skipped here; another input's shape — or an
+    /// explicit `set_dim` call — is expected to bind those.
     fn auto_set_dims_from_input_shapes(&mut self, input_shapes: Vec<Vec<usize>>) {
         for (shape_exprs, shape) in self.input_shape_exprs.iter().zip(input_shapes.iter()) {
             for (dim_expr, &dim_val) in shape_exprs.iter().zip(shape.iter()) {
-                // Check if this expression is a bare symbolic variable
-                let terms = dim_expr.terms.read();
-                if terms.len() == 1
-                    && let luminal::shape::Term::Var(c) = terms[0]
-                {
-                    self.graph.set_dim(c, dim_val);
+                if let Some((var, value)) = solve_single_var_dim(dim_expr, dim_val) {
+                    self.graph.set_dim(var, value);
                 }
             }
         }
