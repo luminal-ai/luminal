@@ -474,3 +474,63 @@ pub(crate) fn compile_region(
         constants: FxHashMap::default(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::fusion::fused_ops::FusedAdd;
+    use luminal::op::LLIROp;
+    use luminal::prelude::petgraph::algo::toposort;
+
+    /// Helper: wrap a `KernelOp` in an `LLIROp` of the kernel dialect.
+    fn llir_of(op: impl KernelOp + 'static) -> LLIROp {
+        LLIROp::new::<dyn KernelOp>(Box::new(op) as Box<dyn KernelOp>)
+    }
+
+    /// Reproducer for the `FusionStart with no predecessor` panic at
+    /// `region_codegen.rs:232`. The egglog rolling pass + iterated mode
+    /// (`LUMINAL_LOOP_ROLL_ITERATE=1`) has been observed to produce LLIR
+    /// graphs where a `FusionStart` marker is reached as a region leaf
+    /// during the FE→FS walk but has no incoming edge — meaning the
+    /// region has nothing to read from. `build_compile_units` then
+    /// panics when constructing `external_inputs` because every FS leaf
+    /// is required to have exactly one external producer.
+    ///
+    /// Until that path is fixed, this test pins the failure mode so a
+    /// regression doesn't silently change the panic message or location.
+    /// `should_panic` rather than `ignore` so it stays runnable in CI
+    /// and surfaces if the panic ever moves.
+    #[test]
+    #[should_panic(expected = "FusionStart with no predecessor")]
+    fn fusion_start_with_no_predecessor_panics() {
+        // Minimal reproducer:
+        //
+        //   (no input) ──▶ FusionStart ──▶ FusedAdd ──▶ FusionEnd
+        //
+        // FusedAdd is a binary op (n_inputs = 2) so a real region would
+        // have two FS leaves. For this panic-shape test only the *first*
+        // FS leaf needs a missing predecessor — `build_compile_units`
+        // panics in `expect("FusionStart with no predecessor")` as soon
+        // as any FS in `fs_topo` lacks one. We add only one FS edge so
+        // FusedAdd has a dangling second input slot, but that's fine:
+        // we're testing the specific panic path inside `build_compile_units`,
+        // not full kernel codegen.
+        let mut llir: LLIRGraph = LLIRGraph::default();
+
+        let fs_node = llir.add_node(llir_of(FusionStart::default()));
+        let fadd_node = llir.add_node(llir_of(FusedAdd::default()));
+        let fe_node = llir.add_node(llir_of(FusionEnd::default()));
+
+        // FusionStart → FusedAdd → FusionEnd.
+        llir.add_edge(fs_node, fadd_node, ());
+        llir.add_edge(fadd_node, fe_node, ());
+
+        let topo = toposort(&llir, None).expect("LLIR cycle in test setup");
+        let absorbed = globally_absorbed_markers(&llir);
+
+        // This is the call that panics with `FusionStart with no
+        // predecessor` because `fs_node`'s incoming-edges iterator is
+        // empty.
+        let _ = build_compile_units(&topo, &llir, &absorbed);
+    }
+}
