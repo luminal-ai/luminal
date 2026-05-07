@@ -292,13 +292,17 @@ impl<'a> Translator<'a> {
         Ok(result.cast(input.dtype))
     }
 
-    pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {
-        let cond = self.get_input_tensor(node, 0)?;
-        let x = self.get_input_tensor(node, 1)?;
-        let y = self.get_input_tensor(node, 2)?;
-        // Ensure x and y have the same dtype
-        let (x, y) = ensure_same_dtype(x, y);
-        // Broadcast all three tensors to a common shape first
+    /// Build the where-formula graph: `cond * x + (1 - cond) * y`, computed
+    /// in F32, cast back to `out_dtype`. Shared between `translate_where`,
+    /// `translate_where_scalar_other`, and `translate_masked_fill_scalar` so
+    /// they all go through one well-tested code path.
+    pub(crate) fn where_formula(
+        &mut self,
+        cond: GraphTensor,
+        x: GraphTensor,
+        y: GraphTensor,
+        out_dtype: DType,
+    ) -> GraphTensor {
         let (cond_b, x_b) = broadcast_binary(cond, x);
         let (cond_bc, y_b) = broadcast_binary(cond_b, y);
         let (x_bc, y_bc) = broadcast_binary(x_b, y_b);
@@ -306,19 +310,32 @@ impl<'a> Translator<'a> {
         let x_f = x_bc.cast(DType::F32);
         let y_f = y_bc.cast(DType::F32);
         let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
-        Ok(c * x_f + (one - c) * y_f)
+        // Cast back: an F32 result downstream-interpreted as bf16 walks the
+        // buffer at half-stride, returning every-other-element zeros.
+        (c * x_f + (one - c) * y_f).cast(out_dtype)
+    }
+
+    pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {
+        let cond = self.get_input_tensor(node, 0)?;
+        let x = self.get_input_tensor(node, 1)?;
+        let y = self.get_input_tensor(node, 2)?;
+        let (x, y) = ensure_same_dtype(x, y);
+        let out_dtype = x.dtype;
+        Ok(self.where_formula(cond, x, y, out_dtype))
     }
 
     pub(crate) fn translate_where_scalar_other(&mut self, node: &Node) -> Result<GraphTensor> {
         let cond = self.get_input_tensor(node, WHERE_COND_ARG)?;
         let x = self.get_input_tensor(node, WHERE_X_ARG)?;
         let other_val = self.get_float_arg(node, WHERE_OTHER_ARG)? as f32;
-        // Broadcast cond and x to a common shape
-        let (cond_b, x_b) = broadcast_binary(cond, x);
-        let c = cond_b.cast(DType::F32);
-        let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
-        let other = self.graph.constant_float(other_val).expand_rhs(c.shape);
-        Ok(c * x_b + (one - c) * other)
+        let out_dtype = x.dtype;
+        // Build a tensor for the scalar `other` matching `x`'s shape so we
+        // can route through the shared where_formula helper.
+        let other = self
+            .graph
+            .constant_float(other_val)
+            .expand_rhs(x.shape);
+        Ok(self.where_formula(cond, x, other, out_dtype))
     }
 
     pub(crate) fn translate_tril(&mut self, node: &Node) -> Result<GraphTensor> {
