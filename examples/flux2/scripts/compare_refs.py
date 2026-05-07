@@ -41,6 +41,9 @@ PAIRS = [
     ("tx_after_single_1",     "ours_tx_after_single_1"),
     ("tx_after_single_2",     "ours_tx_after_single_2"),
     ("velocity_step0",        "ours_velocity_step0"),
+    ("vae_input",             "ours_vae_input"),
+    ("vae_raw_decoded",       "ours_vae_raw_decoded"),
+    ("vae_final_image",       "ours_vae_final_image"),
     ("final_image",           "ours_final_image"),
 ]
 

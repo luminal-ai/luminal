@@ -619,9 +619,13 @@ fn run_full_pipeline(
         h_pack,
         w_pack,
     );
+    dump_ref("vae_packed_latent", &latent, &[1, h_pack * w_pack, transformer::IN_CHANNELS]);
+    dump_ref("vae_unpacked", &unpacked, &[1, transformer::IN_CHANNELS, h_pack, w_pack]);
     let denormed = bn_inverse_host(&unpacked, &bn_mean, &bn_std, transformer::IN_CHANNELS);
+    dump_ref("vae_bn_inversed", &denormed, &[1, transformer::IN_CHANNELS, h_pack, w_pack]);
     let vae_input = unpatchify_host(&denormed, LATENT_CHANNELS, h_pack, w_pack);
     assert_eq!(vae_input.len(), LATENT_CHANNELS * h_lat * w_lat);
+    dump_ref("vae_input", &vae_input, &[1, LATENT_CHANNELS, h_lat, w_lat]);
 
     let mut cx = Graph::default();
     let latent_in = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
@@ -643,6 +647,23 @@ fn run_full_pipeline(
     runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
     runtime.execute(&cx.dyn_map);
     let img = runtime.get_f32(out);
+    // VaeDecoder output is in roughly [-1, 1] range. Diffusers'
+    // ImageProcessor.postprocess does `((x + 1) / 2).clamp(0, 1)` for
+    // output_type="pt".
+    dump_ref(
+        "vae_raw_decoded",
+        &img[..3 * height * width],
+        &[1, 3, height, width],
+    );
+    let final_image: Vec<f32> = img[..3 * height * width]
+        .iter()
+        .map(|&x| ((x + 1.0) * 0.5).clamp(0.0, 1.0))
+        .collect();
+    dump_ref(
+        "vae_final_image",
+        &final_image,
+        &[1, 3, height, width],
+    );
     dump_ref("final_image", &img[..3 * height * width], &[3, height, width]);
     save_png("out.png", &img, width, height)?;
     println!("Wrote out.png");
