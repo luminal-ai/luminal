@@ -1350,6 +1350,29 @@ impl Graph {
                 // per-candidate profile time scales with body size, not the
                 // unrolled graph size.
                 collapse_loops_to_first_iter(&mut graph);
+                // Diagnostic: if any node in the post-collapse LLIR has
+                // its kernel name == "FusionStart" but zero incoming
+                // edges, that's the dangling-FS bug that downstream
+                // codegen panics on. Surface it here, where we still
+                // have the graph to inspect.
+                if std::env::var("LUMINAL_DEBUG_DANGLING_FS_POST_COLLAPSE").is_ok() {
+                    use petgraph::Direction;
+                    for n in graph.node_indices() {
+                        let label = format!("{:?}", graph[n]);
+                        if !label.contains("FusionStart") {
+                            continue;
+                        }
+                        let in_deg =
+                            graph.neighbors_directed(n, Direction::Incoming).count();
+                        if in_deg == 0 {
+                            eprintln!(
+                                "POST_COLLAPSE DANGLING FS: node_idx={} label={}",
+                                n.index(),
+                                label.chars().take(120).collect::<String>(),
+                            );
+                        }
+                    }
+                }
                 runtime.clear_intermediate_buffers();
                 let (rep_metric, rep_display) = runtime.profile(
                     &graph,
@@ -2374,6 +2397,22 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
     use petgraph::visit::EdgeRef;
     use std::collections::BTreeMap;
 
+    let trace_fs = std::env::var("LUMINAL_DEBUG_COLLAPSE_FS").is_ok();
+    // Snapshot every FusionStart's incoming-edge source at entry, so we
+    // can pinpoint which collapse step strips the edge.
+    let mut fs_initial_inputs: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
+    if trace_fs {
+        for n in llir.node_indices() {
+            let label = format!("{:?}", llir[n]);
+            if label.contains("FusionStart") {
+                let preds: Vec<NodeIndex> = llir
+                    .neighbors_directed(n, Direction::Incoming)
+                    .collect();
+                fs_initial_inputs.insert(n, preds);
+            }
+        }
+    }
+
     let mut starts: BTreeMap<usize, NodeIndex> = BTreeMap::new();
     let mut ends: BTreeMap<usize, NodeIndex> = BTreeMap::new();
     let mut inputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
@@ -2473,17 +2512,35 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         static_source.insert(static_node, src);
     }
 
-    // Resolve a source reference to its iter-0 equivalent.
-    let resolve_src = |src: NodeIndex| -> NodeIndex {
-        if let Some(&initial) = start_initial.get(&src) {
-            initial
-        } else if let Some(&first) = input_first_source.get(&src) {
-            first
-        } else if let Some(&shared) = static_source.get(&src) {
-            shared
-        } else {
-            src
+    // Resolve a source reference to its iter-0 equivalent. Transitive
+    // because iterated loop rolling can produce chained markers — a
+    // LoopInput whose first source is a LoopStart whose initial is
+    // another marker, etc. Without transitive resolution the body edge
+    // lands on an intermediate marker that's about to be deleted, and
+    // when `remove_node` runs at the end of this function the edge
+    // dies, leaving a downstream FusionStart with no predecessor and
+    // panicking in `region_codegen::build_compile_units`.
+    let resolve_src = |mut src: NodeIndex| -> NodeIndex {
+        // The marker maps cover at most one resolution step each, so
+        // `loop_markers.len()` is a strict upper bound on the chain
+        // length. Cap iterations to that to guarantee termination
+        // even if a future change accidentally introduces a cycle.
+        for _ in 0..=loop_markers.len() {
+            let next = if let Some(&initial) = start_initial.get(&src) {
+                initial
+            } else if let Some(&first) = input_first_source.get(&src) {
+                first
+            } else if let Some(&shared) = static_source.get(&src) {
+                shared
+            } else {
+                return src;
+            };
+            if next == src {
+                return src;
+            }
+            src = next;
         }
+        src
     };
 
     // Rewrite every body node's incoming edges. Per-edge remove+add to keep
@@ -2534,6 +2591,36 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             marker_post_sub.insert(select_node, body_producer);
         }
     }
+    // Also rewire ANY marker that gets removed below — LoopOutput,
+    // LoopStart (when consumed post-loop directly), LoopInput,
+    // LoopInputStatic. Without these entries, a downstream
+    // consumer (e.g. a FusionStart that egglog inserted to wrap a
+    // marker's output) keeps an edge to the marker; the marker is
+    // removed at the end of this function and the consumer dangles,
+    // panicking later in `region_codegen::build_compile_units` with
+    // `FusionStart with no predecessor`.
+    for (&_stream_id, &output_node) in &outputs {
+        let body_producer = llir
+            .neighbors_directed(output_node, Direction::Incoming)
+            .next()
+            .expect("LoopOutput missing body producer during rewire");
+        marker_post_sub.insert(output_node, body_producer);
+    }
+    for &start_node in starts.values() {
+        if let Some(&initial) = start_initial.get(&start_node) {
+            marker_post_sub.insert(start_node, initial);
+        }
+    }
+    for &input_node in inputs.values() {
+        if let Some(&first) = input_first_source.get(&input_node) {
+            marker_post_sub.insert(input_node, first);
+        }
+    }
+    for &static_node in &static_inputs {
+        if let Some(&shared) = static_source.get(&static_node) {
+            marker_post_sub.insert(static_node, shared);
+        }
+    }
     let post_loop_consumers: FxHashSet<NodeIndex> = loop_markers
         .iter()
         .flat_map(|n| {
@@ -2542,6 +2629,19 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         })
         .filter(|n| !loop_markers.contains(n) && !body_nodes.contains(n))
         .collect();
+    // Transitive marker resolution. With iterated rolling, marker A's
+    // post-sub target can itself be marker B, etc. Resolve to a stable
+    // non-marker so the rewired edge survives the marker-removal step
+    // below.
+    let resolve_marker_post = |mut src: NodeIndex| -> NodeIndex {
+        for _ in 0..=loop_markers.len() {
+            match marker_post_sub.get(&src).copied() {
+                Some(next) if next != src => src = next,
+                _ => return src,
+            }
+        }
+        src
+    };
     for &consumer in &post_loop_consumers {
         let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
             .edges_directed(consumer, Direction::Incoming)
@@ -2549,7 +2649,7 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             .map(|e| (e.source(), e.id()))
             .collect();
         for (src, eid) in pairs {
-            let new_src = marker_post_sub.get(&src).copied().unwrap_or(src);
+            let new_src = resolve_marker_post(src);
             llir.remove_edge(eid);
             llir.add_edge(new_src, consumer, ());
         }
@@ -2557,6 +2657,42 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
 
     for &n in &loop_markers {
         llir.remove_node(n);
+    }
+
+    if trace_fs {
+        for (&fs_node, initial_preds) in &fs_initial_inputs {
+            if !llir.node_indices().any(|n| n == fs_node) {
+                eprintln!(
+                    "  collapse_fs: fs={} REMOVED entirely",
+                    fs_node.index(),
+                );
+                continue;
+            }
+            let now: FxHashSet<NodeIndex> =
+                llir.neighbors_directed(fs_node, Direction::Incoming).collect();
+            if now.is_empty() {
+                let was: Vec<usize> = initial_preds.iter().map(|p| p.index()).collect();
+                let was_kinds: Vec<String> = initial_preds
+                    .iter()
+                    .map(|&p| {
+                        if llir.node_indices().any(|n| n == p) {
+                            format!("{:?}", llir[p])
+                                .chars()
+                                .take(60)
+                                .collect::<String>()
+                        } else {
+                            format!("REMOVED({})", p.index())
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "  collapse_fs DANGLING: fs={} pre_collapse_preds={:?} pre_collapse_pred_kinds={:?}",
+                    fs_node.index(),
+                    was,
+                    was_kinds,
+                );
+            }
+        }
     }
 
     let compacted = compact_llir_preserving_input_order(llir);
