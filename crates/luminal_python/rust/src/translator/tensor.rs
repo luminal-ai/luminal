@@ -134,7 +134,7 @@ impl<'a> Translator<'a> {
                 .constant_float(min_i as f32)
                 .cast(bins_arange.dtype)
                 .expand_rhs(bins_arange.shape);
-            bins_arange = bins_arange + shift;
+            bins_arange += shift;
         }
         let bins_expanded = bins_arange.cast(input.dtype).expand_dim(1, n);
         let input_expanded = input.expand_dim(0, Expression::from(bins_u));
