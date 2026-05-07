@@ -93,7 +93,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the search only ever sees the cuBLAS path. Set unconditionally
     // here because flux2 specifically needs it; other workloads opt
     // in via the same env var.
-    if std::env::var("LUMINAL_EAGER_CUBLAS_CLEANUP").is_err() {
+    if std::env::var("LUMINAL_EAGER_CUBLAS_CLEANUP").is_err()
+        && std::env::var("LUMINAL_NO_EAGER_CUBLAS_CLEANUP").is_err()
+    {
         // SAFETY: single-threaded main(), called before any runtime
         // is spawned. set_var is unsafe in newer std but this is the
         // earliest possible hook.
