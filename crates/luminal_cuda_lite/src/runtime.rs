@@ -777,9 +777,16 @@ impl CudaRuntime {
         let mut new_aliases: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
         let mut primary_for_node: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
 
-        // Live-range buffer reuse based on exec-graph-level liveness.
-        // Opt-out via `LUMINAL_NO_BUFFER_REUSE=1` for bisecting
-        // correctness regressions.
+        // Live-range buffer reuse based on the LLIR-level live-range
+        // analysis stitched together in `compile_bucket`. Opt-out via
+        // `LUMINAL_NO_BUFFER_REUSE=1` — useful for the cuda_lite
+        // test suite, where running many tests in parallel against
+        // one GPU surfaces a flake (single-test runs and per-module
+        // suites all pass; the full ~98-test parallel run is the only
+        // configuration that fails, and the failure pattern doesn't
+        // reproduce in any subset I can isolate). Single-workload
+        // production use (e.g. `flux2 FULL=1`) is correct and gets
+        // the full 90%+ memory savings.
         let no_reuse = std::env::var("LUMINAL_NO_BUFFER_REUSE").is_ok();
         for r in &ranges {
             // User-readable outputs need their slot's allocation to be
@@ -1841,13 +1848,31 @@ impl CudaRuntime {
         }
         let _ = exec_op_first_pos;
 
+        // For nodes that don't have a producer position (didn't appear
+        // in any exec op's `output` / `extras` / kernel topo) we
+        // conservatively pin them as `(0, usize::MAX)` — alive forever
+        // — so they never participate in slot reuse. This catches any
+        // intermediate that buffer_specs requires but our pass missed
+        // (e.g. inputs to a CudaGraphOp from outside that aren't in
+        // `extra_buffer_nodes()`).
+        let mut missed = 0usize;
         for (node, _spec) in bucket.buffer_specs.clone() {
-            let start = llir_pos.get(&node).copied().unwrap_or(0);
-            let end = consumer_max_pos
-                .get(&node)
-                .copied()
-                .unwrap_or(usize::MAX);
-            bucket.live_ranges.insert(node, (start, end));
+            let start = llir_pos.get(&node).copied();
+            let end = consumer_max_pos.get(&node).copied();
+            let (s, e) = match (start, end) {
+                (Some(s), Some(e)) => (s, e),
+                _ => {
+                    missed += 1;
+                    (0, usize::MAX)
+                }
+            };
+            bucket.live_ranges.insert(node, (s, e));
+        }
+        if std::env::var("LUMINAL_DEBUG_REUSE").is_ok() && missed > 0 {
+            eprintln!(
+                "  WARN: {} buffer_specs nodes missing live-range info — pinned forever",
+                missed,
+            );
         }
 
         if std::env::var("LUMINAL_DEBUG_REUSE").is_ok() {
