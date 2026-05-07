@@ -2107,6 +2107,302 @@ pub fn run_egglog_with_report_parts(
         enforce_consistent_first_kind_enodes(&mut egraph);
     }
 
+    // Eager cuBLAS-aware KernelMul stripping. Runs BEFORE the
+    // conditional HLIR cleanup below, so the Sum HLIR enode (which we
+    // need to walk Sum→Mul) is still present. The matmul-backend rules
+    // (`host/cublaslt/cublaslt_*_rewrite.egg`) union a `cublaslt` enode
+    // into the same Op eclass as the matched `Sum`. The egglog-side
+    // cleanup rule then conditionally `(delete ...)`s the broadcast
+    // `KernelMul` that feeds that Sum. Empirically the egg rule misses
+    // some Mul eclasses at flux2 scale — likely small stride-form
+    // differences vs. the rule's pattern — and the surviving KernelMul
+    // produces an `(M, N, K)` broadcast intermediate (~80 GB at text-
+    // encoder shapes) that OOMs the GPU as soon as the genetic search
+    // profiles it. Re-do the strip in Rust where eclass membership is
+    // already materialized: for every Op eclass containing a `cublaslt`
+    // enode, find the Sum enodes also in the eclass, walk to the Mul
+    // eclass each Sum consumes, and delete any `KernelMul` Op enodes
+    // there. The cascade pass below cleans up dangling references.
+    //
+    // Opt-IN via `LUMINAL_EAGER_CUBLAS_CLEANUP=1` rather than enabled by
+    // default: on smaller models where cuBLASLt initialization itself
+    // fails (e.g. some Hopper / driver combinations during Llama-MLP
+    // unit tests), the existing KernelMul fallback is what kept the
+    // search viable. Removing it there causes "Failed to find a viable
+    // initial genome" since every candidate now hits the cuBLAS init
+    // error. Flux 2 — which actually OOMs at the broadcast Mul scale —
+    // sets this env var.
+    if std::env::var("LUMINAL_EAGER_CUBLAS_CLEANUP").is_ok() {
+        // Helper: collect kind labels in an Op eclass (one Op enode →
+        // one kind eclass → many kind enodes).
+        let kind_labels_for_op_class = |op_class: &egraph_serialize::ClassId,
+                                        out: &mut FxHashSet<String>| {
+            out.clear();
+            let enodes = match egraph.eclasses.get(op_class) {
+                Some((_, e)) => e,
+                None => return,
+            };
+            for nid in enodes {
+                let children = match egraph.enodes.get(nid) {
+                    Some((label, c)) if label == "Op" => c,
+                    _ => continue,
+                };
+                let kind_class = match children.first() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                if let Some((_, knodes)) = egraph.eclasses.get(kind_class) {
+                    for knid in knodes {
+                        if let Some((klabel, _)) = egraph.enodes.get(knid) {
+                            out.insert(klabel.clone());
+                        }
+                    }
+                }
+            }
+        };
+
+        // 1) Find Op eclasses containing a `cublaslt` enode.
+        let mut buf: FxHashSet<String> = FxHashSet::default();
+        let mut cublaslt_op_classes: Vec<egraph_serialize::ClassId> = Vec::new();
+        let op_class_ids: Vec<egraph_serialize::ClassId> = egraph
+            .eclasses
+            .iter()
+            .filter(|(_, (_, nodes))| {
+                nodes.iter().any(|n| {
+                    egraph
+                        .enodes
+                        .get(n)
+                        .is_some_and(|(label, _)| label == "Op")
+                })
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+        for c in &op_class_ids {
+            kind_labels_for_op_class(c, &mut buf);
+            if buf.contains("cublaslt") {
+                cublaslt_op_classes.push(c.clone());
+            }
+        }
+
+        if !cublaslt_op_classes.is_empty() {
+            // 2) For each cublaslt-bearing eclass, walk Sum Op enodes
+            //    and collect the Mul eclass each Sum consumes.
+            let mut mul_eclasses_to_strip: FxHashSet<egraph_serialize::ClassId> =
+                FxHashSet::default();
+            for op_class in &cublaslt_op_classes {
+                let enodes = match egraph.eclasses.get(op_class) {
+                    Some((_, e)) => e.clone(),
+                    None => continue,
+                };
+                for nid in &enodes {
+                    let (label, children) = match egraph.enodes.get(nid) {
+                        Some(e) => e.clone(),
+                        None => continue,
+                    };
+                    if label != "Op" || children.len() < 2 {
+                        continue;
+                    }
+                    let kind_class = &children[0];
+                    let is_sum = egraph
+                        .eclasses
+                        .get(kind_class)
+                        .map(|(_, kn)| {
+                            kn.iter().any(|n| {
+                                egraph.enodes.get(n).is_some_and(|(l, _)| l == "Sum")
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !is_sum {
+                        continue;
+                    }
+                    let inputs_class = &children[1];
+                    let inputs_enodes = match egraph.eclasses.get(inputs_class) {
+                        Some((_, e)) => e,
+                        None => continue,
+                    };
+                    for in_nid in inputs_enodes {
+                        let (in_label, in_children) = match egraph.enodes.get(in_nid) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        if in_label == "ICons" && !in_children.is_empty() {
+                            mul_eclasses_to_strip.insert(in_children[0].clone());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Helpers for checking the broadcast-stride pattern. The
+            // egglog rule asserts `(= (MNum 0) (nth_from_end ?as 1))`
+            // and `(= (MNum 0) (nth_from_end ?bs 2))` — only KernelMul
+            // enodes with this exact pattern are matmul-feeder
+            // broadcasts. Other KernelMul enodes (gate*up, mask*scores,
+            // etc.) live in different Mul eclasses entirely, but a
+            // single Mul eclass *could* in principle contain multiple
+            // KernelMul enodes (e.g. via stride-form unification rules).
+            // Re-check the stride pattern per-enode to stay safe.
+            let walk_list = |list_class: &egraph_serialize::ClassId| -> Option<Vec<egraph_serialize::ClassId>> {
+                let mut out = Vec::new();
+                let mut current = list_class.clone();
+                loop {
+                    let nodes = egraph.eclasses.get(&current)?.1.clone();
+                    let cons_or_nil = nodes.iter().find_map(|n| {
+                        let (l, c) = egraph.enodes.get(n)?;
+                        if l == "ECons" && c.len() == 2 {
+                            Some(("ECons".to_string(), c.clone()))
+                        } else if l == "ENil" {
+                            Some(("ENil".to_string(), Vec::new()))
+                        } else {
+                            None
+                        }
+                    })?;
+                    if cons_or_nil.0 == "ENil" {
+                        return Some(out);
+                    }
+                    out.push(cons_or_nil.1[0].clone());
+                    current = cons_or_nil.1[1].clone();
+                }
+            };
+            let is_mnum_zero = |class: &egraph_serialize::ClassId| -> bool {
+                let nodes = match egraph.eclasses.get(class) {
+                    Some((_, n)) => n,
+                    None => return false,
+                };
+                nodes.iter().any(|n| {
+                    let (label, children) = match egraph.enodes.get(n) {
+                        Some(e) => e,
+                        None => return false,
+                    };
+                    if label != "MNum" || children.is_empty() {
+                        return false;
+                    }
+                    let lit_class = &children[0];
+                    egraph
+                        .eclasses
+                        .get(lit_class)
+                        .map(|(_, lns)| {
+                            lns.iter().any(|ln| {
+                                egraph
+                                    .enodes
+                                    .get(ln)
+                                    .is_some_and(|(l, _)| l == "0")
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+            };
+
+            // 3) In each target Mul eclass, delete Op enodes whose
+            //    kind is `KernelMul` AND has the matmul broadcast
+            //    pattern (a_n_stride = MNum 0 AND b_m_stride = MNum 0).
+            //    Once a broadcast KernelMul is found, also strip the
+            //    co-resident HLIR `Mul` Op enode in the same eclass —
+            //    otherwise the search picks the unimplementable HLIR
+            //    fallback and the runtime crashes with
+            //    `CUDA_ERROR_ILLEGAL_ADDRESS`. The cascade below cleans
+            //    up `Sum(Mul)` references that the cublaslt enode
+            //    already supersedes in its Op eclass.
+            let mut to_strip = Vec::new();
+            for mul_class in &mul_eclasses_to_strip {
+                let enodes = match egraph.eclasses.get(mul_class) {
+                    Some((_, e)) => e.clone(),
+                    None => continue,
+                };
+                for nid in &enodes {
+                    let (label, children) = match egraph.enodes.get(nid) {
+                        Some(e) => (e.0.clone(), e.1.clone()),
+                        None => continue,
+                    };
+                    if label != "Op" || children.is_empty() {
+                        continue;
+                    }
+                    let kind_class = &children[0];
+                    // Find the KernelMul kind enode in this eclass
+                    // (the kind eclass holds [shape, as, bs, os, dt]).
+                    let kernel_mul_strides: Option<(
+                        egraph_serialize::ClassId,
+                        egraph_serialize::ClassId,
+                    )> = egraph.eclasses.get(kind_class).and_then(|(_, kn)| {
+                        kn.iter().find_map(|n| {
+                            let (l, c) = egraph.enodes.get(n)?;
+                            if l == "KernelMul" && c.len() >= 3 {
+                                Some((c[1].clone(), c[2].clone()))
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    let Some((a_strides_class, b_strides_class)) = kernel_mul_strides
+                    else {
+                        continue;
+                    };
+                    let a_strides = match walk_list(&a_strides_class) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    let b_strides = match walk_list(&b_strides_class) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    // a_n_stride = nth_from_end(a, 1) = a[len-2]
+                    // b_m_stride = nth_from_end(b, 2) = b[len-3]
+                    if a_strides.len() < 2 || b_strides.len() < 3 {
+                        continue;
+                    }
+                    let a_n = &a_strides[a_strides.len() - 2];
+                    let b_m = &b_strides[b_strides.len() - 3];
+                    if is_mnum_zero(a_n) && is_mnum_zero(b_m) {
+                        to_strip.push(nid.clone());
+                        // Also strip every co-resident Op enode in the
+                        // same Mul eclass: HLIR `Mul`, other broadcast
+                        // KernelMul stride-form variants. We've already
+                        // confirmed this is a matmul-broadcast eclass,
+                        // and cublaslt covers its only legitimate use.
+                        for sib_nid in &enodes {
+                            if sib_nid == nid {
+                                continue;
+                            }
+                            let sib_children = match egraph.enodes.get(sib_nid) {
+                                Some((l, c)) if l == "Op" => c.clone(),
+                                _ => continue,
+                            };
+                            if sib_children.is_empty() {
+                                continue;
+                            }
+                            let sib_kind_class = &sib_children[0];
+                            let is_mul_or_kernel_mul = egraph
+                                .eclasses
+                                .get(sib_kind_class)
+                                .map(|(_, kn)| {
+                                    kn.iter().any(|n| {
+                                        egraph.enodes.get(n).is_some_and(|(l, _)| {
+                                            l == "Mul" || l == "KernelMul"
+                                        })
+                                    })
+                                })
+                                .unwrap_or(false);
+                            if is_mul_or_kernel_mul {
+                                to_strip.push(sib_nid.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            if std::env::var("LUMINAL_DEBUG_CUBLAS_CLEANUP").is_ok() {
+                eprintln!(
+                    "  cublas cleanup: cublaslt eclasses={} target Mul eclasses={} stripped KernelMul enodes={}",
+                    cublaslt_op_classes.len(),
+                    mul_eclasses_to_strip.len(),
+                    to_strip.len(),
+                );
+            }
+            for nid in to_strip {
+                egraph.enodes.remove(&nid);
+            }
+        }
+    }
+
     // Conditional cleanup: an `Op` enode in our IR has the shape
     // `Op (OpKind ...) (IList ...)`. The first child of `Op` is an OpKind
     // eclass; the OpKind enode's label tells us whether it's an HLIR op
@@ -2177,6 +2473,7 @@ pub fn run_egglog_with_report_parts(
             egraph.enodes.remove(&nid);
         }
     }
+
 
     // Cascade: remove enodes whose children reference empty eclasses
     loop {

@@ -297,23 +297,22 @@ pub fn linear_bias(a: GraphTensor, b: GraphTensor, bias: GraphTensor) -> GraphTe
 }
 
 /// Mixed-precision linear (no bias): `A (F32, M, K) @ B (BF16, N, K)ᵀ → (F32, M, N)`.
-/// B is read directly as BF16 and converted to F32 on each load, so the
-/// caller does NOT need to insert a `.cast(F32)` op on the weight tensor.
-/// This is the right entry point for LLM-style linear projections where
-/// weights are BF16 and explicitly casting them would not fit in memory.
 ///
-/// Note on the HLIR alternative: if this lowered to plain HLIR
-/// `cast(F32→BF16) + matmul + cast(BF16→F32)`, the existing 2D cuBLAS
-/// rule fires correctly for the BF16-input GEMM and unit tests pass. At
-/// flux2 text-encoder scale (~7 projections × 32 layers, M=512 N=15360
-/// K=5120) the search still occasionally picks the broadcast Mul +
-/// SumReduce fallback for at least one projection before the
-/// conditional `KernelMul` cleanup removes it, producing a 40 GB
-/// intermediate that OOMs. Until the cleanup is hardened to run eagerly
-/// (or extraction is pinned to the cublaslt alternative once it
-/// exists), this stays as a custom op.
+/// Lowers as plain HLIR — `Cast(A, BF16) @ permute(B_bf16) → Cast(F32)`.
+/// The activation cast and output cast are tiny (M*K and M*N elements;
+/// the K=hidden weight stays BF16). The inner BF16 matmul matches the
+/// existing cublaslt rewrite rules and runs as
+/// `CUBLAS_COMPUTE_32F_FAST_16BF` — Hopper's native 2× BF16 path.
 pub fn linear_no_bias_bf16_w(a: GraphTensor, b_bf16: GraphTensor) -> GraphTensor {
-    matmul_inner(a, b_bf16, /*transpose_b=*/ true, None)
+    assert_eq!(a.dtype, DType::F32, "linear_no_bias_bf16_w expects F32 A");
+    assert_eq!(b_bf16.dtype, DType::Bf16, "linear_no_bias_bf16_w expects BF16 B");
+    let a_dims = a.dims();
+    let b_dims = b_bf16.dims();
+    assert_eq!(a_dims.len(), 2);
+    assert_eq!(b_dims.len(), 2);
+    let a_bf16 = a.cast(DType::Bf16);
+    let b_kn = b_bf16.permute((1, 0));
+    a_bf16.matmul(b_kn).cast(DType::F32)
 }
 
 /// Batched matmul: `A (B, M, K) @ B (B, K, N) → (B, M, N)`, all F32 row-major.

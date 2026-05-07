@@ -84,6 +84,23 @@ fn text_len() -> usize {
 const DEFAULT_GUIDANCE: f32 = 2.5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Eager cuBLAS-aware KernelMul stripping. The text encoder's
+    // ~280 BF16 projection matmuls each have a Mul + SumReduce
+    // fallback alongside the cublaslt rewrite; the genetic search
+    // OOMs on a single Mul-fallback profile (~80 GB intermediate at
+    // M=512 N=15360 K=5120). Forcing the eager Rust strip — see
+    // `egglog_utils::mod::run_egglog_with_report_parts` — guarantees
+    // the search only ever sees the cuBLAS path. Set unconditionally
+    // here because flux2 specifically needs it; other workloads opt
+    // in via the same env var.
+    if std::env::var("LUMINAL_EAGER_CUBLAS_CLEANUP").is_err() {
+        // SAFETY: single-threaded main(), called before any runtime
+        // is spawned. set_var is unsafe in newer std but this is the
+        // earliest possible hook.
+        unsafe {
+            std::env::set_var("LUMINAL_EAGER_CUBLAS_CLEANUP", "1");
+        }
+    }
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "a cat in a hat".to_string());

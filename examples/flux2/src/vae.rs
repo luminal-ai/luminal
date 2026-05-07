@@ -778,8 +778,11 @@ mod tests {
             out,
         );
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
+            // BF16 inputs (activation cast to BF16 before the matmul,
+            // weight stays BF16) produce ~√K · ulp(BF16) error.
+            let tol = 2e-2_f32.max(2e-2 * e.abs());
             assert!(
-                (g - e).abs() < 5e-3,
+                (g - e).abs() < tol,
                 "linear_no_bias_bf16_w mismatch at {i}: got {g}, want {e}"
             );
         }
