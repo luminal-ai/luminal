@@ -73,6 +73,69 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
+/// Numerics-comparison harness. When `DUMP_REFS=1` is set, write a Vec<f32>
+/// to `examples/flux2/reference/{name}.bin` (raw little-endian F32) plus a
+/// `.shape` sidecar. Compare with `scripts/dump_reference.py` outputs from
+/// diffusers. The directory is git-ignored so dumps don't pollute commits.
+fn dump_ref(name: &str, data: &[f32], shape: &[usize]) {
+    if std::env::var("DUMP_REFS").is_err() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("dump_ref: failed to create dir {}: {}", dir.display(), e);
+        return;
+    }
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    };
+    if let Err(e) = std::fs::write(dir.join(format!("ours_{name}.bin")), bytes) {
+        eprintln!("dump_ref({name}): {}", e);
+        return;
+    }
+    let shape_str: String = shape
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = std::fs::write(dir.join(format!("ours_{name}.shape")), shape_str);
+    let mn = data.iter().copied().fold(f32::INFINITY, f32::min);
+    let mx = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mean = data.iter().sum::<f32>() / data.len() as f32;
+    eprintln!(
+        "  ours_{name}: shape={shape:?} min={mn:+.4} max={mx:+.4} mean={mean:+.4}"
+    );
+}
+
+/// Load a reference tensor previously written by `dump_reference.py`. Returns
+/// None if not found or shape mismatch. Used by `LOAD_REF_*` overrides to
+/// substitute diffusers' tensors at specific stages so we can isolate which
+/// stage diverges.
+fn load_ref(name: &str, expected_len: usize) -> Option<Vec<f32>> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference");
+    let path = dir.join(format!("{name}.bin"));
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.len() != expected_len * 4 {
+        eprintln!(
+            "load_ref({name}): file has {} bytes, expected {} (={}×F32)",
+            bytes.len(),
+            expected_len * 4,
+            expected_len,
+        );
+        return None;
+    }
+    let mut out = vec![0f32; expected_len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
+            bytes.len(),
+        );
+    }
+    eprintln!("  loaded {} ({} f32)", path.display(), expected_len);
+    Some(out)
+}
+
 /// Override-able via `TEXT_LEN=N` for testing. Diffusers' Flux 2 pipeline
 /// pads to 512; smaller works for the text encoder's transformer compile to
 /// fit in fewer GPU temp buffers during search.
@@ -216,8 +279,14 @@ fn tokenize_prompt(
     if real_len > text_len {
         ids.truncate(text_len);
     } else {
-        // Right-pad to text_len with the pad token (= 0 for Mistral).
-        ids.resize(text_len, 0);
+        // Right-pad to `text_len` with Mistral's `<pad>` token (id 11).
+        // The previous padding value of 0 (= `<unk>`) silently gave
+        // every padding position a different embedding than diffusers
+        // — divergence appeared at exactly position `real_len` and
+        // compounded through 30 layers, leaving prompt_embeds with
+        // cos_sim ≈ 0.65 against the reference. See
+        // `tokenizer.json` added_tokens_decoder: id=11 is `<pad>`.
+        ids.resize(text_len, 11);
     }
     Ok((ids, real_len.min(text_len)))
 }
@@ -231,6 +300,16 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
     let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| format!("tokenizer: {e}"))?;
     let text_len = text_len();
     let (ids, real_len) = tokenize_prompt(&tokenizer, prompt, text_len)?;
+    if std::env::var("DUMP_REFS").is_ok() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference");
+        let _ = std::fs::create_dir_all(&dir);
+        let bytes: Vec<u8> = ids.iter()
+            .flat_map(|&i| (i as i32).to_le_bytes())
+            .collect();
+        let _ = std::fs::write(dir.join("ours_input_ids.bin"), bytes);
+        eprintln!("  ours_input_ids: real_len={}, first 15: {:?}", real_len, &ids[..15.min(ids.len())]);
+        eprintln!("  ours_input_ids: pos 35..40: {:?}", &ids[35..40.min(ids.len())]);
+    }
     println!(
         "  prompt → {} ids ({} real, padded to {})",
         ids.len(),
@@ -244,8 +323,16 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
         .named_tensor("__input_ids", text_len)
         .as_dtype(DType::Int);
     let pos_ids = cx.named_tensor("__pos_ids", text_len).as_dtype(DType::Int);
+    // Attention mask: 1 for real tokens (positions 0..real_len), 0 for
+    // padding. Mistral 3 self-attention masks padding keys so padding
+    // queries only attend to the real prefix; without it our padding
+    // hidden states drift wildly from diffusers (cos_sim ~0.65 on the
+    // 15360-dim text features even when token IDs match exactly).
+    let attention_mask = cx
+        .named_tensor("__attention_mask", text_len)
+        .as_dtype(DType::F32);
     let encoder = text_encoder::Mistral3TextEncoder::init(&mut cx);
-    let features = encoder.forward(input_ids, pos_ids).output();
+    let features = encoder.forward(input_ids, pos_ids, attention_mask).output();
     // Memory-budget enforcement is opt-in (the estimator over-counts; see
     // the matching comment in `run_vae_only`). Set `TEXT_MEM_GIB` to opt in.
     if let Ok(g) = std::env::var("TEXT_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
@@ -272,6 +359,10 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
 
     runtime.set_data(input_ids, ids);
     runtime.set_data(pos_ids, (0..text_len as i32).collect::<Vec<_>>());
+    let mask: Vec<f32> = (0..text_len)
+        .map(|i| if i < real_len { 1.0_f32 } else { 0.0_f32 })
+        .collect();
+    runtime.set_data(attention_mask, mask);
 
     println!("Compiling text encoder...");
     let t0 = Instant::now();
@@ -289,6 +380,7 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
         text_len,
         text_encoder::OUTPUT_DIM,
     );
+    dump_ref("prompt_embeds", &out, &[1, text_len, text_encoder::OUTPUT_DIM]);
     Ok(out)
 }
 
@@ -350,11 +442,20 @@ fn run_full_pipeline(
     let s_total = s_txt + s_img;
     assert_eq!(rope_cos.len(), s_total * transformer::HEAD_DIM);
 
-    // Initial noise latent in (S_img, IN_CHANNELS) layout.
+    // Initial noise latent in (S_img, IN_CHANNELS) layout. By default
+    // we generate fresh Gaussian noise; with `LOAD_REF_NOISE=1` set, we
+    // load diffusers' `transformer_in_step0` so a side-by-side numerics
+    // run starts from the same noise.
     let mut rng = StdRng::seed_from_u64(env_usize("SEED", 0) as u64);
-    let mut latent: Vec<f32> = (0..s_img * transformer::IN_CHANNELS)
-        .map(|_| rng.sample::<f32, _>(StandardNormal))
-        .collect();
+    let mut latent: Vec<f32> = if std::env::var("LOAD_REF_NOISE").is_ok() {
+        load_ref("transformer_in_step0", s_img * transformer::IN_CHANNELS)
+            .expect("LOAD_REF_NOISE=1 set but transformer_in_step0.bin missing or wrong size")
+    } else {
+        (0..s_img * transformer::IN_CHANNELS)
+            .map(|_| rng.sample::<f32, _>(StandardNormal))
+            .collect()
+    };
+    dump_ref("noise_latent", &latent, &[1, s_img, transformer::IN_CHANNELS]);
 
     println!("Building transformer graph...");
     let mut cx = Graph::default();
@@ -432,6 +533,13 @@ fn run_full_pipeline(
         runtime.set_data(timestep_in, vec![t * 1000.0]);
         runtime.execute(&cx.dyn_map);
         let v = runtime.get_f32(velocity);
+        if i == 0 {
+            dump_ref(
+                "velocity_step0",
+                &v[..s_img * transformer::IN_CHANNELS],
+                &[1, s_img, transformer::IN_CHANNELS],
+            );
+        }
         // Euler integrate: latent += (sigma_next - sigma) * v
         euler_step(&mut latent, &v, sigmas[i], sigmas[i + 1]);
         println!(
@@ -495,6 +603,7 @@ fn run_full_pipeline(
     runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
     runtime.execute(&cx.dyn_map);
     let img = runtime.get_f32(out);
+    dump_ref("final_image", &img[..3 * height * width], &[3, height, width]);
     save_png("out.png", &img, width, height)?;
     println!("Wrote out.png");
     Ok(())

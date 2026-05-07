@@ -135,7 +135,12 @@ fn apply_rope(x: GraphTensor, pos_ids: GraphTensor, n_heads: usize, theta: f32) 
 /// fail to fire reliably; the broadcast Mul + SumReduce fallback creates
 /// a `(n_heads, M, N, K)` intermediate that scales O(seq²) and OOMs at
 /// seq_len ≥ ~256 even with BF16 weights elsewhere).
-fn causal_sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
+fn causal_sdpa(
+    q: GraphTensor,
+    k: GraphTensor,
+    v: GraphTensor,
+    attention_mask: GraphTensor,
+) -> GraphTensor {
     let cx = q.graph();
     let n_heads = q.dims()[0];
     let seq = q.dims()[1];
@@ -150,8 +155,22 @@ fn causal_sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     // Causal mask: positions where k_pos > q_pos are masked.
     let q_pos = cx.arange(seq).cast(DType::F32);
     let k_pos = cx.arange(seq).cast(DType::F32);
-    let mask = k_pos.expand_dim(0, seq).gt(q_pos.expand_dim(1, seq));
-    let mask = mask.cast(DType::F32).expand_dim(0, n_heads);
+    let causal = k_pos.expand_dim(0, seq).gt(q_pos.expand_dim(1, seq));
+    let causal = causal.cast(DType::F32);
+    // Padding mask: keys at positions where attention_mask == 0 (padding
+    // tokens) are masked regardless of the causal relation. Without this,
+    // padding queries attend to prior padding keys via causal alone, and
+    // every padding hidden state diverges from diffusers — surfaces as
+    // cos_sim ≈ 0.65 on `prompt_embeds` even though tokens 0..real_len-1
+    // match exactly. attention_mask has shape (seq,) with 1 for real and
+    // 0 for padding tokens; broadcast as a per-key column to all queries.
+    // (1 - mask[k]) is 1 for padding keys, 0 for real keys → adds -1e10
+    // to every (q, padding_k) score.
+    let pad_key = (attention_mask.cast(DType::F32) * (-1.0_f32) + 1.0_f32) // (seq,)
+        .expand_dim(0, seq); // (seq_q=seq, seq_k=seq) — broadcast over q.
+    // Combine: anywhere either causal or padding masks → -1e10.
+    let mask = causal + pad_key;
+    let mask = mask.expand_dim(0, n_heads);
     let masked = scores + mask * (-1e10_f32);
     let weights = masked.softmax(2);
     // attn = weights @ v: (heads, seq, seq) @ (heads, seq, head_dim) = (heads, seq, head_dim).
@@ -209,7 +228,12 @@ impl MistralLayer {
         }
     }
 
-    fn forward(&self, x: GraphTensor, pos_ids: GraphTensor) -> GraphTensor {
+    fn forward(
+        &self,
+        x: GraphTensor,
+        pos_ids: GraphTensor,
+        attention_mask: GraphTensor,
+    ) -> GraphTensor {
         let h = rmsnorm(x, self.attn_rms, RMS_EPS);
         let q = linear_no_bias(h, self.q_proj);
         let k = linear_no_bias(h, self.k_proj);
@@ -231,7 +255,7 @@ impl MistralLayer {
         let v = v.transpose(0, 1).expand_dim(1, KV_GROUPS).merge_dims(0, 1);
         let q = q.transpose(0, 1); // (NUM_HEADS, seq, HEAD_DIM)
 
-        let attn = causal_sdpa(q, k, v); // (seq, Q_DIM)
+        let attn = causal_sdpa(q, k, v, attention_mask); // (seq, Q_DIM)
         let attn_out = linear_no_bias(attn, self.o_proj); // (seq, HIDDEN)
         let x = x + attn_out;
 
@@ -280,7 +304,12 @@ impl Mistral3TextEncoder {
     ///      = post-residual at layers 9, 19, 29).
     ///   3. Stack along a new "tap" axis: `(seq, 3, HIDDEN)`.
     ///   4. Flatten the tap axis into the channel axis: `(seq, 3*HIDDEN)`.
-    pub fn forward(&self, input_ids: GraphTensor, pos_ids: GraphTensor) -> GraphTensor {
+    pub fn forward(
+        &self,
+        input_ids: GraphTensor,
+        pos_ids: GraphTensor,
+        attention_mask: GraphTensor,
+    ) -> GraphTensor {
         let seq = input_ids.dims1();
         // Token embedding lookup via gather. Mirror the qwen / llama pattern:
         // build a flat index table (id * HIDDEN + col) that picks the right
@@ -299,7 +328,7 @@ impl Mistral3TextEncoder {
         // running layer 9. Same for 19 and 29.
         let mut taps: Vec<GraphTensor> = Vec::with_capacity(TAP_LAYERS.len());
         for (idx, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(x, pos_ids);
+            x = layer.forward(x, pos_ids, attention_mask);
             // Map: TAP_LAYERS = [10, 20, 30] meaning "post-layer 9/19/29".
             if TAP_LAYERS.iter().any(|&k| idx + 1 == k) {
                 taps.push(x);
