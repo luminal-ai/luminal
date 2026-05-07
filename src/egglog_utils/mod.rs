@@ -3230,6 +3230,60 @@ pub fn egglog_to_llir_from_root<'a>(
 
         graph.add_edge(src_node_id, dest_node_id, ());
     }
+
+    // Sanity check: post-extraction, every FusionStart node should have
+    // exactly one incoming edge (its external producer). The downstream
+    // `region_codegen::build_compile_units` panics with `FusionStart with
+    // no predecessor` if any FS leaf has zero. Surface the structural
+    // problem here, where we still know which enode + ilist eclass is
+    // responsible, instead of much later in codegen.
+    if std::env::var("LUMINAL_DEBUG_DANGLING_FS").is_ok() {
+        use crate::prelude::petgraph::Direction;
+        for (enode_id, &node_idx) in &enode_to_node {
+            let label = &egraph.enodes[enode_id].0;
+            if label != "Op" {
+                continue;
+            }
+            let kind_eclass = &egraph.enodes[enode_id].1[0];
+            let kind_label = egraph
+                .eclasses
+                .get(kind_eclass)
+                .and_then(|(_, ks)| ks.first())
+                .map(|n| egraph.enodes[n].0.as_str())
+                .unwrap_or("?");
+            if kind_label != "FusionStart" {
+                continue;
+            }
+            let in_deg = graph
+                .neighbors_directed(node_idx, Direction::Incoming)
+                .count();
+            if in_deg == 0 {
+                let ilist_eclass = &egraph.enodes[enode_id].1[1];
+                eprintln!(
+                    "DANGLING FusionStart: node_idx={} enode={:?} ilist_eclass={:?}",
+                    node_idx.index(),
+                    enode_id,
+                    ilist_eclass,
+                );
+                if let Some((_, ilist_nodes)) = egraph.eclasses.get(ilist_eclass) {
+                    eprintln!(
+                        "  ilist eclass has {} enode(s):",
+                        ilist_nodes.len(),
+                    );
+                    for n in ilist_nodes {
+                        let l = &egraph.enodes[n].0;
+                        eprintln!("    {:?} label={}", n, l);
+                    }
+                }
+                let chosen = choices[ilist_eclass];
+                eprintln!(
+                    "  chosen ilist enode: {:?} label={}",
+                    chosen,
+                    &egraph.enodes[chosen].0,
+                );
+            }
+        }
+    }
     // if enabled!(Level::TRACE) {
     //     fs::write(
     //         format!("llir_graphs/llir_{}.dot", i),
