@@ -474,7 +474,7 @@ def compile(
                 dynamic_shapes=dynamic_shapes,
                 **extra,
             )
-            ep = ep.run_decompositions()
+            ep = ep.run_decompositions(_decomp_table())
         except Exception:
             ep = None
 
@@ -570,7 +570,7 @@ def _eager_pt2_compile(
         if dynamic_shapes is None:
             raise
         ep = torch.export.export(gm, tuple(user_inputs), **_export_kwargs())
-    ep = ep.run_decompositions()
+    ep = ep.run_decompositions(_decomp_table())
 
     # When using shared memory (original_weights), strip large weight buffers
     # from the EP before saving. The Rust side uses device pointers for these
