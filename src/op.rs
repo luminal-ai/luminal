@@ -19,6 +19,7 @@ pub trait Runtime {
     fn late_egglog_passes(
         _ops: &[Arc<Box<dyn EgglogOp>>],
         _options: &crate::graph::BuildSearchSpaceOptions,
+        _dyn_map: &FxHashMap<char, usize>,
     ) -> Vec<crate::egglog_utils::LateEgglogPass>
     where
         Self: Sized,
@@ -56,6 +57,14 @@ pub trait Runtime {
     /// Total bytes of intermediate buffers currently allocated.
     fn intermediate_buffer_bytes(&self) -> usize {
         0
+    }
+    /// Total bytes in the active runtime memory plan, if the runtime has one.
+    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// Total active intermediate allocation bytes, if the runtime can report it.
+    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
+        None
     }
     /// Check if the most recent execution produced NaN in any output buffer.
     /// Used by the search to reject NaN-producing graph variants.

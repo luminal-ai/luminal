@@ -32,7 +32,7 @@ use crate::{
             CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
         },
     },
-    host::HostOp,
+    host::{DeviceBuffer, HostOp},
     try_create_cublaslt,
 };
 
@@ -294,27 +294,140 @@ impl HostOp for GLUMoE {
         stream: &Arc<CudaStream>,
         self_node: NodeIndex,
         inputs: &[NodeIndex],
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
-        // Resolve dimensions
-        let hidden = self.gu_matmul_k.exec(dyn_map).unwrap();
-        let intermediate = self.dn_matmul_k.exec(dyn_map).unwrap();
-        let top_k_expected = self.output_k.exec(dyn_map).unwrap();
-        let gate_up_dim = self.gu_io.exec(dyn_map).unwrap() / hidden; // gate_up_dim = gu_io / hidden
-        let num_experts = self.gu_within_range.exec(dyn_map).unwrap() / (gate_up_dim * hidden);
+        if inputs.len() < 6 {
+            anyhow::bail!("GLUMoE expected at least 6 inputs, got {}", inputs.len());
+        }
 
-        // Derive seq from x buffer size: x is [seq, hidden] F32 → seq = len / (hidden * 4)
-        let x_buf = buffers[&inputs[0]];
-        let seq = x_buf.len() / (hidden * 4);
+        // Resolve dimensions
+        let hidden = self
+            .gu_matmul_k
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoE hidden dimension is unresolved"))?;
+        let intermediate = self
+            .dn_matmul_k
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoE intermediate dimension is unresolved"))?;
+        let top_k = self
+            .output_k
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoE top-k dimension is unresolved"))?;
+        let gu_io = self
+            .gu_io
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoE gate/up stride is unresolved"))?;
+        let dn_io = self
+            .dn_io
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoE down stride is unresolved"))?;
+
+        if hidden == 0 || intermediate == 0 {
+            anyhow::bail!(
+                "GLUMoE got zero-sized matmul dimensions: hidden={hidden}, intermediate={intermediate}"
+            );
+        }
+        if top_k == 0 {
+            return Ok(());
+        }
+        if gu_io % hidden != 0 {
+            anyhow::bail!("GLUMoE gate/up stride {gu_io} is not divisible by hidden {hidden}");
+        }
+        if dn_io % intermediate != 0 {
+            anyhow::bail!(
+                "GLUMoE down stride {dn_io} is not divisible by intermediate {intermediate}"
+            );
+        }
+
+        let gate_up_dim = gu_io / hidden; // gate_up_dim = 2 * intermediate for GLU
+        let down_hidden = dn_io / intermediate;
+        if gate_up_dim != intermediate * 2 {
+            anyhow::bail!(
+                "GLUMoE expected gate/up dim {} to equal 2 * intermediate {}",
+                gate_up_dim,
+                intermediate * 2
+            );
+        }
+        if down_hidden != hidden {
+            anyhow::bail!("GLUMoE down hidden {down_hidden} does not match hidden {hidden}");
+        }
+
+        let output_bytes = self
+            .output_bytes()
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoE output byte size is unresolved"))?;
+        if output_bytes % (hidden * 4) != 0 {
+            anyhow::bail!(
+                "GLUMoE output bytes {output_bytes} are not divisible by hidden bytes {}",
+                hidden * 4
+            );
+        }
+        let seq = output_bytes / (hidden * 4);
+        if seq == 0 {
+            return Ok(());
+        }
+
+        let get_buffer = |name: &str, node: NodeIndex| -> anyhow::Result<DeviceBuffer> {
+            buffers.get(&node).copied().ok_or_else(|| {
+                anyhow::anyhow!("GLUMoE missing {name} buffer for LLIR node {node:?}")
+            })
+        };
 
         // Get input/output buffers
-        let topk_idx_buf = buffers[&inputs[1]]; // [seq, k] Int
-        let topk_vals_buf = buffers[&inputs[2]]; // [seq, k] F32
-        let gate_up_buf = buffers[&inputs[3]]; // [E, gate_up_dim, hidden] BF16
-        let down_buf = buffers[&inputs[4]]; // [E, hidden, intermediate] BF16
-        let mode_aux_buf = buffers[&inputs[5]];
-        let output_buf = buffers[&self_node]; // [seq, hidden] F32
+        let x_buf = get_buffer("x", inputs[0])?; // [seq, hidden] F32
+        let topk_idx_buf = get_buffer("topk indices", inputs[1])?; // [seq, k] Int
+        let topk_vals_buf = get_buffer("topk values", inputs[2])?; // [seq, k] F32
+        let gate_up_buf = get_buffer("gate/up weights", inputs[3])?; // [E, gate_up_dim, hidden] BF16
+        let down_buf = get_buffer("down weights", inputs[4])?; // [E, hidden, intermediate] BF16
+        let mode_aux_buf = get_buffer("mode aux", inputs[5])?;
+        let output_buf = get_buffer("output", self_node)?; // [seq, hidden] F32
+
+        let topk_bytes = seq * top_k * 4;
+        if x_buf.len() < output_bytes {
+            anyhow::bail!(
+                "GLUMoE x buffer too small: have {} bytes, need {output_bytes}",
+                x_buf.len()
+            );
+        }
+        if topk_idx_buf.len() < topk_bytes {
+            anyhow::bail!(
+                "GLUMoE topk index buffer too small: have {} bytes, need {topk_bytes}",
+                topk_idx_buf.len()
+            );
+        }
+        if topk_vals_buf.len() < topk_bytes {
+            anyhow::bail!(
+                "GLUMoE topk value buffer too small: have {} bytes, need {topk_bytes}",
+                topk_vals_buf.len()
+            );
+        }
+        if output_buf.len() < output_bytes {
+            anyhow::bail!(
+                "GLUMoE output buffer too small: have {} bytes, need {output_bytes}",
+                output_buf.len()
+            );
+        }
+
+        let gu_stride_bytes = gate_up_dim * hidden * 2;
+        let down_stride_bytes = hidden * intermediate * 2;
+        if gu_stride_bytes == 0 || gate_up_buf.len() % gu_stride_bytes != 0 {
+            anyhow::bail!(
+                "GLUMoE gate/up weight buffer has {} bytes, not a multiple of per-expert stride {gu_stride_bytes}",
+                gate_up_buf.len()
+            );
+        }
+        let num_experts = gate_up_buf.len() / gu_stride_bytes;
+        if num_experts == 0 {
+            anyhow::bail!("GLUMoE has no expert weights");
+        }
+        if down_buf.len() < num_experts * down_stride_bytes {
+            anyhow::bail!(
+                "GLUMoE down weight buffer too small: have {} bytes, need {}",
+                down_buf.len(),
+                num_experts * down_stride_bytes
+            );
+        }
 
         // Get raw device pointer addresses
         let x_ptr = buf_ptr(x_buf, stream);
@@ -326,21 +439,17 @@ impl HostOp for GLUMoE {
         let (_, f32_to_bf16_fn, activation_fn) = self.get_kernels(stream);
 
         // Read top-k routing values from GPU
-        let topk_idx_host: Vec<u8> = stream.clone_dtoh(topk_idx_buf)?;
-        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host);
-        let topk_vals_host: Vec<u8> = stream.clone_dtoh(topk_vals_buf)?;
-        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
-        let idx_k = topk_idx_i32
-            .len()
-            .checked_div(seq)
-            .unwrap_or(top_k_expected);
-        let val_k = topk_vals_f32
-            .len()
-            .checked_div(seq)
-            .unwrap_or(top_k_expected);
-        let top_k = idx_k.min(val_k);
-        if seq > 0 && top_k == 0 {
-            return Ok(());
+        let topk_idx_host: Vec<u8> = topk_idx_buf.clone_dtoh(stream)?;
+        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host[..topk_bytes]);
+        let topk_vals_host: Vec<u8> = topk_vals_buf.clone_dtoh(stream)?;
+        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host[..topk_bytes]);
+
+        for (pos, &expert_idx) in topk_idx_i32.iter().enumerate() {
+            if expert_idx < 0 || expert_idx as usize >= num_experts {
+                anyhow::bail!(
+                    "GLUMoE expert index {expert_idx} at routing position {pos} out of bounds for {num_experts} experts"
+                );
+            }
         }
 
         // Mode-dependent expert weights used for the final reduction:
@@ -350,9 +459,16 @@ impl HostOp for GLUMoE {
         let expert_weights_f32: &[f32] = match self.mode {
             GLUMoEMode::SwiGLU => topk_vals_f32,
             GLUMoEMode::GemmaGELU => {
-                let per_expert_scale_host: Vec<u8> = stream.clone_dtoh(mode_aux_buf)?;
-                let per_expert_scale_f32: &[f32] = bytemuck::cast_slice(&per_expert_scale_host);
-                debug_assert!(per_expert_scale_f32.len() >= num_experts);
+                let per_expert_scale_host: Vec<u8> = mode_aux_buf.clone_dtoh(stream)?;
+                let per_expert_scale_bytes = num_experts * 4;
+                if per_expert_scale_host.len() < per_expert_scale_bytes {
+                    anyhow::bail!(
+                        "GLUMoE per-expert scale buffer too small: have {} bytes, need {per_expert_scale_bytes}",
+                        per_expert_scale_host.len()
+                    );
+                }
+                let per_expert_scale_f32: &[f32] =
+                    bytemuck::cast_slice(&per_expert_scale_host[..per_expert_scale_bytes]);
                 expert_weights_storage.resize(seq * top_k, 0.0);
                 for t in 0..seq {
                     let base = t * top_k;
@@ -382,10 +498,10 @@ impl HostOp for GLUMoE {
         let hidden_tmp = unsafe { stream.alloc::<u8>(intermediate * 2)? }; // BF16
         let workspace = unsafe { stream.alloc::<u8>(WORKSPACE_SIZE)? };
 
-        let xbf16_ptr = buf_ptr(&x_bf16_buf, stream);
-        let gu_out_ptr = buf_ptr(&gate_up_out_buf, stream);
-        let hid_ptr = buf_ptr(&hidden_tmp, stream);
-        let ws_ptr = buf_ptr(&workspace, stream);
+        let xbf16_ptr = slice_ptr(&x_bf16_buf, stream);
+        let gu_out_ptr = slice_ptr(&gate_up_out_buf, stream);
+        let hid_ptr = slice_ptr(&hidden_tmp, stream);
+        let ws_ptr = slice_ptr(&workspace, stream);
 
         // Cast x F32 → BF16
         let n_cast = (seq * hidden) as i32;
@@ -404,8 +520,8 @@ impl HostOp for GLUMoE {
         }
 
         // Per-token expert computation
-        let gu_stride = (gate_up_dim * hidden * 2) as u64; // bytes per expert gate_up (BF16)
-        let down_stride = (hidden * intermediate * 2) as u64; // bytes per expert down (BF16)
+        let gu_stride = gu_stride_bytes as u64; // bytes per expert gate_up (BF16)
+        let down_stride = down_stride_bytes as u64; // bytes per expert down (BF16)
 
         for t in 0..seq {
             let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64; // BF16
@@ -507,7 +623,11 @@ impl HostOp for GLUMoE {
 // Helpers
 // ============================================================
 
-fn buf_ptr(buf: &CudaSlice<u8>, stream: &Arc<CudaStream>) -> u64 {
+fn buf_ptr(buf: DeviceBuffer, _stream: &Arc<CudaStream>) -> u64 {
+    buf.ptr()
+}
+
+fn slice_ptr(buf: &CudaSlice<u8>, stream: &Arc<CudaStream>) -> u64 {
     let (ptr, _guard) = buf.device_ptr(stream);
     ptr
 }

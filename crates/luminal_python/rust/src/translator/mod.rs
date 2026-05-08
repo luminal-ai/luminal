@@ -2,6 +2,7 @@
 //!
 //! Walks the parsed PT2 graph and constructs an equivalent Luminal computation graph.
 
+mod attention;
 mod binary;
 mod conv;
 mod dispatch;

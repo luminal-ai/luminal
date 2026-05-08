@@ -41,9 +41,8 @@ fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     all_names
 }
 
-/// When dest is NOT shared with any other op, KernelScatterNoCopy should be available.
-/// The ConsumedBuffer cleanup rule should NOT fire because dest only appears inside
-/// the ConsumedBuffer (not in any other ICons).
+/// When dest is NOT shared with any other compute op, KernelScatterNoCopy should
+/// be the only scatter variant left after post-cleanup.
 #[test]
 fn test_scatter_nocopy_selected_when_dest_unshared() {
     let ctx = CudaContext::new(0).unwrap();
@@ -62,10 +61,15 @@ fn test_scatter_nocopy_selected_when_dest_unshared() {
     let names = extract_all_kernel_names(&mut cx);
     println!("All possible kernels: {:?}", names);
 
-    // KernelScatterNoCopy should be available (dest is not shared)
+    // KernelScatterNoCopy should be the only scatter variant (dest is not shared)
     assert!(
         names.iter().any(|n| n == "ScatterNoCopy"),
         "Expected ScatterNoCopy to be available but got: {:?}",
+        names
+    );
+    assert!(
+        !names.iter().any(|n| n == "Scatter"),
+        "Regular Scatter should be pruned when ScatterNoCopy is valid, got: {:?}",
         names
     );
 }
@@ -109,8 +113,42 @@ fn test_scatter_nocopy_not_selected_when_dest_shared() {
     );
 }
 
+/// Shared-use detection must catch the destination in non-first input
+/// positions too. Gather takes indexes first and data second, so this would
+/// miss the unsafe read if cleanup only inspected the head of the input list.
+#[test]
+fn test_scatter_nocopy_not_selected_when_dest_shared_as_later_input() {
+    let ctx = CudaContext::new(0).unwrap();
+    ctx.bind_to_thread().unwrap();
+
+    let mut cx = Graph::default();
+
+    let dest = cx.tensor(10).persist();
+    let src = cx.tensor(3).persist();
+    let scatter_indexes = cx.tensor(3).as_dtype(DType::Int).persist();
+    let read_indexes = cx.tensor(1).as_dtype(DType::Int).persist();
+
+    let scatter_result = src.scatter(scatter_indexes, dest);
+    let _dest_also_read = dest.gather(read_indexes).output();
+    let _result = scatter_result.output();
+
+    let names = extract_all_kernel_names(&mut cx);
+    println!("All possible kernels: {:?}", names);
+
+    assert!(
+        !names.iter().any(|n| n == "ScatterNoCopy"),
+        "ScatterNoCopy should NOT be available when dest is read by another op, got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "Scatter"),
+        "Expected regular Scatter but got: {:?}",
+        names
+    );
+}
+
 /// Actually execute the scatter and verify correctness.
-/// Tests all possible extractions (both KernelScatter and KernelScatterNoCopy).
+/// Post-cleanup should force the valid no-copy extraction.
 #[test]
 fn test_scatter_execution_correctness() {
     let ctx = CudaContext::new(0).unwrap();
@@ -135,9 +173,8 @@ fn test_scatter_execution_correctness() {
     // Expected: [0.0, 10.0, 2.0, 20.0, 30.0]
     let expected = vec![0.0f32, 10.0, 2.0, 20.0, 30.0];
 
-    // Try many random extractions to cover both Scatter and ScatterNoCopy
+    // Try many random extractions; each valid choice should now use ScatterNoCopy.
     let mut rng = rand::rng();
-    let mut tested_scatter = false;
     let mut tested_nocopy = false;
 
     for _ in 0..50 {
@@ -180,27 +217,24 @@ fn test_scatter_execution_correctness() {
 
         let actual = rt.get_f32(result);
 
-        let variant = if has_nocopy {
-            tested_nocopy = true;
-            "ScatterNoCopy"
-        } else if has_scatter {
-            tested_scatter = true;
-            "Scatter"
-        } else {
-            "Unknown"
-        };
+        assert!(
+            has_nocopy,
+            "Expected ScatterNoCopy after post-cleanup, got no no-copy scatter"
+        );
+        assert!(
+            !has_scatter,
+            "Regular Scatter should be pruned when ScatterNoCopy is valid"
+        );
+        tested_nocopy = true;
 
         assert_eq!(
             actual, expected,
-            "Scatter result mismatch with variant {variant}: got {:?}, expected {:?}",
+            "Scatter result mismatch with ScatterNoCopy: got {:?}, expected {:?}",
             actual, expected
         );
     }
 
-    println!(
-        "Tested Scatter: {}, Tested ScatterNoCopy: {}",
-        tested_scatter, tested_nocopy
-    );
+    println!("Tested ScatterNoCopy: {}", tested_nocopy);
     assert!(
         tested_nocopy,
         "ScatterNoCopy was never selected in 50 attempts — can't verify correctness"
@@ -242,12 +276,28 @@ fn test_scatter_kv_cache_roundtrip() {
 
     rt = cx.search(rt, 5);
 
-    // Print which scatter variant was selected
+    // Print and verify which scatter variant was selected
+    let scatter_names: Vec<_> = rt
+        .kernel_names()
+        .iter()
+        .copied()
+        .filter(|name| name.contains("catter"))
+        .collect();
     for name in rt.kernel_names() {
         if name.contains("catter") {
             println!("Selected: {name}");
         }
     }
+    assert!(
+        scatter_names.contains(&"ScatterNoCopy"),
+        "Expected ScatterNoCopy in KV-cache search result, got: {:?}",
+        scatter_names
+    );
+    assert!(
+        !scatter_names.contains(&"Scatter"),
+        "Regular Scatter should be pruned from KV-cache search result, got: {:?}",
+        scatter_names
+    );
 
     // Step 1: Initialize cache to zeros, scatter 10.0 at position 0
     rt.set_data(cache_in, vec![0.0f32; 5]);
@@ -342,17 +392,31 @@ fn test_scatter_dual_cache() {
     rt.set_data(v_new, vec![3.0f32]);
     rt.set_data(indexes, vec![0i32]);
 
-    // Use seeded search for deterministic scatter variant selection.
-    // Seed 0 reliably selects Scatter (not ScatterNoCopy) for both caches.
+    // Use seeded search for deterministic variant selection.
     let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
     rt = cx.search_options(rt, SearchOptions::new(5), &mut rng);
 
-    // Print selected variants
+    // Print and verify selected variants
+    let scatter_names: Vec<_> = rt
+        .kernel_names()
+        .iter()
+        .copied()
+        .filter(|name| name.contains("catter"))
+        .collect();
     for name in rt.kernel_names() {
         if name.contains("catter") {
             println!("Dual test selected: {name}");
         }
     }
+    assert!(
+        !scatter_names.is_empty(),
+        "Expected scatter kernels in dual-cache search result"
+    );
+    assert!(
+        scatter_names.iter().all(|name| *name == "ScatterNoCopy"),
+        "Expected only ScatterNoCopy in dual-cache search result, got: {:?}",
+        scatter_names
+    );
 
     // Step 1: scatter k=2.0, v=3.0 at position 0
     rt.set_data(k_cache, vec![0.0f32; 5]);

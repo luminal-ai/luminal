@@ -9,6 +9,8 @@ use std::hash::{Hash, Hasher};
 use std::{str, sync::Arc, time::Duration};
 use tracing::trace;
 
+pub use egraph_serialize::{ClassId, NodeId};
+
 pub mod api;
 pub mod base;
 
@@ -36,7 +38,9 @@ struct EgglogSchedulePhase {
     schedule: String,
 }
 
-#[derive(Debug, Clone, Default)]
+pub type EGraphPostprocess = Arc<dyn Fn(&mut SerializedEGraph) + Send + Sync + 'static>;
+
+#[derive(Clone, Default)]
 pub struct LateEgglogPass {
     /// Egglog declarations and rules for a backend-provided late pass.
     ///
@@ -49,6 +53,19 @@ pub struct LateEgglogPass {
     /// Backends can use this for analysis-only layers or for analysis followed
     /// by backend-specific cleanup rules.
     pub schedule: String,
+    /// Optional Rust post-processing hook that runs on the serialized e-graph
+    /// after egglog has finished and before the final empty-eclass cascade.
+    pub postprocess: Option<EGraphPostprocess>,
+}
+
+impl std::fmt::Debug for LateEgglogPass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LateEgglogPass")
+            .field("program", &self.program)
+            .field("schedule", &self.schedule)
+            .field("has_postprocess", &self.postprocess.is_some())
+            .finish()
+    }
 }
 
 impl LateEgglogPass {
@@ -56,7 +73,16 @@ impl LateEgglogPass {
         Self {
             program: program.into(),
             schedule: schedule.into(),
+            postprocess: None,
         }
+    }
+
+    pub fn with_postprocess(
+        mut self,
+        postprocess: impl Fn(&mut SerializedEGraph) + Send + Sync + 'static,
+    ) -> Self {
+        self.postprocess = Some(Arc::new(postprocess));
+        self
     }
 }
 
@@ -130,6 +156,7 @@ pub struct OpTextParts {
     late_program: String,
     rewrites: String,
     late_phases: Vec<EgglogSchedulePhase>,
+    late_postprocesses: Vec<EGraphPostprocess>,
 }
 
 impl OpTextParts {
@@ -181,6 +208,10 @@ impl OpTextParts {
                     })
                 })
                 .collect(),
+            late_postprocesses: late_passes
+                .iter()
+                .filter_map(|pass| pass.postprocess.clone())
+                .collect(),
         }
     }
 }
@@ -229,6 +260,10 @@ fn egglog_final_phases() -> Vec<EgglogSchedulePhase> {
         EgglogSchedulePhase {
             name: "cleanup".to_string(),
             schedule: "(saturate cleanup)".to_string(),
+        },
+        EgglogSchedulePhase {
+            name: "post cleanup".to_string(),
+            schedule: "(saturate post_cleanup)".to_string(),
         },
         EgglogSchedulePhase {
             name: "base cleanup".to_string(),
@@ -297,9 +332,8 @@ use crate::{
 };
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egglog_reports::ReportLevel;
-use egraph_serialize::{ClassId, NodeId};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
 pub struct SerializedEGraph {
@@ -1909,6 +1943,20 @@ pub fn run_egglog_with_report_parts(
     root: &str,
     op_parts: &OpTextParts,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    #[cfg(debug_assertions)]
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static WARNED_DEBUG_EGGLOG: AtomicBool = AtomicBool::new(false);
+        if !WARNED_DEBUG_EGGLOG.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "{}",
+                "   Egglog warning: running in a debug build; model-sized saturation can be very slow. Use `cargo run --release ...` for CUDA model examples."
+                    .yellow()
+            );
+        }
+    }
+
     let total_start = std::time::Instant::now();
 
     let full_start = std::time::Instant::now();
@@ -2176,6 +2224,10 @@ pub fn run_egglog_with_report_parts(
         for nid in to_strip {
             egraph.enodes.remove(&nid);
         }
+    }
+
+    for postprocess in &op_parts.late_postprocesses {
+        postprocess(&mut egraph);
     }
 
     // Cascade: remove enodes whose children reference empty eclasses

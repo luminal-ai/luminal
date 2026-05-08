@@ -289,6 +289,24 @@ impl EgglogOp for KernelScatterNoCopy {
         // If ConsumedBuffer was deleted (shared case), cascade cleanup removes the dependent
         // ICons and KernelScatterNoCopy Op, leaving only KernelScatter.
         let mut rules = vec![
+            Rule::raw("(relation consumed_buffer_ilist_contains (IList IR))"),
+            Rule::raw(
+                "(rule
+                    ((= ?list (ICons ?head ?tail)))
+                    ((consumed_buffer_ilist_contains ?list ?head))
+                    :ruleset cleanup
+                    :name \"consumed-buffer-ilist-contains-head\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?list (ICons ?head ?tail))
+                     (consumed_buffer_ilist_contains ?tail ?item))
+                    ((consumed_buffer_ilist_contains ?list ?item))
+                    :ruleset cleanup
+                    :name \"consumed-buffer-ilist-contains-tail\"
+                )",
+            ),
             // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
             Rule::raw(
                 "(rule
@@ -324,13 +342,28 @@ impl EgglogOp for KernelScatterNoCopy {
             "(rule
                 ((= ?cb (ConsumedBuffer ?a))
                  (= ?op1 (Op ?k1 ?ilist1))
-                 (= ?ilist1 (ICons ?cb ?rest1))
+                 (consumed_buffer_ilist_contains ?ilist1 ?cb)
                  (= ?op2 (Op ?k2 ?ilist2))
                  (!= ?op1 ?op2)
-                 (= ?ilist2 (ICons ?a ?t2)))
+                 (consumed_buffer_ilist_contains ?ilist2 ?a))
                 ((delete (ConsumedBuffer ?a)))
                 :ruleset cleanup
-                :name \"consumed-buffer-cleanup-pos\"
+                :name \"consumed-buffer-cleanup-shared-op-use\"
+            )",
+        ));
+        // If a valid no-copy scatter survives cleanup, it dominates the copying scatter.
+        // This must run before base_cleanup resolves ConsumedBuffer back to the destination.
+        rules.push(Rule::raw(
+            "(rule
+                ((= ?cb (ConsumedBuffer ?dest))
+                 (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+                 (= ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?cb (ICons ?indexes (ICons ?src (INil)))))))
+                ((delete (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?dest (ICons ?indexes (ICons ?src (INil)))))))
+                :ruleset post_cleanup
+                :name \"scatter-no-copy-dominates-valid-consumed-buffer\"
             )",
         ));
         // Surviving ConsumedBuffers are valid — union with source and delete.
