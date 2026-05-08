@@ -289,12 +289,12 @@ fn test_scatter_kv_cache_roundtrip() {
         }
     }
     assert!(
-        scatter_names.iter().any(|name| *name == "ScatterNoCopy"),
+        scatter_names.contains(&"ScatterNoCopy"),
         "Expected ScatterNoCopy in KV-cache search result, got: {:?}",
         scatter_names
     );
     assert!(
-        !scatter_names.iter().any(|name| *name == "Scatter"),
+        !scatter_names.contains(&"Scatter"),
         "Regular Scatter should be pruned from KV-cache search result, got: {:?}",
         scatter_names
     );

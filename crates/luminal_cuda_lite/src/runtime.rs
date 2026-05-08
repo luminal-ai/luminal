@@ -265,9 +265,7 @@ impl CudaRuntime {
                 }
             }
 
-            let Some(alias_target) = bucket.output_alias_map.get(&node) else {
-                return None;
-            };
+            let alias_target = bucket.output_alias_map.get(&node)?;
             node = *alias_target;
         }
     }
@@ -1109,9 +1107,7 @@ fn resolve_logical_buffer_node(
         if !visited.insert(node) {
             return None;
         }
-        let Some(target) = output_alias_map.get(&node) else {
-            return None;
-        };
+        let target = output_alias_map.get(&node)?;
         node = *target;
     }
 
@@ -1470,17 +1466,17 @@ impl Runtime for CudaRuntime {
 
             let extra_nodes = exec_op.internal.extra_buffer_nodes();
             for extra_node in extra_nodes {
-                if let Entry::Vacant(e) = buffer_map.entry(extra_node) {
-                    if let Some(buf) = Self::resolve_runtime_buffer(
+                if let Entry::Vacant(e) = buffer_map.entry(extra_node)
+                    && let Some(buf) = Self::resolve_runtime_buffer(
                         bucket,
                         &self.cuda_stream,
                         &self.hlir_buffers,
                         &self.external_buffers,
                         &self.external_output_buffers,
                         extra_node,
-                    ) {
-                        e.insert(buf);
-                    }
+                    )
+                {
+                    e.insert(buf);
                 }
             }
             let _span = span!(
