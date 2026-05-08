@@ -444,6 +444,7 @@ pub fn base_expression_egglog() -> String {
     p.add_ruleset("expr");
     p.add_ruleset("dtype_prop");
     p.add_ruleset("cleanup");
+    p.add_ruleset("post_cleanup");
 
     // Register all sorts
     s.register(&mut p);

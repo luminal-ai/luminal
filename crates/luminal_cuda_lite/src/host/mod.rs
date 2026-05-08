@@ -1,6 +1,6 @@
 use std::{fmt::Debug, sync::Arc};
 
-use crate::cudarc::driver::{CudaSlice, CudaStream};
+use crate::cudarc::driver::{CudaStream, DriverError, result};
 use luminal::{op::EgglogOp, prelude::*};
 mod cublas;
 mod cublaslt;
@@ -11,6 +11,44 @@ pub type Ops = (
     cublaslt::CuBlasLt,
     moe::GLUMoE,
 );
+
+/// Non-owning device buffer handle used by host operations.
+///
+/// Runtime-owned intermediates may be a whole `CudaSlice`, a subregion inside
+/// the reusable arena, or an external pointer. Host ops only need the pointer
+/// and the logical byte length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceBuffer {
+    ptr: u64,
+    len: usize,
+}
+
+impl DeviceBuffer {
+    pub fn new(ptr: u64, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
+    pub fn ptr(self) -> u64 {
+        self.ptr
+    }
+
+    pub fn len(self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn clone_dtoh(self, stream: &Arc<CudaStream>) -> Result<Vec<u8>, DriverError> {
+        let mut host = vec![0u8; self.len];
+        unsafe {
+            result::memcpy_dtoh_async(&mut host, self.ptr, stream.cu_stream())?;
+        }
+        stream.synchronize()?;
+        Ok(host)
+    }
+}
 
 /// Host operations that execute on the CPU but orchestrate GPU work.
 ///
@@ -29,7 +67,7 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         stream: &Arc<CudaStream>,
         self_node: NodeIndex,
         inputs: &[NodeIndex],
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()>;
 
@@ -46,6 +84,15 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// For CudaGraphOp, this returns all internal kernel nodes.
     fn extra_buffer_nodes(&self) -> Vec<NodeIndex> {
         vec![]
+    }
+
+    /// Returns relative lifetimes for extra buffer nodes within this host op.
+    ///
+    /// The tuple is `(node, first_step, last_step)`, where steps are local to
+    /// this host op's execution. Returning `None` tells the runtime to treat
+    /// every extra buffer as live for the whole host op.
+    fn extra_buffer_lifetimes(&self) -> Option<Vec<(NodeIndex, usize, usize)>> {
+        None
     }
 
     /// Returns buffer size requirements for extra nodes (node -> size in elements).
