@@ -136,7 +136,9 @@ def _decomp_table():
     return table
 
 
-def _save_and_compile(ep_or_path, factory, search_iterations, original_weights=None):
+def _save_and_compile(
+    ep_or_path, factory, search_iterations, original_weights=None, user_indices=None
+):
     """Compile a PT2 model via Rust, return CompiledModel.
 
     Args:
@@ -432,7 +434,9 @@ def compile(
     """
     if factory is None:
         factory = _detect_factory_capsule(
-            example_input if isinstance(example_input, (list, tuple)) else [example_input]
+            example_input
+            if isinstance(example_input, (list, tuple))
+            else [example_input]
         )
 
     if isinstance(example_input, (list, tuple)):
@@ -686,8 +690,8 @@ def pt2_backend(gm, example_inputs, factory=None):
     # same frame" assertions on the next call. The deepcopy is cheap relative
     # to the rest of the export pipeline.
     gm = _copy.deepcopy(gm).eval()
-    gm, user_inputs, original_weights, post_lift_indices = (
-        _reinternalize_lifted_params(gm, example_inputs)
+    gm, user_inputs, original_weights, post_lift_indices = _reinternalize_lifted_params(
+        gm, example_inputs
     )
 
     # Lift any SymInt placeholders Dynamo emitted alongside the tensor inputs

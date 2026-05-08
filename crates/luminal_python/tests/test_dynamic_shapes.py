@@ -83,7 +83,9 @@ def test_dynamic_seq_via_torch_compile_reuses_compile(device: torch.device):
         x = torch.randn(shp, 8, device=device)
         ref = model(x)
         out = compiled(x)
-        assert out.shape == ref.shape, f"shape={shp}: got {out.shape} expected {ref.shape}"
+        assert out.shape == ref.shape, (
+            f"shape={shp}: got {out.shape} expected {ref.shape}"
+        )
         assert torch.allclose(out, ref, atol=1e-5), (
             f"shape={shp}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
         )
@@ -122,7 +124,9 @@ def test_dynamic_via_torch_compile_with_lifted_weights(device: torch.device):
         x = torch.randn(shp, 8, device=device)
         ref = model(x)
         out = compiled(x)
-        assert out.shape == ref.shape, f"shape={shp}: got {out.shape} expected {ref.shape}"
+        assert out.shape == ref.shape, (
+            f"shape={shp}: got {out.shape} expected {ref.shape}"
+        )
         assert torch.allclose(out, ref, atol=1e-5), (
             f"shape={shp}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
         )
@@ -159,7 +163,9 @@ def test_compound_shape_expression_auto_resolves(device: torch.device):
         x = torch.randn(shp, 8, device=device)
         ref = model(x)
         out = compiled(x)
-        assert out.shape == ref.shape, f"shape={shp}: got {out.shape} expected {ref.shape}"
+        assert out.shape == ref.shape, (
+            f"shape={shp}: got {out.shape} expected {ref.shape}"
+        )
         assert torch.allclose(out, ref, atol=1e-5)
 
 

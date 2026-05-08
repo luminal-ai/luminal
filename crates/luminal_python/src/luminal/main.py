@@ -13,9 +13,7 @@ def _detect_factory_capsule(example_inputs):
     """Pick the best built-in factory capsule based on input device."""
     # Dynamo can prefix `example_inputs` with SymInt entries when shapes are
     # dynamic — those have no `.device`. Pick the first real tensor instead.
-    first_tensor = next(
-        (t for t in (example_inputs or []) if torch.is_tensor(t)), None
-    )
+    first_tensor = next((t for t in (example_inputs or []) if torch.is_tensor(t)), None)
     device = first_tensor.device if first_tensor is not None else torch.device("cpu")
     if device.type == "cuda":
         try:

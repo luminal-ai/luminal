@@ -33,9 +33,8 @@ fn resolve_dim_sizes(
                 // rather lose the symbolic info than misinterpret it.
                 parse_sympy_expr(s, sym_to_char)
                     .or_else(|| {
-                        pt2_parser::extract_symbol_name_pub(s).and_then(|sym| {
-                            sym_to_char.get(&sym).map(|c| Expression::from(*c))
-                        })
+                        pt2_parser::extract_symbol_name_pub(s)
+                            .and_then(|sym| sym_to_char.get(&sym).map(|c| Expression::from(*c)))
                     })
                     .or_else(|| {
                         // As a last resort, if the EP gave us a concrete `hint`
