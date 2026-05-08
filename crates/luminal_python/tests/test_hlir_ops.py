@@ -1847,6 +1847,60 @@ def test_scaled_dot_product_attention(device: torch.device):
     assert torch.allclose(output, original, atol=1e-5)
 
 
+# ========== F.scaled_dot_product_attention (SDPA aten variants) ==========
+# Tests for `torch.nn.functional.scaled_dot_product_attention`, which lowers
+# to one of `aten._scaled_dot_product_*_attention.default` (variant chosen by
+# PyTorch's dispatcher: efficient/flash/flash_for_cpu/cudnn). Coverage here
+# exercises `translate_sdpa` end-to-end.
+
+
+def _sdpa_qkv(device: torch.device, b: int = 1, h: int = 2, s: int = 4, d: int = 8):
+    """Build a `(B, H, S, D)` Q/K/V triple of float32 tensors on `device`."""
+    torch.manual_seed(0)
+    q = torch.rand((b, h, s, d), device=device)
+    k = torch.rand((b, h, s, d), device=device)
+    v = torch.rand((b, h, s, d), device=device)
+    return q, k, v
+
+
+def test_sdpa_basic(device: torch.device):
+    """`F.scaled_dot_product_attention(q, k, v)` — default scale, no mask."""
+    from test_models import SdpaBasicModel
+
+    model: torch.nn.Module = SdpaBasicModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    q, k, v = _sdpa_qkv(device)
+    expected: torch.Tensor = model(q, k, v)
+    actual: torch.Tensor = compiled(q, k, v)
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_sdpa_causal(device: torch.device):
+    """`F.scaled_dot_product_attention(q, k, v, is_causal=True)`."""
+    from test_models import SdpaCausalModel
+
+    model: torch.nn.Module = SdpaCausalModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    q, k, v = _sdpa_qkv(device)
+    expected: torch.Tensor = model(q, k, v)
+    actual: torch.Tensor = compiled(q, k, v)
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
+def test_sdpa_with_attn_bias(device: torch.device):
+    """SDPA with an additive `attn_mask` (float bias) broadcast over heads."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    q, k, v = _sdpa_qkv(device)
+    bias = torch.zeros((1, 1, q.shape[-2], k.shape[-2]), device=device)
+    bias[..., 0, 1] = -1.0  # any non-trivial bias to verify it's actually applied
+    expected: torch.Tensor = model(q, k, v, bias)
+    actual: torch.Tensor = compiled(q, k, v, bias)
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+
 def test_mlp_block(device: torch.device):
     """Test two-layer MLP: Linear(8,16) -> ReLU -> Linear(16,4) on input (2,8)."""
     model: torch.nn.Module = MLPBlockModel().to(device)

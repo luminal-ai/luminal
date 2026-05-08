@@ -19,9 +19,9 @@ use crate::{
             CudaBlas,
             sys::{cublasOperation_t, cublasSetStream_v2, cublasSgemm_v2, cublasStatus_t},
         },
-        driver::{CudaSlice, CudaStream, DevicePtr},
+        driver::CudaStream,
     },
-    host::HostOp,
+    host::{DeviceBuffer, HostOp},
 };
 
 /// Global shared cuBLAS handle to avoid per-operation workspace allocation
@@ -156,7 +156,7 @@ impl HostOp for CuBlasSgemmV2 {
         stream: &Arc<CudaStream>,
         self_node: NodeIndex,
         inputs: &[NodeIndex],
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
         // GEMM parameters
@@ -178,9 +178,9 @@ impl HostOp for CuBlasSgemmV2 {
         let b_buf = buffers[&inputs[1]];
 
         // Get device pointers
-        let (a_ptr, _a_guard) = a_buf.device_ptr(stream);
-        let (b_ptr, _b_guard) = b_buf.device_ptr(stream);
-        let (c_ptr, _c_guard) = c_buf.device_ptr(stream);
+        let a_ptr = a_buf.ptr();
+        let b_ptr = b_buf.ptr();
+        let c_ptr = c_buf.ptr();
 
         // Debug: Check buffer sizes
         trace!(

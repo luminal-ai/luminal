@@ -110,6 +110,32 @@ def _export_kwargs():
     return kwargs
 
 
+def _decomp_table():
+    """Decomposition table for `ep.run_decompositions()` that preserves SDPA.
+
+    The default table decomposes `aten.scaled_dot_product_attention.default`
+    into ~20 ops (matmul/softmax + an `eq.Scalar`/`logical_not`/`any.dim`/
+    `where`/`full_like` "all-masked" sentinel chain). We translate SDPA as a
+    single fused op via `translate_sdpa`, so we strip the SDPA decompositions
+    here to let them survive into the FX graph the translator walks.
+    """
+    try:
+        from torch.export import default_decompositions
+    except ImportError:
+        return None
+    table = default_decompositions()
+    sdpa_ops = [
+        torch.ops.aten.scaled_dot_product_attention.default,
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+    ]
+    for op in sdpa_ops:
+        table.pop(op, None)
+    return table
+
+
 def _save_and_compile(ep_or_path, factory, search_iterations, original_weights=None):
     """Compile a PT2 model via Rust, return CompiledModel.
 
@@ -270,7 +296,7 @@ def compile(
                     dynamic_shapes=dynamic_shapes,
                     **extra,
                 )
-                ep = ep.run_decompositions()
+                ep = ep.run_decompositions(_decomp_table())
                 break
             except Exception:
                 continue
@@ -283,7 +309,7 @@ def compile(
             dynamic_shapes=None,
             **extra,
         )
-        ep = ep.run_decompositions()
+        ep = ep.run_decompositions(_decomp_table())
 
     return _save_and_compile(ep, factory, search_iterations)
 
@@ -302,7 +328,7 @@ def pt2_backend(gm, example_inputs, factory=None):
     gm, user_inputs, original_weights = _reinternalize_lifted_params(gm, example_inputs)
 
     ep = torch.export.export(gm, tuple(user_inputs), **_export_kwargs())
-    ep = ep.run_decompositions()
+    ep = ep.run_decompositions(_decomp_table())
 
     # When using shared memory (original_weights), strip large weight buffers from
     # the EP before saving.  The Rust side uses device pointers for these weights,

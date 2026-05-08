@@ -2280,3 +2280,48 @@ class IntIndexAssignScalarModel(torch.nn.Module):
         out = x.clone()
         out[indices] = 42.0
         return out
+
+
+class SdpaBasicModel(torch.nn.Module):
+    """`F.scaled_dot_product_attention(q, k, v)` with no mask, no causal flag.
+
+    Lowers to `aten._scaled_dot_product_*_attention` (variant chosen by
+    PyTorch based on device/dtype). Tests the default-scale matmul+softmax
+    path. Inputs are 4-D `(B, H, S, D)`.
+    """
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+
+class SdpaCausalModel(torch.nn.Module):
+    """`F.scaled_dot_product_attention(q, k, v, is_causal=True)`.
+
+    Tests the `is_causal` branch of `translate_sdpa`, which materializes a
+    triangular mask and adds `-1e9 * mask` to the pre-softmax scores.
+    """
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+
+
+class SdpaWithBiasModel(torch.nn.Module):
+    """SDPA with an additive `attn_mask` bias (float, broadcast over heads).
+
+    Tests the additive-bias branch of `translate_sdpa`. The bias has shape
+    `(1, 1, S_q, S_k)` so it broadcasts across batch/head prefix dims of
+    the scores tensor.
+    """
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)

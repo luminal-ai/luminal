@@ -29,9 +29,9 @@ use crate::{
                 cublasLtMatrixLayoutCreate, cublasLtMatrixLayoutDestroy, cudaDataType,
             },
         },
-        driver::{CudaSlice, CudaStream, DevicePtr},
+        driver::{CudaStream, DevicePtr},
     },
-    host::{HostOp, cublas::parse_cublas_op},
+    host::{DeviceBuffer, HostOp, cublas::parse_cublas_op},
     try_create_cublaslt,
 };
 
@@ -268,7 +268,7 @@ impl HostOp for CuBlasLt {
         stream: &Arc<CudaStream>,
         self_node: NodeIndex,
         inputs: &[NodeIndex],
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
         use crate::cudarc::cublaslt::sys::{
@@ -309,9 +309,9 @@ impl HostOp for CuBlasLt {
         let b_buf = buffers[&inputs[1]];
 
         // Get device pointers
-        let (a_ptr, _a_guard) = a_buf.device_ptr(stream);
-        let (b_ptr, _b_guard) = b_buf.device_ptr(stream);
-        let (c_ptr, _c_guard) = c_buf.device_ptr(stream);
+        let a_ptr = a_buf.ptr();
+        let b_ptr = b_buf.ptr();
+        let c_ptr = c_buf.ptr();
 
         // Clamp leading dimensions to minimum valid values.
         // When a dimension is 1 (e.g., k=1 outer product), the stride along that

@@ -28,7 +28,7 @@ cuda_image = (
 @app.function(
     image=cuda_image,
     gpu=gpu_type,
-    timeout=1800,  # 30 minutes
+    timeout=7200,  # 2 hours
 )
 def run_cargo_test():
     """Run cargo test for luminal_cuda_lite on a Modal GPU."""

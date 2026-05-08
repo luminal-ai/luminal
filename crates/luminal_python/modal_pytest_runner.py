@@ -22,7 +22,7 @@ from modal.volume import FileEntryType
 
 app = modal.App("luminal-tests")
 
-DEFAULT_TIMEOUT = 4 * 60 * 60
+DEFAULT_TIMEOUT = 2 * 60 * 60
 CUDARC_CUDA_VERSION = "12080"
 LOCAL_PROJECT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = "/root/luminal/crates/luminal_python"
