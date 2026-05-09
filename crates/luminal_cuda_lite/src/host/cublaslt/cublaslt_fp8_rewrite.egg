@@ -1,0 +1,345 @@
+; FP8 support is narrower than "any FP8 x any FP8". cuBLASLt's regular FP8
+; matmul table supports these A/B descriptor pairs for F32 outputs:
+;   E4M3 x E4M3
+;   E4M3 x E5M2
+;   E5M2 x E4M3
+; and requires TN format on Ada/Hopper-class GPUs. These rules therefore match
+; row-major x column-major Luminal matmuls, which the existing COL-order lowering
+; describes as descriptor A = logical B, descriptor B = logical A, transa=T,
+; transb=N.
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= (F8E4M3) (dtype ?a))
+        (= (F8E4M3) (dtype ?b))
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (F8E4M3) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?cast ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 e4m3/e4m3 row-major x column-major f32 output"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= (F8E4M3) (dtype ?a))
+        (= (F8E5M2) (dtype ?b))
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (F8E5M2) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?cast ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 e5m2/e4m3 row-major x column-major f32 output"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= (F8E5M2) (dtype ?a))
+        (= (F8E4M3) (dtype ?b))
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (F8E4M3) (F8E5M2) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?cast ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 e4m3/e5m2 row-major x column-major f32 output"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= (F8E4M3) (dtype ?a))
+        (= (F8E4M3) (dtype ?b))
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            ?batch
+            ?b_batch_stride
+            ?a_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            (F8E4M3) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?cast ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 e4m3/e4m3 batched row-major x column-major f32 output"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= (F8E4M3) (dtype ?a))
+        (= (F8E5M2) (dtype ?b))
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            ?batch
+            ?b_batch_stride
+            ?a_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            (F8E5M2) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?cast ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 e5m2/e4m3 batched row-major x column-major f32 output"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= (F8E5M2) (dtype ?a))
+        (= (F8E4M3) (dtype ?b))
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            ?batch
+            ?b_batch_stride
+            ?a_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            (F8E4M3) (F8E5M2) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?cast ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 e4m3/e5m2 batched row-major x column-major f32 output"
+)

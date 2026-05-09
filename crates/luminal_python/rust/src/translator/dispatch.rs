@@ -287,12 +287,14 @@ impl<'a> Translator<'a> {
             }
             "torch.ops.aten.ceil.default" => {
                 let a = self.get_input_tensor(node, 0)?;
-                // ceil(x) = -floor(-x)
-                let neg_a = a * (-1.0);
-                let trunc = neg_a.cast(DType::Int).cast(DType::F32);
-                let adjust = neg_a.lt(trunc).cast(DType::F32);
-                let floor_neg = trunc - adjust;
-                floor_neg * (-1.0)
+                // ceil(x) = trunc(x) + (x > trunc(x)).
+                // Cast-to-Int rounds toward zero, so for any positive fractional
+                // `x` the trunc sits below `x` and we add 1; for negatives we
+                // have `trunc >= x` and adjust=0. Avoids the two extra
+                // mul-by-(-1) nodes that the `-floor(-x)` lowering emits.
+                let trunc = a.cast(DType::Int).cast(DType::F32);
+                let adjust = a.gt(trunc).cast(DType::F32);
+                trunc + adjust
             }
             "torch.ops.aten.erf.default" => {
                 let a = self.get_input_tensor(node, 0)?;

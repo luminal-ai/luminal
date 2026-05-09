@@ -188,8 +188,21 @@ impl<'a> Translator<'a> {
             .get(idx)
             .with_context(|| format!("Node {} missing input {idx}", node.target))?
             .arg;
-        arg.as_int()
-            .with_context(|| format!("Input {idx} of {} is not an int: {:?}", node.target, arg))
+        if let Some(v) = arg.as_int() {
+            return Ok(v);
+        }
+        // Fall through to symbolic-aware resolution. Op-arg slots like `dim`
+        // and `axis` are always concrete in practice, but with dynamic shapes
+        // PT2 occasionally hands us a SymInt that is fully bound at export
+        // time (e.g. an `unsqueeze` whose dim was derived from `len(shape)`);
+        // accept those when they reduce to a concrete int rather than failing
+        // with the misleading "not an int" diagnostic.
+        if let Some(expr) = self.resolve_arg_as_expression(arg)
+            && let Some(v) = expr.to_usize()
+        {
+            return Ok(v as i64);
+        }
+        anyhow::bail!("Input {idx} of {} is not an int: {:?}", node.target, arg)
     }
 
     pub(crate) fn get_float_arg(&self, node: &Node, idx: usize) -> Result<f64> {
@@ -208,11 +221,37 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn get_ints_arg(&self, node: &Node, idx: usize) -> Result<Vec<i64>> {
+        use crate::pt2_schema::SymIntEntry;
         let arg = &node
             .inputs
             .get(idx)
             .with_context(|| format!("Node {} missing input {idx}", node.target))?
             .arg;
+        // Symbolic int lists: tolerate them as long as every entry is a
+        // bound concrete value. Prevents false "not an int list" failures on
+        // graphs where torch.export emits sym_ints for what is dimensionally
+        // a static parameter (kernel sizes, etc. with dynamic batch).
+        if let Some(entries) = arg.as_sym_ints() {
+            let mut out = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let v = match entry {
+                    SymIntEntry::Int(i) => Some(i.as_int),
+                    SymIntEntry::Name(s) => self
+                        .resolve_sym_int(&s.as_name)
+                        .and_then(|e| e.to_usize().map(|u| u as i64)),
+                };
+                match v {
+                    Some(n) => out.push(n),
+                    None => {
+                        anyhow::bail!(
+                            "Input {idx} of {} contains an unresolved sym_int entry",
+                            node.target
+                        )
+                    }
+                }
+            }
+            return Ok(out);
+        }
         arg.as_ints()
             .map(|v| v.to_vec())
             .with_context(|| format!("Input {idx} of {} is not int list: {:?}", node.target, arg))

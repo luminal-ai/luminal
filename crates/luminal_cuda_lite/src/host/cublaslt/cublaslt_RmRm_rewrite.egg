@@ -42,6 +42,7 @@
 
         (= ?dt (dtype ?a))
         (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
     )
     (
         ; For row-major C = A × B with cuBLAS (column-major):
@@ -52,14 +53,17 @@
             ?k             ; k unchanged
             "N"            ; transa = No transpose
             "N"            ; transb = No transpose
+            "COL" "COL" "COL" "COL" ; A/B/C/D matrix orders
             ?b_k_stride    ; lda = B's row stride (resolves to n after z→1)
             ?a_m_stride    ; ldb = A's row stride (resolves to k after z→1)
             ?n             ; ldc = n (row-major C[m,n] viewed as col-major [n,m])
+            ?n             ; ldd = ldc for current row-major output rewrites
             (MNum 1)       ; batch_count = 1
             (MNum 0)       ; stride_a = 0
             (MNum 0)       ; stride_b = 0
             (MNum 0)       ; stride_c = 0
-            ?dt)           ; dtype
+            (MNum 0)       ; stride_d = 0
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")   ; type tuple, alpha, beta
             (ICons ?b (ICons ?a (INil)))))
         (union ?sum ?sgemm)
         (set (dtype ?sgemm) ?dt)
@@ -117,6 +121,7 @@
 
         (= ?dt (dtype ?a))
         (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
     )
     (
         ; cuBLAS swap: C^T[n,m] = B^T[n,k] × A^T[k,m] per batch
@@ -124,14 +129,17 @@
         (let ?sgemm (Op (cublaslt
             ?n ?m ?k
             "N" "N"
+            "COL" "COL" "COL" "COL"
             ?b_k_stride       ; lda (cuBLAS A = our B, row stride)
             ?a_m_stride       ; ldb (cuBLAS B = our A, row stride)
             ?n                ; ldc (contiguous output per batch)
+            ?n                ; ldd
             ?batch            ; batch_count
             ?b_batch_stride   ; stride_a (cuBLAS A = our B)
             ?a_batch_stride   ; stride_b (cuBLAS B = our A)
             (MMul ?m ?n)      ; stride_c
-            ?dt)
+            (MMul ?m ?n)      ; stride_d
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
             (ICons ?b (ICons ?a (INil)))))
         (union ?sum ?sgemm)
         (set (dtype ?sgemm) ?dt)

@@ -259,21 +259,15 @@ impl<'a> Translator<'a> {
         for (dim_idx, idx_name) in index_names.iter().enumerate() {
             let idx_tensor = self.get_tensor(&idx_name.name)?;
 
-            // Normalize negative indices for this dimension
-            let axis_size = src_shape[dim_idx].to_usize().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "index.Tensor: dim {} must be concrete for negative index normalization",
-                    dim_idx
-                )
-            })?;
-            let idx_f32 = idx_tensor.cast(DType::F32);
-            let zero = self.graph.constant_float(0.0).expand_rhs(idx_f32.shape);
-            let adjustment = self
-                .graph
-                .constant_float(axis_size as f32)
-                .expand_rhs(idx_f32.shape);
-            let is_negative = idx_f32.lt(zero).cast(DType::F32);
-            let idx_int = (idx_f32 + is_negative * adjustment).cast(DType::Int);
+            // Normalize negative indices for this dimension. Stay in Int —
+            // multiplying an Int tensor by an Expression broadcasts the axis
+            // size, so we avoid three Cast nodes (Int→F32 for indices, F32→Int
+            // for the result, Bool→F32 for the negative mask) per indexed dim.
+            let axis_size = src_shape[dim_idx];
+            let idx_int = idx_tensor.cast(DType::Int);
+            let zero = self.graph.constant(0).expand_rhs(idx_int.shape);
+            let is_negative = idx_int.lt(zero).cast(DType::Int);
+            let idx_int = idx_int + is_negative * axis_size;
 
             let stride = &strides[dim_idx];
             let weighted = if stride.to_usize() == Some(1) {
@@ -340,17 +334,15 @@ impl<'a> Translator<'a> {
         let indices = self.get_input_tensor(node, 2)?;
 
         // Normalize negative indices: -1 → last, -2 → second-to-last, etc.
-        let axis_dim = a.shape.dims[dim].to_usize().ok_or_else(|| {
-            anyhow::anyhow!("Gather: axis dim must be concrete for negative index normalization")
-        })?;
-        let indices_f32 = indices.cast(DType::F32);
-        let zero = self.graph.constant_float(0.0).expand_rhs(indices_f32.shape);
-        let adjustment = self
-            .graph
-            .constant_float(axis_dim as f32)
-            .expand_rhs(indices_f32.shape);
-        let is_negative = indices_f32.lt(zero).cast(DType::F32);
-        let normalized = (indices_f32 + is_negative * adjustment).cast(DType::Int);
+        // Stay in Int the whole way — multiplying an Int tensor by an
+        // Expression broadcasts the axis size and avoids three Cast nodes
+        // (Int→F32 for indices, F32→Int for the result, plus a Bool→F32 for
+        // the negative mask) that the previous F32-routed path emitted.
+        let axis_dim = a.shape.dims[dim];
+        let indices_int = indices.cast(DType::Int);
+        let zero = self.graph.constant(0).expand_rhs(indices_int.shape);
+        let is_negative = indices_int.lt(zero).cast(DType::Int);
+        let normalized = indices_int + is_negative * axis_dim;
 
         Ok(a.gather_elements(normalized, dim))
     }
@@ -410,19 +402,14 @@ impl<'a> Translator<'a> {
             // ensures the bool-mask path lowers to a where-blend instead.
             if idx_tensor.dtype == DType::Bool && idx_tensor.shape.dims == a.shape.dims {
                 // Broadcast the (often scalar) value tensor to match data shape,
-                // then blend by mask. Cast mask to data's dtype for the arithmetic
-                // so this works for both integer and float data.
+                // then blend by mask. Cast mask to data's dtype for the
+                // arithmetic so this works for both integer and float data.
                 let mask_f = idx_tensor.cast(a.dtype);
                 let values_b = values.cast(a.dtype).expand_rhs(a.shape);
-                // Implements where(mask, value, a) as
-                //     a*(1 - mask) + value*mask
-                // — works without a dedicated cond op for any numeric dtype.
-                let one = self
-                    .graph
-                    .constant_float(1.0)
-                    .cast(a.dtype)
-                    .expand_rhs(a.shape);
-                return Ok(a * (one - mask_f) + values_b * mask_f);
+                // where(mask, value, a) as `a + mask*(value - a)`. Saves a mul
+                // and the `1.0` constant compared to the `a*(1 - m) + v*m`
+                // form; works for any numeric dtype without a dedicated cond.
+                return Ok(a + mask_f * (values_b - a));
             }
 
             // Integer-index scatter: index_put with indices=[idx_tensor] writes
