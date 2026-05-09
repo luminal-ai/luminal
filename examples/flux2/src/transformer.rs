@@ -174,26 +174,25 @@ fn layernorm_noaffine(x: GraphTensor, eps: f32) -> GraphTensor {
 /// This matches `apply_rotary_emb(use_real_unbind_dim=-1)` with
 /// `freqs_repeat_interleave_real=True`.
 fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor {
+    if std::env::var("ROPE_KERNEL").is_ok() {
+        return luminal_cuda_lite::kernel::apply_rope(x, cos, sin);
+    }
     // x: (S, H, D); cos/sin: (S, D) → broadcast to (S, 1, D).
     let (_s, _h, d_expr) = x.dims3();
     let d = d_expr.to_usize().expect("head_dim must be static");
     assert!(d % 2 == 0, "RoPE head_dim must be even");
 
-    // Split last dim into pairs (S, H, D/2, 2) for [x0, x1] interleave.
-    let pairs = x.split_dims(2, 2_usize); // (S, H, D/2, 2)
-    let x_a = pairs.slice((.., .., .., ..1)).squeeze(3); // (S, H, D/2)
-    let x_b = pairs.slice((.., .., .., 1..)).squeeze(3); // (S, H, D/2)
+    let pairs = x.split_dims(2, 2_usize);
+    let x_a = pairs.slice((.., .., .., ..1)).squeeze(3);
+    let x_b = pairs.slice((.., .., .., 1..)).squeeze(3);
 
-    // x_rotated = concat([-x_b, x_a]) but interleaved back to D.
-    // The "use_real_unbind_dim=-1" form: split last D into (D/2, 2) pairs
-    // [a0, b0, a1, b1, ...], rotated form is [-b0, a0, -b1, a1, ...].
     let neg_b = x_b * (-1.0_f32);
     let rotated_pairs = neg_b
         .expand_dim(3, 1_usize)
-        .concat_along(x_a.expand_dim(3, 1_usize), 3); // (S, H, D/2, 2)
-    let x_rot = rotated_pairs.merge_dims(2, 3); // (S, H, D)
+        .concat_along(x_a.expand_dim(3, 1_usize), 3);
+    let x_rot = rotated_pairs.merge_dims(2, 3);
 
-    let cos_b = cos.expand_dim(1, 1_usize); // (S, 1, D)
+    let cos_b = cos.expand_dim(1, 1_usize);
     let sin_b = sin.expand_dim(1, 1_usize);
     x.cast(DType::F32) * cos_b.cast(DType::F32) + x_rot.cast(DType::F32) * sin_b.cast(DType::F32)
 }

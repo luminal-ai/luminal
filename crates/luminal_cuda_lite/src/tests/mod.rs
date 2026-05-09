@@ -20,3 +20,5 @@ mod qwen3_moe_rewrite;
 mod transformer;
 #[cfg(test)]
 mod rmsnorm_test;
+#[cfg(test)]
+mod rope_test;
