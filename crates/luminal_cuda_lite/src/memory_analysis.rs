@@ -1139,7 +1139,7 @@ fn local_output_bytes<'a>(
             let batch = expr_field(egraph, sort, kind_children, "batch_count", expr_cache)?;
             let m = expr_field(egraph, sort, kind_children, "m", expr_cache)?;
             let n = expr_field(egraph, sort, kind_children, "n", expr_cache)?;
-            let dtype = dtype_field(egraph, sort, kind_children, "dtype")?;
+            let dtype = dtype_field(egraph, sort, kind_children, "d_dtype")?;
             Some(bytes_for_elements(batch * m * n, dtype))
         }
         "GLUMoE" => {
@@ -1245,7 +1245,7 @@ fn output_bytes_rules(sort: &SortDef) -> Vec<String> {
         )],
         "KernelCast" => dtype_output_bytes_rules(sort, "size", "dtype"),
         "cublaslt" => {
-            dtype_output_bytes_rules_for_expr(sort, "(MMul (MMul ?batch_count ?m) ?n)", "dtype")
+            dtype_output_bytes_rules_for_expr(sort, "(MMul (MMul ?batch_count ?m) ?n)", "d_dtype")
         }
         "GLUMoE" => vec![output_bytes_rule(
             sort,

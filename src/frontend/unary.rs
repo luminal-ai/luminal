@@ -307,7 +307,8 @@ impl GraphTensor {
     #[allow(clippy::excessive_precision)]
     pub fn gelu(self) -> GraphTensor {
         // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
-        0.5 * self * (1. + (0.7978845608 * self * (1. + 0.044715 * self * self)).tanh())
+        let scaled = 1.5957691216 * self * (1. + 0.044715 * self * self);
+        self * scaled.sigmoid()
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis

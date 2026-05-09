@@ -2342,6 +2342,7 @@ pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DTyp
         "Bool" => DType::Bool,
         "F4E2M1" => DType::F4E2M1,
         "F8E4M3" => DType::F8E4M3,
+        "F8E5M2" => DType::F8E5M2,
         "F8UE8M0" => DType::F8UE8M0,
         "I4" => DType::I4,
         "TF32" => DType::TF32,

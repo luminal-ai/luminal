@@ -136,14 +136,15 @@ pub fn gpu_compute_cap() -> Option<(i32, i32)> {
 
 /// Check if the current GPU supports the given dtype for tensor core / WMMA operations.
 pub fn gpu_supports_dtype(dtype: luminal::dtype::DType) -> bool {
-    let Some((major, _)) = gpu_compute_cap() else {
+    let Some((major, minor)) = gpu_compute_cap() else {
         return false;
     };
     match dtype {
         luminal::dtype::DType::Bf16 => major >= 8, // Ampere (sm_80+)
-        luminal::dtype::DType::F4E2M1
-        | luminal::dtype::DType::F8E4M3
-        | luminal::dtype::DType::F8UE8M0 => major >= 10, // Blackwell (sm_100+)
+        luminal::dtype::DType::F8E4M3 | luminal::dtype::DType::F8E5M2 => {
+            major > 8 || (major == 8 && minor >= 9)
+        } // Ada/Hopper (sm_89+)
+        luminal::dtype::DType::F4E2M1 | luminal::dtype::DType::F8UE8M0 => major >= 10, // Blackwell (sm_100+)
         _ => true,
     }
 }

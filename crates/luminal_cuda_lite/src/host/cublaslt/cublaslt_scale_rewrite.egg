@@ -1,0 +1,312 @@
+; Scalar alpha/beta rewrites for cuBLASLt. These rules target scalar constants
+; expanded across the matmul/add shape, i.e. zero strides on every logical axis.
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            1.0 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?scale (Op (Constant ?alpha) (INil)))
+        (= ?scaled (Op (Mul ?shape
+            ?matmul_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?matmul (ICons ?scale (INil)))))
+        (= ?matmul_strides ?scaled_out_strides)
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?scaled ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d alpha scale"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            1.0 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?scale (Op (Constant ?alpha) (INil)))
+        (= ?scaled (Op (Mul ?shape
+            ?matmul_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?scaled_out_strides)
+            (ICons ?matmul (ICons ?scale (INil)))))
+        (= ?matmul_strides ?scaled_out_strides)
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?scaled ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched alpha scale"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?beta_node (Op (Constant ?beta) (INil)))
+        (= ?scaled_c (Op (Mul
+            (ECons ?m (ECons ?n (ENil)))
+            ?c_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_c_out_strides)
+            (ICons ?c (ICons ?beta_node (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?m (ECons ?n (ENil)))
+            ?matmul_add_strides
+            ?scaled_c_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?scaled_c (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
+        (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?scaled_c_add_strides ?scaled_c_out_strides)
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b (MNum 0) ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order 2d scaled c beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?beta_node (Op (Constant ?beta) (INil)))
+        (= ?scaled_c (Op (Mul
+            (ECons ?m (ECons ?n (ENil)))
+            ?c_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_c_out_strides)
+            (ICons ?c (ICons ?beta_node (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?m (ECons ?n (ENil)))
+            ?scaled_c_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?scaled_c (ICons ?matmul (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
+        (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?scaled_c_add_strides ?scaled_c_out_strides)
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b (MNum 0) ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order 2d scaled c plus matmul beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?beta_node (Op (Constant ?beta) (INil)))
+        (= ?scaled_c (Op (Mul
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?c_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?scaled_c_out_strides)
+            (ICons ?c (ICons ?beta_node (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?matmul_add_strides
+            ?scaled_c_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?scaled_c (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
+        (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?scaled_c_add_strides ?scaled_c_out_strides)
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            ?batch
+            ?stride_a ?stride_b ?c_batch_stride ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched scaled c beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?beta_node (Op (Constant ?beta) (INil)))
+        (= ?scaled_c (Op (Mul
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?c_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?scaled_c_out_strides)
+            (ICons ?c (ICons ?beta_node (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?scaled_c_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?scaled_c (ICons ?matmul (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
+        (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?scaled_c_add_strides ?scaled_c_out_strides)
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            ?batch
+            ?stride_a ?stride_b ?c_batch_stride ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched scaled c plus matmul beta"
+)

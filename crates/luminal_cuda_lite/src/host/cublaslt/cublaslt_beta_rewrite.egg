@@ -1,0 +1,396 @@
+; Fuse a row-major Add on top of an existing cuBLASLt matmul into
+; D = alpha * A * B + beta * C.
+;
+; The existing matmul rewrites view Luminal's row-major output [m,n] as a
+; column-major cuBLASLt matrix [n,m]. A row-major C input with logical strides
+; [row_stride, 1] therefore maps to ldc=row_stride. This lets a C slice from a
+; wider parent tensor use a larger ldc while D keeps the matmul output layout.
+; cuBLASLt requires out-of-place C and D to have the same matrix order, so these
+; beta rules only fuse C layouts that map to the current COL-ordered D layout.
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "COL"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?n (ECons ?m (ENil)))
+            ?matmul_add_strides
+            ?c_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?c (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
+        (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "COL" "COL"
+            ?lda ?ldb ?c_row_stride ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b (MNum 0) ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d matmul plus c beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "COL"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?n (ECons ?m (ENil)))
+            ?c_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?c (ICons ?matmul (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
+        (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "COL" "COL"
+            ?lda ?ldb ?c_row_stride ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b (MNum 0) ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d c plus matmul beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "COL"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?matmul_add_strides
+            ?c_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?c (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
+        (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "COL" "COL"
+            ?lda ?ldb ?c_row_stride ?ldd
+            ?batch
+            ?stride_a ?stride_b ?c_batch_stride ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched matmul plus c beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "COL"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?c_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?c (ICons ?matmul (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
+        (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "COL" "COL"
+            ?lda ?ldb ?c_row_stride ?ldd
+            ?batch
+            ?stride_a ?stride_b ?c_batch_stride ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched c plus matmul beta"
+)
+
+; ROW-ordered D beta fusions. These pair with cublaslt_row_order_rewrite.egg,
+; where the cuBLASLt problem dimensions match Luminal's logical output [m,n].
+; A row-major C input with logical strides [row_stride, 1] maps directly to a
+; ROW-ordered cuBLASLt C[m,n] descriptor with ldc=row_stride.
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?m (ECons ?n (ENil)))
+            ?matmul_add_strides
+            ?c_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?c (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
+        (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b (MNum 0) ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order 2d matmul plus c beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?m (ECons ?n (ENil)))
+            ?c_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?c (ICons ?matmul (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
+        (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b (MNum 0) ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order 2d c plus matmul beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?matmul_add_strides
+            ?c_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?c (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
+        (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            ?batch
+            ?stride_a ?stride_b ?c_batch_stride ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched matmul plus c beta"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?matmul_c_order "ROW"
+            ?lda ?ldb ?matmul_ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?matmul_stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 ?epilogue)
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?c_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?c (ICons ?matmul (INil)))))
+
+        (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
+        (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (= ?c_col_stride (MIter))
+        (!= ?c_row_stride (MNum 0))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?c_dtype (dtype ?c))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order "ROW" "ROW"
+            ?lda ?ldb ?c_row_stride ?ldd
+            ?batch
+            ?stride_a ?stride_b ?c_batch_stride ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 1.0 ?epilogue)
+            (ICons ?a (ICons ?b (ICons ?c ?matmul_tail)))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched c plus matmul beta"
+)
