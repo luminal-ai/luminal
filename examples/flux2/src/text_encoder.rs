@@ -86,11 +86,12 @@ fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
 }
 
 fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
-    let last = x.shape.last_axis();
-    let normed = x.std_norm(last, eps);
-    let dims = x.dims();
-    let prefix: Vec<Expression> = dims[..dims.len() - 1].to_vec();
-    normed * weight.expand_lhs(prefix).cast(x.dtype)
+    let w = if weight.dtype == DType::F32 {
+        weight
+    } else {
+        weight.cast(DType::F32)
+    };
+    luminal_cuda_lite::kernel::rmsnorm(x, w, eps)
 }
 
 /// Rotary position embedding — half-rotation convention (`[x0, x1] →
