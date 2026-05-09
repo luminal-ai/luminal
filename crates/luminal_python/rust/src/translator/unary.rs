@@ -51,13 +51,19 @@ impl<'a> Translator<'a> {
         let a = self.get_input_tensor(node, 0)?;
         for input in &node.inputs {
             if input.name == "dtype" {
-                if let Some(dtype_int) = input.arg.as_int() {
-                    let dtype = torch_dtype_int_to_luminal(dtype_int as u32);
-                    return Ok(a.cast(dtype));
-                }
-                if let Some(dtype_int) = input.arg.as_scalar_type() {
-                    let dtype = torch_dtype_int_to_luminal(dtype_int);
-                    return Ok(a.cast(dtype));
+                let dtype_int = input
+                    .arg
+                    .as_int()
+                    .map(|i| i as u32)
+                    .or_else(|| input.arg.as_scalar_type());
+                if let Some(d) = dtype_int {
+                    let dtype = torch_dtype_int_to_luminal(d);
+                    // Skip emitting a Cast op when the dtype already matches —
+                    // PT2 graphs frequently emit `_to_copy` purely as a clone hint
+                    // (e.g. dtype=float32 on a tensor that is already F32), and
+                    // every redundant Cast inflates the graph and survives until
+                    // optimization passes can prove it as a no-op.
+                    return Ok(if a.dtype == dtype { a } else { a.cast(dtype) });
                 }
             }
         }

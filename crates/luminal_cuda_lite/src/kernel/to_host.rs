@@ -13,6 +13,7 @@ use itertools::Itertools;
 use luminal::{
     egglog_utils::{api::Rule, base::OP_KIND},
     graph::LLIRGraph,
+    hlir::{LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart},
     op::{EgglogOp, LLIROp},
     prelude::{
         petgraph::{Direction, algo::toposort, visit::EdgeRef},
@@ -22,7 +23,7 @@ use luminal::{
 use tracing::{Level, enabled, span};
 
 use crate::{
-    host::HostOp,
+    host::{DeviceBuffer, HostOp},
     kernel::{
         CudaFunctionExt, CudaGraphExecHandle, CudaGraphHandle, KernelOp, create_cuda_event,
         destroy_cuda_event,
@@ -47,8 +48,12 @@ struct CompiledKernel {
     shared_mem: Expression,
     /// Input node indices (for buffer lookup)
     inputs: Vec<NodeIndex>,
+    /// Human-readable labels for input nodes, for launch diagnostics.
+    input_labels: Vec<String>,
     /// Reference to the KernelOp for trait methods
     kernel_op: Arc<Box<dyn KernelOp>>,
+    /// Whether this compiled CUDA function has a trailing dyn_dims parameter.
+    has_dyn_dims_param: bool,
     /// Internal buffers allocated for this kernel
     internal_bufs: Vec<CudaSlice<u8>>,
     /// Device constants from compile()
@@ -68,7 +73,9 @@ impl CompiledKernel {
         block: (Expression, Expression, Expression),
         shared_mem: Expression,
         inputs: Vec<NodeIndex>,
+        input_labels: Vec<String>,
         kernel_op: Arc<Box<dyn KernelOp>>,
+        has_dyn_dims_param: bool,
         constants: FxHashMap<char, CudaSlice<u8>>,
         kernel_name: &'static str,
     ) -> Self {
@@ -79,7 +86,9 @@ impl CompiledKernel {
             block,
             shared_mem,
             inputs,
+            input_labels,
             kernel_op,
+            has_dyn_dims_param,
             internal_bufs: Vec::new(),
             constants,
             graph_node: None,
@@ -226,7 +235,7 @@ impl HostOp for CudaGraphOp {
         stream: &Arc<CudaStream>,
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
         self.execute_internal(stream, buffers, dyn_map)
@@ -258,6 +267,40 @@ impl HostOp for CudaGraphOp {
             .collect()
     }
 
+    fn extra_buffer_lifetimes(&self) -> Option<Vec<(NodeIndex, usize, usize)>> {
+        let state = self.state.borrow();
+        let mut lifetimes: FxHashMap<NodeIndex, (usize, usize)> = FxHashMap::default();
+        let max_step = state.kernels.len().saturating_sub(1);
+
+        let mut touch = |node: NodeIndex, step: usize| {
+            lifetimes
+                .entry(node)
+                .and_modify(|(first, last)| {
+                    *first = (*first).min(step);
+                    *last = (*last).max(step);
+                })
+                .or_insert((step, step));
+        };
+
+        for (step, kernel) in state.kernels.iter().enumerate() {
+            for &input in &kernel.inputs {
+                touch(input, step);
+            }
+            touch(kernel.node, step);
+        }
+
+        for node in self.extra_buffer_nodes() {
+            lifetimes.entry(node).or_insert((0, max_step));
+        }
+
+        Some(
+            lifetimes
+                .into_iter()
+                .map(|(node, (start, end))| (node, start, end))
+                .collect(),
+        )
+    }
+
     fn extra_buffer_sizes(&self) -> FxHashMap<NodeIndex, Expression> {
         self.buffer_sizes.clone()
     }
@@ -268,11 +311,64 @@ impl HostOp for CudaGraphOp {
 }
 
 impl CudaGraphOp {
+    fn expected_kernel_inputs(kernel_name: &str) -> Option<usize> {
+        match kernel_name {
+            "Constant" | "Iota" => Some(0),
+            "MaxReduce" | "MeanReduce" | "SumReduce" | "Cast" | "Exp" | "Exp2" | "Log2" | "Sin"
+            | "Recip" | "Sigmoid" | "Softmax" | "Sqrt" => Some(1),
+            "Add" | "BatchMatMul" | "BatchMatVec" | "Embed" | "Gather" | "LessThan" | "Mod"
+            | "Mul" => Some(2),
+            "Scatter" | "ScatterNoCopy" => Some(3),
+            _ => None,
+        }
+    }
+
+    fn kernel_requires_output_buffer(
+        kernel: &CompiledKernel,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> bool {
+        kernel.kernel_op.output_size().exec(dyn_map).unwrap_or(1) != 0
+            && kernel.kernel_op.output_aliases_input().is_none()
+    }
+
+    fn validate_kernel_pointers(
+        kernel: &CompiledKernel,
+        output_ptr: u64,
+        input_ptrs: &[u64],
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<()> {
+        if Self::kernel_requires_output_buffer(kernel, dyn_map) && output_ptr == 0 {
+            anyhow::bail!(
+                "missing output buffer for CUDA kernel {} at LLIR node {:?}",
+                kernel.kernel_name,
+                kernel.node,
+            );
+        }
+
+        for (idx, (input_node, input_ptr)) in kernel.inputs.iter().zip(input_ptrs).enumerate() {
+            if *input_ptr == 0 {
+                let input_label = kernel
+                    .input_labels
+                    .get(idx)
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                anyhow::bail!(
+                    "missing input buffer {idx} for CUDA kernel {} at LLIR node {:?}; input LLIR node {:?} ({input_label})",
+                    kernel.kernel_name,
+                    kernel.node,
+                    input_node,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Execute the CUDA graph with the given buffers and dynamic dimensions.
     fn execute_internal(
         &self,
         stream: &Arc<CudaStream>,
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
         let mut state = self.state.borrow_mut();
@@ -343,7 +439,7 @@ impl CudaGraphOp {
         let mut current_buffer_ptrs: FxHashMap<NodeIndex, u64> = FxHashMap::default();
         for &node in &self.buffer_nodes {
             if let Some(buf) = buffers.get(&node) {
-                current_buffer_ptrs.insert(node, buf.device_ptr(stream).0);
+                current_buffer_ptrs.insert(node, buf.ptr());
             }
         }
 
@@ -391,13 +487,26 @@ impl CudaGraphOp {
                     .iter()
                     .map(|inp| current_buffer_ptrs.get(inp).copied().unwrap_or(0))
                     .collect();
+                Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
+                let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
+                    dyn_dims_ptr
+                } else {
+                    0
+                };
+                if kernel.has_dyn_dims_param && kernel_dyn_dims_ptr == 0 {
+                    anyhow::bail!(
+                        "missing dyn_dims buffer for CUDA kernel {} at LLIR node {:?}",
+                        kernel.kernel_name,
+                        kernel.node,
+                    );
+                }
 
                 let param_values = kernel.kernel_op.build_params(
                     stream,
                     output_ptr,
                     &input_ptrs,
                     &kernel.internal_bufs,
-                    dyn_dims_ptr,
+                    kernel_dyn_dims_ptr,
                 );
                 state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
             }
@@ -424,6 +533,19 @@ impl CudaGraphOp {
                     kernel.block.1.exec(dyn_map).unwrap() as u32,
                     kernel.block.2.exec(dyn_map).unwrap() as u32,
                 );
+                if grid_dim.0 == 0
+                    || grid_dim.1 == 0
+                    || grid_dim.2 == 0
+                    || block_dim.0 == 0
+                    || block_dim.1 == 0
+                    || block_dim.2 == 0
+                {
+                    anyhow::bail!(
+                        "invalid CUDA launch dimensions for kernel {} at LLIR node {:?}: grid={grid_dim:?} block={block_dim:?}",
+                        kernel.kernel_name,
+                        kernel.node,
+                    );
+                }
                 let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
                 let cu_func = unsafe { kernel.function.raw_function() };
 
@@ -452,7 +574,7 @@ impl CudaGraphOp {
         &self,
         state: &mut std::cell::RefMut<'_, CudaGraphOpState>,
         stream: &Arc<CudaStream>,
-        buffers: &FxHashMap<NodeIndex, &CudaSlice<u8>>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
         let ctx = stream.context().clone();
@@ -474,7 +596,7 @@ impl CudaGraphOp {
         let mut buffer_ptrs: FxHashMap<NodeIndex, u64> = FxHashMap::default();
         for &node in &self.buffer_nodes {
             if let Some(buf) = buffers.get(&node) {
-                buffer_ptrs.insert(node, buf.device_ptr(stream).0);
+                buffer_ptrs.insert(node, buf.ptr());
             }
         }
 
@@ -521,6 +643,19 @@ impl CudaGraphOp {
                 kernel.block.1.exec(dyn_map).unwrap() as u32,
                 kernel.block.2.exec(dyn_map).unwrap() as u32,
             );
+            if grid_dim.0 == 0
+                || grid_dim.1 == 0
+                || grid_dim.2 == 0
+                || block_dim.0 == 0
+                || block_dim.1 == 0
+                || block_dim.2 == 0
+            {
+                anyhow::bail!(
+                    "invalid CUDA launch dimensions for kernel {} at LLIR node {:?}: grid={grid_dim:?} block={block_dim:?}",
+                    kernel.kernel_name,
+                    kernel.node,
+                );
+            }
             let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
 
             let output_ptr = buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
@@ -529,18 +664,41 @@ impl CudaGraphOp {
                 .iter()
                 .map(|inp| buffer_ptrs.get(inp).copied().unwrap_or(0))
                 .collect();
+            Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
+            let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
+                dyn_dims_ptr
+            } else {
+                0
+            };
+            if kernel.has_dyn_dims_param && kernel_dyn_dims_ptr == 0 {
+                anyhow::bail!(
+                    "missing dyn_dims buffer for CUDA kernel {} at LLIR node {:?}",
+                    kernel.kernel_name,
+                    kernel.node,
+                );
+            }
 
             let param_values = kernel.kernel_op.build_params(
                 stream,
                 output_ptr,
                 &input_ptrs,
                 &kernel.internal_bufs,
-                dyn_dims_ptr,
+                kernel_dyn_dims_ptr,
             );
             let mut params = UnifiedKernelParams::new(param_values);
 
             let cu_func = unsafe { kernel.function.raw_function() };
             let kernel_node = kernel.node;
+            if std::env::var_os("LUMINAL_CUDA_DEBUG_GRAPH").is_some() {
+                eprintln!(
+                    "cuGraphAddKernelNode kernel={} node={:?} grid={grid_dim:?} block={block_dim:?} shared_mem={shared_mem} inputs={} has_dyn={} params={}",
+                    kernel.kernel_name,
+                    kernel.node,
+                    kernel.inputs.len(),
+                    kernel.has_dyn_dims_param,
+                    params.values.len(),
+                );
+            }
 
             // Get timing event for this index (separate access from kernels)
             let timing_event = if tracing_enabled {
@@ -662,6 +820,36 @@ pub fn kernel_to_host(
     // live in a different convex subgraph than the FS itself.
     let globally_absorbed = region_codegen::globally_absorbed_markers(llir_graph);
 
+    let name_of = |graph: &LLIRGraph, idx: NodeIndex| -> Option<&'static str> {
+        graph
+            .node_weight(idx)
+            .and_then(|op| op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name()))
+    };
+    let is_transparent_input = |graph: &LLIRGraph, node: NodeIndex| -> bool {
+        name_of(graph, node) == Some("FusionStart")
+            || graph[node].to_op::<LoopStart>().is_some()
+            || graph[node].to_op::<LoopEnd>().is_some()
+            || graph[node].to_op::<LoopInput>().is_some()
+            || graph[node].to_op::<LoopInputStatic>().is_some()
+            || graph[node].to_op::<LoopOutput>().is_some()
+            || graph[node].to_op::<LoopOutputSelect>().is_some()
+    };
+    let resolve_transparent_input = |graph: &LLIRGraph, mut node: NodeIndex| -> NodeIndex {
+        let mut visited = FxHashSet::default();
+        while visited.insert(node) && is_transparent_input(graph, node) {
+            let Some(pred) = graph
+                .edges_directed(node, Direction::Incoming)
+                .sorted_by_key(|e| e.id())
+                .map(|e| e.source())
+                .next()
+            else {
+                break;
+            };
+            node = pred;
+        }
+        node
+    };
+
     // Track which kernel node belongs to which CudaGraphOp (for later edge creation)
     let mut kernel_to_cuda_graph: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
     // Track all CudaGraphOp nodes and their subgraphs for edge creation
@@ -678,6 +866,7 @@ pub fn kernel_to_host(
         let mut all_dyn_dims = FxHashSet::default();
         let mut all_buffer_nodes = FxHashSet::default();
         let mut all_buffer_sizes: FxHashMap<NodeIndex, Expression> = FxHashMap::default();
+        let mut external_inputs = FxHashSet::default();
 
         // Pre-scan: collect all dynamic vars from all kernel ops without compiling.
         // This uses KernelOp::all_dyn_vars() which inspects struct expression fields.
@@ -691,9 +880,7 @@ pub fn kernel_to_host(
         // Set global dyn dims ordering so compiles use consistent indices
         let mut global_dyn_dims: Vec<char> = all_dyn_dims.iter().copied().collect();
         global_dyn_dims.sort();
-        if !global_dyn_dims.is_empty() {
-            set_global_dyn_dims(global_dyn_dims.clone());
-        }
+        set_global_dyn_dims(global_dyn_dims.clone());
 
         // Group the topo order into compile units: each FusionEnd-rooted
         // region collapses to a single CompileUnit::Region (one fused
@@ -711,14 +898,35 @@ pub fn kernel_to_host(
                         .to_dialect::<dyn KernelOp>()
                         .unwrap();
 
-                    let (kernel_function, _, _kernel_str, grid, block, shared_mem, constants) =
+                    let (kernel_function, _, kernel_str, grid, block, shared_mem, constants) =
                         kernel_op_ref.compile(cuda_stream, kernel_cache);
+                    let has_dyn_dims_param = kernel_str.contains("dyn_dims");
 
                     // Collect inputs from graph edges
                     let inputs: Vec<NodeIndex> = llir_graph
                         .edges_directed(*kernel_node_idx, Direction::Incoming)
                         .sorted_by_key(|e| e.id())
                         .map(|e| e.source())
+                        .map(|input| resolve_transparent_input(llir_graph, input))
+                        .collect_vec();
+                    if let Some(expected_inputs) =
+                        CudaGraphOp::expected_kernel_inputs(kernel_op_ref.kernel_name())
+                    {
+                        assert_eq!(
+                            inputs.len(),
+                            expected_inputs,
+                            "invalid input arity for CUDA kernel {} at LLIR node {:?}",
+                            kernel_op_ref.kernel_name(),
+                            kernel_node_idx,
+                        );
+                    }
+                    let input_labels = inputs
+                        .iter()
+                        .map(|&input| {
+                            name_of(llir_graph, input)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("{:?}", llir_graph[input]))
+                        })
                         .collect_vec();
 
                     // Collect buffer nodes and sizes
@@ -729,6 +937,12 @@ pub fn kernel_to_host(
                         all_buffer_sizes.insert(*kernel_node_idx, output_size);
                     }
                     all_buffer_nodes.extend(inputs.iter().copied());
+                    external_inputs.extend(
+                        inputs
+                            .iter()
+                            .copied()
+                            .filter(|input| !subgraph.contains(input)),
+                    );
 
                     let kernel_op: Arc<Box<dyn KernelOp>> = Arc::clone(kernel_op_ref);
 
@@ -739,7 +953,9 @@ pub fn kernel_to_host(
                         block,
                         shared_mem,
                         inputs,
+                        input_labels,
                         kernel_op.clone(),
+                        has_dyn_dims_param,
                         constants,
                         kernel_op.kernel_name(),
                     ));
@@ -752,6 +968,7 @@ pub fn kernel_to_host(
                         cuda_stream,
                         kernel_cache,
                     );
+                    let has_dyn_dims_param = compiled.kernel_str.contains("dyn_dims");
 
                     // The region's CompiledKernel is keyed on the FE node
                     // (so FE provides trait methods like output_size /
@@ -763,7 +980,20 @@ pub fn kernel_to_host(
                         .to_dialect::<dyn KernelOp>()
                         .unwrap();
 
-                    let inputs: Vec<NodeIndex> = region.external_inputs.clone();
+                    let inputs: Vec<NodeIndex> = region
+                        .external_inputs
+                        .iter()
+                        .copied()
+                        .map(|input| resolve_transparent_input(llir_graph, input))
+                        .collect();
+                    let input_labels = inputs
+                        .iter()
+                        .map(|&input| {
+                            name_of(llir_graph, input)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("{:?}", llir_graph[input]))
+                        })
+                        .collect_vec();
 
                     let output_size = fe_op_ref.output_size();
                     if output_size.exec(&FxHashMap::default()).unwrap_or(1) != 0 {
@@ -771,6 +1001,12 @@ pub fn kernel_to_host(
                         all_buffer_sizes.insert(region.fe_node, output_size);
                     }
                     all_buffer_nodes.extend(inputs.iter().copied());
+                    external_inputs.extend(
+                        inputs
+                            .iter()
+                            .copied()
+                            .filter(|input| !subgraph.contains(input)),
+                    );
 
                     let kernel_op: Arc<Box<dyn KernelOp>> = Arc::clone(fe_op_ref);
 
@@ -781,7 +1017,9 @@ pub fn kernel_to_host(
                         compiled.block,
                         compiled.shared_mem,
                         inputs,
+                        input_labels,
                         kernel_op,
+                        has_dyn_dims_param,
                         compiled.constants,
                         "FusedRegion",
                     ));
@@ -826,16 +1064,17 @@ pub fn kernel_to_host(
         }
         cuda_graph_subgraphs.push((cuda_graph_node, subgraph.clone()));
 
-        // Find external inputs: nodes outside subgraph that have edges into subgraph
-        let external_inputs: FxHashSet<NodeIndex> = subgraph
-            .iter()
-            .flat_map(|&node| {
-                llir_graph
-                    .edges_directed(node, Direction::Incoming)
-                    .map(|e| e.source())
-                    .filter(|src| !subgraph.contains(src))
-            })
-            .collect();
+        // Find external inputs: nodes outside subgraph that have edges into
+        // subgraph. Also include normalized FusionStart predecessors, because
+        // the compiled kernels read from the concrete producer buffer rather
+        // than the marker node.
+        external_inputs.extend(subgraph.iter().flat_map(|&node| {
+            llir_graph
+                .edges_directed(node, Direction::Incoming)
+                .map(|e| e.source())
+                .map(|input| resolve_transparent_input(llir_graph, input))
+                .filter(|src| !subgraph.contains(src))
+        }));
 
         // Add edges from external inputs to CudaGraphOp
         for input in &external_inputs {

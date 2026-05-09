@@ -1,0 +1,452 @@
+; Natural cuBLASLt row-order output rewrites. These keep Luminal's logical
+; output C[m,n] as a cuBLASLt ROW-ordered D[m,n] instead of using the older
+; swapped COL-ordered D[n,m] view. A and B orders mirror their matched logical
+; layouts, so this family is the legal base for future ROW-ordered beta fusions.
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MIter))
+        (= ?b_k_stride (MMul (MIter) ?n))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "ROW" "ROW" "ROW" "ROW"
+            ?a_m_stride
+            ?b_k_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order row-major x row-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "ROW" "COL" "ROW" "ROW"
+            ?a_m_stride
+            ?b_n_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order row-major x column-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MMul (MIter) ?m))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MIter))
+        (= ?b_k_stride (MMul (MIter) ?n))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "COL" "ROW" "ROW" "ROW"
+            ?a_k_stride
+            ?b_k_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order column-major x row-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MMul (MIter) ?m))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "COL" "COL" "ROW" "ROW"
+            ?a_k_stride
+            ?b_n_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order column-major x column-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_n_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_k_stride (MMul (MIter) ?n))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?k ?b_k_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "ROW" "ROW" "ROW" "ROW"
+            ?a_m_stride
+            ?b_k_stride
+            ?n
+            ?n
+            ?batch
+            ?a_batch_stride
+            ?b_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched row-major x row-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "ROW" "COL" "ROW" "ROW"
+            ?a_m_stride
+            ?b_n_stride
+            ?n
+            ?n
+            ?batch
+            ?a_batch_stride
+            ?b_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched row-major x column-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MMul (MIter) ?m))
+
+        (= ?b_n_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_k_stride (MMul (MIter) ?n))
+
+        (= ?a_batch_stride (MMul ?k ?a_k_stride))
+        (= ?b_batch_stride (MMul ?k ?b_k_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "COL" "ROW" "ROW" "ROW"
+            ?a_k_stride
+            ?b_k_stride
+            ?n
+            ?n
+            ?batch
+            ?a_batch_stride
+            ?b_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched column-major x row-major"
+)
+
+(rule
+    (
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MMul (MIter) ?m))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?k ?a_k_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?m ?n ?k
+            "N" "N"
+            "COL" "COL" "ROW" "ROW"
+            ?a_k_stride
+            ?b_n_stride
+            ?n
+            ?n
+            ?batch
+            ?a_batch_stride
+            ?b_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt row-order batched column-major x column-major"
+)

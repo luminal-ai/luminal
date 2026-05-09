@@ -1,0 +1,614 @@
+; cuBLASLt epilogue rewrites.
+;
+; ReLU in the frontend lowers through maximum_f32(0.0):
+;
+;   (matmul < 0) * 0 + cast(cast((-cast(matmul < 0) + 1) as bool) as f32) * matmul
+;
+; These rules fuse that expression back into CUBLASLT_EPILOGUE_RELU.
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "DEFAULT")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?zero (Op (Constant 0.0) (INil)))
+        (= ?neg_one (Op (Constant -1.0) (INil)))
+        (= ?one (Op (Constant 1.0) (INil)))
+
+        (= ?lt (Op (LessThan
+            ?shape
+            ?matmul_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?mask_strides)
+            (ICons ?matmul (ICons ?zero (INil)))))
+        (= ?lt_f32 (Op (Cast ?size (F32)) (ICons ?lt (INil))))
+
+        (= ?zeroed (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?zeroed_strides)
+            (ICons ?lt_f32 (ICons ?zero (INil)))))
+
+        (= ?neg_mask (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?neg_mask_strides)
+            (ICons ?lt_f32 (ICons ?neg_one (INil)))))
+        (= ?not_mask_f32 (Op (Add
+            ?shape
+            ?neg_mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?not_mask_f32_strides)
+            (ICons ?neg_mask (ICons ?one (INil)))))
+        (= ?not_mask_bool (Op (Cast ?size (Bool)) (ICons ?not_mask_f32 (INil))))
+        (= ?not_mask (Op (Cast ?size (F32)) (ICons ?not_mask_bool (INil))))
+
+        (= ?positive (Op (Mul
+            ?shape
+            ?not_mask_f32_strides
+            ?matmul_strides
+            ?positive_strides)
+            (ICons ?not_mask (ICons ?matmul (INil)))))
+        (= ?relu (Op (Add
+            ?shape
+            ?zeroed_strides
+            ?positive_strides
+            ?relu_strides)
+            (ICons ?zeroed (ICons ?positive (INil)))))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "RELU")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?relu ?fused)
+        (set (dtype ?fused) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d relu epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "DEFAULT")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?zero (Op (Constant 0.0) (INil)))
+        (= ?neg_one (Op (Constant -1.0) (INil)))
+        (= ?one (Op (Constant 1.0) (INil)))
+
+        (= ?lt (Op (LessThan
+            ?shape
+            ?matmul_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?mask_strides)
+            (ICons ?matmul (ICons ?zero (INil)))))
+        (= ?lt_f32 (Op (Cast ?size (F32)) (ICons ?lt (INil))))
+
+        (= ?zeroed (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?zeroed_strides)
+            (ICons ?lt_f32 (ICons ?zero (INil)))))
+
+        (= ?neg_mask (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?neg_mask_strides)
+            (ICons ?lt_f32 (ICons ?neg_one (INil)))))
+        (= ?not_mask_f32 (Op (Add
+            ?shape
+            ?neg_mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?not_mask_f32_strides)
+            (ICons ?neg_mask (ICons ?one (INil)))))
+        (= ?not_mask_bool (Op (Cast ?size (Bool)) (ICons ?not_mask_f32 (INil))))
+        (= ?not_mask (Op (Cast ?size (F32)) (ICons ?not_mask_bool (INil))))
+
+        (= ?positive (Op (Mul
+            ?shape
+            ?not_mask_f32_strides
+            ?matmul_strides
+            ?positive_strides)
+            (ICons ?not_mask (ICons ?matmul (INil)))))
+        (= ?relu (Op (Add
+            ?shape
+            ?zeroed_strides
+            ?positive_strides
+            ?relu_strides)
+            (ICons ?zeroed (ICons ?positive (INil)))))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "RELU")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?relu ?fused)
+        (set (dtype ?fused) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched relu epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "BIAS")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?zero (Op (Constant 0.0) (INil)))
+        (= ?neg_one (Op (Constant -1.0) (INil)))
+        (= ?one (Op (Constant 1.0) (INil)))
+
+        (= ?lt (Op (LessThan
+            ?shape
+            ?matmul_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?mask_strides)
+            (ICons ?matmul (ICons ?zero (INil)))))
+        (= ?lt_f32 (Op (Cast ?size (F32)) (ICons ?lt (INil))))
+
+        (= ?zeroed (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?zeroed_strides)
+            (ICons ?lt_f32 (ICons ?zero (INil)))))
+
+        (= ?neg_mask (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?neg_mask_strides)
+            (ICons ?lt_f32 (ICons ?neg_one (INil)))))
+        (= ?not_mask_f32 (Op (Add
+            ?shape
+            ?neg_mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?not_mask_f32_strides)
+            (ICons ?neg_mask (ICons ?one (INil)))))
+        (= ?not_mask_bool (Op (Cast ?size (Bool)) (ICons ?not_mask_f32 (INil))))
+        (= ?not_mask (Op (Cast ?size (F32)) (ICons ?not_mask_bool (INil))))
+
+        (= ?positive (Op (Mul
+            ?shape
+            ?not_mask_f32_strides
+            ?matmul_strides
+            ?positive_strides)
+            (ICons ?not_mask (ICons ?matmul (INil)))))
+        (= ?relu (Op (Add
+            ?shape
+            ?zeroed_strides
+            ?positive_strides
+            ?relu_strides)
+            (ICons ?zeroed (ICons ?positive (INil)))))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "RELU_BIAS")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?relu ?fused)
+        (set (dtype ?fused) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d relu bias epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "BIAS")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?zero (Op (Constant 0.0) (INil)))
+        (= ?neg_one (Op (Constant -1.0) (INil)))
+        (= ?one (Op (Constant 1.0) (INil)))
+
+        (= ?lt (Op (LessThan
+            ?shape
+            ?matmul_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?mask_strides)
+            (ICons ?matmul (ICons ?zero (INil)))))
+        (= ?lt_f32 (Op (Cast ?size (F32)) (ICons ?lt (INil))))
+
+        (= ?zeroed (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?zeroed_strides)
+            (ICons ?lt_f32 (ICons ?zero (INil)))))
+
+        (= ?neg_mask (Op (Mul
+            ?shape
+            ?mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?neg_mask_strides)
+            (ICons ?lt_f32 (ICons ?neg_one (INil)))))
+        (= ?not_mask_f32 (Op (Add
+            ?shape
+            ?neg_mask_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?not_mask_f32_strides)
+            (ICons ?neg_mask (ICons ?one (INil)))))
+        (= ?not_mask_bool (Op (Cast ?size (Bool)) (ICons ?not_mask_f32 (INil))))
+        (= ?not_mask (Op (Cast ?size (F32)) (ICons ?not_mask_bool (INil))))
+
+        (= ?positive (Op (Mul
+            ?shape
+            ?not_mask_f32_strides
+            ?matmul_strides
+            ?positive_strides)
+            (ICons ?not_mask (ICons ?matmul (INil)))))
+        (= ?relu (Op (Add
+            ?shape
+            ?zeroed_strides
+            ?positive_strides
+            ?relu_strides)
+            (ICons ?zeroed (ICons ?positive (INil)))))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "RELU_BIAS")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?relu ?fused)
+        (set (dtype ?fused) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched relu bias epilogue"
+)
+
+; Canonical tanh-approx GELU can also appear directly as:
+;
+;   x * sigmoid(1.5957691216 * x * (1 + 0.044715 * x * x))
+;
+; Match that sigmoid form and fuse it into the cuBLASLt GELU epilogues.
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "DEFAULT")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
+        (= ?gelu_inner_scaled (Op (Mul ?gelu_inner_scaled_shape ?gelu_inner_scaled_a_stride ?gelu_inner_scaled_b_stride ?gelu_inner_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_inner (INil)))))
+        (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
+        (= ?gelu_one (Op (Constant 1.000000) (INil)))
+        (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
+        (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
+        (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
+        (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
+        (= ?neg1 (Op (Constant -1.000000) (INil)))
+        (= ?gelu_neg (Op (Mul ?gelu_neg_shape ?gelu_neg_a_stride ?gelu_neg_b_stride ?gelu_neg_out_stride) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
+        (= ?log2e (Op (Constant 1.442695) (INil)))
+        (= ?gelu_exp_scaled (Op (Mul ?gelu_exp_scaled_shape ?gelu_exp_scaled_a_stride ?gelu_exp_scaled_b_stride ?gelu_exp_scaled_out_stride) (ICons ?gelu_neg (ICons ?log2e (INil)))))
+        (= ?gelu_exp2_val (Op (Exp2 ?gelu_exp_shape ?gelu_exp_in_stride ?gelu_exp_out_stride) (ICons ?gelu_exp_scaled (INil))))
+        (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
+        (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
+        (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "GELU")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?gelu_out ?fused)
+        (set (dtype ?fused) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt gelu epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "BIAS")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+
+        (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
+        (= ?gelu_inner_scaled (Op (Mul ?gelu_inner_scaled_shape ?gelu_inner_scaled_a_stride ?gelu_inner_scaled_b_stride ?gelu_inner_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_inner (INil)))))
+        (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
+        (= ?gelu_one (Op (Constant 1.000000) (INil)))
+        (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
+        (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
+        (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
+        (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
+        (= ?neg1 (Op (Constant -1.000000) (INil)))
+        (= ?gelu_neg (Op (Mul ?gelu_neg_shape ?gelu_neg_a_stride ?gelu_neg_b_stride ?gelu_neg_out_stride) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
+        (= ?log2e (Op (Constant 1.442695) (INil)))
+        (= ?gelu_exp_scaled (Op (Mul ?gelu_exp_scaled_shape ?gelu_exp_scaled_a_stride ?gelu_exp_scaled_b_stride ?gelu_exp_scaled_out_stride) (ICons ?gelu_neg (ICons ?log2e (INil)))))
+        (= ?gelu_exp2_val (Op (Exp2 ?gelu_exp_shape ?gelu_exp_in_stride ?gelu_exp_out_stride) (ICons ?gelu_exp_scaled (INil))))
+        (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
+        (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
+        (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype (F32)
+            ?compute_type ?scale_dtype
+            ?alpha ?beta "GELU_BIAS")
+            (ICons ?a (ICons ?b ?matmul_tail))))
+        (union ?gelu_out ?fused)
+        (set (dtype ?fused) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt gelu bias epilogue"
+)
+
+; This first slice fuses column-bias adds into CUBLASLT_EPILOGUE_BIAS for the
+; older COL-ordered output view. In that view Luminal's logical [m,n] output is
+; represented as a cuBLASLt [n,m] matrix, so cuBLASLt's row-broadcast bias maps
+; to the common logical column bias of length n.
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?n (ECons ?m (ENil)))
+            ?matmul_add_strides
+            ?bias_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?bias (INil)))))
+
+        (= ?bias_add_strides (ECons (MNum 0) (ECons (MIter) (ENil))))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?d_dtype (dtype ?bias))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "BIAS")
+            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d matmul plus column bias epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?n (ECons ?m (ENil)))
+            ?bias_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?bias (ICons ?matmul (INil)))))
+
+        (= ?bias_add_strides (ECons (MNum 0) (ECons (MIter) (ENil))))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?d_dtype (dtype ?bias))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "BIAS")
+            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt 2d column bias plus matmul epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?matmul_add_strides
+            ?bias_add_strides
+            ?add_out_strides)
+            (ICons ?matmul (ICons ?bias (INil)))))
+
+        (= ?bias_add_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MIter) (ENil)))))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?d_dtype (dtype ?bias))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "BIAS")
+            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched matmul plus column bias epilogue"
+)
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "DEFAULT")
+            (ICons ?a (ICons ?b (INil)))))
+
+        (= ?add (Op (Add
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?bias_add_strides
+            ?matmul_add_strides
+            ?add_out_strides)
+            (ICons ?bias (ICons ?matmul (INil)))))
+
+        (= ?bias_add_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MIter) (ENil)))))
+        (= ?matmul_add_strides ?add_out_strides)
+        (= ?d_dtype (dtype ?bias))
+    )
+    (
+        (let ?fused (Op (cublaslt
+            ?m ?n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha 0.0 "BIAS")
+            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+        (union ?add ?fused)
+        (set (dtype ?fused) ?d_dtype)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched column bias plus matmul epilogue"
+)

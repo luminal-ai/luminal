@@ -275,7 +275,7 @@ fn main() {
     let weights_path = artifact_dir.join("weights.safetensors");
     let cli = cli_args(&artifact_dir);
     let image_path = cli.image_path.clone();
-    let search_graphs = 1usize;
+    let search_graphs = 50usize;
 
     println!("Using artifact directory: {}", artifact_dir.display());
 

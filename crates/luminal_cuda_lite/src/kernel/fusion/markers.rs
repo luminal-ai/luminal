@@ -113,6 +113,9 @@ impl KernelOp for FusionStart {
     fn kernel_name(&self) -> &'static str {
         "FusionStart"
     }
+    fn output_aliases_input(&self) -> Option<usize> {
+        Some(0)
+    }
 }
 
 // =========================================================================

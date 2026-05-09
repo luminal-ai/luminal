@@ -304,13 +304,15 @@ impl<'a> Translator<'a> {
         let (cond_b, x_b) = broadcast_binary(cond, x);
         let (cond_bc, y_b) = broadcast_binary(cond_b, y);
         let (x_bc, y_bc) = broadcast_binary(x_b, y_b);
+        // Lower as `y + c*(x - y)` rather than `c*x + (1-c)*y`: 3 ops vs 4 ops
+        // plus the explicit `1.0` constant. Mathematically identical for
+        // c ∈ {0, 1} and produces the same F32 output type.
         let c = cond_bc.cast(DType::F32);
         let x_f = x_bc.cast(DType::F32);
         let y_f = y_bc.cast(DType::F32);
-        let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
         // Cast back: an F32 result downstream-interpreted as bf16 walks the
         // buffer at half-stride, returning every-other-element zeros.
-        (c * x_f + (one - c) * y_f).cast(out_dtype)
+        (y_f + c * (x_f - y_f)).cast(out_dtype)
     }
 
     pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {

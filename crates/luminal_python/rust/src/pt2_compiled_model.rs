@@ -23,18 +23,167 @@ fn resolve_dim_sizes(
         .map(|s| match s {
             pt2_schema::DimSize::Int(i) => Expression::from(i.as_int as usize),
             pt2_schema::DimSize::Expr(e) => {
-                if let Some(sym) = pt2_parser::extract_symbol_name_pub(&e.as_expr.expr_str) {
-                    if let Some(c) = sym_to_char.get(&sym) {
-                        Expression::from(*c)
-                    } else {
-                        Expression::from(1usize)
-                    }
-                } else {
-                    Expression::from(1usize)
-                }
+                let s = e.as_expr.expr_str.trim();
+                // Try the full sympy-style parse first so compound forms like
+                // `Mul(Integer(2), Symbol('s77', ...))` (emitted by `cat` and
+                // similar dim-altering ops) propagate as a real Expression
+                // rather than collapsing to the size-1 fallback. Fall back to
+                // the bare-Symbol fast path when that fails — the parser
+                // bails on unrecognised heads (Pow, Min, etc.) and we'd
+                // rather lose the symbolic info than misinterpret it.
+                parse_sympy_expr(s, sym_to_char)
+                    .or_else(|| {
+                        pt2_parser::extract_symbol_name_pub(s)
+                            .and_then(|sym| sym_to_char.get(&sym).map(|c| Expression::from(*c)))
+                    })
+                    .or_else(|| {
+                        // As a last resort, if the EP gave us a concrete `hint`
+                        // (the value used to seed shape tracing), use it. The
+                        // dim is technically dynamic but at least output-shape
+                        // resolution won't return 1 for unset dims.
+                        e.as_expr
+                            .hint
+                            .as_ref()
+                            .and_then(|h| h.as_int())
+                            .map(|h| Expression::from(h as usize))
+                    })
+                    .unwrap_or_else(|| Expression::from(1usize))
             }
         })
         .collect()
+}
+
+/// Parse a sympy `srepr`-style expression string into a luminal Expression.
+///
+/// Handles the subset of sympy heads PT2 actually emits for shape metadata:
+///
+///   * `Symbol('name', ...)` — bound to the corresponding luminal char if
+///     present in `sym_to_char`, or treated as a fresh constant 1 otherwise.
+///   * `Integer(N)` / `Number(N)` — concrete int.
+///   * `Mul(a, b, ...)` / `Add(a, b, ...)` — n-ary, folded into pairwise ops.
+///
+/// Returns `None` for anything else so the caller can fall back to a less
+/// precise representation rather than committing a wrong expression.
+fn parse_sympy_expr(s: &str, sym_to_char: &HashMap<String, char>) -> Option<Expression> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Bare integer literal — `srepr` doesn't usually emit this at the top
+    // level (it wraps in `Integer(...)`), but accept it for robustness.
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(Expression::from(n as usize));
+    }
+
+    let (head, body) = split_head(s)?;
+    match head {
+        "Symbol" => {
+            // Body is `'name', positive=True, integer=True` etc. Pull the
+            // first quoted token as the name.
+            let name = extract_first_quoted(body)?;
+            sym_to_char.get(&name).map(|c| Expression::from(*c))
+        }
+        "Integer" | "Number" => {
+            let n: i64 = body.trim().parse().ok()?;
+            Some(Expression::from(n as usize))
+        }
+        "Mul" | "Add" => {
+            let parts = split_top_level_args(body);
+            if parts.is_empty() {
+                return None;
+            }
+            let mut iter = parts.into_iter();
+            let mut acc = parse_sympy_expr(iter.next()?, sym_to_char)?;
+            for p in iter {
+                let rhs = parse_sympy_expr(p, sym_to_char)?;
+                acc = if head == "Mul" { acc * rhs } else { acc + rhs };
+            }
+            Some(acc)
+        }
+        _ => None,
+    }
+}
+
+/// Split `Head(body)` into (head, body); returns None if not in that form.
+fn split_head(s: &str) -> Option<(&str, &str)> {
+    let open = s.find('(')?;
+    if !s.ends_with(')') {
+        return None;
+    }
+    Some((&s[..open], &s[open + 1..s.len() - 1]))
+}
+
+/// Pull out the first single- or double-quoted token from a sympy arg list,
+/// e.g. `'s77', positive=True` → `s77`.
+fn extract_first_quoted(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '\'' || c == '"' {
+            let quote = c;
+            let start = i + 1;
+            i += 1;
+            while i < bytes.len() && bytes[i] as char != quote {
+                i += 1;
+            }
+            return Some(s[start..i].to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split sympy-style argument list at top-level commas, respecting nested
+/// parens and quoted strings. Discards `key=value` kwargs (they don't carry
+/// dimensional information).
+fn split_top_level_args(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut depth = 0;
+    let mut in_quote: Option<char> = None;
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let c = b as char;
+        match in_quote {
+            Some(q) => {
+                if c == q {
+                    in_quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => in_quote = Some(c),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                ',' if depth == 0 => {
+                    let part = s[start..i].trim();
+                    // Drop `key=value` kwargs — they're metadata sympy uses
+                    // for pretty-printing, not arguments to the operator.
+                    if !part.is_empty() && !looks_like_kwarg(part) {
+                        out.push(part);
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    let part = s[start..].trim();
+    if !part.is_empty() && !looks_like_kwarg(part) {
+        out.push(part);
+    }
+    out
+}
+
+fn looks_like_kwarg(part: &str) -> bool {
+    if let Some(eq) = part.find('=') {
+        let key = part[..eq].trim();
+        // sympy kwargs are bare identifiers like `positive`, `integer`.
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    } else {
+        false
+    }
 }
 
 #[pyfunction]
