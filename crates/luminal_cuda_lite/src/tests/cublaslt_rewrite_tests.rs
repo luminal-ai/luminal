@@ -1507,38 +1507,54 @@ fn cublaslt_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
         return;
     };
 
-    let (m, n, k) = (7, 11, 5);
-    let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let bias = cx.tensor(n);
-    let bias_expanded = bias.expand_dim(0, m);
-    let out = (a.matmul(b) + bias_expanded).output();
-    let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional bias epilogue", |llir| {
-        cublaslt_epilogues(llir).contains(&"BIAS")
-            && cublaslt_matrix_order_tuples(llir).contains(&("COL", "COL", "COL", "COL"))
-    });
+    for case in LAYOUT_CASES {
+        let (m, n, k) = (7, 11, 5);
+        let mut cx = Graph::new();
+        let a_storage = cx.tensor(if case.a_col_major { (k, m) } else { (m, k) });
+        let b_storage = cx.tensor(if case.b_col_major { (n, k) } else { (k, n) });
+        let a = if case.a_col_major {
+            a_storage.t()
+        } else {
+            a_storage
+        };
+        let b = if case.b_col_major {
+            b_storage.t()
+        } else {
+            b_storage
+        };
+        let bias = cx.tensor(n);
+        let bias_expanded = bias.expand_dim(0, m);
+        let out = (a.matmul(b) + bias_expanded).output();
+        let llir = extract_forced_cublaslt_llir_where(
+            &mut cx,
+            &format!("functional bias epilogue {}", case.name),
+            |llir| {
+                cublaslt_epilogues(llir).contains(&"BIAS")
+                    && cublaslt_matrix_order_tuples(llir).contains(&("COL", "COL", "COL", "COL"))
+            },
+        );
 
-    let a_data = random_f32_vec(m * k, 0xB1A5_EDA1, -0.5, 0.5);
-    let b_data = random_f32_vec(k * n, 0xB1A5_EDB1, -0.5, 0.5);
-    let bias_data = random_f32_vec(n, 0xB1A5_EDC1, -0.5, 0.5);
-    let expected = reference_column_bias_postop(
-        reference_matmul_2d(&a_data, &b_data, m, n, k),
-        &bias_data,
-        1,
-        m,
-        n,
-        PostOp::Identity,
-    );
+        let a_data = random_f32_vec(m * k, 0xB1A5_EDA1 + case_seed(case), -0.5, 0.5);
+        let b_data = random_f32_vec(k * n, 0xB1A5_EDB1 + case_seed(case), -0.5, 0.5);
+        let bias_data = random_f32_vec(n, 0xB1A5_EDC1 + case_seed(case), -0.5, 0.5);
+        let expected = reference_column_bias_postop(
+            reference_matmul_2d_layout(case, &a_data, &b_data, m, n, k),
+            &bias_data,
+            1,
+            m,
+            n,
+            PostOp::Identity,
+        );
 
-    let mut rt = CudaRuntime::initialize(stream);
-    rt.load_llir(&llir);
-    rt.set_data(a, a_data);
-    rt.set_data(b, b_data);
-    rt.set_data(bias, bias_data);
-    rt.execute(&cx.dyn_map);
+        let mut rt = CudaRuntime::initialize(stream.clone());
+        rt.load_llir(&llir);
+        rt.set_data(a_storage, a_data);
+        rt.set_data(b_storage, b_data);
+        rt.set_data(bias, bias_data);
+        rt.execute(&cx.dyn_map);
 
-    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+        assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    }
 }
 
 #[test]

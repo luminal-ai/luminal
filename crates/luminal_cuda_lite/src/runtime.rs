@@ -1130,6 +1130,28 @@ fn byte_ranges_overlap(a_offset: usize, a_bytes: usize, b_offset: usize, b_bytes
     a_offset < b_offset + b_bytes && b_offset < a_offset + a_bytes
 }
 
+fn is_schedule_only_host_source(llir_graph: &LLIRGraph, source: NodeIndex) -> bool {
+    llir_graph[source]
+        .to_dialect::<dyn HostOp>()
+        .is_some_and(|source_host_op| source_host_op.output_bytes() == 0)
+}
+
+fn host_data_inputs(
+    llir_graph: &LLIRGraph,
+    host_op_node_index: NodeIndex,
+    host_op: &dyn HostOp,
+) -> Vec<NodeIndex> {
+    llir_graph
+        .edges_directed(host_op_node_index, Direction::Incoming)
+        .sorted_by_key(|e| e.id())
+        // CudaGraphOp -> HostOp edges are ordering edges added by kernel_to_host.
+        // They must remain in exec_graph, but they are not data pointers.
+        .filter(|e| !is_schedule_only_host_source(llir_graph, e.source()))
+        .map(|e| e.source())
+        .take(host_op.n_inputs())
+        .collect_vec()
+}
+
 fn logical_interval_peak(planned: &[PlannedBuffer]) -> usize {
     let mut events = Vec::with_capacity(planned.len() * 2);
     for buf in planned {
@@ -1738,11 +1760,11 @@ impl CudaRuntime {
             let _span = span!(Level::TRACE, "compile_host_ops").entered();
             for host_op_node_index in llir_graph.node_indices() {
                 if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
-                    let inputs = llir_graph
-                        .edges_directed(host_op_node_index, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect_vec();
+                    let inputs = host_data_inputs(
+                        &llir_graph,
+                        host_op_node_index,
+                        host_op.as_ref().as_ref(),
+                    );
                     node_to_exec.insert(
                         host_op_node_index,
                         exec_graph.add_node(ExecutableHostOp {
