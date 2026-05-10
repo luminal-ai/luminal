@@ -279,6 +279,9 @@ impl EgglogOp for KernelScatterNoCopy {
     fn rewrites(&self) -> Vec<Rule> {
         // Match KernelScatter and rewrite to KernelScatterNoCopy with ConsumedBuffer on dest.
         // ConsumedBuffer wraps dest to signal in-place modification.
+        // This is only valid when the destination buffer can also represent
+        // the scatter output layout. If dest is a strided/broadcast view,
+        // regular Scatter must first materialize a contiguous output copy.
         //
         // Two-phase resolution:
         // 1. During (run): cleanup rules delete ConsumedBuffer if dest is shared (another op uses it)
@@ -313,6 +316,7 @@ impl EgglogOp for KernelScatterNoCopy {
                     (
                         (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
                             (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+                        (= ?dst ?os)
                         (= ?dty (dtype ?src))
                     )
                     (

@@ -387,33 +387,37 @@ impl<'a> Translator<'a> {
         let dim = normalize_dim(dim, a.shape.len());
 
         // Determine output names
-        let values_name = node
-            .outputs
-            .first()
-            .and_then(|o| o.as_tensor.as_ref().map(|t| t.name.clone()));
-        let indices_name =
-            if let Some(ts) = node.outputs.first().and_then(|o| o.as_tensors.as_ref()) {
-                ts.get(1).map(|t| t.name.clone())
-            } else if node.outputs.len() > 1 {
-                node.outputs[1].as_tensor.as_ref().map(|t| t.name.clone())
-            } else {
-                None
-            };
+        let tuple_outputs = node.outputs.first().and_then(|o| o.as_tensors.as_ref());
+        let values_name = if let Some(ts) = tuple_outputs {
+            ts.first().map(|t| t.name.clone())
+        } else {
+            node.outputs
+                .first()
+                .and_then(|o| o.as_tensor.as_ref().map(|t| t.name.clone()))
+        };
+        let indices_name = if let Some(ts) = tuple_outputs {
+            ts.get(1).map(|t| t.name.clone())
+        } else if node.outputs.len() > 1 {
+            node.outputs[1].as_tensor.as_ref().map(|t| t.name.clone())
+        } else {
+            None
+        };
 
-        // Build top-k outputs from a full stable argsort, then slice to k.
+        // Build top-k outputs from a full stable argsort. Slice the indices
+        // before gathering values so the gather shape matches the requested
+        // top-k output rather than the full sort width.
         let full_argsort = a.stable_argsort(dim, true);
+        let topk_indices = full_argsort.slice_along(..k, dim) * 1.0;
 
         // Only build the outputs that are consumed.
         if let Some(val_name) = values_name
             && !val_name.is_empty()
         {
-            let values = a.gather_elements(full_argsort, dim).slice_along(..k, dim);
+            let values = a.gather_elements(topk_indices, dim);
             self.tensors.insert(val_name, values);
         }
         if let Some(idx_name) = indices_name {
-            // Materialize the sliced indices through a copy before storing them.
-            let indices = full_argsort.slice_along(..k, dim) * 1.0;
-            self.tensors.insert(idx_name, indices);
+            self.tensors.insert(idx_name, topk_indices);
         }
 
         Ok(())

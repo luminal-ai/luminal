@@ -17,7 +17,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "DEFAULT")
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?zero (Op (Constant 0.0) (INil)))
@@ -77,7 +77,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "RELU")
+            ?alpha 0.0 "RELU")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?relu ?fused)
         (set (dtype ?fused) (F32))
@@ -97,7 +97,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "DEFAULT")
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?zero (Op (Constant 0.0) (INil)))
@@ -157,7 +157,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "RELU")
+            ?alpha 0.0 "RELU")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?relu ?fused)
         (set (dtype ?fused) (F32))
@@ -177,7 +177,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "BIAS")
+            ?alpha 0.0 "BIAS")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?zero (Op (Constant 0.0) (INil)))
@@ -237,7 +237,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "RELU_BIAS")
+            ?alpha 0.0 "RELU_BIAS")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?relu ?fused)
         (set (dtype ?fused) (F32))
@@ -257,7 +257,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "BIAS")
+            ?alpha 0.0 "BIAS")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?zero (Op (Constant 0.0) (INil)))
@@ -317,7 +317,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "RELU_BIAS")
+            ?alpha 0.0 "RELU_BIAS")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?relu ?fused)
         (set (dtype ?fused) (F32))
@@ -343,7 +343,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "DEFAULT")
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
@@ -373,7 +373,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "GELU")
+            ?alpha 0.0 "GELU")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?gelu_out ?fused)
         (set (dtype ?fused) (F32))
@@ -393,7 +393,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "BIAS")
+            ?alpha 0.0 "BIAS")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
@@ -423,7 +423,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta "GELU_BIAS")
+            ?alpha 0.0 "GELU_BIAS")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?gelu_out ?fused)
         (set (dtype ?fused) (F32))
