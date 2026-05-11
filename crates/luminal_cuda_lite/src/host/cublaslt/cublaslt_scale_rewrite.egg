@@ -16,6 +16,8 @@
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?scale (Op (Constant ?alpha) (INil)))
+        ; alpha=1.0 hash-conses ?fused == ?matmul; the union merges Mul into ?matmul's eclass and saturate diverges. 
+        (!= ?alpha 1.0)
         (= ?scaled (Op (Mul ?shape
             ?matmul_strides
             (ECons (MNum 0) (ECons (MNum 0) (ENil)))
@@ -57,6 +59,8 @@
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?scale (Op (Constant ?alpha) (INil)))
+        ; See 2d alpha scale: alpha=1.0 makes (saturate ...) diverge.   
+        (!= ?alpha 1.0)
         (= ?scaled (Op (Mul ?shape
             ?matmul_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
