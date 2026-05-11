@@ -400,10 +400,15 @@ unsafe fn cuda_pin_memory(ptr: *mut std::ffi::c_void, size: usize) -> i32 {
     static FN: OnceLock<usize> = OnceLock::new();
 
     let raw = *FN.get_or_init(|| unsafe {
-        let lib = ["libcudart.so", "libcudart.so.13", "libcudart.so.12", "libcudart.so.11"]
-            .iter()
-            .find_map(|n| libloading::Library::new(*n).ok())
-            .expect("FlashInfer: could not dlopen libcudart for cudaHostRegister");
+        let lib = [
+            "libcudart.so",
+            "libcudart.so.13",
+            "libcudart.so.12",
+            "libcudart.so.11",
+        ]
+        .iter()
+        .find_map(|n| libloading::Library::new(*n).ok())
+        .expect("FlashInfer: could not dlopen libcudart for cudaHostRegister");
         let sym: libloading::Symbol<HostRegisterFn> = lib
             .get(b"cudaHostRegister\0")
             .expect("FlashInfer: libcudart missing cudaHostRegister symbol");

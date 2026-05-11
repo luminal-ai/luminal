@@ -205,12 +205,8 @@ fn run_flashinfer(
     // Output is (heads, batch, dim); reshape to (batch, heads, dim).
     let mut out_bytes = vec![0u8; batch_size * HIDDEN * 4];
     unsafe {
-        cudarc::driver::result::memcpy_dtoh_async(
-            &mut out_bytes,
-            out_ptr,
-            stream.cu_stream(),
-        )
-        .unwrap();
+        cudarc::driver::result::memcpy_dtoh_async(&mut out_bytes, out_ptr, stream.cu_stream())
+            .unwrap();
     }
     stream.synchronize().unwrap();
     let raw: Vec<f32> = unsafe {
@@ -228,7 +224,13 @@ fn deterministic_f32(n: usize, seed: f32, scale: f32) -> Vec<f32> {
 }
 
 fn assert_close(a: &[f32], b: &[f32], rtol: f32, atol: f32) {
-    assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
     let mut worst = (0usize, 0.0f32);
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         let diff = (x - y).abs();
@@ -418,8 +420,14 @@ fn flashinfer_bs2_supersequence() {
 
     // Reference: run each sequence separately through the reference graph
     // (the reference uses dense attention so we can't run bs=2 directly).
-    let expected0 =
-        run_reference_attention(&stream, &q[..HIDDEN], &k[..ctx0 * KV_DIM], &v[..ctx0 * KV_DIM], 1, ctx0);
+    let expected0 = run_reference_attention(
+        &stream,
+        &q[..HIDDEN],
+        &k[..ctx0 * KV_DIM],
+        &v[..ctx0 * KV_DIM],
+        1,
+        ctx0,
+    );
     let expected1 = run_reference_attention(
         &stream,
         &q[HIDDEN..],
@@ -730,7 +738,10 @@ fn flashinfer_dump_paged_attn_egglog() {
             }
         }
     }
-    eprintln!("==== ops_vec.len()={} total_rewrites={total_rewrites} fi_rewrites={fi_rewrites} ====", ops_vec.len());
+    eprintln!(
+        "==== ops_vec.len()={} total_rewrites={total_rewrites} fi_rewrites={fi_rewrites} ====",
+        ops_vec.len()
+    );
 
     let (cx, _) = build_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM);
     let (program, root) = hlir_to_egglog(&cx);
@@ -738,7 +749,10 @@ fn flashinfer_dump_paged_attn_egglog() {
     for (i, line) in program.lines().enumerate() {
         eprintln!("{:5}: {line}", i + 1);
     }
-    eprintln!("==== END EGGLOG PROGRAM ({} lines) ====", program.lines().count());
+    eprintln!(
+        "==== END EGGLOG PROGRAM ({} lines) ====",
+        program.lines().count()
+    );
 
     let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
     ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
@@ -866,7 +880,9 @@ fn flashinfer_extraction_reachable_from_search_space() {
     cx.set_dim('r', 2usize);
     cx.build_search_space::<CudaRuntime>();
 
-    let egraph = cx.egraph().expect("egraph missing after build_search_space");
+    let egraph = cx
+        .egraph()
+        .expect("egraph missing after build_search_space");
     let ops = cx
         .egglog_ops()
         .expect("egglog_ops missing after build_search_space");
