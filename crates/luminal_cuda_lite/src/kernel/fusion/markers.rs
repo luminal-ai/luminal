@@ -153,6 +153,24 @@ impl EgglogOp for FusionEnd {
         // out, no transpose); a binary feeding a downstream op binds the
         // binary's out-stride to the downstream op's in-stride along the
         // connecting side.
+        //
+        // The blowup we see in fusion_pair on the 32B flux2 transformer is
+        // dominated by families 3 and 4 (U-B and B-B) because each match adds
+        // 2-3 new FusionStart enodes; with many binary-binary chains in the
+        // graph, the egraph saturate-iteration count balloons. Use
+        // `LUMINAL_FUSION_FAMILIES=uu` to keep only family 1 (U-U) — the
+        // safest subset — or `LUMINAL_FUSION_FAMILIES=uu,bu,ub` to drop the
+        // B-B family while keeping the rest. Default: all families on.
+        let families = std::env::var("LUMINAL_FUSION_FAMILIES").ok();
+        let allowed: Option<std::collections::HashSet<String>> = families
+            .as_ref()
+            .map(|s| s.split(',').map(|p| p.trim().to_lowercase()).collect());
+        let family_on = |name: &str| -> bool {
+            allowed
+                .as_ref()
+                .map(|set| set.contains(name))
+                .unwrap_or(true)
+        };
         let mut rules = Vec::new();
 
         // (KernelX kind, FusedX kind)
@@ -171,6 +189,7 @@ impl EgglogOp for FusionEnd {
         ];
 
         // 1. Pair-fuse U → U: U2(U1(x)) → FE(FU2(FU1(FS(x)))).
+        if family_on("uu") {
         for (ki1, fi1) in unaries {
             for (ko2, fo2) in unaries {
                 rules.push(Rule::raw(format!(
@@ -187,8 +206,10 @@ impl EgglogOp for FusionEnd {
                 )));
             }
         }
+        }
 
         // 2. Pair-fuse B → U: U(B(a, b)) → FE(FU(FB(FS(a), FS(b)))).
+        if family_on("bu") {
         for (kb, fb, lb) in binaries {
             for (ku, fu) in unaries {
                 rules.push(Rule::raw(format!(
@@ -208,10 +229,12 @@ impl EgglogOp for FusionEnd {
                 )));
             }
         }
+        }
 
         // 3. Pair-fuse U → B (lhs / rhs): unary feeds binary's A or B input.
         //    LHS:  B(U(a), b) → FE(FB(FU(FS(a)), FS(b))).
         //    RHS:  B(a, U(b)) → FE(FB(FS(a), FU(FS(b)))).
+        if family_on("ub") {
         for (ku, fu) in unaries {
             for (kb, fb, lb) in binaries {
                 rules.push(Rule::raw(format!(
@@ -246,8 +269,10 @@ impl EgglogOp for FusionEnd {
                 )));
             }
         }
+        }
 
         // 4. Pair-fuse B → B (lhs / rhs): inner binary feeds outer's A or B.
+        if family_on("bb") {
         for (kbi, fbi, lbi) in binaries {
             for (kbo, fbo, lbo) in binaries {
                 rules.push(Rule::raw(format!(
@@ -288,8 +313,17 @@ impl EgglogOp for FusionEnd {
                 )));
             }
         }
+        }
 
         // 5. Grow FE → U: U(FE(inner)) → FE(FU(inner)). No new FS.
+        //
+        // Subsume the inner FE — once it's been extended, the partially-fused
+        // version is dominated by the larger region. The un-fused KernelX
+        // chain stays via union (pair-fuse never subsumed it), so multi-use
+        // consumers can still fall back to the un-fused alternative. Without
+        // this, every intermediate region size coexists in the egraph as an
+        // alternative, which is the partial-fusion explosion we see on the
+        // 32B flux2 transformer.
         for (ku, fu) in unaries {
             rules.push(Rule::raw(format!(
                 "(rule (
@@ -299,11 +333,13 @@ impl EgglogOp for FusionEnd {
                     (let ?fu (Op ({fu} ?shape ?s ?s ?dt) (ICons ?inner (INil))))
                     (let ?new_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?fu (INil))))
                     (union ?u ?new_fe)
+                    (subsume (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
                  ) :ruleset fusion_grow :name \"grow-FE-U-{ku}\")"
             )));
         }
 
         // 6. Grow FE → B (lhs / rhs): one input is the FE, the other external.
+        // Same subsume rationale as Grow FE → U.
         for (kb, fb, lb) in binaries {
             rules.push(Rule::raw(format!(
                 "(rule (
@@ -316,6 +352,7 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?inner_a (ICons ?fs_b (INil)))))
                     (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                     (union ?bin ?new_fe)
+                    (subsume (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                  ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{lb}\")"
             )));
             rules.push(Rule::raw(format!(
@@ -329,6 +366,7 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?fs_a (ICons ?inner_b (INil)))))
                     (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                     (union ?bin ?new_fe)
+                    (subsume (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
                  ) :ruleset fusion_grow :name \"grow-FE-B-rhs-{lb}\")"
             )));
         }
