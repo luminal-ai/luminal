@@ -1,11 +1,16 @@
 //! JIT compilation and dynamic loading of FlashInfer kernels.
 //!
-//! Everything runs at runtime — there is no `build.rs`. `wrapper.cu` and
-//! `wrapper.h` are embedded via `include_str!()` and extracted to the cache
-//! directory on first use. The FlashInfer + CUTLASS header trees are located
-//! by probing `LUMINAL_FLASHINFER_DIR` and a small set of default paths.
-//! `nvcc` is invoked with the model's actual `HEAD_DIM`, then the resulting
-//! `.so` is `dlopen`'d.
+//! Everything runs at compile / profiling time — there is no `build.rs`.
+//! `wrapper.cu` and `wrapper.h` are embedded via `include_str!()` and
+//! extracted to the cache directory on first use. The FlashInfer + CUTLASS
+//! header trees are located by probing `LUMINAL_FLASHINFER_DIR`, a small set
+//! of default paths, and (as a last resort) by `git clone`-ing FlashInfer at
+//! a pinned commit into the cache. `nvcc` is then invoked with the model's
+//! actual `HEAD_DIM` and the resulting `.so` is `dlopen`'d.
+//!
+//! `ensure_compiled` is called from `FlashInferAttention::extract()`, i.e.
+//! during luminal's compile / GA-profiling phase, not from `execute()`. After
+//! the first call the `OnceLock` makes subsequent lookups free.
 
 use std::{
     ffi::c_void,
@@ -318,6 +323,19 @@ fn wrapper_source_hash() -> u64 {
     hasher.finish()
 }
 
+// ── Pinned FlashInfer source ──
+//
+// Bumping this constant invalidates the cached source tree AND the cached .so
+// (the .so cache key incorporates the wrapper hash, which is rebuilt against
+// these headers, so different headers compile to a different .so file even at
+// the same head_dim). If you change `FLASHINFER_GIT_REV`, also re-check
+// `wrapper.cu` against the new FlashInfer API.
+
+const FLASHINFER_GIT_URL: &str = "https://github.com/flashinfer-ai/flashinfer.git";
+const CUTLASS_GIT_URL: &str = "https://github.com/NVIDIA/cutlass.git";
+const FLASHINFER_GIT_REV: &str = "f1e6fdcb8f65104047697f022b5d055ef022d763";
+const CUTLASS_GIT_REV: &str = "f3fde58372d33e9a5650ba7b80fc48b3b49d40c8";
+
 fn locate_flashinfer_includes() -> Option<(PathBuf, PathBuf)> {
     if let Ok(path) = std::env::var("LUMINAL_FLASHINFER_DIR")
         && !path.is_empty()
@@ -348,7 +366,119 @@ fn locate_flashinfer_includes() -> Option<(PathBuf, PathBuf)> {
             return Some((inc, cutlass));
         }
     }
-    None
+
+    // Last resort: fetch the pinned commit into the cache directory.
+    fetch_flashinfer_source().ok().map(|root| {
+        let inc = root.join("include");
+        let cutlass = root.join("3rdparty/cutlass/include");
+        (inc, cutlass)
+    })
+}
+
+/// Clone FlashInfer at `FLASHINFER_GIT_REV` + CUTLASS at `CUTLASS_GIT_REV`
+/// into `~/.cache/luminal/flashinfer-src/<short_rev>/` if absent, then return
+/// the FlashInfer root directory. ~50 MB one-time download; subsequent calls
+/// short-circuit on the directory check.
+fn fetch_flashinfer_source() -> Result<PathBuf, String> {
+    let short = &FLASHINFER_GIT_REV[..12];
+    let cache_root = cache_directory().join("flashinfer-src").join(short);
+    let inc = cache_root.join("include");
+    let cutlass_inc = cache_root.join("3rdparty/cutlass/include");
+
+    if inc.exists() && cutlass_inc.exists() {
+        return Ok(cache_root);
+    }
+
+    let parent = cache_root.parent().unwrap();
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+
+    // Clone into a staging dir, then atomic rename. Protects against multiple
+    // processes racing to fetch the same source.
+    let staging = parent.join(format!(".staging-{}-{}", short, std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+
+    eprintln!(
+        "FlashInfer: cloning {FLASHINFER_GIT_URL} @ {short} into {} (one-time fetch, ~50 MB) …",
+        cache_root.display()
+    );
+
+    run_git(&[
+        "clone",
+        "--filter=blob:none",
+        "--no-checkout",
+        FLASHINFER_GIT_URL,
+        staging.to_str().unwrap(),
+    ])?;
+    run_git_in(&staging, &["checkout", FLASHINFER_GIT_REV])?;
+
+    // Init only the CUTLASS submodule (skip spdlog — we don't need it for kernels).
+    let cutlass_path = staging.join("3rdparty/cutlass");
+    let _ = std::fs::remove_dir_all(&cutlass_path);
+    run_git(&[
+        "clone",
+        "--filter=blob:none",
+        "--no-checkout",
+        CUTLASS_GIT_URL,
+        cutlass_path.to_str().unwrap(),
+    ])?;
+    run_git_in(&cutlass_path, &["checkout", CUTLASS_GIT_REV])?;
+
+    if !staging.join("include").exists() {
+        return Err(format!(
+            "FlashInfer clone succeeded but include/ missing at {}",
+            staging.display()
+        ));
+    }
+    if !staging.join("3rdparty/cutlass/include").exists() {
+        return Err(format!(
+            "CUTLASS clone succeeded but include/ missing at {}",
+            staging.join("3rdparty/cutlass").display()
+        ));
+    }
+
+    // Atomic-ish rename. If another process beat us to it, just keep theirs.
+    match std::fs::rename(&staging, &cache_root) {
+        Ok(()) => {}
+        Err(_) if cache_root.exists() => {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        Err(e) => return Err(format!("rename to {} failed: {e}", cache_root.display())),
+    }
+
+    Ok(cache_root)
+}
+
+fn run_git(args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to spawn `git`: {e}. Is git installed?"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn run_git_in(cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("failed to spawn `git`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git {}` in {} failed: {}",
+            args.join(" "),
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
 }
 
 /// Detect CUDA arch via env override → nvidia-smi → default sm_80.
