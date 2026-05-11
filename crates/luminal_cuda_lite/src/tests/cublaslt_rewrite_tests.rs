@@ -18,6 +18,11 @@ use crate::{
 
 use super::utilities::{assert_close, get_cuda_stream, gpu_supports_dtype, random_f32_vec};
 
+// Broad cuBLASLt rewrite coverage is intentionally opt-in: these tests rerun the
+// egglog optimizer across many layout and epilogue combinations and dominate the
+// serialized CUDA unit-test runtime. Use `cargo test -p luminal_cuda_lite -- --ignored`
+// when changing cuBLASLt rewrites or extraction logic.
+
 #[derive(Debug, Clone, Copy)]
 struct LayoutCase {
     name: &'static str,
@@ -318,6 +323,7 @@ const CUBLASLT_FP8_F32_PAIRS: [(DType, DType); 3] = [
 ];
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_layout_pairs() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(build_2d_matmul_graph(case, DType::F32), case.name, |_| true);
@@ -325,6 +331,7 @@ fn cublaslt_rewrites_cover_2d_layout_pairs() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_layout_pairs() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -413,6 +420,7 @@ fn cublaslt_rewrites_emit_default_matrix_orders() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_row_order_layout_pairs() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -423,6 +431,7 @@ fn cublaslt_rewrites_cover_2d_row_order_layout_pairs() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_row_order_layout_pairs() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -449,6 +458,7 @@ fn cublaslt_rewrites_keep_c_and_d_layouts_equal_initially() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_plus_c_beta_one() {
     for case in LAYOUT_CASES {
         let cx = build_2d_matmul_plus_c_graph(case, DType::F32, false);
@@ -460,6 +470,7 @@ fn cublaslt_rewrites_cover_2d_matmul_plus_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_c_plus_matmul_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -471,6 +482,7 @@ fn cublaslt_rewrites_cover_2d_c_plus_matmul_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_plus_c_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -482,6 +494,7 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_c_plus_matmul_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -493,6 +506,7 @@ fn cublaslt_rewrites_cover_batched_c_plus_matmul_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_row_order_matmul_plus_c_beta_one() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -508,6 +522,7 @@ fn cublaslt_rewrites_cover_2d_row_order_matmul_plus_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_row_order_c_plus_matmul_beta_one() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -523,6 +538,7 @@ fn cublaslt_rewrites_cover_2d_row_order_c_plus_matmul_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_row_order_matmul_plus_c_beta_one() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -538,6 +554,7 @@ fn cublaslt_rewrites_cover_batched_row_order_matmul_plus_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_row_order_c_plus_matmul_beta_one() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -553,6 +570,7 @@ fn cublaslt_rewrites_cover_batched_row_order_c_plus_matmul_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_plus_sliced_c_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -567,6 +585,7 @@ fn cublaslt_rewrites_cover_2d_matmul_plus_sliced_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_sliced_c_plus_matmul_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -581,6 +600,7 @@ fn cublaslt_rewrites_cover_2d_sliced_c_plus_matmul_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_plus_sliced_c_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -595,6 +615,7 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_sliced_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_sliced_c_plus_matmul_beta_one() {
     for case in LAYOUT_CASES {
         assert_cublaslt_rewrite(
@@ -609,6 +630,7 @@ fn cublaslt_rewrites_cover_batched_sliced_c_plus_matmul_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_row_order_matmul_plus_sliced_c_beta_one() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -625,6 +647,7 @@ fn cublaslt_rewrites_cover_2d_row_order_matmul_plus_sliced_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_row_order_matmul_plus_sliced_c_beta_one() {
     for case in LAYOUT_CASES {
         let expected_orders = row_order_tuple(case);
@@ -641,6 +664,7 @@ fn cublaslt_rewrites_cover_batched_row_order_matmul_plus_sliced_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_do_not_fuse_2d_transposed_c_beta_one() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -653,6 +677,7 @@ fn cublaslt_rewrites_do_not_fuse_2d_transposed_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_do_not_fuse_batched_transposed_c_beta_one() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -665,6 +690,7 @@ fn cublaslt_rewrites_do_not_fuse_batched_transposed_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_plus_offset_c_beta_one() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -681,6 +707,7 @@ fn cublaslt_rewrites_cover_2d_matmul_plus_offset_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_plus_offset_c_beta_one() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -697,6 +724,7 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_offset_c_beta_one() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_scaled_alpha_beta() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -714,6 +742,7 @@ fn cublaslt_rewrites_cover_2d_scaled_alpha_beta() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_scaled_alpha_beta() {
     for commuted in [false, true] {
         let case = LayoutCase {
@@ -734,6 +763,7 @@ fn cublaslt_rewrites_cover_batched_scaled_alpha_beta() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_mixed_low_precision_inputs_f32_output_and_c() {
     for (dtype, compute_type) in [(DType::F16, "32F"), (DType::Bf16, "32F_FAST_16BF")] {
         let expected_tuple = (
@@ -765,6 +795,7 @@ fn cublaslt_rewrites_cover_mixed_low_precision_inputs_f32_output_and_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_mixed_low_precision_inputs_f32_output_and_c() {
     for (dtype, compute_type) in [(DType::F16, "32F"), (DType::Bf16, "32F_FAST_16BF")] {
         let expected_tuple = (
@@ -796,6 +827,7 @@ fn cublaslt_rewrites_cover_batched_mixed_low_precision_inputs_f32_output_and_c()
 }
 
 #[test]
+#[ignore = "expensive CUDA FP8 rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_fp8_supported_pairs_execute_2d_matmul_f32_output() {
     for (a_dtype, b_dtype) in CUBLASLT_FP8_F32_PAIRS {
         cublaslt_fp8_candidate_executes_2d_matmul_f32_output(a_dtype, b_dtype);
@@ -803,6 +835,7 @@ fn cublaslt_fp8_supported_pairs_execute_2d_matmul_f32_output() {
 }
 
 #[test]
+#[ignore = "expensive CUDA FP8 rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_fp8_supported_pairs_execute_batched_matmul_f32_output() {
     for (a_dtype, b_dtype) in CUBLASLT_FP8_F32_PAIRS {
         cublaslt_fp8_candidate_executes_batched_matmul_f32_output(a_dtype, b_dtype);
@@ -810,12 +843,14 @@ fn cublaslt_fp8_supported_pairs_execute_batched_matmul_f32_output() {
 }
 
 #[test]
+#[ignore = "expensive CUDA FP8 rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_fp8_e5m2_same_type_does_not_match_f32_output() {
     cublaslt_fp8_same_type_does_not_match_2d_matmul_f32_output(DType::F8E5M2);
     cublaslt_fp8_same_type_does_not_match_batched_matmul_f32_output(DType::F8E5M2);
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_fp8_e4m3_beta_candidate_executes_2d_matmul_plus_f32_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1010,6 +1045,7 @@ fn unchecked_mul_same_shape(lhs: GraphTensor, rhs: GraphTensor, dtype: DType) ->
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_plus_column_bias_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1024,6 +1060,7 @@ fn cublaslt_rewrites_cover_2d_matmul_plus_column_bias_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1038,6 +1075,7 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_do_not_emit_row_order_row_bias_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1052,6 +1090,7 @@ fn cublaslt_rewrites_do_not_emit_row_order_row_bias_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_do_not_emit_batched_row_order_row_bias_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1066,6 +1105,7 @@ fn cublaslt_rewrites_do_not_emit_batched_row_order_row_bias_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_relu_epilogue() {
     for case in LAYOUT_CASES {
         assert_cublaslt_epilogue_rewrite(
@@ -1078,6 +1118,7 @@ fn cublaslt_rewrites_cover_2d_matmul_relu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_relu_epilogue() {
     for case in LAYOUT_CASES {
         assert_cublaslt_epilogue_rewrite(
@@ -1090,6 +1131,7 @@ fn cublaslt_rewrites_cover_batched_matmul_relu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_plus_column_bias_relu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1104,6 +1146,7 @@ fn cublaslt_rewrites_cover_2d_matmul_plus_column_bias_relu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_relu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1118,6 +1161,7 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_relu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_gelu_epilogue() {
     for case in LAYOUT_CASES {
         assert_cublaslt_epilogue_rewrite(
@@ -1130,6 +1174,7 @@ fn cublaslt_rewrites_cover_2d_matmul_gelu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_gelu_epilogue() {
     for case in LAYOUT_CASES {
         assert_cublaslt_epilogue_rewrite(
@@ -1142,6 +1187,7 @@ fn cublaslt_rewrites_cover_batched_matmul_gelu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_2d_matmul_plus_column_bias_gelu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1156,6 +1202,7 @@ fn cublaslt_rewrites_cover_2d_matmul_plus_column_bias_gelu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_gelu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1171,6 +1218,32 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_gelu_epilogue() {
 
 #[test]
 fn cublaslt_beta_rewrite_does_not_cross_activation_epilogues() {
+    let case = LAYOUT_CASES[0];
+    assert_no_forced_cublaslt_llir_where(
+        &mut build_2d_matmul_plus_column_bias_activation_plus_c_graph(
+            case,
+            DType::F32,
+            false,
+            |x| x.relu(),
+        ),
+        case.name,
+        |llir| cublaslt_epilogue_scale_tuples(llir).contains(&("RELU_BIAS", (1.0, 1.0))),
+    );
+    assert_no_forced_cublaslt_llir_where(
+        &mut build_2d_matmul_plus_column_bias_activation_plus_c_graph(
+            case,
+            DType::F32,
+            false,
+            |x| x.gelu(),
+        ),
+        case.name,
+        |llir| cublaslt_epilogue_scale_tuples(llir).contains(&("GELU_BIAS", (1.0, 1.0))),
+    );
+}
+
+#[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+fn cublaslt_beta_rewrite_does_not_cross_activation_epilogues_exhaustive() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
             assert_no_forced_cublaslt_llir_where(
@@ -1199,6 +1272,17 @@ fn cublaslt_beta_rewrite_does_not_cross_activation_epilogues() {
 
 #[test]
 fn cublaslt_alpha_scale_rewrite_does_not_cross_bias_epilogue() {
+    let case = LAYOUT_CASES[0];
+    assert_no_forced_cublaslt_llir_where(
+        &mut build_2d_matmul_plus_column_bias_scaled_graph(case, DType::F32, false),
+        case.name,
+        |llir| cublaslt_epilogue_scale_tuples(llir).contains(&("BIAS", (1.5, 0.0))),
+    );
+}
+
+#[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+fn cublaslt_alpha_scale_rewrite_does_not_cross_bias_epilogue_exhaustive() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
             assert_no_forced_cublaslt_llir_where(
@@ -1211,6 +1295,7 @@ fn cublaslt_alpha_scale_rewrite_does_not_cross_bias_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_do_not_emit_row_order_row_bias_relu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1225,6 +1310,7 @@ fn cublaslt_rewrites_do_not_emit_row_order_row_bias_relu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA negative rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_rewrites_do_not_emit_batched_row_order_row_bias_relu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -1239,6 +1325,7 @@ fn cublaslt_rewrites_do_not_emit_batched_row_order_row_bias_relu_epilogue() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1271,6 +1358,7 @@ fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_sliced_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1311,6 +1399,7 @@ fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_sliced_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1343,6 +1432,7 @@ fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_sliced_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1384,6 +1474,7 @@ fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_sliced_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_offset_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1424,6 +1515,7 @@ fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_offset_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_offset_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1470,6 +1562,7 @@ fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_offset_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_scaled_alpha_beta_candidate_executes_2d_matmul_plus_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1505,6 +1598,7 @@ fn cublaslt_scaled_alpha_beta_candidate_executes_2d_matmul_plus_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_scaled_alpha_beta_candidate_executes_batched_matmul_plus_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1543,6 +1637,7 @@ fn cublaslt_scaled_alpha_beta_candidate_executes_batched_matmul_plus_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1599,6 +1694,7 @@ fn cublaslt_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_bias_epilogue_candidate_executes_batched_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1640,6 +1736,7 @@ fn cublaslt_bias_epilogue_candidate_executes_batched_matmul_plus_column_bias() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_relu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1681,6 +1778,7 @@ fn cublaslt_relu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_relu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1725,6 +1823,7 @@ fn cublaslt_relu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bia
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_gelu_epilogue_candidate_executes_2d_matmul() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1753,6 +1852,7 @@ fn cublaslt_gelu_epilogue_candidate_executes_2d_matmul() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_gelu_epilogue_candidate_executes_batched_matmul() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1785,6 +1885,7 @@ fn cublaslt_gelu_epilogue_candidate_executes_batched_matmul() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_gelu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1829,6 +1930,7 @@ fn cublaslt_gelu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_gelu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bias() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1873,6 +1975,7 @@ fn cublaslt_gelu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bia
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_relu_epilogue_candidate_executes_2d_matmul() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1901,6 +2004,7 @@ fn cublaslt_relu_epilogue_candidate_executes_2d_matmul() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_relu_epilogue_candidate_executes_batched_matmul() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1933,6 +2037,7 @@ fn cublaslt_relu_epilogue_candidate_executes_batched_matmul() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_row_order_beta_one_candidate_executes_2d_layout_pairs() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -1982,6 +2087,7 @@ fn cublaslt_row_order_beta_one_candidate_executes_2d_layout_pairs() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_row_order_beta_one_candidate_executes_batched_row_major_matmul_plus_c() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -2017,6 +2123,7 @@ fn cublaslt_row_order_beta_one_candidate_executes_batched_row_major_matmul_plus_
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_row_order_candidate_executes_2d_layout_pairs() {
     let Some(stream) = get_cuda_stream() else {
         return;
@@ -2062,6 +2169,7 @@ fn cublaslt_row_order_candidate_executes_2d_layout_pairs() {
 }
 
 #[test]
+#[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_row_order_candidate_executes_batched_row_major_matmul() {
     let Some(stream) = get_cuda_stream() else {
         return;

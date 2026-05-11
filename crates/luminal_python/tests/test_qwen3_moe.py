@@ -24,6 +24,7 @@ the bf16 KernelScatter dtype-aware vec count, the `aten.empty(_permuted)`
 `maximum_f32`-on-Int casting fix.
 """
 
+import pytest
 import torch
 import torch._dynamo
 
@@ -151,6 +152,7 @@ def test_hf_qwen3_moe_medium(device: torch.device):
     _run_hf_qwen3_moe_test(config, device, atol=1e-4)
 
 
+@pytest.mark.slow
 def test_hf_qwen3_moe_real_config_1layer(device: torch.device):
     """HuggingFace Qwen3MoeForCausalLM — real Qwen3-30B-A3B architecture, 1 layer.
 
@@ -177,6 +179,7 @@ def test_hf_qwen3_moe_real_config_1layer(device: torch.device):
     )
 
 
+@pytest.mark.slow
 def test_hf_qwen3_moe_real_config_full(device: torch.device):
     """HuggingFace Qwen3MoeForCausalLM — full Qwen3-30B-A3B, pretrained.
 

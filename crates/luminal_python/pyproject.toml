@@ -32,7 +32,7 @@ module-name = "luminal.luminal"
 
 [tool.pytest.ini_options]
 markers = [
-    "slow: tests that download large models or require pre-generated artifacts",
+    "slow: tests that download large models, compile full-width model graphs, fuzz many CUDA search choices, or otherwise require explicit opt-in",
 ]
 
 [dependency-groups]

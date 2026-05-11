@@ -158,6 +158,7 @@ def test_hf_llama_medium(device: torch.device):
     _run_hf_llama_test(config, device, atol=1e-5)
 
 
+@pytest.mark.slow
 def test_hf_llama_large(device: torch.device):
     """HuggingFace LlamaForCausalLM — large (1024 hidden, 1 layer, ~18M params)."""
     config = _make_llama_config(
@@ -171,6 +172,7 @@ def test_hf_llama_large(device: torch.device):
     _run_hf_llama_test(config, device, atol=1e-5)
 
 
+@pytest.mark.slow
 def test_hf_llama3_real_config_1layer(device: torch.device):
     """HuggingFace LlamaForCausalLM — real Llama3.2-1B architecture, 1 layer.
 
@@ -227,6 +229,7 @@ def test_hf_llama_decode_loop_static(device: torch.device):
         tokens.append(next_token)
 
 
+@pytest.mark.slow
 @pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
 def test_hf_llama3_1b_decode_loop_dynamic(device: torch.device):
     """Decode loop on real Llama3.2-1B with pretrained weights.
@@ -282,6 +285,7 @@ def _gpu_mem(label):
         )
 
 
+@pytest.mark.slow
 @pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
 def test_hf_llama3_full(device: torch.device):
     """HuggingFace LlamaForCausalLM — full Llama3.2-1B with real pretrained weights.
@@ -333,6 +337,7 @@ def test_hf_llama3_full(device: torch.device):
     )
 
 
+@pytest.mark.slow
 @pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
 def test_hf_llama3_large_full(device: torch.device):
     """HuggingFace LlamaForCausalLM — full Llama-3.1-8B-Instruct with real pretrained weights.
@@ -414,6 +419,7 @@ def test_dynamic_dim_reuse_no_recompile(device: torch.device):
         )
 
 
+@pytest.mark.slow
 @pytest.mark.xfail(reason="numerical precision — max_diff exceeds atol")
 def test_hf_llama38b_full(device: torch.device):
     """HuggingFace LlamaForCausalLM — full Llama-3.1-8B-Instruct with real pretrained weights.

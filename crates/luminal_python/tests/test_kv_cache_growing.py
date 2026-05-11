@@ -101,6 +101,7 @@ def test_kv_cache_growing():
     not torch.cuda.is_available(),
     reason="R1 full-width 1-layer is too memory-heavy for CPU native backend",
 )
+@pytest.mark.slow
 def test_kv_cache_growing_r1_mla(device: torch.device):
     """Growing-cache decode loop on DeepSeek-R1 (MLA + decoupled RoPE), 1 layer.
 
