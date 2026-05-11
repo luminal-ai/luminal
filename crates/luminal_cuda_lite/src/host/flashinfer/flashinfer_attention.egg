@@ -1,0 +1,125 @@
+; FlashInfer batch decode attention rewrite rule.
+;
+; Matches the paged attention pattern for ANY model with GQA:
+;   Gather(K_cache) → GQA broadcast → Q*K^T matmul → scale → add mask → softmax → attn*V matmul
+;   Gather(V_cache) → GQA broadcast ──────────────────────────────────────────→ attn*V matmul
+;
+; Structural anchors (prevent false matches on MLP/other ops):
+;   - Gather ops from 2D cache pools (MLP never uses Gather)
+;   - GQA broadcast via Mul(gathered, Constant(1.0)) with all-zero strides
+;   - Scale Mul(QK, constant) connecting QK scores to mask Add
+;   - Mask Add with zero-stride broadcast in first dim (nheads broadcast)
+;   - Data flow: two sequential matmul+reduce pairs connected through softmax
+;
+; The egglog rule captures the mask as 5th input.  During extract(), a Rust
+; function walks the mask's computation chain in the e-graph to locate the
+; qo_indptr and kv_indptr Input nodes (validated via the Constant(1e10) anchor
+; and structural checks).  These are appended as inputs 5 and 6 so FlashInfer
+; can build the CSR page table directly — no runtime derivation needed.
+;
+; Shape dimensions are egglog variables, not pinned constants.
+; Dynamic dims "s" (batch/seq) and "c" (context) stay pinned as MVar.
+
+(rule
+    (
+        ; ── Second matmul: Mul(softmax_out, V_gqa) ──
+        ; Shape: (nheads, s, hdim, c) — 4D
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        ; ── Second matmul: Sum (reduction over c) → output ──
+        ; Shape: (nheads, s, hdim) — reduces c
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        ; ── V GQA broadcast: Mul(V_gathered, 1.0) with zero-stride constant ──
+        ; Shape: (nheads, c, hdim) — 3D
+        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        ; ── V Gather: rows from V_cache (2D) ──
+        ; Shape: (c, kvdim), Source: (num_slots, kvdim)
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?v_idx (ICons ?v_cache (INil)))))
+
+        ; ── First matmul: Mul(Q, K_gqa) ──
+        ; Shape: (nheads, s, c, hdim) — 4D
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+
+        ; ── First matmul: Sum (reduction over hdim) → QK scores ──
+        ; Shape: (nheads, s, c) — reduces hdim
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+
+        ; ── Mask Add: Add(scaled_QK, mask) ──
+        ; Shape: (nheads, s, c) — 3D
+        ; Mask is broadcast from (s, c) via zero-stride in first dim (nheads).
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?scaled_qk (ICons ?mask (INil)))))
+
+        ; ── K GQA broadcast: Mul(K_gathered, 1.0) with zero-stride constant ──
+        ; Shape: (nheads, hdim, c) — 3D
+        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        ; ── K Gather: rows from K_cache (2D) ──
+        ; Shape: (c, kvdim), Source: (num_slots, kvdim)
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        ; ── Dtype consistency ──
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+    )
+    (
+        (let ?fi (Op (FlashInferAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s"))
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "FlashInfer batch decode attention"
+)
