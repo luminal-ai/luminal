@@ -1170,6 +1170,47 @@ fn cublaslt_rewrites_cover_batched_matmul_plus_column_bias_gelu_epilogue() {
 }
 
 #[test]
+fn cublaslt_beta_rewrite_does_not_cross_activation_epilogues() {
+    for case in LAYOUT_CASES {
+        for commuted in [false, true] {
+            assert_no_forced_cublaslt_llir_where(
+                &mut build_2d_matmul_plus_column_bias_activation_plus_c_graph(
+                    case,
+                    DType::F32,
+                    commuted,
+                    |x| x.relu(),
+                ),
+                case.name,
+                |llir| cublaslt_epilogue_scale_tuples(llir).contains(&("RELU_BIAS", (1.0, 1.0))),
+            );
+            assert_no_forced_cublaslt_llir_where(
+                &mut build_2d_matmul_plus_column_bias_activation_plus_c_graph(
+                    case,
+                    DType::F32,
+                    commuted,
+                    |x| x.gelu(),
+                ),
+                case.name,
+                |llir| cublaslt_epilogue_scale_tuples(llir).contains(&("GELU_BIAS", (1.0, 1.0))),
+            );
+        }
+    }
+}
+
+#[test]
+fn cublaslt_alpha_scale_rewrite_does_not_cross_bias_epilogue() {
+    for case in LAYOUT_CASES {
+        for commuted in [false, true] {
+            assert_no_forced_cublaslt_llir_where(
+                &mut build_2d_matmul_plus_column_bias_scaled_graph(case, DType::F32, commuted),
+                case.name,
+                |llir| cublaslt_epilogue_scale_tuples(llir).contains(&("BIAS", (1.5, 0.0))),
+            );
+        }
+    }
+}
+
+#[test]
 fn cublaslt_rewrites_do_not_emit_row_order_row_bias_relu_epilogue() {
     for case in LAYOUT_CASES {
         for commuted in [false, true] {
@@ -2220,6 +2261,30 @@ fn build_2d_matmul_plus_column_bias_gelu_graph(
     })
 }
 
+fn build_2d_matmul_plus_column_bias_activation_plus_c_graph(
+    case: LayoutCase,
+    dtype: DType,
+    commuted: bool,
+    activation: impl FnOnce(GraphTensor) -> GraphTensor,
+) -> Graph {
+    build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
+        let bias = cx.tensor(n).as_dtype(dtype).expand_dim(0, m);
+        let residual = cx.tensor((m, n)).as_dtype(dtype);
+        add_commuted(activation(a.matmul(b) + bias), residual, commuted)
+    })
+}
+
+fn build_2d_matmul_plus_column_bias_scaled_graph(
+    case: LayoutCase,
+    dtype: DType,
+    commuted: bool,
+) -> Graph {
+    build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
+        let bias = cx.tensor(n).as_dtype(dtype).expand_dim(0, m);
+        add_commuted(a.matmul(b), bias, commuted) * 1.5
+    })
+}
+
 fn build_2d_matmul_plus_row_bias_relu_graph(
     case: LayoutCase,
     dtype: DType,
@@ -2631,6 +2696,16 @@ fn cublaslt_epilogues(llir: &LLIRGraph) -> Vec<&'static str> {
     llir.node_weights()
         .filter_map(|op| op.to_dialect::<dyn HostOp>())
         .filter_map(|host_op| cublaslt_epilogue(host_op.as_ref().as_ref()))
+        .collect()
+}
+
+fn cublaslt_epilogue_scale_tuples(llir: &LLIRGraph) -> Vec<(&'static str, CublasLtScaleValues)> {
+    llir.node_weights()
+        .filter_map(|op| op.to_dialect::<dyn HostOp>())
+        .filter_map(|host_op| {
+            let host_op = host_op.as_ref().as_ref();
+            Some((cublaslt_epilogue(host_op)?, cublaslt_scale_values(host_op)?))
+        })
         .collect()
 }
 
