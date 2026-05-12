@@ -147,6 +147,38 @@ fn test_scatter_nocopy_not_selected_when_dest_shared_as_later_input() {
     );
 }
 
+/// ScatterNoCopy aliases the destination buffer as the output, so it is only
+/// valid when the destination layout already matches the contiguous scatter
+/// output layout. Broadcast/expanded destinations need regular Scatter's
+/// copy-then-scatter materialization.
+#[test]
+fn test_scatter_nocopy_not_selected_for_expanded_dest_layout() {
+    let ctx = CudaContext::new(0).unwrap();
+    ctx.bind_to_thread().unwrap();
+
+    let mut cx = Graph::default();
+
+    let dest = cx.tensor(128).expand_dim(0, 4).persist();
+    let src = cx.tensor((4, 128)).persist();
+    let indexes = cx.tensor((4, 128)).as_dtype(DType::Int).persist();
+
+    let _result = src.scatter(indexes, dest).output();
+
+    let names = extract_all_kernel_names(&mut cx);
+    println!("All possible kernels: {:?}", names);
+
+    assert!(
+        !names.iter().any(|n| n == "ScatterNoCopy"),
+        "ScatterNoCopy should NOT be available when dest layout differs from output, got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == "Scatter"),
+        "Expected regular Scatter but got: {:?}",
+        names
+    );
+}
+
 /// Actually execute the scatter and verify correctness.
 /// Post-cleanup should force the valid no-copy extraction.
 #[test]

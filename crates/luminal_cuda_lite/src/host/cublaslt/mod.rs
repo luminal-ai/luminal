@@ -146,7 +146,9 @@ impl EgglogOp for CuBlasLt {
     }
 
     fn n_inputs(&self) -> usize {
-        2
+        let c_input = usize::from(self.beta != 0.0);
+        let bias_input = usize::from(epilogue_uses_bias(self.epilogue));
+        2 + c_input + bias_input
     }
 
     fn rewrites(&self) -> Vec<Rule> {

@@ -2078,6 +2078,23 @@ def test_topk_values(device: torch.device):
     assert torch.allclose(model_compiled(x), model(x))
 
 
+def test_topk_values_width_128_with_indices(device: torch.device):
+    """Regression for router-sized TopK values when both tuple outputs are used."""
+
+    class TopKValuesAndIndices(torch.nn.Module):
+        def forward(self, x: torch.Tensor):
+            values, indices = torch.topk(torch.softmax(x, dim=-1), 8, dim=1)
+            return values, indices
+
+    model = TopKValuesAndIndices().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randn(4, 128, device=device)
+    actual_values, actual_indices = model_compiled(x)
+    expected_values, expected_indices = model(x)
+    assert torch.allclose(actual_values, expected_values, atol=1e-5)
+    assert torch.equal(actual_indices.to(expected_indices.dtype), expected_indices)
+
+
 def test_topk_indices(device: torch.device):
     """Tests TopK indices output for 2D tensor along axis=1."""
     model: torch.nn.Module = TopKIndicesTestModel().to(device)

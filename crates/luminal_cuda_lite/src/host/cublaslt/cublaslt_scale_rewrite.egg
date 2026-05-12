@@ -12,7 +12,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            1.0 0.0 ?epilogue)
+            1.0 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?scale (Op (Constant ?alpha) (INil)))
@@ -33,7 +33,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            ?alpha 0.0 ?epilogue)
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?scaled ?fused)
         (set (dtype ?fused) ?d_dtype)
@@ -53,7 +53,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            1.0 0.0 ?epilogue)
+            1.0 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?scale (Op (Constant ?alpha) (INil)))
@@ -74,7 +74,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            ?alpha 0.0 ?epilogue)
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?scaled ?fused)
         (set (dtype ?fused) ?d_dtype)
