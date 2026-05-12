@@ -3298,10 +3298,9 @@ extern \"C\" {{
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
             (module, func)
         };
-        let constants = vars
-            .into_iter()
-            .map(|d| (d, module.get_global(&format!("const_{d}"), stream).unwrap()))
-            .collect();
+        // Constants point to __constant__ memory in the module and are managed
+        // by the module's lifetime. No need to track them separately.
+        let constants = FxHashMap::default();
         let total_threads = batch_size * self.embed_dim;
         (
             func,
