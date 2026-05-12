@@ -7,13 +7,7 @@
 //! latent ─► VAE decoder ─► (3, H, W) image ─► PNG
 //! ```
 //!
-//! ## Modes
-//! Defaults to a status-only printout. Set one of:
-//!  * `VAE_TEST=1`  — decode a Gaussian latent through the VAE only
-//!  * `TEXT_TEST=1` — encode the prompt through the Mistral 3 text encoder only
-//!  * `FULL=1`      — full pipeline: text → transformer → VAE
-//!
-//! ## Required env for `FULL=1`
+//! ## Required env
 //!  * `LUMINAL_DISABLE_LOOP_ROLLING=1` — auto-loop-rolling currently
 //!    interacts badly with our `CustomOpKind`-wrapped CUDA kernels. The
 //!    rolling pass succeeds and produces seemingly-valid loop bodies,
@@ -177,82 +171,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Prompt: {prompt}");
     println!("Resolution: {width}x{height}, steps={steps}, guidance={guidance}");
 
-    if std::env::var("VAE_TEST").is_ok() {
-        run_vae_only(width, height)?;
-    } else if std::env::var("TEXT_TEST").is_ok() {
-        let _ = run_text_encoder(&prompt)?;
-    } else if std::env::var("FULL").is_ok() {
-        run_full_pipeline(&prompt, width, height, steps, guidance)?;
-    } else {
-        print_status(width, height, steps);
-    }
-    Ok(())
-}
-
-fn print_status(width: usize, height: usize, steps: usize) {
-    let image_seq_len = (height / 16) * (width / 16);
-    let cfg = SchedulerConfig::default();
-    let mu = compute_mu(&cfg, image_seq_len);
-    let (sigmas, timesteps) = make_schedule(&cfg, steps, mu);
-    println!("image_seq_len={image_seq_len}, mu={mu:.4}");
-    println!("sigmas:    {:?}", round(&sigmas, 4));
-    println!("timesteps: {:?}", round(&timesteps, 2));
-    println!("\nStatus:");
-    println!("  scheduler:        ✅ tested vs diffusers");
-    println!("  hf loader:        ✅ F8/F4/F6 dtypes (transformer is plain BF16, no NVFP4 path)");
-    println!("  VAE decoder:      ✅ runs end-to-end up to ~128² (set VAE_TEST=1)");
-    println!("  text encoder:     ⚠ graph builds, not validated (set TEXT_TEST=1, needs 48 GB)");
-    println!("  transformer:      ⚠ graph builds, never run (needs 64 GB shards)");
-    println!("  full pipeline:    ⚠ requires ≈110 GB downloads (set FULL=1)");
-}
-
-// =============================================================================
-// VAE-only test path (already validated)
-// =============================================================================
-
-fn run_vae_only(width: usize, height: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let h_lat = height / VAE_DOWNSAMPLE;
-    let w_lat = width / VAE_DOWNSAMPLE;
-    println!(
-        "\nVAE-only test: latent ({LATENT_CHANNELS}, {h_lat}, {w_lat}) -> image (3, {height}, {width})",
-    );
-
-    let vae_path = hf::fetch_vae()?;
-    let mut cx = Graph::default();
-    let latent = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
-    let decoder = VaeDecoder::new(&mut cx);
-    let out = decoder.forward(latent).output();
-    // Memory-budget enforcement is opt-in here. The estimator
-    // (`memory_analysis::estimate_graph_memory_bytes`) sums every node's
-    // output bytes — including views — across the whole graph rather
-    // than computing peak live memory. For the conv-heavy decoder this
-    // sum runs into the hundreds of GiB even at 256² where real peak
-    // memory is only a few GiB, so any reasonable budget rejects all
-    // candidates. Set `VAE_MEM_GIB` to opt in if you need it.
-    if let Ok(g) = std::env::var("VAE_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
-        cx.build_search_space_with_options::<CudaRuntime>(
-            BuildSearchSpaceOptions::new().max_memory_gib(g),
-        );
-    } else {
-        cx.build_search_space::<CudaRuntime>();
-    }
-
-    let ctx = CudaContext::new(0).unwrap();
-    let stream = ctx.default_stream();
-    let mut runtime = CudaRuntime::initialize(stream);
-    runtime.load_safetensors(&cx, vae_path.to_str().unwrap());
-
-    let mut rng = StdRng::seed_from_u64(0);
-    let n_latent = LATENT_CHANNELS * h_lat * w_lat;
-    let latent_data: Vec<f32> = (0..n_latent)
-        .map(|_| rng.sample::<f32, _>(StandardNormal))
-        .collect();
-    runtime.set_data(latent, latent_data);
-    runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
-    runtime.execute(&cx.dyn_map);
-    let out_data = runtime.get_f32(out);
-    save_png("out.png", &out_data, width, height)?;
-    println!("Wrote out.png");
+    run_full_pipeline(&prompt, width, height, steps, guidance)?;
     Ok(())
 }
 
@@ -802,7 +721,3 @@ fn save_png(path: &str, chw: &[f32], w: usize, h: usize) -> Result<(), Box<dyn s
     Ok(())
 }
 
-fn round(v: &[f32], digits: u32) -> Vec<f32> {
-    let s = 10f32.powi(digits as i32);
-    v.iter().map(|x| (x * s).round() / s).collect()
-}

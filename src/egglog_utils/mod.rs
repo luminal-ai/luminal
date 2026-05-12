@@ -722,6 +722,14 @@ fn metric_duration(duration: Duration) -> String {
     pretty_duration::pretty_duration(&duration, None)
 }
 
+/// Verbose per-rule / per-ruleset printing. Off by default — the cycle
+/// header, summary header, and final timing line stay; the breakdown
+/// tables and `print_serialized_shape` ("Egglog extract root shape …")
+/// are suppressed unless `EGGLOG_DEBUG=1`.
+fn egglog_debug() -> bool {
+    std::env::var("EGGLOG_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 fn metric_name(name: &str) -> String {
     let mut name = name.split_whitespace().join(" ");
     if name.len() > 96 {
@@ -909,6 +917,9 @@ fn print_run_summary(run_report: &EgglogRunReport) {
         )
         .cyan()
     );
+    if !egglog_debug() {
+        return;
+    }
     let mut phases = run_report.phases.iter().collect_vec();
     phases.sort_by_key(|phase| std::cmp::Reverse(phase.total_time));
     for phase in phases.into_iter().take(5) {
@@ -984,6 +995,9 @@ fn print_run_summary(run_report: &EgglogRunReport) {
 }
 
 fn print_serialized_shape(s: &egglog::SerializeOutput) {
+    if !egglog_debug() {
+        return;
+    }
     let mut classes = FxHashSet::default();
     let mut labels: FxHashMap<String, usize> = FxHashMap::default();
     let mut nodes = 0;
@@ -1049,72 +1063,74 @@ fn run_schedule_phase(
         .cyan()
     );
 
-    let mut rulesets = report
-        .search_and_apply_time_per_ruleset
-        .keys()
-        .chain(report.merge_time_per_ruleset.keys())
-        .chain(report.rebuild_time_per_ruleset.keys())
-        .map(|ruleset| ruleset.to_string())
-        .unique()
-        .collect_vec();
-    let ruleset_total = |ruleset: &str| {
-        report
+    if egglog_debug() {
+        let mut rulesets = report
             .search_and_apply_time_per_ruleset
-            .get(ruleset)
-            .copied()
-            .unwrap_or(Duration::ZERO)
-            + report
+            .keys()
+            .chain(report.merge_time_per_ruleset.keys())
+            .chain(report.rebuild_time_per_ruleset.keys())
+            .map(|ruleset| ruleset.to_string())
+            .unique()
+            .collect_vec();
+        let ruleset_total = |ruleset: &str| {
+            report
+                .search_and_apply_time_per_ruleset
+                .get(ruleset)
+                .copied()
+                .unwrap_or(Duration::ZERO)
+                + report
+                    .merge_time_per_ruleset
+                    .get(ruleset)
+                    .copied()
+                    .unwrap_or(Duration::ZERO)
+                + report
+                    .rebuild_time_per_ruleset
+                    .get(ruleset)
+                    .copied()
+                    .unwrap_or(Duration::ZERO)
+        };
+        rulesets.sort_by_key(|ruleset| std::cmp::Reverse(ruleset_total(ruleset)));
+        for ruleset in rulesets.into_iter().take(4) {
+            let search = report
+                .search_and_apply_time_per_ruleset
+                .get(ruleset.as_str())
+                .copied()
+                .unwrap_or(Duration::ZERO);
+            let merge = report
                 .merge_time_per_ruleset
-                .get(ruleset)
+                .get(ruleset.as_str())
                 .copied()
-                .unwrap_or(Duration::ZERO)
-            + report
+                .unwrap_or(Duration::ZERO);
+            let rebuild = report
                 .rebuild_time_per_ruleset
-                .get(ruleset)
+                .get(ruleset.as_str())
                 .copied()
-                .unwrap_or(Duration::ZERO)
-    };
-    rulesets.sort_by_key(|ruleset| std::cmp::Reverse(ruleset_total(ruleset)));
-    for ruleset in rulesets.into_iter().take(4) {
-        let search = report
-            .search_and_apply_time_per_ruleset
-            .get(ruleset.as_str())
-            .copied()
-            .unwrap_or(Duration::ZERO);
-        let merge = report
-            .merge_time_per_ruleset
-            .get(ruleset.as_str())
-            .copied()
-            .unwrap_or(Duration::ZERO);
-        let rebuild = report
-            .rebuild_time_per_ruleset
-            .get(ruleset.as_str())
-            .copied()
-            .unwrap_or(Duration::ZERO);
-        eprintln!(
-            "      ruleset {:<18} search {:>10} | merge {:>10} | rebuild {:>10}",
-            metric_name(&ruleset),
-            metric_duration(search),
-            metric_duration(merge),
-            metric_duration(rebuild)
-        );
-    }
+                .unwrap_or(Duration::ZERO);
+            eprintln!(
+                "      ruleset {:<18} search {:>10} | merge {:>10} | rebuild {:>10}",
+                metric_name(&ruleset),
+                metric_duration(search),
+                metric_duration(merge),
+                metric_duration(rebuild)
+            );
+        }
 
-    let rules = sorted_rule_metrics(&report);
-    for (rule, elapsed, matches) in rules
-        .iter()
-        .filter(|(_, elapsed, matches)| *elapsed > Duration::ZERO || *matches > 0)
-        .take(5)
-    {
-        eprintln!(
-            "      rule    {:<96} {:>10} | matches {}",
-            metric_name(rule),
-            metric_duration(*elapsed),
-            matches
-        );
-    }
-    if elapsed >= SLOW_PHASE_TIME || tuple_delta.abs() >= BIG_TUPLE_DELTA {
-        print_slow_phase_detail(phase, &report, tuple_delta, elapsed, &rules);
+        let rules = sorted_rule_metrics(&report);
+        for (rule, elapsed, matches) in rules
+            .iter()
+            .filter(|(_, elapsed, matches)| *elapsed > Duration::ZERO || *matches > 0)
+            .take(5)
+        {
+            eprintln!(
+                "      rule    {:<96} {:>10} | matches {}",
+                metric_name(rule),
+                metric_duration(*elapsed),
+                matches
+            );
+        }
+        if elapsed >= SLOW_PHASE_TIME || tuple_delta.abs() >= BIG_TUPLE_DELTA {
+            print_slow_phase_detail(phase, &report, tuple_delta, elapsed, &rules);
+        }
     }
 
     phases.push(EgglogPhaseReport {
