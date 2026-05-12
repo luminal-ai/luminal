@@ -274,15 +274,21 @@ impl EgglogOp for FusionEnd {
 
         // 4. Pair-fuse B → B (lhs / rhs): inner binary feeds outer's A or B.
         //
-        // Single-consumer guard: only fire when the inner binary `?bi` has
-        // exactly one consumer (`consumer_count_class ?bi = 1`). Without this
-        // the BB family's O(B²) match enumeration on the 32B flux2 transformer
-        // (~5000 binary ops) OOMs the host CPU at 538 GB RSS. The guard turns
-        // the join from "any binary-binary pair sharing shape+dtype" into
-        // "single-use binary chains" — exactly the modulation / residual
-        // chains where fusion pays off. Multi-consumer producers stay
-        // un-fused and the un-fused chain is still extractable via the
-        // pair-fuse union.
+        // Subsume the OUTER binary's row after fusing. This bounds the BB
+        // family's O(B²) join enumeration on the 32B flux2 transformer
+        // (~5000 binary ops, prior OOM at 538 GB RSS): once BB fires on
+        // (B_inner, B_outer), the outer binary row is excluded from further
+        // pair-fuse matching, so the rule can't cascade BB(B_outer, B_next)
+        // on the next pair down the chain. Grow-FE-B-{lhs,rhs} (rules 5/6,
+        // below) extends the FE through subsequent binaries instead, which
+        // is the cheap O(N) path.
+        //
+        // The outer binary's eclass is unioned with the new FusionEnd, so
+        // multi-consumer extraction still works — every consumer picks the
+        // FE alternative, which materializes through FusionEnd's output
+        // buffer. The unfused KernelMul/KernelAdd path stays available
+        // through any consumer that has a separate non-FE rewrite path
+        // (e.g. cublaslt for matmul fallback).
         if family_on("bb") {
         for (kbi, fbi, lbi) in binaries {
             for (kbo, fbo, lbo) in binaries {
@@ -302,6 +308,8 @@ impl EgglogOp for FusionEnd {
                                        (ICons ?fbi (ICons ?fs_c (INil)))))
                         (let ?fe (Op (FusionEnd ?shape ?oo_s ?dt) (ICons ?fbo (INil))))
                         (union ?bo ?fe)
+                        (subsume (Op ({kbo} ?shape ?oi_s ?co_s ?oo_s ?dt)
+                                      (ICons ?bi (ICons ?c (INil)))))
                      ) :ruleset fusion_pair :name \"pair-fuse-B-B-lhs-{lbi}-{lbo}\")"
                 )));
                 rules.push(Rule::raw(format!(
@@ -320,6 +328,8 @@ impl EgglogOp for FusionEnd {
                                        (ICons ?fs_c (ICons ?fbi (INil)))))
                         (let ?fe (Op (FusionEnd ?shape ?oo_s ?dt) (ICons ?fbo (INil))))
                         (union ?bo ?fe)
+                        (subsume (Op ({kbo} ?shape ?co_s ?oi_s ?oo_s ?dt)
+                                      (ICons ?c (ICons ?bi (INil)))))
                      ) :ruleset fusion_pair :name \"pair-fuse-B-B-rhs-{lbi}-{lbo}\")"
                 )));
             }
