@@ -155,22 +155,23 @@ impl EgglogOp for FusionEnd {
         // connecting side.
         //
         // The blowup we see in fusion_pair on the 32B flux2 transformer is
-        // dominated by families 3 and 4 (U-B and B-B) because each match adds
-        // 2-3 new FusionStart enodes; with many binary-binary chains in the
-        // graph, the egraph saturate-iteration count balloons. Use
-        // `LUMINAL_FUSION_FAMILIES=uu` to keep only family 1 (U-U) — the
-        // safest subset — or `LUMINAL_FUSION_FAMILIES=uu,bu,ub` to drop the
-        // B-B family while keeping the rest. Default: all families on.
+        // dominated by family 4 (B-B), where each match adds 3 new
+        // FusionStart enodes and the join enumerates every binary-binary
+        // adjacency. Combined with main's flashinfer + extended cublaslt
+        // rewrite passes, the post-merge egraph on the full DiT exceeds
+        // host CPU memory when all four families fire together (538 GB+
+        // RSS). Subsume in grow rules helps but isn't enough on its own.
+        //
+        // Default subset: uu, bu, ub. BB is opt-in via
+        // `LUMINAL_FUSION_FAMILIES=uu,bu,ub,bb`. Empty env (or no env) =
+        // default subset. `LUMINAL_FUSION_FAMILIES=uu` keeps just U-U,
+        // etc.
         let families = std::env::var("LUMINAL_FUSION_FAMILIES").ok();
-        let allowed: Option<std::collections::HashSet<String>> = families
-            .as_ref()
-            .map(|s| s.split(',').map(|p| p.trim().to_lowercase()).collect());
-        let family_on = |name: &str| -> bool {
-            allowed
-                .as_ref()
-                .map(|set| set.contains(name))
-                .unwrap_or(true)
+        let allowed: std::collections::HashSet<String> = match families.as_ref() {
+            Some(s) => s.split(',').map(|p| p.trim().to_lowercase()).collect(),
+            None => ["uu", "bu", "ub"].iter().map(|s| s.to_string()).collect(),
         };
+        let family_on = |name: &str| -> bool { allowed.contains(name) };
         let mut rules = Vec::new();
 
         // (KernelX kind, FusedX kind)

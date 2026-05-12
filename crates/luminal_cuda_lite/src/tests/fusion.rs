@@ -467,6 +467,15 @@ fn test_single_binary_does_not_fuse_alone() {
 fn test_chain_of_binaries_fuses() {
     // `(a + b) * c`: three external inputs collapse into one region with
     // internal [Add, Mul] and 3 FusionStarts.
+    //
+    // Requires BB family, which is opt-in at runtime via
+    // LUMINAL_FUSION_FAMILIES. Set it before the graph build so the rules
+    // emitted from FusionEnd::rewrites include the B-B pair-fuse rules.
+    // SAFETY: tests run in parallel; we set this before constructing the
+    // Graph, and never unset, so concurrent tests just see BB on.
+    unsafe {
+        std::env::set_var("LUMINAL_FUSION_FAMILIES", "uu,bu,ub,bb");
+    }
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -777,6 +786,10 @@ fn test_pair_fuse_binary_to_binary_rhs() {
     // Pair-fuse B→B (RHS variant): `c * (a + b)`. The inner binary feeds the
     // outer binary's B input, exercising the mirror direction of the rule
     // covered by test_chain_of_binaries_fuses.
+    // See test_chain_of_binaries_fuses for the LUMINAL_FUSION_FAMILIES note.
+    unsafe {
+        std::env::set_var("LUMINAL_FUSION_FAMILIES", "uu,bu,ub,bb");
+    }
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
