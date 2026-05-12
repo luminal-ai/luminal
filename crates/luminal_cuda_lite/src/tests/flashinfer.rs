@@ -4,7 +4,7 @@
 //! 1. Pure egglog metadata (no GPU): trait wiring, sort + rewrite parse cleanly.
 //! 2. Egglog rule firing (no GPU): the rule unifies on a real paged-attention
 //!    HLIR and does NOT fire on bare attention or unrelated matmul/Gather mixes.
-//! 3. Mask op correctness (GPU): `ComputeAttnMask` produces the right (s, c) mask.
+//! 3. Mask helper correctness (GPU): the primitive-op `test_compute_attn_mask` builder produces the right (s, c) mask.
 //! 4. Full kernel correctness (GPU + JIT): direct `FlashInferAttention::execute`
 //!    compared against a luminal-compiled reference attention graph.
 //!
@@ -18,7 +18,7 @@ use luminal::op::{EgglogOp, IntoEgglogOp};
 use luminal::prelude::*;
 
 use crate::host::flashinfer::FlashInferAttention;
-use crate::host::{ComputeAttnMask, DeviceBuffer, HostOp};
+use crate::host::{DeviceBuffer, HostOp};
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::get_cuda_stream;
 
@@ -283,106 +283,6 @@ fn flashinfer_op_sort_shape() {
     assert_eq!(op.n_inputs(), 5);
     let dbg = format!("{:?}", s);
     assert!(dbg.contains("FlashInferAttention"));
-}
-
-#[test]
-fn compute_attn_mask_registers() {
-    assert!(
-        ops_contains_sort("ComputeAttnMask"),
-        "ComputeAttnMask is not in CudaRuntime::Ops"
-    );
-}
-
-// ─── Layer 2: ComputeAttnMask correctness ────────────────────────────────
-
-#[test]
-fn compute_attn_mask_matches_cpu_reference() {
-    let Some(stream) = get_cuda_stream() else {
-        return;
-    };
-
-    // 2 sequences, seq0 length=3, seq1 length=2 → s=2 queries (one per seq, decode),
-    // c=5 total context tokens (3+2).
-    let s_dim = 2usize;
-    let c_dim = 5usize;
-    let q_pos: Vec<i32> = vec![2, 1]; // last position in each seq
-    let qo_indptr: Vec<i32> = vec![0, 1, 2];
-    let kv_indptr: Vec<i32> = vec![0, 3, 5];
-    let r = kv_indptr.len();
-
-    let q_pos_buf = stream
-        .clone_htod(unsafe {
-            std::slice::from_raw_parts(q_pos.as_ptr() as *const u8, q_pos.len() * 4)
-        })
-        .unwrap();
-    let qo_buf = stream
-        .clone_htod(unsafe {
-            std::slice::from_raw_parts(qo_indptr.as_ptr() as *const u8, qo_indptr.len() * 4)
-        })
-        .unwrap();
-    let kv_buf = stream
-        .clone_htod(unsafe {
-            std::slice::from_raw_parts(kv_indptr.as_ptr() as *const u8, kv_indptr.len() * 4)
-        })
-        .unwrap();
-    let out_bytes = s_dim * c_dim * 4;
-    let out_buf = unsafe { stream.alloc::<u8>(out_bytes).unwrap() };
-
-    let op = ComputeAttnMask {
-        s_dim: Expression::from(s_dim),
-        c_dim: Expression::from(c_dim),
-    };
-
-    let q_pos_n = NodeIndex::new(0);
-    let qo_n = NodeIndex::new(1);
-    let kv_n = NodeIndex::new(2);
-    let out_n = NodeIndex::new(3);
-
-    let mut buffers = FxHashMap::default();
-    buffers.insert(
-        q_pos_n,
-        DeviceBuffer::new(q_pos_buf.device_ptr(&stream).0, q_pos.len() * 4),
-    );
-    buffers.insert(
-        qo_n,
-        DeviceBuffer::new(qo_buf.device_ptr(&stream).0, qo_indptr.len() * 4),
-    );
-    buffers.insert(
-        kv_n,
-        DeviceBuffer::new(kv_buf.device_ptr(&stream).0, kv_indptr.len() * 4),
-    );
-    buffers.insert(
-        out_n,
-        DeviceBuffer::new(out_buf.device_ptr(&stream).0, out_bytes),
-    );
-
-    let inputs = [q_pos_n, qo_n, kv_n];
-    let mut dyn_map = FxHashMap::default();
-    dyn_map.insert('r', r);
-
-    op.execute(&stream, out_n, &inputs, &buffers, &dyn_map)
-        .unwrap();
-    stream.synchronize().unwrap();
-
-    let host_bytes = stream.clone_dtoh(&out_buf).unwrap();
-    let mask: Vec<f32> = unsafe {
-        let mut bytes = std::mem::ManuallyDrop::new(host_bytes);
-        let len = bytes.len() / 4;
-        Vec::from_raw_parts(bytes.as_mut_ptr() as *mut f32, len, len)
-    };
-
-    // Expected: query 0 (q_pos=2, seq 0) attends to ctx [0, 3) i.e. mask[0, 0..3]=0;
-    //           query 1 (q_pos=1, seq 1) attends to ctx [3, 5) i.e. mask[1, 3..5]=0.
-    // Everywhere else is -1e10.
-    let mut expected = vec![-1e10f32; s_dim * c_dim];
-    for j in 0..3 {
-        expected[0 * c_dim + j] = 0.0;
-    }
-    for j in 3..5 {
-        expected[1 * c_dim + j] = 0.0;
-    }
-
-    assert_eq!(mask, expected);
 }
 
 // ─── Layer 3: FlashInfer kernel correctness ──────────────────────────────
