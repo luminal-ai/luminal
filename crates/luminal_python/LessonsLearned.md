@@ -867,3 +867,39 @@ Also: search-time dummy-1 inputs are not the same shape as runtime inputs. Anyth
    - Added `aten.gelu.default → a.gelu()` and `aten.silu.default → a.silu()` to `dispatch.rs`.
    - Worked around the `-Infinity` issue at the model level by using a finite `-1e10` for the causal mask in the example (matches the Rust example's convention). The cleaner fix (parsing `"-Infinity"`/`"Infinity"`/`"NaN"` strings in `get_float_arg` / `translate_full`) is left for a follow-up.
 6. **Principle**: when adding a new model that goes through the PT2 backend, expect to plug small holes in `dispatch.rs` and `translator/tensor.rs::translate_full`. The trace points at the python frame, not the Rust dispatch arm — open `dispatch.rs`, ctrl-F the offending op name, and add the one-liner. For float-shaped sentinel values (`-inf`, `inf`, `nan`), the export pipeline currently only accepts finite floats; either rewrite the model or extend the parser.
+
+---
+
+## 2026-05-12 — Dynamic Llama chat gets slower as generation grows
+
+1. **Symptom**: the `examples/llama_chat_server.py` dynamic mode felt great for the first few
+   tokens, then step latency climbed steadily as the response got longer. On the 8B chat server,
+   short generations were around ~70-140 ms/token, while a longer decode logged
+   `mean=370.6ms, last=733.3ms`. Attempts to optimize the wrapper to return only last-position
+   logits triggered CUDA backend failures (`invalid CUDA launch dimensions for kernel Iota` and
+   NVRTC codegen errors around symbolic `const_a--1`).
+2. **Root cause**: dynamic mode compiles a no-cache model (`use_cache=False`) and re-runs the
+   full transformer over the entire prompt plus generated suffix on every decode step. That means
+   attention cost grows with sequence length. On top of that, the wrapper returned the model's
+   full `[batch, seq, vocab]` logits tensor even though generation only uses the last token, so
+   each step also paid for an unnecessary sequence-wide LM head projection and a larger output
+   buffer.
+3. **Why it was tricky**: the slowdown looked like “performance drifting over time,” which can
+   be mistaken for memory fragmentation or a leak. The server stayed healthy and GPU memory was
+   stable, so the real issue was algorithmic. The obvious optimization — slice to the last token
+   inside the compiled graph — ran straight into a separate backend/compiler bug in the current
+   dynamic CUDA path.
+4. **Fix in this session**:
+   - Kept the dynamic path for fast short responses.
+   - Added a configurable `--max-context-tokens` sliding window to
+     `examples/llama_chat_server.py` so dynamic mode can cap how many recent tokens it reprocesses
+     each step. This is off by default because it trades speed for long-context fidelity.
+   - Left the failed “last-token-only compiled wrapper” as a follow-up backend/compiler task rather
+     than shipping an unstable server path.
+5. **Principle**: for autoregressive decode without a KV cache, per-step work that scales with
+   current sequence length will always make token latency rise over time. Treat “stable tokens/s”
+   as impossible unless you either:
+   - make KV-cache decode reusable without recompiling, or
+   - cap the active context window, or
+   - fix the compiled graph so it only computes the last-position logits instead of the whole
+     `[seq, vocab]` output.

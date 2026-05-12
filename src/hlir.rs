@@ -2940,13 +2940,18 @@ impl Runtime for NativeRuntime {
             self.buffers.insert(node, output);
         }
 
-        // Consume all non-Output buffers (inputs + intermediates)
-        let output_nodes: FxHashSet<NodeIndex> = self
+        // Consume intermediates but keep both outputs and Input nodes. The
+        // latter include model weights/constants that are loaded once at
+        // compile time and reused across executions.
+        let persistent_nodes: FxHashSet<NodeIndex> = self
             .graph
             .node_indices()
-            .filter(|n| (**self.graph[*n]).as_any().is::<Output>())
+            .filter(|n| {
+                (**self.graph[*n]).as_any().is::<Output>()
+                    || (**self.graph[*n]).as_any().is::<Input>()
+            })
             .collect();
-        self.buffers.retain(|k, _| output_nodes.contains(k));
+        self.buffers.retain(|k, _| persistent_nodes.contains(k));
     }
 }
 

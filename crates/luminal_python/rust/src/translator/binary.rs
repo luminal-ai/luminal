@@ -21,6 +21,12 @@ impl<'a> Translator<'a> {
                 BinaryOp::Div => a / b,
             })
         } else {
+            if let Some(f) = arg1.as_float() {
+                return Ok(self.apply_scalar_op(a, f as f32, op));
+            }
+            if let Some(expr) = self.resolve_arg_as_expression(arg1) {
+                return Ok(self.apply_symbolic_scalar_op(a, expr, op));
+            }
             let val = self.get_float_arg(node, 1)? as f32;
             Ok(self.apply_scalar_op(a, val, op))
         }
@@ -32,6 +38,13 @@ impl<'a> Translator<'a> {
         op: BinaryOp,
     ) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
+        let arg1 = &node.inputs[1].arg;
+        if let Some(f) = arg1.as_float() {
+            return Ok(self.apply_scalar_op(a, f as f32, op));
+        }
+        if let Some(expr) = self.resolve_arg_as_expression(arg1) {
+            return Ok(self.apply_symbolic_scalar_op(a, expr, op));
+        }
         let val = self.get_float_arg(node, 1)? as f32;
         Ok(self.apply_scalar_op(a, val, op))
     }
@@ -52,6 +65,20 @@ impl<'a> Translator<'a> {
             BinaryOp::Mul => a * scalar,
             BinaryOp::Sub => a - scalar,
             BinaryOp::Div => a / scalar,
+        }
+    }
+
+    pub(crate) fn apply_symbolic_scalar_op(
+        &mut self,
+        a: GraphTensor,
+        val: Expression,
+        op: BinaryOp,
+    ) -> GraphTensor {
+        match op {
+            BinaryOp::Add => a + val,
+            BinaryOp::Mul => a * val,
+            BinaryOp::Sub => a - val,
+            BinaryOp::Div => a / val,
         }
     }
 }
