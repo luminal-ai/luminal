@@ -2546,18 +2546,19 @@ pub fn random_initial_choice<'a>(
         let pick_idx = if !synth_indices.is_empty() {
             synth_indices[rng.random_range(0..synth_indices.len())]
         } else {
-            let mut best: Vec<&NodeId> = Vec::new();
+            let mut best: Vec<usize> = Vec::new();
             let mut best_p = i32::MIN;
-            for n in enodes {
+            for (i, n) in enodes.iter().enumerate() {
                 let p = llir_enode_extract_priority(egraph, n, ops);
                 if p > best_p {
                     best_p = p;
                     best.clear();
-                    best.push(n);
+                    best.push(i);
                 } else if p == best_p {
-                    best.push(n);
+                    best.push(i);
                 }
             }
+            
             best[rng.random_range(0..best.len())]
         };
         choices.insert(eclass, &enodes[pick_idx]);
