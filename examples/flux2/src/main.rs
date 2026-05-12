@@ -7,14 +7,7 @@
 //! latent ─► VAE decoder ─► (3, H, W) image ─► PNG
 //! ```
 //!
-//! ## Required env
-//!  * `LUMINAL_DISABLE_LOOP_ROLLING=1` — auto-loop-rolling currently
-//!    interacts badly with our `CustomOpKind`-wrapped CUDA kernels. The
-//!    rolling pass succeeds and produces seemingly-valid loop bodies,
-//!    but the resulting graph causes `CUDA_ERROR_ILLEGAL_ADDRESS` on the
-//!    first profile execute. Disabling the rolling makes the pipeline
-//!    run cleanly. Compile time grows with layer count when rolling is
-//!    off, so this is a workaround, not a fix.
+//! ## Optional env
 //!  * `FLUX2_NUM_LAYERS` / `FLUX2_NUM_SINGLE_LAYERS` (optional) — override
 //!    the default 8 + 48 transformer block counts. The default count
 //!    overflows the 96 GB GPU because there's no live-range buffer
@@ -141,25 +134,6 @@ fn text_len() -> usize {
 const DEFAULT_GUIDANCE: f32 = 2.5;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Eager cuBLAS-aware KernelMul stripping. The text encoder's
-    // ~280 BF16 projection matmuls each have a Mul + SumReduce
-    // fallback alongside the cublaslt rewrite; the genetic search
-    // OOMs on a single Mul-fallback profile (~80 GB intermediate at
-    // M=512 N=15360 K=5120). Forcing the eager Rust strip — see
-    // `egglog_utils::mod::run_egglog_with_report_parts` — guarantees
-    // the search only ever sees the cuBLAS path. Set unconditionally
-    // here because flux2 specifically needs it; other workloads opt
-    // in via the same env var.
-    if std::env::var("LUMINAL_EAGER_CUBLAS_CLEANUP").is_err()
-        && std::env::var("LUMINAL_NO_EAGER_CUBLAS_CLEANUP").is_err()
-    {
-        // SAFETY: single-threaded main(), called before any runtime
-        // is spawned. set_var is unsafe in newer std but this is the
-        // earliest possible hook.
-        unsafe {
-            std::env::set_var("LUMINAL_EAGER_CUBLAS_CLEANUP", "1");
-        }
-    }
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "a cat in a hat".to_string());

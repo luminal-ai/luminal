@@ -52,9 +52,6 @@ struct RollingSearchDiagnostics {
     rejected_zero_state_params: usize,
     best_rejected: Option<RollingRejectedCandidate>,
     top_runs: Vec<String>,
-    /// Every discovered run, dumped via `LUMINAL_DEBUG_ROLLING=1`.
-    /// Each entry mirrors the `summary` format used for `top_runs`.
-    all_runs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,42 +276,9 @@ impl Graph {
     }
 
     fn run_auto_loop_rolling_prepass(&mut self) {
-        // `auto_roll_loops_prepass` finds and rolls ONE best candidate per
-        // call. Many real models have multiple distinct repeating patterns
-        // (e.g. Flux 2 has 8 double-stream blocks + 48 single-stream
-        // blocks + a 2-resnet mid block — all different bodies). Iterate
-        // until no more loop regions are found, so each pattern gets
-        // rolled exactly once.
-        //
-        // Iteration is opt-in via `LUMINAL_LOOP_ROLL_ITERATE=1`. Multiple
-        // passes can insert loop markers that split fusion regions in
-        // ways the downstream codegen (`region_codegen.rs`) doesn't
-        // handle (FusionStart with no predecessor) for some shapes. The
-        // single-pass default keeps existing examples working; opt in
-        // when the model has multiple distinct repeating patterns and
-        // you've verified codegen still succeeds.
         let before = self.graph.node_count();
-        let iterate = std::env::var("LUMINAL_LOOP_ROLL_ITERATE").is_ok();
-        let max_passes = if iterate { 32 } else { 1 };
-        let mut total_passes = 0;
-        loop {
-            let inserted = self.auto_roll_loops_prepass();
-            if inserted == 0 {
-                break;
-            }
-            total_passes += 1;
-            if total_passes >= max_passes {
-                if iterate {
-                    println!(
-                        "   {:>6}  hit max_passes ({}) — stopping rolling prepass",
-                        "Rolled".yellow().bold(),
-                        max_passes,
-                    );
-                }
-                break;
-            }
-        }
-        if total_passes == 0 {
+        let inserted = self.auto_roll_loops_prepass();
+        if inserted == 0 {
             println!(
                 "   {:>6}  no loop regions found (max body={})",
                 "Rolled".cyan().bold(),
@@ -719,14 +683,6 @@ impl Graph {
         for run in report.diagnostics.top_runs.iter().take(5) {
             println!("   {:>6}  run: {}", "Rolled".yellow().bold(), run);
         }
-        // Verbose dump of every discovered run with its savings so we
-        // can see why a logically-correct rolling target gets rejected
-        // (e.g. state_params=0). Gated on `LUMINAL_DEBUG_ROLLING=1`.
-        if std::env::var("LUMINAL_DEBUG_ROLLING").is_ok() {
-            for (i, run) in report.diagnostics.all_runs.iter().enumerate() {
-                println!("   {:>6}  run[{}]: {}", "Rolled".dimmed(), i, run);
-            }
-        }
         if candidate.occurrences.len() < 2 {
             return 0;
         }
@@ -879,9 +835,8 @@ impl Graph {
                     starts.iter().copied().take(4).collect::<Vec<_>>()
                 );
                 if occs.len() >= 20 && diagnostics.top_runs.len() < 16 {
-                    diagnostics.top_runs.push(summary.clone());
+                    diagnostics.top_runs.push(summary);
                 }
-                diagnostics.all_runs.push(summary);
 
                 let state_params = collect_state_params(&occs, &uses, &self.graph);
                 if state_params.is_empty() {
@@ -1071,20 +1026,14 @@ impl Graph {
         &mut self,
         options: BuildSearchSpaceOptions,
     ) {
-        if std::env::var("LUMINAL_DISABLE_LOOP_ROLLING").is_err() {
-            self.run_auto_loop_rolling_prepass();
-        }
+        self.run_auto_loop_rolling_prepass();
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>()
-            && std::env::var("LUMINAL_DISABLE_CLEANUP").is_err();
+        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
         let memory_dyn_map = self.memory_limit_dyn_map();
         let late_passes = Rt::late_egglog_passes(&ops, &options, &memory_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
-        if std::env::var("LUMINAL_DUMP_HLIR_PROGRAM").is_ok() {
-            eprintln!("=== HLIR program (root={root}) ===\n{program}");
-        }
         self.egraphs = vec![
             run_egglog_with_late_passes(&program, &root, &ops, cleanup_hlir, &late_passes).unwrap(),
         ];
@@ -1362,29 +1311,6 @@ impl Graph {
                 // per-candidate profile time scales with body size, not the
                 // unrolled graph size.
                 collapse_loops_to_first_iter(&mut graph);
-                // Diagnostic: if any node in the post-collapse LLIR has
-                // its kernel name == "FusionStart" but zero incoming
-                // edges, that's the dangling-FS bug that downstream
-                // codegen panics on. Surface it here, where we still
-                // have the graph to inspect.
-                if std::env::var("LUMINAL_DEBUG_DANGLING_FS_POST_COLLAPSE").is_ok() {
-                    use petgraph::Direction;
-                    for n in graph.node_indices() {
-                        let label = format!("{:?}", graph[n]);
-                        if !label.contains("FusionStart") {
-                            continue;
-                        }
-                        let in_deg =
-                            graph.neighbors_directed(n, Direction::Incoming).count();
-                        if in_deg == 0 {
-                            eprintln!(
-                                "POST_COLLAPSE DANGLING FS: node_idx={} label={}",
-                                n.index(),
-                                label.chars().take(120).collect::<String>(),
-                            );
-                        }
-                    }
-                }
                 runtime.clear_intermediate_buffers();
                 let (rep_metric, rep_display) = runtime.profile(
                     &graph,
@@ -1413,35 +1339,7 @@ impl Graph {
                     n_graphs = 1;
                     break;
                 }
-                Ok((_, _, true)) => {
-                    if std::env::var("LUMINAL_DEBUG_INIT_GENOME").is_ok() {
-                        eprintln!("  init genome attempt {}: rejected (NaN outputs)", init_attempts);
-                    }
-                    if options
-                        .group_timeout
-                        .is_some_and(|timeout| group_start.elapsed() >= timeout)
-                    {
-                        panic!("Failed to find a viable initial genome before timeout");
-                    }
-                    list_cache.clear();
-                    expr_cache.clear();
-                    continue;
-                }
-                Err(payload) => {
-                    if std::env::var("LUMINAL_DEBUG_INIT_GENOME").is_ok() {
-                        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "<non-string panic>".to_string()
-                        };
-                        eprintln!(
-                            "  init genome attempt {}: panic = {}",
-                            init_attempts,
-                            msg.chars().take(160).collect::<String>(),
-                        );
-                    }
+                Ok(_) | Err(_) => {
                     if options
                         .group_timeout
                         .is_some_and(|timeout| group_start.elapsed() >= timeout)
@@ -1913,28 +1811,19 @@ fn collect_state_params(
     }
     let param_count = occurrences[0].boundary_inputs.len();
     let mut state_params = vec![];
-    let debug = std::env::var("LUMINAL_DEBUG_STATE_PARAMS").is_ok()
-        && occurrences.len() >= 4
-        && occurrences[0].nodes.len() >= 30;
 
     for p in 0..param_count {
         let mut is_state = true;
-        let mut reason = "ok";
-        let mut fail_iter = 0;
         for i in 1..occurrences.len() {
             let earlier = &occurrences[i - 1];
             let later = &occurrences[i];
             let val = later.boundary_inputs.get(p).copied();
             let Some(val) = val else {
                 is_state = false;
-                reason = "no boundary input at p";
-                fail_iter = i;
                 break;
             };
             if !earlier.output_nodes.contains(&val) {
                 is_state = false;
-                reason = "val not in earlier.output_nodes";
-                fail_iter = i;
                 break;
             }
             let external_uses: Vec<_> = uses
@@ -1948,14 +1837,10 @@ fn collect_state_params(
                 .unwrap_or_default();
             if external_uses.is_empty() {
                 is_state = false;
-                reason = "no external uses";
-                fail_iter = i;
                 break;
             }
             if graph.externals(Direction::Outgoing).any(|root| root == val) {
                 is_state = false;
-                reason = "val is graph root";
-                fail_iter = i;
                 break;
             }
             if external_uses
@@ -1963,36 +1848,11 @@ fn collect_state_params(
                 .any(|(user, _)| !later.nodes.contains(user))
             {
                 is_state = false;
-                let example = external_uses
-                    .iter()
-                    .find(|(user, _)| !later.nodes.contains(user))
-                    .map(|(u, _)| u.index())
-                    .unwrap_or(usize::MAX);
-                reason = "external use outside later.nodes";
-                fail_iter = i;
-                if debug {
-                    eprintln!(
-                        "       state_params reject p={p} iter={i}: val={} reason={reason} bad_user={}",
-                        val.index(),
-                        example,
-                    );
-                }
                 break;
             }
         }
         if is_state {
             state_params.push(p);
-            if debug {
-                eprintln!(
-                    "       state_params accept p={p} (body={} trips={})",
-                    occurrences[0].nodes.len(),
-                    occurrences.len(),
-                );
-            }
-        } else if debug {
-            eprintln!(
-                "       state_params reject p={p} iter={fail_iter}: reason={reason}",
-            );
         }
     }
     state_params
@@ -2463,22 +2323,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
     use petgraph::visit::EdgeRef;
     use std::collections::BTreeMap;
 
-    let trace_fs = std::env::var("LUMINAL_DEBUG_COLLAPSE_FS").is_ok();
-    // Snapshot every FusionStart's incoming-edge source at entry, so we
-    // can pinpoint which collapse step strips the edge.
-    let mut fs_initial_inputs: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
-    if trace_fs {
-        for n in llir.node_indices() {
-            let label = format!("{:?}", llir[n]);
-            if label.contains("FusionStart") {
-                let preds: Vec<NodeIndex> = llir
-                    .neighbors_directed(n, Direction::Incoming)
-                    .collect();
-                fs_initial_inputs.insert(n, preds);
-            }
-        }
-    }
-
     let mut starts: BTreeMap<usize, NodeIndex> = BTreeMap::new();
     let mut ends: BTreeMap<usize, NodeIndex> = BTreeMap::new();
     let mut inputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
@@ -2578,35 +2422,17 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         static_source.insert(static_node, src);
     }
 
-    // Resolve a source reference to its iter-0 equivalent. Transitive
-    // because iterated loop rolling can produce chained markers — a
-    // LoopInput whose first source is a LoopStart whose initial is
-    // another marker, etc. Without transitive resolution the body edge
-    // lands on an intermediate marker that's about to be deleted, and
-    // when `remove_node` runs at the end of this function the edge
-    // dies, leaving a downstream FusionStart with no predecessor and
-    // panicking in `region_codegen::build_compile_units`.
-    let resolve_src = |mut src: NodeIndex| -> NodeIndex {
-        // The marker maps cover at most one resolution step each, so
-        // `loop_markers.len()` is a strict upper bound on the chain
-        // length. Cap iterations to that to guarantee termination
-        // even if a future change accidentally introduces a cycle.
-        for _ in 0..=loop_markers.len() {
-            let next = if let Some(&initial) = start_initial.get(&src) {
-                initial
-            } else if let Some(&first) = input_first_source.get(&src) {
-                first
-            } else if let Some(&shared) = static_source.get(&src) {
-                shared
-            } else {
-                return src;
-            };
-            if next == src {
-                return src;
-            }
-            src = next;
+    // Resolve a source reference to its iter-0 equivalent.
+    let resolve_src = |src: NodeIndex| -> NodeIndex {
+        if let Some(&initial) = start_initial.get(&src) {
+            initial
+        } else if let Some(&first) = input_first_source.get(&src) {
+            first
+        } else if let Some(&shared) = static_source.get(&src) {
+            shared
+        } else {
+            src
         }
-        src
     };
 
     // Rewrite every body node's incoming edges. Per-edge remove+add to keep
@@ -2657,36 +2483,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             marker_post_sub.insert(select_node, body_producer);
         }
     }
-    // Also rewire ANY marker that gets removed below — LoopOutput,
-    // LoopStart (when consumed post-loop directly), LoopInput,
-    // LoopInputStatic. Without these entries, a downstream
-    // consumer (e.g. a FusionStart that egglog inserted to wrap a
-    // marker's output) keeps an edge to the marker; the marker is
-    // removed at the end of this function and the consumer dangles,
-    // panicking later in `region_codegen::build_compile_units` with
-    // `FusionStart with no predecessor`.
-    for (&_stream_id, &output_node) in &outputs {
-        let body_producer = llir
-            .neighbors_directed(output_node, Direction::Incoming)
-            .next()
-            .expect("LoopOutput missing body producer during rewire");
-        marker_post_sub.insert(output_node, body_producer);
-    }
-    for &start_node in starts.values() {
-        if let Some(&initial) = start_initial.get(&start_node) {
-            marker_post_sub.insert(start_node, initial);
-        }
-    }
-    for &input_node in inputs.values() {
-        if let Some(&first) = input_first_source.get(&input_node) {
-            marker_post_sub.insert(input_node, first);
-        }
-    }
-    for &static_node in &static_inputs {
-        if let Some(&shared) = static_source.get(&static_node) {
-            marker_post_sub.insert(static_node, shared);
-        }
-    }
     let post_loop_consumers: FxHashSet<NodeIndex> = loop_markers
         .iter()
         .flat_map(|n| {
@@ -2695,19 +2491,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         })
         .filter(|n| !loop_markers.contains(n) && !body_nodes.contains(n))
         .collect();
-    // Transitive marker resolution. With iterated rolling, marker A's
-    // post-sub target can itself be marker B, etc. Resolve to a stable
-    // non-marker so the rewired edge survives the marker-removal step
-    // below.
-    let resolve_marker_post = |mut src: NodeIndex| -> NodeIndex {
-        for _ in 0..=loop_markers.len() {
-            match marker_post_sub.get(&src).copied() {
-                Some(next) if next != src => src = next,
-                _ => return src,
-            }
-        }
-        src
-    };
     for &consumer in &post_loop_consumers {
         let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
             .edges_directed(consumer, Direction::Incoming)
@@ -2715,7 +2498,7 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             .map(|e| (e.source(), e.id()))
             .collect();
         for (src, eid) in pairs {
-            let new_src = resolve_marker_post(src);
+            let new_src = marker_post_sub.get(&src).copied().unwrap_or(src);
             llir.remove_edge(eid);
             llir.add_edge(new_src, consumer, ());
         }
@@ -2723,42 +2506,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
 
     for &n in &loop_markers {
         llir.remove_node(n);
-    }
-
-    if trace_fs {
-        for (&fs_node, initial_preds) in &fs_initial_inputs {
-            if !llir.node_indices().any(|n| n == fs_node) {
-                eprintln!(
-                    "  collapse_fs: fs={} REMOVED entirely",
-                    fs_node.index(),
-                );
-                continue;
-            }
-            let now: FxHashSet<NodeIndex> =
-                llir.neighbors_directed(fs_node, Direction::Incoming).collect();
-            if now.is_empty() {
-                let was: Vec<usize> = initial_preds.iter().map(|p| p.index()).collect();
-                let was_kinds: Vec<String> = initial_preds
-                    .iter()
-                    .map(|&p| {
-                        if llir.node_indices().any(|n| n == p) {
-                            format!("{:?}", llir[p])
-                                .chars()
-                                .take(60)
-                                .collect::<String>()
-                        } else {
-                            format!("REMOVED({})", p.index())
-                        }
-                    })
-                    .collect();
-                eprintln!(
-                    "  collapse_fs DANGLING: fs={} pre_collapse_preds={:?} pre_collapse_pred_kinds={:?}",
-                    fs_node.index(),
-                    was,
-                    was_kinds,
-                );
-            }
-        }
     }
 
     let compacted = compact_llir_preserving_input_order(llir);
