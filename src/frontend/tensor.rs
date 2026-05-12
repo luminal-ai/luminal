@@ -94,9 +94,12 @@ impl GraphTensor {
     }
 
     /// Mark this tensor to persist across executions. Creates an Output node
-    /// so the buffer is not consumed after execute(), but returns the original
-    /// Input node's GraphTensor (not the Output node).
+    /// and, when this tensor is backed by an Input node, marks that input as
+    /// persistent so runtimes keep its buffer alive across execute() calls.
     pub fn persist(&self) -> GraphTensor {
+        if let Some(input) = self.graph().try_get_op_mut::<Input>(self.id) {
+            input.persistent = true;
+        }
         self.output_raw(*self);
         *self
     }

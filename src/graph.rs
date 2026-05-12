@@ -916,6 +916,7 @@ impl Graph {
             node: 0,
             label: name.clone(),
             dtype: DType::default(),
+            persistent: false,
         }));
         self.get_op_mut::<crate::hlir::Input>(id).node = id.index();
         self.input_meta.insert(id, (name.clone(), DType::default()));
@@ -2616,13 +2617,13 @@ mod tests {
     #[test]
     fn test_hash_egglog_normalized_same_structure() {
         // Two egglog texts differing only in Input node indices and labels
-        let text_a = r#"(let t0 (Input 42 "boundary" (F32)))
-(let t1 (Input 100 "layers.0.wq.weight" (F32)))
+        let text_a = r#"(let t0 (Input 42 "boundary" (F32) false))
+(let t1 (Input 100 "layers.0.wq.weight" (F32) false))
 (let t2 (Add (ECons 128 (ECons 4096 (ENil))) t1 (ECons 1 (ECons 128 (ENil))) t0 (ECons 1 (ECons 1 (ENil))) (ECons 1 (ECons 128 (ENil)))))
 (let t3 (Output t2 42))
 "#;
-        let text_b = r#"(let t0 (Input 84 "boundary" (F32)))
-(let t1 (Input 200 "layers.1.wq.weight" (F32)))
+        let text_b = r#"(let t0 (Input 84 "boundary" (F32) false))
+(let t1 (Input 200 "layers.1.wq.weight" (F32) false))
 (let t2 (Add (ECons 128 (ECons 4096 (ENil))) t1 (ECons 1 (ECons 128 (ENil))) t0 (ECons 1 (ECons 1 (ENil))) (ECons 1 (ECons 128 (ENil)))))
 (let t3 (Output t2 84))
 "#;
@@ -2635,10 +2636,10 @@ mod tests {
 
     #[test]
     fn test_hash_egglog_normalized_different_structure() {
-        let text_a = r#"(let t0 (Input 42 "boundary" (F32)))
+        let text_a = r#"(let t0 (Input 42 "boundary" (F32) false))
 (let t1 (Add (ECons 128 (ENil)) t0 (ECons 1 (ENil)) t0 (ECons 1 (ENil)) (ECons 1 (ENil))))
 "#;
-        let text_b = r#"(let t0 (Input 42 "boundary" (F32)))
+        let text_b = r#"(let t0 (Input 42 "boundary" (F32) false))
 (let t1 (Mul (ECons 128 (ENil)) t0 (ECons 1 (ENil)) t0 (ECons 1 (ENil)) (ECons 1 (ENil))))
 "#;
         assert_ne!(
@@ -2650,12 +2651,23 @@ mod tests {
 
     #[test]
     fn test_hash_egglog_normalized_different_dtypes() {
-        let text_a = "(let t0 (Input 42 \"boundary\" (F32)))\n";
-        let text_b = "(let t0 (Input 42 \"boundary\" (F16)))\n";
+        let text_a = "(let t0 (Input 42 \"boundary\" (F32) false))\n";
+        let text_b = "(let t0 (Input 42 \"boundary\" (F16) false))\n";
         assert_ne!(
             hash_egglog_normalized(text_a),
             hash_egglog_normalized(text_b),
             "Different dtypes should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_hash_egglog_normalized_different_persistence() {
+        let text_a = "(let t0 (Input 42 \"boundary\" (F32) false))\n";
+        let text_b = "(let t0 (Input 42 \"boundary\" (F32) true))\n";
+        assert_ne!(
+            hash_egglog_normalized(text_a),
+            hash_egglog_normalized(text_b),
+            "Different persistence should produce different hashes"
         );
     }
 
@@ -2674,11 +2686,11 @@ mod tests {
     #[test]
     fn test_hash_egglog_normalized_custom_op_id() {
         // CustomOpKind lines differ only in the integer ID (layer index)
-        let text_a = r#"(let t0 (Input 441 "boundary" (F32)))
+        let text_a = r#"(let t0 (Input 441 "boundary" (F32) false))
 (let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
 (let t2 (Output t1 585))
 "#;
-        let text_b = r#"(let t0 (Input 585 "boundary" (F32)))
+        let text_b = r#"(let t0 (Input 585 "boundary" (F32) false))
 (let t1 (Op (CustomOpKind 2 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
 (let t2 (Output t1 729))
 "#;

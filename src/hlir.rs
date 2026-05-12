@@ -250,6 +250,7 @@ pub struct Input {
     pub node: usize,
     pub label: String,
     pub dtype: DType,
+    pub persistent: bool,
 }
 
 impl Display for Input {
@@ -272,7 +273,12 @@ impl EgglogOp for Input {
         sort(
             IR,
             "Input",
-            &[("node", I64), ("label", STRING), ("dtype", DTYPE)],
+            &[
+                ("node", I64),
+                ("label", STRING),
+                ("dtype", DTYPE),
+                ("persistent", BOOL),
+            ],
         )
     }
 
@@ -303,6 +309,7 @@ impl EgglogOp for Input {
                 node,
                 label,
                 dtype: extract_dtype(egraph, kind_children[2]),
+                persistent: egraph.enodes[kind_children[3]].0.parse::<bool>().unwrap(),
             })),
             vec![],
         )
@@ -312,8 +319,8 @@ impl EgglogOp for Input {
 impl HLIROp for Input {
     fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
         format!(
-            "(Input {} \"{}\" ({:?}))",
-            self.node, self.label, self.dtype
+            "(Input {} \"{}\" ({:?}) {})",
+            self.node, self.label, self.dtype, self.persistent
         )
     }
 }
@@ -2940,15 +2947,17 @@ impl Runtime for NativeRuntime {
             self.buffers.insert(node, output);
         }
 
-        // Consume intermediates but keep both outputs and Input nodes. The
-        // latter include model weights/constants that are loaded once at
-        // compile time and reused across executions.
+        // Consume intermediates but keep outputs plus only the inputs that
+        // were explicitly marked persistent via `persist()`.
         let persistent_nodes: FxHashSet<NodeIndex> = self
             .graph
             .node_indices()
             .filter(|n| {
                 (**self.graph[*n]).as_any().is::<Output>()
-                    || (**self.graph[*n]).as_any().is::<Input>()
+                    || (**self.graph[*n])
+                        .as_any()
+                        .downcast_ref::<Input>()
+                        .is_some_and(|input| input.persistent)
             })
             .collect();
         self.buffers.retain(|k, _| persistent_nodes.contains(k));
