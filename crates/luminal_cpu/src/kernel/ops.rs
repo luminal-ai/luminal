@@ -28,14 +28,20 @@ fn unary_dtype_rewrite(hlir_sort: &SortDef, cpu_sort: &SortDef) -> Rule {
     let (args, hlir_match) = new_op_call(hlir_sort, &["inp"]);
     let cpu_op = op_term(call_sort_from_args(cpu_sort, &args), args["__inputs"].clone());
     let dt = v("?__dt");
-    rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp"].clone())))
+    rule(union(hlir_match, cpu_op.clone()))
+        .set(dtype(cpu_op), dt.clone())
+        .fact(eq(dt, dtype(args["inp"].clone())))
+        .ruleset("kernel_lower")
 }
 
 fn binary_dtype_rewrite(hlir_sort: &SortDef, cpu_sort: &SortDef) -> Rule {
     let (args, hlir_match) = new_op_call(hlir_sort, &["inp_a", "inp_b"]);
     let cpu_op = op_term(call_sort_from_args(cpu_sort, &args), args["__inputs"].clone());
     let dt = v("?__dt");
-    rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp_a"].clone())))
+    rule(union(hlir_match, cpu_op.clone()))
+        .set(dtype(cpu_op), dt.clone())
+        .fact(eq(dt, dtype(args["inp_a"].clone())))
+        .ruleset("kernel_lower")
 }
 
 fn resolve(expr: &Expression, dyn_map: &FxHashMap<char, usize>) -> usize {
@@ -223,7 +229,12 @@ impl EgglogOp for CpuSumReduce {
         let (args, hlir_match) = new_op_call(&SumReduce::default().sort(), &["inp"]);
         let cpu_op = op_term(call_sort_from_args(&self.sort(), &args), args["__inputs"].clone());
         let dt = v("?__dt");
-        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp"].clone())))]
+        vec![
+            rule(union(hlir_match, cpu_op.clone()))
+                .set(dtype(cpu_op), dt.clone())
+                .fact(eq(dt, dtype(args["inp"].clone())))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -309,7 +320,12 @@ impl EgglogOp for CpuMaxReduce {
         let (args, hlir_match) = new_op_call(&MaxReduce::default().sort(), &["inp"]);
         let cpu_op = op_term(call_sort_from_args(&self.sort(), &args), args["__inputs"].clone());
         let dt = v("?__dt");
-        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(args["inp"].clone())))    ]
+        vec![
+            rule(union(hlir_match, cpu_op.clone()))
+                .set(dtype(cpu_op), dt.clone())
+                .fact(eq(dt, dtype(args["inp"].clone())))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -378,7 +394,11 @@ impl EgglogOp for CpuConstant {
     fn rewrites(&self) -> Vec<Rule> {
         let (args, hlir_match) = new_op_call(&Constant::default().sort(), &[]);
         let cpu_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), app(&SORTS.f32_dt, vec![]))]
+        vec![
+            rule(union(hlir_match, cpu_op.clone()))
+                .set(dtype(cpu_op), app(&SORTS.f32_dt, vec![]))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -429,7 +449,11 @@ impl EgglogOp for CpuIota {
     fn rewrites(&self) -> Vec<Rule> {
         let (args, hlir_match) = new_op_call(&Iota::default().sort(), &[]);
         let cpu_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(hlir_match, cpu_op.clone())).set(dtype(cpu_op), app(&SORTS.int_dt, vec![]))]
+        vec![
+            rule(union(hlir_match, cpu_op.clone()))
+                .set(dtype(cpu_op), app(&SORTS.int_dt, vec![]))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -509,7 +533,12 @@ impl EgglogOp for CpuGather {
             ("out_strides".to_string(),   out_strides),
         ];
         let cpu_op = self.sort().call(cpu_args);
-        vec![rule(union(gather_match, cpu_op.clone())).set(dtype(cpu_op), dt.clone()).fact(eq(dt, dtype(gather_args["data"].clone())))]
+        vec![
+            rule(union(gather_match, cpu_op.clone()))
+                .set(dtype(cpu_op), dt.clone())
+                .fact(eq(dt, dtype(gather_args["data"].clone())))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {

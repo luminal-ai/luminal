@@ -130,7 +130,8 @@ impl EgglogOp for CpuMatmul {
                 .fact(eq(sum_args["iter_stride"].clone(), elt.clone()))
                 .fact(eq(mul_match, sum_args["inp"].clone()))
                 .set(dtype(matmul_op), dt.clone())
-                .fact(eq(dt, dtype(mul_args["lhs"].clone()))),
+                .fact(eq(dt, dtype(mul_args["lhs"].clone())))
+                .ruleset("matmul_backend"),
         ]
     }
     fn cleanup(&self) -> bool {

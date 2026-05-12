@@ -239,6 +239,7 @@ impl Runtime for CpuRuntime {
             llir_graph: &LLIRGraph,
             dyn_map: &FxHashMap<char, usize>,
             trials: usize,
+            _timeout: Option<std::time::Duration>,
         ) -> (Self::ProfileMetric, String) {
         self.load_llir(llir_graph);
         self.allocate_intermediate_buffers(dyn_map);
