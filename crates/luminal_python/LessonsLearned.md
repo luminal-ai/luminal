@@ -783,6 +783,80 @@ identical across all attempts (dtype issue) vs varying (actual numerical issue).
 4. **Cleaner formulation**: name the concept. Compute an `iteration_invariant_slots: HashSet<LoopStart>` set at the same time `start_meta` is built, with the rule `body_producer ∉ body_nodes ⇒ iteration_invariant`. `resolve_src` and `marker_post_sub` then have explicit branches: if the slot is invariant, use `body_producer` directly; otherwise the standard per-iter clone lookup. The behavior is the same as the `unwrap_or` band-aid, but the code now documents that this is a real, sound case the unroll handles correctly — not a panic suppressor.
 5. **Principle**: when an `unwrap_or` papers over a case that turns out to be semantically valid, the right cleanup isn't to keep the `unwrap_or` and add a comment — it's to name the case. Hoist the predicate into a set or enum and branch on it explicitly. The compiler then enforces that every consumer of the per-iter cloning machinery has an opinion on iteration-invariant slots, instead of silently relying on a `Map::get` returning `None` at the right moment.
 
+---
+
+## 2026-04-30 — `translate_grouped_mm` casted the full expert weight to F32, OOMing search on Qwen3-MoE
+
+### What the symptom was
+
+`benchmarks/ttft/run.py --config qwen3-moe` crashed every search-profile attempt with:
+```
+crates/luminal_cuda_lite/src/runtime.rs:711: called `Result::unwrap()` on an `Err` value:
+  DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+```
+The DB shows this had been failing every run for ~2 weeks. The rust `examples/qwen3_moe` ran fine end-to-end. python_baseline / python_torch_compile / qwen3-4b were all fine — only python_luminal × qwen3-moe failed.
+
+### What the actual root cause was
+
+`translate_grouped_mm` in `crates/luminal_python/rust/src/translator/tensor.rs` was lowering HF's `_grouped_mm(input, weight, offs)` op to a *full-broadcast* batched matmul plus a group-mask:
+
+```rust
+let weight_f = weight.cast(DType::F32);                  // [G=128, K, N] cast → 1.5 GB / layer
+let input_batched = input_f.expand_dim(0, g);
+let all_out = input_batched.matmul(weight_f);            // [G, S, N]
+let mask = ... (g_arange == expert_id).cast(F32);
+let out = (all_out * mask.expand_dim(2, n)).sum(0);      // mask + sum over G
+```
+
+The full `[G, K, N]` F32 cast intermediate is 1.5 GB / layer for gate-up and 0.6 GB / layer for down on Qwen3-30B-A3B. With 60 GB of persistent bf16 weights already on a 97 GB GPU, the search-time profiler ran out of memory allocating those casts.
+
+By contrast, `examples/qwen3_moe`'s `gather_experts` gathers only the top-K active experts per token first, then casts that small `[s, k, d1, d2]` slice (~100 MB / layer). The GLUMoE host op (`crates/luminal_cuda_lite/src/host/moe/glumoe_rewrite.egg`) is also wired to this gather pattern.
+
+### Why it was hard to find
+
+1. **Code path was reasonable in isolation**: at small scale (`test_grouped_mm_fallback`: g=2, K=8, N=16) the broadcast version was fine — the F32 cast was only 1 KB, and search profiling never noticed.
+2. **The error reported "out of memory" but the rest of the system looked healthy**: 60 GB weights + 37 GB headroom looks like plenty until you realise 48 layers × 2.1 GB cast intermediates per layer doesn't fit, even after loop rolling.
+3. **The DB's `code 1` failures looked the same as a Python exception** — the actual panic site (`runtime.rs:711:64` `stream.alloc_zeros(needed_bytes).unwrap()`) had to be recovered from a tmux scrollback because the orchestrator's stdout was already torn down by the time we looked.
+
+### The fix
+
+Rewrote `translate_grouped_mm` to gather first, matmul second:
+
+```rust
+// expert_id[m] = first g s.t. m < offs[g], clamped to [0, G-1]
+let expert_id = ge_boundary.sum(0).minimum_f32(g_max_f).cast(DType::Int);
+
+// flat_idx = expert_id * (K*N) + iota('z', (K, N))   — same shape as
+// rust qwen3_moe's `gather_experts`
+let flat_idx = (expert_id * (k * n))
+    .expand_dim(1, k).expand_dim(2, n)
+    + self.graph.iota(Expression::from('z'), (k, n)).expand_dim(0, s);
+
+let weight_gathered = weight.gather(flat_idx);            // [S, K, N], bf16
+let result = input.cast(F32).unsqueeze(1)
+    .matmul(weight_gathered.cast(F32))                    // [S, 1, N]
+    .squeeze(1);
+```
+
+Two important details:
+
+1. **Clamp `expert_id` to `[0, G-1]`**: at search time, dummy data fills `offs` with all-1s (`make_ones_bytes` in `compile_backend`). For S>1 that pushes `expert_id` to G (boundary count = G), which is one past the last valid expert and OOBs the gather. HF's own grouped-MM forward also clamps for the same reason (invalid expert IDs from EP).
+2. **Don't cast the full weight**: the cast moved from before the batched-matmul (over `[G, K, N]`) to after the gather (over `[S, K, N]`). 16× shrink at prefill (S=top_k=8 vs G=128).
+
+### Result
+
+`search-iters=1` end-to-end works on Qwen3-30B-A3B: `BENCH_RESULT … "ttft_ms": 9350.5, "tpot_ms": 1166.7`. The OOM is gone.
+
+`search-iters>=5` still crashes — but with a *different*, downstream `CUDA_ERROR_ILLEGAL_ADDRESS` during execution after search completes. That looks like the same family as the 2026-03-07 / 2026-03-09 egglog-extractor non-determinism bugs (some mutation during search picks a kernel/rewrite combo that's broken at this scale). It's a separate investigation — the gather-based lowering is correct in isolation (`test_grouped_mm_fallback` passes; a synthetic `g=128, S=8, K=2048, N=1536` bf16 test passes with max-diff ~2.4e-4).
+
+### General principle
+
+**When lowering an op that takes a per-row index over a large parameter, gather first and cast second — never cast the full parameter to F32 just because your matmul kernel is F32-only.** A "broadcast over G + mask" pattern is mathematically equivalent to "gather per-row" but materialises a G× larger intermediate — fine for tests, ruinous on real MoE checkpoints. When in doubt, mirror the rust example's pattern: the egglog fusion rules (GLUMoE here) are written to recognise the gather form, not the broadcast-and-mask form.
+
+Also: search-time dummy-1 inputs are not the same shape as runtime inputs. Anything you compute from a runtime tensor (cumsum offsets, routing indices, mask boundaries) needs to remain in-bounds for the dummy. Clamp index-producing chains as a matter of course, not just when the math says you "should" — `make_ones_bytes` is a hostile witness.
+
+---
+
 ## 2026-05-02 — Whisper port hit two missing-translator pitfalls
 
 1. **Symptom**: Compiling a PyTorch port of Whisper-tiny.en through `luminal_backend` failed twice in a row at the dispatch table: first with `Unsupported ATen op: torch.ops.aten.gelu.default`, then with `full: unsupported fill value type ... -Infinity`.

@@ -11,14 +11,21 @@ from .dtype_util import torch_dtype_code as _torch_dtype_code
 
 def _detect_factory_capsule(example_inputs):
     """Pick the best built-in factory capsule based on input device."""
-    device = example_inputs[0].device if example_inputs else torch.device("cpu")
+    # Dynamo can prefix `example_inputs` with SymInt entries when shapes are
+    # dynamic — those have no `.device`. Pick the first real tensor instead.
+    first_tensor = next((t for t in (example_inputs or []) if torch.is_tensor(t)), None)
+    device = first_tensor.device if first_tensor is not None else torch.device("cpu")
     if device.type == "cuda":
         try:
             from .luminal import _cuda_lite_factory_capsule
 
             return _cuda_lite_factory_capsule()
-        except ImportError:
-            pass
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "CUDA input was provided, but luminal_python was not built with "
+                "the cuda feature. Rebuild with `maturin develop --features cuda` "
+                "or run through `run_tests_cuda.sh`/the Modal CUDA test runner."
+            ) from exc
     from .luminal import _native_factory_capsule
 
     return _native_factory_capsule()

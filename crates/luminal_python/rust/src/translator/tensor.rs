@@ -72,6 +72,97 @@ impl<'a> Translator<'a> {
         })
     }
 
+    /// Lower `aten.histc.default` for the integer-bincount case.
+    ///
+    /// Qwen3-MoE's expert-balance layer calls
+    /// `torch.histc(expert_ids.int(), bins=K, min=0, max=K-1)` to count how
+    /// many tokens were routed to each expert. With those args every
+    /// integer value `i ∈ [0, K-1]` maps to exactly bin `i`, and the result
+    /// is equivalent to `torch.bincount`. We implement that case as a
+    /// broadcast equality + sum:
+    ///
+    ///   counts[b] = sum_i (input[i] == b + min)   for b in [0, bins)
+    ///
+    /// More general histc bin widths (`bins != max - min + 1`, or
+    /// non-integer values that span fractional bins) are not supported
+    /// today — the equality path would silently drop them. We bail rather
+    /// than produce wrong counts.
+    pub(crate) fn translate_histc(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let bins_i64: i64 = self
+            .get_int_arg(node, 1)
+            .context("histc: missing `bins` arg (#1)")?;
+        // `min`/`max` are float kwargs (default 0.0 each, which means
+        // "auto-pick from input"); for the qwen3-moe call they're always
+        // integers passed as floats.
+        let min = self.get_float_arg(node, 2).unwrap_or(0.0);
+        let max = self.get_float_arg(node, 3).unwrap_or(0.0);
+
+        anyhow::ensure!(
+            input.shape.len() == 1,
+            "histc: only 1D input is supported, got {}D",
+            input.shape.len()
+        );
+        anyhow::ensure!(
+            bins_i64 > 0,
+            "histc: bins must be positive, got {}",
+            bins_i64
+        );
+        // Bincount-equivalent case: one integer value per bin.
+        anyhow::ensure!(
+            (max - min - (bins_i64 - 1) as f64).abs() < 1e-6,
+            "histc: only the bincount-equivalent case (bins == max - min + 1) is \
+             supported; got bins={}, min={}, max={}. Other cases would need a \
+             general bin-width / right-edge-inclusion implementation.",
+            bins_i64,
+            min,
+            max,
+        );
+
+        let bins_u = bins_i64 as usize;
+        let n = input.shape.dims[0];
+
+        // arange(bins) [bins] → cast to input dtype, optionally shift by min,
+        // broadcast to [bins, N], compare for equality with input broadcast.
+        let mut bins_arange = self.graph.arange(Expression::from(bins_u));
+        if min != 0.0 {
+            // `min` is non-zero (uncommon in the qwen3-moe path but legal)
+            // — shift the comparison values to start at min.
+            let min_i = min as i64;
+            let shift = self
+                .graph
+                .constant_float(min_i as f32)
+                .cast(bins_arange.dtype)
+                .expand_rhs(bins_arange.shape);
+            bins_arange += shift;
+        }
+        let bins_expanded = bins_arange.cast(input.dtype).expand_dim(1, n);
+        let input_expanded = input.expand_dim(0, Expression::from(bins_u));
+        let matches = input_expanded.eq(bins_expanded); // Bool [bins, N]
+
+        let out_dtype = self.output_meta_dtype(node)?;
+        Ok(matches.cast(out_dtype).sum(1))
+    }
+
+    /// Lower `aten.empty.memory_format` and `aten.empty_permuted.default`.
+    ///
+    /// Both allocate an uninitialised tensor; the caller is responsible for
+    /// writing into it. We materialise zeros instead — luminal has no
+    /// "uninitialised" notion, and PyTorch's contract on `empty` outputs is
+    /// undefined for any read prior to a write, so a zero-fill is sound.
+    /// `aten.empty_permuted` additionally takes a `physical_layout` arg
+    /// (the storage permutation); for a zero-filled tensor that's a no-op.
+    pub(crate) fn translate_empty(&mut self, node: &Node) -> Result<GraphTensor> {
+        let shape = self.get_exprs_arg(node, FULL_SHAPE_ARG)?;
+        let dtype = self.output_meta_dtype(node)?;
+        let zero = self.graph.constant_float(0.0).cast(dtype);
+        Ok(if shape.is_empty() {
+            zero
+        } else {
+            zero.expand_rhs(shape)
+        })
+    }
+
     pub(crate) fn translate_full_like(&mut self, node: &Node) -> Result<GraphTensor> {
         let reference = self.get_input_tensor(node, FULL_LIKE_INPUT_ARG)?;
         let val = if let Ok(f) = self.get_float_arg(node, FULL_LIKE_VALUE_ARG) {
@@ -109,13 +200,18 @@ impl<'a> Translator<'a> {
     /// Output `[S, N]` where token m (in group g s.t. `offs[g-1] <= m < offs[g]`)
     /// is multiplied by `weight[g]`.
     ///
-    /// Implementation:
-    ///   1. Batched matmul across every expert: `[G, S, K] @ [G, K, N] → [G, S, N]`
-    ///      (input broadcast along the G batch dim — matches luminal's 3D@3D pattern
-    ///      so the CUDA optimizer can fuse it into a batched GEMM).
-    ///   2. Build a `[G, S]` group-membership mask from `offs`:
-    ///      `expert_id[m] = Σ_g (offs[g] <= m)`, then `mask[g, m] = (g == expert_id[m])`.
-    ///   3. Multiply `[G, S, N]` result by the broadcast mask and sum over `G`.
+    /// Implementation: for each token m we (a) compute its expert id from offs,
+    /// (b) gather only that expert's `[K, N]` slice from weight, and (c) do a
+    /// single per-token matmul. The gather pattern mirrors the rust qwen3_moe
+    /// example's `gather_experts`, which the GLUMoE host-op fusion in
+    /// `luminal_cuda_lite` is designed to recognise.
+    ///
+    /// Why not the straightforward `[G, S, K] @ [G, K, N] → [G, S, N]` + mask:
+    /// it forces a full F32 cast of the entire `[G, K, N]` weight tensor as
+    /// search-time intermediate, which OOMs on real MoE checkpoints
+    /// (Qwen3-30B-A3B: 1.5 GB / layer × 48 layers for gate-up alone). Gathering
+    /// first keeps the F32 cast on `[S, K, N]` instead — for prefill (S = top_k)
+    /// that is a 16× shrink (G=128, top_k=8).
     ///
     /// `offs` flows through as a runtime tensor — the routing decision is computed
     /// at execution time by the gate network and the same compiled graph handles
@@ -143,62 +239,100 @@ impl<'a> Translator<'a> {
 
         let s = input.shape.dims[0];
         let g = weight.shape.dims[0];
+        let k = weight.shape.dims[1];
         let n = weight.shape.dims[2];
 
-        let input_f = input.cast(DType::F32);
-        let weight_f = weight.cast(DType::F32);
-        let offs_f = offs.cast(DType::F32);
-
-        // Batched matmul over every expert: [G, S, K] @ [G, K, N] → [G, S, N].
-        let input_batched = input_f.expand_dim(0, g);
-        let all_out = input_batched.matmul(weight_f);
-
-        // Group mask [G, S].
-        let s_arange = self.graph.arange(s).cast(DType::F32);
-        let g_arange = self.graph.arange(g).cast(DType::F32);
-        let ge_boundary = s_arange
+        // expert_id[m] = number of g s.t. m >= offs[g], clamped to [0, G-1].
+        // Same value as HF MoE's `expert_ids.clamp(0, num_experts-1)` for
+        // invalid expert IDs from EP, AND protects search-time profiling:
+        // dummy-1 input bytes give offs=[1,…,1], which pushes the raw count
+        // to G for any token with index ≥ 1 and would OOB the weight gather.
+        //
+        // Stay in Int throughout — arange / offs are already Int, ge → Bool
+        // → cast(Int), sum stays Int, and the binary `minimum` handles the
+        // clamp without an F32 round-trip.
+        let _ = g
+            .to_usize()
+            .context("_grouped_mm: G (num_experts) must be concrete")?;
+        let s_arange = self.graph.arange(s); // Int [S]
+        let ge_int = s_arange
             .expand_dim(0, g)
-            .ge(offs_f.expand_dim(1, s))
-            .cast(DType::F32);
-        let expert_id = ge_boundary.sum(0);
-        let mask = g_arange
-            .expand_dim(1, s)
-            .eq(expert_id.expand_dim(0, g))
-            .cast(DType::F32);
+            .ge(offs.expand_dim(1, s)) // Bool [G, S]
+            .cast(DType::Int); // Int [G, S]
+        let raw = ge_int.sum(0); // Int [S], values in [0, G]
+        let cap = self.graph.constant(g - 1).expand_dim(0, s); // Int [S], all G-1
+        let expert_id = raw.minimum(cap); // Int [S]
 
-        // Apply mask and sum over experts.
-        let out = (all_out * mask.expand_dim(2, n)).sum(0);
+        // Flat gather index into weight (treated as a length-G*K*N 1D buffer):
+        //   flat[m, k_, n_] = expert_id[m] * (K*N) + k_ * N + n_
+        // Encoded as `Mul(expert_id, Iota(io_const)) + Iota(MIter, K*N)` so the
+        // resulting Gather matches the GLUMoE / gather-experts egglog patterns.
+        let io = k * n;
+        let base = expert_id * io;
+        let within = self.graph.iota(Expression::from('z'), (k, n));
+        let exp_base = base.expand_dim(1, k).expand_dim(2, n);
+        let exp_within = within.expand_dim(0, s);
+        let flat_idx = exp_base + exp_within;
 
-        Ok(out.cast(input.dtype))
+        // Gather → [S, K, N], preserves weight's native dtype (bf16 stays bf16).
+        let weight_gathered = weight.gather(flat_idx);
+
+        // Per-token matmul: [S, 1, K] @ [S, K, N] → [S, 1, N] → [S, N].
+        // Operands stay in their native dtype — no F32 cast on the gathered
+        // weight or the input. The earlier cast(F32) was a holdover from the
+        // broadcast-and-mask version (which had to use F32 because of the
+        // cast(F32) on the mask). Gather-then-matmul has no such requirement,
+        // and casting `[S, K, N]` to F32 doubled the gather scratch (~100 MB
+        // to ~200 MB per layer for Qwen3-30B-A3B prefill). Matmul rewrites
+        // (cuBLASLt etc.) handle bf16 input with F32 accumulator internally.
+        let result = input.unsqueeze(1).matmul(weight_gathered).squeeze(1);
+
+        Ok(result.cast(input.dtype))
+    }
+
+    /// Build the where-formula graph: `cond * x + (1 - cond) * y`, computed
+    /// in F32, cast back to `out_dtype`. Shared between `translate_where`,
+    /// `translate_where_scalar_other`, and `translate_masked_fill_scalar` so
+    /// they all go through one well-tested code path.
+    pub(crate) fn where_formula(
+        &mut self,
+        cond: GraphTensor,
+        x: GraphTensor,
+        y: GraphTensor,
+        out_dtype: DType,
+    ) -> GraphTensor {
+        let (cond_b, x_b) = broadcast_binary(cond, x);
+        let (cond_bc, y_b) = broadcast_binary(cond_b, y);
+        let (x_bc, y_bc) = broadcast_binary(x_b, y_b);
+        // Lower as `y + c*(x - y)` rather than `c*x + (1-c)*y`: 3 ops vs 4 ops
+        // plus the explicit `1.0` constant. Mathematically identical for
+        // c ∈ {0, 1} and produces the same F32 output type.
+        let c = cond_bc.cast(DType::F32);
+        let x_f = x_bc.cast(DType::F32);
+        let y_f = y_bc.cast(DType::F32);
+        // Cast back: an F32 result downstream-interpreted as bf16 walks the
+        // buffer at half-stride, returning every-other-element zeros.
+        (y_f + c * (x_f - y_f)).cast(out_dtype)
     }
 
     pub(crate) fn translate_where(&mut self, node: &Node) -> Result<GraphTensor> {
         let cond = self.get_input_tensor(node, 0)?;
         let x = self.get_input_tensor(node, 1)?;
         let y = self.get_input_tensor(node, 2)?;
-        // Ensure x and y have the same dtype
         let (x, y) = ensure_same_dtype(x, y);
-        // Broadcast all three tensors to a common shape first
-        let (cond_b, x_b) = broadcast_binary(cond, x);
-        let (cond_bc, y_b) = broadcast_binary(cond_b, y);
-        let (x_bc, y_bc) = broadcast_binary(x_b, y_b);
-        let c = cond_bc.cast(DType::F32);
-        let x_f = x_bc.cast(DType::F32);
-        let y_f = y_bc.cast(DType::F32);
-        let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
-        Ok(c * x_f + (one - c) * y_f)
+        let out_dtype = x.dtype;
+        Ok(self.where_formula(cond, x, y, out_dtype))
     }
 
     pub(crate) fn translate_where_scalar_other(&mut self, node: &Node) -> Result<GraphTensor> {
         let cond = self.get_input_tensor(node, WHERE_COND_ARG)?;
         let x = self.get_input_tensor(node, WHERE_X_ARG)?;
         let other_val = self.get_float_arg(node, WHERE_OTHER_ARG)? as f32;
-        // Broadcast cond and x to a common shape
-        let (cond_b, x_b) = broadcast_binary(cond, x);
-        let c = cond_b.cast(DType::F32);
-        let one = self.graph.constant_float(1.0).expand_rhs(c.shape);
-        let other = self.graph.constant_float(other_val).expand_rhs(c.shape);
-        Ok(c * x_b + (one - c) * other)
+        let out_dtype = x.dtype;
+        // Build a tensor for the scalar `other` matching `x`'s shape so we
+        // can route through the shared where_formula helper.
+        let other = self.graph.constant_float(other_val).expand_rhs(x.shape);
+        Ok(self.where_formula(cond, x, other, out_dtype))
     }
 
     pub(crate) fn translate_tril(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -253,33 +387,37 @@ impl<'a> Translator<'a> {
         let dim = normalize_dim(dim, a.shape.len());
 
         // Determine output names
-        let values_name = node
-            .outputs
-            .first()
-            .and_then(|o| o.as_tensor.as_ref().map(|t| t.name.clone()));
-        let indices_name =
-            if let Some(ts) = node.outputs.first().and_then(|o| o.as_tensors.as_ref()) {
-                ts.get(1).map(|t| t.name.clone())
-            } else if node.outputs.len() > 1 {
-                node.outputs[1].as_tensor.as_ref().map(|t| t.name.clone())
-            } else {
-                None
-            };
+        let tuple_outputs = node.outputs.first().and_then(|o| o.as_tensors.as_ref());
+        let values_name = if let Some(ts) = tuple_outputs {
+            ts.first().map(|t| t.name.clone())
+        } else {
+            node.outputs
+                .first()
+                .and_then(|o| o.as_tensor.as_ref().map(|t| t.name.clone()))
+        };
+        let indices_name = if let Some(ts) = tuple_outputs {
+            ts.get(1).map(|t| t.name.clone())
+        } else if node.outputs.len() > 1 {
+            node.outputs[1].as_tensor.as_ref().map(|t| t.name.clone())
+        } else {
+            None
+        };
 
-        // Build top-k outputs from a full stable argsort, then slice to k.
+        // Build top-k outputs from a full stable argsort. Slice the indices
+        // before gathering values so the gather shape matches the requested
+        // top-k output rather than the full sort width.
         let full_argsort = a.stable_argsort(dim, true);
+        let topk_indices = full_argsort.slice_along(..k, dim) * 1.0;
 
         // Only build the outputs that are consumed.
         if let Some(val_name) = values_name
             && !val_name.is_empty()
         {
-            let values = a.gather_elements(full_argsort, dim).slice_along(..k, dim);
+            let values = a.gather_elements(topk_indices, dim);
             self.tensors.insert(val_name, values);
         }
         if let Some(idx_name) = indices_name {
-            // Materialize the sliced indices through a copy before storing them.
-            let indices = full_argsort.slice_along(..k, dim) * 1.0;
-            self.tensors.insert(idx_name, indices);
+            self.tensors.insert(idx_name, topk_indices);
         }
 
         Ok(())

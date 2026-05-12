@@ -126,8 +126,9 @@ impl DimBucket {
 pub struct BuildSearchSpaceOptions {
     /// Optional maximum runtime-specific intermediate memory, in bytes.
     ///
-    /// Runtimes that support memory estimates can use this to reject candidate
-    /// graphs before profiling them.
+    /// When this is `None`, search does not apply a memory cap. Runtimes that
+    /// support memory estimates can use an explicitly provided limit to reject
+    /// candidate graphs before profiling them.
     pub max_memory_bytes: Option<usize>,
 }
 
@@ -171,7 +172,7 @@ pub struct SearchOptions {
     pub generation_size: usize,
     /// Number of mutations applied to each offspring (default: 30)
     pub mutations: usize,
-    /// Number of profiling trials per candidate (default: 10)
+    /// Number of profiling trials per candidate (default: 3)
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
@@ -190,7 +191,7 @@ impl SearchOptions {
             limit,
             generation_size: 30,
             mutations: 30,
-            trials: 10,
+            trials: 3,
             keep_best: 1,
             profile_timeout: None,
             group_timeout: None,
@@ -1029,7 +1030,8 @@ impl Graph {
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
-        let late_passes = Rt::late_egglog_passes(&ops, &options);
+        let memory_dyn_map = self.memory_limit_dyn_map();
+        let late_passes = Rt::late_egglog_passes(&ops, &options, &memory_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
         self.egraphs = vec![
@@ -1073,7 +1075,8 @@ impl Graph {
         ops.retain(|o| !exclude_ops.contains(&o.sort().name));
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
-        let late_passes = Rt::late_egglog_passes(&ops, &options);
+        let memory_dyn_map = self.memory_limit_dyn_map();
+        let late_passes = Rt::late_egglog_passes(&ops, &options, &memory_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
         self.egraphs = vec![
@@ -1173,6 +1176,16 @@ impl Graph {
         }
 
         combos
+    }
+
+    fn memory_limit_dyn_map(&self) -> FxHashMap<char, usize> {
+        let mut dyn_map = self.dyn_map.clone();
+        for (&dim, buckets) in &self.dim_buckets {
+            if let Some(max) = buckets.iter().map(|bucket| bucket.max).max() {
+                dyn_map.insert(dim, max);
+            }
+        }
+        dyn_map
     }
 
     /// Format a human-readable label for a bucket combination.
@@ -1308,7 +1321,12 @@ impl Graph {
                 let has_nan = runtime.has_nan_outputs(&graph, &profile_dyn_map);
                 (
                     rep_metric,
-                    append_memory_display(rep_display, memory_bytes),
+                    append_memory_display(
+                        rep_display,
+                        memory_bytes,
+                        runtime.planned_intermediate_buffer_bytes(),
+                        runtime.allocated_intermediate_buffer_bytes(),
+                    ),
                     has_nan,
                 )
             }));
@@ -1420,7 +1438,12 @@ impl Graph {
                     let has_nan = runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
                     (
                         rep_metric,
-                        append_memory_display(rep_display, memory_bytes),
+                        append_memory_display(
+                            rep_display,
+                            memory_bytes,
+                            runtime.planned_intermediate_buffer_bytes(),
+                            runtime.allocated_intermediate_buffer_bytes(),
+                        ),
                         has_nan,
                     )
                 }));
@@ -1609,11 +1632,27 @@ fn stable_toposort_by_node_index(graph: &HLIRGraph) -> Option<Vec<NodeIndex>> {
     (ordered.len() == graph.node_count()).then_some(ordered)
 }
 
-fn append_memory_display(display: String, memory_bytes: Option<usize>) -> String {
-    let Some(bytes) = memory_bytes else {
-        return display;
-    };
-    format!("{display} | MEM: {}", format_memory_bytes(bytes))
+fn append_memory_display(
+    display: String,
+    estimate_bytes: Option<usize>,
+    planned_bytes: Option<usize>,
+    allocated_bytes: Option<usize>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(bytes) = estimate_bytes {
+        parts.push(format!("EST: {}", format_memory_bytes(bytes)));
+    }
+    if let Some(bytes) = planned_bytes {
+        parts.push(format!("PLAN: {}", format_memory_bytes(bytes)));
+    }
+    if let Some(bytes) = allocated_bytes {
+        parts.push(format!("ALLOC: {}", format_memory_bytes(bytes)));
+    }
+    if parts.is_empty() {
+        display
+    } else {
+        format!("{display} | {}", parts.join(" | "))
+    }
 }
 
 fn format_memory_bytes(bytes: usize) -> String {
@@ -2550,6 +2589,16 @@ mod tests {
         ) -> Option<usize> {
             Some(1)
         }
+    }
+
+    #[test]
+    fn build_search_space_without_explicit_max_memory_has_no_cap() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+
+        cx.build_search_space::<TestMemoryRuntime>();
+
+        assert_eq!(cx.search_space_max_memory_bytes, None);
     }
 
     #[test]

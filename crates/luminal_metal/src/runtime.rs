@@ -282,6 +282,8 @@ impl Runtime for MetalRuntime {
                 let pipeline = kernel_op.compile(&self.device, &input_dtypes, output_dtype);
                 self.node_dtypes.insert(node, output_dtype);
                 self.pipelines.insert(node, pipeline);
+            } else {
+                panic!("Metal runtime cannot execute unlowered LLIR node {node:?}");
             }
         }
     }

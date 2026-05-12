@@ -52,6 +52,9 @@ fn main() {
         v_out.output();
     }
 
+    cx.set_dim('s', 1);
+    cx.set_dim('p', 1);
+
     println!("Building E-Graph...");
     cx.build_search_space_with_options::<CudaRuntime>(
         BuildSearchSpaceOptions::new().max_memory_mib(500),

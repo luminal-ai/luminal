@@ -37,8 +37,24 @@ impl<'a> Translator<'a> {
                 (axes, keepdim)
             }
             _ => {
-                // Full reduce: flatten to [1, N] and reduce axis 1
+                // Full reduce: flatten to [1, N] and reduce axis 1. The shape
+                // override below assumes contiguous, no-broadcast storage —
+                // otherwise the `[1, N]` view treats stride-0 broadcast dims
+                // as if they held N distinct values and reads past the backing
+                // buffer. Materialize first when that's not the case (matches
+                // the guard `translate_reshape` already applies).
                 let total = concrete_numel(&a)?;
+                let has_broadcast = a
+                    .shape
+                    .dims
+                    .iter()
+                    .zip(a.shape.strides.iter())
+                    .any(|(d, s)| s.to_usize() == Some(0) && d.to_usize() != Some(1));
+                let a = if has_broadcast || !a.shape.is_contiguous() {
+                    a + 0.0
+                } else {
+                    a
+                };
                 let mut flat = a;
                 flat.shape = ShapeTracker::new(vec![1, total]);
                 let result = match op {

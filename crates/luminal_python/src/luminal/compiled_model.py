@@ -77,7 +77,10 @@ class CompiledModel:
                 )
             user_inputs = inputs
 
-        input_device = inputs[0].device if inputs else torch.device("cpu")
+        # Use the first *user* input for device detection — when torch.compile
+        # has lifted SymInts or weights into the call args, `inputs[0]` may not
+        # be a tensor. user_inputs has been filtered to actual tensors.
+        input_device = user_inputs[0].device if user_inputs else torch.device("cpu")
 
         # Auto-detect dynamic dims from input shapes
         if self._has_dynamic_dims:

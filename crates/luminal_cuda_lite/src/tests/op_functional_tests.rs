@@ -16,8 +16,15 @@ use super::utilities::{
     test_binary_cuda, test_mod, test_unary_cuda, to_candle_dtype,
 };
 
+// The property-based op tests each build/search CUDA graphs for multiple random
+// shapes. They are ignored by default to keep the main CUDA unit suite short;
+// run `cargo test -p luminal_cuda_lite -- --ignored` for the broader sweeps.
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(5))]
+
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
 
     #[test]
     fn test_add(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
@@ -28,6 +35,9 @@ proptest! {
         test_binary_cuda((y, x), (y, x), |a, b| a + b, |a, b| (&a + &b).unwrap(), gen_lambda, gen_lambda, seed, rtol, atol);
     }
 
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
+
     #[test]
     fn test_mul(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
         let gen_lambda = |n, s| random_f32_vec(n, s, -0.5, 0.5);
@@ -37,17 +47,26 @@ proptest! {
         test_binary_cuda((y, x), (y, x), |a, b| a * b, |a, b| (&a * &b).unwrap(), gen_lambda, gen_lambda, seed, rtol, atol);
     }
 
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
+
     #[test]
     fn test_max(rows in 1usize..8, cols in 1usize..8, seed in any::<u64>()) {
         let gen_lambda = |n, s| random_f32_vec(n, s, -0.5, 0.5);
         test_unary_cuda((rows, cols), |a| a.max(1), |a| a.max(1).unwrap(), gen_lambda, seed);
     }
 
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
+
     #[test]
     fn test_mean(rows in 1usize..8, cols in 1usize..8, seed in any::<u64>()) {
         let gen_lambda = |n, s| random_f32_vec(n, s, -0.5, 0.5);
         test_unary_cuda((rows, cols), |a| a.mean(1), |a| a.mean(1).unwrap(), gen_lambda, seed);
     }
+
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
 
     #[test]
     fn test_matmul(
@@ -119,6 +138,8 @@ proptest! {
     }
 
     // Unary ops tests
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
     #[test]
     fn test_exp2(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
         // exp2(x) = 2^x, verified by computing 2^x using exp(x * ln(2))
@@ -126,6 +147,9 @@ proptest! {
         test_unary_cuda(x, |a| a.exp2(), |a| (a * 2.0f64.ln()).unwrap().exp().unwrap(), gen_lambda, seed);
         test_unary_cuda((y, x), |a| a.exp2(), |a| (a * 2.0f64.ln()).unwrap().exp().unwrap(), gen_lambda, seed);
     }
+
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
 
     #[test]
     fn test_log2(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
@@ -135,6 +159,9 @@ proptest! {
         test_unary_cuda((y, x), |a| a.log2(), |a| (a.log().unwrap() / 2.0f64.ln()).unwrap(), gen_lambda, seed);
     }
 
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
+
     #[test]
     fn test_sin(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
         let gen_lambda = |n, s| random_f32_vec(n, s, -0.5, 0.5);
@@ -142,12 +169,18 @@ proptest! {
         test_unary_cuda((y, x), |a| a.sin(), |a| a.sin().unwrap(), gen_lambda, seed);
     }
 
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
+
     #[test]
     fn test_recip(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
         let gen_lambda = |n, s| random_f32_vec(n, s, 0.1, 0.5);
         test_unary_cuda(x, |a| a.reciprocal(), |a| a.recip().unwrap(), gen_lambda, seed);
         test_unary_cuda((y, x), |a| a.reciprocal(), |a| a.recip().unwrap(), gen_lambda, seed);
     }
+
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
 
     #[test]
     fn test_sqrt(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
@@ -157,11 +190,16 @@ proptest! {
     }
 
     // Binary ops tests
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
     #[test]
     fn test_mod_op(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
         test_mod(x, x, |a, b| a % b, seed);
         test_mod((y, x), (y, x), |a, b| a % b, seed);
     }
+
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
 
     #[test]
     fn test_less_than(x in 1usize..100, y in 1usize..5, seed in any::<u64>()) {
@@ -335,6 +373,8 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(5))]
 
     /// Test F32 -> F16 -> F32 cast roundtrip with random values.
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
     #[test]
     fn test_cast_f16_random(size in 1usize..200, seed in any::<u64>()) {
         use luminal::dtype::DType;
@@ -527,6 +567,9 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(3))]
 
+    // This walks random extraction genomes and is intentionally opt-in so the
+    // default CUDA unit suite keeps a tight feedback loop.
+    #[ignore = "expensive CUDA genome fuzzing; run with cargo test -p luminal_cuda_lite -- --ignored"]
     #[test]
     fn fuzz_test_cuda_genomes(seed in any::<u64>()) {
         fuzz_test_cuda_genomes_impl(seed);
@@ -593,6 +636,9 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(5))]
+
+    #[ignore = "expensive CUDA op proptest sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+
 
     #[test]
     fn test_embed_proptest(

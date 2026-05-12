@@ -45,6 +45,49 @@ cd ./examples/llama
 cargo run --release
 ```
 
+## Testing
+
+The CUDA test suites have a fast default path and explicit opt-in slow coverage.
+Slow tests include exhaustive cuBLASLt rewrite sweeps, CUDA search/genome fuzzing,
+large Python model compiles, and pretrained/full-width model tests.
+
+Rust CUDA unit tests, matching the default CI path:
+
+```bash
+CUDARC_CUDA_VERSION=12080 CUDA_COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d .)" \
+cargo test -p luminal_cuda_lite -- --test-threads=1
+```
+
+Rust CUDA slow tests only:
+
+```bash
+CUDARC_CUDA_VERSION=12080 CUDA_COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d .)" \
+cargo test -p luminal_cuda_lite -- --ignored --test-threads=1
+```
+
+Rust CUDA full suite, including ignored slow tests:
+
+```bash
+CUDARC_CUDA_VERSION=12080 CUDA_COMPUTE_CAP="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d .)" \
+cargo test -p luminal_cuda_lite -- --include-ignored --test-threads=1
+```
+
+Python CUDA tests, matching the default CI path:
+
+```bash
+cd crates/luminal_python
+RUST_BACKTRACE=1 LUMINAL_TEST_DEVICE=cuda MATURIN_PEP517_ARGS="--features cuda --profile release" CUDARC_CUDA_VERSION=12080 \
+uv run --group dev python -m pytest tests/ -v -s -m "not slow"
+```
+
+Python CUDA full suite, including slow tests:
+
+```bash
+cd crates/luminal_python
+RUST_BACKTRACE=1 LUMINAL_TEST_DEVICE=cuda MATURIN_PEP517_ARGS="--features cuda --profile release" CUDARC_CUDA_VERSION=12080 \
+uv run --group dev python -m pytest tests/ -v -s
+```
+
 ## Features
 
 ### Speed

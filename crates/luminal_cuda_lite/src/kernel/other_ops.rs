@@ -128,7 +128,8 @@ impl KernelOp for KernelMeanReduce {
         let dtype = cuda_dtype(self.dtype);
         let includes = dtype_includes(&[self.dtype]);
         let n_outputs: Expression = self.out_shape.iter().copied().product();
-        let threads_per_block = 256; // 8 warps per block
+        let threads_per_block: usize = 256; // 8 warps per block
+        let n_warps = threads_per_block / 32;
         let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -149,12 +150,24 @@ extern \"C\" {{
         long long iters = {iters};
         long long iter_stride = {iter_stride};
 
-        {dtype} sum = 0;
-        for (long long i = 0; i < iters; i++) {{
-            sum += in[in_start + i * iter_stride];
-        }}
+        float thread_sum = 0.0f;
+        for (long long i = threadIdx.x; i < iters; i += {threads_per_block})
+            thread_sum += (float)in[in_start + i * iter_stride];
 
-        out[{out_index}] = ({dtype})(sum / ({dtype})iters);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+
+        __shared__ float warp_sums[{n_warps}];
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        if (lane == 0) warp_sums[warp] = thread_sum;
+        __syncthreads();
+
+        if (threadIdx.x == 0) {{
+            float sum = 0.0f;
+            for (int w = 0; w < {n_warps}; w++) sum += warp_sums[w];
+            out[{out_index}] = ({dtype})(sum / (float)iters);
+        }}
     }}
 }}",
             dtype = dtype,
@@ -167,6 +180,8 @@ extern \"C\" {{
                 .substitute('z', Expression::from(1))
                 .simplify()
                 .to_kernel(),
+            threads_per_block = threads_per_block,
+            n_warps = n_warps,
         );
 
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
@@ -183,9 +198,9 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (n_outputs, 1.into(), 1.into()), // grid
-            (1.into(), 1.into(), 1.into()),  // blocks (single-threaded)
-            0.into(),                        // shmem size
+            (n_outputs, 1.into(), 1.into()),                // grid
+            (threads_per_block.into(), 1.into(), 1.into()), // block
+            0.into(),                                       // shmem size
             FxHashMap::default(),
         )
     }
@@ -279,6 +294,9 @@ impl EgglogOp for KernelScatterNoCopy {
     fn rewrites(&self) -> Vec<Rule> {
         // Match KernelScatter and rewrite to KernelScatterNoCopy with ConsumedBuffer on dest.
         // ConsumedBuffer wraps dest to signal in-place modification.
+        // This is only valid when the destination buffer can also represent
+        // the scatter output layout. If dest is a strided/broadcast view,
+        // regular Scatter must first materialize a contiguous output copy.
         //
         // Two-phase resolution:
         // 1. During (run): cleanup rules delete ConsumedBuffer if dest is shared (another op uses it)
@@ -289,12 +307,31 @@ impl EgglogOp for KernelScatterNoCopy {
         // If ConsumedBuffer was deleted (shared case), cascade cleanup removes the dependent
         // ICons and KernelScatterNoCopy Op, leaving only KernelScatter.
         let mut rules = vec![
+            Rule::raw("(relation consumed_buffer_ilist_contains (IList IR))"),
+            Rule::raw(
+                "(rule
+                    ((= ?list (ICons ?head ?tail)))
+                    ((consumed_buffer_ilist_contains ?list ?head))
+                    :ruleset cleanup
+                    :name \"consumed-buffer-ilist-contains-head\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?list (ICons ?head ?tail))
+                     (consumed_buffer_ilist_contains ?tail ?item))
+                    ((consumed_buffer_ilist_contains ?list ?item))
+                    :ruleset cleanup
+                    :name \"consumed-buffer-ilist-contains-tail\"
+                )",
+            ),
             // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
             Rule::raw(
                 "(rule
                     (
                         (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
                             (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+                        (= ?dst ?os)
                         (= ?dty (dtype ?src))
                     )
                     (
@@ -324,13 +361,28 @@ impl EgglogOp for KernelScatterNoCopy {
             "(rule
                 ((= ?cb (ConsumedBuffer ?a))
                  (= ?op1 (Op ?k1 ?ilist1))
-                 (= ?ilist1 (ICons ?cb ?rest1))
+                 (consumed_buffer_ilist_contains ?ilist1 ?cb)
                  (= ?op2 (Op ?k2 ?ilist2))
                  (!= ?op1 ?op2)
-                 (= ?ilist2 (ICons ?a ?t2)))
+                 (consumed_buffer_ilist_contains ?ilist2 ?a))
                 ((delete (ConsumedBuffer ?a)))
                 :ruleset cleanup
-                :name \"consumed-buffer-cleanup-pos\"
+                :name \"consumed-buffer-cleanup-shared-op-use\"
+            )",
+        ));
+        // If a valid no-copy scatter survives cleanup, it dominates the copying scatter.
+        // This must run before base_cleanup resolves ConsumedBuffer back to the destination.
+        rules.push(Rule::raw(
+            "(rule
+                ((= ?cb (ConsumedBuffer ?dest))
+                 (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+                 (= ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?cb (ICons ?indexes (ICons ?src (INil)))))))
+                ((delete (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?dest (ICons ?indexes (ICons ?src (INil)))))))
+                :ruleset post_cleanup
+                :name \"scatter-no-copy-dominates-valid-consumed-buffer\"
             )",
         ));
         // Surviving ConsumedBuffers are valid — union with source and delete.

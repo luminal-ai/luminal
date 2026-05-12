@@ -232,6 +232,10 @@ pub struct BaseSorts {
     pub bf16_dt: SortDef,
     pub int_dt: SortDef,
     pub bool_dt: SortDef,
+    pub f4e2m1_dt: SortDef,
+    pub f8e4m3_dt: SortDef,
+    pub f8e5m2_dt: SortDef,
+    pub f8ue8m0_dt: SortDef,
     pub i4_dt: SortDef,
     pub tf32_dt: SortDef,
     // Egglog builtin primitives (for term construction only)
@@ -312,6 +316,10 @@ impl BaseSorts {
             bf16_dt: sort(DTYPE, "Bf16", &[]),
             int_dt: sort(DTYPE, "Int", &[]),
             bool_dt: sort(DTYPE, "Bool", &[]),
+            f4e2m1_dt: sort(DTYPE, "F4E2M1", &[]),
+            f8e4m3_dt: sort(DTYPE, "F8E4M3", &[]),
+            f8e5m2_dt: sort(DTYPE, "F8E5M2", &[]),
+            f8ue8m0_dt: sort(DTYPE, "F8UE8M0", &[]),
             i4_dt: sort(DTYPE, "I4", &[]),
             tf32_dt: sort(DTYPE, "TF32", &[]),
             p_add: func("+", &["a", "b"]),
@@ -367,6 +375,10 @@ impl BaseSorts {
             &self.bf16_dt,
             &self.int_dt,
             &self.bool_dt,
+            &self.f4e2m1_dt,
+            &self.f8e4m3_dt,
+            &self.f8e5m2_dt,
+            &self.f8ue8m0_dt,
             &self.i4_dt,
             &self.tf32_dt,
         ] {
@@ -444,6 +456,7 @@ pub fn base_expression_egglog() -> String {
     p.add_ruleset("expr");
     p.add_ruleset("dtype_prop");
     p.add_ruleset("cleanup");
+    p.add_ruleset("post_cleanup");
 
     // Register all sorts
     s.register(&mut p);
@@ -506,14 +519,24 @@ pub fn base_expression_egglog() -> String {
     );
 
     // Cancel common factor in division: (a*b)/(a*c) → b/c
-    p.add_rule(
-        rewrite(
-            "div-cancel-factor",
-            div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
-            div(v("b"), v("c")),
-        )
-        .ruleset("expr"),
-    );
+    //
+    // DISABLED: this rule rewrites to a `div` whose operands are themselves
+    // typically `mul`s of stride/shape factors, so the new tree matches the
+    // same `div-cancel-factor` pattern again. Combined with `mul-comm` (4
+    // orderings of a*b/c*d) it drives a combinatorial blow-up on the deep
+    // `flatten_strides` index expressions produced by stacked unfold-based
+    // convolutions. At 7 backbone YOLO v11 layers it accounts for ~66k
+    // matches in a single early-stage saturate. Productive simplifications
+    // (`div-self`, `mod-mul-self`, `div-const`, `merge-dims`) cover the
+    // cases we actually need without the explosion.
+    // p.add_rule(
+    //     rewrite(
+    //         "div-cancel-factor",
+    //         div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
+    //         div(v("b"), v("c")),
+    //     )
+    //     .ruleset("expr"),
+    // );
 
     // Division self-cancel: a/a → 1
     p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
@@ -620,14 +643,26 @@ pub fn base_expression_egglog() -> String {
         .ruleset("expr"),
     );
 
+    // `div-div`, restricted to nested constant divisors only. The original
+    // unconstrained form `(a/b)/c → a/(b*c)` produces a new `div` whose
+    // denominator matches the same rule again as soon as `a` is itself a
+    // `div`, and `flatten_strides` produces 4-deep div chains for every
+    // conv. Under `(saturate expr)` the unrestricted version is the single
+    // biggest match generator on YOLO v11 (~200k matches at 7 layers,
+    // growing super-linearly). Restricting both divisors to numeric
+    // literals keeps the productive constant-folding case
+    // (e.g. `((w+7)/2)/2 → (w+7)/4`) while completely avoiding the
+    // explosion on stride/index expressions whose denominators are
+    // composite expressions like `c_in*H*W`.
     p.add_rule(
         rewrite(
-            "div-div",
-            div(div(v("a"), v("b")), v("c")),
-            div(v("a"), mul(v("b"), v("c"))),
+            "div-div-num",
+            div(div(v("a"), num(v("?b"))), num(v("?c"))),
+            div(v("a"), num(pmul(v("?b"), v("?c")))),
         )
         .ruleset("expr"),
     );
+
     p.add_rule(
         rewrite(
             "add-div",
