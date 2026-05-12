@@ -304,7 +304,7 @@ macro_rules! metal_unary_op {
                         device {input_ty} *inp [[buffer(0)]],
                         device {output_ty} *out [[buffer(1)]],
                         constant int *dyn [[buffer({dyn_buffer_index})]],
-                        device uint &n_elements [[buffer({n_elements_index})]],
+                        constant uint &n_elements [[buffer({n_elements_index})]],
                         uint idx [[thread_position_in_grid]]
                     ) {{
                         if (idx < n_elements) {{
@@ -457,7 +457,7 @@ impl MetalKernelOp for MetalAdd {
                 device {b_ty} *b [[buffer(1)]],
                 device {out_ty} *out [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -589,7 +589,7 @@ impl MetalKernelOp for MetalMul {
                 device {b_ty} *b [[buffer(1)]],
                 device {out_ty} *out [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -736,7 +736,7 @@ impl MetalKernelOp for MetalMod {
                 device {b_ty} *b [[buffer(1)]],
                 device {out_ty} *out [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -876,7 +876,7 @@ impl MetalKernelOp for MetalLessThan {
                 device {b_ty} *b [[buffer(1)]],
                 device {out_ty} *out [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -1023,7 +1023,7 @@ impl MetalKernelOp for MetalSumReduce {
                 const device {input_ty} *in [[buffer(0)]],
                 device {output_ty} *out [[buffer(1)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_outputs [[buffer({n_outputs_index})]],
+                constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
                 uint tid [[thread_index_in_threadgroup]],
                 uint simd_lane [[thread_index_in_simdgroup]],
@@ -1204,7 +1204,7 @@ impl MetalKernelOp for MetalMaxReduce {
                 const device {input_ty} *in [[buffer(0)]],
                 device {output_ty} *out [[buffer(1)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_outputs [[buffer({n_outputs_index})]],
+                constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
                 uint tid [[thread_index_in_threadgroup]],
                 uint simd_lane [[thread_index_in_simdgroup]],
@@ -1899,7 +1899,7 @@ impl MetalKernelOp for MetalIota {
             kernel void mkernel(
                 device int *out [[buffer(0)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -2063,7 +2063,7 @@ impl MetalKernelOp for MetalGather {
                 const device {data_ty} *data [[buffer(1)]],
                 device {out_ty} *out [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{
@@ -2282,7 +2282,7 @@ impl MetalKernelOp for MetalScatter {
             kernel void copy_kernel(
                 device {out_ty} *out [[buffer(0)]],
                 const device {dest_ty} *dest [[buffer(1)]],
-                device uint &n_elements [[buffer(2)]],
+                constant uint &n_elements [[buffer(2)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
@@ -2316,7 +2316,7 @@ impl MetalKernelOp for MetalScatter {
                 device {out_ty} *out [[buffer(0)]],
                 const device int *indexes [[buffer(1)]],
                 const device {src_ty} *src [[buffer(2)]],
-                device uint &n_elements [[buffer(3)]],
+                constant uint &n_elements [[buffer(3)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
@@ -2509,7 +2509,7 @@ impl MetalKernelOp for MetalCast {
                 device {input_ty} *inp [[buffer(0)]],
                 device {output_ty} *out [[buffer(1)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
-                device uint &n_elements [[buffer({n_elements_index})]],
+                constant uint &n_elements [[buffer({n_elements_index})]],
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx < n_elements) {{

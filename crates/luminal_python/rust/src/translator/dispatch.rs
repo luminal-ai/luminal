@@ -186,6 +186,17 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.arange.start_step" => self.translate_arange(node)?,
             "torch.ops.aten.full.default" => self.translate_full(node)?,
             "torch.ops.aten.full_like.default" => self.translate_full_like(node)?,
+            // `empty` and `empty_permuted` allocate uninitialised tensors of
+            // a given shape; the caller fills them. We lower to zeros with
+            // the same shape+dtype — downstream reads are officially UB on
+            // PyTorch's side, and downstream writes overwrite our zeros.
+            // Qwen3MoE's MoE block uses `empty_permuted` to allocate the
+            // expert-output staging tensor before scatter-adding into it.
+            "torch.ops.aten.empty.memory_format" | "torch.ops.aten.empty_permuted.default" => {
+                self.translate_empty(node)?
+            }
+            // Qwen3-MoE's expert-balance counts tokens-per-expert via histc.
+            "torch.ops.aten.histc.default" => self.translate_histc(node)?,
 
             // Grouped matmul (MoE expert dispatch).
             // aten._grouped_mm is the native op; transformers::grouped_mm_fallback

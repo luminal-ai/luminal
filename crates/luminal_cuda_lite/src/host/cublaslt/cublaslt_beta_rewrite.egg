@@ -20,6 +20,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?n (ECons ?m (ENil)))
@@ -68,6 +72,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?n (ECons ?m (ENil)))
@@ -116,6 +124,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?batch (ECons ?n (ECons ?m (ENil))))
@@ -164,6 +176,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?batch (ECons ?n (ECons ?m (ENil))))
@@ -216,6 +232,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?m (ECons ?n (ENil)))
@@ -264,6 +284,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?m (ECons ?n (ENil)))
@@ -312,6 +336,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?batch (ECons ?m (ECons ?n (ENil))))
@@ -360,6 +388,10 @@
             ?compute_type ?scale_dtype
             ?alpha 0.0 ?epilogue)
             (ICons ?a (ICons ?b ?matmul_tail))))
+        (!= ?epilogue "RELU")
+        (!= ?epilogue "RELU_BIAS")
+        (!= ?epilogue "GELU")
+        (!= ?epilogue "GELU_BIAS")
 
         (= ?add (Op (Add
             (ECons ?batch (ECons ?m (ECons ?n (ENil))))

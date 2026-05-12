@@ -2,14 +2,20 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::cudarc::driver::{CudaStream, DriverError, result};
 use luminal::{op::EgglogOp, prelude::*};
+pub mod compute_attn_mask;
 mod cublas;
 mod cublaslt;
+pub mod flashinfer;
 pub mod moe;
+
+pub use compute_attn_mask::ComputeAttnMask;
 
 pub type Ops = (
     // cublas::CuBlasSgemmV2,
     cublaslt::CuBlasLt,
     moe::GLUMoE,
+    compute_attn_mask::ComputeAttnMask,
+    flashinfer::FlashInferAttention,
 );
 
 #[cfg(test)]

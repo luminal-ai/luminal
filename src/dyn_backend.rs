@@ -226,8 +226,9 @@ pub fn bytes_to_native_data(bytes: Vec<u8>, dtype: DType) -> NativeData {
     // Safety: source bytes are from a valid typed buffer; we reinterpret.
     unsafe fn from_bytes<T: Copy>(bytes: Vec<u8>) -> Vec<T> {
         let n = bytes.len() / std::mem::size_of::<T>();
+        let cap = bytes.capacity() / std::mem::size_of::<T>();
         let mut bytes = std::mem::ManuallyDrop::new(bytes);
-        unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut T, n, n) }
+        unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut T, n, cap) }
     }
     match dtype {
         DType::F32 | DType::TF32 => NativeData::F32(unsafe { from_bytes(bytes) }),

@@ -355,7 +355,17 @@ impl GraphTensor {
 
     /// Take the elementwise maximum of a tensor and a float
     pub fn maximum_f32(self, rhs: f32) -> GraphTensor {
-        self.maximum(self.graph().constant_float(rhs).expand_rhs(self.shape))
+        // `constant_float` always emits F32; cast it to `self.dtype` so the
+        // downstream `lt`/`le` comparisons inside `maximum` don't panic when
+        // `self` is Int (e.g. `aten.clamp` on Int top-k indices coming out
+        // of an MoE router). For Int self the cast floors the bound, which
+        // matches PyTorch's `clamp(int_tensor, min=<float>)` semantics.
+        self.maximum(
+            self.graph()
+                .constant_float(rhs)
+                .cast(self.dtype)
+                .expand_rhs(self.shape),
+        )
     }
 
     /// Take the elementwise minimum of two tensors

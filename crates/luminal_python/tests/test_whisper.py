@@ -83,6 +83,7 @@ def test_whisper_decoder_layer(device: torch.device):
     assert torch.allclose(out, ref, atol=1e-3), f"max_diff={_max_diff(out, ref):.2e}"
 
 
+@pytest.mark.slow
 def test_whisper_encoder_random_init(device: torch.device):
     """Full encoder over a random mel: 2 conv stems + 4 transformer blocks."""
     model = _make_small_whisper().to(device)
@@ -96,6 +97,7 @@ def test_whisper_encoder_random_init(device: torch.device):
     assert torch.allclose(out, ref, atol=1e-3), f"max_diff={_max_diff(out, ref):.2e}"
 
 
+@pytest.mark.slow
 def test_whisper_full_random_init_one_step(device: torch.device):
     """End-to-end Whisper forward (encoder + decoder for one step) with random weights.
 

@@ -23,6 +23,6 @@ jobs:
             - name: Update Rust toolchain
               run: rustup update
             - name: Build maturin extension
-              run: uv run maturin develop --manifest-path rust/Cargo.toml
+              run: uv run maturin develop --manifest-path rust/Cargo.toml --profile release
             - name: Run pytest
               run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py -v -m "not slow"

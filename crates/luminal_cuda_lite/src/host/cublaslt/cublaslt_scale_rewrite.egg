@@ -12,10 +12,12 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            1.0 0.0 ?epilogue)
+            1.0 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?scale (Op (Constant ?alpha) (INil)))
+        ; alpha=1.0 hash-conses ?fused == ?matmul; the union merges Mul into ?matmul's eclass and saturate diverges. 
+        (!= ?alpha 1.0)
         (= ?scaled (Op (Mul ?shape
             ?matmul_strides
             (ECons (MNum 0) (ECons (MNum 0) (ENil)))
@@ -33,7 +35,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            ?alpha 0.0 ?epilogue)
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?scaled ?fused)
         (set (dtype ?fused) ?d_dtype)
@@ -53,10 +55,12 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            1.0 0.0 ?epilogue)
+            1.0 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?scale (Op (Constant ?alpha) (INil)))
+        ; See 2d alpha scale: alpha=1.0 makes (saturate ...) diverge.   
+        (!= ?alpha 1.0)
         (= ?scaled (Op (Mul ?shape
             ?matmul_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
@@ -74,7 +78,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             ?a_dtype ?b_dtype ?c_dtype ?d_dtype
             ?compute_type ?scale_dtype
-            ?alpha 0.0 ?epilogue)
+            ?alpha 0.0 "DEFAULT")
             (ICons ?a (ICons ?b ?matmul_tail))))
         (union ?scaled ?fused)
         (set (dtype ?fused) ?d_dtype)

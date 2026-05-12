@@ -7,6 +7,8 @@ mod consumed_buffer_tests;
 #[cfg(test)]
 mod cublaslt_rewrite_tests;
 #[cfg(test)]
+mod flashinfer;
+#[cfg(test)]
 mod fusion;
 #[cfg(test)]
 mod model_fuzz;

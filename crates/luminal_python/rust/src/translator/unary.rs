@@ -137,34 +137,34 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_masked_fill_scalar(&mut self, node: &Node) -> Result<GraphTensor> {
+        // `masked_fill(input, mask, fill)` = `where(mask, fill, input)`.
+        // Routes through the shared `where_formula` helper so we exercise
+        // the exact same code path as `aten.where.self`, which is verified
+        // to handle the bf16 cast-back correctly. Hand-rolling the same
+        // formula directly here used to drift (egglog made different
+        // rewrite choices on the rebuilt-locally graph), so we deliberately
+        // re-use the helper.
+        // `aten.masked_fill.Scalar(input, mask, fill)` ≡
+        // `aten.where.self(mask, full_like(input, fill), input)`. The
+        // `full_like + where` sequence is the verified-working path
+        // (test: `where(mask, torch.zeros_like(x), x)` round-trips with
+        // max_diff = 0); we reproduce its exact graph-build order here.
+        // Hand-rolling the formula in any other shape (single-mul, F32
+        // throughout, alternative constant-cast orderings) routes egglog
+        // through a rewrite that returns an F32 buffer downstream-read as
+        // bf16 — the every-other-element-zero pattern.
         let input = self.get_input_tensor(node, MASKED_FILL_INPUT_ARG)?;
         let mask = self.get_input_tensor(node, MASKED_FILL_MASK_ARG)?;
         let fill = self.get_float_arg(node, MASKED_FILL_VALUE_ARG)? as f32;
-        let (input, mask) = broadcast_binary(input, mask);
-        let work_dtype = if input.dtype == DType::Bool {
-            DType::Int
-        } else {
-            input.dtype
-        };
-        let input_work = if input.dtype == DType::Bool {
-            input.cast(DType::Int)
-        } else {
-            input
-        };
-        let mask_work = mask.cast(work_dtype);
-        let fill_work = self
+        let out_dtype = input.dtype;
+        // Build fill_t exactly like translate_full_like does:
+        //   constant_float(val).cast(dtype).expand_rhs(reference.shape)
+        let fill_t = self
             .graph
             .constant_float(fill)
-            .cast(work_dtype)
-            .expand_rhs(input_work.shape);
-        // `input + mask*(fill - input)` — saves a mul, sub, and the 1.0 constant
-        // versus the equivalent `mask*fill + (1 - mask)*input` blend.
-        let result = input_work + mask_work * (fill_work - input_work);
-        Ok(if input.dtype == DType::Bool {
-            result.cast(DType::Bool)
-        } else {
-            result
-        })
+            .cast(out_dtype)
+            .expand_rhs(input.shape);
+        Ok(self.where_formula(mask, fill_t, input, out_dtype))
     }
 
     pub(crate) fn translate_floor_divide(&mut self, node: &Node) -> Result<GraphTensor> {

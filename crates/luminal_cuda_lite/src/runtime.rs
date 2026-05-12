@@ -546,11 +546,11 @@ impl CudaRuntime {
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
         let bytes = self.get_output_data(id);
-        let bytes = bytes.leak();
-        let n_bytes = bytes.len();
-        let bytes_ptr = bytes.as_mut_ptr();
-        let float_ptr = bytes_ptr as *mut f32;
-        unsafe { Vec::from_raw_parts(float_ptr, n_bytes / 4, n_bytes / 4) }
+        let n = bytes.len() / 4;
+        let cap = bytes.capacity() / 4;
+        let ptr = bytes.as_ptr() as *mut f32;
+        std::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
     /// Take a GPU buffer handle for an output tensor. This removes the buffer from
@@ -648,20 +648,20 @@ impl CudaRuntime {
 
     pub fn get_f16(&self, id: impl ToId) -> Vec<f16> {
         let bytes = self.get_output_data(id);
-        let bytes = bytes.leak();
-        let n_bytes = bytes.len();
-        let bytes_ptr = bytes.as_mut_ptr();
-        let f16_ptr = bytes_ptr as *mut f16;
-        unsafe { Vec::from_raw_parts(f16_ptr, n_bytes / 2, n_bytes / 2) }
+        let n = bytes.len() / 2;
+        let cap = bytes.capacity() / 2;
+        let ptr = bytes.as_ptr() as *mut f16;
+        std::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
     pub fn get_bf16(&self, id: impl ToId) -> Vec<bf16> {
         let bytes = self.get_output_data(id);
-        let bytes = bytes.leak();
-        let n_bytes = bytes.len();
-        let bytes_ptr = bytes.as_mut_ptr();
-        let bf16_ptr = bytes_ptr as *mut bf16;
-        unsafe { Vec::from_raw_parts(bf16_ptr, n_bytes / 2, n_bytes / 2) }
+        let n = bytes.len() / 2;
+        let cap = bytes.capacity() / 2;
+        let ptr = bytes.as_ptr() as *mut bf16;
+        std::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
     /// Swap the GPU buffer of an output tensor into the input slot for another tensor.
@@ -1128,6 +1128,28 @@ fn intervals_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize)
 
 fn byte_ranges_overlap(a_offset: usize, a_bytes: usize, b_offset: usize, b_bytes: usize) -> bool {
     a_offset < b_offset + b_bytes && b_offset < a_offset + a_bytes
+}
+
+fn is_schedule_only_host_source(llir_graph: &LLIRGraph, source: NodeIndex) -> bool {
+    llir_graph[source]
+        .to_dialect::<dyn HostOp>()
+        .is_some_and(|source_host_op| source_host_op.output_bytes() == 0)
+}
+
+fn host_data_inputs(
+    llir_graph: &LLIRGraph,
+    host_op_node_index: NodeIndex,
+    host_op: &dyn HostOp,
+) -> Vec<NodeIndex> {
+    llir_graph
+        .edges_directed(host_op_node_index, Direction::Incoming)
+        .sorted_by_key(|e| e.id())
+        // CudaGraphOp -> HostOp edges are ordering edges added by kernel_to_host.
+        // They must remain in exec_graph, but they are not data pointers.
+        .filter(|e| !is_schedule_only_host_source(llir_graph, e.source()))
+        .map(|e| e.source())
+        .take(host_op.n_inputs())
+        .collect_vec()
 }
 
 fn logical_interval_peak(planned: &[PlannedBuffer]) -> usize {
@@ -1738,11 +1760,11 @@ impl CudaRuntime {
             let _span = span!(Level::TRACE, "compile_host_ops").entered();
             for host_op_node_index in llir_graph.node_indices() {
                 if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
-                    let inputs = llir_graph
-                        .edges_directed(host_op_node_index, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect_vec();
+                    let inputs = host_data_inputs(
+                        &llir_graph,
+                        host_op_node_index,
+                        host_op.as_ref().as_ref(),
+                    );
                     node_to_exec.insert(
                         host_op_node_index,
                         exec_graph.add_node(ExecutableHostOp {
