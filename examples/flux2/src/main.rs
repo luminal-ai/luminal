@@ -547,7 +547,16 @@ fn run_full_pipeline(
 
     println!("Compiling transformer (search)...");
     let t0 = Instant::now();
-    runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
+    if let Ok(seed) = std::env::var("TX_SEARCH_SEED")
+        .and_then(|s| s.parse::<u64>().map_err(|_| std::env::VarError::NotPresent))
+    {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+        let opts = luminal::graph::SearchOptions::new(env_usize("SEARCH_ITERS", 5));
+        runtime = cx.search_options(runtime, opts, &mut rng);
+    } else {
+        runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
+    }
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
     println!("Running diffusion loop ({} steps)...", timesteps.len());

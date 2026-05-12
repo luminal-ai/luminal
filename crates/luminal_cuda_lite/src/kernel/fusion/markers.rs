@@ -326,15 +326,16 @@ impl EgglogOp for FusionEnd {
         }
 
         // 5. Grow FE → U: U(FE(inner)) → FE(FU(inner)). No new FS.
-        let subsume_u = std::env::var("LUMINAL_FUSION_GROW_SUBSUME_U").is_ok();
+        //
+        // Subsume the inner FE — once it's been extended, the partially-fused
+        // version is dominated by the larger region. The un-fused KernelX
+        // chain stays via pair-fuse's union, so multi-consumer fan-out can
+        // still pick the un-fused alternative for its other paths. Without
+        // this, every (start, end) prefix/suffix of a chain becomes a
+        // separate FE enode, giving O(N²) region variants per chain — the
+        // actual root cause of the 538 GB egraph blowup on the 32B flux2
+        // transformer with the BB pair-fuse family enabled.
         for (ku, fu) in unaries {
-            let extra = if subsume_u {
-                format!(
-                    "(subsume (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))"
-                )
-            } else {
-                String::new()
-            };
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
@@ -343,28 +344,14 @@ impl EgglogOp for FusionEnd {
                     (let ?fu (Op ({fu} ?shape ?s ?s ?dt) (ICons ?inner (INil))))
                     (let ?new_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?fu (INil))))
                     (union ?u ?new_fe)
-                    {extra}
+                    (subsume (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
                  ) :ruleset fusion_grow :name \"grow-FE-U-{ku}\")"
             )));
         }
 
         // 6. Grow FE → B (lhs / rhs): one input is the FE, the other external.
-        let subsume_b = std::env::var("LUMINAL_FUSION_GROW_SUBSUME_B").is_ok();
+        // Same subsume rationale as Grow FE → U.
         for (kb, fb, lb) in binaries {
-            let extra_lhs = if subsume_b {
-                format!(
-                    "(subsume (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))"
-                )
-            } else {
-                String::new()
-            };
-            let extra_rhs = if subsume_b {
-                format!(
-                    "(subsume (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))"
-                )
-            } else {
-                String::new()
-            };
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
@@ -376,7 +363,7 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?inner_a (ICons ?fs_b (INil)))))
                     (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                     (union ?bin ?new_fe)
-                    {extra_lhs}
+                    (subsume (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                  ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{lb}\")"
             )));
             rules.push(Rule::raw(format!(
@@ -390,7 +377,7 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?fs_a (ICons ?inner_b (INil)))))
                     (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
                     (union ?bin ?new_fe)
-                    {extra_rhs}
+                    (subsume (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
                  ) :ruleset fusion_grow :name \"grow-FE-B-rhs-{lb}\")"
             )));
         }
