@@ -824,9 +824,34 @@ class _ArgminAll(torch.nn.Module):
         return x.argmin()
 
 
+class _ArgmaxAllKeepDim(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.argmax(dim=None, keepdim=True)
+
+
+class _ArgminAllKeepDim(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.argmin(dim=None, keepdim=True)
+
+
 class _ArgmaxKeepDim(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x.argmax(dim=0, keepdim=True)
+
+
+class _ArgminKeepDim(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.argmin(dim=0, keepdim=True)
+
+
+class _ArgmaxNegDimKeepDim(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.argmax(dim=-1, keepdim=True)
+
+
+class _ArgminNegDimKeepDim(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.argmin(dim=-1, keepdim=True)
 
 
 class _SumEmptyDimTuple(torch.nn.Module):
@@ -851,23 +876,45 @@ class _CumsumOf0d(torch.nn.Module):
         return torch.cumsum(s, 0)
 
 
-@pytest.mark.parametrize("shape", [(5,), (3, 4), (2, 3, 4)])
+@pytest.mark.parametrize("shape", [(), (5,), (3, 4), (2, 3, 4)])
 def test_argmax_all(device: torch.device, shape: tuple) -> None:
     x = torch.rand(shape, device=device)
     eager, compiled = _run(_ArgmaxAll(), x)
     _strict_match(compiled, eager)
 
 
-@pytest.mark.parametrize("shape", [(5,), (3, 4)])
+@pytest.mark.parametrize("shape", [(), (5,), (3, 4)])
 def test_argmin_all(device: torch.device, shape: tuple) -> None:
     x = torch.rand(shape, device=device)
     eager, compiled = _run(_ArgminAll(), x)
     _strict_match(compiled, eager)
 
 
-def test_argmax_keepdim_1d(device: torch.device) -> None:
+@pytest.mark.parametrize(
+    "model_cls",
+    [
+        _ArgmaxAllKeepDim,
+        _ArgminAllKeepDim,
+        _ArgmaxKeepDim,
+        _ArgminKeepDim,
+        _ArgmaxNegDimKeepDim,
+        _ArgminNegDimKeepDim,
+    ],
+)
+def test_argextremum_0d_keepdim_returns_scalar(
+    device: torch.device, model_cls: type[torch.nn.Module]
+) -> None:
+    x = torch.tensor(7.0, device=device)
+    eager, compiled = _run(model_cls(), x)
+    _strict_match(compiled, eager)
+
+
+@pytest.mark.parametrize("model_cls", [_ArgmaxKeepDim, _ArgminKeepDim])
+def test_argextremum_keepdim_1d(
+    device: torch.device, model_cls: type[torch.nn.Module]
+) -> None:
     x = torch.rand(5, device=device)
-    eager, compiled = _run(_ArgmaxKeepDim(), x)
+    eager, compiled = _run(model_cls(), x)
     _strict_match(compiled, eager)
 
 

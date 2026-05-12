@@ -144,18 +144,26 @@ impl<'a> Translator<'a> {
             false
         };
 
+        if a.shape.is_empty() {
+            match dim_opt {
+                None | Some(0) | Some(-1) => {
+                    // PyTorch returns scalar index 0 for rank-0 argmax/argmin.
+                    // `keepdim=True` does not add a dimension when the input is 0-d.
+                    return Ok(self.graph.constant(0i64).cast(DType::Int));
+                }
+                Some(dim) => {
+                    return Err(anyhow::anyhow!(
+                        "Dimension out of range (expected to be in range of [-1, 0], but got {dim})"
+                    ));
+                }
+            }
+        }
+
         let descending = which.descending();
 
         let (sort_axis, base) = match dim_opt {
             None => {
                 // Full-reduce: flatten to 1-D, argsort along axis 0.
-                if a.shape.is_empty() {
-                    // Edge case: argmax of a 0-d tensor is index 0. Not
-                    // currently exercised by the test suite but guarded so
-                    // we don't reshape a rank-0 tensor.
-                    let zero = self.graph.constant(0i64).cast(DType::Int);
-                    return Ok(if keepdim { zero.unsqueeze(0) } else { zero });
-                }
                 let total = concrete_numel(&a)?;
                 let flat = reshape_tensor(a, vec![Expression::from(total)]);
                 (0usize, flat)
