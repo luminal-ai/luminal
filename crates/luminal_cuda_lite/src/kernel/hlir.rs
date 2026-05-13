@@ -3290,12 +3290,15 @@ impl KernelOp for KernelEmbed {
         let token_offset_expr = flatten_strides(&self.batch_shape, &self.token_stride).to_kernel();
         let out_offset_expr = flatten_strides(&self.batch_shape, &self.out_stride).to_kernel();
         let embed_dim_expr = self.embed_dim.to_kernel();
+        let total_threads = batch_size * self.embed_dim;
+        let n_elements = total_threads.to_kernel();
         let kernel = format!(
             "
 {dyn_defines}
 extern \"C\" {{
     __global__ void embed(float *out, const int *token_ids, const float *embed_table{dyn_dims_param}) {{
         long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= {n_elements}) return;
         long long embed_dim = {embed_dim_expr};
         long long batch_idx = idx / embed_dim;
         long long embed_idx = idx % embed_dim;
@@ -3318,13 +3321,12 @@ extern \"C\" {{
         };
         // Return empty constants map - we now use shared dyn_dims buffer
         let constants = FxHashMap::default();
-        let total_threads = batch_size * self.embed_dim;
         (
             func,
             module,
             kernel,
-            (total_threads, 1.into(), 1.into()),
-            (1.into(), 1.into(), 1.into()),
+            (total_threads.ceil_div(256), 1.into(), 1.into()),
+            (256.into(), 1.into(), 1.into()),
             0.into(),
             constants,
         )
