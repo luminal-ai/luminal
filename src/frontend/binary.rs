@@ -11,6 +11,7 @@ impl Add for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(self.dims(), rhs.dims(), "Dims must match to add tensors.");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to add tensors. Got {:?} and {:?}",
@@ -73,6 +74,11 @@ impl Mul for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(
+            self.dims(),
+            rhs.dims(),
+            "Dims must match to multiply tensors."
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to multiply tensors. Got {:?} and {:?}",
@@ -137,6 +143,7 @@ impl Rem<GraphTensor> for GraphTensor {
     type Output = GraphTensor;
 
     fn rem(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(self.dims(), rhs.dims(), "Dims must match to mod tensors.");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
@@ -287,6 +294,7 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
 impl GraphTensor {
     /// Less than comparison
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
+        assert_eq!(self.dims(), rhs.dims(), "Dims must match to lt tensors.");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to compare tensors. Got {:?} and {:?}",
@@ -470,6 +478,42 @@ pub(super) mod tests {
         let ref_c = ref_func(ref_a, ref_b).flatten_all().unwrap();
 
         assert_close(rt.get_f32(c.id), &ref_c.to_vec1::<f32>().unwrap())
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to add tensors.")]
+    fn test_add_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a + b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to multiply tensors.")]
+    fn test_mul_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a * b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to mod tensors.")]
+    fn test_mod_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a % b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to lt tensors.")]
+    fn test_lt_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a.lt(b);
     }
 
     proptest! {
