@@ -455,6 +455,31 @@ impl Expression {
         terms.push(Term::CeilDiv);
         Expression::new(terms)
     }
+    /// Floor Division
+    pub fn floor_div<E: Into<Expression>>(self, rhs: E) -> Self {
+        let rhs = rhs.into();
+        if rhs == 1 {
+            return self;
+        }
+        if self == 0 {
+            return 0.into();
+        }
+        if self == rhs {
+            return 1.into();
+        }
+        if let (Some(a), Some(b)) = (self.as_num(), rhs.as_num())
+            && let Some(c) = floor_div_i64(a, b)
+        {
+            return c.into();
+        }
+
+        // Shape dimensions are non-negative, so the existing integer Div term
+        // evaluates with floor semantics for dynamic shape expressions.
+        let mut terms = rhs.terms.read().clone();
+        terms.extend(self.terms.read().iter().copied());
+        terms.push(Term::Div);
+        Expression::new(terms)
+    }
     /// Less than
     pub fn lt<E: Into<Expression>>(self, rhs: E) -> Self {
         let rhs = rhs.into();
@@ -652,6 +677,16 @@ fn is_valid_rpn_expression(terms: &[Term]) -> bool {
         }
     }
     depth == 1
+}
+
+fn floor_div_i64(a: i64, b: i64) -> Option<i64> {
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    if r != 0 && ((r > 0) != (b > 0)) {
+        q.checked_sub(1)
+    } else {
+        Some(q)
+    }
 }
 
 impl From<Term> for Expression {

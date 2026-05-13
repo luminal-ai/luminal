@@ -1969,6 +1969,24 @@ class Conv1dBiasModel(torch.nn.Module):
         return self.conv(x)
 
 
+class Conv1dFloorDivPositionalModel(torch.nn.Module):
+    """Whisper-like Conv1d downsample followed by a fixed positional add."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = torch.nn.Conv1d(8, 16, kernel_size=3, padding=1, bias=True)
+        self.conv2 = torch.nn.Conv1d(
+            16, 16, kernel_size=3, stride=2, padding=1, bias=True
+        )
+        self.position = torch.nn.Parameter(torch.randn(15, 16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.gelu(self.conv1(x))
+        x = torch.nn.functional.gelu(self.conv2(x))
+        x = x.squeeze(0).transpose(0, 1)
+        return x + self.position
+
+
 class Conv2dNoPadModel(torch.nn.Module):
     """Conv2d with no padding: output spatial dims shrink by (kernel-1)."""
 

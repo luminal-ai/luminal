@@ -221,6 +221,7 @@ from test_models import (
     Conv1dNoPadModel,
     Conv1dSamePadModel,
     Conv1dBiasModel,
+    Conv1dFloorDivPositionalModel,
     Conv2dNoPadModel,
     Conv2dSamePadModel,
     Conv2dBiasModel,
@@ -2495,6 +2496,17 @@ def test_conv1d_bias(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv1d_floor_div_positional_pt2(device: torch.device):
+    """Conv1d stride output uses floor division before positional add."""
+    model: torch.nn.Module = Conv1dFloorDivPositionalModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, "pt2")
+    x: torch.Tensor = torch.randn(1, 8, 30, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert output.shape == original.shape == (15, 16)
+    assert torch.allclose(output, original, atol=1e-3, rtol=1e-3)
 
 
 def _run_conv2d_no_pad(device: torch.device, export_mode: str | None = None):

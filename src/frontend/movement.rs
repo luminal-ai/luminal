@@ -467,7 +467,7 @@ impl GraphTensor {
         let mut win = Vec::with_capacity(n);
         for (((dim, k), s), d) in dims.iter().zip(&kernel).zip(&strides).zip(&dilation) {
             let effective_window = *d * (*k - 1) + 1;
-            win.push(((*dim - effective_window) / s) + 1);
+            win.push((*dim - effective_window).floor_div(s) + 1);
         }
 
         // [win..., kernel...]
@@ -903,6 +903,14 @@ mod tests {
                 .unwrap()
             },
         );
+    }
+
+    #[test]
+    fn test_unfold_floor_div_shape_for_odd_window_numerator() {
+        let mut cx = Graph::new();
+        let inp = cx.tensor((80, 3000));
+        let out = inp.pad(((0, 0), (1, 1)), 0.).unfold((1, 3), (1, 2), (1, 1));
+        assert_eq!(out.dims(), &[80, 1500, 1, 3]);
     }
 
     #[test]

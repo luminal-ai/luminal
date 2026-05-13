@@ -186,7 +186,6 @@ impl Gemma {
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         let seq = token_ids.dims1();
-        println!("Token Shape: {:?}", token_ids.dims());
         let mut x = self.embedding.gather(
             (token_ids * HIDDEN).expand_dim(1, HIDDEN)
                 + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
@@ -295,9 +294,6 @@ fn hlir_attention(
     max_seq: usize,
     is_local: bool,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
-    println!("q rope: {:?}", q_rope.dims());
-    println!("k cache: {:?}", k_cache_in.dims());
-    println!("k: {:?}", k_rope.dims());
     let cx = q_rope.graph();
     let seq = q_rope.dims()[0];
     let prev = Expression::from('p');
@@ -321,7 +317,10 @@ fn hlir_attention(
     // Slice to valid range
     let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
     let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
-    k_full.shape.dims[1] = total_seq; // TODO: this is because we can't yet algebraically assert p + s is less than 4096
+    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
+    // cannot yet propagate expression-bound assertions, so `slice` reports
+    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
+    k_full.shape.dims[1] = total_seq;
     v_full.shape.dims[1] = total_seq;
 
     // GQA expand: [N_KV_HEADS, total_seq, HEAD_DIM] -> [N_HEADS, total_seq, HEAD_DIM]
@@ -356,8 +355,6 @@ fn hlir_attention(
         future_mask
     };
     let mask_3d = mask_2d.expand_dim(0, N_HEADS);
-    println!("scores: {:?}", scores.dims());
-    println!("mask: {:?}", mask_3d.dims());
     let masked_scores = scores + mask_3d * (-1e10f32);
 
     let attn_weights = masked_scores.softmax(2);
