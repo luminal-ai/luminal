@@ -336,10 +336,9 @@ impl<'a> Translator<'a> {
                 .get("as_expr")
                 .and_then(|e| e.get("expr_str"))
                 .and_then(|s| s.as_str())
+                && let Some(expr) = self.resolve_expr_str(expr_str)
             {
-                if let Some(expr) = self.resolve_expr_str(expr_str) {
-                    return Some(expr);
-                }
+                return Some(expr);
             }
             if let Some(hint) = val
                 .get("as_expr")

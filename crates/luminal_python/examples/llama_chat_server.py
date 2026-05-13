@@ -170,6 +170,7 @@ f.addEventListener("submit", async (ev) => {
 
 # --- Model + compile -------------------------------------------------------
 
+
 class ChatRequest(BaseModel):
     messages: list[dict[str, str]]
     session_id: str | None = None
@@ -195,12 +196,16 @@ def load_model(
     config.use_cache = use_cache
     config._attn_implementation = "eager"
     log.info("Loading weights (%s, use_cache=%s) to %s ...", dtype, use_cache, DEVICE)
-    model = LlamaForCausalLM.from_pretrained(
-        repo_id,
-        config=config,
-        torch_dtype=dtype,
-        local_files_only=local_files_only,
-    ).eval().to(DEVICE)
+    model = (
+        LlamaForCausalLM.from_pretrained(
+            repo_id,
+            config=config,
+            torch_dtype=dtype,
+            local_files_only=local_files_only,
+        )
+        .eval()
+        .to(DEVICE)
+    )
     return tokenizer, model
 
 
@@ -231,7 +236,10 @@ def warmup_kvcache(compiled, steps: int) -> None:
     if steps <= 0:
         log.info("Warmup skipped (steps=0)")
         return
-    log.info("Warmup: prefill + %d decode shapes. First few will be SLOW (egglog + codegen).", steps)
+    log.info(
+        "Warmup: prefill + %d decode shapes. First few will be SLOW (egglog + codegen).",
+        steps,
+    )
     t0 = time.time()
     with torch.no_grad():
         ids = torch.tensor([[1]], device=DEVICE)
@@ -342,12 +350,20 @@ def _store_session_state(
 def stream_chat_kvcache(tokenizer, compiled, messages, max_new_tokens):
     acquired = _gen_lock.acquire(blocking=False)
     if not acquired:
-        yield _sse({"error": "busy"}); yield b"data: [DONE]\n\n"; return
+        yield _sse({"error": "busy"})
+        yield b"data: [DONE]\n\n"
+        return
     try:
-        enc = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+        enc = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
         ids = (enc.input_ids if hasattr(enc, "input_ids") else enc).to(DEVICE)
         prompt_len = int(ids.shape[1])
-        yield _sse({"status": f"prefilling {prompt_len} tokens (kv-cache mode: each new seq_len recompiles ~30s on 8B)..."})
+        yield _sse(
+            {
+                "status": f"prefilling {prompt_len} tokens (kv-cache mode: each new seq_len recompiles ~30s on 8B)..."
+            }
+        )
 
         t0 = time.time()
         with torch.no_grad():
@@ -360,23 +376,31 @@ def stream_chat_kvcache(tokenizer, compiled, messages, max_new_tokens):
             if seen:
                 idx = torch.tensor(sorted(seen), device=logits.device)
                 vals = logits.index_select(0, idx)
-                vals = torch.where(vals > 0, vals / REPETITION_PENALTY, vals * REPETITION_PENALTY)
+                vals = torch.where(
+                    vals > 0, vals / REPETITION_PENALTY, vals * REPETITION_PENALTY
+                )
                 logits.index_copy_(0, idx, vals)
             nxt = int(torch.argmax(logits).item())
-            if nxt in EOS_TOKENS: break
+            if nxt in EOS_TOKENS:
+                break
             seen.add(nxt)
             piece = tokenizer.decode([nxt], skip_special_tokens=True)
-            if piece: yield _sse({"token": piece})
+            if piece:
+                yield _sse({"token": piece})
             t = time.time()
             with torch.no_grad():
-                out = compiled(torch.tensor([[nxt]], device=DEVICE),
-                               past_key_values=out.past_key_values)
+                out = compiled(
+                    torch.tensor([[nxt]], device=DEVICE),
+                    past_key_values=out.past_key_values,
+                )
             dt = time.time() - t
             if dt > 1.0:
                 log.info("decode step %d slow: %.1fs (new shape compile?)", step, dt)
         yield b"data: [DONE]\n\n"
     except Exception as e:
-        log.exception("generation failed"); yield _sse({"error": str(e)}); yield b"data: [DONE]\n\n"
+        log.exception("generation failed")
+        yield _sse({"error": str(e)})
+        yield b"data: [DONE]\n\n"
     finally:
         _gen_lock.release()
 
@@ -397,9 +421,13 @@ async def stream_chat_dynamic(
     """
     acquired = _gen_lock.acquire(blocking=False)
     if not acquired:
-        yield _sse({"error": "busy"}); yield b"data: [DONE]\n\n"; return
+        yield _sse({"error": "busy"})
+        yield b"data: [DONE]\n\n"
+        return
     try:
-        enc = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
+        enc = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
         ids = (enc.input_ids if hasattr(enc, "input_ids") else enc).to(DEVICE)
         prompt_ids = ids[0].tolist()
         prompt_len = len(prompt_ids)
@@ -463,7 +491,9 @@ async def stream_chat_dynamic(
             if seen:
                 idx = torch.tensor(sorted(seen), device=logits.device)
                 vals = logits.index_select(0, idx)
-                vals = torch.where(vals > 0, vals / REPETITION_PENALTY, vals * REPETITION_PENALTY)
+                vals = torch.where(
+                    vals > 0, vals / REPETITION_PENALTY, vals * REPETITION_PENALTY
+                )
                 logits.index_copy_(0, idx, vals)
             nxt = int(torch.argmax(logits).item())
             if nxt in EOS_TOKENS:
@@ -481,19 +511,26 @@ async def stream_chat_dynamic(
                 )
             all_step_ms.append((time.time() - t) * 1000)
         if all_step_ms:
-            log.info("decode: %d steps, mean=%.1fms, last=%.1fms",
-                     len(all_step_ms),
-                     sum(all_step_ms) / len(all_step_ms),
-                     all_step_ms[-1])
-        _store_session_state(session_id, prompt_ids + generated_ids, out.past_key_values)
+            log.info(
+                "decode: %d steps, mean=%.1fms, last=%.1fms",
+                len(all_step_ms),
+                sum(all_step_ms) / len(all_step_ms),
+                all_step_ms[-1],
+            )
+        _store_session_state(
+            session_id, prompt_ids + generated_ids, out.past_key_values
+        )
         yield b"data: [DONE]\n\n"
     except Exception as e:
-        log.exception("generation failed"); yield _sse({"error": str(e)}); yield b"data: [DONE]\n\n"
+        log.exception("generation failed")
+        yield _sse({"error": str(e)})
+        yield b"data: [DONE]\n\n"
     finally:
         _gen_lock.release()
 
 
 # --- App --------------------------------------------------------------------
+
 
 def build_app(
     tokenizer,
@@ -547,44 +584,77 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"],
-                    help="Execution device. `auto` prefers CUDA when available, "
-                         "otherwise falls back to CPU.")
-    ap.add_argument("--mode", default="dynamic", choices=["dynamic", "kv-cache"],
-                    help="dynamic: HF DynamicCache through torch.compile with "
-                         "automatic dynamic shapes; after prefill/static "
-                         "decode/dynamic decode compile, cached decode reuses "
-                         "one compiled graph. kv-cache: force per-cache-length "
-                         "specialization by disabling automatic dynamic shapes.")
-    ap.add_argument("--warmup-steps", type=int, default=4,
-                    help="dynamic: after a short prefill, run this "
-                         "many decode steps at startup to build the reusable "
-                         "cache graph. kv-cache: decode cache lengths to "
-                         "pre-compile at startup.")
-    ap.add_argument("--example-seq", type=int, default=64,
-                    help="Legacy no-op kept for CLI compatibility.")
-    ap.add_argument("--search-iterations", type=int, default=25,
-                    help="Legacy no-op kept for CLI compatibility.")
-    ap.add_argument("--max-context-tokens", type=int, default=0,
-                    help="Legacy no-op in compiled-cache dynamic mode; kept for "
-                         "CLI compatibility.")
+    ap.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Execution device. `auto` prefers CUDA when available, "
+        "otherwise falls back to CPU.",
+    )
+    ap.add_argument(
+        "--mode",
+        default="dynamic",
+        choices=["dynamic", "kv-cache"],
+        help="dynamic: HF DynamicCache through torch.compile with "
+        "automatic dynamic shapes; after prefill/static "
+        "decode/dynamic decode compile, cached decode reuses "
+        "one compiled graph. kv-cache: force per-cache-length "
+        "specialization by disabling automatic dynamic shapes.",
+    )
+    ap.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=4,
+        help="dynamic: after a short prefill, run this "
+        "many decode steps at startup to build the reusable "
+        "cache graph. kv-cache: decode cache lengths to "
+        "pre-compile at startup.",
+    )
+    ap.add_argument(
+        "--example-seq",
+        type=int,
+        default=64,
+        help="Legacy no-op kept for CLI compatibility.",
+    )
+    ap.add_argument(
+        "--search-iterations",
+        type=int,
+        default=25,
+        help="Legacy no-op kept for CLI compatibility.",
+    )
+    ap.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=0,
+        help="Legacy no-op in compiled-cache dynamic mode; kept for CLI compatibility.",
+    )
     ap.add_argument("--repo-id", default=REPO_ID)
-    ap.add_argument("--local-files-only", action="store_true",
-                    help="Load model/tokenizer/config only from the local "
-                         "Hugging Face cache.")
-    ap.add_argument("--dtype", default="fp32", choices=["bf16", "fp32", "fp16"],
-                    help="Weight/activation dtype. fp32 matches eager argmax "
-                         "exactly on full 8B; bf16 drifts and breaks coherence "
-                         "(empirically picks gibberish tokens).")
+    ap.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Load model/tokenizer/config only from the local Hugging Face cache.",
+    )
+    ap.add_argument(
+        "--dtype",
+        default="fp32",
+        choices=["bf16", "fp32", "fp16"],
+        help="Weight/activation dtype. fp32 matches eager argmax "
+        "exactly on full 8B; bf16 drifts and breaks coherence "
+        "(empirically picks gibberish tokens).",
+    )
     args = ap.parse_args()
     global DTYPE, DEVICE
-    DTYPE = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}[args.dtype]
+    DTYPE = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}[
+        args.dtype
+    ]
     if args.device == "auto":
         DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     else:
         DEVICE = args.device
     if DEVICE == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("`--device cuda` was requested, but torch.cuda.is_available() is False.")
+        raise SystemExit(
+            "`--device cuda` was requested, but torch.cuda.is_available() is False."
+        )
 
     logging.basicConfig(
         level=logging.INFO,
@@ -629,8 +699,14 @@ def main():
     )
 
     import uvicorn
-    log.info("mode=%s device=%s   Open http://<this-host>:%d/   (bind=%s)",
-             args.mode, DEVICE, args.port, args.host)
+
+    log.info(
+        "mode=%s device=%s   Open http://<this-host>:%d/   (bind=%s)",
+        args.mode,
+        DEVICE,
+        args.port,
+        args.host,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

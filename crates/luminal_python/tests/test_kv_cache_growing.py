@@ -250,19 +250,23 @@ def test_dynamic_kv_cache_torch_compile_matches_reference_and_reuses_decode_grap
     torch._dynamo.config.recompile_limit = 16
 
     try:
-        model = LlamaForCausalLM(
-            LlamaConfig(
-                hidden_size=64,
-                num_attention_heads=4,
-                num_key_value_heads=2,
-                num_hidden_layers=1,
-                intermediate_size=128,
-                vocab_size=256,
-                max_position_embeddings=128,
-                use_cache=True,
-                attn_implementation="eager",
+        model = (
+            LlamaForCausalLM(
+                LlamaConfig(
+                    hidden_size=64,
+                    num_attention_heads=4,
+                    num_key_value_heads=2,
+                    num_hidden_layers=1,
+                    intermediate_size=128,
+                    vocab_size=256,
+                    max_position_embeddings=128,
+                    use_cache=True,
+                    attn_implementation="eager",
+                )
             )
-        ).eval().cuda()
+            .eval()
+            .cuda()
+        )
         compiled = torch.compile(model, backend=counting_backend, fullgraph=True)
 
         ref_cache = DynamicCache(config=model.config)
