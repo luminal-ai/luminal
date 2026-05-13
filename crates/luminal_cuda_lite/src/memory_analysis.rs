@@ -42,7 +42,7 @@ pub(crate) fn cuda_memory_analysis_pass(
 (relation cuda_output_bytes (OpKind Expression))
 (relation cuda_local_memory (IR Expression))
 
-(rule ((= ?node (Input ?id ?label ?dtype ?persistent)))
+(rule ((= ?node (Input ?id ?label ?dtype)))
       ((cuda_local_memory ?node (MNum 0)))
       :ruleset cuda_memory_analysis
       :name "cuda-memory-input")

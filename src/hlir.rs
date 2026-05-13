@@ -250,7 +250,6 @@ pub struct Input {
     pub node: usize,
     pub label: String,
     pub dtype: DType,
-    pub persistent: bool,
 }
 
 impl Display for Input {
@@ -273,12 +272,7 @@ impl EgglogOp for Input {
         sort(
             IR,
             "Input",
-            &[
-                ("node", I64),
-                ("label", STRING),
-                ("dtype", DTYPE),
-                ("persistent", BOOL),
-            ],
+            &[("node", I64), ("label", STRING), ("dtype", DTYPE)],
         )
     }
 
@@ -309,7 +303,6 @@ impl EgglogOp for Input {
                 node,
                 label,
                 dtype: extract_dtype(egraph, kind_children[2]),
-                persistent: egraph.enodes[kind_children[3]].0.parse::<bool>().unwrap(),
             })),
             vec![],
         )
@@ -319,8 +312,8 @@ impl EgglogOp for Input {
 impl HLIROp for Input {
     fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
         format!(
-            "(Input {} \"{}\" ({:?}) {})",
-            self.node, self.label, self.dtype, self.persistent
+            "(Input {} \"{}\" ({:?}))",
+            self.node, self.label, self.dtype
         )
     }
 }
@@ -2947,20 +2940,13 @@ impl Runtime for NativeRuntime {
             self.buffers.insert(node, output);
         }
 
-        // Consume intermediates but keep outputs plus only the inputs that
-        // were explicitly marked persistent via `persist()`.
-        let persistent_nodes: FxHashSet<NodeIndex> = self
+        // Consume all non-Output buffers (inputs + intermediates)
+        let output_nodes: FxHashSet<NodeIndex> = self
             .graph
             .node_indices()
-            .filter(|n| {
-                (**self.graph[*n]).as_any().is::<Output>()
-                    || (**self.graph[*n])
-                        .as_any()
-                        .downcast_ref::<Input>()
-                        .is_some_and(|input| input.persistent)
-            })
+            .filter(|n| (**self.graph[*n]).as_any().is::<Output>())
             .collect();
-        self.buffers.retain(|k, _| persistent_nodes.contains(k));
+        self.buffers.retain(|k, _| output_nodes.contains(k));
     }
 }
 

@@ -113,6 +113,9 @@ pub struct WeightData {
     pub device_ptrs: HashMap<String, (u64, usize)>,
 }
 
+type StaticHostInputs = HashMap<NodeIndex, TypedData>;
+type StaticDeviceInputs = HashMap<NodeIndex, (u64, usize)>;
+
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     pub graph: Graph,
@@ -127,6 +130,8 @@ pub struct CompiledGraph {
     pub output_dtypes: Vec<DType>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
+    static_host_inputs: StaticHostInputs,
+    static_device_inputs: StaticDeviceInputs,
 }
 
 impl CompiledGraph {
@@ -151,17 +156,21 @@ impl CompiledGraph {
             input_shape_exprs,
             dim_param_map,
         } = translation;
+        let WeightData {
+            weights,
+            tensor_sizes,
+            device_ptrs,
+        } = weight_data;
 
         // Build compile args from WeightData (convert TypedData -> raw bytes + dtype)
         let compile_args = BackendCompileArgs {
             search_iters,
-            weights: weight_data
-                .weights
+            weights: weights
                 .iter()
                 .map(|(label, td)| (label.clone(), td.bytes.clone(), td.dtype))
                 .collect(),
-            tensor_sizes: weight_data.tensor_sizes,
-            device_ptrs: weight_data.device_ptrs,
+            tensor_sizes,
+            device_ptrs: device_ptrs.clone(),
         };
 
         // Create backend via the factory directly
@@ -175,6 +184,11 @@ impl CompiledGraph {
             .collect();
 
         let label_map = luminal::dyn_backend::build_label_map(&graph);
+        let static_device_inputs = Self::build_static_device_inputs(&device_ptrs, &label_map);
+        let mut static_host_inputs = Self::build_static_host_inputs(&weights, &label_map);
+        for node_id in static_device_inputs.keys() {
+            static_host_inputs.remove(node_id);
+        }
 
         Ok(CompiledGraph {
             graph,
@@ -188,7 +202,39 @@ impl CompiledGraph {
             output_dtypes,
             input_shape_exprs,
             dim_param_map,
+            static_host_inputs,
+            static_device_inputs,
         })
+    }
+
+    fn build_static_host_inputs(
+        weights: &[(String, TypedData)],
+        label_map: &HashMap<String, NodeIndex>,
+    ) -> StaticHostInputs {
+        weights
+            .iter()
+            .filter_map(|(label, typed)| {
+                label_map
+                    .get(label)
+                    .copied()
+                    .map(|node_id| (node_id, typed.clone()))
+            })
+            .collect()
+    }
+
+    fn build_static_device_inputs(
+        device_ptrs: &HashMap<String, (u64, usize)>,
+        label_map: &HashMap<String, NodeIndex>,
+    ) -> StaticDeviceInputs {
+        device_ptrs
+            .iter()
+            .filter_map(|(label, &(ptr, n_bytes))| {
+                label_map
+                    .get(label)
+                    .copied()
+                    .map(|node_id| (node_id, (ptr, n_bytes)))
+            })
+            .collect()
     }
 }
 
@@ -380,7 +426,8 @@ impl CompiledGraph {
         Ok(())
     }
 
-    /// Set a weight from a device pointer (e.g. "fc1.weight"). Zero-copy on device.
+    /// Register a weight from a device pointer (e.g. "fc1.weight"). Zero-copy on device.
+    /// The registration persists across future run() calls.
     /// Requires a GPU backend.
     fn set_weight_device_ptr(
         &mut self,
@@ -396,7 +443,8 @@ impl CompiledGraph {
         let &node_id = self.label_map.get(label).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("No Input node with label: {}", label))
         })?;
-        unsafe { self.runtime.set_device_ptr(node_id, device_ptr, n_bytes) };
+        self.record_static_device_input(node_id, device_ptr, n_bytes);
+        self.apply_static_device_input(node_id);
         Ok(())
     }
 
@@ -441,8 +489,9 @@ impl CompiledGraph {
         Ok(self.runtime.output_is_zero_copy(*node_id))
     }
 
-    /// Set a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
+    /// Register a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
     /// `n_bytes` is the total byte count. `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
+    /// The registration persists across future run() calls.
     fn set_weight_from_ptr(
         &mut self,
         label: &str,
@@ -456,13 +505,14 @@ impl CompiledGraph {
         })?;
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
         let typed = TypedData::from_pytorch_bytes(bytes, dtype_code);
-        self.runtime
-            .set_data_bytes(node_id, typed.bytes, typed.dtype);
+        self.record_static_host_input(node_id, typed);
+        self.apply_static_host_input(node_id);
         Ok(())
     }
 
     /// Execute the graph.
     fn run(&mut self) {
+        self.rehydrate_static_inputs();
         self.runtime.execute(&self.graph.dyn_map);
     }
 
@@ -535,5 +585,52 @@ impl CompiledGraph {
                 .copy_output_to_device_ptr(*node_id, dest_ptr, n_bytes)
         };
         Ok(())
+    }
+}
+
+impl CompiledGraph {
+    fn record_static_host_input(&mut self, node_id: NodeIndex, typed: TypedData) {
+        self.static_device_inputs.remove(&node_id);
+        self.static_host_inputs.insert(node_id, typed);
+    }
+
+    fn record_static_device_input(&mut self, node_id: NodeIndex, device_ptr: u64, n_bytes: usize) {
+        self.static_host_inputs.remove(&node_id);
+        self.static_device_inputs
+            .insert(node_id, (device_ptr, n_bytes));
+    }
+
+    fn apply_static_host_input(&mut self, node_id: NodeIndex) {
+        if let Some(typed) = self.static_host_inputs.get(&node_id) {
+            self.runtime
+                .set_data_bytes(node_id, typed.bytes.clone(), typed.dtype);
+        }
+    }
+
+    fn apply_static_device_input(&mut self, node_id: NodeIndex) {
+        if let Some(&(device_ptr, n_bytes)) = self.static_device_inputs.get(&node_id) {
+            unsafe { self.runtime.set_device_ptr(node_id, device_ptr, n_bytes) };
+        }
+    }
+
+    fn rehydrate_static_inputs(&mut self) {
+        let static_device_inputs: Vec<(NodeIndex, u64, usize)> = self
+            .static_device_inputs
+            .iter()
+            .map(|(&node_id, &(device_ptr, n_bytes))| (node_id, device_ptr, n_bytes))
+            .collect();
+        for (node_id, device_ptr, n_bytes) in static_device_inputs {
+            unsafe { self.runtime.set_device_ptr(node_id, device_ptr, n_bytes) };
+        }
+
+        let static_host_inputs: Vec<(NodeIndex, TypedData)> = self
+            .static_host_inputs
+            .iter()
+            .map(|(&node_id, typed)| (node_id, typed.clone()))
+            .collect();
+        for (node_id, typed) in static_host_inputs {
+            self.runtime
+                .set_data_bytes(node_id, typed.bytes, typed.dtype);
+        }
     }
 }

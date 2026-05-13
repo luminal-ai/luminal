@@ -504,7 +504,7 @@ pub fn hash_serialized_egraph(egraph: &SerializedEGraph) -> u64 {
 /// - CustomOpKind integer IDs (global custom_ops index, differs per layer)
 ///
 /// This function hashes the text while normalizing those chunk-specific values:
-/// - Input lines: only the dtype and persistence are hashed (not node index or label)
+/// - Input lines: only the dtype is hashed (not node index or label)
 /// - Output lines: only the "OUTPUT" marker is hashed (not the node index)
 /// - CustomOpKind lines: the integer ID is replaced with a constant
 /// - All other lines (ops, shapes, strides): hashed verbatim
@@ -513,29 +513,18 @@ pub fn hash_egglog_normalized(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     for line in text.lines() {
         if line.contains("(Input ") {
-            // Format: (let tN (Input NODE "LABEL" (DTYPE) PERSISTENT))
+            // Format: (let tN (Input NODE "LABEL" (DTYPE)))
             // Strip the node index and label identity, but preserve whether this
             // is a synthetic boundary input or a real graph input.
-            // The dtype is the last parenthesized token, e.g. "(F32)", followed
-            // by the explicit persistence bit.
+            // The dtype is the last parenthesized token, e.g. "(F32)".
             if let Some(dtype_start) = line.rfind(" (") {
-                let dtype_slice = &line[dtype_start + 1..];
-                if let Some(dtype_end) = dtype_slice.find(')') {
-                    let dtype = &dtype_slice[..=dtype_end];
-                    let persistent = if dtype_slice[dtype_end + 1..].contains(" true") {
-                        "PERSISTENT"
-                    } else {
-                        "EPHEMERAL"
-                    };
-                    let kind = if line.contains("\"boundary\"") {
-                        "BOUNDARY_INPUT"
-                    } else {
-                        "REAL_INPUT"
-                    };
-                    (kind, dtype, persistent).hash(&mut hasher);
+                let dtype = &line[dtype_start + 1..];
+                let kind = if line.contains("\"boundary\"") {
+                    "BOUNDARY_INPUT"
                 } else {
-                    line.hash(&mut hasher);
-                }
+                    "REAL_INPUT"
+                };
+                (kind, dtype).hash(&mut hasher);
             } else {
                 line.hash(&mut hasher);
             }
@@ -3041,7 +3030,7 @@ mod tests {
     fn runs_late_pass_after_full_cleanup() {
         let ops = <HLIROps as IntoEgglogOp>::into_vec();
         let program = r#"
-            (let t0 (Input 0 "" (F32) false))
+            (let t0 (Input 0 "" (F32)))
             (let t1 (Output t0 0))
         "#;
         let late_pass = LateEgglogPass::new(
