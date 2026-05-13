@@ -174,8 +174,13 @@ fn decoder_self_attention(
     let k_cache_out = k_new.scatter(scatter_idx, k_cache_in);
     let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
 
-    let k_full = k_cache_out.slice((.., ..total, ..));
-    let v_full = v_cache_out.slice((.., ..total, ..));
+    let mut k_full = k_cache_out.slice((.., ..total, ..));
+    let mut v_full = v_cache_out.slice((.., ..total, ..));
+    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
+    // cannot yet propagate expression-bound assertions, so `slice` reports
+    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total`.
+    k_full.shape.dims[1] = total;
+    v_full.shape.dims[1] = total;
 
     let q = split_heads(q);
 
