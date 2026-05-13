@@ -49,7 +49,7 @@ impl KernelOp for RoPEKernel {
         let s = self.s;
         let h = self.h;
         let d = self.d;
-        assert!(d % 2 == 0, "RoPE head_dim must be even");
+        assert!(d.is_multiple_of(2), "RoPE head_dim must be even");
         let kernel = format!(
             r#"
 extern "C" __global__ void rope_kernel(
@@ -159,8 +159,16 @@ impl CustomOp for RoPECustom {
 /// Returns `(S, H, D)` F32.
 pub fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor {
     assert_eq!(x.dtype, DType::F32, "RoPE x must be F32");
-    let cos = if cos.dtype == DType::F32 { cos } else { cos.cast(DType::F32) };
-    let sin = if sin.dtype == DType::F32 { sin } else { sin.cast(DType::F32) };
+    let cos = if cos.dtype == DType::F32 {
+        cos
+    } else {
+        cos.cast(DType::F32)
+    };
+    let sin = if sin.dtype == DType::F32 {
+        sin
+    } else {
+        sin.cast(DType::F32)
+    };
     let x_dims = x.dims();
     assert_eq!(x_dims.len(), 3, "RoPE x must be 3-D (S, H, D)");
     let s = x_dims[0].to_usize().expect("RoPE: S must be static");
@@ -177,10 +185,5 @@ pub fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTe
 
     let kern = RoPEKernel { s, h, d };
     let cx = unsafe { &mut *x.graph_ref };
-    cx.custom_op(
-        RoPECustom(kern),
-        vec![x, cos, sin],
-        (s, h, d),
-        DType::F32,
-    )
+    cx.custom_op(RoPECustom(kern), vec![x, cos, sin], (s, h, d), DType::F32)
 }

@@ -76,8 +76,7 @@
 //!   are unit-tested against a Rust scalar reference in the test module at
 //!   the bottom of this file.
 
-use luminal::{dtype::DType, graph::Graph, prelude::*, shape::Expression};
-use luminal_nn::LayerNorm;
+use luminal::{dtype::DType, graph::Graph, prelude::*};
 
 // ── architecture constants for `black-forest-labs/FLUX.2-dev` ───────────────
 //
@@ -98,13 +97,10 @@ pub fn num_single_layers() -> usize {
         .and_then(|s| s.parse().ok())
         .unwrap_or(48)
 }
-pub const NUM_LAYERS: usize = 8;
-pub const NUM_SINGLE_LAYERS: usize = 48;
 pub const NUM_HEADS: usize = 48;
 pub const HEAD_DIM: usize = 128;
 pub const HIDDEN: usize = NUM_HEADS * HEAD_DIM; // 6144
-pub const MLP_RATIO: f32 = 3.0;
-pub const MLP_HIDDEN: usize = 18432; // (HIDDEN as f32 * MLP_RATIO) as usize
+pub const MLP_HIDDEN: usize = 18432;
 pub const JOINT_ATTENTION_DIM: usize = 15360;
 pub const TIMESTEP_GUIDANCE_CHANNELS: usize = 256;
 pub const IN_CHANNELS: usize = 128;
@@ -221,7 +217,7 @@ fn sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
 fn swiglu(x: GraphTensor) -> GraphTensor {
     let dims = x.dims();
     let last = dims[dims.len() - 1].to_usize().expect("static");
-    assert!(last % 2 == 0);
+    assert!(last.is_multiple_of(2));
     let half = last / 2;
     match dims.len() {
         2 => {
@@ -441,10 +437,10 @@ impl DoubleStreamAttn {
         let v = v.transpose(0, 1);
 
         let attn = sdpa(q, k, v); // (S_total, H, D)
-        // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K
-        // stride for the next matmul (the o_proj path). Without
-        // `* 1.0` the cublaslt 2D rule can't match and the broadcast
-        // Mul intermediate is ~36 GB BF16 at flux2 dimensions.
+                                  // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K
+                                  // stride for the next matmul (the o_proj path). Without
+                                  // `* 1.0` the cublaslt 2D rule can't match and the broadcast
+                                  // Mul intermediate is ~36 GB BF16 at flux2 dimensions.
         let attn = attn.merge_dims(1, 2) * 1.0_f32; // (S_total, HIDDEN)
 
         // Split back into txt + img streams.
@@ -873,8 +869,7 @@ impl Flux2Transformer {
     /// - `timestep`, `guidance`: `(1,)` F32 scalars set per step (already
     ///   scaled by 1000).
     ///
-    /// Returns `(S_img, IN_CHANNELS)` — the model's velocity prediction the
-    /// scheduler integrates.
+    /// Returns the model's velocity prediction the scheduler integrates.
     pub fn forward(
         &self,
         latent: GraphTensor,
@@ -884,62 +879,29 @@ impl Flux2Transformer {
         timestep: GraphTensor,
         guidance: GraphTensor,
     ) -> GraphTensor {
-        self.forward_with_internals(latent, text_embed, rope_cos, rope_sin, timestep, guidance)
-            .0
-    }
-
-    /// Same as `forward` but also returns a Vec<(name, GraphTensor)> of
-    /// intermediate values for numerics-comparison against diffusers'
-    /// `dump_transformer_internals.py`. Names match the diffusers
-    /// dump's `tx_*` keys.
-    pub fn forward_with_internals(
-        &self,
-        latent: GraphTensor,
-        text_embed: GraphTensor,
-        rope_cos: GraphTensor,
-        rope_sin: GraphTensor,
-        timestep: GraphTensor,
-        guidance: GraphTensor,
-    ) -> (GraphTensor, Vec<(String, GraphTensor)>) {
-        let mut dumps: Vec<(String, GraphTensor)> = Vec::new();
         let temb = self.embed_time(timestep, guidance);
-        dumps.push(("temb".into(), temb));
-
         let mod_img = modulation(temb, self.mod_img);
         let mod_txt = modulation(temb, self.mod_txt);
         let mod_single = modulation(temb, self.mod_single);
-        dumps.push(("mod_img".into(), mod_img));
-        dumps.push(("mod_txt".into(), mod_txt));
-        dumps.push(("mod_single".into(), mod_single));
 
         let mut img = linear_no_bias(latent, self.x_embedder);
         let mut txt = linear_no_bias(text_embed, self.context_embedder);
-        dumps.push(("x_embedded".into(), img));
-        dumps.push(("context_embedded".into(), txt));
 
-        for (idx, block) in self.transformer_blocks.iter().enumerate() {
+        for block in self.transformer_blocks.iter() {
             let (i, t) = block.forward(img, txt, mod_img, mod_txt, rope_cos, rope_sin);
             img = i;
             txt = t;
-            if idx < 3 {
-                dumps.push((format!("after_double_{idx}_img"), img));
-                dumps.push((format!("after_double_{idx}_txt"), txt));
-            }
         }
 
         let s_img = img.dims()[0].to_usize().expect("S_img static");
         let s_txt = txt.dims()[0].to_usize().expect("S_txt static");
         let mut hidden = txt.concat_along(img, 0); // (S_txt + S_img, HIDDEN)
 
-        for (idx, block) in self.single_transformer_blocks.iter().enumerate() {
+        for block in self.single_transformer_blocks.iter() {
             hidden = block.forward(hidden, mod_single, rope_cos, rope_sin);
-            if idx < 3 {
-                dumps.push((format!("after_single_{idx}"), hidden));
-            }
         }
 
         // Drop text prefix.
-        let _ = s_txt;
         let img = hidden.slice((s_txt..s_txt + s_img, ..));
 
         // AdaLayerNormContinuous: scale, shift = chunk(linear(silu(temb)), 2).
@@ -950,7 +912,7 @@ impl Flux2Transformer {
         let normed = layernorm_noaffine(img, RMS_EPS);
         let modulated = ada_modulate(normed, scale, shift);
 
-        (linear_no_bias(modulated, self.proj_out), dumps)
+        linear_no_bias(modulated, self.proj_out)
     }
 }
 
@@ -1035,7 +997,9 @@ mod tests {
     ///
     /// Layout per the diffusers Flux 2 pipeline:
     ///   * txt rows: `(0, 0, 0, l)` — only axis-3 (l) varies.
-    ///   * img rows: `(0, h, w, 0)` cartesian-product order — axes 1 and 2 vary.
+    ///   * img rows: `(0, h, w, 0)` cartesian-product order — axes 1 and 2
+    ///     vary.
+    ///
     /// So row 5 (= last img token at `h=1, w=1`) has its axis-1 contribution
     /// at `cos[32..64]` and axis-2 contribution at `cos[64..96]`, both
     /// non-trivial; axes 0 and 3 stay at zero.
@@ -1074,7 +1038,7 @@ mod tests {
             assert!((row5(64 + i) - want).abs() < 1e-5);
         }
         let expected_sin = [
-            0.8414710, 0.8414710, 0.5825398, 0.5825398, 0.3771317, 0.3771317,
+            0.841_471, 0.841_471, 0.5825398, 0.5825398, 0.3771317, 0.3771317,
         ];
         for (i, &want) in expected_sin.iter().enumerate() {
             assert!((row5_sin(32 + i) - want).abs() < 1e-5);

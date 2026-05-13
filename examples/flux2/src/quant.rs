@@ -238,12 +238,7 @@ mod tests {
         // E4M3 finite range. Avoid 0xFF (NaN). The pattern repeats per row.
         let fp8_pattern: [u8; N_BLOCKS] = [0x38, 0x3C]; // -> 1.0, 1.5
         let fp8_bytes: Vec<u8> = (0..OUT)
-            .flat_map(|r| {
-                fp8_pattern
-                    .iter()
-                    .enumerate()
-                    .map(move |(b, p)| p ^ ((r as u8) << 4))
-            })
+            .flat_map(|r| fp8_pattern.iter().map(move |p| p ^ ((r as u8) << 4)))
             .collect();
         let scale_2_value: f32 = 0.25;
 
@@ -257,7 +252,7 @@ mod tests {
                     let i = blk * NVFP4_BLOCK + k;
                     let flat = o * IN + i;
                     let byte = packed[flat / 2];
-                    let nibble = if flat % 2 == 0 {
+                    let nibble = if flat.is_multiple_of(2) {
                         (byte & 0xF) as usize
                     } else {
                         ((byte >> 4) & 0xF) as usize

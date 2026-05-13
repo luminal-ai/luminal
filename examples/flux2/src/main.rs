@@ -60,69 +60,6 @@ fn env_f32(name: &str, default: f32) -> f32 {
         .unwrap_or(default)
 }
 
-/// Numerics-comparison harness. When `DUMP_REFS=1` is set, write a Vec<f32>
-/// to `examples/flux2/reference/{name}.bin` (raw little-endian F32) plus a
-/// `.shape` sidecar. Compare with `scripts/dump_reference.py` outputs from
-/// diffusers. The directory is git-ignored so dumps don't pollute commits.
-fn dump_ref(name: &str, data: &[f32], shape: &[usize]) {
-    if std::env::var("DUMP_REFS").is_err() {
-        return;
-    }
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("dump_ref: failed to create dir {}: {}", dir.display(), e);
-        return;
-    }
-    let bytes = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
-    if let Err(e) = std::fs::write(dir.join(format!("ours_{name}.bin")), bytes) {
-        eprintln!("dump_ref({name}): {}", e);
-        return;
-    }
-    let shape_str: String = shape
-        .iter()
-        .map(|d| d.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    let _ = std::fs::write(dir.join(format!("ours_{name}.shape")), shape_str);
-    let mn = data.iter().copied().fold(f32::INFINITY, f32::min);
-    let mx = data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mean = data.iter().sum::<f32>() / data.len() as f32;
-    eprintln!(
-        "  ours_{name}: shape={shape:?} min={mn:+.4} max={mx:+.4} mean={mean:+.4}"
-    );
-}
-
-/// Load a reference tensor previously written by `dump_reference.py`. Returns
-/// None if not found or shape mismatch. Used by `LOAD_REF_*` overrides to
-/// substitute diffusers' tensors at specific stages so we can isolate which
-/// stage diverges.
-fn load_ref(name: &str, expected_len: usize) -> Option<Vec<f32>> {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference");
-    let path = dir.join(format!("{name}.bin"));
-    let bytes = std::fs::read(&path).ok()?;
-    if bytes.len() != expected_len * 4 {
-        eprintln!(
-            "load_ref({name}): file has {} bytes, expected {} (={}×F32)",
-            bytes.len(),
-            expected_len * 4,
-            expected_len,
-        );
-        return None;
-    }
-    let mut out = vec![0f32; expected_len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            out.as_mut_ptr() as *mut u8,
-            bytes.len(),
-        );
-    }
-    eprintln!("  loaded {} ({} f32)", path.display(), expected_len);
-    Some(out)
-}
-
 /// Override-able via `TEXT_LEN=N` for testing. Diffusers' Flux 2 pipeline
 /// pads to 512; smaller works for the text encoder's transformer compile to
 /// fit in fewer GPU temp buffers during search.
@@ -193,16 +130,6 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
     let tokenizer = Tokenizer::from_file(&tok_path).map_err(|e| format!("tokenizer: {e}"))?;
     let text_len = text_len();
     let (ids, real_len) = tokenize_prompt(&tokenizer, prompt, text_len)?;
-    if std::env::var("DUMP_REFS").is_ok() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference");
-        let _ = std::fs::create_dir_all(&dir);
-        let bytes: Vec<u8> = ids.iter()
-            .flat_map(|&i| (i as i32).to_le_bytes())
-            .collect();
-        let _ = std::fs::write(dir.join("ours_input_ids.bin"), bytes);
-        eprintln!("  ours_input_ids: real_len={}, first 15: {:?}", real_len, &ids[..15.min(ids.len())]);
-        eprintln!("  ours_input_ids: pos 35..40: {:?}", &ids[35..40.min(ids.len())]);
-    }
     println!(
         "  prompt → {} ids ({} real, padded to {})",
         ids.len(),
@@ -228,7 +155,10 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
     let features = encoder.forward(input_ids, pos_ids, attention_mask).output();
     // Memory-budget enforcement is opt-in (the estimator over-counts; see
     // the matching comment in `run_vae_only`). Set `TEXT_MEM_GIB` to opt in.
-    if let Ok(g) = std::env::var("TEXT_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(g) = std::env::var("TEXT_MEM_GIB").and_then(|s| {
+        s.parse::<usize>()
+            .map_err(|_| std::env::VarError::NotPresent)
+    }) {
         cx.build_search_space_with_options::<CudaRuntime>(
             BuildSearchSpaceOptions::new().max_memory_gib(g),
         );
@@ -273,7 +203,6 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
         text_len,
         text_encoder::OUTPUT_DIM,
     );
-    dump_ref("prompt_embeds", &out, &[1, text_len, text_encoder::OUTPUT_DIM]);
     Ok(out)
 }
 
@@ -306,18 +235,7 @@ fn run_full_pipeline(
     let s_txt = text_len();
 
     // ── 1. TEXT ENCODE ─────────────────────────────────────────────────────────
-    let text_features = if std::env::var("LOAD_REF_TEXT").is_ok() {
-        // Numerics-bisect: substitute diffusers' exact prompt_embeds for
-        // ours so divergence in the downstream transformer can be
-        // attributed to the transformer itself, not text-encoder drift.
-        load_ref(
-            "prompt_embeds",
-            s_txt * text_encoder::OUTPUT_DIM,
-        )
-        .expect("LOAD_REF_TEXT=1 set but reference/prompt_embeds.bin missing or wrong size")
-    } else {
-        run_text_encoder(prompt)?
-    };
+    let text_features = run_text_encoder(prompt)?;
     assert_eq!(text_features.len(), s_txt * text_encoder::OUTPUT_DIM);
 
     // ── 2. DIFFUSION LOOP ──────────────────────────────────────────────────────
@@ -346,20 +264,11 @@ fn run_full_pipeline(
     let s_total = s_txt + s_img;
     assert_eq!(rope_cos.len(), s_total * transformer::HEAD_DIM);
 
-    // Initial noise latent in (S_img, IN_CHANNELS) layout. By default
-    // we generate fresh Gaussian noise; with `LOAD_REF_NOISE=1` set, we
-    // load diffusers' `transformer_in_step0` so a side-by-side numerics
-    // run starts from the same noise.
+    // Initial noise latent in (S_img, IN_CHANNELS) layout.
     let mut rng = StdRng::seed_from_u64(env_usize("SEED", 0) as u64);
-    let mut latent: Vec<f32> = if std::env::var("LOAD_REF_NOISE").is_ok() {
-        load_ref("transformer_in_step0", s_img * transformer::IN_CHANNELS)
-            .expect("LOAD_REF_NOISE=1 set but transformer_in_step0.bin missing or wrong size")
-    } else {
-        (0..s_img * transformer::IN_CHANNELS)
-            .map(|_| rng.sample::<f32, _>(StandardNormal))
-            .collect()
-    };
-    dump_ref("noise_latent", &latent, &[1, s_img, transformer::IN_CHANNELS]);
+    let mut latent: Vec<f32> = (0..s_img * transformer::IN_CHANNELS)
+        .map(|_| rng.sample::<f32, _>(StandardNormal))
+        .collect();
 
     println!("Building transformer graph...");
     let mut cx = Graph::default();
@@ -383,20 +292,15 @@ fn run_full_pipeline(
     let guidance_in = cx.named_tensor("__guidance", 1).persist();
 
     let model = transformer::Flux2Transformer::init(&mut cx);
-    let (vel_raw, internals) = model.forward_with_internals(
-        latent_in, text_in, cos_in, sin_in, timestep_in, guidance_in,
-    );
-    let velocity = vel_raw.output();
-    // Promote each internal to a graph output so we can read its
-    // value via `runtime.get_f32` after execute, and compare to
-    // diffusers' matching `tx_*` dump.
-    let internal_outputs: Vec<(String, GraphTensor)> = internals
-        .into_iter()
-        .map(|(name, t)| (name, t.output()))
-        .collect();
+    let velocity = model
+        .forward(latent_in, text_in, cos_in, sin_in, timestep_in, guidance_in)
+        .output();
 
     println!("Building search space (this is the long step — many minutes for the full DiT)...");
-    if let Ok(g) = std::env::var("TX_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(g) = std::env::var("TX_MEM_GIB").and_then(|s| {
+        s.parse::<usize>()
+            .map_err(|_| std::env::VarError::NotPresent)
+    }) {
         cx.build_search_space_with_options::<CudaRuntime>(
             BuildSearchSpaceOptions::new().max_memory_gib(g),
         );
@@ -459,29 +363,6 @@ fn run_full_pipeline(
         runtime.set_data(timestep_in, vec![t / 1000.0]);
         runtime.execute(&cx.dyn_map);
         let v = runtime.get_f32(velocity);
-        if i == 0 {
-            dump_ref(
-                "velocity_step0",
-                &v[..s_img * transformer::IN_CHANNELS],
-                &[1, s_img, transformer::IN_CHANNELS],
-            );
-            // Dump the same `tx_*` intermediates diffusers'
-            // `dump_transformer_internals.py` captures, so
-            // `compare_refs.py` can show exactly which stage
-            // diverges.
-            if std::env::var("DUMP_REFS").is_ok() {
-                for (name, gt) in &internal_outputs {
-                    let buf = runtime.get_f32(*gt);
-                    let dims = gt.dims();
-                    let shape: Vec<usize> = dims
-                        .iter()
-                        .map(|d| d.to_usize().expect("static dim"))
-                        .collect();
-                    let n_elems: usize = shape.iter().product();
-                    dump_ref(&format!("tx_{name}"), &buf[..n_elems], &shape);
-                }
-            }
-        }
         // Euler integrate: latent += (sigma_next - sigma) * v
         euler_step(&mut latent, &v, sigmas[i], sigmas[i + 1]);
         println!(
@@ -515,25 +396,19 @@ fn run_full_pipeline(
     const BN_EPS: f32 = 1e-4; // matches vae/config.json batch_norm_eps=0.0001
     let bn_std: Vec<f32> = bn_var.iter().map(|v| (v + BN_EPS).sqrt()).collect();
 
-    let unpacked = unpack_packed_host(
-        &latent,
-        transformer::IN_CHANNELS,
-        h_pack,
-        w_pack,
-    );
-    dump_ref("vae_packed_latent", &latent, &[1, h_pack * w_pack, transformer::IN_CHANNELS]);
-    dump_ref("vae_unpacked", &unpacked, &[1, transformer::IN_CHANNELS, h_pack, w_pack]);
+    let unpacked = unpack_packed_host(&latent, transformer::IN_CHANNELS, h_pack, w_pack);
     let denormed = bn_inverse_host(&unpacked, &bn_mean, &bn_std, transformer::IN_CHANNELS);
-    dump_ref("vae_bn_inversed", &denormed, &[1, transformer::IN_CHANNELS, h_pack, w_pack]);
     let vae_input = unpatchify_host(&denormed, LATENT_CHANNELS, h_pack, w_pack);
     assert_eq!(vae_input.len(), LATENT_CHANNELS * h_lat * w_lat);
-    dump_ref("vae_input", &vae_input, &[1, LATENT_CHANNELS, h_lat, w_lat]);
 
     let mut cx = Graph::default();
     let latent_in = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
     let decoder = VaeDecoder::new(&mut cx);
     let out = decoder.forward(latent_in).output();
-    if let Ok(g) = std::env::var("VAE_MEM_GIB").and_then(|s| s.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+    if let Ok(g) = std::env::var("VAE_MEM_GIB").and_then(|s| {
+        s.parse::<usize>()
+            .map_err(|_| std::env::VarError::NotPresent)
+    }) {
         cx.build_search_space_with_options::<CudaRuntime>(
             BuildSearchSpaceOptions::new().max_memory_gib(g),
         );
@@ -552,21 +427,6 @@ fn run_full_pipeline(
     // VaeDecoder output is in roughly [-1, 1] range. Diffusers'
     // ImageProcessor.postprocess does `((x + 1) / 2).clamp(0, 1)` for
     // output_type="pt".
-    dump_ref(
-        "vae_raw_decoded",
-        &img[..3 * height * width],
-        &[1, 3, height, width],
-    );
-    let final_image: Vec<f32> = img[..3 * height * width]
-        .iter()
-        .map(|&x| ((x + 1.0) * 0.5).clamp(0.0, 1.0))
-        .collect();
-    dump_ref(
-        "vae_final_image",
-        &final_image,
-        &[1, 3, height, width],
-    );
-    dump_ref("final_image", &img[..3 * height * width], &[3, height, width]);
     save_png("out.png", &img, width, height)?;
     println!("Wrote out.png");
     Ok(())
@@ -694,4 +554,3 @@ fn save_png(path: &str, chw: &[f32], w: usize, h: usize) -> Result<(), Box<dyn s
     encoder.write_header()?.write_image_data(&bytes)?;
     Ok(())
 }
-

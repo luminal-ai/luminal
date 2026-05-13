@@ -113,10 +113,10 @@ mod tests {
 
         let (sigmas, timesteps) = make_schedule(&cfg, 8, mu);
         let expected_sigmas = [
-            1.0, 0.9499281, 0.8877230, 0.8083667, 0.7036315, 0.5590252, 0.3464282, 0.0031514, 0.0,
+            1.0, 0.9499281, 0.887_723, 0.8083667, 0.7036315, 0.5590252, 0.3464282, 0.0031514, 0.0,
         ];
         let expected_timesteps = [
-            1000.0, 949.9281, 887.7230, 808.3667, 703.6315, 559.0252, 346.4282, 3.1514,
+            1000.0, 949.9281, 887.723, 808.3667, 703.6315, 559.0252, 346.4282, 3.1514,
         ];
         assert_eq!(sigmas.len(), expected_sigmas.len());
         for (got, want) in sigmas.iter().zip(expected_sigmas.iter()) {

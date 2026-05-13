@@ -305,7 +305,11 @@ pub fn linear_bias(a: GraphTensor, b: GraphTensor, bias: GraphTensor) -> GraphTe
 /// `CUBLAS_COMPUTE_32F_FAST_16BF` — Hopper's native 2× BF16 path.
 pub fn linear_no_bias_bf16_w(a: GraphTensor, b_bf16: GraphTensor) -> GraphTensor {
     assert_eq!(a.dtype, DType::F32, "linear_no_bias_bf16_w expects F32 A");
-    assert_eq!(b_bf16.dtype, DType::Bf16, "linear_no_bias_bf16_w expects BF16 B");
+    assert_eq!(
+        b_bf16.dtype,
+        DType::Bf16,
+        "linear_no_bias_bf16_w expects BF16 B"
+    );
     let a_dims = a.dims();
     let b_dims = b_bf16.dims();
     assert_eq!(a_dims.len(), 2);
@@ -365,16 +369,24 @@ fn matmul_inner(
     };
 
     let m = a_dims[a_off].to_usize().expect("M must be a static dim");
-    let k_a = a_dims[a_off + 1].to_usize().expect("K (A) must be a static dim");
+    let k_a = a_dims[a_off + 1]
+        .to_usize()
+        .expect("K (A) must be a static dim");
     let (n, k_b) = if transpose_b {
         // B per-batch is (N, K)
         let n = b_dims[a_off].to_usize().expect("N must be a static dim");
-        let k = b_dims[a_off + 1].to_usize().expect("K (B) must be a static dim");
+        let k = b_dims[a_off + 1]
+            .to_usize()
+            .expect("K (B) must be a static dim");
         (n, k)
     } else {
         // B per-batch is (K, N)
-        let k = b_dims[a_off].to_usize().expect("K (B) must be a static dim");
-        let n = b_dims[a_off + 1].to_usize().expect("N must be a static dim");
+        let k = b_dims[a_off]
+            .to_usize()
+            .expect("K (B) must be a static dim");
+        let n = b_dims[a_off + 1]
+            .to_usize()
+            .expect("N must be a static dim");
         (n, k)
     };
     assert_eq!(k_a, k_b, "matmul K mismatch: A K={k_a}, B K={k_b}");

@@ -241,8 +241,7 @@ pub(crate) fn build_compile_units(
                                 "FusionStart panic: fe={} (kernel={:?})",
                                 node.index(),
                                 llir_graph.node_weight(node).and_then(|op| {
-                                    op.to_dialect::<dyn KernelOp>()
-                                        .map(|k| k.kernel_name())
+                                    op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
                                 }),
                             );
                             eprintln!("  fs_topo ({}):", fs_topo.len());
@@ -256,8 +255,7 @@ pub(crate) fn build_compile_units(
                                 let kn = llir_graph
                                     .node_weight(f)
                                     .and_then(|op| {
-                                        op.to_dialect::<dyn KernelOp>()
-                                            .map(|k| k.kernel_name())
+                                        op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
                                     })
                                     .unwrap_or("?");
                                 eprintln!(
@@ -273,8 +271,7 @@ pub(crate) fn build_compile_units(
                                 let kn = llir_graph
                                     .node_weight(i)
                                     .and_then(|op| {
-                                        op.to_dialect::<dyn KernelOp>()
-                                            .map(|k| k.kernel_name())
+                                        op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
                                     })
                                     .unwrap_or("?");
                                 eprintln!("    interior={} kind={}", i.index(), kn);

@@ -147,12 +147,6 @@ pub struct OpTextParts {
     /// Used by the Rust post-processing pass to safely strip HLIR ops only
     /// when an alternative survives in the same eclass.
     pub(crate) cleanable_op_names: FxHashSet<String>,
-    /// All registered op kind names (cleanable + non-cleanable). Used to
-    /// gate kernel-alternative injection to kinds the active runtime
-    /// actually defines — without this gate, the native runtime tests
-    /// would synthesise CUDA-only KernelMul/etc. enodes whose extract()
-    /// path panics with "not yet implemented".
-    pub(crate) all_op_names: FxHashSet<String>,
     late_program: String,
     rewrites: String,
     late_phases: Vec<EgglogSchedulePhase>,
@@ -174,8 +168,6 @@ impl OpTextParts {
             .filter(|op| op.cleanup())
             .map(|op| op.sort().name.to_string())
             .collect();
-        let all_op_names: FxHashSet<String> =
-            ops.iter().map(|op| op.sort().name.to_string()).collect();
         Self {
             op_defs: op_defs_string(ops),
             // The egglog `cleanup` ruleset deletes HLIR ops unconditionally,
@@ -195,7 +187,6 @@ impl OpTextParts {
             } else {
                 FxHashSet::default()
             },
-            all_op_names,
             late_program: late_passes.iter().map(|p| p.program.as_str()).join("\n"),
             late_phases: late_passes
                 .iter()
@@ -1117,18 +1108,6 @@ fn run_schedule_phase(
 }
 
 #[tracing::instrument(skip_all)]
-/// Walk the serialized e-graph and, for every Op eclass whose only OpKind is
-/// an HLIR kind in `hlir_to_kernel`, inject a synthetic kernel alternative.
-/// New nodes get unique synthetic IDs ("synthN") so they don't collide.
-///
-/// Caveats:
-/// - We assume the kernel kind has the same fields as the HLIR kind plus a
-///   trailing `dtype` field, defaulted to F32 when no dtype is around.
-/// - The result is not "rewritten via egglog rules" — it's a Rust-level
-///   patch. The kernel's `extract` reads field children directly, which
-///   matches what the egglog rules would have produced.
-
-
 pub fn run_egglog_with_report(
     program: &str,
     root: &str,

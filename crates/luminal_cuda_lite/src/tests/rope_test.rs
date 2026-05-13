@@ -4,7 +4,7 @@ use luminal::{graph::Graph, op::Runtime};
 use crate::{kernel::apply_rope, runtime::CudaRuntime};
 
 fn cpu_rope(x: &[f32], cos: &[f32], sin: &[f32], s: usize, h: usize, d: usize) -> Vec<f32> {
-    assert!(d % 2 == 0);
+    assert!(d.is_multiple_of(2));
     let mut out = vec![0.0f32; s * h * d];
     for si in 0..s {
         for hi in 0..h {
@@ -77,9 +77,15 @@ fn rope_flux2_shape() {
 
     use rand::{Rng, SeedableRng};
     let mut rng = rand::rngs::SmallRng::seed_from_u64(11);
-    let x_data: Vec<f32> = (0..s * h * d).map(|_| rng.random_range(-2.0..2.0_f32)).collect();
-    let cos_data: Vec<f32> = (0..s * d).map(|_| rng.random_range(-1.0..1.0_f32)).collect();
-    let sin_data: Vec<f32> = (0..s * d).map(|_| rng.random_range(-1.0..1.0_f32)).collect();
+    let x_data: Vec<f32> = (0..s * h * d)
+        .map(|_| rng.random_range(-2.0..2.0_f32))
+        .collect();
+    let cos_data: Vec<f32> = (0..s * d)
+        .map(|_| rng.random_range(-1.0..1.0_f32))
+        .collect();
+    let sin_data: Vec<f32> = (0..s * d)
+        .map(|_| rng.random_range(-1.0..1.0_f32))
+        .collect();
 
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();

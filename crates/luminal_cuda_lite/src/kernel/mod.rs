@@ -18,14 +18,14 @@ pub mod other_ops;
 pub mod rmsnorm;
 pub mod rope;
 
-pub use conv2d::{conv2d_bias, Conv2DCustom, Conv2DKernel};
+pub use conv2d::{Conv2DCustom, Conv2DKernel, conv2d_bias};
 pub use cuda_graph::*;
 pub use matmul2d::{
-    linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t, matmul_3d, matmul_3d_t,
-    Matmul2DCustom, Matmul2DKernel,
+    Matmul2DCustom, Matmul2DKernel, linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t,
+    matmul_3d, matmul_3d_t,
 };
-pub use rmsnorm::{rmsnorm, RMSNormCustom, RMSNormKernel};
-pub use rope::{apply_rope, RoPECustom, RoPEKernel};
+pub use rmsnorm::{RMSNormCustom, RMSNormKernel, rmsnorm};
+pub use rope::{RoPECustom, RoPEKernel, apply_rope};
 
 pub type Ops = (hlir::Ops, other_ops::Ops, fusion::Ops);
 

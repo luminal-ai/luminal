@@ -12,19 +12,18 @@
 //!   `out[co, ho, wo] = bias[co] + sum_{ci,ki,kj} input[ci, ho*S+ki-P, wo*S+kj-P] * weight[co, ci, ki, kj]`
 //! with bounds checks on the spatial dims for padding. This is far from
 //! peak FLOPs (no shared-memory tiling, no warp-level reduction over K)
-//! but it's correct and the memory footprint is just the input + weight
-//! + bias + output buffers — no `(M, K)` or `(M, N, K)` intermediate, so
-//! it scales linearly with the actual conv FLOPs rather than blowing up
-//! at large H/W like the unfold-based formulation.
+//! but it's correct and the memory footprint is just the input + weight +
+//! bias + output buffers — no `(M, K)` or `(M, N, K)` intermediate, so it
+//! scales linearly with the actual conv FLOPs rather than blowing up at
+//! large H/W like the unfold-based formulation.
 
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::{
-    dtype::DType, graph::Graph, op::CustomOp, op::LLIROp, prelude::GraphTensor,
-    shape::Expression,
-};
 use luminal::prelude::FxHashMap;
+use luminal::{
+    dtype::DType, graph::Graph, op::CustomOp, op::LLIROp, prelude::GraphTensor, shape::Expression,
+};
 
 use crate::compile_module_image_for_current_device;
 use crate::kernel::KernelOp;
@@ -231,9 +230,15 @@ pub fn conv2d_bias(
     let w_in = dims[2].to_usize().expect("W must be a static dim");
 
     let w_dims = weight.dims();
-    assert_eq!(w_dims.len(), 2, "conv2d_bias expects weight (C_out, C_in*K*K)");
+    assert_eq!(
+        w_dims.len(),
+        2,
+        "conv2d_bias expects weight (C_out, C_in*K*K)"
+    );
     let c_out = w_dims[0].to_usize().expect("C_out must be a static dim");
-    let w_kk = w_dims[1].to_usize().expect("weight inner dim must be static");
+    let w_kk = w_dims[1]
+        .to_usize()
+        .expect("weight inner dim must be static");
     assert_eq!(
         w_kk,
         c_in * kernel * kernel,

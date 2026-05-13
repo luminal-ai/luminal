@@ -201,12 +201,7 @@ impl CudaGraphOp {
     /// the CUDA graph with `prev_graph_node` as its sole dependency,
     /// which serializes them.
     pub fn kernel_topo_order(&self) -> Vec<NodeIndex> {
-        self.state
-            .borrow()
-            .kernels
-            .iter()
-            .map(|k| k.node)
-            .collect()
+        self.state.borrow().kernels.iter().map(|k| k.node).collect()
     }
 
     /// Direct LLIR-node inputs of one kernel inside this CudaGraphOp.

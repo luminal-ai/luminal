@@ -1,10 +1,6 @@
 use cudarc::driver::CudaContext;
 use half::bf16;
-use luminal::{
-    dtype::DType,
-    graph::Graph,
-    op::Runtime,
-};
+use luminal::{dtype::DType, graph::Graph, op::Runtime};
 
 use crate::{kernel::rmsnorm, runtime::CudaRuntime};
 
@@ -76,7 +72,9 @@ fn rmsnorm_flux2_main_shape() {
     // Use values close to typical post-LN activations.
     use rand::{Rng, SeedableRng};
     let mut rng = rand::rngs::SmallRng::seed_from_u64(42);
-    let x_data: Vec<f32> = (0..rows * n).map(|_| rng.random_range(-3.0..3.0_f32)).collect();
+    let x_data: Vec<f32> = (0..rows * n)
+        .map(|_| rng.random_range(-3.0..3.0_f32))
+        .collect();
     let w_data: Vec<f32> = (0..n).map(|_| rng.random_range(0.5..1.5_f32)).collect();
 
     let ctx = CudaContext::new(0).unwrap();
@@ -106,7 +104,10 @@ fn rmsnorm_flux2_main_shape() {
         }
     }
     eprintln!("flux2 shape: max abs err: {max_err}, max rel err: {max_rel}");
-    assert!(max_err < 1e-3, "max abs error {max_err} too high for flux2 shape");
+    assert!(
+        max_err < 1e-3,
+        "max abs error {max_err} too high for flux2 shape"
+    );
 }
 
 #[test]
@@ -124,7 +125,9 @@ fn rmsnorm_text_encoder_shape() {
 
     use rand::{Rng, SeedableRng};
     let mut rng = rand::rngs::SmallRng::seed_from_u64(7);
-    let x_data: Vec<f32> = (0..rows * n).map(|_| rng.random_range(-3.0..3.0_f32)).collect();
+    let x_data: Vec<f32> = (0..rows * n)
+        .map(|_| rng.random_range(-3.0..3.0_f32))
+        .collect();
     let w_data: Vec<f32> = (0..n).map(|_| rng.random_range(0.5..1.5_f32)).collect();
 
     let ctx = CudaContext::new(0).unwrap();
@@ -250,7 +253,9 @@ fn rmsnorm_with_bf16_weight() {
     let y = y.output();
 
     let x_data: Vec<f32> = (0..rows * n).map(|i| ((i as f32) * 0.01).sin()).collect();
-    let w_data_bf16: Vec<bf16> = (0..n).map(|i| bf16::from_f32(1.0 + (i as f32) * 0.001)).collect();
+    let w_data_bf16: Vec<bf16> = (0..n)
+        .map(|i| bf16::from_f32(1.0 + (i as f32) * 0.001))
+        .collect();
     let w_data_f32: Vec<f32> = w_data_bf16.iter().map(|b| b.to_f32()).collect();
 
     let ctx = CudaContext::new(0).unwrap();
@@ -273,5 +278,8 @@ fn rmsnorm_with_bf16_weight() {
         }
     }
     eprintln!("BF16 weight: max abs error: {max_err}");
-    assert!(max_err < 1e-2, "max error {max_err} too high (BF16 precision)");
+    assert!(
+        max_err < 1e-2,
+        "max error {max_err} too high (BF16 precision)"
+    );
 }

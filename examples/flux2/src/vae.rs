@@ -34,7 +34,7 @@
 //! - **`nearest_upsample_2x`** — `expand_dim(broadcast) + merge_dims` on each
 //!   spatial axis, so each pixel is duplicated 2×2.
 
-use luminal::{dtype::DType, graph::Graph, prelude::*, shape::Expression};
+use luminal::{graph::Graph, prelude::*};
 
 /// Standard AutoencoderKL constants for Flux 2.
 pub const LATENT_CHANNELS: usize = 32;
@@ -70,33 +70,14 @@ fn decoder_block_channels(block_idx: usize) -> (usize, usize) {
 // HLIR primitive helpers
 // =============================================================================
 
-/// 2D convolution with bias on a (C_in, H, W) input, weights stored as
-/// `(C_out, C_in, K, K)` flat-loaded, bias as `(C_out,)`.
+/// 2D convolution with bias on a `(C_in, H, W)` input, weights stored as
+/// `(C_out, C_in, K, K)` flat-loaded, bias as `(C_out,)`. Returns
+/// `(C_out, H_out, W_out)` where `H_out = (H + 2*padding - kernel) / stride + 1`.
 ///
-/// Returns `(C_out, H_out, W_out)` where:
-///   H_out = (H + 2*padding - kernel) / stride + 1
-///
-/// Implementation:
-///   * Build the patch matrix `(H_out*W_out, C_in*K*K)` via `unfold` plus
-///     a small permute/merge chain — the unfold output composes cleanly
-///     when consumed by a downstream matmul.
-///   * Matmul against `weight.t()` to get `(H_out*W_out, C_out)`.
-///   * Add the per-channel bias.
-///   * Re-emit the output as a fresh contiguous `(C_out, H_out, W_out)` tensor
-///     via an explicit gather, so chaining many convs together doesn't drag
-///     compounding stride patterns through the optimizer.
-/// Pure-HLIR conv2d-with-bias on a `(C_in, H, W)` input. Weights stored as
-/// `(C_out, C_in*K*K)`, bias as `(C_out,)`. Output: `(C_out, H_out, W_out)`.
-///
-/// Uses [`luminal_cuda_lite::kernel::conv2d_bias`] — a direct conv kernel
-/// (one CUDA thread per output element) that skips the unfold-then-matmul
-/// formulation entirely. The historical fallback through unfold + matmul
-/// + bias was correct but materialized an `(H_out*W_out, C_in*K*K)`
-/// intermediate per conv (~600 MB at 256², ~5 GB at 1024²) that summed
-/// across the decoder's ~30 convs blew out of GPU memory at any
-/// production resolution. The direct kernel needs only the input,
-/// weight, bias, and output buffers — no intermediate matrix — so its
-/// memory footprint is linear in the actual conv FLOPs.
+/// Wraps the direct conv kernel from [`luminal_cuda_lite::kernel::conv2d_bias`]
+/// (one CUDA thread per output element), which avoids materializing the
+/// `(H_out*W_out, C_in*K*K)` unfold intermediate that earlier HLIR-only
+/// implementations needed.
 fn conv2d_bias(
     x: GraphTensor,
     weight: GraphTensor,
@@ -201,11 +182,8 @@ impl ResnetBlock {
             None
         } else {
             Some((
-                cx.named_tensor(
-                    format!("{prefix}.conv_shortcut.weight"),
-                    (out_c, in_c * 1 * 1),
-                )
-                .persist(),
+                cx.named_tensor(format!("{prefix}.conv_shortcut.weight"), (out_c, in_c))
+                    .persist(),
                 cx.named_tensor(format!("{prefix}.conv_shortcut.bias"), out_c)
                     .persist(),
             ))
@@ -415,10 +393,7 @@ pub struct VaeDecoder {
 impl VaeDecoder {
     pub fn new(cx: &mut Graph) -> Self {
         let post_quant_w = cx
-            .named_tensor(
-                "post_quant_conv.weight",
-                (LATENT_CHANNELS, LATENT_CHANNELS * 1 * 1),
-            )
+            .named_tensor("post_quant_conv.weight", (LATENT_CHANNELS, LATENT_CHANNELS))
             .persist();
         let post_quant_b = cx
             .named_tensor("post_quant_conv.bias", LATENT_CHANNELS)
@@ -616,16 +591,19 @@ mod tests {
     fn matmul_3d_matches_reference() {
         let mut rng = StdRng::seed_from_u64(20);
         let (b, m, n, k) = (3usize, 4usize, 5usize, 7usize);
-        let a_data: Vec<f32> = (0..b * m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
-        let b_data: Vec<f32> = (0..b * k * n).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let a_data: Vec<f32> = (0..b * m * k)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let b_data: Vec<f32> = (0..b * k * n)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
         let mut expected = vec![0.0_f32; b * m * n];
         for bi in 0..b {
             for mi in 0..m {
                 for ni in 0..n {
                     let mut s = 0.0_f32;
                     for ki in 0..k {
-                        s += a_data[bi * m * k + mi * k + ki]
-                            * b_data[bi * k * n + ki * n + ni];
+                        s += a_data[bi * m * k + mi * k + ki] * b_data[bi * k * n + ki * n + ni];
                     }
                     expected[bi * m * n + mi * n + ni] = s;
                 }
@@ -646,7 +624,10 @@ mod tests {
             out,
         );
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
-            assert!((g - e).abs() < 1e-3, "matmul_3d mismatch at {i}: got {g}, want {e}");
+            assert!(
+                (g - e).abs() < 1e-3,
+                "matmul_3d mismatch at {i}: got {g}, want {e}"
+            );
         }
     }
 
@@ -657,16 +638,19 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(99);
         let (b, m, k) = (4usize, 8usize, 16usize);
         let n = m;
-        let a_data: Vec<f32> = (0..b * m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
-        let b_data: Vec<f32> = (0..b * n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let a_data: Vec<f32> = (0..b * m * k)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let b_data: Vec<f32> = (0..b * n * k)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
         let mut expected = vec![0.0_f32; b * m * n];
         for bi in 0..b {
             for mi in 0..m {
                 for ni in 0..n {
                     let mut s = 0.0_f32;
                     for ki in 0..k {
-                        s += a_data[bi * m * k + mi * k + ki]
-                            * b_data[bi * n * k + ni * k + ki];
+                        s += a_data[bi * m * k + mi * k + ki] * b_data[bi * n * k + ni * k + ki];
                     }
                     expected[bi * m * n + mi * n + ni] = s;
                 }
@@ -687,7 +671,10 @@ mod tests {
             out,
         );
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
-            assert!((g - e).abs() < 1e-3, "attn matmul_3d_t mismatch at {i}: got {g}, want {e}");
+            assert!(
+                (g - e).abs() < 1e-3,
+                "attn matmul_3d_t mismatch at {i}: got {g}, want {e}"
+            );
         }
     }
 
@@ -696,16 +683,19 @@ mod tests {
     fn matmul_3d_t_matches_reference() {
         let mut rng = StdRng::seed_from_u64(21);
         let (b, m, n, k) = (4usize, 5usize, 6usize, 9usize);
-        let a_data: Vec<f32> = (0..b * m * k).map(|_| rng.random_range(-1.0..1.0)).collect();
-        let b_data: Vec<f32> = (0..b * n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
+        let a_data: Vec<f32> = (0..b * m * k)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
+        let b_data: Vec<f32> = (0..b * n * k)
+            .map(|_| rng.random_range(-1.0..1.0))
+            .collect();
         let mut expected = vec![0.0_f32; b * m * n];
         for bi in 0..b {
             for mi in 0..m {
                 for ni in 0..n {
                     let mut s = 0.0_f32;
                     for ki in 0..k {
-                        s += a_data[bi * m * k + mi * k + ki]
-                            * b_data[bi * n * k + ni * k + ki];
+                        s += a_data[bi * m * k + mi * k + ki] * b_data[bi * n * k + ni * k + ki];
                     }
                     expected[bi * m * n + mi * n + ni] = s;
                 }
@@ -726,7 +716,10 @@ mod tests {
             out,
         );
         for (i, (g, e)) in got.iter().zip(expected.iter()).enumerate() {
-            assert!((g - e).abs() < 1e-3, "matmul_3d_t mismatch at {i}: got {g}, want {e}");
+            assert!(
+                (g - e).abs() < 1e-3,
+                "matmul_3d_t mismatch at {i}: got {g}, want {e}"
+            );
         }
     }
 
@@ -740,10 +733,7 @@ mod tests {
         let b_f32: Vec<f32> = (0..n * k).map(|_| rng.random_range(-1.0..1.0)).collect();
         // Quantize B to BF16 by truncating the low 16 bits of the F32 bit pattern,
         // then keep an F32 copy of those exact values for the reference matmul.
-        let b_bf16_bits: Vec<u16> = b_f32
-            .iter()
-            .map(|x| (x.to_bits() >> 16) as u16)
-            .collect();
+        let b_bf16_bits: Vec<u16> = b_f32.iter().map(|x| (x.to_bits() >> 16) as u16).collect();
         let b_f32_quant: Vec<f32> = b_bf16_bits
             .iter()
             .map(|&u| f32::from_bits((u as u32) << 16))
@@ -764,10 +754,7 @@ mod tests {
         let out = luminal_cuda_lite::kernel::linear_no_bias_bf16_w(a, b);
         let ac = a_data.clone();
         // BF16 buffer: little-endian u16s as raw bytes.
-        let b_bytes: Vec<u8> = b_bf16_bits
-            .iter()
-            .flat_map(|u| u.to_le_bytes())
-            .collect();
+        let b_bytes: Vec<u8> = b_bf16_bits.iter().flat_map(|u| u.to_le_bytes()).collect();
         let bb = b_bytes;
         let got = run_cuda(
             &mut cx,
@@ -846,6 +833,7 @@ mod tests {
     }
 
     /// Reference 2D conv with bias, NCHW with N=1 implicit.
+    #[allow(clippy::too_many_arguments)]
     fn ref_conv2d(
         x: &[f32],
         weight: &[f32],
@@ -1073,6 +1061,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ref_group_norm(
         x: &[f32],
         weight: &[f32],

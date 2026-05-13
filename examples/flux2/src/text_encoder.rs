@@ -37,7 +37,7 @@
 //! the 96 GB GH200, leaving 60 GB free — enough headroom to keep the VAE
 //! resident alongside (336 MB) and load the transformer separately afterwards.
 
-use luminal::{dtype::DType, graph::Graph, prelude::*, shape::Expression};
+use luminal::{dtype::DType, graph::Graph, prelude::*};
 
 // ── Mistral 3 Small architecture constants for FLUX.2-dev ────────────────────
 pub const HIDDEN: usize = 5120;
@@ -104,7 +104,7 @@ fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
 /// * `theta`: RoPE base
 fn apply_rope(x: GraphTensor, pos_ids: GraphTensor, n_heads: usize, theta: f32) -> GraphTensor {
     let cx = x.graph();
-    let seq = x.dims()[0];
+    let _seq = x.dims()[0];
     let half = HEAD_DIM / 2;
 
     // Frequencies: theta^(-2i/D) for i in 0..D/2 — represented as 1 / theta^(2i/D)
@@ -169,7 +169,7 @@ fn causal_sdpa(
     // to every (q, padding_k) score.
     let pad_key = (attention_mask.cast(DType::F32) * (-1.0_f32) + 1.0_f32) // (seq,)
         .expand_dim(0, seq); // (seq_q=seq, seq_k=seq) — broadcast over q.
-    // Combine: anywhere either causal or padding masks → -1e10.
+                             // Combine: anywhere either causal or padding masks → -1e10.
     let mask = causal + pad_key;
     let mask = mask.expand_dim(0, n_heads);
     let masked = scores + mask * (-1e10_f32);
