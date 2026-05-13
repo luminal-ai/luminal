@@ -500,4 +500,3 @@ impl VaeDecoder {
         conv2d_bias(x, self.conv_out_w, self.conv_out_b, 3, 1, 1)
     }
 }
-

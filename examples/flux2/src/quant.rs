@@ -211,5 +211,4 @@ mod tests {
         assert!((lo - 1.0).abs() < 1e-6);
         assert!((hi - 0.5).abs() < 1e-6);
     }
-
 }
