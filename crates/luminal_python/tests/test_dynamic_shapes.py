@@ -267,10 +267,6 @@ def test_torch_compile_dynamic_true_single_compile(device: torch.device):
     )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA-only — exercises the cuda_lite explicit mark_dynamic path",
-)
 def test_mark_dynamic_seq_via_torch_compile_starts_dynamic(device: torch.device):
     """Explicit `mark_dynamic` should skip the static-then-promote compile dance."""
 
@@ -318,10 +314,6 @@ def test_mark_dynamic_seq_via_torch_compile_starts_dynamic(device: torch.device)
         )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA-only — exercises explicit mark_dynamic with lifted weights",
-)
 def test_mark_dynamic_seq_with_lifted_weights_single_compile(device: torch.device):
     """Lifted parameters should compose with an explicitly dynamic token axis."""
 
@@ -376,10 +368,6 @@ def test_mark_dynamic_seq_with_lifted_weights_single_compile(device: torch.devic
         )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA-only — exercises explicit mark_dynamic with affine output shapes",
-)
 def test_mark_dynamic_seq_preserves_affine_output_shape(device: torch.device):
     """Output-shape expressions like `2 * seq` should stay dynamic from call 1."""
 
@@ -427,10 +415,6 @@ def test_mark_dynamic_seq_preserves_affine_output_shape(device: torch.device):
         )
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA-only — exercises explicit mark_dynamic for multiple dims",
-)
 def test_mark_dynamic_two_dim_via_torch_compile_starts_dynamic(device: torch.device):
     """Marking both batch and seq dynamic should still compile only once."""
 
