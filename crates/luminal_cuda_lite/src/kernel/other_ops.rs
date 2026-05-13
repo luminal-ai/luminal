@@ -509,8 +509,8 @@ extern \"C\" {{
             func,
             module,
             scatter_kernel,
-            (n_src, 1.into(), 1.into()),
-            (1.into(), 1.into(), 1.into()),
+            (n_src.ceil_div(256), 1.into(), 1.into()),
+            (256.into(), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )

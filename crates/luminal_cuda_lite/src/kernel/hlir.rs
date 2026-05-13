@@ -3266,14 +3266,20 @@ impl KernelOp for KernelEmbed {
             .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
             .chain(self.embed_dim.dyn_vars())
             .collect::<FxHashSet<_>>();
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
         let token_offset_expr = flatten_strides(&self.batch_shape, &self.token_stride).to_kernel();
         let out_offset_expr = flatten_strides(&self.batch_shape, &self.out_stride).to_kernel();
         let embed_dim_expr = self.embed_dim.to_kernel();
         let kernel = format!(
             "
-{}
+{dyn_defines}
 extern \"C\" {{
-    __global__ void embed(float *out, const int *token_ids, const float *embed_table) {{
+    __global__ void embed(float *out, const int *token_ids, const float *embed_table{dyn_dims_param}) {{
         long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
         long long embed_dim = {embed_dim_expr};
         long long batch_idx = idx / embed_dim;
@@ -3284,10 +3290,7 @@ extern \"C\" {{
         int token_id = token_ids[token_offset];
         out[out_offset + embed_idx] = embed_table[(long long)token_id * embed_dim + embed_idx];
     }}
-}}",
-            vars.iter()
-                .map(|i| format!("__constant__ int const_{i}[1];"))
-                .join("\n"),
+}}"
         );
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
             (module.clone(), func.clone())
@@ -3298,10 +3301,8 @@ extern \"C\" {{
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
             (module, func)
         };
-        let constants = vars
-            .into_iter()
-            .map(|d| (d, module.get_global(&format!("const_{d}"), stream).unwrap()))
-            .collect();
+        // Return empty constants map - we now use shared dyn_dims buffer
+        let constants = FxHashMap::default();
         let total_threads = batch_size * self.embed_dim;
         (
             func,
