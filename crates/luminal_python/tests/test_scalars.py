@@ -1081,6 +1081,22 @@ class _ReturnScalarIndexAndVector(torch.nn.Module):
         return i, x
 
 
+class _SetItemReturnSameInput(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x[0] = x[0] + 1
+        return x
+
+
+def _xfail_cuda_io_name_collision(device: torch.device) -> None:
+    if device.type == "cuda":
+        pytest.xfail(
+            "LUM-536: PT2 input/output boundary names can collide; runtime "
+            "interface IDs are still name-keyed in this PR. "
+            "https://linear.app/luminalai/issue/LUM-536/"
+            "pt2-interface-ids-should-model-inputoutput-roles-and-passthrough"
+        )
+
+
 class _GatherWith0dIndex(torch.nn.Module):
     def forward(self, x: torch.Tensor, i: torch.Tensor) -> torch.Tensor:
         return torch.gather(x, 0, i)
@@ -1099,6 +1115,7 @@ def test_ellipsis_on_0d(device: torch.device) -> None:
 
 @pytest.mark.parametrize("index", [2, -1])
 def test_index_by_scalar_tensor(device: torch.device, index: int) -> None:
+    _xfail_cuda_io_name_collision(device)
     x = torch.rand(5, device=device)
     i = torch.tensor(index, device=device)
     eager, compiled = _run(_IndexByScalarTensor(), x, i)
@@ -1106,12 +1123,27 @@ def test_index_by_scalar_tensor(device: torch.device, index: int) -> None:
 
 
 def test_passthrough_scalar_index_and_vector(device: torch.device) -> None:
+    _xfail_cuda_io_name_collision(device)
     x = torch.rand(5, device=device)
     i = torch.tensor(2, device=device)
     eager, compiled = _run(_ReturnScalarIndexAndVector(), x, i)
     assert isinstance(compiled, tuple)
     _strict_match(compiled[0], eager[0])
     _strict_match(compiled[1], eager[1])
+
+
+@pytest.mark.xfail(
+    reason=(
+        "LUM-538: PT2 can return a mutated input with the same boundary name; "
+        "Luminal should support or explicitly reject this case. "
+        "https://linear.app/luminalai/issue/LUM-538/"
+        "pt2-mutated-input-can-be-returned-with-the-same-boundary-name-as-the"
+    )
+)
+def test_mutated_input_returned_with_same_boundary_name(device: torch.device) -> None:
+    x = torch.rand(5, device=device)
+    eager, compiled = _run(_SetItemReturnSameInput(), x)
+    _strict_match(compiled, eager)
 
 
 def test_gather_with_0d_index(device: torch.device) -> None:

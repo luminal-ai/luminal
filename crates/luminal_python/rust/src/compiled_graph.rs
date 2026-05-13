@@ -94,8 +94,7 @@ fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
 /// Common intermediate result from translating a model graph.
 pub struct GraphTranslation {
     pub graph: Graph,
-    pub input_tensor_ids: HashMap<String, NodeIndex>,
-    pub output_tensor_ids: HashMap<String, NodeIndex>,
+    pub tensor_ids: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
@@ -123,8 +122,7 @@ pub struct WeightData {
 pub struct CompiledGraph {
     pub graph: Graph,
     pub runtime: Box<dyn DynBackend>,
-    pub input_tensor_ids: HashMap<String, NodeIndex>,
-    pub output_tensor_ids: HashMap<String, NodeIndex>,
+    pub tensor_ids: HashMap<String, NodeIndex>,
     /// Cached label → NodeIndex map for O(1) lookups in set_weight_* methods.
     label_map: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
@@ -152,8 +150,7 @@ impl CompiledGraph {
     ) -> Result<CompiledGraph, String> {
         let GraphTranslation {
             mut graph,
-            input_tensor_ids,
-            output_tensor_ids,
+            tensor_ids,
             input_names,
             output_names,
             output_shape_exprs,
@@ -189,8 +186,7 @@ impl CompiledGraph {
         Ok(CompiledGraph {
             graph,
             runtime: rt,
-            input_tensor_ids,
-            output_tensor_ids,
+            tensor_ids,
             label_map,
             input_names,
             output_names,
@@ -217,7 +213,7 @@ impl CompiledGraph {
         self.input_names
             .iter()
             .map(|name| {
-                if let Some(&node_id) = self.input_tensor_ids.get(name)
+                if let Some(&node_id) = self.tensor_ids.get(name)
                     && let Some(input) = (*self.graph.graph[node_id])
                         .as_any()
                         .downcast_ref::<luminal::hlir::Input>()
@@ -244,11 +240,7 @@ impl CompiledGraph {
     /// Get all tensor names in the graph.
     #[getter]
     fn tensor_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.input_tensor_ids.keys().cloned().collect();
-        names.extend(self.output_tensor_ids.keys().cloned());
-        names.sort();
-        names.dedup();
-        names
+        self.tensor_ids.keys().cloned().collect()
     }
 
     /// Get the name of the active backend.
@@ -345,7 +337,7 @@ impl CompiledGraph {
 
     /// Set input tensor data by name (f32, for backward compatibility).
     fn set_input(&mut self, name: &str, data: Vec<f32>) -> PyResult<()> {
-        let node_id = self.input_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
         self.runtime.set_data_f32(*node_id, data);
@@ -364,7 +356,7 @@ impl CompiledGraph {
         dtype_code: u32,
     ) -> PyResult<()> {
         debug_assert!(ptr != 0, "set_input_from_ptr called with null pointer");
-        let node_id = self.input_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
         let raw_bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
@@ -388,7 +380,7 @@ impl CompiledGraph {
                 "set_input_device_ptr requires a GPU backend",
             ));
         }
-        let node_id = self.input_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
         unsafe { self.runtime.set_device_ptr(*node_id, device_ptr, n_bytes) };
@@ -430,7 +422,7 @@ impl CompiledGraph {
                 "set_output_device_ptr requires a GPU backend",
             ));
         }
-        let node_id = self.output_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
@@ -447,7 +439,7 @@ impl CompiledGraph {
     /// Returns false for aliased outputs that need a fallback DtoD copy, or if no GPU backend.
     /// Must be called after run().
     fn output_is_zero_copy(&self, name: &str) -> PyResult<bool> {
-        let node_id = self.output_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
@@ -496,7 +488,7 @@ impl CompiledGraph {
 
     /// Get output tensor data by name as f32 (copies to host).
     fn get_output(&self, name: &str) -> PyResult<Vec<f32>> {
-        let node_id = self.output_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
@@ -507,7 +499,7 @@ impl CompiledGraph {
 
     /// Get output tensor data by name as i32 (copies to host).
     fn get_output_i32(&self, name: &str) -> PyResult<Vec<i32>> {
-        let node_id = self.output_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
@@ -518,7 +510,7 @@ impl CompiledGraph {
 
     /// Get output tensor data by name as bool (copies to host).
     fn get_output_bool(&self, name: &str) -> PyResult<Vec<bool>> {
-        let node_id = self.output_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
@@ -536,7 +528,7 @@ impl CompiledGraph {
                 "copy_output_to_device_ptr requires a GPU backend",
             ));
         }
-        let node_id = self.output_tensor_ids.get(name).ok_or_else(|| {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name

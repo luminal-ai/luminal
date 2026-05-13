@@ -317,16 +317,13 @@ pub fn translate_pt2(
         })
         .collect();
 
-    // Keep input and output IDs separate: exported passthrough graphs can use
-    // the same graph name for an input and an output, and runtime I/O methods
-    // must address the correct side of that boundary.
-    let mut input_tensor_ids: HashMap<String, NodeIndex> = HashMap::new();
+    // Build tensor_ids from user inputs and outputs
+    let mut tensor_ids: HashMap<String, NodeIndex> = HashMap::new();
     for (name, id) in &translated.user_input_ids {
-        input_tensor_ids.insert(name.clone(), *id);
+        tensor_ids.insert(name.clone(), *id);
     }
-    let mut output_tensor_ids: HashMap<String, NodeIndex> = HashMap::new();
     for (name, id) in &translated.output_ids {
-        output_tensor_ids.insert(name.clone(), *id);
+        tensor_ids.insert(name.clone(), *id);
     }
 
     // Pre-load weights and compute tensor sizes for CUDA dummy data
@@ -389,8 +386,7 @@ pub fn translate_pt2(
 
     let translation = GraphTranslation {
         graph,
-        input_tensor_ids,
-        output_tensor_ids,
+        tensor_ids,
         input_names,
         output_names,
         output_dtypes,

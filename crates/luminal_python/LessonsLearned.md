@@ -855,18 +855,6 @@ Two important details:
 
 Also: search-time dummy-1 inputs are not the same shape as runtime inputs. Anything you compute from a runtime tensor (cumsum offsets, routing indices, mask boundaries) needs to remain in-bounds for the dummy. Clamp index-producing chains as a matter of course, not just when the math says you "should" — `make_ones_bytes` is a hostile witness.
 
----
-
-## 2026-05-12 — PT2 passthrough outputs can collide with input names
-
-1. **Symptom**: `tests/test_scalars.py::test_index_by_scalar_tensor` returned `tensor(1., device='cuda:0')` for `x[i]` on CUDA, while CPU matched PyTorch eager. A minimized repro showed a CUDA identity graph `return (l_i_, l_x_)` returning the correct scalar index but an all-ones vector for `l_x_`.
-2. **Root cause**: `CompiledGraph` used one `tensor_ids: HashMap<String, NodeIndex>` for both runtime input setters and output getters. PT2 passthrough graphs can name an output exactly the same as its source input (`l_x_`). `translate_pt2` inserted input IDs first, then output IDs, so the output ID overwrote the input ID. `set_input_device_ptr("l_x_", ...)` then updated the output node instead of the real input node, leaving the actual CUDA input at search-time dummy ones.
-3. **Why it was hard to find**: the failing user test looked like an indexing bug, and the `1.0` value looked like an index/stride constant leaking into data. The actual index op had been graph-broken away by Dynamo; Luminal was compiling a tiny passthrough subgraph, and only CUDA exposed it because dummy input buffers are filled with ones for search safety.
-4. **The fix**: split the shared map into `input_tensor_ids` and `output_tensor_ids`. Input mutation methods (`set_input*`) now address only input IDs, while output registration/retrieval methods (`set_output_device_ptr`, `get_output*`, `copy_output_to_device_ptr`, `output_is_zero_copy`) address only output IDs. Added a regression test that returns `(i, x)` directly so the input/output name collision is exercised without relying on Dynamo's `x[i]` graph break.
-5. **General principle**: never key two different graph namespaces through one mutable name map unless same-name collisions are explicitly impossible. PT2 graph boundary names are not unique across inputs and outputs; use direction-specific IDs for runtime I/O plumbing.
-
----
-
 ## 2026-05-02 — Whisper port hit two missing-translator pitfalls
 
 1. **Symptom**: Compiling a PyTorch port of Whisper-tiny.en through `luminal_backend` failed twice in a row at the dispatch table: first with `Unsupported ATen op: torch.ops.aten.gelu.default`, then with `full: unsupported fill value type ... -Infinity`.
