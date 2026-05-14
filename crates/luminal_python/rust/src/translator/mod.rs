@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use luminal::graph::Graph;
 use luminal::prelude::*;
 
-use crate::pt2_expr::parse_sympy_expr;
+use crate::pt2_expr::parse_sympy_expr_with_ranges;
 use crate::pt2_parser::{InputKind, ParsedPT2, SymDimMap};
 use crate::pt2_schema::*;
 use crate::pt2_util;
@@ -366,11 +366,12 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn resolve_expr_str(&self, expr_str: &str) -> Option<Expression> {
-        parse_sympy_expr(expr_str, &self.sym_map.sym_to_char).or_else(|| {
+        parse_sympy_expr_with_ranges(expr_str, &self.sym_map.sym_to_char, &self.sym_map.ranges)
+            .or_else(|| {
             crate::pt2_parser::extract_symbol_name_pub(expr_str)
                 .and_then(|sym| self.sym_map.sym_to_char.get(&sym).copied())
                 .map(Expression::from)
-        })
+            })
     }
 
     pub(crate) fn resolve_expr_value(&self, expr: &ExprValue) -> Option<Expression> {

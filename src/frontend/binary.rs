@@ -7,11 +7,24 @@ use std::ops::RemAssign;
 use std::ops::SubAssign;
 use std::ops::{Add, Div, Mul, Rem, Sub};
 
+fn dims_match(lhs: &[Expression], rhs: &[Expression]) -> bool {
+    lhs.len() == rhs.len()
+        && lhs
+            .iter()
+            .zip(rhs.iter())
+            .all(|(lhs, rhs)| lhs == rhs || lhs.simplify() == rhs.simplify() || lhs.egglog_equal(*rhs))
+}
+
 impl Add for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: GraphTensor) -> Self::Output {
-        assert_eq!(self.dims(), rhs.dims(), "Dims must match to add tensors.");
+        let lhs_dims = self.dims();
+        let rhs_dims = rhs.dims();
+        assert!(
+            dims_match(&lhs_dims, &rhs_dims),
+            "Dims must match to add tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to add tensors. Got {:?} and {:?}",
@@ -74,10 +87,11 @@ impl Mul for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: GraphTensor) -> Self::Output {
-        assert_eq!(
-            self.dims(),
-            rhs.dims(),
-            "Dims must match to multiply tensors."
+        let lhs_dims = self.dims();
+        let rhs_dims = rhs.dims();
+        assert!(
+            dims_match(&lhs_dims, &rhs_dims),
+            "Dims must match to multiply tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
         );
         assert_eq!(
             self.dtype, rhs.dtype,
@@ -143,7 +157,12 @@ impl Rem<GraphTensor> for GraphTensor {
     type Output = GraphTensor;
 
     fn rem(self, rhs: GraphTensor) -> Self::Output {
-        assert_eq!(self.dims(), rhs.dims(), "Dims must match to mod tensors.");
+        let lhs_dims = self.dims();
+        let rhs_dims = rhs.dims();
+        assert!(
+            dims_match(&lhs_dims, &rhs_dims),
+            "Dims must match to mod tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
@@ -294,7 +313,12 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
 impl GraphTensor {
     /// Less than comparison
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
-        assert_eq!(self.dims(), rhs.dims(), "Dims must match to lt tensors.");
+        let lhs_dims = self.dims();
+        let rhs_dims = rhs.dims();
+        assert!(
+            dims_match(&lhs_dims, &rhs_dims),
+            "Dims must match to lt tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to compare tensors. Got {:?} and {:?}",
@@ -514,6 +538,14 @@ pub(super) mod tests {
         let a = cx.tensor((2, 3));
         let b = cx.tensor((1, 3));
         let _ = a.lt(b);
+    }
+
+    #[test]
+    fn test_add_accepts_equivalent_symbolic_dims() {
+        let mut cx = Graph::new();
+        let lhs = cx.tensor([expr(1), expr('a') + expr('a').min(1)]);
+        let rhs = cx.tensor([expr(1), expr('a').min(1) + expr('a')]);
+        let _ = lhs + rhs;
     }
 
     proptest! {
