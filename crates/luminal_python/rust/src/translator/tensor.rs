@@ -282,17 +282,8 @@ impl<'a> Translator<'a> {
         // by the time matmul expands into elementwise Mul. Using the PT2 output
         // metadata keeps the matmul dtype aligned with the exported contract
         // without upcasting the full expert weight bank.
-        let weight_gathered = weight.gather(flat_idx);
-        let input = if input.dtype == out_dtype {
-            input
-        } else {
-            input.cast(out_dtype)
-        };
-        let weight_gathered = if weight_gathered.dtype == out_dtype {
-            weight_gathered
-        } else {
-            weight_gathered.cast(out_dtype)
-        };
+        let weight_gathered = weight.gather(flat_idx).cast(out_dtype);
+        let input = input.cast(out_dtype);
 
         // Per-token matmul: [S, 1, K] @ [S, K, N] → [S, 1, N] → [S, N].
         // Operands stay in their native dtype — no F32 cast on the gathered
@@ -304,11 +295,7 @@ impl<'a> Translator<'a> {
         // (cuBLASLt etc.) handle bf16 input with F32 accumulator internally.
         let result = input.unsqueeze(1).matmul(weight_gathered).squeeze(1);
 
-        Ok(if result.dtype == out_dtype {
-            result
-        } else {
-            result.cast(out_dtype)
-        })
+        Ok(result.cast(out_dtype))
     }
 
     /// Build the where-formula graph: `cond * x + (1 - cond) * y`, computed
