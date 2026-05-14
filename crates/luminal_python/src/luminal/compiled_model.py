@@ -1,11 +1,16 @@
 """CompiledModel wrapper for the Rust CompiledGraph."""
 
+import warnings
 from typing import List
 
 import torch
 
 from .dtype_util import code_to_torch_dtype
 from .dtype_util import torch_dtype_code as _torch_dtype_code
+
+
+class DTypeBoundaryWarning(UserWarning):
+    """Warns when the PyTorch boundary must cast input data before execution."""
 
 
 class CompiledModel:
@@ -95,6 +100,15 @@ class CompiledModel:
         for name, tensor, expected_dtype in zip(
             self._input_names, user_inputs, self._input_dtypes
         ):
+            if tensor.dtype != expected_dtype:
+                warnings.warn(
+                    "Luminal compiled input "
+                    f"'{name}' has dtype {tensor.dtype}, but the compiled graph "
+                    f"expects {expected_dtype}; converting at every call will "
+                    "allocate/copy input data.",
+                    DTypeBoundaryWarning,
+                    stacklevel=2,
+                )
             if self._supports_device_ptrs and tensor.is_cuda:
                 t = tensor.detach().contiguous().to(expected_dtype)
                 n_bytes = t.numel() * t.element_size()
