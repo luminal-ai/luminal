@@ -1623,16 +1623,32 @@ class SplitTestModel(torch.nn.Module):
 
 
 class ArgsortStableDuplicatesModel(torch.nn.Module):
-    """Tests deterministic duplicate ordering for exported argsort."""
+    """Tests deterministic duplicate ordering for exported argsort.
+
+    ``idx_dtype`` parameterizes the integer dtype of the returned indices so
+    the test can verify dtype preservation across luminal's int dtype paths
+    (LUM-486). PyTorch's argsort always produces int64; the cast at the end
+    lets us drive the same model toward int32 or int64 outputs.
+    """
 
     SORT_DIM = 1
 
+    def __init__(self, idx_dtype: torch.dtype = torch.int64) -> None:
+        super().__init__()
+        self.idx_dtype = idx_dtype
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.argsort(x, dim=self.SORT_DIM)
+        return torch.argsort(x, dim=self.SORT_DIM).to(self.idx_dtype)
 
 
 class TinyMoERoutingModel(torch.nn.Module):
-    """Minimal deterministic MoE-style routing proof for PT2/native and CUDA."""
+    """Minimal deterministic MoE-style routing proof for PT2/native and CUDA.
+
+    ``idx_dtype`` casts the integer-valued outputs (routed_indices, dispatch,
+    group_ids) to the requested dtype so the test can sweep int32 and int64
+    output paths (LUM-486). Internal indices stay int64 because torch.gather
+    / torch.scatter require int64 index tensors.
+    """
 
     TOP_K = 2
     ROUTING_DIM = -1
@@ -1640,8 +1656,9 @@ class TinyMoERoutingModel(torch.nn.Module):
     DISPATCH_ON = 1
     GROUP_SIZE = 2
 
-    def __init__(self) -> None:
+    def __init__(self, idx_dtype: torch.dtype = torch.int64) -> None:
         super().__init__()
+        self.idx_dtype = idx_dtype
         self.register_buffer(
             "expert_scale",
             torch.tensor([1.5, -0.5, 2.0, 0.25], dtype=torch.float32),
@@ -1677,11 +1694,11 @@ class TinyMoERoutingModel(torch.nn.Module):
         group_ids = torch.floor_divide(routed_indices, self.GROUP_SIZE)
         routing_sign = torch.sign(masked_values)
         return (
-            routed_indices,
+            routed_indices.to(self.idx_dtype),
             masked_values,
-            dispatch,
+            dispatch.to(self.idx_dtype),
             inactive_mask,
-            group_ids,
+            group_ids.to(self.idx_dtype),
             routing_sign,
         )
 
@@ -1950,6 +1967,24 @@ class Conv1dBiasModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
+
+
+class Conv1dFloorDivPositionalModel(torch.nn.Module):
+    """Whisper-like Conv1d downsample followed by a fixed positional add."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = torch.nn.Conv1d(8, 16, kernel_size=3, padding=1, bias=True)
+        self.conv2 = torch.nn.Conv1d(
+            16, 16, kernel_size=3, stride=2, padding=1, bias=True
+        )
+        self.position = torch.nn.Parameter(torch.randn(15, 16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.gelu(self.conv1(x))
+        x = torch.nn.functional.gelu(self.conv2(x))
+        x = x.squeeze(0).transpose(0, 1)
+        return x + self.position
 
 
 class Conv2dNoPadModel(torch.nn.Module):

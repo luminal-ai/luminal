@@ -213,12 +213,18 @@ impl<'a> Translator<'a> {
         let (a, b) = crate::pt2_util::ensure_same_dtype(a, b);
         let (a, b) = broadcast_binary(a, b);
 
-        // Check rounding_mode kwarg
+        // Check rounding_mode kwarg. PT2 serializes string args as
+        // {"as_string": "<value>"}, so we have to drill into the JSON.
         let rounding_mode = node.inputs.iter().find_map(|input| {
             if input.name == "rounding_mode"
                 && let Argument::Other(val) = &input.arg
             {
-                return val.as_str().map(|s| s.to_string());
+                if let Some(s) = val.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(s) = val.get("as_string").and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
             }
             None
         });
@@ -266,6 +272,54 @@ impl<'a> Translator<'a> {
         }
         if let Some(max) = max_val {
             result = result.minimum_f32(max);
+        }
+        Ok(result)
+    }
+
+    /// `aten.clamp.Tensor(Tensor self, Tensor? min=None, Tensor? max=None)`
+    ///
+    /// Unlike `clamp.default` (which takes Python scalar bounds), the `.Tensor`
+    /// overload takes tensor bounds that appear as separate input nodes in the
+    /// FX graph. PyTorch supports any NumPy-broadcastable bound shape:
+    ///
+    ///   - rank-0 (scalar wrapped in a tensor) — most common
+    ///   - same shape as self (per-element clamp, e.g. learned bounds)
+    ///   - any shape that broadcasts to self via right-align + size-1 expand
+    ///     (e.g. `(3, 1)` against `(3, 4)` for per-row clamp; `(4,)` against
+    ///     `(3, 4)` for per-column clamp; `(3, 4)` against `(2, 3, 4)`)
+    ///
+    /// We use `broadcast_binary` to right-align and expand both operands to a
+    /// common shape before the elementwise max/min, matching PyTorch semantics
+    /// across all three modes.
+    ///
+    /// Either bound may be absent (FX represents this as a non-tensor argument
+    /// at the corresponding input slot), in which case we clamp to one side
+    /// only.
+    pub(crate) fn translate_clamp_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let min_tensor = node
+            .inputs
+            .get(1)
+            .and_then(|i| i.arg.as_tensor_name())
+            .map(|n| self.get_tensor(n))
+            .transpose()?;
+        let max_tensor = node
+            .inputs
+            .get(2)
+            .and_then(|i| i.arg.as_tensor_name())
+            .map(|n| self.get_tensor(n))
+            .transpose()?;
+
+        let mut result = a;
+        if let Some(lo) = min_tensor {
+            let lo = lo.cast(result.dtype);
+            let (r, lo) = broadcast_binary(result, lo);
+            result = r.maximum(lo);
+        }
+        if let Some(hi) = max_tensor {
+            let hi = hi.cast(result.dtype);
+            let (r, hi) = broadcast_binary(result, hi);
+            result = r.minimum(hi);
         }
         Ok(result)
     }

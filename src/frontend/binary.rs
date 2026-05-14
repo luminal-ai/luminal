@@ -11,6 +11,7 @@ impl Add for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(self.dims(), rhs.dims(), "Dims must match to add tensors.");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to add tensors. Got {:?} and {:?}",
@@ -73,6 +74,11 @@ impl Mul for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(
+            self.dims(),
+            rhs.dims(),
+            "Dims must match to multiply tensors."
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to multiply tensors. Got {:?} and {:?}",
@@ -474,6 +480,42 @@ pub(super) mod tests {
         assert_close(rt.get_f32(c.id), &ref_c.to_vec1::<f32>().unwrap())
     }
 
+    #[test]
+    #[should_panic(expected = "Dims must match to add tensors.")]
+    fn test_add_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a + b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to multiply tensors.")]
+    fn test_mul_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a * b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to mod tensors.")]
+    fn test_mod_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a % b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to lt tensors.")]
+    fn test_lt_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a.lt(b);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
@@ -560,12 +602,55 @@ pub(super) mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
+        fn test_mod_scalar_broadcast(size in 1usize..64) {
+            // rank-0 RHS expanded against rank-N LHS, mirroring `x % torch.tensor(c)`.
+            test_binary_transforms(
+                size,
+                (),
+                |a, b| a % b.expand_rhs(a.shape),
+                |a, b| {
+                    let lhs = a.to_vec1::<f32>().unwrap();
+                    let rhs_scalar = b.to_scalar::<f32>().unwrap();
+                    let remainder: Vec<f32> = lhs.iter().map(|x| x % rhs_scalar).collect();
+                    Tensor::from_vec(remainder, size, &Device::Cpu).unwrap()
+                },
+                identity,
+                shift_from_zero,
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
         fn test_lt(size in 1usize..64) {
             test_binary(
                 size,
                 size,
                 |a, b| a.lt(b).cast(crate::dtype::DType::F32),
                 |a, b| a.lt(&b).unwrap().to_dtype(DType::F32).unwrap(),
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
+        fn test_lt_scalar_broadcast(size in 1usize..64) {
+            // rank-0 RHS expanded against rank-N LHS for `lt`.
+            test_binary(
+                size,
+                (),
+                |a, b| a.lt(b.expand_rhs(a.shape)).cast(crate::dtype::DType::F32),
+                |a, b| {
+                    let scalar = b.to_scalar::<f32>().unwrap();
+                    let lhs = a.to_vec1::<f32>().unwrap();
+                    let result: Vec<f32> = lhs
+                        .iter()
+                        .map(|x| if *x < scalar { 1.0f32 } else { 0.0f32 })
+                        .collect();
+                    Tensor::from_vec(result, size, &Device::Cpu).unwrap()
+                },
             );
         }
     }

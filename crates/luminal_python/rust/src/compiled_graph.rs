@@ -98,7 +98,12 @@ pub struct GraphTranslation {
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
-    pub output_dtypes: Vec<DType>,
+    /// Output dtypes as PT2 dtype codes (e.g. 5 = int64, 7 = float32).
+    /// Stored as PT2 codes (rather than luminal `DType`) so we can preserve
+    /// distinctions luminal collapses internally — notably int64 vs int32,
+    /// both of which map to `DType::Int` in luminal but must be reported
+    /// back to PyTorch with their original precision.
+    pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
@@ -127,7 +132,9 @@ pub struct CompiledGraph {
     pub output_names: Vec<String>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
-    pub output_dtypes: Vec<DType>,
+    /// Output dtypes as PT2 dtype codes (preserves int64 / int32 distinction
+    /// that luminal collapses to `DType::Int` internally).
+    pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
     static_host_inputs: StaticHostInputs,
@@ -526,10 +533,7 @@ impl CompiledGraph {
     /// Get the PT2 dtype codes for all outputs (in order).
     #[getter]
     fn output_dtypes(&self) -> Vec<u32> {
-        self.output_dtypes
-            .iter()
-            .map(|d| luminal_dtype_to_pt2_code(*d))
-            .collect()
+        self.output_dtypes.clone()
     }
 
     /// Get output tensor data by name as f32 (copies to host).

@@ -462,8 +462,13 @@ fn hlir_attention(
     let k_cache_out = k_new.scatter(scatter_idx, k_cache_in);
     let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
 
-    let k_full = k_cache_out.slice((.., ..total_seq, ..));
-    let v_full = v_cache_out.slice((.., ..total_seq, ..));
+    let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
+    let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
+    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
+    // cannot yet propagate expression-bound assertions, so `slice` reports
+    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
+    k_full.shape.dims[1] = total_seq;
+    v_full.shape.dims[1] = total_seq;
 
     let k_3d = k_full.expand_dim(1, spec.kv_groups).merge_dims(0, 1);
     let v_3d = v_full.expand_dim(1, spec.kv_groups).merge_dims(0, 1);
@@ -616,6 +621,8 @@ impl Gemma4SparseMoE {
         let hidden_exp = hidden.unsqueeze(2);
         let down_out = hidden_exp.matmul(down_gathered.transpose(2, 3)).squeeze(2);
 
-        (down_out * top_k_weights.unsqueeze(top_k_weights.dims().len())).sum(n - 1)
+        let mut weights_exp = top_k_weights.unsqueeze(top_k_weights.dims().len());
+        weights_exp.shape.expand(down_out.dims());
+        (down_out * weights_exp).sum(n - 1)
     }
 }

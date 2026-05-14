@@ -71,9 +71,9 @@ fn build_qwen_moe_graph() -> QwenMoeGraph {
         .unsqueeze(2)
         .matmul(down_gathered.transpose(2, 3))
         .squeeze(2);
-    let output = (down_out * top_k_values.unsqueeze(top_k_values.dims().len()))
-        .sum(n - 1)
-        .output();
+    let mut weights_exp = top_k_values.unsqueeze(top_k_values.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    let output = (down_out * weights_exp).sum(n - 1).output();
 
     QwenMoeGraph {
         graph: cx,
@@ -130,9 +130,9 @@ fn build_gemma_moe_graph() -> GemmaMoeGraph {
         .unsqueeze(2)
         .matmul(down_gathered.transpose(2, 3))
         .squeeze(2);
-    let output = (down_out * top_k_weights.unsqueeze(top_k_weights.dims().len()))
-        .sum(n - 1)
-        .output();
+    let mut weights_exp = top_k_weights.unsqueeze(top_k_weights.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    let output = (down_out * weights_exp).sum(n - 1).output();
 
     GemmaMoeGraph {
         graph: cx,

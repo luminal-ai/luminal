@@ -130,10 +130,13 @@ pub fn translate_pt2(
     let translated = translator::translate(&parsed)?;
     let mut graph = translated.graph;
 
-    // Set initial dynamic dim values from symbol ranges
+    // Set initial dynamic dim values from symbol ranges. PT2 emits
+    // `min_val: null` when the constraint is unbounded; fall back to 1 in
+    // that case (the smallest valid dim — used only as an initial value).
     for (sym_name, c) in &translated.sym_map.sym_to_char {
         if let Some(rc) = translated.sym_map.ranges.get(sym_name) {
-            graph.set_dim(*c, rc.min_val as usize);
+            let initial = rc.min_val.unwrap_or(1).max(0) as usize;
+            graph.set_dim(*c, initial);
         }
     }
 
@@ -149,14 +152,14 @@ pub fn translate_pt2(
         })
         .collect();
 
-    let output_dtypes: Vec<DType> = translated
+    // Preserve original PT2 dtype codes for outputs (e.g. 5 = int64) so the
+    // Python wrapper can return tensors with the right torch.dtype, even when
+    // luminal collapses the type internally (e.g. int64 → DType::Int).
+    let output_dtypes: Vec<u32> = translated
         .output_ids
         .iter()
         .map(|(name, _id)| {
-            parsed
-                .tensor_meta(name)
-                .map(|meta| pt2_util::torch_dtype_int_to_luminal(meta.dtype))
-                .unwrap_or(DType::F32)
+            parsed.tensor_meta(name).map(|meta| meta.dtype).unwrap_or(7) // default to f32
         })
         .collect();
 
