@@ -42,6 +42,17 @@ fn exact_bound_value(bounds: ExprBounds) -> Option<i64> {
     (bounds.min == bounds.max).then_some(bounds.min).flatten()
 }
 
+fn with_bounds(expr: Expression, bounds: ExprBounds) -> BoundedExpr {
+    BoundedExpr { expr, bounds }
+}
+
+fn bool_bounds() -> ExprBounds {
+    ExprBounds {
+        min: Some(0),
+        max: Some(1),
+    }
+}
+
 fn normalize_expr(expr: Expression) -> Expression {
     if expr.len() <= 16 { expr.simplify() } else { expr }
 }
@@ -323,10 +334,10 @@ fn simplify_expr_with_bounds(
     for term in terms {
         match term {
             Term::Num(n) => stack.push(exact_expr(n)),
-            Term::Var(c) => stack.push(BoundedExpr {
-                expr: Expression::from(c),
-                bounds: sym_ranges.get(&c).copied().unwrap_or_default(),
-            }),
+            Term::Var(c) => stack.push(with_bounds(
+                Expression::from(c),
+                sym_ranges.get(&c).copied().unwrap_or_default(),
+            )),
             Term::Add => {
                 let lhs = stack.pop().unwrap();
                 let rhs = stack.pop().unwrap();
@@ -406,72 +417,29 @@ fn simplify_expr_with_bounds(
                 let rhs = stack.pop().unwrap();
                 stack.push(simplify_max(lhs, rhs, sym_ranges));
             }
-            Term::And => {
+            term @ (Term::And | Term::Or | Term::Gte | Term::Lt) => {
                 let lhs = stack.pop().unwrap();
                 let rhs = stack.pop().unwrap();
-                let expr = match (exact_value(lhs), exact_value(rhs)) {
-                    (Some(lhs), Some(rhs)) => Expression::from((lhs != 0 && rhs != 0) as i64),
-                    _ => normalize_expr(lhs.expr & rhs.expr),
+                let expr = match (term, exact_value(lhs), exact_value(rhs)) {
+                    (Term::And, Some(lhs), Some(rhs)) => {
+                        Expression::from((lhs != 0 && rhs != 0) as i64)
+                    }
+                    (Term::And, _, _) => normalize_expr(lhs.expr & rhs.expr),
+                    (Term::Or, Some(lhs), Some(rhs)) => {
+                        Expression::from((lhs != 0 || rhs != 0) as i64)
+                    }
+                    (Term::Or, _, _) => normalize_expr(lhs.expr | rhs.expr),
+                    (Term::Gte, Some(lhs), Some(rhs)) => Expression::from((lhs >= rhs) as i64),
+                    (Term::Gte, _, _) => normalize_expr(lhs.expr.gte(rhs.expr)),
+                    (Term::Lt, Some(lhs), Some(rhs)) => Expression::from((lhs < rhs) as i64),
+                    (Term::Lt, _, _) => normalize_expr(lhs.expr.lt(rhs.expr)),
+                    _ => unreachable!(),
                 };
-                stack.push(BoundedExpr {
-                    expr,
-                    bounds: ExprBounds {
-                        min: Some(0),
-                        max: Some(1),
-                    },
-                });
-            }
-            Term::Or => {
-                let lhs = stack.pop().unwrap();
-                let rhs = stack.pop().unwrap();
-                let expr = match (exact_value(lhs), exact_value(rhs)) {
-                    (Some(lhs), Some(rhs)) => Expression::from((lhs != 0 || rhs != 0) as i64),
-                    _ => normalize_expr(lhs.expr | rhs.expr),
-                };
-                stack.push(BoundedExpr {
-                    expr,
-                    bounds: ExprBounds {
-                        min: Some(0),
-                        max: Some(1),
-                    },
-                });
-            }
-            Term::Gte => {
-                let lhs = stack.pop().unwrap();
-                let rhs = stack.pop().unwrap();
-                let expr = match (exact_value(lhs), exact_value(rhs)) {
-                    (Some(lhs), Some(rhs)) => Expression::from((lhs >= rhs) as i64),
-                    _ => normalize_expr(lhs.expr.gte(rhs.expr)),
-                };
-                stack.push(BoundedExpr {
-                    expr,
-                    bounds: ExprBounds {
-                        min: Some(0),
-                        max: Some(1),
-                    },
-                });
-            }
-            Term::Lt => {
-                let lhs = stack.pop().unwrap();
-                let rhs = stack.pop().unwrap();
-                let expr = match (exact_value(lhs), exact_value(rhs)) {
-                    (Some(lhs), Some(rhs)) => Expression::from((lhs < rhs) as i64),
-                    _ => normalize_expr(lhs.expr.lt(rhs.expr)),
-                };
-                stack.push(BoundedExpr {
-                    expr,
-                    bounds: ExprBounds {
-                        min: Some(0),
-                        max: Some(1),
-                    },
-                });
+                stack.push(with_bounds(expr, bool_bounds()));
             }
         }
     }
-    stack.pop().unwrap_or(BoundedExpr {
-        expr,
-        bounds: ExprBounds::default(),
-    })
+    stack.pop().unwrap_or(with_bounds(expr, ExprBounds::default()))
 }
 
 fn canonical_dim(
