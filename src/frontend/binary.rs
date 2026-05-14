@@ -15,16 +15,20 @@ fn dims_match(lhs: &[Expression], rhs: &[Expression]) -> bool {
             .all(|(lhs, rhs)| lhs == rhs || lhs.simplify() == rhs.simplify() || lhs.egglog_equal(*rhs))
 }
 
+fn assert_matching_dims(lhs: &GraphTensor, rhs: &GraphTensor, op: &str) {
+    let lhs_dims = lhs.dims();
+    let rhs_dims = rhs.dims();
+    assert!(
+        dims_match(&lhs_dims, &rhs_dims),
+        "Dims must match to {op} tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
+    );
+}
+
 impl Add for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: GraphTensor) -> Self::Output {
-        let lhs_dims = self.dims();
-        let rhs_dims = rhs.dims();
-        assert!(
-            dims_match(&lhs_dims, &rhs_dims),
-            "Dims must match to add tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
-        );
+        assert_matching_dims(&self, &rhs, "add");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to add tensors. Got {:?} and {:?}",
@@ -87,12 +91,7 @@ impl Mul for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: GraphTensor) -> Self::Output {
-        let lhs_dims = self.dims();
-        let rhs_dims = rhs.dims();
-        assert!(
-            dims_match(&lhs_dims, &rhs_dims),
-            "Dims must match to multiply tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
-        );
+        assert_matching_dims(&self, &rhs, "multiply");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to multiply tensors. Got {:?} and {:?}",
@@ -157,12 +156,7 @@ impl Rem<GraphTensor> for GraphTensor {
     type Output = GraphTensor;
 
     fn rem(self, rhs: GraphTensor) -> Self::Output {
-        let lhs_dims = self.dims();
-        let rhs_dims = rhs.dims();
-        assert!(
-            dims_match(&lhs_dims, &rhs_dims),
-            "Dims must match to mod tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
-        );
+        assert_matching_dims(&self, &rhs, "mod");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to mod tensors. Got {:?} and {:?}",
@@ -313,12 +307,7 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
 impl GraphTensor {
     /// Less than comparison
     pub fn lt(self, rhs: GraphTensor) -> GraphTensor {
-        let lhs_dims = self.dims();
-        let rhs_dims = rhs.dims();
-        assert!(
-            dims_match(&lhs_dims, &rhs_dims),
-            "Dims must match to lt tensors. lhs={lhs_dims:?} rhs={rhs_dims:?}"
-        );
+        assert_matching_dims(&self, &rhs, "lt");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to compare tensors. Got {:?} and {:?}",
