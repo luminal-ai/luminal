@@ -243,12 +243,12 @@ def warmup_kvcache(compiled, steps: int) -> None:
     t0 = time.time()
     with torch.no_grad():
         ids = torch.tensor([[1]], device=DEVICE)
-        out = compiled(ids)
+        out = _compiled_call(compiled, ids)
         log.info("  prefill[seq=1] compiled in %.1fs", time.time() - t0)
         for i in range(steps):
             t = time.time()
             nxt = torch.tensor([[2]], device=DEVICE)
-            out = compiled(nxt, past_key_values=out.past_key_values)
+            out = _compiled_call(compiled, nxt, past_key_values=out.past_key_values)
             log.info("  decode[cache=%d] compiled in %.1fs", i + 1, time.time() - t)
     log.info("Warmup done in %.1fs total", time.time() - t0)
 
@@ -267,13 +267,16 @@ def warmup_dynamic_cache(compiled, model_config, steps: int) -> None:
         cache = DynamicCache(config=model_config)
         out = None
         t = time.time()
-        out = compiled(input_ids=ids, past_key_values=cache, use_cache=True)
+        out = _compiled_call(
+            compiled, input_ids=ids, past_key_values=cache, use_cache=True
+        )
         log.info("  prefill[seq=1] %.1fs", time.time() - t)
         assert out is not None
         for i in range(steps):
             nxt = out.logits[:, -1:].argmax(dim=-1)
             t = time.time()
-            out = compiled(
+            out = _compiled_call(
+                compiled,
                 input_ids=nxt,
                 past_key_values=out.past_key_values,
                 use_cache=True,
@@ -290,6 +293,13 @@ _gen_lock = threading.Lock()
 
 def _sse(payload: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def _compiled_call(compiled, *args, **kwargs):
+    reload_fn = getattr(compiled, "reload_original_weights", None)
+    if reload_fn is not None:
+        reload_fn()
+    return compiled(*args, **kwargs)
 
 
 def _prune_session_states(
@@ -367,7 +377,7 @@ def stream_chat_kvcache(tokenizer, compiled, messages, max_new_tokens):
 
         t0 = time.time()
         with torch.no_grad():
-            out = compiled(ids)
+            out = _compiled_call(compiled, ids)
         log.info("prefill[seq=%d] %.2fs", prompt_len, time.time() - t0)
 
         seen: set[int] = set()
@@ -389,7 +399,8 @@ def stream_chat_kvcache(tokenizer, compiled, messages, max_new_tokens):
                 yield _sse({"token": piece})
             t = time.time()
             with torch.no_grad():
-                out = compiled(
+                out = _compiled_call(
+                    compiled,
                     torch.tensor([[nxt]], device=DEVICE),
                     past_key_values=out.past_key_values,
                 )
@@ -454,7 +465,8 @@ async def stream_chat_dynamic(
                 t0 = time.time()
                 cache = state.past_key_values
                 for token_id in suffix:
-                    out = compiled(
+                    out = _compiled_call(
+                        compiled,
                         input_ids=torch.tensor([[token_id]], device=DEVICE),
                         past_key_values=cache,
                         use_cache=True,
@@ -478,7 +490,8 @@ async def stream_chat_dynamic(
             with torch.no_grad():
                 cache = DynamicCache(config=model_config)
                 t0 = time.time()
-                out = compiled(
+                out = _compiled_call(
+                    compiled,
                     input_ids=ids,
                     past_key_values=cache,
                     use_cache=True,
@@ -504,7 +517,8 @@ async def stream_chat_dynamic(
                 yield _sse({"token": piece})
             t = time.time()
             with torch.no_grad():
-                out = compiled(
+                out = _compiled_call(
+                    compiled,
                     input_ids=torch.tensor([[nxt]], device=DEVICE),
                     past_key_values=out.past_key_values,
                     use_cache=True,

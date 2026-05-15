@@ -176,9 +176,11 @@ def _save_and_compile(
         # Load CPU weights after compilation
         _load_cpu_weights(compiled, cpu_weights)
 
-        return CompiledModel(
+        model = CompiledModel(
             compiled, weight_refs=keep_alive, user_indices=user_indices
         )
+        model._set_reloadable_weights(weight_device_ptrs, cpu_weights)
+        return model
     finally:
         if owns_tmpdir and tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -732,6 +734,9 @@ class _LazyDynamicCompiledModel:
 
     def set_dim(self, name, value):
         return self._ensure_compiled().set_dim(name, value)
+
+    def reload_original_weights(self):
+        return self._ensure_compiled().reload_original_weights()
 
 
 def pt2_backend(gm, example_inputs, factory=None):
