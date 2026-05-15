@@ -2,7 +2,7 @@ use anyhow::Result;
 use luminal::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::pt2_expr::{canonical_equal_expr, same_expr_with_ranges, sym_char_ranges, ExprBounds};
+use crate::pt2_expr::{ExprBounds, canonical_equal_expr, same_expr_with_ranges, sym_char_ranges};
 use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
@@ -133,10 +133,13 @@ mod tests {
         let a = Expression::from('a');
         let lhs = (a.min(1) + a).min(a + 1) - 1;
         let rhs = (a.min(1) + a).min(a);
-        let sym_ranges = [('a', ExprBounds {
-            min: Some(2),
-            max: None,
-        })]
+        let sym_ranges = [(
+            'a',
+            ExprBounds {
+                min: Some(2),
+                max: None,
+            },
+        )]
         .into_iter()
         .collect::<FxHashMap<_, _>>();
 

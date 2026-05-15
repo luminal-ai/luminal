@@ -64,7 +64,9 @@ pub(crate) fn sym_char_ranges(sym_map: &SymDimMap) -> FxHashMap<char, ExprBounds
                 .and_then(|range| range.min_val)
                 .map(|min| min.max(0))
                 .or(Some(0));
-            let max = range.and_then(|range| range.max_val).filter(|max| *max >= 0);
+            let max = range
+                .and_then(|range| range.max_val)
+                .filter(|max| *max >= 0);
             (*sym_char, ExprBounds { min, max })
         })
         .collect()
@@ -242,7 +244,11 @@ fn bool_bounds() -> ExprBounds {
 }
 
 fn normalize_expr(expr: Expression) -> Expression {
-    if expr.len() <= 16 { expr.simplify() } else { expr }
+    if expr.len() <= 16 {
+        expr.simplify()
+    } else {
+        expr
+    }
 }
 
 fn commutative_key(expr: Expression) -> (usize, String) {
@@ -442,7 +448,11 @@ fn simplify_add(lhs: BoundedExpr, rhs: BoundedExpr) -> BoundedExpr {
     with_bounds(expr, add_bounds(lhs.bounds, rhs.bounds))
 }
 
-fn simplify_sub(lhs: BoundedExpr, rhs: BoundedExpr, sym_ranges: &FxHashMap<char, ExprBounds>) -> BoundedExpr {
+fn simplify_sub(
+    lhs: BoundedExpr,
+    rhs: BoundedExpr,
+    sym_ranges: &FxHashMap<char, ExprBounds>,
+) -> BoundedExpr {
     if same_expr_with_ranges(lhs.expr, rhs.expr, sym_ranges) {
         return exact_expr(0);
     }
@@ -460,7 +470,11 @@ fn simplify_sub(lhs: BoundedExpr, rhs: BoundedExpr, sym_ranges: &FxHashMap<char,
     with_bounds(expr, sub_bounds(lhs.bounds, rhs.bounds))
 }
 
-fn simplify_min(lhs: BoundedExpr, rhs: BoundedExpr, sym_ranges: &FxHashMap<char, ExprBounds>) -> BoundedExpr {
+fn simplify_min(
+    lhs: BoundedExpr,
+    rhs: BoundedExpr,
+    sym_ranges: &FxHashMap<char, ExprBounds>,
+) -> BoundedExpr {
     let bounds = min_bounds(lhs.bounds, rhs.bounds);
     if same_expr_with_ranges(lhs.expr, rhs.expr, sym_ranges) {
         return with_bounds(lhs.expr, bounds);
@@ -490,7 +504,11 @@ fn simplify_min(lhs: BoundedExpr, rhs: BoundedExpr, sym_ranges: &FxHashMap<char,
     with_bounds(normalize_expr(lhs.expr.min(rhs.expr)), bounds)
 }
 
-fn simplify_max(lhs: BoundedExpr, rhs: BoundedExpr, sym_ranges: &FxHashMap<char, ExprBounds>) -> BoundedExpr {
+fn simplify_max(
+    lhs: BoundedExpr,
+    rhs: BoundedExpr,
+    sym_ranges: &FxHashMap<char, ExprBounds>,
+) -> BoundedExpr {
     let bounds = max_bounds(lhs.bounds, rhs.bounds);
     if same_expr_with_ranges(lhs.expr, rhs.expr, sym_ranges) {
         return with_bounds(lhs.expr, bounds);
@@ -560,7 +578,11 @@ fn simplify_bound_expr(expr: Expression, sym_ranges: &FxHashMap<char, ExprBounds
                     (_, _, Some(1)) => lhs.expr,
                     (Term::Div, Some(lhs), Some(rhs)) if rhs != 0 => Expression::from(lhs / rhs),
                     (Term::CeilDiv, Some(lhs), Some(rhs)) if rhs > 0 => {
-                        Expression::from(if lhs % rhs != 0 { lhs / rhs + 1 } else { lhs / rhs })
+                        Expression::from(if lhs % rhs != 0 {
+                            lhs / rhs + 1
+                        } else {
+                            lhs / rhs
+                        })
                     }
                     (Term::Div, _, _) => normalize_expr(lhs.expr / rhs.expr),
                     (Term::CeilDiv, _, _) => normalize_expr(lhs.expr.ceil_div(rhs.expr)),
@@ -610,7 +632,9 @@ fn simplify_bound_expr(expr: Expression, sym_ranges: &FxHashMap<char, ExprBounds
             }
         }
     }
-    stack.pop().unwrap_or(with_bounds(expr, ExprBounds::default()))
+    stack
+        .pop()
+        .unwrap_or(with_bounds(expr, ExprBounds::default()))
 }
 
 /// Split `Head(body)` into `(head, body)`.

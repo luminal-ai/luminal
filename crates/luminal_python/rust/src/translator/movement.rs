@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::pt2_expr::{canonical_equal_expr, sym_char_ranges, ExprBounds};
+use crate::pt2_expr::{ExprBounds, canonical_equal_expr, sym_char_ranges};
 use crate::pt2_schema::*;
 use crate::pt2_util::*;
 

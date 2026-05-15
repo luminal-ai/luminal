@@ -467,7 +467,8 @@ impl CompiledGraph {
         })?;
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
         let typed = TypedData::from_pytorch_bytes(bytes, dtype_code);
-        self.runtime.set_data_bytes(node_id, typed.bytes, typed.dtype);
+        self.runtime
+            .set_data_bytes(node_id, typed.bytes, typed.dtype);
         Ok(())
     }
 
