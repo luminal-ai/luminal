@@ -164,7 +164,7 @@ impl CompiledGraph {
             device_ptrs,
         } = weight_data;
 
-        // Build compile args from WeightData (convert TypedData -> raw bytes + dtype)
+        // Build compile args from WeightData.
         let compile_args = BackendCompileArgs {
             search_iters,
             weights: weights
@@ -172,7 +172,7 @@ impl CompiledGraph {
                 .map(|(label, td)| (label.clone(), td.bytes.clone(), td.dtype))
                 .collect(),
             tensor_sizes,
-            device_ptrs: device_ptrs.clone(),
+            device_ptrs,
         };
 
         // Create backend via the factory directly
