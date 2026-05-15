@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
+use rustc_hash::FxHashMap;
 
+use crate::pt2_expr::{canonical_equal_expr, sym_char_ranges, ExprBounds};
 use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
@@ -10,6 +12,25 @@ const SCATTER_INPUT_ARG: usize = 0;
 const SCATTER_DIM_ARG: usize = 1;
 const SCATTER_INDEX_ARG: usize = 2;
 const SCATTER_VALUE_ARG: usize = 3;
+
+fn normalize_concat_dims(
+    lhs: &mut GraphTensor,
+    rhs: &mut GraphTensor,
+    skip_dim: Option<usize>,
+    sym_ranges: &FxHashMap<char, ExprBounds>,
+) {
+    for i in 0..lhs.shape.len() {
+        if Some(i) == skip_dim {
+            continue;
+        }
+        let lhs_dim = lhs.shape.dims[i];
+        let rhs_dim = rhs.shape.dims[i];
+        if let Some(canonical) = canonical_equal_expr(lhs_dim, rhs_dim, sym_ranges) {
+            lhs.shape.dims[i] = canonical;
+            rhs.shape.dims[i] = canonical;
+        }
+    }
+}
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_reshape(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -201,8 +222,17 @@ impl<'a> Translator<'a> {
 
         let dim = normalize_dim(dim, tensors[0].shape.len());
         let mut result = tensors[0];
+        let sym_ranges = sym_char_ranges(&self.sym_map);
         for t in &tensors[1..] {
-            result = result.concat_along(*t, dim);
+            let mut next = *t;
+            normalize_concat_dims(&mut result, &mut next, Some(dim), &sym_ranges);
+
+            let lhs_axis = result.dims()[dim];
+            let rhs_axis = next.dims()[dim];
+            let mut lhs_padded = result.pad_along(0, rhs_axis, dim, 0.);
+            let mut rhs_padded = next.pad_along(lhs_axis, 0, dim, 0.);
+            normalize_concat_dims(&mut lhs_padded, &mut rhs_padded, None, &sym_ranges);
+            result = lhs_padded + rhs_padded;
         }
         Ok(result)
     }
