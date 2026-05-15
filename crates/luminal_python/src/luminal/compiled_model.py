@@ -30,8 +30,6 @@ class CompiledModel:
         self._output_shapes = graph_result.output_shapes
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
-        self._weight_device_ptrs = {}
-        self._cpu_weights = {}
         self._user_indices = user_indices
         self._is_gpu = getattr(graph_result, "device_type", "cpu") != "cpu"
         self._supports_device_ptrs = getattr(
@@ -45,16 +43,6 @@ class CompiledModel:
             else torch.float32
             for i in range(len(self._input_names))
         ]
-
-    def _set_reloadable_weights(self, weight_device_ptrs, cpu_weights):
-        self._weight_device_ptrs = dict(weight_device_ptrs or {})
-        self._cpu_weights = dict(cpu_weights or {})
-
-    def reload_original_weights(self) -> None:
-        for name, (device_ptr, n_bytes) in self._weight_device_ptrs.items():
-            self._graph.set_weight_device_ptr(name, device_ptr, n_bytes)
-        for name, (ptr, n_bytes, dtype_code) in self._cpu_weights.items():
-            self._graph.set_weight_from_ptr(name, ptr, n_bytes, dtype_code)
 
     def set_dim(self, param_name: str, value: int) -> None:
         """Set a dynamic dimension value by its param name."""
