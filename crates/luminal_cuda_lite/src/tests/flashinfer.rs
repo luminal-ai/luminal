@@ -375,11 +375,11 @@ fn compute_attn_mask_matches_cpu_reference() {
     //           query 1 (q_pos=1, seq 1) attends to ctx [3, 5) i.e. mask[1, 3..5]=0.
     // Everywhere else is -1e10.
     let mut expected = vec![-1e10f32; s_dim * c_dim];
-    for j in 0..3 {
-        expected[0 * c_dim + j] = 0.0;
+    for value in expected.iter_mut().take(3) {
+        *value = 0.0;
     }
     for j in 3..5 {
-        expected[1 * c_dim + j] = 0.0;
+        expected[c_dim + j] = 0.0;
     }
 
     assert_eq!(mask, expected);
@@ -527,7 +527,7 @@ fn test_indptr_to_request_idx(
     n: Expression,
 ) -> GraphTensor {
     let r = indptr.dims1();
-    let indices = graph.arange(n.clone()).expand_dim(1, r.clone());
+    let indices = graph.arange(n).expand_dim(1, r);
     let indptr_2d = indptr.expand_dim(0, n);
     let ge = indptr_2d.le(indices).cast(luminal::dtype::DType::Int);
     ge.sum(1).cast(luminal::dtype::DType::Int) - 1
@@ -541,13 +541,13 @@ fn test_compute_attn_mask(
     c: Expression,
 ) -> GraphTensor {
     let s = q_pos.dims1();
-    let q_request = test_indptr_to_request_idx(graph, qo_indptr, s.clone());
-    let c_request = test_indptr_to_request_idx(graph, kv_indptr, c.clone());
-    let c_arange = graph.arange(c.clone());
+    let q_request = test_indptr_to_request_idx(graph, qo_indptr, s);
+    let c_request = test_indptr_to_request_idx(graph, kv_indptr, c);
+    let c_arange = graph.arange(c);
     let c_kv_start = kv_indptr.gather(c_request);
     let c_local_pos = c_arange - c_kv_start;
-    let q_req_2d = q_request.expand_dim(1, c.clone());
-    let c_req_2d = c_request.expand_dim(0, s.clone());
+    let q_req_2d = q_request.expand_dim(1, c);
+    let c_req_2d = c_request.expand_dim(0, s);
     let same = q_req_2d.eq(c_req_2d);
     let c_pos_2d = c_local_pos.expand_dim(0, s);
     let qp_2d = q_pos.expand_dim(1, c);
@@ -577,6 +577,7 @@ fn scatter_rows(
 
 /// Handles to every named input of the paged-attention test graph, returned
 /// alongside the graph so the GA-selection test can `set_data` on each one.
+#[allow(dead_code)]
 struct PagedAttnHandles {
     q_rope: GraphTensor,
     k_rope: GraphTensor,
