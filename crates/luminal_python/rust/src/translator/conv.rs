@@ -173,7 +173,7 @@ impl<'a> Translator<'a> {
 
         if let Some(b) = bias {
             let out_dims = out.dims();
-            let mut b_expanded = b.expand_dim(0, 1);
+            let mut b_expanded = b.expand_dim(0, out_dims[0]);
             for i in 0..spatial {
                 b_expanded = b_expanded.expand_dim(2 + i, out_dims[2 + i]);
             }
@@ -389,8 +389,11 @@ fn depthwise_conv(
     // Expand to [N, C, group_out, out_spatial_product, kernel_product]
     let patches = patches.expand_dim(2, group_out);
 
-    // Expand weight for broadcast: [1, C, group_out, out_spatial_product, kernel_product]
-    let w_expanded = w_flat.expand_dim(0, 1).expand_dim(3, patches.dims()[3]);
+    // Explicitly expand weight across the batch axis so the elementwise Mul
+    // sees equal visible shapes. HLIR binary ops do not perform broadcasting.
+    let w_expanded = w_flat
+        .expand_dim(0, patches.dims()[0])
+        .expand_dim(3, patches.dims()[3]);
 
     // Element-wise multiply and sum over kernel dim
     let product = patches * w_expanded;

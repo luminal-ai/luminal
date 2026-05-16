@@ -15,7 +15,16 @@ pub struct ExportedProgram {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RangeConstraint {
-    pub min_val: i64,
+    /// Lower bound on a symbolic dimension. PT2 emits `null` when the
+    /// constraint is unbounded (no min set), so this must accept None.
+    #[serde(default)]
+    pub min_val: Option<i64>,
+    /// Upper bound on a symbolic dimension. Also nullable in PT2. Currently
+    /// unused on the luminal side, but accepted to avoid deserialization
+    /// errors when PT2 emits it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub max_val: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]

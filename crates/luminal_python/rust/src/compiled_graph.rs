@@ -98,7 +98,12 @@ pub struct GraphTranslation {
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
-    pub output_dtypes: Vec<DType>,
+    /// Output dtypes as PT2 dtype codes (e.g. 5 = int64, 7 = float32).
+    /// Stored as PT2 codes (rather than luminal `DType`) so we can preserve
+    /// distinctions luminal collapses internally — notably int64 vs int32,
+    /// both of which map to `DType::Int` in luminal but must be reported
+    /// back to PyTorch with their original precision.
+    pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
@@ -124,7 +129,9 @@ pub struct CompiledGraph {
     pub output_names: Vec<String>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
-    pub output_dtypes: Vec<DType>,
+    /// Output dtypes as PT2 dtype codes (preserves int64 / int32 distinction
+    /// that luminal collapses to `DType::Int` internally).
+    pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
@@ -151,17 +158,21 @@ impl CompiledGraph {
             input_shape_exprs,
             dim_param_map,
         } = translation;
+        let WeightData {
+            weights,
+            tensor_sizes,
+            device_ptrs,
+        } = weight_data;
 
-        // Build compile args from WeightData (convert TypedData -> raw bytes + dtype)
+        // Build compile args from WeightData.
         let compile_args = BackendCompileArgs {
             search_iters,
-            weights: weight_data
-                .weights
+            weights: weights
                 .iter()
                 .map(|(label, td)| (label.clone(), td.bytes.clone(), td.dtype))
                 .collect(),
-            tensor_sizes: weight_data.tensor_sizes,
-            device_ptrs: weight_data.device_ptrs,
+            tensor_sizes,
+            device_ptrs,
         };
 
         // Create backend via the factory directly
@@ -380,7 +391,7 @@ impl CompiledGraph {
         Ok(())
     }
 
-    /// Set a weight from a device pointer (e.g. "fc1.weight"). Zero-copy on device.
+    /// Register a weight from a device pointer (e.g. "fc1.weight"). Zero-copy on device.
     /// Requires a GPU backend.
     fn set_weight_device_ptr(
         &mut self,
@@ -441,7 +452,7 @@ impl CompiledGraph {
         Ok(self.runtime.output_is_zero_copy(*node_id))
     }
 
-    /// Set a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
+    /// Register a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
     /// `n_bytes` is the total byte count. `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
     fn set_weight_from_ptr(
         &mut self,
@@ -476,10 +487,7 @@ impl CompiledGraph {
     /// Get the PT2 dtype codes for all outputs (in order).
     #[getter]
     fn output_dtypes(&self) -> Vec<u32> {
-        self.output_dtypes
-            .iter()
-            .map(|d| luminal_dtype_to_pt2_code(*d))
-            .collect()
+        self.output_dtypes.clone()
     }
 
     /// Get output tensor data by name as f32 (copies to host).

@@ -450,3 +450,138 @@ def test_hf_llama38b_full(device: torch.device):
     assert torch.allclose(out.logits, ref.logits, atol=1e-5), (
         f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
     )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Full Llama-3.1-8B dynamic-shape regression requires CUDA",
+)
+def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
+    """Explicitly marking the token sequence dim dynamic should be honored end to end.
+
+    This exercises the real user path:
+      1. wrap the pretrained 8B model with ``torch.compile(..., backend=luminal_backend)``
+      2. mark ``input_ids.shape[1]`` dynamic before the first invocation
+      3. verify the first backend trace is already dynamic on that axis
+      4. reuse the same compiled graph for multiple sequence lengths
+    """
+    import copy
+
+    from transformers import AutoConfig, LlamaForCausalLM
+
+    from luminal.pt2 import (
+        _build_dynamic_shapes_from_gm,
+        _reinternalize_lifted_params,
+        _strip_symint_placeholders,
+    )
+
+    backend_invocations = []
+    capture = {}
+
+    def inspector_backend(gm, example_inputs, **kwargs):
+        backend_invocations.append((gm, example_inputs, kwargs))
+        if len(backend_invocations) == 1:
+            capture["gm"] = copy.deepcopy(gm).eval()
+            capture["example_inputs"] = example_inputs
+        compiled_impl = luminal_backend(gm, example_inputs, **kwargs)
+        if len(backend_invocations) == 1:
+            capture["compiled_impl"] = compiled_impl
+        return compiled_impl
+
+    prev_auto = torch._dynamo.config.automatic_dynamic_shapes
+    prev_cache_limit = torch._dynamo.config.cache_size_limit
+    torch._dynamo.reset()
+    torch._dynamo.config.automatic_dynamic_shapes = False
+    torch._dynamo.config.cache_size_limit = 8
+
+    try:
+        config = AutoConfig.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct")
+        config.use_cache = False
+        config._attn_implementation = "eager"
+
+        model = (
+            LlamaForCausalLM.from_pretrained(
+                "NousResearch/Meta-Llama-3.1-8B-Instruct",
+                config=config,
+                torch_dtype=torch.float32,
+            )
+            .eval()
+            .to(device)
+        )
+        compiled = torch.compile(model, backend=inspector_backend)
+
+        first_input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
+        torch._dynamo.mark_dynamic(first_input_ids, 1, min=2, max=16)
+
+        seq_inputs = {
+            4: first_input_ids,
+            6: torch.arange(1, 7, device=device).unsqueeze(0),
+            9: torch.arange(1, 10, device=device).unsqueeze(0),
+        }
+
+        with torch.no_grad():
+            first_ref = model(first_input_ids)
+            first_out = compiled(first_input_ids)
+
+        compiled_impl = capture["compiled_impl"]
+        assert compiled_impl.has_dynamic_dims, (
+            "explicit mark_dynamic on input_ids[:, 1] should produce a dynamic Luminal graph"
+        )
+        assert len(compiled_impl.dim_params) == 1, (
+            f"expected exactly one dynamic dim param, got {compiled_impl.dim_params}"
+        )
+
+        gm = capture["gm"]
+        example_inputs = capture["example_inputs"]
+        gm, user_inputs, _, _ = _reinternalize_lifted_params(gm, example_inputs)
+        user_inputs, _, strip_ok = _strip_symint_placeholders(gm, user_inputs)
+        dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
+
+        assert strip_ok, "Expected explicit mark_dynamic SymInts to be rewritten"
+        assert dynamic_shapes is not None, (
+            "Expected the first backend trace to preserve a dynamic shape spec"
+        )
+        args_spec = dynamic_shapes.get("args")
+        assert args_spec is not None and len(args_spec) == 1, (
+            f"expected one user-input dynamic spec, got {dynamic_shapes}"
+        )
+        assert args_spec[0] is not None, (
+            f"expected a per-dim dynamic spec for input_ids, got {dynamic_shapes}"
+        )
+        assert set(args_spec[0].keys()) == {1}, (
+            "Expected only the token sequence axis (dim=1) to be dynamic, "
+            f"got {dynamic_shapes}"
+        )
+
+        first_diff = torch.max(torch.abs(first_out.logits - first_ref.logits)).item()
+        assert torch.allclose(first_out.logits, first_ref.logits, atol=1e-3, rtol=0), (
+            f"seq_len=4: max_diff={first_diff:.2e}"
+        )
+
+        for seq_len, input_ids in seq_inputs.items():
+            with torch.no_grad():
+                ref = model(input_ids)
+                out = first_out if seq_len == 4 else compiled(input_ids)
+            assert (
+                out.logits.shape
+                == ref.logits.shape
+                == (
+                    1,
+                    seq_len,
+                    config.vocab_size,
+                )
+            ), f"seq_len={seq_len}: got {out.logits.shape}, expected {ref.logits.shape}"
+            assert torch.allclose(out.logits, ref.logits, atol=1e-3, rtol=0), (
+                f"seq_len={seq_len}: "
+                f"max_diff={torch.max(torch.abs(out.logits - ref.logits)).item():.2e}"
+            )
+
+        assert len(backend_invocations) == 1, (
+            "Explicit mark_dynamic should produce one dynamic backend trace from the start, "
+            f"got {len(backend_invocations)} backend invocations"
+        )
+    finally:
+        torch._dynamo.config.automatic_dynamic_shapes = prev_auto
+        torch._dynamo.config.cache_size_limit = prev_cache_limit
+        torch._dynamo.reset()
