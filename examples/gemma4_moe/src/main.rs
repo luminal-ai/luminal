@@ -11,13 +11,6 @@ use tokenizers::Tokenizer;
 
 const REPO_ID: &str = "google/gemma-4-26B-A4B";
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -25,9 +18,9 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn main() {
-    let max_seq_len = env_usize("MAX_SEQ_LEN", 4096);
-    let gen_tokens = env_usize("GEN_TOKENS", 30);
-    let search_graphs = env_usize("SEARCH_GRAPHS", 50);
+    let max_seq_len = 4096;
+    let gen_tokens = 30;
+    let search_graphs = 50;
     let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
     let print_token_ids = env_bool("PRINT_TOKEN_IDS");
 

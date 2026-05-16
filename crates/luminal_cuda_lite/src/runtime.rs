@@ -1657,8 +1657,8 @@ impl CudaRuntime {
                 //
                 // The default assumption is "yes" for ordinary kernel ops
                 // (Conv outputs, matmul outputs, etc). FusionStart and
-                // Fused* are the exceptions — they're synthetic markers
-                // that the fusion rewrites add inside a region; the
+                // Cuda*Elementwise are the exceptions — they're synthetic
+                // nodes that the fusion rewrites add inside a region; the
                 // megakernel computes them in registers and never writes
                 // to memory, so allocating a buffer would just be waste.
                 //
@@ -1673,12 +1673,12 @@ impl CudaRuntime {
                 // an unrelated downstream op that lives in another region.
                 //
                 // Safe over-approximation: if the node is a FusionStart /
-                // Fused* and *any* of its consumers is a FusionStart
+                // Cuda*Elementwise and *any* of its consumers is a FusionStart
                 // (which can only happen when that consumer is the leaf
                 // of a different region) or a non-marker op (e.g. an
                 // unfused Add/Mul reading the value directly), allocate a
                 // buffer so cross-region reads have somewhere to land.
-                let is_marker = kernel_name == "FusionStart" || kernel_name.starts_with("Fused");
+                let is_marker = kernel_name == "FusionStart" || kernel_name.starts_with("Cuda");
                 let has_external_consumer = is_marker
                     && llir_graph
                         .neighbors_directed(node, Direction::Outgoing)

@@ -840,7 +840,7 @@ pub fn kernel_to_host(
     }
 
     let kernel_subgraphs = partition_marked_convex(llir_graph, &kernel_ops_in_graph).unwrap();
-    // Compute the set of FS / FE / FusedX nodes globally absorbed by some
+    // Compute the set of FS / FE / Cuda*Elementwise nodes globally absorbed by some
     // FusionEnd in the LLIR. Used by `build_compile_units` to suppress
     // standalone marker compile units for shared FS leaves whose consumers
     // live in a different convex subgraph than the FS itself.
@@ -1000,7 +1000,7 @@ pub fn kernel_to_host(
                     // (so FE provides trait methods like output_size /
                     // build_params) but its `inputs` are the external
                     // producers, not FE's literal LLIR predecessors —
-                    // those are interior FusedX nodes that don't exist
+                    // those are interior elementwise nodes that don't exist
                     // as buffer-bearing nodes from the host's view.
                     let fe_op_ref = llir_graph[region.fe_node]
                         .to_dialect::<dyn KernelOp>()
@@ -1165,7 +1165,7 @@ pub fn kernel_to_host(
     }
 
     // Strip fully-absorbed marker nodes (FusionStart, nested FusionEnd,
-    // FusedX) from the LLIR. Region codegen has already folded them into
+    // Cuda*Elementwise) from the LLIR. Region codegen has already folded them into
     // a single fused CUDA function anchored at each region's root
     // FusionEnd; the absorbed nodes have no consumers outside the region
     // and never need their own buffers. Removing them keeps later

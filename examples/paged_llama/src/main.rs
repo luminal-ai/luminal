@@ -135,8 +135,15 @@ fn tick(
 const EOS_TOKEN: u32 = 128009;
 const STOP_TOKEN: u32 = 128001;
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 fn main() {
-    let num_slots = 8192;
+    let num_slots = env_usize("NUM_SLOTS", 8192);
     let search_graphs = 100;
     let gen_tokens = 30;
     let prompt_a = "Explain what a neural network is in a paragraph.";

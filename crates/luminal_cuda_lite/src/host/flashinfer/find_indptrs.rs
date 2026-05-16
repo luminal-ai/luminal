@@ -27,19 +27,16 @@ pub fn find_indptr_inputs<'a>(
     mask_node: &'a NodeId,
 ) -> IndptrNodes<'a> {
     // Step 1: Validate mask = Add(scaled_allowed, neg_constant)
-    let (mask_label, mask_children) = &egraph.enodes[mask_node];
-    assert!(
-        mask_label == "Op",
-        "find_indptr_inputs: mask node is not an Op (label={mask_label})"
-    );
-    let mask_kind = resolve_first_node(egraph, &mask_children[0]);
-    let mask_kind_label = &egraph.enodes[mask_kind].0;
-    assert!(
-        mask_kind_label.contains("Add"),
-        "find_indptr_inputs: mask is not an Add (kind={mask_kind_label})"
-    );
-
-    let mask_inputs = walk_ilist_simple(egraph, &mask_children[1]);
+    let mask_inputs = logical_binary_inputs(egraph, mask_node, "Add").unwrap_or_else(|| {
+        let (mask_label, mask_children) = &egraph.enodes[mask_node];
+        assert!(
+            mask_label == "Op",
+            "find_indptr_inputs: mask node is not an Op (label={mask_label})"
+        );
+        let mask_kind = resolve_first_node(egraph, &mask_children[0]);
+        let mask_kind_label = &egraph.enodes[mask_kind].0;
+        panic!("find_indptr_inputs: mask is not an Add (kind={mask_kind_label})");
+    });
     assert_eq!(
         mask_inputs.len(),
         2,
@@ -98,15 +95,9 @@ fn find_1e10_mul<'a>(
     mask_add_inputs: &[&'a NodeId],
 ) -> (&'a NodeId, &'a NodeId) {
     for &input_node in mask_add_inputs {
-        let (label, children) = &egraph.enodes[input_node];
-        if label != "Op" {
+        let Some(mul_inputs) = logical_binary_inputs(egraph, input_node, "Mul") else {
             continue;
-        }
-        let kind = resolve_first_node(egraph, &children[0]);
-        if !egraph.enodes[kind].0.contains("Mul") {
-            continue;
-        }
-        let mul_inputs = walk_ilist_simple(egraph, &children[1]);
+        };
         if mul_inputs.len() != 2 {
             continue;
         }
@@ -152,6 +143,7 @@ fn find_1e10_mul<'a>(
 }
 
 fn is_constant(egraph: &SerializedEGraph, node: &NodeId, expected: f32) -> bool {
+    let node = resolve_op_with_kind(egraph, node, "Constant").unwrap_or(node);
     let (label, children) = &egraph.enodes[node];
     if label != "Op" {
         return false;
@@ -245,4 +237,92 @@ fn resolve_first_ir_node<'a>(egraph: &'a SerializedEGraph, eclass: &ClassId) -> 
         }
     }
     &nodes[0]
+}
+
+fn resolve_op_with_kind<'a>(
+    egraph: &'a SerializedEGraph,
+    node: &'a NodeId,
+    kind_substr: &str,
+) -> Option<&'a NodeId> {
+    let class = egraph.node_to_class.get(node)?;
+    for candidate in &egraph.eclasses[class].1 {
+        let (label, children) = &egraph.enodes[candidate];
+        if label != "Op" || children.is_empty() {
+            continue;
+        }
+        let kind = resolve_first_node(egraph, &children[0]);
+        if egraph.enodes[kind].0.contains(kind_substr) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn logical_binary_inputs<'a>(
+    egraph: &'a SerializedEGraph,
+    node: &'a NodeId,
+    op_name: &str,
+) -> Option<Vec<&'a NodeId>> {
+    if let Some(op_node) = resolve_op_with_kind(egraph, node, op_name) {
+        let (_, children) = &egraph.enodes[op_node];
+        return Some(walk_ilist_simple(egraph, &children[1]));
+    }
+
+    let (label, children) = &egraph.enodes[node];
+    if label != "Op" || children.len() < 2 {
+        return None;
+    }
+    let kind = resolve_first_node(egraph, &children[0]);
+    if egraph.enodes[kind].0.contains("CudaBinaryElementwise") {
+        let opcode_class = egraph.enodes[kind].1.first()?;
+        let opcode_node = resolve_first_node(egraph, opcode_class);
+        if egraph.enodes[opcode_node].0.trim_matches('"') != op_name {
+            return None;
+        }
+        return Some(
+            walk_ilist_simple(egraph, &children[1])
+                .into_iter()
+                .map(|input| unwrap_fusion_start(egraph, input))
+                .collect(),
+        );
+    }
+    if !egraph.enodes[kind].0.contains("FusionEnd") {
+        return None;
+    }
+    let fe_inputs = walk_ilist_simple(egraph, &children[1]);
+    let elem = *fe_inputs.first()?;
+    let (elem_label, elem_children) = &egraph.enodes[elem];
+    if elem_label != "Op" || elem_children.len() < 2 {
+        return None;
+    }
+    let elem_kind = resolve_first_node(egraph, &elem_children[0]);
+    if !egraph.enodes[elem_kind].0.contains("CudaBinaryElementwise") {
+        return None;
+    }
+    let opcode_class = egraph.enodes[elem_kind].1.first()?;
+    let opcode_node = resolve_first_node(egraph, opcode_class);
+    if egraph.enodes[opcode_node].0.trim_matches('"') != op_name {
+        return None;
+    }
+    Some(
+        walk_ilist_simple(egraph, &elem_children[1])
+            .into_iter()
+            .map(|input| unwrap_fusion_start(egraph, input))
+            .collect(),
+    )
+}
+
+fn unwrap_fusion_start<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> &'a NodeId {
+    let (label, children) = &egraph.enodes[node];
+    if label != "Op" || children.len() < 2 {
+        return node;
+    }
+    let kind = resolve_first_node(egraph, &children[0]);
+    if !egraph.enodes[kind].0.contains("FusionStart") {
+        return node;
+    }
+    walk_ilist_simple(egraph, &children[1])
+        .first()
+        .copied()
+        .unwrap_or(node)
 }

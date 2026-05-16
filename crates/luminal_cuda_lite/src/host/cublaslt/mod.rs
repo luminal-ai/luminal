@@ -177,33 +177,28 @@ impl EgglogOp for CuBlasLt {
             // so their presence is the matmul-broadcast signal — no further
             // stride-form check needed.
             //
-            // We delete BOTH the `KernelMul` and the co-resident HLIR `Mul`
-            // row from the Mul eclass. Deleting just the KernelMul leaves an
-            // HLIR-only eclass, which then triggers
-            // `inject_kernel_alternatives` (in `src/egglog_utils/mod.rs`) to
-            // synthesize a fresh KernelMul during serialization, undoing the
-            // cleanup. Deleting both empties the eclass, inject skips it, and
-            // the empty-eclass cascade pass prunes the downstream Sum /
-            // KernelSum references. cuBLAS, TileMatmulFullSplit,
-            // KernelBatchMatVec, and KernelBatchMatMul all take original
-            // (a, b) inputs rather than the Mul eclass, so they survive the
-            // cascade and remain as the matmul output's only alternative.
+            // Delete the HLIR `Mul` and its generic fusion-region alternative
+            // from the Mul eclass. Emptying that eclass lets the empty-eclass
+            // cascade prune the downstream Sum / KernelSum fallback. cuBLAS,
+            // TileMatmulFullSplit, KernelBatchMatVec, and KernelBatchMatMul all
+            // take original (a, b) inputs rather than the Mul eclass, so they
+            // survive the cascade and remain as the matmul output alternative.
             Rule::raw("(rule
-                ((= ?kmul (Op (KernelMul ?shape ?as ?bs ?os ?dt) ?inputs))
-                 (= ?hmul (Op (Mul ?shape ?as ?bs ?os) ?inputs))
-                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?kmul (INil))))
+                ((= ?mul (Op (Mul ?shape ?as ?bs ?os) ?inputs))
+                 (= ?mul (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs))
+                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
                  (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (KernelMul ?shape ?as ?bs ?os ?dt) ?inputs))
-                 (delete (Op (Mul ?shape ?as ?bs ?os) ?inputs)))
+                ((delete (Op (Mul ?shape ?as ?bs ?os) ?inputs))
+                 (delete (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs)))
                 :ruleset cleanup
             )"),
             Rule::raw("(rule
-                ((= ?kmul (Op (KernelMul ?shape ?as ?bs ?os ?dt) ?inputs))
-                 (= ?hmul (Op (Mul ?shape ?as ?bs ?os) ?inputs))
-                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?kmul (INil))))
+                ((= ?mul (Op (Mul ?shape ?as ?bs ?os) ?inputs))
+                 (= ?mul (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs))
+                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
                  (= ?sum (Op (KernelBatchMatMul ?bos ?bk ?bas ?baks ?bbs ?bbks ?bouts ?bdt) ?bi)))
-                ((delete (Op (KernelMul ?shape ?as ?bs ?os ?dt) ?inputs))
-                 (delete (Op (Mul ?shape ?as ?bs ?os) ?inputs)))
+                ((delete (Op (Mul ?shape ?as ?bs ?os) ?inputs))
+                 (delete (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs)))
                 :ruleset cleanup
             )"),
         ]

@@ -18,17 +18,10 @@ const REPO_ID: &str = "openai/whisper-tiny.en";
 /// without needing a local audio file.
 const DEFAULT_AUDIO_BYTES: &[u8] = include_bytes!("../assets/jfk.wav");
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 fn main() {
     let max_target_pos = N_TEXT_CTX; // 448
-    let gen_tokens = env_usize("GEN_TOKENS", 200);
-    let search_graphs = env_usize("SEARCH_GRAPHS", 50);
+    let gen_tokens = 200;
+    let search_graphs = 50;
     let audio_path = std::env::args().nth(1);
 
     let ctx = CudaContext::new(0).unwrap();

@@ -4,8 +4,8 @@
 //! The cublaslt 2D rules in `host/cublaslt/cublaslt_*Cm_rewrite.egg` /
 //! `cublaslt_Rm*_rewrite.egg` are *supposed* to match any 2D matmul whose
 //! Mul + SumReduce broadcast lowering has the expected stride patterns,
-//! and the conditional `KernelMul` cleanup is *supposed* to delete the
-//! KernelMul + KernelSumReduce fallback whenever a cublaslt alternative
+//! and the conditional matmul cleanup is *supposed* to delete the
+//! elementwise Mul + KernelSumReduce fallback whenever a cublaslt alternative
 //! exists. In practice both fail to fire reliably for the VAE's mid-block
 //! `AttnBlock` matmuls — at 1024² that lets the search occasionally pick
 //! the broadcast-Mul path for `q @ kᵀ`, generating a `(HW, HW, C) =

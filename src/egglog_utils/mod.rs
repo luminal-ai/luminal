@@ -1302,7 +1302,7 @@ pub fn run_egglog_with_report_parts(
     // Conditional cleanup: an `Op` enode in our IR has the shape
     // `Op (OpKind ...) (IList ...)`. The first child of `Op` is an OpKind
     // eclass; the OpKind enode's label tells us whether it's an HLIR op
-    // (e.g. "MulKind") or a kernel op (e.g. "KernelMulKind"). The egglog
+    // (e.g. "MulKind") or a backend op (e.g. "FusionEndKind"). The egglog
     // `cleanup` ruleset can over-delete by removing HLIR variants that have
     // no kernel alternative (e.g. when dtype propagation didn't reach the
     // sub-expression). On conv-heavy graphs that drops Op eclasses to empty
@@ -1316,7 +1316,7 @@ pub fn run_egglog_with_report_parts(
     let cleanable = &op_parts.cleanable_op_names;
     if !cleanable.is_empty() {
         // For each OpKind eclass, find the unique kind label (if any).
-        // OpKind eclasses contain enodes like (MulKind ...) / (KernelMulKind ...).
+        // OpKind eclasses contain enodes like (MulKind ...) / (FusionEndKind ...).
         let mut opkind_class_kinds: FxHashMap<egraph_serialize::ClassId, FxHashSet<String>> =
             FxHashMap::default();
         for (nid, (label, _)) in &egraph.enodes {

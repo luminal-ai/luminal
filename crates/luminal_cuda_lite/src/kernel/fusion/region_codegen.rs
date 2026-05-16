@@ -1,26 +1,26 @@
 // =========================================================================
 // Region codegen for FusionStart / FusionEnd-bracketed fused regions.
 //
-// PR1 left FusedX / FusionStart / FusionEnd nodes in the post-extraction
+// Older fusion lowering left elementwise / FusionStart / FusionEnd nodes in the post-extraction
 // LLIR, each compiling to its own standalone CUDA kernel. PR2 collapses
 // every FusionEnd-rooted region into ONE fused CUDA kernel at codegen
 // time — without rewriting the LLIR.
 //
 // Pipeline:
 //   `kernel_to_host` builds a Vec<CompileUnit> from the topo order:
-//     - CompileUnit::Single(node)  — un-fused KernelX, compiled as before.
-//     - CompileUnit::Region(rgn)   — one FE + its interior FusedX DAG +
+//     - CompileUnit::Single(node)  — unfused non-region kernels, compiled as before.
+//     - CompileUnit::Region(rgn)   — one FE + its interior elementwise DAG +
 //                                    its FS leaves. Compiled here as a
 //                                    single CUDA kernel that reads from
 //                                    the region's external inputs once,
-//                                    chains all FusedX bodies through
+//                                    chains all elementwise bodies through
 //                                    register-resident locals, and writes
 //                                    the FE's output.
 //
 // The CompiledKernel for a Region is keyed on the FE node and stores
 // `inputs = external producer NodeIndices` (one per interior FusionStart),
 // so the existing buffer-pointer wiring in to_host.rs picks up the right
-// device pointers at execute time. Interior FusedX / FusionStart nodes
+// device pointers at execute time. Interior Cuda*Elementwise / FusionStart nodes
 // never enter the kernels Vec — they have no buffers, no launches.
 // =========================================================================
 
@@ -40,6 +40,7 @@ use as_any::Downcast;
 use crate::{
     compile_module_image_for_current_device, cuda_dtype,
     kernel::KernelOp,
+    kernel::fusion::elementwise::{CudaBinaryElementwise, CudaUnaryElementwise},
     kernel::fusion::markers::{FusionEnd, FusionStart},
     kernel::hlir::{dtype_includes, generate_dyn_dims_defines},
 };
@@ -52,10 +53,10 @@ use crate::{
 pub(crate) struct RegionUnit {
     /// The FusionEnd node that anchors this region.
     pub fe_node: NodeIndex,
-    /// Interior FusedX nodes, in topological order (predecessors before
+    /// Interior Cuda*Elementwise nodes, in topological order (predecessors before
     /// consumers). Used to emit register-binding statements in dependency
     /// order in the fused CUDA kernel body.
-    pub fusedx_topo: Vec<NodeIndex>,
+    pub elementwise_topo: Vec<NodeIndex>,
     /// FusionStart nodes that bound the region's leaves. One per external
     /// read site — duplicates (different FS LLIR nodes wrapping the same
     /// upstream tensor) are kept separate so each read uses its own
@@ -79,13 +80,13 @@ pub(crate) enum CompileUnit {
 
 /// Group a sub-DAG's topo order into compile units. Each FusionEnd node
 /// becomes the root of a `CompileUnit::Region`; the region's interior
-/// FusedX and FusionStart nodes are absorbed into that region and removed
+/// Cuda*Elementwise and FusionStart nodes are absorbed into that region and removed
 /// from the per-node iteration. Anything else is wrapped in
 /// `CompileUnit::Single`.
 /// Globally-absorbed FS / FE markers — the set of marker nodes that any
 /// `FusionEnd` in the LLIR walks back to during region detection. A
 /// marker is "absorbed" iff some FE in the LLIR can reach it by walking
-/// incoming edges through `FusionEnd` / `FusedX` nodes, stopping at
+/// incoming edges through `FusionEnd` / Cuda*Elementwise nodes, stopping at
 /// `FusionStart` leaves.
 ///
 /// This is computed once over the full LLIR rather than per-convex-
@@ -123,7 +124,7 @@ pub(crate) fn globally_absorbed_markers(llir_graph: &LLIRGraph) -> FxHashSet<Nod
                         absorbed.insert(pred);
                         stack.push(pred);
                     }
-                    Some(other) if other.starts_with("Fused") => {
+                    Some(_) if is_region_elementwise(llir_graph, pred) => {
                         absorbed.insert(pred);
                         stack.push(pred);
                     }
@@ -187,12 +188,12 @@ pub(crate) fn build_compile_units(
                         absorbed.insert(pred);
                         stack.push(pred);
                     }
-                    Some(other) if other.starts_with("Fused") => {
+                    Some(_) if is_region_elementwise(llir_graph, pred) => {
                         interior.push(pred);
                         stack.push(pred);
                     }
                     _ => {
-                        // Non-marker, non-FusedX predecessor inside what
+                        // Non-marker, non-elementwise predecessor inside what
                         // we thought was a region. Shouldn't happen with
                         // the current rules; treat conservatively: do
                         // not absorb it. This means the region is
@@ -289,7 +290,7 @@ pub(crate) fn build_compile_units(
             node,
             RegionUnit {
                 fe_node: node,
-                fusedx_topo: interior_topo,
+                elementwise_topo: interior_topo,
                 fs_nodes: fs_topo,
                 external_inputs,
             },
@@ -318,24 +319,35 @@ pub(crate) fn build_compile_units(
 }
 
 // =========================================================================
-// Per-FusedX body templates.
+// Per-elementwise body templates.
 //
 // Each entry takes the names of the local variables holding the op's
 // inputs and returns a CUDA expression evaluating to the op's output
 // (a register-resident value, no buffer involved).
 // =========================================================================
 
-fn fused_body(name: &str, locals: &[&str]) -> String {
-    match name {
-        "FusedSin" => format!("sinf({})", locals[0]),
-        "FusedSqrt" => format!("sqrtf({})", locals[0]),
-        "FusedExp" => format!("expf({})", locals[0]),
-        "FusedExp2" => format!("exp2f({})", locals[0]),
-        "FusedLog2" => format!("log2f({})", locals[0]),
-        "FusedRecip" => format!("1.0f / {}", locals[0]),
-        "FusedAdd" => format!("{} + {}", locals[0], locals[1]),
-        "FusedMul" => format!("{} * {}", locals[0], locals[1]),
-        other => panic!("region_codegen: unknown FusedX op {other}"),
+fn is_region_elementwise(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
+    llir_graph
+        .node_weight(node)
+        .and_then(|op| op.to_dialect::<dyn KernelOp>())
+        .is_some_and(|op| {
+            (***op).downcast_ref::<CudaUnaryElementwise>().is_some()
+                || (***op).downcast_ref::<CudaBinaryElementwise>().is_some()
+        })
+}
+
+fn elementwise_body(op: &str, locals: &[&str]) -> String {
+    match op {
+        "Sin" => format!("sinf({})", locals[0]),
+        "Sqrt" => format!("sqrtf({})", locals[0]),
+        "Exp" => format!("expf({})", locals[0]),
+        "Exp2" => format!("exp2f({})", locals[0]),
+        "Log2" => format!("log2f({})", locals[0]),
+        "Recip" => format!("1.0f / {}", locals[0]),
+        "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", locals[0]),
+        "Add" => format!("{} + {}", locals[0], locals[1]),
+        "Mul" => format!("{} * {}", locals[0], locals[1]),
+        other => panic!("region_codegen: unknown elementwise op {other}"),
     }
 }
 
@@ -373,7 +385,7 @@ pub(crate) fn compile_region(
     let dtype: DType = fe_struct.dtype;
 
     // Aggregate all dynamic vars used anywhere in the region (FS strides,
-    // FE strides, FusedX shape — all FusedX share `out_shape`, but their
+    // FE strides and elementwise shapes.
     // own strides are likewise relevant for any future stride-affine ops).
     let mut all_vars: FxHashSet<char> = FxHashSet::default();
     all_vars.extend(out_shape.iter().flat_map(|e| e.dyn_vars()));
@@ -382,6 +394,19 @@ pub(crate) fn compile_region(
         let fs_op = llir_graph[fs_idx].to_dialect::<dyn KernelOp>().unwrap();
         let fs_struct: &FusionStart = (***fs_op).downcast_ref::<FusionStart>().unwrap();
         all_vars.extend(fs_struct.strides.iter().flat_map(|e| e.dyn_vars()));
+    }
+    for &elem_idx in &region.elementwise_topo {
+        let elem_op = llir_graph[elem_idx].to_dialect::<dyn KernelOp>().unwrap();
+        if let Some(elem) = (***elem_op).downcast_ref::<CudaUnaryElementwise>() {
+            all_vars.extend(elem.shape.iter().flat_map(|e| e.dyn_vars()));
+            all_vars.extend(elem.in_strides.iter().flat_map(|e| e.dyn_vars()));
+            all_vars.extend(elem.out_strides.iter().flat_map(|e| e.dyn_vars()));
+        } else if let Some(elem) = (***elem_op).downcast_ref::<CudaBinaryElementwise>() {
+            all_vars.extend(elem.out_shape.iter().flat_map(|e| e.dyn_vars()));
+            all_vars.extend(elem.a_stride.iter().flat_map(|e| e.dyn_vars()));
+            all_vars.extend(elem.b_stride.iter().flat_map(|e| e.dyn_vars()));
+            all_vars.extend(elem.out_stride.iter().flat_map(|e| e.dyn_vars()));
+        }
     }
 
     let cuda_ty = cuda_dtype(dtype);
@@ -408,19 +433,19 @@ pub(crate) fn compile_region(
     }
     let signature = signature_params.join(", ");
 
-    // Body: read FS leaves, then walk FusedX in topo order emitting a
+    // Body: read FS leaves, then walk elementwise nodes in topo order emitting a
     // local per op, then write FE output. Every node gets a local keyed
     // by a position-in-region index so the kernel string is invariant
     // under NodeIndex churn (each `egglog_to_llir` reissues NodeIndexes,
     // so naming locals by `n.index()` would invalidate the kernel
     // string cache on every search candidate). Indices: FS leaves get
-    // 0..fs_nodes.len(), FusedX get fs_nodes.len()..(+ fusedx_topo.len()).
+    // 0..fs_nodes.len(), elementwise nodes get fs_nodes.len()..(+ elementwise_topo.len()).
     let mut local_idx_map: FxHashMap<NodeIndex, usize> = FxHashMap::default();
     for (i, &fs_idx) in region.fs_nodes.iter().enumerate() {
         local_idx_map.insert(fs_idx, i);
     }
     let fs_count = region.fs_nodes.len();
-    for (i, &op_idx) in region.fusedx_topo.iter().enumerate() {
+    for (i, &op_idx) in region.elementwise_topo.iter().enumerate() {
         local_idx_map.insert(op_idx, fs_count + i);
     }
     let local_name = |n: NodeIndex| format!("v_{}", local_idx_map[&n]);
@@ -443,12 +468,21 @@ pub(crate) fn compile_region(
         ));
     }
 
-    // FusedX ops in topo order. Each looks up its predecessor locals
+    // Elementwise ops in topo order. Each looks up its predecessor locals
     // (in incoming-edge id order to match the original op's input
     // arity / position).
-    for &op_idx in &region.fusedx_topo {
+    for &op_idx in &region.elementwise_topo {
         let op_ref = llir_graph[op_idx].to_dialect::<dyn KernelOp>().unwrap();
-        let op_name = op_ref.kernel_name();
+        let elem_name = if let Some(elem) = (***op_ref).downcast_ref::<CudaUnaryElementwise>() {
+            elem.op.as_str()
+        } else if let Some(elem) = (***op_ref).downcast_ref::<CudaBinaryElementwise>() {
+            elem.op.as_str()
+        } else {
+            panic!(
+                "region_codegen: expected Cuda*Elementwise op, got {}",
+                op_ref.kernel_name()
+            );
+        };
 
         let mut input_locals: Vec<String> = llir_graph
             .edges_directed(op_idx, Direction::Incoming)
@@ -467,15 +501,15 @@ pub(crate) fn compile_region(
         input_locals = edges.into_iter().map(|(_, src)| local_name(src)).collect();
         let inputs_ref: Vec<&str> = input_locals.iter().map(|s| s.as_str()).collect();
 
-        let expr = fused_body(op_name, &inputs_ref);
+        let expr = elementwise_body(elem_name, &inputs_ref);
         body.push_str(&format!(
             "        {cuda_ty} {name} = {expr};\n",
             name = local_name(op_idx),
         ));
     }
 
-    // FE write: pick the FusedX feeding FE (its single incoming edge in
-    // the region — a FusedX or, in degenerate single-FS regions which
+    // FE write: pick the elementwise node feeding FE (its single incoming edge in
+    // the region — an elementwise node or, in degenerate single-FS regions which
     // shouldn't arise, an FS).
     let fe_input: NodeIndex = llir_graph
         .neighbors_directed(region.fe_node, Direction::Incoming)
@@ -527,7 +561,7 @@ pub(crate) fn compile_region(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::fusion::fused_ops::FusedAdd;
+    use crate::kernel::fusion::elementwise::CudaBinaryElementwise;
     use luminal::op::LLIROp;
     use luminal::prelude::petgraph::algo::toposort;
 
@@ -554,23 +588,23 @@ mod tests {
     fn fusion_start_with_no_predecessor_panics() {
         // Minimal reproducer:
         //
-        //   (no input) ──▶ FusionStart ──▶ FusedAdd ──▶ FusionEnd
+        //   (no input) ──▶ FusionStart ──▶ CudaBinaryElementwise ──▶ FusionEnd
         //
-        // FusedAdd is a binary op (n_inputs = 2) so a real region would
+        // CudaBinaryElementwise is a binary op (n_inputs = 2) so a real region would
         // have two FS leaves. For this panic-shape test only the *first*
         // FS leaf needs a missing predecessor — `build_compile_units`
         // panics in `expect("FusionStart with no predecessor")` as soon
         // as any FS in `fs_topo` lacks one. We add only one FS edge so
-        // FusedAdd has a dangling second input slot, but that's fine:
+        // CudaBinaryElementwise has a dangling second input slot, but that's fine:
         // we're testing the specific panic path inside `build_compile_units`,
         // not full kernel codegen.
         let mut llir: LLIRGraph = LLIRGraph::default();
 
         let fs_node = llir.add_node(llir_of(FusionStart::default()));
-        let fadd_node = llir.add_node(llir_of(FusedAdd::default()));
+        let fadd_node = llir.add_node(llir_of(CudaBinaryElementwise::default()));
         let fe_node = llir.add_node(llir_of(FusionEnd::default()));
 
-        // FusionStart → FusedAdd → FusionEnd.
+        // FusionStart → CudaBinaryElementwise → FusionEnd.
         llir.add_edge(fs_node, fadd_node, ());
         llir.add_edge(fadd_node, fe_node, ());
 

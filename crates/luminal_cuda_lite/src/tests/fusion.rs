@@ -1,7 +1,9 @@
+use as_any::Downcast;
 use luminal::egglog_utils::{egglog_to_llir, random_initial_choice};
 use luminal::prelude::*;
 
 use crate::kernel::KernelOp;
+use crate::kernel::fusion::{CudaBinaryElementwise, CudaUnaryElementwise};
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::{
     TOLERANCE_SAFETY_FACTOR, dtype_epsilon, random_f32_vec, test_binary_cuda, test_unary_cuda,
@@ -86,7 +88,7 @@ fn test_unary_fusion_preserves_output() {
 #[test]
 fn test_three_unary_ops_fuse() {
     // A chain of 3 pure-elementwise unaries with matching strides should be
-    // reachable as a single marker region containing all three FusedX ops.
+    // reachable as a single marker region containing all three elementwise ops.
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     let _b = a.sin().sqrt().exp2().output();
@@ -104,7 +106,7 @@ fn test_three_unary_ops_fuse() {
 #[test]
 fn test_four_unary_ops_fuse() {
     // 4-op chain should collapse into a single marker region containing all
-    // four FusedX ops (one pair-fuse + repeated grow-FE→U firings).
+    // four elementwise ops (one pair-fuse + repeated grow-FE→U firings).
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     let _b = a.sin().sqrt().exp2().log2().output();
@@ -317,8 +319,15 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
 
         let name_of = |idx: NodeIndex| -> Option<String> {
             llir.node_weight(idx).and_then(|op| {
-                op.to_dialect::<dyn KernelOp>()
-                    .map(|k| k.kernel_name().to_string())
+                op.to_dialect::<dyn KernelOp>().map(|k| {
+                    if let Some(elem) = (***k).downcast_ref::<CudaUnaryElementwise>() {
+                        format!("Fused{}", elem.op)
+                    } else if let Some(elem) = (***k).downcast_ref::<CudaBinaryElementwise>() {
+                        format!("Fused{}", elem.op)
+                    } else {
+                        k.kernel_name().to_string()
+                    }
+                })
             })
         };
 
@@ -343,12 +352,13 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
 
             // Resolve chains of nested FusionStart wrappers (cascade artifact)
             // to the real external source. A FusionStart whose incoming neighbor
-            // is itself a FusionStart — or a FusionEnd whose region is fully
-            // inside ours — is a cascade layer, not a new external tensor.
+            // is itself a FusionStart is a cascade layer, not a new external
+            // tensor. A FusionEnd predecessor is a real external region output
+            // in the generic singleton-region model, so do not walk through it.
             let resolve_source = |mut n: NodeIndex| -> NodeIndex {
                 loop {
                     match name_of(n).as_deref() {
-                        Some("FusionStart") | Some("FusionEnd") => {
+                        Some("FusionStart") => {
                             let mut inc = llir.neighbors_directed(n, petgraph::Direction::Incoming);
                             match inc.next() {
                                 Some(p) => n = p,
@@ -379,15 +389,6 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
                             let mut inc =
                                 llir.neighbors_directed(pred, petgraph::Direction::Incoming);
                             match inc.next() {
-                                Some(src_node)
-                                    if name_of(src_node).as_deref() == Some("FusionEnd") =>
-                                {
-                                    // Merge adjacent regions — treat the FS/FE
-                                    // pair as internal; walk past the upstream
-                                    // FE into its region.
-                                    visited.insert(src_node);
-                                    stack.push(src_node);
-                                }
                                 Some(src_node) => {
                                     start_sources.insert(resolve_source(src_node));
                                 }

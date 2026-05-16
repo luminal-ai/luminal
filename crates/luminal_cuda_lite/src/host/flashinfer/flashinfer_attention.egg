@@ -89,6 +89,16 @@
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
 
+        ; FlashInfer needs qo_indptr/kv_indptr to be recoverable from the mask
+        ; expression. Do not match examples that pass a precomputed mask Input.
+        (= ?mask (Op (Add ?inner_mask_shape ?inner_mask_a_strides ?inner_mask_b_strides ?inner_mask_out_strides)
+            (ICons ?mask_scaled_allowed (ICons ?mask_offset (INil)))))
+        (= ?mask_scaled_allowed (Op (Mul ?allowed_shape ?allowed_strides ?scale_const_strides ?scaled_allowed_strides)
+            (ICons ?mask_allowed (ICons ?mask_scale_const (INil)))))
+        (= ?mask_scale_const (Op (Constant ?mask_scale_val) (INil)))
+        (> ?mask_scale_val 9999999999.0)
+        (< ?mask_scale_val 10000000001.0)
+
         ; ── K GQA broadcast: Mul(K_gathered, 1.0) with zero-stride constant ──
         ; Shape: (nheads, hdim, c) — 3D
         (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
