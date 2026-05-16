@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
+use rustc_hash::FxHashMap;
 
+use crate::pt2_expr::{ExprBounds, canonical_equal_expr, sym_char_ranges};
 use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
@@ -10,6 +12,25 @@ const SCATTER_INPUT_ARG: usize = 0;
 const SCATTER_DIM_ARG: usize = 1;
 const SCATTER_INDEX_ARG: usize = 2;
 const SCATTER_VALUE_ARG: usize = 3;
+
+fn normalize_concat_dims(
+    lhs: &mut GraphTensor,
+    rhs: &mut GraphTensor,
+    skip_dim: Option<usize>,
+    sym_ranges: &FxHashMap<char, ExprBounds>,
+) {
+    for i in 0..lhs.shape.len() {
+        if Some(i) == skip_dim {
+            continue;
+        }
+        let lhs_dim = lhs.shape.dims[i];
+        let rhs_dim = rhs.shape.dims[i];
+        if let Some(canonical) = canonical_equal_expr(lhs_dim, rhs_dim, sym_ranges) {
+            lhs.shape.dims[i] = canonical;
+            rhs.shape.dims[i] = canonical;
+        }
+    }
+}
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_reshape(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -120,6 +141,47 @@ impl<'a> Translator<'a> {
         Ok(a.slice_along(start..end, dim))
     }
 
+    /// `aten.select.int(self, dim, index)` — select element `index` along
+    /// `dim`, dropping that dim. Output rank = input rank − 1, so a 1-D input
+    /// produces a rank-0 scalar. Both `dim` and `index` may be negative and
+    /// are normalized against the input shape.
+    ///
+    /// Lowered as `slice_along(index..index+1, dim).squeeze(dim)`. We use the
+    /// slice + squeeze decomposition (rather than `gather`) because the
+    /// composition is a pure shape manipulation with a single iota, which the
+    /// luminal compiler can fold into surrounding ops.
+    pub(crate) fn translate_select(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let dim = self.get_int_arg(node, 1)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let index_raw = self.get_int_arg(node, 2)?;
+
+        // Normalize a possibly-negative index. PyTorch accepts indices in
+        // [-size, size); negative wraps from the end.
+        let index = if index_raw < 0 {
+            let axis_size = a.shape.dims[dim].to_usize().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "select.int: dim {} must be concrete to normalize a negative index",
+                    dim
+                )
+            })?;
+            let normalized = axis_size as i64 + index_raw;
+            if normalized < 0 {
+                bail!(
+                    "select.int: index {} out of range for dim {} of size {}",
+                    index_raw,
+                    dim,
+                    axis_size
+                );
+            }
+            normalized as usize
+        } else {
+            index_raw as usize
+        };
+
+        Ok(a.slice_along(index..index + 1, dim).squeeze(dim))
+    }
+
     pub(crate) fn translate_cat(&mut self, node: &Node) -> Result<GraphTensor> {
         let tensors: Vec<GraphTensor> = if let Some(names) = node.inputs[0].arg.as_tensors() {
             names
@@ -160,8 +222,17 @@ impl<'a> Translator<'a> {
 
         let dim = normalize_dim(dim, tensors[0].shape.len());
         let mut result = tensors[0];
+        let sym_ranges = sym_char_ranges(&self.sym_map);
         for t in &tensors[1..] {
-            result = result.concat_along(*t, dim);
+            let mut next = *t;
+            normalize_concat_dims(&mut result, &mut next, Some(dim), &sym_ranges);
+
+            let lhs_axis = result.dims()[dim];
+            let rhs_axis = next.dims()[dim];
+            let mut lhs_padded = result.pad_along(0, rhs_axis, dim, 0.);
+            let mut rhs_padded = next.pad_along(lhs_axis, 0, dim, 0.);
+            normalize_concat_dims(&mut lhs_padded, &mut rhs_padded, None, &sym_ranges);
+            result = lhs_padded + rhs_padded;
         }
         Ok(result)
     }
@@ -333,6 +404,17 @@ impl<'a> Translator<'a> {
         let dim = normalize_dim(dim, a.shape.len());
         let indices = self.get_input_tensor(node, 2)?;
 
+        // PyTorch eager allows torch.gather(rank-1, 0, rank-0) and returns
+        // a rank-0 scalar — the only rank-mismatch case eager permits. Our
+        // gather_elements requires the index rank to match the source rank,
+        // so unsqueeze the rank-0 index to (1,), gather, then squeeze back.
+        let promoted_rank0 = indices.shape.is_empty() && a.shape.len() == 1;
+        let indices = if promoted_rank0 {
+            indices.unsqueeze(0)
+        } else {
+            indices
+        };
+
         // Normalize negative indices: -1 → last, -2 → second-to-last, etc.
         // Stay in Int the whole way — multiplying an Int tensor by an
         // Expression broadcasts the axis size and avoids three Cast nodes
@@ -344,7 +426,12 @@ impl<'a> Translator<'a> {
         let is_negative = indices_int.lt(zero).cast(DType::Int);
         let normalized = indices_int + is_negative * axis_dim;
 
-        Ok(a.gather_elements(normalized, dim))
+        let result = a.gather_elements(normalized, dim);
+        Ok(if promoted_rank0 {
+            result.squeeze(0)
+        } else {
+            result
+        })
     }
 
     pub(crate) fn translate_scatter_src(&mut self, node: &Node) -> Result<GraphTensor> {

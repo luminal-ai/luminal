@@ -3,6 +3,7 @@ pub mod typed_data;
 
 // PT2 modules
 mod pt2_compiled_model;
+mod pt2_expr;
 mod pt2_parser;
 mod pt2_schema;
 mod pt2_util;

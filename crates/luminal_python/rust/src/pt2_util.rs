@@ -1,5 +1,9 @@
 use luminal::prelude::*;
 
+fn same_dim(lhs: Expression, rhs: Expression) -> bool {
+    lhs == rhs || lhs.simplify() == rhs.simplify() || lhs.egglog_equal(rhs)
+}
+
 /// Binary operation type.
 #[derive(Clone, Copy)]
 pub enum BinaryOp {
@@ -51,7 +55,7 @@ pub fn broadcast_binary(mut a: GraphTensor, mut b: GraphTensor) -> (GraphTensor,
         let a_dim = a.shape.dims[i];
         let b_dim = b.shape.dims[i];
 
-        if a_dim == b_dim {
+        if same_dim(a_dim, b_dim) {
             continue;
         }
 

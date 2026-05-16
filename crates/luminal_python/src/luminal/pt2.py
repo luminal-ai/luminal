@@ -491,6 +491,62 @@ def compile(
     return _save_and_compile(ep, factory, search_iterations)
 
 
+def _drop_input_guards(ep):
+    """Discard ``ep._guards_code`` so unlift does not emit a ``_guards_fn``.
+
+    LUM-499: When a 0-d int tensor flows into a tensor index (``x[i]`` with
+    ``i = torch.tensor(2)``), torch.export records two equivalent input
+    guards: ``L['i'].item() == 2`` (referencing the original local source)
+    and ``L['args'][1].item() == 2`` (referencing the rewrapped flat args).
+    Two failures stack on top of each other:
+
+    1. ``ep.module()`` (invoked inside ``run_decompositions``) rewrites
+       ``L['args'][1]`` → ``args[1]`` but cannot resolve ``L['i']``, leaving
+       a literal ``L`` reference in the generated ``_guards_fn`` and raising
+       ``NameError: name 'L' is not defined`` during retracing.
+    2. Even after dropping the unresolvable guard, the surviving
+       ``args[1].item()`` is data-dependent: AOT autograd's fake-tensor pass
+       raises ``DataDependentOutputException(_local_scalar_dense)``, forcing
+       a graph break.
+
+    These guards exist solely to validate inputs at runtime in eager-mode
+    consumers of the ExportedProgram; the luminal compiler does its own
+    input shape/dtype checks against the compiled graph signature, so we
+    are not losing any safety by clearing them.
+    """
+
+    if hasattr(ep, "_guards_code"):
+        ep._guards_code = []
+
+
+def _drop_dead_data_dependent_ops(gm):
+    """Remove ``aten.item.default`` (and other data-dependent ops) with no users.
+
+    When dynamo specializes a 0-d int input by tracing through ``.item()``,
+    the resulting graph may contain a dead ``aten.item.default`` node whose
+    output is never consumed. luminal's translator does not lower
+    ``aten._local_scalar_dense`` / ``aten.item.default``, so leaving the dead
+    node in the graph causes a graph break at compile time. Eliminating it
+    keeps the (correctly specialized) downstream graph in a single subgraph.
+    """
+
+    graph = gm.graph
+    changed = False
+    for node in list(graph.nodes):
+        if (
+            node.op == "call_function"
+            and getattr(node.target, "_overloadpacket", None) is torch.ops.aten.item
+            and len(node.users) == 0
+        ):
+            graph.erase_node(node)
+            changed = True
+
+    if changed:
+        graph.eliminate_dead_code()
+        graph.lint()
+        gm.recompile()
+
+
 def _legacy_auto_dim(example_args):
     """Match the historical `dynamic_dim="auto"` heuristic.
 
@@ -570,6 +626,11 @@ def _eager_pt2_compile(
         if dynamic_shapes is None:
             raise
         ep = torch.export.export(gm, tuple(user_inputs), **_export_kwargs())
+    # LUM-499: drop dynamo-emitted input guards before run_decompositions
+    # calls ep.module(), which would otherwise emit a `_guards_fn` containing
+    # data-dependent .item() calls and unresolved `L[...]` references.
+    _drop_input_guards(ep)
+    _drop_dead_data_dependent_ops(ep.graph_module)
     ep = ep.run_decompositions(_decomp_table())
 
     # When using shared memory (original_weights), strip large weight buffers

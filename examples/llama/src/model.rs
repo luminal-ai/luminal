@@ -246,8 +246,13 @@ fn hlir_attention(
     let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
 
     // Slice to valid range: [N_KV_HEADS, total_seq, HEAD_DIM]
-    let k_full = k_cache_out.slice((.., ..total_seq, ..));
-    let v_full = v_cache_out.slice((.., ..total_seq, ..));
+    let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
+    let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
+    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
+    // cannot yet propagate expression-bound assertions, so `slice` reports
+    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
+    k_full.shape.dims[1] = total_seq;
+    v_full.shape.dims[1] = total_seq;
 
     // GQA expand: [N_KV_HEADS, total_seq, HEAD_DIM] -> [N_HEADS, total_seq, HEAD_DIM]
     let k_3d = k_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);

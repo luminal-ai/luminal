@@ -9,6 +9,9 @@ PT2 export, and reuse a single compiled graph across shape changes.
 
 from __future__ import annotations
 
+import copy
+from contextlib import contextmanager
+
 import pytest
 import torch
 import torch._dynamo
@@ -32,6 +35,64 @@ def _compile_with_dynamic_true(model, count_holder):
         return out
 
     return torch.compile(model, backend=wrapper, dynamic=True)
+
+
+def _compile_with_capture(model, count_holder, capture_holder):
+    def wrapper(gm, example_inputs):
+        out = luminal_backend(gm, example_inputs)
+        count_holder.append(1)
+        if "gm" not in capture_holder:
+            capture_holder["gm"] = copy.deepcopy(gm).eval()
+            capture_holder["example_inputs"] = example_inputs
+            capture_holder["compiled_impl"] = out
+        return out
+
+    return torch.compile(model, backend=wrapper)
+
+
+@contextmanager
+def _explicit_mark_dynamic_mode():
+    prev_auto = torch._dynamo.config.automatic_dynamic_shapes
+    prev_cache_limit = torch._dynamo.config.cache_size_limit
+    torch._dynamo.reset()
+    torch._dynamo.config.automatic_dynamic_shapes = False
+    torch._dynamo.config.cache_size_limit = 8
+    try:
+        yield
+    finally:
+        torch._dynamo.config.automatic_dynamic_shapes = prev_auto
+        torch._dynamo.config.cache_size_limit = prev_cache_limit
+        torch._dynamo.reset()
+
+
+def _first_trace_dynamic_shapes(capture_holder):
+    from luminal.pt2 import (
+        _build_dynamic_shapes_from_gm,
+        _reinternalize_lifted_params,
+        _strip_symint_placeholders,
+    )
+
+    gm = copy.deepcopy(capture_holder["gm"]).eval()
+    example_inputs = capture_holder["example_inputs"]
+    gm, user_inputs, _, _ = _reinternalize_lifted_params(gm, example_inputs)
+    user_inputs, _, strip_ok = _strip_symint_placeholders(gm, user_inputs)
+    dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
+    return strip_ok, dynamic_shapes
+
+
+def _assert_input_dynamic_dims(dynamic_shapes, input_index, expected_dims):
+    args_spec = dynamic_shapes.get("args")
+    assert args_spec is not None and len(args_spec) > input_index, (
+        f"expected dynamic spec for input {input_index}, got {dynamic_shapes}"
+    )
+    spec = args_spec[input_index]
+    assert spec is not None, (
+        f"expected a per-dim dynamic spec for input {input_index}, got {dynamic_shapes}"
+    )
+    assert set(spec.keys()) == set(expected_dims), (
+        f"expected dynamic dims {set(expected_dims)} for input {input_index}, "
+        f"got {dynamic_shapes}"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -204,6 +265,202 @@ def test_torch_compile_dynamic_true_single_compile(device: torch.device):
     assert len(counts) == 1, (
         f"dynamic=True should produce a single backend invocation, got {len(counts)}"
     )
+
+
+def test_mark_dynamic_seq_via_torch_compile_starts_dynamic(device: torch.device):
+    """Explicit `mark_dynamic` should skip the static-then-promote compile dance."""
+
+    class Mdl(torch.nn.Module):
+        def forward(self, x):
+            return (x.sin() + x.square()).sum(-1)
+
+    with _explicit_mark_dynamic_mode():
+        model = Mdl().eval().to(device)
+        counts: list[int] = []
+        capture: dict[str, object] = {}
+        compiled = _compile_with_capture(model, counts, capture)
+
+        first = torch.randn(2, 4, device=device)
+        torch._dynamo.mark_dynamic(first, 1, min=2, max=16)
+
+        inputs = {
+            4: first,
+            6: torch.randn(2, 6, device=device),
+            9: torch.randn(2, 9, device=device),
+        }
+
+        for seq_len, x in inputs.items():
+            ref = model(x)
+            out = compiled(x)
+            assert out.shape == ref.shape == (2,), (
+                f"seq_len={seq_len}: got {out.shape}, expected {ref.shape}"
+            )
+            assert torch.allclose(out, ref, atol=1e-5), (
+                f"seq_len={seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
+            )
+
+        compiled_impl = capture["compiled_impl"]
+        assert compiled_impl.has_dynamic_dims
+        assert len(compiled_impl.dim_params) == 1
+
+        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
+        assert strip_ok, "Expected explicit mark_dynamic SymInts to be rewritten"
+        assert dynamic_shapes is not None
+        _assert_input_dynamic_dims(dynamic_shapes, 0, {1})
+
+        assert len(counts) == 1, (
+            "Explicit mark_dynamic should produce one dynamic backend trace from the start, "
+            f"got {len(counts)} backend invocations"
+        )
+
+
+def test_mark_dynamic_seq_with_lifted_weights_single_compile(device: torch.device):
+    """Lifted parameters should compose with an explicitly dynamic token axis."""
+
+    class Mdl(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(128, 16)
+            self.proj = torch.nn.Linear(16, 8)
+
+        def forward(self, input_ids):
+            return self.proj(self.embed(input_ids)).sum(-1)
+
+    with _explicit_mark_dynamic_mode():
+        model = Mdl().eval().to(device)
+        counts: list[int] = []
+        capture: dict[str, object] = {}
+        compiled = _compile_with_capture(model, counts, capture)
+
+        first = torch.tensor([[1, 2, 3, 4]], device=device)
+        torch._dynamo.mark_dynamic(first, 1, min=2, max=32)
+
+        inputs = {
+            4: first,
+            6: torch.arange(1, 7, device=device).unsqueeze(0),
+            9: torch.arange(1, 10, device=device).unsqueeze(0),
+        }
+
+        with torch.no_grad():
+            for seq_len, input_ids in inputs.items():
+                ref = model(input_ids)
+                out = compiled(input_ids)
+                assert out.shape == ref.shape == (1, seq_len), (
+                    f"seq_len={seq_len}: got {out.shape}, expected {ref.shape}"
+                )
+                assert torch.allclose(out, ref, atol=1e-5), (
+                    "seq_len="
+                    f"{seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
+                )
+
+        compiled_impl = capture["compiled_impl"]
+        assert compiled_impl.has_dynamic_dims
+        assert len(compiled_impl.dim_params) == 1
+
+        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
+        assert strip_ok
+        assert dynamic_shapes is not None
+        _assert_input_dynamic_dims(dynamic_shapes, 0, {1})
+
+        assert len(counts) == 1, (
+            "Explicit mark_dynamic should avoid a second compile for lifted-weight models, "
+            f"got {len(counts)} backend invocations"
+        )
+
+
+def test_mark_dynamic_seq_preserves_affine_output_shape(device: torch.device):
+    """Output-shape expressions like `2 * seq` should stay dynamic from call 1."""
+
+    class Mdl(torch.nn.Module):
+        def forward(self, x):
+            return torch.cat([x, x], dim=1)
+
+    with _explicit_mark_dynamic_mode():
+        model = Mdl().eval().to(device)
+        counts: list[int] = []
+        capture: dict[str, object] = {}
+        compiled = _compile_with_capture(model, counts, capture)
+
+        first = torch.randn(2, 4, 3, device=device)
+        torch._dynamo.mark_dynamic(first, 1, min=2, max=16)
+
+        inputs = {
+            4: first,
+            5: torch.randn(2, 5, 3, device=device),
+            7: torch.randn(2, 7, 3, device=device),
+        }
+
+        for seq_len, x in inputs.items():
+            ref = model(x)
+            out = compiled(x)
+            assert out.shape == ref.shape == (2, 2 * seq_len, 3), (
+                f"seq_len={seq_len}: got {out.shape}, expected {ref.shape}"
+            )
+            assert torch.allclose(out, ref, atol=1e-5), (
+                f"seq_len={seq_len}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
+            )
+
+        compiled_impl = capture["compiled_impl"]
+        assert compiled_impl.has_dynamic_dims
+        assert len(compiled_impl.dim_params) == 1
+
+        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
+        assert strip_ok
+        assert dynamic_shapes is not None
+        _assert_input_dynamic_dims(dynamic_shapes, 0, {1})
+
+        assert len(counts) == 1, (
+            "Explicit mark_dynamic should keep affine output-shape models on one compile, "
+            f"got {len(counts)} backend invocations"
+        )
+
+
+def test_mark_dynamic_two_dim_via_torch_compile_starts_dynamic(device: torch.device):
+    """Marking both batch and seq dynamic should still compile only once."""
+
+    class Mdl(torch.nn.Module):
+        def forward(self, x):
+            return x.mean(-1)
+
+    with _explicit_mark_dynamic_mode():
+        model = Mdl().eval().to(device)
+        counts: list[int] = []
+        capture: dict[str, object] = {}
+        compiled = _compile_with_capture(model, counts, capture)
+
+        first = torch.randn(2, 8, 4, device=device)
+        torch._dynamo.mark_dynamic(first, 0, min=1, max=8)
+        torch._dynamo.mark_dynamic(first, 1, min=2, max=16)
+
+        inputs = {
+            (2, 8): first,
+            (3, 9): torch.randn(3, 9, 4, device=device),
+            (5, 11): torch.randn(5, 11, 4, device=device),
+        }
+
+        for shape, x in inputs.items():
+            ref = model(x)
+            out = compiled(x)
+            assert out.shape == ref.shape == shape, (
+                f"shape={shape}: got {out.shape}, expected {ref.shape}"
+            )
+            assert torch.allclose(out, ref, atol=1e-5), (
+                f"shape={shape}: max_diff={torch.max(torch.abs(out - ref)).item():.2e}"
+            )
+
+        compiled_impl = capture["compiled_impl"]
+        assert compiled_impl.has_dynamic_dims
+        assert len(compiled_impl.dim_params) == 2
+
+        strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
+        assert strip_ok
+        assert dynamic_shapes is not None
+        _assert_input_dynamic_dims(dynamic_shapes, 0, {0, 1})
+
+        assert len(counts) == 1, (
+            "Explicitly marked batch+seq dims should compile once from the first call, "
+            f"got {len(counts)} backend invocations"
+        )
 
 
 @pytest.mark.skipif(
