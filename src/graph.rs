@@ -9,11 +9,16 @@ use crate::{
 use crate::{hlir::CustomOpKind, op::*, prelude::*};
 use colored::Colorize;
 use itertools::Itertools;
-use petgraph::{Direction, stable_graph::StableGraph, visit::EdgeRef};
+use petgraph::{
+    Direction,
+    dot::{Config, Dot},
+    stable_graph::StableGraph,
+    visit::EdgeRef,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     any::TypeId,
-    fmt::Debug,
+    fmt::{Debug, Write as FmtWrite},
     io::Write,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -239,6 +244,74 @@ impl SearchOptions {
     pub fn profile_dim(mut self, dim: char, value: usize) -> Self {
         self.profile_dims.insert(dim, value);
         self
+    }
+}
+
+fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir: &LLIRGraph) {
+    let Ok(dir) = std::env::var("LLIR_DUMP_DIR") else {
+        return;
+    };
+
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create LLIR_DUMP_DIR={dir}: {err}");
+        return;
+    }
+
+    let dims = dyn_map
+        .iter()
+        .sorted_by_key(|(dim, _)| **dim)
+        .map(|(dim, value)| format!("{dim}{value}"))
+        .join("_");
+    let stem = if dims.is_empty() {
+        format!("selected-llir-{label}")
+    } else {
+        format!("selected-llir-{label}-{dims}")
+    };
+    let dot_path = format!("{dir}/{stem}.dot");
+    let summary_path = format!("{dir}/{stem}.txt");
+
+    let dot = format!("{:?}", Dot::with_config(llir, &[Config::EdgeNoLabel]));
+    if let Err(err) = std::fs::write(&dot_path, dot) {
+        eprintln!("failed to write {dot_path}: {err}");
+    }
+
+    let mut op_counts = std::collections::BTreeMap::<String, usize>::new();
+    for node in llir.node_indices() {
+        *op_counts.entry(format!("{}", llir[node])).or_default() += 1;
+    }
+
+    let mut summary = String::new();
+    let _ = writeln!(
+        summary,
+        "selected LLIR {label}: {} nodes, {} edges",
+        llir.node_count(),
+        llir.edge_count()
+    );
+    let _ = writeln!(summary, "dyn_map: {dyn_map:?}");
+    let _ = writeln!(summary, "\nop counts:");
+    for (op, count) in op_counts {
+        let _ = writeln!(summary, "  {count:5} {op}");
+    }
+    let _ = writeln!(summary, "\nnodes:");
+    for node in llir.node_indices().sorted_by_key(|n| n.index()) {
+        let inputs = llir
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|edge| edge.id())
+            .map(|edge| edge.source().index().to_string())
+            .join(", ");
+        let _ = writeln!(
+            summary,
+            "  n{} <- [{}] {}",
+            node.index(),
+            inputs,
+            llir[node]
+        );
+    }
+
+    if let Err(err) = std::fs::write(&summary_path, summary) {
+        eprintln!("failed to write {summary_path}: {err}");
+    } else {
+        println!("   LLIR dump {summary_path}");
     }
 }
 
@@ -1540,6 +1613,13 @@ impl Graph {
             "Searched".green().bold(),
             pretty_duration::pretty_duration(&start.elapsed(), None)
         );
+
+        let dump_label = bucket_progress
+            .map(|(bucket_idx, n_buckets)| {
+                format!("bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
+            })
+            .unwrap_or_else(|| "single".to_string());
+        maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
 
         stitched
     }

@@ -144,16 +144,15 @@ fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
 }
 
 /// Pre-norm RMSNorm over the trailing axis with weight (`scale`); no shift.
-/// Uses the fused `KernelRMSNorm` from luminal_cuda_lite which collapses the
-/// 5-7 op HLIR chain (square → mean → +eps → sqrt → recip → broadcast → mul →
-/// weight-mul) into a single CUDA kernel launch — saves ~600 ms/step on flux2.
 fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     let w = if weight.dtype == DType::F32 {
         weight
     } else {
         weight.cast(DType::F32)
     };
-    luminal_cuda_lite::kernel::rmsnorm(x, w, eps)
+    let x_rank = x.dims().len();
+    let w_rank = w.dims().len();
+    x.std_norm(x_rank - 1, eps) * w.expand_lhs(&x.dims()[..x_rank - w_rank])
 }
 
 /// LayerNorm with no affine parameters (mean-norm + std-norm only).
@@ -170,11 +169,8 @@ fn layernorm_noaffine(x: GraphTensor, eps: f32) -> GraphTensor {
 /// This matches `apply_rotary_emb(use_real_unbind_dim=-1)` with
 /// `freqs_repeat_interleave_real=True`.
 fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor {
-    if std::env::var("ROPE_KERNEL").is_ok() {
-        return luminal_cuda_lite::kernel::apply_rope(x, cos, sin);
-    }
-    // x: (S, H, D); cos/sin: (S, D) → broadcast to (S, 1, D).
-    let (_s, _h, d_expr) = x.dims3();
+    // x: (S, H, D); cos/sin: (S, D) -> explicitly broadcast to (S, H, D).
+    let (_s, h, d_expr) = x.dims3();
     let d = d_expr.to_usize().expect("head_dim must be static");
     assert!(d % 2 == 0, "RoPE head_dim must be even");
 
@@ -188,8 +184,8 @@ fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor
         .concat_along(x_a.expand_dim(3, 1_usize), 3);
     let x_rot = rotated_pairs.merge_dims(2, 3);
 
-    let cos_b = cos.expand_dim(1, 1_usize);
-    let sin_b = sin.expand_dim(1, 1_usize);
+    let cos_b = cos.expand_dim(1, h);
+    let sin_b = sin.expand_dim(1, h);
     x.cast(DType::F32) * cos_b.cast(DType::F32) + x_rot.cast(DType::F32) * sin_b.cast(DType::F32)
 }
 

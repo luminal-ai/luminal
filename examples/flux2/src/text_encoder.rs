@@ -91,7 +91,9 @@ fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     } else {
         weight.cast(DType::F32)
     };
-    luminal_cuda_lite::kernel::rmsnorm(x, w, eps)
+    let x_rank = x.dims().len();
+    let w_rank = w.dims().len();
+    x.std_norm(x_rank - 1, eps) * w.expand_lhs(&x.dims()[..x_rank - w_rank])
 }
 
 /// Rotary position embedding — half-rotation convention (`[x0, x1] →

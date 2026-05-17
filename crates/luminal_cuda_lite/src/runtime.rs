@@ -1343,8 +1343,8 @@ impl Runtime for CudaRuntime {
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
-        _trials: usize,
-        _timeout: Option<std::time::Duration>,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
         // Clear active bucket's arena before loading new LLIR for profiling.
         if !self.compiled_buckets.is_empty() {
@@ -1352,10 +1352,18 @@ impl Runtime for CudaRuntime {
         }
         self.load_llir(llir_graph);
         self.profiling = true;
-        let start = std::time::Instant::now();
-        self.execute(dyn_map);
+        let profile_start = std::time::Instant::now();
+        let mut durations = Vec::with_capacity(trials.max(1));
+        for _ in 0..trials.max(1) {
+            let start = std::time::Instant::now();
+            self.execute(dyn_map);
+            durations.push(start.elapsed());
+            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
+        }
         self.profiling = false;
-        let duration = start.elapsed();
+        let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
 
         let total_bytes: usize = self
             .last_kernel_stats
