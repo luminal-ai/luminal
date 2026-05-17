@@ -3,7 +3,7 @@ mod hf;
 mod model;
 
 use audio::{
-    load_wav, load_wav_bytes, log_mel_spectrogram, pad_or_trim, N_FRAMES, N_MELS, N_SAMPLES,
+    N_FRAMES, N_MELS, N_SAMPLES, load_wav, load_wav_bytes, log_mel_spectrogram, pad_or_trim,
 };
 use hf::prepare_hf_model;
 use luminal::prelude::*;
@@ -82,11 +82,21 @@ fn main() {
     // Set the mel spectrogram once.
     runtime.set_data(mel_tensor, mel_data.clone());
 
+    let prompt: Vec<u32> = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
+
     println!("Compiling...");
-    cx.set_dim('s', 1);
-    cx.set_dim('p', 1);
-    runtime.set_data(input, vec![1i32]);
-    runtime.set_data(pos_ids, vec![1i32]);
+    let max_prefill = prompt.len().max(2);
+    cx.set_dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(max_prefill),
+        ],
+    );
+    cx.set_dim('s', max_prefill);
+    cx.set_dim('p', 0);
+    runtime.set_data(input, vec![1i32; max_prefill]);
+    runtime.set_data(pos_ids, (0..max_prefill as i32).collect::<Vec<_>>());
     runtime = cx.search(runtime, search_graphs);
 
     // Reset the KV caches and re-set the mel after search (which executes test runs).
@@ -97,13 +107,10 @@ fn main() {
     runtime.set_data(mel_tensor, mel_data);
 
     // -- Decoding loop --
-    // For tiny.en, decoder starts with [<|startoftranscript|>, <|notimestamps|>] and we process
-    // these prefill tokens one at a time (as the other luminal examples do), then sample
-    // greedily token-by-token.
-    let prompt: Vec<u32> = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
+    // For tiny.en, decoder starts with [<|startoftranscript|>, <|notimestamps|>] as a batched
+    // causal prefill, then samples greedily token-by-token.
     let mut prev_seq = 0usize;
-    let mut next_input: i32 = prompt[0] as i32;
-    let mut prompt_idx = 1usize;
+    let mut next_input = None;
     let mut generated: Vec<u32> = Vec::new();
     let mut step = 0usize;
 
@@ -111,11 +118,52 @@ fn main() {
     std::io::stdout().flush().unwrap();
 
     let start = Instant::now();
-    loop {
+    if gen_tokens > 0 {
+        cx.set_dim('s', prompt.len());
+        cx.set_dim('p', 0);
+
+        runtime.set_data(
+            input,
+            prompt.iter().map(|token| *token as i32).collect::<Vec<_>>(),
+        );
+        runtime.set_data(pos_ids, (0..prompt.len() as i32).collect::<Vec<_>>());
+
+        runtime.execute(&cx.dyn_map);
+        let logits_data = runtime.get_f32(logits);
+
+        // Round-trip the KV caches
+        for (i, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+            let k_buf = runtime.remove_buffer(*k_out);
+            let v_buf = runtime.remove_buffer(*v_out);
+            runtime.set_buffer(kv_cache.k_caches[i], k_buf);
+            runtime.set_buffer(kv_cache.v_caches[i], v_buf);
+        }
+
+        prev_seq = prompt.len();
+
+        let last_row = logits_data[logits_data.len() - N_VOCAB..].to_vec();
+        let next_token = greedy_decode(&last_row, true);
+
+        if next_token != TOKEN_EOT {
+            if let Ok(decoded) = tokenizer.decode(&[next_token], false) {
+                print!("{decoded}");
+                std::io::stdout().flush().unwrap();
+            }
+
+            generated.push(next_token);
+            next_input = Some(next_token as i32);
+            step = 1;
+        }
+    }
+
+    while step < gen_tokens && prev_seq < max_target_pos - 1 {
+        let Some(current_input) = next_input else {
+            break;
+        };
         cx.set_dim('s', 1);
         cx.set_dim('p', prev_seq);
 
-        runtime.set_data(input, vec![next_input]);
+        runtime.set_data(input, vec![current_input]);
         runtime.set_data(pos_ids, vec![prev_seq as i32]);
 
         runtime.execute(&cx.dyn_map);
@@ -131,15 +179,8 @@ fn main() {
 
         prev_seq += 1;
 
-        if prompt_idx < prompt.len() {
-            // Still feeding prefill tokens; ignore the logits.
-            next_input = prompt[prompt_idx] as i32;
-            prompt_idx += 1;
-            continue;
-        }
-
         let last_row = logits_data[logits_data.len() - N_VOCAB..].to_vec();
-        let next_token = greedy_decode(&last_row, step == 0);
+        let next_token = greedy_decode(&last_row, false);
 
         if next_token == TOKEN_EOT {
             break;
@@ -151,7 +192,7 @@ fn main() {
         }
 
         generated.push(next_token);
-        next_input = next_token as i32;
+        next_input = Some(next_token as i32);
         step += 1;
 
         if step >= gen_tokens {
