@@ -45,6 +45,10 @@ EXPECTED_OUTPUT = {
     ],
 }
 
+EXAMPLE_CARGO_ARGS = {
+    "qwen": ["--features", "cuda"],
+}
+
 
 def run_and_capture(command: list[str], *, cwd: str, env: dict[str, str]) -> str:
     process = subprocess.Popen(
@@ -130,7 +134,7 @@ def run_example(example: str):
         "HF_HOME": HF_CACHE_PATH,
     }
     output = run_and_capture(
-        ["cargo", "run", "--release"],
+        ["cargo", "run", "--release", *EXAMPLE_CARGO_ARGS.get(example, [])],
         cwd=f"{WORKDIR}/examples/{example}",
         env=run_env,
     )

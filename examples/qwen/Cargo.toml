@@ -8,22 +8,26 @@ name = "qwen"
 path = "src/main.rs"
 
 [features]
+default = []
+cuda = ["dep:luminal_cuda_lite"]
+metal = ["dep:luminal_metal"]
 
 [dependencies]
 luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
-luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
-luminal_tracing = {path="../../crates/luminal_tracing"}
+luminal_tracing = { path = "../../crates/luminal_tracing" }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }
+luminal_metal = { path = "../../crates/luminal_metal", optional = true }
 tokenizers = "0.22.2"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HuggingFace model download
-hf-hub = {version = "0.4", default-features = false, features = ["rustls-tls", "ureq"]}
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 safetensors = "0.7.0"
-serde = {version = "1.0", features = ["derive"]}
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-half = {version = "2.7.1", features = ["bytemuck"]}
+half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = "1.24.0"
 memmap2 = "0.9.9"
 rustc-hash = "2.1"
