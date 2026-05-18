@@ -414,8 +414,10 @@ impl DoubleStreamAttn {
         let v = v.transpose(0, 1);
 
         let attn = sdpa(q, k, v); // (S_total, H, D)
-        // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K stride for
-        // the next matmul, so materialize the view before the output projection.
+        // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K
+        // stride for the next matmul (the o_proj path). Without
+        // `* 1.0` the cublaslt 2D rule can't match and the broadcast
+        // Mul intermediate is ~36 GB BF16 at flux2 dimensions.
         let attn = attn.merge_dims(1, 2) * 1.0_f32; // (S_total, HIDDEN)
 
         // Split back into txt + img streams.
