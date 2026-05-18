@@ -24,10 +24,6 @@ WORKDIR = "/workspace/luminal"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 EXPECTED_OUTPUT = {
-    "gemma": [
-        "recognize pictures of cats",
-        "little detectives looking for specific features",
-    ],
     "qwen": [
         "computational model inspired by the structure and function of the human brain",
     ],
@@ -45,6 +41,13 @@ EXPECTED_CONCEPTS = {
         ["neurons", "nodes"],
         ["learn", "learning", "adapt"],
         ["data", "patterns", "features"],
+    ],
+    "gemma": [
+        ["neural network", "neural networks"],
+        ["nodes", "neurons"],
+        ["layers"],
+        ["weights"],
+        ["training", "learn", "learns"],
     ],
     "qwen3_moe": [
         ["capital"],

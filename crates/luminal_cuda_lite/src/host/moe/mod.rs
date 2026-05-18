@@ -446,13 +446,13 @@ impl HostOp for GLUMoE {
         let topk_vals_host: Vec<u8> = topk_vals_buf.clone_dtoh(stream)?;
         let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
 
-        if topk_idx_i32.len() % seq != 0 {
+        if !topk_idx_i32.len().is_multiple_of(seq) {
             anyhow::bail!(
                 "GLUMoE topk index element count {} is not divisible by seq {seq}",
                 topk_idx_i32.len()
             );
         }
-        if topk_vals_f32.len() % seq != 0 {
+        if !topk_vals_f32.len().is_multiple_of(seq) {
             anyhow::bail!(
                 "GLUMoE topk value element count {} is not divisible by seq {seq}",
                 topk_vals_f32.len()
