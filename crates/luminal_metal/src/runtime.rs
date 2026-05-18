@@ -223,12 +223,12 @@ impl MetalRuntime {
         let st = SafeTensors::deserialize(&mmap).unwrap();
 
         for node in cx.graph.node_indices() {
-            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>() {
-                if let Ok(tensor) = st.tensor(&input.label) {
-                    let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
-                    self.input_data.remove(&node);
-                    self.hlir_buffers.insert(node, buffer);
-                }
+            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>()
+                && let Ok(tensor) = st.tensor(&input.label)
+            {
+                let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
+                self.input_data.remove(&node);
+                self.hlir_buffers.insert(node, buffer);
             }
         }
     }

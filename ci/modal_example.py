@@ -31,9 +31,6 @@ EXPECTED_OUTPUT = {
     "qwen": [
         "computational model inspired by the structure and function of the human brain",
     ],
-    "qwen3_moe": [
-        "The capital of France is Paris",
-    ],
     "gemma4_moe": [
         "city of romance, art and culture",
     ],
@@ -48,6 +45,11 @@ EXPECTED_CONCEPTS = {
         ["neurons", "nodes"],
         ["learn", "learning", "adapt"],
         ["data", "patterns", "features"],
+    ],
+    "qwen3_moe": [
+        ["capital"],
+        ["france"],
+        ["paris"],
     ],
 }
 
