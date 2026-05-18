@@ -532,7 +532,7 @@ extern \"C\" {{
 
     fn output_bytes(&self) -> Expression {
         let elem_size: Expression = match self.dtype {
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::F32 | DType::Int => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
             DType::Bool
@@ -566,7 +566,7 @@ extern \"C\" {{
 
     fn bytes_loaded(&self) -> Expression {
         let data_elem_size: Expression = match self.dtype {
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::F32 | DType::Int => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
             DType::Bool
@@ -585,7 +585,7 @@ extern \"C\" {{
 
     fn bytes_stored(&self) -> Expression {
         let data_elem_size: Expression = match self.dtype {
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::F32 | DType::Int => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
             DType::Bool
