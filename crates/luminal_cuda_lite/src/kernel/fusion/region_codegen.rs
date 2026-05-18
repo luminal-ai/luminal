@@ -336,17 +336,35 @@ fn is_region_elementwise(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
         })
 }
 
-fn elementwise_body(op: &str, locals: &[&str]) -> String {
+fn elementwise_value(local: &str, dtype: DType) -> String {
+    if matches!(dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0) {
+        format!("static_cast<float>({local})")
+    } else {
+        local.to_string()
+    }
+}
+
+fn elementwise_init_expr(expr: &str, dtype: DType, cuda_ty: &str) -> String {
+    if matches!(dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0) {
+        format!("{cuda_ty}({expr})")
+    } else {
+        expr.to_string()
+    }
+}
+
+fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
+    let a = || elementwise_value(locals[0], dtype);
+    let b = || elementwise_value(locals[1], dtype);
     match op {
-        "Sin" => format!("sinf({})", locals[0]),
-        "Sqrt" => format!("sqrtf({})", locals[0]),
-        "Exp" => format!("expf({})", locals[0]),
-        "Exp2" => format!("exp2f({})", locals[0]),
-        "Log2" => format!("log2f({})", locals[0]),
-        "Recip" => format!("1.0f / {}", locals[0]),
-        "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", locals[0]),
-        "Add" => format!("{} + {}", locals[0], locals[1]),
-        "Mul" => format!("{} * {}", locals[0], locals[1]),
+        "Sin" => format!("sinf({})", a()),
+        "Sqrt" => format!("sqrtf({})", a()),
+        "Exp" => format!("expf({})", a()),
+        "Exp2" => format!("exp2f({})", a()),
+        "Log2" => format!("log2f({})", a()),
+        "Recip" => format!("1.0f / {}", a()),
+        "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", a()),
+        "Add" => format!("{} + {}", a(), b()),
+        "Mul" => format!("{} * {}", a(), b()),
         other => panic!("region_codegen: unknown elementwise op {other}"),
     }
 }
@@ -473,16 +491,17 @@ pub(crate) fn compile_region(
     // arity / position).
     for &op_idx in &region.elementwise_topo {
         let op_ref = llir_graph[op_idx].to_dialect::<dyn KernelOp>().unwrap();
-        let elem_name = if let Some(elem) = (***op_ref).downcast_ref::<CudaUnaryElementwise>() {
-            elem.op.as_str()
-        } else if let Some(elem) = (***op_ref).downcast_ref::<CudaBinaryElementwise>() {
-            elem.op.as_str()
-        } else {
-            panic!(
-                "region_codegen: expected Cuda*Elementwise op, got {}",
-                op_ref.kernel_name()
-            );
-        };
+        let (elem_name, elem_dtype) =
+            if let Some(elem) = (***op_ref).downcast_ref::<CudaUnaryElementwise>() {
+                (elem.op.as_str(), elem.dtype)
+            } else if let Some(elem) = (***op_ref).downcast_ref::<CudaBinaryElementwise>() {
+                (elem.op.as_str(), elem.dtype)
+            } else {
+                panic!(
+                    "region_codegen: expected Cuda*Elementwise op, got {}",
+                    op_ref.kernel_name()
+                );
+            };
 
         let mut input_locals: Vec<String> = llir_graph
             .edges_directed(op_idx, Direction::Incoming)
@@ -501,7 +520,8 @@ pub(crate) fn compile_region(
         input_locals = edges.into_iter().map(|(_, src)| local_name(src)).collect();
         let inputs_ref: Vec<&str> = input_locals.iter().map(|s| s.as_str()).collect();
 
-        let expr = elementwise_body(elem_name, &inputs_ref);
+        let expr = elementwise_body(elem_name, &inputs_ref, elem_dtype);
+        let expr = elementwise_init_expr(&expr, elem_dtype, cuda_ty);
         body.push_str(&format!(
             "        {cuda_ty} {name} = {expr};\n",
             name = local_name(op_idx),

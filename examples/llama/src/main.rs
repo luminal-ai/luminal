@@ -1,18 +1,19 @@
 mod hf;
 mod model;
 
-use hf::prepare_hf_model;
+use hf::{WeightFormat, prepare_hf_model};
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
 use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashSet;
-use std::{io::Write, time::Duration};
+use std::{env, io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
+const FP32_REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
+const FP8_REPO_ID: &str = "nvidia/Llama-3.1-8B-Instruct-FP8";
 const MAX_SEQ_LEN: usize = 4096;
 const GEN_TOKENS: usize = 500;
 const SEARCH_GRAPHS: usize = 500;
@@ -21,6 +22,56 @@ const SEARCH_KEEP_BEST: usize = 4;
 const SEARCH_MEMORY_MIB: usize = 2048;
 const SEARCH_SEED: u64 = 0;
 const PROMPT: &str = "Explain what a neural network is in a paragraph.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LlamaWeightMode {
+    Fp32,
+    Fp8,
+}
+
+impl LlamaWeightMode {
+    fn repo_id(self) -> &'static str {
+        match self {
+            Self::Fp32 => FP32_REPO_ID,
+            Self::Fp8 => FP8_REPO_ID,
+        }
+    }
+
+    fn weight_format(self) -> WeightFormat {
+        match self {
+            Self::Fp32 => WeightFormat::Fp32,
+            Self::Fp8 => WeightFormat::Fp8,
+        }
+    }
+}
+
+fn print_usage(program: &str) {
+    println!("Usage: {program} [--fp8]");
+    println!();
+    println!("  --fp8     Use {FP8_REPO_ID} with FP8 projection weights");
+    println!("  -h,--help Show this help");
+}
+
+fn parse_args() -> LlamaWeightMode {
+    let mut mode = LlamaWeightMode::Fp32;
+    let mut args = env::args();
+    let program = args.next().unwrap_or_else(|| "llama".to_string());
+    for arg in args {
+        match arg.as_str() {
+            "--fp8" => mode = LlamaWeightMode::Fp8,
+            "-h" | "--help" => {
+                print_usage(&program);
+                std::process::exit(0);
+            }
+            _ => {
+                eprintln!("Unknown argument: {arg}");
+                print_usage(&program);
+                std::process::exit(2);
+            }
+        }
+    }
+    mode
+}
 
 fn llama3_chat_prompt(user_prompt: &str) -> String {
     format!(
@@ -67,6 +118,40 @@ fn print_profile(label: &str, profile: &StepProfile, n: usize) {
         avg_ms(profile.get_logits, n),
         avg_ms(profile.cache_roundtrip, n),
         avg_ms(profile.sample, n),
+    );
+}
+
+fn print_host_op_summary(runtime: &CudaRuntime, label: &str) {
+    let host_ops = runtime.host_ops();
+    let debug_ops = host_ops
+        .iter()
+        .map(|op| format!("{op:?}"))
+        .collect::<Vec<_>>();
+    let cublaslt = debug_ops
+        .iter()
+        .filter(|op| op.contains("CuBlasLt"))
+        .count();
+    let fp8_cublaslt = debug_ops
+        .iter()
+        .filter(|op| {
+            op.contains("CuBlasLt") && (op.contains("a_dtype: F8") || op.contains("b_dtype: F8"))
+        })
+        .count();
+    let scaled_fp8_cublaslt = debug_ops
+        .iter()
+        .filter(|op| {
+            op.contains("CuBlasLt")
+                && (op.contains("a_dtype: F8") || op.contains("b_dtype: F8"))
+                && op.contains("a_scale_input: true")
+                && op.contains("b_scale_input: true")
+        })
+        .count();
+    println!(
+        "Host op summary ({label}): total={}, cublasLt={}, fp8_cublasLt={}, scaled_fp8_cublasLt={}",
+        debug_ops.len(),
+        cublaslt,
+        fp8_cublaslt,
+        scaled_fp8_cublaslt
     );
 }
 
@@ -159,13 +244,16 @@ fn main() {
         .with(luminal_filter())
         .init();
 
+    let weight_mode = parse_args();
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
 
-    let model_dir = prepare_hf_model(REPO_ID).expect("Failed to prepare model");
-    println!("Using model directory: {}", model_dir.display());
+    let prepared = prepare_hf_model(weight_mode.repo_id(), weight_mode.weight_format())
+        .expect("Failed to prepare model");
+    println!("Using model: {}", weight_mode.repo_id());
+    println!("Using model directory: {}", prepared.model_dir.display());
 
-    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
+    let tokenizer = Tokenizer::from_file(prepared.model_dir.join("tokenizer.json")).unwrap();
     let chat_prompt = llama3_chat_prompt(PROMPT);
     let prompt_tokens = tokenizer
         .encode(chat_prompt.as_str(), false)
@@ -182,7 +270,11 @@ fn main() {
     let gather_idx_t = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
     let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'));
     let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
-    let (logits, cache_outputs) = Llama::init(&mut cx).forward(
+    let llama = match weight_mode {
+        LlamaWeightMode::Fp32 => Llama::init(&mut cx),
+        LlamaWeightMode::Fp8 => Llama::init_fp8(&mut cx),
+    };
+    let (logits, cache_outputs) = llama.forward(
         input,
         q_pos_t,
         scatter_idx_t,
@@ -212,8 +304,10 @@ fn main() {
     println!("Loading weights...");
     let load_start = std::time::Instant::now();
     let mut runtime = CudaRuntime::initialize(stream);
-    let weights_path = model_dir.join("model_combined.safetensors");
-    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+    for weights_path in &prepared.weight_files {
+        println!("  Loading {}", weights_path.display());
+        runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+    }
     println!("  Weight load: {:.2} s", load_start.elapsed().as_secs_f64());
 
     let cache_bytes = MAX_SEQ_LEN * KV_DIM * std::mem::size_of::<f32>();
@@ -255,6 +349,7 @@ fn main() {
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()
     );
+    print_host_op_summary(&runtime, "post-compile active bucket");
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
@@ -300,6 +395,7 @@ fn main() {
             &gather_idx,
             &mask,
         );
+        print_host_op_summary(&runtime, "after prefill");
         context_len = prompt_len;
 
         let sample_start = std::time::Instant::now();
@@ -347,6 +443,9 @@ fn main() {
             &(0..=context_len as i32).collect::<Vec<_>>(),
             &causal_mask(&[context_len], context_len + 1),
         );
+        if generated == 1 {
+            print_host_op_summary(&runtime, "after first decode");
+        }
         context_len += 1;
 
         let sample_start = std::time::Instant::now();
