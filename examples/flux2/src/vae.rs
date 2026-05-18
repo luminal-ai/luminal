@@ -538,13 +538,8 @@ impl VaeDecoder {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CString, os::raw::c_char, sync::Arc};
-
     use luminal::hlir::CustomOpKind;
-    use luminal_cuda_lite::{
-        cudarc::driver::{CudaContext, CudaStream},
-        runtime::CudaRuntime,
-    };
+    use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 
     use super::*;
 
@@ -650,52 +645,6 @@ mod tests {
                 "value mismatch at {idx}: got {a}, expected {e}"
             );
         }
-    }
-
-    fn cuda_stream() -> Option<Arc<CudaStream>> {
-        if !cuda_driver_is_loadable() {
-            return None;
-        }
-        let ctx = CudaContext::new(0).ok()?;
-        ctx.bind_to_thread().ok()?;
-        Some(ctx.default_stream())
-    }
-
-    #[cfg(unix)]
-    fn cuda_driver_is_loadable() -> bool {
-        const RTLD_LAZY: i32 = 1;
-
-        unsafe extern "C" {
-            fn dlopen(filename: *const c_char, flag: i32) -> *mut std::ffi::c_void;
-            fn dlclose(handle: *mut std::ffi::c_void) -> i32;
-        }
-
-        for name in [
-            "libcuda.so",
-            "libcuda.so.1",
-            "libcuda.so.13",
-            "libcuda.so.12",
-            "libcuda.so.11",
-            "libcuda.so.10",
-            "libcuda.so.9",
-        ] {
-            let Ok(name) = CString::new(name) else {
-                continue;
-            };
-            let handle = unsafe { dlopen(name.as_ptr(), RTLD_LAZY) };
-            if !handle.is_null() {
-                unsafe {
-                    dlclose(handle);
-                }
-                return true;
-            }
-        }
-        false
-    }
-
-    #[cfg(not(unix))]
-    fn cuda_driver_is_loadable() -> bool {
-        true
     }
 
     fn reference_nearest_upsample_2x(input: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
@@ -826,9 +775,10 @@ mod tests {
 
     #[test]
     fn nearest_upsample_2x_matches_reference_cuda() {
-        let Some(stream) = cuda_stream() else {
+        let Ok(ctx) = CudaContext::new(0) else {
             return;
         };
+        ctx.bind_to_thread().unwrap();
 
         let mut cx = Graph::default();
         let input_t = cx.named_tensor("input", (2usize, 3usize, 4usize));
@@ -838,7 +788,7 @@ mod tests {
         let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
 
         cx.build_search_space::<CudaRuntime>();
-        let mut rt = CudaRuntime::initialize(stream);
+        let mut rt = CudaRuntime::initialize(ctx.default_stream());
         rt.set_data(input_t, input);
         rt = cx.search(rt, 1);
         rt.execute(&cx.dyn_map);
@@ -882,9 +832,10 @@ mod tests {
 
     #[test]
     fn group_norm_matches_reference_cuda() {
-        let Some(stream) = cuda_stream() else {
+        let Ok(ctx) = CudaContext::new(0) else {
             return;
         };
+        ctx.bind_to_thread().unwrap();
 
         let mut cx = Graph::default();
         let input_t = cx.named_tensor("input", (4usize, 2usize, 3usize));
@@ -909,7 +860,7 @@ mod tests {
         );
 
         cx.build_search_space::<CudaRuntime>();
-        let mut rt = CudaRuntime::initialize(stream);
+        let mut rt = CudaRuntime::initialize(ctx.default_stream());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);

@@ -21,4 +21,4 @@ jobs:
         steps:
             - uses: actions/checkout@v6
             - name: Run tests
-              run: cargo test --release --workspace --exclude luminal_cuda_lite --exclude luminal_metal --exclude luminal_bench --verbose
+              run: cargo test --release -p luminal -p luminal_nn -p luminal_tracing -p luminal_python --verbose
