@@ -3,7 +3,7 @@ use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
 use half::{bf16, f16};
 use luminal::prelude::*;
 use proptest::prelude::*;
-use safetensors::{Dtype as SafeDType, tensor::TensorView};
+use safetensors::{Dtype, tensor::TensorView};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -38,7 +38,7 @@ fn bytes_of<T: bytemuck::NoUninit>(values: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(values).to_vec()
 }
 
-fn write_test_safetensors(tensors: &[(&str, SafeDType, Vec<usize>, Vec<u8>)]) -> PathBuf {
+fn write_test_safetensors(tensors: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> PathBuf {
     let tensor_views: HashMap<String, TensorView<'_>> = tensors
         .iter()
         .map(|(name, dtype, shape, data)| {
@@ -1378,7 +1378,7 @@ fn test_load_safetensors_f32_survives_search_and_overrides_input_data() {
     let out = (weights + bias).output();
 
     let weight_values = [1.25f32, -2.5, 4.0];
-    let tensors = [("weights", SafeDType::F32, vec![3], bytes_of(&weight_values))];
+    let tensors = [("weights", Dtype::F32, vec![3], bytes_of(&weight_values))];
     let path = write_test_safetensors(&tensors);
 
     cx.build_search_space::<MetalRuntime>();
@@ -1417,31 +1417,31 @@ fn test_load_safetensors_converts_supported_float_dtypes() {
     let tensors = [
         (
             "f16_to_f32",
-            SafeDType::F16,
+            Dtype::F16,
             vec![2],
             bytes_of(&f16_to_f32_values),
         ),
         (
             "bf16_to_f32",
-            SafeDType::BF16,
+            Dtype::BF16,
             vec![2],
             bytes_of(&bf16_to_f32_values),
         ),
         (
             "f16_to_f16",
-            SafeDType::F16,
+            Dtype::F16,
             vec![2],
             bytes_of(&f16_to_f16_values),
         ),
         (
             "f32_to_f16",
-            SafeDType::F32,
+            Dtype::F32,
             vec![2],
             bytes_of(&f32_to_f16_values),
         ),
         (
             "bf16_to_f16",
-            SafeDType::BF16,
+            Dtype::BF16,
             vec![2],
             bytes_of(&bf16_to_f16_values),
         ),
@@ -1461,68 +1461,6 @@ fn test_load_safetensors_converts_supported_float_dtypes() {
     assert_close(&rt.get_f32(f32_to_f16_out), &[7.5, -8.25], 0.001);
     assert_close(&rt.get_f32(bf16_to_f16_out), &[9.5, -10.25], 0.001);
     std::fs::remove_file(path).ok();
-}
-
-#[test]
-fn test_load_sharded_safetensors_with_explicit_dtype() {
-    let mut cx = Graph::default();
-    let a = cx.named_tensor("a", 2);
-    let b = cx.named_tensor("b", 2);
-    let out = (a + b).output();
-
-    let a_values = [bf16::from_f32(1.5), bf16::from_f32(2.25)];
-    let b_values = [bf16::from_f32(3.0), bf16::from_f32(-4.5)];
-
-    let id = SAFETENSORS_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "luminal_metal_sharded_safetensors_{}_{}",
-        std::process::id(),
-        id
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let shard_a = dir.join("model-00001-of-00002.safetensors");
-    let shard_b = dir.join("model-00002-of-00002.safetensors");
-    std::fs::write(
-        &shard_a,
-        safetensors::serialize(
-            &HashMap::from([(
-                "a".to_string(),
-                TensorView::new(SafeDType::BF16, vec![2], &bytes_of(&a_values)).unwrap(),
-            )]),
-            None,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        &shard_b,
-        safetensors::serialize(
-            &HashMap::from([(
-                "b".to_string(),
-                TensorView::new(SafeDType::BF16, vec![2], &bytes_of(&b_values)).unwrap(),
-            )]),
-            None,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("model.safetensors.index.json"),
-        r#"{"weight_map":{"a":"model-00001-of-00002.safetensors","b":"model-00002-of-00002.safetensors"}}"#,
-    )
-    .unwrap();
-
-    cx.build_search_space::<MetalRuntime>();
-    let mut rt = MetalRuntime::initialize(());
-    rt.load_safetensors_as_dtype(&cx, dir.to_str().unwrap(), DType::F32);
-    rt = cx.search(rt, 1);
-    rt.allocate_intermediate_buffers(&cx.dyn_map);
-    rt.execute(&cx.dyn_map);
-
-    assert_close(&rt.get_f32(out), &[4.5, -2.25], 0.001);
-    std::fs::remove_dir_all(dir).ok();
 }
 
 #[test]

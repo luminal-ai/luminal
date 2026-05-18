@@ -16,8 +16,6 @@ tracing = "0.1.43"
 safetensors = "0.7.0"
 memmap2 = "0.9.9"
 bytemuck = "1.24.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 
 [dev-dependencies]
 candle-core = "0.9.2-alpha.1"
