@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 luminal = { path = "../.." }
-metal = "0.31"
+metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
 as-any = "0.3.2"
 itertools = "0.12.1"

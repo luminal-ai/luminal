@@ -1,6 +1,4 @@
-use crate::kernel::{
-    MatmulDescriptor, MetalKernelOp, MetalMatmul, MetalMatmulPlanner, DYN_SLOT_COUNT,
-};
+use crate::kernel::{MetalKernelOp, DYN_SLOT_COUNT};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
@@ -122,80 +120,6 @@ impl MetalRuntime {
         }
     }
 
-    fn fuse_matmuls(llir_graph: &LLIRGraph) -> LLIRGraph {
-        let mut graph = llir_graph.clone();
-        let planner = MetalMatmulPlanner;
-        let mut rewrites = Vec::new();
-
-        for sum_node in graph.node_indices().collect::<Vec<_>>() {
-            let Some(sum_info) = graph[sum_node]
-                .to_dialect::<dyn MetalKernelOp>()
-                .and_then(|op| op.sum_reduce_info())
-            else {
-                continue;
-            };
-
-            let input_edges: Vec<_> = graph
-                .edges_directed(sum_node, Direction::Incoming)
-                .sorted_by_key(|e| e.id())
-                .map(|e| e.source())
-                .collect();
-            if input_edges.len() != 1 {
-                continue;
-            }
-
-            let mul_node = input_edges[0];
-            let Some(mul_info) = graph[mul_node]
-                .to_dialect::<dyn MetalKernelOp>()
-                .and_then(|op| op.mul_info())
-            else {
-                continue;
-            };
-
-            let Some(desc) = MatmulDescriptor::from_mul_and_sum(&mul_info, &sum_info) else {
-                continue;
-            };
-
-            let mul_inputs: Vec<_> = graph
-                .edges_directed(mul_node, Direction::Incoming)
-                .sorted_by_key(|e| e.id())
-                .map(|e| e.source())
-                .collect();
-            if mul_inputs.len() != 2 {
-                continue;
-            }
-
-            rewrites.push((sum_node, mul_node, mul_inputs, planner.plan(&desc)));
-        }
-
-        for (sum_node, mul_node, mul_inputs, plan) in rewrites {
-            graph[sum_node] =
-                luminal::op::LLIROp::new::<dyn MetalKernelOp>(Box::new(MetalMatmul {
-                    m: plan.m,
-                    n: plan.n,
-                    k: plan.k,
-                    lda: plan.lda,
-                    ldb: plan.ldb,
-                    ldd: plan.ldd,
-                    family: plan.family,
-                    bm: plan.bm,
-                    bn: plan.bn,
-                    bk: plan.bk,
-                    wm: plan.wm,
-                    wn: plan.wn,
-                    batch_size: plan.batch_size,
-                    batch_stride_a: plan.batch_stride_a,
-                    batch_stride_b: plan.batch_stride_b,
-                    batch_stride_d: plan.batch_stride_d,
-                }));
-
-            graph.remove_node(mul_node);
-            graph.add_edge(mul_inputs[0], sum_node, ());
-            graph.add_edge(mul_inputs[1], sum_node, ());
-        }
-
-        graph
-    }
     #[cfg(test)]
     pub(crate) fn contains_matmul(&self) -> bool {
         self.llir_graph.node_indices().any(|node| {
@@ -373,7 +297,7 @@ impl Runtime for MetalRuntime {
         self.pipelines.clear();
         self.buffers.clear();
         self.node_dtypes.clear();
-        self.llir_graph = Self::fuse_matmuls(llir_graph);
+        self.llir_graph = llir_graph.clone();
 
         let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
         for node in topo_order {
@@ -410,7 +334,9 @@ impl Runtime for MetalRuntime {
                 let output_dtype = kernel_op.infer_output_dtype(&input_dtypes);
                 let pipeline = kernel_op.compile(&self.device, &input_dtypes, output_dtype);
                 self.node_dtypes.insert(node, output_dtype);
-                self.pipelines.insert(node, pipeline);
+                if let Some(pipeline) = pipeline {
+                    self.pipelines.insert(node, pipeline);
+                }
             } else {
                 panic!("Metal runtime cannot execute unlowered LLIR node {node:?}");
             }
@@ -458,7 +384,6 @@ impl Runtime for MetalRuntime {
 
         self.update_dyn_buffer(dyn_map);
         let command_buffer = self.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
 
         for node in topo_order {
             if self.llir_graph[node].to_op::<Input>().is_some()
@@ -468,7 +393,7 @@ impl Runtime for MetalRuntime {
             }
 
             if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                let pipeline = self.pipelines.get(&node).expect("Pipeline not compiled!");
+                let pipeline = self.pipelines.get(&node);
 
                 let input_nodes: Vec<NodeIndex> = self
                     .llir_graph
@@ -491,22 +416,35 @@ impl Runtime for MetalRuntime {
                         }
                     })
                     .collect();
+                let input_dtypes: Vec<DType> = input_nodes
+                    .iter()
+                    .map(|n| {
+                        self.node_dtypes
+                            .get(n)
+                            .copied()
+                            .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
+                    })
+                    .collect();
 
                 let output_buffer = self
                     .buffers
                     .get(&node)
                     .expect("Output buffer not allocated!");
+                let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
 
-                // Bind dyn dims right after the output slot:
-                // [inputs..., output, dyn, bytes...]
-                let dyn_idx = input_buffers.len() as u64 + 1;
-                encoder.set_buffer(dyn_idx, Some(&self.dyn_buffer), 0);
-
-                kernel_op.encode(encoder, pipeline, &input_buffers, output_buffer, dyn_map);
+                kernel_op.encode(
+                    &command_buffer,
+                    pipeline,
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                    &self.dyn_buffer,
+                    &input_dtypes,
+                    output_dtype,
+                );
             }
         }
 
-        encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
     }
@@ -621,7 +559,6 @@ impl MetalRuntime {
 
         self.update_dyn_buffer(dyn_map);
         let command_buffer = self.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
 
         for node in topo_order {
             if self.llir_graph[node].to_op::<Input>().is_some()
@@ -631,7 +568,7 @@ impl MetalRuntime {
             }
 
             if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                let pipeline = self.pipelines.get(&node).expect("Pipeline not compiled!");
+                let pipeline = self.pipelines.get(&node);
 
                 let input_nodes: Vec<NodeIndex> = self
                     .llir_graph
@@ -654,20 +591,35 @@ impl MetalRuntime {
                         }
                     })
                     .collect();
+                let input_dtypes: Vec<DType> = input_nodes
+                    .iter()
+                    .map(|n| {
+                        self.node_dtypes
+                            .get(n)
+                            .copied()
+                            .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
+                    })
+                    .collect();
 
                 let output_buffer = self
                     .buffers
                     .get(&node)
                     .expect("Output buffer not allocated!");
+                let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
 
-                let dyn_idx = input_buffers.len() as u64 + 1;
-                encoder.set_buffer(dyn_idx, Some(&self.dyn_buffer), 0);
-
-                kernel_op.encode(encoder, pipeline, &input_buffers, output_buffer, dyn_map);
+                kernel_op.encode(
+                    &command_buffer,
+                    pipeline,
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                    &self.dyn_buffer,
+                    &input_dtypes,
+                    output_dtype,
+                );
             }
         }
 
-        encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
 

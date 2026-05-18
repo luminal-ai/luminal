@@ -9,3 +9,6 @@ All other functionality is split into crates in the `crates/` directory. For ins
 - Find the CI plan in the .github/workflows folder.
 - Currently running `cargo test` in luminal_metal and luminal_cuda_lite require access to an Apple and Nvidia GPU respectively.
 - PRs must have no clippy errors and `cargo fmt` must be ran before a PR is submitted.
+
+## Compiler Rewrite Boundary
+- All graph pattern matching and op selection must be expressed in egglog rewrites. Do not add Rust-side LLIR graph post-passes that search for op patterns, fuse kernels, select backend ops, or otherwise rewrite extracted graphs after egglog. If a backend needs a fused/specialized op, add the match and rewrite in egglog and let extraction produce that op directly.

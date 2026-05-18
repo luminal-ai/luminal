@@ -679,8 +679,8 @@ fn metal_regular_tiled_matmul_path() {
 
     let kernels = rt.debug_kernel_ops();
     assert!(
-        kernels.iter().any(|k| k.contains("family: RegularTiled")),
-        "expected regular tiled matmul path, kernels: {:?}",
+        kernels.iter().any(|k| k.contains("MPSMatmul")),
+        "expected MPS matmul path, kernels: {:?}",
         kernels
     );
 
@@ -696,6 +696,132 @@ fn metal_regular_tiled_matmul_path() {
     let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
 
     assert_close(&result, &expected, 2e-3);
+}
+
+#[test]
+fn metal_mps_matmul_transposed_rhs_weight_layout() {
+    let mut cx = Graph::default();
+    let m = 7;
+    let k = 11;
+    let n = 13;
+    let a = cx.tensor((m, k));
+    let weight = cx.tensor((n, k));
+    let output = a.matmul(weight.t()).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(m * k, 0.35, -0.17);
+    let weight_data = seeded_data(n * k, 0.21, -0.09);
+
+    rt.set_data(a, &a_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
+        "expected MPS matmul to cover transposed row-major RHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_a = CandleTensor::from_vec(a_data, (m, k), &device).unwrap();
+    let ref_weight = CandleTensor::from_vec(weight_data, (n, k), &device).unwrap();
+    let expected = ref_a.matmul(&ref_weight.t().unwrap()).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_matmul_transposed_lhs_layout() {
+    let mut cx = Graph::default();
+    let m = 5;
+    let k = 9;
+    let n = 6;
+    let lhs_storage = cx.tensor((k, m));
+    let rhs = cx.tensor((k, n));
+    let output = lhs_storage.t().matmul(rhs).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let lhs_data = seeded_data(k * m, 0.31, -0.12);
+    let rhs_data = seeded_data(k * n, 0.27, -0.08);
+
+    rt.set_data(lhs_storage, &lhs_data);
+    rt.set_data(rhs, &rhs_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_lhs: true")),
+        "expected MPS matmul to cover transposed row-major LHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_lhs = CandleTensor::from_vec(lhs_data, (k, m), &device)
+        .unwrap()
+        .t()
+        .unwrap();
+    let ref_rhs = CandleTensor::from_vec(rhs_data, (k, n), &device).unwrap();
+    let expected = ref_lhs.matmul(&ref_rhs).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
+    let mut cx = Graph::default();
+    let m = 6;
+    let k = 10;
+    let n = 7;
+    let a = cx.tensor((m, k)).as_dtype(DType::F16);
+    let weight = cx.tensor((n, k)).as_dtype(DType::F16);
+    let output = a.matmul(weight.t()).cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(m * k, 0.22, -0.07);
+    let weight_data = seeded_data(n * k, 0.18, -0.05);
+
+    rt.set_data(a, to_f16_vec(&a_data));
+    rt.set_data(weight, to_f16_vec(&weight_data));
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
+        "expected MPS F16 matmul to cover transposed row-major RHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_a = CandleTensor::from_vec(a_data, (m, k), &device).unwrap();
+    let ref_weight = CandleTensor::from_vec(weight_data, (n, k), &device).unwrap();
+    let expected = ref_a.matmul(&ref_weight.t().unwrap()).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 5e-3);
 }
 
 #[test]
