@@ -576,18 +576,6 @@ impl KernelOp for KernelConv2D {
         let c_in = self.input_shape[0].to_kernel();
         let h_in = self.input_shape[1].to_kernel();
         let w_in = self.input_shape[2].to_kernel();
-        let in_c_stride = self.input_stride[0]
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
-        let in_h_stride = self.input_stride[1]
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
-        let in_w_stride = self.input_stride[2]
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
         let weight_co_stride = self
             .weight_co_stride
             .substitute('z', Expression::from(1))
@@ -612,6 +600,9 @@ impl KernelOp for KernelConv2D {
         let pad_h = self.pad_h.to_kernel();
         let pad_w = self.pad_w.to_kernel();
         let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
+        let input_idx = flatten_strides(&self.input_shape, &self.input_stride)
+            .to_kernel()
+            .replace("const_z", "input_linear");
         let n_outputs: Expression = self.out_shape.iter().copied().product();
 
         let kernel = format!(
@@ -642,9 +633,6 @@ extern \"C\" {{
         const long long DW = {dilation_w};
         const long long PH = {pad_h};
         const long long PW = {pad_w};
-        const long long IN_C_STRIDE = {in_c_stride};
-        const long long IN_H_STRIDE = {in_h_stride};
-        const long long IN_W_STRIDE = {in_w_stride};
         const long long W_CO_STRIDE = {weight_co_stride};
         const long long W_INNER_STRIDE = {weight_inner_stride};
         const long long BIAS_C_STRIDE = {bias_c_stride};
@@ -662,7 +650,8 @@ extern \"C\" {{
                 for (long long s = 0; s < KW; ++s) {{
                     long long iw = ow * SW + s * DW - PW;
                     if (iw < 0 || iw >= WIN) continue;
-                    long long input_idx = ci * IN_C_STRIDE + ih * IN_H_STRIDE + iw * IN_W_STRIDE;
+                    long long input_linear = (ci * HIN + ih) * WIN + iw;
+                    long long input_idx = {input_idx};
                     long long inner = (ci * KH + r) * KW + s;
                     long long weight_idx = co * W_CO_STRIDE + inner * W_INNER_STRIDE;
                     acc += input[input_idx] * weight[weight_idx];

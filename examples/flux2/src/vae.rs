@@ -194,9 +194,7 @@ fn group_norm(
 fn nearest_upsample_2x(x: GraphTensor) -> GraphTensor {
     // (C, H, W) -> (C, H, 2, W) -> (C, 2H, W) -> (C, 2H, W, 2) -> (C, 2H, 2W)
     let stage1 = x.expand_dim(2, 2_usize).merge_dims(1, 2);
-    let stage2 = stage1.expand_dim(3, 2_usize).merge_dims(2, 3);
-    // Materialize the broadcast view so subsequent ops see contiguous strides.
-    stage2 + 0.0_f32
+    stage1.expand_dim(3, 2_usize).merge_dims(2, 3)
 }
 
 /// SiLU = x * sigmoid(x).
@@ -346,9 +344,9 @@ impl AttnBlock {
             NORM_NUM_GROUPS,
             NORM_EPS,
         );
-        // (C, H, W) -> (C, H*W) -> (H*W, C), then materialize the strided
-        // transpose before the HLIR matmuls.
-        let merged = normed.merge_dims(1, 2).transpose(0, 1) * 1.0_f32;
+        // (C, H, W) -> (C, H*W) -> (H*W, C). This is a column-major view
+        // that cuBLASLt can consume directly.
+        let merged = normed.merge_dims(1, 2).transpose(0, 1);
 
         let q = linear_bias(merged, self.to_q_w, self.to_q_b);
         let k = linear_bias(merged, self.to_k_w, self.to_k_b);

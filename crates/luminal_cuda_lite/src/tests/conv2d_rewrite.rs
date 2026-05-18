@@ -70,6 +70,21 @@ fn build_padded_conv_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, G
     (cx, x, weight, bias, out)
 }
 
+fn nearest_upsample_2x_hlir(x: GraphTensor) -> GraphTensor {
+    let stage1 = x.expand_dim(2, 2usize).merge_dims(1, 2);
+    stage1.expand_dim(3, 2usize).merge_dims(2, 3)
+}
+
+fn build_upsample_conv_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, GraphTensor) {
+    let mut cx = Graph::new();
+    let x = cx.tensor((2usize, 3usize, 4usize));
+    let weight = cx.tensor((3usize, 2usize * 3 * 3));
+    let bias = cx.tensor(3usize);
+    let up = nearest_upsample_2x_hlir(x);
+    let out = conv2d_bias_padded_hlir(up, weight, bias, 3, 1).output();
+    (cx, x, weight, bias, out)
+}
+
 fn conv1x1_bias_hlir(x: GraphTensor, weight: GraphTensor, bias: GraphTensor) -> GraphTensor {
     let dims = x.dims();
     let h = dims[1];
@@ -280,6 +295,48 @@ fn generic_conv2d_candidate_executes_padded_unfold_matmul_bias() {
     assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
 }
 
+#[test]
+fn generic_conv2d_candidate_executes_upsample_view_input() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let (mut cx, x, weight, bias, out) = build_upsample_conv_graph();
+    cx.build_search_space::<CudaRuntime>();
+    let llir = extract_forced_kernel_llir(&mut cx, "GenericConv2D");
+
+    let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 * 0.09 - 0.8).collect();
+    let weights: Vec<f32> = (0..3 * 2 * 3 * 3)
+        .map(|i| (i as f32 % 17.0) * 0.025 - 0.2)
+        .collect();
+    let biases = vec![0.05_f32, -0.1, 0.2];
+    let upsampled = reference_nearest_upsample_2x(&input, 2, 3, 4);
+    let expected = reference_conv2d(
+        &upsampled,
+        &weights,
+        &biases,
+        ConvCase {
+            c_in: 2,
+            h: 6,
+            w: 8,
+            c_out: 3,
+            kh: 3,
+            kw: 3,
+            padding_h: 1,
+            padding_w: 1,
+        },
+    );
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(x, input);
+    rt.set_data(weight, weights);
+    rt.set_data(bias, biases);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
 struct ConvCase {
     c_in: usize,
     h: usize,
@@ -289,6 +346,25 @@ struct ConvCase {
     kw: usize,
     padding_h: usize,
     padding_w: usize,
+}
+
+fn reference_nearest_upsample_2x(input: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
+    let mut out = vec![0.0_f32; c * h * 2 * w * 2];
+    for ci in 0..c {
+        for y in 0..h {
+            for x in 0..w {
+                let value = input[ci * h * w + y * w + x];
+                for dy in 0..2 {
+                    for dx in 0..2 {
+                        let oy = y * 2 + dy;
+                        let ox = x * 2 + dx;
+                        out[ci * h * 2 * w * 2 + oy * w * 2 + ox] = value;
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn reference_conv2d(input: &[f32], weight: &[f32], bias: &[f32], case: ConvCase) -> Vec<f32> {

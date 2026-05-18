@@ -132,7 +132,10 @@ fn causal_sdpa(
     let seq = q.dims()[1];
     let scale = (HEAD_DIM as f32).sqrt().recip();
     // Materialize strided views from the upstream transpose / GQA-expand chain
-    // before expressing attention as HLIR matmuls.
+    // before expressing attention as HLIR matmuls. Today the generic batched
+    // matmul fallback can handle those arbitrary strides correctly, but the
+    // full model becomes too memory-heavy unless cuBLASLt sees contiguous
+    // per-head matrices.
     let q = q * 1.0_f32;
     let k = k * 1.0_f32;
     let v = v * 1.0_f32;

@@ -179,7 +179,10 @@ fn sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let head_dim = q.dims()[2].to_usize().expect("head_dim must be static");
     let scale = (head_dim as f32).sqrt().recip();
     // Materialize the strided views produced upstream (transpose /
-    // split_dims chains) before expressing attention as HLIR matmuls.
+    // split_dims chains) before expressing attention as HLIR matmuls. cuBLASLt
+    // can represent the leading dimensions, but the current rewrite rules do
+    // not yet match the interleaved per-head layout, so omitting these copies
+    // falls back to a much larger generic plan in the full Flux2 graph.
     let q = q * 1.0_f32;
     let k = k * 1.0_f32;
     let v = v * 1.0_f32;
