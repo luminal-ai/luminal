@@ -10,6 +10,436 @@
 
 (rule
     (
+        ; Match the scaled FP8 linear form directly before the unscaled FP8
+        ; matmul rewrite can hide the quantize/dequant scale structure.
+        (= ?scaled_activation (Op (Mul
+            ?activation_shape
+            ?raw_activation_strides
+            ?recip_activation_strides
+            ?activation_out_strides)
+            (ICons ?raw_activation (ICons ?recip_input_scale (INil)))))
+        (= ?recip_input_scale (Op (Recip
+            ?activation_shape
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?recip_out_strides)
+            (ICons ?input_scale (INil))))
+        (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
+            (ICons ?input_scale (ICons ?weight_scale (INil)))))
+        (= ?scaled (Op (Mul
+            ?out_shape
+            ?cast_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?cast (ICons ?scale_product (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= ?b_dtype (dtype ?b))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_scaled
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+        (union ?scaled ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+:ruleset matmul_backend
+:name "cublaslt scaled fp8 row-major x column-major f32 output"
+)
+
+(rule
+    (
+        (= ?scaled_activation (Op (Mul
+            ?activation_shape
+            ?raw_activation_strides
+            ?recip_activation_strides
+            ?activation_out_strides)
+            (ICons ?raw_activation (ICons ?recip_input_scale (INil)))))
+        (= ?recip_input_scale (Op (Recip
+            ?activation_shape
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?recip_out_strides)
+            (ICons ?input_scale (INil))))
+        (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
+            (ICons ?input_scale (ICons ?weight_scale (INil)))))
+        (= ?scaled (Op (Mul
+            ?out_shape
+            ?cast_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?cast (ICons ?scale_product (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= ?b_dtype (dtype ?b))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
+        (= ?scaled (Op (cublaslt_scaled
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+        (= ?cast (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+    )
+    (
+        (delete (Op (Mul
+            ?out_shape
+            ?cast_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?cast (ICons ?scale_product (INil)))))
+        (delete (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+    )
+    :ruleset cleanup
+    :name "delete raw fp8 path when scaled cublaslt covers direct output scale"
+)
+
+(rule
+    (
+        ; Fusion growth can make the live path consume a raw FP8 cuBLASLt
+        ; candidate through an internal CudaBinaryElementwise scale multiply,
+        ; instead of the original HLIR output-scale Mul. The scalar scale
+        ; product is tensor-wide, so the two scalar factors can be passed as
+        ; cuBLASLt A/B scale inputs and the internal multiply can be bypassed.
+        (= ?raw_gemm (Op (cublaslt
+            ?cm ?cn ?ck
+            ?cta ?ctb
+            ?cao ?cbo ?cco ?cdo
+            ?clda ?cldb ?cldc ?cldd
+            ?cbc ?csa ?csb ?csc ?csd
+            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
+            (ICons ?a (ICons ?b (INil)))))
+        (cublaslt_fp8_f32_output_pair ?cadt ?cbdt)
+        (= ?ccdt (F32))
+        (= ?cddt (F32))
+        (= ?cbeta 0.0)
+        (= ?cepilogue "DEFAULT")
+
+        (= ?fs_cast (Op (FusionStart
+            ?out_shape
+            ?cast_strides
+            (F32))
+            (ICons ?raw_gemm (INil))))
+
+        (= ?out_shape (ECons ?out_m (ECons ?out_n (ENil))))
+        (= ?scale_strides (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+
+        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?a_scale (INil))))
+        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?b_scale (INil))))
+        (= ?scale_product_inner (Op (CudaBinaryElementwise
+            "Mul"
+            (ENil)
+            (ENil)
+            (ENil)
+            (ENil)
+            (F32))
+            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
+        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
+            (ICons ?scale_product_inner (INil))))
+        (= ?fs_scale (Op (FusionStart
+            ?out_shape
+            ?scale_strides
+            (F32))
+            (ICons ?scale_product (INil))))
+        (= ?fused_scale (Op (CudaBinaryElementwise
+            "Mul"
+            ?out_shape
+            ?cast_strides
+            ?scale_strides
+            ?scaled_out_strides
+            (F32))
+            (ICons ?fs_cast (ICons ?fs_scale (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_scaled
+            ?cm ?cn ?ck
+            ?cta ?ctb
+            ?cao ?cbo ?cco ?cdo
+            ?clda ?cldb ?cldc ?cldd
+            ?cbc ?csa ?csb ?csc ?csd
+            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
+            (ICons ?a (ICons ?b (ICons ?a_scale (ICons ?b_scale (INil)))))))
+        (let ?fs_sgemm (Op (FusionStart ?out_shape ?scaled_out_strides (F32))
+            (ICons ?sgemm (INil))))
+        (union ?fused_scale ?fs_sgemm)
+        (set (dtype ?sgemm) (F32))
+        (set (dtype ?fs_sgemm) (F32))
+    )
+    :ruleset fusion_grow
+    :name "cublaslt scaled fp8 fused output-scale f32 output"
+)
+
+(rule
+    (
+        (= ?raw_gemm (Op (cublaslt
+            ?cm ?cn ?ck
+            ?cta ?ctb
+            ?cao ?cbo ?cco ?cdo
+            ?clda ?cldb ?cldc ?cldd
+            ?cbc ?csa ?csb ?csc ?csd
+            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
+            (ICons ?a (ICons ?b (INil)))))
+        (cublaslt_fp8_f32_output_pair ?cadt ?cbdt)
+        (= ?ccdt (F32))
+        (= ?cddt (F32))
+        (= ?cbeta 0.0)
+        (= ?cepilogue "DEFAULT")
+
+        (= ?fs_cast (Op (FusionStart
+            ?out_shape
+            ?cast_strides
+            (F32))
+            (ICons ?raw_gemm (INil))))
+
+        (= ?out_shape (ECons ?out_m (ECons ?out_n (ENil))))
+        (= ?scale_strides (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+
+        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?a_scale (INil))))
+        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?b_scale (INil))))
+        (= ?scale_product_inner (Op (CudaBinaryElementwise
+            "Mul"
+            (ENil)
+            (ENil)
+            (ENil)
+            (ENil)
+            (F32))
+            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
+        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
+            (ICons ?scale_product_inner (INil))))
+        (= ?fs_scale (Op (FusionStart
+            ?out_shape
+            ?scale_strides
+            (F32))
+            (ICons ?scale_product (INil))))
+        (= ?fused_scale (Op (CudaBinaryElementwise
+            "Mul"
+            ?out_shape
+            ?cast_strides
+            ?scale_strides
+            ?scaled_out_strides
+            (F32))
+            (ICons ?fs_cast (ICons ?fs_scale (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+
+        (= ?sgemm (Op (cublaslt_scaled
+            ?cm ?cn ?ck
+            ?cta ?ctb
+            ?cao ?cbo ?cco ?cdo
+            ?clda ?cldb ?cldc ?cldd
+            ?cbc ?csa ?csb ?csc ?csd
+            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
+            (ICons ?a (ICons ?b (ICons ?a_scale (ICons ?b_scale (INil)))))))
+        (= ?fused_scale (Op (FusionStart ?out_shape ?scaled_out_strides (F32))
+            (ICons ?sgemm (INil))))
+    )
+    (
+        (delete (Op (cublaslt
+            ?cm ?cn ?ck
+            ?cta ?ctb
+            ?cao ?cbo ?cco ?cdo
+            ?clda ?cldb ?cldc ?cldd
+            ?cbc ?csa ?csb ?csc ?csd
+            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
+            (ICons ?a (ICons ?b (INil)))))
+        (delete (Op (CudaBinaryElementwise
+            "Mul"
+            ?out_shape
+            ?cast_strides
+            ?scale_strides
+            ?scaled_out_strides
+            (F32))
+            (ICons ?fs_cast (ICons ?fs_scale (INil)))))
+    )
+    :ruleset cleanup
+    :name "delete raw fp8 path when scaled cublaslt covers fused output scale"
+)
+
+(rule
+    (
+        ; Batched form of the scaled FP8 linear rewrite. The scale operands are
+        ; scalar tensors expanded across the last three output/activation axes.
+        (= ?scaled_activation (Op (Mul
+            ?activation_shape
+            ?raw_activation_strides
+            ?recip_activation_strides
+            ?activation_out_strides)
+            (ICons ?raw_activation (ICons ?recip_input_scale (INil)))))
+        (= ?recip_input_scale (Op (Recip
+            ?activation_shape
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?recip_out_strides)
+            (ICons ?input_scale (INil))))
+        (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+
+        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
+            (ICons ?input_scale (ICons ?weight_scale (INil)))))
+        (= ?scaled (Op (Mul
+            ?out_shape
+            ?cast_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?scaled_out_strides)
+            (ICons ?cast (ICons ?scale_product (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+
+        (= ?batch (nth_from_end ?out_shape 2))
+        (= ?m (nth_from_end ?out_shape 1))
+        (= ?n (nth_from_end ?out_shape 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_batch_stride (nth_from_end ?a_stride 3))
+        (= ?a_m_stride (nth_from_end ?a_stride 2))
+        (= ?a_n_stride (nth_from_end ?a_stride 1))
+        (= ?a_k_stride (nth_from_end ?a_stride 0))
+
+        (= ?b_batch_stride (nth_from_end ?b_stride 3))
+        (= ?b_m_stride (nth_from_end ?b_stride 2))
+        (= ?b_n_stride (nth_from_end ?b_stride 1))
+        (= ?b_k_stride (nth_from_end ?b_stride 0))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= ?b_dtype (dtype ?b))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_scaled
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            ?batch
+            ?b_batch_stride
+            ?a_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+        (union ?scaled ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+:ruleset matmul_backend
+:name "cublaslt scaled fp8 batched row-major x column-major f32 output"
+)
+
+(rule
+    (
         (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
         (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))

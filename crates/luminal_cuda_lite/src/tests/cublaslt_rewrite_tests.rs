@@ -1,7 +1,8 @@
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
+        ClassId, NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice,
+        validate_choice_set,
     },
     prelude::*,
 };
@@ -11,7 +12,8 @@ use crate::{
     host::{
         CublasLtMatrixOrders, CublasLtScaleValues, CublasLtTransposeOps, CublasLtTypeTuple, HostOp,
         cublaslt_c_d_layouts_match, cublaslt_epilogue, cublaslt_matrix_orders,
-        cublaslt_scale_values, cublaslt_transpose_ops, cublaslt_type_tuple,
+        cublaslt_scale_values, cublaslt_tensor_scale_inputs, cublaslt_transpose_ops,
+        cublaslt_type_tuple,
     },
     runtime::CudaRuntime,
 };
@@ -897,6 +899,196 @@ fn cublaslt_fp8_e4m3_beta_candidate_executes_2d_matmul_plus_f32_c() {
     rt.set_data(c, c_data);
     rt.execute(&cx.dyn_map);
 
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
+#[test]
+#[ignore = "expensive CUDA FP8 rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+fn cublaslt_fp8_scaled_candidate_executes_2d_matmul_f32_output() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !gpu_supports_cublaslt_fp8_launch(DType::F8E4M3) {
+        return;
+    }
+
+    let (m, n, k) = (16, 16, 16);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let a_scale = cx.tensor(());
+    let b_scale = cx.tensor(());
+    let b_input = cx.tensor((n, k)).as_dtype(DType::F8E4M3);
+    let b = b_input.t();
+    let scaled_a = (a / a_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
+    let out =
+        (scaled_a.matmul(b).cast(DType::F32) * (a_scale * b_scale).expand_rhs((m, n))).output();
+    let expected_tuple = (
+        DType::F8E4M3,
+        DType::F8E4M3,
+        DType::F32,
+        DType::F32,
+        "32F",
+        DType::F32,
+    );
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional scaled fp8", |llir| {
+        cublaslt_type_tuples(llir).contains(&expected_tuple)
+            && cublaslt_tensor_scale_input_tuples(llir).contains(&(true, true))
+            && cublaslt_transpose_op_tuples(llir).contains(&("T", "N"))
+            && cublaslt_matrix_order_tuples(llir).contains(&("COL", "COL", "COL", "COL"))
+    });
+
+    let input_scale = 0.25f32;
+    let weight_scale = 2.0f32;
+    let (a_fp8_bytes, a_values) = fp8_exact_bytes(DType::F8E4M3, m * k, 7);
+    let a_data = a_values
+        .iter()
+        .map(|value| value * input_scale)
+        .collect::<Vec<_>>();
+    let (b_bytes, b_storage_values) = fp8_exact_bytes(DType::F8E4M3, k * n, 9);
+    let b_values = logical_b_from_column_major_storage(&b_storage_values, n, k);
+    let mut expected = reference_matmul_2d(&a_values, &b_values, m, n, k);
+    for value in &mut expected {
+        *value *= input_scale * weight_scale;
+    }
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a, a_data);
+    rt.set_data(a_scale, vec![input_scale]);
+    rt.set_data(b_scale, vec![weight_scale]);
+    rt.set_data(b_input, b_bytes);
+    rt.execute(&cx.dyn_map);
+
+    // Keep the raw bytes live in the test construction: a_data was chosen so
+    // the explicit scaled cast quantizes to these exact FP8 values.
+    assert_eq!(a_fp8_bytes.len(), m * k);
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
+#[test]
+fn cublaslt_fp8_scaled_candidate_reaches_fused_output_scale_consumer() {
+    let (m, n, k) = (16, 16, 16);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let a_scale = cx.tensor(());
+    let b_scale = cx.tensor(());
+    let b_input = cx.tensor((n, k)).as_dtype(DType::F8E4M3);
+    let b = b_input.t();
+    let side = cx.tensor((m, n));
+    let scaled_a = (a / a_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
+    let scaled_out = scaled_a.matmul(b).cast(DType::F32) * (a_scale * b_scale).expand_rhs((m, n));
+    (scaled_out * side).output();
+
+    cx.build_search_space::<CudaRuntime>();
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+
+    assert!(
+        dataflow_reachable_cublaslt_scaled_count(egraph) > 0,
+        "scaled cuBLASLt must remain reachable when fusion growth consumes the output-scale multiply internally"
+    );
+    assert_eq!(
+        dataflow_reachable_cublaslt_raw_fp8_count(egraph),
+        0,
+        "raw FP8 cuBLASLt must be deleted when a scaled equivalent covers the fused output-scale consumer"
+    );
+}
+
+#[test]
+fn cublaslt_fp8_scaled_candidates_reach_fused_mlp_consumer() {
+    let (m, n, k) = (16, 32, 16);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let gate_input_scale = cx.tensor(());
+    let gate_weight_scale = cx.tensor(());
+    let up_input_scale = cx.tensor(());
+    let up_weight_scale = cx.tensor(());
+    let gate_weight = cx.tensor((n, k)).as_dtype(DType::F8E4M3);
+    let up_weight = cx.tensor((n, k)).as_dtype(DType::F8E4M3);
+
+    let scaled_gate_a = (a / gate_input_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
+    let gate = scaled_gate_a.matmul(gate_weight.t()).cast(DType::F32)
+        * (gate_input_scale * gate_weight_scale).expand_rhs((m, n));
+    let scaled_up_a = (a / up_input_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
+    let up = scaled_up_a.matmul(up_weight.t()).cast(DType::F32)
+        * (up_input_scale * up_weight_scale).expand_rhs((m, n));
+    (gate.swish() * up).output();
+
+    cx.build_search_space::<CudaRuntime>();
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+
+    assert!(
+        dataflow_reachable_cublaslt_scaled_count(egraph) >= 2,
+        "scaled cuBLASLt candidates must remain reachable through fused MLP gate/up consumers"
+    );
+    assert_eq!(
+        dataflow_reachable_cublaslt_raw_fp8_count(egraph),
+        0,
+        "raw FP8 cuBLASLt must be deleted when a scaled equivalent covers the fused MLP consumer"
+    );
+}
+
+#[test]
+#[ignore = "expensive CUDA FP8 rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
+fn cublaslt_fp8_scaled_candidate_executes_batched_matmul_f32_output() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !gpu_supports_cublaslt_fp8_launch(DType::F8E4M3) {
+        return;
+    }
+
+    let (batch, m, n, k) = (2, 16, 16, 16);
+    let mut cx = Graph::new();
+    let a = cx.tensor((batch, m, k));
+    let a_scale = cx.tensor(());
+    let b_scale = cx.tensor(());
+    let b_input = cx.tensor((batch, n, k)).as_dtype(DType::F8E4M3);
+    let b = b_input.transpose(1, 2);
+    let scaled_a = (a / a_scale.expand_rhs((batch, m, k))).cast(DType::F8E4M3);
+    let lhs = scaled_a.expand_dim(2, n);
+    let rhs = b.permute((0, 2, 1)).expand_dim(1, m);
+    let mul = unchecked_mul_same_shape(lhs, rhs, DType::F8E4M3);
+    let matmul = mul.sum(3).cast(DType::F32);
+    let out = (matmul * (a_scale * b_scale).expand_rhs((batch, m, n))).output();
+    let expected_tuple = (
+        DType::F8E4M3,
+        DType::F8E4M3,
+        DType::F32,
+        DType::F32,
+        "32F",
+        DType::F32,
+    );
+    let llir =
+        extract_forced_cublaslt_llir_where(&mut cx, "functional scaled batched fp8", |llir| {
+            cublaslt_type_tuples(llir).contains(&expected_tuple)
+                && cublaslt_tensor_scale_input_tuples(llir).contains(&(true, true))
+                && cublaslt_transpose_op_tuples(llir).contains(&("T", "N"))
+                && cublaslt_matrix_order_tuples(llir).contains(&("COL", "COL", "COL", "COL"))
+        });
+
+    let input_scale = 0.5f32;
+    let weight_scale = 1.5f32;
+    let (a_fp8_bytes, a_values) = fp8_exact_bytes(DType::F8E4M3, batch * m * k, 11);
+    let a_data = a_values
+        .iter()
+        .map(|value| value * input_scale)
+        .collect::<Vec<_>>();
+    let (b_bytes, b_storage_values) = fp8_exact_bytes(DType::F8E4M3, batch * k * n, 13);
+    let b_values = logical_b_from_batched_column_major_storage(&b_storage_values, batch, n, k);
+    let mut expected = reference_matmul_batched(&a_values, &b_values, batch, m, n, k);
+    for value in &mut expected {
+        *value *= input_scale * weight_scale;
+    }
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a, a_data);
+    rt.set_data(a_scale, vec![input_scale]);
+    rt.set_data(b_scale, vec![weight_scale]);
+    rt.set_data(b_input, b_bytes);
+    rt.execute(&cx.dyn_map);
+
+    assert_eq!(a_fp8_bytes.len(), batch * m * k);
     assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
 }
 
@@ -2844,7 +3036,7 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
     let cublaslt_kind_classes = egraph
         .enodes
         .iter()
-        .filter(|(_, (label, _))| label == "cublaslt")
+        .filter(|(_, (label, _))| label == "cublaslt" || label == "cublaslt_scaled")
         .map(|(node, _)| egraph.node_to_class[node].clone())
         .collect::<Vec<_>>();
 
@@ -2859,6 +3051,87 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
             .then_some(node)
         })
         .collect()
+}
+
+fn dataflow_reachable_cublaslt_scaled_count(egraph: &SerializedEGraph) -> usize {
+    dataflow_reachable_cublaslt_count(egraph, true)
+}
+
+fn dataflow_reachable_cublaslt_raw_fp8_count(egraph: &SerializedEGraph) -> usize {
+    dataflow_reachable_cublaslt_count(egraph, false)
+}
+
+fn dataflow_reachable_cublaslt_count(egraph: &SerializedEGraph, scaled: bool) -> usize {
+    let reachable = dataflow_reachable_ir_classes(egraph);
+    egraph
+        .enodes
+        .iter()
+        .filter(|(node, (label, children))| {
+            label == "Op"
+                && reachable.contains(&egraph.node_to_class[*node])
+                && children.first().is_some_and(|kind_class| {
+                    egraph
+                        .eclasses
+                        .get(kind_class)
+                        .is_some_and(|(_, kind_nodes)| {
+                            kind_nodes.iter().any(|kind_node| {
+                                egraph.enodes.get(kind_node).is_some_and(|(kind_label, _)| {
+                                    if scaled {
+                                        kind_label == "cublaslt_scaled"
+                                    } else {
+                                        kind_label == "cublaslt"
+                                    }
+                                })
+                            })
+                        })
+                })
+        })
+        .count()
+}
+
+fn dataflow_reachable_ir_classes(egraph: &SerializedEGraph) -> FxHashSet<ClassId> {
+    let mut reachable = FxHashSet::default();
+    let mut stack = egraph.roots.clone();
+    while let Some(class) = stack.pop() {
+        if !reachable.insert(class.clone()) {
+            continue;
+        }
+        let Some((sort, nodes)) = egraph.eclasses.get(&class) else {
+            continue;
+        };
+        for node in nodes {
+            let Some((label, children)) = egraph.enodes.get(node) else {
+                continue;
+            };
+            match (sort.as_str(), label.as_str()) {
+                ("IR", "Output") => {
+                    if let Some(child) = children.first() {
+                        stack.push(child.clone());
+                    }
+                }
+                ("IR", "OutputJoin") => stack.extend(children.iter().cloned()),
+                ("IR", "Op") => {
+                    if let Some(inputs) = children.get(1) {
+                        stack.push(inputs.clone());
+                    }
+                }
+                ("IR", _) => {
+                    for child in children {
+                        if egraph
+                            .eclasses
+                            .get(child)
+                            .is_some_and(|(child_sort, _)| child_sort == "IR")
+                        {
+                            stack.push(child.clone());
+                        }
+                    }
+                }
+                ("IList", "ICons") => stack.extend(children.iter().cloned()),
+                _ => {}
+            }
+        }
+    }
+    reachable
 }
 
 fn llir_has_cublaslt(llir: &LLIRGraph) -> bool {
@@ -2876,6 +3149,13 @@ fn cublaslt_scale_value_tuples(llir: &LLIRGraph) -> Vec<CublasLtScaleValues> {
     llir.node_weights()
         .filter_map(|op| op.to_dialect::<dyn HostOp>())
         .filter_map(|host_op| cublaslt_scale_values(host_op.as_ref().as_ref()))
+        .collect()
+}
+
+fn cublaslt_tensor_scale_input_tuples(llir: &LLIRGraph) -> Vec<(bool, bool)> {
+    llir.node_weights()
+        .filter_map(|op| op.to_dialect::<dyn HostOp>())
+        .filter_map(|host_op| cublaslt_tensor_scale_inputs(host_op.as_ref().as_ref()))
         .collect()
 }
 

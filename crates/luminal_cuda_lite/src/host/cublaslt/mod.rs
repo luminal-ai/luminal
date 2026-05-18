@@ -69,6 +69,8 @@ pub struct CuBlasLt {
     alpha: f64,
     beta: f64,
     epilogue: cublasLtEpilogue_t,
+    a_scale_input: bool,
+    b_scale_input: bool,
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
 }
 
@@ -103,52 +105,62 @@ impl Default for CuBlasLt {
             alpha: 1.0,
             beta: 0.0,
             epilogue: cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            a_scale_input: false,
+            b_scale_input: false,
             cublaslt: OnceLock::new(),
         }
     }
 }
 
+#[derive(Debug, Default)]
+pub struct CuBlasLtScaled;
+
+fn cublaslt_sort(name: &'static str) -> SortDef {
+    sort(
+        OP_KIND,
+        name,
+        &[
+            ("m", EXPRESSION),
+            ("n", EXPRESSION),
+            ("k", EXPRESSION),
+            ("a_layout", STRING),
+            ("b_layout", STRING),
+            ("a_order", STRING),
+            ("b_order", STRING),
+            ("c_order", STRING),
+            ("d_order", STRING),
+            ("lda", EXPRESSION),
+            ("ldb", EXPRESSION),
+            ("ldc", EXPRESSION),
+            ("ldd", EXPRESSION),
+            ("batch_count", EXPRESSION),
+            ("stride_a", EXPRESSION),
+            ("stride_b", EXPRESSION),
+            ("stride_c", EXPRESSION),
+            ("stride_d", EXPRESSION),
+            ("a_dtype", DTYPE),
+            ("b_dtype", DTYPE),
+            ("c_dtype", DTYPE),
+            ("d_dtype", DTYPE),
+            ("compute_type", STRING),
+            ("scale_dtype", STRING),
+            ("alpha", F64),
+            ("beta", F64),
+            ("epilogue", STRING),
+        ],
+    )
+}
+
 impl EgglogOp for CuBlasLt {
     fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "cublaslt",
-            &[
-                ("m", EXPRESSION),
-                ("n", EXPRESSION),
-                ("k", EXPRESSION),
-                ("a_layout", STRING),
-                ("b_layout", STRING),
-                ("a_order", STRING),
-                ("b_order", STRING),
-                ("c_order", STRING),
-                ("d_order", STRING),
-                ("lda", EXPRESSION),
-                ("ldb", EXPRESSION),
-                ("ldc", EXPRESSION),
-                ("ldd", EXPRESSION),
-                ("batch_count", EXPRESSION),
-                ("stride_a", EXPRESSION),
-                ("stride_b", EXPRESSION),
-                ("stride_c", EXPRESSION),
-                ("stride_d", EXPRESSION),
-                ("a_dtype", DTYPE),
-                ("b_dtype", DTYPE),
-                ("c_dtype", DTYPE),
-                ("d_dtype", DTYPE),
-                ("compute_type", STRING),
-                ("scale_dtype", STRING),
-                ("alpha", F64),
-                ("beta", F64),
-                ("epilogue", STRING),
-            ],
-        )
+        cublaslt_sort("cublaslt")
     }
 
     fn n_inputs(&self) -> usize {
         let c_input = usize::from(self.beta != 0.0);
         let bias_input = usize::from(epilogue_uses_bias(self.epilogue));
-        2 + c_input + bias_input
+        let scale_inputs = usize::from(self.a_scale_input) + usize::from(self.b_scale_input);
+        2 + c_input + bias_input + scale_inputs
     }
 
     fn rewrites(&self) -> Vec<Rule> {
@@ -158,7 +170,14 @@ impl EgglogOp for CuBlasLt {
                  (cublaslt_base_dtype (F32))
                  (cublaslt_base_dtype (F16))
                  (cublaslt_base_dtype (Bf16))
-                 (cublaslt_base_dtype (TF32))",
+                 (cublaslt_base_dtype (TF32))
+                 (relation cublaslt_fp8_dtype (DType))
+                 (cublaslt_fp8_dtype (F8E4M3))
+                 (cublaslt_fp8_dtype (F8E5M2))
+                 (relation cublaslt_fp8_f32_output_pair (DType DType))
+                 (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E4M3))
+                 (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E5M2))
+                 (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))",
             ),
             Rule::raw(include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
             Rule::raw(include_str!["cublaslt_RmCm_rewrite.egg"]), // row col
@@ -285,6 +304,104 @@ impl EgglogOp for CuBlasLt {
             alpha,
             beta,
             epilogue,
+            a_scale_input: false,
+            b_scale_input: false,
+            cublaslt: OnceLock::new(),
+        };
+        trace!(?extracted_state);
+
+        let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
+
+        (extracted, input_enodes)
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+}
+
+impl EgglogOp for CuBlasLtScaled {
+    fn sort(&self) -> SortDef {
+        cublaslt_sort("cublaslt_scaled")
+    }
+
+    fn n_inputs(&self) -> usize {
+        4
+    }
+
+    #[allow(unused_variables)]
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a luminal::egglog_utils::SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
+        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
+        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+
+        let a_layout = parse_cublas_op(&egraph.enodes[kind_children[3]].0);
+        let b_layout = parse_cublas_op(&egraph.enodes[kind_children[4]].0);
+        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
+        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
+        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
+        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
+
+        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
+        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
+        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
+        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
+
+        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
+        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
+        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
+        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
+        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
+
+        let a_dtype = extract_dtype(egraph, kind_children[18]);
+        let b_dtype = extract_dtype(egraph, kind_children[19]);
+        let c_dtype = extract_dtype(egraph, kind_children[20]);
+        let d_dtype = extract_dtype(egraph, kind_children[21]);
+        let compute_type_str = &egraph.enodes[kind_children[22]].0;
+        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
+        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
+        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
+        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
+        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
+        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
+
+        let extracted_state = CuBlasLt {
+            m,
+            n,
+            k,
+            a_layout,
+            b_layout,
+            a_order,
+            b_order,
+            c_order,
+            d_order,
+            lda,
+            ldb,
+            ldc,
+            ldd,
+            batch_count,
+            stride_a,
+            stride_b,
+            stride_c,
+            stride_d,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            d_dtype,
+            compute_type,
+            scale_dtype,
+            alpha,
+            beta,
+            epilogue,
+            a_scale_input: true,
+            b_scale_input: true,
             cublaslt: OnceLock::new(),
         };
         trace!(?extracted_state);
@@ -528,6 +645,8 @@ struct LtMatmulPointers {
     c: u64,
     d: u64,
     bias: Option<u64>,
+    a_scale: Option<u64>,
+    b_scale: Option<u64>,
 }
 
 struct LtRawDescriptors {
@@ -675,12 +794,12 @@ fn run_cublaslt_matmul(
     let workspace = unsafe { stream.alloc::<u8>(spec.workspace_size)? };
     let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
 
-    let a_scale = if cuda_dtype_needs_tensorwide_scale(spec.a.dtype) {
+    let a_scale = if cuda_dtype_needs_tensorwide_scale(spec.a.dtype) && ptrs.a_scale.is_none() {
         Some(stream.clone_htod(&[1.0f32])?)
     } else {
         None
     };
-    let b_scale = if cuda_dtype_needs_tensorwide_scale(spec.b.dtype) {
+    let b_scale = if cuda_dtype_needs_tensorwide_scale(spec.b.dtype) && ptrs.b_scale.is_none() {
         Some(stream.clone_htod(&[1.0f32])?)
     } else {
         None
@@ -736,13 +855,17 @@ fn run_cublaslt_matmul(
         }
     }
 
-    let (a_scale_ptr, _a_scale_guard) = if let Some(scale) = &a_scale {
+    let (a_scale_ptr, _a_scale_guard) = if let Some(ptr) = ptrs.a_scale {
+        (Some(ptr), None)
+    } else if let Some(scale) = &a_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
         (None, None)
     };
-    let (b_scale_ptr, _b_scale_guard) = if let Some(scale) = &b_scale {
+    let (b_scale_ptr, _b_scale_guard) = if let Some(ptr) = ptrs.b_scale {
+        (Some(ptr), None)
+    } else if let Some(scale) = &b_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
@@ -865,6 +988,8 @@ fn resolve_cublaslt_pointers(
     buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
     beta: f64,
     epilogue: cublasLtEpilogue_t,
+    a_scale_input: bool,
+    b_scale_input: bool,
 ) -> anyhow::Result<LtMatmulPointers> {
     if inputs.len() < 2 {
         return Err(anyhow::anyhow!(
@@ -885,24 +1010,25 @@ fn resolve_cublaslt_pointers(
         .get(&self_node)
         .ok_or_else(|| anyhow::anyhow!("missing cuBLASLt output buffer"))?
         .ptr();
+    let mut next_input = 2;
     let c = if beta == 0.0 {
         d
-    } else if let Some(c_input) = inputs.get(2) {
+    } else {
+        let c_input = inputs.get(next_input).ok_or_else(|| {
+            anyhow::anyhow!("cuBLASLt matmul with beta={beta} requires a third C input")
+        })?;
+        next_input += 1;
         buffers
             .get(c_input)
             .ok_or_else(|| anyhow::anyhow!("missing cuBLASLt C input buffer"))?
             .ptr()
-    } else {
-        return Err(anyhow::anyhow!(
-            "cuBLASLt matmul with beta={beta} requires a third C input"
-        ));
     };
 
-    let bias_input_index = if beta == 0.0 { 2 } else { 3 };
     let bias = if epilogue_uses_bias(epilogue) {
-        let bias_input = inputs.get(bias_input_index).ok_or_else(|| {
+        let bias_input = inputs.get(next_input).ok_or_else(|| {
             anyhow::anyhow!("cuBLASLt matmul with {epilogue:?} epilogue requires a bias input")
         })?;
+        next_input += 1;
         Some(
             buffers
                 .get(bias_input)
@@ -913,7 +1039,44 @@ fn resolve_cublaslt_pointers(
         None
     };
 
-    Ok(LtMatmulPointers { a, b, c, d, bias })
+    let a_scale = if a_scale_input {
+        let scale_input = inputs
+            .get(next_input)
+            .ok_or_else(|| anyhow::anyhow!("cuBLASLt matmul requires an A scale input pointer"))?;
+        next_input += 1;
+        Some(
+            buffers
+                .get(scale_input)
+                .ok_or_else(|| anyhow::anyhow!("missing cuBLASLt A scale input buffer"))?
+                .ptr(),
+        )
+    } else {
+        None
+    };
+
+    let b_scale = if b_scale_input {
+        let scale_input = inputs
+            .get(next_input)
+            .ok_or_else(|| anyhow::anyhow!("cuBLASLt matmul requires a B scale input pointer"))?;
+        Some(
+            buffers
+                .get(scale_input)
+                .ok_or_else(|| anyhow::anyhow!("missing cuBLASLt B scale input buffer"))?
+                .ptr(),
+        )
+    } else {
+        None
+    };
+
+    Ok(LtMatmulPointers {
+        a,
+        b,
+        c,
+        d,
+        bias,
+        a_scale,
+        b_scale,
+    })
 }
 
 fn epilogue_uses_bias(epilogue: cublasLtEpilogue_t) -> bool {
@@ -986,6 +1149,11 @@ impl CuBlasLt {
             && normalize(self.stride_c) == normalize(self.stride_d)
             && self.c_order == self.d_order
     }
+
+    #[cfg(test)]
+    pub(crate) fn tensor_scale_inputs(&self) -> (bool, bool) {
+        (self.a_scale_input, self.b_scale_input)
+    }
 }
 
 impl HostOp for CuBlasLt {
@@ -1030,7 +1198,15 @@ impl HostOp for CuBlasLt {
         let alpha = LtScalar::from_f64(self.scale_dtype, self.alpha)?;
         let beta = LtScalar::from_f64(self.scale_dtype, self.beta)?;
 
-        let ptrs = resolve_cublaslt_pointers(self_node, inputs, buffers, self.beta, self.epilogue)?;
+        let ptrs = resolve_cublaslt_pointers(
+            self_node,
+            inputs,
+            buffers,
+            self.beta,
+            self.epilogue,
+            self.a_scale_input,
+            self.b_scale_input,
+        )?;
 
         let (a_rows, a_cols) = if a_layout == cublasOperation_t::CUBLAS_OP_N {
             (m, k)
@@ -1205,6 +1381,8 @@ mod tests {
             &buffers,
             0.0,
             cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            false,
+            false,
         )
         .unwrap();
 
@@ -1229,6 +1407,8 @@ mod tests {
             &buffers,
             0.0,
             cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            false,
+            false,
         )
         .unwrap();
 
@@ -1253,6 +1433,8 @@ mod tests {
             &buffers,
             1.0,
             cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            false,
+            false,
         )
         .unwrap();
 
@@ -1277,6 +1459,8 @@ mod tests {
             &buffers,
             0.0,
             cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+            false,
+            false,
         )
         .unwrap();
 
@@ -1285,6 +1469,41 @@ mod tests {
         assert_eq!(ptrs.c, 0xD000);
         assert_eq!(ptrs.d, 0xD000);
         assert_eq!(ptrs.bias, Some(0xB1A5));
+    }
+
+    #[test]
+    fn cublaslt_pointers_use_tensor_scale_inputs_after_base_inputs() {
+        let output = NodeIndex::new(0);
+        let a = NodeIndex::new(1);
+        let b = NodeIndex::new(2);
+        let a_scale = NodeIndex::new(3);
+        let b_scale = NodeIndex::new(4);
+        let buffers = buffers_for(&[
+            (output, 0xD000),
+            (a, 0xA000),
+            (b, 0xB000),
+            (a_scale, 0xA5A5),
+            (b_scale, 0xB5B5),
+        ]);
+
+        let ptrs = resolve_cublaslt_pointers(
+            output,
+            &[a, b, a_scale, b_scale],
+            &buffers,
+            0.0,
+            cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(ptrs.a, 0xA000);
+        assert_eq!(ptrs.b, 0xB000);
+        assert_eq!(ptrs.c, 0xD000);
+        assert_eq!(ptrs.d, 0xD000);
+        assert_eq!(ptrs.bias, None);
+        assert_eq!(ptrs.a_scale, Some(0xA5A5));
+        assert_eq!(ptrs.b_scale, Some(0xB5B5));
     }
 
     #[test]
@@ -1300,6 +1519,8 @@ mod tests {
             &buffers,
             1.0,
             cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            false,
+            false,
         )
         .unwrap_err();
 
@@ -1322,6 +1543,8 @@ mod tests {
             &buffers,
             0.0,
             cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+            false,
+            false,
         )
         .unwrap_err();
 

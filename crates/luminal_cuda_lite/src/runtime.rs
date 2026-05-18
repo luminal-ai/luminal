@@ -287,7 +287,12 @@ impl CudaRuntime {
                         let dev = f32s.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);
                     }
-                    safetensors::Dtype::U8 | safetensors::Dtype::BF16 | safetensors::Dtype::F16 => {
+                    safetensors::Dtype::U8
+                    | safetensors::Dtype::BF16
+                    | safetensors::Dtype::F16
+                    | safetensors::Dtype::F8_E4M3
+                    | safetensors::Dtype::F8_E5M2
+                    | safetensors::Dtype::F8_E8M0 => {
                         let bytes = tensor.data();
                         let dev = bytes.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);
@@ -1189,7 +1194,7 @@ impl Runtime for CudaRuntime {
     }
 
     fn estimate_graph_memory<'a>(
-        egraph: &'a SerializedEGraph,
+        egraph: &'a luminal::egglog_utils::SerializedEGraph,
         choices: &luminal::egglog_utils::EGraphChoiceSet<'a>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> Option<usize> {
