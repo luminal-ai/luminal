@@ -265,6 +265,7 @@ impl QwenMoE {
             .iota(Expression::from('z') / k_expr * e_dim, top_k_indices.dims());
         let routing_flat_idx = row_offsets + top_k_indices;
         let top_k_values = routing_weights.gather(routing_flat_idx);
+        let top_k_values = top_k_values / top_k_values.sum(n - 1).expand_dim(n - 1, TOP_K);
 
         // 4. Gather gate_up expert weights → [s, k, intermediate*2, H]
         //    Transpose last two dims → [s, k, H, intermediate*2]

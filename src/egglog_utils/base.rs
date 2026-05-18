@@ -532,10 +532,7 @@ pub fn base_expression_egglog() -> String {
             div(num(v("a")), num(v("b"))),
             num(pdiv(v("a"), v("b"))),
         )
-        .when(vec![
-            pneq(i64(0), v("b")),
-            peq(i64(0), pmod(v("a"), v("b"))),
-        ])
+        .when(vec![pneq(i64(0), v("b"))])
         .ruleset("expr"),
     );
 
@@ -561,6 +558,28 @@ pub fn base_expression_egglog() -> String {
 
     // Division self-cancel: a/a → 1
     p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
+    p.add_rule(
+        rewrite(
+            "div-mul-num-self",
+            div(mul(v("?x"), num(v("?n"))), num(v("?n"))),
+            v("?x"),
+        )
+        .when(vec![pgte(v("?n"), i64(1))])
+        .ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite(
+            "div-mul-num-plus-rem",
+            div(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
+            v("?x"),
+        )
+        .when(vec![
+            pgte(v("?n"), i64(1)),
+            pgte(v("?r"), i64(0)),
+            plt(v("?r"), v("?n")),
+        ])
+        .ruleset("expr"),
+    );
 
     // Constant folding: ceildiv
     p.add_rule(
@@ -630,6 +649,28 @@ pub fn base_expression_egglog() -> String {
         )
         .ruleset("expr"),
     );
+    p.add_rule(
+        rewrite(
+            "mod-const",
+            modd(num(v("a")), num(v("b"))),
+            num(pmod(v("a"), v("b"))),
+        )
+        .when(vec![pneq(i64(0), v("b"))])
+        .ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite(
+            "mod-mul-num-plus-rem",
+            modd(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
+            num(v("?r")),
+        )
+        .when(vec![
+            pgte(v("?n"), i64(1)),
+            pgte(v("?r"), i64(0)),
+            plt(v("?r"), v("?n")),
+        ])
+        .ruleset("expr"),
+    );
 
     p.add_rule(
         rewrite(
@@ -681,6 +722,12 @@ pub fn base_expression_egglog() -> String {
             div(div(v("a"), num(v("?b"))), num(v("?c"))),
             div(v("a"), num(pmul(v("?b"), v("?c")))),
         )
+        .when(vec![
+            pgte(v("?b"), i64(1)),
+            pgte(v("?c"), i64(1)),
+            plt(v("?b"), i64(3_037_000_500)),
+            plt(v("?c"), i64(3_037_000_500)),
+        ])
         .ruleset("expr"),
     );
 

@@ -250,8 +250,8 @@ fn timesteps_proj(timestep: GraphTensor, num_channels: usize) -> GraphTensor {
     let exponents = cx.arange(half).cast(DType::F32) / half as f32;
     let log10000 = (10000.0_f32).ln();
     let freqs = (exponents * (-log10000)).exp(); // (half,)
-                                                 // Broadcast scalar timestep (shape (1,)) to (half,) by repeating along
-                                                 // the size-1 axis (stride substitution makes it a zero-stride broadcast).
+    // Broadcast scalar timestep (shape (1,)) to (half,) by repeating along
+    // the size-1 axis (stride substitution makes it a zero-stride broadcast).
     let t_broadcast = timestep.cast(DType::F32).repeat([half]);
     let arg = freqs * t_broadcast;
     // flip_sin_to_cos=True: cos first, then sin
@@ -433,10 +433,10 @@ impl DoubleStreamAttn {
         let v = v.transpose(0, 1);
 
         let attn = sdpa(q, k, v); // (S_total, H, D)
-                                  // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K
-                                  // stride for the next matmul (the o_proj path). Without
-                                  // `* 1.0` the cublaslt 2D rule can't match and the broadcast
-                                  // Mul intermediate is ~36 GB BF16 at flux2 dimensions.
+        // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K
+        // stride for the next matmul (the o_proj path). Without
+        // `* 1.0` the cublaslt 2D rule can't match and the broadcast
+        // Mul intermediate is ~36 GB BF16 at flux2 dimensions.
         let attn = attn.merge_dims(1, 2) * 1.0_f32; // (S_total, HIDDEN)
 
         // Split back into txt + img streams.

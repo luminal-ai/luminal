@@ -293,3 +293,82 @@ fn moe_architecture_search_space_equivalence_fuzz() {
         .run();
     eprintln!("moe search equivalence fuzz report: {report:?}");
 }
+
+#[test]
+fn moe_architecture_native_reference_fuzz() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    const SEQ: usize = 2;
+    const HIDDEN: usize = 16;
+    const NUM_EXPERTS: usize = 8;
+    const TOP_K: usize = 2;
+    const MOE_INTERMEDIATE: usize = 6;
+
+    let mut cx = Graph::default();
+    let input = cx.tensor(('s', HIDDEN));
+    let router = cx.tensor((NUM_EXPERTS, HIDDEN));
+    let gate_up_weights = cx
+        .tensor((NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN))
+        .as_dtype(DType::Bf16);
+    let down_weights = cx
+        .tensor((NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE))
+        .as_dtype(DType::Bf16);
+
+    let n = input.dims().len();
+    let e_dim = *router.dims().first().unwrap();
+    let k_expr = Expression::from(TOP_K);
+
+    let routing_weights = input.matmul(router.t()).softmax(n - 1);
+    let top_k_indices = routing_weights.topk_indexes(TOP_K, n - 1);
+    let row_offsets = input
+        .graph()
+        .iota(Expression::from('z') / k_expr * e_dim, top_k_indices.dims());
+    let routing_flat_idx = row_offsets + top_k_indices;
+    let top_k_values = routing_weights.gather(routing_flat_idx);
+    let top_k_weights = top_k_values / top_k_values.sum(n - 1).expand_dim(n - 1, TOP_K);
+
+    let gate_up_gathered = gather_experts(input, top_k_indices, gate_up_weights).cast(DType::F32);
+    let input_exp = input.expand_dim(n - 1, TOP_K).unsqueeze(n);
+    let gate_up_out = input_exp
+        .matmul(gate_up_gathered.transpose(2, 3))
+        .squeeze(n);
+    let gate = gate_up_out.slice((.., .., ..MOE_INTERMEDIATE));
+    let up = gate_up_out.slice((.., .., MOE_INTERMEDIATE..));
+    let hidden = gate.silu() * up;
+
+    let down_gathered = gather_experts(input, top_k_indices, down_weights).cast(DType::F32);
+    let down_out = hidden
+        .unsqueeze(2)
+        .matmul(down_gathered.transpose(2, 3))
+        .squeeze(2);
+    let mut weights_exp = top_k_weights.unsqueeze(top_k_weights.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    let out = (down_out * weights_exp).sum(n - 1).output();
+    cx.set_dim('s', SEQ);
+
+    let report = CudaSearchEquivalenceFuzzer::new(&mut cx, &stream)
+        .seed(0x51A7_E5ED)
+        .samples(SEARCH_EQUIV_SAMPLES)
+        .generation_size(8)
+        .mutations(3)
+        .build_options(BuildSearchSpaceOptions::new().max_memory_mib(512))
+        .native_reference()
+        .input_f32(input.id, random_f32_vec(SEQ * HIDDEN, 301, -0.15, 0.15))
+        .input_f32(
+            router.id,
+            random_f32_vec(NUM_EXPERTS * HIDDEN, 302, -0.2, 0.2),
+        )
+        .input_bf16(
+            gate_up_weights.id,
+            random_bf16_vec(NUM_EXPERTS * MOE_INTERMEDIATE * 2 * HIDDEN, 303, -0.1, 0.1),
+        )
+        .input_bf16(
+            down_weights.id,
+            random_bf16_vec(NUM_EXPERTS * HIDDEN * MOE_INTERMEDIATE, 304, -0.1, 0.1),
+        )
+        .output_f32(out.id, "qwen_swiglu_moe_native_reference", 6e-2, 6e-2)
+        .run();
+    eprintln!("moe native-reference fuzz report: {report:?}");
+}

@@ -13,6 +13,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "unsloth/gemma-3-4b-it";
 
+fn gemma3_chat_prompt(user_prompt: &str) -> String {
+    format!("<bos><start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n")
+}
+
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
@@ -31,7 +35,12 @@ fn main() {
     println!("Using model directory: {}", model_dir.display());
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-    let prompt_tokens = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
+    let chat_prompt = gemma3_chat_prompt(prompt);
+    let prompt_tokens = tokenizer
+        .encode(chat_prompt.as_str(), false)
+        .unwrap()
+        .get_ids()
+        .to_vec();
 
     // Build graph
     let mut cx = Graph::default();
@@ -88,8 +97,8 @@ fn main() {
     let mut seen_tokens = FxHashSet::default();
     let repetition_penalty: f32 = 1.05;
 
-    const EOS_TOKEN: u32 = 1;
-    const STOP_TOKEN: u32 = 107;
+    const EOS_TOKEN: u32 = 1; // <eos>
+    const STOP_TOKEN: u32 = 106; // <end_of_turn>
 
     println!(
         "Prompt: {} tokens, generating up to {} tokens",
@@ -126,7 +135,8 @@ fn main() {
         fwd_durations.push(start.elapsed());
 
         // Greedy decode with repetition penalty
-        let mut last_row = logits_data[logits_data.len() - VOCAB_SIZE..].to_vec();
+        let row_start = (prompt_len - 1) * VOCAB_SIZE;
+        let mut last_row = logits_data[row_start..row_start + VOCAB_SIZE].to_vec();
         for &tok in &seen_tokens {
             let logit = &mut last_row[tok as usize];
             if *logit > 0.0 {

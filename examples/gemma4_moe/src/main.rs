@@ -117,7 +117,8 @@ fn main() {
     let prefill_duration = prefill_start.elapsed();
 
     let logits_data = runtime.get_f32(logits);
-    let last_row = &logits_data[logits_data.len() - VOCAB_SIZE..];
+    let row_start = (prompt_tokens.len() - 1) * VOCAB_SIZE;
+    let last_row = &logits_data[row_start..row_start + VOCAB_SIZE];
     let mut next_token = last_row
         .iter()
         .enumerate()

@@ -6,7 +6,7 @@ use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashSet;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
@@ -21,6 +21,12 @@ const SEARCH_KEEP_BEST: usize = 4;
 const SEARCH_MEMORY_MIB: usize = 2048;
 const SEARCH_SEED: u64 = 0;
 const PROMPT: &str = "Explain what a neural network is in a paragraph.";
+
+fn llama3_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+}
 
 #[derive(Default, Clone)]
 struct StepProfile {
@@ -160,11 +166,9 @@ fn main() {
     println!("Using model directory: {}", model_dir.display());
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-    let chat_prompt = format!(
-        "<|start_header_id|>user<|end_header_id|>\n\n{PROMPT}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-    );
+    let chat_prompt = llama3_chat_prompt(PROMPT);
     let prompt_tokens = tokenizer
-        .encode(chat_prompt.as_str(), true)
+        .encode(chat_prompt.as_str(), false)
         .unwrap()
         .get_ids()
         .to_vec();

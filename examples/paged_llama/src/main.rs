@@ -13,6 +13,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
 
+fn llama3_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+}
+
 struct PageTable {
     tables: Vec<Vec<usize>>,
     next_free_slot: usize,
@@ -163,11 +169,9 @@ fn main() {
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
 
     let encode = |prompt: &str| -> Vec<u32> {
-        let chat = format!(
-            "<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
+        let chat = llama3_chat_prompt(prompt);
         tokenizer
-            .encode(chat.as_str(), true)
+            .encode(chat.as_str(), false)
             .unwrap()
             .get_ids()
             .to_vec()

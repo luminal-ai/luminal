@@ -11,8 +11,8 @@ use std::{error::Error, io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const EOS_TOKEN: u32 = 151645; // <|endoftext|>
-const STOP_TOKEN: u32 = 151643; // <|end|>
+const EOS_TOKEN: u32 = 151645; // <|im_end|>
+const STOP_TOKEN: u32 = 151643; // <|endoftext|>
 
 pub struct QwenRunConfig {
     pub repo_id: String,
@@ -21,6 +21,12 @@ pub struct QwenRunConfig {
     pub search_graphs: usize,
     pub prompt: String,
     pub repetition_penalty: f32,
+}
+
+fn qwen3_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
 }
 
 impl Default for QwenRunConfig {
@@ -125,8 +131,9 @@ where
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|err| err as Box<dyn Error>)?;
+    let prompt = qwen3_chat_prompt(&config.prompt);
     let prompt_tokens = tokenizer
-        .encode(config.prompt.as_str(), true)
+        .encode(prompt.as_str(), false)
         .map_err(|err| err as Box<dyn Error>)?
         .get_ids()
         .to_vec();
@@ -217,7 +224,8 @@ where
         prev_seq = prompt_len;
         fwd_durations.push(start.elapsed());
 
-        let mut last_row = logits_data[logits_data.len() - VOCAB_SIZE..].to_vec();
+        let row_start = (prompt_len - 1) * VOCAB_SIZE;
+        let mut last_row = logits_data[row_start..row_start + VOCAB_SIZE].to_vec();
         for &tok in &seen_tokens {
             let logit = &mut last_row[tok as usize];
             if *logit > 0.0 {

@@ -5,17 +5,25 @@ use hf::prepare_hf_model;
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use model::*;
+use rand::{SeedableRng, rngs::SmallRng};
 use rustc_hash::FxHashSet;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
 
 const REPO_ID: &str = "Qwen/Qwen3-30B-A3B";
+const SEARCH_SEED: u64 = 0;
+
+fn qwen3_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+}
 
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 30;
     let search_graphs = 50;
-    let prompt = "The capital of France is";
+    let prompt = "What is the capital of France?";
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
@@ -24,7 +32,12 @@ fn main() {
     println!("Using model directory: {}", model_dir.display());
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-    let prompt_tokens = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
+    let chat_prompt = qwen3_chat_prompt(prompt);
+    let prompt_tokens = tokenizer
+        .encode(chat_prompt.as_str(), false)
+        .unwrap()
+        .get_ids()
+        .to_vec();
 
     // Build graph
     let mut cx = Graph::default();
@@ -68,14 +81,16 @@ fn main() {
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
-    runtime = cx.search(runtime, search_graphs);
+    let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
+    runtime = cx.search_options(runtime, SearchOptions::new(search_graphs), &mut rng);
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
     }
 
-    print!("{prompt}");
+    println!("Prompt: {prompt}");
+    print!("Response: ");
     std::io::stdout().flush().unwrap();
 
     let mut prev_seq: usize;
@@ -83,10 +98,9 @@ fn main() {
     let mut seen_tokens = FxHashSet::default();
     let repetition_penalty: f32 = 1.05;
 
-    const EOS_TOKEN: u32 = 151645;
-    const STOP_TOKEN: u32 = 151643;
+    const EOS_TOKEN: u32 = 151645; // <|im_end|>
+    const STOP_TOKEN: u32 = 151643; // <|endoftext|>
 
-    // Prefill: process the full prompt in one causal pass.
     let prefill_start = std::time::Instant::now();
     cx.set_dim('s', prompt_tokens.len());
     cx.set_dim('p', 0);
@@ -97,7 +111,6 @@ fn main() {
     runtime.set_data(pos_ids, (0..prompt_tokens.len() as i32).collect::<Vec<_>>());
     runtime.execute(&cx.dyn_map);
 
-    // Round-trip KV cache
     for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
         let k_buf = runtime.remove_buffer(*k_out);
         let v_buf = runtime.remove_buffer(*v_out);

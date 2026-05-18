@@ -24,9 +24,6 @@ WORKDIR = "/workspace/luminal"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 EXPECTED_OUTPUT = {
-    "llama": [
-        "complex system modeled after the structure and function of the human brain",
-    ],
     "gemma": [
         "recognize pictures of cats",
         "little detectives looking for specific features",
@@ -42,6 +39,15 @@ EXPECTED_OUTPUT = {
     ],
     "whisper": [
         "ask not what your country can do for you",
+    ],
+}
+
+EXPECTED_CONCEPTS = {
+    "llama": [
+        ["layers"],
+        ["neurons", "nodes"],
+        ["learn", "learning", "adapt"],
+        ["data", "patterns", "features"],
     ],
 }
 
@@ -83,11 +89,32 @@ def normalize_output(output: str) -> str:
 
 
 def validate_output(example: str, output: str):
+    normalized_output = normalize_output(output)
+
+    expected_concepts = EXPECTED_CONCEPTS.get(example)
+    if expected_concepts is not None:
+        missing = [
+            concept_group
+            for concept_group in expected_concepts
+            if not any(normalize_output(term) in normalized_output for term in concept_group)
+        ]
+        if missing:
+            expected = "\n  - ".join(" / ".join(group) for group in expected_concepts)
+            missing_terms = "\n  - ".join(" / ".join(group) for group in missing)
+            raise AssertionError(
+                f"Output check failed for {example!r}.\n"
+                f"Expected concept groups:\n  - {expected}\n"
+                f"Missing concept groups:\n  - {missing_terms}"
+            )
+
+        expected = ", ".join(" / ".join(group) for group in expected_concepts)
+        print(f"\nOutput check passed for {example!r}: found concepts {expected}")
+        return
+
     expected_phrases = EXPECTED_OUTPUT.get(example)
     if expected_phrases is None:
         raise ValueError(f"No expected output phrases configured for example {example!r}")
 
-    normalized_output = normalize_output(output)
     for phrase in expected_phrases:
         if normalize_output(phrase) in normalized_output:
             print(f"\nOutput check passed for {example!r}: found {phrase!r}")

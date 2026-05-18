@@ -1,7 +1,7 @@
 //! [`DynBackend`] implementation for the Metal runtime.
 
 use luminal::dtype::DType;
-use luminal::dyn_backend::{bytes_to_native_data, compile_backend, BackendCompileArgs, DynBackend};
+use luminal::dyn_backend::{BackendCompileArgs, DynBackend, bytes_to_native_data, compile_backend};
 use luminal::prelude::*;
 
 use crate::runtime::MetalRuntime;

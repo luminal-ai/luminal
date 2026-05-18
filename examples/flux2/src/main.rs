@@ -40,11 +40,11 @@ use std::time::Instant;
 use luminal::graph::BuildSearchSpaceOptions;
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_distr::StandardNormal;
-use scheduler::{compute_mu, euler_step, make_schedule, SchedulerConfig};
+use scheduler::{SchedulerConfig, compute_mu, euler_step, make_schedule};
 use tokenizers::Tokenizer;
-use vae::{VaeDecoder, LATENT_CHANNELS, VAE_DOWNSAMPLE};
+use vae::{LATENT_CHANNELS, VAE_DOWNSAMPLE, VaeDecoder};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)

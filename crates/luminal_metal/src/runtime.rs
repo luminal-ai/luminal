@@ -1,5 +1,5 @@
 use crate::kernel::{
-    MatmulDescriptor, MetalKernelOp, MetalMatmul, MetalMatmulPlanner, DYN_SLOT_COUNT,
+    DYN_SLOT_COUNT, MatmulDescriptor, MetalKernelOp, MetalMatmul, MetalMatmulPlanner,
 };
 use half::{bf16, f16};
 use itertools::Itertools;
@@ -9,8 +9,8 @@ use luminal::{
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
-        petgraph::{algo::toposort, prelude::StableGraph, visit::EdgeRef, Direction},
         FxHashMap, NodeIndex, ToId,
+        petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef},
     },
 };
 use memmap2::MmapOptions;
