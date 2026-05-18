@@ -130,7 +130,15 @@ class CompiledModel:
 
         # CUDA zero-copy path: pre-allocate output tensors and register their device
         # pointers so the final kernel writes directly into PyTorch's buffer.
+        #
+        # Only the dtypes luminal *natively* writes can zero-copy. float64 is
+        # collapsed to f32 internally; registering an f64 device-ptr would
+        # have the kernel write 12 bytes into a 24-byte buffer, leaving half
+        # of every f64 element as garbage. We pre-allocate the f64 tensor so
+        # the collection path can fill it via `get_output` + cast, but skip
+        # the device-ptr handoff.
         _use_zero_copy = self._supports_device_ptrs
+        _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
         output_tensors = []
         if _use_zero_copy:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
@@ -140,7 +148,7 @@ class CompiledModel:
                     else torch.float32
                 )
                 out = torch.empty(shape, dtype=out_dtype, device=input_device)
-                if out_dtype.is_floating_point:
+                if out_dtype in _zero_copy_native_floats:
                     self._graph.set_output_device_ptr(
                         name, out.data_ptr(), out.numel() * out.element_size()
                     )
@@ -164,11 +172,17 @@ class CompiledModel:
                     else torch.float32
                 )
                 out = output_tensors[i]
-                if out_dtype.is_floating_point:
+                if out_dtype in _zero_copy_native_floats:
                     if not self._graph.output_is_zero_copy(name):
                         self._graph.copy_output_to_device_ptr(
                             name, out.data_ptr(), out.numel() * out.element_size()
                         )
+                # float64 (the one floating dtype luminal collapses
+                # internally) doesn't match `_zero_copy_native_floats`,
+                # so it falls through to the int / bool / else chain.
+                # The `else` branch reads the kernel's actual f32 bytes
+                # and casts to out_dtype — restoring f64 from the f32
+                # buffer.
                 elif out_dtype in _int_dtypes:
                     data = self._graph.get_output_i32(name)
                     out = (
