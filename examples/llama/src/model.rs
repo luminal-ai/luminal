@@ -283,7 +283,7 @@ fn llama_rotary_embeddings(
         .merge_dims(1, 2)
 }
 
-fn attention(
+struct AttentionInputs {
     q_rope: GraphTensor,
     k_rope: GraphTensor,
     v: GraphTensor,
@@ -292,6 +292,19 @@ fn attention(
     scatter_idx: GraphTensor,
     gather_idx: GraphTensor,
     attn_mask: GraphTensor,
+}
+
+fn attention(
+    AttentionInputs {
+        q_rope,
+        k_rope,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        attn_mask,
+    }: AttentionInputs,
     config: LlamaConfig,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
     let kv_dim = config.kv_dim();
@@ -340,14 +353,16 @@ impl LlamaLayer {
         let k_rope = llama_rotary_embeddings(k, q_pos, self.config);
 
         let (attn_out, k_cache_out, v_cache_out) = attention(
-            q_rope,
-            k_rope,
-            v,
-            k_cache,
-            v_cache,
-            scatter_idx,
-            gather_idx,
-            attn_mask,
+            AttentionInputs {
+                q_rope,
+                k_rope,
+                v,
+                k_cache,
+                v_cache,
+                scatter_idx,
+                gather_idx,
+                attn_mask,
+            },
             self.config,
         );
         x += attn_out.matmul(self.o_proj.t());

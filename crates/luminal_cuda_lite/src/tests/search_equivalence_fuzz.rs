@@ -164,7 +164,7 @@ fn gemma_architecture_search_space_equivalence_fuzz() {
     let out = (x + mlp_normed).output();
 
     let report = CudaSearchEquivalenceFuzzer::new(&mut cx, &stream)
-        .seed(0x6E_4D4D_AA)
+        .seed(0x6E4D_4DAA)
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
@@ -259,7 +259,7 @@ fn moe_architecture_search_space_equivalence_fuzz() {
     cx.set_dim('s', SEQ);
 
     let report = CudaSearchEquivalenceFuzzer::new(&mut cx, &stream)
-        .seed(0x0D_EE55_EE)
+        .seed(0x0DEE_55EE)
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
