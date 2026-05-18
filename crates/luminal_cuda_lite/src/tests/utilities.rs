@@ -2,7 +2,8 @@ use candle_core::{Device, Tensor, WithDType};
 use cudarc::driver::CudaContext;
 use half::{bf16, f16};
 use luminal::egglog_utils::{
-    egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
+    EGraphChoiceSet, egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
+    validate_choice_set,
 };
 use luminal::prelude::*;
 use num_traits::{Num, Signed};
@@ -126,6 +127,399 @@ pub fn get_cuda_stream() -> Option<Arc<cudarc::driver::CudaStream>> {
     let ctx = CudaContext::new(0).ok()?;
     ctx.bind_to_thread().ok()?;
     Some(ctx.default_stream())
+}
+
+#[derive(Debug, Clone)]
+pub enum CudaFuzzInput {
+    F32(NodeIndex, Vec<f32>),
+    Bf16(NodeIndex, Vec<bf16>),
+    I32(NodeIndex, Vec<i32>),
+}
+
+impl CudaFuzzInput {
+    fn apply(&self, rt: &mut CudaRuntime) {
+        match self {
+            Self::F32(id, data) => rt.set_data(*id, data.clone()),
+            Self::Bf16(id, data) => rt.set_data(*id, data.clone()),
+            Self::I32(id, data) => rt.set_data(*id, data.clone()),
+        }
+    }
+
+    fn apply_native(&self, rt: &mut NativeRuntime) {
+        match self {
+            Self::F32(id, data) => rt.set_data(*id, data.clone()),
+            Self::Bf16(id, data) => rt.set_data(*id, data.clone()),
+            Self::I32(id, data) => rt.set_data(*id, data.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct F32OutputCheck {
+    pub id: NodeIndex,
+    pub name: String,
+    pub rtol: f32,
+    pub atol: f32,
+}
+
+impl F32OutputCheck {
+    pub fn new(id: NodeIndex, name: impl Into<String>, rtol: f32, atol: f32) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            rtol,
+            atol,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchEquivalenceFuzzConfig {
+    pub seed: u64,
+    pub samples: usize,
+    pub generation_size: usize,
+    pub mutations: usize,
+    pub max_attempts: usize,
+    pub build_options: BuildSearchSpaceOptions,
+    pub reference: SearchEquivalenceReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchEquivalenceReference {
+    FirstCudaExtraction,
+    NativeRuntime,
+}
+
+impl Default for SearchEquivalenceFuzzConfig {
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            samples: 32,
+            generation_size: 16,
+            mutations: 2,
+            max_attempts: 1_000,
+            build_options: BuildSearchSpaceOptions::default(),
+            reference: SearchEquivalenceReference::FirstCudaExtraction,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchEquivalenceFuzzReport {
+    pub tested: usize,
+    pub skipped_invalid: usize,
+}
+
+pub struct CudaSearchEquivalenceFuzzer<'a> {
+    cx: &'a mut Graph,
+    stream: &'a Arc<cudarc::driver::CudaStream>,
+    inputs: Vec<CudaFuzzInput>,
+    outputs: Vec<F32OutputCheck>,
+    config: SearchEquivalenceFuzzConfig,
+}
+
+impl<'a> CudaSearchEquivalenceFuzzer<'a> {
+    pub fn new(cx: &'a mut Graph, stream: &'a Arc<cudarc::driver::CudaStream>) -> Self {
+        Self {
+            cx,
+            stream,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            config: SearchEquivalenceFuzzConfig::default(),
+        }
+    }
+
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.config.seed = seed;
+        self
+    }
+
+    pub fn samples(mut self, samples: usize) -> Self {
+        self.config.samples = samples;
+        self
+    }
+
+    pub fn generation_size(mut self, generation_size: usize) -> Self {
+        self.config.generation_size = generation_size;
+        self
+    }
+
+    pub fn mutations(mut self, mutations: usize) -> Self {
+        self.config.mutations = mutations;
+        self
+    }
+
+    pub fn build_options(mut self, build_options: BuildSearchSpaceOptions) -> Self {
+        self.config.build_options = build_options;
+        self
+    }
+
+    pub fn native_reference(mut self) -> Self {
+        self.config.reference = SearchEquivalenceReference::NativeRuntime;
+        self
+    }
+
+    pub fn input_f32(mut self, id: NodeIndex, data: Vec<f32>) -> Self {
+        self.inputs.push(CudaFuzzInput::F32(id, data));
+        self
+    }
+
+    pub fn input_bf16(mut self, id: NodeIndex, data: Vec<bf16>) -> Self {
+        self.inputs.push(CudaFuzzInput::Bf16(id, data));
+        self
+    }
+
+    pub fn input_i32(mut self, id: NodeIndex, data: Vec<i32>) -> Self {
+        self.inputs.push(CudaFuzzInput::I32(id, data));
+        self
+    }
+
+    pub fn output_f32(
+        mut self,
+        id: NodeIndex,
+        name: impl Into<String>,
+        rtol: f32,
+        atol: f32,
+    ) -> Self {
+        self.outputs.push(F32OutputCheck::new(id, name, rtol, atol));
+        self
+    }
+
+    pub fn run(self) -> SearchEquivalenceFuzzReport {
+        fuzz_cuda_search_space_equivalence(
+            self.cx,
+            self.stream,
+            &self.inputs,
+            &self.outputs,
+            self.config,
+        )
+    }
+}
+
+/// End-to-end search-space equivalence fuzzing for CUDA.
+///
+/// This builds the normal CUDA e-graph search space, extracts random selectable
+/// LLIR graphs, runs each with identical inputs, and verifies every requested
+/// f32 output matches the first valid extraction. The reference is intentionally
+/// another selected LLIR graph, not a hand-written CPU implementation: this
+/// catches cases where supposedly equivalent e-graph choices diverge.
+pub fn fuzz_cuda_search_space_equivalence(
+    cx: &mut Graph,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    inputs: &[CudaFuzzInput],
+    outputs: &[F32OutputCheck],
+    config: SearchEquivalenceFuzzConfig,
+) -> SearchEquivalenceFuzzReport {
+    assert!(
+        !outputs.is_empty(),
+        "fuzz harness needs at least one output"
+    );
+
+    let native_reference_outputs = if config.reference == SearchEquivalenceReference::NativeRuntime
+    {
+        cx.build_search_space::<NativeRuntime>();
+        let mut native_rng = StdRng::seed_from_u64(config.seed);
+        let mut native_rt = cx.search_options(
+            NativeRuntime::default(),
+            SearchOptions::new(1),
+            &mut native_rng,
+        );
+        for input in inputs {
+            input.apply_native(&mut native_rt);
+        }
+        native_rt.execute(&cx.dyn_map);
+        Some(
+            outputs
+                .iter()
+                .map(|out| native_rt.get_f32(out.id).clone())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+
+    cx.build_search_space_with_options::<CudaRuntime>(config.build_options);
+
+    let egraph = cx.egraph().expect("search space should be built");
+    let ops = cx.egglog_ops().expect("search ops should be built");
+    let seed = if native_reference_outputs.is_some() {
+        config.seed.wrapping_add(0xC0DA_C0DA)
+    } else {
+        config.seed
+    };
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut prev_selected = FxHashSet::default();
+    let mut base = random_initial_choice(egraph, &mut rng);
+    prev_selected.insert(hash_choice_set(&base));
+
+    let mut skipped_invalid = 0usize;
+    let reference_is_cuda = native_reference_outputs.is_none();
+    let (reference_hash, reference_outputs, mut tested) =
+        if let Some(reference_outputs) = native_reference_outputs {
+            (0, reference_outputs, 0usize)
+        } else {
+            let mut attempts = 0usize;
+            let (reference_hash, reference_outputs) = loop {
+                attempts += 1;
+                if attempts > config.max_attempts {
+                    panic!(
+                        "failed to extract a valid reference LLIR after {} attempts",
+                        config.max_attempts
+                    );
+                }
+                if validate_choice_set(egraph, &base, ops).is_err() {
+                    skipped_invalid += 1;
+                } else {
+                    let hash = hash_choice_set(&base);
+                    match run_choice_outputs(cx, stream, inputs, outputs, &base) {
+                        Ok(values) => break (hash, values),
+                        Err(err) => {
+                            skipped_invalid += 1;
+                            eprintln!("skipping invalid reference candidate hash={hash}: {err}");
+                        }
+                    }
+                }
+                base = random_initial_choice(egraph, &mut rng);
+                prev_selected.insert(hash_choice_set(&base));
+            };
+            (reference_hash, reference_outputs, 1usize)
+        };
+
+    let mut attempts = 0usize;
+    while tested < config.samples && attempts < config.max_attempts {
+        attempts += 1;
+        let mut candidates = extract_generation(
+            egraph,
+            &base,
+            config.generation_size,
+            config.mutations,
+            &mut prev_selected,
+            &mut rng,
+        );
+        if candidates.is_empty() {
+            let next = random_initial_choice(egraph, &mut rng);
+            prev_selected.insert(hash_choice_set(&next));
+            candidates.push(next);
+        }
+
+        for candidate in candidates {
+            if tested >= config.samples {
+                break;
+            }
+            let candidate_hash = hash_choice_set(&candidate);
+            if reference_is_cuda && candidate_hash == reference_hash {
+                continue;
+            }
+            if validate_choice_set(egraph, &candidate, ops).is_err() {
+                skipped_invalid += 1;
+                continue;
+            }
+
+            let candidate_outputs = run_choice_outputs(cx, stream, inputs, outputs, &candidate)
+                .unwrap_or_else(|err| panic!("candidate hash={candidate_hash} failed: {err}"));
+            assert_fuzz_outputs_close(
+                outputs,
+                &reference_outputs,
+                &candidate_outputs,
+                reference_hash,
+                candidate_hash,
+            );
+            base = candidate;
+            tested += 1;
+        }
+    }
+
+    assert_eq!(
+        tested, config.samples,
+        "only tested {tested}/{} LLIR samples before exhausting attempts",
+        config.samples
+    );
+    SearchEquivalenceFuzzReport {
+        tested,
+        skipped_invalid,
+    }
+}
+
+fn run_choice_outputs<'a>(
+    cx: &'a Graph,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    inputs: &[CudaFuzzInput],
+    outputs: &[F32OutputCheck],
+    choices: &EGraphChoiceSet<'a>,
+) -> Result<Vec<Vec<f32>>, String> {
+    let egraph = cx.egraph().ok_or("search space was not built")?;
+    let ops = cx.egglog_ops().ok_or("search ops were not built")?;
+    let mut list_cache = FxHashMap::default();
+    let mut expr_cache = FxHashMap::default();
+    let mut llir_graph = egglog_to_llir(
+        egraph,
+        choices.clone(),
+        ops,
+        &cx.custom_ops,
+        &mut list_cache,
+        &mut expr_cache,
+        None,
+    );
+    unroll_loops_in_llir(&mut llir_graph);
+
+    let mut rt = CudaRuntime::initialize(stream.clone());
+    rt.load_llir(&llir_graph);
+    for input in inputs {
+        input.apply(&mut rt);
+    }
+    rt.execute(&cx.dyn_map);
+
+    Ok(outputs.iter().map(|out| rt.get_f32(out.id)).collect())
+}
+
+fn assert_fuzz_outputs_close(
+    outputs: &[F32OutputCheck],
+    expected: &[Vec<f32>],
+    actual: &[Vec<f32>],
+    reference_hash: u64,
+    candidate_hash: u64,
+) {
+    for ((spec, expected), actual) in outputs.iter().zip(expected.iter()).zip(actual.iter()) {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "output {} length mismatch for candidate hash={candidate_hash} reference hash={reference_hash}",
+            spec.name
+        );
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut worst = 0usize;
+        for (i, (&a, &b)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                a.is_finite(),
+                "output {} candidate hash={candidate_hash} produced non-finite value {a} at index {i}",
+                spec.name
+            );
+            assert!(
+                b.is_finite(),
+                "output {} reference hash={reference_hash} produced non-finite value {b} at index {i}",
+                spec.name
+            );
+            let abs = (a - b).abs();
+            let rel = abs / b.abs().max(1e-12);
+            if abs > max_abs {
+                max_abs = abs;
+                max_rel = rel;
+                worst = i;
+            }
+            if abs > spec.atol + spec.rtol * b.abs() {
+                panic!(
+                    "output {} mismatch candidate hash={candidate_hash} reference hash={reference_hash} index={i} actual={a} expected={b} abs={abs} rel={rel} tolerance={}",
+                    spec.name,
+                    spec.atol + spec.rtol * b.abs()
+                );
+            }
+        }
+        eprintln!(
+            "fuzz output {} ok: candidate hash={candidate_hash} max_abs={max_abs} max_rel={max_rel} worst={worst}",
+            spec.name
+        );
+    }
 }
 
 /// Get the GPU compute capability as (major, minor).

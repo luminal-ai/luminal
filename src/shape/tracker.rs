@@ -347,11 +347,153 @@ impl ShapeTracker {
     /// Split a dim into 2 dims, new dim is placed directly after original dim
     pub fn split_dims(&mut self, axis: usize, new_dim_size: impl Into<Expression>) {
         let new_dim_size = new_dim_size.into();
+        assert!(
+            new_dim_size.as_num().is_none_or(|n| n > 0),
+            "split_dims inner dimension must be positive, got {new_dim_size}"
+        );
+        let old_dim = self.dims[axis];
+        let outer_dim = (old_dim / new_dim_size).simplify();
+        assert!(
+            (outer_dim * new_dim_size)
+                .simplify()
+                .egglog_equal(old_dim.simplify()),
+            "split_dims requires the old dimension ({old_dim}) to be exactly divisible by the inner dimension ({new_dim_size})"
+        );
+
+        let old_stride = self.strides[axis];
+        let zero = old_stride.substitute('z', 0).simplify();
+        let outer_stride = (old_stride.substitute('z', expr('z') * new_dim_size) - zero).simplify();
+        let inner_stride = old_stride;
+
+        assert!(
+            split_stride_is_separable(old_stride, old_dim, outer_dim, new_dim_size),
+            "split_dims cannot represent stride {old_stride} as independent outer/inner strides for inner dimension {new_dim_size}"
+        );
+
         self.dims.insert(axis + 1, new_dim_size);
-        self.strides.insert(axis + 1, self.strides[axis]);
-        self.dims[axis] /= new_dim_size;
-        self.strides[axis] *= new_dim_size;
+        self.strides.insert(axis + 1, inner_stride);
+        self.dims[axis] = outer_dim;
+        self.strides[axis] = outer_stride;
     }
+}
+
+fn split_stride_is_separable(
+    old_stride: Expression,
+    _old_dim: Expression,
+    outer_dim: Expression,
+    inner_dim: Expression,
+) -> bool {
+    if let (Some(outer), Some(inner)) = (outer_dim.as_num(), inner_dim.as_num()) {
+        if outer < 0 || inner <= 0 {
+            return false;
+        }
+        if split_stride_is_separable_concrete(old_stride, outer as usize, inner as usize) {
+            return true;
+        }
+    }
+
+    if split_stride_symbolic_base_identity(old_stride, inner_dim) {
+        return true;
+    }
+
+    if let Some(inner) = inner_dim.as_num()
+        && inner > 0
+    {
+        return split_stride_symbolic_inner_points(old_stride, inner as usize);
+    }
+
+    false
+}
+
+fn split_stride_is_separable_concrete(
+    old_stride: Expression,
+    outer_dim: usize,
+    inner_dim: usize,
+) -> bool {
+    let Some(zero) = eval_stride_at(old_stride, 0) else {
+        return false;
+    };
+
+    for outer in 0..outer_dim {
+        let Some(outer_base) = eval_stride_at(old_stride, outer * inner_dim) else {
+            return false;
+        };
+        for inner in 0..inner_dim {
+            let Some(old) = eval_stride_at(old_stride, outer * inner_dim + inner) else {
+                return false;
+            };
+            let Some(inner_base) = eval_stride_at(old_stride, inner) else {
+                return false;
+            };
+            if old != outer_base - zero + inner_base {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn split_stride_symbolic_base_identity(old_stride: Expression, inner_dim: Expression) -> bool {
+    let zero = old_stride.substitute('z', 0).simplify();
+    let outer_var = fresh_split_var(&[inner_dim, old_stride], &[]);
+    let inner_var = fresh_split_var(&[inner_dim, old_stride], &[outer_var]);
+    let outer = expr(outer_var);
+    let inner = expr(inner_var);
+    let old_split_stride = old_stride
+        .substitute('z', outer * inner_dim + inner)
+        .simplify();
+    let new_split_stride = ((old_stride.substitute('z', outer * inner_dim) - zero)
+        + old_stride.substitute('z', inner))
+    .simplify();
+    old_split_stride.egglog_equal(new_split_stride)
+}
+
+fn split_stride_symbolic_inner_points(old_stride: Expression, inner_dim: usize) -> bool {
+    let zero = old_stride.substitute('z', 0).simplify();
+    let outer = expr('z');
+    let inner_dim_expr = expr(inner_dim);
+    for inner in 0..inner_dim {
+        let old_split_stride = old_stride
+            .substitute('z', outer * inner_dim_expr + inner)
+            .simplify();
+        let new_split_stride = ((old_stride.substitute('z', outer * inner_dim_expr) - zero)
+            + old_stride.substitute('z', inner))
+        .simplify();
+        if old_split_stride != new_split_stride && !old_split_stride.egglog_equal(new_split_stride)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn eval_stride_at(stride: Expression, z: usize) -> Option<i64> {
+    let mut stack = Vec::new();
+    for term in stride.terms.read().iter() {
+        match *term {
+            Term::Num(n) => stack.push(n),
+            Term::Var('z') => stack.push(z as i64),
+            Term::Var(_) => return None,
+            _ => {
+                let a = stack.pop()?;
+                let b = stack.pop()?;
+                stack.push(term.as_op()?(a, b)?);
+            }
+        }
+    }
+    stack.pop()
+}
+
+fn fresh_split_var(expressions: &[Expression], excluded: &[char]) -> char {
+    let candidates = ('a'..='y').chain('A'..='Y');
+    candidates
+        .filter(|&candidate| candidate != 'z' && !excluded.contains(&candidate))
+        .find(|&candidate| {
+            expressions
+                .iter()
+                .all(|expr| !expr.to_symbols().contains(&candidate))
+        })
+        .expect("ran out of temporary symbols for split_dims proof")
 }
 
 #[cfg(test)]
@@ -504,6 +646,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_split_dims_preserves_merged_index_mapping() {
+        let mut tracker = ShapeTracker::new((2, 3, 5));
+        let original_idx = tracker.index_expression();
+
+        tracker.permute((1, 0, 2));
+        tracker.merge_dims(0, 1);
+        tracker.split_dims(0, 2);
+
+        assert_eq!(tracker.dims.as_slice(), &[expr(3), expr(2), expr(5)]);
+
+        let split_idx = tracker.index_expression();
+        for b in 0..3 {
+            for a in 0..2 {
+                for c in 0..5 {
+                    let split_logical = (b * 2 + a) * 5 + c;
+                    let original_logical = (a * 3 + b) * 5 + c;
+                    let split_physical = split_idx
+                        .substitute('z', split_logical)
+                        .simplify()
+                        .to_usize()
+                        .unwrap();
+                    let original_physical = original_idx
+                        .substitute('z', original_logical)
+                        .simplify()
+                        .to_usize()
+                        .unwrap();
+                    assert_eq!(
+                        split_physical, original_physical,
+                        "Failed for a={a}, b={b}, c={c}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "split_dims cannot represent stride")]
+    fn test_split_dims_rejects_non_separable_stride() {
+        let mut tracker = ShapeTracker::new((6,));
+        tracker.repeat((2,));
+        tracker.split_dims(0, 4);
     }
 
     // #[test]

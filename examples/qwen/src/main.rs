@@ -12,7 +12,7 @@ use luminal_metal::MetalRuntime;
     all(feature = "cuda", not(feature = "metal")),
     all(feature = "metal", not(feature = "cuda"), target_vendor = "apple")
 ))]
-use qwen::{run_qwen, QwenRunConfig, Runtime};
+use qwen::{QwenRunConfig, Runtime, run_qwen};
 
 #[cfg(all(feature = "cuda", not(feature = "metal")))]
 fn main() {

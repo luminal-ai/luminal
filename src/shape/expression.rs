@@ -1183,6 +1183,20 @@ mod tests {
     }
 
     #[test]
+    fn test_const_remainder_div_mod_simplifications() {
+        let z = expr('z');
+
+        assert_eq!((expr(5) / 6).simplify(), expr(0));
+        assert_eq!((expr(5) % 6).simplify(), expr(5));
+        assert_eq!(((z * 6 + 5) / 6).simplify(), z);
+        assert_eq!(((z * 6 + 5) % 6).simplify(), expr(5));
+        assert_eq!(
+            (((z * 6 + 5) / 6) * 6 + ((z * 6 + 5) % 6)).simplify(),
+            z * 6 + 5
+        );
+    }
+
+    #[test]
     fn test_lt_mod_shortcut_requires_literal_bound() {
         let z = expr('z');
         let range = expr(651) / 4; // 162

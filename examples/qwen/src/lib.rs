@@ -11,8 +11,8 @@ use std::{error::Error, io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const EOS_TOKEN: u32 = 151645; // <|endoftext|>
-const STOP_TOKEN: u32 = 151643; // <|end|>
+const EOS_TOKEN: u32 = 151645; // <|im_end|>
+const STOP_TOKEN: u32 = 151643; // <|endoftext|>
 
 pub struct QwenRunConfig {
     pub repo_id: String,
@@ -21,6 +21,12 @@ pub struct QwenRunConfig {
     pub search_graphs: usize,
     pub prompt: String,
     pub repetition_penalty: f32,
+}
+
+fn qwen3_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|im_start|>user\n{user_prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
 }
 
 impl Default for QwenRunConfig {
@@ -125,8 +131,9 @@ where
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|err| err as Box<dyn Error>)?;
+    let prompt = qwen3_chat_prompt(&config.prompt);
     let prompt_tokens = tokenizer
-        .encode(config.prompt.as_str(), true)
+        .encode(prompt.as_str(), false)
         .map_err(|err| err as Box<dyn Error>)?
         .get_ids()
         .to_vec();
@@ -156,10 +163,21 @@ where
     }
 
     println!("Compiling...");
-    cx.set_dim('s', 1);
-    cx.set_dim('p', 1);
-    runtime.set_i32_data(input.id, vec![1]);
-    runtime.set_i32_data(token_ids.id, vec![1]);
+    let max_prefill = (prompt_tokens.len() + 16)
+        .next_power_of_two()
+        .min(config.max_seq_len);
+    let search_s = 16.min(max_prefill).max(2);
+    cx.set_dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(search_s),
+        ],
+    );
+    cx.set_dim('s', search_s);
+    cx.set_dim('p', 0);
+    runtime.set_i32_data(input.id, vec![1; search_s]);
+    runtime.set_i32_data(token_ids.id, (0..search_s as i32).collect::<Vec<_>>());
     runtime = cx.search(runtime, config.search_graphs);
 
     for i in 0..LAYERS {
@@ -167,10 +185,8 @@ where
         runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
     }
 
-    let mut prev_seq = 1usize;
-    let mut sentence = vec![prompt_tokens[0]];
-    let total_steps = prompt_tokens.len() - 1 + config.gen_tokens;
     let prompt_len = prompt_tokens.len();
+    let mut prev_seq = 0usize;
     let mut fwd_durations = vec![];
     let mut seen_tokens = FxHashSet::default();
 
@@ -179,10 +195,72 @@ where
         prompt_len, config.gen_tokens
     );
 
-    for i in 0..total_steps {
+    let mut generated = 0usize;
+    let mut sentence = Vec::new();
+
+    if config.gen_tokens > 0 && prompt_len > 0 {
         let start = std::time::Instant::now();
-        let is_prefill = i < prompt_len - 1;
+
+        cx.set_dim('s', prompt_len);
+        cx.set_dim('p', 0);
+
+        runtime.set_i32_data(
+            input.id,
+            prompt_tokens.iter().map(|t| *t as i32).collect::<Vec<_>>(),
+        );
+        runtime.set_i32_data(token_ids.id, (0..prompt_len as i32).collect::<Vec<_>>());
+        runtime.prepare_execute(&cx.dyn_map);
+
+        runtime.execute(&cx.dyn_map);
+        let logits_data = runtime.get_f32(logits.id);
+
+        for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+            let k_buf = runtime.remove_buffer(k_out.id);
+            let v_buf = runtime.remove_buffer(v_out.id);
+            runtime.set_buffer(kv_cache.k_caches[layer_idx].id, k_buf);
+            runtime.set_buffer(kv_cache.v_caches[layer_idx].id, v_buf);
+        }
+
+        prev_seq = prompt_len;
+        fwd_durations.push(start.elapsed());
+
+        let row_start = (prompt_len - 1) * VOCAB_SIZE;
+        let mut last_row = logits_data[row_start..row_start + VOCAB_SIZE].to_vec();
+        for &tok in &seen_tokens {
+            let logit = &mut last_row[tok as usize];
+            if *logit > 0.0 {
+                *logit /= config.repetition_penalty;
+            } else {
+                *logit *= config.repetition_penalty;
+            }
+        }
+        let next_token = last_row
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap()
+            .0 as u32;
+        sentence = vec![next_token];
+        seen_tokens.insert(next_token);
+        generated = 1;
+
+        if next_token != EOS_TOKEN && next_token != STOP_TOKEN {
+            let decoded = tokenizer
+                .decode(&[next_token], true)
+                .map_err(|err| err as Box<dyn Error>)?;
+            print!("{}", decoded);
+            std::io::stdout().flush()?;
+        }
+    }
+
+    while generated < config.gen_tokens && !sentence.is_empty() {
+        let start = std::time::Instant::now();
         let seq_len = sentence.len();
+        let current_token = sentence[0];
+
+        if current_token == EOS_TOKEN || current_token == STOP_TOKEN {
+            break;
+        }
 
         cx.set_dim('s', seq_len);
         cx.set_dim('p', prev_seq);
@@ -210,11 +288,6 @@ where
         prev_seq += seq_len;
         fwd_durations.push(start.elapsed());
 
-        if is_prefill {
-            sentence = vec![prompt_tokens[i + 1]];
-            continue;
-        }
-
         let mut last_row = logits_data[logits_data.len() - VOCAB_SIZE..].to_vec();
         for &tok in &seen_tokens {
             let logit = &mut last_row[tok as usize];
@@ -232,6 +305,7 @@ where
             .0 as u32;
         sentence = vec![next_token];
         seen_tokens.insert(next_token);
+        generated += 1;
 
         if next_token == EOS_TOKEN || next_token == STOP_TOKEN {
             break;
@@ -245,15 +319,11 @@ where
     }
     println!();
 
-    let decode_durations: Vec<_> = fwd_durations.iter().skip(prompt_len).collect();
+    let decode_durations: Vec<_> = fwd_durations.iter().skip(1).collect();
     if decode_durations.len() > 2 {
         println!(
             "  TTFT: {:.2} ms",
-            fwd_durations[..prompt_len]
-                .iter()
-                .sum::<Duration>()
-                .as_secs_f64()
-                * 1e3
+            fwd_durations[..1].iter().sum::<Duration>().as_secs_f64() * 1e3
         );
         println!(
             "  TPOT: {:.2} ms",

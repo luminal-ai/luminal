@@ -91,7 +91,9 @@ fn rmsnorm(x: GraphTensor, weight: GraphTensor, eps: f32) -> GraphTensor {
     } else {
         weight.cast(DType::F32)
     };
-    luminal_cuda_lite::kernel::rmsnorm(x, w, eps)
+    let x_rank = x.dims().len();
+    let w_rank = w.dims().len();
+    x.std_norm(x_rank - 1, eps) * w.expand_lhs(&x.dims()[..x_rank - w_rank])
 }
 
 /// Rotary position embedding — half-rotation convention (`[x0, x1] →
@@ -169,7 +171,7 @@ fn causal_sdpa(
     // to every (q, padding_k) score.
     let pad_key = (attention_mask.cast(DType::F32) * (-1.0_f32) + 1.0_f32) // (seq,)
         .expand_dim(0, seq); // (seq_q=seq, seq_k=seq) — broadcast over q.
-                             // Combine: anywhere either causal or padding masks → -1e10.
+    // Combine: anywhere either causal or padding masks → -1e10.
     let mask = causal + pad_key;
     let mask = mask.expand_dim(0, n_heads);
     let masked = scores + mask * (-1e10_f32);

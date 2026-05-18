@@ -1,4 +1,4 @@
-use crate::kernel::{MetalKernelOp, DYN_SLOT_COUNT};
+use crate::kernel::{DYN_SLOT_COUNT, MetalKernelOp};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
@@ -7,8 +7,8 @@ use luminal::{
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
-        petgraph::{algo::toposort, prelude::StableGraph, visit::EdgeRef, Direction},
         FxHashMap, NodeIndex, ToId,
+        petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef},
     },
 };
 use memmap2::MmapOptions;
@@ -147,12 +147,12 @@ impl MetalRuntime {
         let st = SafeTensors::deserialize(&mmap).unwrap();
 
         for node in cx.graph.node_indices() {
-            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>() {
-                if let Ok(tensor) = st.tensor(&input.label) {
-                    let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
-                    self.input_data.remove(&node);
-                    self.hlir_buffers.insert(node, buffer);
-                }
+            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>()
+                && let Ok(tensor) = st.tensor(&input.label)
+            {
+                let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
+                self.input_data.remove(&node);
+                self.hlir_buffers.insert(node, buffer);
             }
         }
     }

@@ -1,26 +1,27 @@
 use super::{MPSMatrixLayout, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
 use luminal::{
     egglog_utils::{
+        SerializedEGraph,
         api::{
-            app, eq, i64 as lit_i64, rule, sort, union, v, Args, Rule, SortDef, Term as EggTerm,
+            Args, Rule, SortDef, Term as EggTerm, app, eq, i64 as lit_i64, rule, sort, union, v,
         },
         base::{
-            cons, dtype, ilist, iter, mul, new_op_call, nil, num, op_term, DTYPE, ELIST,
-            EXPRESSION, F64, I64, IR, SORTS,
+            DTYPE, ELIST, EXPRESSION, F64, I64, IR, SORTS, cons, dtype, ilist, iter, mul,
+            new_op_call, nil, num, op_term,
         },
-        SerializedEGraph,
     },
     hlir::{
-        binary_sort, reduce_sort, unary_sort, Add, Cast, Constant, Gather, Iota, LessThan,
-        MaxReduce, Mod, Mul, Scatter, SumReduce,
+        Add, Cast, Constant, Gather, Iota, LessThan, MaxReduce, Mod, Mul, Scatter, SumReduce,
+        binary_sort, reduce_sort, unary_sort,
     },
     op::*,
     prelude::*,
     shape::flatten_strides,
 };
 use metal::{
+    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
     foreign_types::{ForeignType, ForeignTypeRef},
-    mps, Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
+    mps,
 };
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
@@ -1681,10 +1682,12 @@ impl EgglogOp for MetalConstant {
     fn rewrites(&self) -> Vec<Rule> {
         let (args, const_match) = new_op_call(&Constant::default().sort(), &[]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(const_match.clone(), metal_op.clone()))
-            .subsume(const_match)
-            .set(dtype(metal_op), app(&SORTS.f32_dt, vec![]))
-            .ruleset("kernel_lower")]
+        vec![
+            rule(union(const_match.clone(), metal_op.clone()))
+                .subsume(const_match)
+                .set(dtype(metal_op), app(&SORTS.f32_dt, vec![]))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1791,10 +1794,12 @@ impl EgglogOp for MetalIota {
     fn rewrites(&self) -> Vec<Rule> {
         let (args, iota_match) = new_op_call(&Iota::default().sort(), &[]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(iota_match.clone(), metal_op.clone()))
-            .subsume(iota_match)
-            .set(dtype(metal_op), app(&SORTS.int_dt, vec![]))
-            .ruleset("kernel_lower")]
+        vec![
+            rule(union(iota_match.clone(), metal_op.clone()))
+                .subsume(iota_match)
+                .set(dtype(metal_op), app(&SORTS.int_dt, vec![]))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -1935,11 +1940,13 @@ impl EgglogOp for MetalGather {
             ("out_strides".to_string(), out_strides),
         ];
         let metal_op = self.sort().call(metal_args);
-        vec![rule(union(gather_match.clone(), metal_op.clone()))
-            .subsume(gather_match)
-            .set(dtype(metal_op), dt.clone())
-            .fact(eq(dt, dtype(gather_args["data"].clone())))
-            .ruleset("kernel_lower")]
+        vec![
+            rule(union(gather_match.clone(), metal_op.clone()))
+                .subsume(gather_match)
+                .set(dtype(metal_op), dt.clone())
+                .fact(eq(dt, dtype(gather_args["data"].clone())))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -2153,11 +2160,13 @@ impl EgglogOp for MetalScatter {
             ("out_strides".to_string(), out_strides),
         ];
         let metal_op = self.sort().call(metal_args);
-        vec![rule(union(scatter_match.clone(), metal_op.clone()))
-            .subsume(scatter_match)
-            .set(dtype(metal_op), dt.clone())
-            .fact(eq(dt, dtype(scatter_args["src"].clone())))
-            .ruleset("kernel_lower")]
+        vec![
+            rule(union(scatter_match.clone(), metal_op.clone()))
+                .subsume(scatter_match)
+                .set(dtype(metal_op), dt.clone())
+                .fact(eq(dt, dtype(scatter_args["src"].clone())))
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {
@@ -2386,10 +2395,12 @@ impl EgglogOp for MetalCast {
     fn rewrites(&self) -> Vec<Rule> {
         let (args, cast_match) = new_op_call(&Cast::default().sort(), &["inp"]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
-        vec![rule(union(cast_match.clone(), metal_op.clone()))
-            .subsume(cast_match)
-            .set(dtype(metal_op), args["dtype"].clone())
-            .ruleset("kernel_lower")]
+        vec![
+            rule(union(cast_match.clone(), metal_op.clone()))
+                .subsume(cast_match)
+                .set(dtype(metal_op), args["dtype"].clone())
+                .ruleset("kernel_lower"),
+        ]
     }
 
     fn cleanup(&self) -> bool {

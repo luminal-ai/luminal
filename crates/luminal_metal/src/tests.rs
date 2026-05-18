@@ -3,7 +3,7 @@ use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
 use half::{bf16, f16};
 use luminal::prelude::*;
 use proptest::prelude::*;
-use safetensors::{tensor::TensorView, Dtype as SafeDType};
+use safetensors::{Dtype as SafeDType, tensor::TensorView};
 use std::{
     collections::HashMap,
     path::PathBuf,

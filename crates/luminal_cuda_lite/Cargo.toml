@@ -29,6 +29,7 @@ colorize = "*"
 
 [dev-dependencies]
 candle-core = { version = "0.9.2", features = ["cuda"] }
+luminal_nn = { path = "../luminal_nn" }
 proptest = "1.9.0"
 rand = "0.9.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

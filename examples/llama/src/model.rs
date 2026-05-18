@@ -2,9 +2,8 @@ use luminal::{
     dtype::DType,
     graph::Graph,
     prelude::{F32Pow, GraphTensor},
-    shape::Expression,
 };
-use luminal_nn::LayerNorm;
+use luminal_nn::{LayerNorm, gather_rows, scatter_rows};
 
 // Llama 3 8B hyperparams
 pub const LAYERS: usize = 32;
@@ -14,37 +13,80 @@ pub const HEAD_DIM: usize = 128;
 pub const KV_GROUPS: usize = 4;
 pub const VOCAB_SIZE: usize = 128256;
 pub const N_KV_HEADS: usize = HIDDEN / HEAD_DIM / KV_GROUPS; // 8
+#[allow(dead_code)]
 pub const N_HEADS: usize = HIDDEN / HEAD_DIM; // 32
+pub const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // 1024
 
-pub struct KVCache {
-    pub k_caches: Vec<GraphTensor>,
-    pub v_caches: Vec<GraphTensor>,
-    pub max_seq: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LlamaConfig {
+    pub layers: usize,
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub head_dim: usize,
+    pub kv_groups: usize,
+    pub vocab_size: usize,
 }
 
-impl KVCache {
-    pub fn new(cx: &mut Graph, max_seq: usize) -> Self {
-        let mut k_caches = Vec::with_capacity(LAYERS);
-        let mut v_caches = Vec::with_capacity(LAYERS);
-        for l in 0..LAYERS {
-            let k = cx
-                .named_tensor(format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            let v = cx
-                .named_tensor(format!("kv_cache.{l}.v"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            k_caches.push(k);
-            v_caches.push(v);
-        }
+impl Default for LlamaConfig {
+    fn default() -> Self {
         Self {
-            k_caches,
-            v_caches,
-            max_seq,
+            layers: LAYERS,
+            hidden: HIDDEN,
+            intermediate: INTERMEDIATE,
+            head_dim: HEAD_DIM,
+            kv_groups: KV_GROUPS,
+            vocab_size: VOCAB_SIZE,
         }
     }
 }
 
+impl LlamaConfig {
+    pub fn n_heads(self) -> usize {
+        self.hidden / self.head_dim
+    }
+
+    pub fn n_kv_heads(self) -> usize {
+        self.hidden / self.head_dim / self.kv_groups
+    }
+
+    pub fn kv_dim(self) -> usize {
+        self.n_kv_heads() * self.head_dim
+    }
+}
+
+pub struct KVCache {
+    pub k_caches: Vec<GraphTensor>,
+    pub v_caches: Vec<GraphTensor>,
+}
+
+impl KVCache {
+    pub fn new(cx: &mut Graph, num_slots: usize) -> Self {
+        Self::new_with_config(cx, num_slots, LlamaConfig::default())
+    }
+
+    pub fn new_with_config(cx: &mut Graph, num_slots: usize, config: LlamaConfig) -> Self {
+        let kv_dim = config.kv_dim();
+        let mut k_caches = Vec::with_capacity(config.layers);
+        let mut v_caches = Vec::with_capacity(config.layers);
+        for l in 0..config.layers {
+            k_caches.push(cx.named_tensor(format!("kv_cache.{l}.k"), (num_slots, kv_dim)));
+            v_caches.push(cx.named_tensor(format!("kv_cache.{l}.v"), (num_slots, kv_dim)));
+        }
+        Self { k_caches, v_caches }
+    }
+
+    #[allow(dead_code)]
+    pub fn tensors(&self) -> Vec<GraphTensor> {
+        self.k_caches
+            .iter()
+            .chain(self.v_caches.iter())
+            .copied()
+            .collect()
+    }
+}
+
 pub struct Llama {
+    config: LlamaConfig,
     embedding: GraphTensor,
     layers: Vec<LlamaLayer>,
     lm_norm: LayerNorm,
@@ -53,60 +95,58 @@ pub struct Llama {
 
 impl Llama {
     pub fn init(cx: &mut Graph) -> Self {
-        let mut w = vec![];
-        for l in 0..LAYERS {
-            let up = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.up_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
-                )
-                .persist();
-            let gate = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.gate_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
-                )
-                .persist();
-            let down = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.down_proj.weight"),
-                    (HIDDEN, INTERMEDIATE),
-                )
-                .persist();
-            let q_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_proj.weight"),
-                    (HIDDEN, HIDDEN),
-                )
-                .persist();
-            let k_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_proj.weight"),
-                    (HIDDEN / KV_GROUPS, HIDDEN),
-                )
-                .persist();
-            let v_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.v_proj.weight"),
-                    (HIDDEN / KV_GROUPS, HIDDEN),
-                )
-                .persist();
-            let o_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.o_proj.weight"),
-                    (HIDDEN, HIDDEN),
-                )
-                .persist();
-            w.push(LlamaLayer {
-                up,
-                gate,
-                down,
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
+        Self::init_with_config(cx, LlamaConfig::default())
+    }
+
+    pub fn init_with_config(cx: &mut Graph, config: LlamaConfig) -> Self {
+        let mut layers = Vec::with_capacity(config.layers);
+        for l in 0..config.layers {
+            layers.push(LlamaLayer {
+                config,
+                up: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.mlp.up_proj.weight"),
+                        (config.intermediate, config.hidden),
+                    )
+                    .persist(),
+                gate: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.mlp.gate_proj.weight"),
+                        (config.intermediate, config.hidden),
+                    )
+                    .persist(),
+                down: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.mlp.down_proj.weight"),
+                        (config.hidden, config.intermediate),
+                    )
+                    .persist(),
+                q_proj: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.self_attn.q_proj.weight"),
+                        (config.hidden, config.hidden),
+                    )
+                    .persist(),
+                k_proj: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.self_attn.k_proj.weight"),
+                        (config.kv_dim(), config.hidden),
+                    )
+                    .persist(),
+                v_proj: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.self_attn.v_proj.weight"),
+                        (config.kv_dim(), config.hidden),
+                    )
+                    .persist(),
+                o_proj: cx
+                    .named_tensor(
+                        format!("model.layers.{l}.self_attn.o_proj.weight"),
+                        (config.hidden, config.hidden),
+                    )
+                    .persist(),
                 attn_rms: LayerNorm::new(
-                    HIDDEN,
+                    config.hidden,
                     Some(&format!("model.layers.{l}.input_layernorm.weight")),
                     None,
                     false,
@@ -114,7 +154,7 @@ impl Llama {
                     cx,
                 ),
                 mlp_rms: LayerNorm::new(
-                    HIDDEN,
+                    config.hidden,
                     Some(&format!("model.layers.{l}.post_attention_layernorm.weight")),
                     None,
                     false,
@@ -123,52 +163,83 @@ impl Llama {
                 ),
             });
         }
-        let lm_norm = LayerNorm::new(HIDDEN, Some("model.norm.weight"), None, false, 1e-5, cx);
-        let lm_head = cx
-            .named_tensor("lm_head.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
-        let embedding = cx
-            .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
         Self {
-            embedding,
-            layers: w,
-            lm_head,
-            lm_norm,
+            config,
+            embedding: cx
+                .named_tensor(
+                    "model.embed_tokens.weight",
+                    (config.vocab_size, config.hidden),
+                )
+                .persist(),
+            layers,
+            lm_head: cx
+                .named_tensor("lm_head.weight", (config.vocab_size, config.hidden))
+                .persist(),
+            lm_norm: LayerNorm::new(
+                config.hidden,
+                Some("model.norm.weight"),
+                None,
+                false,
+                1e-5,
+                cx,
+            ),
         }
     }
 
     #[tracing::instrument(skip_all)]
     pub fn forward(
         &self,
-        token_ids: GraphTensor,
-        pos_ids: GraphTensor,
+        input: GraphTensor,
+        q_pos: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
+        attn_mask: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = token_ids.dims1();
+        let seq = input.dims1();
+        let hidden = self.config.hidden;
         let mut x = self.embedding.gather(
-            (token_ids * HIDDEN).expand_dim(1, HIDDEN)
-                + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
+            (input * hidden).expand_dim(1, hidden)
+                + input.graph().arange(hidden).expand_dim(0, seq),
         );
-        let mut cache_outputs = Vec::with_capacity(LAYERS);
+        let mut cache_outputs = Vec::with_capacity(self.config.layers);
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
                 x,
-                pos_ids,
+                q_pos,
+                scatter_idx,
+                gather_idx,
+                attn_mask,
                 kv_cache.k_caches[i],
                 kv_cache.v_caches[i],
-                kv_cache.max_seq,
             );
             x = x_new;
-            //x = x_new.graph_break();
             cache_outputs.push((k_out, v_out));
         }
         let logits = self.lm_norm.forward(x).matmul(self.lm_head.t());
         (logits, cache_outputs)
     }
+
+    #[allow(dead_code)]
+    pub fn parameter_tensors(&self) -> Vec<GraphTensor> {
+        let mut tensors = Vec::new();
+        tensors.push(self.embedding);
+        for layer in &self.layers {
+            tensors.extend(layer.parameter_tensors());
+        }
+        if let Some(weight) = self.lm_norm.weight {
+            tensors.push(weight);
+        }
+        if let Some(bias) = self.lm_norm.bias {
+            tensors.push(bias);
+        }
+        tensors.push(self.lm_head);
+        tensors
+    }
 }
 
 struct LlamaLayer {
+    config: LlamaConfig,
     up: GraphTensor,
     gate: GraphTensor,
     down: GraphTensor,
@@ -180,132 +251,151 @@ struct LlamaLayer {
     mlp_rms: LayerNorm,
 }
 
-fn llama_rotary_embeddings(mut input: GraphTensor, pos_ids: GraphTensor) -> GraphTensor {
-    // Input: [seq, dim]
-    input = input.split_dims(1, HEAD_DIM).transpose(0, 1); // n_heads, seq, head_dim
+fn llama_rotary_embeddings(
+    mut input: GraphTensor,
+    pos_ids: GraphTensor,
+    config: LlamaConfig,
+) -> GraphTensor {
+    input = input.split_dims(1, config.head_dim).transpose(0, 1);
 
-    // Get freqs
     let freqs = input
         .graph()
-        .arange_options(0, HEAD_DIM, 2)
+        .arange_options(0, config.head_dim, 2)
         .cast(DType::F32)
-        / HEAD_DIM as f32;
+        / config.head_dim as f32;
     let inv_freqs = 500_000_f32.pow(freqs).reciprocal();
     let emb = pos_ids
         .cast(DType::F32)
         .expand_dim(1, 1)
         .matmul(inv_freqs.expand_dim(0, 1));
 
-    // Split into first half and second half (Llama "half" rotation convention)
-    let x0 = input.slice((.., .., ..HEAD_DIM / 2));
-    let x1 = input.slice((.., .., HEAD_DIM / 2..));
+    let x0 = input.slice((.., .., ..config.head_dim / 2));
+    let x1 = input.slice((.., .., config.head_dim / 2..));
 
-    // Apply sin and cos embeddings
     let cos = emb.cos().expand_dim(0, x0.dims()[0]);
     let sin = emb.sin().expand_dim(0, x0.dims()[0]);
     let x0_out = x0 * cos - x1 * sin;
     let x1_out = x1 * cos + x0 * sin;
 
-    // Combine back: [n_heads, seq, HEAD_DIM] -> [seq, n_heads, HEAD_DIM] -> [seq, dim]
     x0_out
         .concat_along(x1_out, 2)
         .transpose(0, 1)
         .merge_dims(1, 2)
 }
 
-/// HLIR attention with pre-allocated KV cache using scatter.
-/// Returns (attn_output, k_cache_updated, v_cache_updated).
-fn hlir_attention(
-    q_rope: GraphTensor,     // [seq, HIDDEN]
-    k_rope: GraphTensor,     // [seq, HIDDEN/KV_GROUPS]
-    v: GraphTensor,          // [seq, HIDDEN/KV_GROUPS]
-    k_cache_in: GraphTensor, // [N_KV_HEADS, max_seq, HEAD_DIM]
-    v_cache_in: GraphTensor, // [N_KV_HEADS, max_seq, HEAD_DIM]
-    max_seq: usize,
+struct AttentionInputs {
+    q_rope: GraphTensor,
+    k_rope: GraphTensor,
+    v: GraphTensor,
+    k_cache: GraphTensor,
+    v_cache: GraphTensor,
+    scatter_idx: GraphTensor,
+    gather_idx: GraphTensor,
+    attn_mask: GraphTensor,
+}
+
+fn attention(
+    AttentionInputs {
+        q_rope,
+        k_rope,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        attn_mask,
+    }: AttentionInputs,
+    config: LlamaConfig,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let cx = q_rope.graph();
-    let seq = q_rope.dims()[0]; // Expression 's'
-    let prev = Expression::from('p');
-    let total_seq = prev + seq;
+    let kv_dim = config.kv_dim();
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, kv_dim);
+    let v_cache_out = scatter_rows(v, scatter_idx, v_cache, kv_dim);
 
-    // Reshape new K, V: [seq, kv_dim] -> [N_KV_HEADS, seq, HEAD_DIM]
-    let k_new = k_rope.split_dims(1, HEAD_DIM).transpose(0, 1);
-    let v_new = v.split_dims(1, HEAD_DIM).transpose(0, 1);
+    let k = gather_rows(k_cache_out, gather_idx, kv_dim);
+    let v_ctx = gather_rows(v_cache_out, gather_idx, kv_dim);
 
-    // Build flat scatter indices for cache positions [prev..prev+seq]
-    // Cache layout: [N_KV_HEADS, max_seq, HEAD_DIM], flat index = h*max_seq*HEAD_DIM + (prev+s)*HEAD_DIM + d
-    let h_offset = cx.arange(N_KV_HEADS) * (max_seq * HEAD_DIM);
-    let p_offset = (cx.arange(seq) + prev) * HEAD_DIM;
-    let d_offset = cx.arange(HEAD_DIM);
-    let scatter_idx = h_offset.expand_dim(1, seq).expand_dim(2, HEAD_DIM)
-        + p_offset.expand_dim(0, N_KV_HEADS).expand_dim(2, HEAD_DIM)
-        + d_offset.expand_dim(0, N_KV_HEADS).expand_dim(1, seq);
+    let q = (q_rope * 1.0)
+        .split_dims(1, config.head_dim)
+        .transpose(0, 1);
+    let k = k.split_dims(1, config.head_dim).permute((1, 2, 0));
+    let v_ctx = v_ctx.split_dims(1, config.head_dim).transpose(0, 1);
 
-    // Scatter new K/V into cache
-    let k_cache_out = k_new.scatter(scatter_idx, k_cache_in);
-    let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
+    let k = k.expand_dim(1, config.kv_groups).merge_dims(0, 1) * 1.0;
+    let v_ctx = v_ctx.expand_dim(1, config.kv_groups).merge_dims(0, 1) * 1.0;
 
-    // Slice to valid range: [N_KV_HEADS, total_seq, HEAD_DIM]
-    let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
-    let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
-    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
-    // cannot yet propagate expression-bound assertions, so `slice` reports
-    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
-    k_full.shape.dims[1] = total_seq;
-    v_full.shape.dims[1] = total_seq;
+    let scores = q.matmul(k) / (config.head_dim as f32).sqrt();
+    let masked_scores = scores + attn_mask.expand_dim(0, config.n_heads());
+    let weights = masked_scores.softmax(2);
+    let out = weights.matmul(v_ctx);
+    let attn_out = out.transpose(0, 1).merge_dims(1, 2);
 
-    // GQA expand: [N_KV_HEADS, total_seq, HEAD_DIM] -> [N_HEADS, total_seq, HEAD_DIM]
-    let k_3d = k_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);
-    let v_3d = v_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);
-
-    // Q: [seq, HIDDEN] -> [N_HEADS, seq, HEAD_DIM]
-    let q = q_rope.split_dims(1, HEAD_DIM).transpose(0, 1);
-
-    // Attention scores: Q @ K^T / sqrt(d)
-    // 3D matmul: [N_HEADS, seq, HEAD_DIM] x [N_HEADS, HEAD_DIM, total_seq] -> [N_HEADS, seq, total_seq]
-    let scores = q.matmul(k_3d.transpose(1, 2)) / (HEAD_DIM as f32).sqrt();
-
-    // Causal mask: mask positions where k_pos > prev + q_local_pos
-    let q_abs = cx.arange(seq).cast(DType::F32) + prev;
-    let k_pos = cx.arange(total_seq).cast(DType::F32);
-    let mask = k_pos.expand_dim(0, seq).gt(q_abs.expand_dim(1, total_seq));
-    let mask_3d = mask.cast(DType::F32).expand_dim(0, N_HEADS);
-    let masked_scores = scores + mask_3d * (-1e10f32);
-
-    // Softmax along key dimension
-    let attn_weights = masked_scores.softmax(2);
-
-    // Weighted sum: [N_HEADS, seq, total_seq] x [N_HEADS, total_seq, HEAD_DIM] -> [N_HEADS, seq, HEAD_DIM]
-    let attn_out = attn_weights.matmul(v_3d);
-
-    // Reshape: [N_HEADS, seq, HEAD_DIM] -> [seq, N_HEADS, HEAD_DIM] -> [seq, HIDDEN]
-    let out = attn_out.transpose(0, 1).merge_dims(1, 2);
-
-    (out, k_cache_out, v_cache_out)
+    (attn_out, k_cache_out, v_cache_out)
 }
 
 impl LlamaLayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         mut x: GraphTensor,
-        pos_ids: GraphTensor,
-        k_cache_in: GraphTensor,
-        v_cache_in: GraphTensor,
-        max_seq: usize,
+        q_pos: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
+        attn_mask: GraphTensor,
+        k_cache: GraphTensor,
+        v_cache: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
         let x_attn = self.attn_rms.forward(x);
         let q = x_attn.matmul(self.q_proj.t());
         let k = x_attn.matmul(self.k_proj.t());
         let v = x_attn.matmul(self.v_proj.t());
-        let q_rope = llama_rotary_embeddings(q, pos_ids);
-        let k_rope = llama_rotary_embeddings(k, pos_ids);
-        let (attn_out, k_cache_out, v_cache_out) =
-            hlir_attention(q_rope, k_rope, v, k_cache_in, v_cache_in, max_seq);
+
+        let q_rope = llama_rotary_embeddings(q, q_pos, self.config);
+        let k_rope = llama_rotary_embeddings(k, q_pos, self.config);
+
+        let (attn_out, k_cache_out, v_cache_out) = attention(
+            AttentionInputs {
+                q_rope,
+                k_rope,
+                v,
+                k_cache,
+                v_cache,
+                scatter_idx,
+                gather_idx,
+                attn_mask,
+            },
+            self.config,
+        );
         x += attn_out.matmul(self.o_proj.t());
 
         let x_mlp = self.mlp_rms.forward(x);
         let mlp_out =
             (x_mlp.matmul(self.gate.t()).swish() * x_mlp.matmul(self.up.t())).matmul(self.down.t());
         (x + mlp_out, k_cache_out, v_cache_out)
+    }
+
+    #[allow(dead_code)]
+    fn parameter_tensors(&self) -> Vec<GraphTensor> {
+        let mut tensors = vec![
+            self.up,
+            self.gate,
+            self.down,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+        ];
+        if let Some(weight) = self.attn_rms.weight {
+            tensors.push(weight);
+        }
+        if let Some(bias) = self.attn_rms.bias {
+            tensors.push(bias);
+        }
+        if let Some(weight) = self.mlp_rms.weight {
+            tensors.push(weight);
+        }
+        if let Some(bias) = self.mlp_rms.bias {
+            tensors.push(bias);
+        }
+        tensors
     }
 }

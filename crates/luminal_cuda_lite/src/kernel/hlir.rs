@@ -891,25 +891,6 @@ impl KernelOp for KernelScatter {
 
         // Single-kernel scatter: copy dest→output then scatter src→output[indexes]
         // Launched as 1 block of 1024 threads with __syncthreads() barrier.
-        // Uses float4 vectorized copy (16 bytes per op) for the copy phase.
-        //
-        // The number of dtype elements that fit in a float4 (16 bytes) depends
-        // on the element size. Computing `n_vec = n_dest / 4` would only be
-        // correct for 4-byte dtypes — for bf16 it walks 2× past the end of
-        // `out`, producing CUDA_ERROR_ILLEGAL_ADDRESS once the OOB region
-        // happens to land on an unmapped page.
-        let elements_per_vec: usize = match self.dtype {
-            DType::F64 => 2,
-            DType::F32 | DType::Int => 4,
-            DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 8,
-            DType::Bool
-            | DType::I8
-            | DType::U8
-            | DType::F8UE8M0
-            | DType::F8E4M3
-            | DType::F8E5M2 => 16,
-            other => panic!("Unsupported dtype for scatter vectorization: {other:?}"),
-        };
         let n_src_elements = self
             .index_shape
             .iter()
@@ -922,6 +903,8 @@ impl KernelOp for KernelScatter {
             .copied()
             .product::<Expression>()
             .to_kernel();
+        let copy_dest_idx = flatten_strides(&self.dest_shape, &self.dest_strides).to_kernel();
+        let copy_out_idx = flatten_strides(&self.dest_shape, &self.out_strides).to_kernel();
         let scatter_idx_idx = flatten_strides(&self.index_shape, &self.index_strides).to_kernel();
         let scatter_src_idx = flatten_strides(&self.index_shape, &self.src_strides).to_kernel();
         let scatter_kernel = format!(
@@ -934,19 +917,11 @@ extern \"C\" {{
         int tid = threadIdx.x;
         long long n_dest = {n_dest_elements};
         long long n_src = {n_src_elements};
-        // Phase 1: vectorized copy dest → output (float4 = 16 bytes / iter,
-        // i.e. {elements_per_vec} {dtype} elements). n_vec is sized so the
-        // total bytes covered (`n_vec * 16`) never exceed `n_dest * sizeof({dtype})`.
-        long long n_vec = n_dest / {elements_per_vec};
-        float4 *out4 = (float4 *)out;
-        const float4 *dest4 = (const float4 *)dest;
-        for (long long i = tid; i < n_vec; i += blockDim.x) {{
-            out4[i] = dest4[i];
-        }}
-        // Handle remaining elements (the dtype-tail past the last full float4).
-        long long remainder_start = n_vec * {elements_per_vec};
-        for (long long i = remainder_start + tid; i < n_dest; i += blockDim.x) {{
-            out[i] = dest[i];
+        // Phase 1: materialize dest into the contiguous output layout.
+        // dest may be a strided or broadcast view, so copying dest[i] would read
+        // past the physical source buffer for expanded tensors.
+        for (long long const_z = tid; const_z < n_dest; const_z += blockDim.x) {{
+            out[{copy_out_idx}] = dest[{copy_dest_idx}];
         }}
         __syncthreads();
         // Phase 2: scatter src → output[indexes[i]]

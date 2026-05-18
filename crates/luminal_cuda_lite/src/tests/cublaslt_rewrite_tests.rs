@@ -2169,6 +2169,85 @@ fn cublaslt_row_order_candidate_executes_2d_layout_pairs() {
 }
 
 #[test]
+#[ignore = "large row-order CUDA functional repro for llama lm_head shape"]
+fn cublaslt_row_order_candidate_executes_large_lm_head_like_projection() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let (m, n, k) = (1, 128_256, 64);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let b_input = cx.tensor((n, k));
+    let b = b_input.t();
+    let out = a.matmul(b).output();
+    let expected_orders = ("ROW", "COL", "ROW", "ROW");
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "lm_head-like row-order", |llir| {
+        cublaslt_matrix_order_tuples(llir).contains(&expected_orders)
+            && cublaslt_scale_value_tuples(llir).contains(&(1.0, 0.0))
+    });
+
+    let a_data = random_f32_vec(m * k, 0x1A11_A000, -0.5, 0.5);
+    let b_data = random_f32_vec(n * k, 0x1A11_B000, -0.5, 0.5);
+    let mut expected = vec![0.0f32; m * n];
+    for col in 0..n {
+        let mut sum = 0.0f32;
+        for kk in 0..k {
+            sum += a_data[kk] * b_data[col * k + kk];
+        }
+        expected[col] = sum;
+    }
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a, a_data);
+    rt.set_data(b_input, b_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
+#[test]
+#[ignore = "large row-order CUDA functional repro for llama MLP residual beta=1 shape"]
+fn cublaslt_row_order_beta_one_candidate_executes_llama_mlp_residual_like_projection() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let (m, n, k) = (1, 4096, 64);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let b_input = cx.tensor((n, k));
+    let b = b_input.t();
+    let c = cx.tensor((m, n));
+    let out = (a.matmul(b) + c).output();
+    let expected_orders = ("ROW", "COL", "ROW", "ROW");
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "mlp residual row-order", |llir| {
+        cublaslt_matrix_order_tuples(llir).contains(&expected_orders)
+            && cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
+    });
+
+    let a_data = random_f32_vec(m * k, 0x1A12_A000, -0.5, 0.5);
+    let b_data = random_f32_vec(n * k, 0x1A12_B000, -0.5, 0.5);
+    let c_data = random_f32_vec(m * n, 0x1A12_C000, -0.5, 0.5);
+    let mut expected = c_data.clone();
+    for col in 0..n {
+        for kk in 0..k {
+            expected[col] += a_data[kk] * b_data[col * k + kk];
+        }
+    }
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a, a_data);
+    rt.set_data(b_input, b_data);
+    rt.set_data(c, c_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
+#[test]
 #[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_row_order_candidate_executes_batched_row_major_matmul() {
     let Some(stream) = get_cuda_stream() else {

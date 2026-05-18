@@ -71,7 +71,7 @@ impl MoE {
 mod tests {
     use super::MoE;
     use luminal::prelude::*;
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
     fn random_vec(n: usize) -> Vec<f32> {
         let mut r = rng();

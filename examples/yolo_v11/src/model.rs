@@ -189,7 +189,7 @@ impl Conv {
         let w = dims[3];
         let x = x.squeeze(0); // (c_in, H, W)
         let xt = x.permute(&[1, 2, 0]); // (H, W, c_in)
-                                        // 2D matmul matches the specialized kernel in cuda_lite.
+        // 2D matmul matches the specialized kernel in cuda_lite.
         let xt = xt.merge_dims(0, 1); // (H*W, c_in)
         let out = xt.matmul(self.weight.t()); // (H*W, c_out)
         let out = out.split_dims(0, w); // (H, W, c_out)
@@ -298,11 +298,7 @@ impl Bottleneck {
 
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
         let y = self.cv2.forward(self.cv1.forward(x));
-        if self.add {
-            (x + y) * 1.0
-        } else {
-            y
-        }
+        if self.add { (x + y) * 1.0 } else { y }
     }
 }
 
@@ -394,8 +390,8 @@ impl C3k2 {
         cx: &mut Graph,
     ) -> Self {
         let c = (c2 as f32 * config.e) as usize; // hidden
-                                                 // Two halves of the original cv1 (channel-split). Saved as
-                                                 // model.<L>.cv1{a,b}.conv.{weight,bias} by python/reference.py.
+        // Two halves of the original cv1 (channel-split). Saved as
+        // model.<L>.cv1{a,b}.conv.{weight,bias} by python/reference.py.
         let cv1a = Conv::new(&format!("{name}.cv1a.conv"), c1, c, 1, 1, 0, cx);
         let cv1b = Conv::new(&format!("{name}.cv1b.conv"), c1, c, 1, 1, 0, cx);
         let cv2 = Conv::new(&format!("{name}.cv2.conv"), (2 + n) * c, c2, 1, 1, 0, cx);
@@ -864,7 +860,7 @@ impl Detect {
         // 4 outer and reg_max inner. luminal split_dims(axis, inner_size) places `inner_size`
         // as the new inner dim, so we must pass REG_MAX (not 4) to get (1, 4, REG_MAX, A).
         let dfl_in = boxes.split_dims(1, REG_MAX); // (1, 4, REG_MAX, A)
-                                                   // Then transpose so the REG_MAX bin axis becomes the softmax channel axis.
+        // Then transpose so the REG_MAX bin axis becomes the softmax channel axis.
         let dfl_in = dfl_in.transpose(1, 2); // (1, REG_MAX, 4, A)
         let dfl_in = dfl_in.softmax(1);
 
@@ -891,7 +887,7 @@ impl Detect {
         // Multiply by strides: (1, 1, A)
         let strides = self.strides.expand_dim(0, 1); // (1, 1, A)
         let dbox = dbox * strides.expand_dim(1, 4usize).squeeze(2); // broadcast across 4 box dims
-                                                                    // (the squeeze removes the size-1 channel from the second expand)
+        // (the squeeze removes the size-1 channel from the second expand)
 
         let scores_sig = scores.sigmoid();
         dbox.concat_along(scores_sig, 1)

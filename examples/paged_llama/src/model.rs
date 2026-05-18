@@ -3,7 +3,7 @@ use luminal::{
     graph::Graph,
     prelude::{F32Pow, GraphTensor},
 };
-use luminal_nn::{gather_rows, scatter_rows, LayerNorm};
+use luminal_nn::{LayerNorm, gather_rows, scatter_rows};
 
 // Llama 3 8B hyperparams
 pub const LAYERS: usize = 32;

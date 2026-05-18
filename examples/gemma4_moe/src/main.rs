@@ -63,10 +63,21 @@ fn main() {
     }
 
     println!("Compiling...");
-    cx.set_dim('s', 1);
-    cx.set_dim('p', 1);
-    runtime.set_data(input, vec![1]);
-    runtime.set_data(pos_ids, vec![1]);
+    let max_prefill = (prompt_tokens.len() + 16)
+        .next_power_of_two()
+        .min(max_seq_len);
+    let search_s = 16.min(max_prefill).max(2);
+    cx.set_dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(search_s),
+        ],
+    );
+    cx.set_dim('s', search_s);
+    cx.set_dim('p', 0);
+    runtime.set_data(input, vec![1; search_s]);
+    runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     runtime = cx.search(runtime, search_graphs);
 
     for layer in 0..LAYERS {
@@ -78,7 +89,7 @@ fn main() {
     print!("{prompt}");
     std::io::stdout().flush().unwrap();
 
-    let mut prev_seq = 0usize;
+    let mut prev_seq: usize;
     let mut fwd_durations = vec![];
     let mut seen_tokens = FxHashSet::default();
     let mut generated_token_ids = vec![];
@@ -87,26 +98,27 @@ fn main() {
     const EOS_TOKEN: u32 = 1;
 
     let prefill_start = std::time::Instant::now();
-    for &token in &prompt_tokens {
-        cx.set_dim('s', 1);
-        cx.set_dim('p', prev_seq);
-        runtime.set_data(input, vec![token as i32]);
-        runtime.set_data(pos_ids, vec![prev_seq as i32]);
-        runtime.execute(&cx.dyn_map);
+    cx.set_dim('s', prompt_tokens.len());
+    cx.set_dim('p', 0);
+    runtime.set_data(
+        input,
+        prompt_tokens.iter().map(|t| *t as i32).collect::<Vec<_>>(),
+    );
+    runtime.set_data(pos_ids, (0..prompt_tokens.len() as i32).collect::<Vec<_>>());
+    runtime.execute(&cx.dyn_map);
 
-        for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-            let k_buf = runtime.remove_buffer(*k_out);
-            let v_buf = runtime.remove_buffer(*v_out);
-            runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
-            runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
-        }
-
-        prev_seq += 1;
+    for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        let k_buf = runtime.remove_buffer(*k_out);
+        let v_buf = runtime.remove_buffer(*v_out);
+        runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
+        runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
     }
+    prev_seq = prompt_tokens.len();
     let prefill_duration = prefill_start.elapsed();
 
     let logits_data = runtime.get_f32(logits);
-    let last_row = &logits_data[..VOCAB_SIZE];
+    let row_start = (prompt_tokens.len() - 1) * VOCAB_SIZE;
+    let last_row = &logits_data[row_start..row_start + VOCAB_SIZE];
     let mut next_token = last_row
         .iter()
         .enumerate()
