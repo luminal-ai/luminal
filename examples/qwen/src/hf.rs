@@ -22,6 +22,17 @@ struct StoredTensor {
     data: Vec<f32>,
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
 /// Downloads model files from HuggingFace and returns the cache directory path.
 pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let api = Api::new()?;
@@ -82,6 +93,12 @@ pub fn combine_safetensors_to_fp32(
 
     // Skip if already combined
     if output_path.exists() {
+        let metadata = std::fs::metadata(&output_path)?;
+        println!(
+            "Using existing combined FP32 model at {} ({}).",
+            output_path.display(),
+            format_bytes(metadata.len())
+        );
         return Ok(output_path);
     }
 
@@ -136,7 +153,17 @@ pub fn combine_safetensors_to_fp32(
         }
     }
 
+    let total_params: usize = all_tensors
+        .values()
+        .map(|stored| stored.shape.iter().product::<usize>())
+        .sum();
+    let fp32_data_bytes = (total_params * std::mem::size_of::<f32>()) as u64;
+
     println!("Extracted {} tensors", all_tensors.len());
+    println!(
+        "Combined FP32 payload: {total_params} params, {} raw tensor bytes",
+        format_bytes(fp32_data_bytes)
+    );
 
     // Serialize to combined file
     println!("Saving combined FP32 model to {}...", output_path.display());
@@ -151,6 +178,10 @@ pub fn combine_safetensors_to_fp32(
         .collect();
 
     let serialized = safetensors::serialize(&tensor_views, None)?;
+    println!(
+        "Combined safetensors file size: {} including metadata/header",
+        format_bytes(serialized.len() as u64)
+    );
 
     let mut file = File::create(&output_path)?;
     file.write_all(&serialized)?;
