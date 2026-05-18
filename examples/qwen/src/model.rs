@@ -26,10 +26,14 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    pub fn new(cx: &mut Graph, max_seq: usize) -> Self {
-        let mut k_caches = Vec::with_capacity(LAYERS);
-        let mut v_caches = Vec::with_capacity(LAYERS);
-        for l in 0..LAYERS {
+    pub fn new(cx: &mut Graph, max_seq: usize, layers: usize) -> Self {
+        assert!(
+            layers <= LAYERS,
+            "requested {layers} layers, but model has {LAYERS}"
+        );
+        let mut k_caches = Vec::with_capacity(layers);
+        let mut v_caches = Vec::with_capacity(layers);
+        for l in 0..layers {
             let k = cx
                 .named_tensor(format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
                 .persist();
@@ -54,9 +58,13 @@ pub struct Qwen {
 }
 
 impl Qwen {
-    pub fn init(cx: &mut Graph) -> Self {
+    pub fn init(cx: &mut Graph, layers: usize) -> Self {
+        assert!(
+            layers <= LAYERS,
+            "requested {layers} layers, but model has {LAYERS}"
+        );
         let mut w = vec![];
-        for l in 0..LAYERS {
+        for l in 0..layers {
             let up = cx
                 .named_tensor(
                     format!("model.layers.{l}.mlp.up_proj.weight"),
@@ -169,7 +177,7 @@ impl Qwen {
             (token_ids * HIDDEN).expand_dim(1, HIDDEN)
                 + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
         );
-        let mut cache_outputs = Vec::with_capacity(LAYERS);
+        let mut cache_outputs = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
                 x,

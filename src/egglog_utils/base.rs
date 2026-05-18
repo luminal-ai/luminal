@@ -524,6 +524,26 @@ pub fn base_expression_egglog() -> String {
             ])
             .ruleset("expr"),
     );
+    p.add_rule(
+        Rule::new()
+            .facts(vec![
+                peq(v("?expr"), mul(mul(v("?x"), num(v("?a"))), num(v("?b")))),
+                peq(v("?prod"), pmul(v("?a"), v("?b"))),
+            ])
+            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
+            .ruleset("expr")
+            .name("fold-right-associated-const-mul"),
+    );
+    p.add_rule(
+        Rule::new()
+            .facts(vec![
+                peq(v("?expr"), mul(num(v("?b")), mul(v("?x"), num(v("?a"))))),
+                peq(v("?prod"), pmul(v("?a"), v("?b"))),
+            ])
+            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
+            .ruleset("expr")
+            .name("fold-left-associated-const-mul"),
+    );
 
     // Constant folding: div (with conditions)
     p.add_rule(

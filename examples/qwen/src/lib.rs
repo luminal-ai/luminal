@@ -21,6 +21,7 @@ pub struct QwenRunConfig {
     pub search_graphs: usize,
     pub prompt: String,
     pub repetition_penalty: f32,
+    pub layers: usize,
 }
 
 fn qwen3_chat_prompt(user_prompt: &str) -> String {
@@ -38,6 +39,7 @@ impl Default for QwenRunConfig {
             search_graphs: 500,
             prompt: "Explain what a neural network is in a paragraph.".to_string(),
             repetition_penalty: 1.05,
+            layers: LAYERS,
         }
     }
 }
@@ -141,8 +143,9 @@ where
     let mut cx = Graph::default();
     let input = cx.named_tensor("input", 's').as_dtype(DType::Int);
     let token_ids = cx.named_tensor("token_ids", 's').as_dtype(DType::Int);
-    let kv_cache = KVCache::new(&mut cx, config.max_seq_len);
-    let (logits, cache_outputs) = Qwen::init(&mut cx).forward(input, token_ids, &kv_cache);
+    let kv_cache = KVCache::new(&mut cx, config.max_seq_len, config.layers);
+    let (logits, cache_outputs) =
+        Qwen::init(&mut cx, config.layers).forward(input, token_ids, &kv_cache);
     let logits = logits.output();
     for (k_out, v_out) in &cache_outputs {
         k_out.output();
@@ -157,7 +160,7 @@ where
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
     let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
-    for i in 0..LAYERS {
+    for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
     }
@@ -180,7 +183,7 @@ where
     runtime.set_i32_data(token_ids.id, (0..search_s as i32).collect::<Vec<_>>());
     runtime = cx.search(runtime, config.search_graphs);
 
-    for i in 0..LAYERS {
+    for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
     }

@@ -49,6 +49,7 @@ pub trait MetalKernelOp: EgglogOp {
         dyn_map: &FxHashMap<char, usize>,
     );
 
+    #[allow(clippy::too_many_arguments)]
     fn encode(
         &self,
         command_buffer: &CommandBufferRef,
@@ -89,6 +90,10 @@ pub trait MetalKernelOp: EgglogOp {
     }
 
     fn sum_reduce_info(&self) -> Option<MetalSumReduceInfo> {
+        None
+    }
+
+    fn output_aliases_input(&self) -> Option<usize> {
         None
     }
 

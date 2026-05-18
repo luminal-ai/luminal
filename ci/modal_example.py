@@ -1,9 +1,10 @@
 import os
-import re
 import subprocess
 import sys
 
 import modal
+
+from example_output import validate_output
 
 example = os.environ.get("EXAMPLE", "llama")
 gpu_type = os.environ.get("GPU_TYPE", "A100-80GB")
@@ -20,41 +21,6 @@ hf_cache = modal.Volume.from_name(
 )
 
 WORKDIR = "/workspace/luminal"
-
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-
-EXPECTED_OUTPUT = {
-    "qwen": [
-        "computational model inspired by the structure and function of the human brain",
-    ],
-    "gemma4_moe": [
-        "city of romance, art and culture",
-    ],
-    "whisper": [
-        "ask not what your country can do for you",
-    ],
-}
-
-EXPECTED_CONCEPTS = {
-    "llama": [
-        ["layers"],
-        ["neurons", "nodes"],
-        ["learn", "learning", "adapt"],
-        ["data", "patterns", "features"],
-    ],
-    "gemma": [
-        ["neural network", "neural networks"],
-        ["nodes", "neurons"],
-        ["layers"],
-        ["weights"],
-        ["training", "learn", "learns"],
-    ],
-    "qwen3_moe": [
-        ["capital"],
-        ["france"],
-        ["paris"],
-    ],
-}
 
 EXAMPLE_CARGO_ARGS = {
     "qwen": ["--features", "cuda"],
@@ -86,49 +52,6 @@ def run_and_capture(command: list[str], *, cwd: str, env: dict[str, str]) -> str
         raise subprocess.CalledProcessError(return_code, command, output=output)
     return output
 
-
-def normalize_output(output: str) -> str:
-    output = ANSI_ESCAPE.sub("", output)
-    output = output.replace("\r", "\n")
-    return re.sub(r"\s+", " ", output).casefold()
-
-
-def validate_output(example: str, output: str):
-    normalized_output = normalize_output(output)
-
-    expected_concepts = EXPECTED_CONCEPTS.get(example)
-    if expected_concepts is not None:
-        missing = [
-            concept_group
-            for concept_group in expected_concepts
-            if not any(normalize_output(term) in normalized_output for term in concept_group)
-        ]
-        if missing:
-            expected = "\n  - ".join(" / ".join(group) for group in expected_concepts)
-            missing_terms = "\n  - ".join(" / ".join(group) for group in missing)
-            raise AssertionError(
-                f"Output check failed for {example!r}.\n"
-                f"Expected concept groups:\n  - {expected}\n"
-                f"Missing concept groups:\n  - {missing_terms}"
-            )
-
-        expected = ", ".join(" / ".join(group) for group in expected_concepts)
-        print(f"\nOutput check passed for {example!r}: found concepts {expected}")
-        return
-
-    expected_phrases = EXPECTED_OUTPUT.get(example)
-    if expected_phrases is None:
-        raise ValueError(f"No expected output phrases configured for example {example!r}")
-
-    for phrase in expected_phrases:
-        if normalize_output(phrase) in normalized_output:
-            print(f"\nOutput check passed for {example!r}: found {phrase!r}")
-            return
-
-    expected = "\n  - ".join(expected_phrases)
-    raise AssertionError(
-        f"Output check failed for {example!r}. Expected one of:\n  - {expected}"
-    )
 
 cuda_image = (
     modal.Image.from_registry(
