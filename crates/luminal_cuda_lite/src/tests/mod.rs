@@ -5,6 +5,8 @@ mod bucket_tests;
 #[cfg(test)]
 mod consumed_buffer_tests;
 #[cfg(test)]
+mod conv2d_rewrite;
+#[cfg(test)]
 mod cublaslt_rewrite_tests;
 #[cfg(test)]
 mod flashinfer;

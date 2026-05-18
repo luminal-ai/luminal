@@ -444,6 +444,54 @@ fn cublaslt_rewrites_cover_batched_row_order_layout_pairs() {
 }
 
 #[test]
+fn cublaslt_rewrites_cover_flux2_qk_transposed_matmul() {
+    let mut cx = Graph::new();
+    let q = cx.tensor((8usize, 4usize));
+    let k = cx.tensor((8usize, 4usize));
+    let _out = q.matmul(k.t()).output();
+
+    assert_cublaslt_rewrite(cx, "flux2 q @ k.t()", |llir| {
+        cublaslt_matrix_order_tuples(llir).contains(&("ROW", "COL", "ROW", "ROW"))
+            || cublaslt_matrix_order_tuples(llir).contains(&("COL", "COL", "COL", "COL"))
+    });
+}
+
+#[test]
+fn cublaslt_rewrites_cover_flux2_linear_bias_epilogue() {
+    let mut cx = Graph::new();
+    let x = cx.tensor((8usize, 4usize));
+    let weight = cx.tensor((6usize, 4usize));
+    let bias = cx.tensor(6usize);
+    let _out = (x.matmul(weight.t()) + bias.expand_dim(0, 8usize)).output();
+
+    assert_cublaslt_epilogue_rewrite(
+        cx,
+        "flux2 x @ weight.t() + bias",
+        "BIAS",
+        Some(("COL", "COL", "COL", "COL")),
+    );
+}
+
+#[test]
+fn cublaslt_cleanup_prunes_flux2_broadcast_mul_fallback() {
+    let mut cx = Graph::new();
+    let q = cx.tensor((8usize, 4usize));
+    let k = cx.tensor((8usize, 4usize));
+    let _out = q.matmul(k.t()).output();
+
+    cx.build_search_space::<CudaRuntime>();
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        !cublaslt_ir_nodes(egraph).is_empty(),
+        "Flux2 q @ k.t() should have at least one cuBLASLt candidate"
+    );
+    assert!(
+        op_ir_nodes(egraph, "Mul").is_empty(),
+        "cuBLASLt cleanup should prune the broadcast Mul fallback once a cuBLASLt candidate exists"
+    );
+}
+
+#[test]
 fn cublaslt_rewrites_keep_c_and_d_layouts_equal_initially() {
     for case in LAYOUT_CASES {
         let cx = build_batched_matmul_graph(case, DType::F32);
@@ -2841,10 +2889,14 @@ fn assert_no_cublaslt_llir_where(
 }
 
 fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
-    let cublaslt_kind_classes = egraph
+    op_ir_nodes(egraph, "cublaslt")
+}
+
+fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
+    let op_kind_classes = egraph
         .enodes
         .iter()
-        .filter(|(_, (label, _))| label == "cublaslt")
+        .filter(|(_, (label, _))| label == kind_label)
         .map(|(node, _)| egraph.node_to_class[node].clone())
         .collect::<Vec<_>>();
 
@@ -2855,7 +2907,7 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
             (label == "Op"
                 && children
                     .first()
-                    .is_some_and(|kind| cublaslt_kind_classes.contains(kind)))
+                    .is_some_and(|kind| op_kind_classes.contains(kind)))
             .then_some(node)
         })
         .collect()

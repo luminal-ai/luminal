@@ -17,7 +17,7 @@ pub mod matmul2d;
 pub mod other_ops;
 pub mod rope;
 
-pub use conv2d::{Conv2DCustom, Conv2DKernel, conv2d_bias};
+pub use conv2d::KernelConv2D;
 pub use cuda_graph::*;
 pub use matmul2d::{
     Matmul2DCustom, Matmul2DKernel, linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t,
@@ -25,7 +25,7 @@ pub use matmul2d::{
 };
 pub use rope::{RoPECustom, RoPEKernel, apply_rope};
 
-pub type Ops = (hlir::Ops, other_ops::Ops, fusion::Ops);
+pub type Ops = (hlir::Ops, other_ops::Ops, conv2d::KernelConv2D, fusion::Ops);
 
 /// Build a mapping from interned string IDs to their string values for a given sequence.
 fn build_interned_strings(trace: &schema::Trace) -> std::collections::HashMap<(u32, u64), String> {
