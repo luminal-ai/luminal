@@ -1,36 +1,11 @@
-use half::{bf16, f16};
 use hf_hub::api::sync::Api;
-use memmap2::MmapOptions;
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::Deserialize;
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 /// Index file structure for sharded safetensors models
 #[derive(Deserialize)]
 struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
-}
-
-/// Stored tensor data with shape and converted FP32 bytes
-struct StoredTensor {
-    shape: Vec<usize>,
-    data: Vec<f32>,
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.2} {}", UNITS[unit])
 }
 
 /// Downloads model files from HuggingFace and returns the cache directory path.
@@ -60,143 +35,11 @@ pub fn download_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::E
     Ok(model_dir)
 }
 
-/// Convert tensor data to f32 vec
-fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
-    let dtype = tensor.dtype();
-    let data = tensor.data();
-
-    match dtype {
-        Dtype::F32 => bytemuck::cast_slice::<u8, f32>(data).to_vec(),
-        Dtype::F16 => {
-            let f16_slice: &[f16] = bytemuck::cast_slice(data);
-            f16_slice.iter().map(|x| x.to_f32()).collect()
-        }
-        Dtype::BF16 => {
-            let bf16_slice: &[bf16] = bytemuck::cast_slice(data);
-            bf16_slice.iter().map(|x| x.to_f32()).collect()
-        }
-        other => {
-            panic!("Unsupported dtype for conversion: {other:?}");
-        }
-    }
-}
-
-/// Combines sharded safetensors files into a single FP32 file.
-///
-/// This function:
-/// 1. Loads tensors from shard(s)
-/// 2. Converts all to FP32 and writes combined file
-pub fn combine_safetensors_to_fp32(
-    model_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined.safetensors");
-
-    // Skip if already combined
-    if output_path.exists() {
-        let metadata = std::fs::metadata(&output_path)?;
-        println!(
-            "Using existing combined FP32 model at {} ({}).",
-            output_path.display(),
-            format_bytes(metadata.len())
-        );
-        return Ok(output_path);
-    }
-
-    let index_path = model_dir.join("model.safetensors.index.json");
-    let single_shard_path = model_dir.join("model.safetensors");
-
-    // Determine which shard files to load
-    let shard_files: Vec<PathBuf> = if single_shard_path.exists() && !index_path.exists() {
-        println!("Single shard model detected, converting to FP32...");
-        vec![single_shard_path]
-    } else if index_path.exists() {
-        let index_content = std::fs::read_to_string(&index_path)?;
-        let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
-
-        let mut files: Vec<String> = index.weight_map.values().cloned().collect();
-        files.sort();
-        files.dedup();
-
-        println!(
-            "Loading {} shard files (converting to FP32)...",
-            files.len()
-        );
-        files.into_iter().map(|f| model_dir.join(f)).collect()
-    } else {
-        return Err("No model.safetensors or model.safetensors.index.json found".into());
-    };
-
-    // Load and convert all tensors
-    let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
-
-    for shard_path in &shard_files {
-        println!(
-            "  Loading {}...",
-            shard_path.file_name().unwrap().to_string_lossy()
-        );
-        let file = File::open(shard_path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let st = SafeTensors::deserialize(&mmap)?;
-
-        for name in st.names() {
-            let tensor = st.tensor(name)?;
-            let shape: Vec<usize> = tensor.shape().to_vec();
-            let fp32_data = tensor_to_f32(&tensor);
-
-            all_tensors.insert(
-                name.to_string(),
-                StoredTensor {
-                    shape,
-                    data: fp32_data,
-                },
-            );
-        }
-    }
-
-    let total_params: usize = all_tensors
-        .values()
-        .map(|stored| stored.shape.iter().product::<usize>())
-        .sum();
-    let fp32_data_bytes = (total_params * std::mem::size_of::<f32>()) as u64;
-
-    println!("Extracted {} tensors", all_tensors.len());
-    println!(
-        "Combined FP32 payload: {total_params} params, {} raw tensor bytes",
-        format_bytes(fp32_data_bytes)
-    );
-
-    // Serialize to combined file
-    println!("Saving combined FP32 model to {}...", output_path.display());
-
-    let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
-        .iter()
-        .map(|(name, stored)| {
-            let data_bytes: &[u8] = bytemuck::cast_slice(&stored.data);
-            let view = TensorView::new(Dtype::F32, stored.shape.clone(), data_bytes).unwrap();
-            (name.clone(), view)
-        })
-        .collect();
-
-    let serialized = safetensors::serialize(&tensor_views, None)?;
-    println!(
-        "Combined safetensors file size: {} including metadata/header",
-        format_bytes(serialized.len() as u64)
-    );
-
-    let mut file = File::create(&output_path)?;
-    file.write_all(&serialized)?;
-
-    println!("Combined FP32 model saved successfully!");
-    Ok(output_path)
-}
-
 /// Downloads a model from HuggingFace and prepares it for use.
 ///
 /// Returns the path to the model directory containing:
 /// - tokenizer.json
-/// - model_combined.safetensors (FP32)
+/// - model.safetensors or model.safetensors.index.json plus shard files
 pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let model_dir = download_hf_model(repo_id)?;
-    combine_safetensors_to_fp32(&model_dir)?;
-    Ok(model_dir)
+    download_hf_model(repo_id)
 }

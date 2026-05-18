@@ -22,6 +22,7 @@ pub struct QwenRunConfig {
     pub prompt: String,
     pub repetition_penalty: f32,
     pub layers: usize,
+    pub weight_dtype: DType,
 }
 
 fn qwen3_chat_prompt(user_prompt: &str) -> String {
@@ -40,6 +41,7 @@ impl Default for QwenRunConfig {
             prompt: "Explain what a neural network is in a paragraph.".to_string(),
             repetition_penalty: 1.05,
             layers: LAYERS,
+            weight_dtype: DType::F32,
         }
     }
 }
@@ -47,7 +49,7 @@ impl Default for QwenRunConfig {
 pub trait QwenRuntime: Runtime<ExecReturn = ()> {
     type Buffer;
 
-    fn load_safetensors(&mut self, cx: &Graph, file_path: &str);
+    fn load_safetensors(&mut self, cx: &Graph, model_dir: &std::path::Path, dtype: DType);
     fn set_i32_data(&mut self, id: NodeIndex, data: Vec<i32>);
     fn set_zeros(&mut self, id: NodeIndex, num_bytes: usize);
     fn remove_buffer(&mut self, id: NodeIndex) -> Self::Buffer;
@@ -61,8 +63,13 @@ pub trait QwenRuntime: Runtime<ExecReturn = ()> {
 impl QwenRuntime for luminal_cuda_lite::runtime::CudaRuntime {
     type Buffer = luminal_cuda_lite::cudarc::driver::CudaSlice<u8>;
 
-    fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
-        luminal_cuda_lite::runtime::CudaRuntime::load_safetensors(self, cx, file_path);
+    fn load_safetensors(&mut self, cx: &Graph, model_dir: &std::path::Path, _dtype: DType) {
+        let weights_path = model_dir.join("model_combined.safetensors");
+        luminal_cuda_lite::runtime::CudaRuntime::load_safetensors(
+            self,
+            cx,
+            weights_path.to_str().unwrap(),
+        );
     }
 
     fn set_i32_data(&mut self, id: NodeIndex, data: Vec<i32>) {
@@ -90,8 +97,13 @@ impl QwenRuntime for luminal_cuda_lite::runtime::CudaRuntime {
 impl QwenRuntime for luminal_metal::MetalRuntime {
     type Buffer = luminal_metal::Buffer;
 
-    fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
-        luminal_metal::MetalRuntime::load_safetensors(self, cx, file_path);
+    fn load_safetensors(&mut self, cx: &Graph, model_dir: &std::path::Path, dtype: DType) {
+        luminal_metal::MetalRuntime::load_safetensors_as_dtype(
+            self,
+            cx,
+            model_dir.to_str().unwrap(),
+            dtype,
+        );
     }
 
     fn set_i32_data(&mut self, id: NodeIndex, data: Vec<i32>) {
@@ -156,8 +168,7 @@ where
     cx.build_search_space::<R>();
 
     println!("Loading weights...");
-    let weights_path = model_dir.join("model_combined.safetensors");
-    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+    runtime.load_safetensors(&cx, &model_dir, config.weight_dtype);
 
     let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
     for i in 0..config.layers {

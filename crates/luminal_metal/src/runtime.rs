@@ -16,7 +16,18 @@ use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptio
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use safetensors::{Dtype as SafeDType, SafeTensors};
-use std::{fs::File, time::Duration};
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    fs::File,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+#[derive(Deserialize)]
+struct SafetensorsIndex {
+    weight_map: HashMap<String, String>,
+}
 
 #[derive(Clone)]
 struct MetalCompiledBucket {
@@ -156,10 +167,53 @@ impl MetalRuntime {
                     .collect();
                 self.buffer_from_slice(&values)
             }
+            (SafeDType::F32, DType::Bf16) => {
+                let values: Vec<bf16> = bytemuck::cast_slice::<u8, f32>(tensor.data())
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (SafeDType::F16, DType::Bf16) => {
+                let values: Vec<bf16> = bytemuck::cast_slice::<u8, f16>(tensor.data())
+                    .iter()
+                    .map(|v| bf16::from_f32(v.to_f32()))
+                    .collect();
+                self.buffer_from_slice(&values)
+            }
+            (SafeDType::BF16, DType::Bf16) => {
+                let data = tensor.data();
+                self.device.new_buffer_with_data(
+                    data.as_ptr() as *const _,
+                    data.len() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }
             (tensor_dtype, dtype) => {
                 panic!("Cannot load safetensor dtype {tensor_dtype:?} into Metal dtype {dtype:?}")
             }
         }
+    }
+
+    fn safetensor_files(path: &Path) -> Vec<PathBuf> {
+        if path.is_file() {
+            return vec![path.to_path_buf()];
+        }
+
+        let single_file = path.join("model.safetensors");
+        let index_file = path.join("model.safetensors.index.json");
+        if single_file.exists() && !index_file.exists() {
+            return vec![single_file];
+        }
+
+        let index_content = std::fs::read_to_string(&index_file)
+            .unwrap_or_else(|err| panic!("Cannot read safetensors index {index_file:?}: {err}"));
+        let index: SafetensorsIndex = serde_json::from_str(&index_content)
+            .unwrap_or_else(|err| panic!("Cannot parse safetensors index {index_file:?}: {err}"));
+        let mut files: Vec<String> = index.weight_map.values().cloned().collect();
+        files.sort();
+        files.dedup();
+        files.into_iter().map(|file| path.join(file)).collect()
     }
 
     #[cfg(test)]
@@ -184,15 +238,32 @@ impl MetalRuntime {
     }
 
     pub fn load_safetensors(&mut self, cx: &Graph, file_path: &str) {
-        let f = File::open(file_path).unwrap();
-        let mmap = unsafe { MmapOptions::new().map(&f).unwrap() };
-        let st = SafeTensors::deserialize(&mmap).unwrap();
+        self.load_safetensors_with_dtype(cx, file_path, None);
+    }
 
+    pub fn load_safetensors_as_dtype(&mut self, cx: &Graph, file_path: &str, dtype: DType) {
+        self.load_safetensors_with_dtype(cx, file_path, Some(dtype));
+    }
+
+    fn load_safetensors_with_dtype(&mut self, cx: &Graph, file_path: &str, dtype: Option<DType>) {
+        let mut inputs_by_label = HashMap::new();
         for node in cx.graph.node_indices() {
-            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>()
-                && let Ok(tensor) = st.tensor(&input.label)
-            {
-                let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
+            if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>() {
+                inputs_by_label.insert(input.label.clone(), (node, input.dtype));
+            }
+        }
+
+        for shard_path in Self::safetensor_files(Path::new(file_path)) {
+            let f = File::open(&shard_path).unwrap();
+            let mmap = unsafe { MmapOptions::new().map(&f).unwrap() };
+            let st = SafeTensors::deserialize(&mmap).unwrap();
+
+            for name in st.names() {
+                let Some((node, graph_dtype)) = inputs_by_label.get(name).copied() else {
+                    continue;
+                };
+                let tensor = st.tensor(name).unwrap();
+                let buffer = self.buffer_from_safetensor(&tensor, dtype.unwrap_or(graph_dtype));
                 self.input_data.remove(&node);
                 self.hlir_buffers.insert(node, buffer);
             }
