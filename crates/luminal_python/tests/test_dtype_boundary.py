@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from luminal import luminal_backend
-from luminal.compiled_model import DTypeBoundaryWarning
+from luminal.compiled_model import DTypeBoundaryError
 
 
 class BoundaryNoopModel(torch.nn.Module):
@@ -121,6 +121,25 @@ def boundary_device(request) -> torch.device:
     return torch.device(device_name)
 
 
+# Dtypes that round-trip the BoundaryNoopModel without an explicit
+# `x.to(model.input_dtypes[0])` cast at the call site. Anything not in this
+# set is a narrow integer (uint8 / int8 / int16) that luminal collapses to
+# `DType::Int` internally — the hard-reject contract makes the boundary
+# refuse the mismatched dtype, and the test for those lives in
+# `test_input_dtype_mismatch_rejects` instead.
+_FIRST_CLASS_NOOP_DTYPES = {
+    "bool",
+    "int32",
+    "int64_i32_range",
+    "int64_outside_i32_range",
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64_f32_exact",
+    "float64_precision_sensitive",
+}
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -132,6 +151,7 @@ def boundary_device(request) -> torch.device:
             id=case.name,
         )
         for case in DTYPE_CASES
+        if case.name in _FIRST_CLASS_NOOP_DTYPES
     ],
 )
 def test_boundary_noop_preserves_dtype_and_values(
@@ -156,22 +176,28 @@ def test_boundary_noop_preserves_dtype_and_values(
         pytest.param(case, id=case.name)
         for case in DTYPE_CASES
         # Narrower integer widths still collapse to luminal's `Int` (i32) at
-        # the boundary; user inputs of these dtypes trigger a conversion (and
-        # warning) on each call. int64 / float64 are now first-class in the
-        # IR — they no longer require conversion at the boundary, so they
-        # don't belong in this test's parametrize set.
+        # the boundary; user inputs of those dtypes don't match the graph's
+        # declared input dtype and so trigger a hard reject. int64 / float64
+        # are first-class in the IR — they match the graph's declared input
+        # dtype directly and don't reject.
         if case.name in {"uint8", "int8", "int16"}
     ],
 )
-def test_boundary_warns_when_input_dtype_requires_conversion(
+def test_input_dtype_mismatch_rejects(
     boundary_device: torch.device,
     case: DTypeCase,
 ) -> None:
+    """Hard-reject contract: a user input whose dtype doesn't match the
+    graph's declared input dtype raises `DTypeBoundaryError` before the
+    graph runs. Previously the boundary silently cast on every call, which
+    hid real precision bugs (e.g. f64 → f32 truncation on values outside
+    the f32 range) and burnt cycles on a per-call allocation+copy.
+    """
     model = BoundaryNoopModel().to(boundary_device)
     compiled = torch.compile(model, backend=luminal_backend)
     x = case.values().to(boundary_device)
 
-    with pytest.warns(DTypeBoundaryWarning, match="allocate/copy input data"):
+    with pytest.raises(DTypeBoundaryError, match="Convert at the call site"):
         compiled(x)
 
 
@@ -197,10 +223,13 @@ def test_boundary_warns_when_input_dtype_requires_conversion(
         }
     ],
 )
-def test_boundary_does_not_warn_when_input_dtype_matches_graph(
+def test_matching_dtype_does_not_raise(
     boundary_device: torch.device,
     case: DTypeCase,
 ) -> None:
+    """Round-trip contract: a user input whose dtype matches the graph's
+    declared input dtype runs without raising, with no warnings emitted at
+    the boundary."""
     model = BoundaryNoopModel().to(boundary_device)
     compiled = torch.compile(model, backend=luminal_backend)
     x = case.values().to(boundary_device)
@@ -209,9 +238,12 @@ def test_boundary_does_not_warn_when_input_dtype_matches_graph(
         warnings.simplefilter("always")
         compiled(x)
 
-    dtype_boundary_warnings = [
+    boundary_warnings = [
         record
         for record in records
-        if issubclass(record.category, DTypeBoundaryWarning)
+        if "boundary" in str(record.message).lower()
+        or "convert" in str(record.message).lower()
     ]
-    assert dtype_boundary_warnings == []
+    assert boundary_warnings == [], (
+        f"unexpected boundary-related warning(s): {boundary_warnings}"
+    )

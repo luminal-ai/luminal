@@ -1,6 +1,5 @@
 """CompiledModel wrapper for the Rust CompiledGraph."""
 
-import warnings
 from typing import List
 
 import torch
@@ -9,8 +8,18 @@ from .dtype_util import code_to_torch_dtype
 from .dtype_util import torch_dtype_code as _torch_dtype_code
 
 
-class DTypeBoundaryWarning(UserWarning):
-    """Warns when the PyTorch boundary must cast input data before execution."""
+class DTypeBoundaryError(TypeError):
+    """Raised when the caller passes an input whose dtype does not match the
+    compiled graph's declared input dtype.
+
+    The previous behaviour cast silently at every call, which (a) hid real
+    precision bugs (e.g. f64 → f32 truncation on values outside the f32
+    range) and (b) burnt CPU/GPU on a per-call allocation+copy that the
+    user couldn't see in their profile. The contract is now strict:
+    `model(x)` requires `x.dtype == model.input_dtypes[i]` for every
+    positional input. Convert at the call site with
+    `x.to(model.input_dtypes[i])` if you need a different dtype.
+    """
 
 
 class CompiledModel:
@@ -101,21 +110,21 @@ class CompiledModel:
             self._input_names, user_inputs, self._input_dtypes
         ):
             if tensor.dtype != expected_dtype:
-                warnings.warn(
-                    "Luminal compiled input "
-                    f"'{name}' has dtype {tensor.dtype}, but the compiled graph "
-                    f"expects {expected_dtype}; converting at every call will "
-                    "allocate/copy input data.",
-                    DTypeBoundaryWarning,
-                    stacklevel=2,
+                raise DTypeBoundaryError(
+                    f"Luminal compiled input '{name}' expects "
+                    f"{expected_dtype} but got {tensor.dtype}. "
+                    "Convert at the call site with "
+                    f"`x.to({expected_dtype})` — the boundary used to silently "
+                    "cast (and warn) on every call, which masked precision "
+                    "bugs and burnt cycles on per-call allocation+copy."
                 )
             if self._supports_device_ptrs and tensor.is_cuda:
-                t = tensor.detach().contiguous().to(expected_dtype)
+                t = tensor.detach().contiguous()
                 n_bytes = t.numel() * t.element_size()
                 self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
                 _input_refs.append(t)
             else:
-                t = tensor.detach().cpu().contiguous().to(expected_dtype)
+                t = tensor.detach().cpu().contiguous()
                 n_bytes = t.numel() * t.element_size()
                 dtype_code = _torch_dtype_code(t.dtype)
                 self._graph.set_input_from_ptr(name, t.data_ptr(), n_bytes, dtype_code)

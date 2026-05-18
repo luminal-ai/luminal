@@ -31,10 +31,42 @@ impl DynBackend for MetalDynBackend {
     }
 }
 
+/// Reject dtypes the Metal kernel emitters don't support.
+///
+/// Metal codegen has no native 64-bit integer or 64-bit float paths.
+/// Reaching the kernel emitter with one of these dtypes used to panic deep
+/// in MSL generation with an unhelpful error; surfacing a clean message
+/// at translate-time lets the user fall back to CPU or pick a narrower
+/// dtype before any Metal compilation runs.
+fn reject_unsupported_dtype(graph: &Graph) -> Result<(), String> {
+    for node_id in graph.graph.node_indices() {
+        if let Some(input) = (*graph.graph[node_id])
+            .as_any()
+            .downcast_ref::<luminal::hlir::Input>()
+        {
+            match input.dtype {
+                DType::I64 | DType::F64 => {
+                    return Err(format!(
+                        "Metal backend does not support {:?} (input `{}`). \
+                         Metal codegen has no native 64-bit kernels; either \
+                         narrow the dtype (e.g. `.to(torch.int32)` / \
+                         `.to(torch.float32)`) before the boundary or \
+                         compile with the CPU / CUDA backend.",
+                        input.dtype, input.label
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn metal_factory(
     graph: &mut Graph,
     args: BackendCompileArgs,
 ) -> Result<Box<dyn DynBackend>, String> {
+    reject_unsupported_dtype(graph)?;
     compile_backend::<MetalRuntime>(
         graph,
         args,
