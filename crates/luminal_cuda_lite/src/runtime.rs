@@ -651,6 +651,29 @@ impl CudaRuntime {
             .collect_vec()
     }
 
+    /// Read a tensor's output bytes back as i64. The kernel must have emitted
+    /// `long long` writes for the producer (see `cuda_dtype`'s `I64` arm);
+    /// otherwise the bytes interpret as garbage.
+    pub fn get_i64(&self, id: impl ToId) -> Vec<i64> {
+        self.get_output_data(id)
+            .chunks_exact(8)
+            .map(|c| {
+                i64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+            })
+            .collect_vec()
+    }
+
+    /// Read a tensor's output bytes back as f64. The kernel must have emitted
+    /// `double` writes for the producer.
+    pub fn get_f64(&self, id: impl ToId) -> Vec<f64> {
+        self.get_output_data(id)
+            .chunks_exact(8)
+            .map(|c| {
+                f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+            })
+            .collect_vec()
+    }
+
     pub fn get_f16(&self, id: impl ToId) -> Vec<f16> {
         let bytes = self.get_output_data(id);
         let n = bytes.len() / 2;
