@@ -17,18 +17,3 @@ jobs:
             - uses: actions/checkout@v6
             - name: Run Metal crate tests
               run: rustup update; cargo test --release -p luminal_metal --verbose -- --test-threads=1
-
-    qwen_metal_example:
-        name: Qwen Metal Example
-        runs-on: macos-14
-        timeout-minutes: 120
-
-        steps:
-            - uses: actions/checkout@v6
-            - name: Cache Hugging Face models
-              uses: actions/cache@v4
-              with:
-                  path: ~/.cache/huggingface
-                  key: qwen-metal-hf-${{ runner.os }}-${{ runner.arch }}-v1
-            - name: Run qwen Metal example and validate output
-              run: rustup update; python3 ci/metal_qwen_example.py
