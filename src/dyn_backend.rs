@@ -41,6 +41,12 @@ pub trait DynBackend {
     fn get_output_i32(&self, _node: NodeIndex) -> Vec<i32> {
         panic!("get_output_i32 not supported by '{}'", self.name());
     }
+    fn get_output_i64(&self, _node: NodeIndex) -> Vec<i64> {
+        panic!("get_output_i64 not supported by '{}'", self.name());
+    }
+    fn get_output_f64(&self, _node: NodeIndex) -> Vec<f64> {
+        panic!("get_output_f64 not supported by '{}'", self.name());
+    }
     fn get_output_bool(&self, _node: NodeIndex) -> Vec<bool> {
         panic!("get_output_bool not supported by '{}'", self.name());
     }
@@ -215,6 +221,7 @@ pub fn make_ones_bytes(n_elements: usize, dtype: DType) -> Vec<u8> {
         DType::F16 => unsafe { as_bytes(vec![f16::from_f32(1.0); n_elements]) },
         DType::Bf16 => unsafe { as_bytes(vec![bf16::from_f32(1.0); n_elements]) },
         DType::Int => unsafe { as_bytes(vec![1i32; n_elements]) },
+        DType::I64 => unsafe { as_bytes(vec![1i64; n_elements]) },
         DType::I16 => unsafe { as_bytes(vec![1i16; n_elements]) },
         DType::U16 => unsafe { as_bytes(vec![1u16; n_elements]) },
         _ => vec![1u8; n_elements], // I8, U8, Bool, sub-byte types
@@ -232,13 +239,11 @@ pub fn bytes_to_native_data(bytes: Vec<u8>, dtype: DType) -> NativeData {
     }
     match dtype {
         DType::F32 | DType::TF32 => NativeData::F32(unsafe { from_bytes(bytes) }),
-        DType::F64 => {
-            let f64s: Vec<f64> = unsafe { from_bytes(bytes) };
-            NativeData::F32(f64s.into_iter().map(|v| v as f32).collect())
-        }
+        DType::F64 => NativeData::F64(unsafe { from_bytes(bytes) }),
         DType::F16 => NativeData::F16(unsafe { from_bytes(bytes) }),
         DType::Bf16 => NativeData::Bf16(unsafe { from_bytes(bytes) }),
         DType::Int => NativeData::Int(unsafe { from_bytes(bytes) }),
+        DType::I64 => NativeData::I64(unsafe { from_bytes(bytes) }),
         DType::Bool => NativeData::Bool(bytes.into_iter().map(|b| b != 0).collect()),
         DType::I8 => NativeData::Int(bytes.iter().map(|&b| b as i8 as i32).collect()),
         DType::U8 => NativeData::Int(bytes.iter().map(|&b| b as i32).collect()),
@@ -285,6 +290,16 @@ impl DynBackend for NativeDynBackend {
     fn get_output_i32(&self, node: NodeIndex) -> Vec<i32> {
         let data = self.output_buffer(node);
         (0..data.len()).map(|i| data.i32(i)).collect()
+    }
+
+    fn get_output_i64(&self, node: NodeIndex) -> Vec<i64> {
+        let data = self.output_buffer(node);
+        (0..data.len()).map(|i| data.i64(i)).collect()
+    }
+
+    fn get_output_f64(&self, node: NodeIndex) -> Vec<f64> {
+        let data = self.output_buffer(node);
+        (0..data.len()).map(|i| data.f64(i)).collect()
     }
 
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {

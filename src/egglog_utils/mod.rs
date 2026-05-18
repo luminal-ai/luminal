@@ -1480,9 +1480,13 @@ pub fn extract_expr_list<'a>(
 pub fn extract_dtype<'a>(egraph: &'a SerializedEGraph, node: &'a NodeId) -> DType {
     match egraph.enodes[node].0.as_str() {
         "F32" => DType::F32,
+        "F64" => DType::F64,
         "F16" => DType::F16,
         "Bf16" => DType::Bf16,
         "Int" => DType::Int,
+        // `"Int64"` rather than `"I64"` to avoid colliding with egglog's
+        // built-in I64 primitive (see `DType::I64` docstring).
+        "Int64" => DType::I64,
         "Bool" => DType::Bool,
         "F4E2M1" => DType::F4E2M1,
         "F6E2M3" => DType::F6E2M3,

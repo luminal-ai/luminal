@@ -388,26 +388,10 @@ fn bytes_to_typed(bytes: &[u8], dtype: u32) -> TypedData {
         2 => TypedData::from_raw(bytes.to_vec(), DType::I8),
         12 => TypedData::from_raw(bytes.to_vec(), DType::Bool),
 
-        // i64 → i32 (truncate, matching luminal's Int type)
-        5 => {
-            let i32s: Vec<i32> = bytes
-                .chunks_exact(8)
-                .map(|b| {
-                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i32
-                })
-                .collect();
-            TypedData::from_i32_vec(i32s)
-        }
-        // f64 → f32 (downcast, luminal has no F64 in practice for most ops)
-        8 => {
-            let f32s: Vec<f32> = bytes
-                .chunks_exact(8)
-                .map(|b| {
-                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-                })
-                .collect();
-            TypedData::from_f32_vec(f32s)
-        }
+        // i64 / f64 are first-class — preserve raw bytes so values outside
+        // the i32 / f32 representable range round-trip through the IR.
+        5 => TypedData::from_raw(bytes.to_vec(), DType::I64),
+        8 => TypedData::from_raw(bytes.to_vec(), DType::F64),
         // i16 → i32 (widen to luminal's Int)
         3 => {
             let i32s: Vec<i32> = bytes

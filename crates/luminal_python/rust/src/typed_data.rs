@@ -152,8 +152,8 @@ impl TypedData {
     /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype code) to TypedData
     /// in luminal's native format. Handles widening/narrowing conversions for types where
     /// PyTorch's byte layout differs from luminal's:
-    /// - i64 → i32, f64 → f32 (luminal has no 64-bit types)
-    /// - i16 → i32, u8 → i32, i8 → i32 (luminal maps all integer types to i32 for PT2)
+    /// - i64 / f64 preserved as `DType::I64` / `DType::F64` (first-class IR types)
+    /// - i16 → i32, u8 → i32, i8 → i32 (luminal maps narrower integers to i32)
     pub fn from_pytorch_bytes(bytes: Vec<u8>, dtype_code: u32) -> Self {
         match dtype_code {
             // Types that map directly — preserve raw bytes
@@ -162,26 +162,10 @@ impl TypedData {
             13 => Self::from_raw(bytes, DType::Bf16),
             4 => Self::from_raw(bytes, DType::Int), // i32
             12 => Self::from_raw(bytes, DType::Bool),
-            // i64 → i32 (truncate)
-            5 => {
-                let i32s: Vec<i32> = bytes
-                    .chunks_exact(8)
-                    .map(|b| {
-                        i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i32
-                    })
-                    .collect();
-                Self::from_i32_vec(i32s)
-            }
-            // f64 → f32 (downcast)
-            8 => {
-                let f32s: Vec<f32> = bytes
-                    .chunks_exact(8)
-                    .map(|b| {
-                        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-                    })
-                    .collect();
-                Self::from_f32_vec(f32s)
-            }
+            // i64 / f64 — first-class in the IR; preserve bits so values
+            // outside the i32 / f32 representable range survive.
+            5 => Self::from_raw(bytes, DType::I64),
+            8 => Self::from_raw(bytes, DType::F64),
             // i16 → i32 (widen)
             3 => {
                 let i32s: Vec<i32> = bytes

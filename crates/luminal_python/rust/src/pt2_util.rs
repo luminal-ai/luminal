@@ -199,15 +199,22 @@ pub fn resolve_neg1_dim_exprs(
 }
 
 /// Map torch dtype integer (PT2 format) to luminal DType.
-/// PT2 numbering: 1=uint8, 2=int8, 3=int16, 4=int32, 5=int64, 6=float16, 7=float32, 8=float64, 12=bool, 13=bfloat16
+/// PT2 numbering: 1=uint8, 2=int8, 3=int16, 4=int32, 5=int64, 6=float16, 7=float32, 8=float64, 12=bool, 13=bfloat16.
+///
+/// `int64`/`float64` are first-class in the IR (`DType::I64`, `DType::F64`)
+/// so values outside the i32 / f32 representable ranges survive round-trip
+/// through luminal arithmetic. Narrower integer widths still collapse to
+/// `DType::Int`; the user-visible dtype is recovered at the Python boundary
+/// via the PT2 dtype-code metadata kept alongside.
 pub fn torch_dtype_int_to_luminal(dtype: u32) -> DType {
     match dtype {
         6 => DType::F16,
         7 => DType::F32,
-        8 => DType::F32, // float64 → F32 (no F64 in luminal)
+        8 => DType::F64,
         13 => DType::Bf16,
         12 => DType::Bool,
-        1..=5 => DType::Int, // uint8, int8, int16, int32, int64
+        5 => DType::I64,
+        1..=4 => DType::Int, // uint8, int8, int16, int32
         _ => DType::F32,
     }
 }

@@ -1202,6 +1202,17 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.iter().map(|f| f.to_f32()).collect(),
                 NativeData::Bf16(f) => f.iter().map(|f| f.to_f32()).collect(),
                 NativeData::Int(i) => i.iter().map(|i| *i as f32).collect(),
+                NativeData::I64(i) => i.iter().map(|i| *i as f32).collect(),
+                NativeData::F64(f) => f.iter().map(|f| *f as f32).collect(),
+                NativeData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
+            }),
+            DType::F64 => NativeData::F64(match &input[0] {
+                NativeData::F64(f) => f.clone(),
+                NativeData::F32(f) => f.iter().map(|f| *f as f64).collect(),
+                NativeData::F16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
+                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
+                NativeData::Int(i) => i.iter().map(|i| *i as f64).collect(),
+                NativeData::I64(i) => i.iter().map(|i| *i as f64).collect(),
                 NativeData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
             }),
             DType::Int => NativeData::Int(match &input[0] {
@@ -1209,6 +1220,21 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
                 NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
                 NativeData::Int(i) => i.clone(),
+                // Narrowing cast: explicit i64 -> i32, used when the translator
+                // bridges an i64 value through a kernel that only has an i32
+                // path. Values outside the i32 range saturate, matching
+                // `tensor.to(torch.int32)` semantics on overflow.
+                NativeData::I64(i) => i.iter().map(|i| *i as i32).collect(),
+                NativeData::F64(f) => f.iter().map(|f| *f as i32).collect(),
+                NativeData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
+            }),
+            DType::I64 => NativeData::I64(match &input[0] {
+                NativeData::I64(i) => i.clone(),
+                NativeData::Int(i) => i.iter().map(|i| *i as i64).collect(),
+                NativeData::F32(f) => f.iter().map(|f| *f as i64).collect(),
+                NativeData::F64(f) => f.iter().map(|f| *f as i64).collect(),
+                NativeData::F16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
+                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
                 NativeData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
             }),
             DType::F16 => NativeData::F16(match &input[0] {
@@ -1216,6 +1242,8 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.clone(),
                 NativeData::Bf16(f) => f.iter().map(|f| f16::from_f32(f.to_f32())).collect(),
                 NativeData::Int(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
+                NativeData::I64(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
+                NativeData::F64(f) => f.iter().map(|f| f16::from_f64(*f)).collect(),
                 NativeData::Bool(b) => b
                     .iter()
                     .map(|b| f16::from_f32(if *b { 1.0 } else { 0.0 }))
@@ -1226,6 +1254,8 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.iter().map(|f| bf16::from_f32(f.to_f32())).collect(),
                 NativeData::Bf16(f) => f.clone(),
                 NativeData::Int(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
+                NativeData::I64(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
+                NativeData::F64(f) => f.iter().map(|f| bf16::from_f64(*f)).collect(),
                 NativeData::Bool(b) => b
                     .iter()
                     .map(|b| bf16::from_f32(if *b { 1.0 } else { 0.0 }))
@@ -1236,6 +1266,8 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
                 NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
                 NativeData::Int(i) => i.iter().map(|i| *i != 0).collect(),
+                NativeData::I64(i) => i.iter().map(|i| *i != 0).collect(),
+                NativeData::F64(f) => f.iter().map(|f| *f != 0.0).collect(),
                 NativeData::Bool(b) => b.clone(),
             }),
             other => unimplemented!("Cast to {other} is not yet supported in native interpreter"),
@@ -1260,6 +1292,11 @@ fn unary_impl(
         NativeData::F16(f) => NativeData::F16(ind.map(|i| f16_fn(f[i])).collect()),
         NativeData::Bf16(f) => NativeData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
         NativeData::Int(_) => panic!("not implemented for int"),
+        NativeData::I64(_) => panic!("not implemented for i64"),
+        // f64 transcendentals bridge through f32 in v1 — translator inserts
+        // a cast-to-f32 around `Log2`/`Exp2`/etc. before this kernel runs,
+        // so reaching here with F64 indicates a missing bridge.
+        NativeData::F64(_) => panic!("not implemented for f64"),
         NativeData::Bool(_) => panic!("not implemented for bool"),
     }
 }
@@ -1721,6 +1758,12 @@ impl NativeOp for Add {
             NativeData::Int(a) => {
                 NativeData::Int(bin_fn(a_ind, a, b_ind, b, NativeData::i32, |x, y| x + y))
             }
+            NativeData::I64(a) => {
+                NativeData::I64(bin_fn(a_ind, a, b_ind, b, NativeData::i64, |x, y| x + y))
+            }
+            NativeData::F64(a) => {
+                NativeData::F64(bin_fn(a_ind, a, b_ind, b, NativeData::f64, |x, y| x + y))
+            }
             NativeData::Bool(_) => panic!("Cannot add Bool tensors, cast to F32 first"),
         }
     }
@@ -1808,6 +1851,12 @@ impl NativeOp for Mul {
             NativeData::Int(a) => {
                 NativeData::Int(bin_fn(a_ind, a, b_ind, b, NativeData::i32, |x, y| x * y))
             }
+            NativeData::I64(a) => {
+                NativeData::I64(bin_fn(a_ind, a, b_ind, b, NativeData::i64, |x, y| x * y))
+            }
+            NativeData::F64(a) => {
+                NativeData::F64(bin_fn(a_ind, a, b_ind, b, NativeData::f64, |x, y| x * y))
+            }
             NativeData::Bool(_) => panic!("Cannot multiply Bool tensors, cast to F32 first"),
         }
     }
@@ -1894,6 +1943,12 @@ impl NativeOp for Mod {
             }
             NativeData::Int(a) => {
                 NativeData::Int(bin_fn(a_ind, a, b_ind, b, NativeData::i32, |x, y| x % y))
+            }
+            NativeData::I64(a) => {
+                NativeData::I64(bin_fn(a_ind, a, b_ind, b, NativeData::i64, |x, y| x % y))
+            }
+            NativeData::F64(a) => {
+                NativeData::F64(bin_fn(a_ind, a, b_ind, b, NativeData::f64, |x, y| x % y))
             }
             NativeData::Bool(_) => panic!("Cannot mod Bool tensors"),
         }
@@ -2117,6 +2172,16 @@ impl NativeOp for Gather {
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
+            NativeData::I64(a) => NativeData::I64(
+                indexes_ind
+                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .collect(),
+            ),
+            NativeData::F64(a) => NativeData::F64(
+                indexes_ind
+                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .collect(),
+            ),
             NativeData::Bool(a) => NativeData::Bool(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
@@ -2263,9 +2328,11 @@ impl NativeOp for Scatter {
         }
         match (dest, src) {
             (NativeData::F32(d), NativeData::F32(s)) => scatter_impl!(F32, d, s),
+            (NativeData::F64(d), NativeData::F64(s)) => scatter_impl!(F64, d, s),
             (NativeData::F16(d), NativeData::F16(s)) => scatter_impl!(F16, d, s),
             (NativeData::Bf16(d), NativeData::Bf16(s)) => scatter_impl!(Bf16, d, s),
             (NativeData::Int(d), NativeData::Int(s)) => scatter_impl!(Int, d, s),
+            (NativeData::I64(d), NativeData::I64(s)) => scatter_impl!(I64, d, s),
             (NativeData::Bool(d), NativeData::Bool(s)) => scatter_impl!(Bool, d, s),
             _ => panic!("dest and src must have the same dtype!"),
         }
@@ -2398,6 +2465,22 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
+            NativeData::I64(a) => NativeData::I64(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .sum::<i64>()
+                })
+                .collect(),
+            ),
+            NativeData::F64(a) => NativeData::F64(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .sum::<f64>()
+                })
+                .collect(),
+            ),
             NativeData::Bool(_) => panic!("Cannot sum Bool tensors, cast to F32 first"),
         }
     }
@@ -2515,6 +2598,24 @@ impl NativeOp for MaxReduce {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
                         .max()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            ),
+            NativeData::I64(a) => NativeData::I64(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .max()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            ),
+            NativeData::F64(a) => NativeData::F64(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .max_by(|a, b| a.total_cmp(b))
                         .unwrap_or_default()
                 })
                 .collect(),
@@ -2688,6 +2789,8 @@ pub enum NativeData {
     F16(Vec<f16>),
     Bf16(Vec<bf16>),
     Int(Vec<i32>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
     Bool(Vec<bool>),
 }
 
@@ -2701,6 +2804,8 @@ impl NativeData {
             NativeData::F16(v) => v.len(),
             NativeData::Bf16(v) => v.len(),
             NativeData::Int(v) => v.len(),
+            NativeData::I64(v) => v.len(),
+            NativeData::F64(v) => v.len(),
             NativeData::Bool(v) => v.len(),
         }
     }
@@ -2711,6 +2816,8 @@ impl NativeData {
             NativeData::F16(v) => v[i].to_f32(),
             NativeData::Bf16(v) => v[i].to_f32(),
             NativeData::Int(v) => v[i] as f32,
+            NativeData::I64(v) => v[i] as f32,
+            NativeData::F64(v) => v[i] as f32,
             NativeData::Bool(v) => {
                 if v[i] {
                     1.0
@@ -2728,6 +2835,8 @@ impl NativeData {
             NativeData::F32(v) => f16::from_f32(v[i]),
             NativeData::Bf16(v) => f16::from_f32(v[i].to_f32()),
             NativeData::Int(v) => f16::from_f32(v[i] as f32),
+            NativeData::I64(v) => f16::from_f32(v[i] as f32),
+            NativeData::F64(v) => f16::from_f64(v[i]),
             NativeData::Bool(v) => f16::from_f32(if v[i] { 1.0 } else { 0.0 }),
         }
     }
@@ -2739,6 +2848,8 @@ impl NativeData {
             NativeData::F32(v) => bf16::from_f32(v[i]),
             NativeData::F16(v) => bf16::from_f32(v[i].to_f32()),
             NativeData::Int(v) => bf16::from_f32(v[i] as f32),
+            NativeData::I64(v) => bf16::from_f32(v[i] as f32),
+            NativeData::F64(v) => bf16::from_f64(v[i]),
             NativeData::Bool(v) => bf16::from_f32(if v[i] { 1.0 } else { 0.0 }),
         }
     }
@@ -2747,14 +2858,57 @@ impl NativeData {
     pub fn i32(&self, i: usize) -> i32 {
         match self {
             NativeData::Int(v) => v[i],
+            NativeData::I64(v) => v[i] as i32,
             NativeData::F32(v) => v[i] as i32,
             NativeData::F16(v) => v[i].to_f32() as i32,
             NativeData::Bf16(v) => v[i].to_f32() as i32,
+            NativeData::F64(v) => v[i] as i32,
             NativeData::Bool(v) => {
                 if v[i] {
                     1
                 } else {
                     0
+                }
+            }
+        }
+    }
+
+    /// 64-bit signed integer accessor. Used by I64-aware kernels; widens other
+    /// variants when an op promotes a mixed-dtype binary to I64.
+    #[inline]
+    pub fn i64(&self, i: usize) -> i64 {
+        match self {
+            NativeData::I64(v) => v[i],
+            NativeData::Int(v) => v[i] as i64,
+            NativeData::F32(v) => v[i] as i64,
+            NativeData::F16(v) => v[i].to_f32() as i64,
+            NativeData::Bf16(v) => v[i].to_f32() as i64,
+            NativeData::F64(v) => v[i] as i64,
+            NativeData::Bool(v) => {
+                if v[i] {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// 64-bit float accessor. Used by F64-aware kernels.
+    #[inline]
+    pub fn f64(&self, i: usize) -> f64 {
+        match self {
+            NativeData::F64(v) => v[i],
+            NativeData::F32(v) => v[i] as f64,
+            NativeData::F16(v) => v[i].to_f32() as f64,
+            NativeData::Bf16(v) => v[i].to_f32() as f64,
+            NativeData::Int(v) => v[i] as f64,
+            NativeData::I64(v) => v[i] as f64,
+            NativeData::Bool(v) => {
+                if v[i] {
+                    1.0
+                } else {
+                    0.0
                 }
             }
         }
@@ -2768,6 +2922,8 @@ impl NativeData {
             NativeData::F16(v) => v[i].to_f32() != 0.0,
             NativeData::Bf16(v) => v[i].to_f32() != 0.0,
             NativeData::Int(v) => v[i] != 0,
+            NativeData::I64(v) => v[i] != 0,
+            NativeData::F64(v) => v[i] != 0.0,
         }
     }
 }
@@ -2790,6 +2946,16 @@ impl From<Vec<bf16>> for NativeData {
 impl From<Vec<i32>> for NativeData {
     fn from(value: Vec<i32>) -> Self {
         NativeData::Int(value)
+    }
+}
+impl From<Vec<i64>> for NativeData {
+    fn from(value: Vec<i64>) -> Self {
+        NativeData::I64(value)
+    }
+}
+impl From<Vec<f64>> for NativeData {
+    fn from(value: Vec<f64>) -> Self {
+        NativeData::F64(value)
     }
 }
 impl From<Vec<bool>> for NativeData {

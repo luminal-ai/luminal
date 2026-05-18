@@ -81,6 +81,7 @@ fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
         DType::I8 => 2,
         DType::I16 => 3,
         DType::Int => 4, // i32
+        DType::I64 => 5,
         DType::U16 => 4, // u16 -> i32 (Pytorch has no u16 in older versions)
         DType::F16 => 6,
         DType::F32 | DType::TF32 => 7,
@@ -510,6 +511,36 @@ impl CompiledGraph {
             ))
         })?;
         Ok(self.runtime.get_output_i32(*node_id))
+    }
+
+    /// Get output tensor data by name as i64 (copies to host).
+    ///
+    /// Used for `torch.int64` outputs. Reads the native I64 buffer when the
+    /// IR computed in I64 (preserving values outside the i32 range); widens
+    /// i32 / bool when the producer chose a narrower dtype.
+    fn get_output_i64(&self, name: &str) -> PyResult<Vec<i64>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_i64(*node_id))
+    }
+
+    /// Get output tensor data by name as f64 (copies to host).
+    ///
+    /// Used for `torch.float64` outputs. Reads the native F64 buffer when
+    /// the IR computed in F64 (preserving precision-sensitive values); widens
+    /// f32 / f16 / bf16 when the producer chose a narrower dtype.
+    fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_f64(*node_id))
     }
 
     /// Get output tensor data by name as bool (copies to host).

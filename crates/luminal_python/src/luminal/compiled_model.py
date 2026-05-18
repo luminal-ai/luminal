@@ -177,12 +177,27 @@ class CompiledModel:
                         self._graph.copy_output_to_device_ptr(
                             name, out.data_ptr(), out.numel() * out.element_size()
                         )
-                # float64 (the one floating dtype luminal collapses
-                # internally) doesn't match `_zero_copy_native_floats`,
-                # so it falls through to the int / bool / else chain.
-                # The `else` branch reads the kernel's actual f32 bytes
-                # and casts to out_dtype — restoring f64 from the f32
-                # buffer.
+                elif out_dtype == torch.float64:
+                    # Real F64 read — preserves precision-sensitive
+                    # values. Replaces the previous f32-then-`.to(f64)`
+                    # cast-back, which lost information for values
+                    # outside f32's representable range.
+                    data = self._graph.get_output_f64(name)
+                    out = (
+                        torch.tensor(data, dtype=torch.float64)
+                        .reshape(tuple(shape))
+                        .to(input_device)
+                    )
+                elif out_dtype == torch.int64:
+                    # Real I64 read — preserves values outside the i32
+                    # range that the previous i32-buffer-then-`.to(int64)`
+                    # path silently truncated.
+                    data = self._graph.get_output_i64(name)
+                    out = (
+                        torch.tensor(data, dtype=torch.int64)
+                        .reshape(tuple(shape))
+                        .to(input_device)
+                    )
                 elif out_dtype in _int_dtypes:
                     data = self._graph.get_output_i32(name)
                     out = (
@@ -216,7 +231,20 @@ class CompiledModel:
                     if i < len(output_dtype_codes)
                     else torch.float32
                 )
-                if out_dtype in _int_dtypes:
+                if out_dtype == torch.float64:
+                    # Real F64 read — preserves precision-sensitive
+                    # values.
+                    data = self._graph.get_output_f64(name)
+                    out = torch.tensor(data, dtype=torch.float64).reshape(
+                        tuple(shape)
+                    )
+                elif out_dtype == torch.int64:
+                    # Real I64 read — preserves values outside the i32 range.
+                    data = self._graph.get_output_i64(name)
+                    out = torch.tensor(data, dtype=torch.int64).reshape(
+                        tuple(shape)
+                    )
+                elif out_dtype in _int_dtypes:
                     data = self._graph.get_output_i32(name)
                     out = (
                         torch.tensor(data, dtype=torch.int32)

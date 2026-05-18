@@ -85,10 +85,6 @@ DTYPE_CASES = [
         "int64_outside_i32_range",
         torch.int64,
         lambda: torch.tensor([-(2**40), -1, 2**40], dtype=torch.int64),
-        xfail_reason=(
-            "Luminal currently collapses integer inputs through i32 at the "
-            "compiled boundary, so out-of-range int64 values lose information."
-        ),
     ),
     DTypeCase(
         "float64_precision_sensitive",
@@ -96,10 +92,6 @@ DTYPE_CASES = [
         lambda: torch.tensor(
             [1.0, 1.0000000000000002, float(2**40) + 0.25],
             dtype=torch.float64,
-        ),
-        xfail_reason=(
-            "Luminal currently routes float64 no-op computation through f32 "
-            "storage/outputs before restoring the PyTorch-visible dtype."
         ),
     ),
 ]
@@ -163,16 +155,12 @@ def test_boundary_noop_preserves_dtype_and_values(
     [
         pytest.param(case, id=case.name)
         for case in DTYPE_CASES
-        if case.name
-        in {
-            "uint8",
-            "int8",
-            "int16",
-            "int64_i32_range",
-            "int64_outside_i32_range",
-            "float64_f32_exact",
-            "float64_precision_sensitive",
-        }
+        # Narrower integer widths still collapse to luminal's `Int` (i32) at
+        # the boundary; user inputs of these dtypes trigger a conversion (and
+        # warning) on each call. int64 / float64 are now first-class in the
+        # IR — they no longer require conversion at the boundary, so they
+        # don't belong in this test's parametrize set.
+        if case.name in {"uint8", "int8", "int16"}
     ],
 )
 def test_boundary_warns_when_input_dtype_requires_conversion(
@@ -192,7 +180,21 @@ def test_boundary_warns_when_input_dtype_requires_conversion(
     [
         pytest.param(case, id=case.name)
         for case in DTYPE_CASES
-        if case.name in {"bool", "int32", "float16", "bfloat16", "float32"}
+        if case.name
+        in {
+            "bool",
+            "int32",
+            "float16",
+            "bfloat16",
+            "float32",
+            # int64 / float64 are first-class in the IR — passing a tensor
+            # of either dtype matches the graph's input dtype directly, no
+            # conversion needed.
+            "int64_i32_range",
+            "int64_outside_i32_range",
+            "float64_f32_exact",
+            "float64_precision_sensitive",
+        }
     ],
 )
 def test_boundary_does_not_warn_when_input_dtype_matches_graph(
