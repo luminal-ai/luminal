@@ -4,8 +4,6 @@ import sys
 
 import modal
 
-from example_output import validate_output
-
 example = os.environ.get("EXAMPLE", "llama")
 gpu_type = os.environ.get("GPU_TYPE", "A100-80GB")
 CUDARC_CUDA_VERSION = "12080"
@@ -82,6 +80,8 @@ cuda_image = (
 def run_example(example: str):
     """Build and run a luminal example on a Modal GPU."""
     subprocess.run(["nvidia-smi"], check=True)
+    sys.path.insert(0, f"{WORKDIR}/ci")
+    from example_output import validate_output
 
     run_env = {
         **os.environ,
