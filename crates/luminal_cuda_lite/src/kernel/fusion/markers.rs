@@ -9,8 +9,8 @@
 //
 // `FusionEnd::rewrites()` carries the seven rule families that build and
 // extend regions (pair-fuse / grow / merge); the actual single-kernel
-// codegen lives in `region_codegen`. Like FusedX, both markers'
-// `compile()` is `unreachable!()` — region codegen folds them away
+// codegen lives in `region_codegen`. Both markers' `compile()` is
+// `unreachable!()` — region codegen folds them away
 // before kernel_to_host's compile loop reaches an interior node.
 // =========================================================================
 
@@ -142,218 +142,164 @@ impl EgglogOp for FusionEnd {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        // Seven rule families build and extend FE-bracketed regions. Each
-        // pair-fuse rule's LHS pattern matches *un-fused* `KernelX` ops; the
-        // RHS produces `FusedX` variants in a different egglog sort, so the
-        // rule's own output cannot re-match its LHS — cascade is prevented
-        // by typing rather than by a discriminator field.
-        //
-        // Stride compatibility is expressed by reusing variable names: a
-        // unary inside a region matches `(KernelU ?shape ?s ?s ?dt)` (in =
-        // out, no transpose); a binary feeding a downstream op binds the
-        // binary's out-stride to the downstream op's in-stride along the
-        // connecting side.
+        // Generic region growth works directly from HLIR elementwise ops into
+        // `Cuda*Elementwise` region nodes. The concrete HLIR op still appears in
+        // the egraph, so fusion remains a normal nondestructive alternative, but
+        // the region-internal representation is arity based instead of one
+        // dedicated fused sort per operation.
         let mut rules = Vec::new();
 
-        // (KernelX kind, FusedX kind)
         let unaries: &[(&str, &str)] = &[
-            ("KernelSin", "FusedSin"),
-            ("KernelSqrt", "FusedSqrt"),
-            ("KernelExp", "FusedExp"),
-            ("KernelExp2", "FusedExp2"),
-            ("KernelLog2", "FusedLog2"),
-            ("KernelRecip", "FusedRecip"),
+            ("Sin", "Sin"),
+            ("Sqrt", "Sqrt"),
+            ("Exp2", "Exp2"),
+            ("Log2", "Log2"),
+            ("Recip", "Recip"),
         ];
-        // (KernelX kind, FusedX kind, rule-name label)
-        let binaries: &[(&str, &str, &str)] = &[
-            ("KernelAdd", "FusedAdd", "Add"),
-            ("KernelMul", "FusedMul", "Mul"),
-        ];
+        let binaries: &[(&str, &str)] = &[("Add", "Add"), ("Mul", "Mul")];
 
-        // 1. Pair-fuse U → U: U2(U1(x)) → FE(FU2(FU1(FS(x)))).
-        for (ki1, fi1) in unaries {
-            for (ko2, fo2) in unaries {
-                rules.push(Rule::raw(format!(
-                    "(rule (
-                        (= ?u1 (Op ({ki1} ?shape ?s ?s ?dt) (ICons ?x (INil))))
-                        (= ?u2 (Op ({ko2} ?shape ?s ?s ?dt) (ICons ?u1 (INil))))
-                     ) (
-                        (let ?fs (Op (FusionStart ?shape ?s ?dt) (ICons ?x (INil))))
-                        (let ?fu1 (Op ({fi1} ?shape ?s ?s ?dt) (ICons ?fs (INil))))
-                        (let ?fu2 (Op ({fo2} ?shape ?s ?s ?dt) (ICons ?fu1 (INil))))
-                        (let ?fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?fu2 (INil))))
-                        (union ?u2 ?fe)
-                     ) :ruleset fusion_pair :name \"pair-fuse-U-U-{ki1}-{ko2}\")"
-                )));
-            }
-        }
-
-        // 2. Pair-fuse B → U: U(B(a, b)) → FE(FU(FB(FS(a), FS(b)))).
-        for (kb, fb, lb) in binaries {
-            for (ku, fu) in unaries {
-                rules.push(Rule::raw(format!(
-                    "(rule (
-                        (= ?bin (Op ({kb} ?shape ?a_s ?b_s ?o_s ?dt)
-                                     (ICons ?a (ICons ?b (INil)))))
-                        (= ?u (Op ({ku} ?shape ?o_s ?o_s ?dt) (ICons ?bin (INil))))
-                     ) (
-                        (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                        (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                        (let ?fbin (Op ({fb} ?shape ?a_s ?b_s ?o_s ?dt)
-                                       (ICons ?fs_a (ICons ?fs_b (INil)))))
-                        (let ?fu (Op ({fu} ?shape ?o_s ?o_s ?dt) (ICons ?fbin (INil))))
-                        (let ?fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fu (INil))))
-                        (union ?u ?fe)
-                     ) :ruleset fusion_pair :name \"pair-fuse-B-U-{lb}-{ku}\")"
-                )));
-            }
-        }
-
-        // 3. Pair-fuse U → B (lhs / rhs): unary feeds binary's A or B input.
-        //    LHS:  B(U(a), b) → FE(FB(FU(FS(a)), FS(b))).
-        //    RHS:  B(a, U(b)) → FE(FB(FS(a), FU(FS(b)))).
-        for (ku, fu) in unaries {
-            for (kb, fb, lb) in binaries {
-                rules.push(Rule::raw(format!(
-                    "(rule (
-                        (= ?u (Op ({ku} ?shape ?u_s ?u_s ?dt) (ICons ?a (INil))))
-                        (= ?bin (Op ({kb} ?shape ?u_s ?b_s ?o_s ?dt)
-                                     (ICons ?u (ICons ?b (INil)))))
-                     ) (
-                        (let ?fs_a (Op (FusionStart ?shape ?u_s ?dt) (ICons ?a (INil))))
-                        (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                        (let ?fu (Op ({fu} ?shape ?u_s ?u_s ?dt) (ICons ?fs_a (INil))))
-                        (let ?fbin (Op ({fb} ?shape ?u_s ?b_s ?o_s ?dt)
-                                       (ICons ?fu (ICons ?fs_b (INil)))))
-                        (let ?fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
-                        (union ?bin ?fe)
-                     ) :ruleset fusion_pair :name \"pair-fuse-U-B-lhs-{ku}-{lb}\")"
-                )));
-                rules.push(Rule::raw(format!(
-                    "(rule (
-                        (= ?u (Op ({ku} ?shape ?u_s ?u_s ?dt) (ICons ?b (INil))))
-                        (= ?bin (Op ({kb} ?shape ?a_s ?u_s ?o_s ?dt)
-                                     (ICons ?a (ICons ?u (INil)))))
-                     ) (
-                        (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                        (let ?fs_b (Op (FusionStart ?shape ?u_s ?dt) (ICons ?b (INil))))
-                        (let ?fu (Op ({fu} ?shape ?u_s ?u_s ?dt) (ICons ?fs_b (INil))))
-                        (let ?fbin (Op ({fb} ?shape ?a_s ?u_s ?o_s ?dt)
-                                       (ICons ?fs_a (ICons ?fu (INil)))))
-                        (let ?fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
-                        (union ?bin ?fe)
-                     ) :ruleset fusion_pair :name \"pair-fuse-U-B-rhs-{ku}-{lb}\")"
-                )));
-            }
-        }
-
-        // 4. Pair-fuse B → B (lhs / rhs): inner binary feeds outer's A or B.
-        for (kbi, fbi, lbi) in binaries {
-            for (kbo, fbo, lbo) in binaries {
-                rules.push(Rule::raw(format!(
-                    "(rule (
-                        (= ?bi (Op ({kbi} ?shape ?ai_s ?bi_s ?oi_s ?dt)
-                                    (ICons ?a (ICons ?b (INil)))))
-                        (= ?bo (Op ({kbo} ?shape ?oi_s ?co_s ?oo_s ?dt)
-                                    (ICons ?bi (ICons ?c (INil)))))
-                     ) (
-                        (let ?fs_a (Op (FusionStart ?shape ?ai_s ?dt) (ICons ?a (INil))))
-                        (let ?fs_b (Op (FusionStart ?shape ?bi_s ?dt) (ICons ?b (INil))))
-                        (let ?fs_c (Op (FusionStart ?shape ?co_s ?dt) (ICons ?c (INil))))
-                        (let ?fbi (Op ({fbi} ?shape ?ai_s ?bi_s ?oi_s ?dt)
-                                       (ICons ?fs_a (ICons ?fs_b (INil)))))
-                        (let ?fbo (Op ({fbo} ?shape ?oi_s ?co_s ?oo_s ?dt)
-                                       (ICons ?fbi (ICons ?fs_c (INil)))))
-                        (let ?fe (Op (FusionEnd ?shape ?oo_s ?dt) (ICons ?fbo (INil))))
-                        (union ?bo ?fe)
-                     ) :ruleset fusion_pair :name \"pair-fuse-B-B-lhs-{lbi}-{lbo}\")"
-                )));
-                rules.push(Rule::raw(format!(
-                    "(rule (
-                        (= ?bi (Op ({kbi} ?shape ?ai_s ?bi_s ?oi_s ?dt)
-                                    (ICons ?a (ICons ?b (INil)))))
-                        (= ?bo (Op ({kbo} ?shape ?co_s ?oi_s ?oo_s ?dt)
-                                    (ICons ?c (ICons ?bi (INil)))))
-                     ) (
-                        (let ?fs_a (Op (FusionStart ?shape ?ai_s ?dt) (ICons ?a (INil))))
-                        (let ?fs_b (Op (FusionStart ?shape ?bi_s ?dt) (ICons ?b (INil))))
-                        (let ?fs_c (Op (FusionStart ?shape ?co_s ?dt) (ICons ?c (INil))))
-                        (let ?fbi (Op ({fbi} ?shape ?ai_s ?bi_s ?oi_s ?dt)
-                                       (ICons ?fs_a (ICons ?fs_b (INil)))))
-                        (let ?fbo (Op ({fbo} ?shape ?co_s ?oi_s ?oo_s ?dt)
-                                       (ICons ?fs_c (ICons ?fbi (INil)))))
-                        (let ?fe (Op (FusionEnd ?shape ?oo_s ?dt) (ICons ?fbo (INil))))
-                        (union ?bo ?fe)
-                     ) :ruleset fusion_pair :name \"pair-fuse-B-B-rhs-{lbi}-{lbo}\")"
-                )));
-            }
-        }
-
-        // 5. Grow FE → U: U(FE(inner)) → FE(FU(inner)). No new FS.
-        for (ku, fu) in unaries {
+        // Grow FE → unary consumer: U(FE(inner)) → FE(CudaUnary(inner)).
+        for (hlir, opcode) in unaries {
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
-                    (= ?u (Op ({ku} ?shape ?s ?s ?dt) (ICons ?fe (INil))))
+                    (= ?u (Op ({hlir} ?shape ?s ?s) (ICons ?fe (INil))))
                  ) (
-                    (let ?fu (Op ({fu} ?shape ?s ?s ?dt) (ICons ?inner (INil))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?fu (INil))))
+                    (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
+                                   (ICons ?inner (INil))))
+                    (let ?new_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?elem (INil))))
                     (union ?u ?new_fe)
-                 ) :ruleset fusion_grow :name \"grow-FE-U-{ku}\")"
+                    (set (dtype ?new_fe) ?dt)
+                 ) :ruleset fusion_grow :name \"grow-FE-U-{hlir}\")"
             )));
         }
 
-        // 6. Grow FE → B (lhs / rhs): one input is the FE, the other external.
-        for (kb, fb, lb) in binaries {
+        // Grow FE → binary consumer, left and right orientations.
+        for (hlir, opcode) in binaries {
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
-                    (= ?bin (Op ({kb} ?shape ?a_s ?b_s ?o_s ?dt)
+                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
                                  (ICons ?fe (ICons ?b (INil)))))
                  ) (
                     (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (let ?fbin (Op ({fb} ?shape ?a_s ?b_s ?o_s ?dt)
+                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
                                    (ICons ?inner_a (ICons ?fs_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
+                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
                     (union ?bin ?new_fe)
-                 ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{lb}\")"
+                    (set (dtype ?new_fe) ?dt)
+                 ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{hlir}\")"
             )));
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                    (= ?bin (Op ({kb} ?shape ?a_s ?b_s ?o_s ?dt)
+                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
                                  (ICons ?a (ICons ?fe (INil)))))
                  ) (
                     (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?fbin (Op ({fb} ?shape ?a_s ?b_s ?o_s ?dt)
+                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
                                    (ICons ?fs_a (ICons ?inner_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
+                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
                     (union ?bin ?new_fe)
-                 ) :ruleset fusion_grow :name \"grow-FE-B-rhs-{lb}\")"
+                    (set (dtype ?new_fe) ?dt)
+                 ) :ruleset fusion_grow :name \"grow-FE-B-rhs-{hlir}\")"
             )));
         }
 
-        // 7. Merge two FEs at a binary: B(FE(ia), FE(ib)) → FE(FB(ia, ib)).
-        //
-        // This is destructive: after creating the larger region, subsume the
-        // two smaller FusionEnd rows. Without that, independently-grown left
-        // and right regions form a Cartesian product, then those alternatives
-        // can merge again higher in the graph.
-        for (kb, fb, lb) in binaries {
+        // Absorb an elementwise producer through a FusionStart boundary. This
+        // makes a region that initially treats `producer(...)` as an external
+        // input able to pull that producer inside later.
+        for (hlir, opcode) in unaries {
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?u (Op ({hlir} ?shape ?s ?s) (ICons ?x (INil))))
+                    (= ?fs_u (Op (FusionStart ?shape ?s ?dt) (ICons ?u (INil))))
+                 ) (
+                    (let ?fs_x (Op (FusionStart ?shape ?s ?dt) (ICons ?x (INil))))
+                    (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
+                                   (ICons ?fs_x (INil))))
+                    (union ?fs_u ?elem)
+                 ) :ruleset fusion_grow :name \"grow-U-FS-{hlir}\")"
+            )));
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
+                    (= ?bad_fs (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
+                    (= ?bad_elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
+                                     (ICons ?bad_fs (INil))))
+                    (= ?bad_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?bad_elem (INil))))
+                    (= ?good_elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
+                                      (ICons ?inner (INil))))
+                    (= ?good_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?good_elem (INil))))
+                    (= ?bad_fe ?good_fe)
+                 ) (
+                    (delete (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
+                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-unary-{hlir}\")"
+            )));
+        }
+        for (hlir, opcode) in binaries {
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
+                                 (ICons ?a (ICons ?b (INil)))))
+                    (= ?fs_bin (Op (FusionStart ?shape ?out_s ?dt) (ICons ?bin (INil))))
+                 ) (
+                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
+                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
+                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
+                                   (ICons ?fs_a (ICons ?fs_b (INil)))))
+                    (union ?fs_bin ?elem)
+                 ) :ruleset fusion_grow :name \"grow-B-FS-{hlir}\")"
+            )));
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?inner_fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
+                    (= ?bad_fs (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
+                    (= ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
+                    (= ?bad_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
+                                     (ICons ?bad_fs (ICons ?fs_b (INil)))))
+                    (= ?bad_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?bad_elem (INil))))
+                    (= ?good_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
+                                      (ICons ?inner_a (ICons ?fs_b (INil)))))
+                    (= ?good_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?good_elem (INil))))
+                    (= ?bad_fe ?good_fe)
+                 ) (
+                    (delete (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
+                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-lhs-{hlir}\")"
+            )));
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?inner_fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
+                    (= ?bad_fs (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
+                    (= ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
+                    (= ?bad_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
+                                     (ICons ?fs_a (ICons ?bad_fs (INil)))))
+                    (= ?bad_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?bad_elem (INil))))
+                    (= ?good_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
+                                      (ICons ?fs_a (ICons ?inner_b (INil)))))
+                    (= ?good_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?good_elem (INil))))
+                    (= ?bad_fe ?good_fe)
+                 ) (
+                    (delete (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
+                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-rhs-{hlir}\")"
+            )));
+        }
+
+        // Merge two FEs at a binary: B(FE(ia), FE(ib)) → FE(CudaBinary(ia, ib)).
+        for (hlir, opcode) in binaries {
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?fe_a (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                     (= ?fe_b (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                    (= ?bin (Op ({kb} ?shape ?a_s ?b_s ?o_s ?dt)
+                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
                                  (ICons ?fe_a (ICons ?fe_b (INil)))))
                  ) (
-                    (let ?fbin (Op ({fb} ?shape ?a_s ?b_s ?o_s ?dt)
+                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
                                    (ICons ?inner_a (ICons ?inner_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?o_s ?dt) (ICons ?fbin (INil))))
+                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
                     (union ?bin ?new_fe)
-                    (subsume (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
-                    (subsume (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                 ) :ruleset fusion_merge :name \"merge-FE-FE-{lb}\")"
+                    (set (dtype ?new_fe) ?dt)
+                 ) :ruleset fusion_merge :name \"merge-FE-FE-{hlir}\")"
             )));
         }
 

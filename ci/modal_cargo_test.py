@@ -47,6 +47,7 @@ def run_cargo_test():
         [
             "cargo",
             "test",
+            "--release",
             "-p",
             "luminal_cuda_lite",
             "--verbose",

@@ -237,7 +237,14 @@ pub struct BaseSorts {
     pub f8e5m2_dt: SortDef,
     pub f8ue8m0_dt: SortDef,
     pub i4_dt: SortDef,
+    pub u4_dt: SortDef,
+    pub i8_dt: SortDef,
+    pub u8_dt: SortDef,
+    pub i16_dt: SortDef,
+    pub u16_dt: SortDef,
     pub tf32_dt: SortDef,
+    pub f6e2m3_dt: SortDef,
+    pub f6e3m2_dt: SortDef,
     // Egglog builtin primitives (for term construction only)
     pub p_add: SortDef,
     pub p_sub: SortDef,
@@ -321,7 +328,14 @@ impl BaseSorts {
             f8e5m2_dt: sort(DTYPE, "F8E5M2", &[]),
             f8ue8m0_dt: sort(DTYPE, "F8UE8M0", &[]),
             i4_dt: sort(DTYPE, "I4", &[]),
+            u4_dt: sort(DTYPE, "U4", &[]),
+            i8_dt: sort(DTYPE, "I8", &[]),
+            u8_dt: sort(DTYPE, "U8", &[]),
+            i16_dt: sort(DTYPE, "I16", &[]),
+            u16_dt: sort(DTYPE, "U16", &[]),
             tf32_dt: sort(DTYPE, "TF32", &[]),
+            f6e2m3_dt: sort(DTYPE, "F6E2M3", &[]),
+            f6e3m2_dt: sort(DTYPE, "F6E3M2", &[]),
             p_add: func("+", &["a", "b"]),
             p_sub: func("-", &["a", "b"]),
             p_mul: func("*", &["a", "b"]),
@@ -380,7 +394,14 @@ impl BaseSorts {
             &self.f8e5m2_dt,
             &self.f8ue8m0_dt,
             &self.i4_dt,
+            &self.u4_dt,
+            &self.i8_dt,
+            &self.u8_dt,
+            &self.i16_dt,
+            &self.u16_dt,
             &self.tf32_dt,
+            &self.f6e2m3_dt,
+            &self.f6e3m2_dt,
         ] {
             p.add_sort(s);
         }
@@ -503,6 +524,26 @@ pub fn base_expression_egglog() -> String {
             ])
             .ruleset("expr"),
     );
+    p.add_rule(
+        Rule::new()
+            .facts(vec![
+                peq(v("?expr"), mul(mul(v("?x"), num(v("?a"))), num(v("?b")))),
+                peq(v("?prod"), pmul(v("?a"), v("?b"))),
+            ])
+            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
+            .ruleset("expr")
+            .name("fold-right-associated-const-mul"),
+    );
+    p.add_rule(
+        Rule::new()
+            .facts(vec![
+                peq(v("?expr"), mul(num(v("?b")), mul(v("?x"), num(v("?a"))))),
+                peq(v("?prod"), pmul(v("?a"), v("?b"))),
+            ])
+            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
+            .ruleset("expr")
+            .name("fold-left-associated-const-mul"),
+    );
 
     // Constant folding: div (with conditions)
     p.add_rule(
@@ -511,10 +552,7 @@ pub fn base_expression_egglog() -> String {
             div(num(v("a")), num(v("b"))),
             num(pdiv(v("a"), v("b"))),
         )
-        .when(vec![
-            pneq(i64(0), v("b")),
-            peq(i64(0), pmod(v("a"), v("b"))),
-        ])
+        .when(vec![pneq(i64(0), v("b"))])
         .ruleset("expr"),
     );
 
@@ -540,6 +578,28 @@ pub fn base_expression_egglog() -> String {
 
     // Division self-cancel: a/a → 1
     p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
+    p.add_rule(
+        rewrite(
+            "div-mul-num-self",
+            div(mul(v("?x"), num(v("?n"))), num(v("?n"))),
+            v("?x"),
+        )
+        .when(vec![pgte(v("?n"), i64(1))])
+        .ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite(
+            "div-mul-num-plus-rem",
+            div(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
+            v("?x"),
+        )
+        .when(vec![
+            pgte(v("?n"), i64(1)),
+            pgte(v("?r"), i64(0)),
+            plt(v("?r"), v("?n")),
+        ])
+        .ruleset("expr"),
+    );
 
     // Constant folding: ceildiv
     p.add_rule(
@@ -609,6 +669,28 @@ pub fn base_expression_egglog() -> String {
         )
         .ruleset("expr"),
     );
+    p.add_rule(
+        rewrite(
+            "mod-const",
+            modd(num(v("a")), num(v("b"))),
+            num(pmod(v("a"), v("b"))),
+        )
+        .when(vec![pneq(i64(0), v("b"))])
+        .ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite(
+            "mod-mul-num-plus-rem",
+            modd(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
+            num(v("?r")),
+        )
+        .when(vec![
+            pgte(v("?n"), i64(1)),
+            pgte(v("?r"), i64(0)),
+            plt(v("?r"), v("?n")),
+        ])
+        .ruleset("expr"),
+    );
 
     p.add_rule(
         rewrite(
@@ -660,6 +742,12 @@ pub fn base_expression_egglog() -> String {
             div(div(v("a"), num(v("?b"))), num(v("?c"))),
             div(v("a"), num(pmul(v("?b"), v("?c")))),
         )
+        .when(vec![
+            pgte(v("?b"), i64(1)),
+            pgte(v("?c"), i64(1)),
+            plt(v("?b"), i64(3_037_000_500)),
+            plt(v("?c"), i64(3_037_000_500)),
+        ])
         .ruleset("expr"),
     );
 

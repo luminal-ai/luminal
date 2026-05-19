@@ -135,6 +135,11 @@ class CompiledModel:
         # Run the graph
         self._graph.run()
 
+        # Integer dtypes for which we read the buffer as i32 and then cast.
+        # Includes int64 because luminal collapses all integer types to its
+        # 32-bit `Int` internally — we restore the original precision here.
+        _int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+
         # Collect outputs
         if _use_zero_copy:
             outputs = []
@@ -150,11 +155,12 @@ class CompiledModel:
                         self._graph.copy_output_to_device_ptr(
                             name, out.data_ptr(), out.numel() * out.element_size()
                         )
-                elif out_dtype == torch.int32:
+                elif out_dtype in _int_dtypes:
                     data = self._graph.get_output_i32(name)
                     out = (
                         torch.tensor(data, dtype=torch.int32)
                         .reshape(tuple(shape))
+                        .to(out_dtype)
                         .to(input_device)
                     )
                 elif out_dtype == torch.bool:
@@ -182,9 +188,13 @@ class CompiledModel:
                     if i < len(output_dtype_codes)
                     else torch.float32
                 )
-                if out_dtype == torch.int32:
+                if out_dtype in _int_dtypes:
                     data = self._graph.get_output_i32(name)
-                    out = torch.tensor(data, dtype=torch.int32).reshape(tuple(shape))
+                    out = (
+                        torch.tensor(data, dtype=torch.int32)
+                        .reshape(tuple(shape))
+                        .to(out_dtype)
+                    )
                 elif out_dtype == torch.bool:
                     data = self._graph.get_output_bool(name)
                     out = torch.tensor(data, dtype=torch.bool).reshape(tuple(shape))

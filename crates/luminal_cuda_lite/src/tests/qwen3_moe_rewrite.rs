@@ -8,10 +8,10 @@ use crate::{
 };
 
 const SEQ: usize = 2;
-const HIDDEN: usize = 16;
+const HIDDEN: usize = 32;
 const NUM_EXPERTS: usize = 8;
 const TOP_K: usize = 2;
-const MOE_INTERMEDIATE: usize = 6;
+const MOE_INTERMEDIATE: usize = 12;
 const RMS_NORM_EPS: f32 = 1e-6;
 
 struct QwenMoeGraph {
@@ -58,6 +58,7 @@ fn build_qwen_moe_graph() -> QwenMoeGraph {
         .iota(Expression::from('z') / k_expr * e_dim, top_k_indices.dims());
     let routing_flat_idx = row_offsets + top_k_indices;
     let top_k_values = routing_weights.gather(routing_flat_idx);
+    let top_k_values = top_k_values / top_k_values.sum(n - 1).expand_dim(n - 1, TOP_K);
 
     let gate_up_gathered = gather_experts(x, top_k_indices, gate_up_weights).cast(DType::F32);
     let x_exp = x.expand_dim(n - 1, TOP_K).unsqueeze(n);
@@ -71,9 +72,9 @@ fn build_qwen_moe_graph() -> QwenMoeGraph {
         .unsqueeze(2)
         .matmul(down_gathered.transpose(2, 3))
         .squeeze(2);
-    let output = (down_out * top_k_values.unsqueeze(top_k_values.dims().len()))
-        .sum(n - 1)
-        .output();
+    let mut weights_exp = top_k_values.unsqueeze(top_k_values.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    let output = (down_out * weights_exp).sum(n - 1).output();
 
     QwenMoeGraph {
         graph: cx,
@@ -130,9 +131,9 @@ fn build_gemma_moe_graph() -> GemmaMoeGraph {
         .unsqueeze(2)
         .matmul(down_gathered.transpose(2, 3))
         .squeeze(2);
-    let output = (down_out * top_k_weights.unsqueeze(top_k_weights.dims().len()))
-        .sum(n - 1)
-        .output();
+    let mut weights_exp = top_k_weights.unsqueeze(top_k_weights.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    let output = (down_out * weights_exp).sum(n - 1).output();
 
     GemmaMoeGraph {
         graph: cx,
@@ -270,7 +271,7 @@ fn test_glumoe_matches_qwen_swiglu_pattern() {
         return;
     }
 
-    assert_eq!(modes, vec![GLUMoEMode::SwiGLU]);
+    assert_eq!(modes, vec![GLUMoEMode::SwiGLUNormalized]);
 }
 
 #[test]
@@ -292,7 +293,7 @@ fn test_glumoe_swiglu_matches_unfused_output() {
     assert!(baseline_modes.is_empty());
 
     let (actual, fused_modes) = run_qwen_moe(true);
-    assert_eq!(fused_modes, vec![GLUMoEMode::SwiGLU]);
+    assert_eq!(fused_modes, vec![GLUMoEMode::SwiGLUNormalized]);
     assert_close(&actual, &expected, 3e-2, 3e-2);
 }
 

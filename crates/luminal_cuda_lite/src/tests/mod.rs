@@ -5,7 +5,11 @@ mod bucket_tests;
 #[cfg(test)]
 mod consumed_buffer_tests;
 #[cfg(test)]
+mod conv2d_rewrite;
+#[cfg(test)]
 mod cublaslt_rewrite_tests;
+#[cfg(test)]
+mod flashinfer;
 #[cfg(test)]
 mod fusion;
 #[cfg(test)]
@@ -16,5 +20,9 @@ mod op_functional_tests;
 mod performance_tests;
 #[cfg(test)]
 mod qwen3_moe_rewrite;
+#[cfg(test)]
+mod rope_test;
+#[cfg(test)]
+mod search_equivalence_fuzz;
 #[cfg(test)]
 mod transformer;

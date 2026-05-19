@@ -50,7 +50,7 @@ const WORKSPACE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 ///   3: gate_up_w      [E, gate_up_dim, hidden]             BF16
 ///   4: down_w         [E, hidden, intermediate]             BF16
 ///   5: mode_aux
-///      - SwiGLU: ignored (rewriter wires `topk_values` again)
+///      - SwiGLU/SwiGLUNormalized: ignored (rewriter wires `topk_values` again)
 ///      - GemmaGELU: per_expert_scale [E]                   F32
 ///
 /// Output: [seq, hidden] F32
@@ -78,6 +78,7 @@ pub struct GLUMoE {
 pub(crate) enum GLUMoEMode {
     SwiGLU,
     GemmaGELU,
+    SwiGLUNormalized,
 }
 
 impl GLUMoEMode {
@@ -85,6 +86,7 @@ impl GLUMoEMode {
         match mode_id {
             0 => Self::SwiGLU,
             1 => Self::GemmaGELU,
+            2 => Self::SwiGLUNormalized,
             other => {
                 panic!("Unknown GLUMoE mode id: {other}");
             }
@@ -93,7 +95,7 @@ impl GLUMoEMode {
 
     fn activation_kernel_mode(self) -> i32 {
         match self {
-            Self::SwiGLU => 0,
+            Self::SwiGLU | Self::SwiGLUNormalized => 0,
             Self::GemmaGELU => 1,
         }
     }
@@ -383,22 +385,22 @@ impl HostOp for GLUMoE {
         let mode_aux_buf = get_buffer("mode aux", inputs[5])?;
         let output_buf = get_buffer("output", self_node)?; // [seq, hidden] F32
 
-        let topk_bytes = seq * top_k * 4;
+        let min_topk_bytes = seq * top_k * 4;
         if x_buf.len() < output_bytes {
             anyhow::bail!(
                 "GLUMoE x buffer too small: have {} bytes, need {output_bytes}",
                 x_buf.len()
             );
         }
-        if topk_idx_buf.len() < topk_bytes {
+        if topk_idx_buf.len() < min_topk_bytes {
             anyhow::bail!(
-                "GLUMoE topk index buffer too small: have {} bytes, need {topk_bytes}",
+                "GLUMoE topk index buffer too small: have {} bytes, need {min_topk_bytes}",
                 topk_idx_buf.len()
             );
         }
-        if topk_vals_buf.len() < topk_bytes {
+        if topk_vals_buf.len() < min_topk_bytes {
             anyhow::bail!(
-                "GLUMoE topk value buffer too small: have {} bytes, need {topk_bytes}",
+                "GLUMoE topk value buffer too small: have {} bytes, need {min_topk_bytes}",
                 topk_vals_buf.len()
             );
         }
@@ -440,24 +442,83 @@ impl HostOp for GLUMoE {
 
         // Read top-k routing values from GPU
         let topk_idx_host: Vec<u8> = topk_idx_buf.clone_dtoh(stream)?;
-        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host[..topk_bytes]);
+        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host);
         let topk_vals_host: Vec<u8> = topk_vals_buf.clone_dtoh(stream)?;
-        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host[..topk_bytes]);
+        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
 
-        for (pos, &expert_idx) in topk_idx_i32.iter().enumerate() {
-            if expert_idx < 0 || expert_idx as usize >= num_experts {
-                anyhow::bail!(
-                    "GLUMoE expert index {expert_idx} at routing position {pos} out of bounds for {num_experts} experts"
-                );
+        if !topk_idx_i32.len().is_multiple_of(seq) {
+            anyhow::bail!(
+                "GLUMoE topk index element count {} is not divisible by seq {seq}",
+                topk_idx_i32.len()
+            );
+        }
+        if !topk_vals_f32.len().is_multiple_of(seq) {
+            anyhow::bail!(
+                "GLUMoE topk value element count {} is not divisible by seq {seq}",
+                topk_vals_f32.len()
+            );
+        }
+        let topk_idx_row_stride = topk_idx_i32.len() / seq;
+        let topk_vals_row_stride = topk_vals_f32.len() / seq;
+        if topk_idx_row_stride < top_k {
+            anyhow::bail!(
+                "GLUMoE topk index row stride {topk_idx_row_stride} is smaller than top_k {top_k}"
+            );
+        }
+        if topk_vals_row_stride < top_k {
+            anyhow::bail!(
+                "GLUMoE topk value row stride {topk_vals_row_stride} is smaller than top_k {top_k}"
+            );
+        }
+
+        let topk_idx_at = |token: usize, expert: usize| -> i32 {
+            topk_idx_i32[token * topk_idx_row_stride + expert]
+        };
+        let topk_val_at = |token: usize, expert: usize| -> f32 {
+            topk_vals_f32[token * topk_vals_row_stride + expert]
+        };
+
+        for t in 0..seq {
+            for i in 0..top_k {
+                let expert_idx = topk_idx_at(t, i);
+                if expert_idx < 0 || expert_idx as usize >= num_experts {
+                    anyhow::bail!(
+                        "GLUMoE expert index {expert_idx} at token {t} top-k position {i} out of bounds for {num_experts} experts"
+                    );
+                }
             }
         }
 
         // Mode-dependent expert weights used for the final reduction:
         // - SwiGLU: direct topk values
+        // - SwiGLUNormalized: normalize topk values row-wise
         // - GemmaGELU: normalize topk values and scale by per-expert factors
         let mut expert_weights_storage: Vec<f32> = Vec::new();
         let expert_weights_f32: &[f32] = match self.mode {
-            GLUMoEMode::SwiGLU => topk_vals_f32,
+            GLUMoEMode::SwiGLU => {
+                if topk_vals_row_stride == top_k {
+                    topk_vals_f32
+                } else {
+                    expert_weights_storage.resize(seq * top_k, 0.0);
+                    for t in 0..seq {
+                        for i in 0..top_k {
+                            expert_weights_storage[t * top_k + i] = topk_val_at(t, i);
+                        }
+                    }
+                    &expert_weights_storage
+                }
+            }
+            GLUMoEMode::SwiGLUNormalized => {
+                expert_weights_storage.resize(seq * top_k, 0.0);
+                for t in 0..seq {
+                    let norm = (0..top_k).map(|i| topk_val_at(t, i)).sum::<f32>();
+                    let inv_norm = if norm != 0.0 { norm.recip() } else { 0.0 };
+                    for i in 0..top_k {
+                        expert_weights_storage[t * top_k + i] = topk_val_at(t, i) * inv_norm;
+                    }
+                }
+                &expert_weights_storage
+            }
             GLUMoEMode::GemmaGELU => {
                 let per_expert_scale_host: Vec<u8> = mode_aux_buf.clone_dtoh(stream)?;
                 let per_expert_scale_bytes = num_experts * 4;
@@ -471,12 +532,10 @@ impl HostOp for GLUMoE {
                     bytemuck::cast_slice(&per_expert_scale_host[..per_expert_scale_bytes]);
                 expert_weights_storage.resize(seq * top_k, 0.0);
                 for t in 0..seq {
-                    let base = t * top_k;
-                    let vals = &topk_vals_f32[base..base + top_k];
-                    let norm = vals.iter().copied().sum::<f32>();
+                    let norm = (0..top_k).map(|i| topk_val_at(t, i)).sum::<f32>();
                     let inv_norm = if norm != 0.0 { norm.recip() } else { 0.0 };
                     for i in 0..top_k {
-                        let expert_idx = topk_idx_i32[base + i] as usize;
+                        let expert_idx = topk_idx_at(t, i) as usize;
                         if expert_idx >= per_expert_scale_f32.len() {
                             anyhow::bail!(
                                 "GLUMoE Gemma mode expert index {} out of bounds {}",
@@ -485,7 +544,8 @@ impl HostOp for GLUMoE {
                             );
                         }
                         let scale = per_expert_scale_f32[expert_idx];
-                        expert_weights_storage[base + i] = vals[i] * inv_norm * scale;
+                        expert_weights_storage[t * top_k + i] =
+                            topk_val_at(t, i) * inv_norm * scale;
                     }
                 }
                 &expert_weights_storage
@@ -525,12 +585,10 @@ impl HostOp for GLUMoE {
 
         for t in 0..seq {
             let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64; // BF16
-            let expert_indices = &topk_idx_i32[t * top_k..(t + 1) * top_k];
             let weights = &expert_weights_f32[t * top_k..(t + 1) * top_k];
 
-            for (i, (&expert_idx, &weight)) in expert_indices.iter().zip(weights.iter()).enumerate()
-            {
-                let expert_idx = expert_idx as usize;
+            for (i, &weight) in weights.iter().enumerate() {
+                let expert_idx = topk_idx_at(t, i) as usize;
 
                 // a. Gate+Up matmul (BF16 in, BF16 out)
                 let expert_gu_ptr = gate_up_ptr + expert_idx as u64 * gu_stride;

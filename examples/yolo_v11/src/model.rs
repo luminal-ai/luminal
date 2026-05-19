@@ -99,7 +99,7 @@ impl Conv {
 
     /// Apply the convolution + bias (no activation). Closely mirrors the
     /// pt2-translator's `conv_unfold` so it exercises the same tested code
-    /// paths in the luminal e-graph. Special-cases 1x1 convs to a plain matmul
+    /// paths in the luminal e-graph. Special-cases 1x1 convs to an HLIR matmul
     /// (no unfold) since they don't need spatial windowing.
     pub fn forward_no_act(&self, x: GraphTensor) -> GraphTensor {
         let x = canonicalize_static_shape(x);
@@ -179,9 +179,8 @@ impl Conv {
         self.forward_no_act(x).silu()
     }
 
-    /// Specialized 1x1 conv path: equivalent to a per-spatial matmul with no
-    /// unfold and no padding. Uses a 2D matmul so the e-graph can match
-    /// luminal_cuda_lite's TileMatmulFullSplit specialization.
+    /// Specialized 1x1 conv path: equivalent to a per-spatial HLIR matmul with
+    /// no unfold and no padding.
     fn forward_1x1(&self, x: GraphTensor) -> GraphTensor {
         // x: (1, c_in, H, W) -> drop batch dim, then permute to (H, W, c_in)
         let dims = x.dims();
@@ -189,7 +188,7 @@ impl Conv {
         let w = dims[3];
         let x = x.squeeze(0); // (c_in, H, W)
         let xt = x.permute(&[1, 2, 0]); // (H, W, c_in)
-                                        // 2D matmul matches the specialized kernel in cuda_lite.
+        // Pure HLIR matmul over flattened spatial positions.
         let xt = xt.merge_dims(0, 1); // (H*W, c_in)
         let out = xt.matmul(self.weight.t()); // (H*W, c_out)
         let out = out.split_dims(0, w); // (H, W, c_out)
@@ -298,11 +297,7 @@ impl Bottleneck {
 
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
         let y = self.cv2.forward(self.cv1.forward(x));
-        if self.add {
-            (x + y) * 1.0
-        } else {
-            y
-        }
+        if self.add { (x + y) * 1.0 } else { y }
     }
 }
 
@@ -394,8 +389,8 @@ impl C3k2 {
         cx: &mut Graph,
     ) -> Self {
         let c = (c2 as f32 * config.e) as usize; // hidden
-                                                 // Two halves of the original cv1 (channel-split). Saved as
-                                                 // model.<L>.cv1{a,b}.conv.{weight,bias} by python/reference.py.
+        // Two halves of the original cv1 (channel-split). Saved as
+        // model.<L>.cv1{a,b}.conv.{weight,bias} by python/reference.py.
         let cv1a = Conv::new(&format!("{name}.cv1a.conv"), c1, c, 1, 1, 0, cx);
         let cv1b = Conv::new(&format!("{name}.cv1b.conv"), c1, c, 1, 1, 0, cx);
         let cv2 = Conv::new(&format!("{name}.cv2.conv"), (2 + n) * c, c2, 1, 1, 0, cx);
@@ -864,7 +859,7 @@ impl Detect {
         // 4 outer and reg_max inner. luminal split_dims(axis, inner_size) places `inner_size`
         // as the new inner dim, so we must pass REG_MAX (not 4) to get (1, 4, REG_MAX, A).
         let dfl_in = boxes.split_dims(1, REG_MAX); // (1, 4, REG_MAX, A)
-                                                   // Then transpose so the REG_MAX bin axis becomes the softmax channel axis.
+        // Then transpose so the REG_MAX bin axis becomes the softmax channel axis.
         let dfl_in = dfl_in.transpose(1, 2); // (1, REG_MAX, 4, A)
         let dfl_in = dfl_in.softmax(1);
 
@@ -891,7 +886,7 @@ impl Detect {
         // Multiply by strides: (1, 1, A)
         let strides = self.strides.expand_dim(0, 1); // (1, 1, A)
         let dbox = dbox * strides.expand_dim(1, 4usize).squeeze(2); // broadcast across 4 box dims
-                                                                    // (the squeeze removes the size-1 channel from the second expand)
+        // (the squeeze removes the size-1 channel from the second expand)
 
         let scores_sig = scores.sigmoid();
         dbox.concat_along(scores_sig, 1)
@@ -1057,4 +1052,34 @@ pub fn make_anchors_and_strides(
 /// DFL constant weights (arange(reg_max) reshaped as (1, reg_max, 1, 1)).
 pub fn dfl_weight() -> Vec<f32> {
     (0..REG_MAX as i32).map(|i| i as f32).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use luminal::hlir::CustomOpKind;
+
+    use super::*;
+
+    #[test]
+    fn yolo_forward_graph_uses_no_custom_ops() {
+        let mut cx = Graph::default();
+        let img = cx.named_tensor("input.image", (1usize, 3usize, IMG_SIZE, IMG_SIZE));
+        let yolo = YoloV11::init(&mut cx);
+        let _ = yolo.forward(img).output();
+
+        assert!(
+            cx.custom_ops.is_empty(),
+            "YOLO should express model computation in pure HLIR, not registered CustomOp wrappers"
+        );
+
+        let custom_nodes: Vec<_> = cx
+            .graph
+            .node_indices()
+            .filter(|&node| cx.try_get_op::<CustomOpKind>(node).is_some())
+            .collect();
+        assert!(
+            custom_nodes.is_empty(),
+            "YOLO graph contains CustomOpKind HLIR nodes: {custom_nodes:?}"
+        );
+    }
 }

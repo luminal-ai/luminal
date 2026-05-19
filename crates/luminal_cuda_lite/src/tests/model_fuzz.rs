@@ -305,7 +305,7 @@ fn fuzz_layer_no_attn(
 }
 
 /// Test a SwiGLU MLP with HLIR-only to specifically verify
-/// the HLIR matmul decomposition (KernelMul + KernelSumReduce).
+/// the HLIR matmul decomposition (elementwise Mul + KernelSumReduce).
 fn fuzz_mlp_hlir_only(seq: usize, hidden: usize, intermediate: usize, seed: u64) {
     let Some(stream) = get_cuda_stream() else {
         return;

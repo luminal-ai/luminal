@@ -123,7 +123,7 @@ pub fn binary_sort(name: &str) -> SortDef {
 /// single-binary-op loop with its fully-unrolled equivalent in the same
 /// eclass. Both representations coexist; the cost-based extractor picks
 /// whichever one downstream patterns prefer — the unrolled form when fusions
-/// (e.g. GLUMoE GemmaGELU, KernelExp's `direct-exp-fusion`) match through
+/// (e.g. GLUMoE GemmaGELU, CUDA elementwise exp fusion) match through
 /// the flat chain, the rolled form otherwise. Without these unions, rolling
 /// a tiny chain blocks the fusion entirely and the extracted graph is
 /// strictly worse than not rolling.

@@ -99,6 +99,87 @@ def test_kv_cache_growing():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
+    reason="dynamic-cache torch.compile reuse requires CUDA coverage",
+)
+@pytest.mark.slow
+def test_dynamic_kv_cache_torch_compile_matches_reference_and_reuses_decode_graph():
+    """End-to-end server-style path: torch.compile + DynamicCache on CUDA."""
+    from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
+
+    backend_invocations = []
+
+    def counting_backend(gm, example_inputs, options=None):
+        backend_invocations.append((gm, example_inputs))
+        return luminal_backend(gm, example_inputs, options)
+
+    prev_auto = torch._dynamo.config.automatic_dynamic_shapes
+    prev_cache_limit = torch._dynamo.config.cache_size_limit
+    prev_recompile_limit = torch._dynamo.config.recompile_limit
+    torch._dynamo.config.automatic_dynamic_shapes = True
+    torch._dynamo.config.cache_size_limit = 16
+    torch._dynamo.config.recompile_limit = 16
+
+    try:
+        model = (
+            LlamaForCausalLM(
+                LlamaConfig(
+                    hidden_size=64,
+                    num_attention_heads=4,
+                    num_key_value_heads=2,
+                    num_hidden_layers=1,
+                    intermediate_size=128,
+                    vocab_size=256,
+                    max_position_embeddings=128,
+                    use_cache=True,
+                    attn_implementation="eager",
+                )
+            )
+            .eval()
+            .cuda()
+        )
+        compiled = torch.compile(model, backend=counting_backend, fullgraph=True)
+
+        ref_cache = DynamicCache(config=model.config)
+        out_cache = DynamicCache(config=model.config)
+        input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
+
+        with torch.no_grad():
+            ref = model(input_ids=input_ids, past_key_values=ref_cache, use_cache=True)
+            out = compiled(
+                input_ids=input_ids,
+                past_key_values=out_cache,
+                use_cache=True,
+            )
+
+        for _ in range(4):
+            ref_next = int(ref.logits[0, -1].argmax().item())
+            out_next = int(out.logits[0, -1].argmax().item())
+            assert out_next == ref_next
+            with torch.no_grad():
+                ref = model(
+                    input_ids=torch.tensor([[ref_next]], device="cuda"),
+                    past_key_values=ref.past_key_values,
+                    use_cache=True,
+                )
+                out = compiled(
+                    input_ids=torch.tensor([[out_next]], device="cuda"),
+                    past_key_values=out.past_key_values,
+                    use_cache=True,
+                )
+
+        assert len(backend_invocations) == 3, (
+            "Expected prefill/static decode/dynamic decode traces only once each, "
+            f"got {len(backend_invocations)} backend invocations"
+        )
+    finally:
+        torch._dynamo.config.automatic_dynamic_shapes = prev_auto
+        torch._dynamo.config.cache_size_limit = prev_cache_limit
+        torch._dynamo.config.recompile_limit = prev_recompile_limit
+        torch._dynamo.reset()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
     reason="R1 full-width 1-layer is too memory-heavy for CPU native backend",
 )
 @pytest.mark.slow

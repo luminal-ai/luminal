@@ -237,6 +237,7 @@ pub(crate) fn split_egraph_by_memory_limit(
     let mut split = splitter.split();
 
     compact_egraph_after_prune(&mut split);
+    validate_unique_loop_markers(&split);
     let stats = MemorySplitStats {
         original_enodes,
         split_enodes: split.enodes.len(),
@@ -442,6 +443,9 @@ impl<'a> StateSplitter<'a> {
                 }
             }
             "Op" => self.split_op_node(owner_class, node, label, children),
+            label if direct_loop_marker(label) => {
+                self.split_direct_loop_marker_node(owner_class, node, label.to_string(), children)
+            }
             _ => {
                 let Some((idx, child_class)) =
                     first_child_with_sort_index(self.original, &children, "IR")
@@ -479,6 +483,9 @@ impl<'a> StateSplitter<'a> {
 
         let input_states = self.split_list_class(inputs_class);
         for kind_node in kind_nodes {
+            let Some((kind_label, _)) = self.original.enodes.get(kind_node) else {
+                continue;
+            };
             let Some(kind) =
                 kind_memory_for_node(self.original, &self.sort_by_name, kind_node, self.dyn_map)
             else {
@@ -488,6 +495,33 @@ impl<'a> StateSplitter<'a> {
                 continue;
             }
             let kind_split_class = self.kind_singleton_class(kind_node);
+            if loop_op_kind(kind_label) {
+                // Loop OpKinds are structural markers. Keep the marker singleton and
+                // pick one feasible state for the data flowing through it.
+                let Some((state, input_split_class)) = input_states
+                    .iter()
+                    .filter_map(|(input_state, input_split_class)| {
+                        let state = op_memory_state(kind, input_state)?;
+                        (state.peak <= self.limit).then(|| (state, input_split_class.clone()))
+                    })
+                    .min_by_key(|(state, _)| (state.peak, state.live))
+                else {
+                    continue;
+                };
+
+                let mut split_children = children.clone();
+                split_children[0] = kind_split_class;
+                split_children[1] = input_split_class;
+                self.add_ir_state_node(
+                    owner_class,
+                    state,
+                    label.clone(),
+                    split_children,
+                    source_node,
+                );
+                continue;
+            }
+
             for (input_state, input_split_class) in &input_states {
                 let Some(state) = op_memory_state(kind, input_state) else {
                     continue;
@@ -507,6 +541,33 @@ impl<'a> StateSplitter<'a> {
                 );
             }
         }
+    }
+
+    fn split_direct_loop_marker_node(
+        &mut self,
+        owner_class: &ClassId,
+        source_node: &NodeId,
+        label: String,
+        children: Vec<ClassId>,
+    ) {
+        let Some((idx, child_class)) = first_child_with_sort_index(self.original, &children, "IR")
+        else {
+            return;
+        };
+        // LoopStart/LoopEnd identity is part of the loop scaffold, so state
+        // splitting must not clone the marker across child-state variants.
+        let Some((state, state_class)) = self
+            .split_ir_class(&child_class)
+            .into_iter()
+            .filter(|(state, _)| state.peak <= self.limit)
+            .min_by_key(|(state, _)| (state.peak, state.live))
+        else {
+            return;
+        };
+
+        let mut split_children = children;
+        split_children[idx] = state_class;
+        self.add_ir_state_node(owner_class, state, label, split_children, source_node);
     }
 
     fn split_list_class(&mut self, class: &ClassId) -> Vec<(ListMemoryState, ClassId)> {
@@ -992,7 +1053,10 @@ fn choose_kind_node<'a>(egraph: &'a SerializedEGraph, kind_class: &ClassId) -> O
     };
     let is_kernel = |node: &&NodeId| -> bool {
         let label = &egraph.enodes[*node].0;
-        label.starts_with("Kernel") || label.starts_with("Fused")
+        label.starts_with("Kernel")
+            || label.starts_with("Cuda")
+            || label == "FusionStart"
+            || label == "FusionEnd"
     };
 
     kind_enodes
@@ -1079,10 +1143,92 @@ fn compact_egraph_after_prune(egraph: &mut SerializedEGraph) {
 }
 
 fn zero_local_op_kind(kind: &str) -> bool {
+    loop_op_kind(kind)
+}
+
+fn loop_op_kind(kind: &str) -> bool {
     matches!(
         kind,
         "LoopInput" | "LoopInputStatic" | "LoopOutput" | "LoopOutputSelect"
     )
+}
+
+fn direct_loop_marker(kind: &str) -> bool {
+    matches!(kind, "LoopStart" | "LoopEnd")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LoopMarkerKey {
+    label: String,
+    fields: Vec<String>,
+}
+
+fn validate_unique_loop_markers(egraph: &SerializedEGraph) {
+    let mut seen = FxHashMap::default();
+    for node in egraph.enodes.keys() {
+        for key in loop_marker_keys_for_node(egraph, node) {
+            if let Some(previous) = seen.insert(key.clone(), node.clone()) {
+                panic!(
+                    "CUDA memory splitter duplicated loop marker {key:?}: {previous:?} and {node:?}"
+                );
+            }
+        }
+    }
+}
+
+fn loop_marker_keys_for_node(egraph: &SerializedEGraph, node: &NodeId) -> Vec<LoopMarkerKey> {
+    let Some((label, children)) = egraph.enodes.get(node) else {
+        return Vec::new();
+    };
+    if direct_loop_marker(label) {
+        return vec![LoopMarkerKey {
+            label: label.clone(),
+            fields: field_signature(egraph, children.iter().skip(1)),
+        }];
+    }
+    if label != "Op" {
+        return Vec::new();
+    }
+    let Some(kind_class) = children.first() else {
+        return Vec::new();
+    };
+    let Some((sort, kind_nodes)) = egraph.eclasses.get(kind_class) else {
+        return Vec::new();
+    };
+    if sort != "OpKind" {
+        return Vec::new();
+    }
+
+    kind_nodes
+        .iter()
+        .filter_map(|kind_node| {
+            let (kind_label, kind_children) = egraph.enodes.get(kind_node)?;
+            loop_op_kind(kind_label).then(|| LoopMarkerKey {
+                label: kind_label.clone(),
+                fields: field_signature(egraph, kind_children.iter()),
+            })
+        })
+        .collect()
+}
+
+fn field_signature<'a>(
+    egraph: &SerializedEGraph,
+    fields: impl Iterator<Item = &'a ClassId>,
+) -> Vec<String> {
+    fields
+        .map(|class| {
+            let node_label = egraph
+                .eclasses
+                .get(class)
+                .and_then(|(_, nodes)| {
+                    nodes
+                        .iter()
+                        .find_map(|node| egraph.enodes.get(node).map(|(label, _)| label.clone()))
+                })
+                .unwrap_or_else(|| "<missing>".to_string());
+            format!("{}:{node_label}", class.as_ref())
+        })
+        .collect()
 }
 
 fn cuda_sort_map() -> FxHashMap<String, SortDef> {
@@ -1104,7 +1250,7 @@ fn local_output_bytes<'a>(
 ) -> Option<Expression> {
     match sort.name.as_str() {
         name if zero_local_op_kind(name) => Some(0.into()),
-        name if name.starts_with("Fused") || name == "FusionStart" => Some(0.into()),
+        name if name.starts_with("Cuda") || name == "FusionStart" => Some(0.into()),
         "KernelConstant" => Some(4.into()),
         "KernelIota" => Some(expr_field(egraph, sort, kind_children, "range", expr_cache)? * 4),
         "KernelLessThan" => Some(n_elements_field(
@@ -1135,7 +1281,7 @@ fn local_output_bytes<'a>(
             let dtype = dtype_field(egraph, sort, kind_children, "dtype")?;
             Some(bytes_for_elements(size, dtype))
         }
-        "cublaslt" => {
+        "cublaslt" | "cublaslt_scaled" => {
             let batch = expr_field(egraph, sort, kind_children, "batch_count", expr_cache)?;
             let m = expr_field(egraph, sort, kind_children, "m", expr_cache)?;
             let n = expr_field(egraph, sort, kind_children, "n", expr_cache)?;
@@ -1213,7 +1359,7 @@ fn n_elements_field<'a>(
 fn output_bytes_rules(sort: &SortDef) -> Vec<String> {
     match sort.name.as_str() {
         name if zero_local_op_kind(name) => vec![output_bytes_rule(sort, "(MNum 0)", "zero")],
-        name if name.starts_with("Fused") || name == "FusionStart" => {
+        name if name.starts_with("Cuda") || name == "FusionStart" => {
             vec![output_bytes_rule(sort, "(MNum 0)", "zero")]
         }
         "KernelConstant" => vec![output_bytes_rule(sort, "(MNum 4)", "f32-scalar")],
@@ -1244,7 +1390,7 @@ fn output_bytes_rules(sort: &SortDef) -> Vec<String> {
             &["(= ?__cuda_elems (n_elements ?batch_shape))"],
         )],
         "KernelCast" => dtype_output_bytes_rules(sort, "size", "dtype"),
-        "cublaslt" => {
+        "cublaslt" | "cublaslt_scaled" => {
             dtype_output_bytes_rules_for_expr(sort, "(MMul (MMul ?batch_count ?m) ?n)", "d_dtype")
         }
         "GLUMoE" => vec![output_bytes_rule(
@@ -1371,7 +1517,9 @@ fn output_bytes_rule_with_facts(
 
 #[cfg(test)]
 mod tests {
-    use super::{cuda_memory_analysis_pass, estimate_graph_memory_bytes};
+    use super::{
+        cuda_memory_analysis_pass, estimate_graph_memory_bytes, loop_marker_keys_for_node,
+    };
     use luminal::{
         egglog_utils::{
             EGraphChoiceSet, SerializedEGraph, count_choice_sets_up_to, random_initial_choice,
@@ -1383,11 +1531,7 @@ mod tests {
     };
 
     fn ops() -> Vec<std::sync::Arc<Box<dyn luminal::op::EgglogOp>>> {
-        let mut ops = <(
-            crate::kernel::hlir::Ops,
-            crate::kernel::other_ops::Ops,
-            crate::host::Ops,
-        ) as IntoEgglogOp>::into_vec();
+        let mut ops = <(crate::kernel::Ops, crate::host::Ops) as IntoEgglogOp>::into_vec();
         ops.extend(<HLIROps as IntoEgglogOp>::into_vec());
         ops
     }
@@ -1399,13 +1543,13 @@ mod tests {
             .expect("cuda memory pass should parse and run")
     }
 
-    fn kernel_add(name: &str, size: usize, a: &str, b: &str) -> String {
+    fn kernel_mod(name: &str, size: &str, a: &str, b: &str) -> String {
         format!(
             r#"
             (let {name}
                 (Op
-                    (KernelAdd
-                        (ECons (MNum {size}) (ENil))
+                    (KernelMod
+                        (ECons {size} (ENil))
                         (ECons (MIter) (ENil))
                         (ECons (MIter) (ENil))
                         (ECons (MIter) (ENil))
@@ -1454,25 +1598,20 @@ mod tests {
     }
 
     #[test]
-    fn cuda_memory_late_pass_runs_on_kernel_add() {
+    fn cuda_memory_late_pass_runs_on_kernel_mod() {
         let ops = ops();
         let late_pass = cuda_memory_analysis_pass(&ops, None, &FxHashMap::default());
-        let program = r#"
+        let program = format!(
+            r#"
             (let t0 (Input 0 "" (F32)))
             (let t1 (Input 1 "" (F32)))
-            (let t2
-                (Op
-                    (KernelAdd
-                        (ECons (MNum 4) (ENil))
-                        (ECons (MIter) (ENil))
-                        (ECons (MIter) (ENil))
-                        (ECons (MIter) (ENil))
-                        (F32))
-                    (ICons t0 (ICons t1 (INil)))))
+            {}
             (let t3 (Output t2 2))
-        "#;
+        "#,
+            kernel_mod("t2", "(MNum 4)", "t0", "t1"),
+        );
 
-        run_egglog_with_late_passes(program, "t3", &ops, false, &[late_pass])
+        run_egglog_with_late_passes(&program, "t3", &ops, false, &[late_pass])
             .expect("cuda memory pass should parse and run");
     }
 
@@ -1500,6 +1639,55 @@ mod tests {
     }
 
     #[test]
+    fn cuda_memory_state_split_does_not_duplicate_loop_markers() {
+        let program = format!(
+            r#"
+            (let t0 (Input 0 "" (F32)))
+            (let t1 (Input 1 "" (F32)))
+            {}
+            {}
+            (union small big)
+            (let loop_start (LoopStart small 0 0 (MNum 2) (F32)))
+            (let loop_end (LoopEnd small 0 0 (F32)))
+            (let loop_input (Op (LoopInput 0 0 (F32)) (ICons small (ICons t0 (INil)))))
+            (let loop_output (Op (LoopOutput 0 0 (F32)) (ICons small (INil))))
+            (let loop_select (Op (LoopOutputSelect 0 0 0 (F32)) (ICons loop_output (INil))))
+            (let out_start (Output loop_start 2))
+            (let out_end (Output loop_end 3))
+            (let out_input (Output loop_input 4))
+            (let out_select (Output loop_select 5))
+            (let out_a (OutputJoin out_start out_end))
+            (let out_b (OutputJoin out_input out_select))
+            (let out (OutputJoin out_a out_b))
+            "#,
+            kernel_mod("small", "(MNum 4)", "t0", "t1"),
+            kernel_mod("big", "(MNum 8)", "t0", "t1"),
+        );
+
+        let egraph = run_memory_egraph(&program, "out", Some(1024));
+        let mut marker_counts = FxHashMap::<String, usize>::default();
+        for node in egraph.enodes.keys() {
+            for key in loop_marker_keys_for_node(&egraph, node) {
+                *marker_counts.entry(key.label).or_default() += 1;
+            }
+        }
+
+        for marker in [
+            "LoopStart",
+            "LoopEnd",
+            "LoopInput",
+            "LoopOutput",
+            "LoopOutputSelect",
+        ] {
+            assert_eq!(
+                marker_counts.get(marker).copied().unwrap_or_default(),
+                1,
+                "{marker} should not be duplicated by memory state splitting"
+            );
+        }
+    }
+
+    #[test]
     fn cuda_memory_estimates_peak_for_two_live_inputs() {
         let program = format!(
             r#"
@@ -1510,9 +1698,9 @@ mod tests {
             {}
             (let out (Output parent 3))
             "#,
-            kernel_add("left", 4, "t0", "t1"),
-            kernel_add("right", 4, "t0", "t1"),
-            kernel_add("parent", 4, "left", "right"),
+            kernel_mod("left", "(MNum 4)", "t0", "t1"),
+            kernel_mod("right", "(MNum 4)", "t0", "t1"),
+            kernel_mod("parent", "(MNum 4)", "left", "right"),
         );
         let egraph = run_memory_egraph(&program, "out", None);
         let mut rng = rand::rng();
@@ -1546,7 +1734,7 @@ mod tests {
                     (ICons dest (ICons indexes (ICons src (INil))))))
             (let out (Output scatter 4))
             "#,
-            kernel_add("dest", 4, "t0", "t1"),
+            kernel_mod("dest", "(MNum 4)", "t0", "t1"),
         );
         let egraph = run_memory_egraph(&program, "out", None);
         let mut rng = rand::rng();
@@ -1569,8 +1757,8 @@ mod tests {
             (union small big)
             (let out (Output small 2))
             "#,
-            kernel_add("small", 4, "t0", "t1"),
-            kernel_add("big", 32, "t0", "t1"),
+            kernel_mod("small", "(MNum 4)", "t0", "t1"),
+            kernel_mod("big", "(MNum 32)", "t0", "t1"),
         );
 
         let egraph = run_memory_egraph(&program, "out", Some(64));
@@ -1590,22 +1778,17 @@ mod tests {
         let mut dyn_map = FxHashMap::default();
         dyn_map.insert('s', 4);
         let late_pass = cuda_memory_analysis_pass(&ops, Some(16), &dyn_map);
-        let program = r#"
+        let program = format!(
+            r#"
             (let t0 (Input 0 "" (F32)))
             (let t1 (Input 1 "" (F32)))
-            (let add
-                (Op
-                    (KernelAdd
-                        (ECons (MVar "s") (ENil))
-                        (ECons (MIter) (ENil))
-                        (ECons (MIter) (ENil))
-                        (ECons (MIter) (ENil))
-                        (F32))
-                    (ICons t0 (ICons t1 (INil)))))
+            {}
             (let out (Output add 2))
-        "#;
+        "#,
+            kernel_mod("add", "(MVar \"s\")", "t0", "t1"),
+        );
 
-        let egraph = run_egglog_with_late_passes(program, "out", &ops, false, &[late_pass])
+        let egraph = run_egglog_with_late_passes(&program, "out", &ops, false, &[late_pass])
             .expect("cuda memory pass should parse and run");
         assert_eq!(count_choice_sets_up_to(&egraph, 10), 1);
 
@@ -1628,9 +1811,9 @@ mod tests {
             {}
             (let out (Output parent 3))
             "#,
-            kernel_add("left", 12, "t0", "t1"),
-            kernel_add("right", 12, "t0", "t1"),
-            kernel_add("parent", 4, "left", "right"),
+            kernel_mod("left", "(MNum 12)", "t0", "t1"),
+            kernel_mod("right", "(MNum 12)", "t0", "t1"),
+            kernel_mod("parent", "(MNum 4)", "left", "right"),
         );
 
         let egraph = run_memory_egraph(&program, "out", Some(64));
@@ -1659,11 +1842,11 @@ mod tests {
             {}
             (let out (Output parent 4))
             "#,
-            kernel_add("left_small", 4, "t0", "t1"),
-            kernel_add("left_medium", 8, "t0", "t1"),
-            kernel_add("left_big", 12, "t0", "t1"),
-            kernel_add("right_small", 4, "t0", "t1"),
-            kernel_add("parent", 4, "left_small", "right_small"),
+            kernel_mod("left_small", "(MNum 4)", "t0", "t1"),
+            kernel_mod("left_medium", "(MNum 8)", "t0", "t1"),
+            kernel_mod("left_big", "(MNum 12)", "t0", "t1"),
+            kernel_mod("right_small", "(MNum 4)", "t0", "t1"),
+            kernel_mod("parent", "(MNum 4)", "left_small", "right_small"),
         );
 
         let uncapped_start = std::time::Instant::now();

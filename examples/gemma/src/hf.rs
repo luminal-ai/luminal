@@ -1,7 +1,7 @@
 use half::{bf16, f16};
 use hf_hub::api::sync::Api;
 use memmap2::MmapOptions;
-use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::Deserialize;
 use std::{
     collections::HashMap,

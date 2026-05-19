@@ -1,8 +1,16 @@
 use crate::{kernel::lower_expression_for_metal, runtime::MetalRuntime};
 use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
-use half::f16;
+use half::{bf16, f16};
 use luminal::prelude::*;
 use proptest::prelude::*;
+use safetensors::{Dtype, tensor::TensorView};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static SAFETENSORS_TEST_FILE_ID: AtomicUsize = AtomicUsize::new(0);
 
 fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     assert_eq!(
@@ -24,6 +32,32 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             rel_err
         );
     }
+}
+
+fn bytes_of<T: bytemuck::NoUninit>(values: &[T]) -> Vec<u8> {
+    bytemuck::cast_slice(values).to_vec()
+}
+
+fn write_test_safetensors(tensors: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> PathBuf {
+    let tensor_views: HashMap<String, TensorView<'_>> = tensors
+        .iter()
+        .map(|(name, dtype, shape, data)| {
+            (
+                (*name).to_string(),
+                TensorView::new(*dtype, shape.clone(), data).unwrap(),
+            )
+        })
+        .collect();
+    let serialized = safetensors::serialize(&tensor_views, None).unwrap();
+    let id = SAFETENSORS_TEST_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "luminal_metal_runtime_{}_{}.safetensors",
+        std::process::id(),
+        id
+    ));
+    std::fs::write(&path, serialized).unwrap();
+    path
 }
 
 const TRANSFORMER_SEQ: usize = 4;
@@ -248,6 +282,36 @@ fn dynamic_dim_sum_reduce_runs() {
 
     let out = rt.get_f32(output);
     assert_close(&out, &[9.0, 12.0], 0.001);
+}
+
+#[test]
+fn metal_bucketed_dynamic_dim_dispatches_correct_graph() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(('s', 4));
+    let output = (input + input).output();
+
+    cx.set_dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 4)]);
+    cx.set_dim('s', 1);
+    cx.build_search_space::<MetalRuntime>();
+
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, vec![1.0f32; 4]);
+    rt = cx.search(rt, 5);
+
+    cx.set_dim('s', 1);
+    let s1_input = vec![1.0, 2.0, 3.0, 4.0];
+    rt.set_data(input, s1_input.clone());
+    rt.execute(&cx.dyn_map);
+    let s1_out = rt.get_f32(output);
+    assert_close(&s1_out[..4], &[2.0, 4.0, 6.0, 8.0], 0.001);
+
+    cx.set_dim('s', 3);
+    let s3_input: Vec<f32> = (0..12).map(|i| i as f32).collect();
+    let s3_expected: Vec<f32> = s3_input.iter().map(|v| v * 2.0).collect();
+    rt.set_data(input, s3_input);
+    rt.execute(&cx.dyn_map);
+    let s3_out = rt.get_f32(output);
+    assert_close(&s3_out[..12], &s3_expected, 0.001);
 }
 
 #[test]
@@ -645,8 +709,13 @@ fn metal_regular_tiled_matmul_path() {
 
     let kernels = rt.debug_kernel_ops();
     assert!(
-        kernels.iter().any(|k| k.contains("family: RegularTiled")),
-        "expected regular tiled matmul path, kernels: {:?}",
+        kernels.iter().any(|k| k.contains("MPSMatmul")),
+        "expected MPS matmul path, kernels: {:?}",
+        kernels
+    );
+    assert!(
+        !kernels.iter().any(|k| k.contains("GenericMatmul")),
+        "MPS-compatible matmul should not extract the generic fallback, kernels: {:?}",
         kernels
     );
 
@@ -662,6 +731,287 @@ fn metal_regular_tiled_matmul_path() {
     let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
 
     assert_close(&result, &expected, 2e-3);
+}
+
+#[test]
+fn metal_mps_matmul_transposed_rhs_weight_layout() {
+    let mut cx = Graph::default();
+    let m = 7;
+    let k = 11;
+    let n = 13;
+    let a = cx.tensor((m, k));
+    let weight = cx.tensor((n, k));
+    let output = a.matmul(weight.t()).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(m * k, 0.35, -0.17);
+    let weight_data = seeded_data(n * k, 0.21, -0.09);
+
+    rt.set_data(a, &a_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
+        "expected MPS matmul to cover transposed row-major RHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_a = CandleTensor::from_vec(a_data, (m, k), &device).unwrap();
+    let ref_weight = CandleTensor::from_vec(weight_data, (n, k), &device).unwrap();
+    let expected = ref_a.matmul(&ref_weight.t().unwrap()).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_matmul_transposed_lhs_layout() {
+    let mut cx = Graph::default();
+    let m = 5;
+    let k = 9;
+    let n = 6;
+    let lhs_storage = cx.tensor((k, m));
+    let rhs = cx.tensor((k, n));
+    let output = lhs_storage.t().matmul(rhs).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let lhs_data = seeded_data(k * m, 0.31, -0.12);
+    let rhs_data = seeded_data(k * n, 0.27, -0.08);
+
+    rt.set_data(lhs_storage, &lhs_data);
+    rt.set_data(rhs, &rhs_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_lhs: true")),
+        "expected MPS matmul to cover transposed row-major LHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_lhs = CandleTensor::from_vec(lhs_data, (k, m), &device)
+        .unwrap()
+        .t()
+        .unwrap();
+    let ref_rhs = CandleTensor::from_vec(rhs_data, (k, n), &device).unwrap();
+    let expected = ref_lhs.matmul(&ref_rhs).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_batched_matmul_row_row_layout() {
+    let mut cx = Graph::default();
+    let batch = 3;
+    let m = 4;
+    let k = 5;
+    let n = 6;
+    let a = cx.tensor((batch, m, k));
+    let b = cx.tensor((batch, k, n));
+    let output = a.matmul(b).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(batch * m * k, 0.17, -0.08);
+    let b_data = seeded_data(batch * k * n, 0.11, -0.05);
+    rt.set_data(a, &a_data);
+    rt.set_data(b, &b_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("MPSBatchedMatmul")),
+        "expected MPS batched matmul path, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(output);
+
+    let mut expected = vec![0.0; batch * m * n];
+    for batch_idx in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0;
+                for inner in 0..k {
+                    sum += a_data[batch_idx * m * k + row * k + inner]
+                        * b_data[batch_idx * k * n + inner * n + col];
+                }
+                expected[batch_idx * m * n + row * n + col] = sum;
+            }
+        }
+    }
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_generic_matmul_covers_noncontiguous_merged_head_projection() {
+    let mut cx = Graph::default();
+    let heads = 3;
+    let seq = 4;
+    let head_dim = 5;
+    let hidden = heads * head_dim;
+    let out_dim = 7;
+    let attn = cx.tensor((heads, seq, head_dim));
+    let weight = cx.tensor((out_dim, hidden));
+    let merged = attn.transpose(0, 1).merge_dims(1, 2);
+    let output = merged.matmul(weight.t()).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let attn_data = seeded_data(heads * seq * head_dim, 0.19, -0.09);
+    let weight_data = seeded_data(out_dim * hidden, 0.14, -0.06);
+    rt.set_data(attn, &attn_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("GenericMatmul")),
+        "expected generic matmul fallback for non-contiguous merged-head projection, kernels: {:?}",
+        kernels
+    );
+    assert!(
+        !kernels.iter().any(|k| {
+            k.contains("MetalMul") && k.contains(&format!("shape: [{seq}, {out_dim}, {hidden}]"))
+        }),
+        "generic fallback should remove the broadcast multiply intermediate, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(output);
+
+    let mut expected = vec![0.0; seq * out_dim];
+    for token in 0..seq {
+        for out_col in 0..out_dim {
+            let mut sum = 0.0;
+            for inner in 0..hidden {
+                let head = inner / head_dim;
+                let dim = inner % head_dim;
+                let attn_idx = head * seq * head_dim + token * head_dim + dim;
+                sum += attn_data[attn_idx] * weight_data[out_col * hidden + inner];
+            }
+            expected[token * out_dim + out_col] = sum;
+        }
+    }
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_batched_matmul_transposed_rhs_layout() {
+    let mut cx = Graph::default();
+    let batch = 4;
+    let m = 3;
+    let k = 7;
+    let n = 5;
+    let a = cx.tensor((batch, m, k));
+    let weight = cx.tensor((batch, n, k));
+    let output = a.matmul(weight.permute((0, 2, 1))).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(batch * m * k, 0.13, -0.06);
+    let weight_data = seeded_data(batch * n * k, 0.09, -0.04);
+    rt.set_data(a, &a_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels
+            .iter()
+            .any(|k| k.contains("MPSBatchedMatmul") && k.contains("transpose_rhs: true")),
+        "expected MPS batched matmul transposed RHS path, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(output);
+
+    let mut expected = vec![0.0; batch * m * n];
+    for batch_idx in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0;
+                for inner in 0..k {
+                    sum += a_data[batch_idx * m * k + row * k + inner]
+                        * weight_data[batch_idx * n * k + col * k + inner];
+                }
+                expected[batch_idx * m * n + row * n + col] = sum;
+            }
+        }
+    }
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
+    let mut cx = Graph::default();
+    let m = 6;
+    let k = 10;
+    let n = 7;
+    let a = cx.tensor((m, k)).as_dtype(DType::F16);
+    let weight = cx.tensor((n, k)).as_dtype(DType::F16);
+    let output = a.matmul(weight.t()).cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(m * k, 0.22, -0.07);
+    let weight_data = seeded_data(n * k, 0.18, -0.05);
+
+    rt.set_data(a, to_f16_vec(&a_data));
+    rt.set_data(weight, to_f16_vec(&weight_data));
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
+        "expected MPS F16 matmul to cover transposed row-major RHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_a = CandleTensor::from_vec(a_data, (m, k), &device).unwrap();
+    let ref_weight = CandleTensor::from_vec(weight_data, (n, k), &device).unwrap();
+    let expected = ref_a.matmul(&ref_weight.t().unwrap()).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 5e-3);
 }
 
 #[test]
@@ -989,6 +1339,131 @@ fn test_scatter_basic() {
 }
 
 #[test]
+fn test_scatter_buffer_roundtrip() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(1);
+    let indexes = cx.tensor(1).as_dtype(DType::Int);
+    let cache = cx.tensor(4).persist();
+    let cache_out = src.scatter(indexes, cache);
+    let read = cache_out.output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[0.0]);
+    rt.set_data(indexes, &[0.0]);
+    rt.set_zeros(cache, 4 * std::mem::size_of::<f32>());
+    rt = cx.search(rt, 1);
+
+    for (pos, value, expected) in [
+        (0, 10.0, [10.0, 0.0, 0.0, 0.0]),
+        (1, 20.0, [10.0, 20.0, 0.0, 0.0]),
+        (2, 30.0, [10.0, 20.0, 30.0, 0.0]),
+    ] {
+        rt.set_data(src, &[value]);
+        rt.set_data(indexes, &[pos as f32]);
+        rt.allocate_intermediate_buffers(&cx.dyn_map);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(read), &expected, 0.001);
+
+        let updated_cache = rt.remove_buffer(cache_out);
+        rt.set_buffer(cache, updated_cache);
+    }
+}
+
+#[test]
+fn test_load_safetensors_f32_survives_search_and_overrides_input_data() {
+    let mut cx = Graph::default();
+    let weights = cx.named_tensor("weights", 3);
+    let bias = cx.named_tensor("bias", 3);
+    let out = (weights + bias).output();
+
+    let weight_values = [1.25f32, -2.5, 4.0];
+    let tensors = [("weights", Dtype::F32, vec![3], bytes_of(&weight_values))];
+    let path = write_test_safetensors(&tensors);
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(weights, &[99.0, 99.0, 99.0]);
+    rt.set_data(bias, &[0.5, 1.0, -1.5]);
+    rt.load_safetensors(&cx, path.to_str().unwrap());
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &[1.75, -1.5, 2.5], 0.001);
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn test_load_safetensors_converts_supported_float_dtypes() {
+    let mut cx = Graph::default();
+    let f16_to_f32 = cx.named_tensor("f16_to_f32", 2);
+    let bf16_to_f32 = cx.named_tensor("bf16_to_f32", 2);
+    let f16_to_f16 = cx.named_tensor("f16_to_f16", 2).as_dtype(DType::F16);
+    let f32_to_f16 = cx.named_tensor("f32_to_f16", 2).as_dtype(DType::F16);
+    let bf16_to_f16 = cx.named_tensor("bf16_to_f16", 2).as_dtype(DType::F16);
+
+    let f16_to_f32_out = (f16_to_f32 + 0.0).output();
+    let bf16_to_f32_out = (bf16_to_f32 + 0.0).output();
+    let f16_to_f16_out = f16_to_f16.cast(DType::F32).output();
+    let f32_to_f16_out = f32_to_f16.cast(DType::F32).output();
+    let bf16_to_f16_out = bf16_to_f16.cast(DType::F32).output();
+
+    let f16_to_f32_values = [f16::from_f32(1.5), f16::from_f32(-2.25)];
+    let bf16_to_f32_values = [bf16::from_f32(3.5), bf16::from_f32(-4.25)];
+    let f16_to_f16_values = [f16::from_f32(5.5), f16::from_f32(-6.25)];
+    let f32_to_f16_values = [7.5f32, -8.25];
+    let bf16_to_f16_values = [bf16::from_f32(9.5), bf16::from_f32(-10.25)];
+    let tensors = [
+        (
+            "f16_to_f32",
+            Dtype::F16,
+            vec![2],
+            bytes_of(&f16_to_f32_values),
+        ),
+        (
+            "bf16_to_f32",
+            Dtype::BF16,
+            vec![2],
+            bytes_of(&bf16_to_f32_values),
+        ),
+        (
+            "f16_to_f16",
+            Dtype::F16,
+            vec![2],
+            bytes_of(&f16_to_f16_values),
+        ),
+        (
+            "f32_to_f16",
+            Dtype::F32,
+            vec![2],
+            bytes_of(&f32_to_f16_values),
+        ),
+        (
+            "bf16_to_f16",
+            Dtype::BF16,
+            vec![2],
+            bytes_of(&bf16_to_f16_values),
+        ),
+    ];
+    let path = write_test_safetensors(&tensors);
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.load_safetensors(&cx, path.to_str().unwrap());
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(f16_to_f32_out), &[1.5, -2.25], 0.001);
+    assert_close(&rt.get_f32(bf16_to_f32_out), &[3.5, -4.25], 0.001);
+    assert_close(&rt.get_f32(f16_to_f16_out), &[5.5, -6.25], 0.001);
+    assert_close(&rt.get_f32(f32_to_f16_out), &[7.5, -8.25], 0.001);
+    assert_close(&rt.get_f32(bf16_to_f16_out), &[9.5, -10.25], 0.001);
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
 fn test_gather_noncontiguous_data_uses_data_shape() {
     let mut cx = Graph::default();
     let input = cx.tensor((4, 3));
@@ -1024,11 +1499,100 @@ fn test_scatter_into_nonzero_dest() {
     rt.set_data(indexes, &[2f32]);
     rt.set_data(dest, &[1.0, 2.0, 3.0, 4.0, 5.0]);
     rt = cx.search(rt, 1);
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("MetalScatterNoCopy")),
+        "expected no-copy scatter for consumed destination, kernels: {:?}",
+        kernels
+    );
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
 
     let out = rt.get_f32(result);
     assert_close(&out, &[1.0, 2.0, 99.0, 4.0, 5.0], 0.001);
+}
+
+#[test]
+fn test_scatter_no_copy_remove_buffer_aliases_dest() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(2);
+    let indexes = cx.tensor(2).as_dtype(DType::Int);
+    let dest = cx.tensor(5);
+    let result = src.scatter(indexes, dest).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[7.0, 8.0]);
+    rt.set_data(indexes, &[1.0, 3.0]);
+    rt.set_data(dest, &[10.0, 20.0, 30.0, 40.0, 50.0]);
+    rt = cx.search(rt, 1);
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let moved = rt.remove_buffer(result);
+    let moved_values = unsafe {
+        std::slice::from_raw_parts(
+            moved.contents() as *const f32,
+            moved.length() as usize / std::mem::size_of::<f32>(),
+        )
+        .to_vec()
+    };
+    assert_close(&moved_values, &[10.0, 7.0, 30.0, 8.0, 50.0], 0.001);
+    rt.set_buffer(dest.id, moved);
+}
+
+#[test]
+fn test_scatter_no_copy_handles_2d_destination() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(2);
+    let indexes = cx.tensor(2).as_dtype(DType::Int);
+    let dest = cx.tensor((2, 3));
+    let result = src.scatter(indexes, dest).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[9.0, 8.0]);
+    rt.set_data(indexes, &[2.0, 4.0]);
+    rt.set_data(dest, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    rt = cx.search(rt, 1);
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("MetalScatterNoCopy")),
+        "expected no-copy scatter for 2D destination, kernels: {:?}",
+        kernels
+    );
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(result), &[1.0, 2.0, 9.0, 4.0, 8.0, 6.0], 0.001);
+}
+
+#[test]
+fn test_scatter_no_copy_not_selected_when_dest_has_another_consumer() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(1);
+    let indexes = cx.tensor(1).as_dtype(DType::Int);
+    let dest = cx.tensor(4);
+    let scatter = src.scatter(indexes, dest).output();
+    let dest_plus_one = (dest + 1.0).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[99.0]);
+    rt.set_data(indexes, &[1.0]);
+    rt.set_data(dest, &[10.0, 20.0, 30.0, 40.0]);
+    rt = cx.search(rt, 1);
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        !kernels.iter().any(|k| k.contains("MetalScatterNoCopy")),
+        "no-copy scatter should not be selected when dest is also consumed, kernels: {:?}",
+        kernels
+    );
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(scatter), &[10.0, 99.0, 30.0, 40.0], 0.001);
+    assert_close(&rt.get_f32(dest_plus_one), &[11.0, 21.0, 31.0, 41.0], 0.001);
 }
 
 #[test]

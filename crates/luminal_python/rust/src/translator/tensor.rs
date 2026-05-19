@@ -220,6 +220,7 @@ impl<'a> Translator<'a> {
         let input = self.get_input_tensor(node, 0)?;
         let weight = self.get_input_tensor(node, 1)?;
         let offs = self.get_input_tensor(node, 2)?;
+        let out_dtype = self.output_meta_dtype(node)?;
 
         anyhow::ensure!(
             input.shape.len() == 2,
@@ -274,8 +275,15 @@ impl<'a> Translator<'a> {
         let exp_within = within.expand_dim(0, s);
         let flat_idx = exp_base + exp_within;
 
-        // Gather → [S, K, N], preserves weight's native dtype (bf16 stays bf16).
-        let weight_gathered = weight.gather(flat_idx);
+        // Gather → [S, K, N], then normalize both operands to the op's declared
+        // output dtype before matmul. On real Qwen3-MoE bf16 checkpoints the FX
+        // graph inserts casts on the activation path, and relying on the input
+        // tensor's translated dtype can leave us with mixed F32/Bf16 operands
+        // by the time matmul expands into elementwise Mul. Using the PT2 output
+        // metadata keeps the matmul dtype aligned with the exported contract
+        // without upcasting the full expert weight bank.
+        let weight_gathered = weight.gather(flat_idx).cast(out_dtype);
+        let input = input.cast(out_dtype);
 
         // Per-token matmul: [S, 1, K] @ [S, K, N] → [S, 1, N] → [S, N].
         // Operands stay in their native dtype — no F32 cast on the gathered
@@ -287,7 +295,7 @@ impl<'a> Translator<'a> {
         // (cuBLASLt etc.) handle bf16 input with F32 accumulator internally.
         let result = input.unsqueeze(1).matmul(weight_gathered).squeeze(1);
 
-        Ok(result.cast(input.dtype))
+        Ok(result.cast(out_dtype))
     }
 
     /// Build the where-formula graph: `cond * x + (1 - cond) * y`, computed

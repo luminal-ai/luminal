@@ -287,7 +287,12 @@ impl CudaRuntime {
                         let dev = f32s.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);
                     }
-                    safetensors::Dtype::U8 | safetensors::Dtype::BF16 | safetensors::Dtype::F16 => {
+                    safetensors::Dtype::U8
+                    | safetensors::Dtype::BF16
+                    | safetensors::Dtype::F16
+                    | safetensors::Dtype::F8_E4M3
+                    | safetensors::Dtype::F8_E5M2
+                    | safetensors::Dtype::F8_E8M0 => {
                         let bytes = tensor.data();
                         let dev = bytes.to_cuda_input(&self.cuda_stream);
                         self.hlir_buffers.insert(node, dev);
@@ -1189,7 +1194,7 @@ impl Runtime for CudaRuntime {
     }
 
     fn estimate_graph_memory<'a>(
-        egraph: &'a SerializedEGraph,
+        egraph: &'a luminal::egglog_utils::SerializedEGraph,
         choices: &luminal::egglog_utils::EGraphChoiceSet<'a>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> Option<usize> {
@@ -1343,8 +1348,8 @@ impl Runtime for CudaRuntime {
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
-        _trials: usize,
-        _timeout: Option<std::time::Duration>,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
         // Clear active bucket's arena before loading new LLIR for profiling.
         if !self.compiled_buckets.is_empty() {
@@ -1352,10 +1357,18 @@ impl Runtime for CudaRuntime {
         }
         self.load_llir(llir_graph);
         self.profiling = true;
-        let start = std::time::Instant::now();
-        self.execute(dyn_map);
+        let profile_start = std::time::Instant::now();
+        let mut durations = Vec::with_capacity(trials.max(1));
+        for _ in 0..trials.max(1) {
+            let start = std::time::Instant::now();
+            self.execute(dyn_map);
+            durations.push(start.elapsed());
+            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
+        }
         self.profiling = false;
-        let duration = start.elapsed();
+        let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
 
         let total_bytes: usize = self
             .last_kernel_stats
@@ -1657,8 +1670,8 @@ impl CudaRuntime {
                 //
                 // The default assumption is "yes" for ordinary kernel ops
                 // (Conv outputs, matmul outputs, etc). FusionStart and
-                // Fused* are the exceptions — they're synthetic markers
-                // that the fusion rewrites add inside a region; the
+                // Cuda*Elementwise are the exceptions — they're synthetic
+                // nodes that the fusion rewrites add inside a region; the
                 // megakernel computes them in registers and never writes
                 // to memory, so allocating a buffer would just be waste.
                 //
@@ -1673,12 +1686,12 @@ impl CudaRuntime {
                 // an unrelated downstream op that lives in another region.
                 //
                 // Safe over-approximation: if the node is a FusionStart /
-                // Fused* and *any* of its consumers is a FusionStart
+                // Cuda*Elementwise and *any* of its consumers is a FusionStart
                 // (which can only happen when that consumer is the leaf
                 // of a different region) or a non-marker op (e.g. an
                 // unfused Add/Mul reading the value directly), allocate a
                 // buffer so cross-region reads have somewhere to land.
-                let is_marker = kernel_name == "FusionStart" || kernel_name.starts_with("Fused");
+                let is_marker = kernel_name == "FusionStart" || kernel_name.starts_with("Cuda");
                 let has_external_consumer = is_marker
                     && llir_graph
                         .neighbors_directed(node, Direction::Outgoing)

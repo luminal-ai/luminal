@@ -1,5 +1,6 @@
 from typing import Callable
 
+import pytest
 import torch
 import torch._dynamo
 from test_models import (
@@ -220,6 +221,7 @@ from test_models import (
     Conv1dNoPadModel,
     Conv1dSamePadModel,
     Conv1dBiasModel,
+    Conv1dFloorDivPositionalModel,
     Conv2dNoPadModel,
     Conv2dSamePadModel,
     Conv2dBiasModel,
@@ -1094,6 +1096,17 @@ def test_reduce_sum_all_axes(device: torch.device):
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((3, 4), device=device)
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
+
+
+def test_reduce_sum_all_axes_int64_preserves_dtype(device: torch.device):
+    """Full reduction of an int64 tensor must preserve int64 (regression for LUM-486)."""
+    model: torch.nn.Module = ReduceSumAllAxesModel().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.randint(0, 10, (3, 4), device=device, dtype=torch.int64)
+    eager = model(x)
+    out = model_compiled(x)
+    assert out.dtype == eager.dtype == torch.int64
+    assert torch.equal(out, eager)
 
 
 def test_reduce_sum_3d_axis1(device: torch.device):
@@ -2022,9 +2035,16 @@ def test_split(device: torch.device):
 # ========== Argsort / MoE Routing Tests ==========
 
 
-def test_argsort_stable_duplicates(device: torch.device):
-    """Duplicate values should follow stable lower-index-first tie-breaking."""
-    model: torch.nn.Module = ArgsortStableDuplicatesModel().to(device)
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+def test_argsort_stable_duplicates(device: torch.device, idx_dtype: torch.dtype):
+    """Duplicate values should follow stable lower-index-first tie-breaking.
+
+    Parametrized over int32/int64 to verify luminal preserves whichever
+    integer dtype the eager model declares (LUM-486).
+    """
+    model: torch.nn.Module = ArgsortStableDuplicatesModel(idx_dtype=idx_dtype).to(
+        device
+    )
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x = torch.tensor(
         [[2.0, 1.0, 1.0, 3.0]],
@@ -2033,13 +2053,21 @@ def test_argsort_stable_duplicates(device: torch.device):
     )
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
-    assert output.dtype == torch.int32
-    assert torch.equal(output, original.to(torch.int32))
+    assert original.dtype == idx_dtype, "test setup: model should cast to idx_dtype"
+    assert output.dtype == original.dtype, (
+        f"luminal returned {output.dtype}, eager produced {original.dtype}"
+    )
+    assert torch.equal(output, original)
 
 
-def test_tiny_moe_routing(device: torch.device):
-    """Focused proof for build MoE routing support."""
-    model: torch.nn.Module = TinyMoERoutingModel().to(device)
+@pytest.mark.parametrize("idx_dtype", [torch.int32, torch.int64])
+def test_tiny_moe_routing(device: torch.device, idx_dtype: torch.dtype):
+    """Focused proof for built MoE routing support.
+
+    Parametrized over int32/int64 for the integer-valued outputs to verify
+    luminal preserves the dtype declared by the eager model (LUM-486).
+    """
+    model: torch.nn.Module = TinyMoERoutingModel(idx_dtype=idx_dtype).to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     scores = torch.tensor(
         [[0.1, 0.9, 0.4, 0.7], [0.6, -0.8, 0.95, 0.2]],
@@ -2050,17 +2078,10 @@ def test_tiny_moe_routing(device: torch.device):
     expected = model(scores)
     output = model_compiled(scores)
 
-    expected_dtypes = (
-        torch.int32,
-        torch.float32,
-        torch.int32,
-        torch.bool,
-        torch.int32,
-        torch.float32,
-    )
-    for actual, eager, expected_dtype in zip(output, expected, expected_dtypes):
-        assert actual.dtype == expected_dtype
-        eager = eager.to(actual.dtype)
+    for actual, eager in zip(output, expected):
+        assert actual.dtype == eager.dtype, (
+            f"luminal returned {actual.dtype}, eager produced {eager.dtype}"
+        )
         if actual.dtype.is_floating_point:
             assert torch.allclose(actual, eager)
         else:
@@ -2475,6 +2496,17 @@ def test_conv1d_bias(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original, atol=1e-4)
+
+
+def test_conv1d_floor_div_positional_pt2(device: torch.device):
+    """Conv1d stride output uses floor division before positional add."""
+    model: torch.nn.Module = Conv1dFloorDivPositionalModel().to(device)
+    model_compiled: Callable = _compile_for_export_mode(model, "pt2")
+    x: torch.Tensor = torch.randn(1, 8, 30, device=device)
+    original: torch.Tensor = model(x)
+    output: torch.Tensor = model_compiled(x)
+    assert output.shape == original.shape == (15, 16)
+    assert torch.allclose(output, original, atol=1e-3, rtol=1e-3)
 
 
 def _run_conv2d_no_pad(device: torch.device, export_mode: str | None = None):

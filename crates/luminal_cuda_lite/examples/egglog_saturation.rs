@@ -231,7 +231,9 @@ fn build_qwen_moe(cx: &mut Graph) -> GraphTensor {
         .unsqueeze(2)
         .matmul(down_gathered.transpose(2, 3))
         .squeeze(2);
-    (down_out * top_k_values.unsqueeze(top_k_values.dims().len())).sum(n - 1)
+    let mut weights_exp = top_k_values.unsqueeze(top_k_values.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    (down_out * weights_exp).sum(n - 1)
 }
 
 fn build_gemma_moe(cx: &mut Graph) -> GraphTensor {
@@ -278,7 +280,9 @@ fn build_gemma_moe(cx: &mut Graph) -> GraphTensor {
         .unsqueeze(2)
         .matmul(down_gathered.transpose(2, 3))
         .squeeze(2);
-    (down_out * top_k_weights.unsqueeze(top_k_weights.dims().len())).sum(n - 1)
+    let mut weights_exp = top_k_weights.unsqueeze(top_k_weights.dims().len());
+    weights_exp.shape.expand(down_out.dims());
+    (down_out * weights_exp).sum(n - 1)
 }
 
 fn gather_experts(

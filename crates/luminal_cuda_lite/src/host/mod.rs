@@ -4,12 +4,15 @@ use crate::cudarc::driver::{CudaStream, DriverError, result};
 use luminal::{op::EgglogOp, prelude::*};
 mod cublas;
 mod cublaslt;
+pub mod flashinfer;
 pub mod moe;
 
 pub type Ops = (
     // cublas::CuBlasSgemmV2,
     cublaslt::CuBlasLt,
+    cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
+    flashinfer::FlashInferAttention,
 );
 
 #[cfg(test)]
@@ -71,6 +74,16 @@ pub(crate) fn cublaslt_c_d_layouts_match(op: &dyn HostOp) -> Option<bool> {
     op.as_any()
         .downcast_ref::<cublaslt::CuBlasLt>()
         .map(cublaslt::CuBlasLt::c_d_layouts_match)
+}
+
+#[cfg(test)]
+pub(crate) type CublasLtTensorScaleInputs = (bool, bool);
+
+#[cfg(test)]
+pub(crate) fn cublaslt_tensor_scale_inputs(op: &dyn HostOp) -> Option<CublasLtTensorScaleInputs> {
+    op.as_any()
+        .downcast_ref::<cublaslt::CuBlasLt>()
+        .map(cublaslt::CuBlasLt::tensor_scale_inputs)
 }
 
 /// Non-owning device buffer handle used by host operations.

@@ -1,5 +1,4 @@
 import os
-import re
 import subprocess
 import sys
 
@@ -21,28 +20,8 @@ hf_cache = modal.Volume.from_name(
 
 WORKDIR = "/workspace/luminal"
 
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-
-EXPECTED_OUTPUT = {
-    "llama": [
-        "complex system modeled after the structure and function of the human brain",
-    ],
-    "gemma": [
-        "recognize pictures of cats",
-        "little detectives looking for specific features",
-    ],
-    "qwen": [
-        "computational model inspired by the structure and function of the human brain",
-    ],
-    "qwen3_moe": [
-        "The capital of France is Paris",
-    ],
-    "gemma4_moe": [
-        "city of romance, art and culture",
-    ],
-    "whisper": [
-        "ask not what your country can do for you",
-    ],
+EXAMPLE_CARGO_ARGS = {
+    "qwen": ["--features", "cuda"],
 }
 
 
@@ -71,28 +50,6 @@ def run_and_capture(command: list[str], *, cwd: str, env: dict[str, str]) -> str
         raise subprocess.CalledProcessError(return_code, command, output=output)
     return output
 
-
-def normalize_output(output: str) -> str:
-    output = ANSI_ESCAPE.sub("", output)
-    output = output.replace("\r", "\n")
-    return re.sub(r"\s+", " ", output).casefold()
-
-
-def validate_output(example: str, output: str):
-    expected_phrases = EXPECTED_OUTPUT.get(example)
-    if expected_phrases is None:
-        raise ValueError(f"No expected output phrases configured for example {example!r}")
-
-    normalized_output = normalize_output(output)
-    for phrase in expected_phrases:
-        if normalize_output(phrase) in normalized_output:
-            print(f"\nOutput check passed for {example!r}: found {phrase!r}")
-            return
-
-    expected = "\n  - ".join(expected_phrases)
-    raise AssertionError(
-        f"Output check failed for {example!r}. Expected one of:\n  - {expected}"
-    )
 
 cuda_image = (
     modal.Image.from_registry(
@@ -123,6 +80,8 @@ cuda_image = (
 def run_example(example: str):
     """Build and run a luminal example on a Modal GPU."""
     subprocess.run(["nvidia-smi"], check=True)
+    sys.path.insert(0, f"{WORKDIR}/ci")
+    from example_output import validate_output
 
     run_env = {
         **os.environ,
@@ -130,7 +89,7 @@ def run_example(example: str):
         "HF_HOME": HF_CACHE_PATH,
     }
     output = run_and_capture(
-        ["cargo", "run", "--release"],
+        ["cargo", "run", "--release", *EXAMPLE_CARGO_ARGS.get(example, [])],
         cwd=f"{WORKDIR}/examples/{example}",
         env=run_env,
     )

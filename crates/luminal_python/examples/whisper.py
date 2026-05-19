@@ -431,7 +431,7 @@ def main() -> None:
     tokenizer = WhisperTokenizer.from_pretrained(REPO_ID)
 
     use_compiled = os.environ.get("LUMINAL_DISABLE", "0") != "1"
-    max_new_tokens = int(os.environ.get("GEN_TOKENS", "100"))
+    max_new_tokens = 100
     search_iters = int(os.environ.get("SEARCH_ITERATIONS", "10"))
 
     if use_compiled:

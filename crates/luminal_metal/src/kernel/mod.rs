@@ -6,7 +6,7 @@ pub use ops::*;
 use luminal::dtype::DType;
 use luminal::op::EgglogOp;
 use luminal::prelude::*;
-use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device};
+use metal::{Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device};
 
 pub const DYN_SLOT_COUNT: usize = 26;
 
@@ -32,7 +32,7 @@ pub trait MetalKernelOp: EgglogOp {
         device: &Device,
         input_dtypes: &[DType],
         output_dtype: DType,
-    ) -> ComputePipelineState;
+    ) -> Option<ComputePipelineState>;
 
     fn infer_output_dtype(&self, input_dtypes: &[DType]) -> DType {
         input_dtypes.first().copied().unwrap_or(DType::F32)
@@ -40,7 +40,7 @@ pub trait MetalKernelOp: EgglogOp {
 
     fn output_size(&self) -> Expression;
 
-    fn encode(
+    fn encode_compute(
         &self,
         encoder: &ComputeCommandEncoderRef,
         pipeline: &ComputePipelineState,
@@ -48,6 +48,26 @@ pub trait MetalKernelOp: EgglogOp {
         output: &Buffer,
         dyn_map: &FxHashMap<char, usize>,
     );
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode(
+        &self,
+        command_buffer: &CommandBufferRef,
+        pipeline: Option<&ComputePipelineState>,
+        inputs: &[&Buffer],
+        output: &Buffer,
+        dyn_map: &FxHashMap<char, usize>,
+        dyn_buffer: &Buffer,
+        _input_dtypes: &[DType],
+        _output_dtype: DType,
+    ) {
+        let pipeline = pipeline.expect("compute pipeline not compiled");
+        let encoder = command_buffer.new_compute_command_encoder();
+        let dyn_idx = inputs.len() as u64 + 1;
+        encoder.set_buffer(dyn_idx, Some(dyn_buffer), 0);
+        self.encode_compute(encoder, pipeline, inputs, output, dyn_map);
+        encoder.end_encoding();
+    }
 
     // ========================================================================
     // Performance Metrics for MBU/MFU Calculation
@@ -70,6 +90,10 @@ pub trait MetalKernelOp: EgglogOp {
     }
 
     fn sum_reduce_info(&self) -> Option<MetalSumReduceInfo> {
+        None
+    }
+
+    fn output_aliases_input(&self) -> Option<usize> {
         None
     }
 

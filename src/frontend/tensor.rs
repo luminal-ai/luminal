@@ -67,8 +67,7 @@ impl GraphTensor {
             // Insert gather to make physically contiguous
             let dims = self.dims();
             let total = dims.iter().copied().reduce(|a, b| a * b).unwrap();
-            let idx_expr = self.shape.index_expression();
-            let idx = self.graph().iota(idx_expr, total);
+            let idx = self.graph().iota('z', total);
             let mut gathered = self.gather(idx);
             gathered.shape = ShapeTracker::new(dims);
             gathered

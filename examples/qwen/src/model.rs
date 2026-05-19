@@ -26,10 +26,14 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    pub fn new(cx: &mut Graph, max_seq: usize) -> Self {
-        let mut k_caches = Vec::with_capacity(LAYERS);
-        let mut v_caches = Vec::with_capacity(LAYERS);
-        for l in 0..LAYERS {
+    pub fn new(cx: &mut Graph, max_seq: usize, layers: usize) -> Self {
+        assert!(
+            layers <= LAYERS,
+            "requested {layers} layers, but model has {LAYERS}"
+        );
+        let mut k_caches = Vec::with_capacity(layers);
+        let mut v_caches = Vec::with_capacity(layers);
+        for l in 0..layers {
             let k = cx
                 .named_tensor(format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
                 .persist();
@@ -54,9 +58,13 @@ pub struct Qwen {
 }
 
 impl Qwen {
-    pub fn init(cx: &mut Graph) -> Self {
+    pub fn init(cx: &mut Graph, layers: usize) -> Self {
+        assert!(
+            layers <= LAYERS,
+            "requested {layers} layers, but model has {LAYERS}"
+        );
         let mut w = vec![];
-        for l in 0..LAYERS {
+        for l in 0..layers {
             let up = cx
                 .named_tensor(
                     format!("model.layers.{l}.mlp.up_proj.weight"),
@@ -169,7 +177,7 @@ impl Qwen {
             (token_ids * HIDDEN).expand_dim(1, HIDDEN)
                 + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
         );
-        let mut cache_outputs = Vec::with_capacity(LAYERS);
+        let mut cache_outputs = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
                 x,
@@ -287,8 +295,13 @@ fn hlir_attention(
     let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
 
     // Slice to valid range: [N_KV_HEADS, total_seq, HEAD_DIM]
-    let k_full = k_cache_out.slice((.., ..total_seq, ..));
-    let v_full = v_cache_out.slice((.., ..total_seq, ..));
+    let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
+    let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
+    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
+    // cannot yet propagate expression-bound assertions, so `slice` reports
+    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
+    k_full.shape.dims[1] = total_seq;
+    v_full.shape.dims[1] = total_seq;
 
     // GQA expand: [N_KV_HEADS, total_seq, HEAD_DIM] -> [N_HEADS, total_seq, HEAD_DIM]
     let k_3d = k_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);

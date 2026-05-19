@@ -1,4 +1,4 @@
-use rustfft::{num_complex::Complex32, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex32};
 use std::io::Cursor;
 use std::path::Path;
 
