@@ -1,4 +1,4 @@
-use crate::kernel::{DYN_SLOT_COUNT, MetalKernelOp};
+use crate::kernel::{DYN_SLOT_COUNT, MetalEncodeContext, MetalKernelOp, MpsKernelCache};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
@@ -16,7 +16,7 @@ use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptio
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use safetensors::{Dtype, SafeTensors};
-use std::{fs::File, time::Duration};
+use std::{cell::RefCell, fs::File, time::Duration};
 
 #[derive(Clone)]
 struct MetalCompiledBucket {
@@ -38,6 +38,8 @@ pub struct MetalRuntime {
     pub buffers: FxHashMap<NodeIndex, Buffer>,
     /// Dynamic dimensions table (a-z), shared across all kernels.
     dyn_buffer: Buffer,
+    /// Retained MPS descriptors/kernels reused across command encodes.
+    mps_cache: RefCell<MpsKernelCache>,
     /// The current LLIR graph
     llir_graph: LLIRGraph,
     /// Inferred runtime dtype for each LLIR node.
@@ -319,6 +321,7 @@ impl Runtime for MetalRuntime {
             hlir_buffers: FxHashMap::default(),
             buffers: FxHashMap::default(),
             dyn_buffer,
+            mps_cache: RefCell::new(MpsKernelCache::default()),
             llir_graph: StableGraph::default(),
             node_dtypes: FxHashMap::default(),
             pipelines: FxHashMap::default(),
@@ -386,6 +389,11 @@ impl Runtime for MetalRuntime {
 
             self.update_dyn_buffer(dyn_map);
             let command_buffer = self.command_queue.new_command_buffer();
+            let mut encode_context = MetalEncodeContext {
+                command_buffer,
+                dyn_buffer: &self.dyn_buffer,
+                mps_cache: &self.mps_cache,
+            };
 
             for node in topo_order {
                 if self.llir_graph[node].to_op::<Input>().is_some()
@@ -428,12 +436,11 @@ impl Runtime for MetalRuntime {
                     let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
 
                     kernel_op.encode(
-                        command_buffer,
+                        &mut encode_context,
                         pipeline,
                         &input_buffers,
                         output_buffer,
                         dyn_map,
-                        &self.dyn_buffer,
                         &input_dtypes,
                         output_dtype,
                     );
@@ -722,6 +729,11 @@ impl MetalRuntime {
 
             self.update_dyn_buffer(dyn_map);
             let command_buffer = self.command_queue.new_command_buffer();
+            let mut encode_context = MetalEncodeContext {
+                command_buffer,
+                dyn_buffer: &self.dyn_buffer,
+                mps_cache: &self.mps_cache,
+            };
 
             for node in topo_order {
                 if self.llir_graph[node].to_op::<Input>().is_some()
@@ -764,12 +776,11 @@ impl MetalRuntime {
                     let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
 
                     kernel_op.encode(
-                        command_buffer,
+                        &mut encode_context,
                         pipeline,
                         &input_buffers,
                         output_buffer,
                         dyn_map,
-                        &self.dyn_buffer,
                         &input_dtypes,
                         output_dtype,
                     );

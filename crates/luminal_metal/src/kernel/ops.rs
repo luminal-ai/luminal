@@ -1,4 +1,4 @@
-use super::{MPSMatrixLayout, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
+use super::{MPSMatrixLayout, MetalEncodeContext, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
 use luminal::{
     egglog_utils::{
         SerializedEGraph,
@@ -19,9 +19,8 @@ use luminal::{
     shape::flatten_strides,
 };
 use metal::{
-    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
+    Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
     foreign_types::{ForeignType, ForeignTypeRef},
-    mps,
 };
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
@@ -1505,33 +1504,12 @@ impl EgglogOp for MPSMatmul {
 }
 
 impl MPSMatmul {
-    fn mps_dtype(dtype: DType) -> mps::MPSDataType {
-        match dtype {
-            DType::F32 | DType::TF32 => mps::MPSDataType::Float32,
-            DType::F16 => mps::MPSDataType::Float16,
-            unsupported => panic!("MPSMatmul does not support dtype {unsupported:?}"),
-        }
-    }
-
     fn row_bytes(row_stride: Expression, dtype: DType, dyn_map: &FxHashMap<char, usize>) -> u64 {
         let elems = row_stride
             .substitute('z', Expression::from(1))
             .exec(dyn_map)
             .unwrap();
         (elems * dtype.bits().div_ceil(8)) as u64
-    }
-
-    fn descriptor(rows: usize, cols: usize, row_bytes: u64, dtype: DType) -> *mut Object {
-        let data_type = Self::mps_dtype(dtype) as isize;
-        unsafe {
-            msg_send![
-                class!(MPSMatrixDescriptor),
-                matrixDescriptorWithRows: rows
-                columns: cols
-                rowBytes: row_bytes as usize
-                dataType: data_type
-            ]
-        }
     }
 
     fn matrix(buffer: &Buffer, descriptor: *mut Object) -> *mut Object {
@@ -1589,12 +1567,11 @@ impl MetalKernelOp for MPSMatmul {
 
     fn encode(
         &self,
-        command_buffer: &CommandBufferRef,
+        context: &mut MetalEncodeContext<'_>,
         _pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
         dyn_map: &FxHashMap<char, usize>,
-        _dyn_buffer: &Buffer,
         input_dtypes: &[DType],
         output_dtype: DType,
     ) {
@@ -1610,46 +1587,48 @@ impl MetalKernelOp for MPSMatmul {
         let rhs_rows = if self.transpose_rhs { n } else { k };
         let rhs_cols = if self.transpose_rhs { k } else { n };
 
-        let lhs_desc = Self::descriptor(
-            lhs_rows,
-            lhs_cols,
-            Self::row_bytes(self.lhs_row_stride, lhs_dtype, dyn_map),
-            lhs_dtype,
-        );
-        let rhs_desc = Self::descriptor(
-            rhs_rows,
-            rhs_cols,
-            Self::row_bytes(self.rhs_row_stride, rhs_dtype, dyn_map),
-            rhs_dtype,
-        );
-        let out_desc = Self::descriptor(
-            m,
-            n,
-            Self::row_bytes(self.out_row_stride, output_dtype, dyn_map),
-            output_dtype,
-        );
+        let (lhs_desc, rhs_desc, out_desc, kernel) = {
+            let mut cache = context.mps_cache.borrow_mut();
+            (
+                cache.matrix_descriptor(
+                    lhs_rows,
+                    lhs_cols,
+                    Self::row_bytes(self.lhs_row_stride, lhs_dtype, dyn_map),
+                    lhs_dtype,
+                ),
+                cache.matrix_descriptor(
+                    rhs_rows,
+                    rhs_cols,
+                    Self::row_bytes(self.rhs_row_stride, rhs_dtype, dyn_map),
+                    rhs_dtype,
+                ),
+                cache.matrix_descriptor(
+                    m,
+                    n,
+                    Self::row_bytes(self.out_row_stride, output_dtype, dyn_map),
+                    output_dtype,
+                ),
+                cache.matrix_multiplication(
+                    context.command_buffer,
+                    self.transpose_lhs,
+                    self.transpose_rhs,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                ),
+            )
+        };
 
         let lhs = Self::matrix(inputs[0], lhs_desc);
         let rhs = Self::matrix(inputs[1], rhs_desc);
         let out = Self::matrix(output, out_desc);
 
         unsafe {
-            let device: *mut Object = msg_send![command_buffer.as_ptr(), device];
-            let kernel: *mut Object = msg_send![class!(MPSMatrixMultiplication), alloc];
-            let kernel: *mut Object = msg_send![
-                kernel,
-                initWithDevice: device
-                transposeLeft: self.transpose_lhs
-                transposeRight: self.transpose_rhs
-                resultRows: m
-                resultColumns: n
-                interiorColumns: k
-                alpha: 1.0f64
-                beta: 0.0f64
-            ];
             let _: () = msg_send![
                 kernel,
-                encodeToCommandBuffer: command_buffer.as_ptr()
+                encodeToCommandBuffer: context.command_buffer.as_ptr()
                 leftMatrix: lhs
                 rightMatrix: rhs
                 resultMatrix: out
@@ -1657,7 +1636,6 @@ impl MetalKernelOp for MPSMatmul {
             let _: () = msg_send![lhs, release];
             let _: () = msg_send![rhs, release];
             let _: () = msg_send![out, release];
-            let _: () = msg_send![kernel, release];
         }
     }
 
@@ -1953,12 +1931,11 @@ impl MetalKernelOp for MPSBatchedMatmul {
 
     fn encode(
         &self,
-        command_buffer: &CommandBufferRef,
+        context: &mut MetalEncodeContext<'_>,
         _pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
         dyn_map: &FxHashMap<char, usize>,
-        _dyn_buffer: &Buffer,
         input_dtypes: &[DType],
         output_dtype: DType,
     ) {
@@ -1982,25 +1959,26 @@ impl MetalKernelOp for MPSBatchedMatmul {
         let lhs_row_bytes = MPSMatmul::row_bytes(self.lhs_row_stride, lhs_dtype, dyn_map);
         let rhs_row_bytes = MPSMatmul::row_bytes(self.rhs_row_stride, rhs_dtype, dyn_map);
         let out_row_bytes = MPSMatmul::row_bytes(self.out_row_stride, output_dtype, dyn_map);
-        let lhs_desc = MPSMatmul::descriptor(lhs_rows, lhs_cols, lhs_row_bytes, lhs_dtype);
-        let rhs_desc = MPSMatmul::descriptor(rhs_rows, rhs_cols, rhs_row_bytes, rhs_dtype);
-        let out_desc = MPSMatmul::descriptor(m, n, out_row_bytes, output_dtype);
+        let (lhs_desc, rhs_desc, out_desc, kernel) = {
+            let mut cache = context.mps_cache.borrow_mut();
+            (
+                cache.matrix_descriptor(lhs_rows, lhs_cols, lhs_row_bytes, lhs_dtype),
+                cache.matrix_descriptor(rhs_rows, rhs_cols, rhs_row_bytes, rhs_dtype),
+                cache.matrix_descriptor(m, n, out_row_bytes, output_dtype),
+                cache.matrix_multiplication(
+                    context.command_buffer,
+                    self.transpose_lhs,
+                    self.transpose_rhs,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                ),
+            )
+        };
 
         unsafe {
-            let device: *mut Object = msg_send![command_buffer.as_ptr(), device];
-            let kernel: *mut Object = msg_send![class!(MPSMatrixMultiplication), alloc];
-            let kernel: *mut Object = msg_send![
-                kernel,
-                initWithDevice: device
-                transposeLeft: self.transpose_lhs
-                transposeRight: self.transpose_rhs
-                resultRows: m
-                resultColumns: n
-                interiorColumns: k
-                alpha: 1.0f64
-                beta: 0.0f64
-            ];
-
             for batch_idx in 0..batch {
                 let batch_expr = Expression::from(batch_idx as i64);
                 let lhs_offset = self
@@ -2027,7 +2005,7 @@ impl MetalKernelOp for MPSBatchedMatmul {
                 let out = MPSMatmul::matrix_with_offset(output, out_offset as u64, out_desc);
                 let _: () = msg_send![
                     kernel,
-                    encodeToCommandBuffer: command_buffer.as_ptr()
+                    encodeToCommandBuffer: context.command_buffer.as_ptr()
                     leftMatrix: lhs
                     rightMatrix: rhs
                     resultMatrix: out
@@ -2036,7 +2014,6 @@ impl MetalKernelOp for MPSBatchedMatmul {
                 let _: () = msg_send![rhs, release];
                 let _: () = msg_send![out, release];
             }
-            let _: () = msg_send![kernel, release];
         }
     }
 
