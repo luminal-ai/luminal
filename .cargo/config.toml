@@ -1,5 +1,5 @@
 [alias]
-examples = "run --release -p luminal_example_runner --"
+examples = "run --release --bin examples-perf --"
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = [

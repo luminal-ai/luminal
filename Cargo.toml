@@ -52,7 +52,6 @@ members = [
     "crates/luminal_metal",
     "crates/luminal_tracing",
     "crates/luminal_bench",
-    "crates/luminal_example_runner",
     "crates/luminal_python/rust",
 ]
 

@@ -1,9 +1,0 @@
-[package]
-name = "luminal_example_runner"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[[bin]]
-name = "luminal_example_runner"
-path = "src/main.rs"
