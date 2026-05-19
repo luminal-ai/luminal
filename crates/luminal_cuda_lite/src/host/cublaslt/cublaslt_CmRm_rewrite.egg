@@ -11,11 +11,13 @@
 ; cuBLAS: cublasSgemm(OP_N, OP_T, n, m, k, α, B, n, A, m, β, C, n)
 (rule
     (
-        ; Match Mul node
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-
-        ; Match Sum that reduces the Mul (k dimension)
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        ; Match the generic matmul produced from Mul -> Sum.
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
 
         ; Match exactly 2D output shape
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -77,8 +79,12 @@
 ; B row-major per batch: b_n_stride=MIter, b_m_stride=0
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
 
         (= ?batch (nth_from_end ?out_shape 2))
         (= ?m (nth_from_end ?out_shape 1))

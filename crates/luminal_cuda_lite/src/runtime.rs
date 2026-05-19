@@ -1410,6 +1410,35 @@ impl Runtime for CudaRuntime {
                 .filter(|n| n.to_dialect::<dyn HostOp>().is_some())
                 .count()
         );
+        let display = if std::env::var_os("LUMINAL_SEARCH_OP_NAMES").is_some() {
+            let mut kernel_counts = std::collections::BTreeMap::<&'static str, usize>::new();
+            let mut host_counts = std::collections::BTreeMap::<String, usize>::new();
+            for node in llir_graph.node_weights() {
+                if let Some(kernel) = node.to_dialect::<dyn KernelOp>() {
+                    *kernel_counts.entry(kernel.kernel_name()).or_default() += 1;
+                }
+                if let Some(host) = node.to_dialect::<dyn HostOp>() {
+                    let debug = format!("{:?}", host.as_ref().as_ref());
+                    let name = debug
+                        .split([' ', '{', '('])
+                        .next()
+                        .unwrap_or("HostOp")
+                        .to_string();
+                    *host_counts.entry(name).or_default() += 1;
+                }
+            }
+            let kernel_summary = kernel_counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .join(",");
+            let host_summary = host_counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .join(",");
+            format!("{display} [Kernels: {kernel_summary}] [Hosts: {host_summary}]")
+        } else {
+            display
+        };
 
         (duration, display)
     }
