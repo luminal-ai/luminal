@@ -3,6 +3,7 @@ use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
     dtype::DType,
+    egglog_utils::SerializedEGraph,
     graph::{BucketLLIR, DimBucket, Graph, LLIRGraph},
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
@@ -304,6 +305,26 @@ impl Runtime for MetalRuntime {
     type ExecReturn = ();
     type ProfileMetric = Duration;
 
+    fn late_egglog_passes(
+        ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
+        options: &luminal::graph::BuildSearchSpaceOptions,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
+        vec![crate::memory_analysis::metal_memory_analysis_pass(
+            ops,
+            options.max_memory_bytes,
+            dyn_map,
+        )]
+    }
+
+    fn estimate_graph_memory<'a>(
+        egraph: &'a SerializedEGraph,
+        choices: &luminal::egglog_utils::EGraphChoiceSet<'a>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Option<usize> {
+        crate::memory_analysis::estimate_graph_memory_bytes(egraph, choices, dyn_map)
+    }
+
     fn initialize(_: Self::CompileArg) -> Self {
         let device = Device::system_default().expect("No Metal device found!");
         let command_queue = device.new_command_queue();
@@ -347,19 +368,25 @@ impl Runtime for MetalRuntime {
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
-        _timeout: Option<std::time::Duration>,
+        timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
         self.load_llir(llir_graph);
         self.allocate_intermediate_buffers(dyn_map);
 
         let trials = trials.max(1);
+        let profile_start = std::time::Instant::now();
         let mut duration = Duration::default();
+        let mut completed_trials = 0;
         for _ in 0..trials {
             let start = std::time::Instant::now();
             self.execute(dyn_map);
             duration += start.elapsed();
+            completed_trials += 1;
+            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
         }
-        duration /= trials as u32;
+        duration /= completed_trials as u32;
 
         (duration, format!("{:.2?}", duration))
     }
@@ -447,6 +474,21 @@ impl Runtime for MetalRuntime {
 
     fn clear_intermediate_buffers(&mut self) {
         self.buffers.clear();
+    }
+
+    fn intermediate_buffer_bytes(&self) -> usize {
+        self.buffers
+            .values()
+            .map(|buffer| buffer.length() as usize)
+            .sum()
+    }
+
+    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
+        Some(self.intermediate_buffer_bytes())
+    }
+
+    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
+        Some(self.intermediate_buffer_bytes())
     }
 
     fn load_llir_buckets(

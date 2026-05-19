@@ -173,15 +173,16 @@ impl BuildSearchSpaceOptions {
 pub struct SearchOptions {
     /// Maximum number of graphs to evaluate
     pub limit: usize,
-    /// Number of offspring per generation (default: 30)
+    /// Number of offspring per generation (default: 10)
     pub generation_size: usize,
-    /// Number of mutations applied to each offspring (default: 30)
+    /// Number of mutations applied to each offspring (default: 10)
     pub mutations: usize,
     /// Number of profiling trials per candidate (default: 3)
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
-    /// Optional per-candidate profiling timeout.
+    /// Per-candidate profiling timeout. If a profile call reaches this budget,
+    /// that candidate is discarded and search continues.
     pub profile_timeout: Option<std::time::Duration>,
     /// Optional per-group search timeout.
     pub group_timeout: Option<std::time::Duration>,
@@ -194,11 +195,11 @@ impl SearchOptions {
     pub fn new(limit: usize) -> Self {
         Self {
             limit,
-            generation_size: 30,
-            mutations: 30,
+            generation_size: 10,
+            mutations: 10,
             trials: 3,
             keep_best: 1,
-            profile_timeout: None,
+            profile_timeout: Some(std::time::Duration::from_secs(1)),
             group_timeout: None,
             profile_dims: FxHashMap::default(),
         }
@@ -1347,6 +1348,11 @@ impl Graph {
         let mut list_cache = FxHashMap::default();
         let mut expr_cache = FxHashMap::default();
         runtime.clear_intermediate_buffers();
+        let profile_timed_out = |elapsed: std::time::Duration| {
+            options
+                .profile_timeout
+                .is_some_and(|timeout| elapsed >= timeout)
+        };
 
         // Find a viable initial genome (may need multiple attempts if some panic)
         let (mut best_genome, mut best_metric, display, mut n_graphs);
@@ -1385,13 +1391,15 @@ impl Graph {
                 // unrolled graph size.
                 collapse_loops_to_first_iter(&mut graph);
                 runtime.clear_intermediate_buffers();
+                let profile_start = std::time::Instant::now();
                 let (rep_metric, rep_display) = runtime.profile(
                     &graph,
                     &profile_dyn_map,
                     options.trials,
                     options.profile_timeout,
                 );
-                let has_nan = runtime.has_nan_outputs(&graph, &profile_dyn_map);
+                let timed_out = profile_timed_out(profile_start.elapsed());
+                let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
                 (
                     rep_metric,
                     append_memory_display(
@@ -1401,11 +1409,12 @@ impl Graph {
                         runtime.allocated_intermediate_buffer_bytes(),
                     ),
                     has_nan,
+                    timed_out,
                 )
             }));
 
             match result {
-                Ok((metric, disp, false)) => {
+                Ok((metric, disp, false, false)) => {
                     best_genome = genome;
                     best_metric = R::aggregate_profile_metrics(&[metric]);
                     display = disp;
@@ -1502,13 +1511,16 @@ impl Graph {
                     // before profiling — see initial-genome path.
                     collapse_loops_to_first_iter(&mut llir_graph);
                     runtime.clear_intermediate_buffers();
+                    let profile_start = std::time::Instant::now();
                     let (rep_metric, rep_display) = runtime.profile(
                         &llir_graph,
                         &profile_dyn_map,
                         options.trials,
                         options.profile_timeout,
                     );
-                    let has_nan = runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
+                    let timed_out = profile_timed_out(profile_start.elapsed());
+                    let has_nan =
+                        !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
                     (
                         rep_metric,
                         append_memory_display(
@@ -1518,15 +1530,16 @@ impl Graph {
                             runtime.allocated_intermediate_buffer_bytes(),
                         ),
                         has_nan,
+                        timed_out,
                     )
                 }));
 
                 let (new_metric, display_metric) = match profile_result {
-                    Ok((metric, display, false)) => {
+                    Ok((metric, display, false, false)) => {
                         (R::aggregate_profile_metrics(&[metric]), display)
                     }
-                    Ok((_, _, true)) | Err(_) => {
-                        // NaN or panic — redraw bars and skip
+                    Ok((_, _, _, true)) | Ok((_, _, true, false)) | Err(_) => {
+                        // Timed out, NaN, or panic — redraw bars and skip.
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
                         }

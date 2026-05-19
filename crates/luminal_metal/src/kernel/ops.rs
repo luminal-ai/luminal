@@ -1427,8 +1427,6 @@ impl EgglogOp for MPSMatmul {
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .subsume(sum_op.clone())
-                .subsume(mul_op)
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
                 .ruleset("kernel_lower")
@@ -1463,6 +1461,17 @@ impl EgglogOp for MPSMatmul {
                 MPSMatrixLayout::TransposedRowMajor,
                 1,
                 1,
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (MPSMatmul ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-mps-matmul-exists\"
+                )",
             ),
         ]
     }
@@ -1839,8 +1848,6 @@ impl EgglogOp for MPSBatchedMatmul {
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .subsume(sum_op.clone())
-                .subsume(mul_op)
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
                 .ruleset("kernel_lower")
@@ -1877,6 +1884,17 @@ impl EgglogOp for MPSBatchedMatmul {
                     modd(z.clone(), v("?k")),
                 ),
                 1,
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (MPSBatchedMatmul ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-mps-batched-matmul-exists\"
+                )",
             ),
         ]
     }
@@ -2161,24 +2179,6 @@ impl EgglogOp for GenericMatmul {
                      (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
                     :ruleset cleanup
                     :name \"delete-broadcast-mul-sum-when-generic-matmul-exists\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
-                     (= ?sum (MPSMatmul ?mm ?mn ?mk ?ml ?mls ?mr ?mrs ?mos ?mtl ?mtr)))
-                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    :ruleset cleanup
-                    :name \"prefer-mps-over-generic-matmul\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
-                     (= ?sum (MPSBatchedMatmul ?bb ?bm ?bn ?bk ?bl ?blbs ?blrs ?br ?brbs ?brrs ?bobs ?bors ?btl ?btr)))
-                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    :ruleset cleanup
-                    :name \"prefer-mps-batched-over-generic-matmul\"
                 )",
             ),
         ]
