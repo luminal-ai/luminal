@@ -47,6 +47,8 @@ pub struct MetalRuntime {
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
     /// Buffers for LLIR intermediate/output tensors
     pub buffers: FxHashMap<NodeIndex, Buffer>,
+    /// Logical byte length for each active LLIR buffer.
+    buffer_lengths: FxHashMap<NodeIndex, u64>,
     /// Dynamic dimensions table (a-z), shared across all kernels.
     dyn_buffer: Buffer,
     /// Retained MPS descriptors/kernels reused across command encodes.
@@ -232,6 +234,7 @@ impl MetalRuntime {
         let data_id = self.follow_aliases(self.output_data_node(id.to_id()));
 
         if let Some(buffer) = self.buffers.remove(&data_id) {
+            self.buffer_lengths.remove(&data_id);
             return buffer;
         }
 
@@ -276,12 +279,21 @@ impl MetalRuntime {
                     .map(|inp| inp.dtype)
             })
             .unwrap_or(DType::F32);
+        let logical_bytes = self
+            .buffer_lengths
+            .get(&data_id)
+            .copied()
+            .unwrap_or_else(|| buffer.length());
+        assert!(
+            logical_bytes <= buffer.length(),
+            "Logical buffer size exceeds allocated Metal buffer size"
+        );
 
         unsafe {
             match dtype {
                 DType::F16 => {
                     let ptr = buffer.contents() as *const f16;
-                    let len = buffer.length() as usize / std::mem::size_of::<f16>();
+                    let len = logical_bytes as usize / std::mem::size_of::<f16>();
                     std::slice::from_raw_parts(ptr, len)
                         .iter()
                         .map(|v| v.to_f32())
@@ -289,7 +301,7 @@ impl MetalRuntime {
                 }
                 DType::Int => {
                     let ptr = buffer.contents() as *const i32;
-                    let len = buffer.length() as usize / std::mem::size_of::<i32>();
+                    let len = logical_bytes as usize / std::mem::size_of::<i32>();
                     std::slice::from_raw_parts(ptr, len)
                         .iter()
                         .map(|v| *v as f32)
@@ -297,7 +309,7 @@ impl MetalRuntime {
                 }
                 _ => {
                     let ptr = buffer.contents() as *const f32;
-                    let len = buffer.length() as usize / std::mem::size_of::<f32>();
+                    let len = logical_bytes as usize / std::mem::size_of::<f32>();
                     std::slice::from_raw_parts(ptr, len).to_vec()
                 }
             }
@@ -325,6 +337,7 @@ impl Runtime for MetalRuntime {
             input_data: FxHashMap::default(),
             hlir_buffers: FxHashMap::default(),
             buffers: FxHashMap::default(),
+            buffer_lengths: FxHashMap::default(),
             dyn_buffer,
             mps_cache: RefCell::new(MpsKernelCache::default()),
             llir_graph: StableGraph::default(),
@@ -347,6 +360,7 @@ impl Runtime for MetalRuntime {
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.buffers.clear();
+        self.buffer_lengths.clear();
         self.dim_buckets.clear();
         self.compiled_buckets = vec![self.compile_bucket(FxHashMap::default(), llir_graph)];
         self.activate_bucket(0);
@@ -427,6 +441,7 @@ impl Runtime for MetalRuntime {
 
     fn clear_intermediate_buffers(&mut self) {
         self.buffers.clear();
+        self.buffer_lengths.clear();
     }
 
     fn load_llir_buckets(
@@ -435,6 +450,7 @@ impl Runtime for MetalRuntime {
         bucket_llirs: &[BucketLLIR],
     ) {
         self.buffers.clear();
+        self.buffer_lengths.clear();
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets = bucket_llirs
             .iter()
@@ -511,6 +527,7 @@ impl MetalRuntime {
 
     fn allocate_active_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
         let mut planned = Vec::new();
+        let capacity_dyn_map = self.active_capacity_dyn_map(dyn_map);
 
         for node in self.llir_graph.node_indices() {
             if self.llir_graph[node].to_op::<Input>().is_some() {
@@ -521,26 +538,56 @@ impl MetalRuntime {
                 if kernel_op.output_aliases_input().is_some() {
                     continue;
                 }
-                let size = kernel_op.output_size().exec(dyn_map).unwrap();
                 let dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-                let bytes = (size * dtype.bits().div_ceil(8)) as u64;
+                let requested_bytes =
+                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, dyn_map);
+                let allocation_bytes =
+                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, &capacity_dyn_map)
+                        .max(requested_bytes);
                 let needs_buffer = self
                     .buffers
                     .get(&node)
-                    .is_none_or(|buffer| buffer.length() != bytes);
+                    .is_none_or(|buffer| requested_bytes > buffer.length());
 
-                planned.push((node, bytes, needs_buffer));
+                planned.push((node, requested_bytes, allocation_bytes, needs_buffer));
             }
         }
 
-        for (node, bytes, needs_buffer) in planned {
+        for (node, requested_bytes, allocation_bytes, needs_buffer) in planned {
+            self.buffer_lengths.insert(node, requested_bytes);
             if needs_buffer {
                 let buffer = self
                     .device
-                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                    .new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
                 self.buffers.insert(node, buffer);
             }
         }
+    }
+
+    fn output_bytes(
+        kernel_op: &dyn MetalKernelOp,
+        dtype: DType,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> u64 {
+        let size = kernel_op.output_size().exec(dyn_map).unwrap();
+        (size * dtype.bits().div_ceil(8)) as u64
+    }
+
+    fn active_capacity_dyn_map(&self, dyn_map: &FxHashMap<char, usize>) -> FxHashMap<char, usize> {
+        let mut capacity_dyn_map = dyn_map.clone();
+        let Some(active_bucket) = self.compiled_buckets.get(self.active_bucket) else {
+            return capacity_dyn_map;
+        };
+
+        for (&dim, buckets) in &self.dim_buckets {
+            if let Some(&bucket_index) = active_bucket.bucket_indices.get(&dim)
+                && let Some(bucket) = buckets.get(bucket_index)
+            {
+                capacity_dyn_map.insert(dim, bucket.max);
+            }
+        }
+
+        capacity_dyn_map
     }
 
     fn compile_bucket(
@@ -646,6 +693,7 @@ impl MetalRuntime {
         self.execution_plan = bucket.execution_plan;
         self.refresh_input_data_buffers();
         self.buffers.clear();
+        self.buffer_lengths.clear();
     }
 
     fn refresh_input_data_buffers(&mut self) {
