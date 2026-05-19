@@ -19,12 +19,23 @@ use safetensors::{Dtype, SafeTensors};
 use std::{cell::RefCell, fs::File, time::Duration};
 
 #[derive(Clone)]
+struct MetalExecutionStep {
+    node: NodeIndex,
+    input_nodes: Vec<NodeIndex>,
+    input_dtypes: Vec<DType>,
+    output_dtype: DType,
+}
+
+#[derive(Clone)]
 struct MetalCompiledBucket {
     bucket_indices: FxHashMap<char, usize>,
     llir_graph: LLIRGraph,
+    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     node_dtypes: FxHashMap<NodeIndex, DType>,
     pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
     output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+    output_data_map: FxHashMap<NodeIndex, NodeIndex>,
+    execution_plan: Vec<MetalExecutionStep>,
 }
 
 pub struct MetalRuntime {
@@ -42,12 +53,18 @@ pub struct MetalRuntime {
     mps_cache: RefCell<MpsKernelCache>,
     /// The current LLIR graph
     llir_graph: LLIRGraph,
+    /// LLIR input node -> HLIR input node.
+    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     /// Inferred runtime dtype for each LLIR node.
     node_dtypes: FxHashMap<NodeIndex, DType>,
     /// Compiled pipeline states for each kernel node
     pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
     /// LLIR output node -> input node whose buffer contains the output.
     output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+    /// HLIR output id -> LLIR node whose data feeds the output.
+    output_data_map: FxHashMap<NodeIndex, NodeIndex>,
+    /// Precomputed executable nodes and input metadata for the active LLIR graph.
+    execution_plan: Vec<MetalExecutionStep>,
     /// Bucket definitions for dynamic dimensions.
     dim_buckets: FxHashMap<char, Vec<DimBucket>>,
     /// Compiled LLIR variants, one per bucket combination.
@@ -66,22 +83,10 @@ impl MetalRuntime {
     }
 
     fn output_data_node(&self, id: NodeIndex) -> NodeIndex {
-        let output_id = self
-            .llir_graph
-            .node_indices()
-            .find(|n| {
-                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
-                    *node == id.index()
-                } else {
-                    false
-                }
-            })
-            .expect("Cannot find output tensor!");
-
-        self.llir_graph
-            .neighbors_directed(output_id, Direction::Incoming)
-            .next()
-            .unwrap()
+        self.output_data_map
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| panic!("Cannot find output tensor {id:?}!"))
     }
 
     fn follow_aliases(&self, mut node: NodeIndex) -> NodeIndex {
@@ -323,9 +328,12 @@ impl Runtime for MetalRuntime {
             dyn_buffer,
             mps_cache: RefCell::new(MpsKernelCache::default()),
             llir_graph: StableGraph::default(),
+            llir_to_hlir: FxHashMap::default(),
             node_dtypes: FxHashMap::default(),
             pipelines: FxHashMap::default(),
             output_alias_map: FxHashMap::default(),
+            output_data_map: FxHashMap::default(),
+            execution_plan: vec![],
             dim_buckets: FxHashMap::default(),
             compiled_buckets: vec![],
             active_bucket: 0,
@@ -373,20 +381,6 @@ impl Runtime for MetalRuntime {
             self.select_bucket(dyn_map);
             self.allocate_active_intermediate_buffers(dyn_map);
 
-            let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
-                .llir_graph
-                .node_indices()
-                .filter_map(|n| {
-                    if let Some(Input { node, .. }) = self.llir_graph[n].to_op::<Input>() {
-                        Some((n, NodeIndex::new(*node)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
-
             self.update_dyn_buffer(dyn_map);
             let command_buffer = self.command_queue.new_command_buffer();
             let mut encode_context = MetalEncodeContext {
@@ -395,56 +389,35 @@ impl Runtime for MetalRuntime {
                 mps_cache: &self.mps_cache,
             };
 
-            for node in topo_order {
-                if self.llir_graph[node].to_op::<Input>().is_some()
-                    || self.llir_graph[node].to_op::<Output>().is_some()
-                {
-                    continue;
-                }
+            for step in &self.execution_plan {
+                let kernel_op = self.llir_graph[step.node]
+                    .to_dialect::<dyn MetalKernelOp>()
+                    .expect("Execution plan referenced a non-Metal op");
+                let pipeline = self.pipelines.get(&step.node);
 
-                if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                    let pipeline = self.pipelines.get(&node);
+                let input_buffers: Vec<&Buffer> = step
+                    .input_nodes
+                    .iter()
+                    .map(|&n| self.buffer_for_llir_node(n, &self.llir_to_hlir))
+                    .collect();
 
-                    let input_nodes: Vec<NodeIndex> = self
-                        .llir_graph
-                        .edges_directed(node, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect();
+                let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
+                    input_buffers[alias_idx]
+                } else {
+                    self.buffers
+                        .get(&step.node)
+                        .expect("Output buffer not allocated!")
+                };
 
-                    let input_buffers: Vec<&Buffer> = input_nodes
-                        .iter()
-                        .map(|&n| self.buffer_for_llir_node(n, &llir_to_hlir))
-                        .collect();
-                    let input_dtypes: Vec<DType> = input_nodes
-                        .iter()
-                        .map(|n| {
-                            self.node_dtypes
-                                .get(n)
-                                .copied()
-                                .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
-                        })
-                        .collect();
-
-                    let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
-                        input_buffers[alias_idx]
-                    } else {
-                        self.buffers
-                            .get(&node)
-                            .expect("Output buffer not allocated!")
-                    };
-                    let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-
-                    kernel_op.encode(
-                        &mut encode_context,
-                        pipeline,
-                        &input_buffers,
-                        output_buffer,
-                        dyn_map,
-                        &input_dtypes,
-                        output_dtype,
-                    );
-                }
+                kernel_op.encode(
+                    &mut encode_context,
+                    pipeline,
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                    &step.input_dtypes,
+                    step.output_dtype,
+                );
             }
 
             command_buffer.commit();
@@ -578,12 +551,17 @@ impl MetalRuntime {
         let mut node_dtypes = FxHashMap::default();
         let mut pipelines = FxHashMap::default();
         let mut output_alias_map = FxHashMap::default();
+        let mut output_data_map = FxHashMap::default();
+        let mut execution_plan = Vec::new();
+        let mut llir_to_hlir = FxHashMap::default();
         let llir_graph = llir_graph.clone();
 
         let topo_order = toposort(&llir_graph, None).expect("Graph has cycles!");
-        for node in topo_order {
+        for node in &topo_order {
+            let node = *node;
             if let Some(input) = llir_graph[node].to_op::<Input>() {
                 node_dtypes.insert(node, input.dtype);
+                llir_to_hlir.insert(node, NodeIndex::new(input.node));
                 continue;
             }
 
@@ -617,17 +595,38 @@ impl MetalRuntime {
                 {
                     output_alias_map.insert(node, target);
                 }
+                execution_plan.push(MetalExecutionStep {
+                    node,
+                    input_nodes,
+                    input_dtypes,
+                    output_dtype,
+                });
             } else {
                 panic!("Metal runtime cannot execute unlowered LLIR node {node:?}");
+            }
+        }
+
+        for node in topo_order {
+            if let Some(Output { node: hlir_node }) = llir_graph[node].to_op::<Output>()
+                && let Some(data_node) = llir_graph
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .next()
+                    .map(|e| e.source())
+            {
+                output_data_map.insert(NodeIndex::new(*hlir_node), data_node);
             }
         }
 
         MetalCompiledBucket {
             bucket_indices,
             llir_graph,
+            llir_to_hlir,
             node_dtypes,
             pipelines,
             output_alias_map,
+            output_data_map,
+            execution_plan,
         }
     }
 
@@ -639,9 +638,12 @@ impl MetalRuntime {
             .clone();
         self.active_bucket = index;
         self.llir_graph = bucket.llir_graph;
+        self.llir_to_hlir = bucket.llir_to_hlir;
         self.node_dtypes = bucket.node_dtypes;
         self.pipelines = bucket.pipelines;
         self.output_alias_map = bucket.output_alias_map;
+        self.output_data_map = bucket.output_data_map;
+        self.execution_plan = bucket.execution_plan;
         self.refresh_input_data_buffers();
         self.buffers.clear();
     }
@@ -713,20 +715,6 @@ impl MetalRuntime {
             self.select_bucket(dyn_map);
             self.allocate_active_intermediate_buffers(dyn_map);
 
-            let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
-                .llir_graph
-                .node_indices()
-                .filter_map(|n| {
-                    if let Some(Input { node, .. }) = self.llir_graph[n].to_op::<Input>() {
-                        Some((n, NodeIndex::new(*node)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
-
             self.update_dyn_buffer(dyn_map);
             let command_buffer = self.command_queue.new_command_buffer();
             let mut encode_context = MetalEncodeContext {
@@ -735,56 +723,35 @@ impl MetalRuntime {
                 mps_cache: &self.mps_cache,
             };
 
-            for node in topo_order {
-                if self.llir_graph[node].to_op::<Input>().is_some()
-                    || self.llir_graph[node].to_op::<Output>().is_some()
-                {
-                    continue;
-                }
+            for step in &self.execution_plan {
+                let kernel_op = self.llir_graph[step.node]
+                    .to_dialect::<dyn MetalKernelOp>()
+                    .expect("Execution plan referenced a non-Metal op");
+                let pipeline = self.pipelines.get(&step.node);
 
-                if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                    let pipeline = self.pipelines.get(&node);
+                let input_buffers: Vec<&Buffer> = step
+                    .input_nodes
+                    .iter()
+                    .map(|&n| self.buffer_for_llir_node(n, &self.llir_to_hlir))
+                    .collect();
 
-                    let input_nodes: Vec<NodeIndex> = self
-                        .llir_graph
-                        .edges_directed(node, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect();
+                let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
+                    input_buffers[alias_idx]
+                } else {
+                    self.buffers
+                        .get(&step.node)
+                        .expect("Output buffer not allocated!")
+                };
 
-                    let input_buffers: Vec<&Buffer> = input_nodes
-                        .iter()
-                        .map(|&n| self.buffer_for_llir_node(n, &llir_to_hlir))
-                        .collect();
-                    let input_dtypes: Vec<DType> = input_nodes
-                        .iter()
-                        .map(|n| {
-                            self.node_dtypes
-                                .get(n)
-                                .copied()
-                                .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
-                        })
-                        .collect();
-
-                    let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
-                        input_buffers[alias_idx]
-                    } else {
-                        self.buffers
-                            .get(&node)
-                            .expect("Output buffer not allocated!")
-                    };
-                    let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-
-                    kernel_op.encode(
-                        &mut encode_context,
-                        pipeline,
-                        &input_buffers,
-                        output_buffer,
-                        dyn_map,
-                        &input_dtypes,
-                        output_dtype,
-                    );
-                }
+                kernel_op.encode(
+                    &mut encode_context,
+                    pipeline,
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                    &step.input_dtypes,
+                    step.output_dtype,
+                );
             }
 
             command_buffer.commit();
