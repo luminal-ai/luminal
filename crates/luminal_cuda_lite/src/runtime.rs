@@ -225,7 +225,6 @@ impl CudaRuntime {
             result::memcpy_dtod_async(dst_ptr, src.ptr(), src.len(), stream.cu_stream())
                 .expect("cuMemcpyDtoDAsync failed");
         }
-        stream.synchronize().unwrap();
         dst
     }
 

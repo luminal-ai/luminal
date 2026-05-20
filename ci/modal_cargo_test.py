@@ -1,8 +1,10 @@
 import modal
 import subprocess
 import os
+import shlex
 
 gpu_type = os.environ.get("GPU_TYPE", "T4")
+modal_timeout = int(os.environ.get("MODAL_TIMEOUT", "7200"))
 CUDARC_CUDA_VERSION = "12080"
 
 app = modal.App("luminal-ci-cargo-test")
@@ -28,7 +30,7 @@ cuda_image = (
 @app.function(
     image=cuda_image,
     gpu=gpu_type,
-    timeout=7200,  # 2 hours
+    timeout=modal_timeout,
 )
 def run_cargo_test():
     """Run cargo test for luminal_cuda_lite on a Modal GPU."""
@@ -43,17 +45,20 @@ def run_cargo_test():
     )
     compute_cap = result.stdout.strip().replace(".", "")
 
+    test_args = shlex.split(os.environ.get("CARGO_TEST_ARGS", "--test-threads=1"))
+    cmd = [
+        "cargo",
+        "test",
+        "--release",
+        "-p",
+        "luminal_cuda_lite",
+        "--verbose",
+        "--",
+        *test_args,
+    ]
+    print("Running:", " ".join(cmd), flush=True)
     subprocess.run(
-        [
-            "cargo",
-            "test",
-            "--release",
-            "-p",
-            "luminal_cuda_lite",
-            "--verbose",
-            "--",
-            "--test-threads=1",
-        ],
+        cmd,
         cwd=WORKDIR,
         env={
             **os.environ,
