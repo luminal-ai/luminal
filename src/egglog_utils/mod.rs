@@ -1620,7 +1620,56 @@ pub fn extract_expr<'a>(
 
 pub type EGraphChoiceSet<'a> = FxHashMap<&'a ClassId, &'a NodeId>;
 
-/// Count the total number of possible IR/IList choice sets, capped at `limit`.
+fn is_search_choice_eclass(label: &str) -> bool {
+    label.contains("IR") || label.contains("IList") || label.contains("OpKind")
+}
+
+fn extractor_list_len(egraph: &SerializedEGraph, eclass_id: &ClassId) -> Option<usize> {
+    let mut len = 0usize;
+    let mut cur_eclass: ClassId = eclass_id.clone();
+    let mut visited: FxHashSet<ClassId> = FxHashSet::default();
+    loop {
+        if !visited.insert(cur_eclass.clone()) {
+            return None;
+        }
+        let (label, enodes) = egraph.eclasses.get(&cur_eclass)?;
+        if !label.contains("List") {
+            return Some(len);
+        }
+        let head_enode = enodes.first()?;
+        let head_label = &egraph.enodes[head_enode].0;
+        if head_label == "ENil" || head_label == "INil" {
+            return Some(len);
+        }
+        if head_label != "ECons" && head_label != "ICons" {
+            return Some(len);
+        }
+        len += 1;
+        let children = &egraph.enodes[head_enode].1;
+        if children.len() < 2 {
+            return Some(len);
+        }
+        cur_eclass = children[1].clone();
+    }
+}
+
+fn opkind_metadata_consistent(egraph: &SerializedEGraph, node: &NodeId) -> bool {
+    let lens: Vec<usize> = egraph.enodes[node]
+        .1
+        .iter()
+        .filter_map(|c| {
+            let lbl = &egraph.eclasses[c].0;
+            if lbl.contains("List") {
+                extractor_list_len(egraph, c)
+            } else {
+                None
+            }
+        })
+        .collect();
+    lens.is_empty() || lens.iter().all(|l| *l == lens[0])
+}
+
+/// Count the total number of possible searchable choice sets, capped at `limit`.
 ///
 /// Search deduplicates candidates by `EGraphChoiceSet`, so this gives the exact
 /// number of candidates when it is below `limit` without risking overflow on
@@ -1632,7 +1681,7 @@ pub fn count_choice_sets_up_to(egraph: &SerializedEGraph, limit: usize) -> usize
 
     let mut count = 1usize;
     for (label, enodes) in egraph.eclasses.values() {
-        if !label.contains("IR") && !label.contains("IList") {
+        if !is_search_choice_eclass(label) {
             continue;
         }
 
@@ -1650,10 +1699,10 @@ pub fn random_initial_choice<'a>(
 ) -> EGraphChoiceSet<'a> {
     let mut choices = FxHashMap::default();
     for (eclass, (label, enodes)) in &egraph.eclasses {
-        if !label.contains("IR") && !label.contains("IList") {
+        if !is_search_choice_eclass(label) {
             continue;
         }
-        // Prefer synth-injected enodes when available — they point at
+        // Use synth-injected enodes when available — they point at
         // deterministic single-variant kind eclasses produced by the
         // deep-clone fallback in `inject_kernel_alternatives`, so the
         // extractor's first-enode walk is guaranteed length-consistent.
@@ -1667,7 +1716,18 @@ pub fn random_initial_choice<'a>(
             .enumerate()
             .filter_map(|(i, n)| n.as_ref().starts_with("synth_").then_some(i))
             .collect();
-        let pick_idx = if !synth_indices.is_empty() {
+        let consistent_opkind_indices: Vec<usize> = if label == "OpKind" {
+            enodes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| opkind_metadata_consistent(egraph, n).then_some(i))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let pick_idx = if !consistent_opkind_indices.is_empty() {
+            consistent_opkind_indices[rng.random_range(0..consistent_opkind_indices.len())]
+        } else if !synth_indices.is_empty() {
             synth_indices[rng.random_range(0..synth_indices.len())]
         } else {
             rng.random_range(0..enodes.len())
@@ -1684,9 +1744,9 @@ pub fn validate_choice_set<'a>(
     choices: &EGraphChoiceSet<'a>,
     ops: &[Arc<Box<dyn EgglogOp>>],
 ) -> Result<(), String> {
-    // Check all IR/IList eclasses have a choice
+    // Check all searchable eclasses have a choice.
     for (eclass, (label, enodes)) in &egraph.eclasses {
-        if !label.contains("IR") && !label.contains("IList") {
+        if !is_search_choice_eclass(label) {
             continue;
         }
         let Some(chosen) = choices.get(eclass) else {
@@ -1719,7 +1779,7 @@ pub fn validate_choice_set<'a>(
                 .eclasses
                 .get(ch)
                 .ok_or_else(|| format!("Eclass {} not found", ch.as_ref()))?;
-            if label.contains("IR") || label.contains("IList") {
+            if is_search_choice_eclass(label) {
                 let n = choices
                     .get(ch)
                     .ok_or_else(|| format!("No choice for reachable eclass {}", ch.as_ref()))?;
@@ -1745,14 +1805,12 @@ pub fn validate_choice_set<'a>(
         if op_name == "Op" {
             // Normalized op — check OpKind child
             if let Some(kind_eclass) = children.first() {
-                if let Some((_, kind_enodes)) = egraph.eclasses.get(kind_eclass) {
-                    if let Some(kn) = kind_enodes.first() {
-                        let kind_name = &egraph.enodes[kn].0;
-                        if kind_name != "CustomOpKind"
-                            && !ops.iter().any(|op| op.sort().name == *kind_name)
-                        {
-                            return Err(format!("No extractor for OpKind {kind_name}"));
-                        }
+                if let Some(kn) = choices.get(kind_eclass) {
+                    let kind_name = &egraph.enodes[kn].0;
+                    if kind_name != "CustomOpKind"
+                        && !ops.iter().any(|op| op.sort().name == *kind_name)
+                    {
+                        return Err(format!("No extractor for OpKind {kind_name}"));
                     }
                 }
             }
@@ -1813,9 +1871,7 @@ pub fn extract_generation<'a>(
     let mutable_classes: Vec<&ClassId> = egraph
         .eclasses
         .iter()
-        .filter(|(_, (label, enodes))| {
-            (label.contains("IR") || label.contains("IList")) && enodes.len() > 1
-        })
+        .filter(|(_, (label, enodes))| is_search_choice_eclass(label) && enodes.len() > 1)
         .map(|(class_id, _)| class_id)
         .collect();
 
@@ -1848,9 +1904,21 @@ pub fn extract_generation<'a>(
         for _ in 0..rng.random_range(1..=mutations_per_generation) {
             // Pick a random mutable eclass
             let class_id = mutable_classes[rng.random_range(0..mutable_classes.len())];
-            let (_, enodes) = &egraph.eclasses[class_id];
+            let (label, enodes) = &egraph.eclasses[class_id];
             // Pick a random enode for this class
-            let new_node = &enodes[rng.random_range(0..enodes.len())];
+            let consistent_opkind_nodes: Vec<&NodeId> = if label == "OpKind" {
+                enodes
+                    .iter()
+                    .filter(|n| opkind_metadata_consistent(egraph, n))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let new_node = if !consistent_opkind_nodes.is_empty() {
+                consistent_opkind_nodes[rng.random_range(0..consistent_opkind_nodes.len())]
+            } else {
+                &enodes[rng.random_range(0..enodes.len())]
+            };
             // Insert returns the previous binding (if any); fold the diff
             // into the running hash. If the new pick equals the old one,
             // the two XORs cancel and `child_hash` is unchanged — exactly
@@ -1932,7 +2000,7 @@ pub fn egglog_to_llir_from_root<'a>(
     let mut reachability_stack = vec![choices[root_class]];
     while let Some(r) = reachability_stack.pop() {
         for ch in &egraph.enodes[r].1 {
-            if egraph.eclasses[ch].0.contains("IR") || egraph.eclasses[ch].0.contains("IList") {
+            if is_search_choice_eclass(&egraph.eclasses[ch].0) {
                 let n = choices[ch];
                 if !reachable.contains(n) {
                     reachability_stack.push(n);
@@ -1968,69 +2036,19 @@ pub fn egglog_to_llir_from_root<'a>(
             // structurally-equivalent kind enodes whose ELIST children
             // were unioned but resolve (under the extractor's first-enode
             // walk) to inconsistent lengths — picking such an enode causes
-            // a downstream `flatten_strides` length mismatch. Prefer the
-            // first kind enode whose ELIST children all walk to the same
-            // length; fall back to the original first enode if no
-            // consistent candidate exists (rare; only happens for ops
-            // outside the runnable subgraph).
+            // a downstream `flatten_strides` length mismatch. Candidate
+            // generation filters these out where possible; this fallback is
+            // structural only and does not rank backend implementations.
             let kind_enodes = &egraph.eclasses[kind_eclass].1;
-            let extractor_length = |eclass_id: &ClassId| -> Option<usize> {
-                let mut len = 0usize;
-                let mut cur_eclass: ClassId = eclass_id.clone();
-                let mut visited: FxHashSet<ClassId> = FxHashSet::default();
-                loop {
-                    if !visited.insert(cur_eclass.clone()) {
-                        return None;
-                    }
-                    let (label, enodes) = egraph.eclasses.get(&cur_eclass)?;
-                    if !label.contains("List") {
-                        return Some(len);
-                    }
-                    let head_enode = enodes.first()?;
-                    let head_label = &egraph.enodes[head_enode].0;
-                    if head_label == "ENil" || head_label == "INil" {
-                        return Some(len);
-                    }
-                    if head_label != "ECons" && head_label != "ICons" {
-                        return Some(len);
-                    }
-                    len += 1;
-                    let children = &egraph.enodes[head_enode].1;
-                    if children.len() < 2 {
-                        return Some(len);
-                    }
-                    cur_eclass = children[1].clone();
-                }
-            };
-            let elist_lens_for = |n: &NodeId| -> Vec<usize> {
-                egraph.enodes[n]
-                    .1
-                    .iter()
-                    .filter_map(|c| {
-                        let lbl = &egraph.eclasses[c].0;
-                        if lbl.contains("List") {
-                            extractor_length(c)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
-            let is_consistent = |n: &NodeId| -> bool {
-                let lens = elist_lens_for(n);
-                lens.is_empty() || lens.iter().all(|l| *l == lens[0])
-            };
-            let is_kernel = |n: &NodeId| -> bool {
-                let l = &egraph.enodes[n].0;
-                l.starts_with("Kernel") || l.starts_with("Fused")
-            };
-            // Prefer a consistent kernel kind; then any consistent;
-            // then any kernel; then fall back to first.
-            let kind_enode = kind_enodes
-                .iter()
-                .find(|n| is_kernel(n) && is_consistent(n))
-                .or_else(|| kind_enodes.iter().find(|n| is_consistent(n)))
-                .or_else(|| kind_enodes.iter().find(|n| is_kernel(n)))
+            let kind_enode = choices
+                .get(kind_eclass)
+                .copied()
+                .filter(|n| opkind_metadata_consistent(egraph, n))
+                .or_else(|| {
+                    kind_enodes
+                        .iter()
+                        .find(|n| opkind_metadata_consistent(egraph, n))
+                })
                 .unwrap_or(&kind_enodes[0]);
             let kind_label = &egraph.enodes[kind_enode].0;
 
@@ -2039,8 +2057,7 @@ pub fn egglog_to_llir_from_root<'a>(
                 .1
                 .iter()
                 .map(|c| {
-                    if egraph.eclasses[c].0.contains("IR") || egraph.eclasses[c].0.contains("IList")
-                    {
+                    if is_search_choice_eclass(&egraph.eclasses[c].0) {
                         choices[c]
                     } else {
                         &egraph.eclasses[c].1[0]
@@ -2085,8 +2102,7 @@ pub fn egglog_to_llir_from_root<'a>(
                 .1
                 .iter()
                 .map(|c| {
-                    if egraph.eclasses[c].0.contains("IR") || egraph.eclasses[c].0.contains("IList")
-                    {
+                    if is_search_choice_eclass(&egraph.eclasses[c].0) {
                         choices[c]
                     } else {
                         &egraph.eclasses[c].1[0]
@@ -2165,10 +2181,11 @@ mod tests {
         let egraph = egraph(vec![
             eclass("a", "IR", 2),
             eclass("b", "IList", 3),
+            eclass("op", "OpKind", 5),
             eclass("c", "Shape", 99),
         ]);
 
-        assert_eq!(count_choice_sets_up_to(&egraph, 100), 6);
+        assert_eq!(count_choice_sets_up_to(&egraph, 100), 30);
     }
 
     #[test]

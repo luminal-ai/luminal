@@ -17,3 +17,20 @@ jobs:
             - uses: actions/checkout@v6
             - name: Run Metal crate tests
               run: rustup update; cargo test --release -p luminal_metal --verbose -- --test-threads=1
+
+    llama_1b_metal_example:
+        name: Llama 1B Metal Example
+        runs-on: macos-14-xlarge
+        timeout-minutes: 120
+
+        steps:
+            - uses: actions/checkout@v6
+            - name: Print runner hardware
+              run: system_profiler SPHardwareDataType SPDisplaysDataType
+            - name: Cache Hugging Face models
+              uses: actions/cache@v4
+              with:
+                  path: ~/.cache/huggingface
+                  key: llama-1b-metal-hf-${{ runner.os }}-${{ runner.arch }}-v1
+            - name: Run Llama 1B Metal example and validate output
+              run: rustup update; python3 ci/metal_llama_1b_example.py

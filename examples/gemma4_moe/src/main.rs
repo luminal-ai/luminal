@@ -5,11 +5,13 @@ use hf::prepare_hf_model;
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use model::*;
+use rand::{SeedableRng, rngs::SmallRng};
 use rustc_hash::FxHashSet;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
 
 const REPO_ID: &str = "google/gemma-4-26B-A4B";
+const SEARCH_SEED: u64 = 0;
 
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
@@ -78,7 +80,12 @@ fn main() {
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
-    runtime = cx.search(runtime, search_graphs);
+    let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
+    runtime = cx.search_options(
+        runtime,
+        SearchOptions::new(search_graphs).profile_timeout(Duration::from_secs(2)),
+        &mut rng,
+    );
 
     for layer in 0..LAYERS {
         let cache_bytes = cache_bytes_for_layer(layer, max_seq_len);

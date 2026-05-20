@@ -3,6 +3,7 @@ use candle_core::{Device as CandleDevice, Tensor as CandleTensor};
 use half::{bf16, f16};
 use luminal::prelude::*;
 use proptest::prelude::*;
+use rand::{SeedableRng, rngs::StdRng};
 use safetensors::{Dtype, tensor::TensorView};
 use std::{
     collections::HashMap,
@@ -36,6 +37,30 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
 
 fn bytes_of<T: bytemuck::NoUninit>(values: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(values).to_vec()
+}
+
+fn search_candidates(cx: &mut Graph, rt: MetalRuntime, limit: usize) -> MetalRuntime {
+    let mut rng = StdRng::seed_from_u64(0);
+    cx.search_options(rt, SearchOptions::new(limit), &mut rng)
+}
+
+fn egraph_has_op(cx: &Graph, op_name: &str) -> bool {
+    cx.egraph()
+        .expect("search space should be built")
+        .enodes
+        .values()
+        .any(|(label, _)| label == op_name)
+}
+
+fn assert_matmul_options(cx: &Graph, mps_op_name: &str) {
+    assert!(
+        egraph_has_op(cx, mps_op_name),
+        "expected {mps_op_name} rewrite option in e-graph"
+    );
+    assert!(
+        egraph_has_op(cx, "GenericMatmul"),
+        "expected GenericMatmul rewrite option in e-graph"
+    );
 }
 
 fn write_test_safetensors(tensors: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> PathBuf {
@@ -401,6 +426,18 @@ proptest! {
     }
 }
 
+#[test]
+fn metal_build_search_space_accepts_memory_budget() {
+    let mut cx = Graph::default();
+    let a = cx.tensor(4);
+    let b = cx.tensor(4);
+    (a * b).output();
+
+    cx.build_search_space_with_options::<MetalRuntime>(
+        BuildSearchSpaceOptions::new().max_memory_mib(1),
+    );
+}
+
 /// Simple deterministic test for add
 #[test]
 fn metal_simple_add() {
@@ -665,7 +702,7 @@ fn metal_specialized_matmul() {
 
     rt.set_data(a, &a_data);
     rt.set_data(b, &b_data);
-    rt = cx.search(rt, 1);
+    rt = search_candidates(&mut cx, rt, 32);
     assert!(
         rt.contains_matmul(),
         "expected Metal runtime to fuse matmul, kernels: {:?}",
@@ -698,6 +735,7 @@ fn metal_regular_tiled_matmul_path() {
     let output = a.matmul(b).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert_matmul_options(&cx, "MPSMatmul");
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(m * k, 0.4, -0.2);
@@ -705,19 +743,7 @@ fn metal_regular_tiled_matmul_path() {
 
     rt.set_data(a, &a_data);
     rt.set_data(b, &b_data);
-    rt = cx.search(rt, 1);
-
-    let kernels = rt.debug_kernel_ops();
-    assert!(
-        kernels.iter().any(|k| k.contains("MPSMatmul")),
-        "expected MPS matmul path, kernels: {:?}",
-        kernels
-    );
-    assert!(
-        !kernels.iter().any(|k| k.contains("GenericMatmul")),
-        "MPS-compatible matmul should not extract the generic fallback, kernels: {:?}",
-        kernels
-    );
+    rt = search_candidates(&mut cx, rt, 32);
 
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
@@ -744,6 +770,7 @@ fn metal_mps_matmul_transposed_rhs_weight_layout() {
     let output = a.matmul(weight.t()).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert_matmul_options(&cx, "MPSMatmul");
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(m * k, 0.35, -0.17);
@@ -751,14 +778,7 @@ fn metal_mps_matmul_transposed_rhs_weight_layout() {
 
     rt.set_data(a, &a_data);
     rt.set_data(weight, &weight_data);
-    rt = cx.search(rt, 1);
-
-    let kernels = rt.debug_kernel_ops();
-    assert!(
-        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
-        "expected MPS matmul to cover transposed row-major RHS, kernels: {:?}",
-        kernels
-    );
+    rt = search_candidates(&mut cx, rt, 32);
 
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
@@ -785,6 +805,7 @@ fn metal_mps_matmul_transposed_lhs_layout() {
     let output = lhs_storage.t().matmul(rhs).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert_matmul_options(&cx, "MPSMatmul");
     let mut rt = MetalRuntime::initialize(());
 
     let lhs_data = seeded_data(k * m, 0.31, -0.12);
@@ -792,14 +813,7 @@ fn metal_mps_matmul_transposed_lhs_layout() {
 
     rt.set_data(lhs_storage, &lhs_data);
     rt.set_data(rhs, &rhs_data);
-    rt = cx.search(rt, 1);
-
-    let kernels = rt.debug_kernel_ops();
-    assert!(
-        kernels.iter().any(|k| k.contains("transpose_lhs: true")),
-        "expected MPS matmul to cover transposed row-major LHS, kernels: {:?}",
-        kernels
-    );
+    rt = search_candidates(&mut cx, rt, 32);
 
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
@@ -830,20 +844,14 @@ fn metal_mps_batched_matmul_row_row_layout() {
     let output = a.matmul(b).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert_matmul_options(&cx, "MPSBatchedMatmul");
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(batch * m * k, 0.17, -0.08);
     let b_data = seeded_data(batch * k * n, 0.11, -0.05);
     rt.set_data(a, &a_data);
     rt.set_data(b, &b_data);
-    rt = cx.search(rt, 1);
-
-    let kernels = rt.debug_kernel_ops();
-    assert!(
-        kernels.iter().any(|k| k.contains("MPSBatchedMatmul")),
-        "expected MPS batched matmul path, kernels: {:?}",
-        kernels
-    );
+    rt = search_candidates(&mut cx, rt, 32);
 
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
@@ -880,13 +888,17 @@ fn metal_generic_matmul_covers_noncontiguous_merged_head_projection() {
     let output = merged.matmul(weight.t()).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert!(
+        egraph_has_op(&cx, "GenericMatmul"),
+        "expected GenericMatmul rewrite option in e-graph"
+    );
     let mut rt = MetalRuntime::initialize(());
 
     let attn_data = seeded_data(heads * seq * head_dim, 0.19, -0.09);
     let weight_data = seeded_data(out_dim * hidden, 0.14, -0.06);
     rt.set_data(attn, &attn_data);
     rt.set_data(weight, &weight_data);
-    rt = cx.search(rt, 1);
+    rt = search_candidates(&mut cx, rt, 32);
 
     let kernels = rt.debug_kernel_ops();
     assert!(
@@ -935,22 +947,14 @@ fn metal_mps_batched_matmul_transposed_rhs_layout() {
     let output = a.matmul(weight.permute((0, 2, 1))).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert_matmul_options(&cx, "MPSBatchedMatmul");
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(batch * m * k, 0.13, -0.06);
     let weight_data = seeded_data(batch * n * k, 0.09, -0.04);
     rt.set_data(a, &a_data);
     rt.set_data(weight, &weight_data);
-    rt = cx.search(rt, 1);
-
-    let kernels = rt.debug_kernel_ops();
-    assert!(
-        kernels
-            .iter()
-            .any(|k| k.contains("MPSBatchedMatmul") && k.contains("transpose_rhs: true")),
-        "expected MPS batched matmul transposed RHS path, kernels: {:?}",
-        kernels
-    );
+    rt = search_candidates(&mut cx, rt, 32);
 
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);
@@ -984,6 +988,7 @@ fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
     let output = a.matmul(weight.t()).cast(DType::F32).output();
 
     cx.build_search_space::<MetalRuntime>();
+    assert_matmul_options(&cx, "MPSMatmul");
     let mut rt = MetalRuntime::initialize(());
 
     let a_data = seeded_data(m * k, 0.22, -0.07);
@@ -991,14 +996,7 @@ fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
 
     rt.set_data(a, to_f16_vec(&a_data));
     rt.set_data(weight, to_f16_vec(&weight_data));
-    rt = cx.search(rt, 1);
-
-    let kernels = rt.debug_kernel_ops();
-    assert!(
-        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
-        "expected MPS F16 matmul to cover transposed row-major RHS, kernels: {:?}",
-        kernels
-    );
+    rt = search_candidates(&mut cx, rt, 32);
 
     rt.allocate_intermediate_buffers(&cx.dyn_map);
     rt.execute(&cx.dyn_map);

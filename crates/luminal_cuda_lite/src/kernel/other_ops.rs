@@ -1338,9 +1338,21 @@ impl KernelOp for KernelSoftmax {
 #define FULL_MASK 0xffffffff
 #define NEG_INF_F __int_as_float(0xff800000)
 {dyn_defines}
+#define LOG2E 1.4426950408889634f
+
 extern \"C\" {{
+    // Online normalizer calculation for softmax (Milakov & Gimelshein 2018).
+
+    // Merge two partial (max, sum) pairs using the online softmax rule.
+    __device__ __forceinline__ void merge_md(float *m, float *d, float m2, float d2) {{
+        float new_m = fmaxf(*m, m2);
+        *d = *d * exp2f((*m - new_m) * LOG2E) + d2 * exp2f((m2 - new_m) * LOG2E);
+        *m = new_m;
+    }}
+
     __global__ void fused_softmax(float *out, const float *inp{dyn_dims_param}) {{
-        __shared__ float shared[THREADS_PER_BLOCK / WARP_SIZE];
+        __shared__ float sh_m[THREADS_PER_BLOCK / WARP_SIZE];
+        __shared__ float sh_d[THREADS_PER_BLOCK / WARP_SIZE];
         long long const_z = blockIdx.x;
         int tid = threadIdx.x;
         int lane_id = tid % WARP_SIZE;
@@ -1352,55 +1364,36 @@ extern \"C\" {{
         long long in_stride = {in_reduce_stride};
         long long out_stride = {out_reduce_stride};
 
-        // Pass 1: find max
-        float max_val = NEG_INF_F;
+        // Pass 1: one read of inp produces (global_max, global_sum).
+        float m = NEG_INF_F, d = 0.0f;
         for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
-            max_val = fmaxf(max_val, inp[in_base + i * in_stride]);
+            merge_md(&m, &d, inp[in_base + i * in_stride], 1.0f);
         }}
+        // Warp reduce: collapse 32 threads within each warp down to lane 0.
         #pragma unroll
         for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            max_val = fmaxf(max_val, __shfl_down_sync(FULL_MASK, max_val, s));
+            merge_md(&m, &d, __shfl_down_sync(FULL_MASK, m, s), __shfl_down_sync(FULL_MASK, d, s));
         }}
-        if (lane_id == 0) shared[warp_id] = max_val;
+        if (lane_id == 0) {{ sh_m[warp_id] = m; sh_d[warp_id] = d; }}
         __syncthreads();
+        // Block reduce: warp 0 collapses the 8 warp results down to one.
         if (warp_id == 0) {{
-            max_val = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? shared[tid] : NEG_INF_F;
+            m = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? sh_m[tid] : NEG_INF_F;
+            d = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? sh_d[tid] : 0.0f;
             #pragma unroll
             for (int s = (THREADS_PER_BLOCK / WARP_SIZE) / 2; s > 0; s /= 2) {{
-                max_val = fmaxf(max_val, __shfl_down_sync(FULL_MASK, max_val, s));
+                merge_md(&m, &d, __shfl_down_sync(FULL_MASK, m, s), __shfl_down_sync(FULL_MASK, d, s));
             }}
-            shared[0] = max_val;
+            sh_m[0] = m;
+            sh_d[0] = d;
         }}
         __syncthreads();
-        max_val = shared[0];
+        float global_max = sh_m[0];
+        float inv_sum = 1.0f / sh_d[0];
 
-        // Pass 2: compute exp2 and sum
-        float sum_val = 0.0f;
+        // Pass 2: write final softmax values.
         for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
-            float v = exp2f((inp[in_base + i * in_stride] - max_val) * 1.4426950408889634f);
-            out[out_base + i * out_stride] = v;  // store exp temporarily
-            sum_val += v;
-        }}
-        #pragma unroll
-        for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            sum_val += __shfl_down_sync(FULL_MASK, sum_val, s);
-        }}
-        if (lane_id == 0) shared[warp_id] = sum_val;
-        __syncthreads();
-        if (warp_id == 0) {{
-            sum_val = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? shared[tid] : 0.0f;
-            #pragma unroll
-            for (int s = (THREADS_PER_BLOCK / WARP_SIZE) / 2; s > 0; s /= 2) {{
-                sum_val += __shfl_down_sync(FULL_MASK, sum_val, s);
-            }}
-            shared[0] = sum_val;
-        }}
-        __syncthreads();
-        float inv_sum = 1.0f / shared[0];
-
-        // Pass 3: normalize
-        for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
-            out[out_base + i * out_stride] *= inv_sum;
+            out[out_base + i * out_stride] = exp2f((inp[in_base + i * in_stride] - global_max) * LOG2E) * inv_sum;
         }}
     }}
 }}"
