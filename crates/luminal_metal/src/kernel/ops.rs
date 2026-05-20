@@ -55,15 +55,21 @@ pub type MetalOps = (
 );
 
 fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
+    let options = metal::CompileOptions::new();
+    options.set_language_version(MTLLanguageVersion::V2_4);
     let library = device
-        .new_library_with_source(source, &metal::CompileOptions::new())
-        .expect("Failed to compile Metal shader");
+        .new_library_with_source(source, &options)
+        .unwrap_or_else(|err| {
+            panic!("Failed to compile Metal shader {function_name}: {err:?}\n{source}")
+        });
     let function = library
         .get_function(function_name, None)
         .expect("Failed to get function from library");
     device
         .new_compute_pipeline_state_with_function(&function)
-        .expect("Failed to create compute pipeline state")
+        .unwrap_or_else(|err| {
+            panic!("Failed to create Metal compute pipeline state for {function_name}: {err:?}\n{source}")
+        })
 }
 
 fn lower_dynamic_consts(mut code: String) -> String {
@@ -1038,42 +1044,33 @@ impl MetalKernelOp for MetalSumReduce {
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint simd_lane [[thread_index_in_simdgroup]],
-                uint simd_id [[simdgroup_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float warp_sums[THREADS_PER_GROUP / 32];
+                threadgroup float partials[THREADS_PER_GROUP];
 
                 int in_start = {in_idx};
                 int iters = {iters};
                 (void)dyn;
 
-                // Each thread accumulates multiple elements
                 float sum = 0.0f;
                 for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
                     sum += {in_val};
                 }}
 
-                // Warp-level reduction using simd_sum
-                sum = simd_sum(sum);
-
-                // First lane of each warp writes to shared memory
-                if (simd_lane == 0) {{
-                    warp_sums[simd_id] = sum;
-                }}
+                partials[tid] = sum;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // First warp does final reduction
-                if (simd_id == 0) {{
-                    int n_warps = THREADS_PER_GROUP / 32;
-                    float block_sum = (tid < uint(n_warps)) ? warp_sums[tid] : 0.0f;
-                    block_sum = simd_sum(block_sum);
-
-                    if (tid == 0) {{
-                        out[{out_idx}] = {out_val};
+                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
+                    if (tid < stride) {{
+                        partials[tid] += partials[tid + stride];
                     }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+
+                if (tid == 0) {{
+                    float block_sum = partials[0];
+                    out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
@@ -1219,42 +1216,33 @@ impl MetalKernelOp for MetalMaxReduce {
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint simd_lane [[thread_index_in_simdgroup]],
-                uint simd_id [[simdgroup_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float warp_maxs[THREADS_PER_GROUP / 32];
+                threadgroup float partials[THREADS_PER_GROUP];
 
                 int in_start = {in_idx};
                 int iters = {iters};
                 (void)dyn;
 
-                // Each thread finds max of multiple elements
                 float max_val = NEG_INF_F;
                 for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
                     max_val = fmax(max_val, {in_val});
                 }}
 
-                // Warp-level reduction using simd_max
-                max_val = simd_max(max_val);
-
-                // First lane of each warp writes to shared memory
-                if (simd_lane == 0) {{
-                    warp_maxs[simd_id] = max_val;
-                }}
+                partials[tid] = max_val;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // First warp does final reduction
-                if (simd_id == 0) {{
-                    int n_warps = THREADS_PER_GROUP / 32;
-                    float block_max = (tid < uint(n_warps)) ? warp_maxs[tid] : NEG_INF_F;
-                    block_max = simd_max(block_max);
-
-                    if (tid == 0) {{
-                        out[{out_idx}] = {out_val};
+                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
+                    if (tid < stride) {{
+                        partials[tid] = fmax(partials[tid], partials[tid + stride]);
                     }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+
+                if (tid == 0) {{
+                    float block_max = partials[0];
+                    out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
@@ -1426,8 +1414,6 @@ impl EgglogOp for MPSMatmul {
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .subsume(sum_op.clone())
-                .subsume(mul_op)
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
                 .ruleset("kernel_lower")
@@ -1462,6 +1448,17 @@ impl EgglogOp for MPSMatmul {
                 MPSMatrixLayout::TransposedRowMajor,
                 1,
                 1,
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (MPSMatmul ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-mps-matmul-exists\"
+                )",
             ),
         ]
     }
@@ -1817,8 +1814,6 @@ impl EgglogOp for MPSBatchedMatmul {
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .subsume(sum_op.clone())
-                .subsume(mul_op)
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
                 .ruleset("kernel_lower")
@@ -1855,6 +1850,17 @@ impl EgglogOp for MPSBatchedMatmul {
                     modd(z.clone(), v("?k")),
                 ),
                 1,
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (MPSBatchedMatmul ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-mps-batched-matmul-exists\"
+                )",
             ),
         ]
     }
@@ -2140,24 +2146,6 @@ impl EgglogOp for GenericMatmul {
                     :name \"delete-broadcast-mul-sum-when-generic-matmul-exists\"
                 )",
             ),
-            Rule::raw(
-                "(rule
-                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
-                     (= ?sum (MPSMatmul ?mm ?mn ?mk ?ml ?mls ?mr ?mrs ?mos ?mtl ?mtr)))
-                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    :ruleset cleanup
-                    :name \"prefer-mps-over-generic-matmul\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
-                     (= ?sum (MPSBatchedMatmul ?bb ?bm ?bn ?bk ?bl ?blbs ?blrs ?br ?brbs ?brrs ?bobs ?bors ?btl ?btr)))
-                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    :ruleset cleanup
-                    :name \"prefer-mps-batched-over-generic-matmul\"
-                )",
-            ),
         ]
     }
 
@@ -2242,13 +2230,11 @@ impl MetalKernelOp for GenericMatmul {
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint simd_lane [[thread_index_in_simdgroup]],
-                uint simd_id [[simdgroup_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float warp_sums[THREADS_PER_GROUP / 32];
+                threadgroup float partials[THREADS_PER_GROUP];
                 int base_idx = {sum_base_idx};
                 int iters = {iters};
                 (void)dyn;
@@ -2259,19 +2245,18 @@ impl MetalKernelOp for GenericMatmul {
                     sum += ({lhs_val}) * ({rhs_val});
                 }}
 
-                sum = simd_sum(sum);
-                if (simd_lane == 0) {{
-                    warp_sums[simd_id] = sum;
-                }}
+                partials[tid] = sum;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                if (simd_id == 0) {{
-                    int n_warps = THREADS_PER_GROUP / 32;
-                    float block_sum = (tid < uint(n_warps)) ? warp_sums[tid] : 0.0f;
-                    block_sum = simd_sum(block_sum);
-                    if (tid == 0) {{
-                        out[{out_idx}] = {out_val};
+                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
+                    if (tid < stride) {{
+                        partials[tid] += partials[tid + stride];
                     }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+
+                if (tid == 0) {{
+                    float block_sum = partials[0];
+                    out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
