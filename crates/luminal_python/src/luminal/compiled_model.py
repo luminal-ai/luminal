@@ -137,17 +137,58 @@ class CompiledModel:
 
         output_dtype_codes = self._graph.output_dtypes
 
-        # CUDA zero-copy path: pre-allocate output tensors and register their device
-        # pointers so the final kernel writes directly into PyTorch's buffer.
-        #
-        # Only the dtypes luminal *natively* writes can zero-copy. float64 is
-        # collapsed to f32 internally; registering an f64 device-ptr would
-        # have the kernel write 12 bytes into a 24-byte buffer, leaving half
-        # of every f64 element as garbage. We pre-allocate the f64 tensor so
-        # the collection path can fill it via `get_output` + cast, but skip
-        # the device-ptr handoff.
-        _use_zero_copy = self._supports_device_ptrs
+        # Per-dtype dispatch table: `{torch_dtype: (getter_name,
+        # read_dtype, final_cast_or_None)}`. `getter_name` is the
+        # `_graph` method that returns the buffer at `read_dtype`;
+        # `final_cast` is non-None only when the kernel emits an i32
+        # buffer that we then narrow to the user-visible dtype (the
+        # `_int_dtypes` shorthand below). I64 and F64 read at their
+        # native width via the strict typed paths; the boolean dtype
+        # is its own variant. The float-fast-path (f32 / f16 / bf16)
+        # is handled separately because it goes through the CUDA
+        # zero-copy device-ptr route.
         _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
+        _output_readers = {
+            torch.float64: ("get_output_f64", torch.float64, None),
+            torch.int64: ("get_output_i64", torch.int64, None),
+            torch.int32: ("get_output_i32", torch.int32, None),
+            torch.int8: ("get_output_i32", torch.int32, torch.int8),
+            torch.int16: ("get_output_i32", torch.int32, torch.int16),
+            torch.uint8: ("get_output_i32", torch.int32, torch.uint8),
+            torch.bool: ("get_output_bool", torch.bool, None),
+        }
+
+        def _read_typed_output(name: str, shape, out_dtype) -> torch.Tensor:
+            """Pull one output back from the runtime at the right dtype.
+            Routes through the per-dtype dispatch table; for any float
+            dtype not in the table, falls back to the generic f32
+            getter and post-casts."""
+            entry = _output_readers.get(out_dtype)
+            if entry is None:
+                data = self._graph.get_output(name)
+                tensor = (
+                    torch.tensor(data, dtype=torch.float32)
+                    .reshape(tuple(shape))
+                    .to(out_dtype)
+                )
+            else:
+                getter_name, read_dtype, final_cast = entry
+                data = getattr(self._graph, getter_name)(name)
+                tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
+                if final_cast is not None:
+                    tensor = tensor.to(final_cast)
+            return tensor.to(input_device)
+
+        # Pre-allocation is GPU-only: the CUDA kernel needs the
+        # output's device pointer registered *before* `_graph.run()`
+        # so the final kernel writes directly into PyTorch's buffer.
+        # Only the float dtypes luminal natively writes
+        # (`_zero_copy_native_floats`) take the zero-copy path; other
+        # dtypes (int*, bool, f64) read back via `_read_typed_output`
+        # after `run()` and so don't need a pre-allocated tensor at
+        # this layer. CPU never zero-copies — there's no separate
+        # device buffer to register against.
+        _use_zero_copy = self._supports_device_ptrs
         output_tensors = []
         if _use_zero_copy:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
@@ -163,114 +204,23 @@ class CompiledModel:
                     )
                 output_tensors.append(out)
 
-        # Run the graph
         self._graph.run()
 
-        # Integer dtypes for which we read the buffer as i32 and then cast.
-        # Includes int64 because luminal collapses all integer types to its
-        # 32-bit `Int` internally — we restore the original precision here.
-        _int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
-
-        # Collect outputs
-        if _use_zero_copy:
-            outputs = []
-            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
-                out_dtype = (
-                    code_to_torch_dtype(output_dtype_codes[i])
-                    if i < len(output_dtype_codes)
-                    else torch.float32
-                )
+        outputs = []
+        for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
+            out_dtype = (
+                code_to_torch_dtype(output_dtype_codes[i])
+                if i < len(output_dtype_codes)
+                else torch.float32
+            )
+            if _use_zero_copy and out_dtype in _zero_copy_native_floats:
                 out = output_tensors[i]
-                if out_dtype in _zero_copy_native_floats:
-                    if not self._graph.output_is_zero_copy(name):
-                        self._graph.copy_output_to_device_ptr(
-                            name, out.data_ptr(), out.numel() * out.element_size()
-                        )
-                elif out_dtype == torch.float64:
-                    # Real F64 read — preserves precision-sensitive
-                    # values. Replaces the previous f32-then-`.to(f64)`
-                    # cast-back, which lost information for values
-                    # outside f32's representable range.
-                    data = self._graph.get_output_f64(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.float64)
-                        .reshape(tuple(shape))
-                        .to(input_device)
+                if not self._graph.output_is_zero_copy(name):
+                    self._graph.copy_output_to_device_ptr(
+                        name, out.data_ptr(), out.numel() * out.element_size()
                     )
-                elif out_dtype == torch.int64:
-                    # Real I64 read — preserves values outside the i32
-                    # range that the previous i32-buffer-then-`.to(int64)`
-                    # path silently truncated.
-                    data = self._graph.get_output_i64(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.int64)
-                        .reshape(tuple(shape))
-                        .to(input_device)
-                    )
-                elif out_dtype in _int_dtypes:
-                    data = self._graph.get_output_i32(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.int32)
-                        .reshape(tuple(shape))
-                        .to(out_dtype)
-                        .to(input_device)
-                    )
-                elif out_dtype == torch.bool:
-                    data = self._graph.get_output_bool(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.bool)
-                        .reshape(tuple(shape))
-                        .to(input_device)
-                    )
-                else:
-                    data = self._graph.get_output(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.float32)
-                        .reshape(tuple(shape))
-                        .to(out_dtype)
-                        .to(input_device)
-                    )
-                outputs.append(out)
-        else:
-            # Native path: retrieve as f32, then convert to target dtype if needed.
-            outputs = []
-            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
-                out_dtype = (
-                    code_to_torch_dtype(output_dtype_codes[i])
-                    if i < len(output_dtype_codes)
-                    else torch.float32
-                )
-                if out_dtype == torch.float64:
-                    # Real F64 read — preserves precision-sensitive
-                    # values.
-                    data = self._graph.get_output_f64(name)
-                    out = torch.tensor(data, dtype=torch.float64).reshape(
-                        tuple(shape)
-                    )
-                elif out_dtype == torch.int64:
-                    # Real I64 read — preserves values outside the i32 range.
-                    data = self._graph.get_output_i64(name)
-                    out = torch.tensor(data, dtype=torch.int64).reshape(
-                        tuple(shape)
-                    )
-                elif out_dtype in _int_dtypes:
-                    data = self._graph.get_output_i32(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.int32)
-                        .reshape(tuple(shape))
-                        .to(out_dtype)
-                    )
-                elif out_dtype == torch.bool:
-                    data = self._graph.get_output_bool(name)
-                    out = torch.tensor(data, dtype=torch.bool).reshape(tuple(shape))
-                else:
-                    data = self._graph.get_output(name)
-                    out = (
-                        torch.tensor(data, dtype=torch.float32)
-                        .reshape(tuple(shape))
-                        .to(out_dtype)
-                    )
-                out = out.to(input_device)
-                outputs.append(out)
+            else:
+                out = _read_typed_output(name, shape, out_dtype)
+            outputs.append(out)
 
         return tuple(outputs)
