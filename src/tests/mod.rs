@@ -438,7 +438,7 @@ fn test_inputs_consumed_after_execute() {
     let _b = (a * 2.0).output();
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
-    rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
+    rt.set_data(a.id, Vec::<f32>::from([1.0, 2.0, 3.0]));
     rt.execute(&cx.dyn_map);
     // Second execute should panic — input 'a' was consumed
     rt.execute(&cx.dyn_map);
@@ -456,15 +456,15 @@ fn test_passthrough_preserves_weights() {
     let mut rt = cx.search(NativeRuntime::default(), 1);
 
     // Iteration 1
-    rt.set_data(w.id, vec![1.0, 2.0, 3.0]);
-    rt.set_data(x.id, vec![10.0, 20.0, 30.0]);
+    rt.set_data(w.id, Vec::<f32>::from([1.0, 2.0, 3.0]));
+    rt.set_data(x.id, Vec::<f32>::from([10.0, 20.0, 30.0]));
     rt.execute(&cx.dyn_map);
     assert_close(rt.get_f32(y.id), &[10.0, 40.0, 90.0]);
 
     // Retrieve weight from passthrough output, refeed
     let weights_back = rt.get_f32(w.id).clone();
     rt.set_data(w.id, weights_back);
-    rt.set_data(x.id, vec![5.0, 5.0, 5.0]);
+    rt.set_data(x.id, Vec::<f32>::from([5.0, 5.0, 5.0]));
     rt.execute(&cx.dyn_map);
     assert_close(rt.get_f32(y.id), &[5.0, 10.0, 15.0]);
 }
@@ -476,7 +476,7 @@ fn test_only_outputs_remain() {
     let _b = (a * 2.0).output();
     cx.build_search_space::<NativeRuntime>();
     let mut rt = cx.search(NativeRuntime::default(), 1);
-    rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
+    rt.set_data(a.id, Vec::<f32>::from([1.0, 2.0, 3.0]));
     rt.execute(&cx.dyn_map);
     let output_count = rt
         .graph

@@ -172,7 +172,7 @@ mod tests {
         // data = [[1,2,3], [4,5,6], [7,8,9], [10,11,12]]
         rt.set_data(
             data.id,
-            vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            Vec::<f32>::from([1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.]),
         );
         // Gather rows 0, 2, 3
         rt.set_data(indices.id, vec![0, 2, 3]);
@@ -195,9 +195,10 @@ mod tests {
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
 
-        rt.set_data(src.id, vec![10., 20., 30., 40., 50., 60.]);
+        rt.set_data(src.id, Vec::<f32>::from([10., 20., 30., 40., 50., 60.]));
         rt.set_data(indices.id, vec![1, 3]);
-        rt.set_data(dest.id, vec![0.; 12]);
+        let dest_zeros: Vec<f32> = vec![0.0; 12];
+        rt.set_data(dest.id, dest_zeros);
         rt.execute(&cx.dyn_map);
 
         assert_eq!(
@@ -221,9 +222,10 @@ mod tests {
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
 
-        rt.set_data(kv_new.id, vec![1., 2., 3., 4., 5., 6., 7., 8.]);
+        rt.set_data(kv_new.id, Vec::<f32>::from([1., 2., 3., 4., 5., 6., 7., 8.]));
         rt.set_data(scatter_idx.id, vec![1, 4]); // Write to slots 1 and 4
-        rt.set_data(cache.id, vec![0.; 24]); // Zero cache
+        let cache_zeros: Vec<f32> = vec![0.0; 24];
+        rt.set_data(cache.id, cache_zeros); // Zero cache
         rt.set_data(gather_idx.id, vec![1, 4]); // Read back from same slots
         rt.execute(&cx.dyn_map);
 
@@ -275,14 +277,16 @@ mod tests {
         let mut rt = cx.search(NativeRuntime::default(), 1);
 
         // Q = [1, 0, 1, 0] → head0=[1,0], head1=[1,0]
-        rt.set_data(q.id, vec![1., 0., 1., 0.]);
+        rt.set_data(q.id, Vec::<f32>::from([1., 0., 1., 0.]));
         // k_new = [0.5, 0.5, 0.5, 0.5]
-        rt.set_data(k_new.id, vec![0.5, 0.5, 0.5, 0.5]);
+        rt.set_data(k_new.id, Vec::<f32>::from([0.5, 0.5, 0.5, 0.5]));
         // v_new = [1, 2, 3, 4]
-        rt.set_data(v_new.id, vec![1., 2., 3., 4.]);
+        rt.set_data(v_new.id, Vec::<f32>::from([1., 2., 3., 4.]));
         // Zero caches
-        rt.set_data(k_cache.id, vec![0.; num_slots * kv_dim]);
-        rt.set_data(v_cache.id, vec![0.; num_slots * kv_dim]);
+        let k_cache_zeros: Vec<f32> = vec![0.0; num_slots * kv_dim];
+        let v_cache_zeros: Vec<f32> = vec![0.0; num_slots * kv_dim];
+        rt.set_data(k_cache.id, k_cache_zeros);
+        rt.set_data(v_cache.id, v_cache_zeros);
         // Scatter new KV to slot 2
         rt.set_data(scatter_idx.id, vec![2]);
         // Gather context from slots 0, 1, 2 (slots 0,1 are zeros, slot 2 is the new KV)
@@ -353,16 +357,16 @@ mod tests {
         // V cached at slot 0: [10, 20]
         // V new (written to slot 1): [30, 40]
         // Q: [1, 1]
-        let mut k_cache_data = vec![0.; num_slots * kv_dim];
+        let mut k_cache_data: Vec<f32> = vec![0.; num_slots * kv_dim];
         k_cache_data[0] = 1.;
         k_cache_data[1] = 0.; // slot 0 K = [1, 0]
-        let mut v_cache_data = vec![0.; num_slots * kv_dim];
+        let mut v_cache_data: Vec<f32> = vec![0.; num_slots * kv_dim];
         v_cache_data[0] = 10.;
         v_cache_data[1] = 20.; // slot 0 V = [10, 20]
 
-        rt.set_data(q.id, vec![1., 1.]);
-        rt.set_data(k_new.id, vec![0., 1.]); // new K = [0, 1]
-        rt.set_data(v_new.id, vec![30., 40.]); // new V = [30, 40]
+        rt.set_data(q.id, Vec::<f32>::from([1., 1.]));
+        rt.set_data(k_new.id, Vec::<f32>::from([0., 1.])); // new K = [0, 1]
+        rt.set_data(v_new.id, Vec::<f32>::from([30., 40.])); // new V = [30, 40]
         rt.set_data(k_cache.id, k_cache_data);
         rt.set_data(v_cache.id, v_cache_data);
         rt.set_data(scatter_idx.id, vec![1]); // write to slot 1
@@ -420,17 +424,17 @@ mod tests {
         let mut rt = cx.search(NativeRuntime::default(), 1);
 
         // Cache has 1 token at slot 0
-        let mut k_cache_data = vec![0.; num_slots * kv_dim];
+        let mut k_cache_data: Vec<f32> = vec![0.; num_slots * kv_dim];
         k_cache_data[0] = 1.;
         k_cache_data[1] = 0.; // slot 0: K=[1,0]
-        let mut v_cache_data = vec![0.; num_slots * kv_dim];
+        let mut v_cache_data: Vec<f32> = vec![0.; num_slots * kv_dim];
         v_cache_data[0] = 100.;
         v_cache_data[1] = 0.; // slot 0: V=[100,0]
 
         // 2 new tokens
-        rt.set_data(q.id, vec![1., 0., 0., 1.]);
-        rt.set_data(k_new.id, vec![0., 1., 1., 1.]); // token0 K=[0,1], token1 K=[1,1]
-        rt.set_data(v_new.id, vec![0., 10., 0., 20.]); // token0 V=[0,10], token1 V=[0,20]
+        rt.set_data(q.id, Vec::<f32>::from([1., 0., 0., 1.]));
+        rt.set_data(k_new.id, Vec::<f32>::from([0., 1., 1., 1.])); // token0 K=[0,1], token1 K=[1,1]
+        rt.set_data(v_new.id, Vec::<f32>::from([0., 10., 0., 20.])); // token0 V=[0,10], token1 V=[0,20]
         rt.set_data(k_cache.id, k_cache_data);
         rt.set_data(v_cache.id, v_cache_data);
         rt.set_data(scatter_idx.id, vec![1, 2]); // write to slots 1, 2

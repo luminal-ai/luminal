@@ -515,9 +515,12 @@ impl CompiledGraph {
 
     /// Get output tensor data by name as i64 (copies to host).
     ///
-    /// Used for `torch.int64` outputs. Reads the native I64 buffer when the
-    /// IR computed in I64 (preserving values outside the i32 range); widens
-    /// i32 / bool when the producer chose a narrower dtype.
+    /// Used for `torch.int64` outputs. Strict on producer dtype — the
+    /// graph's output node must already be `DType::I64`. No implicit
+    /// widening from narrower integer / bool variants. If a graph
+    /// computes in a narrower dtype and the caller asks for i64, the
+    /// translator inserts an explicit `Cast(I64)` before the Output;
+    /// see `translator::translate_graph`.
     fn get_output_i64(&self, name: &str) -> PyResult<Vec<i64>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -530,9 +533,10 @@ impl CompiledGraph {
 
     /// Get output tensor data by name as f64 (copies to host).
     ///
-    /// Used for `torch.float64` outputs. Reads the native F64 buffer when
-    /// the IR computed in F64 (preserving precision-sensitive values); widens
-    /// f32 / f16 / bf16 when the producer chose a narrower dtype.
+    /// Used for `torch.float64` outputs. Strict on producer dtype —
+    /// the graph's output node must already be `DType::F64`. No
+    /// implicit widening from narrower float variants. See
+    /// `get_output_i64` above for the contract.
     fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(

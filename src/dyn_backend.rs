@@ -293,13 +293,31 @@ impl DynBackend for NativeDynBackend {
     }
 
     fn get_output_i64(&self, node: NodeIndex) -> Vec<i64> {
-        let data = self.output_buffer(node);
-        (0..data.len()).map(|i| data.i64(i)).collect()
+        // Strict at the read boundary: producer must already be I64.
+        // No implicit widening from narrower variants — insert an
+        // explicit `Cast(I64)` in the graph before the Output.
+        match self.output_buffer(node) {
+            NativeData::I64(v) => v.clone(),
+            other => panic!(
+                "get_output_i64: buffer dtype is {:?}, expected I64. \
+                 Insert an explicit Cast(I64) in the graph before the \
+                 Output — no implicit widening at the read boundary.",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 
     fn get_output_f64(&self, node: NodeIndex) -> Vec<f64> {
-        let data = self.output_buffer(node);
-        (0..data.len()).map(|i| data.f64(i)).collect()
+        // Strict at the read boundary: producer must already be F64.
+        match self.output_buffer(node) {
+            NativeData::F64(v) => v.clone(),
+            other => panic!(
+                "get_output_f64: buffer dtype is {:?}, expected F64. \
+                 Insert an explicit Cast(F64) in the graph before the \
+                 Output — no implicit widening at the read boundary.",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {

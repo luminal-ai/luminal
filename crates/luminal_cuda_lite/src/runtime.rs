@@ -651,26 +651,47 @@ impl CudaRuntime {
             .collect_vec()
     }
 
-    /// Read a tensor's output bytes back as i64. The kernel must have emitted
-    /// `long long` writes for the producer (see `cuda_dtype`'s `I64` arm);
-    /// otherwise the bytes interpret as garbage.
+    /// Read a tensor's output bytes back as i64. Strict on producer
+    /// dtype — the buffer must already be `DType::I64`. If a graph
+    /// computes in a narrower integer type and the caller wants i64,
+    /// an explicit `Cast(I64)` must appear in the graph before the
+    /// `Output` — no implicit widening at the read boundary.
     pub fn get_i64(&self, id: impl ToId) -> Vec<i64> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::I64)) {
+            panic!(
+                "get_i64: buffer dtype is {buf_dtype:?}, expected I64. \
+                 Insert an explicit Cast(I64) in the graph before the Output \
+                 — no implicit widening at the read boundary."
+            );
+        }
         self.get_output_data(id)
             .chunks_exact(8)
-            .map(|c| {
-                i64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
-            })
+            .map(|c| i64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
             .collect_vec()
     }
 
-    /// Read a tensor's output bytes back as f64. The kernel must have emitted
-    /// `double` writes for the producer.
+    /// Read a tensor's output bytes back as f64. Strict on producer
+    /// dtype — the buffer must already be `DType::F64`. See `get_i64`
+    /// above for the contract.
     pub fn get_f64(&self, id: impl ToId) -> Vec<f64> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::F64)) {
+            panic!(
+                "get_f64: buffer dtype is {buf_dtype:?}, expected F64. \
+                 Insert an explicit Cast(F64) in the graph before the Output \
+                 — no implicit widening at the read boundary."
+            );
+        }
         self.get_output_data(id)
             .chunks_exact(8)
-            .map(|c| {
-                f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
-            })
+            .map(|c| f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
             .collect_vec()
     }
 
