@@ -35,7 +35,12 @@ impl<'a> Translator<'a> {
             false
         };
         let dim = crate::pt2_util::normalize_dim(dim, a.shape.len());
-        Ok(a.stable_argsort(dim, descending))
+        // PyTorch's `torch.argsort` returns int64 unconditionally;
+        // luminal's frontend `stable_argsort` returns i32 (storage-
+        // efficient default for native Rust callers). Cast at the
+        // PT2↔luminal boundary so the strict output-read path sees
+        // an I64 buffer.
+        Ok(a.stable_argsort(dim, descending).cast(DType::I64))
     }
 
     pub(crate) fn translate_unary_op(

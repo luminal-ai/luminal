@@ -79,25 +79,9 @@ impl<'a> Translator<'a> {
         let output_names = self.parsed.output_names();
         for name in &output_names {
             let tensor = self.get_tensor(name)?;
-            // If the EP declares a wider dtype than the producer chose
-            // (e.g. Argsort/TopK emit i32 indices but the user asked
-            // for `torch.int64`, or a graph computes in F32 but
-            // returns to `torch.float64`), insert an explicit
-            // `Cast(declared)`. The read boundary on both runtimes
-            // refuses to widen implicitly, so the Cast has to be in
-            // the graph.
-            let declared = self
-                .parsed
-                .tensor_meta(name)
-                .map(|m| pt2_util::torch_dtype_int_to_luminal(m.dtype));
-            let tensor = match declared {
-                Some(DType::I64) if tensor.dtype != DType::I64 => tensor.cast(DType::I64),
-                Some(DType::F64) if tensor.dtype != DType::F64 => tensor.cast(DType::F64),
-                _ => tensor,
-            };
             let tensor = if tensor.dtype == DType::Bool {
                 tensor.cast(DType::Int).cast(DType::Bool)
-            } else if matches!(tensor.dtype, DType::Int | DType::I64 | DType::F64) {
+            } else if tensor.dtype == DType::Int {
                 tensor
             } else {
                 tensor + 0.0
