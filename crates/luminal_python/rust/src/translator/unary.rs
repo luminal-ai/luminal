@@ -47,29 +47,6 @@ impl<'a> Translator<'a> {
         Ok(f(a))
     }
 
-    /// Same as `translate_unary_op`, but wraps the op with explicit
-    /// `Cast(F32)` → f → `Cast(F64)` when the input is F64. Used by the
-    /// transcendental dispatches (`Log2`, `Exp2`, `Sin`, `Sqrt`,
-    /// `Recip` and their compositions: log/log2/exp/exp2/sin/cos/sqrt/
-    /// rsqrt/reciprocal/sigmoid/tanh/gelu/silu). The luminal CPU
-    /// `unary_impl` doesn't have a native F64 path — kernels work
-    /// through f32 in v1 — and `unary_impl` panics on `NativeData::F64`
-    /// to make the missing kernel loud. Putting the bridging casts in
-    /// the graph makes the F32 round-trip explicit (visible to the
-    /// egglog optimizer) instead of implicit at the kernel layer.
-    pub(crate) fn translate_unary_op_f32_bridge(
-        &mut self,
-        node: &Node,
-        f: impl Fn(GraphTensor) -> GraphTensor,
-    ) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
-        if a.dtype == DType::F64 {
-            Ok(f(a.cast(DType::F32)).cast(DType::F64))
-        } else {
-            Ok(f(a))
-        }
-    }
-
     pub(crate) fn translate_to_copy(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         for input in &node.inputs {
