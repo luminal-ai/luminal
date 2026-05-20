@@ -1293,10 +1293,17 @@ fn unary_impl(
         NativeData::Bf16(f) => NativeData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
         NativeData::Int(_) => panic!("not implemented for int"),
         NativeData::I64(_) => panic!("not implemented for i64"),
-        // f64 transcendentals bridge through f32 in v1 — translator inserts
-        // a cast-to-f32 around `Log2`/`Exp2`/etc. before this kernel runs,
-        // so reaching here with F64 indicates a missing bridge.
-        NativeData::F64(_) => panic!("not implemented for f64"),
+        // F64 transcendentals don't have a native kernel in v1 — the
+        // luminal_python translator wraps them with explicit
+        // `Cast(F32)` → unary → `Cast(F64)` so the kernel sees F32 and
+        // the user-visible dtype round-trips. Reaching here with F64
+        // means the dispatch site is using `translate_unary_op` (no
+        // bridge) instead of `translate_unary_op_f32_bridge`.
+        NativeData::F64(_) => panic!(
+            "unary_impl: no native F64 kernel — dispatch site must wrap with \
+             explicit Cast(F32) → unary → Cast(F64) (see \
+             translate_unary_op_f32_bridge in luminal_python)"
+        ),
         NativeData::Bool(_) => panic!("not implemented for bool"),
     }
 }

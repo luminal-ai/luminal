@@ -56,26 +56,46 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.div.Tensor_mode" => self.translate_div_tensor_mode(node)?,
 
             // Unary ops
+            // `neg` / `relu` / `abs` don't need transcendentals (multiply,
+            // max-with-zero, sign-flip respectively) — F64 stays F64.
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
-            "torch.ops.aten.exp.default" => self.translate_unary_op(node, |a| a.exp())?,
-            "torch.ops.aten.sin.default" => self.translate_unary_op(node, |a| a.sin())?,
-            "torch.ops.aten.cos.default" => self.translate_unary_op(node, |a| a.cos())?,
-            "torch.ops.aten.sqrt.default" => self.translate_unary_op(node, |a| a.sqrt())?,
+            "torch.ops.aten.relu.default" => self.translate_unary_op(node, |a| a.relu())?,
+            "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
+            // Transcendentals go through `unary_impl` which has no native
+            // F64 path; the f32-bridge dispatch inserts explicit
+            // `Cast(F32)` / `Cast(F64)` around the op so the kernel sees
+            // F32 and the user-visible dtype round-trips.
+            "torch.ops.aten.exp.default" => self.translate_unary_op_f32_bridge(node, |a| a.exp())?,
+            "torch.ops.aten.sin.default" => self.translate_unary_op_f32_bridge(node, |a| a.sin())?,
+            "torch.ops.aten.cos.default" => self.translate_unary_op_f32_bridge(node, |a| a.cos())?,
+            "torch.ops.aten.sqrt.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.sqrt())?
+            }
             "torch.ops.aten.rsqrt.default" => {
-                self.translate_unary_op(node, |a| a.sqrt().reciprocal())?
+                self.translate_unary_op_f32_bridge(node, |a| a.sqrt().reciprocal())?
             }
             "torch.ops.aten.reciprocal.default" => {
-                self.translate_unary_op(node, |a| a.reciprocal())?
+                self.translate_unary_op_f32_bridge(node, |a| a.reciprocal())?
             }
-            "torch.ops.aten.sigmoid.default" => self.translate_unary_op(node, |a| a.sigmoid())?,
-            "torch.ops.aten.relu.default" => self.translate_unary_op(node, |a| a.relu())?,
-            "torch.ops.aten.tanh.default" => self.translate_unary_op(node, |a| a.tanh())?,
-            "torch.ops.aten.silu.default" => self.translate_unary_op(node, |a| a.silu())?,
-            "torch.ops.aten.gelu.default" => self.translate_unary_op(node, |a| a.gelu())?,
-            "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
-            "torch.ops.aten.log.default" => self.translate_unary_op(node, |a| a.log())?,
-            "torch.ops.aten.log2.default" => self.translate_unary_op(node, |a| a.log2())?,
-            "torch.ops.aten.exp2.default" => self.translate_unary_op(node, |a| a.exp2())?,
+            "torch.ops.aten.sigmoid.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.sigmoid())?
+            }
+            "torch.ops.aten.tanh.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.tanh())?
+            }
+            "torch.ops.aten.silu.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.silu())?
+            }
+            "torch.ops.aten.gelu.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.gelu())?
+            }
+            "torch.ops.aten.log.default" => self.translate_unary_op_f32_bridge(node, |a| a.log())?,
+            "torch.ops.aten.log2.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.log2())?
+            }
+            "torch.ops.aten.exp2.default" => {
+                self.translate_unary_op_f32_bridge(node, |a| a.exp2())?
+            }
             "torch.ops.aten.sign.default" => self.translate_sign(node)?,
             "torch.ops.aten.bitwise_not.default" => self.translate_bitwise_not(node)?,
 
