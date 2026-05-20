@@ -1220,9 +1220,10 @@ impl NativeOp for Cast {
                 NativeData::F16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
                 NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
                 NativeData::Int(i) => i.clone(),
-                // Narrowing cast: explicit i64 -> i32, used when the translator
-                // bridges an i64 value through a kernel that only has an i32
-                // path. Values outside the i32 range saturate, matching
+                // Saturating `Cast(I64 -> Int)`. This is the explicit
+                // graph node — `Cast` IS the user/translator-emitted
+                // operation, not an implicit bridge. Values outside the
+                // i32 range wrap via Rust's `as i32`, matching
                 // `tensor.to(torch.int32)` semantics on overflow.
                 NativeData::I64(i) => i.iter().map(|i| *i as i32).collect(),
                 NativeData::F64(f) => f.iter().map(|f| *f as i32).collect(),
@@ -2880,8 +2881,17 @@ impl NativeData {
         }
     }
 
-    /// 64-bit signed integer accessor. Used by I64-aware kernels; widens other
-    /// variants when an op promotes a mixed-dtype binary to I64.
+    /// **Kernel-internal** widening accessor. Returns element `i` as
+    /// `i64`, widening from any narrower variant. Used by binary
+    /// kernels (`Add(I64, _)`, `Mul(I64, _)`, ...) to read the RHS
+    /// operand at the LHS's chosen width — mirrors PyTorch eager's
+    /// mixed-dtype binary promotion (`int64 + int32 → int64`). The
+    /// **output-read** boundary is strict (`DynBackend::get_output_i64`
+    /// only accepts `NativeData::I64`); this in-kernel widening is
+    /// deliberate and lives at the kernel-dispatch layer, not the
+    /// user-visible API. A future translator promotion pass could
+    /// hoist the widening into explicit graph-level `Cast` nodes and
+    /// remove this accessor — see follow-up issue.
     #[inline]
     pub fn i64(&self, i: usize) -> i64 {
         match self {
@@ -2901,7 +2911,11 @@ impl NativeData {
         }
     }
 
-    /// 64-bit float accessor. Used by F64-aware kernels.
+    /// **Kernel-internal** widening accessor. Returns element `i` as
+    /// `f64`, widening from any narrower float / int variant. Same
+    /// shape as `i64()` above — used by binary kernels for mixed-dtype
+    /// promotion to F64; the user-visible output-read boundary
+    /// (`DynBackend::get_output_f64`) is strict on `NativeData::F64`.
     #[inline]
     pub fn f64(&self, i: usize) -> f64 {
         match self {
