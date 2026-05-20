@@ -20,11 +20,13 @@ jobs:
 
     llama_1b_metal_example:
         name: Llama 1B Metal Example
-        runs-on: macos-14
+        runs-on: macos-14-xlarge
         timeout-minutes: 120
 
         steps:
             - uses: actions/checkout@v6
+            - name: Print runner hardware
+              run: system_profiler SPHardwareDataType SPDisplaysDataType
             - name: Cache Hugging Face models
               uses: actions/cache@v4
               with:
