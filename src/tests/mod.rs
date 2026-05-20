@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use crate::egglog_utils::{
     extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
 };
-use crate::hlir::Output;
+use crate::hlir::{Add as NativeAdd, LessThan as NativeLessThan, NativeData, NativeOp, Output};
 use crate::prelude::*;
 use candle_core::{Device, Tensor};
 use proptest::prelude::*;
@@ -429,6 +429,34 @@ fn fuzz_test_genome_execution() {
 }
 
 // --- Consumed-input semantics tests ---
+
+#[test]
+#[should_panic(expected = "Add inputs must have the same dtype")]
+fn native_add_rejects_mixed_dtypes() {
+    let op = NativeAdd {
+        shape: vec![2.into()],
+        a_strides: vec![1.into()],
+        b_strides: vec![1.into()],
+        input_shapes: vec![],
+    };
+    let a = NativeData::F32(vec![1.0, 2.0]);
+    let b = NativeData::Int(vec![1, 2]);
+    op.execute(vec![&a, &b], &FxHashMap::default());
+}
+
+#[test]
+#[should_panic(expected = "LessThan inputs must have the same dtype")]
+fn native_less_than_rejects_mixed_dtypes() {
+    let op = NativeLessThan {
+        shape: vec![2.into()],
+        a_strides: vec![1.into()],
+        b_strides: vec![1.into()],
+        input_shapes: vec![],
+    };
+    let a = NativeData::F32(vec![1.0, 2.0]);
+    let b = NativeData::Int(vec![1, 2]);
+    op.execute(vec![&a, &b], &FxHashMap::default());
+}
 
 #[test]
 #[should_panic]
