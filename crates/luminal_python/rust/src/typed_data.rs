@@ -149,42 +149,37 @@ impl TypedData {
         }
     }
 
-    /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype code) to TypedData
-    /// in luminal's native format. Handles widening/narrowing conversions for types where
-    /// PyTorch's byte layout differs from luminal's:
-    /// - i64 / f64 preserved as `DType::I64` / `DType::F64` (first-class IR types)
-    /// - i16 → i32, u8 → i32, i8 → i32 (luminal maps narrower integers to i32)
+    /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype
+    /// code) to `TypedData`. All supported dtypes preserve their raw
+    /// bytes — no width changes at the FFI boundary. Narrow integer
+    /// widths (`uint8` / `int8` / `int16`) panic with a clear message:
+    /// luminal's `NativeData` has no narrower-integer variants yet, so
+    /// the only way they could pass through is via implicit widening
+    /// to `i32`, which the reviewer's no-implicit-cast directive
+    /// forbids. Cast at the call site (`x.to(torch.int32)`) or wait
+    /// for the narrower-int IR follow-up.
     pub fn from_pytorch_bytes(bytes: Vec<u8>, dtype_code: u32) -> Self {
         match dtype_code {
-            // Types that map directly — preserve raw bytes
             7 => Self::from_raw(bytes, DType::F32),
             6 => Self::from_raw(bytes, DType::F16),
             13 => Self::from_raw(bytes, DType::Bf16),
             4 => Self::from_raw(bytes, DType::Int), // i32
             12 => Self::from_raw(bytes, DType::Bool),
-            // i64 / f64 — first-class in the IR; preserve bits so values
-            // outside the i32 / f32 representable range survive.
             5 => Self::from_raw(bytes, DType::I64),
             8 => Self::from_raw(bytes, DType::F64),
-            // i16 → i32 (widen)
-            3 => {
-                let i32s: Vec<i32> = bytes
-                    .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
-                    .collect();
-                Self::from_i32_vec(i32s)
+            1 | 2 | 3 => {
+                let name = match dtype_code {
+                    1 => "uint8",
+                    2 => "int8",
+                    3 => "int16",
+                    _ => unreachable!(),
+                };
+                panic!(
+                    "from_pytorch_bytes: PT2 dtype code {dtype_code} ({name}) \
+                     isn't a first-class IR type yet — cast to torch.int32 at \
+                     the call site, or wait for the narrower-int IR follow-up."
+                );
             }
-            // u8 → i32 (widen)
-            1 => {
-                let i32s: Vec<i32> = bytes.iter().map(|&b| b as i32).collect();
-                Self::from_i32_vec(i32s)
-            }
-            // i8 → i32 (widen, signed)
-            2 => {
-                let i32s: Vec<i32> = bytes.iter().map(|&b| (b as i8) as i32).collect();
-                Self::from_i32_vec(i32s)
-            }
-            // Unknown: best-effort pass-through as f32
             _ => {
                 warn!("Unrecognized pytorch dtype code {dtype_code}, interpreting as f32");
                 Self::from_raw(bytes, DType::F32)
