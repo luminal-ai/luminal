@@ -1292,13 +1292,22 @@ fn unary_impl(
         NativeData::F32(f) => NativeData::F32(ind.map(|i| f32_fn(f[i])).collect()),
         NativeData::F16(f) => NativeData::F16(ind.map(|i| f16_fn(f[i])).collect()),
         NativeData::Bf16(f) => NativeData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
-        NativeData::Int(_) => panic!("not implemented for int"),
-        NativeData::I64(_) => panic!("not implemented for i64"),
-        // f64 transcendentals bridge through f32 in v1 — translator inserts
-        // a cast-to-f32 around `Log2`/`Exp2`/etc. before this kernel runs,
-        // so reaching here with F64 indicates a missing bridge.
-        NativeData::F64(_) => panic!("not implemented for f64"),
-        NativeData::Bool(_) => panic!("not implemented for bool"),
+        NativeData::Int(_) => panic!("unary_impl: no Int kernel — cast to F32 at the call site"),
+        NativeData::I64(_) => panic!("unary_impl: no I64 kernel — cast to F32 at the call site"),
+        // No F64 transcendental kernel. Refuse loudly rather than
+        // silently bridging through F32 — the caller asked for double
+        // precision and that's not what an F32 bridge delivers. Fix at
+        // the call site: cast inputs to F32 (`x.to(torch.float32)`) and
+        // accept the precision, or wait for a native F64 transcendental
+        // kernel.
+        NativeData::F64(_) => panic!(
+            "unary_impl: no F64 transcendental kernel — cast inputs to F32 \
+             at the call site (`x.to(torch.float32)`), or wait for the F64 \
+             transcendental kernel follow-up. Silent F32 bridging is \
+             intentionally rejected: it would hide a precision downgrade \
+             behind an `F64` dtype tag."
+        ),
+        NativeData::Bool(_) => panic!("unary_impl: no Bool kernel — cast to F32 at the call site"),
     }
 }
 
@@ -2967,11 +2976,11 @@ impl From<Vec<i64>> for NativeData {
         NativeData::I64(value)
     }
 }
-impl From<Vec<f64>> for NativeData {
-    fn from(value: Vec<f64>) -> Self {
-        NativeData::F64(value)
-    }
-}
+// No `From<Vec<f64>> for NativeData` impl. Adding it makes plain
+// float literals (`vec![1.0, 2.0, 3.0]` passed to `set_data`)
+// ambiguous between `Vec<f32>` and `Vec<f64>` and forces every test
+// site to spell out `Vec::<f32>::from([...])`. Callers that need to
+// construct an F64 buffer can do `NativeData::F64(my_vec)` directly.
 impl From<Vec<bool>> for NativeData {
     fn from(value: Vec<bool>) -> Self {
         NativeData::Bool(value)

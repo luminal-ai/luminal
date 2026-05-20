@@ -969,7 +969,7 @@ mod tests {
         let inv = values.scatter(perm, zeros).cast(DType::F32).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
-        rt.set_data(data.id, Vec::<f32>::from([0., 1., 2., 3., 4., 5.]));
+        rt.set_data(data.id, vec![0., 1., 2., 3., 4., 5.]);
         rt.set_data(indexes.id, vec![5, 0, 3, 2]);
         rt.set_data(perm.id, vec![3, 2, 4, 1, 5, 0]);
         rt.execute(&cx.dyn_map);
@@ -986,9 +986,9 @@ mod tests {
         let result = src.scatter(indexes, dest).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
-        rt.set_data(src.id, Vec::<f32>::from([10., 20., 30.]));
+        rt.set_data(src.id, vec![10., 20., 30.]);
         rt.set_data(indexes.id, vec![1, 3, 4]);
-        rt.set_data(dest.id, Vec::<f32>::from([0., 0., 0., 0., 0.]));
+        rt.set_data(dest.id, vec![0., 0., 0., 0., 0.]);
         rt.execute(&cx.dyn_map);
         assert_eq!(*rt.get_f32(result.id), vec![0., 10., 0., 20., 30.]);
     }
@@ -1002,9 +1002,9 @@ mod tests {
         let result = src.scatter(indexes, dest).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
-        rt.set_data(src.id, Vec::<f32>::from([99.]));
+        rt.set_data(src.id, vec![99.]);
         rt.set_data(indexes.id, vec![2]);
-        rt.set_data(dest.id, Vec::<f32>::from([1., 2., 3., 4., 5.]));
+        rt.set_data(dest.id, vec![1., 2., 3., 4., 5.]);
         rt.execute(&cx.dyn_map);
         assert_eq!(*rt.get_f32(result.id), vec![1., 2., 99., 4., 5.]);
     }
@@ -1018,9 +1018,9 @@ mod tests {
         let result = src.scatter(indexes, dest).output();
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
-        rt.set_data(src.id, Vec::<f32>::from([40., 30., 20., 10.]));
+        rt.set_data(src.id, vec![40., 30., 20., 10.]);
         rt.set_data(indexes.id, vec![3, 2, 1, 0]);
-        rt.set_data(dest.id, Vec::<f32>::from([1., 2., 3., 4.]));
+        rt.set_data(dest.id, vec![1., 2., 3., 4.]);
         rt.execute(&cx.dyn_map);
         assert_eq!(*rt.get_f32(result.id), vec![10., 20., 30., 40.]);
     }
@@ -1046,7 +1046,7 @@ mod tests {
 
         cx.build_search_space::<NativeRuntime>();
         let mut rt = cx.search(NativeRuntime::default(), 1);
-        rt.set_data(a.id, Vec::<f32>::from([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        rt.set_data(a.id, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         rt.execute(&cx.dyn_map);
 
         assert_exact(
