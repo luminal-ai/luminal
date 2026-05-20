@@ -167,7 +167,7 @@ impl TypedData {
             12 => Self::from_raw(bytes, DType::Bool),
             5 => Self::from_raw(bytes, DType::I64),
             8 => Self::from_raw(bytes, DType::F64),
-            1 | 2 | 3 => {
+            1..=3 => {
                 let name = match dtype_code {
                     1 => "uint8",
                     2 => "int8",

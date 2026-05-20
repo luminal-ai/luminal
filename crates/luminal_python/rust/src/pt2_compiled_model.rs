@@ -391,7 +391,7 @@ fn bytes_to_typed(bytes: &[u8], dtype: u32) -> TypedData {
         12 => TypedData::from_raw(bytes.to_vec(), DType::Bool),
         5 => TypedData::from_raw(bytes.to_vec(), DType::I64),
         8 => TypedData::from_raw(bytes.to_vec(), DType::F64),
-        1 | 2 | 3 => {
+        1..=3 => {
             let name = match dtype {
                 1 => "uint8",
                 2 => "int8",
