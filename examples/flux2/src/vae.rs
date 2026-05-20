@@ -2,7 +2,7 @@
 //!
 //! ## Status
 //!
-//! - All three primitives (`conv2d_bias`, `group_norm`, `nearest_upsample_2x`)
+//! - All three building blocks (`conv2d_bias`, `group_norm`, `nearest_upsample_2x`)
 //!   are implemented and **individually validated** against numerical
 //!   references — see the tests at the bottom of this file.
 //! - Stitching them into the full decoder currently hits a `luminal_cuda_lite`
@@ -70,14 +70,9 @@ fn decoder_block_channels(block_idx: usize) -> (usize, usize) {
 // HLIR primitive helpers
 // =============================================================================
 
-/// 2D convolution with bias on a `(C_in, H, W)` input, weights stored as
-/// `(C_out, C_in, K, K)` flat-loaded, bias as `(C_out,)`. Returns
+/// 2D convolution with bias on a `(C_in, H, W)` input, weights stored flat as
+/// `(C_out, C_in * K * K)`, bias as `(C_out,)`. Returns
 /// `(C_out, H_out, W_out)` where `H_out = (H + 2*padding - kernel) / stride + 1`.
-///
-/// Wraps the direct conv kernel from [`luminal_cuda_lite::kernel::conv2d_bias`]
-/// (one CUDA thread per output element), which avoids materializing the
-/// `(H_out*W_out, C_in*K*K)` unfold intermediate that earlier HLIR-only
-/// implementations needed.
 fn conv2d_bias(
     x: GraphTensor,
     weight: GraphTensor,
@@ -86,7 +81,58 @@ fn conv2d_bias(
     stride: usize,
     padding: usize,
 ) -> GraphTensor {
-    luminal_cuda_lite::kernel::conv2d_bias(x, weight, bias, kernel, stride, padding)
+    let dims = x.dims();
+    assert_eq!(dims.len(), 3, "conv2d_bias expects (C, H, W)");
+    let h = dims[1];
+    let w = dims[2];
+
+    if kernel == 1 && stride == 1 && padding == 0 {
+        let xt = x.permute(&[1, 2, 0]).merge_dims(0, 1); // (H*W, C_in)
+        let out = xt.matmul(weight.t()); // (H*W, C_out)
+        let out = out.split_dims(0, w).permute(&[2, 0, 1]); // (C_out, H, W)
+        return out + bias.expand_dim(1, h).expand_dim(2, w);
+    }
+
+    let zero = Expression::from(0);
+    let pad = Expression::from(padding);
+    let padded = if padding > 0 {
+        x.pad(vec![(zero, zero), (pad, pad), (pad, pad)], 0.0)
+    } else {
+        x
+    };
+
+    let unfolded = padded.unfold(
+        vec![1usize, kernel, kernel],
+        vec![1usize, stride, stride],
+        vec![1usize, 1, 1],
+    );
+    let output_spatial_dims = unfolded.dims()[1..3].to_vec();
+
+    // (C, H_out, W_out, 1, K, K) -> (H_out, W_out, C, K, K)
+    let mut patches = unfolded.squeeze(3).permute(&[1, 2, 0, 3, 4]);
+    while patches.dims().len() > 3 {
+        let last = patches.dims().len();
+        patches = patches.merge_dims(last - 2, last - 1);
+    }
+    let patches = patches.merge_dims(0, 1); // (H_out*W_out, C_in*K*K)
+
+    let out = patches.matmul(weight.t()); // (H_out*W_out, C_out)
+    let out = out
+        .split_dims(0, output_spatial_dims[1])
+        .permute(&[2, 0, 1]); // (C_out, H_out, W_out)
+    let out_dims = out.dims();
+    out + bias.expand_dim(1, out_dims[1]).expand_dim(2, out_dims[2])
+}
+
+fn linear_bias(x: GraphTensor, weight: GraphTensor, bias: GraphTensor) -> GraphTensor {
+    let out = x.matmul(weight.cast(x.dtype).t());
+    let out_dims = out.dims();
+    match out_dims.len() {
+        1 => out + bias,
+        2 => out + bias.expand_dim(0, out_dims[0]),
+        3 => out + bias.expand_dim(0, out_dims[0]).expand_dim(1, out_dims[1]),
+        n => panic!("linear_bias: unsupported rank {n}"),
+    }
 }
 
 /// PyTorch-style GroupNorm on a (C, H, W) tensor.
@@ -148,9 +194,7 @@ fn group_norm(
 fn nearest_upsample_2x(x: GraphTensor) -> GraphTensor {
     // (C, H, W) -> (C, H, 2, W) -> (C, 2H, W) -> (C, 2H, W, 2) -> (C, 2H, 2W)
     let stage1 = x.expand_dim(2, 2_usize).merge_dims(1, 2);
-    let stage2 = stage1.expand_dim(3, 2_usize).merge_dims(2, 3);
-    // Materialize the broadcast view so subsequent ops see contiguous strides.
-    stage2 + 0.0_f32
+    stage1.expand_dim(3, 2_usize).merge_dims(2, 3)
 }
 
 /// SiLU = x * sigmoid(x).
@@ -300,30 +344,21 @@ impl AttnBlock {
             NORM_NUM_GROUPS,
             NORM_EPS,
         );
-        // (C, H, W) -> (C, H*W) -> (H*W, C). The transpose at the end leaves
-        // a column-major view, which the direct matmul kernels assume away;
-        // `* 1.0` forces a contiguous row-major materialization.
-        let merged = normed.merge_dims(1, 2).transpose(0, 1) * 1.0_f32;
+        // (C, H, W) -> (C, H*W) -> (H*W, C). This is a column-major view
+        // that cuBLASLt can consume directly.
+        let merged = normed.merge_dims(1, 2).transpose(0, 1);
 
-        // Q, K, V projections — direct kernel routes around the cublaslt
-        // 2D rule, which silently fails to fire for some of these matmuls
-        // and lets search occasionally pick the broadcast Mul + SumReduce
-        // fallback. At 1024² the bad path on `q @ kᵀ` allocates a
-        // `(HW, HW, C) = (16384, 16384, 512)` ≈ 524 GiB intermediate.
-        let q = luminal_cuda_lite::kernel::linear_bias(merged, self.to_q_w, self.to_q_b);
-        let k = luminal_cuda_lite::kernel::linear_bias(merged, self.to_k_w, self.to_k_b);
-        let v = luminal_cuda_lite::kernel::linear_bias(merged, self.to_v_w, self.to_v_b);
+        let q = linear_bias(merged, self.to_q_w, self.to_q_b);
+        let k = linear_bias(merged, self.to_k_w, self.to_k_b);
+        let v = linear_bias(merged, self.to_v_w, self.to_v_b);
 
         // Standard scaled dot-product attention over the spatial axis.
-        // `q @ kᵀ` with k stored row-major as `(HW, C)`: matmul_2d_t handles
-        // the transpose without materialising k as a separate tensor.
         let scale = (self.channels as f32).sqrt().recip();
-        let scores = luminal_cuda_lite::kernel::matmul_2d_t(q, k) * scale;
+        let scores = q.matmul(k.t()) * scale;
         let attn_w = scores.softmax(1);
-        // attn_w is (HW, HW) row-major, v is (HW, C) row-major; plain matmul.
-        let attn = luminal_cuda_lite::kernel::matmul_2d(attn_w, v);
+        let attn = attn_w.matmul(v);
 
-        let out = luminal_cuda_lite::kernel::linear_bias(attn, self.to_out_w, self.to_out_b);
+        let out = linear_bias(attn, self.to_out_w, self.to_out_b);
         // (H*W, C) -> (C, H*W) -> (C, H, W)
         let out = out.transpose(0, 1).split_dims(1, w);
         residual + out
@@ -498,5 +533,340 @@ impl VaeDecoder {
             return x;
         }
         conv2d_bias(x, self.conv_out_w, self.conv_out_b, 3, 1, 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use luminal::hlir::CustomOpKind;
+    use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
+
+    use super::*;
+
+    fn assert_no_custom_ops(cx: &Graph) {
+        assert!(
+            cx.custom_ops.is_empty(),
+            "Flux2 VAE helpers should use pure HLIR, not registered CustomOp wrappers"
+        );
+        let custom_nodes: Vec<_> = cx
+            .graph
+            .node_indices()
+            .filter(|&node| cx.try_get_op::<CustomOpKind>(node).is_some())
+            .collect();
+        assert!(
+            custom_nodes.is_empty(),
+            "Flux2 VAE graph contains CustomOpKind nodes: {custom_nodes:?}"
+        );
+    }
+
+    #[test]
+    fn vae_helpers_use_no_custom_ops() {
+        let mut cx = Graph::default();
+
+        let x = cx.named_tensor("x", (2usize, 3usize, 3usize));
+        let conv_w = cx.named_tensor("conv_w", (4usize, 2usize * 3 * 3));
+        let conv_b = cx.named_tensor("conv_b", 4usize);
+        let _ = conv2d_bias(x, conv_w, conv_b, 3, 1, 1).output();
+
+        let lin_x = cx.named_tensor("lin_x", (2usize, 3usize));
+        let lin_w = cx.named_tensor("lin_w", (4usize, 3usize));
+        let lin_b = cx.named_tensor("lin_b", 4usize);
+        let _ = linear_bias(lin_x, lin_w, lin_b).output();
+
+        assert_no_custom_ops(&cx);
+    }
+
+    struct Conv2dCase {
+        c_in: usize,
+        h: usize,
+        w: usize,
+        c_out: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+    }
+
+    fn reference_conv2d_bias(
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        case: Conv2dCase,
+    ) -> Vec<f32> {
+        let Conv2dCase {
+            c_in,
+            h,
+            w,
+            c_out,
+            kernel,
+            stride,
+            padding,
+        } = case;
+        let h_out = (h + 2 * padding - kernel) / stride + 1;
+        let w_out = (w + 2 * padding - kernel) / stride + 1;
+        let mut out = vec![0.0_f32; c_out * h_out * w_out];
+        for co in 0..c_out {
+            for oy in 0..h_out {
+                for ox in 0..w_out {
+                    let mut acc = bias[co];
+                    for ci in 0..c_in {
+                        for ky in 0..kernel {
+                            for kx in 0..kernel {
+                                let iy_padded = oy * stride + ky;
+                                let ix_padded = ox * stride + kx;
+                                if iy_padded < padding || ix_padded < padding {
+                                    continue;
+                                }
+                                let iy = iy_padded - padding;
+                                let ix = ix_padded - padding;
+                                if iy >= h || ix >= w {
+                                    continue;
+                                }
+                                let input_idx = ci * h * w + iy * w + ix;
+                                let weight_idx = co * c_in * kernel * kernel
+                                    + ci * kernel * kernel
+                                    + ky * kernel
+                                    + kx;
+                                acc += input[input_idx] * weight[weight_idx];
+                            }
+                        }
+                    }
+                    out[co * h_out * w_out + oy * w_out + ox] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (*a - *e).abs() < 1e-4,
+                "value mismatch at {idx}: got {a}, expected {e}"
+            );
+        }
+    }
+
+    fn reference_nearest_upsample_2x(input: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
+        let mut out = vec![0.0_f32; c * h * 2 * w * 2];
+        for ci in 0..c {
+            for y in 0..h {
+                for x in 0..w {
+                    let value = input[ci * h * w + y * w + x];
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let oy = y * 2 + dy;
+                            let ox = x * 2 + dx;
+                            out[ci * h * 2 * w * 2 + oy * w * 2 + ox] = value;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    struct GroupNormCase {
+        c: usize,
+        h: usize,
+        w: usize,
+        num_groups: usize,
+        eps: f32,
+    }
+
+    fn reference_group_norm(
+        input: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        case: GroupNormCase,
+    ) -> Vec<f32> {
+        let GroupNormCase {
+            c,
+            h,
+            w,
+            num_groups,
+            eps,
+        } = case;
+        let group_size = c / num_groups;
+        let group_volume = group_size * h * w;
+        let mut out = vec![0.0_f32; input.len()];
+        for group in 0..num_groups {
+            let c_start = group * group_size;
+            let mut mean = 0.0_f32;
+            for ci in c_start..c_start + group_size {
+                for idx in 0..h * w {
+                    mean += input[ci * h * w + idx];
+                }
+            }
+            mean /= group_volume as f32;
+
+            let mut variance = 0.0_f32;
+            for ci in c_start..c_start + group_size {
+                for idx in 0..h * w {
+                    let centered = input[ci * h * w + idx] - mean;
+                    variance += centered * centered;
+                }
+            }
+            variance /= group_volume as f32;
+            let inv_std = (variance + eps).sqrt().recip();
+
+            for ci in c_start..c_start + group_size {
+                for idx in 0..h * w {
+                    let flat = ci * h * w + idx;
+                    out[flat] = (input[flat] - mean) * inv_std * weight[ci] + bias[ci];
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn conv2d_bias_matches_reference() {
+        let mut cx = Graph::default();
+        let input_t = cx.named_tensor("input", (2usize, 3usize, 3usize));
+        let weight_t = cx.named_tensor("weight", (2usize, 2usize * 3 * 3));
+        let bias_t = cx.named_tensor("bias", 2usize);
+        let out = conv2d_bias(input_t, weight_t, bias_t, 3, 1, 1).output();
+
+        let input: Vec<f32> = (0..18).map(|i| i as f32 * 0.1 - 0.7).collect();
+        let weight: Vec<f32> = (0..36).map(|i| (i as f32 % 7.0) * 0.05 - 0.15).collect();
+        let bias = vec![0.25_f32, -0.5_f32];
+        let expected = reference_conv2d_bias(
+            &input,
+            &weight,
+            &bias,
+            Conv2dCase {
+                c_in: 2,
+                h: 3,
+                w: 3,
+                c_out: 2,
+                kernel: 3,
+                stride: 1,
+                padding: 1,
+            },
+        );
+
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+        rt.set_data(input_t, input);
+        rt.set_data(weight_t, weight);
+        rt.set_data(bias_t, bias);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn nearest_upsample_2x_matches_reference_native() {
+        let mut cx = Graph::default();
+        let input_t = cx.named_tensor("input", (2usize, 3usize, 4usize));
+        let out = nearest_upsample_2x(input_t).output();
+
+        let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 - 11.0).collect();
+        let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
+
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+        rt.set_data(input_t, input);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn nearest_upsample_2x_matches_reference_cuda() {
+        let Ok(ctx) = CudaContext::new(0) else {
+            return;
+        };
+        ctx.bind_to_thread().unwrap();
+
+        let mut cx = Graph::default();
+        let input_t = cx.named_tensor("input", (2usize, 3usize, 4usize));
+        let out = nearest_upsample_2x(input_t).output();
+
+        let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 - 11.0).collect();
+        let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
+
+        cx.build_search_space::<CudaRuntime>();
+        let mut rt = CudaRuntime::initialize(ctx.default_stream());
+        rt.set_data(input_t, input);
+        rt = cx.search(rt, 1);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(&rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn group_norm_matches_reference_native() {
+        let mut cx = Graph::default();
+        let input_t = cx.named_tensor("input", (4usize, 2usize, 3usize));
+        let weight_t = cx.named_tensor("weight", 4usize);
+        let bias_t = cx.named_tensor("bias", 4usize);
+        let out = group_norm(input_t, weight_t, bias_t, 2, 1e-6).output();
+
+        let input: Vec<f32> = (0..4 * 2 * 3).map(|i| i as f32 * 0.2 - 2.0).collect();
+        let weight = vec![0.7_f32, -0.2, 1.3, 0.5];
+        let bias = vec![0.1_f32, -0.3, 0.4, -0.6];
+        let expected = reference_group_norm(
+            &input,
+            &weight,
+            &bias,
+            GroupNormCase {
+                c: 4,
+                h: 2,
+                w: 3,
+                num_groups: 2,
+                eps: 1e-6,
+            },
+        );
+
+        cx.build_search_space::<NativeRuntime>();
+        let mut rt = cx.search(NativeRuntime::default(), 1);
+        rt.set_data(input_t, input);
+        rt.set_data(weight_t, weight);
+        rt.set_data(bias_t, bias);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn group_norm_matches_reference_cuda() {
+        let Ok(ctx) = CudaContext::new(0) else {
+            return;
+        };
+        ctx.bind_to_thread().unwrap();
+
+        let mut cx = Graph::default();
+        let input_t = cx.named_tensor("input", (4usize, 2usize, 3usize));
+        let weight_t = cx.named_tensor("weight", 4usize);
+        let bias_t = cx.named_tensor("bias", 4usize);
+        let out = group_norm(input_t, weight_t, bias_t, 2, 1e-6).output();
+
+        let input: Vec<f32> = (0..4 * 2 * 3).map(|i| i as f32 * 0.2 - 2.0).collect();
+        let weight = vec![0.7_f32, -0.2, 1.3, 0.5];
+        let bias = vec![0.1_f32, -0.3, 0.4, -0.6];
+        let expected = reference_group_norm(
+            &input,
+            &weight,
+            &bias,
+            GroupNormCase {
+                c: 4,
+                h: 2,
+                w: 3,
+                num_groups: 2,
+                eps: 1e-6,
+            },
+        );
+
+        cx.build_search_space::<CudaRuntime>();
+        let mut rt = CudaRuntime::initialize(ctx.default_stream());
+        rt.set_data(input_t, input);
+        rt.set_data(weight_t, weight);
+        rt.set_data(bias_t, bias);
+        rt = cx.search(rt, 1);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(&rt.get_f32(out.id), &expected);
     }
 }

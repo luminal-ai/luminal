@@ -10,7 +10,7 @@ examples/yolo_v11/
 ├── Cargo.toml              # Rust crate (binary: yolo_v11)
 ├── src/
 │   ├── main.rs             # Full forward, NMS, and annotated image output
-│   └── model.rs            # YOLO v11n architecture in luminal IR
+│   └── model.rs            # YOLO v11n architecture in pure HLIR
 ├── python/
 │   ├── reference.py        # PyTorch eager reference + weight prep
 │   └── luminal_example.py  # torch.compile(..., backend=luminal_backend) demo
@@ -77,6 +77,8 @@ examples/yolo_v11/
 * All Conv blocks are loaded with `bn` folded into a bias-augmented Conv2d
   (`forward_fuse`), so the saved tensors are just `<layer>.conv.weight` and
   `<layer>.conv.bias`.
+* The model computation is specified as pure HLIR tensor algebra. The YOLO graph
+  does not register `Graph::custom_op` wrappers or insert `CustomOpKind` nodes.
 * The `C3k2`, `C3k`, `C2PSA`, and `Attention` modules in PyTorch use
   `tensor.chunk(2, dim=1)` (or `qkv.split([...], dim=...)`) to produce two/three
   channel-slices that then take separate paths. Slicing followed by a residual
@@ -91,8 +93,8 @@ examples/yolo_v11/
   non-contiguous view via `gather + iota` (the same trick `GraphTensor::output`
   uses internally). It's applied wherever an op chain produces a strided view
   that the next op needs to read sequentially.
-* 1x1 convolutions skip the unfold path and use a direct 2D matmul, so
-  luminal_cuda_lite's `TileMatmulFullSplit` kernel can match.
+* 1x1 convolutions skip the unfold path and use a plain HLIR matmul over
+  flattened spatial positions.
 
 ## Known limitation: full-model compile time
 

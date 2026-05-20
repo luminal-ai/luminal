@@ -379,6 +379,8 @@ impl KernelOp for KernelSumReduce {
             .collect::<FxHashSet<_>>();
 
         let dtype = cuda_dtype(self.dtype);
+        let uses_fp8_storage = matches!(self.dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0);
+        let accum_dtype = if uses_fp8_storage { "float" } else { dtype };
         let includes = dtype_includes(&[self.dtype]);
         let n_outputs: Expression = self.out_shape.iter().copied().product();
         let threads_per_block = 256; // 8 warps per block
@@ -390,6 +392,16 @@ impl KernelOp for KernelSumReduce {
         };
 
         let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+        let load_value = if uses_fp8_storage {
+            format!("static_cast<float>(in_data[in_start + {iter_stride_of_i}])")
+        } else {
+            format!("in_data[in_start + {iter_stride_of_i}]")
+        };
+        let zero = if uses_fp8_storage {
+            "0.0f".to_string()
+        } else {
+            format!("({dtype})0")
+        };
 
         let kernel = format!(
             "{includes}
@@ -399,7 +411,7 @@ impl KernelOp for KernelSumReduce {
 {dyn_defines}
 extern \"C\" {{
     __global__ void reduce_sum_k({dtype} *out, const {dtype} *in_data{dyn_dims_param}) {{
-        __shared__ {dtype} warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
+        __shared__ {accum_dtype} warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
         long long const_z = blockIdx.x;
 
         int tid = threadIdx.x;
@@ -409,11 +421,11 @@ extern \"C\" {{
         long long in_start = {in_index};
         long long iters = {iters};
 
-        {dtype} partial = 0;
-        {dtype} comp = 0;   // Kahan compensation
+        {accum_dtype} partial = {zero};
+        {accum_dtype} comp = {zero};   // Kahan compensation
         for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
-            {dtype} y = in_data[in_start + {iter_stride_of_i}] - comp;
-            {dtype} t = partial + y;
+            {accum_dtype} y = {load_value} - comp;
+            {accum_dtype} t = partial + y;
             comp = (t - partial) - y;
             partial = t;
         }}
@@ -430,7 +442,7 @@ extern \"C\" {{
 
         if (warp_id == 0) {{
             int cnt = THREADS_PER_BLOCK / WARP_SIZE;
-            {dtype} block_sum = tid < cnt ? warp_sums[tid] : ({dtype})0;
+            {accum_dtype} block_sum = tid < cnt ? warp_sums[tid] : {zero};
 
             #pragma unroll
             for (int s = cnt / 2; s > 0; s /= 2) {{
@@ -438,16 +450,18 @@ extern \"C\" {{
             }}
 
             if (tid == 0) {{
-                out[{out_index}] = block_sum;
+                out[{out_index}] = ({dtype})block_sum;
             }}
         }}
     }}
 }}",
             dtype = dtype,
+            accum_dtype = accum_dtype,
             in_index = flatten_strides(&self.out_shape, &self.in_stride).to_kernel(),
             out_index = flatten_strides(&self.out_shape, &self.out_stride).to_kernel(),
             iters = self.iters.to_kernel(),
-            iter_stride_of_i = iter_stride_of_i,
+            load_value = load_value,
+            zero = zero,
         );
 
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {

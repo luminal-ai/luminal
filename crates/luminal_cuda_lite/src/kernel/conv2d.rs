@@ -1,60 +1,533 @@
-//! Direct conv2d_bias kernel — fuses unfold + matmul + bias into one
-//! CUDA kernel with no `(H_out*W_out, C_in*K*K)` intermediate matrix.
+//! CUDA conv2d-with-bias backend rewrite.
 //!
-//! This is exposed as a luminal `CustomOp`, not a standard egglog-rewritten
-//! `KernelOp`, because the conv has no useful fusion opportunities with
-//! surrounding ops in the graphs it's used in (the VAE's resnet blocks),
-//! and pattern-matching the unfold+permute+merge_dims+matmul+bias chain
-//! reliably from egglog is significantly more work than just bypassing
-//! the egglog rewrite path entirely.
-//!
-//! The kernel is one-thread-per-output: each thread computes
-//!   `out[co, ho, wo] = bias[co] + sum_{ci,ki,kj} input[ci, ho*S+ki-P, wo*S+kj-P] * weight[co, ci, ki, kj]`
-//! with bounds checks on the spatial dims for padding. This is far from
-//! peak FLOPs (no shared-memory tiling, no warp-level reduction over K)
-//! but it's correct and the memory footprint is just the input + weight +
-//! bias + output buffers — no `(M, K)` or `(M, N, K)` intermediate, so it
-//! scales linearly with the actual conv FLOPs rather than blowing up at
-//! large H/W like the unfold-based formulation.
+//! `KernelConv2D` is selected by egglog from pure HLIR conv graphs and lowers
+//! to a one-thread-per-output CUDA kernel. It avoids materializing unfold/im2col
+//! intermediates while keeping model code free of custom ops.
 
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::prelude::FxHashMap;
 use luminal::{
-    dtype::DType, graph::Graph, op::CustomOp, op::LLIROp, prelude::GraphTensor, shape::Expression,
+    dtype::DType,
+    egglog_utils::{
+        api::{Rule, SortDef, sort},
+        base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
+        extract_dtype, extract_expr, extract_expr_list,
+    },
+    op::{EgglogOp, LLIROp},
+    prelude::FxHashSet,
+    shape::{Expression, flatten_strides},
 };
 
 use crate::compile_module_image_for_current_device;
-use crate::kernel::KernelOp;
+use crate::kernel::{KernelOp, hlir::generate_dyn_dims_defines};
 
-/// Direct conv2d-with-bias kernel. All shape/kernel params are static
-/// (baked into the CUDA source via #defines), so each conv shape gets
-/// its own compiled kernel. Inputs (in order): input `(C_in, H_in, W_in)`,
-/// weight `(C_out, C_in*K*K)` (i.e. flattened `(C_out, C_in, K, K)`), bias
-/// `(C_out,)`. Output: `(C_out, H_out, W_out)`.
-#[derive(Debug, Clone)]
-pub struct Conv2DKernel {
-    pub c_in: usize,
-    pub h_in: usize,
-    pub w_in: usize,
-    pub c_out: usize,
-    pub kernel: usize,
-    pub stride: usize,
-    pub padding: usize,
-    pub h_out: usize,
-    pub w_out: usize,
+#[derive(Default, Debug, Clone)]
+pub struct KernelConv2D {
+    out_shape: Vec<Expression>,
+    input_shape: Vec<Expression>,
+    input_stride: Vec<Expression>,
+    weight_co_stride: Expression,
+    weight_inner_stride: Expression,
+    bias_c_stride: Expression,
+    out_stride: Vec<Expression>,
+    kernel_h: Expression,
+    kernel_w: Expression,
+    stride_h: Expression,
+    stride_w: Expression,
+    dilation_h: Expression,
+    dilation_w: Expression,
+    pad_h: Expression,
+    pad_w: Expression,
+    dtype: DType,
 }
 
-impl Conv2DKernel {
-    fn output_elements(&self) -> usize {
-        self.c_out * self.h_out * self.w_out
+impl EgglogOp for KernelConv2D {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelConv2D",
+            &[
+                ("out_shape", ELIST),
+                ("input_shape", ELIST),
+                ("input_stride", ELIST),
+                ("weight_co_stride", EXPRESSION),
+                ("weight_inner_stride", EXPRESSION),
+                ("bias_c_stride", EXPRESSION),
+                ("out_stride", ELIST),
+                ("kernel_h", EXPRESSION),
+                ("kernel_w", EXPRESSION),
+                ("stride_h", EXPRESSION),
+                ("stride_w", EXPRESSION),
+                ("dilation_h", EXPRESSION),
+                ("dilation_w", EXPRESSION),
+                ("pad_h", EXPRESSION),
+                ("pad_w", EXPRESSION),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        3
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![
+            // 1x1 convs in Flux2's VAE are represented without `unfold`:
+            //
+            //   input.permute([H,W,C]).merge(H,W)
+            //     -> matmul(weight.t())
+            //     -> split/permute back to [C_out,H,W]
+            //     -> + channel bias
+            //
+            // The lowered form is still the same Mul -> KernelSum -> Add
+            // matmul skeleton, but the lhs FusionStart reads directly from the
+            // original input instead of a KernelGather window tensor.
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride (F32)) (ICons ?sum_fs (ICons ?bias_fs (INil)))))
+                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
+                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+
+                        (= ?sum (Op (KernelSum ?matmul_out_shape ?c_in ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
+                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
+                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?input_1x1_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?input_fs (ICons ?weight_fs (INil)))))
+                        (= ?input_fs (Op (FusionStart ?mul_shape ?input_1x1_stride (F32)) (ICons ?input (INil))))
+                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
+
+                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?c_in (ENil)))))
+                        (= ?input_1x1_stride (ECons ?flat_stride (ECons (MNum 0) (ECons ?input_c_stride (ENil)))))
+                        (= ?flat_stride (MIter))
+
+                        (= ?k_stride (MIter))
+                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
+                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
+                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
+                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
+                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
+                        (= (MNum 0) (nth_from_end ?weight_stride 2))
+                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    )
+                    (
+                        (let ?conv (Op (KernelConv2D
+                            ?out_shape
+                            (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
+                            (ECons ?input_c_stride (ECons (MMul ?w_out ?flat_stride) (ECons ?flat_stride (ENil))))
+                            ?weight_co_stride
+                            ?weight_inner_stride
+                            ?bias_c_stride
+                            ?out_stride
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 0)
+                            (MNum 0)
+                            (F32))
+                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                        (union ?out ?conv)
+                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (set (dtype ?conv) (F32))
+                    )
+                    :ruleset kernel_lower
+                    :name \"kernel conv2d 1x1 from cuda lowered matmul bias\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride (F32)) (ICons ?bias_fs (ICons ?sum_fs (INil)))))
+                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
+                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+
+                        (= ?sum (Op (KernelSum ?matmul_out_shape ?c_in ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
+                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
+                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?input_1x1_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?input_fs (ICons ?weight_fs (INil)))))
+                        (= ?input_fs (Op (FusionStart ?mul_shape ?input_1x1_stride (F32)) (ICons ?input (INil))))
+                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
+
+                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?c_in (ENil)))))
+                        (= ?input_1x1_stride (ECons ?flat_stride (ECons (MNum 0) (ECons ?input_c_stride (ENil)))))
+                        (= ?flat_stride (MIter))
+
+                        (= ?k_stride (MIter))
+                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
+                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
+                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
+                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
+                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
+                        (= (MNum 0) (nth_from_end ?weight_stride 2))
+                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    )
+                    (
+                        (let ?conv (Op (KernelConv2D
+                            ?out_shape
+                            (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
+                            (ECons ?input_c_stride (ECons (MMul ?w_out ?flat_stride) (ECons ?flat_stride (ENil))))
+                            ?weight_co_stride
+                            ?weight_inner_stride
+                            ?bias_c_stride
+                            ?out_stride
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 0)
+                            (MNum 0)
+                            (F32))
+                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                        (union ?out ?conv)
+                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (set (dtype ?conv) (F32))
+                    )
+                    :ruleset kernel_lower
+                    :name \"kernel conv2d 1x1 from cuda lowered bias matmul\"
+                )",
+            ),
+            // Match the same conv after generic CUDA lowering has normalized
+            // the elementwise pieces into fusion regions:
+            //
+            //   KernelGather(input windows)
+            //     -> CudaBinaryElementwise("Mul", weight)
+            //     -> KernelSum(reduce K)
+            //     -> CudaBinaryElementwise("Add", bias)
+            //
+            // This is the form that survives long enough for CUDA search in
+            // real models. The KernelConv2D op consumes the pre-gather input
+            // and avoids materializing both the im2col window tensor and the
+            // elementwise product tensor.
+            //
+            // TODO(egglog-shapes): the current e-graph does not reliably prove
+            // the derived arithmetic equalities for this chain after CUDA
+            // normalization:
+            //   * `M == H_out * W_out`
+            //   * `K == C_in * KH * KW`
+            //   * separately-derived but structurally identical stride
+            //     expressions, e.g. the Mul output stride and KernelSum input
+            //     stride, belong to the same e-class.
+            // Keep the rewrite anchored on the stable conv layout facts the
+            // graph does carry today: six-axis unfold window shape, flattened
+            // `[M, C_out, K]` product, reduction over `K`, the three-axis
+            // `[C_out, H_out, W_out]` output view, and channel-only bias
+            // broadcast. Once expression/list canonicalization can prove those
+            // equalities, tighten this rule and its regression tests.
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride (F32)) (ICons ?sum_fs (ICons ?bias_fs (INil)))))
+                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
+                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+
+                        (= ?sum (Op (KernelSum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
+                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
+                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?patch_fs (ICons ?weight_fs (INil)))))
+                        (= ?patch_fs (Op (FusionStart ?mul_shape ?patch_stride (F32)) (ICons ?patches (INil))))
+                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
+                        (= ?patches (Op (KernelGather ?idx_shape ?idx_stride ?input_shape ?input_stride ?gather_out_stride (F32)) (ICons ?indices (ICons ?input (INil)))))
+
+                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
+                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
+                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?k_dim (ENil)))))
+
+                        (= ?k_stride (MIter))
+                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
+                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
+                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
+                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
+                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
+                        (= (MNum 0) (nth_from_end ?weight_stride 2))
+                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    )
+                    (
+                        (let ?conv (Op (KernelConv2D
+                            ?out_shape
+                            ?input_shape
+                            ?input_stride
+                            ?weight_co_stride
+                            ?weight_inner_stride
+                            ?bias_c_stride
+                            ?out_stride
+                            ?kernel_h
+                            ?kernel_w
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 0)
+                            (MNum 0)
+                            (F32))
+                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                        (union ?out ?conv)
+                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (set (dtype ?conv) (F32))
+                    )
+                    :ruleset kernel_lower
+                    :name \"kernel conv2d from cuda lowered unfold matmul bias\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride (F32)) (ICons ?bias_fs (ICons ?sum_fs (INil)))))
+                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
+                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+
+                        (= ?sum (Op (KernelSum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
+                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
+                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?patch_fs (ICons ?weight_fs (INil)))))
+                        (= ?patch_fs (Op (FusionStart ?mul_shape ?patch_stride (F32)) (ICons ?patches (INil))))
+                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
+                        (= ?patches (Op (KernelGather ?idx_shape ?idx_stride ?input_shape ?input_stride ?gather_out_stride (F32)) (ICons ?indices (ICons ?input (INil)))))
+
+                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
+                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
+                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?k_dim (ENil)))))
+
+                        (= ?k_stride (MIter))
+                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
+                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
+                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
+                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
+                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
+                        (= (MNum 0) (nth_from_end ?weight_stride 2))
+                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    )
+                    (
+                        (let ?conv (Op (KernelConv2D
+                            ?out_shape
+                            ?input_shape
+                            ?input_stride
+                            ?weight_co_stride
+                            ?weight_inner_stride
+                            ?bias_c_stride
+                            ?out_stride
+                            ?kernel_h
+                            ?kernel_w
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 0)
+                            (MNum 0)
+                            (F32))
+                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                        (union ?out ?conv)
+                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
+                        (set (dtype ?conv) (F32))
+                    )
+                    :ruleset kernel_lower
+                    :name \"kernel conv2d from cuda lowered bias unfold matmul\"
+                )",
+            ),
+            // Match the im2col-style HLIR conv used by Flux2:
+            //
+            //   input.unfold([1, kh, kw], [1, 1, 1], [1, 1, 1])
+            //     -> squeeze/permute/merge view
+            //     -> matmul(weight.t())
+            //     -> split/permute view
+            //     -> + bias.expand_dim(1, h_out).expand_dim(2, w_out)
+            //
+            // The kernel consumes the pre-unfold input directly. That input may
+            // already be a padded HLIR tensor, so the rewrite is still correct
+            // for Flux2's padded convs while removing the large patch matrix.
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?add_out_stride) (ICons ?sum (ICons ?bias (INil)))))
+                        (= ?sum (Op (Sum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+                        (= ?mul (Op (Mul ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride) (ICons ?patches (ICons ?weight (INil)))))
+                        (= ?patches (Op (Gather ?idx_shape ?idx_stride ?input_shape ?input_stride) (ICons ?indices (ICons ?input (INil)))))
+
+                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
+                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
+                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+
+                        ; This rewrite is for stride=1, dilation=1 over the
+                        ; tensor passed to unfold. Padded HLIR inputs are already
+                        ; represented as their own tensor, so padding is 0 here.
+                        (= ?h_out (MAdd (MSub ?h_in ?kernel_h) (MNum 1)))
+                        (= ?w_out (MAdd (MSub ?w_in ?kernel_w) (MNum 1)))
+                        (= ?m (MMul ?h_out ?w_out))
+                        (= ?k_dim (MMul ?c_in (MMul ?kernel_h ?kernel_w)))
+                        (= ?k_stride (MIter))
+
+                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
+                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
+                        (= (MNum 0) (nth_from_end ?weight_stride 2))
+
+                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+
+                        (= (F32) (dtype ?input))
+                        (= (F32) (dtype ?weight))
+                        (= (F32) (dtype ?bias))
+                    )
+                    (
+                        (let ?conv (Op (KernelConv2D
+                            ?out_shape
+                            ?input_shape
+                            ?input_stride
+                            ?weight_co_stride
+                            ?weight_inner_stride
+                            ?bias_c_stride
+                            ?add_out_stride
+                            ?kernel_h
+                            ?kernel_w
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 0)
+                            (MNum 0)
+                            (F32))
+                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                        (union ?add ?conv)
+                        (subsume (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?add_out_stride) (ICons ?sum (ICons ?bias (INil)))))
+                        (set (dtype ?conv) (F32))
+                    )
+                    :ruleset kernel_specialize
+                    :name \"kernel conv2d from unfold matmul bias\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?add_out_stride) (ICons ?bias (ICons ?sum (INil)))))
+                        (= ?sum (Op (Sum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+                        (= ?mul (Op (Mul ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride) (ICons ?patches (ICons ?weight (INil)))))
+                        (= ?patches (Op (Gather ?idx_shape ?idx_stride ?input_shape ?input_stride) (ICons ?indices (ICons ?input (INil)))))
+
+                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
+                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
+                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+
+                        (= ?h_out (MAdd (MSub ?h_in ?kernel_h) (MNum 1)))
+                        (= ?w_out (MAdd (MSub ?w_in ?kernel_w) (MNum 1)))
+                        (= ?m (MMul ?h_out ?w_out))
+                        (= ?k_dim (MMul ?c_in (MMul ?kernel_h ?kernel_w)))
+                        (= ?k_stride (MIter))
+
+                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
+                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
+                        (= (MNum 0) (nth_from_end ?weight_stride 2))
+
+                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+
+                        (= (F32) (dtype ?input))
+                        (= (F32) (dtype ?weight))
+                        (= (F32) (dtype ?bias))
+                    )
+                    (
+                        (let ?conv (Op (KernelConv2D
+                            ?out_shape
+                            ?input_shape
+                            ?input_stride
+                            ?weight_co_stride
+                            ?weight_inner_stride
+                            ?bias_c_stride
+                            ?add_out_stride
+                            ?kernel_h
+                            ?kernel_w
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 1)
+                            (MNum 0)
+                            (MNum 0)
+                            (F32))
+                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                        (union ?add ?conv)
+                        (subsume (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?add_out_stride) (ICons ?bias (ICons ?sum (INil)))))
+                        (set (dtype ?conv) (F32))
+                    )
+                    :ruleset kernel_specialize
+                    :name \"kernel conv2d from bias unfold matmul\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?add (Op (Add ?shape ?as ?bs ?os) ?inputs))
+                        (= ?add (Op (KernelConv2D ?out_shape ?input_shape ?input_stride ?wco ?wi ?bc ?out_stride ?kh ?kw ?sh ?sw ?dh ?dw ?ph ?pw ?dt) ?conv_inputs))
+                    )
+                    ((delete (Op (Add ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?fe (Op (FusionEnd ?shape ?os ?dt) ?inputs))
+                        (= ?fe (Op (KernelConv2D ?out_shape ?input_shape ?input_stride ?wco ?wi ?bc ?out_stride ?kh ?kw ?sh ?sw ?dh ?dw ?ph ?pw ?conv_dt) ?conv_inputs))
+                    )
+                    ((delete (Op (FusionEnd ?shape ?os ?dt) ?inputs)))
+                    :ruleset cleanup
+                )",
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a luminal::egglog_utils::SerializedEGraph,
+        kind_children: &[&'a luminal::egglog_utils::NodeId],
+        input_enodes: Vec<&'a luminal::egglog_utils::NodeId>,
+        list_cache: &mut FxHashMap<&'a luminal::egglog_utils::NodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a luminal::egglog_utils::NodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a luminal::egglog_utils::NodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
+                    .unwrap(),
+                input_shape: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                input_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                weight_co_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+                weight_inner_stride: extract_expr(egraph, kind_children[4], expr_cache).unwrap(),
+                bias_c_stride: extract_expr(egraph, kind_children[5], expr_cache).unwrap(),
+                out_stride: extract_expr_list(egraph, kind_children[6], list_cache, expr_cache)
+                    .unwrap(),
+                kernel_h: extract_expr(egraph, kind_children[7], expr_cache).unwrap(),
+                kernel_w: extract_expr(egraph, kind_children[8], expr_cache).unwrap(),
+                stride_h: extract_expr(egraph, kind_children[9], expr_cache).unwrap(),
+                stride_w: extract_expr(egraph, kind_children[10], expr_cache).unwrap(),
+                dilation_h: extract_expr(egraph, kind_children[11], expr_cache).unwrap(),
+                dilation_w: extract_expr(egraph, kind_children[12], expr_cache).unwrap(),
+                pad_h: extract_expr(egraph, kind_children[13], expr_cache).unwrap(),
+                pad_w: extract_expr(egraph, kind_children[14], expr_cache).unwrap(),
+                dtype: extract_dtype(egraph, kind_children[15]),
+            }) as Box<dyn KernelOp>),
+            input_enodes,
+        )
     }
 }
 
-const THREADS_PER_BLOCK: usize = 256;
-
-impl KernelOp for Conv2DKernel {
+impl KernelOp for KernelConv2D {
     fn compile(
         &self,
         stream: &Arc<CudaStream>,
@@ -68,74 +541,135 @@ impl KernelOp for Conv2DKernel {
         Expression,
         FxHashMap<char, CudaSlice<u8>>,
     ) {
-        let total = self.output_elements();
-        let grid = total.div_ceil(THREADS_PER_BLOCK);
+        assert_eq!(self.dtype, DType::F32, "KernelConv2D currently emits F32");
+
+        let vars: FxHashSet<char> = self
+            .out_shape
+            .iter()
+            .chain(&self.input_shape)
+            .chain(&self.input_stride)
+            .chain(&self.out_stride)
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.weight_co_stride.dyn_vars())
+            .chain(self.weight_inner_stride.dyn_vars())
+            .chain(self.bias_c_stride.dyn_vars())
+            .chain(self.kernel_h.dyn_vars())
+            .chain(self.kernel_w.dyn_vars())
+            .chain(self.stride_h.dyn_vars())
+            .chain(self.stride_w.dyn_vars())
+            .chain(self.dilation_h.dyn_vars())
+            .chain(self.dilation_w.dyn_vars())
+            .chain(self.pad_h.dyn_vars())
+            .chain(self.pad_w.dyn_vars())
+            .collect();
+
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+
+        let c_out = self.out_shape[0].to_kernel();
+        let h_out = self.out_shape[1].to_kernel();
+        let w_out = self.out_shape[2].to_kernel();
+        let c_in = self.input_shape[0].to_kernel();
+        let h_in = self.input_shape[1].to_kernel();
+        let w_in = self.input_shape[2].to_kernel();
+        let weight_co_stride = self
+            .weight_co_stride
+            .substitute('z', Expression::from(1))
+            .simplify()
+            .to_kernel();
+        let weight_inner_stride = self
+            .weight_inner_stride
+            .substitute('z', Expression::from(1))
+            .simplify()
+            .to_kernel();
+        let bias_c_stride = self
+            .bias_c_stride
+            .substitute('z', Expression::from(1))
+            .simplify()
+            .to_kernel();
+        let kh = self.kernel_h.to_kernel();
+        let kw = self.kernel_w.to_kernel();
+        let stride_h = self.stride_h.to_kernel();
+        let stride_w = self.stride_w.to_kernel();
+        let dilation_h = self.dilation_h.to_kernel();
+        let dilation_w = self.dilation_w.to_kernel();
+        let pad_h = self.pad_h.to_kernel();
+        let pad_w = self.pad_w.to_kernel();
+        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
+        let input_idx = flatten_strides(&self.input_shape, &self.input_stride)
+            .to_kernel()
+            .replace("const_z", "input_linear");
+        let n_outputs: Expression = self.out_shape.iter().copied().product();
 
         let kernel = format!(
             "
-extern \"C\" __global__ void conv2d_bias_kernel(
-    float* __restrict__ out,
-    const float* __restrict__ input,
-    const float* __restrict__ weight,
-    const float* __restrict__ bias
-) {{
-    const int TOTAL = {total};
-    const int CIN  = {c_in};
-    const int H    = {h_in};
-    const int W    = {w_in};
-    const int HOUT = {h_out};
-    const int WOUT = {w_out};
-    const int K    = {k};
-    const int S    = {s};
-    const int P    = {p};
+{dyn_defines}
+extern \"C\" {{
+    __global__ void generic_conv2d_bias(
+        float* __restrict__ out,
+        const float* __restrict__ input,
+        const float* __restrict__ weight,
+        const float* __restrict__ bias{dyn_dims_param}
+    ) {{
+        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        const long long total = {total};
+        if (const_z >= total) return;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= TOTAL) return;
-    int hw = HOUT * WOUT;
-    int co = idx / hw;
-    int rem = idx - co * hw;
-    int ho = rem / WOUT;
-    int wo = rem - ho * WOUT;
+        const long long COUT = {c_out};
+        const long long HOUT = {h_out};
+        const long long WOUT = {w_out};
+        const long long CIN = {c_in};
+        const long long HIN = {h_in};
+        const long long WIN = {w_in};
+        const long long KH = {kh};
+        const long long KW = {kw};
+        const long long SH = {stride_h};
+        const long long SW = {stride_w};
+        const long long DH = {dilation_h};
+        const long long DW = {dilation_w};
+        const long long PH = {pad_h};
+        const long long PW = {pad_w};
+        const long long W_CO_STRIDE = {weight_co_stride};
+        const long long W_INNER_STRIDE = {weight_inner_stride};
+        const long long BIAS_C_STRIDE = {bias_c_stride};
 
-    float acc = bias[co];
-    int weight_co_base = co * (CIN * K * K);
-    for (int ci = 0; ci < CIN; ci++) {{
-        int input_ci_base = ci * (H * W);
-        int weight_ci_base = weight_co_base + ci * (K * K);
-        #pragma unroll
-        for (int ki = 0; ki < K; ki++) {{
-            int hi = ho * S + ki - P;
-            if (hi < 0 || hi >= H) continue;
-            int input_row_base = input_ci_base + hi * W;
-            int weight_row_base = weight_ci_base + ki * K;
-            #pragma unroll
-            for (int kj = 0; kj < K; kj++) {{
-                int wj = wo * S + kj - P;
-                if (wj < 0 || wj >= W) continue;
-                acc += input[input_row_base + wj] * weight[weight_row_base + kj];
+        long long co = const_z / (HOUT * WOUT);
+        long long rem = const_z - co * HOUT * WOUT;
+        long long oh = rem / WOUT;
+        long long ow = rem - oh * WOUT;
+
+        float acc = bias[co * BIAS_C_STRIDE];
+        for (long long ci = 0; ci < CIN; ++ci) {{
+            for (long long r = 0; r < KH; ++r) {{
+                long long ih = oh * SH + r * DH - PH;
+                if (ih < 0 || ih >= HIN) continue;
+                for (long long s = 0; s < KW; ++s) {{
+                    long long iw = ow * SW + s * DW - PW;
+                    if (iw < 0 || iw >= WIN) continue;
+                    long long input_linear = (ci * HIN + ih) * WIN + iw;
+                    long long input_idx = {input_idx};
+                    long long inner = (ci * KH + r) * KW + s;
+                    long long weight_idx = co * W_CO_STRIDE + inner * W_INNER_STRIDE;
+                    acc += input[input_idx] * weight[weight_idx];
+                }}
             }}
         }}
+        out[{out_idx}] = acc;
     }}
-    out[idx] = acc;
-}}
-",
-            total = total,
-            c_in = self.c_in,
-            h_in = self.h_in,
-            w_in = self.w_in,
-            h_out = self.h_out,
-            w_out = self.w_out,
-            k = self.kernel,
-            s = self.stride,
-            p = self.padding,
+}}",
+            total = n_outputs.to_kernel(),
         );
 
-        let (module, func) = if let Some((m, f)) = compile_cache.get(&kernel) {
-            (m.clone(), f.clone())
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
         } else {
             let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("conv2d_bias_kernel").unwrap();
+            let func = module.load_function("generic_conv2d_bias").unwrap();
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
             (module, func)
         };
@@ -144,37 +678,45 @@ extern \"C\" __global__ void conv2d_bias_kernel(
             func,
             module,
             kernel,
-            (
-                Expression::from(grid),
-                Expression::from(1usize),
-                Expression::from(1usize),
-            ),
-            (
-                Expression::from(THREADS_PER_BLOCK),
-                Expression::from(1usize),
-                Expression::from(1usize),
-            ),
-            Expression::from(0usize),
+            (n_outputs.ceil_div(256), 1.into(), 1.into()),
+            (n_outputs.min(256), 1.into(), 1.into()),
+            0.into(),
             FxHashMap::default(),
         )
     }
 
     fn output_size(&self) -> Expression {
-        Expression::from(self.output_elements())
+        self.out_shape.iter().copied().product()
+    }
+
+    fn all_dyn_vars(&self) -> FxHashSet<char> {
+        self.out_shape
+            .iter()
+            .chain(&self.input_shape)
+            .chain(&self.input_stride)
+            .chain(&self.out_stride)
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.weight_co_stride.dyn_vars())
+            .chain(self.weight_inner_stride.dyn_vars())
+            .chain(self.bias_c_stride.dyn_vars())
+            .chain(self.kernel_h.dyn_vars())
+            .chain(self.kernel_w.dyn_vars())
+            .chain(self.stride_h.dyn_vars())
+            .chain(self.stride_w.dyn_vars())
+            .chain(self.dilation_h.dyn_vars())
+            .chain(self.dilation_w.dyn_vars())
+            .chain(self.pad_h.dyn_vars())
+            .chain(self.pad_w.dyn_vars())
+            .collect()
     }
 
     fn output_bytes(&self) -> Expression {
         self.output_size() * 4
     }
 
-    fn output_dtype(&self) -> DType {
-        DType::F32
-    }
-
     fn bytes_loaded(&self) -> Expression {
-        // Per output: C_in * K * K input loads + same many weight loads + 1 bias load.
-        let per_out = self.c_in * self.kernel * self.kernel * 2 + 1;
-        Expression::from(self.output_elements() * per_out * 4)
+        let c_in = self.input_shape[0];
+        self.output_size() * self.kernel_h * self.kernel_w * c_in * 2 * 4 + self.output_size() * 4
     }
 
     fn bytes_stored(&self) -> Expression {
@@ -182,108 +724,15 @@ extern \"C\" __global__ void conv2d_bias_kernel(
     }
 
     fn flops(&self) -> Expression {
-        // 2 * C_in * K * K mul-adds per output, plus the bias add = +1.
-        let per_out = self.c_in * self.kernel * self.kernel * 2 + 1;
-        Expression::from(self.output_elements() * per_out)
+        let c_in = self.input_shape[0];
+        self.output_size() * self.kernel_h * self.kernel_w * c_in * 2
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
     }
 
     fn kernel_name(&self) -> &'static str {
-        "Conv2DBias"
+        "GenericConv2D"
     }
-}
-
-/// luminal `CustomOp` that wraps `Conv2DKernel`. Lets us drop the kernel
-/// straight into an HLIR graph via `cx.custom_op(...)` without going
-/// through egglog rewrites.
-#[derive(Debug, Clone)]
-pub struct Conv2DCustom(pub Conv2DKernel);
-
-impl CustomOp for Conv2DCustom {
-    fn to_llir_op(&self) -> LLIROp {
-        LLIROp::new::<dyn KernelOp>(Box::new(self.0.clone()) as Box<dyn KernelOp>)
-    }
-}
-
-/// 2D conv-with-bias on a `(C_in, H, W)` F32 input tensor, with weights
-/// stored as `(C_out, C_in*K*K)` and bias as `(C_out,)`. Stride/padding/kernel
-/// are static. Output: `(C_out, H_out, W_out)`.
-///
-/// This is a thin wrapper over [`Conv2DKernel`] that hides the
-/// `cx.custom_op` plumbing. All inputs MUST be `DType::F32` and contiguous
-/// row-major; pass `tensor * 1.0_f32` first if you have a strided view.
-pub fn conv2d_bias(
-    input: GraphTensor,
-    weight: GraphTensor,
-    bias: GraphTensor,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-) -> GraphTensor {
-    assert_eq!(input.dtype, DType::F32, "conv2d_bias requires F32 input");
-    assert_eq!(weight.dtype, DType::F32, "conv2d_bias requires F32 weight");
-    assert_eq!(bias.dtype, DType::F32, "conv2d_bias requires F32 bias");
-
-    let dims = input.dims();
-    assert_eq!(dims.len(), 3, "conv2d_bias expects (C_in, H, W) input");
-    let c_in = dims[0].to_usize().expect("C_in must be a static dim");
-    let h_in = dims[1].to_usize().expect("H must be a static dim");
-    let w_in = dims[2].to_usize().expect("W must be a static dim");
-
-    let w_dims = weight.dims();
-    assert_eq!(
-        w_dims.len(),
-        2,
-        "conv2d_bias expects weight (C_out, C_in*K*K)"
-    );
-    let c_out = w_dims[0].to_usize().expect("C_out must be a static dim");
-    let w_kk = w_dims[1]
-        .to_usize()
-        .expect("weight inner dim must be static");
-    assert_eq!(
-        w_kk,
-        c_in * kernel * kernel,
-        "weight inner dim {w_kk} != C_in*K*K = {}",
-        c_in * kernel * kernel,
-    );
-
-    let b_dims = bias.dims();
-    assert_eq!(b_dims.len(), 1, "conv2d_bias expects bias (C_out,)");
-    assert_eq!(
-        b_dims[0].to_usize().expect("bias dim must be static"),
-        c_out
-    );
-
-    assert!(
-        h_in + 2 * padding >= kernel,
-        "padded H_in ({}) is smaller than kernel ({})",
-        h_in + 2 * padding,
-        kernel,
-    );
-    assert!(
-        w_in + 2 * padding >= kernel,
-        "padded W_in ({}) is smaller than kernel ({})",
-        w_in + 2 * padding,
-        kernel,
-    );
-    let h_out = (h_in + 2 * padding - kernel) / stride + 1;
-    let w_out = (w_in + 2 * padding - kernel) / stride + 1;
-
-    let kern = Conv2DKernel {
-        c_in,
-        h_in,
-        w_in,
-        c_out,
-        kernel,
-        stride,
-        padding,
-        h_out,
-        w_out,
-    };
-    let cx: &mut Graph = unsafe { &mut *input.graph_ref };
-    cx.custom_op(
-        Conv2DCustom(kern),
-        vec![input, weight, bias],
-        (c_out, h_out, w_out),
-        DType::F32,
-    )
 }

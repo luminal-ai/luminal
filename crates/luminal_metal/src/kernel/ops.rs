@@ -2494,6 +2494,416 @@ impl EgglogOp for MetalIota {
     fn sort(&self) -> SortDef {
         sort(
             IR,
+            "GenericMatmul",
+            &[
+                ("out_shape", ELIST),
+                ("mul_shape", ELIST),
+                ("k", EXPRESSION),
+                ("lhs", IR),
+                ("lhs_strides", ELIST),
+                ("rhs", IR),
+                ("rhs_strides", ELIST),
+                ("sum_input_strides", ELIST),
+                ("sum_iter_stride", EXPRESSION),
+                ("out_strides", ELIST),
+            ],
+        )
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        let mul_shape = v("?generic_matmul_mul_shape");
+        let out_shape = v("?generic_matmul_out_shape");
+        let k = v("?generic_matmul_k");
+        let lhs = v("?generic_matmul_lhs");
+        let rhs = v("?generic_matmul_rhs");
+        let lhs_strides = v("?generic_matmul_lhs_strides");
+        let rhs_strides = v("?generic_matmul_rhs_strides");
+        let mul_output_strides = v("?generic_matmul_mul_output_strides");
+        let sum_input_strides = v("?generic_matmul_sum_input_strides");
+        let sum_iter_stride = v("?generic_matmul_sum_iter_stride");
+        let out_strides = v("?generic_matmul_out_strides");
+
+        let mul_op = op_term(
+            MetalMul::default().sort().call([
+                ("shape", mul_shape.clone()),
+                ("a_strides", lhs_strides.clone()),
+                ("b_strides", rhs_strides.clone()),
+                ("out_strides", mul_output_strides),
+            ]),
+            ilist(vec![lhs.clone(), rhs.clone()]),
+        );
+        let sum_op = op_term(
+            MetalSumReduce::default().sort().call([
+                ("shape", out_shape.clone()),
+                ("iters", k.clone()),
+                ("strides", sum_input_strides.clone()),
+                ("iter_stride", sum_iter_stride.clone()),
+                ("out_strides", out_strides.clone()),
+            ]),
+            ilist(vec![mul_op.clone()]),
+        );
+        let generic_op = GenericMatmul::default().sort().call([
+            ("out_shape", out_shape),
+            ("mul_shape", mul_shape),
+            ("k", k),
+            ("lhs", lhs),
+            ("lhs_strides", lhs_strides),
+            ("rhs", rhs),
+            ("rhs_strides", rhs_strides),
+            ("sum_input_strides", sum_input_strides),
+            ("sum_iter_stride", sum_iter_stride),
+            ("out_strides", out_strides),
+        ]);
+        let dt = v("?generic_matmul_dt");
+
+        vec![
+            rule(union(sum_op.clone(), generic_op.clone()))
+                .set(dtype(generic_op.clone()), dt.clone())
+                .fact(eq(dt, dtype(sum_op)))
+                .ruleset("matmul_backend")
+                .name("generic-matmul-metal-mul-sum"),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-generic-matmul-exists\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?sum (MPSMatmul ?mm ?mn ?mk ?ml ?mls ?mr ?mrs ?mos ?mtl ?mtr)))
+                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
+                    :ruleset cleanup
+                    :name \"prefer-mps-over-generic-matmul\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?sum (MPSBatchedMatmul ?bb ?bm ?bn ?bk ?bl ?blbs ?blrs ?br ?brbs ?brrs ?bobs ?bors ?btl ?btr)))
+                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
+                    :ruleset cleanup
+                    :name \"prefer-mps-batched-over-generic-matmul\"
+                )",
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        _input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        use luminal::egglog_utils::{extract_expr, extract_expr_list};
+        (
+            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
+                    .unwrap(),
+                mul_shape: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                k: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
+                lhs_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
+                    .unwrap(),
+                rhs_strides: extract_expr_list(egraph, kind_children[6], list_cache, expr_cache)
+                    .unwrap(),
+                sum_input_strides: extract_expr_list(
+                    egraph,
+                    kind_children[7],
+                    list_cache,
+                    expr_cache,
+                )
+                .unwrap(),
+                sum_iter_stride: extract_expr(egraph, kind_children[8], expr_cache).unwrap(),
+                out_strides: extract_expr_list(egraph, kind_children[9], list_cache, expr_cache)
+                    .unwrap(),
+            })),
+            vec![kind_children[3], kind_children[5]],
+        )
+    }
+}
+
+impl MetalKernelOp for GenericMatmul {
+    fn compile(
+        &self,
+        device: &Device,
+        input_dtypes: &[DType],
+        output_dtype: DType,
+    ) -> Option<ComputePipelineState> {
+        let lhs_dtype = input_dtypes.first().copied().unwrap_or(DType::F32);
+        let rhs_dtype = input_dtypes.get(1).copied().unwrap_or(lhs_dtype);
+        let lhs_ty = metal_buffer_type(lhs_dtype);
+        let rhs_ty = metal_buffer_type(rhs_dtype);
+        let out_ty = metal_buffer_type(output_dtype);
+
+        let sum_base = flatten_strides(&self.out_shape, &self.sum_input_strides);
+        let sum_base_idx = lower_expression_for_metal(&sum_base, "gid");
+        let iter_offset = lower_expression_for_metal(&self.sum_iter_stride, "i");
+        let lhs_index = flatten_strides(&self.mul_shape, &self.lhs_strides);
+        let rhs_index = flatten_strides(&self.mul_shape, &self.rhs_strides);
+        let out_index = flatten_strides(&self.out_shape, &self.out_strides);
+        let lhs_idx = lower_expression_for_metal(&lhs_index, "mul_idx");
+        let rhs_idx = lower_expression_for_metal(&rhs_index, "mul_idx");
+        let out_idx = lower_expression_for_metal(&out_index, "gid");
+        let iters = lower_expression_for_metal(&self.k, "gid");
+        let lhs_val = metal_numeric_read(lhs_dtype, "lhs", &lhs_idx);
+        let rhs_val = metal_numeric_read(rhs_dtype, "rhs", &rhs_idx);
+        let out_val = metal_numeric_write(output_dtype, "block_sum");
+
+        let source = format!(
+            r#"
+            #include <metal_stdlib>
+            using namespace metal;
+
+            #define THREADS_PER_GROUP 256
+
+            kernel void mkernel(
+                const device {lhs_ty} *lhs [[buffer(0)]],
+                const device {rhs_ty} *rhs [[buffer(1)]],
+                device {out_ty} *out [[buffer(2)]],
+                constant int *dyn [[buffer({dyn_buffer_index})]],
+                constant uint &n_outputs [[buffer({n_outputs_index})]],
+                uint gid [[threadgroup_position_in_grid]],
+                uint tid [[thread_index_in_threadgroup]],
+                uint simd_lane [[thread_index_in_simdgroup]],
+                uint simd_id [[simdgroup_index_in_threadgroup]]
+            ) {{
+                if (gid >= n_outputs) return;
+
+                threadgroup float warp_sums[THREADS_PER_GROUP / 32];
+                int base_idx = {sum_base_idx};
+                int iters = {iters};
+                (void)dyn;
+
+                float sum = 0.0f;
+                for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
+                    int mul_idx = base_idx + {iter_offset};
+                    sum += ({lhs_val}) * ({rhs_val});
+                }}
+
+                sum = simd_sum(sum);
+                if (simd_lane == 0) {{
+                    warp_sums[simd_id] = sum;
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (simd_id == 0) {{
+                    int n_warps = THREADS_PER_GROUP / 32;
+                    float block_sum = (tid < uint(n_warps)) ? warp_sums[tid] : 0.0f;
+                    block_sum = simd_sum(block_sum);
+                    if (tid == 0) {{
+                        out[{out_idx}] = {out_val};
+                    }}
+                }}
+            }}
+            "#,
+            lhs_ty = lhs_ty,
+            rhs_ty = rhs_ty,
+            out_ty = out_ty,
+            sum_base_idx = sum_base_idx,
+            iters = iters,
+            iter_offset = iter_offset,
+            lhs_val = lhs_val,
+            rhs_val = rhs_val,
+            out_idx = out_idx,
+            out_val = out_val,
+            dyn_buffer_index = 3u64,
+            n_outputs_index = 4u64,
+        );
+        Some(compile_shader(device, &source, "mkernel"))
+    }
+
+    fn infer_output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        input_dtypes.first().copied().unwrap_or(DType::F32)
+    }
+
+    fn output_size(&self) -> Expression {
+        self.out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .max(Expression::from(1))
+    }
+
+    fn encode_compute(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipeline: &ComputePipelineState,
+        inputs: &[&Buffer],
+        output: &Buffer,
+        dyn_map: &FxHashMap<char, usize>,
+    ) {
+        let n_outputs = self.output_size().exec(dyn_map).unwrap() as u32;
+
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(inputs[0]), 0);
+        encoder.set_buffer(1, Some(inputs[1]), 0);
+        encoder.set_buffer(2, Some(output), 0);
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &n_outputs as *const u32 as *const _,
+        );
+
+        let thread_group_size = MTLSize::new(256, 1, 1);
+        let thread_groups = MTLSize::new(n_outputs as u64, 1, 1);
+        encoder.dispatch_thread_groups(thread_groups, thread_group_size);
+    }
+
+    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+        let n_outputs = self.output_size().exec(dyn_map).unwrap_or(0);
+        let k = self.k.exec(dyn_map).unwrap_or(0);
+        2 * n_outputs * k * std::mem::size_of::<f32>()
+    }
+
+    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+        self.output_size().exec(dyn_map).unwrap_or(0) * std::mem::size_of::<f32>()
+    }
+
+    fn flops(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+        let n_outputs = self.output_size().exec(dyn_map).unwrap_or(0);
+        let k = self.k.exec(dyn_map).unwrap_or(0);
+        2 * n_outputs * k
+    }
+
+    fn is_matmul(&self) -> bool {
+        true
+    }
+}
+
+// ============================================================================
+// Data Operations
+// ============================================================================
+
+// MetalConstant: produces a single float value
+#[derive(Debug, Default, Clone)]
+pub struct MetalConstant {
+    value: f32,
+}
+
+impl EgglogOp for MetalConstant {
+    fn sort(&self) -> SortDef {
+        sort(IR, "MetalConstant", &[("value", F64)])
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        let (args, const_match) = new_op_call(&Constant::default().sort(), &[]);
+        let metal_op = call_sort_from_args(&self.sort(), &args);
+        vec![
+            rule(union(const_match.clone(), metal_op.clone()))
+                .subsume(const_match)
+                .set(dtype(metal_op), app(&SORTS.f32_dt, vec![]))
+                .ruleset("kernel_lower"),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        children: &[&'a ENodeId],
+        _input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+                value: egraph.enodes[children[0]]
+                    .0
+                    .replace("\"", "")
+                    .parse::<f32>()
+                    .unwrap(),
+            })),
+            vec![],
+        )
+    }
+}
+
+impl MetalKernelOp for MetalConstant {
+    fn compile(
+        &self,
+        device: &Device,
+        _input_dtypes: &[DType],
+        _output_dtype: DType,
+    ) -> Option<ComputePipelineState> {
+        // Ensure value is formatted with decimal point for Metal (e.g., -1.0f not -1f)
+        let value_str = if self.value.fract() == 0.0 {
+            format!("{:.1}", self.value)
+        } else {
+            format!("{}", self.value)
+        };
+
+        let source = format!(
+            r#"
+            #include <metal_stdlib>
+            using namespace metal;
+
+            kernel void mkernel(
+                device float *out [[buffer(0)]],
+                constant int *dyn [[buffer({dyn_buffer_index})]],
+                uint idx [[thread_position_in_grid]]
+            ) {{
+                if (idx == 0) {{
+                    out[0] = {value}f;
+                }}
+            }}
+            "#,
+            value = value_str,
+            dyn_buffer_index = 1u64,
+        );
+        Some(compile_shader(device, &source, "mkernel"))
+    }
+
+    fn output_size(&self) -> Expression {
+        Expression::from(1)
+    }
+
+    fn infer_output_dtype(&self, _input_dtypes: &[DType]) -> DType {
+        DType::F32
+    }
+
+    fn encode_compute(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipeline: &ComputePipelineState,
+        _inputs: &[&Buffer],
+        output: &Buffer,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) {
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(output), 0);
+
+        let thread_group_size = MTLSize::new(1, 1, 1);
+        let thread_groups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(thread_groups, thread_group_size);
+    }
+}
+
+// MetalIota: generates sequence [expr(0), expr(1), ..., expr(range-1)]
+#[derive(Debug, Default, Clone)]
+pub struct MetalIota {
+    expr: Expression,
+    range: Expression,
+}
+
+impl EgglogOp for MetalIota {
+    fn sort(&self) -> SortDef {
+        sort(
+            IR,
             "MetalIota",
             &[("expr", EXPRESSION), ("range", EXPRESSION)],
         )

@@ -68,20 +68,10 @@ pub const WEIGHT_DTYPE: DType = DType::Bf16;
 // =============================================================================
 
 fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
-    // Direct mixed-precision kernel: F32 A × BF16 B^T → F32 (M, N), with the
-    // BF16 → F32 conversion happening on each load inside the kernel rather
-    // than as a separate cast op. This keeps the BF16 weight in memory as-is
-    // (a 24 GB → 48 GB cast for the full encoder would not fit on the GPU)
-    // and bypasses the egglog matmul lowering, where the cublaslt 2D rule
-    // doesn't reliably fire for these shapes — see kernel::matmul2d's docs.
-    //
-    // Falls back to the standard `x.matmul(w.cast(x.dtype).t())` lowering
-    // for ranks > 2 (e.g. attention's batched (heads, seq, head_dim) form),
-    // since the custom kernel is only 2D.
-    if x.shape.len() == 2 && w.shape.len() == 2 {
-        luminal_cuda_lite::kernel::linear_no_bias_bf16_w(x, w)
+    if x.dtype == w.dtype {
+        x.matmul(w.t())
     } else {
-        x.matmul(w.cast(x.dtype).t())
+        x.cast(w.dtype).matmul(w.t()).cast(x.dtype)
     }
 }
 
@@ -131,13 +121,6 @@ fn apply_rope(x: GraphTensor, pos_ids: GraphTensor, n_heads: usize, theta: f32) 
 /// Standard scaled dot-product attention over `(n_heads, seq_q, head_dim)`,
 /// `(n_heads, seq_k, head_dim)`, `(n_heads, seq_k, head_dim)` with a causal
 /// mask. Returns `(seq_q, n_heads * head_dim)`.
-///
-/// Routes the two batched matmuls through `kernel::matmul_3d_t` /
-/// `matmul_3d` rather than the egglog matmul lowering. The standard path
-/// has the same problem the VAE attention had (cublaslt batched rules
-/// fail to fire reliably; the broadcast Mul + SumReduce fallback creates
-/// a `(n_heads, M, N, K)` intermediate that scales O(seq²) and OOMs at
-/// seq_len ≥ ~256 even with BF16 weights elsewhere).
 fn causal_sdpa(
     q: GraphTensor,
     k: GraphTensor,
@@ -148,13 +131,16 @@ fn causal_sdpa(
     let n_heads = q.dims()[0];
     let seq = q.dims()[1];
     let scale = (HEAD_DIM as f32).sqrt().recip();
-    // The kernel needs contiguous batches; a `* 1.0` after the upstream
-    // transpose / GQA-expand chain materialises the strided view.
+    // Materialize strided views from the upstream transpose / GQA-expand chain
+    // before expressing attention as HLIR matmuls. Today the generic batched
+    // matmul fallback can handle those arbitrary strides correctly, but the
+    // full model becomes too memory-heavy unless cuBLASLt sees contiguous
+    // per-head matrices.
     let q = q * 1.0_f32;
     let k = k * 1.0_f32;
     let v = v * 1.0_f32;
     // Q @ K^T: (heads, seq, head_dim) @ (heads, seq, head_dim)^T = (heads, seq, seq).
-    let scores = luminal_cuda_lite::kernel::matmul_3d_t(q, k) * scale;
+    let scores = q.matmul(k.transpose(1, 2)) * scale;
     // Causal mask: positions where k_pos > q_pos are masked.
     let q_pos = cx.arange(seq).cast(DType::F32);
     let k_pos = cx.arange(seq).cast(DType::F32);
@@ -177,13 +163,9 @@ fn causal_sdpa(
     let masked = scores + mask * (-1e10_f32);
     let weights = masked.softmax(2);
     // attn = weights @ v: (heads, seq, seq) @ (heads, seq, head_dim) = (heads, seq, head_dim).
-    let attn = luminal_cuda_lite::kernel::matmul_3d(weights, v);
-    // `transpose(0, 1).merge_dims(1, 2)` produces the merge_dims
-    // non-contiguous K stride `(((z/HEAD_DIM)*HEAD_DIM)*SEQ)+(z%HEAD_DIM)`.
-    // The cublaslt 2D rule requires `K stride = MIter` (contiguous), so
-    // without forcing materialization here the downstream o_proj matmul
-    // falls through to a broadcast Mul whose `(SEQ, HIDDEN, KV_DIM)`
-    // intermediate is ~20 GB BF16 and OOMs the GPU during search.
+    let attn = weights.matmul(v);
+    // `transpose(0, 1).merge_dims(1, 2)` produces a non-contiguous K stride;
+    // materialize before the downstream o_proj matmul.
     attn.transpose(0, 1).merge_dims(1, 2) * 1.0_f32 // (seq_q, n_heads*head_dim)
 }
 
@@ -372,7 +354,25 @@ pub fn format_chat(system_message: &str, user_prompt: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use luminal::hlir::CustomOpKind;
+
     use super::*;
+
+    fn assert_no_custom_ops(cx: &Graph) {
+        assert!(
+            cx.custom_ops.is_empty(),
+            "Flux2 text encoder helpers should use pure HLIR, not registered CustomOp wrappers"
+        );
+        let custom_nodes: Vec<_> = cx
+            .graph
+            .node_indices()
+            .filter(|&node| cx.try_get_op::<CustomOpKind>(node).is_some())
+            .collect();
+        assert!(
+            custom_nodes.is_empty(),
+            "Flux2 text encoder graph contains CustomOpKind nodes: {custom_nodes:?}"
+        );
+    }
 
     #[test]
     fn chat_template_matches_jinja_output() {
@@ -394,5 +394,24 @@ mod tests {
         assert_eq!(OUTPUT_DIM, TAP_LAYERS.len() * HIDDEN);
         // hidden_states[30] requires running 30 layers (0..29 inclusive).
         assert_eq!(NUM_LAYERS_USED, *TAP_LAYERS.iter().max().unwrap());
+    }
+
+    #[test]
+    fn text_encoder_helpers_use_no_custom_ops() {
+        let mut cx = Graph::default();
+
+        let x = cx.named_tensor("x", (2usize, 3usize));
+        let w = cx
+            .named_tensor("w", (4usize, 3usize))
+            .as_dtype(WEIGHT_DTYPE);
+        let _ = linear_no_bias(x, w).output();
+
+        let q = cx.named_tensor("q", (1usize, 2usize, HEAD_DIM));
+        let k = cx.named_tensor("k", (1usize, 2usize, HEAD_DIM));
+        let v = cx.named_tensor("v", (1usize, 2usize, HEAD_DIM));
+        let mask = cx.named_tensor("attention_mask", 2usize);
+        let _ = causal_sdpa(q, k, v, mask).output();
+
+        assert_no_custom_ops(&cx);
     }
 }

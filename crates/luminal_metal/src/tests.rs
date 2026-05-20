@@ -1013,6 +1013,287 @@ fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
 }
 
 #[test]
+fn metal_mps_matmul_transposed_rhs_weight_layout() {
+    let mut cx = Graph::default();
+    let m = 7;
+    let k = 11;
+    let n = 13;
+    let a = cx.tensor((m, k));
+    let weight = cx.tensor((n, k));
+    let output = a.matmul(weight.t()).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(m * k, 0.35, -0.17);
+    let weight_data = seeded_data(n * k, 0.21, -0.09);
+
+    rt.set_data(a, &a_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
+        "expected MPS matmul to cover transposed row-major RHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_a = CandleTensor::from_vec(a_data, (m, k), &device).unwrap();
+    let ref_weight = CandleTensor::from_vec(weight_data, (n, k), &device).unwrap();
+    let expected = ref_a.matmul(&ref_weight.t().unwrap()).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_matmul_transposed_lhs_layout() {
+    let mut cx = Graph::default();
+    let m = 5;
+    let k = 9;
+    let n = 6;
+    let lhs_storage = cx.tensor((k, m));
+    let rhs = cx.tensor((k, n));
+    let output = lhs_storage.t().matmul(rhs).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let lhs_data = seeded_data(k * m, 0.31, -0.12);
+    let rhs_data = seeded_data(k * n, 0.27, -0.08);
+
+    rt.set_data(lhs_storage, &lhs_data);
+    rt.set_data(rhs, &rhs_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_lhs: true")),
+        "expected MPS matmul to cover transposed row-major LHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_lhs = CandleTensor::from_vec(lhs_data, (k, m), &device)
+        .unwrap()
+        .t()
+        .unwrap();
+    let ref_rhs = CandleTensor::from_vec(rhs_data, (k, n), &device).unwrap();
+    let expected = ref_lhs.matmul(&ref_rhs).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_batched_matmul_row_row_layout() {
+    let mut cx = Graph::default();
+    let batch = 3;
+    let m = 4;
+    let k = 5;
+    let n = 6;
+    let a = cx.tensor((batch, m, k));
+    let b = cx.tensor((batch, k, n));
+    let output = a.matmul(b).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(batch * m * k, 0.17, -0.08);
+    let b_data = seeded_data(batch * k * n, 0.11, -0.05);
+    rt.set_data(a, &a_data);
+    rt.set_data(b, &b_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("MPSBatchedMatmul")),
+        "expected MPS batched matmul path, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(output);
+
+    let mut expected = vec![0.0; batch * m * n];
+    for batch_idx in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0;
+                for inner in 0..k {
+                    sum += a_data[batch_idx * m * k + row * k + inner]
+                        * b_data[batch_idx * k * n + inner * n + col];
+                }
+                expected[batch_idx * m * n + row * n + col] = sum;
+            }
+        }
+    }
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_generic_matmul_covers_noncontiguous_merged_head_projection() {
+    let mut cx = Graph::default();
+    let heads = 3;
+    let seq = 4;
+    let head_dim = 5;
+    let hidden = heads * head_dim;
+    let out_dim = 7;
+    let attn = cx.tensor((heads, seq, head_dim));
+    let weight = cx.tensor((out_dim, hidden));
+    let merged = attn.transpose(0, 1).merge_dims(1, 2);
+    let output = merged.matmul(weight.t()).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let attn_data = seeded_data(heads * seq * head_dim, 0.19, -0.09);
+    let weight_data = seeded_data(out_dim * hidden, 0.14, -0.06);
+    rt.set_data(attn, &attn_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("GenericMatmul")),
+        "expected generic matmul fallback for non-contiguous merged-head projection, kernels: {:?}",
+        kernels
+    );
+    assert!(
+        !kernels.iter().any(|k| {
+            k.contains("MetalMul") && k.contains(&format!("shape: [{seq}, {out_dim}, {hidden}]"))
+        }),
+        "generic fallback should remove the broadcast multiply intermediate, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(output);
+
+    let mut expected = vec![0.0; seq * out_dim];
+    for token in 0..seq {
+        for out_col in 0..out_dim {
+            let mut sum = 0.0;
+            for inner in 0..hidden {
+                let head = inner / head_dim;
+                let dim = inner % head_dim;
+                let attn_idx = head * seq * head_dim + token * head_dim + dim;
+                sum += attn_data[attn_idx] * weight_data[out_col * hidden + inner];
+            }
+            expected[token * out_dim + out_col] = sum;
+        }
+    }
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_batched_matmul_transposed_rhs_layout() {
+    let mut cx = Graph::default();
+    let batch = 4;
+    let m = 3;
+    let k = 7;
+    let n = 5;
+    let a = cx.tensor((batch, m, k));
+    let weight = cx.tensor((batch, n, k));
+    let output = a.matmul(weight.permute((0, 2, 1))).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(batch * m * k, 0.13, -0.06);
+    let weight_data = seeded_data(batch * n * k, 0.09, -0.04);
+    rt.set_data(a, &a_data);
+    rt.set_data(weight, &weight_data);
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels
+            .iter()
+            .any(|k| k.contains("MPSBatchedMatmul") && k.contains("transpose_rhs: true")),
+        "expected MPS batched matmul transposed RHS path, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(output);
+
+    let mut expected = vec![0.0; batch * m * n];
+    for batch_idx in 0..batch {
+        for row in 0..m {
+            for col in 0..n {
+                let mut sum = 0.0;
+                for inner in 0..k {
+                    sum += a_data[batch_idx * m * k + row * k + inner]
+                        * weight_data[batch_idx * n * k + col * k + inner];
+                }
+                expected[batch_idx * m * n + row * n + col] = sum;
+            }
+        }
+    }
+
+    assert_close(&result, &expected, 1e-3);
+}
+
+#[test]
+fn metal_mps_matmul_f16_transposed_rhs_weight_layout() {
+    let mut cx = Graph::default();
+    let m = 6;
+    let k = 10;
+    let n = 7;
+    let a = cx.tensor((m, k)).as_dtype(DType::F16);
+    let weight = cx.tensor((n, k)).as_dtype(DType::F16);
+    let output = a.matmul(weight.t()).cast(DType::F32).output();
+
+    cx.build_search_space::<MetalRuntime>();
+    let mut rt = MetalRuntime::initialize(());
+
+    let a_data = seeded_data(m * k, 0.22, -0.07);
+    let weight_data = seeded_data(n * k, 0.18, -0.05);
+
+    rt.set_data(a, to_f16_vec(&a_data));
+    rt.set_data(weight, to_f16_vec(&weight_data));
+    rt = cx.search(rt, 1);
+
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        kernels.iter().any(|k| k.contains("transpose_rhs: true")),
+        "expected MPS F16 matmul to cover transposed row-major RHS, kernels: {:?}",
+        kernels
+    );
+
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(output);
+
+    let device = CandleDevice::Cpu;
+    let ref_a = CandleTensor::from_vec(a_data, (m, k), &device).unwrap();
+    let ref_weight = CandleTensor::from_vec(weight_data, (n, k), &device).unwrap();
+    let expected = ref_a.matmul(&ref_weight.t().unwrap()).unwrap();
+    let expected: Vec<f32> = expected.flatten_all().unwrap().to_vec1().unwrap();
+
+    assert_close(&result, &expected, 5e-3);
+}
+
+#[test]
 fn metal_rms_norm() {
     let mut cx = Graph::default();
     let input = cx.tensor((TRANSFORMER_SEQ, TRANSFORMER_HIDDEN));

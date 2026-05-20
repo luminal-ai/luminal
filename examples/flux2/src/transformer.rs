@@ -120,26 +120,10 @@ pub const WEIGHT_DTYPE: DType = DType::Bf16;
 // =============================================================================
 
 fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
-    // For 2D inputs we go through `kernel::linear_no_bias_bf16_w`, which
-    // is a direct mixed-precision SGEMM (F32 A × BF16 B^T → F32) that
-    // converts BF16 → F32 on each load instead of materializing a
-    // separate F32 cast tensor. Two reasons we don't use the egglog
-    // matmul lowering for these:
-    //   1. The cublaslt 2D rule fails to fire reliably for some matmul
-    //      shapes (see kernel::matmul2d's docs); even one bad genome
-    //      pick on the broadcast Mul + SumReduce fallback creates an
-    //      `(M, N, K)` intermediate that OOMs the GPU.
-    //   2. Explicitly casting all BF16 weights to F32 first would more
-    //      than double the transformer's working set (~120 GB) and
-    //      wouldn't fit. The kernel keeps weights as BF16 in memory.
-    //
-    // Higher-rank cases (3D batched matmul inside attention) fall
-    // through to the standard matmul lowering — those go through the
-    // separate `matmul_3d` / `matmul_3d_t` helpers in `sdpa` below.
-    if x.shape.len() == 2 && w.shape.len() == 2 {
-        luminal_cuda_lite::kernel::linear_no_bias_bf16_w(x, w)
+    if x.dtype == w.dtype {
+        x.matmul(w.t())
     } else {
-        x.matmul(w.cast(x.dtype).t())
+        x.cast(w.dtype).matmul(w.t()).cast(x.dtype)
     }
 }
 
@@ -191,20 +175,20 @@ fn apply_rope(x: GraphTensor, cos: GraphTensor, sin: GraphTensor) -> GraphTensor
 
 /// Scaled dot-product attention with NO mask, no causal: standard SDPA.
 /// q, k, v: `(H, S, D)`. Returns `(S, H, D)`.
-///
-/// Routes through the direct batched matmul kernels for the same reason
-/// the text encoder does — see `text_encoder::causal_sdpa` for context.
 fn sdpa(q: GraphTensor, k: GraphTensor, v: GraphTensor) -> GraphTensor {
     let head_dim = q.dims()[2].to_usize().expect("head_dim must be static");
     let scale = (head_dim as f32).sqrt().recip();
-    // The kernel needs contiguous batches; materialize the strided views
-    // produced upstream (transpose / split_dims chains).
+    // Materialize the strided views produced upstream (transpose /
+    // split_dims chains) before expressing attention as HLIR matmuls. cuBLASLt
+    // can represent the leading dimensions, but the current rewrite rules do
+    // not yet match the interleaved per-head layout, so omitting these copies
+    // falls back to a much larger generic plan in the full Flux2 graph.
     let q = q * 1.0_f32;
     let k = k * 1.0_f32;
     let v = v * 1.0_f32;
-    let scores = luminal_cuda_lite::kernel::matmul_3d_t(q, k) * scale; // (H, S, S)
+    let scores = q.matmul(k.transpose(1, 2)) * scale; // (H, S, S)
     let attn_w = scores.softmax(2);
-    let attn = luminal_cuda_lite::kernel::matmul_3d(attn_w, v); // (H, S, D)
+    let attn = attn_w.matmul(v); // (H, S, D)
     attn.transpose(0, 1) // (S, H, D)
 }
 
@@ -518,9 +502,8 @@ impl SingleStreamAttn {
         let q = q.transpose(0, 1);
         let k = k.transpose(0, 1);
         let v = v.transpose(0, 1);
-        // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K
-        // stride; force materialization so cublaslt can match the
-        // downstream `to_out` matmul. See dual-stream block above.
+        // `merge_dims(1, 2)` on (S, H, D) produces non-contiguous K stride;
+        // materialize before the downstream `to_out` matmul.
         let attn = sdpa(q, k, v).merge_dims(1, 2) * 1.0_f32; // (S, HIDDEN)
 
         let mlp = swiglu(mlp_in); // (S, MLP_HIDDEN)
@@ -915,3 +898,44 @@ impl Flux2Transformer {
 // =============================================================================
 // Tests
 // =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use luminal::hlir::CustomOpKind;
+
+    use super::*;
+
+    fn assert_no_custom_ops(cx: &Graph) {
+        assert!(
+            cx.custom_ops.is_empty(),
+            "Flux2 transformer helpers should use pure HLIR, not registered CustomOp wrappers"
+        );
+        let custom_nodes: Vec<_> = cx
+            .graph
+            .node_indices()
+            .filter(|&node| cx.try_get_op::<CustomOpKind>(node).is_some())
+            .collect();
+        assert!(
+            custom_nodes.is_empty(),
+            "Flux2 transformer graph contains CustomOpKind nodes: {custom_nodes:?}"
+        );
+    }
+
+    #[test]
+    fn transformer_helpers_use_no_custom_ops() {
+        let mut cx = Graph::default();
+
+        let x = cx.named_tensor("x", (3usize, 4usize));
+        let w = cx
+            .named_tensor("w", (5usize, 4usize))
+            .as_dtype(WEIGHT_DTYPE);
+        let _ = linear_no_bias(x, w).output();
+
+        let q = cx.named_tensor("q", (2usize, 3usize, 4usize));
+        let k = cx.named_tensor("k", (2usize, 3usize, 4usize));
+        let v = cx.named_tensor("v", (2usize, 3usize, 4usize));
+        let _ = sdpa(q, k, v).output();
+
+        assert_no_custom_ops(&cx);
+    }
+}

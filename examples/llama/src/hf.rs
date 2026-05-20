@@ -17,10 +17,22 @@ struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
 
-/// Stored tensor data with shape and converted FP32 bytes
+/// Stored tensor data with shape, dtype, and serialized bytes.
 struct StoredTensor {
     shape: Vec<usize>,
-    data: Vec<f32>,
+    dtype: Dtype,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightFormat {
+    Fp32,
+    Fp8,
+}
+
+pub struct PreparedModel {
+    pub model_dir: PathBuf,
+    pub weight_files: Vec<PathBuf>,
 }
 
 /// Downloads model files from HuggingFace and returns the cache directory path.
@@ -84,6 +96,59 @@ fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
     }
 }
 
+fn tensor_to_f32_bytes(tensor: &safetensors::tensor::TensorView) -> Vec<u8> {
+    let fp32 = tensor_to_f32(tensor);
+    bytemuck::cast_slice(&fp32).to_vec()
+}
+
+fn stored_tensor_from_view(
+    tensor: &safetensors::tensor::TensorView,
+    preserve_fp8: bool,
+) -> StoredTensor {
+    let shape = tensor.shape().to_vec();
+    let dtype = tensor.dtype();
+    match dtype {
+        Dtype::F32 if preserve_fp8 => StoredTensor {
+            shape,
+            dtype,
+            data: tensor.data().to_vec(),
+        },
+        Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::F8_E8M0 if preserve_fp8 => StoredTensor {
+            shape,
+            dtype,
+            data: tensor.data().to_vec(),
+        },
+        Dtype::F32 | Dtype::F16 | Dtype::BF16 => StoredTensor {
+            shape,
+            dtype: Dtype::F32,
+            data: tensor_to_f32_bytes(tensor),
+        },
+        other => {
+            panic!("Unsupported dtype for model preparation: {other:?}");
+        }
+    }
+}
+
+fn model_shard_files(model_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let index_path = model_dir.join("model.safetensors.index.json");
+    let single_shard_path = model_dir.join("model.safetensors");
+
+    if single_shard_path.exists() && !index_path.exists() {
+        Ok(vec![single_shard_path])
+    } else if index_path.exists() {
+        let index_content = std::fs::read_to_string(&index_path)?;
+        let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
+
+        let mut files: Vec<String> = index.weight_map.values().cloned().collect();
+        files.sort();
+        files.dedup();
+
+        Ok(files.into_iter().map(|f| model_dir.join(f)).collect())
+    } else {
+        Err("No model.safetensors or model.safetensors.index.json found".into())
+    }
+}
+
 /// Combines sharded safetensors files into a single FP32 file.
 ///
 /// This function:
@@ -100,29 +165,11 @@ pub fn combine_safetensors_to_fp32(
         return Ok(output_path);
     }
 
-    let index_path = model_dir.join("model.safetensors.index.json");
-    let single_shard_path = model_dir.join("model.safetensors");
-
-    // Determine which shard files to load
-    let shard_files: Vec<PathBuf> = if single_shard_path.exists() && !index_path.exists() {
-        info!("Single shard model detected, converting to FP32...");
-        vec![single_shard_path]
-    } else if index_path.exists() {
-        let index_content = std::fs::read_to_string(&index_path)?;
-        let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
-
-        let mut files: Vec<String> = index.weight_map.values().cloned().collect();
-        files.sort();
-        files.dedup();
-
-        info!(
-            "Loading {} shard files (converting to FP32)...",
-            files.len()
-        );
-        files.into_iter().map(|f| model_dir.join(f)).collect()
-    } else {
-        return Err("No model.safetensors or model.safetensors.index.json found".into());
-    };
+    let shard_files = model_shard_files(model_dir)?;
+    info!(
+        "Loading {} shard files (converting to FP32)...",
+        shard_files.len()
+    );
 
     // Load and convert all tensors
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
@@ -138,16 +185,7 @@ pub fn combine_safetensors_to_fp32(
 
         for name in st.names() {
             let tensor = st.tensor(name)?;
-            let shape: Vec<usize> = tensor.shape().to_vec();
-            let fp32_data = tensor_to_f32(&tensor);
-
-            all_tensors.insert(
-                name.to_string(),
-                StoredTensor {
-                    shape,
-                    data: fp32_data,
-                },
-            );
+            all_tensors.insert(name.to_string(), stored_tensor_from_view(&tensor, false));
         }
     }
 
@@ -159,8 +197,7 @@ pub fn combine_safetensors_to_fp32(
     let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
         .iter()
         .map(|(name, stored)| {
-            let data_bytes: &[u8] = bytemuck::cast_slice(&stored.data);
-            let view = TensorView::new(Dtype::F32, stored.shape.clone(), data_bytes).unwrap();
+            let view = TensorView::new(stored.dtype, stored.shape.clone(), &stored.data).unwrap();
             (name.clone(), view)
         })
         .collect();
@@ -174,13 +211,81 @@ pub fn combine_safetensors_to_fp32(
     Ok(output_path)
 }
 
+/// Combines sharded safetensors files into one file while preserving FP8 tensors.
+///
+/// Non-FP8 tensors are converted to FP32 so the existing embedding, norm, and
+/// output-head graph inputs can still load without changing their dtypes.
+pub fn combine_safetensors_preserve_fp8(
+    model_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output_path = model_dir.join("model_combined_fp8.safetensors");
+
+    if output_path.exists() {
+        return Ok(output_path);
+    }
+
+    let shard_files = model_shard_files(model_dir)?;
+    info!(
+        "Loading {} shard files (preserving FP8 tensors)...",
+        shard_files.len()
+    );
+
+    let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
+
+    for shard_path in &shard_files {
+        info!(
+            "  Loading {}...",
+            shard_path.file_name().unwrap().to_string_lossy()
+        );
+        let file = File::open(shard_path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let st = SafeTensors::deserialize(&mmap)?;
+
+        for name in st.names() {
+            let tensor = st.tensor(name)?;
+            all_tensors.insert(name.to_string(), stored_tensor_from_view(&tensor, true));
+        }
+    }
+
+    info!("Extracted {} language model tensors", all_tensors.len());
+    info!(
+        "Saving mixed FP8/FP32 model to {}...",
+        output_path.display()
+    );
+
+    let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
+        .iter()
+        .map(|(name, stored)| {
+            let view = TensorView::new(stored.dtype, stored.shape.clone(), &stored.data).unwrap();
+            (name.clone(), view)
+        })
+        .collect();
+
+    let serialized = safetensors::serialize(&tensor_views, None)?;
+
+    let mut file = File::create(&output_path)?;
+    file.write_all(&serialized)?;
+
+    info!("Combined mixed FP8/FP32 model saved successfully!");
+    Ok(output_path)
+}
+
 /// Downloads a model from HuggingFace and prepares it for use.
 ///
 /// Returns the path to the model directory containing:
 /// - tokenizer.json
-/// - model_combined.safetensors (FP32)
-pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// - a combined safetensors file for the requested weight format
+pub fn prepare_hf_model(
+    repo_id: &str,
+    weight_format: WeightFormat,
+) -> Result<PreparedModel, Box<dyn std::error::Error>> {
     let model_dir = download_hf_model(repo_id)?;
-    combine_safetensors_to_fp32(&model_dir)?;
-    Ok(model_dir)
+    let weights_path = match weight_format {
+        WeightFormat::Fp32 => combine_safetensors_to_fp32(&model_dir)?,
+        WeightFormat::Fp8 => combine_safetensors_preserve_fp8(&model_dir)?,
+    };
+    Ok(PreparedModel {
+        model_dir,
+        weight_files: vec![weights_path],
+    })
 }
