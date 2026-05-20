@@ -497,7 +497,7 @@ impl MetalRuntime {
     fn create_input_buffer(&self, data: &NativeData, dtype: DType) -> Buffer {
         match dtype {
             DType::F32 => {
-                let values: Vec<f32> = (0..data.len()).map(|i| data.f32(i)).collect();
+                let values = data.to_f32_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,
@@ -505,7 +505,7 @@ impl MetalRuntime {
                 )
             }
             DType::F16 => {
-                let values: Vec<f16> = (0..data.len()).map(|i| data.f16(i)).collect();
+                let values = data.to_f16_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,
@@ -513,7 +513,7 @@ impl MetalRuntime {
                 )
             }
             DType::Int => {
-                let values: Vec<i32> = (0..data.len()).map(|i| data.i32(i)).collect();
+                let values = data.to_i32_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,

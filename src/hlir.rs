@@ -2019,7 +2019,7 @@ impl NativeOp for LessThan {
                 NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
             (NativeData::Bool(a), NativeData::Bool(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| !x & y))
             }
             _ => panic!("LessThan inputs must have the same dtype"),
         }
@@ -2787,6 +2787,49 @@ impl NativeData {
         match self {
             NativeData::Bool(v) => v[i],
             _ => panic!("NativeData::bool called on non-Bool data"),
+        }
+    }
+
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        match self {
+            NativeData::F32(v) => v.clone(),
+            NativeData::F16(v) => v.iter().map(|v| v.to_f32()).collect(),
+            NativeData::Bf16(v) => v.iter().map(|v| v.to_f32()).collect(),
+            NativeData::Int(v) => v.iter().map(|v| *v as f32).collect(),
+            NativeData::Bool(v) => v.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect(),
+        }
+    }
+
+    pub fn to_f16_vec(&self) -> Vec<f16> {
+        match self {
+            NativeData::F32(v) => v.iter().copied().map(f16::from_f32).collect(),
+            NativeData::F16(v) => v.clone(),
+            NativeData::Bf16(v) => v.iter().map(|v| f16::from_f32(v.to_f32())).collect(),
+            NativeData::Int(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
+            NativeData::Bool(v) => v
+                .iter()
+                .map(|v| f16::from_f32(if *v { 1.0 } else { 0.0 }))
+                .collect(),
+        }
+    }
+
+    pub fn to_i32_vec(&self) -> Vec<i32> {
+        match self {
+            NativeData::F32(v) => v.iter().map(|v| *v as i32).collect(),
+            NativeData::F16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
+            NativeData::Bf16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
+            NativeData::Int(v) => v.clone(),
+            NativeData::Bool(v) => v.iter().map(|v| if *v { 1 } else { 0 }).collect(),
+        }
+    }
+
+    pub fn to_bool_vec(&self) -> Vec<bool> {
+        match self {
+            NativeData::F32(v) => v.iter().map(|v| *v != 0.0).collect(),
+            NativeData::F16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
+            NativeData::Bf16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
+            NativeData::Int(v) => v.iter().map(|v| *v != 0).collect(),
+            NativeData::Bool(v) => v.clone(),
         }
     }
 }

@@ -279,17 +279,17 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_f32(&self, node: NodeIndex) -> Vec<f32> {
         let data = self.output_buffer(node);
-        (0..data.len()).map(|i| data.f32(i)).collect()
+        data.to_f32_vec()
     }
 
     fn get_output_i32(&self, node: NodeIndex) -> Vec<i32> {
         let data = self.output_buffer(node);
-        (0..data.len()).map(|i| data.i32(i)).collect()
+        data.to_i32_vec()
     }
 
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {
         let data = self.output_buffer(node);
-        (0..data.len()).map(|i| data.bool(i)).collect()
+        data.to_bool_vec()
     }
 
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
