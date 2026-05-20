@@ -316,6 +316,27 @@ fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir:
     }
 }
 
+fn random_choice_generation<'a, G: rand::Rng>(
+    egraph: &'a SerializedEGraph,
+    generation_size: usize,
+    prev_selected: &mut FxHashSet<u64>,
+    rng: &mut G,
+) -> Vec<crate::egglog_utils::EGraphChoiceSet<'a>> {
+    let mut generation = Vec::with_capacity(generation_size);
+    let max_attempts = generation_size.saturating_mul(100);
+    let mut attempts = 0;
+
+    while generation.len() < generation_size && attempts < max_attempts {
+        attempts += 1;
+        let genome = random_initial_choice(egraph, rng);
+        if prev_selected.insert(hash_choice_set(&genome)) {
+            generation.push(genome);
+        }
+    }
+
+    generation
+}
+
 /// A Luminal compute graph.
 ///
 /// All computation is represented as a directed acyclic graph.
@@ -1444,6 +1465,7 @@ impl Graph {
         // Track top-N parents for offspring generation
         let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
             vec![(best_metric.clone(), best_genome.clone())];
+        let mut resample_generation = false;
 
         while n_graphs < search_limit {
             if options
@@ -1455,25 +1477,32 @@ impl Graph {
 
             // Generate offspring from all parents, dividing budget evenly
             let budget = (search_limit - n_graphs).min(options.generation_size);
-            let per_parent = budget.div_ceil(parents.len());
-            let mut all_offspring = Vec::new();
-            for (_, parent_genome) in &parents {
-                let remaining = budget.saturating_sub(all_offspring.len());
-                if remaining == 0 {
-                    break;
+            let all_offspring = if resample_generation {
+                random_choice_generation(egraph, budget, &mut prev_selected, rng)
+            } else {
+                let per_parent = budget.div_ceil(parents.len());
+                let mut offspring = Vec::new();
+                for (_, parent_genome) in &parents {
+                    let remaining = budget.saturating_sub(offspring.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    offspring.extend(extract_generation(
+                        egraph,
+                        parent_genome,
+                        per_parent.min(remaining),
+                        options.mutations,
+                        &mut prev_selected,
+                        rng,
+                    ));
                 }
-                all_offspring.extend(extract_generation(
-                    egraph,
-                    parent_genome,
-                    per_parent.min(remaining),
-                    options.mutations,
-                    &mut prev_selected,
-                    rng,
-                ));
-            }
+                offspring
+            };
             if all_offspring.is_empty() {
                 break;
             }
+
+            let mut generation_found_non_timeout = false;
 
             for genome in all_offspring {
                 if options
@@ -1536,10 +1565,22 @@ impl Graph {
 
                 let (new_metric, display_metric) = match profile_result {
                     Ok((metric, display, false, false)) => {
+                        generation_found_non_timeout = true;
                         (R::aggregate_profile_metrics(&[metric]), display)
                     }
-                    Ok((_, _, _, true)) | Ok((_, _, true, false)) | Err(_) => {
-                        // Timed out, NaN, or panic — redraw bars and skip.
+                    Ok((_, _, _, true)) | Err(_) => {
+                        // Timed out or panicked — redraw bars and skip.
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        render_bars(n_graphs, search_limit, bucket_progress);
+                        std::io::stdout().flush().unwrap();
+                        continue;
+                    }
+                    Ok((_, _, true, false)) => {
+                        generation_found_non_timeout = true;
+                        // Completed profiling but produced NaNs — redraw bars and skip.
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
                         }
@@ -1590,6 +1631,8 @@ impl Graph {
                 render_bars(n_graphs, search_limit, bucket_progress);
                 std::io::stdout().flush().unwrap();
             }
+
+            resample_generation = !generation_found_non_timeout;
         }
 
         // Clear progress bars
