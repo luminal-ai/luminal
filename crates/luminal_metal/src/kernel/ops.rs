@@ -19,7 +19,7 @@ use luminal::{
     shape::flatten_strides,
 };
 use metal::{
-    Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
+    Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLLanguageVersion, MTLSize,
     foreign_types::{ForeignType, ForeignTypeRef},
 };
 use objc::runtime::Object;
