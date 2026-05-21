@@ -90,6 +90,21 @@ impl EgglogOp for CudaUnaryElementwise {
         }
 
         rules.push(Rule::raw(
+            "(rule (
+                    (= ?sqrt (Op (Sqrt ?shape ?x_stride ?sqrt_stride) (ICons ?x (INil))))
+                    (= ?recip (Op (Recip ?shape ?sqrt_stride ?out_stride) (ICons ?sqrt (INil))))
+                    (= ?dt (dtype ?recip))
+                 ) (
+                    (let ?fs (Op (FusionStart ?shape ?x_stride ?dt) (ICons ?x (INil))))
+                    (let ?elem (Op (CudaUnaryElementwise \"Rsqrt\" ?shape ?x_stride ?out_stride ?dt)
+                                   (ICons ?fs (INil))))
+                    (let ?fe (Op (FusionEnd ?shape ?out_stride ?dt) (ICons ?elem (INil))))
+                    (union ?recip ?fe)
+                    (set (dtype ?fe) ?dt)
+                 ) :ruleset kernel_lower :name \"cuda-elem-rsqrt-from-sqrt-recip\")",
+        ));
+
+        rules.push(Rule::raw(
             "(rule
                 (
                     (= ?mul (Op (Mul ?shape ?x_stride ?const_stride ?inter_stride) (ICons ?x (ICons ?exp_const (INil)))))

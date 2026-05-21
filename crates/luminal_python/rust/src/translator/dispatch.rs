@@ -175,7 +175,11 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.pow.Tensor_Scalar" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let exp = self.get_float_arg(node, 1)?;
-                a.pow(exp as f32)
+                if (exp - 2.0).abs() < f64::EPSILON {
+                    a * a
+                } else {
+                    a.pow(exp as f32)
+                }
             }
             "torch.ops.aten.pow.Tensor_Tensor" => {
                 let a = self.get_input_tensor(node, 0)?;

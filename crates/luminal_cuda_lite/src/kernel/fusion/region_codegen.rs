@@ -358,6 +358,7 @@ fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
     match op {
         "Sin" => format!("sinf({})", a()),
         "Sqrt" => format!("sqrtf({})", a()),
+        "Rsqrt" => format!("rsqrtf({})", a()),
         "Exp" => format!("expf({})", a()),
         "Exp2" => format!("exp2f({})", a()),
         "Log2" => format!("log2f({})", a()),
