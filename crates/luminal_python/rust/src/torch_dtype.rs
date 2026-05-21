@@ -113,8 +113,13 @@ impl TorchDType {
 }
 
 /// PyTorch dtype → luminal `DType`. `Err(self)` for variants luminal's IR
-/// doesn't model (complex, the float8 family). The boundary code panics with
-/// the variant name on `Err`; cf. `typed_data::from_pytorch_bytes`.
+/// doesn't model as first-class types — the narrow ints (`Byte` / `Char` /
+/// `Short`), the complex family, and the float8 NUZ variants. `DType::U8`,
+/// `DType::I8`, `DType::I16` exist on the luminal side but the IR has no
+/// kernels / codegen for them, so we refuse the conversion here rather
+/// than silently producing a buffer the kernels can't actually run.
+/// Boundary code panics with the variant name on `Err`; cf.
+/// `typed_data::from_pytorch_bytes`, `pt2_util::torch_dtype_int_to_luminal`.
 impl TryFrom<TorchDType> for DType {
     type Error = TorchDType;
     fn try_from(t: TorchDType) -> Result<Self, Self::Error> {
@@ -126,13 +131,13 @@ impl TryFrom<TorchDType> for DType {
             TorchDType::Double => DType::F64,
             TorchDType::Bool => DType::Bool,
             TorchDType::BFloat16 => DType::Bf16,
-            TorchDType::Byte => DType::U8,
-            TorchDType::Char => DType::I8,
-            TorchDType::Short => DType::I16,
-            TorchDType::Uint16 => DType::U16,
             TorchDType::Float8E4m3Fn => DType::F8E4M3,
             TorchDType::Float8E5m2 => DType::F8E5M2,
-            TorchDType::Unknown
+            TorchDType::Byte
+            | TorchDType::Char
+            | TorchDType::Short
+            | TorchDType::Uint16
+            | TorchDType::Unknown
             | TorchDType::ComplexHalf
             | TorchDType::ComplexFloat
             | TorchDType::ComplexDouble
@@ -143,16 +148,11 @@ impl TryFrom<TorchDType> for DType {
 }
 
 /// luminal `DType` → PyTorch dtype. `Err(dtype)` for luminal-specific
-/// variants without a PyTorch counterpart (`I4`, `U4`, `F6E2M3`, ...).
-///
-/// `DType::TF32` maps to `Float` (PyTorch's TF32 is a compute mode of f32,
-/// not a separate dtype; storage is f32).
-///
-/// `DType::U16` historically mapped to PyTorch's `Int` (PT2 code 4) as a
-/// workaround for older PyTorch versions that lacked `UINT16`; the modern
-/// PT2 schema does carry `UINT16 = 28`, but we keep the workaround until a
-/// caller exercises the U16 path end-to-end and we can verify the modern
-/// mapping doesn't regress existing behavior.
+/// variants without a PyTorch counterpart (`I4`, `U4`, `F6E2M3`, ...) and
+/// for the narrow ints (`U8` / `I8` / `I16` / `U16`) which exist in the
+/// luminal enum but aren't first-class through the IR — same reasoning as
+/// `TryFrom<TorchDType> for DType` above. `DType::TF32` maps to `Float`
+/// (PyTorch's TF32 is a compute mode of f32, not a separate dtype).
 impl TryFrom<DType> for TorchDType {
     type Error = DType;
     fn try_from(d: DType) -> Result<Self, Self::Error> {
@@ -163,10 +163,6 @@ impl TryFrom<DType> for TorchDType {
             DType::Bf16 => TorchDType::BFloat16,
             DType::Int => TorchDType::Int,
             DType::I64 => TorchDType::Long,
-            DType::I8 => TorchDType::Char,
-            DType::U8 => TorchDType::Byte,
-            DType::I16 => TorchDType::Short,
-            DType::U16 => TorchDType::Int, // pre-existing workaround; see doc above.
             DType::Bool => TorchDType::Bool,
             DType::F8E4M3 => TorchDType::Float8E4m3Fn,
             DType::F8E5M2 => TorchDType::Float8E5m2,
@@ -188,7 +184,9 @@ mod tests {
 
     #[test]
     fn supported_dtypes_roundtrip() {
-        // Only the variants luminal's IR models can roundtrip cleanly.
+        // Only the variants luminal's IR models as first-class can
+        // roundtrip cleanly. Narrow ints (`U8` / `I8` / `I16` / `U16`)
+        // are intentionally excluded — see the `TryFrom` impls.
         for d in [
             DType::F32,
             DType::F64,
@@ -197,13 +195,23 @@ mod tests {
             DType::Int,
             DType::I64,
             DType::Bool,
-            DType::I8,
-            DType::U8,
-            DType::I16,
         ] {
             let t = TorchDType::try_from(d).expect("known DType");
             let back = DType::try_from(t).expect("known TorchDType");
             assert_eq!(d, back, "roundtrip mismatch for {d:?}");
+        }
+    }
+
+    #[test]
+    fn narrow_ints_refuse_conversion() {
+        // Forward (PyTorch → luminal) and reverse (luminal → PyTorch)
+        // both refuse the narrow-int variants; downstream sites translate
+        // the `Err` into a typed panic with the variant name.
+        for t in [TorchDType::Byte, TorchDType::Char, TorchDType::Short] {
+            assert!(DType::try_from(t).is_err(), "expected Err for {t:?}");
+        }
+        for d in [DType::U8, DType::I8, DType::I16, DType::U16] {
+            assert!(TorchDType::try_from(d).is_err(), "expected Err for {d:?}");
         }
     }
 
