@@ -119,13 +119,8 @@ impl<'a> Translator<'a> {
     /// buffer would be sized for the un-sliced argsort tensor while the
     /// shape tracker reports a smaller rank.
     ///
-    /// PyTorch's `torch.argmax` / `torch.argmin` returns int64
-    /// indices (same `kLong` contract as `sort` / `topk` — pinned by
-    /// the structured kernel meta function). Internally we compute
-    /// the index in `DType::Int` (storage-efficient default for the
-    /// argsort-slice-squeeze chain) and cast to `DType::I64` at the
-    /// PT2↔luminal boundary so the strict output-read path sees an
-    /// I64 buffer.
+    /// The result is cast to `DType::I64` to match PyTorch's int64
+    /// argmax / argmin indices.
     pub(crate) fn translate_argextremum(
         &mut self,
         node: &Node,
