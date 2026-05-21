@@ -148,16 +148,20 @@ impl TryFrom<TorchDType> for DType {
 }
 
 /// luminal `DType` → PyTorch dtype. `Err(dtype)` for luminal-specific
-/// variants without a PyTorch counterpart (`I4`, `U4`, `F6E2M3`, ...) and
-/// for the narrow ints (`U8` / `I8` / `I16` / `U16`) which exist in the
-/// luminal enum but aren't first-class through the IR — same reasoning as
-/// `TryFrom<TorchDType> for DType` above. `DType::TF32` maps to `Float`
-/// (PyTorch's TF32 is a compute mode of f32, not a separate dtype).
+/// variants without a first-class PyTorch counterpart — the narrow ints
+/// (`U8` / `I8` / `I16` / `U16`), the sub-byte / exotic widths (`I4`,
+/// `U4`, `F6E2M3`, ...), and `TF32`.
+///
+/// `TF32` is a compute-mode hint inside luminal, not a storage dtype on
+/// the PyTorch side (PyTorch has no `torch.tf32`); silently mapping it to
+/// `Float` would hand PyTorch an f32 buffer that the caller had been
+/// tracking as TF32 inside luminal. Refuse instead — a real cast to
+/// `DType::F32` upstream is the explicit way to bridge.
 impl TryFrom<DType> for TorchDType {
     type Error = DType;
     fn try_from(d: DType) -> Result<Self, Self::Error> {
         Ok(match d {
-            DType::F32 | DType::TF32 => TorchDType::Float,
+            DType::F32 => TorchDType::Float,
             DType::F64 => TorchDType::Double,
             DType::F16 => TorchDType::Half,
             DType::Bf16 => TorchDType::BFloat16,
@@ -210,7 +214,15 @@ mod tests {
         for t in [TorchDType::Byte, TorchDType::Char, TorchDType::Short] {
             assert!(DType::try_from(t).is_err(), "expected Err for {t:?}");
         }
-        for d in [DType::U8, DType::I8, DType::I16, DType::U16] {
+        for d in [
+            DType::U8,
+            DType::I8,
+            DType::I16,
+            DType::U16,
+            // TF32 is a luminal-internal compute-mode hint, not a PyTorch
+            // storage dtype — refuse to silently alias it as `Float`.
+            DType::TF32,
+        ] {
             assert!(TorchDType::try_from(d).is_err(), "expected Err for {d:?}");
         }
     }
