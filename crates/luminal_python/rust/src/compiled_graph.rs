@@ -73,23 +73,13 @@ fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(char, usiz
     Some((var, candidate))
 }
 
-/// Convert luminal DType to PT2 dtype integer code (for python interop)
-/// Types without a direct Pytorch equivalent map to the closest safe representation
+/// Convert luminal `DType` to a PT2 dtype code via `TorchDType`. Panics
+/// for luminal-specific dtypes that have no PyTorch counterpart (`I4`,
+/// `U4`, the F6 / F4 families, ...).
 fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
-    match dtype {
-        DType::U8 => 1,
-        DType::I8 => 2,
-        DType::I16 => 3,
-        DType::Int => 4, // i32
-        DType::I64 => 5,
-        DType::U16 => 4, // u16 -> i32 (Pytorch has no u16 in older versions)
-        DType::F16 => 6,
-        DType::F32 | DType::TF32 => 7,
-        DType::F64 => 8,
-        DType::Bool => 12,
-        DType::Bf16 => 13,
-        _ => panic!("luminal_dtype_to_pt2_code: unsupported dtype {:?}", dtype),
-    }
+    crate::torch_dtype::TorchDType::try_from(dtype)
+        .map(|t| t.code())
+        .unwrap_or_else(|d| panic!("luminal_dtype_to_pt2_code: unsupported dtype {d:?}"))
 }
 
 /// Common intermediate result from translating a model graph.

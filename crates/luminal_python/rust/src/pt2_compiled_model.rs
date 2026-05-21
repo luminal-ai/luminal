@@ -10,7 +10,7 @@ use crate::pt2_expr::parse_sympy_expr;
 use crate::pt2_schema;
 use crate::translator;
 use crate::typed_data::TypedData;
-use crate::{pt2_parser, pt2_util};
+use crate::pt2_parser;
 
 /// Pre-loaded weight/constant data paired with tensor sizes.
 type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);
@@ -374,41 +374,10 @@ fn safetensors_dtype_to_pt2(dtype: safetensors::Dtype) -> u32 {
     }
 }
 
-/// Convert raw bytes to `TypedData` using PT2 dtype numbering. All
-/// supported widths preserve their raw bytes. Narrow integer widths
-/// (`uint8` / `int8` / `int16`) panic loudly — luminal's `NativeData`
-/// has no narrower-integer variants yet, so the only way they used
-/// to pass through was via implicit widening to `i32`. That's the
-/// reviewer's "no implicit casts" directive failing; the answer is
-/// either cast at the call site (`tensor.to(torch.int32)`) or wait
-/// for the narrower-int IR follow-up.
+/// Convert raw bytes to `TypedData` using PT2 dtype numbering. Thin
+/// wrapper around `TypedData::from_pytorch_bytes` — the dtype dispatch
+/// (including the narrow-int panic and unknown-code rejection) lives
+/// there, so this site stays a one-liner that just clones the slice.
 fn bytes_to_typed(bytes: &[u8], dtype: u32) -> TypedData {
-    match dtype {
-        7 => TypedData::from_raw(bytes.to_vec(), DType::F32),
-        6 => TypedData::from_raw(bytes.to_vec(), DType::F16),
-        13 => TypedData::from_raw(bytes.to_vec(), DType::Bf16),
-        4 => TypedData::from_raw(bytes.to_vec(), DType::Int), // i32
-        12 => TypedData::from_raw(bytes.to_vec(), DType::Bool),
-        5 => TypedData::from_raw(bytes.to_vec(), DType::I64),
-        8 => TypedData::from_raw(bytes.to_vec(), DType::F64),
-        1..=3 => {
-            let name = match dtype {
-                1 => "uint8",
-                2 => "int8",
-                3 => "int16",
-                _ => unreachable!(),
-            };
-            panic!(
-                "bytes_to_typed: PT2 dtype code {dtype} ({name}) isn't a \
-                 first-class IR type yet — cast model weights / inputs to \
-                 torch.int32 at the call site, or wait for the narrower-int \
-                 IR follow-up."
-            );
-        }
-        _ => {
-            let luminal_dtype = pt2_util::torch_dtype_int_to_luminal(dtype);
-            warn!("Unrecognized dtype {dtype}, interpreting as {luminal_dtype:?}");
-            TypedData::from_raw(bytes.to_vec(), luminal_dtype)
-        }
-    }
+    TypedData::from_pytorch_bytes(bytes.to_vec(), dtype)
 }

@@ -198,23 +198,33 @@ pub fn resolve_neg1_dim_exprs(
     }
 }
 
-/// Map torch dtype integer (PT2 format) to luminal DType.
-/// PT2 numbering: 1=uint8, 2=int8, 3=int16, 4=int32, 5=int64, 6=float16, 7=float32, 8=float64, 12=bool, 13=bfloat16.
+/// Map a PT2 dtype code to luminal `DType`.
 ///
-/// `int64`/`float64` are first-class in the IR (`DType::I64`, `DType::F64`)
-/// so values outside the i32 / f32 representable ranges survive round-trip
-/// through luminal arithmetic. Narrower integer widths still collapse to
-/// `DType::Int`; the user-visible dtype is recovered at the Python boundary
-/// via the PT2 dtype-code metadata kept alongside.
+/// Narrow ints (`Byte` / `Char` / `Short`) currently collapse to
+/// `DType::Int` — the IR doesn't model them as first-class types yet, but
+/// upstream sites (`typed_data::from_pytorch_bytes`,
+/// `pt2_compiled_model::bytes_to_typed`) refuse to construct buffers from
+/// those codes, so this branch is only reachable for dtype-metadata reads
+/// where the narrow-int collapse is harmless (we hold onto the original
+/// PT2 code separately for the Python-side readback).
+///
+/// Variants luminal's IR can't model at all (`ComplexHalf`, the float8
+/// family, ...) and unknown codes both panic with the variant name so the
+/// failure points at the missing IR support rather than silently falling
+/// back to F32.
 pub fn torch_dtype_int_to_luminal(dtype: u32) -> DType {
-    match dtype {
-        6 => DType::F16,
-        7 => DType::F32,
-        8 => DType::F64,
-        13 => DType::Bf16,
-        12 => DType::Bool,
-        5 => DType::I64,
-        1..=4 => DType::Int, // uint8, int8, int16, int32
-        _ => DType::F32,
+    let t = crate::torch_dtype::TorchDType::from_code(dtype)
+        .unwrap_or_else(|c| panic!("torch_dtype_int_to_luminal: unknown PT2 dtype code {c}"));
+    match t {
+        // Narrow ints collapse to Int (see doc above).
+        crate::torch_dtype::TorchDType::Byte
+        | crate::torch_dtype::TorchDType::Char
+        | crate::torch_dtype::TorchDType::Short => DType::Int,
+        other => DType::try_from(other).unwrap_or_else(|t| {
+            panic!(
+                "torch_dtype_int_to_luminal: {} isn't a first-class luminal IR type",
+                t.name()
+            )
+        }),
     }
 }

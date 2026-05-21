@@ -4,7 +4,6 @@
 //! through the PT2 path without forcing everything to f32.
 
 use luminal::hlir::NativeData;
-use luminal::prelude::tracing::warn;
 use luminal::prelude::*;
 
 /// A dtype-tagged byte buffer. All weight, constant, and input data flows through this type.
@@ -150,40 +149,40 @@ impl TypedData {
     }
 
     /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype
-    /// code) to `TypedData`. All supported dtypes preserve their raw
-    /// bytes — no width changes at the FFI boundary. Narrow integer
-    /// widths (`uint8` / `int8` / `int16`) panic with a clear message:
-    /// luminal's `NativeData` has no narrower-integer variants yet, so
-    /// the only way they could pass through is via implicit widening
-    /// to `i32`, which the reviewer's no-implicit-cast directive
-    /// forbids. Cast at the call site (`x.to(torch.int32)`) or wait
-    /// for the narrower-int IR follow-up.
+    /// code) to `TypedData`. Supported dtypes preserve their raw bytes —
+    /// no width changes at the FFI boundary. Narrow integer widths
+    /// (`Byte` / `Char` / `Short`) panic: luminal's `NativeData` has no
+    /// narrower-integer variants yet, so the only way they could pass
+    /// through is via implicit widening to `i32`, which the no-implicit-
+    /// cast directive forbids. Cast at the call site
+    /// (`x.to(torch.int32)`) or wait for the narrower-int IR follow-up.
     pub fn from_pytorch_bytes(bytes: Vec<u8>, dtype_code: u32) -> Self {
-        match dtype_code {
-            7 => Self::from_raw(bytes, DType::F32),
-            6 => Self::from_raw(bytes, DType::F16),
-            13 => Self::from_raw(bytes, DType::Bf16),
-            4 => Self::from_raw(bytes, DType::Int), // i32
-            12 => Self::from_raw(bytes, DType::Bool),
-            5 => Self::from_raw(bytes, DType::I64),
-            8 => Self::from_raw(bytes, DType::F64),
-            1..=3 => {
-                let name = match dtype_code {
-                    1 => "uint8",
-                    2 => "int8",
-                    3 => "int16",
-                    _ => unreachable!(),
-                };
-                panic!(
-                    "from_pytorch_bytes: PT2 dtype code {dtype_code} ({name}) \
-                     isn't a first-class IR type yet — cast to torch.int32 at \
-                     the call site, or wait for the narrower-int IR follow-up."
-                );
-            }
-            _ => {
-                warn!("Unrecognized pytorch dtype code {dtype_code}, interpreting as f32");
-                Self::from_raw(bytes, DType::F32)
-            }
+        let t = crate::torch_dtype::TorchDType::from_code(dtype_code).unwrap_or_else(|c| {
+            panic!("from_pytorch_bytes: unknown PT2 dtype code {c}")
+        });
+        match t {
+            crate::torch_dtype::TorchDType::Float => Self::from_raw(bytes, DType::F32),
+            crate::torch_dtype::TorchDType::Half => Self::from_raw(bytes, DType::F16),
+            crate::torch_dtype::TorchDType::BFloat16 => Self::from_raw(bytes, DType::Bf16),
+            crate::torch_dtype::TorchDType::Int => Self::from_raw(bytes, DType::Int),
+            crate::torch_dtype::TorchDType::Bool => Self::from_raw(bytes, DType::Bool),
+            crate::torch_dtype::TorchDType::Long => Self::from_raw(bytes, DType::I64),
+            crate::torch_dtype::TorchDType::Double => Self::from_raw(bytes, DType::F64),
+            crate::torch_dtype::TorchDType::Byte
+            | crate::torch_dtype::TorchDType::Char
+            | crate::torch_dtype::TorchDType::Short => panic!(
+                "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
+                 IR type yet — cast to torch.int32 at the call site, or wait \
+                 for the narrower-int IR follow-up.",
+                t.name(),
+                t.code(),
+            ),
+            other => panic!(
+                "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
+                 IR type — no luminal mapping.",
+                other.name(),
+                other.code(),
+            ),
         }
     }
 
