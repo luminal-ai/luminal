@@ -7,10 +7,10 @@ use std::collections::HashMap;
 
 use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, WeightData};
 use crate::pt2_expr::parse_sympy_expr;
+use crate::pt2_parser;
 use crate::pt2_schema;
 use crate::translator;
 use crate::typed_data::TypedData;
-use crate::pt2_parser;
 
 /// Pre-loaded weight/constant data paired with tensor sizes.
 type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);

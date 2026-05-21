@@ -34,7 +34,10 @@ fn luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// .value` — drift fails CI rather than silently miscompiling at runtime.
 #[pyfunction]
 fn _torch_dtype_codes() -> HashMap<&'static str, u32> {
-    TorchDType::ALL.iter().map(|v| (v.name(), v.code())).collect()
+    TorchDType::ALL
+        .iter()
+        .map(|v| (v.name(), v.code()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -157,9 +157,8 @@ impl TypedData {
     /// cast directive forbids. Cast at the call site
     /// (`x.to(torch.int32)`) or wait for the narrower-int IR follow-up.
     pub fn from_pytorch_bytes(bytes: Vec<u8>, dtype_code: u32) -> Self {
-        let t = crate::torch_dtype::TorchDType::from_code(dtype_code).unwrap_or_else(|c| {
-            panic!("from_pytorch_bytes: unknown PT2 dtype code {c}")
-        });
+        let t = crate::torch_dtype::TorchDType::from_code(dtype_code)
+            .unwrap_or_else(|c| panic!("from_pytorch_bytes: unknown PT2 dtype code {c}"));
         match t {
             crate::torch_dtype::TorchDType::Float => Self::from_raw(bytes, DType::F32),
             crate::torch_dtype::TorchDType::Half => Self::from_raw(bytes, DType::F16),
