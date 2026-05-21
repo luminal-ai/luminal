@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from luminal import luminal_backend
-from luminal.compiled_model import DTypeBoundaryError
 
 
 class BoundaryNoopModel(torch.nn.Module):
@@ -175,11 +174,9 @@ def test_boundary_noop_preserves_dtype_and_values(
     [
         pytest.param(case, id=case.name)
         for case in DTYPE_CASES
-        # Narrower integer widths still collapse to luminal's `Int` (i32) at
-        # the boundary; user inputs of those dtypes don't match the graph's
-        # declared input dtype and so trigger a hard reject. int64 / float64
-        # are first-class in the IR — they match the graph's declared input
-        # dtype directly and don't reject.
+        # Narrow integer widths (uint8 / int8 / int16) aren't first-class in
+        # luminal's IR — the translator refuses them outright. int64 /
+        # float64 are first-class and round-trip without rejection.
         if case.name in {"uint8", "int8", "int16"}
     ],
 )
@@ -187,17 +184,21 @@ def test_input_dtype_mismatch_rejects(
     boundary_device: torch.device,
     case: DTypeCase,
 ) -> None:
-    """Hard-reject contract: a user input whose dtype doesn't match the
-    graph's declared input dtype raises `DTypeBoundaryError` before the
-    graph runs. Previously the boundary silently cast on every call, which
-    hid real precision bugs (e.g. f64 → f32 truncation on values outside
-    the f32 range) and burnt cycles on a per-call allocation+copy.
+    """Hard-reject contract: a graph whose declared input dtype is one of
+    the narrow ints (uint8 / int8 / int16) fails at compile time with a
+    clear panic from `torch_dtype_int_to_luminal`. Previously the
+    translator silently widened narrow ints to `Int` (i32), which left
+    the user's actual dtype invisible past the FFI boundary; today the
+    failure points at the missing IR support directly.
     """
     model = BoundaryNoopModel().to(boundary_device)
     compiled = torch.compile(model, backend=luminal_backend)
     x = case.values().to(boundary_device)
 
-    with pytest.raises(DTypeBoundaryError, match="Convert at the call site"):
+    # `pyo3_runtime.PanicException` inherits from `BaseException` (not
+    # `Exception`), so `pytest.raises(Exception, ...)` would miss it.
+    # Match on the panic message text — stable across torch versions.
+    with pytest.raises(BaseException, match="isn't a first-class IR type yet"):
         compiled(x)
 
 

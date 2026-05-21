@@ -198,28 +198,24 @@ pub fn resolve_neg1_dim_exprs(
     }
 }
 
-/// Map a PT2 dtype code to luminal `DType`.
-///
-/// Narrow ints (`Byte` / `Char` / `Short`) currently collapse to
-/// `DType::Int` — the IR doesn't model them as first-class types yet, but
-/// upstream sites (`typed_data::from_pytorch_bytes`,
-/// `pt2_compiled_model::bytes_to_typed`) refuse to construct buffers from
-/// those codes, so this branch is only reachable for dtype-metadata reads
-/// where the narrow-int collapse is harmless (we hold onto the original
-/// PT2 code separately for the Python-side readback).
-///
-/// Variants luminal's IR can't model at all (`ComplexHalf`, the float8
-/// family, ...) and unknown codes both panic with the variant name so the
-/// failure points at the missing IR support rather than silently falling
-/// back to F32.
+/// Map a PT2 dtype code to luminal `DType`. Panics for variants the IR
+/// doesn't model as first-class types (narrow ints `Byte` / `Char` /
+/// `Short`, the complex family, the float8 family) and for unknown
+/// codes — better to fail loudly at the translator boundary than to
+/// silently widen and lie about the user's dtype.
 pub fn torch_dtype_int_to_luminal(dtype: u32) -> DType {
     let t = crate::torch_dtype::TorchDType::from_code(dtype)
         .unwrap_or_else(|c| panic!("torch_dtype_int_to_luminal: unknown PT2 dtype code {c}"));
     match t {
-        // Narrow ints collapse to Int (see doc above).
         crate::torch_dtype::TorchDType::Byte
         | crate::torch_dtype::TorchDType::Char
-        | crate::torch_dtype::TorchDType::Short => DType::Int,
+        | crate::torch_dtype::TorchDType::Short => panic!(
+            "torch_dtype_int_to_luminal: PT2 dtype {} (code {}) isn't a first-class \
+             IR type yet — cast to torch.int32 at the call site, or wait for the \
+             narrower-int IR follow-up.",
+            t.name(),
+            t.code(),
+        ),
         other => DType::try_from(other).unwrap_or_else(|t| {
             panic!(
                 "torch_dtype_int_to_luminal: {} isn't a first-class luminal IR type",
