@@ -513,21 +513,8 @@ impl CompiledGraph {
         Ok(self.runtime.get_output_i32(*node_id))
     }
 
-    /// Get output tensor data by name as i64 (copies to host).
-    ///
-    /// Used for `torch.int64` outputs. Strict on producer dtype — the
-    /// graph's output node must already be `DType::I64`. No implicit
-    /// widening from narrower integer / bool variants at the read
-    /// boundary.
-    ///
-    /// On the PT2 path, the per-op translator dispatch sites cast at
-    /// the PyTorch↔luminal boundary for the ops whose `kLong`
-    /// contract is pinned in the structured kernel meta function —
-    /// `argsort` (`translate_argsort`), `topk` indices and `sort`
-    /// indices (`translate_topk` / `translate_sort`), `argmax` /
-    /// `argmin` (`translate_argextremum`). A panic here for a PT2
-    /// caller means a new PyTorch int64-producing op needs the same
-    /// boundary cast in its translator dispatch.
+    /// Read an output as i64. Strict: the producer node must already
+    /// be `DType::I64`; no widening at the read boundary.
     fn get_output_i64(&self, name: &str) -> PyResult<Vec<i64>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -538,16 +525,8 @@ impl CompiledGraph {
         Ok(self.runtime.get_output_i64(*node_id))
     }
 
-    /// Get output tensor data by name as f64 (copies to host).
-    ///
-    /// Used for `torch.float64` outputs. Strict on producer dtype —
-    /// the graph's output node must already be `DType::F64`. No
-    /// implicit widening from narrower float variants at the read
-    /// boundary; F64 transcendentals (`exp` / `log` / `sin` / ...) on
-    /// the CPU runtime panic in `unary_impl` with instructions to cast
-    /// inputs to F32 at the call site rather than silently degrading
-    /// precision behind an F64 dtype tag. See `get_output_i64` above
-    /// for the broader contract.
+    /// Read an output as f64. Strict: the producer node must already
+    /// be `DType::F64`; no widening at the read boundary.
     fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(

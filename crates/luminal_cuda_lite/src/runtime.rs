@@ -650,16 +650,8 @@ impl CudaRuntime {
             .collect_vec()
     }
 
-    /// Read a tensor's output bytes back as i64. Strict on producer
-    /// dtype — the CUDA buffer must already carry `DType::I64`. No
-    /// implicit widening from narrower integer / bool variants at
-    /// the read boundary. The fix for a dtype mismatch is a
-    /// `Cast(DType::I64)` before the `Output` in the producer graph;
-    /// on the PT2 path, the per-op translator dispatch sites
-    /// (`translate_argsort`, `translate_topk`, `translate_sort`,
-    /// `translate_argextremum`, ...) emit the cast for ops whose
-    /// `kLong` contract is pinned by PyTorch's structured-kernel
-    /// meta function.
+    /// Read an output buffer as i64. Strict: the buffer must already
+    /// be `DType::I64`; no widening at the read boundary.
     pub fn get_i64(&self, id: impl ToId) -> Vec<i64> {
         let id = id.to_id();
         let data_id = self.resolve_data_node(id);
@@ -668,8 +660,7 @@ impl CudaRuntime {
         if !matches!(buf_dtype, Some(DType::I64)) {
             panic!(
                 "get_i64: buffer dtype is {buf_dtype:?}, expected I64. \
-                 Add a `Cast(DType::I64)` before the Output in the producer \
-                 graph — no implicit widening at the read boundary."
+                 Add a `Cast(DType::I64)` before the Output."
             );
         }
         self.get_output_data(id)
@@ -678,9 +669,8 @@ impl CudaRuntime {
             .collect_vec()
     }
 
-    /// Read a tensor's output bytes back as f64. Strict on producer
-    /// dtype — the CUDA buffer must already carry `DType::F64`. See
-    /// `get_i64` above for the broader contract.
+    /// Read an output buffer as f64. Strict: the buffer must already
+    /// be `DType::F64`; no widening at the read boundary.
     pub fn get_f64(&self, id: impl ToId) -> Vec<f64> {
         let id = id.to_id();
         let data_id = self.resolve_data_node(id);
@@ -689,8 +679,7 @@ impl CudaRuntime {
         if !matches!(buf_dtype, Some(DType::F64)) {
             panic!(
                 "get_f64: buffer dtype is {buf_dtype:?}, expected F64. \
-                 Add a `Cast(DType::F64)` before the Output in the producer \
-                 graph — no implicit widening at the read boundary."
+                 Add a `Cast(DType::F64)` before the Output."
             );
         }
         self.get_output_data(id)

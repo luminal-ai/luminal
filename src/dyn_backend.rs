@@ -293,36 +293,22 @@ impl DynBackend for NativeDynBackend {
     }
 
     fn get_output_i64(&self, node: NodeIndex) -> Vec<i64> {
-        // Strict at the read boundary: the producer's `NativeData`
-        // buffer must already be `I64`. No implicit widening from
-        // narrower integer / bool variants. The fix for a dtype
-        // mismatch is a `Cast(DType::I64)` before the `Output` in the
-        // producer graph — on the PT2 path, that's emitted at the
-        // translator's per-op dispatch site for ops whose `kLong`
-        // contract is pinned by PyTorch's structured-kernel meta
-        // function (see `CompiledGraph::get_output_i64`'s doc).
         match self.output_buffer(node) {
             NativeData::I64(v) => v.clone(),
             other => panic!(
                 "get_output_i64: buffer dtype is {:?}, expected I64. \
-                 Add a `Cast(DType::I64)` before the Output in the \
-                 producer graph — no implicit widening at the read \
-                 boundary.",
+                 Add a `Cast(DType::I64)` before the Output.",
                 std::mem::discriminant(other)
             ),
         }
     }
 
     fn get_output_f64(&self, node: NodeIndex) -> Vec<f64> {
-        // Strict at the read boundary: producer must already be F64.
-        // See `get_output_i64` above for the broader contract.
         match self.output_buffer(node) {
             NativeData::F64(v) => v.clone(),
             other => panic!(
                 "get_output_f64: buffer dtype is {:?}, expected F64. \
-                 Add a `Cast(DType::F64)` before the Output in the \
-                 producer graph — no implicit widening at the read \
-                 boundary.",
+                 Add a `Cast(DType::F64)` before the Output.",
                 std::mem::discriminant(other)
             ),
         }
