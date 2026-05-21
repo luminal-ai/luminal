@@ -81,7 +81,11 @@ fn main() {
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    runtime = cx.search_options(runtime, SearchOptions::new(search_graphs), &mut rng);
+    runtime = cx.search_options(
+        runtime,
+        SearchOptions::new(search_graphs).profile_timeout(Duration::from_secs(2)),
+        &mut rng,
+    );
 
     for layer in 0..LAYERS {
         let cache_bytes = cache_bytes_for_layer(layer, max_seq_len);

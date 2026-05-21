@@ -1,5 +1,6 @@
 pub mod dyn_backend;
 pub mod kernel;
+mod memory_analysis;
 pub mod runtime;
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use super::{MPSMatrixLayout, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
+use super::{MPSMatrixLayout, MetalEncodeContext, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
 use luminal::{
     egglog_utils::{
         SerializedEGraph,
@@ -19,9 +19,8 @@ use luminal::{
     shape::flatten_strides,
 };
 use metal::{
-    Buffer, CommandBufferRef, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize,
+    Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLLanguageVersion, MTLSize,
     foreign_types::{ForeignType, ForeignTypeRef},
-    mps,
 };
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
@@ -56,15 +55,21 @@ pub type MetalOps = (
 );
 
 fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
+    let options = metal::CompileOptions::new();
+    options.set_language_version(MTLLanguageVersion::V2_4);
     let library = device
-        .new_library_with_source(source, &metal::CompileOptions::new())
-        .expect("Failed to compile Metal shader");
+        .new_library_with_source(source, &options)
+        .unwrap_or_else(|err| {
+            panic!("Failed to compile Metal shader {function_name}: {err:?}\n{source}")
+        });
     let function = library
         .get_function(function_name, None)
         .expect("Failed to get function from library");
     device
         .new_compute_pipeline_state_with_function(&function)
-        .expect("Failed to create compute pipeline state")
+        .unwrap_or_else(|err| {
+            panic!("Failed to create Metal compute pipeline state for {function_name}: {err:?}\n{source}")
+        })
 }
 
 fn lower_dynamic_consts(mut code: String) -> String {
@@ -1039,42 +1044,33 @@ impl MetalKernelOp for MetalSumReduce {
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint simd_lane [[thread_index_in_simdgroup]],
-                uint simd_id [[simdgroup_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float warp_sums[THREADS_PER_GROUP / 32];
+                threadgroup float partials[THREADS_PER_GROUP];
 
                 int in_start = {in_idx};
                 int iters = {iters};
                 (void)dyn;
 
-                // Each thread accumulates multiple elements
                 float sum = 0.0f;
                 for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
                     sum += {in_val};
                 }}
 
-                // Warp-level reduction using simd_sum
-                sum = simd_sum(sum);
-
-                // First lane of each warp writes to shared memory
-                if (simd_lane == 0) {{
-                    warp_sums[simd_id] = sum;
-                }}
+                partials[tid] = sum;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // First warp does final reduction
-                if (simd_id == 0) {{
-                    int n_warps = THREADS_PER_GROUP / 32;
-                    float block_sum = (tid < uint(n_warps)) ? warp_sums[tid] : 0.0f;
-                    block_sum = simd_sum(block_sum);
-
-                    if (tid == 0) {{
-                        out[{out_idx}] = {out_val};
+                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
+                    if (tid < stride) {{
+                        partials[tid] += partials[tid + stride];
                     }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+
+                if (tid == 0) {{
+                    float block_sum = partials[0];
+                    out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
@@ -1220,42 +1216,33 @@ impl MetalKernelOp for MetalMaxReduce {
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint simd_lane [[thread_index_in_simdgroup]],
-                uint simd_id [[simdgroup_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float warp_maxs[THREADS_PER_GROUP / 32];
+                threadgroup float partials[THREADS_PER_GROUP];
 
                 int in_start = {in_idx};
                 int iters = {iters};
                 (void)dyn;
 
-                // Each thread finds max of multiple elements
                 float max_val = NEG_INF_F;
                 for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
                     max_val = fmax(max_val, {in_val});
                 }}
 
-                // Warp-level reduction using simd_max
-                max_val = simd_max(max_val);
-
-                // First lane of each warp writes to shared memory
-                if (simd_lane == 0) {{
-                    warp_maxs[simd_id] = max_val;
-                }}
+                partials[tid] = max_val;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                // First warp does final reduction
-                if (simd_id == 0) {{
-                    int n_warps = THREADS_PER_GROUP / 32;
-                    float block_max = (tid < uint(n_warps)) ? warp_maxs[tid] : NEG_INF_F;
-                    block_max = simd_max(block_max);
-
-                    if (tid == 0) {{
-                        out[{out_idx}] = {out_val};
+                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
+                    if (tid < stride) {{
+                        partials[tid] = fmax(partials[tid], partials[tid + stride]);
                     }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+
+                if (tid == 0) {{
+                    float block_max = partials[0];
+                    out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
@@ -1427,8 +1414,6 @@ impl EgglogOp for MPSMatmul {
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .subsume(sum_op.clone())
-                .subsume(mul_op)
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
                 .ruleset("kernel_lower")
@@ -1463,6 +1448,17 @@ impl EgglogOp for MPSMatmul {
                 MPSMatrixLayout::TransposedRowMajor,
                 1,
                 1,
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (MPSMatmul ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-mps-matmul-exists\"
+                )",
             ),
         ]
     }
@@ -1505,33 +1501,12 @@ impl EgglogOp for MPSMatmul {
 }
 
 impl MPSMatmul {
-    fn mps_dtype(dtype: DType) -> mps::MPSDataType {
-        match dtype {
-            DType::F32 | DType::TF32 => mps::MPSDataType::Float32,
-            DType::F16 => mps::MPSDataType::Float16,
-            unsupported => panic!("MPSMatmul does not support dtype {unsupported:?}"),
-        }
-    }
-
     fn row_bytes(row_stride: Expression, dtype: DType, dyn_map: &FxHashMap<char, usize>) -> u64 {
         let elems = row_stride
             .substitute('z', Expression::from(1))
             .exec(dyn_map)
             .unwrap();
         (elems * dtype.bits().div_ceil(8)) as u64
-    }
-
-    fn descriptor(rows: usize, cols: usize, row_bytes: u64, dtype: DType) -> *mut Object {
-        let data_type = Self::mps_dtype(dtype) as isize;
-        unsafe {
-            msg_send![
-                class!(MPSMatrixDescriptor),
-                matrixDescriptorWithRows: rows
-                columns: cols
-                rowBytes: row_bytes as usize
-                dataType: data_type
-            ]
-        }
     }
 
     fn matrix(buffer: &Buffer, descriptor: *mut Object) -> *mut Object {
@@ -1589,12 +1564,11 @@ impl MetalKernelOp for MPSMatmul {
 
     fn encode(
         &self,
-        command_buffer: &CommandBufferRef,
+        context: &mut MetalEncodeContext<'_>,
         _pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
         dyn_map: &FxHashMap<char, usize>,
-        _dyn_buffer: &Buffer,
         input_dtypes: &[DType],
         output_dtype: DType,
     ) {
@@ -1610,46 +1584,48 @@ impl MetalKernelOp for MPSMatmul {
         let rhs_rows = if self.transpose_rhs { n } else { k };
         let rhs_cols = if self.transpose_rhs { k } else { n };
 
-        let lhs_desc = Self::descriptor(
-            lhs_rows,
-            lhs_cols,
-            Self::row_bytes(self.lhs_row_stride, lhs_dtype, dyn_map),
-            lhs_dtype,
-        );
-        let rhs_desc = Self::descriptor(
-            rhs_rows,
-            rhs_cols,
-            Self::row_bytes(self.rhs_row_stride, rhs_dtype, dyn_map),
-            rhs_dtype,
-        );
-        let out_desc = Self::descriptor(
-            m,
-            n,
-            Self::row_bytes(self.out_row_stride, output_dtype, dyn_map),
-            output_dtype,
-        );
+        let (lhs_desc, rhs_desc, out_desc, kernel) = {
+            let mut cache = context.mps_cache.borrow_mut();
+            (
+                cache.matrix_descriptor(
+                    lhs_rows,
+                    lhs_cols,
+                    Self::row_bytes(self.lhs_row_stride, lhs_dtype, dyn_map),
+                    lhs_dtype,
+                ),
+                cache.matrix_descriptor(
+                    rhs_rows,
+                    rhs_cols,
+                    Self::row_bytes(self.rhs_row_stride, rhs_dtype, dyn_map),
+                    rhs_dtype,
+                ),
+                cache.matrix_descriptor(
+                    m,
+                    n,
+                    Self::row_bytes(self.out_row_stride, output_dtype, dyn_map),
+                    output_dtype,
+                ),
+                cache.matrix_multiplication(
+                    context.command_buffer,
+                    self.transpose_lhs,
+                    self.transpose_rhs,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                ),
+            )
+        };
 
         let lhs = Self::matrix(inputs[0], lhs_desc);
         let rhs = Self::matrix(inputs[1], rhs_desc);
         let out = Self::matrix(output, out_desc);
 
         unsafe {
-            let device: *mut Object = msg_send![command_buffer.as_ptr(), device];
-            let kernel: *mut Object = msg_send![class!(MPSMatrixMultiplication), alloc];
-            let kernel: *mut Object = msg_send![
-                kernel,
-                initWithDevice: device
-                transposeLeft: self.transpose_lhs
-                transposeRight: self.transpose_rhs
-                resultRows: m
-                resultColumns: n
-                interiorColumns: k
-                alpha: 1.0f64
-                beta: 0.0f64
-            ];
             let _: () = msg_send![
                 kernel,
-                encodeToCommandBuffer: command_buffer.as_ptr()
+                encodeToCommandBuffer: context.command_buffer.as_ptr()
                 leftMatrix: lhs
                 rightMatrix: rhs
                 resultMatrix: out
@@ -1657,7 +1633,6 @@ impl MetalKernelOp for MPSMatmul {
             let _: () = msg_send![lhs, release];
             let _: () = msg_send![rhs, release];
             let _: () = msg_send![out, release];
-            let _: () = msg_send![kernel, release];
         }
     }
 
@@ -1839,8 +1814,6 @@ impl EgglogOp for MPSBatchedMatmul {
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
             rule(union(sum_op.clone(), mps_op.clone()))
-                .subsume(sum_op.clone())
-                .subsume(mul_op)
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
                 .ruleset("kernel_lower")
@@ -1877,6 +1850,17 @@ impl EgglogOp for MPSBatchedMatmul {
                     modd(z.clone(), v("?k")),
                 ),
                 1,
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
+                     (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (= ?sum (MPSBatchedMatmul ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr)))
+                    ((delete (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                     (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
+                    :ruleset cleanup
+                    :name \"delete-broadcast-mul-sum-when-mps-batched-matmul-exists\"
+                )",
             ),
         ]
     }
@@ -1953,12 +1937,11 @@ impl MetalKernelOp for MPSBatchedMatmul {
 
     fn encode(
         &self,
-        command_buffer: &CommandBufferRef,
+        context: &mut MetalEncodeContext<'_>,
         _pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
         dyn_map: &FxHashMap<char, usize>,
-        _dyn_buffer: &Buffer,
         input_dtypes: &[DType],
         output_dtype: DType,
     ) {
@@ -1982,25 +1965,26 @@ impl MetalKernelOp for MPSBatchedMatmul {
         let lhs_row_bytes = MPSMatmul::row_bytes(self.lhs_row_stride, lhs_dtype, dyn_map);
         let rhs_row_bytes = MPSMatmul::row_bytes(self.rhs_row_stride, rhs_dtype, dyn_map);
         let out_row_bytes = MPSMatmul::row_bytes(self.out_row_stride, output_dtype, dyn_map);
-        let lhs_desc = MPSMatmul::descriptor(lhs_rows, lhs_cols, lhs_row_bytes, lhs_dtype);
-        let rhs_desc = MPSMatmul::descriptor(rhs_rows, rhs_cols, rhs_row_bytes, rhs_dtype);
-        let out_desc = MPSMatmul::descriptor(m, n, out_row_bytes, output_dtype);
+        let (lhs_desc, rhs_desc, out_desc, kernel) = {
+            let mut cache = context.mps_cache.borrow_mut();
+            (
+                cache.matrix_descriptor(lhs_rows, lhs_cols, lhs_row_bytes, lhs_dtype),
+                cache.matrix_descriptor(rhs_rows, rhs_cols, rhs_row_bytes, rhs_dtype),
+                cache.matrix_descriptor(m, n, out_row_bytes, output_dtype),
+                cache.matrix_multiplication(
+                    context.command_buffer,
+                    self.transpose_lhs,
+                    self.transpose_rhs,
+                    m,
+                    n,
+                    k,
+                    1.0,
+                    0.0,
+                ),
+            )
+        };
 
         unsafe {
-            let device: *mut Object = msg_send![command_buffer.as_ptr(), device];
-            let kernel: *mut Object = msg_send![class!(MPSMatrixMultiplication), alloc];
-            let kernel: *mut Object = msg_send![
-                kernel,
-                initWithDevice: device
-                transposeLeft: self.transpose_lhs
-                transposeRight: self.transpose_rhs
-                resultRows: m
-                resultColumns: n
-                interiorColumns: k
-                alpha: 1.0f64
-                beta: 0.0f64
-            ];
-
             for batch_idx in 0..batch {
                 let batch_expr = Expression::from(batch_idx as i64);
                 let lhs_offset = self
@@ -2027,7 +2011,7 @@ impl MetalKernelOp for MPSBatchedMatmul {
                 let out = MPSMatmul::matrix_with_offset(output, out_offset as u64, out_desc);
                 let _: () = msg_send![
                     kernel,
-                    encodeToCommandBuffer: command_buffer.as_ptr()
+                    encodeToCommandBuffer: context.command_buffer.as_ptr()
                     leftMatrix: lhs
                     rightMatrix: rhs
                     resultMatrix: out
@@ -2036,7 +2020,6 @@ impl MetalKernelOp for MPSBatchedMatmul {
                 let _: () = msg_send![rhs, release];
                 let _: () = msg_send![out, release];
             }
-            let _: () = msg_send![kernel, release];
         }
     }
 
@@ -2163,24 +2146,6 @@ impl EgglogOp for GenericMatmul {
                     :name \"delete-broadcast-mul-sum-when-generic-matmul-exists\"
                 )",
             ),
-            Rule::raw(
-                "(rule
-                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
-                     (= ?sum (MPSMatmul ?mm ?mn ?mk ?ml ?mls ?mr ?mrs ?mos ?mtl ?mtr)))
-                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    :ruleset cleanup
-                    :name \"prefer-mps-over-generic-matmul\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    ((= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
-                     (= ?sum (MPSBatchedMatmul ?bb ?bm ?bn ?bk ?bl ?blbs ?blrs ?br ?brbs ?brrs ?bobs ?bors ?btl ?btr)))
-                    ((delete (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
-                    :ruleset cleanup
-                    :name \"prefer-mps-batched-over-generic-matmul\"
-                )",
-            ),
         ]
     }
 
@@ -2265,13 +2230,11 @@ impl MetalKernelOp for GenericMatmul {
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint simd_lane [[thread_index_in_simdgroup]],
-                uint simd_id [[simdgroup_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float warp_sums[THREADS_PER_GROUP / 32];
+                threadgroup float partials[THREADS_PER_GROUP];
                 int base_idx = {sum_base_idx};
                 int iters = {iters};
                 (void)dyn;
@@ -2282,19 +2245,18 @@ impl MetalKernelOp for GenericMatmul {
                     sum += ({lhs_val}) * ({rhs_val});
                 }}
 
-                sum = simd_sum(sum);
-                if (simd_lane == 0) {{
-                    warp_sums[simd_id] = sum;
-                }}
+                partials[tid] = sum;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                if (simd_id == 0) {{
-                    int n_warps = THREADS_PER_GROUP / 32;
-                    float block_sum = (tid < uint(n_warps)) ? warp_sums[tid] : 0.0f;
-                    block_sum = simd_sum(block_sum);
-                    if (tid == 0) {{
-                        out[{out_idx}] = {out_val};
+                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
+                    if (tid < stride) {{
+                        partials[tid] += partials[tid + stride];
                     }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }}
+
+                if (tid == 0) {{
+                    float block_sum = partials[0];
+                    out[{out_idx}] = {out_val};
                 }}
             }}
             "#,

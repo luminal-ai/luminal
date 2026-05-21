@@ -113,10 +113,6 @@ impl QwenRuntime for luminal_metal::MetalRuntime {
     fn get_f32(&self, id: NodeIndex) -> Vec<f32> {
         luminal_metal::MetalRuntime::get_f32(self, id)
     }
-
-    fn prepare_execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
-        luminal_metal::MetalRuntime::allocate_intermediate_buffers(self, dyn_map);
-    }
 }
 
 pub fn run_qwen<R>(mut runtime: R, config: QwenRunConfig) -> Result<(), Box<dyn Error>>
@@ -177,6 +173,17 @@ where
             DimBucket::new(2, max_prefill).representative(search_s),
         ],
     );
+    let max_decode_p = config.max_seq_len.saturating_sub(1);
+    let decode_p_representative = prompt_tokens.len().min(max_decode_p).max(1);
+    let p_buckets = if max_decode_p == 0 {
+        vec![DimBucket::new(0, 0)]
+    } else {
+        vec![
+            DimBucket::new(0, 0),
+            DimBucket::new(1, max_decode_p).representative(decode_p_representative),
+        ]
+    };
+    cx.set_dim_buckets('p', &p_buckets);
     cx.set_dim('s', search_s);
     cx.set_dim('p', 0);
     runtime.set_i32_data(input.id, vec![1; search_s]);
