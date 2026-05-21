@@ -64,4 +64,4 @@ jobs:
                   MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
                   MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
                   HF_TOKEN: ${{ secrets.HF_TOKEN }}
-              run: modal run modal_pytest_runner.py --gpu A100 --timeout 14400 tests/ -v -s -m slow
+              run: modal run modal_pytest_runner.py --gpu A100-80GB --timeout 14400 tests/ -v -s -m slow
