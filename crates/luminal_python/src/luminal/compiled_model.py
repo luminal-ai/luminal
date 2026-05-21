@@ -137,46 +137,60 @@ class CompiledModel:
 
         output_dtype_codes = self._graph.output_dtypes
 
-        # Per-dtype dispatch table: `{torch_dtype: (getter_name,
-        # read_dtype, final_cast_or_None)}`. `getter_name` is the
-        # `_graph` method that returns the buffer at `read_dtype`;
-        # `final_cast` is non-None only when the kernel emits an i32
-        # buffer that we then narrow to the user-visible dtype (the
-        # `_int_dtypes` shorthand below). I64 and F64 read at their
-        # native width via the strict typed paths; the boolean dtype
-        # is its own variant. The float-fast-path (f32 / f16 / bf16)
-        # is handled separately because it goes through the CUDA
-        # zero-copy device-ptr route.
+        # Per-dtype dispatch table mapping `torch_dtype` → the typed
+        # `_graph` getter that returns its buffer at the native width.
+        # Every supported dtype has an explicit entry; anything not
+        # listed raises `NotImplementedError` from `_read_typed_output`.
+        # There is no open-ended fallback — a missing entry means we
+        # don't know how to read that dtype yet, and we'd rather fail
+        # loudly than silently reinterpret bytes.
+        #
+        # Narrow ints (`int8` / `int16` / `uint8`) are intentionally
+        # absent — luminal's IR refuses them at the FFI boundary (cf.
+        # `pt2_util::torch_dtype_int_to_luminal`,
+        # `typed_data::from_pytorch_bytes`), so a graph can never
+        # declare a narrow-int output that reaches this dispatch.
+        #
+        # `float16` / `bfloat16` route through the generic f32 getter
+        # then `.to(...)` to the declared dtype. That's NOT a silent
+        # precision drop — the underlying runtime kernels already emit
+        # f32 bytes for these dtypes (no native f16/bf16 host-read path
+        # exists yet); the cast at the end is the inverse of the
+        # upstream conversion, not a fresh truncation. A proper typed
+        # getter is tracked as follow-up work.
         _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
         _output_readers = {
+            torch.float32: ("get_output", torch.float32, None),
             torch.float64: ("get_output_f64", torch.float64, None),
+            torch.float16: ("get_output", torch.float32, torch.float16),
+            torch.bfloat16: ("get_output", torch.float32, torch.bfloat16),
             torch.int64: ("get_output_i64", torch.int64, None),
             torch.int32: ("get_output_i32", torch.int32, None),
-            torch.int8: ("get_output_i32", torch.int32, torch.int8),
-            torch.int16: ("get_output_i32", torch.int32, torch.int16),
-            torch.uint8: ("get_output_i32", torch.int32, torch.uint8),
             torch.bool: ("get_output_bool", torch.bool, None),
         }
 
         def _read_typed_output(name: str, shape, out_dtype) -> torch.Tensor:
             """Pull one output back from the runtime at the right dtype.
-            Routes through the per-dtype dispatch table; for any float
-            dtype not in the table, falls back to the generic f32
-            getter and post-casts."""
+
+            Strict: any `out_dtype` not in `_output_readers` raises
+            `NotImplementedError`. The previous code's open-ended
+            fallback read the buffer as f32 and `.to(out_dtype)`'d
+            back, which silently aliased dtypes we don't really
+            support; refusing surfaces the gap.
+            """
             entry = _output_readers.get(out_dtype)
             if entry is None:
-                data = self._graph.get_output(name)
-                tensor = (
-                    torch.tensor(data, dtype=torch.float32)
-                    .reshape(tuple(shape))
-                    .to(out_dtype)
+                raise NotImplementedError(
+                    f"Output '{name}' declared dtype {out_dtype} isn't "
+                    f"supported by the luminal read boundary. Add a typed "
+                    f"getter for this dtype (see `_output_readers`) or cast "
+                    f"the output to a supported dtype upstream."
                 )
-            else:
-                getter_name, read_dtype, final_cast = entry
-                data = getattr(self._graph, getter_name)(name)
-                tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
-                if final_cast is not None:
-                    tensor = tensor.to(final_cast)
+            getter_name, read_dtype, final_cast = entry
+            data = getattr(self._graph, getter_name)(name)
+            tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
+            if final_cast is not None:
+                tensor = tensor.to(final_cast)
             return tensor.to(input_device)
 
         # Pre-allocation is GPU-only: the CUDA kernel needs the
