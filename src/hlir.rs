@@ -2871,62 +2871,6 @@ impl NativeData {
             NativeData::Bool(v) => v.len(),
         }
     }
-    #[inline]
-    pub fn f32(&self, i: usize) -> f32 {
-        match self {
-            NativeData::F32(v) => v[i],
-            _ => panic!("NativeData::f32 called on non-F32 data"),
-        }
-    }
-
-    #[inline]
-    pub fn f16(&self, i: usize) -> f16 {
-        match self {
-            NativeData::F16(v) => v[i],
-            _ => panic!("NativeData::f16 called on non-F16 data"),
-        }
-    }
-
-    #[inline]
-    pub fn bf16(&self, i: usize) -> bf16 {
-        match self {
-            NativeData::Bf16(v) => v[i],
-            _ => panic!("NativeData::bf16 called on non-Bf16 data"),
-        }
-    }
-
-    #[inline]
-    pub fn i32(&self, i: usize) -> i32 {
-        match self {
-            NativeData::Int(v) => v[i],
-            _ => panic!("NativeData::i32 called on non-Int data"),
-        }
-    }
-
-    #[inline]
-    pub fn i64(&self, i: usize) -> i64 {
-        match self {
-            NativeData::I64(v) => v[i],
-            _ => panic!("NativeData::i64 called on non-I64 data"),
-        }
-    }
-
-    #[inline]
-    pub fn f64(&self, i: usize) -> f64 {
-        match self {
-            NativeData::F64(v) => v[i],
-            _ => panic!("NativeData::f64 called on non-F64 data"),
-        }
-    }
-
-    #[inline]
-    pub fn bool(&self, i: usize) -> bool {
-        match self {
-            NativeData::Bool(v) => v[i],
-            _ => panic!("NativeData::bool called on non-Bool data"),
-        }
-    }
-
     pub fn to_f32_vec(&self) -> Vec<f32> {
         match self {
             NativeData::F32(v) => v.clone(),

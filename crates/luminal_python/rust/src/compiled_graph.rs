@@ -5,6 +5,7 @@ use luminal::{
     visualization::ToDot,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::collections::HashMap;
 
 use crate::typed_data::TypedData;
@@ -501,6 +502,41 @@ impl CompiledGraph {
             ))
         })?;
         Ok(self.runtime.get_output_i32(*node_id))
+    }
+
+    /// Read an output as f16 (returned as raw little-endian bytes —
+    /// Python has no native f16, so the caller bit-casts via
+    /// `torch.frombuffer(..., dtype=torch.float16)`). Strict: the
+    /// producer node must already be `DType::F16`; no widening at
+    /// the read boundary.
+    fn get_output_f16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        let data = self.runtime.get_output_f16(*node_id);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    /// Read an output as bf16 (returned as raw little-endian bytes —
+    /// caller bit-casts via `torch.frombuffer(..., dtype=torch.
+    /// bfloat16)`). Strict: the producer node must already be
+    /// `DType::Bf16`; no widening at the read boundary.
+    fn get_output_bf16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        let data = self.runtime.get_output_bf16(*node_id);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
     }
 
     /// Read an output as i64. Strict: the producer node must already

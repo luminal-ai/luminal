@@ -153,35 +153,33 @@ class CompiledModel:
         output_torch_dtypes = [code_to_torch_dtype(c) for c in output_dtype_codes]
 
         # Per-dtype dispatch table mapping `torch_dtype` → the typed
-        # `_graph` getter that returns its buffer at the native width.
-        # Every supported dtype has an explicit entry; anything not
-        # listed raises `NotImplementedError` from `_read_typed_output`.
-        # There is no open-ended fallback — a missing entry means we
-        # don't know how to read that dtype yet, and we'd rather fail
-        # loudly than silently reinterpret bytes.
+        # `_graph` getter for that dtype. Every supported dtype has an
+        # explicit native-width getter; anything not listed raises
+        # `NotImplementedError` from `_read_typed_output`. There is no
+        # open-ended fallback — a missing entry means we don't know how
+        # to read that dtype yet, and we'd rather fail loudly than
+        # silently reinterpret bytes.
+        #
+        # `float16` / `bfloat16` getters return `uint16` bit patterns
+        # (Python has no native `f16` / `bf16`); the helper below
+        # bit-casts them back to the declared dtype via
+        # `torch.frombuffer`. That's a reinterpret, not a numeric
+        # cast — no precision change.
         #
         # Narrow ints (`int8` / `int16` / `uint8`) are intentionally
         # absent — luminal's IR refuses them at the FFI boundary (cf.
         # `pt2_util::torch_dtype_int_to_luminal`,
         # `typed_data::from_pytorch_bytes`), so a graph can never
         # declare a narrow-int output that reaches this dispatch.
-        #
-        # `float16` / `bfloat16` route through the generic f32 getter
-        # then `.to(...)` to the declared dtype. That's NOT a silent
-        # precision drop — the underlying runtime kernels already emit
-        # f32 bytes for these dtypes (no native f16/bf16 host-read path
-        # exists yet); the cast at the end is the inverse of the
-        # upstream conversion, not a fresh truncation. A proper typed
-        # getter is tracked as follow-up work.
         _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
         _output_readers = {
-            torch.float32: ("get_output", torch.float32, None),
-            torch.float64: ("get_output_f64", torch.float64, None),
-            torch.float16: ("get_output", torch.float32, torch.float16),
-            torch.bfloat16: ("get_output", torch.float32, torch.bfloat16),
-            torch.int64: ("get_output_i64", torch.int64, None),
-            torch.int32: ("get_output_i32", torch.int32, None),
-            torch.bool: ("get_output_bool", torch.bool, None),
+            torch.float32: ("get_output", torch.float32),
+            torch.float64: ("get_output_f64", torch.float64),
+            torch.float16: ("get_output_f16", torch.float16),
+            torch.bfloat16: ("get_output_bf16", torch.bfloat16),
+            torch.int64: ("get_output_i64", torch.int64),
+            torch.int32: ("get_output_i32", torch.int32),
+            torch.bool: ("get_output_bool", torch.bool),
         }
 
         def _read_typed_output(name: str, shape, out_dtype) -> torch.Tensor:
@@ -192,6 +190,12 @@ class CompiledModel:
             fallback read the buffer as f32 and `.to(out_dtype)`'d
             back, which silently aliased dtypes we don't really
             support; refusing surfaces the gap.
+
+            For `float16` / `bfloat16` the typed getter returns
+            `uint16` bit patterns (Python has no native half-precision
+            float type); we bit-cast via `torch.tensor(..., uint16)`
+            and `.view(half)` so the conversion is a reinterpret of the
+            bytes, not a numeric cast.
             """
             entry = _output_readers.get(out_dtype)
             if entry is None:
@@ -201,11 +205,17 @@ class CompiledModel:
                     f"getter for this dtype (see `_output_readers`) or cast "
                     f"the output to a supported dtype upstream."
                 )
-            getter_name, read_dtype, final_cast = entry
+            getter_name, read_dtype = entry
             data = getattr(self._graph, getter_name)(name)
-            tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
-            if final_cast is not None:
-                tensor = tensor.to(final_cast)
+            if out_dtype in (torch.float16, torch.bfloat16):
+                # Getter returned raw bytes — bit-cast via frombuffer.
+                tensor = torch.frombuffer(data, dtype=out_dtype).reshape(tuple(shape))
+                # frombuffer shares memory with `data` (read-only); clone
+                # so the returned tensor owns its storage and `data` can
+                # be dropped.
+                tensor = tensor.clone()
+            else:
+                tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
             return tensor.to(input_device)
 
         # Pre-allocation is GPU-only: the CUDA kernel needs the

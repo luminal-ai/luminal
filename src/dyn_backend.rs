@@ -38,6 +38,12 @@ pub trait DynBackend {
     fn set_data_bytes(&mut self, node: NodeIndex, bytes: Vec<u8>, dtype: DType);
     fn set_data_f32(&mut self, node: NodeIndex, data: Vec<f32>);
     fn get_output_f32(&self, node: NodeIndex) -> Vec<f32>;
+    fn get_output_f16(&self, _node: NodeIndex) -> Vec<half::f16> {
+        panic!("get_output_f16 not supported by '{}'", self.name());
+    }
+    fn get_output_bf16(&self, _node: NodeIndex) -> Vec<half::bf16> {
+        panic!("get_output_bf16 not supported by '{}'", self.name());
+    }
     fn get_output_i32(&self, _node: NodeIndex) -> Vec<i32> {
         panic!("get_output_i32 not supported by '{}'", self.name());
     }
@@ -283,13 +289,47 @@ impl DynBackend for NativeDynBackend {
     }
 
     fn get_output_f32(&self, node: NodeIndex) -> Vec<f32> {
-        let data = self.output_buffer(node);
-        data.to_f32_vec()
+        match self.output_buffer(node) {
+            NativeData::F32(v) => v.clone(),
+            other => panic!(
+                "get_output_f32: buffer dtype is {:?}, expected F32. \
+                 Add a `Cast(DType::F32)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_f16(&self, node: NodeIndex) -> Vec<half::f16> {
+        match self.output_buffer(node) {
+            NativeData::F16(v) => v.clone(),
+            other => panic!(
+                "get_output_f16: buffer dtype is {:?}, expected F16. \
+                 Add a `Cast(DType::F16)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_bf16(&self, node: NodeIndex) -> Vec<half::bf16> {
+        match self.output_buffer(node) {
+            NativeData::Bf16(v) => v.clone(),
+            other => panic!(
+                "get_output_bf16: buffer dtype is {:?}, expected Bf16. \
+                 Add a `Cast(DType::Bf16)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 
     fn get_output_i32(&self, node: NodeIndex) -> Vec<i32> {
-        let data = self.output_buffer(node);
-        data.to_i32_vec()
+        match self.output_buffer(node) {
+            NativeData::Int(v) => v.clone(),
+            other => panic!(
+                "get_output_i32: buffer dtype is {:?}, expected Int (i32). \
+                 Add a `Cast(DType::Int)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 
     fn get_output_i64(&self, node: NodeIndex) -> Vec<i64> {
@@ -315,8 +355,14 @@ impl DynBackend for NativeDynBackend {
     }
 
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {
-        let data = self.output_buffer(node);
-        data.to_bool_vec()
+        match self.output_buffer(node) {
+            NativeData::Bool(v) => v.clone(),
+            other => panic!(
+                "get_output_bool: buffer dtype is {:?}, expected Bool. \
+                 Add a `Cast(DType::Bool)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {

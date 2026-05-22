@@ -688,7 +688,19 @@ impl CudaRuntime {
             .collect_vec()
     }
 
+    /// Read an output buffer as f16. Strict: the buffer must already
+    /// be `DType::F16`; no widening at the read boundary.
     pub fn get_f16(&self, id: impl ToId) -> Vec<f16> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::F16)) {
+            panic!(
+                "get_f16: buffer dtype is {buf_dtype:?}, expected F16. \
+                 Add a `Cast(DType::F16)` before the Output."
+            );
+        }
         let bytes = self.get_output_data(id);
         let n = bytes.len() / 2;
         let cap = bytes.capacity() / 2;
@@ -697,7 +709,19 @@ impl CudaRuntime {
         unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
+    /// Read an output buffer as bf16. Strict: the buffer must already
+    /// be `DType::Bf16`; no widening at the read boundary.
     pub fn get_bf16(&self, id: impl ToId) -> Vec<bf16> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::Bf16)) {
+            panic!(
+                "get_bf16: buffer dtype is {buf_dtype:?}, expected Bf16. \
+                 Add a `Cast(DType::Bf16)` before the Output."
+            );
+        }
         let bytes = self.get_output_data(id);
         let n = bytes.len() / 2;
         let cap = bytes.capacity() / 2;
