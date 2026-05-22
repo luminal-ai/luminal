@@ -208,12 +208,13 @@ class CompiledModel:
             getter_name, read_dtype = entry
             data = getattr(self._graph, getter_name)(name)
             if out_dtype in (torch.float16, torch.bfloat16):
-                # Getter returned raw bytes — bit-cast via frombuffer.
-                tensor = torch.frombuffer(data, dtype=out_dtype).reshape(tuple(shape))
-                # frombuffer shares memory with `data` (read-only); clone
-                # so the returned tensor owns its storage and `data` can
-                # be dropped.
-                tensor = tensor.clone()
+                # Getter returned an immutable `bytes` from Rust; wrap in
+                # `bytearray` to make the storage writable (suppresses
+                # the "non-writable buffer" warning), then bit-cast via
+                # `frombuffer` — no numeric conversion.
+                tensor = torch.frombuffer(
+                    bytearray(data), dtype=out_dtype
+                ).reshape(tuple(shape))
             else:
                 tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
             return tensor.to(input_device)
