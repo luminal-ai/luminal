@@ -212,9 +212,9 @@ class CompiledModel:
                 # `bytearray` to make the storage writable (suppresses
                 # the "non-writable buffer" warning), then bit-cast via
                 # `frombuffer` — no numeric conversion.
-                tensor = torch.frombuffer(
-                    bytearray(data), dtype=out_dtype
-                ).reshape(tuple(shape))
+                tensor = torch.frombuffer(bytearray(data), dtype=out_dtype).reshape(
+                    tuple(shape)
+                )
             else:
                 tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
             return tensor.to(input_device)
