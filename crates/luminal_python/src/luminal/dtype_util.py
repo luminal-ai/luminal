@@ -37,10 +37,25 @@ _CODE_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_DTYPE_TO_CODE.items()}
 
 
 def torch_dtype_code(dtype):
-    """Map torch.dtype to PT2 dtype integer code."""
-    return _TORCH_DTYPE_TO_CODE.get(dtype, ScalarType.FLOAT.value)
+    """Map torch.dtype to PT2 dtype integer code. Raises `KeyError`
+    on an unsupported dtype rather than silently aliasing to FLOAT."""
+    try:
+        return _TORCH_DTYPE_TO_CODE[dtype]
+    except KeyError:
+        raise KeyError(
+            f"torch_dtype_code: {dtype} isn't a supported PT2 dtype "
+            f"(supported: {sorted(_TORCH_DTYPE_TO_CODE.keys(), key=str)})"
+        ) from None
 
 
 def code_to_torch_dtype(code):
-    """Map PT2 dtype integer code to torch.dtype."""
-    return _CODE_TO_TORCH_DTYPE.get(code, torch.float32)
+    """Map PT2 dtype integer code to torch.dtype. Raises `KeyError`
+    on an unknown code rather than silently defaulting to float32."""
+    try:
+        return _CODE_TO_TORCH_DTYPE[code]
+    except KeyError:
+        raise KeyError(
+            f"code_to_torch_dtype: PT2 dtype code {code} isn't mapped "
+            f"to a torch.dtype (known codes: "
+            f"{sorted(_CODE_TO_TORCH_DTYPE.keys())})"
+        ) from None

@@ -49,14 +49,18 @@ class CompiledModel:
         self._supports_device_ptrs = getattr(
             graph_result, "supports_device_ptrs", False
         )
-        # Expected input dtypes from graph (used to convert user inputs)
+        # Expected input dtypes from graph. Every declared input MUST
+        # have a dtype code — refuse to silently default to float32 if
+        # the Rust side returned a shorter list than `input_names`.
         input_dtype_codes = graph_result.input_dtypes
-        self._input_dtypes = [
-            code_to_torch_dtype(input_dtype_codes[i])
-            if i < len(input_dtype_codes)
-            else torch.float32
-            for i in range(len(self._input_names))
-        ]
+        if len(input_dtype_codes) != len(self._input_names):
+            raise RuntimeError(
+                f"CompiledGraph returned {len(input_dtype_codes)} input dtype "
+                f"codes for {len(self._input_names)} declared inputs "
+                f"({self._input_names!r}) — every declared input needs a "
+                f"matching dtype."
+            )
+        self._input_dtypes = [code_to_torch_dtype(c) for c in input_dtype_codes]
 
     def set_dim(self, param_name: str, value: int) -> None:
         """Set a dynamic dimension value by its param name."""
@@ -135,7 +139,18 @@ class CompiledModel:
         else:
             output_shapes = self._output_shapes
 
+        # Every declared output MUST have a dtype code; refuse to default
+        # to float32 the way we used to if the Rust side returned fewer
+        # codes than declared outputs.
         output_dtype_codes = self._graph.output_dtypes
+        if len(output_dtype_codes) != len(self._output_names):
+            raise RuntimeError(
+                f"CompiledGraph returned {len(output_dtype_codes)} output "
+                f"dtype codes for {len(self._output_names)} declared outputs "
+                f"({self._output_names!r}) — every declared output needs a "
+                f"matching dtype."
+            )
+        output_torch_dtypes = [code_to_torch_dtype(c) for c in output_dtype_codes]
 
         # Per-dtype dispatch table mapping `torch_dtype` → the typed
         # `_graph` getter that returns its buffer at the native width.
@@ -206,11 +221,7 @@ class CompiledModel:
         output_tensors = []
         if _use_zero_copy:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
-                out_dtype = (
-                    code_to_torch_dtype(output_dtype_codes[i])
-                    if i < len(output_dtype_codes)
-                    else torch.float32
-                )
+                out_dtype = output_torch_dtypes[i]
                 out = torch.empty(shape, dtype=out_dtype, device=input_device)
                 if out_dtype in _zero_copy_native_floats:
                     self._graph.set_output_device_ptr(
@@ -222,11 +233,7 @@ class CompiledModel:
 
         outputs = []
         for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
-            out_dtype = (
-                code_to_torch_dtype(output_dtype_codes[i])
-                if i < len(output_dtype_codes)
-                else torch.float32
-            )
+            out_dtype = output_torch_dtypes[i]
             if _use_zero_copy and out_dtype in _zero_copy_native_floats:
                 out = output_tensors[i]
                 if not self._graph.output_is_zero_copy(name):
