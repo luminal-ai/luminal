@@ -256,10 +256,10 @@ fn run_argsort_test(rows: usize, cols: usize, seed: u64) {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
     let stream = ctx.default_stream();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream);
     rt.set_data(input, data);
-    rt = cx.search(rt, 10);
+    rt = cx.search(rt, CompileOptions::new(10));
     rt.execute(&cx.dyn_map);
     let out_dim0 = rt.get_i32(sorted_dim0.id);
     let out_dim1 = rt.get_i32(sorted_dim1.id);
@@ -424,7 +424,7 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
     let e = (d + c).relu();
     let out = e.output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
     let ops = cx.egglog_ops().unwrap();
 
@@ -592,7 +592,7 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
         )
         .output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
 
     let token_data: Vec<i32> = random_i32_vec(seq_len, seed, 0, vocab_size as i32 - 1);
@@ -600,7 +600,7 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
 
     rt.set_data(token_ids, token_data.clone());
     rt.set_data(embed_table, embed_data.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::new(5));
     rt.execute(&cx.dyn_map);
 
     let result = rt.get_f32(output);

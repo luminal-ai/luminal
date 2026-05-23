@@ -27,11 +27,11 @@ pub fn kernel_add_bandwidth_test() {
     ctx.bind_to_thread().unwrap();
     let stream = ctx.default_stream();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
     rt.set_data(a, data_a.clone());
     rt.set_data(b, data_b.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::new(5));
 
     // Warm up
     rt.execute(&cx.dyn_map);

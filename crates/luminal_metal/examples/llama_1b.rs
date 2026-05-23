@@ -1,7 +1,7 @@
 use hf_hub::api::sync::Api;
 use luminal::{
     dtype::DType,
-    graph::{BuildSearchSpaceOptions, DimBucket, Graph},
+    graph::{CompileOptions, DimBucket, Graph},
     prelude::{F32Pow, GraphTensor, Runtime},
 };
 use luminal_metal::MetalRuntime;
@@ -449,12 +449,34 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     cx.set_dim('s', 1);
     cx.set_dim('c', 1);
+    let max_prefill = (prompt_tokens.len() + 16)
+        .next_power_of_two()
+        .min(MAX_SEQ_LEN);
+    let max_context = (prompt_tokens.len() + GEN_TOKENS + 1)
+        .next_power_of_two()
+        .min(MAX_SEQ_LEN);
+    let search_s = 16.min(max_prefill).max(2);
+    let search_c = 16.min(max_context).max(2);
+    let build_options = CompileOptions::default()
+        .max_memory_mib(SEARCH_MEMORY_MIB)
+        .dim_buckets(
+            's',
+            &[
+                DimBucket::new(1, 1),
+                DimBucket::new(2, max_prefill).representative(search_s),
+            ],
+        )
+        .dim_buckets(
+            'c',
+            &[
+                DimBucket::new(1, 1),
+                DimBucket::new(2, max_context).representative(search_c),
+            ],
+        );
 
     println!("Building E-Graph...");
     let egraph_start = Instant::now();
-    cx.build_search_space_with_options::<MetalRuntime>(
-        BuildSearchSpaceOptions::new().max_memory_mib(SEARCH_MEMORY_MIB),
-    );
+    cx.build_search_space::<MetalRuntime>(build_options);
     println!(
         "  E-Graph build: {:.2} s",
         egraph_start.elapsed().as_secs_f64()
@@ -474,28 +496,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Compiling...");
     let compile_start = Instant::now();
-    let max_prefill = (prompt_tokens.len() + 16)
-        .next_power_of_two()
-        .min(MAX_SEQ_LEN);
-    let max_context = (prompt_tokens.len() + GEN_TOKENS + 1)
-        .next_power_of_two()
-        .min(MAX_SEQ_LEN);
-    let search_s = 16.min(max_prefill).max(2);
-    let search_c = 16.min(max_context).max(2);
-    cx.set_dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(search_s),
-        ],
-    );
-    cx.set_dim_buckets(
-        'c',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_context).representative(search_c),
-        ],
-    );
     cx.set_dim('s', search_s);
     cx.set_dim('c', search_c);
     runtime.set_data(input, vec![1; search_s]);
@@ -503,7 +503,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(gather_idx_t, (0..search_c as i32).collect::<Vec<_>>());
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
-    runtime = cx.search(runtime, SEARCH_GRAPHS);
+    runtime = cx.search(runtime, CompileOptions::new(SEARCH_GRAPHS));
     println!(
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()

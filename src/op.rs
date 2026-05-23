@@ -18,7 +18,7 @@ pub trait Runtime {
     /// to Luminal core.
     fn late_egglog_passes(
         _ops: &[Arc<Box<dyn EgglogOp>>],
-        _options: &crate::graph::BuildSearchSpaceOptions,
+        _options: &crate::graph::CompileOptions,
         _dyn_map: &FxHashMap<char, usize>,
     ) -> Vec<crate::egglog_utils::LateEgglogPass>
     where

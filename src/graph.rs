@@ -1,7 +1,8 @@
 use crate::egglog_utils::{
     count_choice_sets_up_to, egglog_to_llir, extract_generation, hash_choice_set, hlir_to_egglog,
-    random_initial_choice, run_egglog_with_late_passes,
+    random_initial_choice, run_egglog_with_late_passes_and_interval_analysis,
 };
+use crate::shape::{DimInterval, DynDimIntervals};
 use crate::{
     egglog_utils::SerializedEGraph,
     op::{EgglogOp, IntoEgglogOp, LLIROp},
@@ -74,12 +75,19 @@ struct RollingSearchReport {
     diagnostics: RollingSearchDiagnostics,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SearchSpaceContext {
+    bucket_indices: FxHashMap<char, usize>,
+    representative_dyn_map: FxHashMap<char, usize>,
+    intervals: DynDimIntervals,
+}
+
 /// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
 pub type BucketLLIR = (FxHashMap<char, usize>, FxHashMap<char, usize>, LLIRGraph);
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
 /// For an exact value, use `min == max` (zero-length range).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DimBucket {
     pub min: usize,
     pub max: usize,
@@ -124,22 +132,61 @@ impl DimBucket {
     }
 }
 
-/// Options for building an e-graph search space.
+/// Options for building an e-graph search space and searching it.
 ///
-/// These options are attached to the built search space and used by search.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BuildSearchSpaceOptions {
+/// Use the builder pattern to configure search parameters:
+/// ```
+/// use luminal::prelude::CompileOptions;
+/// let opts = CompileOptions::new(5)
+///     .generation_size(50)
+///     .mutations(40)
+///     .trials(15);
+/// ```
+#[derive(Debug, Clone)]
+pub struct CompileOptions {
+    /// Maximum number of graphs to evaluate during search.
+    pub limit: usize,
     /// Optional maximum runtime-specific intermediate memory, in bytes.
     ///
     /// When this is `None`, search does not apply a memory cap. Runtimes that
     /// support memory estimates can use an explicitly provided limit to reject
     /// candidate graphs before profiling them.
     pub max_memory_bytes: Option<usize>,
+    /// Number of offspring per generation (default: 10)
+    pub generation_size: usize,
+    /// Number of mutations applied to each offspring (default: 10)
+    pub mutations: usize,
+    /// Number of profiling trials per candidate (default: 3)
+    pub trials: usize,
+    /// Number of best genomes to keep as parents per generation (default: 1)
+    pub keep_best: usize,
+    /// Per-candidate profiling timeout. If a profile call reaches this budget,
+    /// that candidate is discarded and search continues.
+    pub profile_timeout: Option<std::time::Duration>,
+    /// Optional per-group search timeout.
+    pub group_timeout: Option<std::time::Duration>,
+    /// Optional profiling dimension overrides.
+    pub profile_dims: FxHashMap<char, usize>,
+    /// Bucket definitions per dynamic dimension. Dimensions without buckets use
+    /// a single implicit bucket.
+    pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
 }
 
-impl BuildSearchSpaceOptions {
-    pub fn new() -> Self {
-        Self::default()
+impl CompileOptions {
+    /// Create compile options with the given search limit. Other fields use defaults.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            max_memory_bytes: None,
+            generation_size: 10,
+            mutations: 10,
+            trials: 3,
+            keep_best: 1,
+            profile_timeout: Some(std::time::Duration::from_secs(1)),
+            group_timeout: None,
+            profile_dims: FxHashMap::default(),
+            dim_buckets: FxHashMap::default(),
+        }
     }
 
     /// Set a maximum intermediate memory budget in bytes.
@@ -156,53 +203,6 @@ impl BuildSearchSpaceOptions {
     /// Set a maximum intermediate memory budget in GiB.
     pub fn max_memory_gib(self, max_memory_gib: usize) -> Self {
         self.max_memory_bytes(max_memory_gib.saturating_mul(1024 * 1024 * 1024))
-    }
-}
-
-/// Options for controlling the genetic search algorithm.
-///
-/// Use the builder pattern to configure search parameters:
-/// ```
-/// use luminal::prelude::SearchOptions;
-/// let opts = SearchOptions::new(5)
-///     .generation_size(50)
-///     .mutations(40)
-///     .trials(15);
-/// ```
-#[derive(Debug, Clone)]
-pub struct SearchOptions {
-    /// Maximum number of graphs to evaluate
-    pub limit: usize,
-    /// Number of offspring per generation (default: 10)
-    pub generation_size: usize,
-    /// Number of mutations applied to each offspring (default: 10)
-    pub mutations: usize,
-    /// Number of profiling trials per candidate (default: 3)
-    pub trials: usize,
-    /// Number of best genomes to keep as parents per generation (default: 1)
-    pub keep_best: usize,
-    /// Per-candidate profiling timeout. If a profile call reaches this budget,
-    /// that candidate is discarded and search continues.
-    pub profile_timeout: Option<std::time::Duration>,
-    /// Optional per-group search timeout.
-    pub group_timeout: Option<std::time::Duration>,
-    /// Optional profiling dimension overrides.
-    pub profile_dims: FxHashMap<char, usize>,
-}
-
-impl SearchOptions {
-    /// Create new search options with the given limit. Other fields use defaults.
-    pub fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            generation_size: 10,
-            mutations: 10,
-            trials: 3,
-            keep_best: 1,
-            profile_timeout: Some(std::time::Duration::from_secs(1)),
-            group_timeout: None,
-            profile_dims: FxHashMap::default(),
-        }
     }
 
     /// Set the number of offspring per generation.
@@ -245,6 +245,43 @@ impl SearchOptions {
     pub fn profile_dim(mut self, dim: char, value: usize) -> Self {
         self.profile_dims.insert(dim, value);
         self
+    }
+
+    /// Define buckets for a dynamic dimension.
+    ///
+    /// Bucketed compilation builds a separate search space and selected LLIR for
+    /// each bucket combination. Buckets must not overlap and must cover all
+    /// values that will be used at runtime.
+    pub fn dim_buckets(mut self, dimension: char, buckets: &[DimBucket]) -> Self {
+        validate_dim_buckets(dimension, buckets);
+        self.dim_buckets.insert(dimension, buckets.to_vec());
+        self
+    }
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+fn validate_dim_buckets(dimension: char, buckets: &[DimBucket]) {
+    assert!(
+        !buckets.is_empty(),
+        "Buckets for dim '{dimension}' must not be empty"
+    );
+    for (i, a) in buckets.iter().enumerate() {
+        for b in buckets.iter().skip(i + 1) {
+            assert!(
+                a.max < b.min || b.max < a.min,
+                "Overlapping buckets for dim '{}': [{}, {}] and [{}, {}]",
+                dimension,
+                a.min,
+                a.max,
+                b.min,
+                b.max,
+            );
+        }
     }
 }
 
@@ -346,17 +383,18 @@ pub struct Graph {
     pub dyn_map: FxHashMap<char, usize>,
     /// Edge weights: (Input index, Output index, Input shape)
     pub graph: HLIRGraph,
-    /// E-Graph search space. Always exactly one e-graph; the `Vec` is kept
-    /// for the public `Graph::egraph()` accessor's `Option<&...>` shape.
+    /// E-Graph search spaces. Bucketed compilation stores one egraph per
+    /// bucket combination; unbucketed compilation stores one egraph.
     egraphs: Vec<SerializedEGraph>,
+    egraph_contexts: Vec<SearchSpaceContext>,
     /// Available ops
     pub ops: Option<Vec<Arc<Box<dyn EgglogOp>>>>,
     /// Custom ops
     pub custom_ops: Vec<Box<dyn CustomOp>>,
-    /// Bucket definitions per dynamic dimension. Dimensions without buckets use a
-    /// single implicit bucket (current behavior). When set, search compiles a
-    /// separate LLIR per bucket combination and runtime dispatches automatically.
-    pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    /// Bucket definitions used by the currently built search space.
+    search_space_dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    /// Optional graph-wide interval assumptions for dynamic dimensions.
+    pub dim_intervals: DynDimIntervals,
     /// Metadata for Input nodes: NodeIndex -> (label, dtype).
     /// Stored as plain data so it survives cross-binary type identity mismatches
     /// when external backend plugins are compiled separately.
@@ -708,29 +746,9 @@ impl Graph {
         self.dyn_map.insert(dimension, val);
     }
 
-    /// Define buckets for a dynamic dimension.
-    ///
-    /// When buckets are set, `search()` compiles a separate optimized LLIR graph
-    /// for each bucket combination. At runtime, `execute()` dispatches to the
-    /// appropriate compiled graph based on the current `dyn_map` values.
-    ///
-    /// Buckets must not overlap and must cover all values that will be used at runtime.
-    pub fn set_dim_buckets(&mut self, dimension: char, buckets: &[DimBucket]) {
-        // Validate no overlapping ranges
-        for (i, a) in buckets.iter().enumerate() {
-            for b in buckets.iter().skip(i + 1) {
-                assert!(
-                    a.max < b.min || b.max < a.min,
-                    "Overlapping buckets for dim '{}': [{}, {}] and [{}, {}]",
-                    dimension,
-                    a.min,
-                    a.max,
-                    b.min,
-                    b.max,
-                );
-            }
-        }
-        self.dim_buckets.insert(dimension, buckets.to_vec());
+    pub fn set_dim_interval(&mut self, dimension: char, min: i64, max: i64) {
+        self.dim_intervals
+            .insert(dimension, DimInterval::new(min, max));
     }
 
     /// Attempt to discover repeated HLIR regions and build explicit region
@@ -1102,64 +1120,100 @@ impl Graph {
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn build_search_space<Rt: Runtime + 'static>(&mut self) {
-        self.build_search_space_with_options::<Rt>(BuildSearchSpaceOptions::default());
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn build_search_space_with_max_memory<Rt: Runtime + 'static>(
-        &mut self,
-        max_memory_bytes: usize,
-    ) {
-        self.build_search_space_with_options::<Rt>(
-            BuildSearchSpaceOptions::default().max_memory_bytes(max_memory_bytes),
-        );
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn build_search_space_with_options<Rt: Runtime + 'static>(
-        &mut self,
-        options: BuildSearchSpaceOptions,
-    ) {
+    pub fn build_search_space<Rt: Runtime + 'static>(&mut self, options: CompileOptions) {
         self.run_auto_loop_rolling_prepass();
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
-        let memory_dyn_map = self.memory_limit_dyn_map();
+        let dim_buckets = options.dim_buckets.clone();
+        let memory_dyn_map = self.memory_limit_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &memory_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
-        self.egraphs = vec![
-            run_egglog_with_late_passes(&program, &root, &ops, cleanup_hlir, &late_passes).unwrap(),
-        ];
+        let contexts = self.search_space_contexts(&dim_buckets);
+        self.egraphs = contexts
+            .iter()
+            .map(|context| {
+                let (contextual_program, use_interval_analysis) =
+                    self.egglog_program_with_interval_facts(&program, &context.intervals);
+                run_egglog_with_late_passes_and_interval_analysis(
+                    &contextual_program,
+                    &root,
+                    &ops,
+                    cleanup_hlir,
+                    &late_passes,
+                    use_interval_analysis,
+                )
+                .unwrap()
+            })
+            .collect();
+        self.egraph_contexts = contexts;
         self.ops = Some(ops);
         self.search_space_max_memory_bytes = options.max_memory_bytes;
+        self.search_space_dim_buckets = dim_buckets;
+    }
+
+    fn search_space_contexts(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> Vec<SearchSpaceContext> {
+        if dim_buckets.is_empty() {
+            return vec![SearchSpaceContext {
+                bucket_indices: FxHashMap::default(),
+                representative_dyn_map: self.dyn_map.clone(),
+                intervals: self.dim_intervals.clone(),
+            }];
+        }
+
+        self.bucket_combinations(dim_buckets)
+            .into_iter()
+            .map(|(bucket_indices, representative_dyn_map)| {
+                let mut intervals = self.dim_intervals.clone();
+                for (&dim, &idx) in &bucket_indices {
+                    let bucket = &dim_buckets[&dim][idx];
+                    let min = i64::try_from(bucket.min)
+                        .expect("DimBucket min must fit into i64 for interval analysis");
+                    let max = i64::try_from(bucket.max)
+                        .expect("DimBucket max must fit into i64 for interval analysis");
+                    let bucket_interval = DimInterval::new(min, max);
+                    intervals
+                        .entry(dim)
+                        .and_modify(|existing| {
+                            existing.min = existing.min.max(bucket_interval.min);
+                            existing.max = existing.max.min(bucket_interval.max);
+                            assert!(
+                                existing.min <= existing.max,
+                                "Bucket interval for dim '{dim}' does not overlap graph interval"
+                            );
+                        })
+                        .or_insert(bucket_interval);
+                }
+                SearchSpaceContext {
+                    bucket_indices,
+                    representative_dyn_map,
+                    intervals,
+                }
+            })
+            .collect()
+    }
+
+    fn egglog_program_with_interval_facts(
+        &self,
+        program: &str,
+        intervals: &DynDimIntervals,
+    ) -> (String, bool) {
+        let facts = crate::egglog_utils::base::interval_facts_egglog(intervals, []);
+        if facts.is_empty() {
+            (program.to_string(), false)
+        } else {
+            (format!("{facts}\n{program}"), true)
+        }
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(&mut self) {
-        self.build_search_space_exclude_ops_with_options::<Rt, Ex>(
-            BuildSearchSpaceOptions::default(),
-        );
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn build_search_space_exclude_ops_with_max_memory<
-        Rt: Runtime + 'static,
-        Ex: IntoEgglogOp,
-    >(
+    pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(
         &mut self,
-        max_memory_bytes: usize,
-    ) {
-        self.build_search_space_exclude_ops_with_options::<Rt, Ex>(
-            BuildSearchSpaceOptions::default().max_memory_bytes(max_memory_bytes),
-        );
-    }
-
-    #[tracing::instrument(skip_all)]
-    pub fn build_search_space_exclude_ops_with_options<Rt: Runtime + 'static, Ex: IntoEgglogOp>(
-        &mut self,
-        options: BuildSearchSpaceOptions,
+        options: CompileOptions,
     ) {
         self.run_auto_loop_rolling_prepass();
         let exclude_ops = Ex::into_vec()
@@ -1170,15 +1224,32 @@ impl Graph {
         ops.retain(|o| !exclude_ops.contains(&o.sort().name));
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
-        let memory_dyn_map = self.memory_limit_dyn_map();
+        let dim_buckets = options.dim_buckets.clone();
+        let memory_dyn_map = self.memory_limit_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &memory_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
-        self.egraphs = vec![
-            run_egglog_with_late_passes(&program, &root, &ops, cleanup_hlir, &late_passes).unwrap(),
-        ];
+        let contexts = self.search_space_contexts(&dim_buckets);
+        self.egraphs = contexts
+            .iter()
+            .map(|context| {
+                let (contextual_program, use_interval_analysis) =
+                    self.egglog_program_with_interval_facts(&program, &context.intervals);
+                run_egglog_with_late_passes_and_interval_analysis(
+                    &contextual_program,
+                    &root,
+                    &ops,
+                    cleanup_hlir,
+                    &late_passes,
+                    use_interval_analysis,
+                )
+                .unwrap()
+            })
+            .collect();
+        self.egraph_contexts = contexts;
         self.ops = Some(ops);
         self.search_space_max_memory_bytes = options.max_memory_bytes;
+        self.search_space_dim_buckets = dim_buckets;
     }
 
     /// Get a reference to the first e-graph search space (if built)
@@ -1191,37 +1262,68 @@ impl Graph {
         self.ops.as_ref()
     }
 
+    /// Build the search space and search it with one shared set of options.
+    ///
+    /// This is the usual compile entry point when runtime inputs such as
+    /// weights have already been loaded. Use `build_search_space` and `search`
+    /// directly when the two phases need to be separated.
     #[tracing::instrument(skip_all)]
-    pub fn search<R: Runtime + 'static>(&mut self, runtime: R, limit: usize) -> R {
+    pub fn compile<R: Runtime + 'static>(&mut self, runtime: R, options: CompileOptions) -> R {
         let mut rng = rand::rng();
-        self.search_options(runtime, SearchOptions::new(limit), &mut rng)
+        self.compile_with_rng(runtime, options, &mut rng)
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn search_options<R: Runtime + 'static, G: rand::Rng>(
+    pub fn compile_with_rng<R: Runtime + 'static, G: rand::Rng>(
         &mut self,
-        mut runtime: R,
-        options: SearchOptions,
+        runtime: R,
+        options: CompileOptions,
         rng: &mut G,
     ) -> R {
-        if self.dim_buckets.is_empty() {
+        self.build_search_space::<R>(options.clone());
+        self.search_with_rng(runtime, options, rng)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn search<R: Runtime + 'static>(&mut self, runtime: R, options: CompileOptions) -> R {
+        let mut rng = rand::rng();
+        self.search_with_rng(runtime, options, &mut rng)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn search_with_rng<R: Runtime + 'static, G: rand::Rng>(
+        &mut self,
+        mut runtime: R,
+        options: CompileOptions,
+        rng: &mut G,
+    ) -> R {
+        assert!(
+            options.dim_buckets.is_empty() || options.dim_buckets == self.search_space_dim_buckets,
+            "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
+        );
+
+        if self.search_space_dim_buckets.is_empty() {
             // No buckets: existing single-search path
             let stitched =
-                self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None);
+                self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None, 0);
 
             runtime.clear_intermediate_buffers();
             runtime.load_llir(&stitched);
             runtime
         } else {
             // Bucketed search: compile one LLIR per bucket combination
-            let bucket_combos = self.bucket_combinations();
-            let n_combos = bucket_combos.len();
+            let bucket_contexts = self.search_space_contexts(&self.search_space_dim_buckets);
+            let n_combos = bucket_contexts.len();
             let mut bucket_llirs: Vec<BucketLLIR> = Vec::with_capacity(n_combos);
+            assert!(
+                self.egraphs.len() == n_combos,
+                "dim buckets must be configured before build_search_space; search space has {} egraphs but current bucket configuration has {n_combos} combinations",
+                self.egraphs.len(),
+            );
 
-            for (combo_idx, (bucket_indices, representative_dyn_map)) in
-                bucket_combos.into_iter().enumerate()
-            {
-                let bucket_label = self.format_bucket_label(&bucket_indices);
+            for (combo_idx, context) in bucket_contexts.into_iter().enumerate() {
+                let bucket_label = self
+                    .format_bucket_label(&self.search_space_dim_buckets, &context.bucket_indices);
                 println!(
                     "   {:>6}  Group {}/{}: {}",
                     "Search".cyan().bold(),
@@ -1234,23 +1336,31 @@ impl Graph {
                     &mut runtime,
                     &options,
                     rng,
-                    &representative_dyn_map,
+                    &context.representative_dyn_map,
                     Some((combo_idx, n_combos)),
+                    combo_idx,
                 );
-                bucket_llirs.push((bucket_indices, representative_dyn_map, stitched));
+                bucket_llirs.push((
+                    context.bucket_indices,
+                    context.representative_dyn_map,
+                    stitched,
+                ));
             }
 
             runtime.clear_intermediate_buffers();
-            runtime.load_llir_buckets(&self.dim_buckets, &bucket_llirs);
+            runtime.load_llir_buckets(&self.search_space_dim_buckets, &bucket_llirs);
             runtime
         }
     }
 
     /// Compute cartesian product of all bucket combinations.
     /// Returns Vec of (bucket_indices, representative_dyn_map).
-    fn bucket_combinations(&self) -> Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> {
+    fn bucket_combinations(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> {
         let mut dims: Vec<(char, &Vec<DimBucket>)> =
-            self.dim_buckets.iter().map(|(c, b)| (*c, b)).collect();
+            dim_buckets.iter().map(|(c, b)| (*c, b)).collect();
         dims.sort_by_key(|(c, _)| *c);
 
         let mut combos: Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> =
@@ -1273,9 +1383,12 @@ impl Graph {
         combos
     }
 
-    fn memory_limit_dyn_map(&self) -> FxHashMap<char, usize> {
+    fn memory_limit_dyn_map(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> FxHashMap<char, usize> {
         let mut dyn_map = self.dyn_map.clone();
-        for (&dim, buckets) in &self.dim_buckets {
+        for (&dim, buckets) in dim_buckets {
             if let Some(max) = buckets.iter().map(|bucket| bucket.max).max() {
                 dyn_map.insert(dim, max);
             }
@@ -1284,12 +1397,16 @@ impl Graph {
     }
 
     /// Format a human-readable label for a bucket combination.
-    fn format_bucket_label(&self, bucket_indices: &FxHashMap<char, usize>) -> String {
+    fn format_bucket_label(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_indices: &FxHashMap<char, usize>,
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut dims: Vec<_> = bucket_indices.iter().collect();
         dims.sort_by_key(|(c, _)| **c);
         for (dim, &idx) in dims {
-            let bucket = &self.dim_buckets[dim][idx];
+            let bucket = &dim_buckets[dim][idx];
             if bucket.min == bucket.max {
                 parts.push(format!("{}={}", dim, bucket.min));
             } else {
@@ -1311,10 +1428,11 @@ impl Graph {
     fn search_single<R: Runtime + 'static, G: rand::Rng>(
         &mut self,
         runtime: &mut R,
-        options: &SearchOptions,
+        options: &CompileOptions,
         rng: &mut G,
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
+        egraph_index: usize,
     ) -> LLIRGraph {
         let mut profile_dyn_map = dyn_map.clone();
         for (&dim, &value) in &options.profile_dims {
@@ -1322,7 +1440,7 @@ impl Graph {
         }
         let limit = options.limit;
         let ops = self.ops.as_ref().unwrap();
-        let egraph = &self.egraphs[0];
+        let egraph = &self.egraphs[egraph_index];
         let search_limit = count_choice_sets_up_to(egraph, limit);
         let start = std::time::Instant::now();
 
@@ -2732,7 +2850,7 @@ mod tests {
         let mut cx = Graph::new();
         let _ = cx.tensor(1).output();
 
-        cx.build_search_space::<TestMemoryRuntime>();
+        cx.build_search_space::<TestMemoryRuntime>(CompileOptions::default());
 
         assert_eq!(cx.search_space_max_memory_bytes, None);
     }
@@ -2742,11 +2860,60 @@ mod tests {
     fn build_search_space_max_memory_rejects_candidates() {
         let mut cx = Graph::new();
         let _ = cx.tensor(1).output();
-        cx.build_search_space_with_options::<TestMemoryRuntime>(
-            BuildSearchSpaceOptions::new().max_memory_bytes(0),
+        cx.build_search_space::<TestMemoryRuntime>(CompileOptions::default().max_memory_bytes(0));
+
+        let _ = cx.search(TestMemoryRuntime, CompileOptions::new(1));
+    }
+
+    #[test]
+    fn compile_builds_search_space_and_searches_it() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+
+        let _ = cx.compile(TestMemoryRuntime, CompileOptions::new(1));
+
+        assert_eq!(cx.egraphs.len(), 1);
+        assert_eq!(cx.search_space_max_memory_bytes, None);
+    }
+
+    #[test]
+    fn bucketed_build_search_space_builds_one_egraph_per_bucket() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor('s').output();
+
+        cx.build_search_space::<TestMemoryRuntime>(
+            CompileOptions::default()
+                .dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 4)]),
         );
 
-        let _ = cx.search(TestMemoryRuntime, 1);
+        assert_eq!(cx.egraphs.len(), 2);
+        assert_eq!(cx.egraph_contexts.len(), 2);
+        assert_eq!(
+            cx.egraph_contexts[0].intervals[&'s'],
+            DimInterval::new(1, 1)
+        );
+        assert_eq!(
+            cx.egraph_contexts[1].intervals[&'s'],
+            DimInterval::new(2, 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "search cannot change buckets after build")]
+    fn search_with_rng_dim_buckets_after_build_search_space_panics() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor('s').output();
+
+        cx.build_search_space::<TestMemoryRuntime>(CompileOptions::default());
+        let mut rng = rand::rng();
+        let _ = cx.search_with_rng(
+            TestMemoryRuntime,
+            CompileOptions::new(1).dim_buckets(
+                's',
+                &[DimBucket::new(1, 1), DimBucket::new(2, 4).representative(4)],
+            ),
+            &mut rng,
+        );
     }
 
     #[test]
@@ -2851,8 +3018,8 @@ mod tests {
 
         let vals = random_vec(8);
         let mut rt = NativeRuntime::default();
-        cx.build_search_space::<NativeRuntime>();
-        rt = cx.search(rt, 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::new(1));
         rt.set_data(x.id, vals.clone());
         rt.execute(&cx.dyn_map);
 
@@ -2888,8 +3055,8 @@ mod tests {
 
         let vals = random_vec(8);
         let mut rt = NativeRuntime::default();
-        cx.build_search_space::<NativeRuntime>();
-        rt = cx.search(rt, 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::new(1));
         rt.set_data(x.id, vals.clone());
         rt.execute(&cx.dyn_map);
 

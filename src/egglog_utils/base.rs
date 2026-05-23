@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use super::api::*;
 use crate::shape::{self, ToShape};
+use rustc_hash::FxHashSet;
 
 // ---- Sort classes (pub const) ----
 
@@ -54,6 +55,12 @@ pub fn peq(a: Term, b: Term) -> Term {
 }
 pub fn pneq(a: Term, b: Term) -> Term {
     neq(a, b)
+}
+pub fn interval_lower(e: Term) -> Term {
+    app(&func("lower", &["expr"]), vec![e])
+}
+pub fn interval_upper(e: Term) -> Term {
+    app(&func("upper", &["expr"]), vec![e])
 }
 
 // ---- Egglog function applications ----
@@ -412,6 +419,38 @@ pub fn dtype(e: Term) -> Term {
     app(&func("dtype", &["inp"]), vec![e])
 }
 
+pub fn interval_facts_egglog(
+    intervals: &shape::DynDimIntervals,
+    vars: impl IntoIterator<Item = char>,
+) -> String {
+    let mut all_vars = FxHashSet::default();
+    all_vars.extend(intervals.keys().copied());
+    all_vars.extend(vars);
+
+    let mut all_vars = all_vars.into_iter().collect::<Vec<_>>();
+    all_vars.sort_unstable();
+
+    let mut out = String::new();
+    for var in all_vars {
+        let interval = intervals
+            .get(&var)
+            .copied()
+            .unwrap_or_else(shape::DimInterval::unbounded);
+        let var_expr = mvar(str(&var.to_string()));
+        out.push_str(&format!(
+            "(set {} {})\n",
+            term_to_egglog(&interval_lower(var_expr.clone())),
+            interval.min
+        ));
+        out.push_str(&format!(
+            "(set {} {})\n",
+            term_to_egglog(&interval_upper(var_expr)),
+            interval.max
+        ));
+    }
+    out
+}
+
 // ---- Normalized Op helpers ----
 
 /// Build an `(Op kind inputs)` IR term.
@@ -460,11 +499,19 @@ pub fn new_op_call(kind_sort: &SortDef, input_names: &[&str]) -> (Args, Term) {
     (args, op)
 }
 
+pub fn base_expression_egglog() -> String {
+    base_expression_egglog_impl(false)
+}
+
+pub fn base_expression_egglog_with_intervals() -> String {
+    base_expression_egglog_impl(true)
+}
+
 /// Generate the egglog program equivalent to `base.egg`.
 ///
 /// This builds the Expression, EList, and DType datatypes along with all
 /// algebraic rewrites, replacement rules, and list helper functions.
-pub fn base_expression_egglog() -> String {
+fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
     let s = BaseSorts::new();
 
     // Build the program
@@ -475,12 +522,29 @@ pub fn base_expression_egglog() -> String {
 
     // Rulesets
     p.add_ruleset("expr");
+    if use_interval_analysis {
+        p.add_ruleset("interval_expr");
+    }
     p.add_ruleset("dtype_prop");
     p.add_ruleset("cleanup");
     p.add_ruleset("post_cleanup");
 
     // Register all sorts
     s.register(&mut p);
+    if use_interval_analysis {
+        p.add_function(FunctionDef {
+            name: "lower".to_string(),
+            args: vec![EXPRESSION.name.to_string()],
+            ret: I64.name.to_string(),
+            merge: Some("(max old new)".to_string()),
+        });
+        p.add_function(FunctionDef {
+            name: "upper".to_string(),
+            args: vec![EXPRESSION.name.to_string()],
+            ret: I64.name.to_string(),
+            merge: Some("(min old new)".to_string()),
+        });
+    }
 
     // ---- Algebraic rewrites ----
     // Commutativity
@@ -724,6 +788,182 @@ pub fn base_expression_egglog() -> String {
         )
         .ruleset("expr"),
     );
+
+    if use_interval_analysis {
+        // ---- Interval analysis and interval-guarded simplifications ----
+        p.add_rule(
+            Rule::new()
+                .fact(peq(v("?e"), num(v("?n"))))
+                .set(interval_lower(v("?e")), v("?n"))
+                .set(interval_upper(v("?e")), v("?n"))
+                .ruleset("interval_expr")
+                .name("interval-num-exact"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), add(v("?a"), v("?b"))),
+                    peq(v("?lo_a"), interval_lower(v("?a"))),
+                    peq(v("?lo_b"), interval_lower(v("?b"))),
+                    peq(v("?sum"), padd(v("?lo_a"), v("?lo_b"))),
+                ])
+                .set(interval_lower(v("?e")), v("?sum"))
+                .when(vec![
+                    pgte(v("?lo_a"), i64(0)),
+                    pgte(v("?lo_b"), i64(0)),
+                    pgte(psub(i64(i64::MAX), v("?lo_b")), v("?lo_a")),
+                ])
+                .ruleset("interval_expr")
+                .name("interval-add-lower-nonnegative"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), add(v("?a"), v("?b"))),
+                    peq(v("?hi_a"), interval_upper(v("?a"))),
+                    peq(v("?hi_b"), interval_upper(v("?b"))),
+                    peq(v("?sum"), padd(v("?hi_a"), v("?hi_b"))),
+                ])
+                .set(interval_upper(v("?e")), v("?sum"))
+                .when(vec![
+                    plt(v("?hi_a"), i64(i64::MAX)),
+                    plt(v("?hi_b"), i64(i64::MAX)),
+                    pgte(psub(i64(i64::MAX), v("?hi_b")), v("?hi_a")),
+                ])
+                .ruleset("interval_expr")
+                .name("interval-add-upper-finite"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), min(v("?a"), v("?b"))),
+                    peq(v("?lo_a"), interval_lower(v("?a"))),
+                    peq(v("?lo_b"), interval_lower(v("?b"))),
+                ])
+                .set(interval_lower(v("?e")), pmin(v("?lo_a"), v("?lo_b")))
+                .ruleset("interval_expr")
+                .name("interval-min-lower"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), min(v("?a"), v("?b"))),
+                    peq(v("?hi_a"), interval_upper(v("?a"))),
+                    peq(v("?hi_b"), interval_upper(v("?b"))),
+                ])
+                .set(interval_upper(v("?e")), pmin(v("?hi_a"), v("?hi_b")))
+                .ruleset("interval_expr")
+                .name("interval-min-upper"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), max(v("?a"), v("?b"))),
+                    peq(v("?lo_a"), interval_lower(v("?a"))),
+                    peq(v("?lo_b"), interval_lower(v("?b"))),
+                ])
+                .set(interval_lower(v("?e")), pmax(v("?lo_a"), v("?lo_b")))
+                .ruleset("interval_expr")
+                .name("interval-max-lower"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), max(v("?a"), v("?b"))),
+                    peq(v("?hi_a"), interval_upper(v("?a"))),
+                    peq(v("?hi_b"), interval_upper(v("?b"))),
+                ])
+                .set(interval_upper(v("?e")), pmax(v("?hi_a"), v("?hi_b")))
+                .ruleset("interval_expr")
+                .name("interval-max-upper"),
+        );
+        p.add_rule(
+            rewrite("interval-lt-true", lt(v("?x"), num(v("?n"))), num(i64(1)))
+                .when(vec![
+                    peq(v("?hi"), interval_upper(v("?x"))),
+                    plt(v("?hi"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite("interval-lt-false", lt(v("?x"), num(v("?n"))), num(i64(0)))
+                .when(vec![
+                    peq(v("?lo"), interval_lower(v("?x"))),
+                    pgte(v("?lo"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite("interval-gte-true", gte(v("?x"), num(v("?n"))), num(i64(1)))
+                .when(vec![
+                    peq(v("?lo"), interval_lower(v("?x"))),
+                    pgte(v("?lo"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-gte-false",
+                gte(v("?x"), num(v("?n"))),
+                num(i64(0)),
+            )
+            .when(vec![
+                peq(v("?hi"), interval_upper(v("?x"))),
+                plt(v("?hi"), v("?n")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-min-right-identity",
+                min(v("?x"), num(v("?n"))),
+                v("?x"),
+            )
+            .when(vec![
+                peq(v("?hi"), interval_upper(v("?x"))),
+                pgte(v("?n"), v("?hi")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-max-right-identity",
+                max(v("?x"), num(v("?n"))),
+                v("?x"),
+            )
+            .when(vec![
+                peq(v("?lo"), interval_lower(v("?x"))),
+                pgte(v("?lo"), v("?n")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite("interval-mod-small", modd(v("?x"), num(v("?n"))), v("?x"))
+                .when(vec![
+                    pgte(v("?n"), i64(1)),
+                    peq(v("?lo"), interval_lower(v("?x"))),
+                    peq(v("?hi"), interval_upper(v("?x"))),
+                    pgte(v("?lo"), i64(0)),
+                    plt(v("?hi"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-div-small",
+                div(v("?x"), num(v("?n"))),
+                num(i64(0)),
+            )
+            .when(vec![
+                pgte(v("?n"), i64(1)),
+                peq(v("?lo"), interval_lower(v("?x"))),
+                peq(v("?hi"), interval_upper(v("?x"))),
+                pgte(v("?lo"), i64(0)),
+                plt(v("?hi"), v("?n")),
+            ])
+            .ruleset("interval_expr"),
+        );
+    }
 
     // `div-div`, restricted to nested constant divisors only. The original
     // unconstrained form `(a/b)/c → a/(b*c)` produces a new `div` whose

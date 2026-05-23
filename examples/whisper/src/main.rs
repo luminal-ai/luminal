@@ -63,9 +63,18 @@ fn main() {
         k_out.output();
         v_out.output();
     }
+    let prompt: Vec<u32> = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
+    let max_prefill = prompt.len().max(2);
+    let build_options = CompileOptions::default().dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(max_prefill),
+        ],
+    );
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(build_options);
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
@@ -82,22 +91,12 @@ fn main() {
     // Set the mel spectrogram once.
     runtime.set_data(mel_tensor, mel_data.clone());
 
-    let prompt: Vec<u32> = vec![TOKEN_SOT, TOKEN_NO_TIMESTAMPS];
-
     println!("Compiling...");
-    let max_prefill = prompt.len().max(2);
-    cx.set_dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(max_prefill),
-        ],
-    );
     cx.set_dim('s', max_prefill);
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1i32; max_prefill]);
     runtime.set_data(pos_ids, (0..max_prefill as i32).collect::<Vec<_>>());
-    runtime = cx.search(runtime, search_graphs);
+    runtime = cx.search(runtime, CompileOptions::new(search_graphs));
 
     // Reset the KV caches and re-set the mel after search (which executes test runs).
     for i in 0..N_TEXT_LAYER {

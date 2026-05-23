@@ -83,13 +83,13 @@ fn run_reference_attention(
     let (mut cx, q_t, k_t, v_t, out_t) = build_attention_graph();
     cx.set_dim('s', batch_size);
     cx.set_dim('c', context_len);
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let mut rt = CudaRuntime::initialize(stream.clone());
     rt.set_data(q_t, q.to_vec());
     rt.set_data(k_t, k.to_vec());
     rt.set_data(v_t, v.to_vec());
-    rt = cx.search(rt, 3);
+    rt = cx.search(rt, CompileOptions::new(3));
 
     rt.set_data(q_t, q.to_vec());
     rt.set_data(k_t, k.to_vec());
@@ -779,7 +779,7 @@ fn flashinfer_extraction_reachable_from_search_space() {
     cx.set_dim('s', 1usize);
     cx.set_dim('c', 16usize);
     cx.set_dim('r', 2usize);
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let egraph = cx
         .egraph()

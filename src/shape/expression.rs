@@ -20,12 +20,48 @@ type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
 
 pub static EXPR_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
 static SIMPLIFY_CACHE: OnceLock<Mutex<LruCache<Expression, Expression>>> = OnceLock::new();
+static INTERVAL_SIMPLIFY_CACHE: OnceLock<Mutex<LruCache<IntervalSimplifyKey, Expression>>> =
+    OnceLock::new();
 static EXPRESSION_INTERNER: OnceLock<RwLock<FxHashMap<Vec<Term>, ExprBox>>> = OnceLock::new();
 
 const MAX_CACHED_SIMPLIFICATIONS: usize = 10_000;
 
 pub fn expr(e: impl Into<Expression>) -> Expression {
     e.into()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DimInterval {
+    pub min: i64,
+    pub max: i64,
+}
+
+impl DimInterval {
+    pub fn new(min: i64, max: i64) -> Self {
+        assert!(min <= max, "DimInterval min ({min}) must be <= max ({max})");
+        Self { min, max }
+    }
+
+    pub fn unbounded() -> Self {
+        Self {
+            min: 0,
+            max: i64::MAX,
+        }
+    }
+}
+
+pub type DynDimIntervals = FxHashMap<char, DimInterval>;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct IntervalSimplifyKey {
+    expr: Expression,
+    intervals: Vec<(char, DimInterval)>,
+}
+
+fn canonical_intervals(intervals: &DynDimIntervals) -> Vec<(char, DimInterval)> {
+    let mut intervals = intervals.iter().map(|(&c, &i)| (c, i)).collect::<Vec<_>>();
+    intervals.sort_by_key(|(c, _)| *c);
+    intervals
 }
 
 #[derive(Copy, Clone)]
@@ -92,6 +128,9 @@ impl Expression {
         }
         // Also clear the simplify cache since it contains Expression keys
         if let Some(cache) = SIMPLIFY_CACHE.get() {
+            cache.lock().unwrap().clear();
+        }
+        if let Some(cache) = INTERVAL_SIMPLIFY_CACHE.get() {
             cache.lock().unwrap().clear();
         }
     }
@@ -384,6 +423,19 @@ impl Expression {
         }
 
         egglog_simplify(self)
+    }
+
+    /// Simplify the expression under dynamic-dimension interval assumptions.
+    ///
+    /// Rewrites using these bounds are only valid for assignments inside the
+    /// provided intervals, so this uses a cache distinct from unconstrained
+    /// simplification.
+    #[tracing::instrument(skip_all)]
+    pub fn simplify_with_intervals(self, intervals: &DynDimIntervals) -> Self {
+        if intervals.is_empty() {
+            return self.simplify();
+        }
+        egglog_simplify_with_intervals(self, intervals)
     }
     pub fn as_num(&self) -> Option<i64> {
         if let Term::Num(n) = self.terms.read()[0] {
@@ -1140,6 +1192,58 @@ fn egglog_simplify(e: Expression) -> Expression {
     simplified
 }
 
+#[tracing::instrument(skip_all)]
+fn egglog_simplify_with_intervals(e: Expression, intervals: &DynDimIntervals) -> Expression {
+    let key = IntervalSimplifyKey {
+        expr: e,
+        intervals: canonical_intervals(intervals),
+    };
+    let cache = INTERVAL_SIMPLIFY_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::<IntervalSimplifyKey, Expression>::new(
+            NonZeroUsize::new(MAX_CACHED_SIMPLIFICATIONS).unwrap(),
+        ))
+    });
+
+    if let Some(out) = cache.lock().unwrap().get(&key).copied() {
+        return out;
+    }
+
+    let expr = e.to_egglog();
+    let interval_facts =
+        egglog_utils::base::interval_facts_egglog(intervals, e.dyn_vars().into_iter());
+    let mut program = String::new();
+    program.push_str(&egglog_utils::base::base_expression_egglog_with_intervals());
+    program.push('\n');
+    program.push_str(&egglog_utils::base::base_cleanup_egglog());
+    program.push('\n');
+    program.push_str(&interval_facts);
+    program.push('\n');
+    program.push_str(&format!("(let expr_root {expr})\n"));
+    program.push_str(
+        "(run-schedule
+            (repeat 5 (seq expr interval_expr))
+            (saturate base_cleanup)
+            (saturate cleanup)
+        )",
+    );
+    let mut egraph = egglog::EGraph::default();
+    let commands = egraph
+        .parser
+        .get_program_from_string(None, &program)
+        .unwrap();
+    egraph.run_program(commands).unwrap();
+    let (sort, value) = egraph.eval_expr(&var!("expr_root")).unwrap();
+    let serialized = SerializedEGraph::new(&egraph, vec![(sort, value)]);
+    let simplified = serialized.eclasses[serialized.roots.first().unwrap()]
+        .1
+        .iter()
+        .map(|root| extract_expr(&serialized, root, &mut FxHashMap::default()).unwrap_or(e))
+        .min_by_key(|e| e.len())
+        .unwrap();
+    cache.lock().unwrap().push(key, simplified);
+    simplified
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,6 +1298,27 @@ mod tests {
             (((z * 6 + 5) / 6) * 6 + ((z * 6 + 5) % 6)).simplify(),
             z * 6 + 5
         );
+    }
+
+    #[test]
+    fn test_interval_simplifications() {
+        let s = expr('s');
+        let intervals = [('s', DimInterval::new(0, 127))].into_iter().collect();
+
+        assert_eq!((s % 128).simplify_with_intervals(&intervals), s);
+        assert_eq!((s / 128).simplify_with_intervals(&intervals), expr(0));
+        assert_eq!(s.lt(128).simplify_with_intervals(&intervals), expr(1));
+        assert_eq!(s.gte(128).simplify_with_intervals(&intervals), expr(0));
+        assert_eq!(s.min(128).simplify_with_intervals(&intervals), s);
+    }
+
+    #[test]
+    fn test_interval_simplification_requires_proof() {
+        let s = expr('s');
+        let intervals = [('s', DimInterval::new(0, 256))].into_iter().collect();
+
+        assert_ne!((s % 128).simplify_with_intervals(&intervals), s);
+        assert_ne!(s.lt(128).simplify_with_intervals(&intervals), expr(1));
     }
 
     #[test]

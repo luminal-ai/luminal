@@ -13,7 +13,7 @@ use petgraph::stable_graph::NodeIndex;
 use rustc_hash::FxHashMap;
 
 use crate::dtype::DType;
-use crate::graph::Graph;
+use crate::graph::{CompileOptions, Graph};
 use crate::hlir::{NativeData, NativeRuntime, Output};
 use crate::op::Runtime;
 
@@ -133,7 +133,7 @@ pub fn compile_backend<Rt: Runtime + 'static>(
     // survives cross-binary type identity mismatches with external plugins).
     let label_map = build_label_map(graph);
 
-    graph.build_search_space::<Rt>();
+    graph.build_search_space::<Rt>(CompileOptions::default());
 
     let mut rt = init()?;
 
@@ -162,7 +162,7 @@ pub fn compile_backend<Rt: Runtime + 'static>(
     }
 
     // Search
-    let mut rt = graph.search(rt, args.search_iters);
+    let mut rt = graph.search(rt, CompileOptions::new(args.search_iters));
 
     // Rebuild label map after search (graph may have changed)
     let label_map = build_label_map(graph);

@@ -132,7 +132,7 @@ fn conv2d_matmul_without_conv_output_shape(
 #[test]
 fn generic_conv2d_rewrite_matches_unfold_matmul_bias() {
     let (mut cx, _, _, _, _) = build_conv_graph();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
@@ -148,7 +148,7 @@ fn generic_conv2d_rewrite_matches_unfold_matmul_bias() {
 #[test]
 fn generic_conv2d_rewrite_matches_conv1x1_matmul_bias() {
     let (mut cx, _, _, _, _) = build_conv1x1_graph();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
@@ -165,7 +165,7 @@ fn generic_conv2d_rewrite_requires_conv_output_shape() {
     let bias = cx.tensor(3usize);
     conv2d_matmul_without_conv_output_shape(x, weight, bias, 3, 2).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("search space should have an e-graph");
 
     assert!(
@@ -181,7 +181,7 @@ fn generic_conv2d_candidate_executes_unfold_matmul_bias() {
     };
 
     let (mut cx, x, weight, bias, out) = build_conv_graph();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let llir = extract_forced_kernel_llir(&mut cx, "GenericConv2D");
 
     let input: Vec<f32> = (0..2 * 5 * 6).map(|i| i as f32 * 0.03 - 0.4).collect();
@@ -222,7 +222,7 @@ fn generic_conv2d_candidate_executes_conv1x1_matmul_bias() {
     };
 
     let (mut cx, x, weight, bias, out) = build_conv1x1_graph();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let llir = extract_forced_kernel_llir(&mut cx, "GenericConv2D");
 
     let input: Vec<f32> = (0..2 * 4 * 5).map(|i| i as f32 * 0.07 - 1.0).collect();
@@ -261,7 +261,7 @@ fn generic_conv2d_candidate_executes_padded_unfold_matmul_bias() {
     };
 
     let (mut cx, x, weight, bias, out) = build_padded_conv_graph();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let llir = extract_forced_kernel_llir(&mut cx, "GenericConv2D");
 
     let input: Vec<f32> = (0..2 * 4 * 5).map(|i| i as f32 * 0.05 - 0.5).collect();
@@ -302,7 +302,7 @@ fn generic_conv2d_candidate_executes_upsample_view_input() {
     };
 
     let (mut cx, x, weight, bias, out) = build_upsample_conv_graph();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let llir = extract_forced_kernel_llir(&mut cx, "GenericConv2D");
 
     let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 * 0.09 - 0.8).collect();

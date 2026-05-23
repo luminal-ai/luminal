@@ -293,7 +293,7 @@ struct FusedRegion {
 /// Helper: collect every distinct fused region reachable across many random
 /// extractions of the search space.
 fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("egraph not built");
     let ops = cx.egglog_ops().expect("ops not built");
     let custom_ops = &cx.custom_ops;

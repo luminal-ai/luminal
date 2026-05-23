@@ -83,7 +83,7 @@ fn fuzz_mlp(seq: usize, hidden: usize, intermediate: usize, seed: u64) {
     let w_down = cx.tensor((hidden, intermediate));
     let out = swiglu_mlp(input, w_gate, w_up, w_down).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
 
     let input_data = random_f32_vec(seq * hidden, seed, -0.5, 0.5);
@@ -95,7 +95,7 @@ fn fuzz_mlp(seq: usize, hidden: usize, intermediate: usize, seed: u64) {
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::new(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -143,7 +143,7 @@ fn fuzz_norm_proj(seq: usize, hidden: usize, proj_dim: usize, eps: f32, seed: u6
     let proj_w = cx.tensor((proj_dim, hidden));
     let out = rms_norm(input, norm_w, eps).matmul(proj_w.t()).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
 
     let input_data = random_f32_vec(seq * hidden, seed, -0.5, 0.5);
@@ -156,7 +156,7 @@ fn fuzz_norm_proj(seq: usize, hidden: usize, proj_dim: usize, eps: f32, seed: u6
     rt.set_data(input, input_data.clone());
     rt.set_data(norm_w, norm_data.clone());
     rt.set_data(proj_w, proj_data.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::new(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -219,7 +219,7 @@ fn fuzz_layer_no_attn(
     let mlp_out = swiglu_mlp(mlp_normed, w_gate, w_up, w_down);
     let out = (x + mlp_out).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
 
     let input_data = random_f32_vec(seq * hidden, seed, -0.5, 0.5);
@@ -245,7 +245,7 @@ fn fuzz_layer_no_attn(
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::new(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -318,7 +318,7 @@ fn fuzz_mlp_hlir_only(seq: usize, hidden: usize, intermediate: usize, seed: u64)
     let w_down = cx.tensor((hidden, intermediate));
     let out = swiglu_mlp(input, w_gate, w_up, w_down).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
 
     let input_data = random_f32_vec(seq * hidden, seed, -0.5, 0.5);
@@ -330,7 +330,7 @@ fn fuzz_mlp_hlir_only(seq: usize, hidden: usize, intermediate: usize, seed: u64)
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::new(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -481,7 +481,7 @@ mod gemma {
         let mlp_normed = rms_norm(mlp_out, post_ff_norm_w, EPS);
         let out = (x + mlp_normed).output();
 
-        cx.build_search_space::<CudaRuntime>();
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut rt = CudaRuntime::initialize(stream.clone());
 
         let seed = 800u64;
@@ -518,7 +518,7 @@ mod gemma {
         rt.set_data(w_gate, gate_data.clone());
         rt.set_data(w_up, up_data.clone());
         rt.set_data(w_down, down_data.clone());
-        rt = cx.search(rt, 5);
+        rt = cx.search(rt, CompileOptions::new(5));
         rt.execute(&cx.dyn_map);
         let result = rt.get_f32(out);
 
@@ -641,7 +641,7 @@ mod qwen {
         let embedding = cx.tensor((VOCAB, HIDDEN));
         let out = rms_norm(input, norm_w, EPS).matmul(embedding.t()).output();
 
-        cx.build_search_space::<CudaRuntime>();
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut rt = CudaRuntime::initialize(stream.clone());
 
         let seed = 1300u64;
@@ -655,7 +655,7 @@ mod qwen {
         rt.set_data(input, input_data.clone());
         rt.set_data(norm_w, norm_data.clone());
         rt.set_data(embedding, emb_data.clone());
-        rt = cx.search(rt, 5);
+        rt = cx.search(rt, CompileOptions::new(5));
         rt.execute(&cx.dyn_map);
         let result = rt.get_f32(out);
 

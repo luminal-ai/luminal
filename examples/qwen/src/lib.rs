@@ -147,26 +147,11 @@ where
         k_out.output();
         v_out.output();
     }
-
-    println!("Building E-Graph...");
-    cx.build_search_space::<R>();
-
-    println!("Loading weights...");
-    let weights_path = model_dir.join("model_combined.safetensors");
-    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
-
-    let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
-    for i in 0..config.layers {
-        runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
-    }
-
-    println!("Compiling...");
     let max_prefill = (prompt_tokens.len() + 16)
         .next_power_of_two()
         .min(config.max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    cx.set_dim_buckets(
+    let mut compile_options = CompileOptions::default().dim_buckets(
         's',
         &[
             DimBucket::new(1, 1),
@@ -183,12 +168,27 @@ where
             DimBucket::new(1, max_decode_p).representative(decode_p_representative),
         ]
     };
-    cx.set_dim_buckets('p', &p_buckets);
+    compile_options = compile_options.dim_buckets('p', &p_buckets);
+
+    println!("Building E-Graph...");
+    cx.build_search_space::<R>(compile_options);
+
+    println!("Loading weights...");
+    let weights_path = model_dir.join("model_combined.safetensors");
+    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+
+    let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
+    for i in 0..config.layers {
+        runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
+        runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
+    }
+
+    println!("Compiling...");
     cx.set_dim('s', search_s);
     cx.set_dim('p', 0);
     runtime.set_i32_data(input.id, vec![1; search_s]);
     runtime.set_i32_data(token_ids.id, (0..search_s as i32).collect::<Vec<_>>());
-    runtime = cx.search(runtime, config.search_graphs);
+    runtime = cx.search(runtime, CompileOptions::new(config.search_graphs));
 
     for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);

@@ -235,18 +235,26 @@ fn egglog_ruleset_declarations() -> String {
         .join("\n")
 }
 
-fn egglog_main_cycle_phases(cycle: usize) -> Vec<EgglogSchedulePhase> {
+fn expr_schedule(use_interval_analysis: bool) -> &'static str {
+    if use_interval_analysis {
+        "(saturate (seq expr interval_expr))"
+    } else {
+        "(saturate expr)"
+    }
+}
+
+fn egglog_main_cycle_phases(cycle: usize, use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
     vec![EgglogSchedulePhase {
         name: format!("cycle {cycle:03} main"),
-        schedule: egglog_main_schedule(),
+        schedule: egglog_main_schedule(use_interval_analysis),
     }]
 }
 
-fn egglog_final_phases() -> Vec<EgglogSchedulePhase> {
+fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
     vec![
         EgglogSchedulePhase {
             name: "final expr".to_string(),
-            schedule: "(saturate expr)".to_string(),
+            schedule: expr_schedule(use_interval_analysis).to_string(),
         },
         EgglogSchedulePhase {
             name: "cleanup".to_string(),
@@ -263,14 +271,16 @@ fn egglog_final_phases() -> Vec<EgglogSchedulePhase> {
     ]
 }
 
-fn egglog_main_schedule() -> String {
+fn egglog_main_schedule(use_interval_analysis: bool) -> String {
+    let expr = expr_schedule(use_interval_analysis);
     // Producer rules create raw alternatives that downstream fusion consumes.
     // Fusion grow/merge only consumes Kernel*/FusionEnd alternatives, so keeping
     // producer discovery saturated before fusion reaches the same fixed point
     // while avoiding repeated expensive pair-discovery scans during growth.
-    "(saturate (seq
+    format!(
+        "(saturate (seq
         (saturate (seq
-            (saturate expr)
+            {expr}
             (saturate dtype_prop)
             (run matmul_flatten)
             (run kernel_lower)
@@ -282,19 +292,19 @@ fn egglog_main_schedule() -> String {
             (run fusion_pair)
         ))
         (saturate (seq
-            (saturate expr)
+            {expr}
             (saturate dtype_prop)
             (run fusion_grow)
             (run fusion_merge)
         ))
     ))"
-    .to_string()
+    )
 }
 
 fn egglog_schedule_program() -> String {
-    let mut schedules = vec![format!("(run-schedule {})", egglog_main_schedule())];
+    let mut schedules = vec![format!("(run-schedule {})", egglog_main_schedule(false))];
     schedules.extend(
-        egglog_final_phases()
+        egglog_final_phases(false)
             .into_iter()
             .map(|phase| format!("(run-schedule {})", phase.schedule)),
     );
@@ -302,9 +312,22 @@ fn egglog_schedule_program() -> String {
 }
 
 fn egglog_setup_with(program: &str, parts: &OpTextParts) -> String {
+    egglog_setup_with_options(program, parts, false)
+}
+
+fn egglog_setup_with_options(
+    program: &str,
+    parts: &OpTextParts,
+    use_interval_analysis: bool,
+) -> String {
+    let base_program = if use_interval_analysis {
+        base::base_expression_egglog_with_intervals()
+    } else {
+        base::base_expression_egglog()
+    };
     [
         egglog_ruleset_declarations(),
-        base::base_expression_egglog(),
+        base_program,
         parts.op_defs.clone(),
         parts.cleanups.clone(),
         base::base_cleanup_egglog(),
@@ -1130,6 +1153,19 @@ pub fn run_egglog_with_report_and_late_passes(
     run_egglog_with_report_parts(program, root, &op_parts)
 }
 
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with_report_late_passes_and_interval_analysis(
+    program: &str,
+    root: &str,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+    cleanup: bool,
+    late_passes: &[LateEgglogPass],
+    use_interval_analysis: bool,
+) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    let op_parts = OpTextParts::new_with_late_passes(ops, cleanup, late_passes);
+    run_egglog_with_report_parts_impl(program, root, &op_parts, use_interval_analysis)
+}
+
 /// Same as [`run_egglog_with_report`], but takes pre-computed [`OpTextParts`].
 /// Useful when a caller runs many egglog invocations with the same op set
 /// and wants to factor the op-derived text work out of a parallel loop.
@@ -1139,6 +1175,15 @@ pub fn run_egglog_with_report_parts(
     program: &str,
     root: &str,
     op_parts: &OpTextParts,
+) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    run_egglog_with_report_parts_impl(program, root, op_parts, false)
+}
+
+fn run_egglog_with_report_parts_impl(
+    program: &str,
+    root: &str,
+    op_parts: &OpTextParts,
+    use_interval_analysis: bool,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
     #[cfg(debug_assertions)]
     {
@@ -1158,7 +1203,7 @@ pub fn run_egglog_with_report_parts(
 
     let full_start = std::time::Instant::now();
     let setup_text_start = std::time::Instant::now();
-    let setup_code = egglog_setup_with(program, op_parts);
+    let setup_code = egglog_setup_with_options(program, op_parts, use_interval_analysis);
     let setup_text_elapsed = setup_text_start.elapsed();
     let setup_lines = setup_code.lines().count();
     let mut egraph = egglog::EGraph::default();
@@ -1197,7 +1242,7 @@ pub fn run_egglog_with_report_parts(
     let mut reached_fixed_point = false;
     for cycle in 1..=MAIN_SCHEDULE_MAX_CYCLES {
         let mut cycle_updated = false;
-        for phase in egglog_main_cycle_phases(cycle) {
+        for phase in egglog_main_cycle_phases(cycle, use_interval_analysis) {
             cycle_updated |= run_schedule_phase(&mut egraph, &mut phases, &phase)?;
         }
         if egraph.num_tuples() > MAIN_SCHEDULE_MAX_TUPLES {
@@ -1217,7 +1262,7 @@ pub fn run_egglog_with_report_parts(
             "egglog saturation did not reach a fixed point within {MAIN_SCHEDULE_MAX_CYCLES} cycles"
         )));
     }
-    for phase in egglog_final_phases() {
+    for phase in egglog_final_phases(use_interval_analysis) {
         run_schedule_phase(&mut egraph, &mut phases, &phase)?;
     }
     for phase in &op_parts.late_phases {
@@ -1430,6 +1475,26 @@ pub fn run_egglog_with_late_passes(
 ) -> Result<SerializedEGraph, egglog::Error> {
     run_egglog_with_report_and_late_passes(program, root, ops, cleanup, late_passes)
         .map(|(egraph, _)| egraph)
+}
+
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with_late_passes_and_interval_analysis(
+    program: &str,
+    root: &str,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+    cleanup: bool,
+    late_passes: &[LateEgglogPass],
+    use_interval_analysis: bool,
+) -> Result<SerializedEGraph, egglog::Error> {
+    run_egglog_with_report_late_passes_and_interval_analysis(
+        program,
+        root,
+        ops,
+        cleanup,
+        late_passes,
+        use_interval_analysis,
+    )
+    .map(|(egraph, _)| egraph)
 }
 
 /// Same as [`run_egglog`] but takes pre-computed [`OpTextParts`], so the

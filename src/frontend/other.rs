@@ -125,8 +125,8 @@ mod tests {
         let mut cx = Graph::new();
         let b = func(&mut cx).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         rt.execute(&cx.dyn_map);
 
@@ -210,8 +210,8 @@ mod tests {
         let c = cx.tensor((2, 3));
         let stacked = cx.stack(&[a, b, c], 0).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         let a_data = random_vec(6);
         let b_data = random_vec(6);

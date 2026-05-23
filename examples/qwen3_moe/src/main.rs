@@ -50,9 +50,20 @@ fn main() {
         k_out.output();
         v_out.output();
     }
+    let max_prefill = (prompt_tokens.len() + 16)
+        .next_power_of_two()
+        .min(max_seq_len);
+    let search_s = 16.min(max_prefill).max(2);
+    let build_options = CompileOptions::default().dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(search_s),
+        ],
+    );
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(build_options);
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
@@ -66,23 +77,12 @@ fn main() {
     }
 
     println!("Compiling...");
-    let max_prefill = (prompt_tokens.len() + 16)
-        .next_power_of_two()
-        .min(max_seq_len);
-    let search_s = 16.min(max_prefill).max(2);
-    cx.set_dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(search_s),
-        ],
-    );
     cx.set_dim('s', search_s);
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    runtime = cx.search_options(runtime, SearchOptions::new(search_graphs), &mut rng);
+    runtime = cx.search_with_rng(runtime, CompileOptions::new(search_graphs), &mut rng);
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);

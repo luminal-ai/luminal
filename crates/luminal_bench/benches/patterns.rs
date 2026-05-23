@@ -41,7 +41,7 @@ struct PreparedBench {
 
 #[cfg(feature = "metal")]
 fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Option<PreparedBench> {
-    cx.build_search_space::<MetalRuntime>();
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
     let mut rt = MetalRuntime::initialize(());
 
     let mut rng = rand::rng();
@@ -50,7 +50,7 @@ fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Opt
         rt.set_data(*node, &data);
     }
 
-    let rt = cx.search(rt, 5);
+    let rt = cx.search(rt, CompileOptions::new(5));
 
     Some(PreparedBench {
         rt,

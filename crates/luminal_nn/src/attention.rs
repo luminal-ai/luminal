@@ -166,8 +166,8 @@ mod tests {
         let indices = cx.tensor(3).as_dtype(DType::Int);
         let result = gather_rows(data, indices, 3).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         // data = [[1,2,3], [4,5,6], [7,8,9], [10,11,12]]
         rt.set_data(
@@ -192,8 +192,8 @@ mod tests {
         let dest = cx.tensor((4, 3));
         let result = scatter_rows(src, indices, dest, 3).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         rt.set_data(src.id, vec![10., 20., 30., 40., 50., 60.]);
         rt.set_data(indices.id, vec![1, 3]);
@@ -218,8 +218,8 @@ mod tests {
         let updated_cache = scatter_rows(kv_new, scatter_idx, cache, 4);
         let gathered = gather_rows(updated_cache, gather_idx, 4).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         rt.set_data(kv_new.id, vec![1., 2., 3., 4., 5., 6., 7., 8.]);
         rt.set_data(scatter_idx.id, vec![1, 4]); // Write to slots 1 and 4
@@ -271,8 +271,8 @@ mod tests {
         let k_cache_new = k_cache_new.output();
         let v_cache_new = v_cache_new.output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         // Q = [1, 0, 1, 0] → head0=[1,0], head1=[1,0]
         rt.set_data(q.id, vec![1., 0., 1., 0.]);
@@ -344,8 +344,8 @@ mod tests {
         );
         let attn_out = attn_out.output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         // Setup: 1 cached token at slot 0, 1 new token written to slot 1
         // K cached at slot 0: [1, 0]
@@ -416,8 +416,8 @@ mod tests {
         );
         let attn_out = attn_out.output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         // Cache has 1 token at slot 0
         let mut k_cache_data = vec![0.; num_slots * kv_dim];

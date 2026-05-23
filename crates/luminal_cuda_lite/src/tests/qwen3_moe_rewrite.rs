@@ -208,11 +208,13 @@ fn run_qwen_moe(include_glumoe: bool) -> Vec<f32> {
     let mut model = build_qwen_moe_graph();
     model.graph.set_dim('s', SEQ);
     if include_glumoe {
-        model.graph.build_search_space::<CudaRuntime>();
+        model
+            .graph
+            .build_search_space::<CudaRuntime>(CompileOptions::default());
     } else {
         model
             .graph
-            .build_search_space_exclude_ops::<CudaRuntime, GLUMoE>();
+            .build_search_space_exclude_ops::<CudaRuntime, GLUMoE>(CompileOptions::default());
     }
 
     let x_data = random_f32_vec(SEQ * HIDDEN, 11, -0.15, 0.15);
@@ -231,7 +233,7 @@ fn run_qwen_moe(include_glumoe: bool) -> Vec<f32> {
     rt.set_data(model.router, router_data);
     rt.set_data(model.gate_up_weights, gate_up_data);
     rt.set_data(model.down_weights, down_data);
-    rt = model.graph.search(rt, 10);
+    rt = model.graph.search(rt, CompileOptions::new(10));
     rt.execute(&model.graph.dyn_map);
 
     rt.get_f32(model.output.id)
@@ -245,11 +247,13 @@ fn run_gemma_moe(include_glumoe: bool) -> Vec<f32> {
     let mut model = build_gemma_moe_graph();
     model.graph.set_dim('s', SEQ);
     if include_glumoe {
-        model.graph.build_search_space::<CudaRuntime>();
+        model
+            .graph
+            .build_search_space::<CudaRuntime>(CompileOptions::default());
     } else {
         model
             .graph
-            .build_search_space_exclude_ops::<CudaRuntime, GLUMoE>();
+            .build_search_space_exclude_ops::<CudaRuntime, GLUMoE>(CompileOptions::default());
     }
 
     let router_input_data = random_f32_vec(SEQ * HIDDEN, 21, -0.15, 0.15);
@@ -274,7 +278,7 @@ fn run_gemma_moe(include_glumoe: bool) -> Vec<f32> {
     rt.set_data(model.per_expert_scale, per_expert_scale_data);
     rt.set_data(model.gate_up_weights, gate_up_data);
     rt.set_data(model.down_weights, down_data);
-    rt = model.graph.search(rt, 10);
+    rt = model.graph.search(rt, CompileOptions::new(10));
     rt.execute(&model.graph.dyn_map);
 
     rt.get_f32(model.output.id)
@@ -288,7 +292,9 @@ fn test_glumoe_matches_qwen_swiglu_pattern() {
 
     let mut model = build_qwen_moe_graph();
     model.graph.set_dim('s', SEQ);
-    model.graph.build_search_space::<CudaRuntime>();
+    model
+        .graph
+        .build_search_space::<CudaRuntime>(CompileOptions::default());
     assert_glumoe_in_search_space(&model.graph);
 }
 
@@ -300,7 +306,9 @@ fn test_glumoe_matches_gemma_gelu_pattern() {
 
     let mut model = build_gemma_moe_graph();
     model.graph.set_dim('s', SEQ);
-    model.graph.build_search_space::<CudaRuntime>();
+    model
+        .graph
+        .build_search_space::<CudaRuntime>(CompileOptions::default());
     assert_glumoe_in_search_space(&model.graph);
 }
 

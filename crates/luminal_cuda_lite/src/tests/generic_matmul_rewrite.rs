@@ -24,7 +24,7 @@ fn generic_matmul_covers_noncontiguous_merged_head_projection() {
     let merged = attn.transpose(0, 1).merge_dims(1, 2);
     merged.matmul(weight.t()).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let llir = extract_forced_kernel_llir(&mut cx, "GenericMatmul");
     let names = llir_kernel_names(&llir);
 
@@ -52,7 +52,7 @@ fn generic_matmul_executes_noncontiguous_merged_head_projection() {
     let merged = attn.transpose(0, 1).merge_dims(1, 2);
     let output = merged.matmul(weight.t()).output();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let stream = get_cuda_stream().expect("CUDA device required for GenericMatmul execution test");
     let mut rt = CudaRuntime::initialize(stream);
 
@@ -61,7 +61,7 @@ fn generic_matmul_executes_noncontiguous_merged_head_projection() {
     rt.set_data(attn, attn_data.as_slice());
     rt.set_data(weight, weight_data.as_slice());
 
-    rt = cx.search(rt, 1);
+    rt = cx.search(rt, CompileOptions::new(1));
     assert!(
         rt.kernel_names().contains(&"GenericMatmul"),
         "expected GenericMatmul to be selected, kernels: {:?}",

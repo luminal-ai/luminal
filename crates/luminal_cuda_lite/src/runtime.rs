@@ -1307,7 +1307,7 @@ impl Runtime for CudaRuntime {
 
     fn late_egglog_passes(
         ops: &[Arc<Box<dyn luminal::op::EgglogOp>>],
-        options: &luminal::graph::BuildSearchSpaceOptions,
+        options: &luminal::graph::CompileOptions,
         dyn_map: &FxHashMap<char, usize>,
     ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
         vec![crate::memory_analysis::cuda_memory_analysis_pass(

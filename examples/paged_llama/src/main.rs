@@ -204,9 +204,20 @@ fn main() {
         k_out.output();
         v_out.output();
     }
+    // Bucket s=1 (decode) vs s>1 (prefill/mixed). Each bucket gets its own
+    // optimized compilation — decode can select warp-parallel kernels while
+    // prefill can select tiled matmul / cuBLAS.
+    let max_prefill = (tokens_a.len().max(tokens_b.len()) + 16).next_power_of_two();
+    let build_options = CompileOptions::default().dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(16),
+        ],
+    );
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(build_options);
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
@@ -220,18 +231,6 @@ fn main() {
     }
 
     println!("Compiling...");
-    // Bucket s=1 (decode) vs s>1 (prefill/mixed). Each bucket gets its own
-    // optimized compilation — decode can select warp-parallel kernels while
-    // prefill can select tiled matmul / cuBLAS.
-    let max_prefill = (tokens_a.len().max(tokens_b.len()) + 16).next_power_of_two();
-    cx.set_dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(16),
-        ],
-    );
-
     // Dummy data sized for the largest representative (s=16, c=16)
     let search_s = 16;
     let search_c = 16;
@@ -242,7 +241,7 @@ fn main() {
     runtime.set_data(scatter_idx_t, vec![0i32; search_s]);
     runtime.set_data(gather_idx_t, vec![0i32; search_c]);
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
-    runtime = cx.search(runtime, search_graphs);
+    runtime = cx.search(runtime, CompileOptions::new(search_graphs));
 
     // Re-initialize KV cache after search (search consumes buffers)
     let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();

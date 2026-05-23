@@ -41,7 +41,7 @@ mod metal_backend {
         const NAME: &'static str = "Metal";
 
         fn build_search_space(cx: &mut Graph) {
-            cx.build_search_space::<MetalRuntime>();
+            cx.build_search_space::<MetalRuntime>(CompileOptions::default());
         }
     }
 }

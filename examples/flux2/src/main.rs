@@ -37,7 +37,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::time::Instant;
 
-use luminal::graph::BuildSearchSpaceOptions;
+use luminal::graph::CompileOptions;
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -159,11 +159,9 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
         s.parse::<usize>()
             .map_err(|_| std::env::VarError::NotPresent)
     }) {
-        cx.build_search_space_with_options::<CudaRuntime>(
-            BuildSearchSpaceOptions::new().max_memory_gib(g),
-        );
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default().max_memory_gib(g));
     } else {
-        cx.build_search_space::<CudaRuntime>();
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     }
 
     let ctx = CudaContext::new(0).unwrap();
@@ -189,7 +187,7 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
 
     println!("Compiling text encoder...");
     let t0 = Instant::now();
-    runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
+    runtime = cx.search(runtime, CompileOptions::new(env_usize("SEARCH_ITERS", 5)));
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
     println!("Encoding prompt...");
@@ -301,11 +299,9 @@ fn run_full_pipeline(
         s.parse::<usize>()
             .map_err(|_| std::env::VarError::NotPresent)
     }) {
-        cx.build_search_space_with_options::<CudaRuntime>(
-            BuildSearchSpaceOptions::new().max_memory_gib(g),
-        );
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default().max_memory_gib(g));
     } else {
-        cx.build_search_space::<CudaRuntime>();
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     }
 
     let ctx = CudaContext::new(0).unwrap();
@@ -349,10 +345,10 @@ fn run_full_pipeline(
     {
         use rand::SeedableRng;
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-        let opts = luminal::graph::SearchOptions::new(env_usize("SEARCH_ITERS", 5));
-        runtime = cx.search_options(runtime, opts, &mut rng);
+        let opts = luminal::graph::CompileOptions::new(env_usize("SEARCH_ITERS", 5));
+        runtime = cx.search_with_rng(runtime, opts, &mut rng);
     } else {
-        runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
+        runtime = cx.search(runtime, CompileOptions::new(env_usize("SEARCH_ITERS", 5)));
     }
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
@@ -409,11 +405,9 @@ fn run_full_pipeline(
         s.parse::<usize>()
             .map_err(|_| std::env::VarError::NotPresent)
     }) {
-        cx.build_search_space_with_options::<CudaRuntime>(
-            BuildSearchSpaceOptions::new().max_memory_gib(g),
-        );
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default().max_memory_gib(g));
     } else {
-        cx.build_search_space::<CudaRuntime>();
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     }
 
     let ctx = CudaContext::new(0).unwrap();
@@ -421,7 +415,7 @@ fn run_full_pipeline(
     let mut runtime = CudaRuntime::initialize(stream);
     runtime.load_safetensors(&cx, vae_path.to_str().unwrap());
     runtime.set_data(latent_in, vae_input);
-    runtime = cx.search(runtime, env_usize("SEARCH_ITERS", 5));
+    runtime = cx.search(runtime, CompileOptions::new(env_usize("SEARCH_ITERS", 5)));
     runtime.execute(&cx.dyn_map);
     let img = runtime.get_f32(out);
     // VaeDecoder output is in roughly [-1, 1] range. Diffusers'

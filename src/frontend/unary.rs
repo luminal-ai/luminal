@@ -492,8 +492,8 @@ pub(super) mod tests {
         let a = cx.tensor(shape.clone());
         let b = func(a).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
 
         let v = random_vec(shape.iter().copied().product());
         rt.set_data(a.id, v.clone());

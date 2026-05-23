@@ -1,5 +1,8 @@
 use cudarc::driver::CudaContext;
-use luminal::{graph::Graph, op::Runtime};
+use luminal::{
+    graph::{CompileOptions, Graph},
+    op::Runtime,
+};
 
 use crate::{kernel::apply_rope, runtime::CudaRuntime};
 
@@ -42,12 +45,12 @@ fn rope_matches_cpu_reference() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
     let stream = ctx.default_stream();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream);
     rt.set_data(x, x_data.clone());
     rt.set_data(cos, cos_data.clone());
     rt.set_data(sin, sin_data.clone());
-    rt = cx.search(rt, 1);
+    rt = cx.search(rt, CompileOptions::new(1));
     rt.execute(&cx.dyn_map);
     let got = rt.get_f32(y.id);
 
@@ -90,12 +93,12 @@ fn rope_flux2_shape() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
     let stream = ctx.default_stream();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream);
     rt.set_data(x, x_data.clone());
     rt.set_data(cos, cos_data.clone());
     rt.set_data(sin, sin_data.clone());
-    rt = cx.search(rt, 1);
+    rt = cx.search(rt, CompileOptions::new(1));
     rt.execute(&cx.dyn_map);
     let got = rt.get_f32(y.id);
 

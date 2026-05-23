@@ -39,7 +39,7 @@ fn run_metal_pattern_benchmark(
         let mut cx = Graph::default();
         pattern.build_graph(&mut cx, *size);
 
-        cx.build_search_space::<MetalRuntime>();
+        cx.build_search_space::<MetalRuntime>(CompileOptions::default());
         let mut rt = MetalRuntime::initialize(());
 
         let mut rng = rand::rng();
@@ -50,7 +50,7 @@ fn run_metal_pattern_benchmark(
             }
         }
 
-        let mut rt = cx.search(rt, 5);
+        let mut rt = cx.search(rt, CompileOptions::new(5));
         rt.allocate_intermediate_buffers(&cx.dyn_map);
 
         let mut bench_metrics = None;

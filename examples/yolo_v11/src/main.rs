@@ -318,7 +318,7 @@ fn main() {
 
     println!("Building E-Graph...");
     let t0 = Instant::now();
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     println!("  built E-Graph in {:?}", t0.elapsed());
 
     println!("Loading weights...");
@@ -335,7 +335,7 @@ fn main() {
 
     println!("Compiling (search_graphs={search_graphs})...");
     let t0 = Instant::now();
-    runtime = cx.search(runtime, search_graphs);
+    runtime = cx.search(runtime, CompileOptions::new(search_graphs));
     println!("  search took {:?}", t0.elapsed());
 
     // Re-set anchors/strides/dfl/img after search (search may consume the inputs)
