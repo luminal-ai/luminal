@@ -55,7 +55,7 @@ pub type MetalOps = (
 );
 
 fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
-    let options = metal::CompileOptions::default();
+    let options = metal::CompileOptions::new();
     options.set_language_version(MTLLanguageVersion::V2_4);
     let library = device
         .new_library_with_source(source, &options)
