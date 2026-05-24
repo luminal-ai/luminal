@@ -4,7 +4,7 @@ use super::{CpuKernelOp, CpuSumReduceInfo, CpuMulInfo};
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, app, eq, rule, sort, union, v}, base::{ELIST, EXPRESSION, F64, IR, SORTS, dtype, new_op_call, op_term}
+        SerializedEGraph, api::{Args, Rule, SortDef, Term as EggTerm, app, eq, rule, sort, union, v}, base::{ELIST, EXPRESSION, F64, OP_KIND, SORTS, dtype, new_op_call, op_term}
     },
     hlir::{
         Constant, Gather, Iota, MaxReduce, SumReduce, binary_sort, reduce_sort, unary_sort
@@ -388,12 +388,15 @@ pub struct CpuConstant {
 
 impl EgglogOp for CpuConstant {
     fn sort(&self) -> SortDef {
-        sort(IR, "CpuConstant", &[("value", F64)])
+        sort(OP_KIND, "CpuConstant", &[("value", F64)])
     }
 
     fn rewrites(&self) -> Vec<Rule> {
         let (args, hlir_match) = new_op_call(&Constant::default().sort(), &[]);
-        let cpu_op = call_sort_from_args(&self.sort(), &args);
+        let cpu_op = op_term(
+            call_sort_from_args(&self.sort(), &args),
+            args["__inputs"].clone(),
+        );
         vec![
             rule(union(hlir_match, cpu_op.clone()))
                 .set(dtype(cpu_op), app(&SORTS.f32_dt, vec![]))
@@ -411,12 +414,12 @@ impl EgglogOp for CpuConstant {
             kind_children: &[&'a ENodeId],
             input_enodes: Vec<&'a ENodeId>,
             _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-            expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+            _expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
             let value = egraph.enodes[kind_children[0]].0.replace('"', "").parse::<f32>().unwrap_or(0.0);
             (
                 LLIROp::new::<dyn CpuKernelOp>(Box::new(Self { value })),
-                vec![],
+                input_enodes,
             )
     }
 }
@@ -443,12 +446,15 @@ pub struct CpuIota {
 
 impl EgglogOp for CpuIota {
     fn sort(&self) -> SortDef {
-        sort(IR, "CpuIota", &[("expr", EXPRESSION), ("range", EXPRESSION)])
+        sort(OP_KIND, "CpuIota", &[("expr", EXPRESSION), ("range", EXPRESSION)])
     }
 
     fn rewrites(&self) -> Vec<Rule> {
         let (args, hlir_match) = new_op_call(&Iota::default().sort(), &[]);
-        let cpu_op = call_sort_from_args(&self.sort(), &args);
+        let cpu_op = op_term(
+            call_sort_from_args(&self.sort(), &args),
+            args["__inputs"].clone(),
+        );
         vec![
             rule(union(hlir_match, cpu_op.clone()))
                 .set(dtype(cpu_op), app(&SORTS.int_dt, vec![]))
@@ -464,7 +470,7 @@ impl EgglogOp for CpuIota {
             &'a self,
             egraph: &'a SerializedEGraph,
             kind_children: &[&'a ENodeId],
-            _input_enodes: Vec<&'a ENodeId>,
+            input_enodes: Vec<&'a ENodeId>,
             _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
@@ -474,7 +480,7 @@ impl EgglogOp for CpuIota {
                 expr: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
                 range: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
             })),
-            vec![],
+            input_enodes,
         )
     }
 }
@@ -508,11 +514,9 @@ pub struct CpuGather {
 
 impl EgglogOp for CpuGather {
     fn sort(&self) -> SortDef {
-        sort(IR, "CpuGather", &[
+        sort(OP_KIND, "CpuGather", &[
             ("out_shape", ELIST),
-            ("indexes", IR),
             ("index_strides", ELIST),
-            ("data", IR),
             ("data_strides", ELIST),
             ("out_strides", ELIST),
         ])
@@ -525,14 +529,12 @@ impl EgglogOp for CpuGather {
         let dt = v("?__dt");
 
         let cpu_args = [
-            ("out_shape".to_string(), gather_args["index_shape"].clone()),
-            ("indexes".to_string(),       gather_args["indexes"].clone()),
+            ("out_shape".to_string(),     gather_args["index_shape"].clone()),
             ("index_strides".to_string(), gather_args["index_strides"].clone()),
-            ("data".to_string(),          gather_args["data"].clone()),
             ("data_strides".to_string(),  gather_args["data_strides"].clone()),
             ("out_strides".to_string(),   out_strides),
         ];
-        let cpu_op = self.sort().call(cpu_args);
+        let cpu_op = op_term(self.sort().call(cpu_args), gather_args["__inputs"].clone());
         vec![
             rule(union(gather_match, cpu_op.clone()))
                 .set(dtype(cpu_op), dt.clone())
@@ -549,7 +551,7 @@ impl EgglogOp for CpuGather {
             &'a self,
             egraph: &'a SerializedEGraph,
             kind_children: &[&'a ENodeId],
-            _input_enodes: Vec<&'a ENodeId>,
+            input_enodes: Vec<&'a ENodeId>,
             list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
             expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
         ) -> (LLIROp, Vec<&'a ENodeId>) {
@@ -557,11 +559,11 @@ impl EgglogOp for CpuGather {
         (
             LLIROp::new::<dyn CpuKernelOp>(Box::new(Self {
                 out_shape:    extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                index_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
-                data_stride:  extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap(),
-                out_stride:   extract_expr_list(egraph, kind_children[5], list_cache, expr_cache).unwrap(),
+                index_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap(),
+                data_stride:  extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
+                out_stride:   extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap(),
             })),
-            vec![kind_children[1], kind_children[3]],
+            input_enodes,
         )
     }
 }

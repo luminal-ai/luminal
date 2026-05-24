@@ -42,9 +42,7 @@ impl CpuRuntime {
     /// Widen any typed input slice to f32
     fn to_f32(data: &NativeData, dtype: DType) -> Vec<f32> {
         match dtype {
-            DType::F32 => (0..data.len()).map(|i| data.f32(i)).collect(),
-            DType::F16 => (0..data.len()).map(|i| data.f16(i).to_f32()).collect(),
-            DType::Int => (0..data.len()).map(|i| data.i32(i) as f32).collect(),
+            DType::F32 | DType::F16 | DType::Int => data.to_f32_vec(),
             other => panic!("CpuRuntime: unsupported input dtype {other:?}"),
         }
     }
