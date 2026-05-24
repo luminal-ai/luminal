@@ -35,9 +35,19 @@ use crate::{
         },
         driver::{CudaStream, DevicePtr},
     },
-    host::{DeviceBuffer, HostOp, cublas::parse_cublas_op},
+    host::{DeviceBuffer, HostOp},
     try_create_cublaslt,
 };
+
+fn parse_cublas_op(s: &str) -> cublasOperation_t {
+    let stripped = s.trim_matches('"');
+    match stripped {
+        "T" => cublasOperation_t::CUBLAS_OP_T,
+        "N" => cublasOperation_t::CUBLAS_OP_N,
+        "C" => cublasOperation_t::CUBLAS_OP_C,
+        other => panic!("Unknown cuBLAS operation: '{other}' (original: '{s}')"),
+    }
+}
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -189,50 +199,50 @@ impl EgglogOp for CuBlasLt {
             Rule::raw(include_str!["cublaslt_beta_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_epilogue_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_row_order_rewrite.egg"]),
-            // Delete the matmul-broadcast Mul eclass when the consuming Sum
-            // eclass has a `cublaslt` or `KernelBatchMatMul` alternative. The
-            // cuBLASLt / batched-matmul rewrite rules only union those enodes
-            // into the Sum eclass after the broadcast pattern check passes,
-            // so their presence is the matmul-broadcast signal — no further
-            // stride-form check needed.
-            //
-            // Delete the HLIR `Mul` fallback from the Mul eclass. Emptying that
-            // eclass lets the empty-eclass cascade prune the downstream Sum /
-            // KernelSum fallback. cuBLAS, TileMatmulFullSplit, KernelBatchMatVec,
-            // and KernelBatchMatMul all take original (a, b) inputs rather than
-            // the Mul eclass, so they survive the cascade and remain as the
-            // matmul output alternative.
+            // cuBLASLt now specializes GenericMatmul, so cleanup should prune
+            // the matmul output alternatives directly. Do not delete the
+            // broadcast Mul here; it may still have non-matmul consumers.
             Rule::raw("(rule
-                ((= ?mul (Op (Mul ?shape ?as ?bs ?os) ?inputs))
-                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
                  (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (Mul ?shape ?as ?bs ?os) ?inputs)))
+                ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
                 :ruleset cleanup
+                :name \"delete-sum-when-cublaslt-exists\"
             )"),
             Rule::raw("(rule
-                ((= ?mul (Op (Mul ?shape ?as ?bs ?os) ?inputs))
-                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                 (= ?sum (Op (KernelBatchMatMul ?bos ?bk ?bas ?baks ?bbs ?bbks ?bouts ?bdt) ?bi)))
-                ((delete (Op (Mul ?shape ?as ?bs ?os) ?inputs)))
-                :ruleset cleanup
-            )"),
-            // Also remove any generic fusion wrapper that was unioned with the
-            // broadcast Mul. This is deliberately a separate rule: requiring a
-            // FusionEnd in the same eclass made cleanup miss valid cuBLASLt
-            // matmuls when fusion wrapping was absent.
-            Rule::raw("(rule
-                ((= ?mul (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs))
-                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
+                ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
                  (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs)))
+                ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
                 :ruleset cleanup
+                :name \"delete-kernel-sum-when-cublaslt-exists\"
             )"),
             Rule::raw("(rule
-                ((= ?mul (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs))
-                 (= ?sum (Op (Sum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
-                 (= ?sum (Op (KernelBatchMatMul ?bos ?bk ?bas ?baks ?bbs ?bbks ?bouts ?bdt) ?bi)))
-                ((delete (Op (FusionEnd ?fshape ?fos ?fdt) ?finputs)))
+                ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
+                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
+                ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
                 :ruleset cleanup
+                :name \"delete-sum-when-scaled-cublaslt-exists\"
+            )"),
+            Rule::raw("(rule
+                ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
+                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
+                ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
+                :ruleset cleanup
+                :name \"delete-kernel-sum-when-scaled-cublaslt-exists\"
+            )"),
+            Rule::raw("(rule
+                ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
+                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
+                ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
+                :ruleset cleanup
+                :name \"prefer-cublaslt-over-generic-matmul\"
+            )"),
+            Rule::raw("(rule
+                ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
+                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
+                ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
+                :ruleset cleanup
+                :name \"prefer-scaled-cublaslt-over-generic-matmul\"
             )"),
         ]
     }

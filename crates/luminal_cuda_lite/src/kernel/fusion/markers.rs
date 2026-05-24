@@ -309,6 +309,61 @@ impl EgglogOp for FusionEnd {
         // `Cycle(NodeIndex(_))`. Grow rules already compose adjacent regions
         // correctly without dissolve.
 
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+                (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
+                (!= ?fe_shape ?inner_shape)
+             ) (
+                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+             ) :ruleset cleanup :name \"delete-malformed-FE-unary-shape\")",
+        ));
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+                (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
+                (!= ?fe_s ?inner_s)
+             ) (
+                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+             ) :ruleset cleanup :name \"delete-malformed-FE-unary-strides\")",
+        ));
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+                (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
+                (!= ?fe_shape ?inner_shape)
+             ) (
+                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+             ) :ruleset cleanup :name \"delete-malformed-FE-binary-shape\")",
+        ));
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+                (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
+                (!= ?fe_s ?inner_s)
+             ) (
+                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+             ) :ruleset cleanup :name \"delete-malformed-FE-binary-strides\")",
+        ));
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+                (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
+                (!= ?fe_shape ?inner_shape)
+             ) (
+                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+             ) :ruleset cleanup :name \"delete-malformed-FE-nested-shape\")",
+        ));
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+                (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
+                (!= ?fe_s ?inner_s)
+             ) (
+                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
+             ) :ruleset cleanup :name \"delete-malformed-FE-nested-strides\")",
+        ));
+
         rules
     }
 

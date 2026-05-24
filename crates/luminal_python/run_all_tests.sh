@@ -8,7 +8,7 @@ echo "=========================================="
 echo "  Luminal Python: Full Test Suite"
 echo "=========================================="
 
-NATIVE_TESTS="tests/test_hlir_ops.py tests/test_unary.py"
+NATIVE_TESTS="tests/test_hlir_ops.py tests/test_unary.py tests/test_dtype_boundary.py tests/test_torch_dtype_parity.py"
 CUDA_TESTS="tests/"
 
 # ── Phase 1: Native Backend ─────────────────────────────────

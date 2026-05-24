@@ -119,10 +119,8 @@ impl<'a> Translator<'a> {
     /// buffer would be sized for the un-sliced argsort tensor while the
     /// shape tracker reports a smaller rank.
     ///
-    /// The output dtype is `DType::Int` (luminal's 32-bit int); PT2
-    /// metadata records int64 and the Python wrapper widens at the
-    /// boundary, so the PyTorch contract is preserved end-to-end
-    /// (LUM-486).
+    /// The result is cast to `DType::I64` to match PyTorch's int64
+    /// argmax / argmin indices.
     pub(crate) fn translate_argextremum(
         &mut self,
         node: &Node,
@@ -149,7 +147,7 @@ impl<'a> Translator<'a> {
                 None | Some(0) | Some(-1) => {
                     // PyTorch returns scalar index 0 for rank-0 argmax/argmin.
                     // `keepdim=True` does not add a dimension when the input is 0-d.
-                    return Ok(self.graph.constant(0i64).cast(DType::Int));
+                    return Ok(self.graph.constant(0i64).cast(DType::I64));
                 }
                 Some(dim) => {
                     return Err(anyhow::anyhow!(
@@ -188,6 +186,6 @@ impl<'a> Translator<'a> {
         } else {
             picked
         };
-        Ok(result * 1)
+        Ok((result * 1).cast(DType::I64))
     }
 }

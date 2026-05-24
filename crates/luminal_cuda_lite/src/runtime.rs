@@ -80,6 +80,14 @@ struct PlannedBuffer {
     end: usize,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct NonFiniteBufferReport {
+    pub(crate) node: NodeIndex,
+    pub(crate) index: usize,
+    pub(crate) value: f32,
+}
+
 /// Per-bucket compiled state. Each bucket holds its own executable graph,
 /// explicit runtime metadata, intermediate buffers, and node mappings.
 /// Weights (hlir_buffers) are shared.
@@ -106,6 +114,9 @@ pub(crate) struct CompiledBucket {
     pub(crate) bucket_indices: FxHashMap<char, usize>,
     /// Whether HLIR pointers have been synced into this bucket's cached_buffer_ptrs
     pub(crate) hlir_synced: bool,
+    /// Test/debug mode: give every intermediate a distinct arena range so
+    /// post-execution diagnostics can inspect expired nodes without reuse noise.
+    pub(crate) preserve_intermediate_buffers_for_debug: bool,
 }
 
 impl CompiledBucket {
@@ -130,6 +141,7 @@ impl CompiledBucket {
             intermediate_buffer_dims: FxHashSet::default(),
             bucket_indices: FxHashMap::default(),
             hlir_synced: false,
+            preserve_intermediate_buffers_for_debug: false,
         }
     }
 }
@@ -225,8 +237,94 @@ impl CudaRuntime {
             result::memcpy_dtod_async(dst_ptr, src.ptr(), src.len(), stream.cu_stream())
                 .expect("cuMemcpyDtoDAsync failed");
         }
-        stream.synchronize().unwrap();
         dst
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_nonfinite_f32_buffer_in_nodes(
+        &self,
+        nodes: impl IntoIterator<Item = NodeIndex>,
+    ) -> Option<NonFiniteBufferReport> {
+        let _ = self.cuda_stream.synchronize();
+        let bucket = self.active();
+        let mut checked = FxHashSet::default();
+
+        for node in nodes {
+            let spec_node = resolve_logical_buffer_node(
+                node,
+                &bucket.logical_buffer_bytes,
+                &bucket.output_alias_map,
+            )
+            .unwrap_or(node);
+            if !checked.insert(spec_node) {
+                continue;
+            }
+
+            let Some(spec) = bucket.buffer_specs.get(&spec_node) else {
+                continue;
+            };
+            if !matches!(spec.dtype, DType::F32) {
+                continue;
+            }
+
+            let Some(buf) = Self::resolve_runtime_buffer(
+                bucket,
+                &self.cuda_stream,
+                &self.hlir_buffers,
+                &self.external_buffers,
+                &self.external_output_buffers,
+                spec_node,
+            ) else {
+                continue;
+            };
+            if buf.is_empty() || buf.len() % std::mem::size_of::<f32>() != 0 {
+                continue;
+            }
+
+            let host_bytes = match buf.clone_dtoh(&self.cuda_stream) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            let values: &[f32] = bytemuck::cast_slice(&host_bytes);
+            if let Some((index, value)) = values
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Some(NonFiniteBufferReport {
+                    node: spec_node,
+                    index,
+                    value,
+                });
+            }
+        }
+
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_nonfinite_f32_buffer(&self) -> Option<NonFiniteBufferReport> {
+        let bucket = self.active();
+        self.first_nonfinite_f32_buffer_in_nodes(
+            bucket
+                .buffer_specs
+                .keys()
+                .copied()
+                .sorted_by_key(|node| node.index()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preserve_intermediate_buffers_for_debug(&mut self) {
+        for bucket in &mut self.compiled_buckets {
+            bucket.preserve_intermediate_buffers_for_debug = true;
+            bucket.logical_buffer_offsets.clear();
+            bucket.logical_buffer_bytes.clear();
+            bucket.cached_buffer_ptrs.clear();
+            bucket.arena = None;
+            bucket.arena_bytes = 0;
+        }
     }
 
     fn resolve_runtime_buffer(
@@ -651,7 +749,57 @@ impl CudaRuntime {
             .collect_vec()
     }
 
+    /// Read an output buffer as i64. Strict: the buffer must already
+    /// be `DType::I64`; no widening at the read boundary.
+    pub fn get_i64(&self, id: impl ToId) -> Vec<i64> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::I64)) {
+            panic!(
+                "get_i64: buffer dtype is {buf_dtype:?}, expected I64. \
+                 Add a `Cast(DType::I64)` before the Output."
+            );
+        }
+        self.get_output_data(id)
+            .chunks_exact(8)
+            .map(|c| i64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect_vec()
+    }
+
+    /// Read an output buffer as f64. Strict: the buffer must already
+    /// be `DType::F64`; no widening at the read boundary.
+    pub fn get_f64(&self, id: impl ToId) -> Vec<f64> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::F64)) {
+            panic!(
+                "get_f64: buffer dtype is {buf_dtype:?}, expected F64. \
+                 Add a `Cast(DType::F64)` before the Output."
+            );
+        }
+        self.get_output_data(id)
+            .chunks_exact(8)
+            .map(|c| f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect_vec()
+    }
+
+    /// Read an output buffer as f16. Strict: the buffer must already
+    /// be `DType::F16`; no widening at the read boundary.
     pub fn get_f16(&self, id: impl ToId) -> Vec<f16> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::F16)) {
+            panic!(
+                "get_f16: buffer dtype is {buf_dtype:?}, expected F16. \
+                 Add a `Cast(DType::F16)` before the Output."
+            );
+        }
         let bytes = self.get_output_data(id);
         let n = bytes.len() / 2;
         let cap = bytes.capacity() / 2;
@@ -660,7 +808,19 @@ impl CudaRuntime {
         unsafe { Vec::from_raw_parts(ptr, n, cap) }
     }
 
+    /// Read an output buffer as bf16. Strict: the buffer must already
+    /// be `DType::Bf16`; no widening at the read boundary.
     pub fn get_bf16(&self, id: impl ToId) -> Vec<bf16> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let bucket = self.active();
+        let buf_dtype = bucket.buffer_specs.get(&data_id).map(|s| s.dtype);
+        if !matches!(buf_dtype, Some(DType::Bf16)) {
+            panic!(
+                "get_bf16: buffer dtype is {buf_dtype:?}, expected Bf16. \
+                 Add a `Cast(DType::Bf16)` before the Output."
+            );
+        }
         let bytes = self.get_output_data(id);
         let n = bytes.len() / 2;
         let cap = bytes.capacity() / 2;
@@ -898,6 +1058,32 @@ impl CudaRuntime {
         let planned_logical_count = planned.len();
         let planned_logical_bytes = planned.iter().map(|buf| buf.bytes).sum::<usize>();
         let logical_peak = logical_interval_peak(&planned);
+
+        if bucket.preserve_intermediate_buffers_for_debug {
+            planned.sort_by_key(|buf| buf.node.index());
+            let mut arena_end = 0usize;
+            for buf in &planned {
+                let offset = align_up(arena_end, ARENA_ALIGNMENT);
+                bucket.logical_buffer_offsets.insert(buf.node, offset);
+                bucket.logical_buffer_bytes.insert(buf.node, buf.bytes);
+                arena_end = offset + align_up(buf.bytes, ARENA_ALIGNMENT);
+            }
+            bucket.arena_bytes = arena_end;
+
+            if std::env::var_os("LUMINAL_CUDA_MEMORY_DEBUG").is_some() {
+                eprintln!(
+                    "   CUDA memory plan specs={total_spec_count} used={planned_logical_count} skipped={} spec_bytes={} used_bytes={} skipped_bytes={} logical_peak={} preserved_arena={} allocations={}",
+                    total_spec_count.saturating_sub(planned_logical_count),
+                    total_spec_bytes,
+                    planned_logical_bytes,
+                    total_spec_bytes.saturating_sub(planned_logical_bytes),
+                    logical_peak,
+                    bucket.arena_bytes,
+                    bucket.logical_buffer_offsets.len(),
+                );
+            }
+            return;
+        }
 
         let mut arena_end = 0usize;
         let mut placed: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(planned.len());
@@ -1410,6 +1596,35 @@ impl Runtime for CudaRuntime {
                 .filter(|n| n.to_dialect::<dyn HostOp>().is_some())
                 .count()
         );
+        let display = if std::env::var_os("LUMINAL_SEARCH_OP_NAMES").is_some() {
+            let mut kernel_counts = std::collections::BTreeMap::<&'static str, usize>::new();
+            let mut host_counts = std::collections::BTreeMap::<String, usize>::new();
+            for node in llir_graph.node_weights() {
+                if let Some(kernel) = node.to_dialect::<dyn KernelOp>() {
+                    *kernel_counts.entry(kernel.kernel_name()).or_default() += 1;
+                }
+                if let Some(host) = node.to_dialect::<dyn HostOp>() {
+                    let debug = format!("{:?}", host.as_ref().as_ref());
+                    let name = debug
+                        .split([' ', '{', '('])
+                        .next()
+                        .unwrap_or("HostOp")
+                        .to_string();
+                    *host_counts.entry(name).or_default() += 1;
+                }
+            }
+            let kernel_summary = kernel_counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .join(",");
+            let host_summary = host_counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .join(",");
+            format!("{display} [Kernels: {kernel_summary}] [Hosts: {host_summary}]")
+        } else {
+            display
+        };
 
         (duration, display)
     }
@@ -1430,35 +1645,6 @@ impl Runtime for CudaRuntime {
             }
         }
 
-        let bucket = &mut self.compiled_buckets[self.active_bucket];
-        Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
-        // Cache HLIR input pointers
-        if !self.changed_hlir.is_empty() || !bucket.hlir_synced {
-            let hlir_nodes: Vec<NodeIndex> = if !bucket.hlir_synced {
-                // First time this bucket is active since HLIR changed — sync all
-                self.hlir_buffers.keys().copied().collect()
-            } else {
-                self.changed_hlir.iter().copied().collect()
-            };
-            for hlir_node in hlir_nodes {
-                let Some(&llir_node) = bucket.hlir_to_llir.get(&hlir_node) else {
-                    continue;
-                };
-                let Some(input) = self.hlir_buffers.get(&hlir_node) else {
-                    continue;
-                };
-                let ptr = match input {
-                    CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
-                    CudaInput::Ptr(p) => *p,
-                };
-                bucket.cached_buffer_ptrs.insert(llir_node, ptr);
-            }
-            bucket.hlir_synced = true;
-            // Only clear changed_hlir if single bucket (multi-bucket: others may need it)
-            if self.compiled_buckets.len() == 1 {
-                self.changed_hlir.clear();
-            }
-        }
         // Ensure all CUDA graphs are built (handles first execute and any missing graphs)
         self.prebuild_graphs(dyn_map);
 
@@ -1535,6 +1721,21 @@ impl Runtime for CudaRuntime {
                         exec_op.internal.stats_name().unwrap_or("unknown")
                     );
                 });
+
+            #[cfg(test)]
+            if std::env::var_os("LUMINAL_CUDA_CHECK_NONFINITE_INTERNAL").is_some() {
+                let mut produced_nodes = exec_op.internal.extra_buffer_nodes();
+                produced_nodes.push(exec_op.output);
+                if let Some(report) = self.first_nonfinite_f32_buffer_in_nodes(produced_nodes) {
+                    panic!(
+                        "CUDA execute produced non-finite buffer after {:?}: node={} index={} value={}",
+                        exec_op.internal.stats_name().unwrap_or("unknown"),
+                        report.node.index(),
+                        report.index,
+                        report.value
+                    );
+                }
+            }
         }
         // Single sync at end - CUDA stream ordering guarantees sequential execution
         self.cuda_stream.synchronize().unwrap();

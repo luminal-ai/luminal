@@ -13,6 +13,8 @@ mod flashinfer;
 #[cfg(test)]
 mod fusion;
 #[cfg(test)]
+mod generic_matmul_rewrite;
+#[cfg(test)]
 mod model_fuzz;
 #[cfg(test)]
 mod op_functional_tests;

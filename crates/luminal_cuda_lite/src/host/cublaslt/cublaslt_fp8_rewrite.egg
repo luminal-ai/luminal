@@ -25,8 +25,12 @@
             (ICons ?input_scale (INil))))
         (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
 
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
         (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
             (ICons ?input_scale (ICons ?weight_scale (INil)))))
@@ -96,8 +100,12 @@
             (ICons ?input_scale (INil))))
         (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
 
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
         (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
             (ICons ?input_scale (ICons ?weight_scale (INil)))))
@@ -368,8 +376,12 @@
             (ICons ?input_scale (INil))))
         (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
 
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
         (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
             (ICons ?input_scale (ICons ?weight_scale (INil)))))
@@ -440,8 +452,12 @@
 
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -489,8 +505,12 @@
 
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -538,8 +558,12 @@
 
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -587,8 +611,12 @@
 
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
 
         (= ?batch (nth_from_end ?out_shape 2))
@@ -650,8 +678,12 @@
 
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
 
         (= ?batch (nth_from_end ?out_shape 2))
@@ -713,8 +745,12 @@
 
 (rule
     (
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
 
         (= ?batch (nth_from_end ?out_shape 2))

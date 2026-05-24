@@ -198,16 +198,29 @@ pub fn resolve_neg1_dim_exprs(
     }
 }
 
-/// Map torch dtype integer (PT2 format) to luminal DType.
-/// PT2 numbering: 1=uint8, 2=int8, 3=int16, 4=int32, 5=int64, 6=float16, 7=float32, 8=float64, 12=bool, 13=bfloat16
+/// Map a PT2 dtype code to luminal `DType`. Panics for variants the IR
+/// doesn't model as first-class types (narrow ints `Byte` / `Char` /
+/// `Short`, the complex family, the float8 family) and for unknown
+/// codes — better to fail loudly at the translator boundary than to
+/// silently widen and lie about the user's dtype.
 pub fn torch_dtype_int_to_luminal(dtype: u32) -> DType {
-    match dtype {
-        6 => DType::F16,
-        7 => DType::F32,
-        8 => DType::F32, // float64 → F32 (no F64 in luminal)
-        13 => DType::Bf16,
-        12 => DType::Bool,
-        1..=5 => DType::Int, // uint8, int8, int16, int32, int64
-        _ => DType::F32,
+    let t = crate::torch_dtype::TorchDType::from_code(dtype)
+        .unwrap_or_else(|c| panic!("torch_dtype_int_to_luminal: unknown PT2 dtype code {c}"));
+    match t {
+        crate::torch_dtype::TorchDType::Byte
+        | crate::torch_dtype::TorchDType::Char
+        | crate::torch_dtype::TorchDType::Short => panic!(
+            "torch_dtype_int_to_luminal: PT2 dtype {} (code {}) isn't a first-class \
+             IR type yet — cast to torch.int32 at the call site, or wait for the \
+             narrower-int IR follow-up.",
+            t.name(),
+            t.code(),
+        ),
+        other => DType::try_from(other).unwrap_or_else(|t| {
+            panic!(
+                "torch_dtype_int_to_luminal: {} isn't a first-class luminal IR type",
+                t.name()
+            )
+        }),
     }
 }

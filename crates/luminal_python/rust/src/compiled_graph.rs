@@ -5,6 +5,7 @@ use luminal::{
     visualization::ToDot,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::collections::HashMap;
 
 use crate::typed_data::TypedData;
@@ -73,22 +74,13 @@ fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(char, usiz
     Some((var, candidate))
 }
 
-/// Convert luminal DType to PT2 dtype integer code (for python interop)
-/// Types without a direct Pytorch equivalent map to the closest safe representation
+/// Convert luminal `DType` to a PT2 dtype code via `TorchDType`. Panics
+/// for luminal-specific dtypes that have no PyTorch counterpart (`I4`,
+/// `U4`, the F6 / F4 families, ...).
 fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
-    match dtype {
-        DType::U8 => 1,
-        DType::I8 => 2,
-        DType::I16 => 3,
-        DType::Int => 4, // i32
-        DType::U16 => 4, // u16 -> i32 (Pytorch has no u16 in older versions)
-        DType::F16 => 6,
-        DType::F32 | DType::TF32 => 7,
-        DType::F64 => 8,
-        DType::Bool => 12,
-        DType::Bf16 => 13,
-        _ => panic!("luminal_dtype_to_pt2_code: unsupported dtype {:?}", dtype),
-    }
+    crate::torch_dtype::TorchDType::try_from(dtype)
+        .map(|t| t.code())
+        .unwrap_or_else(|d| panic!("luminal_dtype_to_pt2_code: unsupported dtype {d:?}"))
 }
 
 /// Common intermediate result from translating a model graph.
@@ -510,6 +502,65 @@ impl CompiledGraph {
             ))
         })?;
         Ok(self.runtime.get_output_i32(*node_id))
+    }
+
+    /// Read an output as f16 (returned as raw little-endian bytes —
+    /// Python has no native f16, so the caller bit-casts via
+    /// `torch.frombuffer(..., dtype=torch.float16)`). Strict: the
+    /// producer node must already be `DType::F16`; no widening at
+    /// the read boundary.
+    fn get_output_f16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        let data = self.runtime.get_output_f16(*node_id);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    /// Read an output as bf16 (returned as raw little-endian bytes —
+    /// caller bit-casts via `torch.frombuffer(..., dtype=torch.
+    /// bfloat16)`). Strict: the producer node must already be
+    /// `DType::Bf16`; no widening at the read boundary.
+    fn get_output_bf16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        let data = self.runtime.get_output_bf16(*node_id);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    /// Read an output as i64. Strict: the producer node must already
+    /// be `DType::I64`; no widening at the read boundary.
+    fn get_output_i64(&self, name: &str) -> PyResult<Vec<i64>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_i64(*node_id))
+    }
+
+    /// Read an output as f64. Strict: the producer node must already
+    /// be `DType::F64`; no widening at the read boundary.
+    fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_f64(*node_id))
     }
 
     /// Get output tensor data by name as bool (copies to host).

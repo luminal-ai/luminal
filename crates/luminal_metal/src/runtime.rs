@@ -1,8 +1,9 @@
-use crate::kernel::{DYN_SLOT_COUNT, MetalKernelOp};
+use crate::kernel::{DYN_SLOT_COUNT, MetalEncodeContext, MetalKernelOp, MpsKernelCache};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
     dtype::DType,
+    egglog_utils::SerializedEGraph,
     graph::{BucketLLIR, DimBucket, Graph, LLIRGraph},
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
@@ -16,15 +17,26 @@ use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptio
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use safetensors::{Dtype, SafeTensors};
-use std::{fs::File, time::Duration};
+use std::{cell::RefCell, fs::File, time::Duration};
+
+#[derive(Clone)]
+struct MetalExecutionStep {
+    node: NodeIndex,
+    input_nodes: Vec<NodeIndex>,
+    input_dtypes: Vec<DType>,
+    output_dtype: DType,
+}
 
 #[derive(Clone)]
 struct MetalCompiledBucket {
     bucket_indices: FxHashMap<char, usize>,
     llir_graph: LLIRGraph,
+    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     node_dtypes: FxHashMap<NodeIndex, DType>,
     pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
     output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+    output_data_map: FxHashMap<NodeIndex, NodeIndex>,
+    execution_plan: Vec<MetalExecutionStep>,
 }
 
 pub struct MetalRuntime {
@@ -36,16 +48,26 @@ pub struct MetalRuntime {
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
     /// Buffers for LLIR intermediate/output tensors
     pub buffers: FxHashMap<NodeIndex, Buffer>,
+    /// Logical byte length for each active LLIR buffer.
+    buffer_lengths: FxHashMap<NodeIndex, u64>,
     /// Dynamic dimensions table (a-z), shared across all kernels.
     dyn_buffer: Buffer,
+    /// Retained MPS descriptors/kernels reused across command encodes.
+    mps_cache: RefCell<MpsKernelCache>,
     /// The current LLIR graph
     llir_graph: LLIRGraph,
+    /// LLIR input node -> HLIR input node.
+    llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     /// Inferred runtime dtype for each LLIR node.
     node_dtypes: FxHashMap<NodeIndex, DType>,
     /// Compiled pipeline states for each kernel node
     pipelines: FxHashMap<NodeIndex, ComputePipelineState>,
     /// LLIR output node -> input node whose buffer contains the output.
     output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
+    /// HLIR output id -> LLIR node whose data feeds the output.
+    output_data_map: FxHashMap<NodeIndex, NodeIndex>,
+    /// Precomputed executable nodes and input metadata for the active LLIR graph.
+    execution_plan: Vec<MetalExecutionStep>,
     /// Bucket definitions for dynamic dimensions.
     dim_buckets: FxHashMap<char, Vec<DimBucket>>,
     /// Compiled LLIR variants, one per bucket combination.
@@ -64,22 +86,10 @@ impl MetalRuntime {
     }
 
     fn output_data_node(&self, id: NodeIndex) -> NodeIndex {
-        let output_id = self
-            .llir_graph
-            .node_indices()
-            .find(|n| {
-                if let Some(Output { node }) = self.llir_graph[*n].to_op::<Output>() {
-                    *node == id.index()
-                } else {
-                    false
-                }
-            })
-            .expect("Cannot find output tensor!");
-
-        self.llir_graph
-            .neighbors_directed(output_id, Direction::Incoming)
-            .next()
-            .unwrap()
+        self.output_data_map
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| panic!("Cannot find output tensor {id:?}!"))
     }
 
     fn follow_aliases(&self, mut node: NodeIndex) -> NodeIndex {
@@ -225,6 +235,7 @@ impl MetalRuntime {
         let data_id = self.follow_aliases(self.output_data_node(id.to_id()));
 
         if let Some(buffer) = self.buffers.remove(&data_id) {
+            self.buffer_lengths.remove(&data_id);
             return buffer;
         }
 
@@ -269,12 +280,21 @@ impl MetalRuntime {
                     .map(|inp| inp.dtype)
             })
             .unwrap_or(DType::F32);
+        let logical_bytes = self
+            .buffer_lengths
+            .get(&data_id)
+            .copied()
+            .unwrap_or_else(|| buffer.length());
+        assert!(
+            logical_bytes <= buffer.length(),
+            "Logical buffer size exceeds allocated Metal buffer size"
+        );
 
         unsafe {
             match dtype {
                 DType::F16 => {
                     let ptr = buffer.contents() as *const f16;
-                    let len = buffer.length() as usize / std::mem::size_of::<f16>();
+                    let len = logical_bytes as usize / std::mem::size_of::<f16>();
                     std::slice::from_raw_parts(ptr, len)
                         .iter()
                         .map(|v| v.to_f32())
@@ -282,7 +302,7 @@ impl MetalRuntime {
                 }
                 DType::Int => {
                     let ptr = buffer.contents() as *const i32;
-                    let len = buffer.length() as usize / std::mem::size_of::<i32>();
+                    let len = logical_bytes as usize / std::mem::size_of::<i32>();
                     std::slice::from_raw_parts(ptr, len)
                         .iter()
                         .map(|v| *v as f32)
@@ -290,7 +310,7 @@ impl MetalRuntime {
                 }
                 _ => {
                     let ptr = buffer.contents() as *const f32;
-                    let len = buffer.length() as usize / std::mem::size_of::<f32>();
+                    let len = logical_bytes as usize / std::mem::size_of::<f32>();
                     std::slice::from_raw_parts(ptr, len).to_vec()
                 }
             }
@@ -303,6 +323,26 @@ impl Runtime for MetalRuntime {
     type CompileArg = ();
     type ExecReturn = ();
     type ProfileMetric = Duration;
+
+    fn late_egglog_passes(
+        ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
+        options: &luminal::graph::BuildSearchSpaceOptions,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
+        vec![crate::memory_analysis::metal_memory_analysis_pass(
+            ops,
+            options.max_memory_bytes,
+            dyn_map,
+        )]
+    }
+
+    fn estimate_graph_memory<'a>(
+        egraph: &'a SerializedEGraph,
+        choices: &luminal::egglog_utils::EGraphChoiceSet<'a>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Option<usize> {
+        crate::memory_analysis::estimate_graph_memory_bytes(egraph, choices, dyn_map)
+    }
 
     fn initialize(_: Self::CompileArg) -> Self {
         let device = Device::system_default().expect("No Metal device found!");
@@ -318,11 +358,16 @@ impl Runtime for MetalRuntime {
             input_data: FxHashMap::default(),
             hlir_buffers: FxHashMap::default(),
             buffers: FxHashMap::default(),
+            buffer_lengths: FxHashMap::default(),
             dyn_buffer,
+            mps_cache: RefCell::new(MpsKernelCache::default()),
             llir_graph: StableGraph::default(),
+            llir_to_hlir: FxHashMap::default(),
             node_dtypes: FxHashMap::default(),
             pipelines: FxHashMap::default(),
             output_alias_map: FxHashMap::default(),
+            output_data_map: FxHashMap::default(),
+            execution_plan: vec![],
             dim_buckets: FxHashMap::default(),
             compiled_buckets: vec![],
             active_bucket: 0,
@@ -336,6 +381,7 @@ impl Runtime for MetalRuntime {
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.buffers.clear();
+        self.buffer_lengths.clear();
         self.dim_buckets.clear();
         self.compiled_buckets = vec![self.compile_bucket(FxHashMap::default(), llir_graph)];
         self.activate_bucket(0);
@@ -347,19 +393,25 @@ impl Runtime for MetalRuntime {
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
-        _timeout: Option<std::time::Duration>,
+        timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
         self.load_llir(llir_graph);
         self.allocate_intermediate_buffers(dyn_map);
 
         let trials = trials.max(1);
+        let profile_start = std::time::Instant::now();
         let mut duration = Duration::default();
+        let mut completed_trials = 0;
         for _ in 0..trials {
             let start = std::time::Instant::now();
             self.execute(dyn_map);
             duration += start.elapsed();
+            completed_trials += 1;
+            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
         }
-        duration /= trials as u32;
+        duration /= completed_trials as u32;
 
         (duration, format!("{:.2?}", duration))
     }
@@ -370,74 +422,43 @@ impl Runtime for MetalRuntime {
             self.select_bucket(dyn_map);
             self.allocate_active_intermediate_buffers(dyn_map);
 
-            let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
-                .llir_graph
-                .node_indices()
-                .filter_map(|n| {
-                    if let Some(Input { node, .. }) = self.llir_graph[n].to_op::<Input>() {
-                        Some((n, NodeIndex::new(*node)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
-
             self.update_dyn_buffer(dyn_map);
             let command_buffer = self.command_queue.new_command_buffer();
+            let mut encode_context = MetalEncodeContext {
+                command_buffer,
+                dyn_buffer: &self.dyn_buffer,
+                mps_cache: &self.mps_cache,
+            };
 
-            for node in topo_order {
-                if self.llir_graph[node].to_op::<Input>().is_some()
-                    || self.llir_graph[node].to_op::<Output>().is_some()
-                {
-                    continue;
-                }
+            for step in &self.execution_plan {
+                let kernel_op = self.llir_graph[step.node]
+                    .to_dialect::<dyn MetalKernelOp>()
+                    .expect("Execution plan referenced a non-Metal op");
+                let pipeline = self.pipelines.get(&step.node);
 
-                if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                    let pipeline = self.pipelines.get(&node);
+                let input_buffers: Vec<&Buffer> = step
+                    .input_nodes
+                    .iter()
+                    .map(|&n| self.buffer_for_llir_node(n, &self.llir_to_hlir))
+                    .collect();
 
-                    let input_nodes: Vec<NodeIndex> = self
-                        .llir_graph
-                        .edges_directed(node, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect();
+                let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
+                    input_buffers[alias_idx]
+                } else {
+                    self.buffers
+                        .get(&step.node)
+                        .expect("Output buffer not allocated!")
+                };
 
-                    let input_buffers: Vec<&Buffer> = input_nodes
-                        .iter()
-                        .map(|&n| self.buffer_for_llir_node(n, &llir_to_hlir))
-                        .collect();
-                    let input_dtypes: Vec<DType> = input_nodes
-                        .iter()
-                        .map(|n| {
-                            self.node_dtypes
-                                .get(n)
-                                .copied()
-                                .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
-                        })
-                        .collect();
-
-                    let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
-                        input_buffers[alias_idx]
-                    } else {
-                        self.buffers
-                            .get(&node)
-                            .expect("Output buffer not allocated!")
-                    };
-                    let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-
-                    kernel_op.encode(
-                        command_buffer,
-                        pipeline,
-                        &input_buffers,
-                        output_buffer,
-                        dyn_map,
-                        &self.dyn_buffer,
-                        &input_dtypes,
-                        output_dtype,
-                    );
-                }
+                kernel_op.encode(
+                    &mut encode_context,
+                    pipeline,
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                    &step.input_dtypes,
+                    step.output_dtype,
+                );
             }
 
             command_buffer.commit();
@@ -447,6 +468,22 @@ impl Runtime for MetalRuntime {
 
     fn clear_intermediate_buffers(&mut self) {
         self.buffers.clear();
+        self.buffer_lengths.clear();
+    }
+
+    fn intermediate_buffer_bytes(&self) -> usize {
+        self.buffers
+            .values()
+            .map(|buffer| buffer.length() as usize)
+            .sum()
+    }
+
+    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
+        Some(self.intermediate_buffer_bytes())
+    }
+
+    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
+        Some(self.intermediate_buffer_bytes())
     }
 
     fn load_llir_buckets(
@@ -455,6 +492,7 @@ impl Runtime for MetalRuntime {
         bucket_llirs: &[BucketLLIR],
     ) {
         self.buffers.clear();
+        self.buffer_lengths.clear();
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets = bucket_llirs
             .iter()
@@ -497,7 +535,7 @@ impl MetalRuntime {
     fn create_input_buffer(&self, data: &NativeData, dtype: DType) -> Buffer {
         match dtype {
             DType::F32 => {
-                let values: Vec<f32> = (0..data.len()).map(|i| data.f32(i)).collect();
+                let values = data.to_f32_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,
@@ -505,7 +543,7 @@ impl MetalRuntime {
                 )
             }
             DType::F16 => {
-                let values: Vec<f16> = (0..data.len()).map(|i| data.f16(i)).collect();
+                let values = data.to_f16_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,
@@ -513,7 +551,7 @@ impl MetalRuntime {
                 )
             }
             DType::Int => {
-                let values: Vec<i32> = (0..data.len()).map(|i| data.i32(i)).collect();
+                let values = data.to_i32_vec();
                 self.device.new_buffer_with_data(
                     values.as_ptr() as *const _,
                     std::mem::size_of_val(values.as_slice()) as u64,
@@ -531,6 +569,7 @@ impl MetalRuntime {
 
     fn allocate_active_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
         let mut planned = Vec::new();
+        let capacity_dyn_map = self.active_capacity_dyn_map(dyn_map);
 
         for node in self.llir_graph.node_indices() {
             if self.llir_graph[node].to_op::<Input>().is_some() {
@@ -541,26 +580,56 @@ impl MetalRuntime {
                 if kernel_op.output_aliases_input().is_some() {
                     continue;
                 }
-                let size = kernel_op.output_size().exec(dyn_map).unwrap();
                 let dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-                let bytes = (size * dtype.bits().div_ceil(8)) as u64;
+                let requested_bytes =
+                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, dyn_map);
+                let allocation_bytes =
+                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, &capacity_dyn_map)
+                        .max(requested_bytes);
                 let needs_buffer = self
                     .buffers
                     .get(&node)
-                    .is_none_or(|buffer| buffer.length() != bytes);
+                    .is_none_or(|buffer| requested_bytes > buffer.length());
 
-                planned.push((node, bytes, needs_buffer));
+                planned.push((node, requested_bytes, allocation_bytes, needs_buffer));
             }
         }
 
-        for (node, bytes, needs_buffer) in planned {
+        for (node, requested_bytes, allocation_bytes, needs_buffer) in planned {
+            self.buffer_lengths.insert(node, requested_bytes);
             if needs_buffer {
                 let buffer = self
                     .device
-                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared);
+                    .new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
                 self.buffers.insert(node, buffer);
             }
         }
+    }
+
+    fn output_bytes(
+        kernel_op: &dyn MetalKernelOp,
+        dtype: DType,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> u64 {
+        let size = kernel_op.output_size().exec(dyn_map).unwrap();
+        (size * dtype.bits().div_ceil(8)) as u64
+    }
+
+    fn active_capacity_dyn_map(&self, dyn_map: &FxHashMap<char, usize>) -> FxHashMap<char, usize> {
+        let mut capacity_dyn_map = dyn_map.clone();
+        let Some(active_bucket) = self.compiled_buckets.get(self.active_bucket) else {
+            return capacity_dyn_map;
+        };
+
+        for (&dim, buckets) in &self.dim_buckets {
+            if let Some(&bucket_index) = active_bucket.bucket_indices.get(&dim)
+                && let Some(bucket) = buckets.get(bucket_index)
+            {
+                capacity_dyn_map.insert(dim, bucket.max);
+            }
+        }
+
+        capacity_dyn_map
     }
 
     fn compile_bucket(
@@ -571,12 +640,17 @@ impl MetalRuntime {
         let mut node_dtypes = FxHashMap::default();
         let mut pipelines = FxHashMap::default();
         let mut output_alias_map = FxHashMap::default();
+        let mut output_data_map = FxHashMap::default();
+        let mut execution_plan = Vec::new();
+        let mut llir_to_hlir = FxHashMap::default();
         let llir_graph = llir_graph.clone();
 
         let topo_order = toposort(&llir_graph, None).expect("Graph has cycles!");
-        for node in topo_order {
+        for node in &topo_order {
+            let node = *node;
             if let Some(input) = llir_graph[node].to_op::<Input>() {
                 node_dtypes.insert(node, input.dtype);
+                llir_to_hlir.insert(node, NodeIndex::new(input.node));
                 continue;
             }
 
@@ -610,17 +684,38 @@ impl MetalRuntime {
                 {
                     output_alias_map.insert(node, target);
                 }
+                execution_plan.push(MetalExecutionStep {
+                    node,
+                    input_nodes,
+                    input_dtypes,
+                    output_dtype,
+                });
             } else {
                 panic!("Metal runtime cannot execute unlowered LLIR node {node:?}");
+            }
+        }
+
+        for node in topo_order {
+            if let Some(Output { node: hlir_node }) = llir_graph[node].to_op::<Output>()
+                && let Some(data_node) = llir_graph
+                    .edges_directed(node, Direction::Incoming)
+                    .sorted_by_key(|e| e.id())
+                    .next()
+                    .map(|e| e.source())
+            {
+                output_data_map.insert(NodeIndex::new(*hlir_node), data_node);
             }
         }
 
         MetalCompiledBucket {
             bucket_indices,
             llir_graph,
+            llir_to_hlir,
             node_dtypes,
             pipelines,
             output_alias_map,
+            output_data_map,
+            execution_plan,
         }
     }
 
@@ -632,11 +727,15 @@ impl MetalRuntime {
             .clone();
         self.active_bucket = index;
         self.llir_graph = bucket.llir_graph;
+        self.llir_to_hlir = bucket.llir_to_hlir;
         self.node_dtypes = bucket.node_dtypes;
         self.pipelines = bucket.pipelines;
         self.output_alias_map = bucket.output_alias_map;
+        self.output_data_map = bucket.output_data_map;
+        self.execution_plan = bucket.execution_plan;
         self.refresh_input_data_buffers();
         self.buffers.clear();
+        self.buffer_lengths.clear();
     }
 
     fn refresh_input_data_buffers(&mut self) {
@@ -706,74 +805,43 @@ impl MetalRuntime {
             self.select_bucket(dyn_map);
             self.allocate_active_intermediate_buffers(dyn_map);
 
-            let llir_to_hlir: FxHashMap<NodeIndex, NodeIndex> = self
-                .llir_graph
-                .node_indices()
-                .filter_map(|n| {
-                    if let Some(Input { node, .. }) = self.llir_graph[n].to_op::<Input>() {
-                        Some((n, NodeIndex::new(*node)))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let topo_order = toposort(&self.llir_graph, None).expect("Graph has cycles!");
-
             self.update_dyn_buffer(dyn_map);
             let command_buffer = self.command_queue.new_command_buffer();
+            let mut encode_context = MetalEncodeContext {
+                command_buffer,
+                dyn_buffer: &self.dyn_buffer,
+                mps_cache: &self.mps_cache,
+            };
 
-            for node in topo_order {
-                if self.llir_graph[node].to_op::<Input>().is_some()
-                    || self.llir_graph[node].to_op::<Output>().is_some()
-                {
-                    continue;
-                }
+            for step in &self.execution_plan {
+                let kernel_op = self.llir_graph[step.node]
+                    .to_dialect::<dyn MetalKernelOp>()
+                    .expect("Execution plan referenced a non-Metal op");
+                let pipeline = self.pipelines.get(&step.node);
 
-                if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                    let pipeline = self.pipelines.get(&node);
+                let input_buffers: Vec<&Buffer> = step
+                    .input_nodes
+                    .iter()
+                    .map(|&n| self.buffer_for_llir_node(n, &self.llir_to_hlir))
+                    .collect();
 
-                    let input_nodes: Vec<NodeIndex> = self
-                        .llir_graph
-                        .edges_directed(node, Direction::Incoming)
-                        .sorted_by_key(|e| e.id())
-                        .map(|e| e.source())
-                        .collect();
+                let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
+                    input_buffers[alias_idx]
+                } else {
+                    self.buffers
+                        .get(&step.node)
+                        .expect("Output buffer not allocated!")
+                };
 
-                    let input_buffers: Vec<&Buffer> = input_nodes
-                        .iter()
-                        .map(|&n| self.buffer_for_llir_node(n, &llir_to_hlir))
-                        .collect();
-                    let input_dtypes: Vec<DType> = input_nodes
-                        .iter()
-                        .map(|n| {
-                            self.node_dtypes
-                                .get(n)
-                                .copied()
-                                .unwrap_or_else(|| panic!("Missing inferred dtype for node {n:?}"))
-                        })
-                        .collect();
-
-                    let output_buffer = if let Some(alias_idx) = kernel_op.output_aliases_input() {
-                        input_buffers[alias_idx]
-                    } else {
-                        self.buffers
-                            .get(&node)
-                            .expect("Output buffer not allocated!")
-                    };
-                    let output_dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-
-                    kernel_op.encode(
-                        command_buffer,
-                        pipeline,
-                        &input_buffers,
-                        output_buffer,
-                        dyn_map,
-                        &self.dyn_buffer,
-                        &input_dtypes,
-                        output_dtype,
-                    );
-                }
+                kernel_op.encode(
+                    &mut encode_context,
+                    pipeline,
+                    &input_buffers,
+                    output_buffer,
+                    dyn_map,
+                    &step.input_dtypes,
+                    step.output_dtype,
+                );
             }
 
             command_buffer.commit();

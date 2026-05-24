@@ -4,7 +4,6 @@
 //! through the PT2 path without forcing everything to f32.
 
 use luminal::hlir::NativeData;
-use luminal::prelude::tracing::warn;
 use luminal::prelude::*;
 
 /// A dtype-tagged byte buffer. All weight, constant, and input data flows through this type.
@@ -149,62 +148,40 @@ impl TypedData {
         }
     }
 
-    /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype code) to TypedData
-    /// in luminal's native format. Handles widening/narrowing conversions for types where
-    /// PyTorch's byte layout differs from luminal's:
-    /// - i64 → i32, f64 → f32 (luminal has no 64-bit types)
-    /// - i16 → i32, u8 → i32, i8 → i32 (luminal maps all integer types to i32 for PT2)
+    /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype
+    /// code) to `TypedData`. Supported dtypes preserve their raw bytes —
+    /// no width changes at the FFI boundary. Narrow integer widths
+    /// (`Byte` / `Char` / `Short`) panic: luminal's `NativeData` has no
+    /// narrower-integer variants yet, so the only way they could pass
+    /// through is via implicit widening to `i32`, which the no-implicit-
+    /// cast directive forbids. Cast at the call site
+    /// (`x.to(torch.int32)`) or wait for the narrower-int IR follow-up.
     pub fn from_pytorch_bytes(bytes: Vec<u8>, dtype_code: u32) -> Self {
-        match dtype_code {
-            // Types that map directly — preserve raw bytes
-            7 => Self::from_raw(bytes, DType::F32),
-            6 => Self::from_raw(bytes, DType::F16),
-            13 => Self::from_raw(bytes, DType::Bf16),
-            4 => Self::from_raw(bytes, DType::Int), // i32
-            12 => Self::from_raw(bytes, DType::Bool),
-            // i64 → i32 (truncate)
-            5 => {
-                let i32s: Vec<i32> = bytes
-                    .chunks_exact(8)
-                    .map(|b| {
-                        i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i32
-                    })
-                    .collect();
-                Self::from_i32_vec(i32s)
-            }
-            // f64 → f32 (downcast)
-            8 => {
-                let f32s: Vec<f32> = bytes
-                    .chunks_exact(8)
-                    .map(|b| {
-                        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-                    })
-                    .collect();
-                Self::from_f32_vec(f32s)
-            }
-            // i16 → i32 (widen)
-            3 => {
-                let i32s: Vec<i32> = bytes
-                    .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
-                    .collect();
-                Self::from_i32_vec(i32s)
-            }
-            // u8 → i32 (widen)
-            1 => {
-                let i32s: Vec<i32> = bytes.iter().map(|&b| b as i32).collect();
-                Self::from_i32_vec(i32s)
-            }
-            // i8 → i32 (widen, signed)
-            2 => {
-                let i32s: Vec<i32> = bytes.iter().map(|&b| (b as i8) as i32).collect();
-                Self::from_i32_vec(i32s)
-            }
-            // Unknown: best-effort pass-through as f32
-            _ => {
-                warn!("Unrecognized pytorch dtype code {dtype_code}, interpreting as f32");
-                Self::from_raw(bytes, DType::F32)
-            }
+        let t = crate::torch_dtype::TorchDType::from_code(dtype_code)
+            .unwrap_or_else(|c| panic!("from_pytorch_bytes: unknown PT2 dtype code {c}"));
+        match t {
+            crate::torch_dtype::TorchDType::Float => Self::from_raw(bytes, DType::F32),
+            crate::torch_dtype::TorchDType::Half => Self::from_raw(bytes, DType::F16),
+            crate::torch_dtype::TorchDType::BFloat16 => Self::from_raw(bytes, DType::Bf16),
+            crate::torch_dtype::TorchDType::Int => Self::from_raw(bytes, DType::Int),
+            crate::torch_dtype::TorchDType::Bool => Self::from_raw(bytes, DType::Bool),
+            crate::torch_dtype::TorchDType::Long => Self::from_raw(bytes, DType::I64),
+            crate::torch_dtype::TorchDType::Double => Self::from_raw(bytes, DType::F64),
+            crate::torch_dtype::TorchDType::Byte
+            | crate::torch_dtype::TorchDType::Char
+            | crate::torch_dtype::TorchDType::Short => panic!(
+                "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
+                 IR type yet — cast to torch.int32 at the call site, or wait \
+                 for the narrower-int IR follow-up.",
+                t.name(),
+                t.code(),
+            ),
+            other => panic!(
+                "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
+                 IR type — no luminal mapping.",
+                other.name(),
+                other.code(),
+            ),
         }
     }
 

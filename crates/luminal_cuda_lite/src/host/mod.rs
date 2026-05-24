@@ -2,13 +2,11 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::cudarc::driver::{CudaStream, DriverError, result};
 use luminal::{op::EgglogOp, prelude::*};
-mod cublas;
 mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
 
 pub type Ops = (
-    // cublas::CuBlasSgemmV2,
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
