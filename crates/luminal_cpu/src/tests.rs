@@ -63,13 +63,6 @@ fn ref_softmax(x: &[f32]) -> Vec<f32> {
     exps.iter().map(|v| v / sum).collect()
 }
 
-fn ref_rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
-    let d = x.len();
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / d as f32;
-    let scale = 1.0 / (mean_sq + eps).sqrt();
-    x.iter().zip(w).map(|(xi, wi)| xi * scale * wi).collect()
-}
-
 fn ref_swish(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
@@ -319,7 +312,6 @@ fn cpu_iota() {
     // We test iota indirectly through the gather op which uses it internally,
     // and directly by using it in an identity gather.
     let mut cx = Graph::default();
-    let a = cx.tensor(4);
     // a + 0*iota-sourced-value exercises the iota node in the graph
     // A simpler direct test: use it through an expression that Luminal lowers to Iota
     // (Luminal's arange() directly emits an Iota node)
