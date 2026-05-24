@@ -222,12 +222,6 @@ pub trait EgglogOp: Debug {
         0
     }
 
-    /// When several equivalent IR `Op` enodes share an e-class (e.g. egglog-fused matmul vs
-    /// mul+sum), higher values are preferred during LLIR extraction. Default: 0.
-    fn llir_extract_priority(&self) -> i32 {
-        0
-    }
-
     /// Extract this op from the egraph.
     /// - `kind_children`: metadata fields from OpKind enode (shapes, strides, dtypes, etc.)
     /// - `input_enodes`: IR inputs from IList, already walked and resolved

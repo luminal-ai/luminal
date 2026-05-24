@@ -1644,36 +1644,9 @@ pub fn count_choice_sets_up_to(egraph: &SerializedEGraph, limit: usize) -> usize
     count
 }
 
-/// Extraction preference for one IR e-node; see [`EgglogOp::llir_extract_priority`].
-pub fn llir_enode_extract_priority(
-    egraph: &SerializedEGraph,
-    ir_enode: &NodeId,
-    ops: &[Arc<Box<dyn EgglogOp>>],
-) -> i32 {
-    let (label, children) = &egraph.enodes[ir_enode];
-    if label != "Op" || children.is_empty() {
-        return 0;
-    }
-    let kind_eclass = &children[0];
-    let kind_enodes = &egraph.eclasses[kind_eclass].1;
-    kind_enodes
-        .iter()
-        .map(|kn| {
-            let kname = &egraph.enodes[kn].0;
-            ops.iter()
-                .filter(|o| o.sort().name == *kname)
-                .map(|o| o.llir_extract_priority())
-                .max()
-                .unwrap_or(0)
-        })
-        .max()
-        .unwrap_or(0)
-}
-
 pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
     rng: &mut impl Rng,
-    ops: &[Arc<Box<dyn EgglogOp>>],
 ) -> EGraphChoiceSet<'a> {
     let mut choices = FxHashMap::default();
     for (eclass, (label, enodes)) in &egraph.eclasses {
@@ -1697,20 +1670,7 @@ pub fn random_initial_choice<'a>(
         let pick_idx = if !synth_indices.is_empty() {
             synth_indices[rng.random_range(0..synth_indices.len())]
         } else {
-            let mut best: Vec<usize> = Vec::new();
-            let mut best_p = i32::MIN;
-            for (i, n) in enodes.iter().enumerate() {
-                let p = llir_enode_extract_priority(egraph, n, ops);
-                if p > best_p {
-                    best_p = p;
-                    best.clear();
-                    best.push(i);
-                } else if p == best_p {
-                    best.push(i);
-                }
-            }
-            
-            best[rng.random_range(0..best.len())]
+            rng.random_range(0..enodes.len())
         };
         choices.insert(eclass, &enodes[pick_idx]);
     }

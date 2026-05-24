@@ -138,10 +138,6 @@ impl EgglogOp for CpuMatmul {
         false
     }
 
-    fn llir_extract_priority(&self) -> i32 {
-        1
-    }
-
     fn extract<'a>(
             &'a self,
             egraph: &'a SerializedEGraph,

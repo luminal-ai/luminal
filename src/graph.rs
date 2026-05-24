@@ -1362,7 +1362,7 @@ impl Graph {
                 }
                 panic!("Failed to find a viable initial genome after 100 attempts");
             }
-            let genome = random_initial_choice(egraph, rng, ops);
+            let genome = random_initial_choice(egraph, rng);
             prev_selected.insert(hash_choice_set(&genome));
             let memory_bytes = self.candidate_memory_bytes::<R>(egraph, &genome, &profile_dyn_map);
             if self.exceeds_memory_limit(memory_bytes) {
