@@ -7,6 +7,7 @@ mod binary;
 mod conv;
 mod dispatch;
 mod movement;
+mod movement_dynamic;
 mod reduction;
 mod tensor;
 mod unary;

@@ -251,26 +251,12 @@ fn normalize_expr(expr: Expression) -> Expression {
     }
 }
 
-fn commutative_key(expr: Expression) -> (usize, String) {
-    (expr.len(), format!("{expr:?}"))
-}
-
-fn sort_commutative(lhs: Expression, rhs: Expression) -> (Expression, Expression) {
-    if commutative_key(lhs) <= commutative_key(rhs) {
-        (lhs, rhs)
-    } else {
-        (rhs, lhs)
-    }
-}
-
 fn normalize_add_expr(lhs: Expression, rhs: Expression) -> Expression {
-    let (lhs, rhs) = sort_commutative(lhs, rhs);
-    normalize_expr(lhs + rhs)
+    normalize_expr(crate::dim_arith::add_dims(lhs, rhs))
 }
 
 fn normalize_mul_expr(lhs: Expression, rhs: Expression) -> Expression {
-    let (lhs, rhs) = sort_commutative(lhs, rhs);
-    normalize_expr(lhs * rhs)
+    normalize_expr(crate::dim_arith::mul_dims(lhs, rhs))
 }
 
 fn checked_add_opt(lhs: Option<i64>, rhs: Option<i64>) -> Option<i64> {

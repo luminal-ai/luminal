@@ -114,29 +114,17 @@ pub fn resolve_neg1_dim(target: &[i64], current_dims: &[Expression]) -> Vec<Expr
     }
 
     if let Some(idx) = neg1_idx {
-        let mut total = Expression::from(1usize);
-        for d in current_dims {
-            total *= *d;
-        }
-        if let (Some(total_val), Some(_)) = (
-            {
-                let mut t = 1i64;
-                let mut all_concrete = true;
-                for d in current_dims {
-                    if let Some(v) = d.to_usize() {
-                        t *= v as i64;
-                    } else {
-                        all_concrete = false;
-                    }
-                }
-                if all_concrete { Some(t) } else { None }
-            },
-            Some(known_product),
-        ) {
-            result[idx] = Expression::from((total_val / known_product) as usize);
-        } else {
-            result[idx] = total / Expression::from(known_product as usize);
-        }
+        result[idx] = match current_dims
+            .iter()
+            .map(|d| d.to_usize())
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(vs) => Expression::from(vs.iter().product::<usize>() / known_product as usize),
+            None => {
+                crate::dim_arith::product_of_dims(current_dims.iter().copied())
+                    / Expression::from(known_product as usize)
+            }
+        };
     }
 
     result
@@ -185,11 +173,12 @@ pub fn resolve_neg1_dim_exprs(
         if input_symbolic.is_empty() {
             result[idx] = Expression::from((input_concrete / target_concrete) as usize);
         } else {
-            let mut expr = Expression::from((input_concrete / target_concrete) as usize);
-            for s in &input_symbolic {
-                expr *= *s;
-            }
-            result[idx] = expr;
+            let mut operands: Vec<Expression> = Vec::with_capacity(input_symbolic.len() + 1);
+            operands.push(Expression::from(
+                (input_concrete / target_concrete) as usize,
+            ));
+            operands.extend(input_symbolic.iter().copied());
+            result[idx] = crate::dim_arith::product_of_dims(operands);
         }
 
         result

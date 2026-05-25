@@ -1,4 +1,5 @@
 mod compiled_graph;
+mod dim_arith;
 pub mod torch_dtype;
 pub mod typed_data;
 

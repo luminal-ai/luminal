@@ -306,7 +306,11 @@ impl<'a> Translator<'a> {
                     let mut target: Vec<Expression> = src_dims.to_vec();
                     target[first_non_none_dim] = idx_dim_size;
                     expanded.shape.expand(target);
-                    return Ok(source.gather_elements(expanded, first_non_none_dim));
+                    return Ok(super::movement_dynamic::pt2_gather_elements(
+                        source,
+                        expanded,
+                        first_non_none_dim,
+                    ));
                 }
             } else {
                 bail!(
@@ -426,7 +430,7 @@ impl<'a> Translator<'a> {
         let is_negative = indices_int.lt(zero).cast(DType::Int);
         let normalized = indices_int + is_negative * axis_dim;
 
-        let result = a.gather_elements(normalized, dim);
+        let result = super::movement_dynamic::pt2_gather_elements(a, normalized, dim);
         Ok(if promoted_rank0 {
             result.squeeze(0)
         } else {
@@ -440,7 +444,12 @@ impl<'a> Translator<'a> {
         let dim = normalize_dim(dim, a.shape.len());
         let indices = self.get_input_tensor(node, 2)?;
         let src = self.get_input_tensor(node, 3)?;
-        Ok(a.scatter_elements(indices.cast(DType::Int), src, dim))
+        Ok(super::movement_dynamic::pt2_scatter_elements(
+            a,
+            indices.cast(DType::Int),
+            src,
+            dim,
+        ))
     }
 
     pub(crate) fn translate_scatter_value(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -463,7 +472,12 @@ impl<'a> Translator<'a> {
             bail!("scatter.value: unsupported scalar argument {:?}", value_arg);
         }
         .expand_rhs(indices.shape);
-        Ok(a.scatter_elements(indices.cast(DType::Int), value, dim))
+        Ok(super::movement_dynamic::pt2_scatter_elements(
+            a,
+            indices.cast(DType::Int),
+            value,
+            dim,
+        ))
     }
 
     pub(crate) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -508,7 +522,7 @@ impl<'a> Translator<'a> {
             let indices = idx_tensor.cast(DType::Int);
             let new_last = indices.shape.len();
             let indices = indices.expand_dim(new_last, Expression::from(1usize));
-            Ok(a.scatter_nd(indices, values))
+            Ok(super::movement_dynamic::pt2_scatter_nd(a, indices, values))
         } else {
             bail!("index_put with multiple index tensors not yet supported");
         }

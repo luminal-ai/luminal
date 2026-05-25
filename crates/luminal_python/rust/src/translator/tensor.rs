@@ -424,7 +424,7 @@ impl<'a> Translator<'a> {
         if let Some(val_name) = values_name
             && !val_name.is_empty()
         {
-            let values = a.gather_elements(topk_indices, dim);
+            let values = super::movement_dynamic::pt2_gather_elements(a, topk_indices, dim);
             self.tensors.insert(val_name, values);
         }
         if let Some(idx_name) = indices_name {
@@ -468,7 +468,7 @@ impl<'a> Translator<'a> {
         if let Some(val_name) = values_name
             && !val_name.is_empty()
         {
-            let values = a.gather_elements(full_argsort, dim);
+            let values = super::movement_dynamic::pt2_gather_elements(a, full_argsort, dim);
             self.tensors.insert(val_name, values);
         }
         if let Some(idx_name) = indices_name {
