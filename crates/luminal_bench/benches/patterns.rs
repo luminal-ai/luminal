@@ -19,7 +19,6 @@ use luminal::hlir::Input;
 #[cfg(feature = "metal")]
 use luminal::op::{Runtime, RuntimeStats};
 
-#[cfg(feature = "metal")]
 use luminal::prelude::*;
 
 #[cfg(feature = "metal")]
@@ -47,7 +46,10 @@ fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Opt
     let mut rng = rand::rng();
     for (node, size) in input_sizes {
         debug_assert!(
-            (*cx.graph[*node]).as_any().downcast_ref::<Input>().is_some(),
+            (*cx.graph[*node])
+                .as_any()
+                .downcast_ref::<Input>()
+                .is_some(),
             "benchmark data can only be attached to Input nodes"
         );
         let data: Vec<f32> = (0..*size).map(|_| rng.random::<f32>()).collect();
@@ -63,7 +65,6 @@ fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Opt
     })
 }
 
-#[cfg(feature = "metal")]
 fn tensor_input_sizes<const N: usize>(
     inputs: [(GraphTensor, usize); N],
 ) -> Vec<(NodeIndex, usize)> {
