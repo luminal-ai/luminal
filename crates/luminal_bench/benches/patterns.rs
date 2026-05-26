@@ -46,6 +46,10 @@ fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Opt
 
     let mut rng = rand::rng();
     for (node, size) in input_sizes {
+        debug_assert!(
+            (*cx.graph[*node]).as_any().downcast_ref::<Input>().is_some(),
+            "benchmark data can only be attached to Input nodes"
+        );
         let data: Vec<f32> = (0..*size).map(|_| rng.random::<f32>()).collect();
         rt.set_data(*node, &data);
     }
@@ -57,6 +61,16 @@ fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Opt
         dyn_map: cx.dyn_map.clone(),
         metrics: None,
     })
+}
+
+#[cfg(feature = "metal")]
+fn tensor_input_sizes<const N: usize>(
+    inputs: [(GraphTensor, usize); N],
+) -> Vec<(NodeIndex, usize)> {
+    inputs
+        .into_iter()
+        .map(|(tensor, elements)| (tensor.id, elements))
+        .collect()
 }
 
 // ============================================================================
@@ -81,17 +95,7 @@ fn bench_matmul(
         let b_tensor = cx.tensor((k, n));
         let _ = a.matmul(b_tensor).output();
 
-        let input_sizes: Vec<(NodeIndex, usize)> = cx
-            .graph
-            .node_indices()
-            .filter_map(|node| {
-                if (*cx.graph[node]).as_any().downcast_ref::<Input>().is_some() {
-                    Some((node, m * k.max(k * n)))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let input_sizes = tensor_input_sizes([(a, m * k), (b_tensor, k * n)]);
 
         let Some(mut prepared) = prepare_and_search(&mut cx, &input_sizes) else {
             println!("error:  Skipping matmul/{} - search failed", size_name);
@@ -154,17 +158,7 @@ fn bench_softmax(
         let x = cx.tensor((rows, cols));
         let _ = x.softmax(1).output();
 
-        let input_sizes: Vec<(NodeIndex, usize)> = cx
-            .graph
-            .node_indices()
-            .filter_map(|node| {
-                if (*cx.graph[node]).as_any().downcast_ref::<Input>().is_some() {
-                    Some((node, size_value))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let input_sizes = tensor_input_sizes([(x, size_value)]);
 
         let Some(mut prepared) = prepare_and_search(&mut cx, &input_sizes) else {
             println!("error:  Skipping softmax/{} - search failed", size_name);
@@ -228,17 +222,7 @@ fn bench_layer_norm(
         // LayerNorm along last axis with epsilon
         let _ = x.layer_norm(1, 1e-5).output();
 
-        let input_sizes: Vec<(NodeIndex, usize)> = cx
-            .graph
-            .node_indices()
-            .filter_map(|node| {
-                if (*cx.graph[node]).as_any().downcast_ref::<Input>().is_some() {
-                    Some((node, batch_seq * hidden_dim))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let input_sizes = tensor_input_sizes([(x, batch_seq * hidden_dim)]);
 
         let Some(mut prepared) = prepare_and_search(&mut cx, &input_sizes) else {
             println!("error:  Skipping layer_norm/{} - search failed", size_name);
@@ -303,17 +287,7 @@ fn bench_gelu(
         let x = cx.tensor(size_value);
         let _ = x.gelu().output();
 
-        let input_sizes: Vec<(NodeIndex, usize)> = cx
-            .graph
-            .node_indices()
-            .filter_map(|node| {
-                if (*cx.graph[node]).as_any().downcast_ref::<Input>().is_some() {
-                    Some((node, size_value))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let input_sizes = tensor_input_sizes([(x, size_value)]);
 
         let Some(mut prepared) = prepare_and_search(&mut cx, &input_sizes) else {
             println!("error:  Skipping gelu/{} - search failed", size_name);
@@ -381,17 +355,11 @@ fn bench_attention(
         let attn_weights = scaled_scores.softmax(1);
         let _ = attn_weights.matmul(v).output();
 
-        let input_sizes: Vec<(NodeIndex, usize)> = cx
-            .graph
-            .node_indices()
-            .filter_map(|node| {
-                if (*cx.graph[node]).as_any().downcast_ref::<Input>().is_some() {
-                    Some((node, seq_len * head_dim))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let input_sizes = tensor_input_sizes([
+            (q, seq_len * head_dim),
+            (k, seq_len * head_dim),
+            (v, seq_len * head_dim),
+        ]);
 
         let Some(mut prepared) = prepare_and_search(&mut cx, &input_sizes) else {
             println!("error:  Skipping attention/{} - search failed", size_name);
