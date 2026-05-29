@@ -1437,6 +1437,7 @@ impl Graph {
     /// Run the genetic search and return the unrolled LLIR for the winning
     /// genome. `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`
     /// adds a second "Bucket" progress bar.
+    #[allow(clippy::too_many_arguments)]
     fn search_single<R: Runtime + 'static, G: rand::Rng>(
         &mut self,
         runtime: &mut R,
