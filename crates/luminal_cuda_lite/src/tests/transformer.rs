@@ -280,7 +280,7 @@ fn test_mini_transformer_layer() {
 
     // Use minimal search iterations to avoid excessive graph rewriting
     // which can cause float drift through softmax/RMSNorm reordering
-    rt = cx.search(rt, CompileOptions::new(1));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -316,7 +316,7 @@ fn test_mini_transformer_two_layers() {
         rt.set_data(*tensor, data.clone());
     }
 
-    rt = cx.search(rt, CompileOptions::new(1));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -372,7 +372,7 @@ fn test_transformer_multi_seed() {
             rt.set_data(*tensor, data.clone());
         }
 
-        rt = cx.search(rt, CompileOptions::new(1));
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
         rt.execute(&cx.dyn_map);
         let result = rt.get_f32(out);
 
@@ -404,7 +404,7 @@ fn test_rms_norm_cuda() {
         .collect();
     rt.set_data(input, input_data.clone());
     rt.set_data(weight, weight_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -447,7 +447,7 @@ fn test_self_attention_cuda() {
     rt.set_data(wk, wk_data.clone());
     rt.set_data(wv, wv_data.clone());
     rt.set_data(wo, wo_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -491,7 +491,7 @@ fn test_swiglu_mlp_cuda() {
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -530,7 +530,7 @@ fn test_rolled_chained_scalar_muls() {
     let mut rt = CudaRuntime::initialize(stream);
     let x_data = random_f32_vec(4 * 32, 101, -0.5, 0.5);
     rt.set_data(x, x_data.clone());
-    rt = cx.search(rt, CompileOptions::new(3));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(3));
     rt.execute(&cx.dyn_map);
 
     let result = rt.get_f32(out);

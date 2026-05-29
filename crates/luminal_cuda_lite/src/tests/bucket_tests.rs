@@ -46,7 +46,11 @@ fn test_bucket_dispatch_simple() {
     rt.set_data(a, vec![1.0f32; 4]);
 
     let mut rng = SmallRng::seed_from_u64(42);
-    rt = cx.search_with_rng(rt, CompileOptions::new(5), &mut rng);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng,
+    );
 
     // Test bucket 1: s=1
     cx.set_dim('s', 1);
@@ -91,7 +95,11 @@ fn test_bucket_matmul_dynamic() {
     rt.set_data(b_tensor, b_data.clone());
 
     let mut rng = SmallRng::seed_from_u64(42);
-    rt = cx.search_with_rng(rt, CompileOptions::new(5), &mut rng);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng,
+    );
 
     // Execute at s=1
     cx.set_dim('s', 1);
@@ -146,7 +154,11 @@ fn test_bucket_results_match_unbucketed() {
     let input_data = random_f32_vec(12, seed, -1.0, 1.0);
     rt1.set_data(a1, input_data.clone());
     let mut rng1 = SmallRng::seed_from_u64(seed);
-    rt1 = cx1.search_with_rng(rt1, CompileOptions::new(5), &mut rng1);
+    rt1 = cx1.search_with_rng(
+        rt1,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng1,
+    );
     rt1.set_data(a1, input_data.clone());
     rt1.execute(&cx1.dyn_map);
     let result_unbucketed = rt1.get_f32(b1);
@@ -158,7 +170,11 @@ fn test_bucket_results_match_unbucketed() {
     let mut rt2 = CudaRuntime::initialize(stream.clone());
     rt2.set_data(a2, input_data.clone());
     let mut rng2 = SmallRng::seed_from_u64(seed);
-    rt2 = cx2.search_with_rng(rt2, CompileOptions::new(5), &mut rng2);
+    rt2 = cx2.search_with_rng(
+        rt2,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng2,
+    );
     rt2.set_data(a2, input_data.clone());
     rt2.execute(&cx2.dyn_map);
     let result_bucketed = rt2.get_f32(b2);
@@ -186,7 +202,11 @@ fn test_bucket_out_of_range_panics() {
     cx.set_dim('s', 1);
     rt.set_data(a, vec![1.0f32; 4]);
     let mut rng = SmallRng::seed_from_u64(42);
-    rt = cx.search_with_rng(rt, CompileOptions::new(3), &mut rng);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(3),
+        &mut rng,
+    );
 
     // s=10 is outside all buckets — should panic
     cx.set_dim('s', 10);
@@ -211,7 +231,11 @@ fn test_bucket_no_buckets_backward_compat() {
     let input_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
     rt.set_data(a, input_data.clone());
     let mut rng = SmallRng::seed_from_u64(42);
-    rt = cx.search_with_rng(rt, CompileOptions::new(3), &mut rng);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(3),
+        &mut rng,
+    );
 
     rt.set_data(a, input_data.clone());
     rt.execute(&cx.dyn_map);
@@ -257,7 +281,11 @@ fn test_bucket_switch_preserves_weights() {
     rt.set_data(b_tensor, b_data.clone());
 
     let mut rng = SmallRng::seed_from_u64(42);
-    rt = cx.search_with_rng(rt, CompileOptions::new(5), &mut rng);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng,
+    );
 
     // Execute with bucket 1 (s=1)
     cx.set_dim('s', 1);
@@ -311,7 +339,11 @@ fn test_bucket_multiple_executions_same_bucket() {
     cx.set_dim('s', 1);
     rt.set_data(a, vec![1.0f32; 4]);
     let mut rng = SmallRng::seed_from_u64(42);
-    rt = cx.search_with_rng(rt, CompileOptions::new(3), &mut rng);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(3),
+        &mut rng,
+    );
 
     // Execute at different sizes within the same bucket
     for s in [1, 2, 4, 8] {

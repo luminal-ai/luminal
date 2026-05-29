@@ -21,8 +21,7 @@ let b = cx.tensor((1, 4));
 let c = a.matmul(b).output();
 
 // Compile
-cx.build_search_space::<NativeRuntime>();
-let mut rt = cx.search(NativeRuntime::default(), 1);
+let mut rt = cx.compile(NativeRuntime::default(), CompileOptions::default());
 
 // Set input tensors
 rt.set_data(a, vec![1.0, 2.0, 3.0]);

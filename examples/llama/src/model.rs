@@ -111,125 +111,18 @@ impl Llama {
         config: LlamaConfig,
         fp8_linears: bool,
     ) -> Self {
-        let mut layers = Vec::with_capacity(config.layers);
-        for l in 0..config.layers {
-            layers.push(LlamaLayer {
-                config,
-                up: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.mlp.up_proj"),
-                    (config.intermediate, config.hidden),
-                    fp8_linears,
-                ),
-                up_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.mlp.up_proj"),
-                    fp8_linears,
-                ),
-                gate: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.mlp.gate_proj"),
-                    (config.intermediate, config.hidden),
-                    fp8_linears,
-                ),
-                gate_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.mlp.gate_proj"),
-                    fp8_linears,
-                ),
-                down: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.mlp.down_proj"),
-                    (config.hidden, config.intermediate),
-                    fp8_linears,
-                ),
-                down_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.mlp.down_proj"),
-                    fp8_linears,
-                ),
-                q_proj: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.self_attn.q_proj"),
-                    (config.hidden, config.hidden),
-                    fp8_linears,
-                ),
-                q_proj_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.self_attn.q_proj"),
-                    fp8_linears,
-                ),
-                k_proj: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.self_attn.k_proj"),
-                    (config.kv_dim(), config.hidden),
-                    fp8_linears,
-                ),
-                k_proj_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.self_attn.k_proj"),
-                    fp8_linears,
-                ),
-                v_proj: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.self_attn.v_proj"),
-                    (config.kv_dim(), config.hidden),
-                    fp8_linears,
-                ),
-                v_proj_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.self_attn.v_proj"),
-                    fp8_linears,
-                ),
-                o_proj: linear_weight(
-                    cx,
-                    format!("model.layers.{l}.self_attn.o_proj"),
-                    (config.hidden, config.hidden),
-                    fp8_linears,
-                ),
-                o_proj_scales: fp8_linear_scales(
-                    cx,
-                    format!("model.layers.{l}.self_attn.o_proj"),
-                    fp8_linears,
-                ),
-                attn_rms: LayerNorm::new(
-                    config.hidden,
-                    Some(&format!("model.layers.{l}.input_layernorm.weight")),
-                    None,
-                    false,
-                    1e-5,
-                    cx,
-                ),
-                mlp_rms: LayerNorm::new(
-                    config.hidden,
-                    Some(&format!("model.layers.{l}.post_attention_layernorm.weight")),
-                    None,
-                    false,
-                    1e-5,
-                    cx,
-                ),
-            });
-        }
         Self {
             config,
-            embedding: cx
-                .named_tensor(
-                    "model.embed_tokens.weight",
-                    (config.vocab_size, config.hidden),
-                )
-                .persist(),
-            layers,
-            lm_head: cx
-                .named_tensor("lm_head.weight", (config.vocab_size, config.hidden))
-                .persist(),
-            lm_norm: LayerNorm::new(
-                config.hidden,
-                Some("model.norm.weight"),
-                None,
-                false,
-                1e-5,
+            embedding: persist(
                 cx,
+                "model.embed_tokens.weight",
+                (config.vocab_size, config.hidden),
             ),
+            layers: (0..config.layers)
+                .map(|l| LlamaLayer::init(cx, l, config, fp8_linears))
+                .collect(),
+            lm_head: persist(cx, "lm_head.weight", (config.vocab_size, config.hidden)),
+            lm_norm: rms_norm(cx, config.hidden, "model.norm.weight"),
         }
     }
 
@@ -243,12 +136,7 @@ impl Llama {
         attn_mask: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = input.dims1();
-        let hidden = self.config.hidden;
-        let mut x = self.embedding.gather(
-            (input * hidden).expand_dim(1, hidden)
-                + input.graph().arange(hidden).expand_dim(0, seq),
-        );
+        let mut x = token_embedding(self.embedding, input, self.config.hidden);
         let mut cache_outputs = Vec::with_capacity(self.config.layers);
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
@@ -311,6 +199,170 @@ struct Fp8LinearScales {
     weight: GraphTensor,
 }
 
+impl LlamaLayer {
+    fn init(cx: &mut Graph, l: usize, config: LlamaConfig, fp8: bool) -> Self {
+        Self {
+            config,
+            up: layer_linear_weight(
+                cx,
+                l,
+                "mlp.up_proj",
+                (config.intermediate, config.hidden),
+                fp8,
+            ),
+            up_scales: layer_linear_scales(cx, l, "mlp.up_proj", fp8),
+            gate: layer_linear_weight(
+                cx,
+                l,
+                "mlp.gate_proj",
+                (config.intermediate, config.hidden),
+                fp8,
+            ),
+            gate_scales: layer_linear_scales(cx, l, "mlp.gate_proj", fp8),
+            down: layer_linear_weight(
+                cx,
+                l,
+                "mlp.down_proj",
+                (config.hidden, config.intermediate),
+                fp8,
+            ),
+            down_scales: layer_linear_scales(cx, l, "mlp.down_proj", fp8),
+            q_proj: layer_linear_weight(
+                cx,
+                l,
+                "self_attn.q_proj",
+                (config.hidden, config.hidden),
+                fp8,
+            ),
+            q_proj_scales: layer_linear_scales(cx, l, "self_attn.q_proj", fp8),
+            k_proj: layer_linear_weight(
+                cx,
+                l,
+                "self_attn.k_proj",
+                (config.kv_dim(), config.hidden),
+                fp8,
+            ),
+            k_proj_scales: layer_linear_scales(cx, l, "self_attn.k_proj", fp8),
+            v_proj: layer_linear_weight(
+                cx,
+                l,
+                "self_attn.v_proj",
+                (config.kv_dim(), config.hidden),
+                fp8,
+            ),
+            v_proj_scales: layer_linear_scales(cx, l, "self_attn.v_proj", fp8),
+            o_proj: layer_linear_weight(
+                cx,
+                l,
+                "self_attn.o_proj",
+                (config.hidden, config.hidden),
+                fp8,
+            ),
+            o_proj_scales: layer_linear_scales(cx, l, "self_attn.o_proj", fp8),
+            attn_rms: rms_norm(
+                cx,
+                config.hidden,
+                format!("model.layers.{l}.input_layernorm.weight"),
+            ),
+            mlp_rms: rms_norm(
+                cx,
+                config.hidden,
+                format!("model.layers.{l}.post_attention_layernorm.weight"),
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        mut x: GraphTensor,
+        q_pos: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
+        attn_mask: GraphTensor,
+        k_cache: GraphTensor,
+        v_cache: GraphTensor,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let x_attn = self.attn_rms.forward(x);
+        let q = linear_matmul(x_attn, self.q_proj, self.q_proj_scales);
+        let k = linear_matmul(x_attn, self.k_proj, self.k_proj_scales);
+        let v = linear_matmul(x_attn, self.v_proj, self.v_proj_scales);
+
+        let q_rope = llama_rotary_embeddings(q, q_pos, self.config);
+        let k_rope = llama_rotary_embeddings(k, q_pos, self.config);
+
+        let (attn_out, k_cache_out, v_cache_out) = attention(
+            AttentionInputs {
+                q_rope,
+                k_rope,
+                v,
+                k_cache,
+                v_cache,
+                scatter_idx,
+                gather_idx,
+                attn_mask,
+            },
+            self.config,
+        );
+        x += linear_matmul(attn_out, self.o_proj, self.o_proj_scales);
+
+        let x_mlp = self.mlp_rms.forward(x);
+        let mlp_out = linear_matmul(x_mlp, self.gate, self.gate_scales).swish()
+            * linear_matmul(x_mlp, self.up, self.up_scales);
+        let mlp_out = linear_matmul(mlp_out, self.down, self.down_scales);
+        (x + mlp_out, k_cache_out, v_cache_out)
+    }
+
+    #[allow(dead_code)]
+    fn parameter_tensors(&self) -> Vec<GraphTensor> {
+        let mut tensors = vec![
+            self.up,
+            self.gate,
+            self.down,
+            self.q_proj,
+            self.k_proj,
+            self.v_proj,
+            self.o_proj,
+        ];
+        for scales in [
+            self.up_scales,
+            self.gate_scales,
+            self.down_scales,
+            self.q_proj_scales,
+            self.k_proj_scales,
+            self.v_proj_scales,
+            self.o_proj_scales,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            tensors.push(scales.input);
+            tensors.push(scales.weight);
+        }
+        if let Some(weight) = self.attn_rms.weight {
+            tensors.push(weight);
+        }
+        if let Some(bias) = self.attn_rms.bias {
+            tensors.push(bias);
+        }
+        if let Some(weight) = self.mlp_rms.weight {
+            tensors.push(weight);
+        }
+        if let Some(bias) = self.mlp_rms.bias {
+            tensors.push(bias);
+        }
+        tensors
+    }
+}
+
+fn persist(
+    cx: &mut Graph,
+    name: impl ToString,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    cx.named_tensor(name, shape).persist()
+}
+
 fn linear_weight(
     cx: &mut Graph,
     prefix: impl ToString,
@@ -323,6 +375,16 @@ fn linear_weight(
     } else {
         tensor.persist()
     }
+}
+
+fn layer_linear_weight(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    shape: impl luminal::prelude::ToShape,
+    fp8: bool,
+) -> GraphTensor {
+    linear_weight(cx, format!("model.layers.{layer}.{suffix}"), shape, fp8)
 }
 
 fn fp8_linear_scales(cx: &mut Graph, prefix: impl ToString, fp8: bool) -> Option<Fp8LinearScales> {
@@ -338,6 +400,27 @@ fn fp8_linear_scales(cx: &mut Graph, prefix: impl ToString, fp8: bool) -> Option
             .named_tensor(format!("{prefix}.weight_scale"), ())
             .persist(),
     })
+}
+
+fn layer_linear_scales(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    fp8: bool,
+) -> Option<Fp8LinearScales> {
+    fp8_linear_scales(cx, format!("model.layers.{layer}.{suffix}"), fp8)
+}
+
+fn rms_norm(cx: &mut Graph, dim: usize, weight_name: impl ToString) -> LayerNorm {
+    LayerNorm::new(dim, Some(&weight_name.to_string()), None, false, 1e-5, cx)
+}
+
+fn token_embedding(embedding: GraphTensor, token_ids: GraphTensor, hidden: usize) -> GraphTensor {
+    let seq = token_ids.dims1();
+    embedding.gather(
+        (token_ids * hidden).expand_dim(1, hidden)
+            + token_ids.graph().arange(hidden).expand_dim(0, seq),
+    )
 }
 
 fn expand_scalar(scale: GraphTensor, like: GraphTensor) -> GraphTensor {
@@ -442,88 +525,4 @@ fn attention(
     let attn_out = out.transpose(0, 1).merge_dims(1, 2);
 
     (attn_out, k_cache_out, v_cache_out)
-}
-
-impl LlamaLayer {
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        mut x: GraphTensor,
-        q_pos: GraphTensor,
-        scatter_idx: GraphTensor,
-        gather_idx: GraphTensor,
-        attn_mask: GraphTensor,
-        k_cache: GraphTensor,
-        v_cache: GraphTensor,
-    ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let x_attn = self.attn_rms.forward(x);
-        let q = linear_matmul(x_attn, self.q_proj, self.q_proj_scales);
-        let k = linear_matmul(x_attn, self.k_proj, self.k_proj_scales);
-        let v = linear_matmul(x_attn, self.v_proj, self.v_proj_scales);
-
-        let q_rope = llama_rotary_embeddings(q, q_pos, self.config);
-        let k_rope = llama_rotary_embeddings(k, q_pos, self.config);
-
-        let (attn_out, k_cache_out, v_cache_out) = attention(
-            AttentionInputs {
-                q_rope,
-                k_rope,
-                v,
-                k_cache,
-                v_cache,
-                scatter_idx,
-                gather_idx,
-                attn_mask,
-            },
-            self.config,
-        );
-        x += linear_matmul(attn_out, self.o_proj, self.o_proj_scales);
-
-        let x_mlp = self.mlp_rms.forward(x);
-        let mlp_out = linear_matmul(x_mlp, self.gate, self.gate_scales).swish()
-            * linear_matmul(x_mlp, self.up, self.up_scales);
-        let mlp_out = linear_matmul(mlp_out, self.down, self.down_scales);
-        (x + mlp_out, k_cache_out, v_cache_out)
-    }
-
-    #[allow(dead_code)]
-    fn parameter_tensors(&self) -> Vec<GraphTensor> {
-        let mut tensors = vec![
-            self.up,
-            self.gate,
-            self.down,
-            self.q_proj,
-            self.k_proj,
-            self.v_proj,
-            self.o_proj,
-        ];
-        for scales in [
-            self.up_scales,
-            self.gate_scales,
-            self.down_scales,
-            self.q_proj_scales,
-            self.k_proj_scales,
-            self.v_proj_scales,
-            self.o_proj_scales,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            tensors.push(scales.input);
-            tensors.push(scales.weight);
-        }
-        if let Some(weight) = self.attn_rms.weight {
-            tensors.push(weight);
-        }
-        if let Some(bias) = self.attn_rms.bias {
-            tensors.push(bias);
-        }
-        if let Some(weight) = self.mlp_rms.weight {
-            tensors.push(weight);
-        }
-        if let Some(bias) = self.mlp_rms.bias {
-            tensors.push(bias);
-        }
-        tensors
-    }
 }

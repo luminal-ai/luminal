@@ -126,7 +126,10 @@ mod tests {
         let b = func(&mut cx).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         rt.execute(&cx.dyn_map);
 
@@ -211,7 +214,10 @@ mod tests {
         let stacked = cx.stack(&[a, b, c], 0).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let a_data = random_vec(6);
         let b_data = random_vec(6);

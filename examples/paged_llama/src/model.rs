@@ -25,8 +25,8 @@ pub struct PagedKVCache {
 
 impl PagedKVCache {
     pub fn new(cx: &mut Graph, num_slots: usize) -> Self {
-        let mut k_caches = vec![];
-        let mut v_caches = vec![];
+        let mut k_caches = Vec::with_capacity(LAYERS);
+        let mut v_caches = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
             k_caches.push(cx.named_tensor(format!("kv_cache.{l}.k"), (num_slots, KV_DIM)));
             v_caches.push(cx.named_tensor(format!("kv_cache.{l}.v"), (num_slots, KV_DIM)));
@@ -44,78 +44,11 @@ pub struct Llama {
 
 impl Llama {
     pub fn init(cx: &mut Graph) -> Self {
-        let mut layers = vec![];
-        for l in 0..LAYERS {
-            layers.push(LlamaLayer {
-                up: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.mlp.up_proj.weight"),
-                        (INTERMEDIATE, HIDDEN),
-                    )
-                    .persist(),
-                gate: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.mlp.gate_proj.weight"),
-                        (INTERMEDIATE, HIDDEN),
-                    )
-                    .persist(),
-                down: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.mlp.down_proj.weight"),
-                        (HIDDEN, INTERMEDIATE),
-                    )
-                    .persist(),
-                q_proj: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.self_attn.q_proj.weight"),
-                        (HIDDEN, HIDDEN),
-                    )
-                    .persist(),
-                k_proj: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.self_attn.k_proj.weight"),
-                        (KV_DIM, HIDDEN),
-                    )
-                    .persist(),
-                v_proj: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.self_attn.v_proj.weight"),
-                        (KV_DIM, HIDDEN),
-                    )
-                    .persist(),
-                o_proj: cx
-                    .named_tensor(
-                        format!("model.layers.{l}.self_attn.o_proj.weight"),
-                        (HIDDEN, HIDDEN),
-                    )
-                    .persist(),
-                attn_rms: LayerNorm::new(
-                    HIDDEN,
-                    Some(&format!("model.layers.{l}.input_layernorm.weight")),
-                    None,
-                    false,
-                    1e-5,
-                    cx,
-                ),
-                mlp_rms: LayerNorm::new(
-                    HIDDEN,
-                    Some(&format!("model.layers.{l}.post_attention_layernorm.weight")),
-                    None,
-                    false,
-                    1e-5,
-                    cx,
-                ),
-            });
-        }
         Self {
-            embedding: cx
-                .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
-                .persist(),
-            layers,
-            lm_head: cx
-                .named_tensor("lm_head.weight", (VOCAB_SIZE, HIDDEN))
-                .persist(),
-            lm_norm: LayerNorm::new(HIDDEN, Some("model.norm.weight"), None, false, 1e-5, cx),
+            embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)),
+            layers: (0..LAYERS).map(|l| LlamaLayer::init(cx, l)).collect(),
+            lm_head: persist(cx, "lm_head.weight", (VOCAB_SIZE, HIDDEN)),
+            lm_norm: rms_norm(cx, "model.norm.weight"),
         }
     }
 
@@ -141,12 +74,8 @@ impl Llama {
         attn_mask: GraphTensor,
         kv_cache: &PagedKVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = input.dims1();
-        let mut x = self.embedding.gather(
-            (input * HIDDEN).expand_dim(1, HIDDEN)
-                + input.graph().arange(HIDDEN).expand_dim(0, seq),
-        );
-        let mut cache_outputs = vec![];
+        let mut x = token_embedding(self.embedding, input);
+        let mut cache_outputs = Vec::with_capacity(LAYERS);
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
                 x,
@@ -175,6 +104,99 @@ struct LlamaLayer {
     o_proj: GraphTensor,
     attn_rms: LayerNorm,
     mlp_rms: LayerNorm,
+}
+
+impl LlamaLayer {
+    fn init(cx: &mut Graph, l: usize) -> Self {
+        Self {
+            up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)),
+            gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN)),
+            down: layer_weight(cx, l, "mlp.down_proj", (HIDDEN, INTERMEDIATE)),
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (HIDDEN, HIDDEN)),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, HIDDEN)),
+            attn_rms: rms_norm(cx, format!("model.layers.{l}.input_layernorm.weight")),
+            mlp_rms: rms_norm(
+                cx,
+                format!("model.layers.{l}.post_attention_layernorm.weight"),
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        mut x: GraphTensor,
+        q_pos: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
+        attn_mask: GraphTensor,
+        k_cache: GraphTensor,
+        v_cache: GraphTensor,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let x_attn = self.attn_rms.forward(x);
+        let q = x_attn.matmul(self.q_proj.t());
+        let k = x_attn.matmul(self.k_proj.t());
+        let v = x_attn.matmul(self.v_proj.t());
+
+        let q_rope = llama_rotary_embeddings(q, q_pos);
+        let k_rope = llama_rotary_embeddings(k, q_pos);
+
+        let (attn_out, k_cache_out, v_cache_out) = paged_attention(
+            q_rope,
+            k_rope,
+            v,
+            k_cache,
+            v_cache,
+            scatter_idx,
+            gather_idx,
+            attn_mask,
+        );
+
+        x += attn_out.matmul(self.o_proj.t());
+
+        let x_mlp = self.mlp_rms.forward(x);
+        let mlp_out =
+            (x_mlp.matmul(self.gate.t()).swish() * x_mlp.matmul(self.up.t())).matmul(self.down.t());
+        (x + mlp_out, k_cache_out, v_cache_out)
+    }
+}
+
+fn persist(
+    cx: &mut Graph,
+    name: impl ToString,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    cx.named_tensor(name, shape).persist()
+}
+
+fn layer_weight(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    persist(cx, format!("model.layers.{layer}.{suffix}.weight"), shape)
+}
+
+fn rms_norm(cx: &mut Graph, weight_name: impl ToString) -> LayerNorm {
+    LayerNorm::new(
+        HIDDEN,
+        Some(&weight_name.to_string()),
+        None,
+        false,
+        1e-5,
+        cx,
+    )
+}
+
+fn token_embedding(embedding: GraphTensor, token_ids: GraphTensor) -> GraphTensor {
+    let seq = token_ids.dims1();
+    embedding.gather(
+        (token_ids * HIDDEN).expand_dim(1, HIDDEN)
+            + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
+    )
 }
 
 fn llama_rotary_embeddings(mut input: GraphTensor, pos_ids: GraphTensor) -> GraphTensor {
@@ -263,45 +285,4 @@ fn paged_attention(
     // Phase 5: Reshape → (s, HIDDEN)
     let attn_out = out.transpose(0, 1).merge_dims(1, 2);
     (attn_out, k_cache_out, v_cache_out)
-}
-
-impl LlamaLayer {
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        mut x: GraphTensor,
-        q_pos: GraphTensor,
-        scatter_idx: GraphTensor,
-        gather_idx: GraphTensor,
-        attn_mask: GraphTensor,
-        k_cache: GraphTensor,
-        v_cache: GraphTensor,
-    ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let x_attn = self.attn_rms.forward(x);
-        let q = x_attn.matmul(self.q_proj.t());
-        let k = x_attn.matmul(self.k_proj.t());
-        let v = x_attn.matmul(self.v_proj.t());
-
-        // Apply RoPE before scattering into cache
-        let q_rope = llama_rotary_embeddings(q, q_pos);
-        let k_rope = llama_rotary_embeddings(k, q_pos);
-
-        let (attn_out, k_cache_out, v_cache_out) = paged_attention(
-            q_rope,
-            k_rope,
-            v,
-            k_cache,
-            v_cache,
-            scatter_idx,
-            gather_idx,
-            attn_mask,
-        );
-
-        x += attn_out.matmul(self.o_proj.t());
-
-        let x_mlp = self.mlp_rms.forward(x);
-        let mlp_out =
-            (x_mlp.matmul(self.gate.t()).swish() * x_mlp.matmul(self.up.t())).matmul(self.down.t());
-        (x + mlp_out, k_cache_out, v_cache_out)
-    }
 }

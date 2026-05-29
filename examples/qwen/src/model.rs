@@ -34,14 +34,16 @@ impl KVCache {
         let mut k_caches = Vec::with_capacity(layers);
         let mut v_caches = Vec::with_capacity(layers);
         for l in 0..layers {
-            let k = cx
-                .named_tensor(format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            let v = cx
-                .named_tensor(format!("kv_cache.{l}.v"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            k_caches.push(k);
-            v_caches.push(v);
+            k_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.k"),
+                (N_KV_HEADS, max_seq, HEAD_DIM),
+            ));
+            v_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.v"),
+                (N_KV_HEADS, max_seq, HEAD_DIM),
+            ));
         }
         Self {
             k_caches,
@@ -63,105 +65,10 @@ impl Qwen {
             layers <= LAYERS,
             "requested {layers} layers, but model has {LAYERS}"
         );
-        let mut w = vec![];
-        for l in 0..layers {
-            let up = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.up_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
-                )
-                .persist();
-            let gate = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.gate_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
-                )
-                .persist();
-            let down = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.down_proj.weight"),
-                    (HIDDEN, INTERMEDIATE),
-                )
-                .persist();
-            let q_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_proj.weight"),
-                    (Q_DIM, HIDDEN),
-                )
-                .persist();
-            let k_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_proj.weight"),
-                    (KV_DIM, HIDDEN),
-                )
-                .persist();
-            let v_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.v_proj.weight"),
-                    (KV_DIM, HIDDEN),
-                )
-                .persist();
-            let o_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.o_proj.weight"),
-                    (HIDDEN, Q_DIM),
-                )
-                .persist();
-            let q_norm = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_norm.weight"),
-                    HEAD_DIM,
-                )
-                .persist();
-            let k_norm = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_norm.weight"),
-                    HEAD_DIM,
-                )
-                .persist();
-            w.push(QwenLayer {
-                up,
-                gate,
-                down,
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                q_norm,
-                k_norm,
-                attn_rms: LayerNorm::new(
-                    HIDDEN,
-                    Some(&format!("model.layers.{l}.input_layernorm.weight")),
-                    None,
-                    false,
-                    RMS_NORM_EPS,
-                    cx,
-                ),
-                mlp_rms: LayerNorm::new(
-                    HIDDEN,
-                    Some(&format!("model.layers.{l}.post_attention_layernorm.weight")),
-                    None,
-                    false,
-                    RMS_NORM_EPS,
-                    cx,
-                ),
-            });
-        }
-        let lm_norm = LayerNorm::new(
-            HIDDEN,
-            Some("model.norm.weight"),
-            None,
-            false,
-            RMS_NORM_EPS,
-            cx,
-        );
-        let embedding = cx
-            .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
         Self {
-            embedding,
-            layers: w,
-            lm_norm,
+            embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)),
+            layers: (0..layers).map(|l| QwenLayer::init(cx, l)).collect(),
+            lm_norm: rms_norm(cx, "model.norm.weight"),
         }
     }
 
@@ -172,11 +79,7 @@ impl Qwen {
         pos_ids: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = token_ids.dims1();
-        let mut x = self.embedding.gather(
-            (token_ids * HIDDEN).expand_dim(1, HIDDEN)
-                + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
-        );
+        let mut x = token_embedding(self.embedding, token_ids);
         let mut cache_outputs = Vec::with_capacity(self.layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
@@ -207,6 +110,90 @@ struct QwenLayer {
     k_norm: GraphTensor,
     attn_rms: LayerNorm,
     mlp_rms: LayerNorm,
+}
+
+impl QwenLayer {
+    fn init(cx: &mut Graph, l: usize) -> Self {
+        Self {
+            up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)),
+            gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN)),
+            down: layer_weight(cx, l, "mlp.down_proj", (HIDDEN, INTERMEDIATE)),
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)),
+            q_norm: layer_weight(cx, l, "self_attn.q_norm", HEAD_DIM),
+            k_norm: layer_weight(cx, l, "self_attn.k_norm", HEAD_DIM),
+            attn_rms: rms_norm(cx, format!("model.layers.{l}.input_layernorm.weight")),
+            mlp_rms: rms_norm(
+                cx,
+                format!("model.layers.{l}.post_attention_layernorm.weight"),
+            ),
+        }
+    }
+
+    pub fn forward(
+        &self,
+        mut x: GraphTensor,
+        pos_ids: GraphTensor,
+        k_cache_in: GraphTensor,
+        v_cache_in: GraphTensor,
+        max_seq: usize,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let x_attn = self.attn_rms.forward(x);
+        let q = x_attn.matmul(self.q_proj.t());
+        let k = x_attn.matmul(self.k_proj.t());
+        let v = x_attn.matmul(self.v_proj.t());
+
+        let q_rope = qwen_rotary_embeddings(qk_norm(q, self.q_norm, N_HEADS), pos_ids, N_HEADS);
+        let k_rope =
+            qwen_rotary_embeddings(qk_norm(k, self.k_norm, N_KV_HEADS), pos_ids, N_KV_HEADS);
+
+        let (attn_out, k_cache_out, v_cache_out) =
+            hlir_attention(q_rope, k_rope, v, k_cache_in, v_cache_in, max_seq);
+        x += attn_out.matmul(self.o_proj.t());
+
+        let x_mlp = self.mlp_rms.forward(x);
+        let mlp_out =
+            (x_mlp.matmul(self.gate.t()).swish() * x_mlp.matmul(self.up.t())).matmul(self.down.t());
+        (x + mlp_out, k_cache_out, v_cache_out)
+    }
+}
+
+fn persist(
+    cx: &mut Graph,
+    name: impl ToString,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    cx.named_tensor(name, shape).persist()
+}
+
+fn layer_weight(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    persist(cx, format!("model.layers.{layer}.{suffix}.weight"), shape)
+}
+
+fn rms_norm(cx: &mut Graph, weight_name: impl ToString) -> LayerNorm {
+    LayerNorm::new(
+        HIDDEN,
+        Some(&weight_name.to_string()),
+        None,
+        false,
+        RMS_NORM_EPS,
+        cx,
+    )
+}
+
+fn token_embedding(embedding: GraphTensor, token_ids: GraphTensor) -> GraphTensor {
+    let seq = token_ids.dims1();
+    embedding.gather(
+        (token_ids * HIDDEN).expand_dim(1, HIDDEN)
+            + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
+    )
 }
 
 /// Per-head RMS normalization for QK-norm.
@@ -330,37 +317,4 @@ fn hlir_attention(
     let out = attn_out.transpose(0, 1).merge_dims(1, 2);
 
     (out, k_cache_out, v_cache_out)
-}
-
-impl QwenLayer {
-    pub fn forward(
-        &self,
-        mut x: GraphTensor,
-        pos_ids: GraphTensor,
-        k_cache_in: GraphTensor,
-        v_cache_in: GraphTensor,
-        max_seq: usize,
-    ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let x_attn = self.attn_rms.forward(x);
-        let q = x_attn.matmul(self.q_proj.t());
-        let k = x_attn.matmul(self.k_proj.t());
-        let v = x_attn.matmul(self.v_proj.t());
-
-        // QK-norm: per-head RMS normalization
-        let q_normed = qk_norm(q, self.q_norm, N_HEADS);
-        let k_normed = qk_norm(k, self.k_norm, N_KV_HEADS);
-
-        // RoPE
-        let q_rope = qwen_rotary_embeddings(q_normed, pos_ids, N_HEADS);
-        let k_rope = qwen_rotary_embeddings(k_normed, pos_ids, N_KV_HEADS);
-
-        let (attn_out, k_cache_out, v_cache_out) =
-            hlir_attention(q_rope, k_rope, v, k_cache_in, v_cache_in, max_seq);
-        x += attn_out.matmul(self.o_proj.t());
-
-        let x_mlp = self.mlp_rms.forward(x);
-        let mlp_out =
-            (x_mlp.matmul(self.gate.t()).swish() * x_mlp.matmul(self.up.t())).matmul(self.down.t());
-        (x + mlp_out, k_cache_out, v_cache_out)
-    }
 }

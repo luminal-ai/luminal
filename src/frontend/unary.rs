@@ -493,7 +493,10 @@ pub(super) mod tests {
         let b = func(a).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let v = random_vec(shape.iter().copied().product());
         rt.set_data(a.id, v.clone());

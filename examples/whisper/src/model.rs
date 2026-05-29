@@ -33,6 +33,14 @@ fn linear_no_bias(x: GraphTensor, w: GraphTensor) -> GraphTensor {
     x.matmul(w.t())
 }
 
+fn persist(
+    cx: &mut Graph,
+    name: impl ToString,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    cx.named_tensor(name, shape).persist()
+}
+
 /// 1D convolution with bias. Input: (ch_in, length). Weight: (ch_out, ch_in*kernel)
 /// (HF stores it as (ch_out, ch_in, kernel) which flat-loads identically). Output: (ch_out, out_length).
 fn conv1d_bias(
@@ -90,27 +98,13 @@ struct AttentionWeights {
 impl AttentionWeights {
     fn new(prefix: &str, dim: usize, cx: &mut Graph) -> Self {
         Self {
-            q_proj: cx
-                .named_tensor(format!("{prefix}.q_proj.weight"), (dim, dim))
-                .persist(),
-            q_bias: cx
-                .named_tensor(format!("{prefix}.q_proj.bias"), dim)
-                .persist(),
-            k_proj: cx
-                .named_tensor(format!("{prefix}.k_proj.weight"), (dim, dim))
-                .persist(),
-            v_proj: cx
-                .named_tensor(format!("{prefix}.v_proj.weight"), (dim, dim))
-                .persist(),
-            v_bias: cx
-                .named_tensor(format!("{prefix}.v_proj.bias"), dim)
-                .persist(),
-            out_proj: cx
-                .named_tensor(format!("{prefix}.out_proj.weight"), (dim, dim))
-                .persist(),
-            out_bias: cx
-                .named_tensor(format!("{prefix}.out_proj.bias"), dim)
-                .persist(),
+            q_proj: persist(cx, format!("{prefix}.q_proj.weight"), (dim, dim)),
+            q_bias: persist(cx, format!("{prefix}.q_proj.bias"), dim),
+            k_proj: persist(cx, format!("{prefix}.k_proj.weight"), (dim, dim)),
+            v_proj: persist(cx, format!("{prefix}.v_proj.weight"), (dim, dim)),
+            v_bias: persist(cx, format!("{prefix}.v_proj.bias"), dim),
+            out_proj: persist(cx, format!("{prefix}.out_proj.weight"), (dim, dim)),
+            out_bias: persist(cx, format!("{prefix}.out_proj.bias"), dim),
         }
     }
 }
@@ -123,6 +117,14 @@ fn split_heads(x: GraphTensor) -> GraphTensor {
 fn merge_heads(x: GraphTensor) -> GraphTensor {
     // (n_heads, seq, head_dim) -> (seq, n_heads, head_dim) -> (seq, dim)
     x.transpose(0, 1).merge_dims(1, 2)
+}
+
+fn embedding_lookup(embedding: GraphTensor, ids: GraphTensor) -> GraphTensor {
+    let seq = ids.dims1();
+    embedding.gather(
+        (ids * N_TEXT_STATE).expand_dim(1, N_TEXT_STATE)
+            + ids.graph().arange(N_TEXT_STATE).expand_dim(0, seq),
+    )
 }
 
 /// Encoder self-attention (full, non-causal). Input/output shape (seq, dim).
@@ -239,18 +241,10 @@ impl EncoderLayer {
                 N_AUDIO_STATE,
                 cx,
             ),
-            fc1: cx
-                .named_tensor(format!("{prefix}.fc1.weight"), (FF_DIM, N_AUDIO_STATE))
-                .persist(),
-            fc1_b: cx
-                .named_tensor(format!("{prefix}.fc1.bias"), FF_DIM)
-                .persist(),
-            fc2: cx
-                .named_tensor(format!("{prefix}.fc2.weight"), (N_AUDIO_STATE, FF_DIM))
-                .persist(),
-            fc2_b: cx
-                .named_tensor(format!("{prefix}.fc2.bias"), N_AUDIO_STATE)
-                .persist(),
+            fc1: persist(cx, format!("{prefix}.fc1.weight"), (FF_DIM, N_AUDIO_STATE)),
+            fc1_b: persist(cx, format!("{prefix}.fc1.bias"), FF_DIM),
+            fc2: persist(cx, format!("{prefix}.fc2.weight"), (N_AUDIO_STATE, FF_DIM)),
+            fc2_b: persist(cx, format!("{prefix}.fc2.bias"), N_AUDIO_STATE),
             final_ln: standard_layernorm(&format!("{prefix}.final_layer_norm"), N_AUDIO_STATE, cx),
         }
     }
@@ -295,18 +289,10 @@ impl DecoderLayer {
                 N_TEXT_STATE,
                 cx,
             ),
-            fc1: cx
-                .named_tensor(format!("{prefix}.fc1.weight"), (FF_DIM, N_TEXT_STATE))
-                .persist(),
-            fc1_b: cx
-                .named_tensor(format!("{prefix}.fc1.bias"), FF_DIM)
-                .persist(),
-            fc2: cx
-                .named_tensor(format!("{prefix}.fc2.weight"), (N_TEXT_STATE, FF_DIM))
-                .persist(),
-            fc2_b: cx
-                .named_tensor(format!("{prefix}.fc2.bias"), N_TEXT_STATE)
-                .persist(),
+            fc1: persist(cx, format!("{prefix}.fc1.weight"), (FF_DIM, N_TEXT_STATE)),
+            fc1_b: persist(cx, format!("{prefix}.fc1.bias"), FF_DIM),
+            fc2: persist(cx, format!("{prefix}.fc2.weight"), (N_TEXT_STATE, FF_DIM)),
+            fc2_b: persist(cx, format!("{prefix}.fc2.bias"), N_TEXT_STATE),
             final_ln: standard_layernorm(&format!("{prefix}.final_layer_norm"), N_TEXT_STATE, cx),
         }
     }
@@ -346,14 +332,16 @@ impl KVCache {
         let mut k_caches = Vec::with_capacity(N_TEXT_LAYER);
         let mut v_caches = Vec::with_capacity(N_TEXT_LAYER);
         for l in 0..N_TEXT_LAYER {
-            let k = cx
-                .named_tensor(format!("kv_cache.{l}.k"), (N_TEXT_HEAD, max_seq, HEAD_DIM))
-                .persist();
-            let v = cx
-                .named_tensor(format!("kv_cache.{l}.v"), (N_TEXT_HEAD, max_seq, HEAD_DIM))
-                .persist();
-            k_caches.push(k);
-            v_caches.push(v);
+            k_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.k"),
+                (N_TEXT_HEAD, max_seq, HEAD_DIM),
+            ));
+            v_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.v"),
+                (N_TEXT_HEAD, max_seq, HEAD_DIM),
+            ));
         }
         Self {
             k_caches,
@@ -376,27 +364,23 @@ pub struct WhisperEncoder {
 impl WhisperEncoder {
     pub fn init(cx: &mut Graph) -> Self {
         Self {
-            conv1_w: cx
-                .named_tensor("model.encoder.conv1.weight", (N_AUDIO_STATE, N_MELS * 3))
-                .persist(),
-            conv1_b: cx
-                .named_tensor("model.encoder.conv1.bias", N_AUDIO_STATE)
-                .persist(),
-            conv2_w: cx
-                .named_tensor(
-                    "model.encoder.conv2.weight",
-                    (N_AUDIO_STATE, N_AUDIO_STATE * 3),
-                )
-                .persist(),
-            conv2_b: cx
-                .named_tensor("model.encoder.conv2.bias", N_AUDIO_STATE)
-                .persist(),
-            positional_embedding: cx
-                .named_tensor(
-                    "model.encoder.embed_positions.weight",
-                    (N_AUDIO_CTX, N_AUDIO_STATE),
-                )
-                .persist(),
+            conv1_w: persist(
+                cx,
+                "model.encoder.conv1.weight",
+                (N_AUDIO_STATE, N_MELS * 3),
+            ),
+            conv1_b: persist(cx, "model.encoder.conv1.bias", N_AUDIO_STATE),
+            conv2_w: persist(
+                cx,
+                "model.encoder.conv2.weight",
+                (N_AUDIO_STATE, N_AUDIO_STATE * 3),
+            ),
+            conv2_b: persist(cx, "model.encoder.conv2.bias", N_AUDIO_STATE),
+            positional_embedding: persist(
+                cx,
+                "model.encoder.embed_positions.weight",
+                (N_AUDIO_CTX, N_AUDIO_STATE),
+            ),
             layers: (0..N_AUDIO_LAYER)
                 .map(|i| EncoderLayer::new(i, cx))
                 .collect(),
@@ -427,15 +411,16 @@ pub struct WhisperDecoder {
 impl WhisperDecoder {
     pub fn init(cx: &mut Graph) -> Self {
         Self {
-            embed_tokens: cx
-                .named_tensor("model.decoder.embed_tokens.weight", (N_VOCAB, N_TEXT_STATE))
-                .persist(),
-            embed_positions: cx
-                .named_tensor(
-                    "model.decoder.embed_positions.weight",
-                    (N_TEXT_CTX, N_TEXT_STATE),
-                )
-                .persist(),
+            embed_tokens: persist(
+                cx,
+                "model.decoder.embed_tokens.weight",
+                (N_VOCAB, N_TEXT_STATE),
+            ),
+            embed_positions: persist(
+                cx,
+                "model.decoder.embed_positions.weight",
+                (N_TEXT_CTX, N_TEXT_STATE),
+            ),
             layers: (0..N_TEXT_LAYER)
                 .map(|i| DecoderLayer::new(i, cx))
                 .collect(),
@@ -450,18 +435,8 @@ impl WhisperDecoder {
         xa: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = token_ids.dims1();
-        // Token embedding gather
-        let mut x = self.embed_tokens.gather(
-            (token_ids * N_TEXT_STATE).expand_dim(1, N_TEXT_STATE)
-                + token_ids.graph().arange(N_TEXT_STATE).expand_dim(0, seq),
-        );
-        // Positional embedding gather (using pos_ids)
-        let pos_emb = self.embed_positions.gather(
-            (pos_ids * N_TEXT_STATE).expand_dim(1, N_TEXT_STATE)
-                + pos_ids.graph().arange(N_TEXT_STATE).expand_dim(0, seq),
-        );
-        x += pos_emb;
+        let mut x = embedding_lookup(self.embed_tokens, token_ids);
+        x += embedding_lookup(self.embed_positions, pos_ids);
 
         let mut cache_outputs = Vec::with_capacity(N_TEXT_LAYER);
         for (i, layer) in self.layers.iter().enumerate() {

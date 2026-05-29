@@ -53,6 +53,10 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn search_options() -> CompileOptions {
+    CompileOptions::default().search_graph_limit(env_usize("SEARCH_ITERS", 5))
+}
+
 fn env_f32(name: &str, default: f32) -> f32 {
     std::env::var(name)
         .ok()
@@ -187,7 +191,7 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
 
     println!("Compiling text encoder...");
     let t0 = Instant::now();
-    runtime = cx.search(runtime, CompileOptions::new(env_usize("SEARCH_ITERS", 5)));
+    runtime = cx.search(runtime, search_options());
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
     println!("Encoding prompt...");
@@ -345,10 +349,9 @@ fn run_full_pipeline(
     {
         use rand::SeedableRng;
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-        let opts = luminal::graph::CompileOptions::new(env_usize("SEARCH_ITERS", 5));
-        runtime = cx.search_with_rng(runtime, opts, &mut rng);
+        runtime = cx.search_with_rng(runtime, search_options(), &mut rng);
     } else {
-        runtime = cx.search(runtime, CompileOptions::new(env_usize("SEARCH_ITERS", 5)));
+        runtime = cx.search(runtime, search_options());
     }
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
@@ -415,7 +418,7 @@ fn run_full_pipeline(
     let mut runtime = CudaRuntime::initialize(stream);
     runtime.load_safetensors(&cx, vae_path.to_str().unwrap());
     runtime.set_data(latent_in, vae_input);
-    runtime = cx.search(runtime, CompileOptions::new(env_usize("SEARCH_ITERS", 5)));
+    runtime = cx.search(runtime, search_options());
     runtime.execute(&cx.dyn_map);
     let img = runtime.get_f32(out);
     // VaeDecoder output is in roughly [-1, 1] range. Diffusers'

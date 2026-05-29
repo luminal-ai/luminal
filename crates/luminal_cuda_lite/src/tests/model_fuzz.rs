@@ -95,7 +95,7 @@ fn fuzz_mlp(seq: usize, hidden: usize, intermediate: usize, seed: u64) {
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -156,7 +156,7 @@ fn fuzz_norm_proj(seq: usize, hidden: usize, proj_dim: usize, eps: f32, seed: u6
     rt.set_data(input, input_data.clone());
     rt.set_data(norm_w, norm_data.clone());
     rt.set_data(proj_w, proj_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -245,7 +245,7 @@ fn fuzz_layer_no_attn(
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -330,7 +330,7 @@ fn fuzz_mlp_hlir_only(seq: usize, hidden: usize, intermediate: usize, seed: u64)
     rt.set_data(w_gate, gate_data.clone());
     rt.set_data(w_up, up_data.clone());
     rt.set_data(w_down, down_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out);
 
@@ -518,7 +518,7 @@ mod gemma {
         rt.set_data(w_gate, gate_data.clone());
         rt.set_data(w_up, up_data.clone());
         rt.set_data(w_down, down_data.clone());
-        rt = cx.search(rt, CompileOptions::new(5));
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
         rt.execute(&cx.dyn_map);
         let result = rt.get_f32(out);
 
@@ -655,7 +655,7 @@ mod qwen {
         rt.set_data(input, input_data.clone());
         rt.set_data(norm_w, norm_data.clone());
         rt.set_data(embedding, emb_data.clone());
-        rt = cx.search(rt, CompileOptions::new(5));
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
         rt.execute(&cx.dyn_map);
         let result = rt.get_f32(out);
 

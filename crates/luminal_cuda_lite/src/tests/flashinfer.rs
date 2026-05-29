@@ -89,7 +89,7 @@ fn run_reference_attention(
     rt.set_data(q_t, q.to_vec());
     rt.set_data(k_t, k.to_vec());
     rt.set_data(v_t, v.to_vec());
-    rt = cx.search(rt, CompileOptions::new(3));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(3));
 
     rt.set_data(q_t, q.to_vec());
     rt.set_data(k_t, k.to_vec());

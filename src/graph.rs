@@ -137,7 +137,9 @@ impl DimBucket {
 /// Use the builder pattern to configure search parameters:
 /// ```
 /// use luminal::prelude::CompileOptions;
-/// let opts = CompileOptions::new(5)
+/// let opts = CompileOptions::default()
+///     .search_graph_limit(5)
+///     .search_time_limit(std::time::Duration::from_secs(30))
 ///     .generation_size(50)
 ///     .mutations(40)
 ///     .trials(15);
@@ -146,6 +148,8 @@ impl DimBucket {
 pub struct CompileOptions {
     /// Maximum number of graphs to evaluate during search.
     pub limit: usize,
+    /// Maximum wall-clock time to spend searching.
+    pub search_time_limit: std::time::Duration,
     /// Optional maximum runtime-specific intermediate memory, in bytes.
     ///
     /// When this is `None`, search does not apply a memory cap. Runtimes that
@@ -163,8 +167,6 @@ pub struct CompileOptions {
     /// Per-candidate profiling timeout. If a profile call reaches this budget,
     /// that candidate is discarded and search continues.
     pub profile_timeout: Option<std::time::Duration>,
-    /// Optional per-group search timeout.
-    pub group_timeout: Option<std::time::Duration>,
     /// Optional profiling dimension overrides.
     pub profile_dims: FxHashMap<char, usize>,
     /// Bucket definitions per dynamic dimension. Dimensions without buckets use
@@ -173,20 +175,16 @@ pub struct CompileOptions {
 }
 
 impl CompileOptions {
-    /// Create compile options with the given search limit. Other fields use defaults.
-    pub fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            max_memory_bytes: None,
-            generation_size: 10,
-            mutations: 10,
-            trials: 3,
-            keep_best: 1,
-            profile_timeout: Some(std::time::Duration::from_secs(1)),
-            group_timeout: None,
-            profile_dims: FxHashMap::default(),
-            dim_buckets: FxHashMap::default(),
-        }
+    /// Set the maximum number of graphs to evaluate during search.
+    pub fn search_graph_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Set the maximum wall-clock time to spend searching.
+    pub fn search_time_limit(mut self, search_time_limit: std::time::Duration) -> Self {
+        self.search_time_limit = search_time_limit;
+        self
     }
 
     /// Set a maximum intermediate memory budget in bytes.
@@ -235,12 +233,6 @@ impl CompileOptions {
         self
     }
 
-    /// Set an optional per-group search timeout.
-    pub fn group_timeout(mut self, group_timeout: std::time::Duration) -> Self {
-        self.group_timeout = Some(group_timeout);
-        self
-    }
-
     /// Override a dynamic dimension value used during search profiling.
     pub fn profile_dim(mut self, dim: char, value: usize) -> Self {
         self.profile_dims.insert(dim, value);
@@ -261,7 +253,18 @@ impl CompileOptions {
 
 impl Default for CompileOptions {
     fn default() -> Self {
-        Self::new(1)
+        Self {
+            limit: 100,
+            search_time_limit: std::time::Duration::MAX,
+            max_memory_bytes: None,
+            generation_size: 10,
+            mutations: 10,
+            trials: 3,
+            keep_best: 1,
+            profile_timeout: Some(std::time::Duration::from_secs(1)),
+            profile_dims: FxHashMap::default(),
+            dim_buckets: FxHashMap::default(),
+        }
     }
 }
 
@@ -1302,10 +1305,18 @@ impl Graph {
             "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
         );
 
+        let search_started_at = std::time::Instant::now();
         if self.search_space_dim_buckets.is_empty() {
             // No buckets: existing single-search path
-            let stitched =
-                self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None, 0);
+            let stitched = self.search_single(
+                &mut runtime,
+                &options,
+                rng,
+                &self.dyn_map.clone(),
+                None,
+                0,
+                search_started_at,
+            );
 
             runtime.clear_intermediate_buffers();
             runtime.load_llir(&stitched);
@@ -1339,6 +1350,7 @@ impl Graph {
                     &context.representative_dyn_map,
                     Some((combo_idx, n_combos)),
                     combo_idx,
+                    search_started_at,
                 );
                 bucket_llirs.push((
                     context.bucket_indices,
@@ -1433,6 +1445,7 @@ impl Graph {
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
         egraph_index: usize,
+        search_started_at: std::time::Instant,
     ) -> LLIRGraph {
         let mut profile_dyn_map = dyn_map.clone();
         for (&dim, &value) in &options.profile_dims {
@@ -1482,11 +1495,11 @@ impl Graph {
                 }
             };
 
-        let group_start = std::time::Instant::now();
         let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
         let mut list_cache = FxHashMap::default();
         let mut expr_cache = FxHashMap::default();
         runtime.clear_intermediate_buffers();
+        let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
         let profile_timed_out = |elapsed: std::time::Duration| {
             options
                 .profile_timeout
@@ -1561,11 +1574,8 @@ impl Graph {
                     break;
                 }
                 Ok(_) | Err(_) => {
-                    if options
-                        .group_timeout
-                        .is_some_and(|timeout| group_start.elapsed() >= timeout)
-                    {
-                        panic!("Failed to find a viable initial genome before timeout");
+                    if search_time_limit_reached() {
+                        panic!("Failed to find a viable initial genome before search time limit");
                     }
                     list_cache.clear();
                     expr_cache.clear();
@@ -1586,10 +1596,7 @@ impl Graph {
         let mut resample_generation = false;
 
         while n_graphs < search_limit {
-            if options
-                .group_timeout
-                .is_some_and(|timeout| group_start.elapsed() >= timeout)
-            {
+            if search_time_limit_reached() {
                 break;
             }
 
@@ -1623,10 +1630,7 @@ impl Graph {
             let mut generation_found_non_timeout = false;
 
             for genome in all_offspring {
-                if options
-                    .group_timeout
-                    .is_some_and(|timeout| group_start.elapsed() >= timeout)
-                {
+                if search_time_limit_reached() {
                     break;
                 }
                 n_graphs += 1;
@@ -2808,6 +2812,7 @@ mod tests {
     use super::*;
     use crate::egglog_utils::hash_egglog_normalized;
     use crate::tests::{assert_close, random_vec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct TestMemoryRuntime;
@@ -2845,6 +2850,69 @@ mod tests {
         }
     }
 
+    static PROFILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct CountingRuntime;
+
+    impl Runtime for CountingRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let count = PROFILE_CALLS.fetch_add(1, Ordering::SeqCst);
+            (count, format!("{count} ms"))
+        }
+    }
+
+    #[test]
+    fn compile_options_defaults_and_search_time_limit_builder() {
+        let opts = CompileOptions::default();
+        assert_eq!(opts.limit, 100);
+        assert_eq!(opts.search_time_limit, std::time::Duration::MAX);
+
+        let time_limit = std::time::Duration::from_millis(25);
+        let opts = CompileOptions::default()
+            .search_graph_limit(7)
+            .search_time_limit(time_limit);
+        assert_eq!(opts.limit, 7);
+        assert_eq!(opts.search_time_limit, time_limit);
+    }
+
+    #[test]
+    fn search_time_limit_stops_after_initial_viable_candidate() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((4, 8));
+        let b = cx.tensor((8, 4));
+        let c = cx.tensor((4, 4));
+        let _ = (a.matmul(b) + c).relu().softmax(1).output();
+
+        cx.build_search_space::<CountingRuntime>(CompileOptions::default());
+
+        PROFILE_CALLS.store(0, Ordering::SeqCst);
+        let _ = cx.search(
+            CountingRuntime,
+            CompileOptions::default().search_time_limit(std::time::Duration::ZERO),
+        );
+        assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn build_search_space_without_explicit_max_memory_has_no_cap() {
         let mut cx = Graph::new();
@@ -2862,7 +2930,10 @@ mod tests {
         let _ = cx.tensor(1).output();
         cx.build_search_space::<TestMemoryRuntime>(CompileOptions::default().max_memory_bytes(0));
 
-        let _ = cx.search(TestMemoryRuntime, CompileOptions::new(1));
+        let _ = cx.search(
+            TestMemoryRuntime,
+            CompileOptions::default().search_graph_limit(1),
+        );
     }
 
     #[test]
@@ -2870,7 +2941,10 @@ mod tests {
         let mut cx = Graph::new();
         let _ = cx.tensor(1).output();
 
-        let _ = cx.compile(TestMemoryRuntime, CompileOptions::new(1));
+        let _ = cx.compile(
+            TestMemoryRuntime,
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         assert_eq!(cx.egraphs.len(), 1);
         assert_eq!(cx.search_space_max_memory_bytes, None);
@@ -2908,7 +2982,7 @@ mod tests {
         let mut rng = rand::rng();
         let _ = cx.search_with_rng(
             TestMemoryRuntime,
-            CompileOptions::new(1).dim_buckets(
+            CompileOptions::default().search_graph_limit(1).dim_buckets(
                 's',
                 &[DimBucket::new(1, 1), DimBucket::new(2, 4).representative(4)],
             ),
@@ -3019,7 +3093,7 @@ mod tests {
         let vals = random_vec(8);
         let mut rt = NativeRuntime::default();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        rt = cx.search(rt, CompileOptions::new(1));
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
         rt.set_data(x.id, vals.clone());
         rt.execute(&cx.dyn_map);
 
@@ -3056,7 +3130,7 @@ mod tests {
         let vals = random_vec(8);
         let mut rt = NativeRuntime::default();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        rt = cx.search(rt, CompileOptions::new(1));
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
         rt.set_data(x.id, vals.clone());
         rt.execute(&cx.dyn_map);
 

@@ -96,7 +96,8 @@ fn main() {
     cx.set_dim('p', 0);
     runtime.set_data(input, vec![1i32; max_prefill]);
     runtime.set_data(pos_ids, (0..max_prefill as i32).collect::<Vec<_>>());
-    runtime = cx.search(runtime, CompileOptions::new(search_graphs));
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
+    runtime = cx.search(runtime, search_options);
 
     // Reset the KV caches and re-set the mel after search (which executes test runs).
     for i in 0..N_TEXT_LAYER {

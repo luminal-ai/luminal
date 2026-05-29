@@ -29,17 +29,19 @@ pub struct KVCache {
 
 impl KVCache {
     pub fn new(cx: &mut Graph, max_seq: usize) -> Self {
-        let mut k_caches = vec![];
-        let mut v_caches = vec![];
+        let mut k_caches = Vec::with_capacity(LAYERS);
+        let mut v_caches = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
-            let k = cx
-                .named_tensor(format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            let v = cx
-                .named_tensor(format!("kv_cache.{l}.v"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            k_caches.push(k);
-            v_caches.push(v);
+            k_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.k"),
+                (N_KV_HEADS, max_seq, HEAD_DIM),
+            ));
+            v_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.v"),
+                (N_KV_HEADS, max_seq, HEAD_DIM),
+            ));
         }
         Self {
             k_caches,
@@ -58,111 +60,11 @@ pub struct Qwen3MoE {
 
 impl Qwen3MoE {
     pub fn init(cx: &mut Graph) -> Self {
-        let mut layers = vec![];
-        for l in 0..LAYERS {
-            let q_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_proj.weight"),
-                    (Q_DIM, HIDDEN),
-                )
-                .persist();
-            let k_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_proj.weight"),
-                    (KV_DIM, HIDDEN),
-                )
-                .persist();
-            let v_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.v_proj.weight"),
-                    (KV_DIM, HIDDEN),
-                )
-                .persist();
-            let o_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.o_proj.weight"),
-                    (HIDDEN, Q_DIM),
-                )
-                .persist();
-            let q_norm = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_norm.weight"),
-                    HEAD_DIM,
-                )
-                .persist();
-            let k_norm = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_norm.weight"),
-                    HEAD_DIM,
-                )
-                .persist();
-            let router = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.gate.weight"),
-                    (NUM_EXPERTS, HIDDEN),
-                )
-                .persist();
-            let gate_up_weights = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.gate_up_weights"),
-                    (NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN),
-                )
-                .persist();
-            let down_weights = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.down_weights"),
-                    (NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE),
-                )
-                .persist();
-            layers.push(Qwen3MoELayer {
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                q_norm,
-                k_norm,
-                attn_rms: LayerNorm::new(
-                    HIDDEN,
-                    Some(&format!("model.layers.{l}.input_layernorm.weight")),
-                    None,
-                    false,
-                    RMS_NORM_EPS,
-                    cx,
-                ),
-                mlp_rms: LayerNorm::new(
-                    HIDDEN,
-                    Some(&format!("model.layers.{l}.post_attention_layernorm.weight")),
-                    None,
-                    false,
-                    RMS_NORM_EPS,
-                    cx,
-                ),
-                moe: QwenMoE {
-                    router,
-                    gate_up_weights: gate_up_weights.as_dtype(DType::Bf16),
-                    down_weights: down_weights.as_dtype(DType::Bf16),
-                },
-            });
-        }
-        let lm_norm = LayerNorm::new(
-            HIDDEN,
-            Some("model.norm.weight"),
-            None,
-            false,
-            RMS_NORM_EPS,
-            cx,
-        );
-        let embedding = cx
-            .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
-        let lm_head = cx
-            .named_tensor("lm_head.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
         Self {
-            embedding,
-            layers,
-            lm_norm,
-            lm_head,
+            embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)),
+            layers: (0..LAYERS).map(|l| Qwen3MoELayer::init(cx, l)).collect(),
+            lm_norm: rms_norm(cx, "model.norm.weight"),
+            lm_head: persist(cx, "lm_head.weight", (VOCAB_SIZE, HIDDEN)),
         }
     }
 
@@ -172,11 +74,7 @@ impl Qwen3MoE {
         pos_ids: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = token_ids.dims1();
-        let mut x = self.embedding.gather(
-            (token_ids * HIDDEN).expand_dim(1, HIDDEN)
-                + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
-        );
+        let mut x = token_embedding(self.embedding, token_ids);
         let mut cache_outputs = Vec::with_capacity(LAYERS);
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
@@ -214,6 +112,39 @@ struct QwenMoE {
 }
 
 impl Qwen3MoELayer {
+    fn init(cx: &mut Graph, l: usize) -> Self {
+        Self {
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)),
+            q_norm: layer_weight(cx, l, "self_attn.q_norm", HEAD_DIM),
+            k_norm: layer_weight(cx, l, "self_attn.k_norm", HEAD_DIM),
+            attn_rms: rms_norm(cx, format!("model.layers.{l}.input_layernorm.weight")),
+            mlp_rms: rms_norm(
+                cx,
+                format!("model.layers.{l}.post_attention_layernorm.weight"),
+            ),
+            moe: QwenMoE {
+                router: layer_weight(cx, l, "mlp.gate", (NUM_EXPERTS, HIDDEN)),
+                gate_up_weights: layer_tensor(
+                    cx,
+                    l,
+                    "mlp.gate_up_weights",
+                    (NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN),
+                )
+                .as_dtype(DType::Bf16),
+                down_weights: layer_tensor(
+                    cx,
+                    l,
+                    "mlp.down_weights",
+                    (NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE),
+                )
+                .as_dtype(DType::Bf16),
+            },
+        }
+    }
+
     pub fn forward(
         &self,
         mut x: GraphTensor,
@@ -245,6 +176,51 @@ impl Qwen3MoELayer {
         let mlp_out = self.moe.forward(x_mlp);
         (x + mlp_out, k_cache_out, v_cache_out)
     }
+}
+
+fn persist(
+    cx: &mut Graph,
+    name: impl ToString,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    cx.named_tensor(name, shape).persist()
+}
+
+fn layer_tensor(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    persist(cx, format!("model.layers.{layer}.{suffix}"), shape)
+}
+
+fn layer_weight(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    layer_tensor(cx, layer, &format!("{suffix}.weight"), shape)
+}
+
+fn rms_norm(cx: &mut Graph, weight_name: impl ToString) -> LayerNorm {
+    LayerNorm::new(
+        HIDDEN,
+        Some(&weight_name.to_string()),
+        None,
+        false,
+        RMS_NORM_EPS,
+        cx,
+    )
+}
+
+fn token_embedding(embedding: GraphTensor, token_ids: GraphTensor) -> GraphTensor {
+    let seq = token_ids.dims1();
+    embedding.gather(
+        (token_ids * HIDDEN).expand_dim(1, HIDDEN)
+            + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
+    )
 }
 
 impl QwenMoE {

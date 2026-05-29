@@ -259,7 +259,7 @@ fn run_argsort_test(rows: usize, cols: usize, seed: u64) {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream);
     rt.set_data(input, data);
-    rt = cx.search(rt, CompileOptions::new(10));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(10));
     rt.execute(&cx.dyn_map);
     let out_dim0 = rt.get_i32(sorted_dim0.id);
     let out_dim1 = rt.get_i32(sorted_dim1.id);
@@ -600,7 +600,7 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
 
     rt.set_data(token_ids, token_data.clone());
     rt.set_data(embed_table, embed_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
 
     let result = rt.get_f32(output);

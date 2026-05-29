@@ -241,7 +241,8 @@ fn main() {
     runtime.set_data(scatter_idx_t, vec![0i32; search_s]);
     runtime.set_data(gather_idx_t, vec![0i32; search_c]);
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
-    runtime = cx.search(runtime, CompileOptions::new(search_graphs));
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
+    runtime = cx.search(runtime, search_options);
 
     // Re-initialize KV cache after search (search consumes buffers)
     let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();

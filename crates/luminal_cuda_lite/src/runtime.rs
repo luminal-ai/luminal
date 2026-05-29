@@ -1556,37 +1556,9 @@ impl Runtime for CudaRuntime {
         self.profiling = false;
         let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
 
-        let total_bytes: usize = self
-            .last_kernel_stats
-            .iter()
-            .map(|s| s.bytes_loaded + s.bytes_stored)
-            .sum::<usize>();
-        let total_flops: usize = self
-            .last_kernel_stats
-            .iter()
-            .map(|s| s.flops)
-            .sum::<usize>();
-        let aggregate_bw = if self.last_total_time_us > 0.0 {
-            (total_bytes as f64) / (self.last_total_time_us * 1e-6) / 1e9
-        } else {
-            0.0
-        };
-        let aggregate_tf = if self.last_total_time_us > 0.0 {
-            (total_flops as f64) / (self.last_total_time_us * 1e-6) / 1e12
-        } else {
-            0.0
-        };
-
-        let peak_bw = crate::cuda_bandwidth_gbps(self.cuda_stream.context());
-        let peak_tf = crate::cuda_compute_f32_tflops(self.cuda_stream.context());
-        let mbu = peak_bw.map(|p| aggregate_bw / p as f64);
-        let mfu = peak_tf.map(|p| aggregate_tf / p as f64);
-
         let duration_str = format_duration_precise(&duration);
-        let mbu_str = mbu.map_or("-".to_string(), |v| format!("{:.1}%", v * 100.0));
-        let mfu_str = mfu.map_or("-".to_string(), |v| format!("{:.1}%", v * 100.0));
         let display = format!(
-            "{duration_str} | MBU: {mbu_str} | MFU: {mfu_str} [KRN: {} HOST: {}]",
+            "{duration_str} | [KRN: {} HOST: {}]",
             llir_graph
                 .node_weights()
                 .filter(|n| n.to_dialect::<dyn KernelOp>().is_some())
@@ -2079,18 +2051,10 @@ impl CudaRuntime {
         if !self.last_kernel_stats.is_empty() {
             println!("\n=== Kernel Execution Statistics ===\n");
             println!(
-                "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>8}",
-                "Kernel",
-                "Time (us)",
-                "Loaded",
-                "Stored",
-                "Agg FLOPS",
-                "BW (GB/s)",
-                "TFLOPS",
-                "MBU",
-                "MFU"
+                "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                "Kernel", "Time (us)", "Loaded", "Stored", "Agg FLOPS", "BW (GB/s)", "TFLOPS"
             );
-            println!("{}", "-".repeat(116));
+            println!("{}", "-".repeat(92));
             for s in &self.last_kernel_stats {
                 self.print_stat_row(
                     s.name,
@@ -2101,29 +2065,20 @@ impl CudaRuntime {
                     s.flops,
                     s.bandwidth_gbps,
                     s.tflops,
-                    peak_bw,
-                    peak_tf,
                 );
             }
-            println!("{}", "-".repeat(116));
+            println!("{}", "-".repeat(92));
         }
 
         // Print aggregate stats
         println!("\n=== Aggregate Statistics ===\n");
         println!(
-            "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>8}",
-            "", "Time (us)", "Loaded", "Stored", "Agg FLOPS", "BW (GB/s)", "TFLOPS", "MBU", "MFU"
+            "{:<20} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "", "Time (us)", "Loaded", "Stored", "Agg FLOPS", "BW (GB/s)", "TFLOPS"
         );
-        println!("{}", "-".repeat(116));
-        let (mbu, mfu) = match (peak_bw, peak_tf) {
-            (Some(pb), Some(pt)) => (
-                format!("{:.1}%", aggregate_bw / pb as f64 * 100.0),
-                format!("{:.1}%", aggregate_tf / pt as f64 * 100.0),
-            ),
-            _ => ("-".into(), "-".into()),
-        };
+        println!("{}", "-".repeat(92));
         println!(
-            "{:<20} {:>12.2} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8} {:>8}",
+            "{:<20} {:>12.2} {:>12} {:>12} {:>12} {:>12} {:>12}",
             "Total",
             self.last_total_time_us,
             format_size(total_bytes_loaded),
@@ -2131,8 +2086,6 @@ impl CudaRuntime {
             format_flops(total_flops),
             format!("{:.2}", aggregate_bw),
             format!("{:.4}", aggregate_tf),
-            mbu,
-            mfu
         );
 
         if let (Some(pb), Some(pt)) = (peak_bw, peak_tf) {
@@ -2152,8 +2105,6 @@ impl CudaRuntime {
         flops: usize,
         bw: f64,
         tf: f64,
-        peak_bw: Option<usize>,
-        peak_tf: Option<usize>,
     ) {
         let total = loaded + stored;
         let ld = if loaded > 0 {
@@ -2181,21 +2132,13 @@ impl CudaRuntime {
         } else {
             "-".into()
         };
-        let mbu = peak_bw
-            .filter(|_| total > 0)
-            .map(|p| format!("{:.1}%", bw / p as f64 * 100.0))
-            .unwrap_or("-".into());
-        let mfu = peak_tf
-            .filter(|_| flops > 0)
-            .map(|p| format!("{:.1}%", tf / p as f64 * 100.0))
-            .unwrap_or("-".into());
 
         match count {
             Some(c) => println!(
-                "{name:<20} {time_us:>12.2} {c:>8} {ld:>12} {st:>12} {fl:>12} {bw_s:>12} {tf_s:>12} {mbu:>8} {mfu:>8}"
+                "{name:<20} {time_us:>12.2} {c:>8} {ld:>12} {st:>12} {fl:>12} {bw_s:>12} {tf_s:>12}"
             ),
             None => println!(
-                "{name:<20} {time_us:>12.2} {ld:>12} {st:>12} {fl:>12} {bw_s:>12} {tf_s:>12} {mbu:>8} {mfu:>8}"
+                "{name:<20} {time_us:>12.2} {ld:>12} {st:>12} {fl:>12} {bw_s:>12} {tf_s:>12}"
             ),
         }
     }

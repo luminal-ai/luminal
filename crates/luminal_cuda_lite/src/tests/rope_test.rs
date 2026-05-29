@@ -50,7 +50,7 @@ fn rope_matches_cpu_reference() {
     rt.set_data(x, x_data.clone());
     rt.set_data(cos, cos_data.clone());
     rt.set_data(sin, sin_data.clone());
-    rt = cx.search(rt, CompileOptions::new(1));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
     rt.execute(&cx.dyn_map);
     let got = rt.get_f32(y.id);
 
@@ -98,7 +98,7 @@ fn rope_flux2_shape() {
     rt.set_data(x, x_data.clone());
     rt.set_data(cos, cos_data.clone());
     rt.set_data(sin, sin_data.clone());
-    rt = cx.search(rt, CompileOptions::new(1));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
     rt.execute(&cx.dyn_map);
     let got = rt.get_f32(y.id);
 

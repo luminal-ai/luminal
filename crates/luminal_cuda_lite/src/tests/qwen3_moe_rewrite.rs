@@ -233,7 +233,9 @@ fn run_qwen_moe(include_glumoe: bool) -> Vec<f32> {
     rt.set_data(model.router, router_data);
     rt.set_data(model.gate_up_weights, gate_up_data);
     rt.set_data(model.down_weights, down_data);
-    rt = model.graph.search(rt, CompileOptions::new(10));
+    rt = model
+        .graph
+        .search(rt, CompileOptions::default().search_graph_limit(10));
     rt.execute(&model.graph.dyn_map);
 
     rt.get_f32(model.output.id)
@@ -278,7 +280,9 @@ fn run_gemma_moe(include_glumoe: bool) -> Vec<f32> {
     rt.set_data(model.per_expert_scale, per_expert_scale_data);
     rt.set_data(model.gate_up_weights, gate_up_data);
     rt.set_data(model.down_weights, down_data);
-    rt = model.graph.search(rt, CompileOptions::new(10));
+    rt = model
+        .graph
+        .search(rt, CompileOptions::default().search_graph_limit(10));
     rt.execute(&model.graph.dyn_map);
 
     rt.get_f32(model.output.id)

@@ -338,13 +338,11 @@ fn main() {
     println!("  Search trials: {SEARCH_TRIALS}");
     println!("  Search keep-best: {SEARCH_KEEP_BEST}");
     let mut rng = StdRng::seed_from_u64(SEARCH_SEED);
-    runtime = cx.search_with_rng(
-        runtime,
-        CompileOptions::new(SEARCH_GRAPHS)
-            .trials(SEARCH_TRIALS)
-            .keep_best(SEARCH_KEEP_BEST),
-        &mut rng,
-    );
+    let search_options = CompileOptions::default()
+        .search_graph_limit(SEARCH_GRAPHS)
+        .trials(SEARCH_TRIALS)
+        .keep_best(SEARCH_KEEP_BEST);
+    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
     println!(
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()

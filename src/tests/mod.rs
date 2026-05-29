@@ -24,7 +24,7 @@ proptest! {
         let d = (b * c / e).sin().output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::default().search_graph_limit(1));
 
         rt.set_data(b.id, vals.clone());
         rt.set_data(c.id, vals.clone());
@@ -58,7 +58,7 @@ proptest! {
         let a = b.matmul(c).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::default().search_graph_limit(1));
         let lhs = lhs.into_iter().take(m * k).collect::<Vec<f32>>();
         let rhs = rhs.into_iter().take(k * n).collect::<Vec<f32>>();
         rt.set_data(b.id, lhs.clone());
@@ -82,7 +82,7 @@ proptest! {
         let a = cx.tensor((2, 2));
         let b = (a.permute((1, 0)) * 1.0).output();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::default().search_graph_limit(1));
         rt.set_data(a.id, values.clone());
         rt.execute(&cx.dyn_map);
 
@@ -99,7 +99,7 @@ proptest! {
         let mask = a.ge(kth_largest.expand_dim(1, cols)).cast(crate::dtype::DType::F32);
         let filtered = (a * mask).output();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::default().search_graph_limit(1));
         let values = values.into_iter().take(rows * cols).collect::<Vec<f32>>();
         rt.set_data(a.id, values.clone());
         rt.execute(&cx.dyn_map);
@@ -465,7 +465,10 @@ fn test_inputs_consumed_after_execute() {
     let a = cx.tensor(3);
     let _b = (a * 2.0).output();
     cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-    let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+    let mut rt = cx.search(
+        NativeRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
     rt.execute(&cx.dyn_map);
     // Second execute should panic — input 'a' was consumed
@@ -481,7 +484,10 @@ fn test_passthrough_preserves_weights() {
     w.persist();
 
     cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-    let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+    let mut rt = cx.search(
+        NativeRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
 
     // Iteration 1
     rt.set_data(w.id, vec![1.0, 2.0, 3.0]);
@@ -503,7 +509,10 @@ fn test_only_outputs_remain() {
     let a = cx.tensor(3);
     let _b = (a * 2.0).output();
     cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-    let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+    let mut rt = cx.search(
+        NativeRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
     rt.execute(&cx.dyn_map);
     let output_count = rt
@@ -556,7 +565,10 @@ fn integration_auto_loop_rolling_matches_reference_native_runtime() {
 
     let (mut graph, input_id, weight_ids, output_id) = build_repeated_block_graph(layers, width);
     graph.build_search_space::<NativeRuntime>(CompileOptions::default());
-    let mut rt = graph.search(NativeRuntime::default(), CompileOptions::new(1));
+    let mut rt = graph.search(
+        NativeRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
     rt.set_data(input_id, input);
     for (node, data) in weight_ids.iter().zip(weights.iter()) {
         rt.set_data(*node, data.clone());

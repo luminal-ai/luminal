@@ -174,7 +174,10 @@ pub fn compile_backend<Rt: Runtime + 'static>(
     }
 
     // Search
-    let mut rt = graph.search(rt, CompileOptions::new(args.search_iters));
+    let mut rt = graph.search(
+        rt,
+        CompileOptions::default().search_graph_limit(args.search_iters),
+    );
 
     // Rebuild label map after search (graph may have changed)
     let label_map = build_label_map(graph);

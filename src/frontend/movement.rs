@@ -968,7 +968,10 @@ mod tests {
         let zeros = cx.iota(Expression::from(0usize), 6);
         let inv = values.scatter(perm, zeros).cast(DType::F32).output();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
         rt.set_data(data.id, vec![0., 1., 2., 3., 4., 5.]);
         rt.set_data(indexes.id, vec![5, 0, 3, 2]);
         rt.set_data(perm.id, vec![3, 2, 4, 1, 5, 0]);
@@ -985,7 +988,10 @@ mod tests {
         let dest = cx.tensor(5);
         let result = src.scatter(indexes, dest).output();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
         rt.set_data(src.id, vec![10., 20., 30.]);
         rt.set_data(indexes.id, vec![1, 3, 4]);
         rt.set_data(dest.id, vec![0., 0., 0., 0., 0.]);
@@ -1001,7 +1007,10 @@ mod tests {
         let dest = cx.tensor(5);
         let result = src.scatter(indexes, dest).output();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
         rt.set_data(src.id, vec![99.]);
         rt.set_data(indexes.id, vec![2]);
         rt.set_data(dest.id, vec![1., 2., 3., 4., 5.]);
@@ -1017,7 +1026,10 @@ mod tests {
         let dest = cx.tensor(4);
         let result = src.scatter(indexes, dest).output();
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
         rt.set_data(src.id, vec![40., 30., 20., 10.]);
         rt.set_data(indexes.id, vec![3, 2, 1, 0]);
         rt.set_data(dest.id, vec![1., 2., 3., 4.]);
@@ -1045,7 +1057,10 @@ mod tests {
         let repeated = (a.repeat((2, 2)) * 1.0).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
         rt.set_data(a.id, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         rt.execute(&cx.dyn_map);
 

@@ -50,7 +50,7 @@ fn prepare_and_search(cx: &mut Graph, input_sizes: &[(NodeIndex, usize)]) -> Opt
         rt.set_data(*node, &data);
     }
 
-    let rt = cx.search(rt, CompileOptions::new(5));
+    let rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
 
     Some(PreparedBench {
         rt,

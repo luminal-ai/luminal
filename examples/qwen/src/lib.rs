@@ -188,7 +188,8 @@ where
     cx.set_dim('p', 0);
     runtime.set_i32_data(input.id, vec![1; search_s]);
     runtime.set_i32_data(token_ids.id, (0..search_s as i32).collect::<Vec<_>>());
-    runtime = cx.search(runtime, CompileOptions::new(config.search_graphs));
+    let search_options = CompileOptions::default().search_graph_limit(config.search_graphs);
+    runtime = cx.search(runtime, search_options);
 
     for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);

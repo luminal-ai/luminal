@@ -61,7 +61,7 @@ fn generic_matmul_executes_noncontiguous_merged_head_projection() {
     rt.set_data(attn, attn_data.as_slice());
     rt.set_data(weight, weight_data.as_slice());
 
-    rt = cx.search(rt, CompileOptions::new(1));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
     assert!(
         rt.kernel_names().contains(&"GenericMatmul"),
         "expected GenericMatmul to be selected, kernels: {:?}",

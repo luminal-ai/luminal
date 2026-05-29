@@ -50,7 +50,7 @@ fn run_metal_pattern_benchmark(
             }
         }
 
-        let mut rt = cx.search(rt, CompileOptions::new(5));
+        let mut rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
         rt.allocate_intermediate_buffers(&cx.dyn_map);
 
         let mut bench_metrics = None;

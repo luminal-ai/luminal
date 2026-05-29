@@ -331,7 +331,7 @@ pub fn fuzz_cuda_search_space_equivalence(
         let mut native_rng = StdRng::seed_from_u64(config.seed);
         let mut native_rt = cx.search_with_rng(
             NativeRuntime::default(),
-            CompileOptions::new(1),
+            CompileOptions::default().search_graph_limit(1),
             &mut native_rng,
         );
         for input in inputs {
@@ -701,7 +701,7 @@ pub fn test_unary_cuda<T: TestDType>(
 
     let input_data = generator(n_elements, seed);
     rt.set_data(a, input_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
 
     let result = T::get_from_runtime(&rt, b.id);
@@ -776,7 +776,7 @@ pub fn test_binary_cuda<T: TestDType>(
     let b_data = b_generator(b_elements, seed.wrapping_add(1));
     rt.set_data(a, a_data.clone());
     rt.set_data(b, b_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
 
     let result = T::get_from_runtime(&rt, c.id);
@@ -844,7 +844,7 @@ pub fn test_mod(
     let b_data = random_f32_vec(b_elements, seed.wrapping_add(1), 0.1, 0.5);
     rt.set_data(a, a_data.clone());
     rt.set_data(b, b_data.clone());
-    rt = cx.search(rt, CompileOptions::new(5));
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
     rt.execute(&cx.dyn_map);
 
     let result = rt.get_f32(c);

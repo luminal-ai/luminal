@@ -503,7 +503,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(gather_idx_t, (0..search_c as i32).collect::<Vec<_>>());
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
-    runtime = cx.search(runtime, CompileOptions::new(SEARCH_GRAPHS));
+    let search_options = CompileOptions::default().search_graph_limit(SEARCH_GRAPHS);
+    runtime = cx.search(runtime, search_options);
     println!(
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()

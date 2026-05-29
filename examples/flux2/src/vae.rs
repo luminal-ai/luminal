@@ -720,6 +720,10 @@ mod tests {
         out
     }
 
+    fn one_search() -> CompileOptions {
+        CompileOptions::default().search_graph_limit(1)
+    }
+
     #[test]
     fn conv2d_bias_matches_reference() {
         let mut cx = Graph::default();
@@ -747,7 +751,7 @@ mod tests {
         );
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
@@ -766,7 +770,7 @@ mod tests {
         let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.execute(&cx.dyn_map);
 
@@ -790,7 +794,7 @@ mod tests {
         cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut rt = CudaRuntime::initialize(ctx.default_stream());
         rt.set_data(input_t, input);
-        rt = cx.search(rt, CompileOptions::new(1));
+        rt = cx.search(rt, one_search());
         rt.execute(&cx.dyn_map);
 
         assert_close(&rt.get_f32(out.id), &expected);
@@ -821,7 +825,7 @@ mod tests {
         );
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(NativeRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
@@ -864,7 +868,7 @@ mod tests {
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
-        rt = cx.search(rt, CompileOptions::new(1));
+        rt = cx.search(rt, one_search());
         rt.execute(&cx.dyn_map);
 
         assert_close(&rt.get_f32(out.id), &expected);

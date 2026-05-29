@@ -184,7 +184,10 @@ mod tests {
         let output = moe.forward(input).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = vec![1.0, 2.0, 3.0];
         // Router strongly favors expert 0
@@ -239,7 +242,10 @@ mod tests {
         let output = moe.forward(input).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = vec![1.0, 1.0];
         // Nearly-equal routing to all experts (slight differences to avoid argsort ties)
@@ -293,7 +299,10 @@ mod tests {
         let output = moe.forward(input).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = vec![
             1.0, 0.0, 0.0, // batch 0: routes to expert via feature 0
@@ -350,7 +359,10 @@ mod tests {
         let output = moe.forward(input).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = random_vec(in_dim);
         let router_data = random_vec(in_dim * n_experts);
@@ -395,7 +407,10 @@ mod tests {
         let output = moe.forward(input).output();
 
         cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), CompileOptions::new(1));
+        let mut rt = cx.search(
+            NativeRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = random_vec(batch * in_dim);
         let router_data = random_vec(in_dim * n_experts);

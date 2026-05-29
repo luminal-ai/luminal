@@ -82,7 +82,8 @@ fn main() {
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    runtime = cx.search_with_rng(runtime, CompileOptions::new(search_graphs), &mut rng);
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
+    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
