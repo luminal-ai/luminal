@@ -348,7 +348,7 @@ use crate::{
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egglog_reports::ReportLevel;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
 pub struct SerializedEGraph {

@@ -1,6 +1,7 @@
 use crate::egglog_utils::{
-    count_choice_sets_up_to, egglog_to_llir, extract_generation, hash_choice_set, hlir_to_egglog,
-    random_initial_choice, run_egglog_with_late_passes_and_interval_analysis,
+    ClassId, EGraphChoiceSet, NodeId, count_choice_sets_up_to, egglog_to_llir, extract_generation,
+    hash_choice_set, hlir_to_egglog, random_initial_choice,
+    run_egglog_with_late_passes_and_interval_analysis,
 };
 use crate::shape::{DimInterval, DynDimIntervals};
 use crate::{
@@ -17,17 +18,22 @@ use petgraph::{
     visit::EdgeRef,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use std::{
     any::TypeId,
     fmt::{Debug, Write as FmtWrite},
+    fs,
     io::Write,
     ops::{Deref, DerefMut},
+    path::PathBuf,
     sync::Arc,
 };
 use tracing;
 
 pub type LLIRGraph = StableGraph<LLIROp, ()>;
 pub type HLIRGraph = StableGraph<Box<dyn HLIROp>, ()>;
+const COMPILE_CACHE_SCHEMA_VERSION: u32 = 2;
+const DEFAULT_COMPILE_CACHE_NAMESPACE: &str = "luminal-graph-search";
 
 #[derive(Debug, Clone)]
 struct RollingOccurrence {
@@ -283,6 +289,394 @@ fn validate_dim_buckets(dimension: char, buckets: &[DimBucket]) {
             );
         }
     }
+}
+
+/// Disk-backed cache for compiled search results.
+///
+/// The cache stores the winning e-graph choices for each dynamic-dimension
+/// bucket. Loading a hit still rebuilds backend runtime objects such as Metal
+/// pipeline states, but skips the expensive genetic search and profiling loop.
+#[derive(Debug, Clone)]
+pub struct CompileCache {
+    namespace: String,
+    dir: Option<PathBuf>,
+}
+
+impl CompileCache {
+    /// Create a cache in Luminal's default cache directory.
+    ///
+    /// Set `LUMINAL_COMPILE_CACHE_DIR` to override the directory.
+    pub fn new(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            dir: default_compile_cache_dir(),
+        }
+    }
+
+    /// Create a cache rooted at an explicit directory.
+    pub fn with_dir(namespace: impl Into<String>, dir: impl Into<PathBuf>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            dir: Some(dir.into()),
+        }
+    }
+
+    /// Disable cache use while keeping call sites uniform.
+    pub fn disabled(namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: namespace.into(),
+            dir: None,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    fn path_for(&self, context: &CompileCacheContext) -> Option<PathBuf> {
+        let dir = self.dir.as_ref()?;
+        let encoded = serde_json::to_vec(context).ok()?;
+        Some(dir.join(format!("{:016x}.json", deterministic_hash_bytes(&encoded))))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct CompileCacheContext {
+    schema_version: u32,
+    namespace: String,
+    runtime_type: String,
+    egraph_fingerprint: u64,
+    search_space_max_memory_bytes: Option<usize>,
+    dyn_map: Vec<(char, usize)>,
+    dim_intervals: Vec<(char, DimInterval)>,
+    options: CachedSearchOptions,
+    dim_buckets: Vec<CachedDimBucketSet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct CachedSearchOptions {
+    limit: usize,
+    generation_size: usize,
+    mutations: usize,
+    trials: usize,
+    keep_best: usize,
+    profile_timeout_nanos: Option<u64>,
+    group_timeout_nanos: Option<u64>,
+    profile_dims: Vec<(char, usize)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct CachedDimBucketSet {
+    dim: char,
+    buckets: Vec<CachedDimBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct CachedDimBucket {
+    min: usize,
+    max: usize,
+    representative: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CompileCacheFile {
+    context: CompileCacheContext,
+    egraphs: Vec<SerializedEGraph>,
+    buckets: Vec<CachedBucketChoices>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedBucketChoices {
+    egraph_index: usize,
+    bucket_indices: Vec<(char, usize)>,
+    representative_dyn_map: Vec<(char, usize)>,
+    choices: CachedChoiceSet,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedChoiceSet {
+    choices: Vec<CachedChoice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedChoice {
+    class_id: String,
+    node_id: String,
+}
+
+fn default_compile_cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("LUMINAL_COMPILE_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".cache").join("luminal").join("compile"))
+}
+
+fn compile_cache_enabled_from_env() -> bool {
+    std::env::var("LUMINAL_COMPILE_CACHE")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn default_env_compile_cache() -> Option<CompileCache> {
+    if !compile_cache_enabled_from_env() {
+        return None;
+    }
+
+    let cache = CompileCache::new(DEFAULT_COMPILE_CACHE_NAMESPACE);
+    cache.is_enabled().then_some(cache)
+}
+
+fn deterministic_hash_bytes(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn deterministic_hash_str(text: &str) -> u64 {
+    deterministic_hash_bytes(text.as_bytes())
+}
+
+fn duration_nanos_saturating(duration: std::time::Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn sorted_char_map(map: &FxHashMap<char, usize>) -> Vec<(char, usize)> {
+    map.iter()
+        .map(|(dim, value)| (*dim, *value))
+        .sorted_by_key(|(dim, _)| *dim)
+        .collect()
+}
+
+fn sorted_dim_intervals(map: &DynDimIntervals) -> Vec<(char, DimInterval)> {
+    map.iter()
+        .map(|(dim, interval)| (*dim, *interval))
+        .sorted_by_key(|(dim, _)| *dim)
+        .collect()
+}
+
+fn vec_to_char_map(entries: &[(char, usize)]) -> FxHashMap<char, usize> {
+    entries.iter().copied().collect()
+}
+
+fn graph_source_fingerprint(graph: &Graph) -> u64 {
+    let (program, root) = hlir_to_egglog(graph);
+    let mut text = String::with_capacity(program.len() + root.len() + 16);
+    text.push_str(&program);
+    text.push_str("\nROOT\n");
+    text.push_str(&root);
+    deterministic_hash_str(&text)
+}
+
+impl CompileCacheContext {
+    fn new<R: Runtime + 'static>(
+        namespace: &str,
+        graph: &Graph,
+        options: &CompileOptions,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        max_memory_bytes: Option<usize>,
+    ) -> Self {
+        let profile_timeout_nanos = options.profile_timeout.map(duration_nanos_saturating);
+        let group_timeout_nanos = options.group_timeout.map(duration_nanos_saturating);
+        let dim_buckets = dim_buckets
+            .iter()
+            .map(|(dim, buckets)| CachedDimBucketSet {
+                dim: *dim,
+                buckets: buckets
+                    .iter()
+                    .map(|bucket| CachedDimBucket {
+                        min: bucket.min,
+                        max: bucket.max,
+                        representative: bucket.representative_value(),
+                    })
+                    .collect(),
+            })
+            .sorted_by_key(|set| set.dim)
+            .collect();
+
+        Self {
+            schema_version: COMPILE_CACHE_SCHEMA_VERSION,
+            namespace: namespace.to_string(),
+            runtime_type: std::any::type_name::<R>().to_string(),
+            egraph_fingerprint: graph_source_fingerprint(graph),
+            search_space_max_memory_bytes: max_memory_bytes,
+            dyn_map: sorted_char_map(&graph.dyn_map),
+            dim_intervals: sorted_dim_intervals(&graph.dim_intervals),
+            options: CachedSearchOptions {
+                limit: options.limit,
+                generation_size: options.generation_size,
+                mutations: options.mutations,
+                trials: options.trials,
+                keep_best: options.keep_best,
+                profile_timeout_nanos,
+                group_timeout_nanos,
+                profile_dims: sorted_char_map(&options.profile_dims),
+            },
+            dim_buckets,
+        }
+    }
+}
+
+impl CachedChoiceSet {
+    fn from_reachable_choice_set(egraph: &SerializedEGraph, choices: &EGraphChoiceSet<'_>) -> Self {
+        let mut reachable_classes = FxHashSet::default();
+        let mut stack = Vec::new();
+        if let Some(root_class) = egraph.roots.first() {
+            reachable_classes.insert(root_class);
+            stack.push(root_class);
+        }
+
+        while let Some(class_id) = stack.pop() {
+            let Some(node_id) = choices.get(class_id).copied() else {
+                continue;
+            };
+            let Some((_, children)) = egraph.enodes.get(node_id) else {
+                continue;
+            };
+            for child_class in children {
+                if choices.contains_key(child_class) && reachable_classes.insert(child_class) {
+                    stack.push(child_class);
+                }
+            }
+        }
+
+        Self {
+            choices: reachable_classes
+                .into_iter()
+                .filter_map(|class_id| {
+                    choices.get(class_id).map(|node_id| CachedChoice {
+                        class_id: class_id.as_ref().to_string(),
+                        node_id: node_id.as_ref().to_string(),
+                    })
+                })
+                .sorted_by(|a, b| {
+                    a.class_id
+                        .cmp(&b.class_id)
+                        .then_with(|| a.node_id.cmp(&b.node_id))
+                })
+                .collect(),
+        }
+    }
+
+    fn to_choice_set<'a>(&self, egraph: &'a SerializedEGraph) -> Option<EGraphChoiceSet<'a>> {
+        let mut out = FxHashMap::default();
+        for choice in &self.choices {
+            let class_lookup = ClassId::from(choice.class_id.clone());
+            let node_lookup = NodeId::from(choice.node_id.clone());
+            let (class_id, _) = egraph.eclasses.get_key_value(&class_lookup)?;
+            let (node_id, _) = egraph.enodes.get_key_value(&node_lookup)?;
+            out.insert(class_id, node_id);
+        }
+        Some(out)
+    }
+}
+
+fn is_cached_choice_eclass(label: &str) -> bool {
+    label.contains("IR") || label.contains("IList") || label.contains("OpKind")
+}
+
+fn validate_cached_choice_set(
+    egraph: &SerializedEGraph,
+    choices: &EGraphChoiceSet<'_>,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+) -> Result<(), String> {
+    let root_class = egraph
+        .roots
+        .first()
+        .ok_or_else(|| "cached choice set has no root eclass".to_string())?;
+    let root_choice = *choices
+        .get(root_class)
+        .ok_or_else(|| format!("No choice for root eclass {}", root_class.as_ref()))?;
+
+    let mut reachable = FxHashSet::default();
+    reachable.insert(root_choice);
+    let mut stack = vec![(root_class, root_choice)];
+    while let Some((class_id, node_id)) = stack.pop() {
+        let (_, children) = egraph
+            .enodes
+            .get(node_id)
+            .ok_or_else(|| format!("Enode {} not found in egraph", node_id.as_ref()))?;
+        let Some((_, class_nodes)) = egraph.eclasses.get(class_id) else {
+            return Err(format!("Eclass {} not found", class_id.as_ref()));
+        };
+        if !class_nodes.contains(node_id) {
+            return Err(format!(
+                "Chosen enode {} not in eclass {}",
+                node_id.as_ref(),
+                class_id.as_ref()
+            ));
+        }
+        let node_class = egraph
+            .node_to_class
+            .get(node_id)
+            .ok_or_else(|| format!("Class for enode {} not found", node_id.as_ref()))?;
+        if node_class != class_id {
+            return Err(format!(
+                "Chosen enode {} belongs to {}, not {}",
+                node_id.as_ref(),
+                node_class.as_ref(),
+                class_id.as_ref()
+            ));
+        }
+
+        for child_class in children {
+            let (label, _) = egraph
+                .eclasses
+                .get(child_class)
+                .ok_or_else(|| format!("Eclass {} not found", child_class.as_ref()))?;
+            if !is_cached_choice_eclass(label) {
+                continue;
+            }
+            let child_node = *choices.get(child_class).ok_or_else(|| {
+                format!("No choice for reachable eclass {}", child_class.as_ref())
+            })?;
+            if !reachable.contains(child_node) {
+                stack.push((child_class, child_node));
+                reachable.insert(child_node);
+            }
+        }
+    }
+
+    for node_id in reachable {
+        let (op_name, children) = &egraph.enodes[node_id];
+        let eclass = &egraph.node_to_class[node_id];
+        let (label, _) = &egraph.eclasses[eclass];
+        if label != "IR" || op_name == "OutputJoin" {
+            continue;
+        }
+        if op_name == "Op" {
+            let Some(kind_eclass) = children.first() else {
+                return Err("Op node missing OpKind child".to_string());
+            };
+            let Some(kind_node) = choices.get(kind_eclass) else {
+                return Err(format!(
+                    "No choice for OpKind eclass {}",
+                    kind_eclass.as_ref()
+                ));
+            };
+            let kind_name = &egraph.enodes[kind_node].0;
+            if kind_name != "CustomOpKind" && !ops.iter().any(|op| op.sort().name == *kind_name) {
+                return Err(format!("No extractor for OpKind {kind_name}"));
+            }
+            continue;
+        }
+        if !ops.iter().any(|op| op.sort().name == *op_name) {
+            return Err(format!("No extractor for op {op_name}"));
+        }
+    }
+
+    Ok(())
 }
 
 fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir: &LLIRGraph) {
@@ -1122,8 +1516,7 @@ impl Graph {
     #[tracing::instrument(skip_all)]
     pub fn build_search_space<Rt: Runtime + 'static>(&mut self, options: CompileOptions) {
         self.run_auto_loop_rolling_prepass();
-        let mut ops = Rt::Ops::into_vec();
-        ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
+        let ops = Self::egglog_ops_for::<Rt>();
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
         let dim_buckets = options.dim_buckets.clone();
         let memory_dyn_map = self.memory_limit_dyn_map(&dim_buckets);
@@ -1210,6 +1603,12 @@ impl Graph {
         }
     }
 
+    fn egglog_ops_for<Rt: Runtime + 'static>() -> Vec<Arc<Box<dyn EgglogOp>>> {
+        let mut ops = Rt::Ops::into_vec();
+        ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
+        ops
+    }
+
     #[tracing::instrument(skip_all)]
     pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(
         &mut self,
@@ -1280,8 +1679,8 @@ impl Graph {
         options: CompileOptions,
         rng: &mut G,
     ) -> R {
-        self.build_search_space::<R>(options.clone());
-        self.search_with_rng(runtime, options, rng)
+        let cache = default_env_compile_cache();
+        self.search_with_rng_inner(runtime, options, rng, cache.as_ref(), true)
     }
 
     #[tracing::instrument(skip_all)]
@@ -1293,28 +1692,151 @@ impl Graph {
     #[tracing::instrument(skip_all)]
     pub fn search_with_rng<R: Runtime + 'static, G: rand::Rng>(
         &mut self,
-        mut runtime: R,
+        runtime: R,
         options: CompileOptions,
         rng: &mut G,
     ) -> R {
-        assert!(
-            options.dim_buckets.is_empty() || options.dim_buckets == self.search_space_dim_buckets,
-            "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
-        );
+        let cache = default_env_compile_cache();
+        self.search_with_rng_inner(runtime, options, rng, cache.as_ref(), false)
+    }
 
+    /// Search with a disk-backed compiler cache.
+    ///
+    /// Cache hits skip the candidate profiling/search loop and reload the
+    /// previously selected e-graph choices for each bucket.
+    #[tracing::instrument(skip_all)]
+    pub fn search_cached<R: Runtime + 'static>(
+        &mut self,
+        runtime: R,
+        limit: usize,
+        cache: &CompileCache,
+    ) -> R {
+        let mut rng = rand::rng();
+        self.search_options_cached(runtime, CompileOptions::new(limit), &mut rng, cache)
+    }
+
+    /// Search with custom options and a disk-backed compiler cache.
+    #[tracing::instrument(skip_all)]
+    pub fn search_options_cached<R: Runtime + 'static, G: rand::Rng>(
+        &mut self,
+        runtime: R,
+        options: CompileOptions,
+        rng: &mut G,
+        cache: &CompileCache,
+    ) -> R {
+        self.search_with_rng_inner(runtime, options, rng, Some(cache), false)
+    }
+
+    fn search_with_rng_inner<R: Runtime + 'static, G: rand::Rng>(
+        &mut self,
+        mut runtime: R,
+        options: CompileOptions,
+        rng: &mut G,
+        cache: Option<&CompileCache>,
+        force_rebuild: bool,
+    ) -> R {
+        let use_existing_search_space = !force_rebuild && !self.egraphs.is_empty();
+        if use_existing_search_space {
+            assert!(
+                options.dim_buckets.is_empty()
+                    || options.dim_buckets == self.search_space_dim_buckets,
+                "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
+            );
+        }
+
+        let effective_dim_buckets = if options.dim_buckets.is_empty() && use_existing_search_space {
+            self.search_space_dim_buckets.clone()
+        } else {
+            options.dim_buckets.clone()
+        };
+        let effective_max_memory =
+            if use_existing_search_space && options.max_memory_bytes.is_none() {
+                self.search_space_max_memory_bytes
+            } else {
+                options.max_memory_bytes
+            };
+
+        let cache = cache.filter(|cache| cache.is_enabled());
+        let cache_context = cache.map(|cache| {
+            CompileCacheContext::new::<R>(
+                &cache.namespace,
+                self,
+                &options,
+                &effective_dim_buckets,
+                effective_max_memory,
+            )
+        });
+        if let (Some(cache), Some(context)) = (cache, cache_context.as_ref()) {
+            let mut fallback_ops = None;
+            if self.ops.is_none() {
+                fallback_ops = Some(Self::egglog_ops_for::<R>());
+            }
+            let cached = {
+                let ops = self
+                    .ops
+                    .as_ref()
+                    .or(fallback_ops.as_ref())
+                    .expect("fallback ops should be available");
+                self.try_load_compile_cache(cache, context, ops, &effective_dim_buckets)
+            };
+            if let Some((cached_egraphs, cached_contexts, bucket_llirs)) = cached {
+                self.egraphs = cached_egraphs;
+                self.egraph_contexts = cached_contexts;
+                if self.ops.is_none() {
+                    self.ops = fallback_ops;
+                }
+                self.search_space_dim_buckets = effective_dim_buckets;
+                self.search_space_max_memory_bytes = effective_max_memory;
+                runtime.clear_intermediate_buffers();
+                self.load_search_llirs(&mut runtime, &bucket_llirs);
+                return runtime;
+            }
+        }
+
+        if force_rebuild || self.egraphs.is_empty() || self.ops.is_none() {
+            let mut build_options = options.clone();
+            build_options.dim_buckets = effective_dim_buckets.clone();
+            build_options.max_memory_bytes = effective_max_memory;
+            self.build_search_space::<R>(build_options);
+        }
+
+        let (bucket_llirs, cached_choices) =
+            self.search_options_uncached(&mut runtime, &options, rng);
+
+        runtime.clear_intermediate_buffers();
+        self.load_search_llirs(&mut runtime, &bucket_llirs);
+
+        if let (Some(cache), Some(context)) = (cache, cache_context.as_ref()) {
+            self.write_compile_cache(cache, context, cached_choices);
+        }
+
+        runtime
+    }
+
+    fn search_options_uncached<R: Runtime + 'static, G: rand::Rng>(
+        &mut self,
+        runtime: &mut R,
+        options: &CompileOptions,
+        rng: &mut G,
+    ) -> (Vec<BucketLLIR>, Vec<CachedBucketChoices>) {
         if self.search_space_dim_buckets.is_empty() {
             // No buckets: existing single-search path
-            let stitched =
-                self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None, 0);
-
-            runtime.clear_intermediate_buffers();
-            runtime.load_llir(&stitched);
-            runtime
+            let dyn_map = self.dyn_map.clone();
+            let (stitched, choices) = self.search_single(runtime, options, rng, &dyn_map, None, 0);
+            let bucket_llirs = vec![(FxHashMap::default(), dyn_map.clone(), stitched)];
+            let cached_choices = vec![CachedBucketChoices {
+                egraph_index: 0,
+                bucket_indices: vec![],
+                representative_dyn_map: sorted_char_map(&dyn_map),
+                choices,
+            }];
+            (bucket_llirs, cached_choices)
         } else {
             // Bucketed search: compile one LLIR per bucket combination
             let bucket_contexts = self.search_space_contexts(&self.search_space_dim_buckets);
             let n_combos = bucket_contexts.len();
             let mut bucket_llirs: Vec<BucketLLIR> = Vec::with_capacity(n_combos);
+            let mut cached_choices = Vec::with_capacity(n_combos);
             assert!(
                 self.egraphs.len() == n_combos,
                 "dim buckets must be configured before build_search_space; search space has {} egraphs but current bucket configuration has {n_combos} combinations",
@@ -1332,14 +1854,20 @@ impl Graph {
                     bucket_label,
                 );
 
-                let stitched = self.search_single(
-                    &mut runtime,
-                    &options,
+                let (stitched, choices) = self.search_single(
+                    runtime,
+                    options,
                     rng,
                     &context.representative_dyn_map,
                     Some((combo_idx, n_combos)),
                     combo_idx,
                 );
+                cached_choices.push(CachedBucketChoices {
+                    egraph_index: combo_idx,
+                    bucket_indices: sorted_char_map(&context.bucket_indices),
+                    representative_dyn_map: sorted_char_map(&context.representative_dyn_map),
+                    choices,
+                });
                 bucket_llirs.push((
                     context.bucket_indices,
                     context.representative_dyn_map,
@@ -1347,10 +1875,161 @@ impl Graph {
                 ));
             }
 
-            runtime.clear_intermediate_buffers();
-            runtime.load_llir_buckets(&self.search_space_dim_buckets, &bucket_llirs);
-            runtime
+            (bucket_llirs, cached_choices)
         }
+    }
+
+    fn load_search_llirs<R: Runtime + 'static>(
+        &self,
+        runtime: &mut R,
+        bucket_llirs: &[BucketLLIR],
+    ) {
+        if self.search_space_dim_buckets.is_empty() {
+            let Some((_, _, llir)) = bucket_llirs.first() else {
+                panic!("search produced no LLIRs");
+            };
+            runtime.load_llir(llir);
+        } else {
+            runtime.load_llir_buckets(&self.search_space_dim_buckets, bucket_llirs);
+        }
+    }
+
+    fn try_load_compile_cache(
+        &self,
+        cache: &CompileCache,
+        context: &CompileCacheContext,
+        ops: &Vec<Arc<Box<dyn EgglogOp>>>,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> Option<(
+        Vec<SerializedEGraph>,
+        Vec<SearchSpaceContext>,
+        Vec<BucketLLIR>,
+    )> {
+        let path = cache.path_for(context)?;
+        let bytes = fs::read(&path).ok()?;
+        let cache_file: CompileCacheFile = match serde_json::from_slice(&bytes) {
+            Ok(cache_file) => cache_file,
+            Err(err) => {
+                eprintln!(
+                    "   {:>6}  ignoring invalid compile cache {}: {err}",
+                    "Cache".yellow().bold(),
+                    path.display()
+                );
+                return None;
+            }
+        };
+
+        if cache_file.context != *context {
+            return None;
+        }
+
+        let CompileCacheFile {
+            context: _,
+            egraphs,
+            buckets,
+        } = cache_file;
+        let expected_contexts = self.search_space_contexts(dim_buckets);
+        if buckets.len() != expected_contexts.len() || egraphs.len() != expected_contexts.len() {
+            return None;
+        }
+
+        let mut bucket_llirs = Vec::with_capacity(buckets.len());
+        for (expected_index, (bucket, expected_context)) in buckets
+            .into_iter()
+            .zip(expected_contexts.iter())
+            .enumerate()
+        {
+            if bucket.egraph_index != expected_index
+                || bucket.bucket_indices != sorted_char_map(&expected_context.bucket_indices)
+                || bucket.representative_dyn_map
+                    != sorted_char_map(&expected_context.representative_dyn_map)
+            {
+                return None;
+            }
+            let egraph = egraphs.get(bucket.egraph_index)?;
+            let choices = bucket.choices.to_choice_set(egraph)?;
+            if validate_cached_choice_set(egraph, &choices, ops).is_err() {
+                return None;
+            }
+            let llir = self.extract_cached_llir(egraph, choices, ops);
+            bucket_llirs.push((
+                vec_to_char_map(&bucket.bucket_indices),
+                vec_to_char_map(&bucket.representative_dyn_map),
+                llir,
+            ));
+        }
+
+        println!("   {:>10}  {}", "Cache Hit".green().bold(), path.display());
+        Some((egraphs, expected_contexts, bucket_llirs))
+    }
+
+    fn write_compile_cache(
+        &self,
+        cache: &CompileCache,
+        context: &CompileCacheContext,
+        buckets: Vec<CachedBucketChoices>,
+    ) {
+        let Some(path) = cache.path_for(context) else {
+            return;
+        };
+        if self.egraphs.len() != buckets.len() {
+            eprintln!(
+                "   {:>6}  refusing to write compile cache with {} egraphs for {} buckets",
+                "Cache".yellow().bold(),
+                self.egraphs.len(),
+                buckets.len(),
+            );
+            return;
+        }
+        let cache_file = CompileCacheFile {
+            context: context.clone(),
+            egraphs: self.egraphs.clone(),
+            buckets,
+        };
+        let Ok(json) = serde_json::to_vec_pretty(&cache_file) else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "   {:>6}  failed to create compile cache directory {}: {err}",
+                "Cache".yellow().bold(),
+                parent.display()
+            );
+            return;
+        }
+        match fs::write(&path, json) {
+            Ok(()) => println!(
+                "   {:>10}  {}",
+                "Cache Store".green().bold(),
+                path.display()
+            ),
+            Err(err) => eprintln!(
+                "   {:>6}  failed to write compile cache {}: {err}",
+                "Cache".yellow().bold(),
+                path.display()
+            ),
+        }
+    }
+
+    fn extract_cached_llir<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        choices: EGraphChoiceSet<'a>,
+        ops: &'a Vec<Arc<Box<dyn EgglogOp>>>,
+    ) -> LLIRGraph {
+        let mut stitched = egglog_to_llir(
+            egraph,
+            choices,
+            ops,
+            &self.custom_ops,
+            &mut FxHashMap::default(),
+            &mut FxHashMap::default(),
+            None,
+        );
+        unroll_loops_in_llir(&mut stitched);
+        stitched
     }
 
     /// Compute cartesian product of all bucket combinations.
@@ -1433,7 +2112,7 @@ impl Graph {
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
         egraph_index: usize,
-    ) -> LLIRGraph {
+    ) -> (LLIRGraph, CachedChoiceSet) {
         let mut profile_dyn_map = dyn_map.clone();
         for (&dim, &value) in &options.profile_dims {
             profile_dyn_map.insert(dim, value);
@@ -1771,6 +2450,7 @@ impl Graph {
         // single-iteration collapse, then run the real loop unroll. The
         // resulting LLIR is the full N-iteration graph the runtime executes;
         // the per-candidate collapsed form was used only for ranking.
+        let cached_choices = CachedChoiceSet::from_reachable_choice_set(egraph, &best_genome);
         let mut stitched = egglog_to_llir(
             egraph,
             best_genome,
@@ -1795,7 +2475,7 @@ impl Graph {
             .unwrap_or_else(|| "single".to_string());
         maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
 
-        stitched
+        (stitched, cached_choices)
     }
 
     fn candidate_memory_bytes<'a, R: Runtime + 'static>(
@@ -2824,6 +3504,8 @@ mod tests {
 
         fn load_llir(&mut self, _: &LLIRGraph) {}
 
+        fn load_llir_buckets(&mut self, _: &FxHashMap<char, Vec<DimBucket>>, _: &[BucketLLIR]) {}
+
         fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
 
         fn profile(
@@ -2842,6 +3524,45 @@ mod tests {
             _: &FxHashMap<char, usize>,
         ) -> Option<usize> {
             Some(1)
+        }
+    }
+
+    static CACHE_TEST_PROFILE_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    struct CacheTestRuntime {
+        panic_on_profile: bool,
+    }
+
+    impl Runtime for CacheTestRuntime {
+        type Ops = ();
+        type CompileArg = bool;
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(panic_on_profile: Self::CompileArg) -> Self {
+            Self { panic_on_profile }
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn load_llir_buckets(&mut self, _: &FxHashMap<char, Vec<DimBucket>>, _: &[BucketLLIR]) {}
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            CACHE_TEST_PROFILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                !self.panic_on_profile,
+                "compile cache miss forced profiling"
+            );
+            (0, "0 ms".to_string())
         }
     }
 
@@ -2914,6 +3635,125 @@ mod tests {
             ),
             &mut rng,
         );
+    }
+
+    #[test]
+    fn search_cached_reuses_saved_choices_without_profiling() {
+        fn build_graph() -> Graph {
+            let mut cx = Graph::new();
+            let x = cx.tensor(4);
+            (x.exp2().sin() + x).output();
+            cx
+        }
+
+        if let Some(cache_dir) = std::env::var_os("LUMINAL_CROSS_PROCESS_CACHE_TEST_DIR") {
+            let cache = CompileCache::with_dir(
+                "search_cached_reuses_saved_choices_cross_process",
+                cache_dir,
+            );
+            let panic_on_profile =
+                std::env::var_os("LUMINAL_CROSS_PROCESS_CACHE_TEST_PANIC").is_some();
+            let mut cx = build_graph();
+            cx.search_cached(CacheTestRuntime::initialize(panic_on_profile), 1, &cache);
+            return;
+        }
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "luminal-compile-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache = CompileCache::with_dir("search_cached_reuses_saved_choices", &cache_dir);
+        CACHE_TEST_PROFILE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut first = build_graph();
+        first.search_cached(CacheTestRuntime::initialize(false), 1, &cache);
+        let calls_after_first = CACHE_TEST_PROFILE_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls_after_first > 0,
+            "first search should profile before writing the cache"
+        );
+
+        let mut second = build_graph();
+        second.search_cached(CacheTestRuntime::initialize(true), 1, &cache);
+        assert_eq!(
+            CACHE_TEST_PROFILE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first,
+            "cached search should not profile candidates"
+        );
+
+        let entries = fs::read_dir(&cache_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "expected one cache file");
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn search_cached_stores_one_egraph_per_bucket() {
+        fn build_graph() -> Graph {
+            let mut cx = Graph::new();
+            let x = cx.tensor('s');
+            (x.exp2().sin() + x).output();
+            cx
+        }
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "luminal-bucketed-compile-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cache =
+            CompileCache::with_dir("search_cached_stores_one_egraph_per_bucket", &cache_dir);
+        let options =
+            CompileOptions::new(1).dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 4)]);
+        CACHE_TEST_PROFILE_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut first = build_graph();
+        first.search_options_cached(
+            CacheTestRuntime::initialize(false),
+            options.clone(),
+            &mut rand::rng(),
+            &cache,
+        );
+        let calls_after_first = CACHE_TEST_PROFILE_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            calls_after_first > 0,
+            "first bucketed search should profile before writing the cache"
+        );
+
+        let entries = fs::read_dir(&cache_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "expected one cache file");
+        let cache_file: CompileCacheFile =
+            serde_json::from_slice(&fs::read(entries[0].path()).unwrap()).unwrap();
+        assert_eq!(cache_file.egraphs.len(), 2);
+        assert_eq!(cache_file.buckets.len(), 2);
+
+        let mut second = build_graph();
+        second.search_options_cached(
+            CacheTestRuntime::initialize(true),
+            options,
+            &mut rand::rng(),
+            &cache,
+        );
+        assert_eq!(second.egraphs.len(), 2);
+        assert_eq!(
+            CACHE_TEST_PROFILE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            calls_after_first,
+            "cached bucketed search should not profile candidates"
+        );
+
+        let _ = fs::remove_dir_all(cache_dir);
     }
 
     #[test]
