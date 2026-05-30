@@ -123,7 +123,7 @@ struct GemmaLayer {
 
 impl GemmaLayer {
     fn init(cx: &mut Graph, l: usize) -> Self {
-        let is_local = (l + 1) % SLIDING_WINDOW_PATTERN != 0;
+        let is_local = !(l + 1).is_multiple_of(SLIDING_WINDOW_PATTERN);
         Self {
             up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)),
             gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN)),
