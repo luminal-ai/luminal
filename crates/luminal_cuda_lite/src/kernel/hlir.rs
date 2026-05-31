@@ -196,7 +196,7 @@ extern \"C\" {{
         long long in_start = {in_index};
         long long iters = {iters};
 
-        {dtype} max_value = NEG_INF_F;
+        {dtype} max_value = ({dtype})NEG_INF_F;
         for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
             max_value = fmaxf(max_value, in[in_start + {iter_stride_of_i}]);
         }}
@@ -213,7 +213,7 @@ extern \"C\" {{
 
         if (warp_id == 0) {{
             int cnt = THREADS_PER_BLOCK / WARP_SIZE;
-            {dtype} block_max = tid < cnt ? warp_sums[tid] : NEG_INF_F;
+            {dtype} block_max = tid < cnt ? warp_sums[tid] : ({dtype})NEG_INF_F;
 
             #pragma unroll
             for (int s = cnt / 2; s > 0; s /= 2) {{
