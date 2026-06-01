@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use half::{bf16, f16};
 use luminal::{
@@ -15,6 +18,8 @@ use luminal::{
     },
 };
 
+#[cfg(test)]
+use crate::kernel::CudaGraphHandle;
 use crate::{
     cudarc::{
         cublas::sys::cublasOperation_t,
@@ -33,7 +38,7 @@ use crate::{
                 cublasLtMatrixLayoutSetAttribute, cublasLtOrder_t, cudaDataType,
             },
         },
-        driver::{CudaStream, DevicePtr},
+        driver::{CudaSlice, CudaStream, DevicePtr},
     },
     host::{DeviceBuffer, HostOp},
     try_create_cublaslt,
@@ -581,8 +586,8 @@ fn epilogue_name(epilogue: cublasLtEpilogue_t) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum LtScalar {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LtScalar {
     F64(f64),
     F32(f32),
     F16(f16),
@@ -622,16 +627,16 @@ impl LtScalar {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LtMatmulProblem {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LtMatmulProblem {
     m: u64,
     n: u64,
     k: u64,
     batch_count: i32,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LtMatrixSpec {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LtMatrixSpec {
     dtype: cudaDataType,
     rows: u64,
     cols: u64,
@@ -640,8 +645,8 @@ struct LtMatrixSpec {
     order: cublasLtOrder_t,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LtComputeSpec {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LtComputeSpec {
     compute_type: cublasComputeType_t,
     scale_dtype: cudaDataType,
     alpha: LtScalar,
@@ -649,8 +654,8 @@ struct LtComputeSpec {
     epilogue: cublasLtEpilogue_t,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LtMatmulSpec {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LtMatmulSpec {
     problem: LtMatmulProblem,
     trans_a: cublasOperation_t,
     trans_b: cublasOperation_t,
@@ -662,8 +667,8 @@ struct LtMatmulSpec {
     workspace_size: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LtMatmulPointers {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LtMatmulPointers {
     a: u64,
     b: u64,
     c: u64,
@@ -673,13 +678,58 @@ struct LtMatmulPointers {
     b_scale: Option<u64>,
 }
 
-struct LtRawDescriptors {
+impl LtMatmulPointers {
+    pub(crate) fn changed_fields(self, other: Self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.a != other.a {
+            fields.push("a");
+        }
+        if self.b != other.b {
+            fields.push("b");
+        }
+        if self.c != other.c {
+            fields.push("c");
+        }
+        if self.d != other.d {
+            fields.push("d");
+        }
+        if self.bias != other.bias {
+            fields.push("bias");
+        }
+        if self.a_scale != other.a_scale {
+            fields.push("a_scale");
+        }
+        if self.b_scale != other.b_scale {
+            fields.push("b_scale");
+        }
+        fields
+    }
+}
+
+pub(crate) struct LtRawDescriptors {
     matmul_desc: cublasLtMatmulDesc_t,
     a_desc: cublasLtMatrixLayout_t,
     b_desc: cublasLtMatrixLayout_t,
     c_desc: cublasLtMatrixLayout_t,
     d_desc: cublasLtMatrixLayout_t,
     preference: cublasLtMatmulPreference_t,
+}
+
+static CUBLASLT_HEURISTIC_CACHE: OnceLock<
+    Mutex<Vec<(LtMatmulSpec, cublasLtMatmulHeuristicResult_t)>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static CUBLASLT_PREPARE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_cublaslt_prepare_count_for_test() {
+    CUBLASLT_PREPARE_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn cublaslt_prepare_count_for_test() -> usize {
+    CUBLASLT_PREPARE_COUNT.load(Ordering::SeqCst)
 }
 
 impl Default for LtRawDescriptors {
@@ -717,6 +767,121 @@ impl Drop for LtRawDescriptors {
                 let _ = cublasLtMatmulDescDestroy(self.matmul_desc);
             }
         }
+    }
+}
+
+pub(crate) struct PreparedCuBlasLtMatmul {
+    cublaslt: Arc<CudaBlasLT>,
+    spec: LtMatmulSpec,
+    resources: LtRawDescriptors,
+    heuristic: cublasLtMatmulHeuristicResult_t,
+    _workspace: CudaSlice<u8>,
+    workspace_ptr: u64,
+    _a_scale: Option<CudaSlice<f32>>,
+    default_a_scale_ptr: Option<u64>,
+    _b_scale: Option<CudaSlice<f32>>,
+    default_b_scale_ptr: Option<u64>,
+    _c_scale: Option<CudaSlice<f32>>,
+    _d_scale: Option<CudaSlice<f32>>,
+}
+
+impl PreparedCuBlasLtMatmul {
+    fn update_descriptor_pointers(
+        &self,
+        stream: &Arc<CudaStream>,
+        ptrs: LtMatmulPointers,
+    ) -> anyhow::Result<()> {
+        stream.context().bind_to_thread()?;
+        if let Some(bias_ptr) = ptrs.bias {
+            set_scalar_scale_pointer(
+                self.resources.matmul_desc,
+                cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                bias_ptr,
+            )?;
+        }
+        if cuda_dtype_needs_tensorwide_scale(self.spec.a.dtype) {
+            let ptr = ptrs.a_scale.or(self.default_a_scale_ptr).ok_or_else(|| {
+                anyhow::anyhow!("cuBLASLt matmul is missing required A scale pointer")
+            })?;
+            set_scalar_scale_pointer(
+                self.resources.matmul_desc,
+                cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                ptr,
+            )?;
+        }
+        if cuda_dtype_needs_tensorwide_scale(self.spec.b.dtype) {
+            let ptr = ptrs.b_scale.or(self.default_b_scale_ptr).ok_or_else(|| {
+                anyhow::anyhow!("cuBLASLt matmul is missing required B scale pointer")
+            })?;
+            set_scalar_scale_pointer(
+                self.resources.matmul_desc,
+                cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                ptr,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enqueue(
+        &self,
+        stream: &Arc<CudaStream>,
+        ptrs: LtMatmulPointers,
+    ) -> anyhow::Result<()> {
+        self.update_descriptor_pointers(stream, ptrs)?;
+        let alpha_ptr = self.spec.compute.alpha.as_ptr();
+        let beta_ptr = self.spec.compute.beta.as_ptr();
+        unsafe {
+            cublasLtMatmul(
+                *self.cublaslt.handle(),
+                self.resources.matmul_desc,
+                alpha_ptr,
+                ptrs.a as *const std::ffi::c_void,
+                self.resources.a_desc,
+                ptrs.b as *const std::ffi::c_void,
+                self.resources.b_desc,
+                beta_ptr,
+                ptrs.c as *const std::ffi::c_void,
+                self.resources.c_desc,
+                ptrs.d as *mut std::ffi::c_void,
+                self.resources.d_desc,
+                &self.heuristic.algo,
+                self.workspace_ptr as *mut std::ffi::c_void,
+                self.spec.workspace_size,
+                stream.cu_stream() as *mut _,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CuBlasLtCaptureSignature {
+    pub(crate) spec: LtMatmulSpec,
+    pub(crate) ptrs: LtMatmulPointers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CuBlasLtPrepareKey {
+    spec: LtMatmulSpec,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CuBlasLtResolvedGraphCall {
+    pub(crate) spec: LtMatmulSpec,
+    pub(crate) ptrs: LtMatmulPointers,
+}
+
+impl CuBlasLtResolvedGraphCall {
+    pub(crate) fn signature(self) -> CuBlasLtCaptureSignature {
+        CuBlasLtCaptureSignature {
+            spec: self.spec,
+            ptrs: self.ptrs,
+        }
+    }
+
+    pub(crate) fn prepare_key(self) -> CuBlasLtPrepareKey {
+        CuBlasLtPrepareKey { spec: self.spec }
     }
 }
 
@@ -796,12 +961,15 @@ fn set_scalar_scale_pointer(
     Ok(())
 }
 
-fn run_cublaslt_matmul(
+pub(crate) fn prepare_cublaslt_matmul(
     stream: &Arc<CudaStream>,
     cublaslt: &Arc<CudaBlasLT>,
     spec: &LtMatmulSpec,
     ptrs: LtMatmulPointers,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PreparedCuBlasLtMatmul> {
+    #[cfg(test)]
+    CUBLASLT_PREPARE_COUNT.fetch_add(1, Ordering::SeqCst);
+
     if spec.problem.m == 0 || spec.problem.n == 0 || spec.problem.k == 0 {
         return Err(anyhow::anyhow!(
             "cuBLASLT matmul got zero-sized dimensions: m={}, n={}, k={}",
@@ -813,17 +981,17 @@ fn run_cublaslt_matmul(
 
     let mut resources = LtRawDescriptors::default();
     let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
-    let mut algo_count: i32 = 0;
 
     let workspace = unsafe { stream.alloc::<u8>(spec.workspace_size)? };
-    let (workspace_ptr, _workspace_guard) = workspace.device_ptr(stream);
+    let (workspace_ptr, workspace_guard) = workspace.device_ptr(stream);
+    drop(workspace_guard);
 
-    let a_scale = if cuda_dtype_needs_tensorwide_scale(spec.a.dtype) && ptrs.a_scale.is_none() {
+    let a_scale = if cuda_dtype_needs_tensorwide_scale(spec.a.dtype) {
         Some(stream.clone_htod(&[1.0f32])?)
     } else {
         None
     };
-    let b_scale = if cuda_dtype_needs_tensorwide_scale(spec.b.dtype) && ptrs.b_scale.is_none() {
+    let b_scale = if cuda_dtype_needs_tensorwide_scale(spec.b.dtype) {
         Some(stream.clone_htod(&[1.0f32])?)
     } else {
         None
@@ -879,29 +1047,27 @@ fn run_cublaslt_matmul(
         }
     }
 
-    let (a_scale_ptr, _a_scale_guard) = if let Some(ptr) = ptrs.a_scale {
-        (Some(ptr), None)
-    } else if let Some(scale) = &a_scale {
+    let (default_a_scale_ptr, a_scale_guard) = if let Some(scale) = &a_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
         (None, None)
     };
-    let (b_scale_ptr, _b_scale_guard) = if let Some(ptr) = ptrs.b_scale {
-        (Some(ptr), None)
-    } else if let Some(scale) = &b_scale {
+    let a_scale_ptr = ptrs.a_scale.or(default_a_scale_ptr);
+    let (default_b_scale_ptr, b_scale_guard) = if let Some(scale) = &b_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
         (None, None)
     };
-    let (c_scale_ptr, _c_scale_guard) = if let Some(scale) = &c_scale {
+    let b_scale_ptr = ptrs.b_scale.or(default_b_scale_ptr);
+    let (c_scale_ptr, c_scale_guard) = if let Some(scale) = &c_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
         (None, None)
     };
-    let (d_scale_ptr, _d_scale_guard) = if let Some(scale) = &d_scale {
+    let (d_scale_ptr, d_scale_guard) = if let Some(scale) = &d_scale {
         let (ptr, guard) = scale.device_ptr(stream);
         (Some(ptr), Some(guard))
     } else {
@@ -935,6 +1101,7 @@ fn run_cublaslt_matmul(
             ptr,
         )?;
     }
+    drop((a_scale_guard, b_scale_guard, c_scale_guard, d_scale_guard));
 
     create_matrix_layout(&mut resources.a_desc, spec.a)?;
     create_matrix_layout(&mut resources.b_desc, spec.b)?;
@@ -952,58 +1119,148 @@ fn run_cublaslt_matmul(
         }
     }
 
-    unsafe {
-        cublasLtMatmulPreferenceCreate(&mut resources.preference).result()?;
-        cublasLtMatmulPreferenceSetAttribute(
-            resources.preference,
-            cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-            &spec.workspace_size as *const _ as *const std::ffi::c_void,
-            std::mem::size_of::<usize>(),
-        )
-        .result()?;
+    let heuristic_cache = CUBLASLT_HEURISTIC_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let cached_heuristic = {
+        let cache = heuristic_cache.lock().unwrap();
+        cache
+            .iter()
+            .find(|(cached_spec, _)| cached_spec == spec)
+            .map(|(_, heuristic)| unsafe { std::ptr::read(heuristic) })
+    };
+    if let Some(cached) = cached_heuristic {
+        heuristic = cached;
+    } else {
+        let mut algo_count: i32 = 0;
+        unsafe {
+            cublasLtMatmulPreferenceCreate(&mut resources.preference).result()?;
+            cublasLtMatmulPreferenceSetAttribute(
+                resources.preference,
+                cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &spec.workspace_size as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<usize>(),
+            )
+            .result()?;
 
-        cublasLtMatmulAlgoGetHeuristic(
-            *cublaslt.handle(),
-            resources.matmul_desc,
-            resources.a_desc,
-            resources.b_desc,
-            resources.c_desc,
-            resources.d_desc,
-            resources.preference,
-            1,
-            &mut heuristic,
-            &mut algo_count,
-        )
-        .result()?;
+            cublasLtMatmulAlgoGetHeuristic(
+                *cublaslt.handle(),
+                resources.matmul_desc,
+                resources.a_desc,
+                resources.b_desc,
+                resources.c_desc,
+                resources.d_desc,
+                resources.preference,
+                1,
+                &mut heuristic,
+                &mut algo_count,
+            )
+            .result()?;
 
-        if algo_count == 0 {
-            return Err(anyhow::anyhow!("No suitable cuBLASLT algorithm found"));
+            if algo_count == 0 {
+                return Err(anyhow::anyhow!("No suitable cuBLASLT algorithm found"));
+            }
         }
-
-        let alpha_ptr = spec.compute.alpha.as_ptr();
-        let beta_ptr = spec.compute.beta.as_ptr();
-        cublasLtMatmul(
-            *cublaslt.handle(),
-            resources.matmul_desc,
-            alpha_ptr,
-            ptrs.a as *const std::ffi::c_void,
-            resources.a_desc,
-            ptrs.b as *const std::ffi::c_void,
-            resources.b_desc,
-            beta_ptr,
-            ptrs.c as *const std::ffi::c_void,
-            resources.c_desc,
-            ptrs.d as *mut std::ffi::c_void,
-            resources.d_desc,
-            &heuristic.algo,
-            workspace_ptr as *mut std::ffi::c_void,
-            spec.workspace_size,
-            stream.cu_stream() as *mut _,
-        )
-        .result()?;
+        heuristic_cache
+            .lock()
+            .unwrap()
+            .push((*spec, unsafe { std::ptr::read(&heuristic) }));
     }
 
-    Ok(())
+    Ok(PreparedCuBlasLtMatmul {
+        cublaslt: cublaslt.clone(),
+        spec: *spec,
+        resources,
+        heuristic,
+        _workspace: workspace,
+        workspace_ptr,
+        _a_scale: a_scale,
+        default_a_scale_ptr,
+        _b_scale: b_scale,
+        default_b_scale_ptr,
+        _c_scale: c_scale,
+        _d_scale: d_scale,
+    })
+}
+
+fn run_cublaslt_matmul(
+    stream: &Arc<CudaStream>,
+    cublaslt: &Arc<CudaBlasLT>,
+    spec: &LtMatmulSpec,
+    ptrs: LtMatmulPointers,
+) -> anyhow::Result<()> {
+    let prepared = prepare_cublaslt_matmul(stream, cublaslt, spec, ptrs)?;
+    prepared.enqueue(stream, ptrs)
+}
+
+#[cfg(test)]
+pub(crate) fn cublaslt_graph_capture_supported(stream: &Arc<CudaStream>) -> bool {
+    fn probe(stream: &Arc<CudaStream>) -> anyhow::Result<()> {
+        let capture_stream = stream.context().new_stream()?;
+        let cublaslt = try_create_cublaslt(stream.clone())
+            .map_err(|message| anyhow::anyhow!("cuBLASLt unavailable: {message}"))?;
+
+        let a_buf = stream.clone_htod(&[1.0f32])?;
+        let b_buf = stream.clone_htod(&[1.0f32])?;
+        let d_buf = unsafe { stream.alloc::<f32>(1)? };
+        let (a, a_guard) = a_buf.device_ptr(stream);
+        let (b, b_guard) = b_buf.device_ptr(stream);
+        let (d, d_guard) = d_buf.device_ptr(stream);
+        drop((a_guard, b_guard, d_guard));
+
+        let matrix = LtMatrixSpec {
+            dtype: cudaDataType::CUDA_R_32F,
+            rows: 1,
+            cols: 1,
+            ld: 1,
+            batch_stride: 1,
+            order: cublasLtOrder_t::CUBLASLT_ORDER_ROW,
+        };
+        let spec = LtMatmulSpec {
+            problem: LtMatmulProblem {
+                m: 1,
+                n: 1,
+                k: 1,
+                batch_count: 1,
+            },
+            trans_a: cublasOperation_t::CUBLAS_OP_N,
+            trans_b: cublasOperation_t::CUBLAS_OP_N,
+            a: matrix,
+            b: matrix,
+            c: matrix,
+            d: matrix,
+            compute: LtComputeSpec {
+                compute_type: cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                scale_dtype: cudaDataType::CUDA_R_32F,
+                alpha: LtScalar::F32(1.0),
+                beta: LtScalar::F32(0.0),
+                epilogue: cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+            },
+            workspace_size: 1024 * 1024,
+        };
+        let ptrs = LtMatmulPointers {
+            a,
+            b,
+            c: d,
+            d,
+            bias: None,
+            a_scale: None,
+            b_scale: None,
+        };
+        let prepared = prepare_cublaslt_matmul(stream, &cublaslt, &spec, ptrs)?;
+
+        let mut graph = CudaGraphHandle::new(stream.context().clone())?;
+        let entry = graph.add_empty_node(&[])?;
+        capture_stream.join(stream)?;
+        graph.begin_capture_to_graph(&capture_stream, &[entry])?;
+        let enqueue_result = prepared.enqueue(&capture_stream, ptrs);
+        let end_result = graph.end_capture(&capture_stream);
+        enqueue_result?;
+        end_result?;
+        Ok(())
+    }
+
+    let supported = probe(stream).is_ok();
+    let _ = stream.synchronize();
+    supported
 }
 
 fn resolve_cublaslt_pointers(
@@ -1124,6 +1381,151 @@ impl CuBlasLt {
         })?;
         let _ = self.cublaslt.set(created.clone());
         Ok(created)
+    }
+
+    pub(crate) fn graph_inputs(&self) -> usize {
+        self.n_inputs()
+    }
+
+    pub(crate) fn resolve_for_graph(
+        &self,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<CuBlasLtResolvedGraphCall> {
+        let resolve = |e: &Expression| -> Expression { e.substitute('z', Expression::from(1)) };
+        let m = resolve(&self.m).exec(dyn_map).unwrap() as u64;
+        let n = resolve(&self.n).exec(dyn_map).unwrap() as u64;
+        let k = resolve(&self.k).exec(dyn_map).unwrap() as u64;
+        let a_layout = self.a_layout;
+        let b_layout = self.b_layout;
+        let lda = resolve(&self.lda).exec(dyn_map).unwrap() as i64;
+        let ldb = resolve(&self.ldb).exec(dyn_map).unwrap() as i64;
+        let ldc = resolve(&self.ldc).exec(dyn_map).unwrap() as i64;
+        let ldd = resolve(&self.ldd).exec(dyn_map).unwrap() as i64;
+        let batch_count = resolve(&self.batch_count).exec(dyn_map).unwrap() as i32;
+        let stride_a = resolve(&self.stride_a).exec(dyn_map).unwrap() as i64;
+        let stride_b = resolve(&self.stride_b).exec(dyn_map).unwrap() as i64;
+        let stride_c = resolve(&self.stride_c).exec(dyn_map).unwrap() as i64;
+        let stride_d = resolve(&self.stride_d).exec(dyn_map).unwrap() as i64;
+
+        let a_cuda_dtype = dtype_to_cuda_dtype(self.a_dtype);
+        let b_cuda_dtype = dtype_to_cuda_dtype(self.b_dtype);
+        let c_cuda_dtype = dtype_to_cuda_dtype(self.c_dtype);
+        let d_cuda_dtype = dtype_to_cuda_dtype(self.d_dtype);
+        let scale_cuda_dtype = dtype_to_cuda_dtype(self.scale_dtype);
+        let element_size = (self.d_dtype.bits() / 8) as u64;
+        assert!(
+            element_size > 0,
+            "cuBLAS LT does not support sub-byte dtype {}",
+            self.d_dtype
+        );
+
+        let alpha = LtScalar::from_f64(self.scale_dtype, self.alpha)?;
+        let beta = LtScalar::from_f64(self.scale_dtype, self.beta)?;
+
+        let ptrs = resolve_cublaslt_pointers(
+            self_node,
+            inputs,
+            buffers,
+            self.beta,
+            self.epilogue,
+            self.a_scale_input,
+            self.b_scale_input,
+        )?;
+
+        let (a_rows, a_cols) = if a_layout == cublasOperation_t::CUBLAS_OP_N {
+            (m, k)
+        } else {
+            (k, m)
+        };
+        let (b_rows, b_cols) = if b_layout == cublasOperation_t::CUBLAS_OP_N {
+            (k, n)
+        } else {
+            (n, k)
+        };
+        let lda = clamp_ld_for_order(lda, a_rows, a_cols, self.a_order);
+        let ldb = clamp_ld_for_order(ldb, b_rows, b_cols, self.b_order);
+        let ldc = clamp_ld_for_order(ldc, m, n, self.c_order);
+        let ldd = clamp_ld_for_order(ldd, m, n, self.d_order);
+
+        let _span = span!(
+            Level::TRACE,
+            "cuBLASLT_resolve_graph",
+            m, n, k, lda, ldb, ldc, ldd, batch_count, ?a_layout, ?b_layout,
+            ?self.a_order, ?self.b_order, ?self.c_order, ?self.d_order,
+            ?self.a_dtype, ?self.b_dtype, ?self.c_dtype, ?self.d_dtype,
+            ?self.compute_type, ?self.scale_dtype, self.alpha, self.beta,
+            ?self.epilogue,
+        )
+        .entered();
+
+        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+        let c_spec = LtMatrixSpec {
+            dtype: c_cuda_dtype,
+            rows: m,
+            cols: n,
+            ld: ldc,
+            batch_stride: stride_c,
+            order: self.c_order,
+        };
+        let d_spec = LtMatrixSpec {
+            dtype: d_cuda_dtype,
+            rows: m,
+            cols: n,
+            ld: ldd,
+            batch_stride: stride_d,
+            order: self.d_order,
+        };
+        let spec = LtMatmulSpec {
+            problem: LtMatmulProblem {
+                m,
+                n,
+                k,
+                batch_count,
+            },
+            trans_a: a_layout,
+            trans_b: b_layout,
+            a: LtMatrixSpec {
+                dtype: a_cuda_dtype,
+                rows: a_rows,
+                cols: a_cols,
+                ld: lda,
+                batch_stride: stride_a,
+                order: self.a_order,
+            },
+            b: LtMatrixSpec {
+                dtype: b_cuda_dtype,
+                rows: b_rows,
+                cols: b_cols,
+                ld: ldb,
+                batch_stride: stride_b,
+                order: self.b_order,
+            },
+            c: c_spec,
+            d: d_spec,
+            compute: LtComputeSpec {
+                compute_type: self.compute_type,
+                scale_dtype: scale_cuda_dtype,
+                alpha,
+                beta,
+                epilogue: self.epilogue,
+            },
+            workspace_size: WORKSPACE_SIZE,
+        };
+
+        Ok(CuBlasLtResolvedGraphCall { spec, ptrs })
+    }
+
+    pub(crate) fn prepare_resolved_for_graph(
+        &self,
+        stream: &Arc<CudaStream>,
+        resolved: CuBlasLtResolvedGraphCall,
+    ) -> anyhow::Result<PreparedCuBlasLtMatmul> {
+        let _span = span!(Level::TRACE, "cuBLASLT_prepare_graph").entered();
+        let cublaslt = self.get_cublaslt(stream)?;
+        prepare_cublaslt_matmul(stream, &cublaslt, &resolved.spec, resolved.ptrs)
     }
 
     #[cfg(test)]

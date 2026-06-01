@@ -7,6 +7,12 @@ use crate::prelude::*;
 use as_any::{AsAny, Downcast};
 use rustc_hash::FxHashMap;
 
+pub struct ProfileBucketContext<'a> {
+    pub dim_buckets: &'a FxHashMap<char, Vec<DimBucket>>,
+    pub bucket_indices: &'a FxHashMap<char, usize>,
+    pub representative_dyn_map: &'a FxHashMap<char, usize>,
+}
+
 pub trait Runtime {
     type Ops: IntoEgglogOp;
     type CompileArg;
@@ -36,6 +42,20 @@ pub trait Runtime {
         trials: usize,
         timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String);
+    /// Profile one candidate in the context of a specific dynamic-dimension
+    /// bucket. Runtimes with bucket-sensitive lowering can override this so
+    /// search ranks candidates under the same execution model used after
+    /// final bucket compilation.
+    fn profile_with_bucket_context(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+        _bucket_context: ProfileBucketContext<'_>,
+    ) -> (Self::ProfileMetric, String) {
+        self.profile(llir_graph, dyn_map, trials, timeout)
+    }
     /// Aggregate multiple profile metrics into one comparable metric.
     /// Used for regionalized profiling where one candidate maps to multiple LLIR regions.
     fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {

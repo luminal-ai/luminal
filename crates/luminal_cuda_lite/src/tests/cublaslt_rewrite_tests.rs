@@ -7,10 +7,12 @@ use luminal::{
     prelude::*,
 };
 use rand::{SeedableRng, rngs::StdRng};
+use std::sync::Arc;
 
 use crate::{
     host::{
         CublasLtMatrixOrders, CublasLtScaleValues, CublasLtTransposeOps, CublasLtTypeTuple, HostOp,
+        cublaslt::{cublaslt_prepare_count_for_test, reset_cublaslt_prepare_count_for_test},
         cublaslt_c_d_layouts_match, cublaslt_epilogue, cublaslt_matrix_orders,
         cublaslt_scale_values, cublaslt_tensor_scale_inputs, cublaslt_transpose_ops,
         cublaslt_type_tuple,
@@ -132,6 +134,45 @@ fn reference_matmul_2d(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Ve
         }
     }
     expected
+}
+
+fn reference_mixed_chain(
+    a: &[f32],
+    pre: &[f32],
+    b: &[f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Vec<f32> {
+    let mut expected = vec![0.0; m * n];
+    for row in 0..m {
+        for col in 0..n {
+            let mut acc = 0.0;
+            for inner in 0..k {
+                acc += (a[row * k + inner] + pre[row * k + inner]) * b[inner * n + col];
+            }
+            expected[row * n + col] = acc.exp();
+        }
+    }
+    expected
+}
+
+fn cublaslt_available_for_runtime(stream: &Arc<cudarc::driver::CudaStream>) -> bool {
+    crate::try_create_cublaslt(stream.clone()).is_ok()
+}
+
+fn build_mixed_chain_graph(
+    m: impl Into<Expression>,
+    n: usize,
+    k: usize,
+) -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
+    let m = m.into();
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let pre = cx.tensor((m, k));
+    let b = cx.tensor((k, n));
+    let out = ((a + pre).matmul(b).exp()).output();
+    (cx, a.id, pre.id, b.id, out.id)
 }
 
 fn add_in_place(values: &mut [f32], addends: &[f32]) {
@@ -505,6 +546,463 @@ fn cublaslt_rewrites_keep_c_and_d_layouts_equal_initially() {
             case.name
         );
     }
+}
+
+#[test]
+fn mixed_cuda_graph_cublaslt_kernel_chain_executes_correctly() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (m, n, k) = (7, 11, 5);
+    let (mut cx, a, pre, b, out) = build_mixed_chain_graph(m, n, k);
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "mixed graph chain", |llir| {
+        cublaslt_scale_value_tuples(llir).contains(&(1.0, 0.0))
+    });
+
+    let a_data = random_f32_vec(m * k, 0xCAFE_0001, -0.08, 0.08);
+    let pre_data = random_f32_vec(m * k, 0xCAFE_0002, -0.03, 0.03);
+    let b_data = random_f32_vec(k * n, 0xCAFE_0003, -0.08, 0.08);
+    let expected = reference_mixed_chain(&a_data, &pre_data, &b_data, m, n, k);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a, a_data);
+    rt.set_data(pre, pre_data);
+    rt.set_data(b, b_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out), &expected, 1e-5, 1e-5);
+    let summaries = rt.debug_cuda_graph_summaries();
+    let mixed = summaries
+        .iter()
+        .find(|summary| summary.n_cublaslt == 1)
+        .expect("expected one CudaGraphOp to capture the cuBLASLt island");
+    assert!(mixed.n_kernels >= 2, "expected kernels around cuBLASLt");
+    assert_eq!(mixed.n_steps, mixed.n_kernels + mixed.n_cublaslt);
+    assert_eq!(mixed.absorbed_host_nodes.len(), 1);
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn cuda_graph_cublaslt_only_executes_correctly() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (m, n, k) = (7, 11, 5);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let b = cx.tensor((k, n));
+    let out = a.matmul(b).output();
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "cuBLASLt-only graph", |_| true);
+
+    let a_data = random_f32_vec(m * k, 0xC001_0001, -0.08, 0.08);
+    let b_data = random_f32_vec(k * n, 0xC001_0002, -0.08, 0.08);
+    let expected = reference_matmul_2d(&a_data, &b_data, m, n, k);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a.id, a_data);
+    rt.set_data(b.id, b_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    let summary = rt
+        .debug_cuda_graph_summaries()
+        .into_iter()
+        .find(|summary| summary.n_cublaslt == 1)
+        .expect("expected a cuBLASLt-only CudaGraphOp");
+    assert_eq!(summary.n_kernels, 0);
+    assert_eq!(summary.n_steps, 1);
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (m, n, k) = (5, 8, 8);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let b = cx.tensor((k, n));
+    let first = a.matmul(b);
+    let out = (a + first.sin()).matmul(b).output();
+    let llir = extract_forced_cublaslt_llir_where(
+        &mut cx,
+        "ordered matching cuBLASLt prepared reuse",
+        |llir| {
+            let orders = cublaslt_matrix_order_tuples(llir);
+            orders.len() == 2 && orders[0] == orders[1]
+        },
+    );
+
+    let a_data = random_f32_vec(m * k, 0xC001_1001, -0.08, 0.08);
+    let b_data = random_f32_vec(k * n, 0xC001_1002, -0.08, 0.08);
+    let first = reference_matmul_2d(&a_data, &b_data, m, n, k);
+    let dep = a_data
+        .iter()
+        .zip(&first)
+        .map(|(a, first)| a + first.sin())
+        .collect::<Vec<_>>();
+    let expected = reference_matmul_2d(&dep, &b_data, m, n, k);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a.id, a_data);
+    rt.set_data(b.id, b_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    let summary = rt
+        .debug_cuda_graph_summaries()
+        .into_iter()
+        .find(|summary| summary.n_cublaslt == 2)
+        .expect("expected one mixed CudaGraphOp with two cuBLASLt islands");
+    assert_eq!(
+        summary.n_cublaslt_prepared, 1,
+        "dependency-ordered matching cuBLASLt calls should share prepared resources"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn cuda_graph_cublaslt_skips_prepare_when_unrelated_dyn_dim_changes() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (m, n, k) = (7, 11, 5);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let b = cx.tensor((k, n));
+    let out = a.matmul(b).output();
+    a.output();
+    b.output();
+    cx.set_dim('p', 1);
+    let llir = extract_forced_cublaslt_llir_where(
+        &mut cx,
+        "cuBLASLt unchanged under unrelated dyn dim",
+        |_| true,
+    );
+
+    let a_data = random_f32_vec(m * k, 0xC004_0001, -0.08, 0.08);
+    let b_data = random_f32_vec(k * n, 0xC004_0002, -0.08, 0.08);
+    let expected = reference_matmul_2d(&a_data, &b_data, m, n, k);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a.id, a_data);
+    rt.set_data(b.id, b_data);
+
+    reset_cublaslt_prepare_count_for_test();
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    let first_prepare_count = cublaslt_prepare_count_for_test();
+    assert!(
+        first_prepare_count > 0,
+        "first execution should prepare the captured cuBLASLt island"
+    );
+
+    cx.set_dim('p', 2);
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    assert_eq!(
+        cublaslt_prepare_count_for_test(),
+        first_prepare_count,
+        "unrelated dyn dim changes should not redo expensive cuBLASLt prepare"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (n, k) = (11, 5);
+    let mut cx = Graph::new();
+    let a = cx.tensor(('m', k));
+    let b = cx.tensor((k, n));
+    let out = a.matmul(b).output();
+    cx.set_dim('m', 7);
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "cuBLASLt-only dynamic graph", |_| true);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+
+    for (m, seed) in [
+        (7usize, 0xC002_0001),
+        (9usize, 0xC002_0002),
+        (7usize, 0xC002_0003),
+    ] {
+        cx.set_dim('m', m);
+        let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
+        let b_data = random_f32_vec(k * n, seed + 10, -0.08, 0.08);
+        let expected = reference_matmul_2d(&a_data, &b_data, m, n, k);
+
+        rt.set_data(a.id, a_data);
+        rt.set_data(b.id, b_data);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    }
+
+    let summary = rt
+        .debug_cuda_graph_summaries()
+        .into_iter()
+        .find(|summary| summary.n_cublaslt == 1)
+        .expect("expected a cuBLASLt-only CudaGraphOp after recapture");
+    assert_eq!(summary.n_kernels, 0);
+    assert_eq!(summary.n_steps, 1);
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn cublaslt_with_dynamic_c_spec_is_captured() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+
+    let (n, k) = (11, 5);
+    let mut cx = Graph::new();
+    let a = cx.tensor(('c', k));
+    let b = cx.tensor((k, n));
+    let out = a.matmul(b).output();
+    cx.set_dim('c', 7);
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "dynamic c cuBLASLt graph", |_| true);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+
+    for (c, seed) in [(7usize, 0xC003_0001), (9usize, 0xC003_0002)] {
+        cx.set_dim('c', c);
+        let a_data = random_f32_vec(c * k, seed, -0.08, 0.08);
+        let b_data = random_f32_vec(k * n, seed + 10, -0.08, 0.08);
+        let expected = reference_matmul_2d(&a_data, &b_data, c, n, k);
+
+        rt.set_data(a.id, a_data);
+        rt.set_data(b.id, b_data);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    }
+
+    assert!(
+        rt.debug_cuda_graph_summaries()
+            .iter()
+            .any(|summary| summary.n_cublaslt == 1),
+        "c-dependent cuBLASLt should be absorbed into a CUDA graph"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn bucket_range_and_singleton_cublaslt_buckets_are_captured() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (n, k) = (11, 5);
+    let mut cx = Graph::new();
+    let a = cx.tensor(('s', k));
+    let b = cx.tensor((k, n));
+    let out = a.matmul(b).output();
+    cx.set_dim('s', 1);
+    let llir =
+        extract_forced_cublaslt_llir_where(&mut cx, "bucketed s cuBLASLt graph capture", |_| true);
+
+    let dim_buckets = [('s', vec![DimBucket::new(1, 1), DimBucket::new(2, 4)])]
+        .into_iter()
+        .collect();
+    let bucket_llirs = vec![
+        (
+            [('s', 0usize)].into_iter().collect(),
+            [('s', 1usize)].into_iter().collect(),
+            llir.clone(),
+        ),
+        (
+            [('s', 1usize)].into_iter().collect(),
+            [('s', 3usize)].into_iter().collect(),
+            llir,
+        ),
+    ];
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir_buckets(&dim_buckets, &bucket_llirs);
+
+    cx.set_dim('s', 1);
+    let a_data = random_f32_vec(k, 0xB001_0001, -0.08, 0.08);
+    let b_data = random_f32_vec(k * n, 0xB001_0002, -0.08, 0.08);
+    let expected = reference_matmul_2d(&a_data, &b_data, 1, n, k);
+    rt.set_data(a.id, a_data);
+    rt.set_data(b.id, b_data.clone());
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    assert!(
+        rt.debug_cuda_graph_summaries()
+            .iter()
+            .any(|summary| summary.n_cublaslt == 1),
+        "singleton s bucket should capture s-dependent cuBLASLt"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+    assert!(
+        rt.debug_active_bucket_stabilizes_intermediate_pointers(),
+        "bucket with captured cuBLASLt needs stable intermediate pointers"
+    );
+
+    cx.set_dim('s', 3);
+    let a_data = random_f32_vec(3 * k, 0xB001_0003, -0.08, 0.08);
+    let expected = reference_matmul_2d(&a_data, &b_data, 3, n, k);
+    rt.set_data(a.id, a_data);
+    rt.set_data(b.id, b_data);
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    assert!(
+        rt.debug_cuda_graph_summaries()
+            .iter()
+            .any(|summary| summary.n_cublaslt == 1),
+        "range s bucket should capture s-dependent cuBLASLt"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+    assert!(
+        rt.debug_active_bucket_stabilizes_intermediate_pointers(),
+        "bucket with captured cuBLASLt needs stable intermediate pointers"
+    );
+}
+
+#[test]
+fn mixed_cuda_graph_cublaslt_recaptures_on_input_pointer_change() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (m, n, k) = (7, 11, 5);
+    let (mut cx, a, pre, b, out) = build_mixed_chain_graph(m, n, k);
+    let llir =
+        extract_forced_cublaslt_llir_where(&mut cx, "mixed graph pointer recapture", |_| true);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+
+    reset_cublaslt_prepare_count_for_test();
+    let mut first_prepare_count = None;
+    for seed in [0xCC00_0001, 0xCC00_0002] {
+        let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
+        let pre_data = random_f32_vec(m * k, seed + 10, -0.03, 0.03);
+        let b_data = random_f32_vec(k * n, seed + 20, -0.08, 0.08);
+        let expected = reference_mixed_chain(&a_data, &pre_data, &b_data, m, n, k);
+
+        rt.set_data(a, a_data);
+        rt.set_data(pre, pre_data);
+        rt.set_data(b, b_data);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out), &expected, 1e-5, 1e-5);
+        if first_prepare_count.is_none() {
+            first_prepare_count = Some(cublaslt_prepare_count_for_test());
+        }
+    }
+    assert_eq!(
+        cublaslt_prepare_count_for_test(),
+        first_prepare_count.unwrap(),
+        "A/B/C/D pointer-only recapture should reuse prepared cuBLASLt resources"
+    );
+
+    let summaries = rt.debug_cuda_graph_summaries();
+    assert!(
+        summaries.iter().any(|summary| summary.n_cublaslt == 1),
+        "expected cuBLASLt to remain captured after pointer recapture"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn mixed_cuda_graph_cublaslt_recaptures_on_dynamic_shape_change() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+    if !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream) {
+        return;
+    }
+
+    let (n, k) = (11, 5);
+    let (mut cx, a, pre, b, out) = build_mixed_chain_graph('m', n, k);
+    cx.set_dim('m', 7);
+    let llir =
+        extract_forced_cublaslt_llir_where(&mut cx, "mixed graph dynamic recapture", |_| true);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+
+    for (m, seed) in [(7usize, 0xDD00_0001), (9usize, 0xDD00_0002)] {
+        cx.set_dim('m', m);
+        let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
+        let pre_data = random_f32_vec(m * k, seed + 10, -0.03, 0.03);
+        let b_data = random_f32_vec(k * n, seed + 20, -0.08, 0.08);
+        let expected = reference_mixed_chain(&a_data, &pre_data, &b_data, m, n, k);
+
+        rt.set_data(a, a_data);
+        rt.set_data(pre, pre_data);
+        rt.set_data(b, b_data);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out), &expected, 1e-5, 1e-5);
+    }
+
+    let summaries = rt.debug_cuda_graph_summaries();
+    assert!(
+        summaries.iter().any(|summary| summary.n_cublaslt == 1),
+        "expected cuBLASLt to remain captured after dynamic-shape recapture"
+    );
+    assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
 }
 
 #[test]

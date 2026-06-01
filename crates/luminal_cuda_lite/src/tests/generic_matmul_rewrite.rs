@@ -109,7 +109,7 @@ fn extract_forced_kernel_llir(cx: &mut Graph, kernel_name: &str) -> LLIRGraph {
     );
 
     for (idx, kernel_node) in kernel_nodes.iter().enumerate() {
-        let mut rng = StdRng::seed_from_u64(0x9E_EE_0000 + idx as u64);
+        let mut rng = StdRng::seed_from_u64(0x9EEE_0000 + idx as u64);
         let mut choices = random_initial_choice(egraph, &mut rng);
         let kernel_class = &egraph.node_to_class[*kernel_node];
         choices.insert(kernel_class, kernel_node);

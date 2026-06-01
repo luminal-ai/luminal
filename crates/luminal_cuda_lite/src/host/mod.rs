@@ -2,7 +2,7 @@ use std::{fmt::Debug, sync::Arc};
 
 use crate::cudarc::driver::{CudaStream, DriverError, result};
 use luminal::{op::EgglogOp, prelude::*};
-mod cublaslt;
+pub(crate) mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
 
@@ -164,6 +164,15 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// this host op's execution. Returning `None` tells the runtime to treat
     /// every extra buffer as live for the whole host op.
     fn extra_buffer_lifetimes(&self) -> Option<Vec<(NodeIndex, usize, usize)>> {
+        None
+    }
+
+    /// Returns pairs of extra buffer nodes that must not share arena storage.
+    ///
+    /// This refines `extra_buffer_lifetimes` for host ops with internal DAGs:
+    /// two buffers may have disjoint positions in one topological order while
+    /// still being unordered by real dependencies, so CUDA could overlap them.
+    fn extra_buffer_conflicts(&self) -> Option<Vec<(NodeIndex, NodeIndex)>> {
         None
     }
 

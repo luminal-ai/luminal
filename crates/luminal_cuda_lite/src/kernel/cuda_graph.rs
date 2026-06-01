@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaStream, DriverError,
-    sys::{self, CUevent, CUfunction, CUgraph, CUgraphExec, CUgraphNode},
+    sys::{
+        self, CUevent, CUfunction, CUgraph, CUgraphExec, CUgraphExecUpdateResult,
+        CUgraphExecUpdateResultInfo, CUgraphNode, CUstreamCaptureMode,
+    },
 };
 
 /// A CUDA graph that can be modified and instantiated.
@@ -67,6 +70,176 @@ impl CudaGraphHandle {
             .result()?;
             Ok(node.assume_init())
         }
+    }
+
+    /// Updates a kernel node in the mutable source graph.
+    pub unsafe fn set_kernel_node_params(
+        &mut self,
+        node: CUgraphNode,
+        func: CUfunction,
+        grid_dim: (u32, u32, u32),
+        block_dim: (u32, u32, u32),
+        shared_mem_bytes: u32,
+        kernel_params: *mut *mut c_void,
+    ) -> Result<(), DriverError> {
+        self.ctx.bind_to_thread()?;
+        let params = sys::CUDA_KERNEL_NODE_PARAMS {
+            func,
+            gridDimX: grid_dim.0,
+            gridDimY: grid_dim.1,
+            gridDimZ: grid_dim.2,
+            blockDimX: block_dim.0,
+            blockDimY: block_dim.1,
+            blockDimZ: block_dim.2,
+            sharedMemBytes: shared_mem_bytes,
+            kernelParams: kernel_params,
+            extra: std::ptr::null_mut(),
+            kern: std::ptr::null_mut(),
+            ctx: std::ptr::null_mut(),
+        };
+
+        unsafe { sys::cuGraphKernelNodeSetParams_v2(node, &params).result() }
+    }
+
+    /// Adds an empty dependency node to the graph.
+    pub fn add_empty_node(
+        &mut self,
+        dependencies: &[CUgraphNode],
+    ) -> Result<CUgraphNode, DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut node = MaybeUninit::uninit();
+        unsafe {
+            sys::cuGraphAddEmptyNode(
+                node.as_mut_ptr(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                dependencies.len(),
+            )
+            .result()?;
+            Ok(node.assume_init())
+        }
+    }
+
+    /// Destroys a node in the mutable graph.
+    pub unsafe fn destroy_node(&mut self, node: CUgraphNode) -> Result<(), DriverError> {
+        self.ctx.bind_to_thread()?;
+        unsafe { sys::cuGraphDestroyNode(node).result() }
+    }
+
+    /// Adds dependency edges to the mutable graph.
+    pub fn add_dependencies(
+        &mut self,
+        from: &[CUgraphNode],
+        to: &[CUgraphNode],
+    ) -> Result<(), DriverError> {
+        assert_eq!(from.len(), to.len());
+        self.ctx.bind_to_thread()?;
+        unsafe {
+            sys::cuGraphAddDependencies(self.cu_graph, from.as_ptr(), to.as_ptr(), from.len())
+        }
+        .result()
+    }
+
+    /// Removes dependency edges from the mutable graph.
+    pub fn remove_dependencies(
+        &mut self,
+        from: &[CUgraphNode],
+        to: &[CUgraphNode],
+    ) -> Result<(), DriverError> {
+        assert_eq!(from.len(), to.len());
+        self.ctx.bind_to_thread()?;
+        unsafe {
+            sys::cuGraphRemoveDependencies(self.cu_graph, from.as_ptr(), to.as_ptr(), from.len())
+        }
+        .result()
+    }
+
+    /// Returns all nodes currently in the graph.
+    pub fn nodes(&self) -> Result<Vec<CUgraphNode>, DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut count = 0usize;
+        unsafe {
+            sys::cuGraphGetNodes(self.cu_graph, std::ptr::null_mut(), &mut count).result()?;
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut nodes = vec![std::ptr::null_mut(); count];
+        unsafe {
+            sys::cuGraphGetNodes(self.cu_graph, nodes.as_mut_ptr(), &mut count).result()?;
+        }
+        nodes.truncate(count);
+        Ok(nodes)
+    }
+
+    /// Returns the direct dependencies of a node.
+    pub fn dependencies(&self, node: CUgraphNode) -> Result<Vec<CUgraphNode>, DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut count = 0usize;
+        unsafe {
+            sys::cuGraphNodeGetDependencies(node, std::ptr::null_mut(), &mut count).result()?;
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut deps = vec![std::ptr::null_mut(); count];
+        unsafe {
+            sys::cuGraphNodeGetDependencies(node, deps.as_mut_ptr(), &mut count).result()?;
+        }
+        deps.truncate(count);
+        Ok(deps)
+    }
+
+    /// Returns the direct dependents of a node.
+    pub fn dependent_nodes(&self, node: CUgraphNode) -> Result<Vec<CUgraphNode>, DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut count = 0usize;
+        unsafe {
+            sys::cuGraphNodeGetDependentNodes(node, std::ptr::null_mut(), &mut count).result()?;
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let mut deps = vec![std::ptr::null_mut(); count];
+        unsafe {
+            sys::cuGraphNodeGetDependentNodes(node, deps.as_mut_ptr(), &mut count).result()?;
+        }
+        deps.truncate(count);
+        Ok(deps)
+    }
+
+    /// Begins stream capture that appends captured work into this graph.
+    pub fn begin_capture_to_graph(
+        &mut self,
+        stream: &CudaStream,
+        dependencies: &[CUgraphNode],
+    ) -> Result<(), DriverError> {
+        self.ctx.bind_to_thread()?;
+        unsafe {
+            sys::cuStreamBeginCaptureToGraph(
+                stream.cu_stream(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                std::ptr::null(),
+                dependencies.len(),
+                CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+            .result()
+        }
+    }
+
+    /// Ends stream capture previously started by begin_capture_to_graph.
+    pub fn end_capture(&mut self, stream: &CudaStream) -> Result<(), DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut graph = MaybeUninit::uninit();
+        unsafe {
+            sys::cuStreamEndCapture(stream.cu_stream(), graph.as_mut_ptr()).result()?;
+            let captured = graph.assume_init();
+            if captured != self.cu_graph && !captured.is_null() {
+                sys::cuGraphDestroy(captured).result()?;
+            }
+        }
+        Ok(())
     }
 
     /// Adds an event record node to the graph for timing.
@@ -154,6 +327,25 @@ impl CudaGraphExecHandle {
 
         unsafe { sys::cuGraphExecKernelNodeSetParams_v2(self.cu_graph_exec, node, &params) }
             .result()
+    }
+
+    /// Attempts to update this executable graph from an already-mutated source graph.
+    pub fn update_from_graph(&mut self, graph: &CudaGraphHandle) -> Result<(), DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut result = CUgraphExecUpdateResultInfo {
+            result: CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS,
+            errorNode: std::ptr::null_mut(),
+            errorFromNode: std::ptr::null_mut(),
+        };
+        unsafe {
+            sys::cuGraphExecUpdate_v2(self.cu_graph_exec, graph.cu_graph, &mut result).result()?;
+        }
+        if result.result != CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS {
+            return Err(DriverError(
+                sys::CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -478,6 +670,38 @@ mod tests {
         let mut result = [0.0f32];
         stream.memcpy_dtoh(&output, &mut result).unwrap();
         assert_eq!(result[0], 6.0f32);
+    }
+
+    #[test]
+    fn test_graph_empty_node_dependency_reconnect() {
+        let Ok(ctx) = CudaContext::new(0) else { return };
+        let mut graph = CudaGraphHandle::new(ctx).unwrap();
+
+        let entry = graph.add_empty_node(&[]).unwrap();
+        let middle = graph.add_empty_node(&[entry]).unwrap();
+        let exit = graph.add_empty_node(&[middle]).unwrap();
+
+        let nodes = graph.nodes().unwrap();
+        assert!(nodes.contains(&entry));
+        assert!(nodes.contains(&middle));
+        assert!(nodes.contains(&exit));
+        assert_eq!(graph.dependencies(middle).unwrap(), vec![entry]);
+        assert_eq!(graph.dependent_nodes(middle).unwrap(), vec![exit]);
+
+        graph.add_dependencies(&[entry], &[exit]).unwrap();
+        let exit_deps = graph.dependencies(exit).unwrap();
+        assert!(exit_deps.contains(&entry));
+        assert!(exit_deps.contains(&middle));
+
+        graph.remove_dependencies(&[middle], &[exit]).unwrap();
+        let exit_deps = graph.dependencies(exit).unwrap();
+        assert_eq!(exit_deps.len(), 1);
+        assert!(exit_deps.contains(&entry));
+
+        unsafe {
+            graph.destroy_node(middle).unwrap();
+        }
+        assert!(!graph.nodes().unwrap().contains(&middle));
     }
 
     // CUDA Graph Tests

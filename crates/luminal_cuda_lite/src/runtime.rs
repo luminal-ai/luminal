@@ -1,6 +1,6 @@
 use crate::{
     host::{DeviceBuffer, HostOp},
-    kernel::{CudaGraphTiming, KernelOp, record_cuda_graph_timings},
+    kernel::{CudaGraphOp, CudaGraphTiming, KernelOp, record_cuda_graph_timings},
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result};
 
@@ -33,6 +33,7 @@ use tracing::{Level, span, trace};
 use uuid::Uuid;
 
 const ARENA_ALIGNMENT: usize = 256;
+const MIN_ARENA_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
 
 pub enum CudaInput {
     Buffer(CudaSlice<u8>),
@@ -80,6 +81,13 @@ struct PlannedBuffer {
     end: usize,
 }
 
+#[derive(Debug, Clone)]
+struct ArenaSlot {
+    members: Vec<PlannedBuffer>,
+    offset: usize,
+    capacity_bytes: usize,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct NonFiniteBufferReport {
@@ -99,6 +107,10 @@ pub(crate) struct CompiledBucket {
     pub(crate) arena_bytes: usize,
     pub(crate) logical_buffer_offsets: FxHashMap<NodeIndex, usize>,
     pub(crate) logical_buffer_bytes: FxHashMap<NodeIndex, usize>,
+    pub(crate) logical_buffer_capacity_bytes: FxHashMap<NodeIndex, usize>,
+    arena_slots: Vec<ArenaSlot>,
+    logical_buffer_slots: FxHashMap<NodeIndex, usize>,
+    arena_conflicts: FxHashSet<(NodeIndex, NodeIndex)>,
     pub(crate) cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     pub(crate) buffer_specs: FxHashMap<NodeIndex, BufferSpec>,
     pub(crate) llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
@@ -117,6 +129,9 @@ pub(crate) struct CompiledBucket {
     /// Test/debug mode: give every intermediate a distinct arena range so
     /// post-execution diagnostics can inspect expired nodes without reuse noise.
     pub(crate) preserve_intermediate_buffers_for_debug: bool,
+    /// Keep intermediate offsets and base allocation stable across shape growth
+    /// when captured library graph nodes embed intermediate pointers.
+    stabilize_intermediate_pointers: bool,
 }
 
 impl CompiledBucket {
@@ -128,6 +143,10 @@ impl CompiledBucket {
             arena_bytes: 0,
             logical_buffer_offsets: FxHashMap::default(),
             logical_buffer_bytes: FxHashMap::default(),
+            logical_buffer_capacity_bytes: FxHashMap::default(),
+            arena_slots: Vec::new(),
+            logical_buffer_slots: FxHashMap::default(),
+            arena_conflicts: FxHashSet::default(),
             cached_buffer_ptrs: FxHashMap::default(),
             buffer_specs: FxHashMap::default(),
             llir_to_hlir: FxHashMap::default(),
@@ -142,6 +161,7 @@ impl CompiledBucket {
             bucket_indices: FxHashMap::default(),
             hlir_synced: false,
             preserve_intermediate_buffers_for_debug: false,
+            stabilize_intermediate_pointers: false,
         }
     }
 }
@@ -321,6 +341,7 @@ impl CudaRuntime {
             bucket.preserve_intermediate_buffers_for_debug = true;
             bucket.logical_buffer_offsets.clear();
             bucket.logical_buffer_bytes.clear();
+            bucket.logical_buffer_capacity_bytes.clear();
             bucket.cached_buffer_ptrs.clear();
             bucket.arena = None;
             bucket.arena_bytes = 0;
@@ -885,17 +906,64 @@ impl CudaRuntime {
         stream: &Arc<CudaStream>,
         dyn_dims: &FxHashMap<char, usize>,
     ) {
-        let needs_new_plan = !Self::buffer_plan_matches(bucket, dyn_dims);
+        let profile_alloc = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let alloc_profile_start = std::time::Instant::now();
+        let old_arena_len = bucket.arena.as_ref().map(|arena| arena.len()).unwrap_or(0);
+        let old_arena_bytes = bucket.arena_bytes;
+        let mut sync_time = Duration::ZERO;
+        let mut plan_time = Duration::ZERO;
+        let mut refresh_time = Duration::ZERO;
+        let mut cuda_alloc_time = Duration::ZERO;
+        let mut cache_ptrs_time = Duration::ZERO;
+        let mut allocated_bytes = 0usize;
+        let mut allocated_new_arena = false;
+        let needs_new_plan =
+            bucket.logical_buffer_slots.is_empty() && !bucket.buffer_specs.is_empty();
         if needs_new_plan {
-            if bucket.arena.is_some() {
-                stream.synchronize().unwrap();
+            let timer = std::time::Instant::now();
+            Self::initialize_fixed_intermediate_buffer_plan(bucket, dyn_dims);
+            plan_time += timer.elapsed();
+        }
+
+        if !bucket.logical_buffer_slots.is_empty() {
+            let timer = std::time::Instant::now();
+            Self::refresh_fixed_intermediate_buffer_plan(bucket, dyn_dims);
+            refresh_time += timer.elapsed();
+        } else {
+            let needs_legacy_plan = !Self::buffer_plan_matches(bucket, dyn_dims);
+            if needs_legacy_plan {
+                if bucket.arena.is_some() {
+                    let timer = std::time::Instant::now();
+                    stream.synchronize().unwrap();
+                    sync_time += timer.elapsed();
+                }
+                let timer = std::time::Instant::now();
+                Self::plan_intermediate_buffers(bucket, dyn_dims);
+                plan_time += timer.elapsed();
+            } else {
+                let timer = std::time::Instant::now();
+                Self::refresh_intermediate_buffer_lengths(bucket, dyn_dims);
+                refresh_time += timer.elapsed();
             }
-            Self::plan_intermediate_buffers(bucket, dyn_dims);
         }
 
         if bucket.arena_bytes == 0 {
             bucket.arena = None;
             bucket.cached_buffer_ptrs.clear();
+            if profile_alloc {
+                eprintln!(
+                    "CUDA_ALLOC_PROFILE total_ms={:.3} needs_new_plan={} sync_ms={:.3} plan_ms={:.3} refresh_ms={:.3} cuda_alloc_ms={:.3} cache_ptrs_ms={:.3} allocated_new_arena=false old_arena_len={} new_arena_len=0 old_arena_bytes={} new_arena_bytes=0 allocation_bytes=0 cached_ptrs=0 logical_offsets=0",
+                    alloc_profile_start.elapsed().as_secs_f64() * 1e3,
+                    needs_new_plan,
+                    sync_time.as_secs_f64() * 1e3,
+                    plan_time.as_secs_f64() * 1e3,
+                    refresh_time.as_secs_f64() * 1e3,
+                    cuda_alloc_time.as_secs_f64() * 1e3,
+                    cache_ptrs_time.as_secs_f64() * 1e3,
+                    old_arena_len,
+                    old_arena_bytes,
+                );
+            }
             return;
         }
 
@@ -904,14 +972,48 @@ impl CudaRuntime {
             .as_ref()
             .is_none_or(|arena| arena.len() < bucket.arena_bytes)
         {
-            bucket.arena = Some(stream.alloc_zeros(bucket.arena_bytes).unwrap());
+            let allocation_bytes = if bucket.stabilize_intermediate_pointers {
+                bucket.arena_bytes.max(MIN_ARENA_ALLOCATION_BYTES)
+            } else {
+                bucket.arena_bytes
+            };
+            let timer = std::time::Instant::now();
+            bucket.arena = Some(unsafe { stream.alloc(allocation_bytes).unwrap() });
+            cuda_alloc_time += timer.elapsed();
+            allocated_bytes = allocation_bytes;
+            allocated_new_arena = true;
         }
 
+        let timer = std::time::Instant::now();
         let arena_ptr = bucket.arena.as_ref().unwrap().device_ptr(stream).0;
         for (logical_node, &offset) in &bucket.logical_buffer_offsets {
+            if !bucket.logical_buffer_bytes.contains_key(logical_node) {
+                continue;
+            }
             if let Some(ptr) = arena_ptr.checked_add(offset as u64) {
                 bucket.cached_buffer_ptrs.insert(*logical_node, ptr);
             }
+        }
+        cache_ptrs_time += timer.elapsed();
+        if profile_alloc {
+            eprintln!(
+                "CUDA_ALLOC_PROFILE total_ms={:.3} needs_new_plan={} sync_ms={:.3} plan_ms={:.3} refresh_ms={:.3} cuda_alloc_ms={:.3} cache_ptrs_ms={:.3} allocated_new_arena={} old_arena_len={} new_arena_len={} old_arena_bytes={} new_arena_bytes={} allocation_bytes={} cached_ptrs={} logical_offsets={}",
+                alloc_profile_start.elapsed().as_secs_f64() * 1e3,
+                needs_new_plan,
+                sync_time.as_secs_f64() * 1e3,
+                plan_time.as_secs_f64() * 1e3,
+                refresh_time.as_secs_f64() * 1e3,
+                cuda_alloc_time.as_secs_f64() * 1e3,
+                cache_ptrs_time.as_secs_f64() * 1e3,
+                allocated_new_arena,
+                old_arena_len,
+                bucket.arena.as_ref().map(|arena| arena.len()).unwrap_or(0),
+                old_arena_bytes,
+                bucket.arena_bytes,
+                allocated_bytes,
+                bucket.cached_buffer_ptrs.len(),
+                bucket.logical_buffer_offsets.len(),
+            );
         }
     }
 
@@ -922,15 +1024,306 @@ impl CudaRuntime {
         if bucket.logical_buffer_offsets.is_empty() && !bucket.buffer_specs.is_empty() {
             return false;
         }
-        bucket
-            .intermediate_buffer_dims
-            .iter()
-            .all(|dim| bucket.last_dyn_map.get(dim) == dyn_dims.get(dim))
+        bucket.buffer_specs.iter().all(|(node, spec)| {
+            let Some(bytes) = spec.bytes.exec(dyn_dims) else {
+                return false;
+            };
+            if bytes == 0 {
+                return true;
+            }
+            bucket.logical_buffer_offsets.contains_key(node)
+                && bucket
+                    .logical_buffer_capacity_bytes
+                    .get(node)
+                    .is_some_and(|capacity| *capacity >= bytes)
+        })
+    }
+
+    fn refresh_intermediate_buffer_lengths(
+        bucket: &mut CompiledBucket,
+        dyn_dims: &FxHashMap<char, usize>,
+    ) {
+        bucket.logical_buffer_bytes.clear();
+        for (node, spec) in &bucket.buffer_specs {
+            let bytes = spec.bytes.exec(dyn_dims).unwrap();
+            if bytes > 0 {
+                bucket.logical_buffer_bytes.insert(*node, bytes);
+            }
+        }
+        bucket.last_dyn_map = dyn_dims.clone();
+    }
+
+    fn initialize_fixed_intermediate_buffer_plan(
+        bucket: &mut CompiledBucket,
+        dyn_dims: &FxHashMap<char, usize>,
+    ) {
+        bucket.arena_slots.clear();
+        bucket.logical_buffer_slots.clear();
+
+        let mut planned = Self::planned_intermediate_buffers(bucket, dyn_dims, true);
+        if planned.is_empty() {
+            return;
+        }
+
+        if bucket.preserve_intermediate_buffers_for_debug {
+            planned.sort_by_key(|buf| buf.node.index());
+            for buf in planned {
+                let slot_idx = bucket.arena_slots.len();
+                bucket.logical_buffer_slots.insert(buf.node, slot_idx);
+                bucket.arena_slots.push(ArenaSlot {
+                    members: vec![buf],
+                    offset: 0,
+                    capacity_bytes: 0,
+                });
+            }
+            return;
+        }
+
+        Self::assign_fixed_arena_slots(bucket, planned);
+    }
+
+    fn assign_fixed_arena_slots(bucket: &mut CompiledBucket, mut planned: Vec<PlannedBuffer>) {
+        planned.sort_by_key(|buf| {
+            (
+                buf.start,
+                std::cmp::Reverse(buf.bytes),
+                std::cmp::Reverse(buf.end.saturating_sub(buf.start)),
+                buf.node.index(),
+            )
+        });
+        for buf in planned {
+            if let Some((slot_idx, slot)) =
+                bucket.arena_slots.iter_mut().enumerate().find(|(_, slot)| {
+                    slot.members.iter().all(|member| {
+                        !intervals_overlap(buf.start, buf.end, member.start, member.end)
+                            && !bucket
+                                .arena_conflicts
+                                .contains(&ordered_node_pair(buf.node, member.node))
+                    })
+                })
+            {
+                bucket.logical_buffer_slots.insert(buf.node, slot_idx);
+                slot.members.push(buf);
+            } else {
+                let slot_idx = bucket.arena_slots.len();
+                bucket.logical_buffer_slots.insert(buf.node, slot_idx);
+                bucket.arena_slots.push(ArenaSlot {
+                    members: vec![buf],
+                    offset: 0,
+                    capacity_bytes: 0,
+                });
+            }
+        }
+    }
+
+    fn refresh_fixed_intermediate_buffer_plan(
+        bucket: &mut CompiledBucket,
+        dyn_dims: &FxHashMap<char, usize>,
+    ) {
+        bucket.logical_buffer_offsets.clear();
+        bucket.logical_buffer_bytes.clear();
+        bucket.logical_buffer_capacity_bytes.clear();
+        bucket.last_dyn_map = dyn_dims.clone();
+
+        let mut arena_end = 0usize;
+        for slot in &mut bucket.arena_slots {
+            let mut slot_capacity = slot.capacity_bytes;
+            for member in &slot.members {
+                let Some(spec) = bucket.buffer_specs.get(&member.node) else {
+                    continue;
+                };
+                let bytes = spec.bytes.exec(dyn_dims).unwrap();
+                if bytes == 0 {
+                    continue;
+                }
+                bucket.logical_buffer_bytes.insert(member.node, bytes);
+                let planned_capacity = if bucket.stabilize_intermediate_pointers {
+                    bytes.checked_next_power_of_two().unwrap_or(bytes)
+                } else {
+                    bytes
+                };
+                let capacity_bytes = bucket
+                    .logical_buffer_capacity_bytes
+                    .get(&member.node)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(planned_capacity);
+                bucket
+                    .logical_buffer_capacity_bytes
+                    .insert(member.node, capacity_bytes);
+                slot_capacity = slot_capacity.max(align_up(capacity_bytes, ARENA_ALIGNMENT));
+            }
+            slot.capacity_bytes = slot_capacity;
+            if slot.capacity_bytes == 0 {
+                slot.offset = arena_end;
+                continue;
+            }
+            slot.offset = align_up(arena_end, ARENA_ALIGNMENT);
+            for member in &slot.members {
+                if bucket.logical_buffer_bytes.contains_key(&member.node) {
+                    bucket
+                        .logical_buffer_offsets
+                        .insert(member.node, slot.offset);
+                }
+            }
+            arena_end = slot.offset + slot.capacity_bytes;
+        }
+        bucket.arena_bytes = arena_end;
+    }
+
+    fn planned_intermediate_buffers(
+        bucket: &mut CompiledBucket,
+        dyn_dims: &FxHashMap<char, usize>,
+        include_zero_sized: bool,
+    ) -> Vec<PlannedBuffer> {
+        bucket.intermediate_buffer_dims.clear();
+        bucket.arena_conflicts.clear();
+        let mut logical_bytes = FxHashMap::default();
+        for (node, spec) in &bucket.buffer_specs {
+            bucket
+                .intermediate_buffer_dims
+                .extend(spec.bytes.dyn_vars());
+            let bytes = spec.bytes.exec(dyn_dims).unwrap();
+            if bytes > 0 || include_zero_sized {
+                logical_bytes.insert(*node, bytes.max(1));
+            }
+        }
+
+        Self::planned_intermediate_buffers_from_logical_bytes(bucket, logical_bytes)
+    }
+
+    fn planned_intermediate_buffers_from_logical_bytes(
+        bucket: &mut CompiledBucket,
+        logical_bytes: FxHashMap<NodeIndex, usize>,
+    ) -> Vec<PlannedBuffer> {
+        if logical_bytes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut first_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        let mut last_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        let exec_order = toposort(&bucket.exec_graph, None).unwrap_or_default();
+        let output_alias_map = bucket.output_alias_map.clone();
+
+        let mut touch = |node: NodeIndex, step: usize| {
+            let Some(node) = resolve_logical_buffer_node(node, &logical_bytes, &output_alias_map)
+            else {
+                return;
+            };
+            first_use
+                .entry(node)
+                .and_modify(|first| *first = (*first).min(step))
+                .or_insert(step);
+            last_use
+                .entry(node)
+                .and_modify(|last| *last = (*last).max(step))
+                .or_insert(step);
+        };
+
+        let mut time = 0usize;
+        for exec_node in exec_order.iter().copied() {
+            let exec_op = &bucket.exec_graph[exec_node];
+            if let Some(conflicts) = exec_op.internal.extra_buffer_conflicts() {
+                for (a, b) in conflicts {
+                    let Some(a) = resolve_logical_buffer_node(a, &logical_bytes, &output_alias_map)
+                    else {
+                        continue;
+                    };
+                    let Some(b) = resolve_logical_buffer_node(b, &logical_bytes, &output_alias_map)
+                    else {
+                        continue;
+                    };
+                    if a != b {
+                        bucket.arena_conflicts.insert(ordered_node_pair(a, b));
+                    }
+                }
+            }
+            let precise_extra_lifetimes = exec_op.internal.extra_buffer_lifetimes();
+            let span = precise_extra_lifetimes
+                .as_ref()
+                .and_then(|lifetimes| lifetimes.iter().map(|(_, _, end)| *end).max())
+                .map(|end| end + 1)
+                .unwrap_or(1)
+                .max(1);
+            let start_time = time;
+            let end_time = time + span - 1;
+            time += span;
+
+            let precise_nodes = precise_extra_lifetimes
+                .as_ref()
+                .map(|lifetimes| {
+                    lifetimes
+                        .iter()
+                        .filter_map(|(node, _, _)| {
+                            resolve_logical_buffer_node(*node, &logical_bytes, &output_alias_map)
+                        })
+                        .collect::<FxHashSet<_>>()
+                })
+                .unwrap_or_default();
+
+            let mut touch_if_not_precise = |node: NodeIndex, step: usize| {
+                if resolve_logical_buffer_node(node, &logical_bytes, &output_alias_map)
+                    .is_some_and(|node| precise_nodes.contains(&node))
+                {
+                    return;
+                }
+                touch(node, step);
+            };
+
+            touch_if_not_precise(exec_op.output, start_time);
+            touch_if_not_precise(exec_op.output, end_time);
+            for &input in &exec_op.inputs {
+                touch_if_not_precise(input, start_time);
+                touch_if_not_precise(input, end_time);
+            }
+
+            if let Some(lifetimes) = precise_extra_lifetimes {
+                for (node, start, end) in lifetimes {
+                    touch(node, start_time + start);
+                    touch(node, start_time + end);
+                }
+            } else {
+                for extra_node in exec_op.internal.extra_buffer_nodes() {
+                    touch(extra_node, start_time);
+                    touch(extra_node, end_time);
+                }
+            }
+        }
+
+        for &producer in bucket.output_producers.values() {
+            let mut alias_node = producer;
+            while let Some(target) = bucket.output_alias_map.get(&alias_node) {
+                alias_node = *target;
+            }
+            touch(alias_node, time);
+
+            let mut data_node = producer;
+            while let Some(target) = bucket.output_data_map.get(&data_node) {
+                data_node = *target;
+            }
+            touch(data_node, time);
+            touch(producer, time);
+        }
+
+        logical_bytes
+            .into_iter()
+            .filter(|(node, _)| first_use.contains_key(node) || last_use.contains_key(node))
+            .map(|(node, bytes)| PlannedBuffer {
+                node,
+                bytes,
+                start: first_use.get(&node).copied().unwrap_or(0),
+                end: last_use.get(&node).copied().unwrap_or(0),
+            })
+            .collect_vec()
     }
 
     fn plan_intermediate_buffers(bucket: &mut CompiledBucket, dyn_dims: &FxHashMap<char, usize>) {
+        let old_offsets = bucket.logical_buffer_offsets.clone();
+        let old_bytes = bucket.logical_buffer_bytes.clone();
+        let old_capacity_bytes = bucket.logical_buffer_capacity_bytes.clone();
         bucket.logical_buffer_offsets.clear();
         bucket.logical_buffer_bytes.clear();
+        bucket.logical_buffer_capacity_bytes.clear();
         bucket.arena_bytes = 0;
         bucket.intermediate_buffer_dims.clear();
         bucket.cached_buffer_ptrs.clear();
@@ -1063,10 +1456,18 @@ impl CudaRuntime {
             planned.sort_by_key(|buf| buf.node.index());
             let mut arena_end = 0usize;
             for buf in &planned {
+                let capacity_bytes = old_capacity_bytes
+                    .get(&buf.node)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes));
                 let offset = align_up(arena_end, ARENA_ALIGNMENT);
                 bucket.logical_buffer_offsets.insert(buf.node, offset);
                 bucket.logical_buffer_bytes.insert(buf.node, buf.bytes);
-                arena_end = offset + align_up(buf.bytes, ARENA_ALIGNMENT);
+                bucket
+                    .logical_buffer_capacity_bytes
+                    .insert(buf.node, capacity_bytes);
+                arena_end = offset + align_up(capacity_bytes, ARENA_ALIGNMENT);
             }
             bucket.arena_bytes = arena_end;
 
@@ -1088,18 +1489,56 @@ impl CudaRuntime {
         let mut arena_end = 0usize;
         let mut placed: Vec<(usize, usize, usize, usize)> = Vec::with_capacity(planned.len());
         let mut placement_order = planned.iter().collect_vec();
-        placement_order.sort_by_key(|buf| {
-            (
-                std::cmp::Reverse(buf.bytes),
-                std::cmp::Reverse(buf.end.saturating_sub(buf.start)),
-                buf.start,
-                buf.node.index(),
-            )
-        });
+        if bucket.stabilize_intermediate_pointers {
+            placement_order.sort_by_key(|buf| {
+                let old_offset = old_offsets.get(&buf.node).copied();
+                let old_size_matches = old_bytes
+                    .get(&buf.node)
+                    .is_some_and(|old_bytes| *old_bytes == buf.bytes);
+                (
+                    old_offset.is_none(),
+                    !old_size_matches,
+                    old_offset.unwrap_or(usize::MAX),
+                    buf.start,
+                    std::cmp::Reverse(buf.bytes),
+                    std::cmp::Reverse(buf.end.saturating_sub(buf.start)),
+                    buf.node.index(),
+                )
+            });
+        } else {
+            placement_order.sort_by_key(|buf| {
+                (
+                    std::cmp::Reverse(buf.bytes),
+                    std::cmp::Reverse(buf.end.saturating_sub(buf.start)),
+                    buf.start,
+                    buf.node.index(),
+                )
+            });
+        }
 
         for buf in placement_order {
-            let allocation_bytes = align_up(buf.bytes, ARENA_ALIGNMENT);
-            let mut candidates = vec![0usize];
+            let planned_capacity = if bucket.stabilize_intermediate_pointers {
+                buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes)
+            } else {
+                buf.bytes
+            };
+            let capacity_bytes = if bucket.stabilize_intermediate_pointers {
+                old_capacity_bytes
+                    .get(&buf.node)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(planned_capacity)
+            } else {
+                planned_capacity
+            };
+            let allocation_bytes = align_up(capacity_bytes, ARENA_ALIGNMENT);
+            let mut candidates = Vec::with_capacity(placed.len() + 2);
+            if bucket.stabilize_intermediate_pointers
+                && let Some(old_offset) = old_offsets.get(&buf.node).copied()
+            {
+                candidates.push(old_offset);
+            }
+            candidates.push(0usize);
             for &(placed_start, placed_end, placed_offset, placed_bytes) in &placed {
                 if intervals_overlap(buf.start, buf.end, placed_start, placed_end) {
                     candidates.push(align_up(placed_offset + placed_bytes, ARENA_ALIGNMENT));
@@ -1136,6 +1575,9 @@ impl CudaRuntime {
 
             bucket.logical_buffer_offsets.insert(buf.node, offset);
             bucket.logical_buffer_bytes.insert(buf.node, buf.bytes);
+            bucket
+                .logical_buffer_capacity_bytes
+                .insert(buf.node, capacity_bytes);
             placed.push((buf.start, buf.end, offset, allocation_bytes));
             arena_end = arena_end.max(offset + allocation_bytes);
         }
@@ -1155,28 +1597,100 @@ impl CudaRuntime {
         }
     }
 
-    /// Pre-allocate buffers with the given dynamic dimension values.
-    /// CUDA graph building is handled internally by CudaGraphOp on first execution.
-    #[tracing::instrument(skip_all)]
-    pub fn prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) {
-        let bucket = &mut self.compiled_buckets[self.active_bucket];
-        // 1. Allocate intermediate buffers (needed for buffer pointers)
-        Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
-
-        // 2. Process changed HLIR inputs to get their buffer pointers
-        if !self.changed_hlir.is_empty() || !bucket.hlir_synced {
-            let to_process: Vec<(NodeIndex, NodeIndex, u64)> = self
-                .changed_hlir
-                .iter()
-                .chain(
-                    // On first sync for this bucket, process ALL hlir keys
-                    if !bucket.hlir_synced {
-                        self.hlir_buffers.keys().collect::<Vec<_>>()
-                    } else {
-                        vec![]
-                    }
-                    .into_iter(),
+    fn prepare_bucket_buffers(&mut self, bucket_idx: usize, dyn_map: &FxHashMap<char, usize>) {
+        let profile_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let prepare_start = std::time::Instant::now();
+        let changed_hlir_count = self.changed_hlir.len();
+        let timer = std::time::Instant::now();
+        let allocation_dyn_map = self.bucket_capacity_dyn_map(bucket_idx, dyn_map);
+        let allocation_dyn_map_time = timer.elapsed();
+        let bucket_count = self.compiled_buckets.len();
+        let (
+            stabilize_intermediate_pointers,
+            was_hlir_synced,
+            old_arena_len,
+            old_arena_bytes,
+            allocate_time,
+            refresh_lengths_time,
+            new_arena_len,
+            new_arena_bytes,
+            cached_ptrs_after_alloc,
+        ) = {
+            let bucket = &mut self.compiled_buckets[bucket_idx];
+            let stabilize_intermediate_pointers = bucket.stabilize_intermediate_pointers;
+            let was_hlir_synced = bucket.hlir_synced;
+            let old_arena_len = bucket.arena.as_ref().map(|arena| arena.len()).unwrap_or(0);
+            let old_arena_bytes = bucket.arena_bytes;
+            let timer = std::time::Instant::now();
+            if bucket.stabilize_intermediate_pointers {
+                Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, &allocation_dyn_map);
+                let allocate_time = timer.elapsed();
+                let timer = std::time::Instant::now();
+                if allocation_dyn_map != *dyn_map {
+                    Self::refresh_intermediate_buffer_lengths(bucket, dyn_map);
+                }
+                let refresh_lengths_time = timer.elapsed();
+                (
+                    stabilize_intermediate_pointers,
+                    was_hlir_synced,
+                    old_arena_len,
+                    old_arena_bytes,
+                    allocate_time,
+                    refresh_lengths_time,
+                    bucket.arena.as_ref().map(|arena| arena.len()).unwrap_or(0),
+                    bucket.arena_bytes,
+                    bucket.cached_buffer_ptrs.len(),
                 )
+            } else {
+                Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
+                (
+                    stabilize_intermediate_pointers,
+                    was_hlir_synced,
+                    old_arena_len,
+                    old_arena_bytes,
+                    timer.elapsed(),
+                    Duration::ZERO,
+                    bucket.arena.as_ref().map(|arena| arena.len()).unwrap_or(0),
+                    bucket.arena_bytes,
+                    bucket.cached_buffer_ptrs.len(),
+                )
+            }
+        };
+
+        if self.changed_hlir.is_empty() && self.compiled_buckets[bucket_idx].hlir_synced {
+            if profile_prepare {
+                eprintln!(
+                    "CUDA_PREPARE_PROFILE dyn={dyn_map:?} bucket={bucket_idx} total_ms={:.3} allocation_dyn_map_ms={:.3} allocate_ms={:.3} refresh_lengths_ms={:.3} collect_hlir_ms=0.000 resolve_ptrs_ms=0.000 insert_ptrs_ms=0.000 changed_hlir={} was_hlir_synced={} stabilize={} old_arena_len={} new_arena_len={} old_arena_bytes={} new_arena_bytes={} hlir_nodes=0 to_process=0 cached_ptrs_after_alloc={} cached_ptrs_final={}",
+                    prepare_start.elapsed().as_secs_f64() * 1e3,
+                    allocation_dyn_map_time.as_secs_f64() * 1e3,
+                    allocate_time.as_secs_f64() * 1e3,
+                    refresh_lengths_time.as_secs_f64() * 1e3,
+                    changed_hlir_count,
+                    was_hlir_synced,
+                    stabilize_intermediate_pointers,
+                    old_arena_len,
+                    new_arena_len,
+                    old_arena_bytes,
+                    new_arena_bytes,
+                    cached_ptrs_after_alloc,
+                    self.compiled_buckets[bucket_idx].cached_buffer_ptrs.len(),
+                );
+            }
+            return;
+        }
+
+        let (to_process, collect_hlir_time, resolve_ptrs_time, hlir_nodes_count) = {
+            let bucket = &self.compiled_buckets[bucket_idx];
+            let timer = std::time::Instant::now();
+            let mut hlir_nodes = self.changed_hlir.iter().copied().collect_vec();
+            if !bucket.hlir_synced {
+                hlir_nodes.extend(self.hlir_buffers.keys().copied());
+            }
+            let hlir_nodes = hlir_nodes.into_iter().unique().collect_vec();
+            let collect_hlir_time = timer.elapsed();
+            let timer = std::time::Instant::now();
+            let to_process: Vec<(NodeIndex, u64)> = hlir_nodes
+                .iter()
                 .filter_map(|hlir_node| {
                     let llir_node = bucket.hlir_to_llir.get(hlir_node)?;
                     let input = self.hlir_buffers.get(hlir_node)?;
@@ -1184,22 +1698,169 @@ impl CudaRuntime {
                         CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
                         CudaInput::Ptr(p) => *p,
                     };
-                    Some((*hlir_node, *llir_node, ptr))
+                    Some((*llir_node, ptr))
                 })
                 .collect();
+            (
+                to_process,
+                collect_hlir_time,
+                timer.elapsed(),
+                hlir_nodes.len(),
+            )
+        };
 
-            for (_hlir_node, llir_node, ptr) in to_process {
-                bucket.cached_buffer_ptrs.insert(llir_node, ptr);
-            }
-            bucket.hlir_synced = true;
-            // Only clear changed_hlir if there's a single bucket
-            // (multi-bucket: other buckets may still need these changes)
-            if self.compiled_buckets.len() == 1 {
-                self.changed_hlir.clear();
-            }
+        let timer = std::time::Instant::now();
+        let bucket = &mut self.compiled_buckets[bucket_idx];
+        let to_process_count = to_process.len();
+        for (llir_node, ptr) in to_process {
+            bucket.cached_buffer_ptrs.insert(llir_node, ptr);
+        }
+        bucket.hlir_synced = true;
+        let cached_ptrs_final = bucket.cached_buffer_ptrs.len();
+        let insert_ptrs_time = timer.elapsed();
+        // Only clear changed_hlir if there's a single bucket. In multi-bucket
+        // mode, other buckets may still need to observe the same HLIR changes.
+        if bucket_count == 1 {
+            self.changed_hlir.clear();
+        }
+        if profile_prepare {
+            eprintln!(
+                "CUDA_PREPARE_PROFILE dyn={dyn_map:?} bucket={bucket_idx} total_ms={:.3} allocation_dyn_map_ms={:.3} allocate_ms={:.3} refresh_lengths_ms={:.3} collect_hlir_ms={:.3} resolve_ptrs_ms={:.3} insert_ptrs_ms={:.3} changed_hlir={} was_hlir_synced={} stabilize={} old_arena_len={} new_arena_len={} old_arena_bytes={} new_arena_bytes={} hlir_nodes={} to_process={} cached_ptrs_after_alloc={} cached_ptrs_final={}",
+                prepare_start.elapsed().as_secs_f64() * 1e3,
+                allocation_dyn_map_time.as_secs_f64() * 1e3,
+                allocate_time.as_secs_f64() * 1e3,
+                refresh_lengths_time.as_secs_f64() * 1e3,
+                collect_hlir_time.as_secs_f64() * 1e3,
+                resolve_ptrs_time.as_secs_f64() * 1e3,
+                insert_ptrs_time.as_secs_f64() * 1e3,
+                changed_hlir_count,
+                was_hlir_synced,
+                stabilize_intermediate_pointers,
+                old_arena_len,
+                new_arena_len,
+                old_arena_bytes,
+                new_arena_bytes,
+                hlir_nodes_count,
+                to_process_count,
+                cached_ptrs_after_alloc,
+                cached_ptrs_final,
+            );
+        }
+    }
+
+    fn buffer_map_for_exec_op(
+        &self,
+        bucket: &CompiledBucket,
+        exec_op: &ExecutableHostOp,
+        allow_missing_inputs: bool,
+    ) -> anyhow::Result<Option<FxHashMap<NodeIndex, DeviceBuffer>>> {
+        let mut buffer_map: FxHashMap<NodeIndex, DeviceBuffer> = FxHashMap::default();
+
+        if let Some(buf) = Self::resolve_runtime_buffer(
+            bucket,
+            &self.cuda_stream,
+            &self.hlir_buffers,
+            &self.external_buffers,
+            &self.external_output_buffers,
+            exec_op.output,
+        ) {
+            buffer_map.insert(exec_op.output, buf);
         }
 
-        // CUDA graph building is now handled internally by CudaGraphOp on first execution
+        for &inp in &exec_op.inputs {
+            let Some(buf) = Self::resolve_runtime_buffer(
+                bucket,
+                &self.cuda_stream,
+                &self.hlir_buffers,
+                &self.external_buffers,
+                &self.external_output_buffers,
+                inp,
+            ) else {
+                if allow_missing_inputs {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "missing input buffer for CUDA graph materialization: LLIR node {:?}",
+                    inp
+                );
+            };
+            buffer_map.insert(inp, buf);
+        }
+
+        for extra_node in exec_op.internal.extra_buffer_nodes() {
+            if let Entry::Occupied(_) = buffer_map.entry(extra_node) {
+                continue;
+            }
+            let Some(buf) = Self::resolve_runtime_buffer(
+                bucket,
+                &self.cuda_stream,
+                &self.hlir_buffers,
+                &self.external_buffers,
+                &self.external_output_buffers,
+                extra_node,
+            ) else {
+                if allow_missing_inputs {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "missing extra buffer for CUDA graph materialization: LLIR node {:?}",
+                    extra_node
+                );
+            };
+            buffer_map.insert(extra_node, buf);
+        }
+
+        Ok(Some(buffer_map))
+    }
+
+    fn materialize_bucket_cuda_graphs(
+        &self,
+        bucket_idx: usize,
+        dyn_map: &FxHashMap<char, usize>,
+        allow_missing_inputs: bool,
+    ) -> anyhow::Result<()> {
+        let bucket = &self.compiled_buckets[bucket_idx];
+        for exec_node in toposort(&bucket.exec_graph, None).unwrap() {
+            let exec_op = &bucket.exec_graph[exec_node];
+            let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() else {
+                continue;
+            };
+            let Some(buffer_map) =
+                self.buffer_map_for_exec_op(bucket, exec_op, allow_missing_inputs)?
+            else {
+                continue;
+            };
+            cuda_graph.materialize(&exec_op.stream, &buffer_map, dyn_map)?;
+        }
+        Ok(())
+    }
+
+    fn bucket_capacity_dyn_map(
+        &self,
+        bucket_idx: usize,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> FxHashMap<char, usize> {
+        let mut capacity_dyn_map = dyn_map.clone();
+        let Some(bucket) = self.compiled_buckets.get(bucket_idx) else {
+            return capacity_dyn_map;
+        };
+        for (dim, buckets) in &self.dim_buckets {
+            let bucket_idx = bucket.bucket_indices.get(dim).copied().unwrap_or(0);
+            if let Some(dim_bucket) = buckets.get(bucket_idx) {
+                capacity_dyn_map.insert(*dim, dim_bucket.max);
+            }
+        }
+        capacity_dyn_map
+    }
+
+    /// Pre-allocate buffers and materialize CUDA graphs with the given dynamic
+    /// dimension values when all required input buffers are already available.
+    #[tracing::instrument(skip_all)]
+    pub fn prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) {
+        let bucket_idx = self.active_bucket;
+        self.prepare_bucket_buffers(bucket_idx, dyn_map);
+        self.materialize_bucket_cuda_graphs(bucket_idx, dyn_map, true)
+            .unwrap();
     }
 }
 
@@ -1317,6 +1978,14 @@ fn intervals_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize)
     a_start <= b_end && b_start <= a_end
 }
 
+fn ordered_node_pair(a: NodeIndex, b: NodeIndex) -> (NodeIndex, NodeIndex) {
+    if a.index() <= b.index() {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 fn byte_ranges_overlap(a_offset: usize, a_bytes: usize, b_offset: usize, b_bytes: usize) -> bool {
     a_offset < b_offset + b_bytes && b_offset < a_offset + a_bytes
 }
@@ -1359,6 +2028,74 @@ fn logical_interval_peak(planned: &[PlannedBuffer]) -> usize {
     }
 
     peak.max(0) as usize
+}
+
+impl CudaRuntime {
+    fn profile_loaded_llir(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+    ) -> (Duration, String) {
+        self.profiling = true;
+        let profile_start = std::time::Instant::now();
+        let mut durations = Vec::with_capacity(trials.max(1));
+        for _ in 0..trials.max(1) {
+            let start = std::time::Instant::now();
+            self.execute(dyn_map);
+            durations.push(start.elapsed());
+            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
+        }
+        self.profiling = false;
+        let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
+
+        let duration_str = format_duration_precise(&duration);
+        let display = format!(
+            "{duration_str} | [KRN: {} HOST: {}]",
+            llir_graph
+                .node_weights()
+                .filter(|n| n.to_dialect::<dyn KernelOp>().is_some())
+                .count(),
+            llir_graph
+                .node_weights()
+                .filter(|n| n.to_dialect::<dyn HostOp>().is_some())
+                .count()
+        );
+        let display = if std::env::var_os("LUMINAL_SEARCH_OP_NAMES").is_some() {
+            let mut kernel_counts = std::collections::BTreeMap::<&'static str, usize>::new();
+            let mut host_counts = std::collections::BTreeMap::<String, usize>::new();
+            for node in llir_graph.node_weights() {
+                if let Some(kernel) = node.to_dialect::<dyn KernelOp>() {
+                    *kernel_counts.entry(kernel.kernel_name()).or_default() += 1;
+                }
+                if let Some(host) = node.to_dialect::<dyn HostOp>() {
+                    let debug = format!("{:?}", host.as_ref().as_ref());
+                    let name = debug
+                        .split([' ', '{', '('])
+                        .next()
+                        .unwrap_or("HostOp")
+                        .to_string();
+                    *host_counts.entry(name).or_default() += 1;
+                }
+            }
+            let kernel_summary = kernel_counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .join(",");
+            let host_summary = host_counts
+                .iter()
+                .map(|(name, count)| format!("{name}:{count}"))
+                .join(",");
+            format!("{display} [Kernels: {kernel_summary}] [Hosts: {host_summary}]")
+        } else {
+            display
+        };
+
+        (duration, display)
+    }
 }
 
 impl Runtime for CudaRuntime {
@@ -1542,68 +2279,53 @@ impl Runtime for CudaRuntime {
             self.active_mut().arena = None;
         }
         self.load_llir(llir_graph);
-        self.profiling = true;
-        let profile_start = std::time::Instant::now();
-        let mut durations = Vec::with_capacity(trials.max(1));
-        for _ in 0..trials.max(1) {
-            let start = std::time::Instant::now();
-            self.execute(dyn_map);
-            durations.push(start.elapsed());
-            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
-                break;
-            }
+        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
+    }
+
+    fn profile_with_bucket_context(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+        bucket_context: luminal::op::ProfileBucketContext<'_>,
+    ) -> (Self::ProfileMetric, String) {
+        // Profile with the same bucket metadata that final bucket compilation
+        // uses, so bucket-sensitive graph packaging decisions match search.
+        if bucket_context.dim_buckets.is_empty() {
+            return self.profile(llir_graph, dyn_map, trials, timeout);
         }
-        self.profiling = false;
-        let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
-
-        let duration_str = format_duration_precise(&duration);
-        let display = format!(
-            "{duration_str} | [KRN: {} HOST: {}]",
-            llir_graph
-                .node_weights()
-                .filter(|n| n.to_dialect::<dyn KernelOp>().is_some())
-                .count(),
-            llir_graph
-                .node_weights()
-                .filter(|n| n.to_dialect::<dyn HostOp>().is_some())
-                .count()
-        );
-        let display = if std::env::var_os("LUMINAL_SEARCH_OP_NAMES").is_some() {
-            let mut kernel_counts = std::collections::BTreeMap::<&'static str, usize>::new();
-            let mut host_counts = std::collections::BTreeMap::<String, usize>::new();
-            for node in llir_graph.node_weights() {
-                if let Some(kernel) = node.to_dialect::<dyn KernelOp>() {
-                    *kernel_counts.entry(kernel.kernel_name()).or_default() += 1;
-                }
-                if let Some(host) = node.to_dialect::<dyn HostOp>() {
-                    let debug = format!("{:?}", host.as_ref().as_ref());
-                    let name = debug
-                        .split([' ', '{', '('])
-                        .next()
-                        .unwrap_or("HostOp")
-                        .to_string();
-                    *host_counts.entry(name).or_default() += 1;
-                }
-            }
-            let kernel_summary = kernel_counts
-                .iter()
-                .map(|(name, count)| format!("{name}:{count}"))
-                .join(",");
-            let host_summary = host_counts
-                .iter()
-                .map(|(name, count)| format!("{name}:{count}"))
-                .join(",");
-            format!("{display} [Kernels: {kernel_summary}] [Hosts: {host_summary}]")
-        } else {
-            display
-        };
-
-        (duration, display)
+        if !self.compiled_buckets.is_empty() {
+            self.active_mut().arena = None;
+        }
+        let bucket_llirs = vec![(
+            bucket_context.bucket_indices.clone(),
+            bucket_context.representative_dyn_map.clone(),
+            llir_graph.clone(),
+        )];
+        self.load_llir_buckets(bucket_context.dim_buckets, &bucket_llirs);
+        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
     }
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+        let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let runtime_profile_start = std::time::Instant::now();
+        let mut bucket_dispatch_time = Duration::ZERO;
+        let mut prepare_buffers_time = Duration::ZERO;
+        let mut output_registration_time = Duration::ZERO;
+        let mut materialize_time = Duration::ZERO;
+        let mut buffer_map_time = Duration::ZERO;
+        let mut graph_launch_time = Duration::ZERO;
+        let mut host_op_time = Duration::ZERO;
+        let mut sync_time = Duration::ZERO;
+        let mut stats_time = Duration::ZERO;
+        let mut consume_time = Duration::ZERO;
+        let mut graph_launches = 0usize;
+        let mut host_op_launches = 0usize;
+
         // Dispatch to correct bucket if multi-bucket mode
+        let timer = std::time::Instant::now();
         if self.compiled_buckets.len() > 1 {
             let idx = self.resolve_bucket(dyn_map);
             if idx != self.active_bucket {
@@ -1616,12 +2338,25 @@ impl Runtime for CudaRuntime {
                 self.compiled_buckets[idx].hlir_synced = false;
             }
         }
+        bucket_dispatch_time += timer.elapsed();
 
-        // Ensure all CUDA graphs are built (handles first execute and any missing graphs)
-        self.prebuild_graphs(dyn_map);
+        // Ensure bucket buffers and HLIR pointers are current before resolving
+        // output registrations and materializing graph node parameters.
+        let timer = std::time::Instant::now();
+        self.prepare_bucket_buffers(self.active_bucket, dyn_map);
+        prepare_buffers_time += timer.elapsed();
 
         // Resolve external output pointer registrations (zero-copy output path)
+        let timer = std::time::Instant::now();
         self.apply_output_ptr_registrations();
+        output_registration_time += timer.elapsed();
+
+        // Materialize CUDA graphs before timed execution. The first real launch
+        // should only patch an already-instantiated graph, not build it from scratch.
+        let timer = std::time::Instant::now();
+        self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
+            .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
+        materialize_time += timer.elapsed();
 
         let total_start = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
@@ -1630,69 +2365,50 @@ impl Runtime for CudaRuntime {
             let exec_op = &bucket.exec_graph[exec_node];
             trace!("Executing: {:?}", exec_op);
 
-            // Build buffer map for the HostOp interface
-            let mut buffer_map: FxHashMap<NodeIndex, DeviceBuffer> = FxHashMap::default();
-
-            if let Some(buf) = Self::resolve_runtime_buffer(
-                bucket,
-                &self.cuda_stream,
-                &self.hlir_buffers,
-                &self.external_buffers,
-                &self.external_output_buffers,
-                exec_op.output,
-            ) {
-                buffer_map.insert(exec_op.output, buf);
-            }
-
-            for &inp in &exec_op.inputs {
-                if let Some(buf) = Self::resolve_runtime_buffer(
-                    bucket,
-                    &self.cuda_stream,
-                    &self.hlir_buffers,
-                    &self.external_buffers,
-                    &self.external_output_buffers,
-                    inp,
-                ) {
-                    buffer_map.insert(inp, buf);
-                }
-            }
-
-            let extra_nodes = exec_op.internal.extra_buffer_nodes();
-            for extra_node in extra_nodes {
-                if let Entry::Vacant(e) = buffer_map.entry(extra_node)
-                    && let Some(buf) = Self::resolve_runtime_buffer(
-                        bucket,
-                        &self.cuda_stream,
-                        &self.hlir_buffers,
-                        &self.external_buffers,
-                        &self.external_output_buffers,
-                        extra_node,
-                    )
-                {
-                    e.insert(buf);
-                }
-            }
+            let timer = std::time::Instant::now();
+            let buffer_map = self
+                .buffer_map_for_exec_op(bucket, exec_op, false)
+                .unwrap_or_else(|e| panic!("CUDA execute buffer resolution failed: {e}"))
+                .expect("CUDA execute requires all HostOp buffers");
+            buffer_map_time += timer.elapsed();
             let _span = span!(
                 Level::TRACE,
                 "host_op_execute",
                 n_inputs = exec_op.inputs.len()
             )
             .entered();
-            exec_op
-                .internal
-                .execute(
-                    &exec_op.stream,
-                    exec_op.output,
-                    &exec_op.inputs,
-                    &buffer_map,
-                    dyn_map,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "CUDA execute error in {:?}: {e}",
-                        exec_op.internal.stats_name().unwrap_or("unknown")
-                    );
-                });
+            if let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                let timer = std::time::Instant::now();
+                cuda_graph
+                    .launch_materialized(&exec_op.stream)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "CUDA graph launch error in {:?}: {e}",
+                            exec_op.internal.stats_name().unwrap_or("unknown")
+                        );
+                    });
+                graph_launch_time += timer.elapsed();
+                graph_launches += 1;
+            } else {
+                let timer = std::time::Instant::now();
+                exec_op
+                    .internal
+                    .execute(
+                        &exec_op.stream,
+                        exec_op.output,
+                        &exec_op.inputs,
+                        &buffer_map,
+                        dyn_map,
+                    )
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "CUDA execute error in {:?}: {e}",
+                            exec_op.internal.stats_name().unwrap_or("unknown")
+                        );
+                    });
+                host_op_time += timer.elapsed();
+                host_op_launches += 1;
+            }
 
             #[cfg(test)]
             if std::env::var_os("LUMINAL_CUDA_CHECK_NONFINITE_INTERNAL").is_some() {
@@ -1710,10 +2426,13 @@ impl Runtime for CudaRuntime {
             }
         }
         // Single sync at end - CUDA stream ordering guarantees sequential execution
+        let timer = std::time::Instant::now();
         self.cuda_stream.synchronize().unwrap();
+        sync_time += timer.elapsed();
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
 
         // Populate last_kernel_stats from HostOps that report stats
+        let timer = std::time::Instant::now();
         self.last_kernel_stats.clear();
         let bucket = &self.compiled_buckets[self.active_bucket];
         for exec_node in bucket.exec_graph.node_indices() {
@@ -1730,11 +2449,13 @@ impl Runtime for CudaRuntime {
                 });
             }
         }
+        stats_time += timer.elapsed();
 
         // Consume input buffers
         if self.profiling {
             return;
         }
+        let timer = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
         let mut inputs_with_outputs = bucket.preserved_hlir_inputs.clone();
 
@@ -1764,6 +2485,36 @@ impl Runtime for CudaRuntime {
                 bucket.cached_buffer_ptrs.remove(llir_node);
             }
         }
+        consume_time += timer.elapsed();
+
+        if profile_runtime {
+            let runtime_total = runtime_profile_start.elapsed();
+            let launch_total = graph_launch_time + host_op_time + sync_time;
+            eprintln!(
+                "CUDA_EXEC_PROFILE dyn={dyn_map:?} bucket={} graph_launches={} host_ops={} total_ms={:.3} prelaunch_ms={:.3} dispatch_ms={:.3} prepare_buffers_ms={:.3} output_registration_ms={:.3} materialize_ms={:.3} buffer_map_ms={:.3} launch_total_ms={:.3} graph_launch_call_ms={:.3} host_op_call_ms={:.3} sync_ms={:.3} stats_ms={:.3} consume_ms={:.3}",
+                self.active_bucket,
+                graph_launches,
+                host_op_launches,
+                runtime_total.as_secs_f64() * 1e3,
+                (bucket_dispatch_time
+                    + prepare_buffers_time
+                    + output_registration_time
+                    + materialize_time)
+                    .as_secs_f64()
+                    * 1e3,
+                bucket_dispatch_time.as_secs_f64() * 1e3,
+                prepare_buffers_time.as_secs_f64() * 1e3,
+                output_registration_time.as_secs_f64() * 1e3,
+                materialize_time.as_secs_f64() * 1e3,
+                buffer_map_time.as_secs_f64() * 1e3,
+                launch_total.as_secs_f64() * 1e3,
+                graph_launch_time.as_secs_f64() * 1e3,
+                host_op_time.as_secs_f64() * 1e3,
+                sync_time.as_secs_f64() * 1e3,
+                stats_time.as_secs_f64() * 1e3,
+                consume_time.as_secs_f64() * 1e3,
+            );
+        }
     }
 
     fn load_llir_buckets(
@@ -1778,13 +2529,23 @@ impl Runtime for CudaRuntime {
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets.clear();
 
+        let mut representative_dyn_maps = Vec::with_capacity(bucket_llirs.len());
         for (bucket_indices, representative_dyn_map, llir) in bucket_llirs {
             let mut bucket = self.compile_bucket(llir);
             bucket.bucket_indices = bucket_indices.clone();
-            let _ = representative_dyn_map;
+            representative_dyn_maps.push(representative_dyn_map.clone());
             self.compiled_buckets.push(bucket);
         }
-        self.active_bucket = 0;
+        for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
+            self.prepare_bucket_buffers(idx, representative_dyn_map);
+            self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)
+                .unwrap();
+        }
+        // The first real execution for model workloads is usually prefill, which
+        // lands in the largest/range bucket rather than the singleton decode
+        // bucket. Start there so pre-execute diagnostics and first-use setup do
+        // not touch the decode bucket's captured library graph state.
+        self.active_bucket = self.compiled_buckets.len().saturating_sub(1);
 
         // Mark all HLIR inputs as changed so their pointers get re-cached
         self.changed_hlir.extend(self.hlir_buffers.keys().copied());
@@ -1792,6 +2553,45 @@ impl Runtime for CudaRuntime {
 }
 
 impl CudaRuntime {
+    #[cfg(test)]
+    pub(crate) fn debug_cuda_graph_summaries(&self) -> Vec<crate::kernel::CudaGraphDebugSummary> {
+        self.compiled_buckets
+            .get(self.active_bucket)
+            .into_iter()
+            .flat_map(|bucket| bucket.exec_graph.node_weights())
+            .filter_map(|exec_op| {
+                exec_op
+                    .internal
+                    .as_any()
+                    .downcast_ref::<CudaGraphOp>()
+                    .map(CudaGraphOp::debug_summary)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_standalone_cublaslt_host_ops(&self) -> usize {
+        self.compiled_buckets
+            .get(self.active_bucket)
+            .into_iter()
+            .flat_map(|bucket| bucket.exec_graph.node_weights())
+            .filter(|exec_op| {
+                exec_op
+                    .internal
+                    .as_any()
+                    .downcast_ref::<crate::host::cublaslt::CuBlasLt>()
+                    .is_some()
+            })
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_active_bucket_stabilizes_intermediate_pointers(&self) -> bool {
+        self.compiled_buckets
+            .get(self.active_bucket)
+            .is_some_and(|bucket| bucket.stabilize_intermediate_pointers)
+    }
+
     /// Compile a single LLIR graph into a CompiledBucket.
     fn compile_bucket(&mut self, llir_graph: &LLIRGraph) -> CompiledBucket {
         let mut bucket = CompiledBucket::new();
@@ -1944,7 +2744,23 @@ impl CudaRuntime {
         // Add host ops
         {
             let _span = span!(Level::TRACE, "compile_host_ops").entered();
+            let absorbed_host_nodes: FxHashSet<NodeIndex> = llir_graph
+                .node_indices()
+                .filter_map(|node| {
+                    let host = llir_graph[node].to_dialect::<dyn HostOp>()?;
+                    let cuda_graph = host
+                        .as_ref()
+                        .as_ref()
+                        .as_any()
+                        .downcast_ref::<CudaGraphOp>()?;
+                    Some(cuda_graph.absorbed_host_nodes())
+                })
+                .flatten()
+                .collect();
             for host_op_node_index in llir_graph.node_indices() {
+                if absorbed_host_nodes.contains(&host_op_node_index) {
+                    continue;
+                }
                 if let Some(host_op) = llir_graph[host_op_node_index].to_dialect::<dyn HostOp>() {
                     let inputs = host_data_inputs(
                         &llir_graph,
@@ -1963,6 +2779,13 @@ impl CudaRuntime {
                 }
             }
         }
+        bucket.stabilize_intermediate_pointers = exec_graph.node_weights().any(|exec_op| {
+            exec_op
+                .internal
+                .as_any()
+                .downcast_ref::<CudaGraphOp>()
+                .is_some_and(|cuda_graph| !cuda_graph.absorbed_host_nodes().is_empty())
+        });
 
         // Add edges
         for edge in llir_graph.edge_indices() {
@@ -2434,4 +3257,97 @@ fn intersects(a: &FixedBitSet, b: &FixedBitSet) -> bool {
     // Note: is_empty() checks if length is 0, not if there are no bits set
     // Use count_ones() to check if there are any set bits after intersection
     tmp.count_ones(..) > 0
+}
+
+#[cfg(test)]
+mod arena_plan_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_arena_slot_refresh_grows_capacity_without_reassigning_slots() {
+        let a = NodeIndex::new(1);
+        let b = NodeIndex::new(2);
+        let mut bucket = CompiledBucket::new();
+        bucket.stabilize_intermediate_pointers = true;
+        bucket.buffer_specs.insert(
+            a,
+            BufferSpec {
+                bytes: Expression::from('s') * 4,
+                dtype: DType::F32,
+            },
+        );
+        bucket.buffer_specs.insert(
+            b,
+            BufferSpec {
+                bytes: Expression::from('s') * 8,
+                dtype: DType::F32,
+            },
+        );
+        bucket.logical_buffer_slots.insert(a, 0);
+        bucket.logical_buffer_slots.insert(b, 0);
+        bucket.arena_slots.push(ArenaSlot {
+            members: vec![
+                PlannedBuffer {
+                    node: a,
+                    bytes: 1,
+                    start: 0,
+                    end: 0,
+                },
+                PlannedBuffer {
+                    node: b,
+                    bytes: 1,
+                    start: 1,
+                    end: 1,
+                },
+            ],
+            offset: 0,
+            capacity_bytes: 0,
+        });
+
+        let mut dyn_map = FxHashMap::default();
+        dyn_map.insert('s', 4);
+        CudaRuntime::refresh_fixed_intermediate_buffer_plan(&mut bucket, &dyn_map);
+        let first_offset_a = bucket.logical_buffer_offsets[&a];
+        let first_offset_b = bucket.logical_buffer_offsets[&b];
+        let first_arena_bytes = bucket.arena_bytes;
+
+        dyn_map.insert('s', 32);
+        CudaRuntime::refresh_fixed_intermediate_buffer_plan(&mut bucket, &dyn_map);
+
+        assert_eq!(bucket.logical_buffer_slots[&a], 0);
+        assert_eq!(bucket.logical_buffer_slots[&b], 0);
+        assert_eq!(bucket.logical_buffer_offsets[&a], first_offset_a);
+        assert_eq!(bucket.logical_buffer_offsets[&b], first_offset_b);
+        assert!(bucket.arena_bytes >= first_arena_bytes);
+        assert_eq!(bucket.arena_slots.len(), 1);
+    }
+
+    #[test]
+    fn fixed_arena_slot_assignment_respects_dependency_conflicts() {
+        let a = NodeIndex::new(1);
+        let b = NodeIndex::new(2);
+        let planned = vec![
+            PlannedBuffer {
+                node: a,
+                bytes: 16,
+                start: 0,
+                end: 0,
+            },
+            PlannedBuffer {
+                node: b,
+                bytes: 16,
+                start: 1,
+                end: 1,
+            },
+        ];
+
+        let mut shareable = CompiledBucket::new();
+        CudaRuntime::assign_fixed_arena_slots(&mut shareable, planned.clone());
+        assert_eq!(shareable.arena_slots.len(), 1);
+
+        let mut conflicting = CompiledBucket::new();
+        conflicting.arena_conflicts.insert(ordered_node_pair(a, b));
+        CudaRuntime::assign_fixed_arena_slots(&mut conflicting, planned);
+        assert_eq!(conflicting.arena_slots.len(), 2);
+    }
 }

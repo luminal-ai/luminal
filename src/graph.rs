@@ -82,6 +82,13 @@ struct SearchSpaceContext {
     intervals: DynDimIntervals,
 }
 
+#[derive(Debug, Clone)]
+struct SearchProfileBucketContext {
+    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    bucket_indices: FxHashMap<char, usize>,
+    representative_dyn_map: FxHashMap<char, usize>,
+}
+
 /// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
 pub type BucketLLIR = (FxHashMap<char, usize>, FxHashMap<char, usize>, LLIRGraph);
 
@@ -1314,6 +1321,7 @@ impl Graph {
                 rng,
                 &self.dyn_map.clone(),
                 None,
+                None,
                 0,
                 search_started_at,
             );
@@ -1349,6 +1357,11 @@ impl Graph {
                     rng,
                     &context.representative_dyn_map,
                     Some((combo_idx, n_combos)),
+                    Some(SearchProfileBucketContext {
+                        dim_buckets: self.search_space_dim_buckets.clone(),
+                        bucket_indices: context.bucket_indices.clone(),
+                        representative_dyn_map: context.representative_dyn_map.clone(),
+                    }),
                     combo_idx,
                     search_started_at,
                 );
@@ -1445,6 +1458,7 @@ impl Graph {
         rng: &mut G,
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
+        bucket_profile_context: Option<SearchProfileBucketContext>,
         egraph_index: usize,
         search_started_at: std::time::Instant,
     ) -> LLIRGraph {
@@ -1545,12 +1559,27 @@ impl Graph {
                 collapse_loops_to_first_iter(&mut graph);
                 runtime.clear_intermediate_buffers();
                 let profile_start = std::time::Instant::now();
-                let (rep_metric, rep_display) = runtime.profile(
-                    &graph,
-                    &profile_dyn_map,
-                    options.trials,
-                    options.profile_timeout,
-                );
+                let (rep_metric, rep_display) =
+                    if let Some(bucket_context) = &bucket_profile_context {
+                        runtime.profile_with_bucket_context(
+                            &graph,
+                            &profile_dyn_map,
+                            options.trials,
+                            options.profile_timeout,
+                            ProfileBucketContext {
+                                dim_buckets: &bucket_context.dim_buckets,
+                                bucket_indices: &bucket_context.bucket_indices,
+                                representative_dyn_map: &bucket_context.representative_dyn_map,
+                            },
+                        )
+                    } else {
+                        runtime.profile(
+                            &graph,
+                            &profile_dyn_map,
+                            options.trials,
+                            options.profile_timeout,
+                        )
+                    };
                 let timed_out = profile_timed_out(profile_start.elapsed());
                 let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
                 (
@@ -1664,12 +1693,27 @@ impl Graph {
                     collapse_loops_to_first_iter(&mut llir_graph);
                     runtime.clear_intermediate_buffers();
                     let profile_start = std::time::Instant::now();
-                    let (rep_metric, rep_display) = runtime.profile(
-                        &llir_graph,
-                        &profile_dyn_map,
-                        options.trials,
-                        options.profile_timeout,
-                    );
+                    let (rep_metric, rep_display) =
+                        if let Some(bucket_context) = &bucket_profile_context {
+                            runtime.profile_with_bucket_context(
+                                &llir_graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                                ProfileBucketContext {
+                                    dim_buckets: &bucket_context.dim_buckets,
+                                    bucket_indices: &bucket_context.bucket_indices,
+                                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                                },
+                            )
+                        } else {
+                            runtime.profile(
+                                &llir_graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                            )
+                        };
                     let timed_out = profile_timed_out(profile_start.elapsed());
                     let has_nan =
                         !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
