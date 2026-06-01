@@ -187,7 +187,18 @@ impl EgglogOp for CuBlasLt {
                  (relation cublaslt_fp8_f32_output_pair (DType DType))
                  (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E4M3))
                  (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E5M2))
-                 (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))",
+                 (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))
+                 ; Fast-fail guard for the FP8 lowering rules: assert
+                 ; cublaslt_fp8_present iff any Cast op targets an FP8 dtype.
+                 ; On graphs without FP8 (e.g. bf16 gemma), this relation stays
+                 ; empty and the gated rules' first LHS fact fails the join
+                 ; immediately instead of paying multi-way enumeration cost.
+                 (relation cublaslt_fp8_present ())
+                 (rule
+                     ((= ?c (Op (Cast ?size ?dtype) ?inputs))
+                      (cublaslt_fp8_dtype ?dtype))
+                     ((cublaslt_fp8_present))
+                     :ruleset matmul_backend)",
             ),
             Rule::raw(include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
             Rule::raw(include_str!["cublaslt_RmCm_rewrite.egg"]), // row col

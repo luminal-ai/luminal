@@ -899,6 +899,76 @@ fn cublaslt_fp8_e5m2_same_type_does_not_match_f32_output() {
     cublaslt_fp8_same_type_does_not_match_batched_matmul_f32_output(DType::F8E5M2);
 }
 
+// --- cublaslt_fp8_present guard regression tests ---
+//
+// The FP8 lowering rules have a multi-way LHS join over Mul × Recip × Cast ×
+// GenericMatmul × Cast × Mul × Mul. On graphs with many of those ops (e.g. a
+// PT2-lowered gemma forward), the intermediate join cardinality explodes —
+// hundreds of GiB of transient allocation — even though the rule's dtype
+// filter ultimately rejects every candidate when no FP8 is present. The
+// `(cublaslt_fp8_present)` relation + auto-rule (declared in this module's
+// `rewrites()`) short-circuits the join at fact zero. These tests guard
+// against (a) the guard accidentally blocking valid FP8 lowering and
+// (b) the FP8 rules accidentally firing on bf16-only graphs.
+
+#[test]
+fn cublaslt_fp8_guard_does_not_block_scaled_fp8_lowering() {
+    // Mirrors `cublaslt_fp8_scaled_candidate_executes_2d_matmul_f32_output`
+    // up to the e-graph extraction step — the scaled FP8 pattern is the most
+    // complex of the gated rules, so it's the most likely to expose a
+    // misfiring guard.
+    let (m, n, k) = (16, 16, 16);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k));
+    let a_scale = cx.tensor(());
+    let b_scale = cx.tensor(());
+    let b_input = cx.tensor((n, k)).as_dtype(DType::F8E4M3);
+    let b = b_input.t();
+    let scaled_a = (a / a_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
+    let _out =
+        (scaled_a.matmul(b).cast(DType::F32) * (a_scale * b_scale).expand_rhs((m, n))).output();
+    let expected_tuple = (
+        DType::F8E4M3,
+        DType::F8E4M3,
+        DType::F32,
+        DType::F32,
+        "32F",
+        DType::F32,
+    );
+    let _llir = extract_forced_cublaslt_llir_where(
+        &mut cx,
+        "fp8 guard positive (scaled lowering still fires)",
+        |llir| {
+            cublaslt_type_tuples(llir).contains(&expected_tuple)
+                && cublaslt_tensor_scale_input_tuples(llir).contains(&(true, true))
+        },
+    );
+}
+
+#[test]
+fn cublaslt_fp8_guard_no_fp8_op_for_bf16_only_graph() {
+    // bf16 matmul with no FP8 Cast anywhere → cublaslt_fp8_present stays
+    // empty → none of the 11 fp8 lowering rules should produce a candidate
+    // with an FP8 dtype in either operand slot. (A bf16 cublasLt op is
+    // expected to appear via the RmRm/RmCm/CmRm/CmCm lowering paths.)
+    let (m, n, k) = (16, 16, 16);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k)).as_dtype(DType::Bf16);
+    let b = cx.tensor((k, n)).as_dtype(DType::Bf16);
+    let _out = a.matmul(b).cast(DType::F32).output();
+
+    assert_no_cublaslt_llir_where(
+        &mut cx,
+        "fp8 guard negative (bf16-only graph must not produce FP8 cublasLt op)",
+        |llir| {
+            cublaslt_type_tuples(llir).iter().any(|tuple| {
+                matches!(tuple.0, DType::F8E4M3 | DType::F8E5M2)
+                    || matches!(tuple.1, DType::F8E4M3 | DType::F8E5M2)
+            })
+        },
+    );
+}
+
 #[test]
 #[ignore = "expensive CUDA functional candidate sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_fp8_e4m3_beta_candidate_executes_2d_matmul_plus_f32_c() {
