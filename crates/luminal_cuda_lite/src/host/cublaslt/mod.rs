@@ -193,6 +193,20 @@ impl EgglogOp for CuBlasLt {
                  ; On graphs without FP8 (e.g. bf16 gemma), this relation stays
                  ; empty and the gated rules' first LHS fact fails the join
                  ; immediately instead of paying multi-way enumeration cost.
+                 ;
+                 ; This is a temporary workaround to get gemma-4 MoE working
+                 ; through luminal_python — PT2 produces a denser HLIR than
+                 ; the hand-written rust path (many more Mul/Cast/Recip
+                 ; nodes), which pushes the fp8 rules' multi-way LHS join
+                 ; over a cardinality cliff (~270 GiB of transient
+                 ; allocation on a 124K-node e-graph). The real fix is to
+                 ; understand WHY these specific rules' intermediate join
+                 ; state grows so large when their final match count is 0 —
+                 ; whether it's a planner ordering issue, a rule-structure
+                 ; issue (the join may be expressible with smaller
+                 ; intermediates), or something egglog-internal that should
+                 ; be reported upstream. Until then, the guard short-
+                 ; circuits the join before any of that cost is paid.
                  (relation cublaslt_fp8_present ())
                  (rule
                      ((= ?c (Op (Cast ?size ?dtype) ?inputs))
