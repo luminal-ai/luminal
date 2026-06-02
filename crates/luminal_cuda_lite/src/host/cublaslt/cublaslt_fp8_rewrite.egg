@@ -10,7 +10,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         ; Match the scaled FP8 linear form directly before the unscaled FP8
         ; matmul rewrite can hide the quantize/dequant scale structure.
         (= ?scaled_activation (Op (Mul
@@ -88,7 +88,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?scaled_activation (Op (Mul
             ?activation_shape
             ?raw_activation_strides
@@ -198,7 +198,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         ; Fusion growth can make the live path consume a raw FP8 cuBLASLt
         ; candidate through an internal CudaBinaryElementwise scale multiply,
         ; instead of the original HLIR output-scale Mul. The scalar scale
@@ -277,7 +277,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?raw_gemm (Op (cublaslt
             ?cm ?cn ?ck
             ?cta ?ctb
@@ -365,7 +365,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         ; Batched form of the scaled FP8 linear rewrite. The scale operands are
         ; scalar tensors expanded across the last three output/activation axes.
         (= ?scaled_activation (Op (Mul
@@ -457,7 +457,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
@@ -511,7 +511,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
@@ -565,7 +565,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
@@ -619,7 +619,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
@@ -687,7 +687,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
@@ -755,7 +755,7 @@
 
 (rule
     (
-        (cublaslt_fp8_present)
+        (cublaslt_fp8_ir ?a)
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride

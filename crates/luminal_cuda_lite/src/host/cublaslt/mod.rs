@@ -188,30 +188,29 @@ impl EgglogOp for CuBlasLt {
                  (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E4M3))
                  (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E5M2))
                  (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))
-                 ; Fast-fail guard for the FP8 lowering rules: assert
-                 ; cublaslt_fp8_present iff any Cast op targets an FP8 dtype.
-                 ; On graphs without FP8 (e.g. bf16 gemma), this relation stays
-                 ; empty and the gated rules' first LHS fact fails the join
-                 ; immediately instead of paying multi-way enumeration cost.
+                 ; Indexable seed for the FP8 lowering rules. Tags every IR
+                 ; node whose dtype is FP8. Each fp8 rewrite rule in
+                 ; cublaslt_fp8_rewrite.egg starts its LHS with
+                 ; `(cublaslt_fp8_ir ?a)`, which binds the rule's FP8
+                 ; matmul-input variable from this small tagged set.
                  ;
-                 ; This is a temporary workaround to get gemma-4 MoE working
-                 ; through luminal_python — PT2 produces a denser HLIR than
-                 ; the hand-written rust path (many more Mul/Cast/Recip
-                 ; nodes), which pushes the fp8 rules' multi-way LHS join
-                 ; over a cardinality cliff (~270 GiB of transient
-                 ; allocation on a 124K-node e-graph). The real fix is to
-                 ; understand WHY these specific rules' intermediate join
-                 ; state grows so large when their final match count is 0 —
-                 ; whether it's a planner ordering issue, a rule-structure
-                 ; issue (the join may be expressible with smaller
-                 ; intermediates), or something egglog-internal that should
-                 ; be reported upstream. Until then, the guard short-
-                 ; circuits the join before any of that cost is paid.
-                 (relation cublaslt_fp8_present ())
+                 ; Why this matters: without the tag, the fp8 rules' LHS is
+                 ; a multi-way join over Mul x Recip x Cast x GenericMatmul
+                 ; x Cast x Mul x Mul. On PT2-produced HLIR (e.g. gemma-4
+                 ; MoE) those tables have thousands of entries each, and
+                 ; egglog's planner enumerates the join product before the
+                 ; per-rule dtype filter at the tail rejects everything
+                 ; (~270 GiB of transient join intermediates on a 124K-node
+                 ; e-graph). Starting the LHS from a relation with cardinality
+                 ; equal to the number of FP8-typed nodes (typically 0 on
+                 ; bf16 graphs, ~tens-hundreds on a quantized inference path)
+                 ; forces the planner to walk outward from a small set and
+                 ; keeps the rule cost bounded regardless of how dense the
+                 ; surrounding Mul/Cast tables are.
+                 (relation cublaslt_fp8_ir (IR))
                  (rule
-                     ((= ?c (Op (Cast ?size ?dtype) ?inputs))
-                      (cublaslt_fp8_dtype ?dtype))
-                     ((cublaslt_fp8_present))
+                     ((= ?dt (dtype ?n)) (cublaslt_fp8_dtype ?dt))
+                     ((cublaslt_fp8_ir ?n))
                      :ruleset matmul_backend)",
             ),
             Rule::raw(include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
