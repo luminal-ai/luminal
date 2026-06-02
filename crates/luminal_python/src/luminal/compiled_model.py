@@ -26,7 +26,8 @@ class CompiledModel:
     """Wrapper around CompiledGraph that handles PyTorch tensor conversion."""
 
     def __init__(
-        self, graph_result, weight_refs=None, input_names=None, user_indices=None
+        self, graph_result, weight_refs=None, input_names=None, user_indices=None,
+        user_output_names=None,
     ):
         """Initialize with a compiled CompiledGraph from Rust.
 
@@ -37,11 +38,28 @@ class CompiledModel:
             user_indices: When torch.compile lifts model parameters into extra args,
                 this tells __call__ which arg positions are actual user inputs.
                 None means all args are user inputs (PT2 path).
+            user_output_names: The graph-output names that are USER_OUTPUTs (from
+                the ExportedProgram graph_signature). When a module mutates
+                registered buffers in place (e.g. a StaticCache cache write),
+                torch.export functionalizes those mutations into extra graph
+                outputs (BUFFER_MUTATION). The Rust side returns *all* graph
+                outputs; this filters __call__'s return down to just the user
+                outputs (the model's real return value), so e.g. logits aren't
+                shadowed by a mutated cache buffer. None means return all outputs.
         """
         self._graph = graph_result
         self._input_names = input_names or graph_result.input_names
         self._output_names = graph_result.output_names
         self._output_shapes = graph_result.output_shapes
+        # Positions (in the full graph-output order) to return; None = all.
+        self._user_output_indices = None
+        if user_output_names:
+            name_to_idx = {n: i for i, n in enumerate(self._output_names)}
+            kept = [name_to_idx[n] for n in user_output_names if n in name_to_idx]
+            # Only filter if we actually identified a strict subset; otherwise
+            # leave as-is (don't silently drop outputs on a name mismatch).
+            if kept and len(kept) < len(self._output_names):
+                self._user_output_indices = kept
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
         self._user_indices = user_indices
@@ -254,5 +272,11 @@ class CompiledModel:
             else:
                 out = _read_typed_output(name, shape, out_dtype)
             outputs.append(out)
+
+        # Drop functionalized buffer-mutation outputs; return only the model's
+        # real outputs (the scatter/write kernels still execute — they feed the
+        # in-graph attention read — they're just not part of the return value).
+        if self._user_output_indices is not None:
+            outputs = [outputs[i] for i in self._user_output_indices]
 
         return tuple(outputs)

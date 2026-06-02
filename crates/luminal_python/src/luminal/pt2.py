@@ -137,7 +137,8 @@ def _decomp_table():
 
 
 def _save_and_compile(
-    ep_or_path, factory, search_iterations, original_weights=None, user_indices=None
+    ep_or_path, factory, search_iterations, original_weights=None, user_indices=None,
+    user_output_names=None,
 ):
     """Compile a PT2 model via Rust, return CompiledModel.
 
@@ -177,7 +178,8 @@ def _save_and_compile(
         _load_cpu_weights(compiled, cpu_weights)
 
         return CompiledModel(
-            compiled, weight_refs=keep_alive, user_indices=user_indices
+            compiled, weight_refs=keep_alive, user_indices=user_indices,
+            user_output_names=user_output_names,
         )
     finally:
         if owns_tmpdir and tmpdir:
@@ -633,6 +635,34 @@ def _eager_pt2_compile(
     _drop_dead_data_dependent_ops(ep.graph_module)
     ep = ep.run_decompositions(_decomp_table())
 
+    # Capture the USER_OUTPUT names before saving. When the module mutates
+    # registered buffers in place (e.g. a StaticCache cache write), export
+    # functionalizes those into extra BUFFER_MUTATION graph outputs that the
+    # Rust side returns alongside the real outputs; we filter them out at the
+    # CompiledModel boundary so the caller gets the model's actual return value.
+    try:
+        user_output_names = list(ep.graph_signature.user_outputs)
+    except Exception:
+        user_output_names = None
+
+    # Buffers mutated in place (e.g. a StaticCache cache write via index_copy_)
+    # are shared zero-copy with the Rust runtime. The egglog search runs the
+    # graph with dummy data during compile, so an in-place scatter corrupts
+    # these buffers at positions the real run won't overwrite (e.g. cache pos
+    # == seq). The hand-written Rust qwen example re-zeros its KV cache after
+    # the search for exactly this reason. We snapshot the to-be-mutated buffers
+    # before compile and restore them after, undoing the search's corruption.
+    saved_mutated = {}
+    if original_weights:
+        try:
+            mutated_targets = set(ep.graph_signature.buffers_to_mutate.values())
+        except Exception:
+            mutated_targets = set()
+        for name in mutated_targets:
+            t = original_weights.get(name)
+            if t is not None:
+                saved_mutated[name] = t.detach().clone()
+
     # When using shared memory (original_weights), strip large weight buffers
     # from the EP before saving. The Rust side uses device pointers for these
     # weights, not the .pt2 file data, so serializing them is pure IO waste
@@ -657,13 +687,18 @@ def _eager_pt2_compile(
         torch.cuda.empty_cache()
 
     try:
-        return _save_and_compile(
+        compiled = _save_and_compile(
             pt2_path,
             factory,
             10,
             original_weights=original_weights,
             user_indices=user_indices,
+            user_output_names=user_output_names,
         )
+        # Undo any in-place corruption the search inflicted on shared buffers.
+        for name, snapshot in saved_mutated.items():
+            original_weights[name].copy_(snapshot)
+        return compiled
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

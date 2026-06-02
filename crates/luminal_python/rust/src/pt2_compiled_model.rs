@@ -117,8 +117,35 @@ fn compile_pt2(
     let (translation, mut weights) = translate_pt2(pt2_path, weights_path)?;
     weights.device_ptrs = weight_device_ptrs;
 
+    // Diagnostic: dump the raw translator HLIR op histogram BEFORE parse_graph
+    // (which rolls loops + runs egglog in place). This is "what the frontend
+    // emits", comparable to the hand-coded Rust example's pre-search graph.
+    if std::env::var("LUMINAL_HLIR_HISTOGRAM").is_ok() {
+        dump_hlir_histogram(&translation.graph, &translation.input_names);
+    }
+
     CompiledGraph::parse_graph(translation, weights, factory, search_iters)
         .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// Print a histogram of raw (pre-egglog) HLIR op types in `graph`, using each
+/// op's Display name with any trailing `(...)` detail stripped so it collapses
+/// to the bare op type (e.g. `Input(weight)` -> `Input`, `Cast(F32)` -> `Cast`).
+fn dump_hlir_histogram(graph: &Graph, input_names: &[String]) {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for n in graph.graph.node_indices() {
+        let disp = format!("{}", graph.graph[n]);
+        let bare = disp.split('(').next().unwrap_or(&disp).trim().to_string();
+        *counts.entry(bare).or_insert(0) += 1;
+    }
+    let total: usize = counts.values().sum();
+    eprintln!("=== LUMINAL_HLIR_HISTOGRAM (raw translator HLIR) ===");
+    eprintln!("    n_inputs={} total_nodes={}", input_names.len(), total);
+    for (k, v) in &counts {
+        eprintln!("    {k:<16} {v}");
+    }
+    eprintln!("=== END LUMINAL_HLIR_HISTOGRAM ===");
 }
 
 /// Translate a PT2 exported model into a format-neutral GraphTranslation + WeightData.

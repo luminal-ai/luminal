@@ -85,6 +85,22 @@ impl<'a> Translator<'a> {
             // No-op
             "torch.ops.aten.alias.default" => self.get_input_tensor(node, 0)?,
 
+            // `dst.copy_(src)` functionalizes to `copy(dst, src) -> src` in
+            // `dst`'s dtype/shape. Supports the same-shape case (e.g. the
+            // StaticCache `cumulative_length.copy_(cache_position)` reset).
+            "torch.ops.aten.copy.default" => {
+                let dst = self.get_input_tensor(node, 0)?;
+                let src = self.get_input_tensor(node, 1)?;
+                if dst.shape.dims != src.shape.dims {
+                    bail!(
+                        "aten.copy.default: differing shapes unsupported (dst {:?} vs src {:?})",
+                        dst.shape.dims,
+                        src.shape.dims
+                    );
+                }
+                src.cast(dst.dtype)
+            }
+
             // Shape ops
             "torch.ops.aten.view.default" => self.translate_reshape(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,

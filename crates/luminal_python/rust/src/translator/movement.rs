@@ -482,11 +482,86 @@ impl<'a> Translator<'a> {
 
     pub(crate) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
+        let values = self.get_input_tensor(node, 2)?;
+
+        // Optional-tensor indices with `None` placeholders, e.g.
+        //   cache[:, :, pos] = v   ->   indices = [None, None, pos]
+        // (StaticCache's `index_copy_(dim, pos, v)` lowers to this). Supported
+        // when exactly one entry is a tensor: scatter `values` into `a` along
+        // that dim. We build explicit row-major flat destination indices (one
+        // per `values` element) and use the low-level `scatter`, mirroring the
+        // hand-written cache write in the Rust qwen example
+        // (examples/qwen/src/model.rs `hlir_attention`: h/p/d offsets summed,
+        // then `.scatter`). This deliberately avoids `scatter_elements`, whose
+        // iota machinery miscomputes for a broadcast index on a non-leading axis.
+        if node.inputs[1].arg.as_tensors().is_none()
+            && let Some(entries) = node.inputs[1].arg.as_optional_tensors()
+        {
+            let indexed: Vec<(usize, String)> = entries
+                .iter()
+                .enumerate()
+                .filter_map(|(d, e)| match e {
+                    crate::pt2_schema::OptionalTensorEntry::Tensor(t) => {
+                        Some((d, t.as_tensor.name.clone()))
+                    }
+                    crate::pt2_schema::OptionalTensorEntry::None(_) => None,
+                })
+                .collect();
+            if indexed.len() != 1 {
+                bail!(
+                    "index_put optional-tensor indices: only a single indexed dim \
+                     is supported (the `cache[:, :, pos] = v` pattern); got {}",
+                    indexed.len()
+                );
+            }
+            let (dim, idx_name) = (indexed[0].0, indexed[0].1.as_str());
+            let idx = self.get_tensor(idx_name)?.cast(DType::Int);
+            if idx.shape.len() != 1 {
+                bail!(
+                    "index_put optional-tensor indices: position tensor must be 1-D, \
+                     got rank {}",
+                    idx.shape.len()
+                );
+            }
+
+            let adims = a.dims();
+            let rank = adims.len();
+            let vdims = values.dims();
+            // Row-major strides of the destination buffer.
+            let mut strides = vec![Expression::from(1usize); rank];
+            for d in (0..rank.saturating_sub(1)).rev() {
+                strides[d] = strides[d + 1] * adims[d + 1];
+            }
+            // Flat destination index per `values` element, broadcast to
+            // `values`' shape: flat(i0..in) = sum_d coord_d * strides[d], where
+            // coord_dim = pos[k] (the indexed axis) and coord_d = arange(vdims[d])
+            // elsewhere. Each `coord_d` is placed on axis `d` and broadcast over
+            // the others (stride-0); the Add chain materializes the index.
+            let mut flat: Option<GraphTensor> = None;
+            for d in 0..rank {
+                let coord = if d == dim {
+                    idx
+                } else {
+                    a.graph().arange(vdims[d]).cast(DType::Int)
+                };
+                // `constant` is rank-0; luminal `*` needs matching dims, so
+                // broadcast the stride scalar to `coord`'s shape before the mul.
+                let stride_c = a.graph().constant(strides[d]).expand_rhs(coord.shape);
+                let term = (coord * stride_c)
+                    .expand_lhs(vdims[..d].to_vec())
+                    .expand_rhs(vdims[d + 1..].to_vec());
+                flat = Some(match flat {
+                    Some(f) => f + term,
+                    None => term,
+                });
+            }
+            return Ok(values.scatter(flat.unwrap(), a));
+        }
+
         let index_names = node.inputs[1]
             .arg
             .as_tensors()
             .context("index_put: indices not as_tensors")?;
-        let values = self.get_input_tensor(node, 2)?;
 
         if index_names.len() == 1 {
             let idx_tensor = self.get_tensor(&index_names[0].name)?;
