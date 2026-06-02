@@ -7,6 +7,15 @@ edition = "2024"
 name = "qwen"
 path = "src/main.rs"
 
+[[bin]]
+name = "hlir_dump"
+path = "src/bin/hlir_dump.rs"
+
+[[bin]]
+name = "qwen_stdio"
+path = "src/bin/qwen_stdio.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 cuda = ["dep:luminal_cuda_lite"]
