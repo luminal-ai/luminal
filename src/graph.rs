@@ -1582,6 +1582,7 @@ impl Graph {
                     };
                 let timed_out = profile_timed_out(profile_start.elapsed());
                 let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
+                let invalid_profile = rep_display.starts_with("invalid ");
                 (
                     rep_metric,
                     append_memory_display(
@@ -1592,11 +1593,12 @@ impl Graph {
                     ),
                     has_nan,
                     timed_out,
+                    invalid_profile,
                 )
             }));
 
             match result {
-                Ok((metric, disp, false, false)) => {
+                Ok((metric, disp, false, false, false)) => {
                     best_genome = genome;
                     best_metric = R::aggregate_profile_metrics(&[metric]);
                     display = disp;
@@ -1717,6 +1719,7 @@ impl Graph {
                     let timed_out = profile_timed_out(profile_start.elapsed());
                     let has_nan =
                         !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
+                    let invalid_profile = rep_display.starts_with("invalid ");
                     (
                         rep_metric,
                         append_memory_display(
@@ -1727,15 +1730,16 @@ impl Graph {
                         ),
                         has_nan,
                         timed_out,
+                        invalid_profile,
                     )
                 }));
 
                 let (new_metric, display_metric) = match profile_result {
-                    Ok((metric, display, false, false)) => {
+                    Ok((metric, display, false, false, false)) => {
                         generation_found_non_timeout = true;
                         (R::aggregate_profile_metrics(&[metric]), display)
                     }
-                    Ok((_, _, _, true)) | Err(_) => {
+                    Ok((_, _, _, true, _)) | Err(_) => {
                         // Timed out or panicked — redraw bars and skip.
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
@@ -1745,9 +1749,19 @@ impl Graph {
                         std::io::stdout().flush().unwrap();
                         continue;
                     }
-                    Ok((_, _, true, false)) => {
+                    Ok((_, _, true, false, _)) => {
                         generation_found_non_timeout = true;
                         // Completed profiling but produced NaNs — redraw bars and skip.
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        render_bars(n_graphs, search_limit, bucket_progress);
+                        std::io::stdout().flush().unwrap();
+                        continue;
+                    }
+                    Ok((_, _, false, false, true)) => {
+                        // Backend rejected this candidate during load/profile.
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
                         }
@@ -1829,6 +1843,14 @@ impl Graph {
             &mut FxHashMap::default(),
             None,
         );
+        if std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some() {
+            let dump_label = bucket_progress
+                .map(|(bucket_idx, n_buckets)| {
+                    format!("pre-unroll-bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
+                })
+                .unwrap_or_else(|| "pre-unroll-single".to_string());
+            maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
+        }
         unroll_loops_in_llir(&mut stitched);
 
         println!(

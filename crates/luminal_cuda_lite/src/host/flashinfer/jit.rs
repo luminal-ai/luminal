@@ -34,6 +34,7 @@ pub type PlanFn = unsafe extern "C" fn(
     num_kv_heads: i32,
     page_size: i32,
     head_dim: i32,
+    enable_cuda_graph: bool,
     stream: *mut c_void,
     plan_info_out: *mut i64,
     plan_info_len_out: *mut i32,
@@ -61,15 +62,25 @@ pub type RunFn = unsafe extern "C" fn(
 ) -> i32;
 
 pub type ExtractFn = unsafe extern "C" fn(
-    flat_idx: *const i32,
+    slot_idx: *const i32,
     out: *mut i32,
     c: i32,
     kv_dim: i32,
     stream: *mut c_void,
 );
 
-pub type DeriveIndptrFn =
-    unsafe extern "C" fn(mask: *const f32, indptr: *mut i32, s: i32, c: i32, stream: *mut c_void);
+pub type PrepareDecodeMetadataFn = unsafe extern "C" fn(
+    int_workspace: *mut c_void,
+    plan_info_vec: *mut i64,
+    plan_info_len: i32,
+    current_c: *const i32,
+    slot_idx: *const i32,
+    kv_indices: *mut i32,
+    kv_indptr: *mut i32,
+    capacity_c: i32,
+    kv_dim: i32,
+    stream: *mut c_void,
+);
 
 pub type TransposeOutputFn = unsafe extern "C" fn(
     src: *const f32,
@@ -135,7 +146,7 @@ pub struct FlashInferLib {
     pub plan: PlanFn,
     pub run: RunFn,
     pub extract_slot_indices: ExtractFn,
-    pub derive_indptr_from_mask: DeriveIndptrFn,
+    pub prepare_decode_metadata: PrepareDecodeMetadataFn,
     pub transpose_output: TransposeOutputFn,
     pub prefill_plan: PrefillPlanFn,
     pub prefill_run: PrefillRunFn,
@@ -176,8 +187,9 @@ impl FlashInferLib {
         let run: RunFn = unsafe { *lib.get::<RunFn>(b"flashinfer_batch_decode_run\0")? };
         let extract_slot_indices: ExtractFn =
             unsafe { *lib.get::<ExtractFn>(b"flashinfer_extract_slot_indices\0")? };
-        let derive_indptr_from_mask: DeriveIndptrFn =
-            unsafe { *lib.get::<DeriveIndptrFn>(b"flashinfer_derive_indptr_from_mask\0")? };
+        let prepare_decode_metadata: PrepareDecodeMetadataFn = unsafe {
+            *lib.get::<PrepareDecodeMetadataFn>(b"flashinfer_prepare_decode_metadata\0")?
+        };
         let transpose_output: TransposeOutputFn =
             unsafe { *lib.get::<TransposeOutputFn>(b"flashinfer_transpose_output\0")? };
         let prefill_plan: PrefillPlanFn =
@@ -189,7 +201,7 @@ impl FlashInferLib {
             plan,
             run,
             extract_slot_indices,
-            derive_indptr_from_mask,
+            prepare_decode_metadata,
             transpose_output,
             prefill_plan,
             prefill_run,

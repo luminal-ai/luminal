@@ -35,6 +35,7 @@
 
 #include "wrapper.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <cuda_fp16.h>
@@ -118,6 +119,52 @@ __global__ void cast_f16_to_f32_kernel(const half* src, float* dst, size_t n) {
     if (i < n) dst[i] = __half2float(src[i]);
 }
 
+__global__ void prepare_decode_metadata_kernel(
+    const int32_t* current_c_ptr,
+    const int32_t* slot_idx,
+    int32_t* kv_indices,
+    int32_t* kv_indptr,
+    int32_t* o_indptr,
+    bool* block_valid_mask,
+    const int32_t* kv_tile_indices,
+    const int32_t* kv_chunk_size_ptr,
+    int capacity_c,
+    int kv_dim,
+    int padded_batch_size) {
+    (void)kv_dim;
+    int current_c = current_c_ptr ? *current_c_ptr : capacity_c;
+    int chunk_size = kv_chunk_size_ptr ? *kv_chunk_size_ptr : capacity_c;
+    chunk_size = max(chunk_size, 1);
+    int planned_chunks = (capacity_c + chunk_size - 1) / chunk_size;
+    int current_chunks = current_c > 0 ? (current_c + chunk_size - 1) / chunk_size : 0;
+    int n = max(capacity_c, padded_batch_size);
+
+    if (blockIdx.x == 0 && threadIdx.x == 0 && kv_indptr) {
+        kv_indptr[0] = 0;
+        kv_indptr[1] = current_c;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0 && o_indptr) {
+        o_indptr[0] = 0;
+        o_indptr[1] = current_chunks;
+    }
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < n;
+         i += blockDim.x * gridDim.x) {
+        if (i < capacity_c && i < current_c && slot_idx && kv_indices) {
+            kv_indices[i] = slot_idx[i];
+        }
+        if (block_valid_mask && i < padded_batch_size) {
+            bool valid = false;
+            if (current_c > 0 && i < planned_chunks) {
+                int chunk = kv_tile_indices ? kv_tile_indices[i] : i;
+                valid = chunk >= 0 && chunk * chunk_size < current_c;
+            }
+            block_valid_mask[i] = valid;
+        }
+    }
+}
+
 extern "C" {
 
 int flashinfer_batch_decode_plan(
@@ -126,6 +173,7 @@ int flashinfer_batch_decode_plan(
     void* page_locked_int_workspace,
     int32_t* indptr_h, int batch_size,
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    bool enable_cuda_graph,
     cudaStream_t stream,
     int64_t* plan_info_out, int* plan_info_len_out)
 {
@@ -147,7 +195,7 @@ int flashinfer_batch_decode_plan(
             int_workspace, page_locked_int_workspace,
             int_ws_size, plan_info, indptr_h,
             (uint32_t)batch_size, (uint32_t)num_qo_heads,
-            (uint32_t)page_size, /*enable_cuda_graph=*/false,
+            (uint32_t)page_size, enable_cuda_graph,
             stream, work_estimation_func);
     };
 
@@ -250,6 +298,42 @@ int flashinfer_batch_decode_run(
     return (int)status;
 }
 
+void flashinfer_prepare_decode_metadata(
+    void* int_workspace,
+    int64_t* plan_info_vec, int plan_info_len,
+    const int32_t* current_c,
+    const int32_t* slot_idx,
+    int32_t* kv_indices,
+    int32_t* kv_indptr,
+    int capacity_c,
+    int kv_dim,
+    cudaStream_t stream)
+{
+    DecodePlanInfo plan_info;
+    plan_info.FromVector(std::vector<int64_t>(plan_info_vec, plan_info_vec + plan_info_len));
+
+    bool* block_valid_mask = nullptr;
+    if (plan_info.split_kv && plan_info.enable_cuda_graph) {
+        block_valid_mask =
+            GetPtrFromBaseOffset<bool>(int_workspace, plan_info.block_valid_mask_offset);
+    }
+    const IdType* kv_tile_indices =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_tile_indices_offset);
+    IdType* o_indptr =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.o_indptr_offset);
+    const IdType* kv_chunk_size_ptr =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_chunk_size_ptr_offset);
+
+    int padded_batch_size = (int)plan_info.padded_batch_size;
+    int n = max(capacity_c, padded_batch_size);
+    if (n <= 0) return;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    prepare_decode_metadata_kernel<<<blocks, threads, 0, stream>>>(
+        current_c, slot_idx, kv_indices, kv_indptr, o_indptr, block_valid_mask,
+        kv_tile_indices, kv_chunk_size_ptr, capacity_c, kv_dim, padded_batch_size);
+}
+
 // ═══════════════════════════════════════════════════════════
 // BatchPrefill (fp16/bf16 only — tensor core MMA requires 16-bit inputs)
 // ═══════════════════════════════════════════════════════════
@@ -284,45 +368,20 @@ int flashinfer_batch_prefill_run(
 // ── Slot index extraction kernel (outside extern "C" for __global__) ──
 
 __global__ void extract_slot_indices_kernel(
-    const int32_t* flat_idx, int32_t* out, int c, int kv_dim) {
+    const int32_t* slot_idx, int32_t* out, int c, int kv_dim) {
+    (void)kv_dim;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < c) out[i] = flat_idx[i * kv_dim] / kv_dim;
+    if (i < c) out[i] = slot_idx[i];
 }
 
 extern "C" void flashinfer_extract_slot_indices(
-    const int32_t* flat_idx, int32_t* out, int c, int kv_dim,
+    const int32_t* slot_idx, int32_t* out, int c, int kv_dim,
     cudaStream_t stream) {
     if (c == 0) return;
     int threads = 256;
     int blocks = (c + threads - 1) / threads;
     extract_slot_indices_kernel<<<blocks, threads, 0, stream>>>(
-        flat_idx, out, c, kv_dim);
-}
-
-// ── Derive CSR indptr from attention mask ──
-// Mask is (s, c) f32. Entries > -1e9 are "valid" (0.0), rest are -inf.
-// Per-row count of valid entries = context length for that sequence.
-// Output: indptr[0..=s] with indptr[0]=0 and indptr[i+1] = indptr[i] + ctx_len[i].
-// Single thread is fine since s is tiny (batch_size during decode, typically 1-8).
-
-__global__ void derive_indptr_kernel(
-    const float* mask, int32_t* indptr, int s, int c) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    indptr[0] = 0;
-    for (int i = 0; i < s; i++) {
-        int count = 0;
-        for (int j = 0; j < c; j++) {
-            if (mask[i * c + j] > -1e9f) count++;
-        }
-        indptr[i + 1] = indptr[i] + count;
-    }
-}
-
-extern "C" void flashinfer_derive_indptr_from_mask(
-    const float* mask, int32_t* indptr, int s, int c,
-    cudaStream_t stream) {
-    if (s == 0) return;
-    derive_indptr_kernel<<<1, 1, 0, stream>>>(mask, indptr, s, c);
+        slot_idx, out, c, kv_dim);
 }
 
 // ── Output transpose: (batch, heads, dim) → (heads, batch, dim) ──

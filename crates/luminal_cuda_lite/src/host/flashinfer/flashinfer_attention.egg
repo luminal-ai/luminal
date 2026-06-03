@@ -6,19 +6,52 @@
 ;
 ; Structural anchors (prevent false matches on MLP/other ops):
 ;   - Gather ops from 2D cache pools (MLP never uses Gather)
+;   - K and V cache gathers use the same flat gather index
 ;   - GQA broadcast via Mul(gathered, Constant(1.0)) with all-zero strides
 ;   - Scale Mul(QK, constant) connecting QK scores to mask Add
 ;   - Mask Add with zero-stride broadcast in first dim (nheads broadcast)
 ;   - Data flow: two sequential matmul+reduce pairs connected through softmax
 ;
-; The egglog rule captures the mask as 5th input.  During extract(), a Rust
-; function walks the mask's computation chain in the e-graph to locate the
-; qo_indptr and kv_indptr Input nodes (validated via the Constant(1e10) anchor
-; and structural checks).  These are appended as inputs 5 and 6 so FlashInfer
-; can build the CSR page table directly — no runtime derivation needed.
+; The egglog rule captures the mask as a proof-only 5th structural input.
+; During extract(), Rust drops that runtime dependency and recovers the compact
+; gather_idx input from the lowered flat gather index.
 ;
 ; Shape dimensions are egglog variables, not pinned constants.
 ; Dynamic dims "s" (batch/seq) and "c" (context) stay pinned as MVar.
+
+(relation flashinfer_cache_pair (IR IR))
+
+; K and V cache sources must come from the same cache-update provenance.
+; This prevents a rolled loop-body K cache from pairing with the one remaining
+; unrolled V cache outside the loop, which is shape-compatible but not the
+; same attention instance.
+(rule
+    (
+        (= ?k_cache (Op (Scatter ?k_ds ?k_dst ?k_is ?k_istr ?k_ss)
+            (ICons ?k_dest (ICons ?scatter_idx (ICons ?k_src (INil))))))
+        (= ?v_cache (Op (Scatter ?v_ds ?v_dst ?v_is ?v_istr ?v_ss)
+            (ICons ?v_dest (ICons ?scatter_idx (ICons ?v_src (INil))))))
+        (= ?k_dest (Input ?k_node ?k_label ?k_dt))
+        (= ?v_dest (Input ?v_node ?v_label ?v_dt))
+    )
+    ((flashinfer_cache_pair ?k_cache ?v_cache))
+    :ruleset matmul_backend
+    :name "FlashInfer raw cache pair"
+)
+
+(rule
+    (
+        (= ?k_cache (Op (Scatter ?k_ds ?k_dst ?k_is ?k_istr ?k_ss)
+            (ICons ?k_dest (ICons ?scatter_idx (ICons ?k_src (INil))))))
+        (= ?v_cache (Op (Scatter ?v_ds ?v_dst ?v_is ?v_istr ?v_ss)
+            (ICons ?v_dest (ICons ?scatter_idx (ICons ?v_src (INil))))))
+        (= ?k_dest (Op (LoopInput ?loop_id ?k_stream ?k_dt) ?k_loop_inputs))
+        (= ?v_dest (Op (LoopInput ?loop_id ?v_stream ?v_dt) ?v_loop_inputs))
+    )
+    ((flashinfer_cache_pair ?k_cache ?v_cache))
+    :ruleset matmul_backend
+    :name "FlashInfer rolled cache pair"
+)
 
 (rule
     (
@@ -58,7 +91,7 @@
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
-            (ICons ?v_idx (ICons ?v_cache (INil)))))
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         ; ── First matmul: Mul(Q, K_gqa) ──
         ; Shape: (nheads, s, c, hdim) — 4D
@@ -122,6 +155,7 @@
         (= ?dt (dtype ?q))
         (= ?dt (dtype ?k_cache))
         (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
     )
     (
         (let ?fi (Op (FlashInferAttention
@@ -132,4 +166,279 @@
     )
     :ruleset matmul_backend
     :name "FlashInfer batch decode attention"
+)
+
+(rule
+    (
+        ; Direct causal mask spelling:
+        ;   (q_pos[:, None] < arange(c)[None, :]).cast(F32) * -1e10
+        ; This proves each row blocks a suffix and leaves a valid prefix.
+        ;
+        ; This spelling currently lowers to the fp32 batch-decode runtime path,
+        ; not prefill. It is only valid when the active dynamic-dim bucket proves
+        ; s == 1.
+        (= ?s_lower (lower (MVar "s")))
+        (= ?s_upper (upper (MVar "s")))
+        (> ?s_lower 0)
+        (< ?s_upper 2)
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?scaled_qk (ICons ?mask (INil)))))
+
+        (= ?mask (Op (Mul
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?blocked_strides
+            ?neg_scale_strides
+            ?mask_out_strides)
+            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
+        (= ?neg_mask_scale (Op (Constant ?neg_mask_scale_val) (INil)))
+        (< ?neg_mask_scale_val -9999999999.0)
+        (> ?neg_mask_scale_val -10000000001.0)
+        (= ?blocked_f32 (Op (Cast ?blocked_cast_size (F32))
+            (ICons ?blocked_bool (INil))))
+        (= ?blocked_bool (Op (LessThan
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?q_pos_cmp_strides
+            ?col_cmp_strides
+            ?blocked_out_strides)
+            (ICons ?q_pos (ICons ?col_offsets (INil)))))
+        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+
+        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+    )
+    (
+        (let ?fi (Op (FlashInferAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s"))
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "FlashInfer direct causal attention"
+)
+
+(rule
+    (
+        ; Same attention skeleton as above, but accept a causal mask produced
+        ; by gathering rows from a square upper-triangular blocked mask:
+        ;   triu(c, 1).cast(F32) * -1e10
+        ;   gather(q_pos * c + arange(c))
+        ; This proves each query row exposes only a prefix of the gathered KV
+        ; sequence. Runtime derives decode indptrs from the mask values.
+        ;
+        ; Like the direct causal spelling, this is decode-only until the fp32
+        ; prefill runtime exists. The active bucket must prove s == 1.
+        (= ?s_lower (lower (MVar "s")))
+        (= ?s_upper (upper (MVar "s")))
+        (> ?s_lower 0)
+        (< ?s_upper 2)
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?scaled_qk (ICons ?mask (INil)))))
+
+        ; Mask indices are row-aligned triangular-mask rows plus arange(c).
+        (= ?mask (Op (Gather
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?mask_idx_strides
+            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            ?mask_src_strides)
+            (ICons ?mask_indices (ICons ?scaled_blocked (INil)))))
+        (= ?mask_indices (Op (Add
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?row_idx_strides
+            ?col_idx_strides
+            ?mask_idx_out_strides)
+            (ICons ?row_offsets (ICons ?col_offsets (INil)))))
+        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?row_offsets (Op (Mul
+            (ECons (MVar "s") (ENil))
+            ?q_pos_strides
+            ?ctx_scalar_strides
+            ?row_offsets_out_strides)
+            (ICons ?q_pos (ICons ?ctx_scalar (INil)))))
+        (= ?ctx_scalar (Op (Iota (MVar "c") (MNum 1)) (INil)))
+
+        ; The source square is an upper-triangular blocked mask. The LessThan
+        ; strides prove row_index < col_index; multiplying by -1e10 turns
+        ; blocked positions into additive -inf and leaves the prefix at zero.
+        (= ?scaled_blocked (Op (Mul
+            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            ?blocked_strides
+            ?neg_scale_strides
+            ?scaled_blocked_strides)
+            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
+        (= ?neg_mask_scale (Op (Constant ?neg_mask_scale_val) (INil)))
+        (< ?neg_mask_scale_val -9999999999.0)
+        (> ?neg_mask_scale_val -10000000001.0)
+        (= ?blocked_f32 (Op (Cast ?blocked_cast_size (F32))
+            (ICons ?blocked_bool (INil))))
+        (= ?blocked_bool (Op (LessThan
+            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            ?tri_row_strides
+            ?tri_col_strides
+            ?blocked_out_strides)
+            (ICons ?tri_iota_f32 (ICons ?tri_iota_minus_zero (INil)))))
+        (= ?tri_iota_minus_zero (Op (Add
+            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            ?tri_minus_zero_a_strides
+            ?tri_minus_zero_b_strides
+            ?tri_minus_zero_out_strides)
+            (ICons ?tri_iota_f32 (ICons ?zero_offset (INil)))))
+        (= ?zero_offset (Op (Mul
+            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            ?zero_offset_a_strides
+            ?zero_offset_b_strides
+            ?zero_offset_out_strides)
+            (ICons ?zero_const (ICons ?neg_one_const (INil)))))
+        (= ?zero_const (Op (Constant 0.000000) (INil)))
+        (= ?neg_one_const (Op (Constant -1.000000) (INil)))
+        (= ?tri_iota_f32 (Op (Cast ?tri_iota_cast_size (F32))
+            (ICons ?tri_iota (INil))))
+        (= ?tri_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+
+        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+    )
+    (
+        (let ?fi (Op (FlashInferAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s"))
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "FlashInfer causal triu-gather attention"
 )

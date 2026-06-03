@@ -237,6 +237,17 @@ pub(crate) fn split_egraph_by_memory_limit(
     let mut split = splitter.split();
 
     compact_egraph_after_prune(&mut split);
+    if split.roots.is_empty() || split.enodes.is_empty() {
+        eprintln!(
+            "   CUDA memory pruning could not prove a feasible root; leaving search space unpruned"
+        );
+        return MemorySplitStats {
+            original_enodes,
+            split_enodes: original_enodes,
+            original_eclasses,
+            split_eclasses: original_eclasses,
+        };
+    }
     validate_unique_loop_markers(&split);
     let stats = MemorySplitStats {
         original_enodes,
@@ -1292,6 +1303,12 @@ fn local_output_bytes<'a>(
             let k = expr_field(egraph, sort, kind_children, "gu_matmul_k", expr_cache)?;
             Some(Expression::from('s') * k * 4)
         }
+        "FlashInferAttention" => {
+            let num_qo_heads = expr_field(egraph, sort, kind_children, "num_qo_heads", expr_cache)?;
+            let head_dim = expr_field(egraph, sort, kind_children, "head_dim", expr_cache)?;
+            let batch_dim = expr_field(egraph, sort, kind_children, "batch_dim", expr_cache)?;
+            Some(batch_dim * num_qo_heads * head_dim * 4)
+        }
         _ => {
             let shape_field = ["shape", "out_shape", "dest_shape"]
                 .into_iter()
@@ -1397,6 +1414,11 @@ fn output_bytes_rules(sort: &SortDef) -> Vec<String> {
             sort,
             "(MMul (MMul (MVar \"s\") ?gu_matmul_k) (MNum 4))",
             "f32-glumoe",
+        )],
+        "FlashInferAttention" => vec![output_bytes_rule(
+            sort,
+            "(MMul (MMul (MMul ?batch_dim ?num_qo_heads) ?head_dim) (MNum 4))",
+            "f32-flashinfer",
         )],
         _ => {
             let Some(shape_field) = ["shape", "out_shape", "dest_shape"]

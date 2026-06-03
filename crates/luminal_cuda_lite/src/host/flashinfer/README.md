@@ -25,7 +25,7 @@ src/host/flashinfer/
   flashinfer_attention.egg  — egglog rewrite rule (pattern match → FlashInferAttention)
   mod.rs                    — FlashInferAttention op (EgglogOp + HostOp impl)
   jit.rs                    — JIT compilation: nvcc wrapper.cu → .so, dlopen, fn pointers
-  find_indptrs.rs           — walks the mask e-graph node to locate qo_indptr / kv_indptr inputs
+  find_indptrs.rs           — recovers compact gather indices from lowered gather_rows indices
   wrapper.cu                — CUDA: FlashInfer template instantiation + helper kernels
   wrapper.h                 — C API header for wrapper.cu
   README.md                 — this file
@@ -52,11 +52,11 @@ Shape dimensions are egglog variables, not pinned constants — the rule works f
 
 When the rule fires, it unions `FlashInferAttention` with the original attention output, making it an equivalent alternative in the e-graph. The GA search then profiles both paths and picks the faster one.
 
-### 2. Extraction: Finding Indptrs
+### 2. Extraction: Dropping Proof-Only Inputs
 
-During `extract()` (called when egglog selects the FlashInferAttention e-node), `find_indptrs.rs` walks backward from the mask node in the e-graph to locate the `qo_indptr` and `kv_indptr` Input nodes. It validates the mask structure by checking for the `Mul(allowed, Constant(1e10))` pattern that `compute_attn_mask()` produces.
+During `extract()` (called when egglog selects the FlashInferAttention e-node), the mask remains a structural proof that the original attention is causal, but it is not kept as a runtime input. `find_indptrs.rs` walks the lowered `gather_rows` index expression and recovers the compact slot index tensor from `indices * KV_DIM + arange(KV_DIM)`.
 
-The indptrs are appended as inputs 5 and 6 to the FlashInferAttention op, so the runtime can build the CSR page table directly without recomputing anything.
+The runtime FlashInfer inputs are only `Q`, `K_cache`, `V_cache`, and compact `gather_idx` for the causal decode path. Optional explicit `qo_indptr` and `kv_indptr` inputs are still accepted for direct host-op tests and multi-sequence callers.
 
 ### 3. JIT Compilation
 
@@ -74,11 +74,10 @@ Supported HEAD_DIM values: 64, 128, 256.
 `FlashInferAttention::execute()` dispatches to decode or prefill based on `total_q_tokens vs batch_size`:
 
 **Common steps:**
-1. **Extract kv_indices** — a helper kernel converts the flat gather index `(c, KV_DIM)` to slot indices `(c,)`
-2. **Read indptrs to host** — copied to CPU for the plan phase
-3. **Plan** — queries GPU occupancy and decides split-KV decomposition
-4. **Run** — the fused kernel writes `(total_q_tokens, num_qo_heads, head_dim)`
-5. **Transpose** — transposes to `(num_qo_heads, total_q_tokens, head_dim)` to match the Sum reduction layout
+1. **Copy kv_indices** — a helper kernel copies compact slot indices into FlashInfer's page table buffer
+2. **Plan** — queries GPU occupancy and decides split-KV decomposition
+3. **Run** — the fused kernel writes `(total_q_tokens, num_qo_heads, head_dim)`
+4. **Transpose** — transposes to `(num_qo_heads, total_q_tokens, head_dim)` to match the Sum reduction layout
 
 **Decode path** (current, fp32): Always used. Runs FlashInfer's BatchDecode directly on fp32 buffers.
 

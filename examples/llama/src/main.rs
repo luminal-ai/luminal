@@ -146,13 +146,60 @@ fn print_host_op_summary(runtime: &CudaRuntime, label: &str) {
                 && op.contains("b_scale_input: true")
         })
         .count();
+    let flashinfer = debug_ops
+        .iter()
+        .filter(|op| op.contains("FlashInferAttention"))
+        .count();
     println!(
-        "Host op summary ({label}): total={}, cublasLt={}, fp8_cublasLt={}, scaled_fp8_cublasLt={}",
+        "Host op summary ({label}): total={}, cublasLt={}, fp8_cublasLt={}, scaled_fp8_cublasLt={}, flashinfer={}",
         debug_ops.len(),
         cublaslt,
         fp8_cublaslt,
-        scaled_fp8_cublaslt
+        scaled_fp8_cublaslt,
+        flashinfer
     );
+}
+
+fn print_cuda_graph_summary(runtime: &CudaRuntime, label: &str) {
+    if std::env::var_os("LUMINAL_LLAMA_CUDA_GRAPH_SUMMARY").is_none() {
+        return;
+    }
+
+    let summaries = runtime.debug_cuda_graph_summaries();
+    let total_kernels: usize = summaries.iter().map(|s| s.n_kernels).sum();
+    let total_cublaslt: usize = summaries.iter().map(|s| s.n_cublaslt).sum();
+    let total_flashinfer: usize = summaries.iter().map(|s| s.n_flashinfer).sum();
+    let total_steps: usize = summaries.iter().map(|s| s.n_steps).sum();
+    println!(
+        "CUDA graph summary ({label}): graphs={}, kernels={}, cublasLt={}, flashinfer={}, steps={}",
+        summaries.len(),
+        total_kernels,
+        total_cublaslt,
+        total_flashinfer,
+        total_steps
+    );
+    for (idx, summary) in summaries.iter().enumerate() {
+        let dep_sum: usize = summary.step_dependency_counts.iter().sum();
+        let dep_max = summary
+            .step_dependency_counts
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        println!(
+            "  graph[{idx}]: kernels={}, cublasLt={}, flashinfer={}, prepared_cublasLt={}, steps={}, absorbed_host_nodes={}, dep_sum={}, dep_max={}, flashinfer_inputs={:?}, flashinfer_recaptures={:?}",
+            summary.n_kernels,
+            summary.n_cublaslt,
+            summary.n_flashinfer,
+            summary.n_cublaslt_prepared,
+            summary.n_steps,
+            summary.absorbed_host_nodes.len(),
+            dep_sum,
+            dep_max,
+            summary.flashinfer_input_counts,
+            summary.flashinfer_recapture_counts,
+        );
+    }
 }
 
 fn sample_greedy(logits_row: &[f32], seen: &FxHashSet<u32>, repetition_penalty: f32) -> u32 {
@@ -180,7 +227,6 @@ fn run_model_step(
     q_pos_t: GraphTensor,
     scatter_idx_t: GraphTensor,
     gather_idx_t: GraphTensor,
-    attn_mask_t: GraphTensor,
     logits: GraphTensor,
     kv_cache: &KVCache,
     cache_outputs: &[(GraphTensor, GraphTensor)],
@@ -188,7 +234,6 @@ fn run_model_step(
     q_pos: &[i32],
     scatter_idx: &[i32],
     gather_idx: &[i32],
-    attn_mask: &[f32],
 ) -> (Vec<f32>, StepProfile) {
     let start = std::time::Instant::now();
     let seq_len = tokens.len();
@@ -201,8 +246,7 @@ fn run_model_step(
     runtime.set_data(input, tokens.iter().map(|t| *t as i32).collect::<Vec<_>>());
     runtime.set_data(q_pos_t, q_pos.to_vec());
     runtime.set_data(scatter_idx_t, scatter_idx.to_vec());
-    runtime.set_data(gather_idx_t, gather_idx.to_vec());
-    runtime.set_data(attn_mask_t, attn_mask.to_vec());
+    runtime.update_data(gather_idx_t, gather_idx.to_vec());
     profile.set_inputs = set_start.elapsed();
 
     let execute_start = std::time::Instant::now();
@@ -224,18 +268,6 @@ fn run_model_step(
     profile.total = start.elapsed();
 
     (logits_data, profile)
-}
-
-fn causal_mask(q_pos: &[usize], context_len: usize) -> Vec<f32> {
-    let mut mask = vec![-1e10f32; q_pos.len() * context_len];
-    for (qi, &pos) in q_pos.iter().enumerate() {
-        for ci in 0..context_len {
-            if ci <= pos {
-                mask[qi * context_len + ci] = 0.0;
-            }
-        }
-    }
-    mask
 }
 
 fn main() {
@@ -268,20 +300,13 @@ fn main() {
     let q_pos_t = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
     let scatter_idx_t = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
     let gather_idx_t = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
-    let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'));
     let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
     let llama = match weight_mode {
         LlamaWeightMode::Fp32 => Llama::init(&mut cx),
         LlamaWeightMode::Fp8 => Llama::init_fp8(&mut cx),
     };
-    let (logits, cache_outputs) = llama.forward(
-        input,
-        q_pos_t,
-        scatter_idx_t,
-        gather_idx_t,
-        attn_mask_t,
-        &kv_cache,
-    );
+    let (logits, cache_outputs) =
+        llama.forward(input, q_pos_t, scatter_idx_t, gather_idx_t, &kv_cache);
     let logits = logits.output();
     for (k_out, v_out) in &cache_outputs {
         k_out.output();
@@ -333,7 +358,6 @@ fn main() {
     runtime.set_data(q_pos_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(gather_idx_t, (0..search_s as i32).collect::<Vec<_>>());
-    runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_s]);
     println!("  Search seed: {SEARCH_SEED}");
     println!("  Search trials: {SEARCH_TRIALS}");
     println!("  Search keep-best: {SEARCH_KEEP_BEST}");
@@ -348,6 +372,13 @@ fn main() {
         compile_start.elapsed().as_secs_f64()
     );
     print_host_op_summary(&runtime, "post-compile active bucket");
+    print_cuda_graph_summary(&runtime, "post-compile active bucket");
+
+    runtime.set_data_with_capacity(
+        gather_idx_t,
+        Vec::<i32>::new(),
+        MAX_SEQ_LEN * std::mem::size_of::<i32>(),
+    );
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
@@ -375,7 +406,6 @@ fn main() {
         let q_pos: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
         let scatter_idx = q_pos.clone();
         let gather_idx = q_pos.clone();
-        let mask = causal_mask(&positions, prompt_len);
         let (logits_data, mut profile) = run_model_step(
             &mut cx,
             &mut runtime,
@@ -383,7 +413,6 @@ fn main() {
             q_pos_t,
             scatter_idx_t,
             gather_idx_t,
-            attn_mask_t,
             logits,
             &kv_cache,
             &cache_outputs,
@@ -391,9 +420,9 @@ fn main() {
             &q_pos,
             &scatter_idx,
             &gather_idx,
-            &mask,
         );
         print_host_op_summary(&runtime, "after prefill");
+        print_cuda_graph_summary(&runtime, "after prefill");
         context_len = prompt_len;
 
         let sample_start = std::time::Instant::now();
@@ -431,7 +460,6 @@ fn main() {
             q_pos_t,
             scatter_idx_t,
             gather_idx_t,
-            attn_mask_t,
             logits,
             &kv_cache,
             &cache_outputs,
@@ -439,10 +467,10 @@ fn main() {
             &[context_len as i32],
             &[context_len as i32],
             &(0..=context_len as i32).collect::<Vec<_>>(),
-            &causal_mask(&[context_len], context_len + 1),
         );
         if generated == 1 {
             print_host_op_summary(&runtime, "after first decode");
+            print_cuda_graph_summary(&runtime, "after first decode");
         }
         context_len += 1;
 

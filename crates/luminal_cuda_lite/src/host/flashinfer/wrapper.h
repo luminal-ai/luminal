@@ -16,6 +16,7 @@ int flashinfer_batch_decode_plan(
     void* page_locked_int_workspace,
     int32_t* indptr_h, int batch_size,
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    bool enable_cuda_graph,
     cudaStream_t stream,
     int64_t* plan_info_out, int* plan_info_len_out);
 
@@ -36,18 +37,24 @@ int flashinfer_batch_decode_run(
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
     cudaStream_t stream);
 
-// Extract slot indices from a flat gather index tensor.
-// flat_idx shape: (c, kv_dim) i32, out shape: (c,) i32.
-// out[i] = flat_idx[i * kv_dim] / kv_dim
+// Copy compact slot/page indices into FlashInfer's page table.
+// slot_idx shape: (c,) i32, out shape: (c,) i32.
 void flashinfer_extract_slot_indices(
-    const int32_t* flat_idx, int32_t* out, int c, int kv_dim,
+    const int32_t* slot_idx, int32_t* out, int c, int kv_dim,
     cudaStream_t stream);
 
-// Derive CSR indptr from attention mask.
-// mask shape: (s, c) f32. Entries > -1e9 are valid.
-// indptr shape: (s + 1,) i32. indptr[0] = 0, indptr[i+1] = cumsum of valid counts.
-void flashinfer_derive_indptr_from_mask(
-    const float* mask, int32_t* indptr, int s, int c,
+// Update graph-stable decode metadata from the current decode length.
+// Used by CUDA-graph decode plans that are built for a fixed capacity but run
+// with a changing current context length.
+void flashinfer_prepare_decode_metadata(
+    void* int_workspace,
+    int64_t* plan_info_vec, int plan_info_len,
+    const int32_t* current_c,
+    const int32_t* slot_idx,
+    int32_t* kv_indices,
+    int32_t* kv_indptr,
+    int capacity_c,
+    int kv_dim,
     cudaStream_t stream);
 
 // Transpose output from (batch, heads, dim) to (heads, batch, dim).

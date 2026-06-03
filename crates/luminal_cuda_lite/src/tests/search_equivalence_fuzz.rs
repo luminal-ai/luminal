@@ -80,12 +80,10 @@ fn llama_architecture_search_space_equivalence_fuzz() {
     let q_pos = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
     let scatter_idx = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
     let gather_idx = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
-    let attn_mask = cx.named_tensor("attn_mask", ('s', 'c'));
     let kv_cache = llama_model::KVCache::new_with_config(&mut cx, SLOTS, config);
     let llama = llama_model::Llama::init_with_config(&mut cx, config);
 
-    let (logits, cache_outputs) =
-        llama.forward(input, q_pos, scatter_idx, gather_idx, attn_mask, &kv_cache);
+    let (logits, cache_outputs) = llama.forward(input, q_pos, scatter_idx, gather_idx, &kv_cache);
     let logits = logits.output();
     let mut fuzzer = CudaSearchEquivalenceFuzzer::new(&mut cx, &stream)
         .seed(0x5EED_1234)
@@ -106,8 +104,7 @@ fn llama_architecture_search_space_equivalence_fuzz() {
         .input_i32(input.id, vec![3, 17])
         .input_i32(q_pos.id, vec![1, 2])
         .input_i32(scatter_idx.id, vec![1, 2])
-        .input_i32(gather_idx.id, vec![0, 1, 2])
-        .input_f32(attn_mask.id, vec![0.0, 0.0, -1e4, 0.0, 0.0, 0.0]);
+        .input_i32(gather_idx.id, vec![0, 1, 2]);
 
     let kv_dim = config.kv_dim();
     for tensor in kv_cache.tensors() {

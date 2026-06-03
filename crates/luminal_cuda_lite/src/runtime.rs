@@ -36,8 +36,33 @@ const ARENA_ALIGNMENT: usize = 256;
 const MIN_ARENA_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
 
 pub enum CudaInput {
-    Buffer(CudaSlice<u8>),
+    Buffer { buf: CudaSlice<u8>, len: usize },
     Ptr(u64),
+}
+
+impl CudaInput {
+    fn from_bytes(stream: &Arc<CudaStream>, bytes: &[u8]) -> Self {
+        Self::from_bytes_with_capacity(stream, bytes, bytes.len())
+    }
+
+    fn from_bytes_with_capacity(stream: &Arc<CudaStream>, bytes: &[u8], capacity: usize) -> Self {
+        assert!(capacity >= bytes.len());
+        if capacity == bytes.len() {
+            return CudaInput::Buffer {
+                buf: stream.clone_htod(bytes).unwrap(),
+                len: bytes.len(),
+            };
+        }
+        let mut buf = stream.alloc_zeros::<u8>(capacity).unwrap();
+        if !bytes.is_empty() {
+            let mut view = buf.slice_mut(..bytes.len());
+            stream.memcpy_htod(bytes, &mut view).unwrap();
+        }
+        CudaInput::Buffer {
+            buf,
+            len: bytes.len(),
+        }
+    }
 }
 
 /// Executable operation in the runtime graph.
@@ -372,8 +397,8 @@ impl CudaRuntime {
 
             if let Some(hlir_node) = bucket.llir_to_hlir.get(&node) {
                 match hlir_buffers.get(hlir_node) {
-                    Some(CudaInput::Buffer(buf)) => {
-                        return Some(DeviceBuffer::new(buf.device_ptr(stream).0, buf.len()));
+                    Some(CudaInput::Buffer { buf, len }) => {
+                        return Some(DeviceBuffer::new(buf.device_ptr(stream).0, *len));
                     }
                     Some(CudaInput::Ptr(_)) => {
                         if let Some(ext) = external_buffers.get(hlir_node) {
@@ -424,9 +449,91 @@ impl CudaRuntime {
 
     pub fn set_data(&mut self, id: impl ToId, data: impl ToCudaInput) {
         let id = id.to_id();
-        let cuda_input = data.to_cuda_input(&self.cuda_stream);
+        let bytes = data.into_cuda_bytes();
+        if let Some(CudaInput::Buffer { buf, len }) = self.hlir_buffers.get_mut(&id)
+            && bytes.len() <= buf.len()
+        {
+            if !bytes.is_empty() {
+                let mut view = buf.slice_mut(..bytes.len());
+                self.cuda_stream.memcpy_htod(&bytes, &mut view).unwrap();
+            }
+            *len = bytes.len();
+            self.changed_hlir.insert(id);
+            self.external_buffers.remove(&id);
+            return;
+        }
+
+        let cuda_input = CudaInput::from_bytes(&self.cuda_stream, &bytes);
+        self.external_buffers.remove(&id);
         self.hlir_buffers.insert(id, cuda_input);
         self.changed_hlir.insert(id);
+    }
+
+    /// Allocate an owned input buffer with a caller-chosen capacity and initialize
+    /// its logical contents from `data`.
+    ///
+    /// Subsequent `update_data` calls can change the logical length and contents
+    /// without changing the device pointer as long as the new payload fits inside
+    /// `capacity_bytes`.
+    pub fn set_data_with_capacity(
+        &mut self,
+        id: impl ToId,
+        data: impl ToCudaInput,
+        capacity_bytes: usize,
+    ) {
+        let id = id.to_id();
+        let bytes = data.into_cuda_bytes();
+        assert!(
+            capacity_bytes >= bytes.len(),
+            "set_data_with_capacity capacity ({capacity_bytes}) is smaller than data length ({})",
+            bytes.len()
+        );
+        let cuda_input =
+            CudaInput::from_bytes_with_capacity(&self.cuda_stream, &bytes, capacity_bytes);
+        self.external_buffers.remove(&id);
+        self.hlir_buffers.insert(id, cuda_input);
+        self.changed_hlir.insert(id);
+    }
+
+    /// Update an existing owned input buffer in-place without changing its device
+    /// pointer. Panics if the node does not have an owned buffer or the payload
+    /// exceeds the buffer's capacity.
+    pub fn update_data(&mut self, id: impl ToId, data: impl ToCudaInput) {
+        self.try_update_data(id, data).unwrap();
+    }
+
+    /// Fallible variant of `update_data`.
+    pub fn try_update_data(&mut self, id: impl ToId, data: impl ToCudaInput) -> Result<(), String> {
+        let id = id.to_id();
+        let bytes = data.into_cuda_bytes();
+        match self.hlir_buffers.get_mut(&id) {
+            Some(CudaInput::Buffer { buf, len }) => {
+                if bytes.len() > buf.len() {
+                    return Err(format!(
+                        "update_data payload length {} exceeds input buffer capacity {} for node {:?}",
+                        bytes.len(),
+                        buf.len(),
+                        id
+                    ));
+                }
+                if !bytes.is_empty() {
+                    let mut view = buf.slice_mut(..bytes.len());
+                    self.cuda_stream.memcpy_htod(&bytes, &mut view).unwrap();
+                }
+                *len = bytes.len();
+                self.external_buffers.remove(&id);
+                self.changed_hlir.insert(id);
+                Ok(())
+            }
+            Some(CudaInput::Ptr(ptr)) => Err(format!(
+                "update_data requires an owned input buffer, but node {:?} is an external pointer 0x{ptr:x}",
+                id
+            )),
+            None => Err(format!(
+                "update_data missing input buffer for node {:?}",
+                id
+            )),
+        }
     }
 
     /// Allocate a zeroed GPU buffer for the given node. This is more efficient than
@@ -434,7 +541,13 @@ impl CudaRuntime {
     pub fn set_zeros(&mut self, id: impl ToId, num_bytes: usize) {
         let id = id.to_id();
         let buf = self.cuda_stream.alloc_zeros(num_bytes).unwrap();
-        self.hlir_buffers.insert(id, CudaInput::Buffer(buf));
+        self.hlir_buffers.insert(
+            id,
+            CudaInput::Buffer {
+                buf,
+                len: num_bytes,
+            },
+        );
         self.changed_hlir.insert(id);
     }
 
@@ -544,7 +657,11 @@ impl CudaRuntime {
                 .get(hlir_node)
                 .expect("Cannot find input tensor in runtime!")
             {
-                CudaInput::Buffer(buf) => self.cuda_stream.clone_dtoh(buf).unwrap(),
+                CudaInput::Buffer { buf, len } => {
+                    DeviceBuffer::new(buf.device_ptr(&self.cuda_stream).0, *len)
+                        .clone_dtoh(&self.cuda_stream)
+                        .unwrap()
+                }
                 CudaInput::Ptr(_) => {
                     // External device pointer — use the CudaSlice view from external_buffers
                     if let Some(ext) = self.external_buffers.get(hlir_node) {
@@ -585,8 +702,8 @@ impl CudaRuntime {
                 .get(hlir_node)
                 .expect("Cannot find input tensor in runtime!")
             {
-                CudaInput::Buffer(buf) => {
-                    DeviceBuffer::new(buf.device_ptr(&self.cuda_stream).0, buf.len())
+                CudaInput::Buffer { buf, len } => {
+                    DeviceBuffer::new(buf.device_ptr(&self.cuda_stream).0, *len)
                 }
                 CudaInput::Ptr(_) => self
                     .external_buffers
@@ -708,7 +825,7 @@ impl CudaRuntime {
                     .remove(&hlir_node)
                     .expect("Cannot find input tensor in runtime!")
                 {
-                    CudaInput::Buffer(buf) => buf,
+                    CudaInput::Buffer { buf, .. } => buf,
                     CudaInput::Ptr(p) => panic!("Cannot take raw pointer input (ptr=0x{:x})", p),
                 }
             } else {
@@ -739,7 +856,7 @@ impl CudaRuntime {
                 .remove(&hlir_node)
                 .expect("Cannot find HLIR input buffer in runtime!")
             {
-                CudaInput::Buffer(_buf) => {}
+                CudaInput::Buffer { .. } => {}
                 CudaInput::Ptr(p) => panic!("Cannot take raw pointer input (ptr=0x{:x})", p),
             }
 
@@ -752,7 +869,8 @@ impl CudaRuntime {
     /// (just a pointer swap, no GPU memcpy).
     pub fn set_buffer(&mut self, id: impl ToId, buf: CudaSlice<u8>) {
         let id = id.to_id();
-        self.hlir_buffers.insert(id, CudaInput::Buffer(buf));
+        let len = buf.len();
+        self.hlir_buffers.insert(id, CudaInput::Buffer { buf, len });
         self.changed_hlir.insert(id);
     }
 
@@ -877,13 +995,19 @@ impl CudaRuntime {
         )
         .expect("Output not in intermediate buffers");
         let input_buf = Self::copy_device_buffer_to_new_slice(&self.cuda_stream, src);
-        self.hlir_buffers
-            .insert(input_id, CudaInput::Buffer(input_buf));
+        let len = input_buf.len();
+        self.hlir_buffers.insert(
+            input_id,
+            CudaInput::Buffer {
+                buf: input_buf,
+                len,
+            },
+        );
         self.changed_hlir.insert(input_id);
 
         // Update cached pointer for the input
         let ptr = match &self.hlir_buffers[&input_id] {
-            CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
+            CudaInput::Buffer { buf, .. } => buf.device_ptr(&self.cuda_stream).0,
             CudaInput::Ptr(p) => *p,
         };
         self.compiled_buckets[bi]
@@ -1695,7 +1819,7 @@ impl CudaRuntime {
                     let llir_node = bucket.hlir_to_llir.get(hlir_node)?;
                     let input = self.hlir_buffers.get(hlir_node)?;
                     let ptr = match input {
-                        CudaInput::Buffer(buf) => buf.device_ptr(&self.cuda_stream).0,
+                        CudaInput::Buffer { buf, .. } => buf.device_ptr(&self.cuda_stream).0,
                         CudaInput::Ptr(p) => *p,
                     };
                     Some((*llir_node, ptr))
@@ -1857,86 +1981,66 @@ impl CudaRuntime {
     /// dimension values when all required input buffers are already available.
     #[tracing::instrument(skip_all)]
     pub fn prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) {
+        self.try_prebuild_graphs(dyn_map).unwrap();
+    }
+
+    fn try_prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) -> anyhow::Result<()> {
         let bucket_idx = self.active_bucket;
         self.prepare_bucket_buffers(bucket_idx, dyn_map);
         self.materialize_bucket_cuda_graphs(bucket_idx, dyn_map, true)
-            .unwrap();
     }
 }
 
 pub trait ToCudaInput {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput;
+    fn into_cuda_bytes(self) -> Vec<u8>;
+
+    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput
+    where
+        Self: Sized,
+    {
+        CudaInput::from_bytes(stream, &self.into_cuda_bytes())
+    }
 }
 
 impl ToCudaInput for &[f32] {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        bytemuck::cast_slice(self).to_vec()
     }
 }
 
 impl ToCudaInput for Vec<i32> {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        bytemuck::cast_slice(&self).to_vec()
     }
 }
 
 impl ToCudaInput for Vec<f32> {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 4)
-                })
-                .unwrap(),
-        )
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        bytemuck::cast_slice(&self).to_vec()
     }
 }
 
 impl ToCudaInput for Vec<f16> {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 2)
-                })
-                .unwrap(),
-        )
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        bytemuck::cast_slice(&self).to_vec()
     }
 }
 
 impl ToCudaInput for Vec<bf16> {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(
-            stream
-                .clone_htod(unsafe {
-                    std::slice::from_raw_parts(self.as_ptr() as *const u8, self.len() * 2)
-                })
-                .unwrap(),
-        )
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        bytemuck::cast_slice(&self).to_vec()
     }
 }
 
 impl ToCudaInput for &[u8] {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(stream.clone_htod(self).unwrap())
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        self.to_vec()
     }
 }
 
 impl ToCudaInput for Vec<u8> {
-    fn to_cuda_input(self, stream: &Arc<CudaStream>) -> CudaInput {
-        CudaInput::Buffer(stream.clone_htod(&self).unwrap())
+    fn into_cuda_bytes(self) -> Vec<u8> {
+        self
     }
 }
 
@@ -2031,6 +2135,13 @@ fn logical_interval_peak(planned: &[PlannedBuffer]) -> usize {
 }
 
 impl CudaRuntime {
+    fn invalid_profile_metric(reason: impl std::fmt::Display) -> (Duration, String) {
+        (
+            Duration::from_secs(24 * 60 * 60),
+            format!("invalid CUDA candidate: {reason}"),
+        )
+    }
+
     fn profile_loaded_llir(
         &mut self,
         llir_graph: &LLIRGraph,
@@ -2096,6 +2207,72 @@ impl CudaRuntime {
 
         (duration, display)
     }
+
+    fn try_load_llir(&mut self, llir_graph: &LLIRGraph) -> anyhow::Result<()> {
+        // Sync before clearing old data to ensure all operations complete
+        let _ = self.cuda_stream.synchronize();
+
+        // Sync after clearing all buffers to ensure CUDA resources are freed
+        if let Err(e) = self.cuda_stream.synchronize() {
+            let _ = self.cuda_stream.context().bind_to_thread();
+            if self.cuda_stream.synchronize().is_err() {
+                panic!("CUDA context unrecoverable after sync error: {e}");
+            }
+        }
+
+        // Rebind CUDA context to thread after cleanup to ensure valid state
+        let _ = self.cuda_stream.context().bind_to_thread();
+
+        let bucket = self.compile_bucket(llir_graph);
+        self.compiled_buckets = vec![bucket];
+        self.active_bucket = 0;
+        self.dim_buckets.clear();
+
+        // Mark all HLIR inputs as changed so their pointers get re-cached in execute
+        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
+
+        // Prebuild CUDA graphs if we have a previous dyn_map (e.g., from search/profile)
+        let bucket = &self.compiled_buckets[0];
+        if !bucket.last_dyn_map.is_empty() {
+            let dyn_map = bucket.last_dyn_map.clone();
+            self.try_prebuild_graphs(&dyn_map)?;
+        }
+        Ok(())
+    }
+
+    fn try_load_llir_buckets(
+        &mut self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_llirs: &[BucketLLIR],
+    ) -> anyhow::Result<()> {
+        // Sync before clearing old data
+        let _ = self.cuda_stream.synchronize();
+        let _ = self.cuda_stream.context().bind_to_thread();
+
+        self.dim_buckets = dim_buckets.clone();
+        self.compiled_buckets.clear();
+
+        let mut representative_dyn_maps = Vec::with_capacity(bucket_llirs.len());
+        for (bucket_indices, representative_dyn_map, llir) in bucket_llirs {
+            let mut bucket = self.compile_bucket(llir);
+            bucket.bucket_indices = bucket_indices.clone();
+            representative_dyn_maps.push(representative_dyn_map.clone());
+            self.compiled_buckets.push(bucket);
+        }
+        for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
+            self.prepare_bucket_buffers(idx, representative_dyn_map);
+            self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)?;
+        }
+        // The first real execution for model workloads is usually prefill, which
+        // lands in the largest/range bucket rather than the singleton decode
+        // bucket. Start there so pre-execute diagnostics and first-use setup do
+        // not touch the decode bucket's captured library graph state.
+        self.active_bucket = self.compiled_buckets.len().saturating_sub(1);
+
+        // Mark all HLIR inputs as changed so their pointers get re-cached
+        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
+        Ok(())
+    }
 }
 
 impl Runtime for CudaRuntime {
@@ -2149,34 +2326,7 @@ impl Runtime for CudaRuntime {
 
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
-        // Sync before clearing old data to ensure all operations complete
-        let _ = self.cuda_stream.synchronize();
-
-        // Sync after clearing all buffers to ensure CUDA resources are freed
-        if let Err(e) = self.cuda_stream.synchronize() {
-            let _ = self.cuda_stream.context().bind_to_thread();
-            if self.cuda_stream.synchronize().is_err() {
-                panic!("CUDA context unrecoverable after sync error: {e}");
-            }
-        }
-
-        // Rebind CUDA context to thread after cleanup to ensure valid state
-        let _ = self.cuda_stream.context().bind_to_thread();
-
-        let bucket = self.compile_bucket(llir_graph);
-        self.compiled_buckets = vec![bucket];
-        self.active_bucket = 0;
-        self.dim_buckets.clear();
-
-        // Mark all HLIR inputs as changed so their pointers get re-cached in execute
-        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
-
-        // Prebuild CUDA graphs if we have a previous dyn_map (e.g., from search/profile)
-        let bucket = &self.compiled_buckets[0];
-        if !bucket.last_dyn_map.is_empty() {
-            let dyn_map = bucket.last_dyn_map.clone();
-            self.prebuild_graphs(&dyn_map);
-        }
+        self.try_load_llir(llir_graph).unwrap();
     }
 
     fn allocate_dummy_input(&mut self, node_index: usize, num_bytes: usize) {
@@ -2187,7 +2337,13 @@ impl Runtime for CudaRuntime {
         let host_data = vec![0u8; num_bytes];
         let buf = self.cuda_stream.clone_htod(&host_data).unwrap();
         let id = NodeIndex::new(node_index);
-        self.hlir_buffers.insert(id, CudaInput::Buffer(buf));
+        self.hlir_buffers.insert(
+            id,
+            CudaInput::Buffer {
+                buf,
+                len: num_bytes,
+            },
+        );
         self.changed_hlir.insert(id);
     }
 
@@ -2278,7 +2434,9 @@ impl Runtime for CudaRuntime {
         if !self.compiled_buckets.is_empty() {
             self.active_mut().arena = None;
         }
-        self.load_llir(llir_graph);
+        if let Err(e) = self.try_load_llir(llir_graph) {
+            return Self::invalid_profile_metric(e);
+        }
         self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
     }
 
@@ -2303,7 +2461,9 @@ impl Runtime for CudaRuntime {
             bucket_context.representative_dyn_map.clone(),
             llir_graph.clone(),
         )];
-        self.load_llir_buckets(bucket_context.dim_buckets, &bucket_llirs);
+        if let Err(e) = self.try_load_llir_buckets(bucket_context.dim_buckets, &bucket_llirs) {
+            return Self::invalid_profile_metric(e);
+        }
         self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
     }
 
@@ -2522,39 +2682,13 @@ impl Runtime for CudaRuntime {
         dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) {
-        // Sync before clearing old data
-        let _ = self.cuda_stream.synchronize();
-        let _ = self.cuda_stream.context().bind_to_thread();
-
-        self.dim_buckets = dim_buckets.clone();
-        self.compiled_buckets.clear();
-
-        let mut representative_dyn_maps = Vec::with_capacity(bucket_llirs.len());
-        for (bucket_indices, representative_dyn_map, llir) in bucket_llirs {
-            let mut bucket = self.compile_bucket(llir);
-            bucket.bucket_indices = bucket_indices.clone();
-            representative_dyn_maps.push(representative_dyn_map.clone());
-            self.compiled_buckets.push(bucket);
-        }
-        for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
-            self.prepare_bucket_buffers(idx, representative_dyn_map);
-            self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)
-                .unwrap();
-        }
-        // The first real execution for model workloads is usually prefill, which
-        // lands in the largest/range bucket rather than the singleton decode
-        // bucket. Start there so pre-execute diagnostics and first-use setup do
-        // not touch the decode bucket's captured library graph state.
-        self.active_bucket = self.compiled_buckets.len().saturating_sub(1);
-
-        // Mark all HLIR inputs as changed so their pointers get re-cached
-        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
+        self.try_load_llir_buckets(dim_buckets, bucket_llirs)
+            .unwrap();
     }
 }
 
 impl CudaRuntime {
-    #[cfg(test)]
-    pub(crate) fn debug_cuda_graph_summaries(&self) -> Vec<crate::kernel::CudaGraphDebugSummary> {
+    pub fn debug_cuda_graph_summaries(&self) -> Vec<crate::kernel::CudaGraphDebugSummary> {
         self.compiled_buckets
             .get(self.active_bucket)
             .into_iter()
@@ -3262,6 +3396,66 @@ fn intersects(a: &FixedBitSet, b: &FixedBitSet) -> bool {
 #[cfg(test)]
 mod arena_plan_tests {
     use super::*;
+
+    #[test]
+    fn set_data_reuses_hlir_buffer_when_payload_fits() {
+        let mut rt = CudaRuntime::new().unwrap();
+        let input = NodeIndex::new(123);
+
+        rt.set_data(input, vec![1i32, 2, 3, 4]);
+        let (first_ptr, first_capacity, first_len) = match rt.hlir_buffers.get(&input).unwrap() {
+            CudaInput::Buffer { buf, len } => (buf.device_ptr(&rt.cuda_stream).0, buf.len(), *len),
+            CudaInput::Ptr(_) => panic!("set_data must create an owned CUDA buffer"),
+        };
+        assert_eq!(first_capacity, 16);
+        assert_eq!(first_len, 16);
+
+        rt.set_data(input, vec![9i32, 8]);
+        let (second_ptr, second_capacity, second_len) = match rt.hlir_buffers.get(&input).unwrap() {
+            CudaInput::Buffer { buf, len } => (buf.device_ptr(&rt.cuda_stream).0, buf.len(), *len),
+            CudaInput::Ptr(_) => panic!("set_data must keep an owned CUDA buffer"),
+        };
+
+        assert_eq!(second_ptr, first_ptr);
+        assert_eq!(second_capacity, first_capacity);
+        assert_eq!(second_len, 8);
+
+        let bytes = DeviceBuffer::new(second_ptr, second_len)
+            .clone_dtoh(&rt.cuda_stream)
+            .unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, i32>(&bytes), &[9, 8]);
+    }
+
+    #[test]
+    fn update_data_mutates_reserved_hlir_buffer_in_place() {
+        let mut rt = CudaRuntime::new().unwrap();
+        let input = NodeIndex::new(124);
+
+        rt.set_data_with_capacity(input, vec![1i32, 2], 16);
+        let first_ptr = match rt.hlir_buffers.get(&input).unwrap() {
+            CudaInput::Buffer { buf, len } => {
+                assert_eq!(buf.len(), 16);
+                assert_eq!(*len, 8);
+                buf.device_ptr(&rt.cuda_stream).0
+            }
+            CudaInput::Ptr(_) => panic!("set_data_with_capacity must create an owned buffer"),
+        };
+
+        rt.update_data(input, vec![3i32, 4, 5, 6]);
+        let (second_ptr, second_len) = match rt.hlir_buffers.get(&input).unwrap() {
+            CudaInput::Buffer { buf, len } => (buf.device_ptr(&rt.cuda_stream).0, *len),
+            CudaInput::Ptr(_) => panic!("update_data must keep an owned buffer"),
+        };
+        assert_eq!(second_ptr, first_ptr);
+        assert_eq!(second_len, 16);
+
+        let bytes = DeviceBuffer::new(second_ptr, second_len)
+            .clone_dtoh(&rt.cuda_stream)
+            .unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, i32>(&bytes), &[3, 4, 5, 6]);
+
+        assert!(rt.try_update_data(input, vec![0i32; 5]).is_err());
+    }
 
     #[test]
     fn fixed_arena_slot_refresh_grows_capacity_without_reassigning_slots() {

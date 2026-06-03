@@ -2,6 +2,7 @@ use luminal::{
     dtype::DType,
     graph::Graph,
     prelude::{F32Pow, GraphTensor},
+    shape::Expression,
 };
 use luminal_nn::{LayerNorm, gather_rows, scatter_rows};
 
@@ -133,7 +134,6 @@ impl Llama {
         q_pos: GraphTensor,
         scatter_idx: GraphTensor,
         gather_idx: GraphTensor,
-        attn_mask: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         let mut x = token_embedding(self.embedding, input, self.config.hidden);
@@ -144,7 +144,6 @@ impl Llama {
                 q_pos,
                 scatter_idx,
                 gather_idx,
-                attn_mask,
                 kv_cache.k_caches[i],
                 kv_cache.v_caches[i],
             );
@@ -279,7 +278,6 @@ impl LlamaLayer {
         q_pos: GraphTensor,
         scatter_idx: GraphTensor,
         gather_idx: GraphTensor,
-        attn_mask: GraphTensor,
         k_cache: GraphTensor,
         v_cache: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
@@ -300,7 +298,7 @@ impl LlamaLayer {
                 v_cache,
                 scatter_idx,
                 gather_idx,
-                attn_mask,
+                q_pos,
             },
             self.config,
         );
@@ -486,7 +484,7 @@ struct AttentionInputs {
     v_cache: GraphTensor,
     scatter_idx: GraphTensor,
     gather_idx: GraphTensor,
-    attn_mask: GraphTensor,
+    q_pos: GraphTensor,
 }
 
 fn attention(
@@ -498,7 +496,7 @@ fn attention(
         v_cache,
         scatter_idx,
         gather_idx,
-        attn_mask,
+        q_pos,
     }: AttentionInputs,
     config: LlamaConfig,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
@@ -519,6 +517,14 @@ fn attention(
     let v_ctx = v_ctx.expand_dim(1, config.kv_groups).merge_dims(0, 1) * 1.0;
 
     let scores = q.matmul(k) / (config.head_dim as f32).sqrt();
+    let ctx = Expression::from('c');
+    let causal_square = scores.graph().triu(ctx, 1).cast(DType::F32) * -1e10;
+    let row_offsets = (q_pos * ctx).expand_dim(1, ctx);
+    let col_offsets = scores
+        .graph()
+        .arange(ctx)
+        .expand_dim(0, Expression::from('s'));
+    let attn_mask = causal_square.gather(row_offsets + col_offsets);
     let masked_scores = scores + attn_mask.expand_dim(0, config.n_heads());
     let weights = masked_scores.softmax(2);
     let out = weights.matmul(v_ctx);

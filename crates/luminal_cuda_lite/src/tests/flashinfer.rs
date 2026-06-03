@@ -13,7 +13,9 @@
 use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{CudaStream, DevicePtr};
-use luminal::egglog_utils::{hlir_to_egglog, run_egglog};
+use luminal::egglog_utils::{
+    hlir_to_egglog, run_egglog, run_egglog_with_late_passes_and_interval_analysis,
+};
 use luminal::op::{EgglogOp, IntoEgglogOp};
 use luminal::prelude::*;
 
@@ -100,18 +102,6 @@ fn run_reference_attention(
 
 // ─── Direct FlashInfer driver ────────────────────────────────────────────
 
-fn build_flat_gather_idx(kv_indices: &[i32]) -> Vec<i32> {
-    let c = kv_indices.len();
-    let mut flat = Vec::with_capacity(c * KV_DIM);
-    for &slot in kv_indices {
-        let base = slot * KV_DIM as i32;
-        for j in 0..KV_DIM as i32 {
-            flat.push(base + j);
-        }
-    }
-    flat
-}
-
 fn transpose_hbd_to_bhd(data: &[f32], heads: usize, batch: usize, dim: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; data.len()];
     for h in 0..heads {
@@ -150,9 +140,7 @@ fn run_flashinfer(
     let q_buf = copy_to_dev(stream, q);
     let k_buf = copy_to_dev(stream, k_cache);
     let v_buf = copy_to_dev(stream, v_cache);
-    let flat_idx = build_flat_gather_idx(kv_indices);
-    let flat_idx_buf = copy_to_dev(stream, &flat_idx);
-    let mask_buf = alloc_dev(stream, 4); // unused but reserved
+    let idx_buf = copy_to_dev(stream, kv_indices);
     let qo_indptr: Vec<i32> = (0..=batch_size as i32).collect();
     let qo_indptr_buf = copy_to_dev(stream, &qo_indptr);
     let kv_indptr_buf = copy_to_dev(stream, kv_indptr);
@@ -168,30 +156,28 @@ fn run_flashinfer(
     };
 
     // Reserve dedicated NodeIndex values for the test ports.
-    let nodes: Vec<NodeIndex> = (0..8).map(NodeIndex::new).collect();
-    let (q_n, k_n, v_n, idx_n, mask_n, qo_n, kv_n, out_n) = (
-        nodes[0], nodes[1], nodes[2], nodes[3], nodes[4], nodes[5], nodes[6], nodes[7],
+    let nodes: Vec<NodeIndex> = (0..7).map(NodeIndex::new).collect();
+    let (q_n, k_n, v_n, idx_n, qo_n, kv_n, out_n) = (
+        nodes[0], nodes[1], nodes[2], nodes[3], nodes[4], nodes[5], nodes[6],
     );
 
     let mut buffers = FxHashMap::default();
     let q_ptr = q_buf.device_ptr(stream).0;
     let k_ptr = k_buf.device_ptr(stream).0;
     let v_ptr = v_buf.device_ptr(stream).0;
-    let idx_ptr = flat_idx_buf.device_ptr(stream).0;
-    let mask_ptr = mask_buf.device_ptr(stream).0;
+    let idx_ptr = idx_buf.device_ptr(stream).0;
     let qo_ptr = qo_indptr_buf.device_ptr(stream).0;
     let kv_ptr = kv_indptr_buf.device_ptr(stream).0;
     let out_ptr = out_buf.device_ptr(stream).0;
     buffers.insert(q_n, DeviceBuffer::new(q_ptr, q.len() * 4));
     buffers.insert(k_n, DeviceBuffer::new(k_ptr, k_cache.len() * 4));
     buffers.insert(v_n, DeviceBuffer::new(v_ptr, v_cache.len() * 4));
-    buffers.insert(idx_n, DeviceBuffer::new(idx_ptr, flat_idx.len() * 4));
-    buffers.insert(mask_n, DeviceBuffer::new(mask_ptr, 4));
+    buffers.insert(idx_n, DeviceBuffer::new(idx_ptr, kv_indices.len() * 4));
     buffers.insert(qo_n, DeviceBuffer::new(qo_ptr, qo_indptr.len() * 4));
     buffers.insert(kv_n, DeviceBuffer::new(kv_ptr, kv_indptr.len() * 4));
     buffers.insert(out_n, DeviceBuffer::new(out_ptr, batch_size * HIDDEN * 4));
 
-    let inputs = [q_n, k_n, v_n, idx_n, mask_n, qo_n, kv_n];
+    let inputs = [q_n, k_n, v_n, idx_n, qo_n, kv_n];
 
     let mut dyn_map = FxHashMap::default();
     dyn_map.insert('s', batch_size);
@@ -215,6 +201,96 @@ fn run_flashinfer(
         Vec::from_raw_parts(bytes.as_mut_ptr() as *mut f32, len, len)
     };
     transpose_hbd_to_bhd(&raw, N_HEADS, batch_size, HEAD_DIM)
+}
+
+fn run_flashinfer_with_compact_decode_indices(
+    stream: &Arc<CudaStream>,
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    kv_indices: &[i32],
+) -> Vec<f32> {
+    let batch_size = q.len() / HIDDEN;
+    let q_buf = copy_to_dev(stream, q);
+    let k_buf = copy_to_dev(stream, k_cache);
+    let v_buf = copy_to_dev(stream, v_cache);
+    let idx_buf = copy_to_dev(stream, kv_indices);
+    let out_buf = alloc_dev(stream, batch_size * HIDDEN * 4);
+
+    let fi = FlashInferAttention {
+        num_qo_heads: N_HEADS,
+        num_kv_heads: N_KV_HEADS,
+        head_dim: HEAD_DIM,
+        page_size: 1,
+        batch_dim: Expression::from('s'),
+        plan_info: Mutex::new(Vec::new()),
+    };
+
+    let nodes: Vec<NodeIndex> = (0..5).map(NodeIndex::new).collect();
+    let (q_n, k_n, v_n, idx_n, out_n) = (nodes[0], nodes[1], nodes[2], nodes[3], nodes[4]);
+
+    let mut buffers = FxHashMap::default();
+    let q_ptr = q_buf.device_ptr(stream).0;
+    let k_ptr = k_buf.device_ptr(stream).0;
+    let v_ptr = v_buf.device_ptr(stream).0;
+    let idx_ptr = idx_buf.device_ptr(stream).0;
+    let out_ptr = out_buf.device_ptr(stream).0;
+    buffers.insert(q_n, DeviceBuffer::new(q_ptr, q.len() * 4));
+    buffers.insert(k_n, DeviceBuffer::new(k_ptr, k_cache.len() * 4));
+    buffers.insert(v_n, DeviceBuffer::new(v_ptr, v_cache.len() * 4));
+    buffers.insert(idx_n, DeviceBuffer::new(idx_ptr, kv_indices.len() * 4));
+    buffers.insert(out_n, DeviceBuffer::new(out_ptr, batch_size * HIDDEN * 4));
+
+    let inputs = [q_n, k_n, v_n, idx_n];
+
+    let mut dyn_map = FxHashMap::default();
+    dyn_map.insert('s', batch_size);
+    dyn_map.insert('c', kv_indices.len());
+
+    fi.execute(stream, out_n, &inputs, &buffers, &dyn_map)
+        .expect("FlashInferAttention compact-index execute failed");
+    stream.synchronize().unwrap();
+
+    let mut out_bytes = vec![0u8; batch_size * HIDDEN * 4];
+    unsafe {
+        cudarc::driver::result::memcpy_dtoh_async(&mut out_bytes, out_ptr, stream.cu_stream())
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let raw: Vec<f32> = unsafe {
+        let mut bytes = std::mem::ManuallyDrop::new(out_bytes);
+        let len = bytes.len() / 4;
+        Vec::from_raw_parts(bytes.as_mut_ptr() as *mut f32, len, len)
+    };
+    transpose_hbd_to_bhd(&raw, N_HEADS, batch_size, HEAD_DIM)
+}
+
+fn resolve_flashinfer_decode_for_signature_test(
+    context_len: usize,
+    cache_slots: usize,
+) -> crate::host::flashinfer::FlashInferResolvedDecode {
+    let fi = FlashInferAttention {
+        num_qo_heads: N_HEADS,
+        num_kv_heads: N_KV_HEADS,
+        head_dim: HEAD_DIM,
+        page_size: 1,
+        batch_dim: Expression::from('s'),
+        plan_info: Mutex::new(Vec::new()),
+    };
+    let nodes: Vec<NodeIndex> = (0..5).map(NodeIndex::new).collect();
+    let (q_n, k_n, v_n, idx_n, out_n) = (nodes[0], nodes[1], nodes[2], nodes[3], nodes[4]);
+    let mut buffers = FxHashMap::default();
+    buffers.insert(q_n, DeviceBuffer::new(0x1000, HIDDEN * 4));
+    buffers.insert(k_n, DeviceBuffer::new(0x2000, cache_slots * KV_DIM * 4));
+    buffers.insert(v_n, DeviceBuffer::new(0x3000, cache_slots * KV_DIM * 4));
+    buffers.insert(idx_n, DeviceBuffer::new(0x4000, cache_slots * 4));
+    buffers.insert(out_n, DeviceBuffer::new(0x6000, HIDDEN * 4));
+
+    let mut dyn_map = FxHashMap::default();
+    dyn_map.insert('s', 1);
+    dyn_map.insert('c', context_len);
+    fi.resolve_for_graph(out_n, &[q_n, k_n, v_n, idx_n], &buffers, &dyn_map)
+        .unwrap()
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -279,10 +355,27 @@ fn flashinfer_egg_rule_parses() {
 fn flashinfer_op_sort_shape() {
     let op = FlashInferAttention::default();
     let s = op.sort();
-    // 5 params, n_inputs=5 (mask, indptrs appended later in extract())
+    // The egglog proof node still has 5 structural inputs; extract() lowers
+    // it to 4 runtime inputs by dropping mask and compacting gather_idx.
     assert_eq!(op.n_inputs(), 5);
     let dbg = format!("{:?}", s);
     assert!(dbg.contains("FlashInferAttention"));
+}
+
+#[test]
+fn flashinfer_graph_signature_is_stable_when_c_moves_within_capacity() {
+    let resolved_c4 = resolve_flashinfer_decode_for_signature_test(4, 2048);
+    let plan_c = resolved_c4.graph_plan_capacity(None);
+    let sig_c4 = resolved_c4.signature_for_graph_plan(plan_c);
+
+    let resolved_c5 = resolve_flashinfer_decode_for_signature_test(5, 2048);
+    let sig_c5 =
+        resolved_c5.signature_for_graph_plan(resolved_c5.graph_plan_capacity(Some(plan_c)));
+
+    assert_eq!(
+        sig_c4, sig_c5,
+        "derived FlashInfer decode graph signature should not change when only current c changes within the planned capacity"
+    );
 }
 
 // ─── Layer 3: FlashInfer kernel correctness ──────────────────────────────
@@ -390,6 +483,22 @@ fn flashinfer_noncontiguous_page_table() {
     assert_close(&result, &expected, 1e-4, 1e-5);
 }
 
+#[test]
+fn flashinfer_compact_decode_indices_match_reference() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let batch_size = 1;
+    let context_len = 3;
+    let q = deterministic_f32(batch_size * HIDDEN, 0.017, 0.1);
+    let k = deterministic_f32(context_len * KV_DIM, 0.023, 0.1);
+    let v = deterministic_f32(context_len * KV_DIM, 0.037, 0.1);
+    let expected = run_reference_attention(&stream, &q, &k, &v, batch_size, context_len);
+    let kv_indices: Vec<i32> = (0..context_len as i32).collect();
+    let result = run_flashinfer_with_compact_decode_indices(&stream, &q, &k, &v, &kv_indices);
+    assert_close(&result, &expected, 1e-4, 1e-5);
+}
+
 // ─── Layer 3b: HEAD_DIM 128 path (validates the head-dim JIT dispatch) ────
 //
 // Each FlashInfer .so is compiled for one HEAD_DIM. JIT caches by head dim;
@@ -456,6 +565,29 @@ fn test_compute_attn_mask(
     allowed * 1e10 - 1e10
 }
 
+fn test_compute_triu_gather_mask(
+    graph: &mut Graph,
+    q_pos: GraphTensor,
+    c: Expression,
+) -> GraphTensor {
+    let s = q_pos.dims1();
+    let causal_square = graph.triu(c, 1).cast(luminal::dtype::DType::F32) * -1e10;
+    let row_offsets = (q_pos * c).expand_dim(1, c);
+    let col_offsets = graph.arange(c).expand_dim(0, s);
+    causal_square.gather(row_offsets + col_offsets)
+}
+
+fn test_compute_direct_causal_mask(
+    graph: &mut Graph,
+    q_pos: GraphTensor,
+    c: Expression,
+) -> GraphTensor {
+    let s = q_pos.dims1();
+    let q_pos = q_pos.expand_dim(1, c);
+    let col = graph.arange(c).expand_dim(0, s);
+    q_pos.lt(col).cast(luminal::dtype::DType::F32) * -1e10
+}
+
 fn gather_rows(data: GraphTensor, indices: GraphTensor, d: usize) -> GraphTensor {
     let n = indices.dims1();
     let base = (indices * d).expand_dim(1, d);
@@ -479,6 +611,7 @@ fn scatter_rows(
 /// alongside the graph so the GA-selection test can `set_data` on each one.
 #[allow(dead_code)]
 struct PagedAttnHandles {
+    attn_out: GraphTensor,
     q_rope: GraphTensor,
     k_rope: GraphTensor,
     v_new: GraphTensor,
@@ -491,6 +624,43 @@ struct PagedAttnHandles {
     kv_indptr: GraphTensor,
 }
 
+#[derive(Clone, Copy)]
+enum TestMaskKind {
+    Indptr,
+    TriuGather,
+    DirectCausal,
+}
+
+#[derive(Clone, Copy)]
+enum TestCacheProvenance {
+    Raw,
+    LoopInput { loop_id: usize, stream_id: usize },
+}
+
+fn cache_dest_with_provenance(
+    graph: &mut Graph,
+    cache: GraphTensor,
+    alt_name: &str,
+    kv_dim: usize,
+    provenance: TestCacheProvenance,
+) -> GraphTensor {
+    match provenance {
+        TestCacheProvenance::Raw => cache,
+        TestCacheProvenance::LoopInput { loop_id, stream_id } => {
+            let alt = graph.named_tensor(alt_name, (2048, kv_dim)).persist();
+            let id = graph.add_op(
+                luminal::hlir::LoopInput {
+                    loop_id,
+                    stream_id,
+                    dtype: cache.dtype,
+                },
+                &[cache.id, alt.id],
+            );
+            GraphTensor::from_id(id, cache.shape.contiguous(), graph, cache.dtype)
+        }
+    }
+}
+
 /// Build a full paged-attention HLIR graph with the structural anchors the
 /// FlashInfer egglog rule looks for: scatter into a 2D cache, gather rows out
 /// by index, GQA broadcast via `Mul(..., 1.0)` with zero strides, Q*K^T → Sum
@@ -499,6 +669,33 @@ fn build_paged_attention_graph(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+) -> (Graph, PagedAttnHandles) {
+    build_paged_attention_graph_with_mask(n_heads, n_kv_heads, head_dim, TestMaskKind::Indptr)
+}
+
+fn build_paged_attention_graph_with_mask(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mask_kind: TestMaskKind,
+) -> (Graph, PagedAttnHandles) {
+    build_paged_attention_graph_with_mask_and_cache_provenance(
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        mask_kind,
+        TestCacheProvenance::Raw,
+        TestCacheProvenance::Raw,
+    )
+}
+
+fn build_paged_attention_graph_with_mask_and_cache_provenance(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mask_kind: TestMaskKind,
+    k_provenance: TestCacheProvenance,
+    v_provenance: TestCacheProvenance,
 ) -> (Graph, PagedAttnHandles) {
     let kv_groups = n_heads / n_kv_heads;
     let kv_dim = n_kv_heads * head_dim;
@@ -527,14 +724,21 @@ fn build_paged_attention_graph(
         .named_tensor("kv_indptr", 'r')
         .as_dtype(luminal::dtype::DType::Int);
 
-    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, kv_dim);
-    let v_cache_out = scatter_rows(v_new, scatter_idx, v_cache, kv_dim);
+    let k_dest = cache_dest_with_provenance(&mut cx, k_cache, "k_cache_alt", kv_dim, k_provenance);
+    let v_dest = cache_dest_with_provenance(&mut cx, v_cache, "v_cache_alt", kv_dim, v_provenance);
+
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_dest, kv_dim);
+    let v_cache_out = scatter_rows(v_new, scatter_idx, v_dest, kv_dim);
 
     let k = gather_rows(k_cache_out, gather_idx, kv_dim);
     let v_ctx = gather_rows(v_cache_out, gather_idx, kv_dim);
 
     let c: Expression = 'c'.into();
-    let attn_mask = test_compute_attn_mask(&mut cx, q_pos, qo_indptr, kv_indptr, c);
+    let attn_mask = match mask_kind {
+        TestMaskKind::Indptr => test_compute_attn_mask(&mut cx, q_pos, qo_indptr, kv_indptr, c),
+        TestMaskKind::TriuGather => test_compute_triu_gather_mask(&mut cx, q_pos, c),
+        TestMaskKind::DirectCausal => test_compute_direct_causal_mask(&mut cx, q_pos, c),
+    };
 
     let q = (q_rope * 1.0).split_dims(1, head_dim).transpose(0, 1);
     let k = k.split_dims(1, head_dim).permute((1, 2, 0));
@@ -549,13 +753,14 @@ fn build_paged_attention_graph(
     let out = weights.matmul(v_ctx);
     let attn_out = out.transpose(0, 1).merge_dims(1, 2);
 
-    attn_out.output();
+    let attn_out = attn_out.output();
     k_cache_out.output();
     v_cache_out.output();
 
     (
         cx,
         PagedAttnHandles {
+            attn_out,
             q_rope,
             k_rope,
             v_new,
@@ -573,13 +778,41 @@ fn build_paged_attention_graph(
 /// Saturate egglog on the graph and report whether a FlashInferAttention
 /// e-node was produced. Helper used by the rule-firing tests.
 fn saturate_and_has_flashinfer(cx: &Graph) -> (bool, Vec<String>) {
+    saturate_and_has_flashinfer_inner(cx, None)
+}
+
+fn saturate_and_has_flashinfer_with_decode_interval(cx: &Graph) -> (bool, Vec<String>) {
+    saturate_and_has_flashinfer_with_s_interval(cx, 1, 1)
+}
+
+fn saturate_and_has_flashinfer_with_s_interval(
+    cx: &Graph,
+    s_min: i64,
+    s_max: i64,
+) -> (bool, Vec<String>) {
+    saturate_and_has_flashinfer_inner(cx, Some((s_min, s_max)))
+}
+
+fn saturate_and_has_flashinfer_inner(
+    cx: &Graph,
+    s_interval: Option<(i64, i64)>,
+) -> (bool, Vec<String>) {
     let (program, root) = hlir_to_egglog(cx);
     let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
     ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
     // cleanup=false: keep every saturation-introduced e-node so we can inspect
     // whether the FlashInferAttention rule produced a node, regardless of
     // whether downstream extraction would have pruned it.
-    let egraph = run_egglog(&program, &root, &ops, false).expect("egglog failed");
+    let egraph = if let Some((s_min, s_max)) = s_interval {
+        let mut intervals = luminal::prelude::FxHashMap::default();
+        intervals.insert('s', luminal::shape::DimInterval::new(s_min, s_max));
+        let interval_facts = luminal::egglog_utils::base::interval_facts_egglog(&intervals, []);
+        let program = format!("{interval_facts}\n{program}");
+        run_egglog_with_late_passes_and_interval_analysis(&program, &root, &ops, false, &[], true)
+            .expect("egglog failed")
+    } else {
+        run_egglog(&program, &root, &ops, false).expect("egglog failed")
+    };
 
     let has_flashinfer = egraph
         .enodes
@@ -681,7 +914,7 @@ fn flashinfer_dump_paged_attn_egglog() {
 fn flashinfer_rule_does_not_fire_on_bare_attention() {
     // Dense attention without paged gather + cache should NOT match.
     let (cx, _, _, _, _) = build_attention_graph();
-    let (has_flashinfer, _) = saturate_and_has_flashinfer(&cx);
+    let (has_flashinfer, _) = saturate_and_has_flashinfer_with_decode_interval(&cx);
     assert!(
         !has_flashinfer,
         "FlashInferAttention should NOT fire on bare attention (no gather/cache)"
@@ -714,10 +947,33 @@ fn flashinfer_rule_does_not_fire_on_unrelated_matmuls() {
     let abc = ab.softmax(1).matmul(c_tensor.t());
     abc.output();
 
-    let (has_flashinfer, _) = saturate_and_has_flashinfer(&cx);
+    let (has_flashinfer, _) = saturate_and_has_flashinfer_with_decode_interval(&cx);
     assert!(
         !has_flashinfer,
         "FlashInferAttention should NOT fire on unrelated matmuls + Gather"
+    );
+}
+
+#[test]
+fn flashinfer_rule_rejects_mixed_cache_provenance() {
+    // Regression for decode loop rolling: K and V can be shape-compatible even
+    // when one cache update is from the rolled loop body and the other is from
+    // the remaining unrolled layer. That is not one semantic attention op.
+    let (cx, _) = build_paged_attention_graph_with_mask_and_cache_provenance(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+        TestCacheProvenance::LoopInput {
+            loop_id: 7,
+            stream_id: 0,
+        },
+        TestCacheProvenance::Raw,
+    );
+    let (has_flashinfer, _) = saturate_and_has_flashinfer_with_decode_interval(&cx);
+    assert!(
+        !has_flashinfer,
+        "FlashInferAttention should NOT fire when K and V cache updates come from different loop provenance"
     );
 }
 
@@ -730,6 +986,196 @@ fn flashinfer_rule_fires_on_full_paged_attention() {
         has_flashinfer,
         "FlashInferAttention was NOT found in the e-graph (Llama-shaped paged attention). \
          OpKinds present: {op_kinds:?}"
+    );
+}
+
+#[test]
+fn flashinfer_rule_fires_on_same_rolled_cache_provenance() {
+    let (cx, _) = build_paged_attention_graph_with_mask_and_cache_provenance(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+        TestCacheProvenance::LoopInput {
+            loop_id: 7,
+            stream_id: 0,
+        },
+        TestCacheProvenance::LoopInput {
+            loop_id: 7,
+            stream_id: 1,
+        },
+    );
+    let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
+    assert!(
+        has_flashinfer,
+        "FlashInferAttention should fire when K and V cache updates come from the same rolled loop. \
+         OpKinds present: {op_kinds:?}"
+    );
+}
+
+#[test]
+fn flashinfer_rule_fires_on_triu_gather_causal_mask() {
+    let (cx, _) = build_paged_attention_graph_with_mask(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+    );
+    let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
+    assert!(
+        has_flashinfer,
+        "FlashInferAttention was NOT found for triu-gather causal mask. \
+         OpKinds present: {op_kinds:?}"
+    );
+}
+
+#[test]
+fn flashinfer_rule_fires_on_direct_causal_mask() {
+    let (cx, _) = build_paged_attention_graph_with_mask(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::DirectCausal,
+    );
+    let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
+    assert!(
+        has_flashinfer,
+        "FlashInferAttention was NOT found for direct q_pos/arange causal mask. \
+         OpKinds present: {op_kinds:?}"
+    );
+}
+
+#[test]
+fn flashinfer_derived_causal_rule_rejects_prefill_bucket() {
+    let (cx, _) = build_paged_attention_graph_with_mask(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+    );
+    let (has_flashinfer, _) = saturate_and_has_flashinfer_with_s_interval(&cx, 2, 64);
+    assert!(
+        !has_flashinfer,
+        "derived causal FlashInferAttention should not fire in a prefill bucket; fp32 FlashInfer prefill is not implemented"
+    );
+}
+
+#[test]
+fn cuda_graph_captures_flashinfer_decode_island() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let batch_size = 1;
+    let context_len = 4;
+    let (mut cx, handles) = build_paged_attention_graph_with_mask(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+    );
+    cx.set_dim('s', batch_size);
+    cx.set_dim('c', context_len);
+    cx.set_dim_interval('s', 1, 1);
+
+    let llir = extract_forced_flashinfer_llir(&mut cx, "cuda graph FlashInfer decode");
+
+    let q = deterministic_f32(batch_size * HIDDEN, 0.071, 0.1);
+    let k = deterministic_f32(context_len * KV_DIM, 0.073, 0.1);
+    let v = deterministic_f32(context_len * KV_DIM, 0.079, 0.1);
+    let expected = run_reference_attention(&stream, &q, &k, &v, batch_size, context_len);
+
+    let mut k_cache = vec![0.0f32; 2048 * KV_DIM];
+    let mut v_cache = vec![0.0f32; 2048 * KV_DIM];
+    k_cache[..context_len * KV_DIM].copy_from_slice(&k);
+    v_cache[..context_len * KV_DIM].copy_from_slice(&v);
+
+    let q_dev = stream.clone_htod(q.as_slice()).unwrap();
+    let q_ptr = q_dev.device_ptr(&stream).0;
+    let gather_dev = stream
+        .clone_htod(&(0..context_len as i32).collect::<Vec<_>>())
+        .unwrap();
+    let gather_ptr = gather_dev.device_ptr(&stream).0;
+
+    let mut rt = CudaRuntime::initialize(stream.clone());
+    rt.load_llir(&llir);
+    unsafe {
+        rt.set_device_ptr(handles.q_rope, q_ptr, q.len() * 4);
+    }
+    rt.set_data(
+        handles.k_rope,
+        k[(context_len - 1) * KV_DIM..context_len * KV_DIM].to_vec(),
+    );
+    rt.set_data(
+        handles.v_new,
+        v[(context_len - 1) * KV_DIM..context_len * KV_DIM].to_vec(),
+    );
+    rt.set_data(handles.k_cache, k_cache);
+    rt.set_data(handles.v_cache, v_cache);
+    rt.set_data(handles.scatter_idx, vec![(context_len - 1) as i32]);
+    unsafe {
+        rt.set_device_ptr(handles.gather_idx, gather_ptr, context_len * 4);
+    }
+    rt.set_data(handles.q_pos, vec![(context_len - 1) as i32]);
+
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_f32(handles.attn_out.id);
+    assert_close(&result, &expected, 1e-4, 1e-5);
+
+    let summaries = rt.debug_cuda_graph_summaries();
+    let summary = summaries
+        .iter()
+        .find(|summary| summary.n_flashinfer == 1)
+        .expect("expected one CudaGraphOp to capture the FlashInfer decode island");
+    assert_eq!(summary.absorbed_host_nodes.len(), 1);
+    assert_eq!(
+        summary.n_steps,
+        summary.n_kernels + summary.n_cublaslt + summary.n_flashinfer
+    );
+    let standalone_flashinfer = rt
+        .host_ops()
+        .into_iter()
+        .filter(|op| op.stats_name() == Some("FlashInferAttention"))
+        .count();
+    assert_eq!(standalone_flashinfer, 0);
+
+    let context_len_2 = 3;
+    cx.set_dim('c', context_len_2);
+    let expected2 = run_reference_attention(
+        &stream,
+        &q,
+        &k[..context_len_2 * KV_DIM],
+        &v[..context_len_2 * KV_DIM],
+        batch_size,
+        context_len_2,
+    );
+    rt.set_data(
+        handles.k_rope,
+        k[(context_len_2 - 1) * KV_DIM..context_len_2 * KV_DIM].to_vec(),
+    );
+    rt.set_data(
+        handles.v_new,
+        v[(context_len_2 - 1) * KV_DIM..context_len_2 * KV_DIM].to_vec(),
+    );
+    rt.set_data(handles.scatter_idx, vec![(context_len_2 - 1) as i32]);
+    unsafe {
+        rt.set_device_ptr(handles.q_rope, q_ptr, q.len() * 4);
+        rt.set_device_ptr(handles.gather_idx, gather_ptr, context_len_2 * 4);
+    }
+    rt.set_data(handles.q_pos, vec![(context_len_2 - 1) as i32]);
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(handles.attn_out.id), &expected2, 1e-4, 1e-5);
+
+    let summary_after_c_change = rt
+        .debug_cuda_graph_summaries()
+        .into_iter()
+        .find(|summary| summary.n_flashinfer == 1)
+        .expect("expected FlashInfer decode island to remain in a CudaGraphOp");
+    assert_eq!(
+        summary_after_c_change.flashinfer_recapture_counts,
+        vec![0],
+        "changing only c within the planned decode capacity should update device metadata, not recapture FlashInfer"
     );
 }
 
@@ -838,5 +1284,85 @@ fn flashinfer_extraction_reachable_from_search_space() {
     assert!(
         found,
         "FlashInferAttention extraction not reachable from search space after 50 generations"
+    );
+}
+
+fn flashinfer_ir_nodes(egraph: &luminal::egglog_utils::SerializedEGraph) -> Vec<&ENodeId> {
+    let op_kind_classes = egraph
+        .enodes
+        .iter()
+        .filter(|(_, (label, _))| label == "FlashInferAttention")
+        .map(|(node, _)| egraph.node_to_class[node].clone())
+        .collect::<Vec<_>>();
+
+    egraph
+        .enodes
+        .iter()
+        .filter_map(|(node, (label, children))| {
+            (label == "Op"
+                && children
+                    .first()
+                    .is_some_and(|kind| op_kind_classes.contains(kind)))
+            .then_some(node)
+        })
+        .collect()
+}
+
+fn extract_forced_flashinfer_llir(cx: &mut Graph, case_name: &str) -> LLIRGraph {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    let ops = cx
+        .egglog_ops()
+        .expect("search space should have registered egglog ops");
+    let flashinfer_nodes = flashinfer_ir_nodes(egraph);
+    assert!(
+        !flashinfer_nodes.is_empty(),
+        "expected a FlashInferAttention rewrite candidate for {case_name}"
+    );
+
+    let mut last_error = None;
+    for (idx, flashinfer_node) in flashinfer_nodes.iter().enumerate() {
+        let mut rng = StdRng::seed_from_u64(0xF1A5_0000 + idx as u64);
+        let mut choices = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
+        let flashinfer_class = &egraph.node_to_class[*flashinfer_node];
+        choices.insert(flashinfer_class, flashinfer_node);
+
+        if let Err(err) = luminal::egglog_utils::validate_choice_set(egraph, &choices, ops) {
+            last_error = Some(err);
+            continue;
+        }
+
+        let mut list_cache = FxHashMap::default();
+        let mut expr_cache = FxHashMap::default();
+        let llir = luminal::egglog_utils::egglog_to_llir(
+            egraph,
+            choices,
+            ops,
+            &cx.custom_ops,
+            &mut list_cache,
+            &mut expr_cache,
+            None,
+        );
+
+        let has_flashinfer = llir.node_indices().any(|n| {
+            llir[n]
+                .to_dialect::<dyn HostOp>()
+                .and_then(|op| op.stats_name())
+                == Some("FlashInferAttention")
+        });
+        if has_flashinfer {
+            return llir;
+        }
+
+        last_error = Some("forced FlashInfer candidate did not extract to HostOp".into());
+    }
+
+    panic!(
+        "expected to extract FlashInferAttention for {case_name}; last error: {}",
+        last_error.unwrap_or_else(|| "no candidate could be forced".into())
     );
 }
