@@ -1520,10 +1520,6 @@ impl Graph {
                 .max(10_000);
 
             loop {
-                if search_time_limit_reached() {
-                    panic!("Failed to find a viable initial genome before search time limit");
-                }
-
                 let mut generation = random_choice_generation(egraph, 1, &mut prev_selected, rng);
                 let Some(genome) = generation.pop() else {
                     panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());

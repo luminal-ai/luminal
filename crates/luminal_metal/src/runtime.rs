@@ -3,7 +3,6 @@ use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
     dtype::DType,
-    egglog_utils::SerializedEGraph,
     graph::{BucketLLIR, DimBucket, Graph, LLIRGraph},
     hlir::{Input, NativeData, Output},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
@@ -332,14 +331,6 @@ impl Runtime for MetalRuntime {
         vec![crate::memory_analysis::metal_memory_analysis_pass(
             ops, None, dyn_map,
         )]
-    }
-
-    fn estimate_graph_memory<'a>(
-        egraph: &'a SerializedEGraph,
-        choices: &luminal::egglog_utils::EGraphChoiceSet<'a>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> Option<usize> {
-        crate::memory_analysis::estimate_graph_memory_bytes(egraph, choices, dyn_map)
     }
 
     fn initialize(_: Self::CompileArg) -> Self {
