@@ -1936,14 +1936,97 @@ pub fn extract_generation<'a>(
     prev_selected: &mut FxHashSet<u64>,
     rng: &mut impl Rng,
 ) -> Vec<EGraphChoiceSet<'a>> {
-    // Get list of mutable eclasses (those with more than one enode option)
     let mutable_classes: Vec<&ClassId> = egraph
         .eclasses
         .iter()
         .filter(|(_, (label, enodes))| is_search_choice_eclass(label) && enodes.len() > 1)
         .map(|(class_id, _)| class_id)
         .collect();
+    extract_generation_from_classes(
+        egraph,
+        base,
+        &mutable_classes,
+        generation_size,
+        mutations_per_generation,
+        prev_selected,
+        rng,
+    )
+}
 
+pub fn extract_reachable_generation<'a>(
+    egraph: &'a SerializedEGraph,
+    base: &EGraphChoiceSet<'a>,
+    generation_size: usize,
+    mutations_per_generation: usize,
+    prev_selected: &mut FxHashSet<u64>,
+    rng: &mut impl Rng,
+) -> Vec<EGraphChoiceSet<'a>> {
+    let mutable_classes = reachable_mutable_choice_classes(egraph, base);
+    extract_generation_from_classes(
+        egraph,
+        base,
+        &mutable_classes,
+        generation_size,
+        mutations_per_generation,
+        prev_selected,
+        rng,
+    )
+}
+
+fn reachable_mutable_choice_classes<'a>(
+    egraph: &'a SerializedEGraph,
+    choices: &EGraphChoiceSet<'a>,
+) -> Vec<&'a ClassId> {
+    let mut reachable = FxHashSet::default();
+    let mut class_seen = FxHashSet::default();
+    let mut mutable_classes = Vec::new();
+    let Some(root) = egraph.roots.first() else {
+        return mutable_classes;
+    };
+    let Some(root_choice) = choices.get(root) else {
+        return mutable_classes;
+    };
+    if let Some((label, enodes)) = egraph.eclasses.get(root) {
+        if is_search_choice_eclass(label) && enodes.len() > 1 && class_seen.insert(root) {
+            mutable_classes.push(root);
+        }
+    }
+
+    let mut stack = vec![*root_choice];
+    while let Some(node) = stack.pop() {
+        if !reachable.insert(node) {
+            continue;
+        }
+        let Some((_, children)) = egraph.enodes.get(node) else {
+            continue;
+        };
+        for child_class in children {
+            let Some((label, enodes)) = egraph.eclasses.get(child_class) else {
+                continue;
+            };
+            if is_search_choice_eclass(label) {
+                if enodes.len() > 1 && class_seen.insert(child_class) {
+                    mutable_classes.push(child_class);
+                }
+                if let Some(chosen_node) = choices.get(child_class) {
+                    stack.push(*chosen_node);
+                }
+            }
+        }
+    }
+
+    mutable_classes
+}
+
+fn extract_generation_from_classes<'a>(
+    egraph: &'a SerializedEGraph,
+    base: &EGraphChoiceSet<'a>,
+    mutable_classes: &[&'a ClassId],
+    generation_size: usize,
+    mutations_per_generation: usize,
+    prev_selected: &mut FxHashSet<u64>,
+    rng: &mut impl Rng,
+) -> Vec<EGraphChoiceSet<'a>> {
     // If there are no mutable classes, we can only return the base if it's unseen
     if mutable_classes.is_empty() {
         let h = hash_choice_set(base);

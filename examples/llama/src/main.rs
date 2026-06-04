@@ -85,7 +85,6 @@ struct StepProfile {
     set_inputs: Duration,
     execute: Duration,
     get_logits: Duration,
-    cache_roundtrip: Duration,
     sample: Duration,
 }
 
@@ -95,7 +94,6 @@ fn sum_profiles<'a>(profiles: impl Iterator<Item = &'a StepProfile>) -> StepProf
         acc.set_inputs += p.set_inputs;
         acc.execute += p.execute;
         acc.get_logits += p.get_logits;
-        acc.cache_roundtrip += p.cache_roundtrip;
         acc.sample += p.sample;
         acc
     })
@@ -111,12 +109,11 @@ fn avg_ms(duration: Duration, n: usize) -> f64 {
 
 fn print_profile(label: &str, profile: &StepProfile, n: usize) {
     println!(
-        "  {label}: n={n}, avg={:.2} ms [set={:.2}, exec={:.2}, logits_dtoh={:.2}, cache={:.2}, sample={:.2}]",
+        "  {label}: n={n}, avg={:.2} ms [set={:.2}, exec={:.2}, logits_dtoh={:.2}, sample={:.2}]",
         avg_ms(profile.total, n),
         avg_ms(profile.set_inputs, n),
         avg_ms(profile.execute, n),
         avg_ms(profile.get_logits, n),
-        avg_ms(profile.cache_roundtrip, n),
         avg_ms(profile.sample, n),
     );
 }
@@ -228,8 +225,6 @@ fn run_model_step(
     scatter_idx_t: GraphTensor,
     gather_idx_t: GraphTensor,
     logits: GraphTensor,
-    kv_cache: &KVCache,
-    cache_outputs: &[(GraphTensor, GraphTensor)],
     tokens: &[u32],
     q_pos: &[i32],
     scatter_idx: &[i32],
@@ -246,7 +241,7 @@ fn run_model_step(
     runtime.set_data(input, tokens.iter().map(|t| *t as i32).collect::<Vec<_>>());
     runtime.set_data(q_pos_t, q_pos.to_vec());
     runtime.set_data(scatter_idx_t, scatter_idx.to_vec());
-    runtime.update_data(gather_idx_t, gather_idx.to_vec());
+    runtime.set_data(gather_idx_t, gather_idx.to_vec());
     profile.set_inputs = set_start.elapsed();
 
     let execute_start = std::time::Instant::now();
@@ -257,14 +252,6 @@ fn run_model_step(
     let logits_data = runtime.get_f32(logits);
     profile.get_logits = logits_start.elapsed();
 
-    let cache_start = std::time::Instant::now();
-    for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-        let k_buf = runtime.remove_buffer(*k_out);
-        let v_buf = runtime.remove_buffer(*v_out);
-        runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
-        runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
-    }
-    profile.cache_roundtrip = cache_start.elapsed();
     profile.total = start.elapsed();
 
     (logits_data, profile)
@@ -325,6 +312,10 @@ fn main() {
                 DimBucket::new(1, 1),
                 DimBucket::new(2, max_prefill).representative(search_s),
             ],
+        )
+        .dim_buckets(
+            'c',
+            &[DimBucket::new(1, MAX_SEQ_LEN).representative(search_s)],
         );
 
     println!("Building E-Graph...");
@@ -414,8 +405,6 @@ fn main() {
             scatter_idx_t,
             gather_idx_t,
             logits,
-            &kv_cache,
-            &cache_outputs,
             &prompt_tokens,
             &q_pos,
             &scatter_idx,
@@ -461,8 +450,6 @@ fn main() {
             scatter_idx_t,
             gather_idx_t,
             logits,
-            &kv_cache,
-            &cache_outputs,
             &[current_token],
             &[context_len as i32],
             &[context_len as i32],

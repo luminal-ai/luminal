@@ -14,7 +14,7 @@ rand = "0.9.2"
 urlencoding = "2.1.2"
 open = "5"
 dyn-clone = "1.0.12"
-half = {version="2.7.1", features=["num-traits"]}
+half = {version="2.7.1", features=["num-traits", "bytemuck"]}
 tinyvec = { version = "1.6.0", features = ["serde"] }
 colored = "2.0.4"
 regex = "1.9.5"

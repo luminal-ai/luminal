@@ -511,6 +511,76 @@ fn test_scatter_dual_cache() {
     );
 }
 
+/// ScatterNoCopy should mutate the persistent cache inputs directly, so decode
+/// steps do not need remove/set/refresh feedback between executions.
+#[test]
+fn test_scatter_dual_cache_accumulates_without_roundtrip() {
+    let ctx = CudaContext::new(0).unwrap();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let mut cx = Graph::default();
+
+    let k_cache = cx.named_tensor("k_cache", 5).persist();
+    let v_cache = cx.named_tensor("v_cache", 5).persist();
+    let k_new = cx.tensor(1).persist();
+    let v_new = cx.tensor(1).persist();
+    let indexes = cx.tensor(1).as_dtype(DType::Int).persist();
+
+    let k_out = k_new.scatter(indexes, k_cache);
+    let v_out = v_new.scatter(indexes, v_cache);
+    let attn_out = ((k_out + 0.0) * (v_out + 0.0)).output();
+    let k_cache_out = k_out.output();
+    let v_cache_out = v_out.output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data(k_cache, vec![0.0f32; 5]);
+    rt.set_data(v_cache, vec![0.0f32; 5]);
+    rt.set_data(k_new, vec![2.0f32]);
+    rt.set_data(v_new, vec![3.0f32]);
+    rt.set_data(indexes, vec![0i32]);
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(0);
+    rt = cx.search_with_rng(
+        rt,
+        CompileOptions::default().search_graph_limit(5),
+        &mut rng,
+    );
+
+    let scatter_names: Vec<_> = rt
+        .kernel_names()
+        .iter()
+        .copied()
+        .filter(|name| name.contains("catter"))
+        .collect();
+    assert!(
+        scatter_names.iter().all(|name| *name == "ScatterNoCopy"),
+        "Expected only ScatterNoCopy in dual-cache search result, got: {:?}",
+        scatter_names
+    );
+
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(attn_out), vec![6.0, 0.0, 0.0, 0.0, 0.0]);
+
+    rt.set_data(k_new, vec![4.0f32]);
+    rt.set_data(v_new, vec![5.0f32]);
+    rt.set_data(indexes, vec![1i32]);
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(attn_out), vec![6.0, 20.0, 0.0, 0.0, 0.0]);
+
+    rt.set_data(k_new, vec![6.0f32]);
+    rt.set_data(v_new, vec![7.0f32]);
+    rt.set_data(indexes, vec![2i32]);
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(attn_out), vec![6.0, 20.0, 42.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(k_cache_out), vec![2.0, 4.0, 6.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(v_cache_out), vec![3.0, 5.0, 7.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(k_cache), vec![2.0, 4.0, 6.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(v_cache), vec![3.0, 5.0, 7.0, 0.0, 0.0]);
+}
+
 /// Batched KV-cache updates scatter many rows at once during prefill. This is
 /// the path decode does not exercise when it scatters one token at a time.
 #[test]

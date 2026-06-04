@@ -1,6 +1,7 @@
 use crate::egglog_utils::{
-    count_choice_sets_up_to, egglog_to_llir, extract_generation, hash_choice_set, hlir_to_egglog,
-    random_initial_choice, run_egglog_with_late_passes_and_interval_analysis,
+    EGraphChoiceSet, count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation,
+    hash_choice_set, hlir_to_egglog, random_initial_choice,
+    run_egglog_with_late_passes_and_interval_analysis,
 };
 use crate::shape::{DimInterval, DynDimIntervals};
 use crate::{
@@ -382,6 +383,43 @@ fn random_choice_generation<'a, G: rand::Rng>(
     }
 
     generation
+}
+
+fn insert_memory_parent<'a>(
+    parents: &mut Vec<(usize, EGraphChoiceSet<'a>)>,
+    memory_bytes: usize,
+    genome: EGraphChoiceSet<'a>,
+    keep_best: usize,
+) {
+    let keep_best = keep_best.max(1);
+    let pos = parents
+        .iter()
+        .position(|(existing, _)| memory_bytes < *existing)
+        .unwrap_or(parents.len());
+    parents.insert(pos, (memory_bytes, genome));
+    if parents.len() > keep_best {
+        parents.truncate(keep_best);
+    }
+}
+
+fn panic_initial_memory_limit(
+    max_memory_bytes: Option<usize>,
+    memory_rejections: usize,
+    memory_parents: &[(usize, EGraphChoiceSet<'_>)],
+) -> ! {
+    if let Some(max_memory_bytes) = max_memory_bytes {
+        let best_seen = memory_parents
+            .first()
+            .map(|(bytes, _)| format_memory_bytes(*bytes))
+            .unwrap_or_else(|| "unknown".to_string());
+        panic!(
+            "Failed to find a viable initial genome under memory limit {} after {} memory probes; best estimate seen was {}",
+            format_memory_bytes(max_memory_bytes),
+            memory_rejections,
+            best_seen
+        );
+    }
+    panic!("Failed to find a viable initial genome after {memory_rejections} memory probes");
 }
 
 /// A Luminal compute graph.
@@ -1521,100 +1559,194 @@ impl Graph {
                 .is_some_and(|timeout| elapsed >= timeout)
         };
 
-        // Find a viable initial genome (may need multiple attempts if some panic)
-        let (mut best_genome, mut best_metric, display, mut n_graphs);
-        let mut init_attempts = 0;
-        loop {
-            init_attempts += 1;
-            if init_attempts > 100 {
-                if let Some(max_memory_bytes) = self.search_space_max_memory_bytes {
-                    panic!(
-                        "Failed to find a viable initial genome under memory limit {} after 100 attempts",
-                        format_memory_bytes(max_memory_bytes)
-                    );
-                }
-                panic!("Failed to find a viable initial genome after 100 attempts");
-            }
-            let genome = random_initial_choice(egraph, rng);
-            prev_selected.insert(hash_choice_set(&genome));
-            let memory_bytes = self.candidate_memory_bytes::<R>(egraph, &genome, &profile_dyn_map);
-            if self.exceeds_memory_limit(memory_bytes) {
-                continue;
-            }
+        // Find a viable initial genome. Memory-rejected candidates are dry
+        // search probes, not searched graphs: they are never profiled and do
+        // not count toward the graph search limit.
+        let (mut best_genome, mut best_metric, display, mut n_graphs) = {
+            let mut invalid_attempts = 0usize;
+            let mut memory_rejections = 0usize;
+            let mut memory_parents: Vec<(usize, EGraphChoiceSet<'_>)> = Vec::new();
+            let mut pending_memory_offspring: Vec<EGraphChoiceSet<'_>> = Vec::new();
+            let max_invalid_attempts = 100usize;
+            let memory_guided_warmup = 100usize;
+            let max_memory_probes = options
+                .limit
+                .max(1)
+                .saturating_mul(options.generation_size.max(1))
+                .saturating_mul(100)
+                .max(10_000);
 
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut graph = egglog_to_llir(
-                    egraph,
-                    genome.clone(),
-                    ops,
-                    &self.custom_ops,
-                    &mut list_cache,
-                    &mut expr_cache,
-                    None,
-                );
-                // Collapse the rolled body to a single iteration before
-                // profiling — one transformer block instead of N×block, so
-                // per-candidate profile time scales with body size, not the
-                // unrolled graph size.
-                collapse_loops_to_first_iter(&mut graph);
-                runtime.clear_intermediate_buffers();
-                let profile_start = std::time::Instant::now();
-                let (rep_metric, rep_display) =
-                    if let Some(bucket_context) = &bucket_profile_context {
-                        runtime.profile_with_bucket_context(
-                            &graph,
-                            &profile_dyn_map,
-                            options.trials,
-                            options.profile_timeout,
-                            ProfileBucketContext {
-                                dim_buckets: &bucket_context.dim_buckets,
-                                bucket_indices: &bucket_context.bucket_indices,
-                                representative_dyn_map: &bucket_context.representative_dyn_map,
-                            },
-                        )
-                    } else {
-                        runtime.profile(
-                            &graph,
-                            &profile_dyn_map,
-                            options.trials,
-                            options.profile_timeout,
-                        )
-                    };
-                let timed_out = profile_timed_out(profile_start.elapsed());
-                let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
-                let invalid_profile = rep_display.starts_with("invalid ");
-                (
-                    rep_metric,
-                    append_memory_display(
-                        rep_display,
-                        memory_bytes,
-                        runtime.planned_intermediate_buffer_bytes(),
-                        runtime.allocated_intermediate_buffer_bytes(),
-                    ),
-                    has_nan,
-                    timed_out,
-                    invalid_profile,
-                )
-            }));
-
-            match result {
-                Ok((metric, disp, false, false, false)) => {
-                    best_genome = genome;
-                    best_metric = R::aggregate_profile_metrics(&[metric]);
-                    display = disp;
-                    n_graphs = 1;
-                    break;
+            loop {
+                if search_time_limit_reached() {
+                    panic!("Failed to find a viable initial genome before search time limit");
                 }
-                Ok(_) | Err(_) => {
-                    if search_time_limit_reached() {
-                        panic!("Failed to find a viable initial genome before search time limit");
+
+                let use_memory_guided =
+                    memory_rejections >= memory_guided_warmup && !memory_parents.is_empty();
+                let genome = if use_memory_guided {
+                    let mut duplicate_attempts = 0usize;
+                    loop {
+                        if let Some(genome) = pending_memory_offspring.pop() {
+                            break genome;
+                        }
+                        let per_parent = options
+                            .generation_size
+                            .max(1)
+                            .div_ceil(memory_parents.len());
+                        for (_, parent_genome) in &memory_parents {
+                            pending_memory_offspring.extend(extract_reachable_generation(
+                                egraph,
+                                parent_genome,
+                                per_parent,
+                                options.mutations.max(1),
+                                &mut prev_selected,
+                                rng,
+                            ));
+                        }
+                        if pending_memory_offspring.is_empty() {
+                            let genome = random_initial_choice(egraph, rng);
+                            if prev_selected.insert(hash_choice_set(&genome)) {
+                                break genome;
+                            }
+                            duplicate_attempts += 1;
+                            if duplicate_attempts >= 1_000 {
+                                panic_initial_memory_limit(
+                                    self.search_space_max_memory_bytes,
+                                    memory_rejections,
+                                    &memory_parents,
+                                );
+                            }
+                        }
                     }
-                    list_cache.clear();
-                    expr_cache.clear();
+                } else {
+                    let mut duplicate_attempts = 0usize;
+                    loop {
+                        let genome = random_initial_choice(egraph, rng);
+                        if prev_selected.insert(hash_choice_set(&genome)) {
+                            break genome;
+                        }
+                        duplicate_attempts += 1;
+                        if duplicate_attempts >= 1_000 {
+                            panic_initial_memory_limit(
+                                self.search_space_max_memory_bytes,
+                                memory_rejections,
+                                &memory_parents,
+                            );
+                        }
+                    }
+                };
+
+                list_cache.clear();
+                expr_cache.clear();
+                let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut graph = egglog_to_llir(
+                        egraph,
+                        genome.clone(),
+                        ops,
+                        &self.custom_ops,
+                        &mut list_cache,
+                        &mut expr_cache,
+                        None,
+                    );
+                    // Collapse the rolled body to a single iteration before
+                    // profiling — one transformer block instead of N×block, so
+                    // per-candidate profile time scales with body size, not the
+                    // unrolled graph size.
+                    collapse_loops_to_first_iter(&mut graph);
+                    graph
+                }));
+                let Ok(graph) = graph_result else {
+                    invalid_attempts += 1;
+                    if invalid_attempts > max_invalid_attempts {
+                        panic!(
+                            "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
+                        );
+                    }
+                    continue;
+                };
+
+                let memory_bytes = self.candidate_llir_memory_bytes(
+                    runtime,
+                    &graph,
+                    &profile_dyn_map,
+                    bucket_profile_context.as_ref(),
+                );
+                if self.exceeds_memory_limit(memory_bytes) {
+                    memory_rejections += 1;
+                    if let Some(memory_bytes) = memory_bytes {
+                        insert_memory_parent(
+                            &mut memory_parents,
+                            memory_bytes,
+                            genome,
+                            options.keep_best.max(4),
+                        );
+                    }
+                    if memory_rejections >= max_memory_probes {
+                        panic_initial_memory_limit(
+                            self.search_space_max_memory_bytes,
+                            memory_rejections,
+                            &memory_parents,
+                        );
+                    }
                     continue;
                 }
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.clear_intermediate_buffers();
+                    let profile_start = std::time::Instant::now();
+                    let (rep_metric, rep_display) =
+                        if let Some(bucket_context) = &bucket_profile_context {
+                            runtime.profile_with_bucket_context(
+                                &graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                                ProfileBucketContext {
+                                    dim_buckets: &bucket_context.dim_buckets,
+                                    bucket_indices: &bucket_context.bucket_indices,
+                                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                                },
+                            )
+                        } else {
+                            runtime.profile(
+                                &graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                            )
+                        };
+                    let timed_out = profile_timed_out(profile_start.elapsed());
+                    let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
+                    let invalid_profile = rep_display.starts_with("invalid ");
+                    (
+                        rep_metric,
+                        append_memory_display(
+                            rep_display,
+                            memory_bytes,
+                            runtime.planned_intermediate_buffer_bytes(),
+                            runtime.allocated_intermediate_buffer_bytes(),
+                        ),
+                        has_nan,
+                        timed_out,
+                        invalid_profile,
+                    )
+                }));
+
+                match result {
+                    Ok((metric, disp, false, false, false)) => {
+                        break (genome, R::aggregate_profile_metrics(&[metric]), disp, 1);
+                    }
+                    Ok(_) | Err(_) => {
+                        invalid_attempts += 1;
+                        if invalid_attempts > max_invalid_attempts {
+                            panic!(
+                                "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
+                            );
+                        }
+                    }
+                }
             }
-        }
+        };
 
         // Print initial result and progress
         let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
@@ -1644,7 +1776,7 @@ impl Graph {
                     if remaining == 0 {
                         break;
                     }
-                    offspring.extend(extract_generation(
+                    offspring.extend(extract_reachable_generation(
                         egraph,
                         parent_genome,
                         per_parent.min(remaining),
@@ -1665,22 +1797,10 @@ impl Graph {
                 if search_time_limit_reached() {
                     break;
                 }
-                n_graphs += 1;
                 list_cache.clear();
                 expr_cache.clear();
-                let memory_bytes =
-                    self.candidate_memory_bytes::<R>(egraph, &genome, &profile_dyn_map);
-                if self.exceeds_memory_limit(memory_bytes) {
-                    for _ in 1..n_bar_lines {
-                        print!("\x1b[1A");
-                    }
-                    print!("\r\x1b[2K");
-                    render_bars(n_graphs, search_limit, bucket_progress);
-                    std::io::stdout().flush().unwrap();
-                    continue;
-                }
 
-                let profile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut llir_graph = egglog_to_llir(
                         egraph,
                         genome.clone(),
@@ -1693,6 +1813,30 @@ impl Graph {
                     // Collapse the rolled body to a single iteration
                     // before profiling — see initial-genome path.
                     collapse_loops_to_first_iter(&mut llir_graph);
+                    llir_graph
+                }));
+                let Ok(llir_graph) = graph_result else {
+                    for _ in 1..n_bar_lines {
+                        print!("\x1b[1A");
+                    }
+                    print!("\r\x1b[2K");
+                    render_bars(n_graphs, search_limit, bucket_progress);
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                };
+
+                let memory_bytes = self.candidate_llir_memory_bytes(
+                    runtime,
+                    &llir_graph,
+                    &profile_dyn_map,
+                    bucket_profile_context.as_ref(),
+                );
+                if self.exceeds_memory_limit(memory_bytes) {
+                    continue;
+                }
+
+                n_graphs += 1;
+                let profile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.clear_intermediate_buffers();
                     let profile_start = std::time::Instant::now();
                     let (rep_metric, rep_display) =
@@ -1869,16 +2013,29 @@ impl Graph {
         stitched
     }
 
-    fn candidate_memory_bytes<'a, R: Runtime + 'static>(
+    fn candidate_llir_memory_bytes<R: Runtime + 'static>(
         &self,
-        egraph: &'a SerializedEGraph,
-        genome: &crate::egglog_utils::EGraphChoiceSet<'a>,
+        runtime: &mut R,
+        llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
+        bucket_profile_context: Option<&SearchProfileBucketContext>,
     ) -> Option<usize> {
-        let memory_bytes = R::estimate_graph_memory(egraph, genome, dyn_map);
+        let memory_bytes = if let Some(bucket_context) = bucket_profile_context {
+            runtime.estimate_llir_memory_with_bucket_context(
+                llir_graph,
+                dyn_map,
+                ProfileBucketContext {
+                    dim_buckets: &bucket_context.dim_buckets,
+                    bucket_indices: &bucket_context.bucket_indices,
+                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                },
+            )
+        } else {
+            runtime.estimate_llir_memory(llir_graph, dyn_map)
+        };
         if self.search_space_max_memory_bytes.is_some() && memory_bytes.is_none() {
             panic!(
-                "{} cannot enforce build_search_space max_memory_bytes because it did not estimate candidate memory",
+                "{} cannot enforce build_search_space max_memory_bytes because it did not estimate LLIR candidate memory",
                 std::any::type_name::<R>()
             );
         }
@@ -2908,9 +3065,9 @@ mod tests {
             (0, "0 ms".to_string())
         }
 
-        fn estimate_graph_memory<'a>(
-            _: &'a SerializedEGraph,
-            _: &crate::egglog_utils::EGraphChoiceSet<'a>,
+        fn estimate_llir_memory(
+            &mut self,
+            _: &LLIRGraph,
             _: &FxHashMap<char, usize>,
         ) -> Option<usize> {
             Some(1)
@@ -2945,6 +3102,14 @@ mod tests {
         ) -> (Self::ProfileMetric, String) {
             let count = PROFILE_CALLS.fetch_add(1, Ordering::SeqCst);
             (count, format!("{count} ms"))
+        }
+
+        fn estimate_llir_memory(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+        ) -> Option<usize> {
+            Some(1)
         }
     }
 
@@ -3001,6 +3166,24 @@ mod tests {
             TestMemoryRuntime,
             CompileOptions::default().search_graph_limit(1),
         );
+    }
+
+    #[test]
+    fn max_memory_rejects_candidate_before_profile() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+        cx.build_search_space::<CountingRuntime>(CompileOptions::default().max_memory_bytes(0));
+
+        PROFILE_CALLS.store(0, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cx.search(
+                CountingRuntime,
+                CompileOptions::default().search_graph_limit(1),
+            );
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 0);
     }
 
     #[test]

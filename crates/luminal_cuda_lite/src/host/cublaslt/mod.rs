@@ -1387,6 +1387,26 @@ impl CuBlasLt {
         self.n_inputs()
     }
 
+    pub(crate) fn graph_spec_dyn_vars(&self) -> FxHashSet<char> {
+        [
+            &self.m,
+            &self.n,
+            &self.k,
+            &self.lda,
+            &self.ldb,
+            &self.ldc,
+            &self.ldd,
+            &self.batch_count,
+            &self.stride_a,
+            &self.stride_b,
+            &self.stride_c,
+            &self.stride_d,
+        ]
+        .into_iter()
+        .flat_map(|expr| expr.dyn_vars())
+        .collect()
+    }
+
     pub(crate) fn resolve_for_graph(
         &self,
         self_node: NodeIndex,

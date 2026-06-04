@@ -17,7 +17,7 @@ itertools = "0.12.1"
 fixedbitset = "0.5.7"
 safetensors = "0.7.0"
 tracing = "0.1.43"
-half = { version = "2.7.1", features = ["num-traits"] }
+half = { version = "2.7.1", features = ["num-traits", "bytemuck"] }
 pretty-duration = "0.1.1"
 bytemuck = "1.24.0"
 memmap2 = "0.9.9"

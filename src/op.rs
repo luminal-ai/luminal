@@ -91,20 +91,26 @@ pub trait Runtime {
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         false
     }
-    /// Estimate intermediate memory for a selected graph in the cleaned e-graph.
-    ///
-    /// This is intentionally optional because memory accounting is runtime
-    /// specific: backends decide which IR nodes allocate buffers and how dtype
-    /// storage is represented.
-    fn estimate_graph_memory<'a>(
-        _egraph: &'a SerializedEGraph,
-        _choices: &crate::egglog_utils::EGraphChoiceSet<'a>,
+    /// Estimate intermediate memory for a fully extracted LLIR graph before
+    /// profiling. Runtimes can implement this with the same planner they use
+    /// for execution so search can reject over-budget candidates without
+    /// allocating device memory.
+    fn estimate_llir_memory(
+        &mut self,
+        _llir_graph: &LLIRGraph,
         _dyn_map: &FxHashMap<char, usize>,
-    ) -> Option<usize>
-    where
-        Self: Sized,
-    {
+    ) -> Option<usize> {
         None
+    }
+    /// Bucket-aware variant of `estimate_llir_memory`, used during bucketed
+    /// search so the memory gate sees the same representative shape as profiling.
+    fn estimate_llir_memory_with_bucket_context(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+        _bucket_context: ProfileBucketContext<'_>,
+    ) -> Option<usize> {
+        self.estimate_llir_memory(llir_graph, dyn_map)
     }
     /// Load multiple compiled LLIR graphs, one per bucket combination.
     /// Each entry is (bucket_indices, representative_dyn_map, stitched_llir).

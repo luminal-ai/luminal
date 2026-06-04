@@ -301,11 +301,12 @@ impl FlashInferAttention {
 
         let kv_dim = self.num_kv_heads * self.head_dim;
         let kv_bytes = kv_dim * std::mem::size_of::<f32>();
-        let max_kv_pages = if kv_bytes == 0 {
-            c
-        } else {
-            (k_buf.len() / kv_bytes).min(v_buf.len() / kv_bytes).max(c)
-        };
+        let max_kv_pages = k_buf
+            .len()
+            .checked_div(kv_bytes)
+            .zip(v_buf.len().checked_div(kv_bytes))
+            .map(|(k_pages, v_pages)| k_pages.min(v_pages).max(c))
+            .unwrap_or(c);
         let (kv_indptr_host, batch_size, explicit_kv_indptr) = if inputs.len() >= 6 {
             let r = *dyn_map
                 .get(&'r')

@@ -54,7 +54,7 @@ fn main() {
         .next_power_of_two()
         .min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default().dim_buckets(
+    let build_options = CompileOptions::default().max_memory_gib(5).dim_buckets(
         's',
         &[
             DimBucket::new(1, 1),

@@ -82,6 +82,8 @@ struct CompiledKernel {
     kernel_op: Arc<Box<dyn KernelOp>>,
     /// Whether this compiled CUDA function has a trailing dyn_dims parameter.
     has_dyn_dims_param: bool,
+    /// Dynamic dimensions that can affect launch dimensions, params, or code.
+    dyn_vars: FxHashSet<char>,
     /// Internal buffers allocated for this kernel
     internal_bufs: Vec<CudaSlice<u8>>,
     /// Device constants from compile()
@@ -332,6 +334,17 @@ impl CompiledKernel {
         constants: FxHashMap<char, CudaSlice<u8>>,
         kernel_name: &'static str,
     ) -> Self {
+        let dyn_vars = kernel_op
+            .all_dyn_vars()
+            .into_iter()
+            .chain(grid.0.dyn_vars())
+            .chain(grid.1.dyn_vars())
+            .chain(grid.2.dyn_vars())
+            .chain(block.0.dyn_vars())
+            .chain(block.1.dyn_vars())
+            .chain(block.2.dyn_vars())
+            .chain(shared_mem.dyn_vars())
+            .collect();
         Self {
             node,
             function,
@@ -342,6 +355,7 @@ impl CompiledKernel {
             input_labels,
             kernel_op,
             has_dyn_dims_param,
+            dyn_vars,
             internal_bufs: Vec::new(),
             constants,
             graph_node: None,
@@ -1017,6 +1031,16 @@ impl CudaGraphOp {
             || dyn_map
                 .iter()
                 .any(|(k, v)| state.last_dyn_values.get(k) != Some(v));
+        let changed_dyn_vars = if dyn_map_changed {
+            dyn_map
+                .keys()
+                .chain(state.last_dyn_values.keys())
+                .copied()
+                .filter(|dim| dyn_map.get(dim) != state.last_dyn_values.get(dim))
+                .collect::<FxHashSet<_>>()
+        } else {
+            FxHashSet::default()
+        };
 
         // Check if any kernel's internal buffer dimensions changed
         let mut needs_internal_realloc = false;
@@ -1116,6 +1140,19 @@ impl CudaGraphOp {
         let needs_update = dyn_map_changed || buffer_ptrs_changed;
 
         if needs_update {
+            let kernel_dirty = (0..state.kernels.len())
+                .map(|idx| {
+                    let kernel = &state.kernels[idx];
+                    let output_ptr_changed = current_buffer_ptrs.get(&kernel.node)
+                        != state.last_buffer_ptrs.get(&kernel.node);
+                    let input_ptr_changed = kernel.inputs.iter().any(|input| {
+                        current_buffer_ptrs.get(input) != state.last_buffer_ptrs.get(input)
+                    });
+                    let dyn_changed = !changed_dyn_vars.is_disjoint(&kernel.dyn_vars);
+                    output_ptr_changed || input_ptr_changed || dyn_changed
+                })
+                .collect_vec();
+
             // Update kernel params
             let dyn_dims_ptr = state
                 .dyn_dims_buffer
@@ -1126,7 +1163,10 @@ impl CudaGraphOp {
             // Build params for each kernel first
             let num_kernels = state.kernels.len();
             let timer = Instant::now();
-            for idx in 0..num_kernels {
+            for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
+                if !dirty {
+                    continue;
+                }
                 let kernel = &state.kernels[idx];
                 let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
                 let input_ptrs: Vec<u64> = kernel
@@ -1163,7 +1203,10 @@ impl CudaGraphOp {
             // is recaptured below, cuGraphExecUpdate will refresh the executable
             // from these source-node params.
             let timer = Instant::now();
-            for idx in 0..num_kernels {
+            for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
+                if !dirty {
+                    continue;
+                }
                 let kernel = &state.kernels[idx];
                 let graph_node = state.node_to_graph_node[&kernel.node];
 
@@ -1210,6 +1253,15 @@ impl CudaGraphOp {
                 let mut spec_changes = 0usize;
                 let mut ptr_changes = 0usize;
                 for idx in 0..state.cublaslt_ops.len() {
+                    if !buffer_ptrs_changed {
+                        let spec_dyn_changed = {
+                            let op = state.cublaslt_ops[idx].cublaslt();
+                            !changed_dyn_vars.is_disjoint(&op.graph_spec_dyn_vars())
+                        };
+                        if !spec_dyn_changed && state.cublaslt_ops[idx].signature.is_some() {
+                            continue;
+                        }
+                    }
                     let timer = Instant::now();
                     let resolved = {
                         let op = &state.cublaslt_ops[idx];
@@ -1456,7 +1508,10 @@ impl CudaGraphOp {
                     .bind_to_thread()?;
 
                 let timer = Instant::now();
-                for idx in 0..num_kernels {
+                for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
+                    if !dirty {
+                        continue;
+                    }
                     let kernel = &state.kernels[idx];
                     let graph_node = state.node_to_graph_node[&kernel.node];
 
