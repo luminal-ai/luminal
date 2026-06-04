@@ -7,10 +7,54 @@ use crate::prelude::*;
 use as_any::{AsAny, Downcast};
 use rustc_hash::FxHashMap;
 
+#[derive(Clone, Copy)]
 pub struct ProfileBucketContext<'a> {
     pub dim_buckets: &'a FxHashMap<char, Vec<DimBucket>>,
     pub bucket_indices: &'a FxHashMap<char, usize>,
     pub representative_dyn_map: &'a FxHashMap<char, usize>,
+}
+
+#[derive(Clone, Copy)]
+pub struct CandidateFilterContext<'a> {
+    pub search_options: &'a crate::graph::CompileOptions,
+    pub dyn_map: &'a FxHashMap<char, usize>,
+    pub bucket_context: Option<ProfileBucketContext<'a>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CandidateFilterResult {
+    pub accepted: bool,
+    pub display: Option<String>,
+}
+
+impl CandidateFilterResult {
+    pub fn accept() -> Self {
+        Self {
+            accepted: true,
+            display: None,
+        }
+    }
+
+    pub fn accept_with_display(display: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            display: Some(display.into()),
+        }
+    }
+
+    pub fn reject() -> Self {
+        Self {
+            accepted: false,
+            display: None,
+        }
+    }
+
+    pub fn reject_with_display(display: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            display: Some(display.into()),
+        }
+    }
 }
 
 pub trait Runtime {
@@ -78,39 +122,21 @@ pub trait Runtime {
     fn intermediate_buffer_bytes(&self) -> usize {
         0
     }
-    /// Total bytes in the active runtime memory plan, if the runtime has one.
-    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
-        None
-    }
-    /// Total active intermediate allocation bytes, if the runtime can report it.
-    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
-        None
-    }
     /// Check if the most recent execution produced NaN in any output buffer.
     /// Used by the search to reject NaN-producing graph variants.
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         false
     }
-    /// Estimate intermediate memory for a fully extracted LLIR graph before
-    /// profiling. Runtimes can implement this with the same planner they use
-    /// for execution so search can reject over-budget candidates without
-    /// allocating device memory.
-    fn estimate_llir_memory(
+    /// Runtime-specific pre-profile candidate filter. Backends can reject an
+    /// extracted LLIR graph before profiling it, for example because it exceeds
+    /// a backend-specific resource budget. Core treats this as an opaque
+    /// accept/reject decision and optional display text.
+    fn filter_llir_candidate(
         &mut self,
         _llir_graph: &LLIRGraph,
-        _dyn_map: &FxHashMap<char, usize>,
-    ) -> Option<usize> {
-        None
-    }
-    /// Bucket-aware variant of `estimate_llir_memory`, used during bucketed
-    /// search so the memory gate sees the same representative shape as profiling.
-    fn estimate_llir_memory_with_bucket_context(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
-        _bucket_context: ProfileBucketContext<'_>,
-    ) -> Option<usize> {
-        self.estimate_llir_memory(llir_graph, dyn_map)
+        _context: CandidateFilterContext<'_>,
+    ) -> CandidateFilterResult {
+        CandidateFilterResult::accept()
     }
     /// Load multiple compiled LLIR graphs, one per bucket combination.
     /// Each entry is (bucket_indices, representative_dyn_map, stitched_llir).

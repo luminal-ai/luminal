@@ -258,11 +258,6 @@ impl<'a> CudaSearchEquivalenceFuzzer<'a> {
         self
     }
 
-    pub fn build_options(mut self, build_options: CompileOptions) -> Self {
-        self.config.build_options = build_options;
-        self
-    }
-
     pub fn native_reference(mut self) -> Self {
         self.config.reference = SearchEquivalenceReference::NativeRuntime;
         self

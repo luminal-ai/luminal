@@ -305,7 +305,6 @@ fn main() {
     let max_prefill = (prompt_len + 16).next_power_of_two().min(MAX_SEQ_LEN);
     let search_s = 16.min(max_prefill).max(2);
     let build_options = CompileOptions::default()
-        .max_memory_mib(SEARCH_MEMORY_MIB)
         .dim_buckets(
             's',
             &[
@@ -328,7 +327,7 @@ fn main() {
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();
-    let mut runtime = CudaRuntime::initialize(stream);
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_mib(SEARCH_MEMORY_MIB);
     for weights_path in &prepared.weight_files {
         println!("  Loading {}", weights_path.display());
         runtime.load_safetensors(&cx, weights_path.to_str().unwrap());

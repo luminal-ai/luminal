@@ -326,13 +326,11 @@ impl Runtime for MetalRuntime {
 
     fn late_egglog_passes(
         ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
-        options: &luminal::graph::CompileOptions,
+        _options: &luminal::graph::CompileOptions,
         dyn_map: &FxHashMap<char, usize>,
     ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
         vec![crate::memory_analysis::metal_memory_analysis_pass(
-            ops,
-            options.max_memory_bytes,
-            dyn_map,
+            ops, None, dyn_map,
         )]
     }
 
@@ -476,14 +474,6 @@ impl Runtime for MetalRuntime {
             .values()
             .map(|buffer| buffer.length() as usize)
             .sum()
-    }
-
-    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
-        Some(self.intermediate_buffer_bytes())
-    }
-
-    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
-        Some(self.intermediate_buffer_bytes())
     }
 
     fn load_llir_buckets(

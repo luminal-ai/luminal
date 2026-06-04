@@ -210,6 +210,7 @@ pub struct CudaRuntime {
     kernel_cache: FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
     /// When true, execute() skips input buffer consumption (used during search/profile)
     profiling: bool,
+    max_intermediate_memory_bytes: Option<usize>,
 
     // Per-bucket compiled state
     compiled_buckets: Vec<CompiledBucket>,
@@ -242,6 +243,31 @@ impl CudaRuntime {
         let stream = ctx.default_stream();
 
         Ok(Self::initialize(stream))
+    }
+
+    pub fn with_max_memory_bytes(mut self, max_memory_bytes: usize) -> Self {
+        self.max_intermediate_memory_bytes = Some(max_memory_bytes);
+        self
+    }
+
+    pub fn with_max_memory_mib(self, max_memory_mib: usize) -> Self {
+        self.with_max_memory_bytes(max_memory_mib.saturating_mul(1024 * 1024))
+    }
+
+    pub fn with_max_memory_gib(self, max_memory_gib: usize) -> Self {
+        self.with_max_memory_bytes(max_memory_gib.saturating_mul(1024 * 1024 * 1024))
+    }
+
+    pub fn set_max_memory_bytes(&mut self, max_memory_bytes: Option<usize>) {
+        self.max_intermediate_memory_bytes = max_memory_bytes;
+    }
+
+    pub fn set_max_memory_mib(&mut self, max_memory_mib: usize) {
+        self.set_max_memory_bytes(Some(max_memory_mib.saturating_mul(1024 * 1024)));
+    }
+
+    pub fn set_max_memory_gib(&mut self, max_memory_gib: usize) {
+        self.set_max_memory_bytes(Some(max_memory_gib.saturating_mul(1024 * 1024 * 1024)));
     }
 
     /// Get the active compiled bucket.
@@ -2451,31 +2477,33 @@ impl Runtime for CudaRuntime {
     type ExecReturn = ();
     type ProfileMetric = Duration;
 
-    fn estimate_llir_memory(
+    fn filter_llir_candidate(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> Option<usize> {
+        context: luminal::op::CandidateFilterContext<'_>,
+    ) -> luminal::op::CandidateFilterResult {
         let mut bucket = self.compile_bucket(llir_graph);
-        Self::dry_plan_intermediate_buffers(&mut bucket, dyn_map);
-        Some(Self::planned_allocation_bytes(&bucket))
-    }
-
-    fn estimate_llir_memory_with_bucket_context(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
-        bucket_context: luminal::op::ProfileBucketContext<'_>,
-    ) -> Option<usize> {
-        let mut bucket = self.compile_bucket(llir_graph);
-        bucket.bucket_indices = bucket_context.bucket_indices.clone();
-        let allocation_dyn_map = Self::bucket_capacity_dyn_map_from_context(
-            dyn_map,
-            &bucket,
-            bucket_context.dim_buckets,
-        );
+        let allocation_dyn_map = if let Some(bucket_context) = context.bucket_context {
+            bucket.bucket_indices = bucket_context.bucket_indices.clone();
+            Self::bucket_capacity_dyn_map_from_context(
+                context.dyn_map,
+                &bucket,
+                bucket_context.dim_buckets,
+            )
+        } else {
+            context.dyn_map.clone()
+        };
         Self::dry_plan_intermediate_buffers(&mut bucket, &allocation_dyn_map);
-        Some(Self::planned_allocation_bytes(&bucket))
+        let planned_bytes = Self::planned_allocation_bytes(&bucket);
+        let display = format!("EST: {}", format_memory_bytes(planned_bytes));
+        if self
+            .max_intermediate_memory_bytes
+            .is_some_and(|max_memory_bytes| planned_bytes > max_memory_bytes)
+        {
+            luminal::op::CandidateFilterResult::reject_with_display(display)
+        } else {
+            luminal::op::CandidateFilterResult::accept_with_display(display)
+        }
     }
 
     fn initialize(stream: Self::CompileArg) -> Self {
@@ -2488,6 +2516,7 @@ impl Runtime for CudaRuntime {
             last_total_time_us: 0.0,
             kernel_cache: FxHashMap::default(),
             profiling: false,
+            max_intermediate_memory_bytes: None,
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
@@ -2543,18 +2572,6 @@ impl Runtime for CudaRuntime {
             .iter()
             .map(|b| b.arena.as_ref().map(|arena| arena.len()).unwrap_or(0))
             .sum()
-    }
-
-    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
-        self.compiled_buckets
-            .get(self.active_bucket)
-            .map(|bucket| bucket.arena_bytes)
-    }
-
-    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
-        self.compiled_buckets
-            .get(self.active_bucket)
-            .map(|bucket| bucket.arena.as_ref().map(|arena| arena.len()).unwrap_or(0))
     }
 
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
@@ -3305,6 +3322,22 @@ fn format_size(bytes: usize) -> String {
         format!("{:.2} KB", bytes as f64 / 1e3)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_memory_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
     }
 }
 

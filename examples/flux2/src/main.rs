@@ -159,18 +159,20 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
     let features = encoder.forward(input_ids, pos_ids, attention_mask).output();
     // Memory-budget enforcement is opt-in (the estimator over-counts; see
     // the matching comment in `run_vae_only`). Set `TEXT_MEM_GIB` to opt in.
-    if let Ok(g) = std::env::var("TEXT_MEM_GIB").and_then(|s| {
-        s.parse::<usize>()
-            .map_err(|_| std::env::VarError::NotPresent)
-    }) {
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default().max_memory_gib(g));
-    } else {
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    }
+    let max_memory_gib = std::env::var("TEXT_MEM_GIB")
+        .and_then(|s| {
+            s.parse::<usize>()
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .ok();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
+    if let Some(g) = max_memory_gib {
+        runtime.set_max_memory_gib(g);
+    }
 
     println!(
         "Loading {} text encoder shards (~48 GB BF16)...",
@@ -299,18 +301,20 @@ fn run_full_pipeline(
         .output();
 
     println!("Building search space (this is the long step — many minutes for the full DiT)...");
-    if let Ok(g) = std::env::var("TX_MEM_GIB").and_then(|s| {
-        s.parse::<usize>()
-            .map_err(|_| std::env::VarError::NotPresent)
-    }) {
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default().max_memory_gib(g));
-    } else {
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    }
+    let max_memory_gib = std::env::var("TX_MEM_GIB")
+        .and_then(|s| {
+            s.parse::<usize>()
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .ok();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
+    if let Some(g) = max_memory_gib {
+        runtime.set_max_memory_gib(g);
+    }
 
     println!(
         "Loading {} transformer shards (~{:.1} GB BF16)...",
@@ -404,18 +408,20 @@ fn run_full_pipeline(
     let latent_in = cx.named_tensor("latent", (LATENT_CHANNELS, h_lat, w_lat));
     let decoder = VaeDecoder::new(&mut cx);
     let out = decoder.forward(latent_in).output();
-    if let Ok(g) = std::env::var("VAE_MEM_GIB").and_then(|s| {
-        s.parse::<usize>()
-            .map_err(|_| std::env::VarError::NotPresent)
-    }) {
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default().max_memory_gib(g));
-    } else {
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    }
+    let max_memory_gib = std::env::var("VAE_MEM_GIB")
+        .and_then(|s| {
+            s.parse::<usize>()
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .ok();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
+    if let Some(g) = max_memory_gib {
+        runtime.set_max_memory_gib(g);
+    }
     runtime.load_safetensors(&cx, vae_path.to_str().unwrap());
     runtime.set_data(latent_in, vae_input);
     runtime = cx.search(runtime, search_options());

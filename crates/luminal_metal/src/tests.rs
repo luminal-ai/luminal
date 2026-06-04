@@ -431,16 +431,6 @@ proptest! {
     }
 }
 
-#[test]
-fn metal_build_search_space_accepts_memory_budget() {
-    let mut cx = Graph::default();
-    let a = cx.tensor(4);
-    let b = cx.tensor(4);
-    (a * b).output();
-
-    cx.build_search_space::<MetalRuntime>(CompileOptions::default().max_memory_mib(1));
-}
-
 /// Simple deterministic test for add
 #[test]
 fn metal_simple_add() {

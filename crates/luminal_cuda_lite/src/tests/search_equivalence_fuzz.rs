@@ -90,7 +90,6 @@ fn llama_architecture_search_space_equivalence_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .output_f32(logits.id, "logits", 5e-2, 5e-2);
     for (layer, (k_out, v_out)) in cache_outputs.into_iter().enumerate() {
         let k_out = k_out.output();
@@ -165,7 +164,6 @@ fn gemma_architecture_search_space_equivalence_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .input_f32(input.id, random_f32_vec(SEQ * HIDDEN, 101, -0.15, 0.15))
         .input_f32(attn_norm_w.id, random_f32_vec(HIDDEN, 102, 0.7, 1.3))
         .input_f32(post_attn_norm_w.id, random_f32_vec(HIDDEN, 103, 0.7, 1.3))
@@ -260,7 +258,6 @@ fn moe_architecture_search_space_equivalence_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .input_f32(
             router_input.id,
             random_f32_vec(SEQ * HIDDEN, 201, -0.15, 0.15),
@@ -350,7 +347,6 @@ fn moe_architecture_native_reference_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .native_reference()
         .input_f32(input.id, random_f32_vec(SEQ * HIDDEN, 301, -0.15, 0.15))
         .input_f32(

@@ -53,7 +53,7 @@ fn main() {
         .next_power_of_two()
         .min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default().max_memory_gib(5).dim_buckets(
+    let build_options = CompileOptions::default().dim_buckets(
         's',
         &[
             DimBucket::new(1, 1),
@@ -65,7 +65,7 @@ fn main() {
     cx.build_search_space::<CudaRuntime>(build_options);
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream);
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(5);
     let weights_path = model_dir.join("model_combined.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
