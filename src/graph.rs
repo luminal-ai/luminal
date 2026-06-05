@@ -165,9 +165,11 @@ pub struct CompileOptions {
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
-    /// Per-candidate profiling timeout. If a profile call reaches this budget,
-    /// that candidate is discarded and search continues.
-    pub profile_timeout: Option<std::time::Duration>,
+    /// Per-candidate viability budget covering compile (`load_llir`) + run.
+    /// Candidates exceeding it are discarded.
+    pub candidate_timeout: Option<std::time::Duration>,
+    /// Caps how long profiling runs a single trial; not a rejection criterion.
+    pub execution_timeout: Option<std::time::Duration>,
     /// Optional profiling dimension overrides.
     pub profile_dims: FxHashMap<char, usize>,
     /// Bucket definitions per dynamic dimension. Dimensions without buckets use
@@ -212,9 +214,15 @@ impl CompileOptions {
         self
     }
 
-    /// Set an optional per-candidate profiling timeout.
-    pub fn profile_timeout(mut self, profile_timeout: std::time::Duration) -> Self {
-        self.profile_timeout = Some(profile_timeout);
+    /// Set the outer per-candidate timeout (compilation + execution).
+    pub fn candidate_timeout(mut self, candidate_timeout: std::time::Duration) -> Self {
+        self.candidate_timeout = Some(candidate_timeout);
+        self
+    }
+
+    /// Set the inner single-execution timeout (execution only, excludes compile).
+    pub fn execution_timeout(mut self, execution_timeout: std::time::Duration) -> Self {
+        self.execution_timeout = Some(execution_timeout);
         self
     }
 
@@ -245,7 +253,8 @@ impl Default for CompileOptions {
             mutations: 10,
             trials: 3,
             keep_best: 1,
-            profile_timeout: Some(std::time::Duration::from_secs(1)),
+            candidate_timeout: Some(std::time::Duration::from_secs(5)),
+            execution_timeout: Some(std::time::Duration::from_secs(1)),
             profile_dims: FxHashMap::default(),
             dim_buckets: FxHashMap::default(),
         }
@@ -1498,9 +1507,11 @@ impl Graph {
         let mut expr_cache = FxHashMap::default();
         runtime.clear_intermediate_buffers();
         let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
-        let profile_timed_out = |elapsed: std::time::Duration| {
+        // `profile_start.elapsed()` wraps the whole compile+run, so this is the
+        // candidate-timeout (viability) check, not the per-execution one.
+        let candidate_timed_out = |elapsed: std::time::Duration| {
             options
-                .profile_timeout
+                .candidate_timeout
                 .is_some_and(|timeout| elapsed >= timeout)
         };
 
@@ -1511,6 +1522,8 @@ impl Graph {
             let mut invalid_attempts = 0usize;
             let mut filter_fails = 0usize;
             let mut last_filter_rejection: Option<String> = None;
+            // Breakdown of why profiled candidates were invalid, for the give-up message.
+            let (mut n_timed_out, mut n_nan, mut n_invalid_profile, mut n_panicked) = (0, 0, 0, 0);
             let max_invalid_attempts = 100usize;
             let max_filter_fails = options
                 .limit
@@ -1580,7 +1593,7 @@ impl Graph {
                                 &graph,
                                 &profile_dyn_map,
                                 options.trials,
-                                options.profile_timeout,
+                                options.execution_timeout,
                                 ProfileBucketContext {
                                     dim_buckets: &bucket_context.dim_buckets,
                                     bucket_indices: &bucket_context.bucket_indices,
@@ -1592,10 +1605,10 @@ impl Graph {
                                 &graph,
                                 &profile_dyn_map,
                                 options.trials,
-                                options.profile_timeout,
+                                options.execution_timeout,
                             )
                         };
-                    let timed_out = profile_timed_out(profile_start.elapsed());
+                    let timed_out = candidate_timed_out(profile_start.elapsed());
                     let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
                     let invalid_profile = rep_display.starts_with("invalid ");
                     (
@@ -1611,14 +1624,26 @@ impl Graph {
                     Ok((metric, disp, false, false, false)) => {
                         break (genome, R::aggregate_profile_metrics(&[metric]), disp, 1);
                     }
-                    Ok(_) | Err(_) => {
-                        invalid_attempts += 1;
-                        if invalid_attempts > max_invalid_attempts {
-                            panic!(
-                                "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
-                            );
+                    Ok((_, _, has_nan, timed_out, invalid_profile)) => {
+                        if timed_out {
+                            n_timed_out += 1;
+                        } else if has_nan {
+                            n_nan += 1;
+                        } else if invalid_profile {
+                            n_invalid_profile += 1;
                         }
+                        invalid_attempts += 1;
                     }
+                    Err(_) => {
+                        n_panicked += 1;
+                        invalid_attempts += 1;
+                    }
+                }
+                if invalid_attempts > max_invalid_attempts {
+                    panic!(
+                        "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts \
+                         (candidate_timed_out={n_timed_out} nan={n_nan} invalid_profile={n_invalid_profile} panicked={n_panicked})"
+                    );
                 }
             }
         };
@@ -1722,7 +1747,7 @@ impl Graph {
                                 &llir_graph,
                                 &profile_dyn_map,
                                 options.trials,
-                                options.profile_timeout,
+                                options.execution_timeout,
                                 ProfileBucketContext {
                                     dim_buckets: &bucket_context.dim_buckets,
                                     bucket_indices: &bucket_context.bucket_indices,
@@ -1734,10 +1759,10 @@ impl Graph {
                                 &llir_graph,
                                 &profile_dyn_map,
                                 options.trials,
-                                options.profile_timeout,
+                                options.execution_timeout,
                             )
                         };
-                    let timed_out = profile_timed_out(profile_start.elapsed());
+                    let timed_out = candidate_timed_out(profile_start.elapsed());
                     let has_nan =
                         !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
                     let invalid_profile = rep_display.starts_with("invalid ");

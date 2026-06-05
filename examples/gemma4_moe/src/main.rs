@@ -81,9 +81,8 @@ fn main() {
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    let search_options = CompileOptions::default()
-        .search_graph_limit(search_graphs)
-        .profile_timeout(Duration::from_secs(2));
+    // Profiling timeouts use the CompileOptions defaults (5s candidate / 1s execution).
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
     runtime = cx.search_with_rng(runtime, search_options, &mut rng);
 
     for layer in 0..LAYERS {
