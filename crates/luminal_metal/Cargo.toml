@@ -28,5 +28,8 @@ rustc-hash = "2.1"
 tokenizers = "0.22.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[features]
+debug = []
+
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy", "debug"))'] }

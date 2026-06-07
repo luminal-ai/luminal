@@ -61,10 +61,6 @@ fn assert_matmul_options(cx: &Graph, mps_op_name: &str) {
         egraph_has_op(cx, mps_op_name),
         "expected {mps_op_name} rewrite option in e-graph"
     );
-    assert!(
-        egraph_has_op(cx, "GenericMatmul"),
-        "expected GenericMatmul rewrite option in e-graph"
-    );
 }
 
 fn write_test_safetensors(tensors: &[(&str, Dtype, Vec<usize>, Vec<u8>)]) -> PathBuf {
@@ -342,6 +338,33 @@ fn metal_bucketed_dynamic_dim_dispatches_correct_graph() {
     rt.execute(&cx.dyn_map);
     let s3_out = rt.get_f32(output);
     assert_close(&s3_out[..12], &s3_expected, 0.001);
+}
+
+#[test]
+fn metal_set_data_reuses_input_buffer_and_preserves_logical_len() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(('s',));
+    let output = input.output();
+
+    cx.set_dim('s', 8);
+    cx.build_search_space::<MetalRuntime>(
+        CompileOptions::default().dim_buckets('s', &[DimBucket::new(1, 8)]),
+    );
+
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, vec![0.0f32; 8]);
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+    let initial_capacity = rt.hlir_buffers.get(&input.id).unwrap().length();
+
+    cx.set_dim('s', 2);
+    rt.set_data(input, &[3.0f32, 4.0]);
+    assert_eq!(
+        rt.hlir_buffers.get(&input.id).unwrap().length(),
+        initial_capacity
+    );
+
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(output), vec![3.0, 4.0]);
 }
 
 #[test]

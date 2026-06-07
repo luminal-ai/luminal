@@ -45,6 +45,8 @@ pub struct MetalRuntime {
     input_data: FxHashMap<NodeIndex, NativeData>,
     /// Buffers for HLIR input tensors (set by user)
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
+    /// Logical byte length for each HLIR input buffer.
+    hlir_buffer_lengths: FxHashMap<NodeIndex, u64>,
     /// Buffers for LLIR intermediate/output tensors
     pub buffers: FxHashMap<NodeIndex, Buffer>,
     /// Logical byte length for each active LLIR buffer.
@@ -203,6 +205,7 @@ impl MetalRuntime {
             {
                 let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
                 self.input_data.remove(&node);
+                self.hlir_buffer_lengths.insert(node, buffer.length());
                 self.hlir_buffers.insert(node, buffer);
             }
         }
@@ -212,8 +215,7 @@ impl MetalRuntime {
         let id = id.to_id();
         let data = data.into();
         if let Some(dtype) = self.input_dtype(id) {
-            let buffer = self.create_input_buffer(&data, dtype);
-            self.hlir_buffers.insert(id, buffer);
+            self.update_input_buffer_from_native(id, &data, dtype);
         }
         self.input_data.insert(id, data);
     }
@@ -227,6 +229,7 @@ impl MetalRuntime {
             std::ptr::write_bytes(buffer.contents(), 0, num_bytes);
         }
         self.input_data.remove(&id);
+        self.hlir_buffer_lengths.insert(id, num_bytes as u64);
         self.hlir_buffers.insert(id, buffer);
     }
 
@@ -239,6 +242,7 @@ impl MetalRuntime {
         }
 
         if let Some(Input { node, .. }) = self.llir_graph[data_id].to_op::<Input>() {
+            self.hlir_buffer_lengths.remove(&NodeIndex::new(*node));
             return self
                 .hlir_buffers
                 .remove(&NodeIndex::new(*node))
@@ -251,6 +255,7 @@ impl MetalRuntime {
     pub fn set_buffer(&mut self, id: impl ToId, buffer: Buffer) {
         let id = id.to_id();
         self.input_data.remove(&id);
+        self.hlir_buffer_lengths.insert(id, buffer.length());
         self.hlir_buffers.insert(id, buffer);
     }
 
@@ -283,6 +288,13 @@ impl MetalRuntime {
             .buffer_lengths
             .get(&data_id)
             .copied()
+            .or_else(|| {
+                self.llir_graph[data_id].to_op::<Input>().and_then(|inp| {
+                    self.hlir_buffer_lengths
+                        .get(&NodeIndex::new(inp.node))
+                        .copied()
+                })
+            })
             .unwrap_or_else(|| buffer.length());
         assert!(
             logical_bytes <= buffer.length(),
@@ -346,6 +358,7 @@ impl Runtime for MetalRuntime {
             command_queue,
             input_data: FxHashMap::default(),
             hlir_buffers: FxHashMap::default(),
+            hlir_buffer_lengths: FxHashMap::default(),
             buffers: FxHashMap::default(),
             buffer_lengths: FxHashMap::default(),
             dyn_buffer,
@@ -513,34 +526,76 @@ impl RuntimeStats for MetalRuntime {
 }
 
 impl MetalRuntime {
-    fn create_input_buffer(&self, data: &NativeData, dtype: DType) -> Buffer {
+    fn update_input_buffer_from_native(&mut self, id: impl ToId, data: &NativeData, dtype: DType) {
         match dtype {
             DType::F32 => {
-                let values = data.to_f32_vec();
-                self.device.new_buffer_with_data(
-                    values.as_ptr() as *const _,
-                    std::mem::size_of_val(values.as_slice()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
+                if let NativeData::F32(values) = data {
+                    self.update_input_buffer(id, DType::F32, values);
+                } else {
+                    let values = data.to_f32_vec();
+                    self.update_input_buffer(id, DType::F32, &values);
+                }
             }
             DType::F16 => {
-                let values = data.to_f16_vec();
-                self.device.new_buffer_with_data(
-                    values.as_ptr() as *const _,
-                    std::mem::size_of_val(values.as_slice()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
+                if let NativeData::F16(values) = data {
+                    self.update_input_buffer(id, DType::F16, values);
+                } else {
+                    let values = data.to_f16_vec();
+                    self.update_input_buffer(id, DType::F16, &values);
+                }
             }
             DType::Int => {
-                let values = data.to_i32_vec();
-                self.device.new_buffer_with_data(
-                    values.as_ptr() as *const _,
-                    std::mem::size_of_val(values.as_slice()) as u64,
-                    MTLResourceOptions::StorageModeShared,
-                )
+                if let NativeData::Int(values) = data {
+                    self.update_input_buffer(id, DType::Int, values);
+                } else {
+                    let values = data.to_i32_vec();
+                    self.update_input_buffer(id, DType::Int, &values);
+                }
             }
             unsupported => panic!("Metal input dtype {unsupported:?} is not supported yet"),
         }
+    }
+
+    fn update_input_buffer<T: Copy>(&mut self, id: impl ToId, expected_dtype: DType, values: &[T]) {
+        let id = id.to_id();
+        if let Some(dtype) = self.input_dtype(id) {
+            assert_eq!(
+                dtype, expected_dtype,
+                "Cannot update Metal input {id:?} as {expected_dtype:?}; graph input has dtype {dtype:?}"
+            );
+        }
+
+        let byte_len = std::mem::size_of_val(values) as u64;
+        let needs_buffer = self
+            .hlir_buffers
+            .get(&id)
+            .is_none_or(|buffer| byte_len > buffer.length());
+        if needs_buffer {
+            let capacity = byte_len.max(1);
+            let buffer = self
+                .device
+                .new_buffer(capacity, MTLResourceOptions::StorageModeShared);
+            if byte_len > 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        values.as_ptr() as *const u8,
+                        buffer.contents() as *mut u8,
+                        byte_len as usize,
+                    );
+                }
+            }
+            self.hlir_buffers.insert(id, buffer);
+        } else if byte_len > 0 {
+            let buffer = self.hlir_buffers.get(&id).expect("Input buffer not set!");
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    values.as_ptr() as *const u8,
+                    buffer.contents() as *mut u8,
+                    byte_len as usize,
+                );
+            }
+        }
+        self.hlir_buffer_lengths.insert(id, byte_len);
     }
 
     pub fn allocate_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
@@ -720,13 +775,19 @@ impl MetalRuntime {
     }
 
     fn refresh_input_data_buffers(&mut self) {
-        for node in self.llir_graph.node_indices() {
-            if let Some(input) = self.llir_graph[node].to_op::<Input>() {
-                let hlir_id = NodeIndex::new(input.node);
-                if let Some(data) = self.input_data.get(&hlir_id) {
-                    let buffer = self.create_input_buffer(data, input.dtype);
-                    self.hlir_buffers.insert(hlir_id, buffer);
-                }
+        let inputs = self
+            .llir_graph
+            .node_indices()
+            .filter_map(|node| {
+                self.llir_graph[node]
+                    .to_op::<Input>()
+                    .map(|input| (NodeIndex::new(input.node), input.dtype))
+            })
+            .collect::<Vec<_>>();
+
+        for (hlir_id, dtype) in inputs {
+            if let Some(data) = self.input_data.get(&hlir_id).cloned() {
+                self.update_input_buffer_from_native(hlir_id, &data, dtype);
             }
         }
     }

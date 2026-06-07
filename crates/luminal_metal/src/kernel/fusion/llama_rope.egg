@@ -1,0 +1,488 @@
+; Recognize the full decomposed Llama RoPE materialization and
+                ; union it with a direct MetalLlamaRope kernel candidate.
+                (rule
+                    (
+                        (= ?one (MetalConstant 1.000000))
+                        (= ?neg_one (MetalConstant -1.000000))
+                        (= ?pi_half (MetalConstant 1.570796))
+                        (= ?log2e (MetalConstant 1.442695))
+                        (= ?theta_ln_const (MetalConstant ?theta_ln))
+
+                        ; Final materialization of the transposed+merged RoPE result.
+                        (= ?final (Op
+                            (MetalMul
+                                (ECons ?seq (ECons ?hidden (ENil)))
+                                ?final_rope_strides
+                                ?final_one_strides
+                                ?final_out_strides)
+                            (ICons ?rope_concat (ICons ?one (INil)))))
+
+                        ; concat_along(x0_out, x1_out, 2), before transpose/merge.
+                        (= ?rope_concat (Op
+                            (MetalAdd
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?concat_a_strides
+                                ?concat_b_strides
+                                ?concat_out_strides)
+                            (ICons ?x0_padded (ICons ?x1_padded (INil)))))
+
+                        (= ?x0_padded (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x0_pad_data_strides
+                                ?x0_pad_mask_strides
+                                ?concat_a_strides)
+                            (ICons ?x0_pad_gather (ICons ?x0_pad_mask (INil)))))
+                        (= ?x1_padded (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x1_pad_data_strides
+                                ?x1_pad_mask_strides
+                                ?concat_b_strides)
+                            (ICons ?x1_pad_gather (ICons ?x1_pad_mask (INil)))))
+                        (= ?x0_pad_gather
+                            (MetalGather
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x0_pad_indexes
+                                ?x0_pad_index_strides
+                                ?x0_out
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?rot_out_strides
+                                ?x0_pad_gather_strides))
+                        (= ?x1_pad_gather
+                            (MetalGather
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x1_pad_indexes
+                                ?x1_pad_index_strides
+                                ?x1_out
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?rot_out_strides
+                                ?x1_pad_gather_strides))
+
+                        ; x0_out = x0 * cos - x1 * sin
+                        (= ?x0_out (Op
+                            (MetalAdd
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x0_out_a_strides
+                                ?x0_out_b_strides
+                                ?rot_out_strides)
+                            (ICons ?x0_cos (ICons ?neg_x1_sin (INil)))))
+                        (= ?x0_cos (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x0_input_strides
+                                ?angle_broadcast_strides
+                                ?x0_out_a_strides)
+                            (ICons ?input (ICons ?cos (INil)))))
+                        (= ?neg_x1_sin (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_sin_strides
+                                ?neg_one_strides
+                                ?x0_out_b_strides)
+                            (ICons ?x1_sin (ICons ?neg_one (INil)))))
+                        (= ?x1_sin (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_read_strides
+                                ?angle_broadcast_strides
+                                ?x1_sin_strides)
+                            (ICons ?x1 (ICons ?sin (INil)))))
+
+                        ; x1_out = x1 * cos + x0 * sin
+                        (= ?x1_out (Op
+                            (MetalAdd
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_out_a_strides
+                                ?x1_out_b_strides
+                                ?rot_out_strides)
+                            (ICons ?x1_cos (ICons ?x0_sin (INil)))))
+                        (= ?x1_cos (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_read_strides
+                                ?angle_broadcast_strides
+                                ?x1_out_a_strides)
+                            (ICons ?x1 (ICons ?cos (INil)))))
+                        (= ?x0_sin (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x0_input_strides
+                                ?angle_broadcast_strides
+                                ?x1_out_b_strides)
+                            (ICons ?input (ICons ?sin (INil)))))
+
+                        ; x1 is the second half slice of the split head dimension.
+                        (= ?x1
+                            (MetalGather
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_indexes
+                                ?x1_index_strides
+                                ?input
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?input_strides
+                                ?x1_gather_out_strides))
+
+                        ; Shared sin/cos angle table.
+                        (= ?sin (Op
+                            (MetalSin
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?angle_strides
+                                ?angle_strides)
+                            (ICons ?angles (INil))))
+                        (= ?cos (Op
+                            (MetalSin
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?cos_arg_strides
+                                ?angle_strides)
+                            (ICons ?cos_arg (INil))))
+                        (= ?cos_arg (Op
+                            (MetalAdd
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?neg_angle_strides
+                                ?pi_half_strides
+                                ?cos_arg_strides)
+                            (ICons ?neg_angles (ICons ?pi_half (INil)))))
+                        (= ?neg_angles (Op
+                            (MetalMul
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?angle_strides
+                                ?neg_one_angle_strides
+                                ?neg_angle_strides)
+                            (ICons ?angles (ICons ?neg_one (INil)))))
+
+                        ; angles = cast(pos) @ reciprocal(exp(arange(0, hdim, 2) / hdim * ln(theta))).
+                        (= ?angles
+                            (GenericMatmul
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?angle_mul_shape
+                                ?angle_k
+                                ?pos_f32
+                                ?pos_f32_strides
+                                ?inv_freq
+                                ?inv_freq_matmul_strides
+                                ?angle_sum_strides
+                                ?angle_sum_iter_stride
+                                ?angle_strides))
+                        (= ?pos_f32 (MetalCast ?pos ?pos_cast_size (F32)))
+                        (= ?inv_freq (Op
+                            (MetalRecip
+                                (ECons ?half (ENil))
+                                ?freq_strides
+                                ?freq_strides)
+                            (ICons ?freq_exp (INil))))
+                        (= ?freq_exp (Op
+                            (MetalExp2
+                                (ECons ?half (ENil))
+                                ?freq_strides
+                                ?freq_strides)
+                            (ICons ?freq_log2 (INil))))
+                        (= ?freq_log2 (Op
+                            (MetalMul
+                                (ECons ?half (ENil))
+                                ?freq_ln_strides
+                                ?log2e_strides
+                                ?freq_strides)
+                            (ICons ?freq_ln (ICons ?log2e (INil)))))
+                        (= ?freq_ln (Op
+                            (MetalMul
+                                (ECons ?half (ENil))
+                                ?freq_norm_strides
+                                ?theta_ln_strides
+                                ?freq_ln_strides)
+                            (ICons ?freq_norm (ICons ?theta_ln_const (INil)))))
+                        (= ?freq_norm (Op
+                            (MetalMul
+                                (ECons ?half (ENil))
+                                ?freq_iota_strides
+                                ?inv_head_dim_strides
+                                ?freq_norm_strides)
+                            (ICons ?freq_iota_f32 (ICons ?inv_head_dim (INil)))))
+                        (= ?freq_iota_f32 (MetalCast ?freq_iota ?freq_cast_size (F32)))
+                        (= ?freq_iota (MetalIota ?freq_iota_expr ?half))
+                        (= ?inv_head_dim (MetalConstant ?inv_head_dim_value))
+                        (= (F32) (dtype ?final))
+                    )
+                    (
+                        (let ?rope (MetalLlamaRope
+                            (ECons ?seq (ECons ?hidden (ENil)))
+                            ?input
+                            ?pos
+                            ?nheads
+                            ?hdim
+                            ?theta_ln
+                            ?final_out_strides))
+                        (union ?final ?rope)
+                        (set (dtype ?rope) (F32))
+                    )
+                    :ruleset cleanup
+                    :name "metal-llama-rope-materialize"
+                )
+                
+
+                ; Once the direct MetalLlamaRope candidate exists, delete the
+                ; final multiply-by-one materialization of the decomposed RoPE
+                ; output so extraction cannot keep that wrapper.
+                (rule
+                    ((= ?final (Op
+                        (MetalMul
+                            (ECons ?seq (ECons ?hidden (ENil)))
+                            ?final_rope_strides
+                            ?final_one_strides
+                            ?final_out_strides)
+                        (ICons ?rope_concat (ICons ?one (INil)))))
+                     (= ?final (MetalLlamaRope
+                        (ECons ?seq (ECons ?hidden (ENil)))
+                        ?input
+                        ?pos
+                        ?nheads
+                        ?hdim
+                        ?theta_ln
+                        ?final_out_strides)))
+                    ((delete (Op
+                        (MetalMul
+                            (ECons ?seq (ECons ?hidden (ENil)))
+                            ?final_rope_strides
+                            ?final_one_strides
+                            ?final_out_strides)
+                        (ICons ?rope_concat (ICons ?one (INil))))))
+                    :ruleset cleanup
+                    :name "delete-final-rope-materialize-when-metal-rope-exists"
+                )
+
+                ; Some KV-cache paths consume the RoPE result while it is still
+                ; laid out as [heads, seq, head_dim], so there is no final
+                ; [seq, hidden] materialization for MetalLlamaRope to replace.
+                ; Recognize that 3D materialization directly.
+                (rule
+                    (
+                        (= ?one (MetalConstant 1.000000))
+                        (= ?neg_one (MetalConstant -1.000000))
+                        (= ?pi_half (MetalConstant 1.570796))
+                        (= ?log2e (MetalConstant 1.442695))
+                        (= ?theta_ln_const (MetalConstant ?theta_ln))
+
+                        (= ?rope_concat (Op
+                            (MetalAdd
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?concat_a_strides
+                                ?concat_b_strides
+                                ?concat_out_strides)
+                            (ICons ?x0_padded (ICons ?x1_padded (INil)))))
+
+                        (= ?x0_padded (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x0_pad_data_strides
+                                ?x0_pad_mask_strides
+                                ?concat_a_strides)
+                            (ICons ?x0_pad_gather (ICons ?x0_pad_mask (INil)))))
+                        (= ?x1_padded (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x1_pad_data_strides
+                                ?x1_pad_mask_strides
+                                ?concat_b_strides)
+                            (ICons ?x1_pad_gather (ICons ?x1_pad_mask (INil)))))
+                        (= ?x0_pad_gather
+                            (MetalGather
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x0_pad_indexes
+                                ?x0_pad_index_strides
+                                ?x0_out
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?rot_out_strides
+                                ?x0_pad_gather_strides))
+                        (= ?x1_pad_gather
+                            (MetalGather
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?x1_pad_indexes
+                                ?x1_pad_index_strides
+                                ?x1_out
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?rot_out_strides
+                                ?x1_pad_gather_strides))
+
+                        (= ?x0_out (Op
+                            (MetalAdd
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x0_out_a_strides
+                                ?x0_out_b_strides
+                                ?rot_out_strides)
+                            (ICons ?x0_cos (ICons ?neg_x1_sin (INil)))))
+                        (= ?x0_cos (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?input_strides
+                                ?angle_broadcast_strides
+                                ?x0_out_a_strides)
+                            (ICons ?input (ICons ?cos (INil)))))
+                        (= ?neg_x1_sin (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_sin_strides
+                                ?neg_one_strides
+                                ?x0_out_b_strides)
+                            (ICons ?x1_sin (ICons ?neg_one (INil)))))
+                        (= ?x1_sin (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_read_strides
+                                ?angle_broadcast_strides
+                                ?x1_sin_strides)
+                            (ICons ?x1 (ICons ?sin (INil)))))
+
+                        (= ?x1_out (Op
+                            (MetalAdd
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_out_a_strides
+                                ?x1_out_b_strides
+                                ?rot_out_strides)
+                            (ICons ?x1_cos (ICons ?x0_sin (INil)))))
+                        (= ?x1_cos (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_read_strides
+                                ?angle_broadcast_strides
+                                ?x1_out_a_strides)
+                            (ICons ?x1 (ICons ?cos (INil)))))
+                        (= ?x0_sin (Op
+                            (MetalMul
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?input_strides
+                                ?angle_broadcast_strides
+                                ?x1_out_b_strides)
+                            (ICons ?input (ICons ?sin (INil)))))
+
+                        (= ?x1
+                            (MetalGather
+                                (ECons ?nheads (ECons ?seq (ECons ?half (ENil))))
+                                ?x1_indexes
+                                ?x1_index_strides
+                                ?input
+                                (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                                ?input_strides
+                                ?x1_gather_out_strides))
+
+                        (= ?sin (Op
+                            (MetalSin
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?angle_strides
+                                ?angle_strides)
+                            (ICons ?angles (INil))))
+                        (= ?cos (Op
+                            (MetalSin
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?cos_arg_strides
+                                ?angle_strides)
+                            (ICons ?cos_arg (INil))))
+                        (= ?cos_arg (Op
+                            (MetalAdd
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?neg_angle_strides
+                                ?pi_half_strides
+                                ?cos_arg_strides)
+                            (ICons ?neg_angles (ICons ?pi_half (INil)))))
+                        (= ?neg_angles (Op
+                            (MetalMul
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?angle_strides
+                                ?neg_one_angle_strides
+                                ?neg_angle_strides)
+                            (ICons ?angles (ICons ?neg_one (INil)))))
+
+                        (= ?angles
+                            (GenericMatmul
+                                (ECons ?seq (ECons ?half (ENil)))
+                                ?angle_mul_shape
+                                ?angle_k
+                                ?pos_f32
+                                ?pos_f32_strides
+                                ?inv_freq
+                                ?inv_freq_matmul_strides
+                                ?angle_sum_strides
+                                ?angle_sum_iter_stride
+                                ?angle_strides))
+                        (= ?pos_f32 (MetalCast ?pos ?pos_cast_size (F32)))
+                        (= ?inv_freq (Op
+                            (MetalRecip
+                                (ECons ?half (ENil))
+                                ?freq_strides
+                                ?freq_strides)
+                            (ICons ?freq_exp (INil))))
+                        (= ?freq_exp (Op
+                            (MetalExp2
+                                (ECons ?half (ENil))
+                                ?freq_strides
+                                ?freq_strides)
+                            (ICons ?freq_log2 (INil))))
+                        (= ?freq_log2 (Op
+                            (MetalMul
+                                (ECons ?half (ENil))
+                                ?freq_ln_strides
+                                ?log2e_strides
+                                ?freq_strides)
+                            (ICons ?freq_ln (ICons ?log2e (INil)))))
+                        (= ?freq_ln (Op
+                            (MetalMul
+                                (ECons ?half (ENil))
+                                ?freq_norm_strides
+                                ?theta_ln_strides
+                                ?freq_ln_strides)
+                            (ICons ?freq_norm (ICons ?theta_ln_const (INil)))))
+                        (= ?freq_norm (Op
+                            (MetalMul
+                                (ECons ?half (ENil))
+                                ?freq_iota_strides
+                                ?inv_head_dim_strides
+                                ?freq_norm_strides)
+                            (ICons ?freq_iota_f32 (ICons ?inv_head_dim (INil)))))
+                        (= ?freq_iota_f32 (MetalCast ?freq_iota ?freq_cast_size (F32)))
+                        (= ?freq_iota (MetalIota ?freq_iota_expr ?half))
+                        (= ?inv_head_dim (MetalConstant ?inv_head_dim_value))
+                        (= (F32) (dtype ?rope_concat))
+                    )
+                    (
+                        (let ?rope3d (MetalLlamaRope3D
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                            ?input
+                            ?pos
+                            ?input_strides
+                            ?nheads
+                            ?hdim
+                            ?theta_ln
+                            ?concat_out_strides))
+                        (union ?rope_concat ?rope3d)
+                        (set (dtype ?rope3d) (F32))
+                    )
+                    :ruleset cleanup
+                    :name "metal-llama-rope-3d-materialize"
+                )
+
+                (rule
+                    ((= ?rope_concat (Op
+                        (MetalAdd
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                            ?concat_a_strides
+                            ?concat_b_strides
+                            ?concat_out_strides)
+                        (ICons ?x0_padded (ICons ?x1_padded (INil)))))
+                     (= ?rope_concat (MetalLlamaRope3D
+                        (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                        ?input
+                        ?pos
+                        ?input_strides
+                        ?nheads
+                        ?hdim
+                        ?theta_ln
+                        ?concat_out_strides)))
+                    ((subsume (Op
+                        (MetalAdd
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                            ?concat_a_strides
+                            ?concat_b_strides
+                            ?concat_out_strides)
+                        (ICons ?x0_padded (ICons ?x1_padded (INil))))))
+                    :ruleset cleanup
+                    :name "metal-llama-rope-3d-subsumes-concat-add"
+                )

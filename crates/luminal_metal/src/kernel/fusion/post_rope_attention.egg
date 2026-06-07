@@ -1,0 +1,475 @@
+; Match decomposed paged attention after Q/K have already been RoPE-rotated:
+;   scores = Q @ gathered(K cache).T * scale + mask
+;   weights = softmax(scores)
+;   output = weights @ gathered(V cache)
+; The gathered K/V rows are expanded from KV heads to query heads for GQA.
+; Union the final attention output with MetalFusedPostRopeAttention.
+(rule
+                (
+                    ; V projection: softmax(scores) @ V_context.
+                    (= ?mul2 (Op (Mul
+                        (ECons ?nheads (ECons ?seq (ECons ?hdim (ECons ?context (ENil)))))
+                        ?mul2_a_strides
+                        ?mul2_b_strides
+                        ?mul2_out_strides)
+                        (ICons ?soft (ICons ?v_gqa (INil)))))
+                    (= ?output (Op (Sum
+                        (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                        ?context
+                        ?out_in_strides
+                        (MIter)
+                        ?out_out_strides)
+                        (ICons ?mul2 (INil))))
+
+                    ; Softmax(scores + mask) over the context dimension.
+                    (= ?soft (Op (Mul
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?soft_a_strides
+                        ?soft_b_strides
+                        ?soft_out_strides)
+                        (ICons ?exp (ICons ?inv_denom (INil)))))
+                    (= ?inv_denom (Op (Recip
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?recip_in_strides
+                        ?recip_out_strides)
+                        (ICons ?denom (INil))))
+                    (= ?denom (Op (Sum
+                        (ECons ?nheads (ECons ?seq (ENil)))
+                        ?context
+                        ?denom_in_strides
+                        (MIter)
+                        ?denom_out_strides)
+                        (ICons ?exp (INil))))
+                    (= ?exp (Op (Exp2
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?exp_in_strides
+                        ?exp_out_strides)
+                        (ICons ?exp_arg (INil))))
+                    (= ?log2e (Op (Constant 1.442695) (INil)))
+                    (= ?exp_arg (Op (Mul
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?exp_arg_a_strides
+                        ?exp_arg_b_strides
+                        ?exp_arg_out_strides)
+                        (ICons ?centered (ICons ?log2e (INil)))))
+                    (= ?centered (Op (Add
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?centered_a_strides
+                        ?centered_b_strides
+                        ?centered_out_strides)
+                        (ICons ?masked (ICons ?neg_max (INil)))))
+                    (= ?neg_one (Op (Constant -1.000000) (INil)))
+                    (= ?neg_max (Op (Mul
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?neg_max_a_strides
+                        ?neg_max_b_strides
+                        ?neg_max_out_strides)
+                        (ICons ?max_scores (ICons ?neg_one (INil)))))
+                    (= ?max_scores (Op (Max
+                        (ECons ?nheads (ECons ?seq (ENil)))
+                        ?context
+                        ?max_in_strides
+                        (MIter)
+                        ?max_out_strides)
+                        (ICons ?masked (INil))))
+
+                    ; QK scores plus an additive mask broadcast over heads.
+                    (= ?masked (Op (Add
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?mask_add_a_strides
+                        (ECons (MNum 0) (ECons (MMul (MIter) ?context) (ECons (MIter) (ENil))))
+                        ?mask_add_out_strides)
+                        (ICons ?scaled_qk (ICons ?mask (INil)))))
+                    (= ?scale_const (Op (Constant ?scale) (INil)))
+                    (= ?scaled_qk (Op (Mul
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?scale_a_strides
+                        ?scale_b_strides
+                        ?scale_out_strides)
+                        (ICons ?qk (ICons ?scale_const (INil)))))
+
+                    ; Q @ K_context.
+                    (= ?q_mat_const (Op (Constant 1.000000) (INil)))
+                    (= ?q (Op (Mul
+                        (ECons ?seq (ECons ?hidden (ENil)))
+                        ?q_mat_a_strides
+                        ?q_mat_b_strides
+                        ?q_mat_out_strides)
+                        (ICons ?q_src (ICons ?q_mat_const (INil)))))
+                    (= ?mul1 (Op (Mul
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ECons ?hdim (ENil)))))
+                        ?mul1_a_strides
+                        ?mul1_b_strides
+                        ?mul1_out_strides)
+                        (ICons ?q (ICons ?k_gqa (INil)))))
+                    (= ?qk (Op (Sum
+                        (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                        ?hdim
+                        ?qk_in_strides
+                        (MIter)
+                        ?qk_out_strides)
+                        (ICons ?mul1 (INil))))
+
+                    ; K rows gathered from a 2D cache and broadcast to query heads.
+                    (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+                    (= ?k_gqa (Op (Mul
+                        (ECons ?nheads (ECons ?hdim (ECons ?context (ENil))))
+                        ?k_gqa_a_strides
+                        (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                        ?k_gqa_out_strides)
+                        (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+                    (= ?k_gathered (Op (Gather
+                        (ECons ?context (ECons ?kvdim (ENil)))
+                        (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil)))
+                        (ECons ?max_context (ECons ?kvdim (ENil)))
+                        (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil))))
+                        (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+                    ; V rows gathered from a matching 2D cache and broadcast to query heads.
+                    (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+                    (= ?v_gqa (Op (Mul
+                        (ECons ?nheads (ECons ?context (ECons ?hdim (ENil))))
+                        ?v_gqa_a_strides
+                        (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                        ?v_gqa_out_strides)
+                        (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+                    (= ?v_gathered (Op (Gather
+                        (ECons ?context (ECons ?kvdim (ENil)))
+                        (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil)))
+                        (ECons ?max_context (ECons ?kvdim (ENil)))
+                        (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil))))
+                        (ICons ?v_idx (ICons ?v_cache (INil)))))
+
+                    (= ?dt (dtype ?q))
+                    (= ?dt (dtype ?k_cache))
+                    (= ?dt (dtype ?v_cache))
+                    (= ?dt (dtype ?mask))
+                )
+                (
+                    (let ?fused (Op (MetalFusedPostRopeAttention
+                        ?nheads (MDiv ?kvdim ?hdim) ?hdim ?hidden ?seq ?context ?max_context ?scale)
+                        (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?v_idx (ICons ?mask (INil)))))))))
+                    (union ?output ?fused)
+                    (set (dtype ?fused) ?dt)
+                )
+                :ruleset kernel_lower
+                :name "metal fused post-rope paged attention"
+            )
+            
+
+                ; Once the fused post-RoPE attention candidate exists, delete
+                ; the final decomposed attention sum so extraction cannot keep
+                ; the old softmax-times-V reduction.
+                (rule
+                    ((= ?output (Op (Sum
+                        (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                        ?context
+                        ?out_in_strides
+                        (MIter)
+                        ?out_out_strides)
+                        (ICons ?mul2 (INil))))
+                     (= ?output (Op (MetalFusedPostRopeAttention
+                        ?nheads ?nkvheads ?hdim ?hidden ?seq ?context ?max_context ?scale)
+                        ?fused_inputs)))
+                    ((delete (Op (Sum
+                        (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                        ?context
+                        ?out_in_strides
+                        (MIter)
+                        ?out_out_strides)
+                        (ICons ?mul2 (INil)))))
+                    :ruleset cleanup
+                    :name "delete-post-rope-attention-sum-when-metal-fused-attention-exists"
+                )
+                
+
+                ; Prefer the fused post-RoPE attention op over the generic
+                ; matmul fallback for the final attention value.
+                (rule
+                    ((= ?output (GenericMatmul
+                        ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?output (Op (MetalFusedPostRopeAttention
+                        ?nheads ?nkvheads ?hdim ?hidden ?seq ?context ?max_context ?scale)
+                        ?fused_inputs)))
+                    ((subsume (GenericMatmul
+                        ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
+                    :ruleset cleanup
+                    :name "metal-fused-attention-subsumes-generic-matmul"
+                )
+                
+
+                ; Prefer the fused post-RoPE attention op over an MPS batched
+                ; matmul candidate for the same attention output.
+                (rule
+                    ((= ?output (MPSBatchedMatmul
+                        ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr))
+                     (= ?output (Op (MetalFusedPostRopeAttention
+                        ?nheads ?nkvheads ?hdim ?hidden ?seq ?context ?max_context ?scale)
+                        ?fused_inputs)))
+                    ((subsume (MPSBatchedMatmul
+                        ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr)))
+                    :ruleset cleanup
+                    :name "metal-fused-attention-subsumes-mps-batched-matmul"
+                )
+                
+
+                ; Prefer the fused post-RoPE attention op over a plain MPS
+                ; matmul candidate for the same attention output.
+                (rule
+                    ((= ?output (MPSMatmul
+                        ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr))
+                     (= ?output (Op (MetalFusedPostRopeAttention
+                        ?nheads ?nkvheads ?hdim ?hidden ?seq ?context ?max_context ?scale)
+                        ?fused_inputs)))
+                    ((subsume (MPSMatmul
+                        ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr)))
+                    :ruleset cleanup
+                    :name "metal-fused-attention-subsumes-mps-matmul"
+                )
+
+                ; Delete the now-dead decomposed attention subtree once the
+                ; fused op is available. Keep the fused inputs themselves
+                ; (post-RoPE Q, cache buffers, gather indices, and mask).
+                (rule
+                    (
+                        (= ?output (Op (MetalFusedPostRopeAttention
+                            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?hidden ?seq ?context ?max_context ?scale)
+                            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?v_idx (ICons ?mask (INil)))))))))
+
+                        (= ?mul2 (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ECons ?context (ENil)))))
+                            ?mul2_a_strides
+                            ?mul2_b_strides
+                            ?mul2_out_strides)
+                            (ICons ?soft (ICons ?v_gqa (INil)))))
+                        (= ?output (Op (Sum
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                            ?context
+                            ?out_in_strides
+                            (MIter)
+                            ?out_out_strides)
+                            (ICons ?mul2 (INil))))
+
+                        (= ?soft (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?soft_a_strides
+                            ?soft_b_strides
+                            ?soft_out_strides)
+                            (ICons ?exp (ICons ?inv_denom (INil)))))
+                        (= ?inv_denom (Op (Recip
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?recip_in_strides
+                            ?recip_out_strides)
+                            (ICons ?denom (INil))))
+                        (= ?denom (Op (Sum
+                            (ECons ?nheads (ECons ?seq (ENil)))
+                            ?context
+                            ?denom_in_strides
+                            (MIter)
+                            ?denom_out_strides)
+                            (ICons ?exp (INil))))
+                        (= ?exp (Op (Exp2
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?exp_in_strides
+                            ?exp_out_strides)
+                            (ICons ?exp_arg (INil))))
+                        (= ?log2e (Op (Constant 1.442695) (INil)))
+                        (= ?exp_arg (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?exp_arg_a_strides
+                            ?exp_arg_b_strides
+                            ?exp_arg_out_strides)
+                            (ICons ?centered (ICons ?log2e (INil)))))
+                        (= ?centered (Op (Add
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?centered_a_strides
+                            ?centered_b_strides
+                            ?centered_out_strides)
+                            (ICons ?masked (ICons ?neg_max (INil)))))
+                        (= ?neg_one (Op (Constant -1.000000) (INil)))
+                        (= ?neg_max (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?neg_max_a_strides
+                            ?neg_max_b_strides
+                            ?neg_max_out_strides)
+                            (ICons ?max_scores (ICons ?neg_one (INil)))))
+                        (= ?max_scores (Op (Max
+                            (ECons ?nheads (ECons ?seq (ENil)))
+                            ?context
+                            ?max_in_strides
+                            (MIter)
+                            ?max_out_strides)
+                            (ICons ?masked (INil))))
+
+                        (= ?masked (Op (Add
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?mask_add_a_strides
+                            (ECons (MNum 0) (ECons (MMul (MIter) ?context) (ECons (MIter) (ENil))))
+                            ?mask_add_out_strides)
+                            (ICons ?scaled_qk (ICons ?mask (INil)))))
+                        (= ?scale_const (Op (Constant ?scale) (INil)))
+                        (= ?scaled_qk (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?scale_a_strides
+                            ?scale_b_strides
+                            ?scale_out_strides)
+                            (ICons ?qk (ICons ?scale_const (INil)))))
+
+                        (= ?mul1 (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ECons ?hdim (ENil)))))
+                            ?mul1_a_strides
+                            ?mul1_b_strides
+                            ?mul1_out_strides)
+                            (ICons ?q (ICons ?k_gqa (INil)))))
+                        (= ?qk (Op (Sum
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?hdim
+                            ?qk_in_strides
+                            (MIter)
+                            ?qk_out_strides)
+                            (ICons ?mul1 (INil))))
+
+                        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+                        (= ?k_gqa (Op (Mul
+                            (ECons ?nheads (ECons ?hdim (ECons ?context (ENil))))
+                            ?k_gqa_a_strides
+                            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                            ?k_gqa_out_strides)
+                            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+                        (= ?k_gathered (Op (Gather
+                            (ECons ?context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil)))
+                            (ECons ?max_context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil))))
+                            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+                        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+                        (= ?v_gqa (Op (Mul
+                            (ECons ?nheads (ECons ?context (ECons ?hdim (ENil))))
+                            ?v_gqa_a_strides
+                            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                            ?v_gqa_out_strides)
+                            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+                        (= ?v_gathered (Op (Gather
+                            (ECons ?context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil)))
+                            (ECons ?max_context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil))))
+                            (ICons ?v_idx (ICons ?v_cache (INil)))))
+
+                    )
+                    (
+                        (delete (Op (Sum
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ENil))))
+                            ?context
+                            ?out_in_strides
+                            (MIter)
+                            ?out_out_strides)
+                            (ICons ?mul2 (INil))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?hdim (ECons ?context (ENil)))))
+                            ?mul2_a_strides
+                            ?mul2_b_strides
+                            ?mul2_out_strides)
+                            (ICons ?soft (ICons ?v_gqa (INil)))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?soft_a_strides
+                            ?soft_b_strides
+                            ?soft_out_strides)
+                            (ICons ?exp (ICons ?inv_denom (INil)))))
+                        (delete (Op (Recip
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?recip_in_strides
+                            ?recip_out_strides)
+                            (ICons ?denom (INil))))
+                        (delete (Op (Sum
+                            (ECons ?nheads (ECons ?seq (ENil)))
+                            ?context
+                            ?denom_in_strides
+                            (MIter)
+                            ?denom_out_strides)
+                            (ICons ?exp (INil))))
+                        (delete (Op (Exp2
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?exp_in_strides
+                            ?exp_out_strides)
+                            (ICons ?exp_arg (INil))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?exp_arg_a_strides
+                            ?exp_arg_b_strides
+                            ?exp_arg_out_strides)
+                            (ICons ?centered (ICons ?log2e (INil)))))
+                        (delete (Op (Add
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?centered_a_strides
+                            ?centered_b_strides
+                            ?centered_out_strides)
+                            (ICons ?masked (ICons ?neg_max (INil)))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?neg_max_a_strides
+                            ?neg_max_b_strides
+                            ?neg_max_out_strides)
+                            (ICons ?max_scores (ICons ?neg_one (INil)))))
+                        (delete (Op (Max
+                            (ECons ?nheads (ECons ?seq (ENil)))
+                            ?context
+                            ?max_in_strides
+                            (MIter)
+                            ?max_out_strides)
+                            (ICons ?masked (INil))))
+                        (delete (Op (Add
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?mask_add_a_strides
+                            (ECons (MNum 0) (ECons (MMul (MIter) ?context) (ECons (MIter) (ENil))))
+                            ?mask_add_out_strides)
+                            (ICons ?scaled_qk (ICons ?mask (INil)))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?scale_a_strides
+                            ?scale_b_strides
+                            ?scale_out_strides)
+                            (ICons ?qk (ICons ?scale_const (INil)))))
+                        (delete (Op (Sum
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ENil))))
+                            ?hdim
+                            ?qk_in_strides
+                            (MIter)
+                            ?qk_out_strides)
+                            (ICons ?mul1 (INil))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?seq (ECons ?context (ECons ?hdim (ENil)))))
+                            ?mul1_a_strides
+                            ?mul1_b_strides
+                            ?mul1_out_strides)
+                            (ICons ?q (ICons ?k_gqa (INil)))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?hdim (ECons ?context (ENil))))
+                            ?k_gqa_a_strides
+                            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                            ?k_gqa_out_strides)
+                            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+                        (delete (Op (Gather
+                            (ECons ?context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil)))
+                            (ECons ?max_context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil))))
+                            (ICons ?k_idx (ICons ?k_cache (INil)))))
+                        (delete (Op (Mul
+                            (ECons ?nheads (ECons ?context (ECons ?hdim (ENil))))
+                            ?v_gqa_a_strides
+                            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                            ?v_gqa_out_strides)
+                            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+                        (delete (Op (Gather
+                            (ECons ?context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil)))
+                            (ECons ?max_context (ECons ?kvdim (ENil)))
+                            (ECons (MMul (MIter) ?kvdim) (ECons (MIter) (ENil))))
+                            (ICons ?v_idx (ICons ?v_cache (INil)))))
+                    )
+                    :ruleset cleanup
+                    :name "delete-decomposed-post-rope-attention"
+                )

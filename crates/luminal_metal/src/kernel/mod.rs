@@ -1,5 +1,7 @@
+mod fusion;
 mod matmul;
-mod ops;
+pub(crate) mod ops;
+pub use fusion::*;
 pub use matmul::*;
 pub use ops::*;
 
@@ -166,6 +168,11 @@ pub trait MetalKernelOp: EgglogOp {
         dyn_map: &FxHashMap<char, usize>,
     );
 
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        ""
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn encode(
         &self,
@@ -179,9 +186,17 @@ pub trait MetalKernelOp: EgglogOp {
     ) {
         let pipeline = pipeline.expect("compute pipeline not compiled");
         let encoder = context.command_buffer.new_compute_command_encoder();
+        #[cfg(feature = "debug")]
+        {
+            let label = self.label();
+            set_objc_label(encoder.as_ptr() as *mut Object, label);
+            push_debug_group(encoder.as_ptr() as *mut Object, label);
+        }
         let dyn_idx = inputs.len() as u64 + 1;
         encoder.set_buffer(dyn_idx, Some(context.dyn_buffer), 0);
         self.encode_compute(encoder, pipeline, inputs, output, dyn_map);
+        #[cfg(feature = "debug")]
+        pop_debug_group(encoder.as_ptr() as *mut Object, self.label());
         encoder.end_encoding();
     }
 
@@ -219,3 +234,37 @@ pub trait MetalKernelOp: EgglogOp {
 }
 
 luminal::impl_into_ops!(MetalKernelOp);
+
+#[cfg(feature = "debug")]
+pub(crate) fn set_objc_label(object: *mut Object, label: &str) {
+    if label.is_empty() {
+        return;
+    }
+    unsafe {
+        let s = std::ffi::CString::new(label).unwrap();
+        let ns: *mut Object = msg_send![class!(NSString), stringWithUTF8String: s.as_ptr()];
+        let _: () = msg_send![object, setLabel: ns];
+    }
+}
+
+#[cfg(feature = "debug")]
+pub(crate) fn push_debug_group(object: *mut Object, label: &str) {
+    if label.is_empty() {
+        return;
+    }
+    unsafe {
+        let s = std::ffi::CString::new(label).unwrap();
+        let ns: *mut Object = msg_send![class!(NSString), stringWithUTF8String: s.as_ptr()];
+        let _: () = msg_send![object, pushDebugGroup: ns];
+    }
+}
+
+#[cfg(feature = "debug")]
+pub(crate) fn pop_debug_group(object: *mut Object, label: &str) {
+    if label.is_empty() {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![object, popDebugGroup];
+    }
+}

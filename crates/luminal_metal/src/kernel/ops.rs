@@ -1,4 +1,9 @@
-use super::{MPSMatrixLayout, MetalEncodeContext, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo};
+use super::{
+    MPSMatrixLayout, MetalEncodeContext, MetalKernelOp, MetalMulInfo, MetalSumReduceInfo,
+    MetalTransposedRhsGemv, fusion,
+};
+#[cfg(feature = "debug")]
+use super::{pop_debug_group, push_debug_group, set_objc_label};
 use luminal::{
     egglog_utils::{
         SerializedEGraph,
@@ -44,6 +49,8 @@ pub type MetalOps = (
     MPSMatmul,
     MPSBatchedMatmul,
     GenericMatmul,
+    MetalTransposedRhsGemv,
+    fusion::Ops,
     // Data ops
     MetalConstant,
     MetalIota,
@@ -54,7 +61,11 @@ pub type MetalOps = (
     MetalCast,
 );
 
-fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
+pub(crate) fn compile_shader(
+    device: &Device,
+    source: &str,
+    function_name: &str,
+) -> ComputePipelineState {
     let options = metal::CompileOptions::new();
     options.set_language_version(MTLLanguageVersion::V2_4);
     let library = device
@@ -443,6 +454,11 @@ impl EgglogOp for MetalAdd {
 }
 
 impl MetalKernelOp for MetalAdd {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Add"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -577,6 +593,11 @@ impl EgglogOp for MetalMul {
 }
 
 impl MetalKernelOp for MetalMul {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Mul"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -719,6 +740,11 @@ impl EgglogOp for MetalMod {
 }
 
 impl MetalKernelOp for MetalMod {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Mod"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -860,6 +886,11 @@ impl EgglogOp for MetalLessThan {
 }
 
 impl MetalKernelOp for MetalLessThan {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "LessThan"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -1011,6 +1042,11 @@ impl EgglogOp for MetalSumReduce {
 }
 
 impl MetalKernelOp for MetalSumReduce {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "SumReduce"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -1182,6 +1218,11 @@ impl EgglogOp for MetalMaxReduce {
 }
 
 impl MetalKernelOp for MetalMaxReduce {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "MaxReduce"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -1534,6 +1575,11 @@ impl MPSMatmul {
 }
 
 impl MetalKernelOp for MPSMatmul {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "MPSMatmul"
+    }
+
     fn compile(
         &self,
         _device: &Device,
@@ -1623,6 +1669,12 @@ impl MetalKernelOp for MPSMatmul {
         let out = Self::matrix(output, out_desc);
 
         unsafe {
+            #[cfg(feature = "debug")]
+            {
+                let label = self.label();
+                set_objc_label(kernel, label);
+                push_debug_group(context.command_buffer.as_ptr() as *mut Object, label);
+            }
             let _: () = msg_send![
                 kernel,
                 encodeToCommandBuffer: context.command_buffer.as_ptr()
@@ -1633,6 +1685,8 @@ impl MetalKernelOp for MPSMatmul {
             let _: () = msg_send![lhs, release];
             let _: () = msg_send![rhs, release];
             let _: () = msg_send![out, release];
+            #[cfg(feature = "debug")]
+            pop_debug_group(context.command_buffer.as_ptr() as *mut Object, self.label());
         }
     }
 
@@ -1907,6 +1961,11 @@ impl EgglogOp for MPSBatchedMatmul {
 }
 
 impl MetalKernelOp for MPSBatchedMatmul {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "MPSBatchedMatmul"
+    }
+
     fn compile(
         &self,
         _device: &Device,
@@ -1985,6 +2044,12 @@ impl MetalKernelOp for MPSBatchedMatmul {
         };
 
         unsafe {
+            #[cfg(feature = "debug")]
+            {
+                let label = self.label();
+                set_objc_label(kernel, label);
+                push_debug_group(context.command_buffer.as_ptr() as *mut Object, label);
+            }
             for batch_idx in 0..batch {
                 let batch_expr = Expression::from(batch_idx as i64);
                 let lhs_offset = self
@@ -2020,6 +2085,8 @@ impl MetalKernelOp for MPSBatchedMatmul {
                 let _: () = msg_send![rhs, release];
                 let _: () = msg_send![out, release];
             }
+            #[cfg(feature = "debug")]
+            pop_debug_group(context.command_buffer.as_ptr() as *mut Object, self.label());
         }
     }
 
@@ -2137,6 +2204,24 @@ impl EgglogOp for GenericMatmul {
                 .name("generic-matmul-metal-mul-sum"),
             Rule::raw(
                 "(rule
+                    ((= ?matmul (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?matmul (MPSMatmul ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr)))
+                    ((union (MGte ?m (MNum 2)) (MGte ?m (MNum 2))))
+                    :ruleset matmul_backend
+                    :name \"materialize-mps-matmul-row-count-check\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?matmul (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?matmul (MPSBatchedMatmul ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr)))
+                    ((union (MGte ?m (MNum 2)) (MGte ?m (MNum 2))))
+                    :ruleset matmul_backend
+                    :name \"materialize-mps-batched-matmul-row-count-check\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
                     ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
                      (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
                      (= ?sum (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
@@ -2144,6 +2229,26 @@ impl EgglogOp for GenericMatmul {
                      (delete (Op (MetalMul ?shape ?as ?bs ?os) ?inputs)))
                     :ruleset cleanup
                     :name \"delete-broadcast-mul-sum-when-generic-matmul-exists\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?matmul (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?matmul (MPSMatmul ?m ?n ?k ?lhs ?lhsrs ?rhs ?rhsrs ?ors ?tl ?tr))
+                     (= (MGte ?m (MNum 2)) (MNum 1)))
+                    ((subsume (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
+                    :ruleset cleanup
+                    :name \"mps-matmul-subsumes-dynamic-generic-matmul\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?matmul (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos))
+                     (= ?matmul (MPSBatchedMatmul ?b ?m ?n ?k ?lhs ?lhsbs ?lhsrs ?rhs ?rhsbs ?rhsrs ?obs ?ors ?tl ?tr))
+                     (= (MGte ?m (MNum 2)) (MNum 1)))
+                    ((subsume (GenericMatmul ?go ?gm ?gk ?gl ?glas ?gr ?grs ?gsis ?gsit ?gos)))
+                    :ruleset cleanup
+                    :name \"mps-batched-matmul-subsumes-dynamic-generic-matmul\"
                 )",
             ),
         ]
@@ -2190,6 +2295,11 @@ impl EgglogOp for GenericMatmul {
 }
 
 impl MetalKernelOp for GenericMatmul {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "GenericMatmul"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -2386,6 +2496,11 @@ impl EgglogOp for MetalConstant {
 }
 
 impl MetalKernelOp for MetalConstant {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Constant"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -2496,6 +2611,11 @@ impl EgglogOp for MetalIota {
 }
 
 impl MetalKernelOp for MetalIota {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Iota"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -2648,6 +2768,11 @@ impl EgglogOp for MetalGather {
 }
 
 impl MetalKernelOp for MetalGather {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Gather"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -2873,6 +2998,11 @@ impl EgglogOp for MetalScatter {
 }
 
 impl MetalKernelOp for MetalScatter {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Scatter"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -3185,6 +3315,11 @@ impl EgglogOp for MetalScatterNoCopy {
 }
 
 impl MetalKernelOp for MetalScatterNoCopy {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "ScatterNoCopy"
+    }
+
     fn compile(
         &self,
         device: &Device,
@@ -3358,6 +3493,11 @@ impl EgglogOp for MetalCast {
 }
 
 impl MetalKernelOp for MetalCast {
+    #[cfg(feature = "debug")]
+    fn label(&self) -> &'static str {
+        "Cast"
+    }
+
     fn compile(
         &self,
         device: &Device,

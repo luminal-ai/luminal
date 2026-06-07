@@ -206,6 +206,7 @@ impl Llama {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         input: GraphTensor,
@@ -213,6 +214,7 @@ impl Llama {
         scatter_idx: GraphTensor,
         gather_idx: GraphTensor,
         attn_mask: GraphTensor,
+        last_idx: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         let seq = input.dims1();
@@ -235,7 +237,9 @@ impl Llama {
             cache_outputs.push((k_out, v_out));
         }
 
-        let logits = self.lm_norm.forward(x).matmul(self.embedding.t());
+        // Only compute logits for the last query token (saves ~seq_len× lm_head compute)
+        let last_x = gather_rows(x, last_idx, HIDDEN);
+        let logits = self.lm_norm.forward(last_x).matmul(self.embedding.t());
         (logits, cache_outputs)
     }
 }
@@ -282,15 +286,18 @@ fn llama_rotary_embeddings(mut input: GraphTensor, pos_ids: GraphTensor) -> Grap
 
 #[allow(clippy::too_many_arguments)]
 fn attention(
-    q_rope: GraphTensor,
-    k_rope: GraphTensor,
+    q: GraphTensor,
+    k: GraphTensor,
     v: GraphTensor,
+    q_pos: GraphTensor,
     k_cache: GraphTensor,
     v_cache: GraphTensor,
     scatter_idx: GraphTensor,
     gather_idx: GraphTensor,
     attn_mask: GraphTensor,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
+    let q_rope = llama_rotary_embeddings(q, q_pos);
+    let k_rope = llama_rotary_embeddings(k, q_pos);
     let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, KV_DIM);
     let v_cache_out = scatter_rows(v, scatter_idx, v_cache, KV_DIM);
 
@@ -329,13 +336,11 @@ impl LlamaLayer {
         let q = x_attn.matmul(self.q_proj.t());
         let k = x_attn.matmul(self.k_proj.t());
         let v = x_attn.matmul(self.v_proj.t());
-
-        let q_rope = llama_rotary_embeddings(q, q_pos);
-        let k_rope = llama_rotary_embeddings(k, q_pos);
         let (attn_out, k_cache_out, v_cache_out) = attention(
-            q_rope,
-            k_rope,
+            q,
+            k,
             v,
+            q_pos,
             k_cache,
             v_cache,
             scatter_idx,
@@ -360,6 +365,7 @@ fn run_model_step(
     scatter_idx_t: GraphTensor,
     gather_idx_t: GraphTensor,
     attn_mask_t: GraphTensor,
+    last_idx_t: GraphTensor,
     logits: GraphTensor,
     kv_cache: &KVCache,
     cache_outputs: &[(GraphTensor, GraphTensor)],
@@ -374,11 +380,11 @@ fn run_model_step(
     cx.set_dim('c', gather_idx.len());
 
     runtime.set_data(input, tokens.iter().map(|t| *t as i32).collect::<Vec<_>>());
-    runtime.set_data(q_pos_t, q_pos.to_vec());
-    runtime.set_data(scatter_idx_t, scatter_idx.to_vec());
-    runtime.set_data(gather_idx_t, gather_idx.to_vec());
-    runtime.set_data(attn_mask_t, attn_mask.to_vec());
-    runtime.allocate_intermediate_buffers(&cx.dyn_map);
+    runtime.set_data(q_pos_t, q_pos);
+    runtime.set_data(scatter_idx_t, scatter_idx);
+    runtime.set_data(gather_idx_t, gather_idx);
+    runtime.set_data(attn_mask_t, attn_mask);
+    runtime.set_data(last_idx_t, &[tokens.len() as i32 - 1]);
 
     let execute_start = Instant::now();
     runtime.execute(&cx.dyn_map);
@@ -391,8 +397,8 @@ fn run_model_step(
     let cache_start = Instant::now();
     for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
         let k_buf = runtime.remove_buffer(*k_out);
-        let v_buf = runtime.remove_buffer(*v_out);
         runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
+        let v_buf = runtime.remove_buffer(*v_out);
         runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
     }
     let cache_roundtrip = cache_start.elapsed();
@@ -424,6 +430,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map_err(|err| err as Box<dyn Error>)?
         .get_ids()
         .to_vec();
+    let max_prefill = (prompt_tokens.len() + 16)
+        .next_power_of_two()
+        .min(MAX_SEQ_LEN);
+    let max_context = (prompt_tokens.len() + GEN_TOKENS + 1)
+        .next_power_of_two()
+        .min(MAX_SEQ_LEN);
 
     let mut cx = Graph::default();
     let input = cx.named_tensor("input", 's').as_dtype(DType::Int);
@@ -431,13 +443,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let scatter_idx_t = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
     let gather_idx_t = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
     let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'));
-    let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
-    let (logits, cache_outputs) = Llama::init(&mut cx).forward(
+    let last_idx_t = cx.named_tensor("last_idx", 1).as_dtype(DType::Int);
+    let kv_cache = KVCache::new(&mut cx, max_context);
+    let model = Llama::init(&mut cx);
+    let (logits, cache_outputs) = model.forward(
         input,
         q_pos_t,
         scatter_idx_t,
         gather_idx_t,
         attn_mask_t,
+        last_idx_t,
         &kv_cache,
     );
     let logits = logits.output();
@@ -448,12 +463,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     cx.set_dim('s', 1);
     cx.set_dim('c', 1);
-    let max_prefill = (prompt_tokens.len() + 16)
-        .next_power_of_two()
-        .min(MAX_SEQ_LEN);
-    let max_context = (prompt_tokens.len() + GEN_TOKENS + 1)
-        .next_power_of_two()
-        .min(MAX_SEQ_LEN);
     let search_s = 16.min(max_prefill).max(2);
     let search_c = 16.min(max_context).max(2);
     let build_options = CompileOptions::default()
@@ -486,7 +495,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.load_safetensors(&cx, model_dir.join("model.safetensors").to_str().unwrap());
     println!("  Weight load: {:.2} s", load_start.elapsed().as_secs_f64());
 
-    let cache_bytes = MAX_SEQ_LEN * KV_DIM * std::mem::size_of::<f32>();
+    let cache_bytes = max_context * KV_DIM * std::mem::size_of::<f32>();
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
@@ -501,12 +510,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(gather_idx_t, (0..search_c as i32).collect::<Vec<_>>());
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
+    runtime.set_data(last_idx_t, vec![search_s as i32 - 1]);
     let search_options = CompileOptions::default().search_graph_limit(SEARCH_GRAPHS);
     runtime = cx.search(runtime, search_options);
+
     println!(
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()
     );
+
+    cx.set_dim('s', prompt_tokens.len());
+    cx.set_dim('c', prompt_tokens.len());
+    cx.set_dim('s', 1);
+    cx.set_dim('c', prompt_tokens.len() + 1);
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
@@ -538,6 +554,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             scatter_idx_t,
             gather_idx_t,
             attn_mask_t,
+            last_idx_t,
             logits,
             &kv_cache,
             &cache_outputs,
@@ -585,6 +602,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             scatter_idx_t,
             gather_idx_t,
             attn_mask_t,
+            last_idx_t,
             logits,
             &kv_cache,
             &cache_outputs,
