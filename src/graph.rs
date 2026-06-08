@@ -1119,7 +1119,7 @@ impl Graph {
         self.run_auto_loop_rolling_prepass();
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<ReferenceRuntime>();
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
@@ -1217,7 +1217,7 @@ impl Graph {
         let mut ops = Rt::Ops::into_vec();
         ops.retain(|o| !exclude_ops.contains(&o.sort().name));
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<ReferenceRuntime>();
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
@@ -3182,8 +3182,8 @@ mod tests {
         );
 
         let vals = random_vec(8);
-        let mut rt = NativeRuntime::default();
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
         rt.set_data(x.id, vals.clone());
         rt.execute(&cx.dyn_map);
@@ -3219,8 +3219,8 @@ mod tests {
         );
 
         let vals = random_vec(8);
-        let mut rt = NativeRuntime::default();
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
         rt.set_data(x.id, vals.clone());
         rt.execute(&cx.dyn_map);

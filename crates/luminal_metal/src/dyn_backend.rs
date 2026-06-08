@@ -1,7 +1,9 @@
 //! [`DynBackend`] implementation for the Metal runtime.
 
 use luminal::dtype::DType;
-use luminal::dyn_backend::{BackendCompileArgs, DynBackend, bytes_to_native_data, compile_backend};
+use luminal::dyn_backend::{
+    BackendCompileArgs, DynBackend, bytes_to_reference_data, compile_backend,
+};
 use luminal::prelude::*;
 
 use crate::runtime::MetalRuntime;
@@ -18,7 +20,7 @@ impl DynBackend for MetalDynBackend {
 
     fn set_data_bytes(&mut self, node: NodeIndex, bytes: Vec<u8>, dtype: DType) {
         self.runtime
-            .set_data(node, bytes_to_native_data(bytes, dtype));
+            .set_data(node, bytes_to_reference_data(bytes, dtype));
     }
     fn set_data_f32(&mut self, node: NodeIndex, data: Vec<f32>) {
         self.runtime.set_data(node, data);
@@ -72,7 +74,7 @@ pub fn metal_factory(
         args,
         || Ok(MetalRuntime::initialize(())),
         |rt, node, bytes, dtype| {
-            rt.set_data(node, bytes_to_native_data(bytes, dtype));
+            rt.set_data(node, bytes_to_reference_data(bytes, dtype));
         },
         None,
         |rt| Box::new(MetalDynBackend { runtime: rt }),

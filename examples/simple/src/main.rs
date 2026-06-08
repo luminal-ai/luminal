@@ -11,8 +11,8 @@ fn main() {
     display_graph(&cx);
 
     // Compile
-    cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-    let mut rt = cx.search(NativeRuntime::default(), CompileOptions::default());
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = cx.search(ReferenceRuntime::default(), CompileOptions::default());
 
     // Set input tensors
     rt.set_data(a, vec![1.0, 2.0, 3.0]);

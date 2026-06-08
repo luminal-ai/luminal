@@ -3,7 +3,7 @@
 Deviates from the standard `torch.compile(..., backend=luminal_backend)`
 pattern in CLAUDE.md because the thing under test is the capsule-name
 check itself, not a feature behavior. Exercising it through torch.compile
-would only cover the happy path (`_native_factory_capsule` produces a
+would only cover the happy path (`_reference_factory_capsule` produces a
 correctly-named capsule, so validation passes trivially).
 """
 

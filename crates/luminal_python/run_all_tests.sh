@@ -11,15 +11,15 @@ echo "=========================================="
 NATIVE_TESTS="tests/test_hlir_ops.py tests/test_unary.py tests/test_dtype_boundary.py tests/test_torch_dtype_parity.py"
 CUDA_TESTS="tests/"
 
-# ── Phase 1: Native Backend ─────────────────────────────────
+# ── Phase 1: Reference Backend ──────────────────────────────
 
 echo ""
-echo "=== Phase 1: Building native backend ==="
+echo "=== Phase 1: Building reference backend ==="
 rm -rf rust/target/wheels rust/target/debug rust/target/release
 uv run --group dev maturin develop --manifest-path rust/Cargo.toml
 
 echo ""
-echo "--- 1a: Native backend tests ---"
+echo "--- 1a: Reference backend tests ---"
 uv run --group dev pytest $NATIVE_TESTS -v
 
 # ── Phase 2: CUDA Backend ───────────────────────────────────
