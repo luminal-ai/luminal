@@ -1207,7 +1207,12 @@ fn run_egglog_with_report_parts_impl(
     let setup_text_elapsed = setup_text_start.elapsed();
     let setup_lines = setup_code.lines().count();
     let mut egraph = egglog::EGraph::default();
-    egraph.set_report_level(ReportLevel::WithPlan);
+    // EXPERIMENT (egglog#900 tree decomposition ON): the DecomposedPlan report
+    // path (Plan::to_report) is an unimplemented todo!() that's only reached at
+    // ReportLevel::WithPlan/StageInfo. Keep decomposition ON (the actual
+    // speedup) and request only TimeOnly reports so we never hit it. Trade-off:
+    // per-rule query-plan diagnostics are dropped.
+    egraph.set_report_level(ReportLevel::TimeOnly);
     let setup_start = std::time::Instant::now();
     let setup_tuples_before = egraph.num_tuples();
     let parse_start = std::time::Instant::now();
