@@ -583,3 +583,132 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
         torch._dynamo.config.automatic_dynamic_shapes = prev_auto
         torch._dynamo.config.cache_size_limit = prev_cache_limit
         torch._dynamo.reset()
+
+
+@pytest.mark.slow
+def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
+    """Prototype: luminal's bf16 error stays within the bf16 rounding floor.
+
+    Rather than comparing a single luminal run to eager bf16 with a fixed atol,
+    this measures the *average* absolute logit error of luminal vs an fp32
+    reference, and of PyTorch-eager bf16 vs the same fp32 reference (the bf16
+    rounding floor), across several prompts of varying length, and asserts
+    luminal adds no more than a small factor over that floor.
+
+    The luminal graph is compiled ONCE with the sequence dimension marked
+    dynamic and reused for every prompt length (verified via a counting backend).
+    """
+    from transformers import AutoConfig, AutoTokenizer, LlamaForCausalLM
+
+    config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
+    config.use_cache = False
+    config._attn_implementation = "eager"
+    model = (
+        LlamaForCausalLM.from_pretrained("NousResearch/Llama-3.2-1B", config=config)
+        .eval()
+        .to(device)
+    )
+    tokenizer = AutoTokenizer.from_pretrained("NousResearch/Llama-3.2-1B")
+
+    prompts = [
+        "Hello",
+        "The capital of France is",
+        "In 1969 the first humans landed on the Moon during the",
+        "Machine learning models are trained on large datasets to learn "
+        "patterns and make predictions about",
+        "Once upon a time in a distant kingdom there lived a curious young "
+        "inventor who spent every waking hour tinkering with gears, springs, "
+        "and strange contraptions that nobody else could understand",
+    ]
+    id_lists = [tokenizer.encode(p) for p in prompts]
+    lengths = [len(t) for t in id_lists]
+    print(f"prompt token lengths: {lengths}")
+
+    # luminal's average error vs fp32 may exceed the bf16 floor by at most this.
+    factor = 1.5
+    # Minimum fraction of positions where luminal's argmax matches eager bf16.
+    # Not 1.0: near-ties (logit gap < the bf16 floor) flip benignly, so a single
+    # strict-equality run flakes. A real miscompile collapses this toward 0.
+    min_token_agreement = 0.9
+
+    # Count luminal backend compilations to prove we compile exactly once.
+    backend_calls = []
+
+    def counting_backend(gm, example_inputs, **kwargs):
+        backend_calls.append(1)
+        return luminal_backend(gm, example_inputs, **kwargs)
+
+    prev_auto = torch._dynamo.config.automatic_dynamic_shapes
+    prev_cache = torch._dynamo.config.cache_size_limit
+    torch._dynamo.reset()
+    torch._dynamo.config.automatic_dynamic_shapes = False
+    torch._dynamo.config.cache_size_limit = 8
+    try:
+        # Compile ONCE with the sequence dim dynamic; reuse for every length.
+        compiled = torch.compile(model, backend=counting_backend)
+        first = torch.tensor([id_lists[0]], device=device)
+        torch._dynamo.mark_dynamic(first, 1, min=min(lengths), max=max(lengths))
+
+        # Phase A — bf16: luminal (one graph, reused) + PyTorch eager, per prompt.
+        ids_all, lum_logits, bf16_logits = [], [], []
+        agree_positions, total_positions = 0, 0
+        with torch.no_grad():
+            for i, toks in enumerate(id_lists):
+                ids = first if i == 0 else torch.tensor([toks], device=device)
+                out_lum = compiled(ids).logits.detach().float()
+                ref_bf16 = model(ids).logits.detach().float()
+                # Per-position argmax agreement vs eager bf16, accumulated across
+                # prompts. We do NOT require exact equality per run: at a near-tie
+                # (logit gap < the bf16 floor) luminal and eager bf16 can pick
+                # different tokens, exactly as two correct bf16 runs disagree with
+                # fp32 there. Threshold-assert the aggregate below instead.
+                agree = out_lum.argmax(dim=-1) == ref_bf16.argmax(dim=-1)
+                agree_positions += int(agree.sum().item())
+                total_positions += int(agree.numel())
+                ids_all.append(ids)
+                lum_logits.append(out_lum)
+                bf16_logits.append(ref_bf16)
+
+        agreement = agree_positions / total_positions
+        print(
+            f"luminal vs eager-bf16 argmax agreement: "
+            f"{agree_positions}/{total_positions} = {agreement:.3%}"
+        )
+        assert agreement >= min_token_agreement, (
+            f"luminal vs eager-bf16 argmax agreement {agreement:.2%} "
+            f"below the {min_token_agreement:.0%} floor "
+            f"({agree_positions}/{total_positions} positions)"
+        )
+
+        assert len(backend_calls) == 1, (
+            f"expected the dynamic seq dim to compile luminal exactly once, "
+            f"got {len(backend_calls)} compilations"
+        )
+
+        # Phase B — fp32 reference: upcast in place, run PyTorch eager (no compile).
+        model.float()
+        f32_logits = []
+        with torch.no_grad():
+            for ids in ids_all:
+                f32_logits.append(model(ids).logits.detach())
+
+        # Per-prompt mean absolute logit error vs the fp32 reference, then average.
+        e_bf16 = sum(
+            (b - f).abs().mean().item() for b, f in zip(bf16_logits, f32_logits)
+        ) / len(prompts)
+        e_lum = sum(
+            (lg - f).abs().mean().item() for lg, f in zip(lum_logits, f32_logits)
+        ) / len(prompts)
+        ratio = e_lum / e_bf16 if e_bf16 > 0 else float("inf")
+        print(
+            f"avg |bf16 - fp32| = {e_bf16:.4e}   "
+            f"avg |luminal - fp32| = {e_lum:.4e}   ratio = {ratio:.2f}"
+        )
+        assert e_lum <= e_bf16 * factor, (
+            f"luminal avg error {e_lum:.3e} exceeds {factor}x the bf16 floor "
+            f"{e_bf16:.3e} (ratio {ratio:.2f})"
+        )
+    finally:
+        torch._dynamo.config.automatic_dynamic_shapes = prev_auto
+        torch._dynamo.config.cache_size_limit = prev_cache
+        torch._dynamo.reset()
