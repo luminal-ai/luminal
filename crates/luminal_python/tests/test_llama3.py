@@ -585,7 +585,6 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
         torch._dynamo.reset()
 
 
-@pytest.mark.slow
 def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
     """Prototype: luminal's bf16 error stays within the bf16 rounding floor.
 
