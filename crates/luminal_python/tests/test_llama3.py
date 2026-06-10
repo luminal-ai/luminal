@@ -136,7 +136,11 @@ def _assert_bf16_logits_match(out_logits, ref_logits, label: str = ""):
         f"{label}next-token argmax mismatch"
     )
     torch.testing.assert_close(
-        out_f, ref_f, rtol=0.05, atol=1.5, msg=lambda m: f"{label}bf16 logits diverged\n{m}"
+        out_f,
+        ref_f,
+        rtol=0.05,
+        atol=1.5,
+        msg=lambda m: f"{label}bf16 logits diverged\n{m}",
     )
 
 
@@ -558,7 +562,9 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
             f"got {dynamic_shapes}"
         )
 
-        _assert_bf16_logits_match(first_out.logits, first_ref.logits, label="seq_len=4: ")
+        _assert_bf16_logits_match(
+            first_out.logits, first_ref.logits, label="seq_len=4: "
+        )
 
         for seq_len, input_ids in seq_inputs.items():
             with torch.no_grad():
@@ -573,7 +579,9 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
                     config.vocab_size,
                 )
             ), f"seq_len={seq_len}: got {out.logits.shape}, expected {ref.logits.shape}"
-            _assert_bf16_logits_match(out.logits, ref.logits, label=f"seq_len={seq_len}: ")
+            _assert_bf16_logits_match(
+                out.logits, ref.logits, label=f"seq_len={seq_len}: "
+            )
 
         assert len(backend_invocations) == 1, (
             "Explicit mark_dynamic should produce one dynamic backend trace from the start, "

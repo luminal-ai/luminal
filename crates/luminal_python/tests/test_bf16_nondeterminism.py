@@ -23,10 +23,16 @@ def _model(device):
     from transformers import LlamaConfig, LlamaForCausalLM
 
     cfg = LlamaConfig(
-        hidden_size=4096, num_attention_heads=32, num_key_value_heads=8,
-        num_hidden_layers=1, intermediate_size=11008, vocab_size=2048,
-        max_position_embeddings=64, use_cache=False,
-        attn_implementation="eager", head_dim=128,
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        num_hidden_layers=1,
+        intermediate_size=11008,
+        vocab_size=2048,
+        max_position_embeddings=64,
+        use_cache=False,
+        attn_implementation="eager",
+        head_dim=128,
     )
     torch.manual_seed(0)
     return LlamaForCausalLM(cfg).eval().to(device).to(torch.bfloat16)
@@ -54,7 +60,9 @@ def test_nondeterminism():
         # bf16 vs bf16 should agree to the rounding floor; a broken extraction
         # is off by O(1-10) or NaN.
         broken = err > 1 or err != err
-        print(f"  compile {i:2d}: max_abs_err = {err:.3e}  {'BROKEN' if broken else 'ok'}")
+        print(
+            f"  compile {i:2d}: max_abs_err = {err:.3e}  {'BROKEN' if broken else 'ok'}"
+        )
 
     n_broken = sum(1 for e in errs if e > 1 or e != e)
     assert n_broken == 0, (
