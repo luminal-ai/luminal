@@ -61,7 +61,8 @@ impl MoE {
         let expert_out = expanded_act.matmul(gathered).squeeze(n); // [batch.., k, out]
 
         // 6. Weighted sum over experts: [batch.., k, out] * [batch.., k, 1] → sum(k) → [batch.., out]
-        let weights_exp = top_k_values.unsqueeze(top_k_values.dims().len()); // [batch.., k, 1]
+        let mut weights_exp = top_k_values.unsqueeze(top_k_values.dims().len()); // [batch.., k, 1]
+        weights_exp.shape.expand(expert_out.dims());
         (expert_out * weights_exp).sum(n - 1)
     }
 }
@@ -70,7 +71,7 @@ impl MoE {
 mod tests {
     use super::MoE;
     use luminal::prelude::*;
-    use rand::{rng, Rng};
+    use rand::{Rng, rng};
 
     fn random_vec(n: usize) -> Vec<f32> {
         let mut r = rng();
@@ -182,8 +183,11 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = vec![1.0, 2.0, 3.0];
         // Router strongly favors expert 0
@@ -237,8 +241,11 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = vec![1.0, 1.0];
         // Nearly-equal routing to all experts (slight differences to avoid argsort ties)
@@ -291,8 +298,11 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = vec![
             1.0, 0.0, 0.0, // batch 0: routes to expert via feature 0
@@ -348,8 +358,11 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = random_vec(in_dim);
         let router_data = random_vec(in_dim * n_experts);
@@ -393,8 +406,11 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let input_data = random_vec(batch * in_dim);
         let router_data = random_vec(in_dim * n_experts);
@@ -478,7 +494,8 @@ mod tests {
         let down_out = hidden_exp.matmul(down_gathered.transpose(2, 3)).squeeze(2); // [s, k, H]
 
         // 7. Weighted sum over k experts → [s, H]
-        let weights_exp = top_k_values.unsqueeze(top_k_values.dims().len()); // [s, k, 1]
+        let mut weights_exp = top_k_values.unsqueeze(top_k_values.dims().len()); // [s, k, 1]
+        weights_exp.shape.expand(down_out.dims());
         let _output = (down_out * weights_exp).sum(n - 1).output();
 
         // Dump the HLIR to egglog

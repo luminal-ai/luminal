@@ -1,10 +1,36 @@
 use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
+use rustc_hash::FxHashMap;
 
+use crate::pt2_expr::{ExprBounds, canonical_equal_expr, sym_char_ranges};
 use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
 use super::Translator;
+
+const SCATTER_INPUT_ARG: usize = 0;
+const SCATTER_DIM_ARG: usize = 1;
+const SCATTER_INDEX_ARG: usize = 2;
+const SCATTER_VALUE_ARG: usize = 3;
+
+fn normalize_concat_dims(
+    lhs: &mut GraphTensor,
+    rhs: &mut GraphTensor,
+    skip_dim: Option<usize>,
+    sym_ranges: &FxHashMap<char, ExprBounds>,
+) {
+    for i in 0..lhs.shape.len() {
+        if Some(i) == skip_dim {
+            continue;
+        }
+        let lhs_dim = lhs.shape.dims[i];
+        let rhs_dim = rhs.shape.dims[i];
+        if let Some(canonical) = canonical_equal_expr(lhs_dim, rhs_dim, sym_ranges) {
+            lhs.shape.dims[i] = canonical;
+            rhs.shape.dims[i] = canonical;
+        }
+    }
+}
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_reshape(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -115,6 +141,47 @@ impl<'a> Translator<'a> {
         Ok(a.slice_along(start..end, dim))
     }
 
+    /// `aten.select.int(self, dim, index)` — select element `index` along
+    /// `dim`, dropping that dim. Output rank = input rank − 1, so a 1-D input
+    /// produces a rank-0 scalar. Both `dim` and `index` may be negative and
+    /// are normalized against the input shape.
+    ///
+    /// Lowered as `slice_along(index..index+1, dim).squeeze(dim)`. We use the
+    /// slice + squeeze decomposition (rather than `gather`) because the
+    /// composition is a pure shape manipulation with a single iota, which the
+    /// luminal compiler can fold into surrounding ops.
+    pub(crate) fn translate_select(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        let dim = self.get_int_arg(node, 1)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let index_raw = self.get_int_arg(node, 2)?;
+
+        // Normalize a possibly-negative index. PyTorch accepts indices in
+        // [-size, size); negative wraps from the end.
+        let index = if index_raw < 0 {
+            let axis_size = a.shape.dims[dim].to_usize().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "select.int: dim {} must be concrete to normalize a negative index",
+                    dim
+                )
+            })?;
+            let normalized = axis_size as i64 + index_raw;
+            if normalized < 0 {
+                bail!(
+                    "select.int: index {} out of range for dim {} of size {}",
+                    index_raw,
+                    dim,
+                    axis_size
+                );
+            }
+            normalized as usize
+        } else {
+            index_raw as usize
+        };
+
+        Ok(a.slice_along(index..index + 1, dim).squeeze(dim))
+    }
+
     pub(crate) fn translate_cat(&mut self, node: &Node) -> Result<GraphTensor> {
         let tensors: Vec<GraphTensor> = if let Some(names) = node.inputs[0].arg.as_tensors() {
             names
@@ -155,8 +222,17 @@ impl<'a> Translator<'a> {
 
         let dim = normalize_dim(dim, tensors[0].shape.len());
         let mut result = tensors[0];
+        let sym_ranges = sym_char_ranges(&self.sym_map);
         for t in &tensors[1..] {
-            result = result.concat_along(*t, dim);
+            let mut next = *t;
+            normalize_concat_dims(&mut result, &mut next, Some(dim), &sym_ranges);
+
+            let lhs_axis = result.dims()[dim];
+            let rhs_axis = next.dims()[dim];
+            let mut lhs_padded = result.pad_along(0, rhs_axis, dim, 0.);
+            let mut rhs_padded = next.pad_along(lhs_axis, 0, dim, 0.);
+            normalize_concat_dims(&mut lhs_padded, &mut rhs_padded, None, &sym_ranges);
+            result = lhs_padded + rhs_padded;
         }
         Ok(result)
     }
@@ -230,7 +306,11 @@ impl<'a> Translator<'a> {
                     let mut target: Vec<Expression> = src_dims.to_vec();
                     target[first_non_none_dim] = idx_dim_size;
                     expanded.shape.expand(target);
-                    return Ok(source.gather_elements(expanded, first_non_none_dim));
+                    return Ok(super::movement_dynamic::pt2_gather_elements(
+                        source,
+                        expanded,
+                        first_non_none_dim,
+                    ));
                 }
             } else {
                 bail!(
@@ -254,21 +334,15 @@ impl<'a> Translator<'a> {
         for (dim_idx, idx_name) in index_names.iter().enumerate() {
             let idx_tensor = self.get_tensor(&idx_name.name)?;
 
-            // Normalize negative indices for this dimension
-            let axis_size = src_shape[dim_idx].to_usize().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "index.Tensor: dim {} must be concrete for negative index normalization",
-                    dim_idx
-                )
-            })?;
-            let idx_f32 = idx_tensor.cast(DType::F32);
-            let zero = self.graph.constant_float(0.0).expand_rhs(idx_f32.shape);
-            let adjustment = self
-                .graph
-                .constant_float(axis_size as f32)
-                .expand_rhs(idx_f32.shape);
-            let is_negative = idx_f32.lt(zero).cast(DType::F32);
-            let idx_int = (idx_f32 + is_negative * adjustment).cast(DType::Int);
+            // Normalize negative indices for this dimension. Stay in Int —
+            // multiplying an Int tensor by an Expression broadcasts the axis
+            // size, so we avoid three Cast nodes (Int→F32 for indices, F32→Int
+            // for the result, Bool→F32 for the negative mask) per indexed dim.
+            let axis_size = src_shape[dim_idx];
+            let idx_int = idx_tensor.cast(DType::Int);
+            let zero = self.graph.constant(0).expand_rhs(idx_int.shape);
+            let is_negative = idx_int.lt(zero).cast(DType::Int);
+            let idx_int = idx_int + is_negative * axis_size;
 
             let stride = &strides[dim_idx];
             let weighted = if stride.to_usize() == Some(1) {
@@ -334,20 +408,34 @@ impl<'a> Translator<'a> {
         let dim = normalize_dim(dim, a.shape.len());
         let indices = self.get_input_tensor(node, 2)?;
 
-        // Normalize negative indices: -1 → last, -2 → second-to-last, etc.
-        let axis_dim = a.shape.dims[dim].to_usize().ok_or_else(|| {
-            anyhow::anyhow!("Gather: axis dim must be concrete for negative index normalization")
-        })?;
-        let indices_f32 = indices.cast(DType::F32);
-        let zero = self.graph.constant_float(0.0).expand_rhs(indices_f32.shape);
-        let adjustment = self
-            .graph
-            .constant_float(axis_dim as f32)
-            .expand_rhs(indices_f32.shape);
-        let is_negative = indices_f32.lt(zero).cast(DType::F32);
-        let normalized = (indices_f32 + is_negative * adjustment).cast(DType::Int);
+        // PyTorch eager allows torch.gather(rank-1, 0, rank-0) and returns
+        // a rank-0 scalar — the only rank-mismatch case eager permits. Our
+        // gather_elements requires the index rank to match the source rank,
+        // so unsqueeze the rank-0 index to (1,), gather, then squeeze back.
+        let promoted_rank0 = indices.shape.is_empty() && a.shape.len() == 1;
+        let indices = if promoted_rank0 {
+            indices.unsqueeze(0)
+        } else {
+            indices
+        };
 
-        Ok(a.gather_elements(normalized, dim))
+        // Normalize negative indices: -1 → last, -2 → second-to-last, etc.
+        // Stay in Int the whole way — multiplying an Int tensor by an
+        // Expression broadcasts the axis size and avoids three Cast nodes
+        // (Int→F32 for indices, F32→Int for the result, plus a Bool→F32 for
+        // the negative mask) that the previous F32-routed path emitted.
+        let axis_dim = a.shape.dims[dim];
+        let indices_int = indices.cast(DType::Int);
+        let zero = self.graph.constant(0).expand_rhs(indices_int.shape);
+        let is_negative = indices_int.lt(zero).cast(DType::Int);
+        let normalized = indices_int + is_negative * axis_dim;
+
+        let result = super::movement_dynamic::pt2_gather_elements(a, normalized, dim);
+        Ok(if promoted_rank0 {
+            result.squeeze(0)
+        } else {
+            result
+        })
     }
 
     pub(crate) fn translate_scatter_src(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -356,7 +444,40 @@ impl<'a> Translator<'a> {
         let dim = normalize_dim(dim, a.shape.len());
         let indices = self.get_input_tensor(node, 2)?;
         let src = self.get_input_tensor(node, 3)?;
-        Ok(a.scatter_elements(indices.cast(DType::Int), src, dim))
+        Ok(super::movement_dynamic::pt2_scatter_elements(
+            a,
+            indices.cast(DType::Int),
+            src,
+            dim,
+        ))
+    }
+
+    pub(crate) fn translate_scatter_value(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let dim = self.get_int_arg(node, SCATTER_DIM_ARG)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let value_arg = &node
+            .inputs
+            .get(SCATTER_VALUE_ARG)
+            .context("scatter.value missing value input")?
+            .arg;
+        let value = if let Some(b) = value_arg.as_bool() {
+            self.graph.constant(if b { 1 } else { 0 }).cast(a.dtype)
+        } else if let Some(i) = value_arg.as_int() {
+            self.graph.constant(i).cast(a.dtype)
+        } else if let Some(f) = value_arg.as_float() {
+            self.graph.constant_float(f as f32).cast(a.dtype)
+        } else {
+            bail!("scatter.value: unsupported scalar argument {:?}", value_arg);
+        }
+        .expand_rhs(indices.shape);
+        Ok(super::movement_dynamic::pt2_scatter_elements(
+            a,
+            indices.cast(DType::Int),
+            value,
+            dim,
+        ))
     }
 
     pub(crate) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -368,15 +489,40 @@ impl<'a> Translator<'a> {
         let values = self.get_input_tensor(node, 2)?;
 
         if index_names.len() == 1 {
-            let indices = self.get_tensor(&index_names[0].name)?.cast(DType::Int);
-            // scatter_nd expects indices of shape [batch, K] where K = number of index dims.
-            // PT2's index_put gives 1D indices [batch]; reshape to [batch, 1].
-            let indices = if indices.shape.len() == 1 {
-                indices.expand_dim(1, Expression::from(1usize))
-            } else {
-                indices
-            };
-            Ok(a.scatter_nd(indices, values))
+            let idx_tensor = self.get_tensor(&index_names[0].name)?;
+
+            // Boolean-mask index_put: when the only index is a Bool tensor whose
+            // shape matches the data tensor, PyTorch semantics are
+            //   data[mask] = value   ↔   where(mask, value, data)
+            // NOT a scatter into positions. Casting the Bool mask to Int and
+            // feeding it to scatter_nd would reinterpret True/False as row
+            // indices 1/0 and silently corrupt the data. Reproducer:
+            //   x = arange(16).reshape(4, 4); mask = zeros(4, 4, dtype=bool)
+            //   y = x.clone(); y[mask] = 99   # eager: y == x (no-op)
+            // Pre-fix the compiled graph wrote 99 to row 0; this branch
+            // ensures the bool-mask path lowers to a where-blend instead.
+            if idx_tensor.dtype == DType::Bool && idx_tensor.shape.dims == a.shape.dims {
+                // Broadcast the (often scalar) value tensor to match data shape,
+                // then blend by mask. Cast mask to data's dtype for the
+                // arithmetic so this works for both integer and float data.
+                let mask_f = idx_tensor.cast(a.dtype);
+                let values_b = values.cast(a.dtype).expand_rhs(a.shape);
+                // where(mask, value, a) as `a + mask*(value - a)`. Saves a mul
+                // and the `1.0` constant compared to the `a*(1 - m) + v*m`
+                // form; works for any numeric dtype without a dedicated cond.
+                return Ok(a + mask_f * (values_b - a));
+            }
+
+            // Integer-index scatter: index_put with indices=[idx_tensor] writes
+            // into dim 0 of `a` at every position named in idx_tensor (flattened),
+            // broadcasting values across the trailing dims of `a`. idx_tensor can
+            // be ANY shape — its whole shape is "batch dims" in scatter_nd terms,
+            // and K is always 1 (number of dims we're indexing into). Always pad
+            // a trailing size-1 dim so the rank-1 and rank-N cases share a path.
+            let indices = idx_tensor.cast(DType::Int);
+            let new_last = indices.shape.len();
+            let indices = indices.expand_dim(new_last, Expression::from(1usize));
+            Ok(super::movement_dynamic::pt2_scatter_nd(a, indices, values))
         } else {
             bail!("index_put with multiple index tensors not yet supported");
         }

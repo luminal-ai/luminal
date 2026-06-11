@@ -18,11 +18,11 @@ jobs:
         name: "${{ matrix.example }} (Modal ${{ matrix.gpu.type }})"
         runs-on: ubuntu-latest
         environment: Modal
-        timeout-minutes: 70
+        timeout-minutes: 120
         strategy:
             fail-fast: false
             matrix:
-                example: [llama, gemma, qwen, qwen3_moe]
+                example: [llama, gemma, qwen, qwen3_moe, gemma4_moe, whisper]
                 gpu:
                     - { type: "A100-80GB" }
                     # To add more GPUs, just append another entry:

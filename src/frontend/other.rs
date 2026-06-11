@@ -105,6 +105,9 @@ impl GraphTensor {
         if let Some(gmem) = self.graph().try_get_op_mut::<Input>(self.id) {
             gmem.dtype = dtype;
         }
+        if let Some((_, d)) = self.graph().input_meta.get_mut(&self.id) {
+            *d = dtype;
+        }
         self
     }
 }
@@ -122,8 +125,11 @@ mod tests {
         let mut cx = Graph::new();
         let b = func(&mut cx).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         rt.execute(&cx.dyn_map);
 
@@ -207,8 +213,11 @@ mod tests {
         let c = cx.tensor((2, 3));
         let stacked = cx.stack(&[a, b, c], 0).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let a_data = random_vec(6);
         let b_data = random_vec(6);

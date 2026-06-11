@@ -152,16 +152,6 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
-    pub fn graph_break(self) -> GraphTensor {
-        let new_id = self.graph().add_op(
-            crate::hlir::GraphBreak {
-                input_shape: self.shape,
-            },
-            &[self.id],
-        );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
-    }
-
     /// Scale so std is 1.0
     pub fn std_norm<T>(self, axes: impl ToAxes, epsilon: T) -> GraphTensor
     where
@@ -317,7 +307,8 @@ impl GraphTensor {
     #[allow(clippy::excessive_precision)]
     pub fn gelu(self) -> GraphTensor {
         // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
-        0.5 * self * (1. + (0.7978845608 * self * (1. + 0.044715 * self * self)).tanh())
+        let scaled = 1.5957691216 * self * (1. + 0.044715 * self * self);
+        self * scaled.sigmoid()
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis
@@ -501,8 +492,11 @@ pub(super) mod tests {
         let a = cx.tensor(shape.clone());
         let b = func(a).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let v = random_vec(shape.iter().copied().product());
         rt.set_data(a.id, v.clone());
@@ -663,7 +657,7 @@ pub(super) mod tests {
                 let mut out: Vec<(NotNan<f32>, usize)> =
                     heap.into_iter().map(|std::cmp::Reverse(t)| t).collect();
 
-                out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                out.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 out.into_iter().map(|(_, i)| i).collect()
             }
             test_unary(

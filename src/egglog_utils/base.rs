@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use super::api::*;
 use crate::shape::{self, ToShape};
+use rustc_hash::FxHashSet;
 
 // ---- Sort classes (pub const) ----
 
@@ -54,6 +55,12 @@ pub fn peq(a: Term, b: Term) -> Term {
 }
 pub fn pneq(a: Term, b: Term) -> Term {
     neq(a, b)
+}
+pub fn interval_lower(e: Term) -> Term {
+    app(&func("lower", &["expr"]), vec![e])
+}
+pub fn interval_upper(e: Term) -> Term {
+    app(&func("upper", &["expr"]), vec![e])
 }
 
 // ---- Egglog function applications ----
@@ -228,12 +235,27 @@ pub struct BaseSorts {
 
     // DType variants
     pub f32_dt: SortDef,
+    pub f64_dt: SortDef,
     pub f16_dt: SortDef,
     pub bf16_dt: SortDef,
     pub int_dt: SortDef,
+    /// Egglog sort for `DType::I64`. Named `"Int64"` (not `"I64"`) to avoid
+    /// shadowing egglog's built-in `I64` primitive sort.
+    pub int64_dt: SortDef,
     pub bool_dt: SortDef,
+    pub f4e2m1_dt: SortDef,
+    pub f8e4m3_dt: SortDef,
+    pub f8e5m2_dt: SortDef,
+    pub f8ue8m0_dt: SortDef,
     pub i4_dt: SortDef,
+    pub u4_dt: SortDef,
+    pub i8_dt: SortDef,
+    pub u8_dt: SortDef,
+    pub i16_dt: SortDef,
+    pub u16_dt: SortDef,
     pub tf32_dt: SortDef,
+    pub f6e2m3_dt: SortDef,
+    pub f6e3m2_dt: SortDef,
     // Egglog builtin primitives (for term construction only)
     pub p_add: SortDef,
     pub p_sub: SortDef,
@@ -308,12 +330,25 @@ impl BaseSorts {
             row_major: sort(ELIST, "RowMajor", &[("list", ELIST)]),
 
             f32_dt: sort(DTYPE, "F32", &[]),
+            f64_dt: sort(DTYPE, "F64", &[]),
             f16_dt: sort(DTYPE, "F16", &[]),
             bf16_dt: sort(DTYPE, "Bf16", &[]),
             int_dt: sort(DTYPE, "Int", &[]),
+            int64_dt: sort(DTYPE, "Int64", &[]),
             bool_dt: sort(DTYPE, "Bool", &[]),
+            f4e2m1_dt: sort(DTYPE, "F4E2M1", &[]),
+            f8e4m3_dt: sort(DTYPE, "F8E4M3", &[]),
+            f8e5m2_dt: sort(DTYPE, "F8E5M2", &[]),
+            f8ue8m0_dt: sort(DTYPE, "F8UE8M0", &[]),
             i4_dt: sort(DTYPE, "I4", &[]),
+            u4_dt: sort(DTYPE, "U4", &[]),
+            i8_dt: sort(DTYPE, "I8", &[]),
+            u8_dt: sort(DTYPE, "U8", &[]),
+            i16_dt: sort(DTYPE, "I16", &[]),
+            u16_dt: sort(DTYPE, "U16", &[]),
             tf32_dt: sort(DTYPE, "TF32", &[]),
+            f6e2m3_dt: sort(DTYPE, "F6E2M3", &[]),
+            f6e3m2_dt: sort(DTYPE, "F6E3M2", &[]),
             p_add: func("+", &["a", "b"]),
             p_sub: func("-", &["a", "b"]),
             p_mul: func("*", &["a", "b"]),
@@ -363,12 +398,25 @@ impl BaseSorts {
             &self.remove_nth_from_end,
             &self.row_major,
             &self.f32_dt,
+            &self.f64_dt,
             &self.f16_dt,
             &self.bf16_dt,
             &self.int_dt,
+            &self.int64_dt,
             &self.bool_dt,
+            &self.f4e2m1_dt,
+            &self.f8e4m3_dt,
+            &self.f8e5m2_dt,
+            &self.f8ue8m0_dt,
             &self.i4_dt,
+            &self.u4_dt,
+            &self.i8_dt,
+            &self.u8_dt,
+            &self.i16_dt,
+            &self.u16_dt,
             &self.tf32_dt,
+            &self.f6e2m3_dt,
+            &self.f6e3m2_dt,
         ] {
             p.add_sort(s);
         }
@@ -377,6 +425,38 @@ impl BaseSorts {
 
 pub fn dtype(e: Term) -> Term {
     app(&func("dtype", &["inp"]), vec![e])
+}
+
+pub fn interval_facts_egglog(
+    intervals: &shape::DynDimIntervals,
+    vars: impl IntoIterator<Item = char>,
+) -> String {
+    let mut all_vars = FxHashSet::default();
+    all_vars.extend(intervals.keys().copied());
+    all_vars.extend(vars);
+
+    let mut all_vars = all_vars.into_iter().collect::<Vec<_>>();
+    all_vars.sort_unstable();
+
+    let mut out = String::new();
+    for var in all_vars {
+        let interval = intervals
+            .get(&var)
+            .copied()
+            .unwrap_or_else(shape::DimInterval::unbounded);
+        let var_expr = mvar(str(&var.to_string()));
+        out.push_str(&format!(
+            "(set {} {})\n",
+            term_to_egglog(&interval_lower(var_expr.clone())),
+            interval.min
+        ));
+        out.push_str(&format!(
+            "(set {} {})\n",
+            term_to_egglog(&interval_upper(var_expr)),
+            interval.max
+        ));
+    }
+    out
 }
 
 // ---- Normalized Op helpers ----
@@ -427,11 +507,19 @@ pub fn new_op_call(kind_sort: &SortDef, input_names: &[&str]) -> (Args, Term) {
     (args, op)
 }
 
+pub fn base_expression_egglog() -> String {
+    base_expression_egglog_impl(false)
+}
+
+pub fn base_expression_egglog_with_intervals() -> String {
+    base_expression_egglog_impl(true)
+}
+
 /// Generate the egglog program equivalent to `base.egg`.
 ///
 /// This builds the Expression, EList, and DType datatypes along with all
 /// algebraic rewrites, replacement rules, and list helper functions.
-pub fn base_expression_egglog() -> String {
+fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
     let s = BaseSorts::new();
 
     // Build the program
@@ -442,12 +530,30 @@ pub fn base_expression_egglog() -> String {
 
     // Rulesets
     p.add_ruleset("expr");
+    if use_interval_analysis {
+        p.add_ruleset("interval_expr");
+    }
     p.add_ruleset("dtype_prop");
     p.add_ruleset("cleanup");
-    p.add_ruleset("early");
+    p.add_ruleset("post_cleanup");
 
     // Register all sorts
     s.register(&mut p);
+    // Always define interval functions so backend rewrites can use interval
+    // facts as optional guards. When interval analysis is disabled these
+    // functions simply have no values, so guarded rules do not fire.
+    p.add_function(FunctionDef {
+        name: "lower".to_string(),
+        args: vec![EXPRESSION.name.to_string()],
+        ret: I64.name.to_string(),
+        merge: Some("(max old new)".to_string()),
+    });
+    p.add_function(FunctionDef {
+        name: "upper".to_string(),
+        args: vec![EXPRESSION.name.to_string()],
+        ret: I64.name.to_string(),
+        merge: Some("(min old new)".to_string()),
+    });
 
     // ---- Algebraic rewrites ----
     // Commutativity
@@ -491,6 +597,26 @@ pub fn base_expression_egglog() -> String {
             ])
             .ruleset("expr"),
     );
+    p.add_rule(
+        Rule::new()
+            .facts(vec![
+                peq(v("?expr"), mul(mul(v("?x"), num(v("?a"))), num(v("?b")))),
+                peq(v("?prod"), pmul(v("?a"), v("?b"))),
+            ])
+            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
+            .ruleset("expr")
+            .name("fold-right-associated-const-mul"),
+    );
+    p.add_rule(
+        Rule::new()
+            .facts(vec![
+                peq(v("?expr"), mul(num(v("?b")), mul(v("?x"), num(v("?a"))))),
+                peq(v("?prod"), pmul(v("?a"), v("?b"))),
+            ])
+            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
+            .ruleset("expr")
+            .name("fold-left-associated-const-mul"),
+    );
 
     // Constant folding: div (with conditions)
     p.add_rule(
@@ -499,25 +625,54 @@ pub fn base_expression_egglog() -> String {
             div(num(v("a")), num(v("b"))),
             num(pdiv(v("a"), v("b"))),
         )
-        .when(vec![
-            pneq(i64(0), v("b")),
-            peq(i64(0), pmod(v("a"), v("b"))),
-        ])
+        .when(vec![pneq(i64(0), v("b"))])
         .ruleset("expr"),
     );
 
     // Cancel common factor in division: (a*b)/(a*c) → b/c
-    p.add_rule(
-        rewrite(
-            "div-cancel-factor",
-            div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
-            div(v("b"), v("c")),
-        )
-        .ruleset("expr"),
-    );
+    //
+    // DISABLED: this rule rewrites to a `div` whose operands are themselves
+    // typically `mul`s of stride/shape factors, so the new tree matches the
+    // same `div-cancel-factor` pattern again. Combined with `mul-comm` (4
+    // orderings of a*b/c*d) it drives a combinatorial blow-up on the deep
+    // `flatten_strides` index expressions produced by stacked unfold-based
+    // convolutions. At 7 backbone YOLO v11 layers it accounts for ~66k
+    // matches in a single early-stage saturate. Productive simplifications
+    // (`div-self`, `mod-mul-self`, `div-const`, `merge-dims`) cover the
+    // cases we actually need without the explosion.
+    // p.add_rule(
+    //     rewrite(
+    //         "div-cancel-factor",
+    //         div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
+    //         div(v("b"), v("c")),
+    //     )
+    //     .ruleset("expr"),
+    // );
 
     // Division self-cancel: a/a → 1
     p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
+    p.add_rule(
+        rewrite(
+            "div-mul-num-self",
+            div(mul(v("?x"), num(v("?n"))), num(v("?n"))),
+            v("?x"),
+        )
+        .when(vec![pgte(v("?n"), i64(1))])
+        .ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite(
+            "div-mul-num-plus-rem",
+            div(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
+            v("?x"),
+        )
+        .when(vec![
+            pgte(v("?n"), i64(1)),
+            pgte(v("?r"), i64(0)),
+            plt(v("?r"), v("?n")),
+        ])
+        .ruleset("expr"),
+    );
 
     // Constant folding: ceildiv
     p.add_rule(
@@ -587,6 +742,28 @@ pub fn base_expression_egglog() -> String {
         )
         .ruleset("expr"),
     );
+    p.add_rule(
+        rewrite(
+            "mod-const",
+            modd(num(v("a")), num(v("b"))),
+            num(pmod(v("a"), v("b"))),
+        )
+        .when(vec![pneq(i64(0), v("b"))])
+        .ruleset("expr"),
+    );
+    p.add_rule(
+        rewrite(
+            "mod-mul-num-plus-rem",
+            modd(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
+            num(v("?r")),
+        )
+        .when(vec![
+            pgte(v("?n"), i64(1)),
+            pgte(v("?r"), i64(0)),
+            plt(v("?r"), v("?n")),
+        ])
+        .ruleset("expr"),
+    );
 
     p.add_rule(
         rewrite(
@@ -621,14 +798,208 @@ pub fn base_expression_egglog() -> String {
         .ruleset("expr"),
     );
 
+    if use_interval_analysis {
+        // ---- Interval analysis and interval-guarded simplifications ----
+        p.add_rule(
+            Rule::new()
+                .fact(peq(v("?e"), num(v("?n"))))
+                .set(interval_lower(v("?e")), v("?n"))
+                .set(interval_upper(v("?e")), v("?n"))
+                .ruleset("interval_expr")
+                .name("interval-num-exact"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), add(v("?a"), v("?b"))),
+                    peq(v("?lo_a"), interval_lower(v("?a"))),
+                    peq(v("?lo_b"), interval_lower(v("?b"))),
+                    peq(v("?sum"), padd(v("?lo_a"), v("?lo_b"))),
+                ])
+                .set(interval_lower(v("?e")), v("?sum"))
+                .when(vec![
+                    pgte(v("?lo_a"), i64(0)),
+                    pgte(v("?lo_b"), i64(0)),
+                    pgte(psub(i64(i64::MAX), v("?lo_b")), v("?lo_a")),
+                ])
+                .ruleset("interval_expr")
+                .name("interval-add-lower-nonnegative"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), add(v("?a"), v("?b"))),
+                    peq(v("?hi_a"), interval_upper(v("?a"))),
+                    peq(v("?hi_b"), interval_upper(v("?b"))),
+                    peq(v("?sum"), padd(v("?hi_a"), v("?hi_b"))),
+                ])
+                .set(interval_upper(v("?e")), v("?sum"))
+                .when(vec![
+                    plt(v("?hi_a"), i64(i64::MAX)),
+                    plt(v("?hi_b"), i64(i64::MAX)),
+                    pgte(psub(i64(i64::MAX), v("?hi_b")), v("?hi_a")),
+                ])
+                .ruleset("interval_expr")
+                .name("interval-add-upper-finite"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), min(v("?a"), v("?b"))),
+                    peq(v("?lo_a"), interval_lower(v("?a"))),
+                    peq(v("?lo_b"), interval_lower(v("?b"))),
+                ])
+                .set(interval_lower(v("?e")), pmin(v("?lo_a"), v("?lo_b")))
+                .ruleset("interval_expr")
+                .name("interval-min-lower"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), min(v("?a"), v("?b"))),
+                    peq(v("?hi_a"), interval_upper(v("?a"))),
+                    peq(v("?hi_b"), interval_upper(v("?b"))),
+                ])
+                .set(interval_upper(v("?e")), pmin(v("?hi_a"), v("?hi_b")))
+                .ruleset("interval_expr")
+                .name("interval-min-upper"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), max(v("?a"), v("?b"))),
+                    peq(v("?lo_a"), interval_lower(v("?a"))),
+                    peq(v("?lo_b"), interval_lower(v("?b"))),
+                ])
+                .set(interval_lower(v("?e")), pmax(v("?lo_a"), v("?lo_b")))
+                .ruleset("interval_expr")
+                .name("interval-max-lower"),
+        );
+        p.add_rule(
+            Rule::new()
+                .facts(vec![
+                    peq(v("?e"), max(v("?a"), v("?b"))),
+                    peq(v("?hi_a"), interval_upper(v("?a"))),
+                    peq(v("?hi_b"), interval_upper(v("?b"))),
+                ])
+                .set(interval_upper(v("?e")), pmax(v("?hi_a"), v("?hi_b")))
+                .ruleset("interval_expr")
+                .name("interval-max-upper"),
+        );
+        p.add_rule(
+            rewrite("interval-lt-true", lt(v("?x"), num(v("?n"))), num(i64(1)))
+                .when(vec![
+                    peq(v("?hi"), interval_upper(v("?x"))),
+                    plt(v("?hi"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite("interval-lt-false", lt(v("?x"), num(v("?n"))), num(i64(0)))
+                .when(vec![
+                    peq(v("?lo"), interval_lower(v("?x"))),
+                    pgte(v("?lo"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite("interval-gte-true", gte(v("?x"), num(v("?n"))), num(i64(1)))
+                .when(vec![
+                    peq(v("?lo"), interval_lower(v("?x"))),
+                    pgte(v("?lo"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-gte-false",
+                gte(v("?x"), num(v("?n"))),
+                num(i64(0)),
+            )
+            .when(vec![
+                peq(v("?hi"), interval_upper(v("?x"))),
+                plt(v("?hi"), v("?n")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-min-right-identity",
+                min(v("?x"), num(v("?n"))),
+                v("?x"),
+            )
+            .when(vec![
+                peq(v("?hi"), interval_upper(v("?x"))),
+                pgte(v("?n"), v("?hi")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-max-right-identity",
+                max(v("?x"), num(v("?n"))),
+                v("?x"),
+            )
+            .when(vec![
+                peq(v("?lo"), interval_lower(v("?x"))),
+                pgte(v("?lo"), v("?n")),
+            ])
+            .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite("interval-mod-small", modd(v("?x"), num(v("?n"))), v("?x"))
+                .when(vec![
+                    pgte(v("?n"), i64(1)),
+                    peq(v("?lo"), interval_lower(v("?x"))),
+                    peq(v("?hi"), interval_upper(v("?x"))),
+                    pgte(v("?lo"), i64(0)),
+                    plt(v("?hi"), v("?n")),
+                ])
+                .ruleset("interval_expr"),
+        );
+        p.add_rule(
+            rewrite(
+                "interval-div-small",
+                div(v("?x"), num(v("?n"))),
+                num(i64(0)),
+            )
+            .when(vec![
+                pgte(v("?n"), i64(1)),
+                peq(v("?lo"), interval_lower(v("?x"))),
+                peq(v("?hi"), interval_upper(v("?x"))),
+                pgte(v("?lo"), i64(0)),
+                plt(v("?hi"), v("?n")),
+            ])
+            .ruleset("interval_expr"),
+        );
+    }
+
+    // `div-div`, restricted to nested constant divisors only. The original
+    // unconstrained form `(a/b)/c → a/(b*c)` produces a new `div` whose
+    // denominator matches the same rule again as soon as `a` is itself a
+    // `div`, and `flatten_strides` produces 4-deep div chains for every
+    // conv. Under `(saturate expr)` the unrestricted version is the single
+    // biggest match generator on YOLO v11 (~200k matches at 7 layers,
+    // growing super-linearly). Restricting both divisors to numeric
+    // literals keeps the productive constant-folding case
+    // (e.g. `((w+7)/2)/2 → (w+7)/4`) while completely avoiding the
+    // explosion on stride/index expressions whose denominators are
+    // composite expressions like `c_in*H*W`.
     p.add_rule(
         rewrite(
-            "div-div",
-            div(div(v("a"), v("b")), v("c")),
-            div(v("a"), mul(v("b"), v("c"))),
+            "div-div-num",
+            div(div(v("a"), num(v("?b"))), num(v("?c"))),
+            div(v("a"), num(pmul(v("?b"), v("?c")))),
         )
+        .when(vec![
+            pgte(v("?b"), i64(1)),
+            pgte(v("?c"), i64(1)),
+            plt(v("?b"), i64(3_037_000_500)),
+            plt(v("?c"), i64(3_037_000_500)),
+        ])
         .ruleset("expr"),
     );
+
     p.add_rule(
         rewrite(
             "add-div",

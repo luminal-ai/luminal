@@ -56,5 +56,6 @@
         (set (dtype ?new_mul) ?dt)
         (set (dtype ?new_sum) ?dt)
     )
+    :ruleset matmul_flatten
     :name "batch-collapse squeeze dim=1"
 )

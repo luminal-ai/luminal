@@ -1,10 +1,9 @@
-mod backend;
 mod hf;
 mod model;
 
-use backend::*;
 use hf::prepare_hf_model;
 use luminal::prelude::*;
+use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
 use rustc_hash::FxHashSet;
@@ -13,6 +12,10 @@ use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "unsloth/gemma-3-4b-it";
+
+fn gemma3_chat_prompt(user_prompt: &str) -> String {
+    format!("<bos><start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n")
+}
 
 fn main() {
     let max_seq_len = 4096;
@@ -25,11 +28,19 @@ fn main() {
         .with(luminal_filter())
         .init();
 
+    let ctx = CudaContext::new(0).unwrap();
+    let stream = ctx.default_stream();
+
     let model_dir = prepare_hf_model(REPO_ID).expect("Failed to prepare model");
     println!("Using model directory: {}", model_dir.display());
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
-    let prompt_tokens = tokenizer.encode(prompt, true).unwrap().get_ids().to_vec();
+    let chat_prompt = gemma3_chat_prompt(prompt);
+    let prompt_tokens = tokenizer
+        .encode(chat_prompt.as_str(), false)
+        .unwrap()
+        .get_ids()
+        .to_vec();
 
     // Build graph
     let mut cx = Graph::default();
@@ -42,45 +53,124 @@ fn main() {
         k_out.output();
         v_out.output();
     }
+    let max_prefill = (prompt_tokens.len() + 16)
+        .next_power_of_two()
+        .min(max_seq_len);
+    let search_s = 16.min(max_prefill).max(2);
+    let build_options = CompileOptions::default().dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(search_s),
+        ],
+    );
 
     println!("Building E-Graph...");
-    build_search_space(&mut cx);
+    cx.build_search_space::<CudaRuntime>(build_options);
 
     println!("Loading weights...");
-    let mut runtime = init_runtime();
+    let mut runtime = CudaRuntime::initialize(stream);
     let weights_path = model_dir.join("model_combined.safetensors");
-    load_weights(&mut runtime, &cx, &weights_path);
-    init_kv_cache(&mut runtime, &kv_cache, max_seq_len);
+    runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+
+    let cache_bytes = N_KV_HEADS * max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
+    for i in 0..LAYERS {
+        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
+        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
+    }
 
     println!("Compiling...");
-    cx.set_dim('s', 1);
-    cx.set_dim('p', 1);
-    runtime.set_data(input, vec![1]);
-    runtime.set_data(token_ids, vec![1]);
-    runtime = cx.search(runtime, search_graphs);
+    cx.set_dim('s', search_s);
+    cx.set_dim('p', 0);
+    runtime.set_data(input, vec![1; search_s]);
+    runtime.set_data(token_ids, (0..search_s as i32).collect::<Vec<_>>());
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
+    runtime = cx.search(runtime, search_options);
 
-    init_kv_cache(&mut runtime, &kv_cache, max_seq_len);
+    for i in 0..LAYERS {
+        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
+        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
+    }
 
-    let mut prev_seq = 1usize;
-    let mut sentence = vec![prompt_tokens[0]];
-    let total_steps = prompt_tokens.len() - 1 + gen_tokens;
     let prompt_len = prompt_tokens.len();
+    let mut prev_seq = 0usize;
     let mut fwd_durations = vec![];
     let mut seen_tokens = FxHashSet::default();
     let repetition_penalty: f32 = 1.05;
 
-    const EOS_TOKEN: u32 = 1;
-    const STOP_TOKEN: u32 = 107;
+    const EOS_TOKEN: u32 = 1; // <eos>
+    const STOP_TOKEN: u32 = 106; // <end_of_turn>
 
     println!(
         "Prompt: {} tokens, generating up to {} tokens",
         prompt_len, gen_tokens
     );
 
-    for i in 0..total_steps {
+    let mut generated = 0usize;
+    let mut sentence = Vec::new();
+
+    if gen_tokens > 0 && prompt_len > 0 {
         let start = std::time::Instant::now();
-        let is_prefill = i < prompt_len - 1;
+
+        cx.set_dim('s', prompt_len);
+        cx.set_dim('p', 0);
+
+        runtime.set_data(
+            input,
+            prompt_tokens.iter().map(|t| *t as i32).collect::<Vec<_>>(),
+        );
+        runtime.set_data(token_ids, (0..prompt_len as i32).collect::<Vec<_>>());
+
+        runtime.execute(&cx.dyn_map);
+        let logits_data = runtime.get_f32(logits);
+
+        // Round-trip KV cache
+        for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+            let k_buf = runtime.remove_buffer(*k_out);
+            let v_buf = runtime.remove_buffer(*v_out);
+            runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
+            runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
+        }
+
+        prev_seq = prompt_len;
+        fwd_durations.push(start.elapsed());
+
+        // Greedy decode with repetition penalty
+        let row_start = (prompt_len - 1) * VOCAB_SIZE;
+        let mut last_row = logits_data[row_start..row_start + VOCAB_SIZE].to_vec();
+        for &tok in &seen_tokens {
+            let logit = &mut last_row[tok as usize];
+            if *logit > 0.0 {
+                *logit /= repetition_penalty;
+            } else {
+                *logit *= repetition_penalty;
+            }
+        }
+        let next_token = last_row
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .unwrap()
+            .0 as u32;
+        sentence = vec![next_token];
+        seen_tokens.insert(next_token);
+        generated = 1;
+
+        if next_token != EOS_TOKEN && next_token != STOP_TOKEN {
+            let decoded = tokenizer.decode(&[next_token], true).unwrap();
+            print!("{}", decoded);
+            std::io::stdout().flush().unwrap();
+        }
+    }
+
+    while generated < gen_tokens && !sentence.is_empty() {
+        let start = std::time::Instant::now();
         let seq_len = sentence.len();
+        let current_token = sentence[0];
+
+        if current_token == EOS_TOKEN || current_token == STOP_TOKEN {
+            break;
+        }
 
         cx.set_dim('s', seq_len);
         cx.set_dim('p', prev_seq);
@@ -97,15 +187,16 @@ fn main() {
         runtime.execute(&cx.dyn_map);
         let logits_data = runtime.get_f32(logits);
 
-        roundtrip_kv_cache(&mut runtime, &kv_cache, &cache_outputs);
+        // Round-trip KV cache
+        for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+            let k_buf = runtime.remove_buffer(*k_out);
+            let v_buf = runtime.remove_buffer(*v_out);
+            runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
+            runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
+        }
 
         prev_seq += seq_len;
         fwd_durations.push(start.elapsed());
-
-        if is_prefill {
-            sentence = vec![prompt_tokens[i + 1]];
-            continue;
-        }
 
         // Greedy decode with repetition penalty
         let mut last_row = logits_data[logits_data.len() - VOCAB_SIZE..].to_vec();
@@ -125,6 +216,7 @@ fn main() {
             .0 as u32;
         sentence = vec![next_token];
         seen_tokens.insert(next_token);
+        generated += 1;
 
         if next_token == EOS_TOKEN || next_token == STOP_TOKEN {
             break;
@@ -137,15 +229,11 @@ fn main() {
     println!();
 
     // Benchmarks
-    let decode_durations: Vec<_> = fwd_durations.iter().skip(prompt_len).collect();
+    let decode_durations: Vec<_> = fwd_durations.iter().skip(1).collect();
     if decode_durations.len() > 2 {
         println!(
             "  TTFT: {:.2} ms",
-            fwd_durations[..prompt_len]
-                .iter()
-                .sum::<Duration>()
-                .as_secs_f64()
-                * 1e3
+            fwd_durations[..1].iter().sum::<Duration>().as_secs_f64() * 1e3
         );
         println!(
             "  TPOT: {:.2} ms",

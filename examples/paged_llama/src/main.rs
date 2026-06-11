@@ -13,6 +13,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
 
+fn llama3_chat_prompt(user_prompt: &str) -> String {
+    format!(
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+}
+
 struct PageTable {
     tables: Vec<Vec<usize>>,
     next_free_slot: usize,
@@ -135,8 +141,15 @@ fn tick(
 const EOS_TOKEN: u32 = 128009;
 const STOP_TOKEN: u32 = 128001;
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 fn main() {
-    let num_slots = 8192;
+    let num_slots = env_usize("NUM_SLOTS", 8192);
     let search_graphs = 100;
     let gen_tokens = 30;
     let prompt_a = "Explain what a neural network is in a paragraph.";
@@ -156,11 +169,9 @@ fn main() {
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
 
     let encode = |prompt: &str| -> Vec<u32> {
-        let chat = format!(
-            "<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
+        let chat = llama3_chat_prompt(prompt);
         tokenizer
-            .encode(chat.as_str(), true)
+            .encode(chat.as_str(), false)
             .unwrap()
             .get_ids()
             .to_vec()
@@ -193,9 +204,20 @@ fn main() {
         k_out.output();
         v_out.output();
     }
+    // Bucket s=1 (decode) vs s>1 (prefill/mixed). Each bucket gets its own
+    // optimized compilation — decode can select warp-parallel kernels while
+    // prefill can select tiled matmul / cuBLAS.
+    let max_prefill = (tokens_a.len().max(tokens_b.len()) + 16).next_power_of_two();
+    let build_options = CompileOptions::default().dim_buckets(
+        's',
+        &[
+            DimBucket::new(1, 1),
+            DimBucket::new(2, max_prefill).representative(16),
+        ],
+    );
 
     println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(build_options);
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
@@ -209,18 +231,6 @@ fn main() {
     }
 
     println!("Compiling...");
-    // Bucket s=1 (decode) vs s>1 (prefill/mixed). Each bucket gets its own
-    // optimized compilation — decode can select warp-parallel kernels while
-    // prefill can select tiled matmul / cuBLAS.
-    let max_prefill = (tokens_a.len().max(tokens_b.len()) + 16).next_power_of_two();
-    cx.set_dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(16),
-        ],
-    );
-
     // Dummy data sized for the largest representative (s=16, c=16)
     let search_s = 16;
     let search_c = 16;
@@ -231,7 +241,8 @@ fn main() {
     runtime.set_data(scatter_idx_t, vec![0i32; search_s]);
     runtime.set_data(gather_idx_t, vec![0i32; search_c]);
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
-    runtime = cx.search(runtime, search_graphs);
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
+    runtime = cx.search(runtime, search_options);
 
     // Re-initialize KV cache after search (search consumes buffers)
     let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();

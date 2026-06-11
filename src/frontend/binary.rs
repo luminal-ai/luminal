@@ -11,6 +11,7 @@ impl Add for GraphTensor {
     type Output = GraphTensor;
 
     fn add(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(self.dims(), rhs.dims(), "Dims must match to add tensors.");
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to add tensors. Got {:?} and {:?}",
@@ -73,6 +74,11 @@ impl Mul for GraphTensor {
     type Output = GraphTensor;
 
     fn mul(self, rhs: GraphTensor) -> Self::Output {
+        assert_eq!(
+            self.dims(),
+            rhs.dims(),
+            "Dims must match to multiply tensors."
+        );
         assert_eq!(
             self.dtype, rhs.dtype,
             "Dtypes must match to multiply tensors. Got {:?} and {:?}",
@@ -355,7 +361,17 @@ impl GraphTensor {
 
     /// Take the elementwise maximum of a tensor and a float
     pub fn maximum_f32(self, rhs: f32) -> GraphTensor {
-        self.maximum(self.graph().constant_float(rhs).expand_rhs(self.shape))
+        // `constant_float` always emits F32; cast it to `self.dtype` so the
+        // downstream `lt`/`le` comparisons inside `maximum` don't panic when
+        // `self` is Int (e.g. `aten.clamp` on Int top-k indices coming out
+        // of an MoE router). For Int self the cast floors the bound, which
+        // matches PyTorch's `clamp(int_tensor, min=<float>)` semantics.
+        self.maximum(
+            self.graph()
+                .constant_float(rhs)
+                .cast(self.dtype)
+                .expand_rhs(self.shape),
+        )
     }
 
     /// Take the elementwise minimum of two tensors
@@ -446,8 +462,11 @@ pub(super) mod tests {
         let b = cx.tensor(b_shape.clone());
         let c = func(a, b).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
 
         let lhs_values = lhs_transform(random_vec(a_shape.iter().copied().product()));
         let rhs_values = rhs_transform(random_vec(b_shape.iter().copied().product()));
@@ -462,6 +481,42 @@ pub(super) mod tests {
         let ref_c = ref_func(ref_a, ref_b).flatten_all().unwrap();
 
         assert_close(rt.get_f32(c.id), &ref_c.to_vec1::<f32>().unwrap())
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to add tensors.")]
+    fn test_add_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a + b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to multiply tensors.")]
+    fn test_mul_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a * b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to mod tensors.")]
+    fn test_mod_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a % b;
+    }
+
+    #[test]
+    #[should_panic(expected = "Dims must match to lt tensors.")]
+    fn test_lt_rejects_implicit_broadcast() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((2, 3));
+        let b = cx.tensor((1, 3));
+        let _ = a.lt(b);
     }
 
     proptest! {
@@ -550,12 +605,55 @@ pub(super) mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
+        fn test_mod_scalar_broadcast(size in 1usize..64) {
+            // rank-0 RHS expanded against rank-N LHS, mirroring `x % torch.tensor(c)`.
+            test_binary_transforms(
+                size,
+                (),
+                |a, b| a % b.expand_rhs(a.shape),
+                |a, b| {
+                    let lhs = a.to_vec1::<f32>().unwrap();
+                    let rhs_scalar = b.to_scalar::<f32>().unwrap();
+                    let remainder: Vec<f32> = lhs.iter().map(|x| x % rhs_scalar).collect();
+                    Tensor::from_vec(remainder, size, &Device::Cpu).unwrap()
+                },
+                identity,
+                shift_from_zero,
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
         fn test_lt(size in 1usize..64) {
             test_binary(
                 size,
                 size,
                 |a, b| a.lt(b).cast(crate::dtype::DType::F32),
                 |a, b| a.lt(&b).unwrap().to_dtype(DType::F32).unwrap(),
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(10))]
+        #[test]
+        fn test_lt_scalar_broadcast(size in 1usize..64) {
+            // rank-0 RHS expanded against rank-N LHS for `lt`.
+            test_binary(
+                size,
+                (),
+                |a, b| a.lt(b.expand_rhs(a.shape)).cast(crate::dtype::DType::F32),
+                |a, b| {
+                    let scalar = b.to_scalar::<f32>().unwrap();
+                    let lhs = a.to_vec1::<f32>().unwrap();
+                    let result: Vec<f32> = lhs
+                        .iter()
+                        .map(|x| if *x < scalar { 1.0f32 } else { 0.0f32 })
+                        .collect();
+                    Tensor::from_vec(result, size, &Device::Cpu).unwrap()
+                },
             );
         }
     }

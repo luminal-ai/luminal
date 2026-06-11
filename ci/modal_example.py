@@ -1,6 +1,8 @@
-import modal
-import subprocess
 import os
+import subprocess
+import sys
+
+import modal
 
 example = os.environ.get("EXAMPLE", "llama")
 gpu_type = os.environ.get("GPU_TYPE", "A100-80GB")
@@ -17,6 +19,37 @@ hf_cache = modal.Volume.from_name(
 )
 
 WORKDIR = "/workspace/luminal"
+
+EXAMPLE_CARGO_ARGS = {
+    "qwen": ["--features", "cuda"],
+}
+
+
+def run_and_capture(command: list[str], *, cwd: str, env: dict[str, str]) -> str:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+
+    chunks = []
+    while True:
+        chunk = process.stdout.read1(4096)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        chunks.append(chunk)
+
+    return_code = process.wait()
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command, output=output)
+    return output
+
 
 cuda_image = (
     modal.Image.from_registry(
@@ -39,7 +72,7 @@ cuda_image = (
 @app.function(
     image=cuda_image,
     gpu=gpu_type,
-    timeout=3600,  # 60 minutes
+    timeout=7200,  # 2 hours
     volumes={
         HF_CACHE_PATH: hf_cache,
     },
@@ -47,17 +80,20 @@ cuda_image = (
 def run_example(example: str):
     """Build and run a luminal example on a Modal GPU."""
     subprocess.run(["nvidia-smi"], check=True)
+    sys.path.insert(0, f"{WORKDIR}/ci")
+    from example_output import validate_output
 
-    subprocess.run(
-        ["cargo", "run", "--release"],
+    run_env = {
+        **os.environ,
+        "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
+        "HF_HOME": HF_CACHE_PATH,
+    }
+    output = run_and_capture(
+        ["cargo", "run", "--release", *EXAMPLE_CARGO_ARGS.get(example, [])],
         cwd=f"{WORKDIR}/examples/{example}",
-        env={
-            **os.environ,
-            "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
-            "HF_HOME": HF_CACHE_PATH,
-        },
-        check=True,
+        env=run_env,
     )
+    validate_output(example, output)
 
     hf_cache.commit()
 

@@ -1,13 +1,16 @@
+use luminal::dyn_backend::BackendFactory;
 use luminal::prelude::tracing::warn;
 use luminal::prelude::*;
 use pyo3::prelude::*;
+use pyo3::types::{PyCapsule, PyCapsuleMethods};
 use std::collections::HashMap;
 
 use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, WeightData};
+use crate::pt2_expr::parse_sympy_expr;
+use crate::pt2_parser;
 use crate::pt2_schema;
 use crate::translator;
 use crate::typed_data::TypedData;
-use crate::{pt2_parser, pt2_util};
 
 /// Pre-loaded weight/constant data paired with tensor sizes.
 type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);
@@ -19,37 +22,87 @@ fn resolve_dim_sizes(
     sizes
         .iter()
         .map(|s| match s {
-            pt2_schema::DimSize::Int(i) => Expression::from(i.as_int as usize),
+            pt2_schema::DimSize::Int(i) => Expression::from(i.as_int),
             pt2_schema::DimSize::Expr(e) => {
-                if let Some(sym) = pt2_parser::extract_symbol_name_pub(&e.as_expr.expr_str) {
-                    if let Some(c) = sym_to_char.get(&sym) {
-                        Expression::from(*c)
-                    } else {
-                        Expression::from(1usize)
-                    }
-                } else {
-                    Expression::from(1usize)
-                }
+                let s = e.as_expr.expr_str.trim();
+                // Try the full sympy-style parse first so compound forms like
+                // `Mul(Integer(2), Symbol('s77', ...))` (emitted by `cat` and
+                // similar dim-altering ops) propagate as a real Expression
+                // rather than collapsing to the size-1 fallback. Fall back to
+                // the bare-Symbol fast path when that fails — the parser
+                // bails on unrecognised heads (Pow, Min, etc.) and we'd
+                // rather lose the symbolic info than misinterpret it.
+                parse_sympy_expr(s, sym_to_char)
+                    .or_else(|| {
+                        pt2_parser::extract_symbol_name_pub(s)
+                            .and_then(|sym| sym_to_char.get(&sym).map(|c| Expression::from(*c)))
+                    })
+                    .or_else(|| {
+                        // As a last resort, if the EP gave us a concrete `hint`
+                        // (the value used to seed shape tracing), use it. The
+                        // dim is technically dynamic but at least output-shape
+                        // resolution won't return 1 for unset dims.
+                        e.as_expr
+                            .hint
+                            .as_ref()
+                            .and_then(|h| h.as_int())
+                            .map(Expression::from)
+                    })
+                    .unwrap_or_else(|| Expression::from(1usize))
             }
         })
         .collect()
 }
 
 #[pyfunction]
-#[pyo3(signature = (pt2_path, weights_path, backend, search_iters, weight_device_ptrs=None))]
+#[pyo3(signature = (pt2_path, weights_path, search_iters, factory_capsule, weight_device_ptrs=None))]
 pub fn process_pt2(
     pt2_path: &str,
     weights_path: &str,
-    backend: &str,
     search_iters: usize,
+    factory_capsule: &Bound<'_, PyCapsule>,
     weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
 ) -> PyResult<CompiledGraph> {
+    let factory: BackendFactory = {
+        let expected = ::luminal::dyn_backend::BACKEND_FACTORY_CAPSULE_NAME;
+        match factory_capsule.name()? {
+            Some(name) => {
+                // SAFETY: the &CStr is used immediately (for a byte-wise
+                // comparison) and never stored; the capsule is borrowed for
+                // the duration of this function, so the name pointer stays
+                // valid for as long as we read it here.
+                let actual = unsafe { name.as_cstr() };
+                if actual != expected {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "factory_capsule has wrong name: expected {:?}, got {:?}",
+                        expected, actual,
+                    )));
+                }
+            }
+            None => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "factory_capsule has no name; expected \"luminal.backend_factory\"",
+                ));
+            }
+        }
+        let wrapper_ptr = factory_capsule
+            .pointer_checked(Some(expected))
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e}")))?
+            .as_ptr() as *const *const std::ffi::c_void;
+        let fn_ptr = unsafe { *wrapper_ptr };
+        if fn_ptr.is_null() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "factory_capsule inner function pointer is null",
+            ));
+        }
+        unsafe { std::mem::transmute(fn_ptr) }
+    };
     compile_pt2(
         pt2_path,
         weights_path,
-        backend,
         search_iters,
         weight_device_ptrs.unwrap_or_default(),
+        factory,
     )
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
 }
@@ -57,14 +110,14 @@ pub fn process_pt2(
 fn compile_pt2(
     pt2_path: &str,
     weights_path: &str,
-    backend: &str,
     search_iters: usize,
     weight_device_ptrs: HashMap<String, (u64, usize)>,
+    factory: BackendFactory,
 ) -> anyhow::Result<CompiledGraph> {
     let (translation, mut weights) = translate_pt2(pt2_path, weights_path)?;
     weights.device_ptrs = weight_device_ptrs;
 
-    CompiledGraph::parse_graph(translation, weights, backend, search_iters)
+    CompiledGraph::parse_graph(translation, weights, factory, search_iters)
         .map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -77,10 +130,13 @@ pub fn translate_pt2(
     let translated = translator::translate(&parsed)?;
     let mut graph = translated.graph;
 
-    // Set initial dynamic dim values from symbol ranges
+    // Set initial dynamic dim values from symbol ranges. PT2 emits
+    // `min_val: null` when the constraint is unbounded; fall back to 1 in
+    // that case (the smallest valid dim — used only as an initial value).
     for (sym_name, c) in &translated.sym_map.sym_to_char {
         if let Some(rc) = translated.sym_map.ranges.get(sym_name) {
-            graph.set_dim(*c, rc.min_val as usize);
+            let initial = rc.min_val.unwrap_or(1).max(0) as usize;
+            graph.set_dim(*c, initial);
         }
     }
 
@@ -96,14 +152,14 @@ pub fn translate_pt2(
         })
         .collect();
 
-    let output_dtypes: Vec<DType> = translated
+    // Preserve original PT2 dtype codes for outputs (e.g. 5 = int64) so the
+    // Python wrapper can return tensors with the right torch.dtype, even when
+    // luminal collapses the type internally (e.g. int64 → DType::Int).
+    let output_dtypes: Vec<u32> = translated
         .output_ids
         .iter()
         .map(|(name, _id)| {
-            parsed
-                .tensor_meta(name)
-                .map(|meta| pt2_util::torch_dtype_int_to_luminal(meta.dtype))
-                .unwrap_or(DType::F32)
+            parsed.tensor_meta(name).map(|meta| meta.dtype).unwrap_or(7) // default to f32
         })
         .collect();
 
@@ -318,52 +374,10 @@ fn safetensors_dtype_to_pt2(dtype: safetensors::Dtype) -> u32 {
     }
 }
 
-/// Convert raw bytes to TypedData using PT2 dtype numbering.
-/// Preserves native byte format for types luminal supports directly (f32, f16, bf16, i32, bool, u8, i8).
-/// Converts i64/f64/i16 to the closest luminal-native representation.
+/// Convert raw bytes to `TypedData` using PT2 dtype numbering. Thin
+/// wrapper around `TypedData::from_pytorch_bytes` — the dtype dispatch
+/// (including the narrow-int panic and unknown-code rejection) lives
+/// there, so this site stays a one-liner that just clones the slice.
 fn bytes_to_typed(bytes: &[u8], dtype: u32) -> TypedData {
-    match dtype {
-        // Types that map directly — preserve raw bytes
-        7 => TypedData::from_raw(bytes.to_vec(), DType::F32),
-        6 => TypedData::from_raw(bytes.to_vec(), DType::F16),
-        13 => TypedData::from_raw(bytes.to_vec(), DType::Bf16),
-        4 => TypedData::from_raw(bytes.to_vec(), DType::Int), // i32
-        1 => TypedData::from_raw(bytes.to_vec(), DType::U8),
-        2 => TypedData::from_raw(bytes.to_vec(), DType::I8),
-        12 => TypedData::from_raw(bytes.to_vec(), DType::Bool),
-
-        // i64 → i32 (truncate, matching luminal's Int type)
-        5 => {
-            let i32s: Vec<i32> = bytes
-                .chunks_exact(8)
-                .map(|b| {
-                    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as i32
-                })
-                .collect();
-            TypedData::from_i32_vec(i32s)
-        }
-        // f64 → f32 (downcast, luminal has no F64 in practice for most ops)
-        8 => {
-            let f32s: Vec<f32> = bytes
-                .chunks_exact(8)
-                .map(|b| {
-                    f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-                })
-                .collect();
-            TypedData::from_f32_vec(f32s)
-        }
-        // i16 → i32 (widen to luminal's Int)
-        3 => {
-            let i32s: Vec<i32> = bytes
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
-                .collect();
-            TypedData::from_i32_vec(i32s)
-        }
-        _ => {
-            let luminal_dtype = pt2_util::torch_dtype_int_to_luminal(dtype);
-            warn!("Unrecognized dtype {dtype}, interpreting as {luminal_dtype:?}");
-            TypedData::from_raw(bytes.to_vec(), luminal_dtype)
-        }
-    }
+    TypedData::from_pytorch_bytes(bytes.to_vec(), dtype)
 }

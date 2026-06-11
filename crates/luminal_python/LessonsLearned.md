@@ -178,15 +178,15 @@ a different (broken) e-node from the same e-class.
 ### What the symptom was
 
 `test_onehot` panicked at `src/hlir.rs:1625` in `get_f32()`: the output buffer was
-`NativeData::Int` instead of the expected `NativeData::F32`.
+`ReferenceData::Int` instead of the expected `ReferenceData::F32`.
 
 ### What the actual root cause was
 
 The Cast parser's `* 1.0` workaround for `Int → F32` casts used `input * one_expanded`
 (Int GraphTensor on the left, F32 constant on the right). However, `Mul for GraphTensor`
 always uses `self.dtype` (the **left** operand's dtype) for the result, and the native
-runtime's `Mul::execute` dispatches on the **first** input's `NativeData` variant. So
-`Int * F32` produced `DType::Int` / `NativeData::Int` — the exact opposite of the intended
+runtime's `Mul::execute` dispatches on the **first** input's `ReferenceData` variant. So
+`Int * F32` produced `DType::Int` / `ReferenceData::Int` — the exact opposite of the intended
 F32 output.
 
 ### Why it was hard to find
@@ -220,7 +220,7 @@ constant must be the left operand.
 
 ### What the symptom was
 
-`test_scatter_nd` passed on native backend but failed on CUDA with "does not produce an
+`test_scatter_nd` passed on reference backend but failed on CUDA with "does not produce an
 egraph". The CUDA compilation could not extract a valid program from the e-graph.
 
 ### What the actual root cause was
@@ -237,13 +237,13 @@ matching dtypes. `F32 != Int` → the rule never fires → the Mul node gets **n
 
 Every downstream op checks `(= ?dty (dtype ?upstream))`. Without dtype on the Mul, no
 CUDA kernel rewrite rules fire for any downstream op (KernelMul, KernelAdd, KernelLessThan,
-etc.). When `cleanup_hlir` runs (enabled for CUDA, disabled for native), it deletes all
+etc.). When `cleanup_hlir` runs (enabled for CUDA, disabled for reference), it deletes all
 unrewritten HLIR ops, leaving empty e-classes → egraph extraction fails.
 
 ### Why it was hard to find
 
-1. **Works on native**: `cleanup_hlir = false` for NativeRuntime, so unrewritten HLIR ops
-   are never deleted. NativeOp dispatches on actual runtime data, not egglog dtype.
+1. **Works on reference**: `cleanup_hlir = false` for ReferenceRuntime, so unrewritten HLIR ops
+   are never deleted. ReferenceOp dispatches on actual runtime data, not egglog dtype.
 2. **Cascading failure**: The root cause (missing dtype on one Mul) silently propagated
    through every downstream op, making it look like a systemic CUDA issue rather than a
    single dtype mismatch.
@@ -320,7 +320,7 @@ The resulting Mul had input A with 4D strides and input B with 1D strides.
 ### Why it was hard to find
 
 1. **Only triggered by 1B model**: The tiny model's Where inputs all had matching ranks (no scalars).
-2. **CUDA-only**: The native runtime's `bin_fn` uses `StridedIterator` which handles mismatched
+2. **CUDA-only**: The reference runtime's `bin_fn` uses `StridedIterator` which handles mismatched
    strides more gracefully. CUDA's `KernelMul::compile` calls `flatten_strides` which asserts
    `range.len() == strides.len()`.
 3. **Delayed crash**: The mismatch was created during ONNX parsing but only manifested during
@@ -344,7 +344,7 @@ with matching shape tracker dimensions.
 
 1. **Symptom**: `test_topk_values` failed on CUDA — rows 0-1 were correct but rows 2+ returned
    the value at column 0 of each row (all three top-k positions got the same value).
-   Native backend was fine.
+   Reference backend was fine.
 
 2. **Root cause**: `gather_elements` was called with a non-contiguous index tensor produced by
    `argsort(axis=1) → slice_along(..k, axis=1)`. The slice creates a ShapeTracker view of the
@@ -568,7 +568,7 @@ is easier to verify and less likely to confuse source/destination ordering. Also
 
 6 CUDA tests (`test_pow`, `test_pow_broadcast`, `test_div`, `test_mod`, `test_mod_broadcast`,
 `test_erf`) consistently failed with `Failed to find a viable initial genome for group 0 after
-100 attempts`. All 6 passed on native backend.
+100 attempts`. All 6 passed on reference backend.
 
 ### What the actual root cause was
 
@@ -589,8 +589,8 @@ The `has_nan_outputs` check rejected every candidate genome, exhausting all 100 
 
 1. **No panic, no crash — silent NaN rejection**: The error message said "Failed to find a
    viable initial genome" which suggested an egglog rewrite issue, not a data issue.
-2. **Works on native**: `NativeRuntime::has_nan_outputs()` returns `false` by default (no NaN
-   check), so zero inputs never caused problems on native.
+2. **Works on reference**: `ReferenceRuntime::has_nan_outputs()` returns `false` by default (no NaN
+   check), so zero inputs never caused problems on reference.
 3. **torch.compile vs direct export difference**: Directly exporting a model via
    `torch.onnx.export(model, ...)` produces initializers. But `torch.compile`'s backend
    receives a `GraphModule` where weights are graph inputs, not initializers. The ONNX file
@@ -756,3 +756,112 @@ identical across all attempts (dtype issue) vs varying (actual numerical issue).
 3. **Why hard**: Per-operation error was ~1e-7 but compounded over 16 layers × ~25 extra materializations. The egglog `Exp` rewrite depends on exact constant format matching.
 4. **Fix**: Added `KernelExp` (uses `expf()`), `KernelSigmoid` (uses `1/(1+expf(-x))`), and Kahan summation in SumReduce. Each uses both `kernel_rewrite` and a direct egglog pattern match with range checks (e.g., `(> ?val 1.44) (< ?val 1.45)`) to bypass constant format dependency.
 5. **Principle**: When decomposed CUDA kernel chains cause precision loss, add fused kernels via `kernel_rewrite`. For robustness, add BOTH the logical-op rewrite path AND a direct HLIR pattern match — the constant format in egglog can be fragile.
+
+## 2026-04-26 — Loop unroll-union rules silently disabled in full egglog stage
+
+1. **Symptom**: Python `test_llama_transformer_block` (CUDA backend) produced output ~1e-2 off from PyTorch (atol=1e-4) on the `loop_rolling` branch. All component tests (RMSNorm, attention, SwiGLU, RoPE) passed. The diff pattern was suspicious: row 0 of the (1,4,32) output matched exactly, rows 1–3 differed slightly. Disabling rolling fixed it.
+2. **Root cause**: The auto-roll prepass folds three sequential scalar muls in PyTorch's `pow(2)` decomposition (`exp2(log2(x) * 0.693 * 2.0 * 1.442)` — the last constant is `log2(e)`). The kernel `direct-exp-fusion` egglog rule rewrites `Mul(?x, log2_e_const) → Exp2(...)` into `KernelExp(?x)` (single `expf()` instead of separate exp2f + multiply by truncated log2(e)). Without rolling, this fusion fires and the float chain stays stable; with rolling the fusion can't see through the `LoopStart`/`LoopEnd` markers, so the chain stays as `KernelMul → KernelExp2`, and the truncated `log2(e)` constant accumulates ~1e-7 error per layer that compounds into ~1e-2 over the full block.
+
+   The unroll-union rules I'd added (`Mul`/`Add`/etc. binary-op rules that union a rolled body with its fully-unrolled equivalent) were registered only in `EgglogOp::early_rewrites()`, not `rewrites()`. The egglog driver feeds `early_rewrites` only into the early-stage program and `rewrites` only into the full-stage program. So the unrolled chain materialised in the early egraph, the early→full extract picked the (cheaper) rolled form, the unrolled chain was lost, and `direct-exp-fusion` (which runs in the full stage) had nothing to match against.
+3. **Why hard**: The post-unroll LLIR for the rolled vs un-rolled paths *looked* nearly identical when scanned visually — both had the Log2 → Mul × 3 → Exp2 chain. The diff was 2 extra Muls vs no-rolling, and the actual semantic gap was visible only in op-name counts: WITH-rolling had 3 `KernelExp2` and 0 `KernelExp`, WITHOUT-rolling had 1 `KernelExp2` and 2 `KernelExp`. Tracking the missing fusion to the early/full ruleset split required reading the egglog driver carefully and noticing that `OpTextParts` builds `early_rewrites` and `full_rewrites` from disjoint method calls.
+4. **Fix**: Register `binary_op_unroll_rules` in BOTH `early_rewrites()` (so fusion patterns like GLUMoE can match before the early-stage extract, which is what fixed `test_glumoe_gemma_gelu_matches_unfused_output` earlier in the session) AND `rewrites()` (so kernel-level rewrites like `direct-exp-fusion` can match in the full stage on the unrolled chain). One block per binary op (`Add`, `Mul`, `Mod`, `LessThan`).
+5. **Principle**: When egglog has multiple stages (early/full) with disjoint rule sets, any rewrite that materialises new HLIR/IR enodes (rather than just lowering to LLIR) needs to fire in BOTH stages if downstream rewrites in BOTH stages might want to see the new structure. Putting "preparatory" rewrites only in `early_rewrites` means their effect is lost across the early→full handoff. The narrow rule of thumb: if your rule's outputs are intended to enable matches by other rules, audit which stages those other rules run in and register accordingly.
+
+## 2026-04-26 — `unroll_loops_in_llir` panicked on iteration-invariant body producers
+
+1. **Symptom**: Modal CI/CD job for the gemma example panicked at `src/graph.rs:1867` with `no entry found for key`. The line is `clone_map[i - 1][&body_producer]` inside `unroll_loops_in_llir`'s `resolve_src` closure — `body_producer` (the LoopEnd's incoming source for that slot) wasn't a key in the per-iteration clone map. cuda_lite/python tests didn't repro: only triggered by the specific genome and graph shapes that gemma's longer search settles on.
+2. **Root cause**: `body_nodes` is computed by walking *forward* from each LoopStart/LoopInput/LoopInputStatic outgoing edge, stopping at markers and `Output` ops. Some egglog-extracted LLIRs land a `body_producer` that isn't reachable via that forward walk — i.e., its only ancestors are non-marker (a constant, an external input, or an op whose chain was congruence-merged off the marker chain by rules like `LoopInputStatic inline`). Semantically this is a degenerate "iteration-invariant body": every iter computes the same value, so the loop's state never changes. The per-iter clone path needed a fallback for that case.
+3. **Why hard**: cuda_lite and python tests don't generate genomes that produce this shape, so local runs always pass. The forward-walk-only definition of `body_nodes` is *almost* always right — only specific extraction shapes from longer searches expose the gap. Test-driven debugging has limited reach when the failure mode depends on a search trajectory the local fuzzers don't explore.
+4. **Fix**: in `unroll_loops_in_llir::resolve_src`, when the LoopStart-resolved `body_producer` isn't in `body_nodes`, return `body_producer` itself for iter > 0 instead of indexing `clone_map[i - 1]`. The body op didn't depend on the loop variable, so every iter > 0 carries the same value forward — using `body_producer` directly is semantically correct. Mirrored the same `unwrap_or(body_producer)` fallback in the post-loop substitution map (`marker_post_sub` for LoopEnd / LoopOutputSelect). Added a backward-walk-from-end-markers backfill in `collapse_loops_to_first_iter` so its body-node iteration also covers these nodes (it doesn't have a clone_map, but does need to rewire body ops' incoming edges before deleting markers).
+5. **Principle**: When a graph-walk-derived set is used as a hashmap key requirement, every code path that *could* produce a key outside that set needs a graceful fallback — not just a defensive `expect`. For loop unrolling specifically, the rule is: `body_nodes` is the set of "ops that participate in per-iter computation"; ops on the LoopEnd's path that *don't* participate (iteration-invariant) are still legitimate, and need a "no clone, share across iters" path through `resolve_src` and `marker_post_sub`. Forward-walk-only `body_nodes` is correct only when extraction never produces iteration-invariant body producers — and in an egglog-driven search, that's not a guarantee you can make.
+
+## 2026-04-26 — Iteration-invariant state slots are a first-class concept, not a defensive fallback
+
+1. **Symptom + fix recap**: gemma Modal CI panicked at `clone_map[i-1][&body_producer]` because some state slots' `body_producer` (LoopEnd's incoming) isn't in `body_nodes` (forward walk from input markers). The first commit pair (16de9638 / 93fb02c4) caught this with `.unwrap_or(body_producer)` — which works but reads as "defensive, unclear *why* this case exists."
+2. **What's actually happening**: extracted LLIR from gemma legitimately puts a `KernelConstant` at LoopEnd's incoming for some state slots. e.g. for one slot of gemma's body=104 trips=5 rolling: `initial = KernelConstant 1.442695` (log2 e), `body_producer = same node`. For another: `body_producer = KernelConstant 9.21034` (ln 10000, RoPE's frequency base after `Log2 * ln(2)` simplification). egglog's kernel-level rewrites legitimately union body-slot eclasses with these constants when the body chain provably reduces to them. The state really is iteration-invariant — every iter sees the same value.
+3. **Why "defensive fallback" framing is misleading**: it implies the LLIR is broken. It isn't. The forward-walk-only `body_nodes` definition just doesn't cover this case, because the case requires no per-iter cloning at all. A *node not reachable from any loop input marker has no input-marker ancestor*, so by construction its value doesn't depend on the loop's per-iter state.
+4. **Cleaner formulation**: name the concept. Compute an `iteration_invariant_slots: HashSet<LoopStart>` set at the same time `start_meta` is built, with the rule `body_producer ∉ body_nodes ⇒ iteration_invariant`. `resolve_src` and `marker_post_sub` then have explicit branches: if the slot is invariant, use `body_producer` directly; otherwise the standard per-iter clone lookup. The behavior is the same as the `unwrap_or` band-aid, but the code now documents that this is a real, sound case the unroll handles correctly — not a panic suppressor.
+5. **Principle**: when an `unwrap_or` papers over a case that turns out to be semantically valid, the right cleanup isn't to keep the `unwrap_or` and add a comment — it's to name the case. Hoist the predicate into a set or enum and branch on it explicitly. The compiler then enforces that every consumer of the per-iter cloning machinery has an opinion on iteration-invariant slots, instead of silently relying on a `Map::get` returning `None` at the right moment.
+
+---
+
+## 2026-04-30 — `translate_grouped_mm` casted the full expert weight to F32, OOMing search on Qwen3-MoE
+
+### What the symptom was
+
+`benchmarks/ttft/run.py --config qwen3-moe` crashed every search-profile attempt with:
+```
+crates/luminal_cuda_lite/src/runtime.rs:711: called `Result::unwrap()` on an `Err` value:
+  DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")
+```
+The DB shows this had been failing every run for ~2 weeks. The rust `examples/qwen3_moe` ran fine end-to-end. python_baseline / python_torch_compile / qwen3-4b were all fine — only python_luminal × qwen3-moe failed.
+
+### What the actual root cause was
+
+`translate_grouped_mm` in `crates/luminal_python/rust/src/translator/tensor.rs` was lowering HF's `_grouped_mm(input, weight, offs)` op to a *full-broadcast* batched matmul plus a group-mask:
+
+```rust
+let weight_f = weight.cast(DType::F32);                  // [G=128, K, N] cast → 1.5 GB / layer
+let input_batched = input_f.expand_dim(0, g);
+let all_out = input_batched.matmul(weight_f);            // [G, S, N]
+let mask = ... (g_arange == expert_id).cast(F32);
+let out = (all_out * mask.expand_dim(2, n)).sum(0);      // mask + sum over G
+```
+
+The full `[G, K, N]` F32 cast intermediate is 1.5 GB / layer for gate-up and 0.6 GB / layer for down on Qwen3-30B-A3B. With 60 GB of persistent bf16 weights already on a 97 GB GPU, the search-time profiler ran out of memory allocating those casts.
+
+By contrast, `examples/qwen3_moe`'s `gather_experts` gathers only the top-K active experts per token first, then casts that small `[s, k, d1, d2]` slice (~100 MB / layer). The GLUMoE host op (`crates/luminal_cuda_lite/src/host/moe/glumoe_rewrite.egg`) is also wired to this gather pattern.
+
+### Why it was hard to find
+
+1. **Code path was reasonable in isolation**: at small scale (`test_grouped_mm_fallback`: g=2, K=8, N=16) the broadcast version was fine — the F32 cast was only 1 KB, and search profiling never noticed.
+2. **The error reported "out of memory" but the rest of the system looked healthy**: 60 GB weights + 37 GB headroom looks like plenty until you realise 48 layers × 2.1 GB cast intermediates per layer doesn't fit, even after loop rolling.
+3. **The DB's `code 1` failures looked the same as a Python exception** — the actual panic site (`runtime.rs:711:64` `stream.alloc_zeros(needed_bytes).unwrap()`) had to be recovered from a tmux scrollback because the orchestrator's stdout was already torn down by the time we looked.
+
+### The fix
+
+Rewrote `translate_grouped_mm` to gather first, matmul second:
+
+```rust
+// expert_id[m] = first g s.t. m < offs[g], clamped to [0, G-1]
+let expert_id = ge_boundary.sum(0).minimum_f32(g_max_f).cast(DType::Int);
+
+// flat_idx = expert_id * (K*N) + iota('z', (K, N))   — same shape as
+// rust qwen3_moe's `gather_experts`
+let flat_idx = (expert_id * (k * n))
+    .expand_dim(1, k).expand_dim(2, n)
+    + self.graph.iota(Expression::from('z'), (k, n)).expand_dim(0, s);
+
+let weight_gathered = weight.gather(flat_idx);            // [S, K, N], bf16
+let result = input.cast(F32).unsqueeze(1)
+    .matmul(weight_gathered.cast(F32))                    // [S, 1, N]
+    .squeeze(1);
+```
+
+Two important details:
+
+1. **Clamp `expert_id` to `[0, G-1]`**: at search time, dummy data fills `offs` with all-1s (`make_ones_bytes` in `compile_backend`). For S>1 that pushes `expert_id` to G (boundary count = G), which is one past the last valid expert and OOBs the gather. HF's own grouped-MM forward also clamps for the same reason (invalid expert IDs from EP).
+2. **Don't cast the full weight**: the cast moved from before the batched-matmul (over `[G, K, N]`) to after the gather (over `[S, K, N]`). 16× shrink at prefill (S=top_k=8 vs G=128).
+
+### Result
+
+`search-iters=1` end-to-end works on Qwen3-30B-A3B: `BENCH_RESULT … "ttft_ms": 9350.5, "tpot_ms": 1166.7`. The OOM is gone.
+
+`search-iters>=5` still crashes — but with a *different*, downstream `CUDA_ERROR_ILLEGAL_ADDRESS` during execution after search completes. That looks like the same family as the 2026-03-07 / 2026-03-09 egglog-extractor non-determinism bugs (some mutation during search picks a kernel/rewrite combo that's broken at this scale). It's a separate investigation — the gather-based lowering is correct in isolation (`test_grouped_mm_fallback` passes; a synthetic `g=128, S=8, K=2048, N=1536` bf16 test passes with max-diff ~2.4e-4).
+
+### General principle
+
+**When lowering an op that takes a per-row index over a large parameter, gather first and cast second — never cast the full parameter to F32 just because your matmul kernel is F32-only.** A "broadcast over G + mask" pattern is mathematically equivalent to "gather per-row" but materialises a G× larger intermediate — fine for tests, ruinous on real MoE checkpoints. When in doubt, mirror the rust example's pattern: the egglog fusion rules (GLUMoE here) are written to recognise the gather form, not the broadcast-and-mask form.
+
+Also: search-time dummy-1 inputs are not the same shape as runtime inputs. Anything you compute from a runtime tensor (cumsum offsets, routing indices, mask boundaries) needs to remain in-bounds for the dummy. Clamp index-producing chains as a matter of course, not just when the math says you "should" — `make_ones_bytes` is a hostile witness.
+
+## 2026-05-02 — Whisper port hit two missing-translator pitfalls
+
+1. **Symptom**: Compiling a PyTorch port of Whisper-tiny.en through `luminal_backend` failed twice in a row at the dispatch table: first with `Unsupported ATen op: torch.ops.aten.gelu.default`, then with `full: unsupported fill value type ... -Infinity`.
+2. **Root cause #1**: the dispatch table in `crates/luminal_python/rust/src/translator/dispatch.rs` mapped `sigmoid`, `tanh`, `relu` etc. but not `gelu` or `silu`. Whisper's encoder uses `F.gelu`, so the activation hit a hole.
+3. **Root cause #2**: PyTorch serializes `float("-inf")` in PT2 as the string `"-Infinity"` (and `"NaN"`/`"Infinity"` analogously). `translate_full`'s `get_float_arg` only accepts numeric float/int payloads, so any `torch.full((..), -inf)` (the obvious way to write a causal mask) blows up. Decoder mask code is the most common spot.
+4. **Why it was tricky**: both errors arrive from inside `pt2_backend` with a stack trace that ends in `process_pt2`, hiding the actual ATen target inside the message. You only see the offending op name in the error string itself, so you have to read `RuntimeError: Failed to translate node N: …` carefully and grep `dispatch.rs` for it.
+5. **Fix in this session**:
+   - Added `aten.gelu.default → a.gelu()` and `aten.silu.default → a.silu()` to `dispatch.rs`.
+   - Worked around the `-Infinity` issue at the model level by using a finite `-1e10` for the causal mask in the example (matches the Rust example's convention). The cleaner fix (parsing `"-Infinity"`/`"Infinity"`/`"NaN"` strings in `get_float_arg` / `translate_full`) is left for a follow-up.
+6. **Principle**: when adding a new model that goes through the PT2 backend, expect to plug small holes in `dispatch.rs` and `translator/tensor.rs::translate_full`. The trace points at the python frame, not the Rust dispatch arm — open `dispatch.rs`, ctrl-F the offending op name, and add the one-liner. For float-shaped sentinel values (`-inf`, `inf`, `nan`), the export pipeline currently only accepts finite floats; either rewrite the model or extend the parser.

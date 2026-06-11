@@ -1,4 +1,5 @@
 pub mod dtype;
+pub mod dyn_backend;
 pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;
@@ -16,7 +17,7 @@ pub mod prelude {
     pub use crate::frontend::binary::F32Pow;
     pub use crate::frontend::*;
     pub use crate::graph::*;
-    pub use crate::hlir::NativeRuntime;
+    pub use crate::hlir::ReferenceRuntime;
     pub use crate::op::Runtime;
     pub use crate::shape::*;
     pub use crate::visualization::{display_graph, display_graph_to_file};

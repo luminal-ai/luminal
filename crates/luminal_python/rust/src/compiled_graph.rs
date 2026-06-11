@@ -1,37 +1,86 @@
-#[cfg(feature = "cuda")]
-use luminal::prelude::tracing::{trace, warn};
 use luminal::{
-    hlir::{NativeData, Output},
+    dyn_backend::{BackendCompileArgs, BackendFactory, DynBackend},
     prelude::*,
     shape::Expression,
     visualization::ToDot,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use std::collections::HashMap;
-#[cfg(feature = "cuda")]
-use std::collections::HashSet;
 
-use crate::{runtime::RuntimeBackend, typed_data::TypedData};
+use crate::typed_data::TypedData;
 
 /// Maps symbolic dimension parameter names (e.g. "seq_len") to luminal Expression variable chars.
 pub type DimParamMap = HashMap<String, char>;
 
-/// Convert luminal DType to PT2 dtype integer code (for python interop)
-/// Types without a direct Pytorch equivalent map to the closest safe representation
-fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
-    match dtype {
-        DType::U8 => 1,
-        DType::I8 => 2,
-        DType::I16 => 3,
-        DType::Int => 4, // i32
-        DType::U16 => 4, // u16 -> i32 (Pytorch has no u16 in older versions)
-        DType::F16 => 6,
-        DType::F32 | DType::TF32 => 7,
-        DType::F64 => 8,
-        DType::Bool => 12,
-        DType::Bf16 => 13,
-        _ => panic!("luminal_dtype_to_pt2_code: unsupported dtype {:?}", dtype),
+/// Recover a single-variable dim's variable value from an observed runtime size.
+///
+/// Returns `Some((var, value))` when the expression contains exactly one
+/// variable, is affine in that variable, and `value` round-trips through
+/// `exec_single_var_checked` to reproduce `dim_val`. Returns `None` otherwise
+/// — multi-variable expressions, non-affine forms, slope==0, and inversions
+/// that don't divide cleanly are all rejected so we never write a wrong
+/// guess into `dyn_map`.
+fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(char, usize)> {
+    use luminal::shape::Term;
+    let terms = expr.terms.read();
+
+    // Identify the unique variable, if any.
+    let mut var: Option<char> = None;
+    for t in terms.iter() {
+        if let Term::Var(c) = t {
+            match var {
+                None => var = Some(*c),
+                Some(existing) if existing == *c => {}
+                Some(_) => return None, // multi-var — bail out
+            }
+        }
     }
+    let var = var?;
+
+    // Bare-var fast path — terms is exactly `[Var]`.
+    if terms.len() == 1 {
+        return Some((var, dim_val));
+    }
+
+    // Probe two points to recover slope/intercept of an assumed affine form
+    // `f(x) = slope*x + intercept`. We use 2 and 3 (luminal's default
+    // dynamic-dim min is 2, and 3 keeps the inputs small in case the
+    // expression includes a multiplication that could overflow at scale).
+    drop(terms);
+    let f2 = expr.exec_single_var_checked(2)? as i64;
+    let f3 = expr.exec_single_var_checked(3)? as i64;
+    let slope = f3 - f2;
+    if slope == 0 {
+        return None;
+    }
+    let intercept = f2 - 2 * slope;
+    let target = dim_val as i64 - intercept;
+    if slope == 0 || target % slope != 0 {
+        return None;
+    }
+    let candidate = target / slope;
+    if candidate < 0 {
+        return None;
+    }
+    let candidate = candidate as usize;
+
+    // Verify by re-evaluating with the candidate value. Catches non-affine
+    // forms whose probe points happen to be collinear (e.g. `min(s, 100)`
+    // would look affine for s ∈ {2, 3} but flatten beyond 100).
+    if expr.exec_single_var_checked(candidate)? != dim_val {
+        return None;
+    }
+    Some((var, candidate))
+}
+
+/// Convert luminal `DType` to a PT2 dtype code via `TorchDType`. Panics
+/// for luminal-specific dtypes that have no PyTorch counterpart (`I4`,
+/// `U4`, the F6 / F4 families, ...).
+fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
+    crate::torch_dtype::TorchDType::try_from(dtype)
+        .map(|t| t.code())
+        .unwrap_or_else(|d| panic!("luminal_dtype_to_pt2_code: unsupported dtype {d:?}"))
 }
 
 /// Common intermediate result from translating a model graph.
@@ -41,7 +90,12 @@ pub struct GraphTranslation {
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
-    pub output_dtypes: Vec<DType>,
+    /// Output dtypes as PT2 dtype codes (e.g. 5 = int64, 7 = float32).
+    /// Stored as PT2 codes (rather than luminal `DType`) so we can preserve
+    /// distinctions luminal collapses internally — notably int64 vs int32,
+    /// both of which map to `DType::Int` in luminal but must be reported
+    /// back to PyTorch with their original precision.
+    pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
@@ -59,7 +113,7 @@ pub struct WeightData {
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     pub graph: Graph,
-    pub runtime: RuntimeBackend,
+    pub runtime: Box<dyn DynBackend>,
     pub tensor_ids: HashMap<String, NodeIndex>,
     /// Cached label → NodeIndex map for O(1) lookups in set_weight_* methods.
     label_map: HashMap<String, NodeIndex>,
@@ -67,7 +121,9 @@ pub struct CompiledGraph {
     pub output_names: Vec<String>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
-    pub output_dtypes: Vec<DType>,
+    /// Output dtypes as PT2 dtype codes (preserves int64 / int32 distinction
+    /// that luminal collapses to `DType::Int` internally).
+    pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<Expression>>,
     pub dim_param_map: DimParamMap,
 }
@@ -76,12 +132,12 @@ impl CompiledGraph {
     /// Compilation pipeline for PT2/FX graphs.
     ///
     /// Takes a `GraphTranslation` (produced by `translate_pt2`) and `WeightData`,
-    /// builds the backend, loads weights, and
+    /// builds the backend via the global registry, loads weights, and
     /// returns a ready-to-execute `CompiledGraph`.
     pub fn parse_graph(
         translation: GraphTranslation,
         weight_data: WeightData,
-        backend: &str,
+        factory: BackendFactory,
         search_iters: usize,
     ) -> Result<CompiledGraph, String> {
         let GraphTranslation {
@@ -94,38 +150,26 @@ impl CompiledGraph {
             input_shape_exprs,
             dim_param_map,
         } = translation;
+        let WeightData {
+            weights,
+            tensor_sizes,
+            device_ptrs,
+        } = weight_data;
 
-        let rt = match backend {
-            #[cfg(feature = "cuda")]
-            "cuda" | "gpu" => {
-                CompiledGraph::build_cuda_backend(&mut graph, &weight_data, search_iters)?
-            }
-            "native" | "cpu" => {
-                CompiledGraph::build_native_backend(&mut graph, &weight_data, search_iters)?
-            }
-            _ => {
-                #[cfg(feature = "cuda")]
-                {
-                    return Err(format!(
-                        "Invalid backend '{}'. Must be 'native' or 'cuda'",
-                        backend
-                    ));
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    if backend == "cuda" {
-                        return Err(
-                            "CUDA backend requested, but this luminal extension was built without the `cuda` feature. Rebuild with `maturin develop --features cuda -r` or use backend='native'."
-                                .to_string(),
-                        );
-                    }
-                    return Err(format!(
-                        "Invalid backend '{}'. This build only supports 'native'. Rebuild with the `cuda` feature to enable 'cuda'.",
-                        backend
-                    ));
-                }
-            }
+        // Build compile args from WeightData.
+        let compile_args = BackendCompileArgs {
+            search_iters,
+            weights: weights
+                .iter()
+                .map(|(label, td)| (label.clone(), td.bytes.clone(), td.dtype))
+                .collect(),
+            tensor_sizes,
+            device_ptrs,
         };
+
+        // Create backend via the factory directly
+        let rt =
+            luminal::dyn_backend::compile_backend_from_factory(factory, &mut graph, compile_args)?;
 
         // Resolve concrete output shapes from expressions
         let output_shapes: Vec<Vec<usize>> = output_shape_exprs
@@ -133,7 +177,7 @@ impl CompiledGraph {
             .map(|exprs| exprs.iter().map(|e| e.to_usize().unwrap_or(1)).collect())
             .collect();
 
-        let label_map = CompiledGraph::build_label_map(&graph);
+        let label_map = luminal::dyn_backend::build_label_map(&graph);
 
         Ok(CompiledGraph {
             graph,
@@ -148,160 +192,6 @@ impl CompiledGraph {
             input_shape_exprs,
             dim_param_map,
         })
-    }
-
-    /// Build a label → NodeIndex map for all Input nodes in the graph.
-    /// Used for efficient weight loading by label matching.
-    fn build_label_map(graph: &Graph) -> HashMap<String, NodeIndex> {
-        graph
-            .graph
-            .node_indices()
-            .filter_map(|node_id| {
-                (*graph.graph[node_id])
-                    .as_any()
-                    .downcast_ref::<luminal::hlir::Input>()
-                    .map(|input| (input.label.clone(), node_id))
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "cuda")]
-    fn build_cuda_backend(
-        graph: &mut Graph,
-        weight_data: &WeightData,
-        search_iters: usize,
-    ) -> Result<RuntimeBackend, String> {
-        let device_ptrs = &weight_data.device_ptrs;
-        use luminal_cuda_lite::cudarc::driver::CudaContext;
-        use luminal_cuda_lite::runtime::CudaRuntime;
-
-        let cuda_ctx = CudaContext::new(0).map_err(|e| format!("CUDA context init failed: {e}"))?;
-        let stream = cuda_ctx.default_stream();
-
-        graph.build_search_space::<CudaRuntime>();
-
-        let mut rt = CudaRuntime::initialize(stream);
-
-        // Build label → NodeIndex map for device pointer matching.
-        let label_map = CompiledGraph::build_label_map(graph);
-
-        // For weights with device pointers: use them directly (zero-copy).
-        // This avoids allocating ~N GB of dummy data during search.
-        // The pointers survive search because profiling mode skips buffer consumption,
-        // and graph-level .persist() ensures they survive post-search execution too.
-        let mut device_ptr_nodes: HashSet<NodeIndex> = HashSet::new();
-        let mut matched_count = 0usize;
-        let mut missed_labels: Vec<String> = Vec::new();
-        for (label, &(ptr, n_bytes)) in device_ptrs {
-            if let Some(&node_id) = label_map.get(label) {
-                unsafe { rt.set_device_ptr(node_id, ptr, n_bytes) };
-                device_ptr_nodes.insert(node_id);
-                matched_count += 1;
-            } else {
-                missed_labels.push(label.clone());
-            }
-        }
-        let total_device_bytes: usize = device_ptrs.values().map(|(_, n)| *n).sum();
-        trace!(
-            "[CUDA BUILD] Device pointers: {} matched, {} missed out of {} total ({:.3} GiB)",
-            matched_count,
-            missed_labels.len(),
-            device_ptrs.len(),
-            total_device_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-        if !missed_labels.is_empty() {
-            warn!(
-                "[CUDA BUILD] {} device-ptr labels did not match any Input node (first 10): {:?}",
-                missed_labels.len(),
-                &missed_labels[..missed_labels.len().min(10)]
-            );
-            let available: Vec<&String> = label_map.keys().take(10).collect();
-            warn!(
-                "[CUDA BUILD] Available label_map keys (first 10): {:?}",
-                available
-            );
-        }
-
-        // Set dummy 1.0 data for remaining Input nodes (user inputs, constants without
-        // device pointers) for safe search profiling.
-        // IMPORTANT: Must use 1.0, NOT 0.0. Zero inputs cause NaN in many ops:
-        //   - fmod(0, 0) = NaN  (Mod)
-        //   - recip(0) = inf → weight * inf = NaN  (Div)
-        //   - log(0) = -inf  (Pow)
-        //   - chain ops with zero produce NaN  (Erf)
-        let mut dummy_total_elements = 0usize;
-        let mut dummy_count = 0usize;
-        for node_id in graph.graph.node_indices() {
-            if device_ptr_nodes.contains(&node_id) {
-                continue;
-            }
-            if let Some(input) = (*graph.graph[node_id])
-                .as_any()
-                .downcast_ref::<luminal::hlir::Input>()
-            {
-                if let Some(&n) = weight_data.tensor_sizes.get(&input.label) {
-                    if n > 0 {
-                        dummy_total_elements += n;
-                        dummy_count += 1;
-                        // Use dtype-aware dummy data: TypedData::ones produces correct
-                        // byte patterns for every dtype (f32, f16, bf16, i32, bool, f8, etc.).
-                        // Must use 1, not 0 — zero inputs cause NaN in many ops.
-                        rt.set_data(node_id, TypedData::ones(n, input.dtype).bytes);
-                    }
-                }
-            }
-        }
-        trace!(
-            "[CUDA BUILD] Dummy data: {} nodes, {} elements ({:.3} GiB as f32)",
-            dummy_count,
-            dummy_total_elements,
-            (dummy_total_elements * 4) as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        // Search (device-pointer weights are used directly; dummy data for the rest)
-        let mut rt = graph.search(rt, search_iters);
-
-        // Load real weight data for non-device-ptr weights (constants from PT2 archive, etc.)
-        let mut loaded_weight_bytes = 0usize;
-        let mut loaded_weight_count = 0usize;
-        for (label, data) in &weight_data.weights {
-            if !device_ptrs.contains_key(label) {
-                if let Some(&node_id) = label_map.get(label) {
-                    loaded_weight_bytes += data.n_bytes();
-                    loaded_weight_count += 1;
-                    rt.set_data(node_id, data.bytes.clone());
-                }
-            }
-        }
-        trace!(
-            "[CUDA BUILD] Post-search weight load: {} weights, {:.3} GiB",
-            loaded_weight_count,
-            loaded_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-        );
-
-        Ok(RuntimeBackend::Cuda(Box::new(rt)))
-    }
-
-    fn build_native_backend(
-        graph: &mut Graph,
-        weight_data: &WeightData,
-        search_iters: usize,
-    ) -> Result<RuntimeBackend, String> {
-        graph.build_search_space::<NativeRuntime>();
-        let mut rt = graph.search(NativeRuntime::default(), search_iters);
-
-        // Load weight data after search, preserving native dtype.
-        // TypedData -> NativeData conversion (From<TypedData>) handles mapping to the
-        // correct NativeData variant (F32, F16, Bf16, Int, Bool).
-        let label_map = CompiledGraph::build_label_map(graph);
-        for (label, data) in &weight_data.weights {
-            if let Some(&node_id) = label_map.get(label) {
-                let native: NativeData = data.into();
-                rt.set_data(node_id, native);
-            }
-        }
-
-        Ok(RuntimeBackend::Native(rt))
     }
 }
 
@@ -349,10 +239,22 @@ impl CompiledGraph {
         self.tensor_ids.keys().cloned().collect()
     }
 
-    /// Get the name of the active backend (native or cuda).
+    /// Get the name of the active backend.
     #[getter]
-    fn backend(&self) -> &'static str {
+    fn backend(&self) -> &str {
         self.runtime.name()
+    }
+
+    /// The device type this backend operates on (e.g. "cpu", "cuda").
+    #[getter]
+    fn device_type(&self) -> &str {
+        self.runtime.device_type()
+    }
+
+    /// Whether the active backend supports device pointer operations (zero-copy GPU I/O).
+    #[getter]
+    fn supports_device_ptrs(&self) -> bool {
+        self.runtime.supports_device_ptrs()
     }
 
     /// Whether this graph has dynamic (symbolic) dimensions.
@@ -381,17 +283,27 @@ impl CompiledGraph {
     }
 
     /// Auto-detect and set dynamic dimensions from input tensor shapes.
-    /// For each user input, matches the concrete shape against its symbolic
-    /// shape expressions and sets the corresponding dyn_map entries.
+    ///
+    /// For each user input we walk the symbolic shape expressions side-by-side
+    /// with the concrete sizes Dynamo handed us at runtime and try to recover
+    /// each unbound variable's value. Two cases are handled:
+    ///
+    ///   * Bare-variable dim (`s`): set directly from the size.
+    ///   * Single-variable affine dim (`a*s + b`): solve `s = (size - b)/a`
+    ///     by sampling the expression at two probe points to extract the
+    ///     slope, recovering the intercept, and verifying that plugging the
+    ///     recovered value back through `exec_single_var_checked` reproduces
+    ///     the observed size. The verification step rejects everything
+    ///     non-affine (`s*s`, `min(s, 8)`, etc.) without committing a wrong
+    ///     guess to `dyn_map`.
+    ///
+    /// Multi-variable dims are skipped here; another input's shape — or an
+    /// explicit `set_dim` call — is expected to bind those.
     fn auto_set_dims_from_input_shapes(&mut self, input_shapes: Vec<Vec<usize>>) {
         for (shape_exprs, shape) in self.input_shape_exprs.iter().zip(input_shapes.iter()) {
             for (dim_expr, &dim_val) in shape_exprs.iter().zip(shape.iter()) {
-                // Check if this expression is a bare symbolic variable
-                let terms = dim_expr.terms.read();
-                if terms.len() == 1
-                    && let luminal::shape::Term::Var(c) = terms[0]
-                {
-                    self.graph.set_dim(c, dim_val);
+                if let Some((var, value)) = solve_single_var_dim(dim_expr, dim_val) {
+                    self.graph.set_dim(var, value);
                 }
             }
         }
@@ -445,91 +357,83 @@ impl CompiledGraph {
         })?;
         let raw_bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
         let typed = TypedData::from_pytorch_bytes(raw_bytes, dtype_code);
-        self.runtime.set_data(*node_id, typed);
+        self.runtime
+            .set_data_bytes(*node_id, typed.bytes, typed.dtype);
         Ok(())
     }
 
-    /// Set input from a CUDA device pointer. Zero-copy on device.
-    /// The pointer must be a valid CUDA device allocation with at least n_bytes bytes.
-    #[cfg(feature = "cuda")]
+    /// Set input from a device pointer. Zero-copy on device.
+    /// The pointer must be a valid device allocation with at least n_bytes bytes.
+    /// Requires a GPU backend (e.g. CUDA).
     fn set_input_device_ptr(
         &mut self,
         name: &str,
         device_ptr: u64,
         n_bytes: usize,
     ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_input_device_ptr requires a GPU backend",
+            ));
+        }
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
-        match &mut self.runtime {
-            RuntimeBackend::Cuda(rt) => unsafe { rt.set_device_ptr(*node_id, device_ptr, n_bytes) },
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "set_input_device_ptr requires CUDA backend",
-                ));
-            }
-        }
+        unsafe { self.runtime.set_device_ptr(*node_id, device_ptr, n_bytes) };
         Ok(())
     }
 
-    /// For PT2 weights (e.g. "fc1.weight"). Persistence is handled at graph level via .persist().
-    #[cfg(feature = "cuda")]
+    /// Register a weight from a device pointer (e.g. "fc1.weight"). Zero-copy on device.
+    /// Requires a GPU backend.
     fn set_weight_device_ptr(
         &mut self,
         label: &str,
         device_ptr: u64,
         n_bytes: usize,
     ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_weight_device_ptr requires a GPU backend",
+            ));
+        }
         let &node_id = self.label_map.get(label).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("No Input node with label: {}", label))
         })?;
-        match &mut self.runtime {
-            RuntimeBackend::Cuda(rt) => {
-                unsafe { rt.set_device_ptr(node_id, device_ptr, n_bytes) };
-            }
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "set_weight_device_ptr requires CUDA backend",
-                ));
-            }
-        }
+        unsafe { self.runtime.set_device_ptr(node_id, device_ptr, n_bytes) };
         Ok(())
     }
 
     /// Register an external device pointer for an output tensor (zero-copy output).
     /// Call before run() — the runtime will write kernel results directly into this buffer.
     /// For aliased outputs (in-place ops), falls back to DtoD copy; check output_is_zero_copy() after run().
-    #[cfg(feature = "cuda")]
+    /// Requires a GPU backend.
     fn set_output_device_ptr(
         &mut self,
         name: &str,
         device_ptr: u64,
         n_bytes: usize,
     ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_output_device_ptr requires a GPU backend",
+            ));
+        }
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
             ))
         })?;
-
-        match &mut self.runtime {
-            RuntimeBackend::Cuda(rt) => {
-                unsafe { rt.set_output_device_ptr(*node_id, device_ptr, n_bytes) };
-            }
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "set_output_device_ptr requires CUDA backend",
-                ));
-            }
-        }
-
+        unsafe {
+            self.runtime
+                .set_output_device_ptr(*node_id, device_ptr, n_bytes)
+        };
         Ok(())
     }
 
     /// Check whether an output tensor was zero-copied (written directly to the registered pointer).
-    /// Returns false for aliased outputs that need a fallback DtoD copy. Must be called after run().
-    #[cfg(feature = "cuda")]
+    /// Returns false for aliased outputs that need a fallback DtoD copy, or if no GPU backend.
+    /// Must be called after run().
     fn output_is_zero_copy(&self, name: &str) -> PyResult<bool> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -537,14 +441,10 @@ impl CompiledGraph {
                 name
             ))
         })?;
-
-        match &self.runtime {
-            RuntimeBackend::Cuda(rt) => Ok(rt.output_is_zero_copy(*node_id)),
-            _ => Ok(false),
-        }
+        Ok(self.runtime.output_is_zero_copy(*node_id))
     }
 
-    /// Set a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
+    /// Register a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
     /// `n_bytes` is the total byte count. `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
     fn set_weight_from_ptr(
         &mut self,
@@ -559,7 +459,8 @@ impl CompiledGraph {
         })?;
         let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
         let typed = TypedData::from_pytorch_bytes(bytes, dtype_code);
-        self.runtime.set_data(node_id, typed);
+        self.runtime
+            .set_data_bytes(node_id, typed.bytes, typed.dtype);
         Ok(())
     }
 
@@ -578,16 +479,10 @@ impl CompiledGraph {
     /// Get the PT2 dtype codes for all outputs (in order).
     #[getter]
     fn output_dtypes(&self) -> Vec<u32> {
-        self.output_dtypes
-            .iter()
-            .map(|d| luminal_dtype_to_pt2_code(*d))
-            .collect()
+        self.output_dtypes.clone()
     }
 
     /// Get output tensor data by name as f32 (copies to host).
-    /// For native backend: handles any NativeData variant by converting to f32.
-    /// The native runtime may produce NativeData::Int or NativeData::Bool for some ops
-    /// (e.g., Cast chains), so we can't assume NativeData::F32.
     fn get_output(&self, name: &str) -> PyResult<Vec<f32>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
@@ -595,57 +490,109 @@ impl CompiledGraph {
                 name
             ))
         })?;
-        match &self.runtime {
-            RuntimeBackend::Native(rt) => {
-                let id = *node_id;
-                let output_id = rt
-                    .graph
-                    .node_indices()
-                    .find(|n| {
-                        if let Some(out) = (**rt.graph[*n]).as_any().downcast_ref::<Output>() {
-                            out.node == id.index()
-                        } else {
-                            false
-                        }
-                    })
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "No output node found for tensor: {}",
-                            name
-                        ))
-                    })?;
-                let data = rt.buffers.get(&output_id).ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "No buffer data for output tensor: {}",
-                        name
-                    ))
-                })?;
-                // Convert any NativeData variant to f32
-                Ok((0..data.len()).map(|i| data.f32(i)).collect())
-            }
-            #[cfg(feature = "cuda")]
-            RuntimeBackend::Cuda(rt) => Ok(rt.get_f32(*node_id)),
-        }
+        Ok(self.runtime.get_output_f32(*node_id))
     }
 
-    /// Copy output tensor data directly to a CUDA device pointer (DtoD).
-    /// Avoids the DtoH + HtoD round-trip of get_output() + .to(device).
-    #[cfg(feature = "cuda")]
-    fn copy_output_to_device_ptr(&self, name: &str, dest_ptr: u64, n_bytes: usize) -> PyResult<()> {
+    /// Get output tensor data by name as i32 (copies to host).
+    fn get_output_i32(&self, name: &str) -> PyResult<Vec<i32>> {
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
                 "Unknown output tensor: {}",
                 name
             ))
         })?;
-        match &self.runtime {
-            RuntimeBackend::Cuda(rt) => {
-                unsafe { rt.copy_output_to_device_ptr(*node_id, dest_ptr, n_bytes) };
-                Ok(())
-            }
-            _ => Err(pyo3::exceptions::PyValueError::new_err(
-                "copy_output_to_device_ptr requires CUDA backend",
-            )),
+        Ok(self.runtime.get_output_i32(*node_id))
+    }
+
+    /// Read an output as f16 (returned as raw little-endian bytes —
+    /// Python has no native f16, so the caller bit-casts via
+    /// `torch.frombuffer(..., dtype=torch.float16)`). Strict: the
+    /// producer node must already be `DType::F16`; no widening at
+    /// the read boundary.
+    fn get_output_f16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        let data = self.runtime.get_output_f16(*node_id);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    /// Read an output as bf16 (returned as raw little-endian bytes —
+    /// caller bit-casts via `torch.frombuffer(..., dtype=torch.
+    /// bfloat16)`). Strict: the producer node must already be
+    /// `DType::Bf16`; no widening at the read boundary.
+    fn get_output_bf16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        let data = self.runtime.get_output_bf16(*node_id);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    /// Read an output as i64. Strict: the producer node must already
+    /// be `DType::I64`; no widening at the read boundary.
+    fn get_output_i64(&self, name: &str) -> PyResult<Vec<i64>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_i64(*node_id))
+    }
+
+    /// Read an output as f64. Strict: the producer node must already
+    /// be `DType::F64`; no widening at the read boundary.
+    fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_f64(*node_id))
+    }
+
+    /// Get output tensor data by name as bool (copies to host).
+    fn get_output_bool(&self, name: &str) -> PyResult<Vec<bool>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_bool(*node_id))
+    }
+
+    /// Copy output tensor data directly to a device pointer (DtoD).
+    /// Avoids the DtoH + HtoD round-trip of get_output() + .to(device).
+    /// Requires a GPU backend.
+    fn copy_output_to_device_ptr(&self, name: &str, dest_ptr: u64, n_bytes: usize) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "copy_output_to_device_ptr requires a GPU backend",
+            ));
         }
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        unsafe {
+            self.runtime
+                .copy_output_to_device_ptr(*node_id, dest_ptr, n_bytes)
+        };
+        Ok(())
     }
 }

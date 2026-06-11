@@ -7,11 +7,75 @@ use crate::prelude::*;
 use as_any::{AsAny, Downcast};
 use rustc_hash::FxHashMap;
 
+#[derive(Clone, Copy)]
+pub struct ProfileBucketContext<'a> {
+    pub dim_buckets: &'a FxHashMap<char, Vec<DimBucket>>,
+    pub bucket_indices: &'a FxHashMap<char, usize>,
+    pub representative_dyn_map: &'a FxHashMap<char, usize>,
+}
+
+#[derive(Clone, Copy)]
+pub struct CandidateFilterContext<'a> {
+    pub search_options: &'a crate::graph::CompileOptions,
+    pub dyn_map: &'a FxHashMap<char, usize>,
+    pub bucket_context: Option<ProfileBucketContext<'a>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CandidateFilterResult {
+    pub accepted: bool,
+    pub display: Option<String>,
+}
+
+impl CandidateFilterResult {
+    pub fn accept() -> Self {
+        Self {
+            accepted: true,
+            display: None,
+        }
+    }
+
+    pub fn accept_with_display(display: impl Into<String>) -> Self {
+        Self {
+            accepted: true,
+            display: Some(display.into()),
+        }
+    }
+
+    pub fn reject() -> Self {
+        Self {
+            accepted: false,
+            display: None,
+        }
+    }
+
+    pub fn reject_with_display(display: impl Into<String>) -> Self {
+        Self {
+            accepted: false,
+            display: Some(display.into()),
+        }
+    }
+}
+
 pub trait Runtime {
     type Ops: IntoEgglogOp;
     type CompileArg;
     type ExecReturn;
     type ProfileMetric: PartialOrd + Clone + Debug;
+    /// Backend-provided egglog layers that run after the normal full-egraph
+    /// cleanup schedule. Core keeps this empty; runtimes can use it for
+    /// backend-specific analyses and cleanup passes without adding those rules
+    /// to Luminal core.
+    fn late_egglog_passes(
+        _ops: &[Arc<Box<dyn EgglogOp>>],
+        _options: &crate::graph::CompileOptions,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<crate::egglog_utils::LateEgglogPass>
+    where
+        Self: Sized,
+    {
+        vec![]
+    }
     fn initialize(arg: Self::CompileArg) -> Self;
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn;
@@ -20,7 +84,30 @@ pub trait Runtime {
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
+        timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String);
+    /// Profile one candidate in the context of a specific dynamic-dimension
+    /// bucket. Runtimes with bucket-sensitive lowering can override this so
+    /// search ranks candidates under the same execution model used after
+    /// final bucket compilation.
+    fn profile_with_bucket_context(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+        _bucket_context: ProfileBucketContext<'_>,
+    ) -> (Self::ProfileMetric, String) {
+        self.profile(llir_graph, dyn_map, trials, timeout)
+    }
+    /// Aggregate multiple profile metrics into one comparable metric.
+    /// Used for regionalized profiling where one candidate maps to multiple LLIR regions.
+    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
+        metrics
+            .first()
+            .unwrap_or_else(|| panic!("aggregate_profile_metrics called with empty metrics"))
+            .clone()
+    }
     /// Allocate a dummy input buffer for a boundary node during per-chunk profiling.
     /// `node_index` is the HLIR node index used in the Input op's `node` field.
     /// `num_bytes` is the number of bytes to allocate.
@@ -39,6 +126,17 @@ pub trait Runtime {
     /// Used by the search to reject NaN-producing graph variants.
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
         false
+    }
+    /// Runtime-specific pre-profile candidate filter. Backends can reject an
+    /// extracted LLIR graph before profiling it, for example because it exceeds
+    /// a backend-specific resource budget. Core treats this as an opaque
+    /// accept/reject decision and optional display text.
+    fn filter_llir_candidate(
+        &mut self,
+        _llir_graph: &LLIRGraph,
+        _context: CandidateFilterContext<'_>,
+    ) -> CandidateFilterResult {
+        CandidateFilterResult::accept()
     }
     /// Load multiple compiled LLIR graphs, one per bucket combination.
     /// Each entry is (bucket_indices, representative_dyn_map, stitched_llir).
@@ -162,9 +260,6 @@ pub trait EgglogOp: Debug {
     fn rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
         vec![]
     }
-    fn early_rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
-        vec![]
-    }
     fn cleanup(&self) -> bool;
 
     /// Additional IR datatype variants this op needs (e.g. `"(ConsumedBuffer IR)"`).
@@ -226,7 +321,11 @@ impl LLIROp {
         assert!(
             op.type_name().contains("dyn")
                 || op.type_name().contains("Input")
-                || op.type_name().contains("Output"),
+                || op.type_name().contains("Output")
+                || op.type_name().contains("LoopStart")
+                || op.type_name().contains("LoopEnd")
+                || op.type_name().contains("LoopInput")
+                || op.type_name().contains("LoopOutput"),
             "op types must be erased into dialect traits for dialect casting to work!"
         );
         Self(Arc::new(Box::new(DialectOp::new(op))))

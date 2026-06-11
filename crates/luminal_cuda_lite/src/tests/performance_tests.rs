@@ -6,7 +6,7 @@ use crate::cuda_bandwidth_gbps;
 use crate::runtime::CudaRuntime;
 
 /// Test that measures bandwidth utilization for a large element-wise add kernel.
-/// This demonstrates that KernelAdd can achieve reasonable bandwidth with large tensors.
+/// This demonstrates that generic fused Add can achieve reasonable bandwidth with large tensors.
 #[test]
 pub fn kernel_add_bandwidth_test() {
     // 64M elements = 256MB per tensor, 768MB total memory traffic (2 reads + 1 write)
@@ -27,11 +27,11 @@ pub fn kernel_add_bandwidth_test() {
     ctx.bind_to_thread().unwrap();
     let stream = ctx.default_stream();
 
-    cx.build_search_space::<CudaRuntime>();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
     rt.set_data(a, data_a.clone());
     rt.set_data(b, data_b.clone());
-    rt = cx.search(rt, 5);
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
 
     // Warm up
     rt.execute(&cx.dyn_map);
@@ -40,7 +40,7 @@ pub fn kernel_add_bandwidth_test() {
     rt.execute(&cx.dyn_map);
 
     // Print stats
-    println!("\n=== Large KernelAdd Bandwidth Test ===");
+    println!("\n=== Large Fused Add Bandwidth Test ===");
     println!(
         "Tensor size: {} elements ({} MB per tensor)",
         size,

@@ -1,7 +1,8 @@
 use crate::egglog_utils::{
-    egglog_to_llir, extract_generation, hash_choice_set, hash_egglog_normalized,
-    hlir_subgraph_to_egglog, hlir_to_egglog, random_initial_choice, run_egglog, stitch_llir_graphs,
+    count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation, hash_choice_set,
+    hlir_to_egglog, random_initial_choice, run_egglog_with_late_passes_and_interval_analysis,
 };
+use crate::shape::{DimInterval, DynDimIntervals};
 use crate::{
     egglog_utils::SerializedEGraph,
     op::{EgglogOp, IntoEgglogOp, LLIROp},
@@ -9,11 +10,16 @@ use crate::{
 use crate::{hlir::CustomOpKind, op::*, prelude::*};
 use colored::Colorize;
 use itertools::Itertools;
-use petgraph::{Direction, algo::toposort, stable_graph::StableGraph, visit::EdgeRef};
+use petgraph::{
+    Direction,
+    dot::{Config, Dot},
+    stable_graph::StableGraph,
+    visit::EdgeRef,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     any::TypeId,
-    fmt::Debug,
+    fmt::{Debug, Write as FmtWrite},
     io::Write,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -23,21 +29,72 @@ use tracing;
 pub type LLIRGraph = StableGraph<LLIROp, ()>;
 pub type HLIRGraph = StableGraph<Box<dyn HLIROp>, ()>;
 
+#[derive(Debug, Clone)]
+struct RollingOccurrence {
+    nodes: Vec<NodeIndex>,
+    boundary_inputs: Vec<NodeIndex>,
+    output_nodes: Vec<NodeIndex>,
+}
+
+#[derive(Debug, Clone)]
+struct RollingCandidate {
+    occurrences: Vec<RollingOccurrence>,
+    state_param_indices: Vec<usize>,
+    savings: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RollingRun {
+    occurrences: Vec<RollingOccurrence>,
+    starts: Vec<usize>,
+    window: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RollingSearchDiagnostics {
+    windows_probed: usize,
+    adjacent_hash_matches: usize,
+    repeated_signature_runs: usize,
+    rejected_zero_state_params: usize,
+    best_rejected: Option<RollingRejectedCandidate>,
+    top_runs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RollingRejectedCandidate {
+    window: usize,
+    repetitions: usize,
+    boundary_inputs: usize,
+    state_params: usize,
+    savings: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RollingSearchReport {
+    candidate: Option<RollingCandidate>,
+    diagnostics: RollingSearchDiagnostics,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SearchSpaceContext {
+    bucket_indices: FxHashMap<char, usize>,
+    representative_dyn_map: FxHashMap<char, usize>,
+    intervals: DynDimIntervals,
+}
+
+#[derive(Debug, Clone)]
+struct SearchProfileBucketContext {
+    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    bucket_indices: FxHashMap<char, usize>,
+    representative_dyn_map: FxHashMap<char, usize>,
+}
+
 /// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
 pub type BucketLLIR = (FxHashMap<char, usize>, FxHashMap<char, usize>, LLIRGraph);
 
-/// A group of structurally identical chunks that share the same e-graph.
-#[derive(Debug, Clone)]
-struct ChunkGroup {
-    /// The representative chunk index (used for e-graph building and search)
-    representative: usize,
-    /// All chunk indices in this group (including the representative)
-    members: Vec<usize>,
-}
-
 /// A bucket for a dynamic dimension, defining a range of valid values.
 /// For an exact value, use `min == max` (zero-length range).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DimBucket {
     pub min: usize,
     pub max: usize,
@@ -82,40 +139,53 @@ impl DimBucket {
     }
 }
 
-/// Options for controlling the genetic search algorithm.
+/// Options for building an e-graph search space and searching it.
 ///
 /// Use the builder pattern to configure search parameters:
 /// ```
-/// use luminal::prelude::SearchOptions;
-/// let opts = SearchOptions::new(5)
+/// use luminal::prelude::CompileOptions;
+/// let opts = CompileOptions::default()
+///     .search_graph_limit(5)
+///     .search_time_limit(std::time::Duration::from_secs(30))
 ///     .generation_size(50)
 ///     .mutations(40)
 ///     .trials(15);
 /// ```
 #[derive(Debug, Clone)]
-pub struct SearchOptions {
-    /// Maximum number of graphs to evaluate
+pub struct CompileOptions {
+    /// Maximum number of graphs to evaluate during search.
     pub limit: usize,
-    /// Number of offspring per generation (default: 30)
+    /// Maximum wall-clock time to spend searching.
+    pub search_time_limit: std::time::Duration,
+    /// Number of offspring per generation (default: 10)
     pub generation_size: usize,
-    /// Number of mutations applied to each offspring (default: 30)
+    /// Number of mutations applied to each offspring (default: 10)
     pub mutations: usize,
-    /// Number of profiling trials per candidate (default: 10)
+    /// Number of profiling trials per candidate (default: 3)
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
+    /// Per-candidate profiling timeout. If a profile call reaches this budget,
+    /// that candidate is discarded and search continues.
+    pub profile_timeout: Option<std::time::Duration>,
+    /// Optional profiling dimension overrides.
+    pub profile_dims: FxHashMap<char, usize>,
+    /// Bucket definitions per dynamic dimension. Dimensions without buckets use
+    /// a single implicit bucket.
+    pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
 }
 
-impl SearchOptions {
-    /// Create new search options with the given limit. Other fields use defaults.
-    pub fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            generation_size: 30,
-            mutations: 30,
-            trials: 10,
-            keep_best: 1,
-        }
+impl CompileOptions {
+    /// Set the maximum number of graphs to evaluate during search.
+    pub fn search_graph_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Set the maximum wall-clock time to spend searching.
+    pub fn search_time_limit(mut self, search_time_limit: std::time::Duration) -> Self {
+        self.search_time_limit = search_time_limit;
+        self
     }
 
     /// Set the number of offspring per generation.
@@ -141,6 +211,163 @@ impl SearchOptions {
         self.keep_best = keep_best;
         self
     }
+
+    /// Set an optional per-candidate profiling timeout.
+    pub fn profile_timeout(mut self, profile_timeout: std::time::Duration) -> Self {
+        self.profile_timeout = Some(profile_timeout);
+        self
+    }
+
+    /// Override a dynamic dimension value used during search profiling.
+    pub fn profile_dim(mut self, dim: char, value: usize) -> Self {
+        self.profile_dims.insert(dim, value);
+        self
+    }
+
+    /// Define buckets for a dynamic dimension.
+    ///
+    /// Bucketed compilation builds a separate search space and selected LLIR for
+    /// each bucket combination. Buckets must not overlap and must cover all
+    /// values that will be used at runtime.
+    pub fn dim_buckets(mut self, dimension: char, buckets: &[DimBucket]) -> Self {
+        validate_dim_buckets(dimension, buckets);
+        self.dim_buckets.insert(dimension, buckets.to_vec());
+        self
+    }
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            limit: 100,
+            search_time_limit: std::time::Duration::MAX,
+            generation_size: 10,
+            mutations: 10,
+            trials: 3,
+            keep_best: 1,
+            profile_timeout: Some(std::time::Duration::from_secs(1)),
+            profile_dims: FxHashMap::default(),
+            dim_buckets: FxHashMap::default(),
+        }
+    }
+}
+
+fn validate_dim_buckets(dimension: char, buckets: &[DimBucket]) {
+    assert!(
+        !buckets.is_empty(),
+        "Buckets for dim '{dimension}' must not be empty"
+    );
+    for (i, a) in buckets.iter().enumerate() {
+        for b in buckets.iter().skip(i + 1) {
+            assert!(
+                a.max < b.min || b.max < a.min,
+                "Overlapping buckets for dim '{}': [{}, {}] and [{}, {}]",
+                dimension,
+                a.min,
+                a.max,
+                b.min,
+                b.max,
+            );
+        }
+    }
+}
+
+fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir: &LLIRGraph) {
+    let Ok(dir) = std::env::var("LLIR_DUMP_DIR") else {
+        return;
+    };
+
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        eprintln!("failed to create LLIR_DUMP_DIR={dir}: {err}");
+        return;
+    }
+
+    let dims = dyn_map
+        .iter()
+        .sorted_by_key(|(dim, _)| **dim)
+        .map(|(dim, value)| format!("{dim}{value}"))
+        .join("_");
+    let stem = if dims.is_empty() {
+        format!("selected-llir-{label}")
+    } else {
+        format!("selected-llir-{label}-{dims}")
+    };
+    let dot_path = format!("{dir}/{stem}.dot");
+    let summary_path = format!("{dir}/{stem}.txt");
+
+    let dot = format!("{:?}", Dot::with_config(llir, &[Config::EdgeNoLabel]));
+    if let Err(err) = std::fs::write(&dot_path, dot) {
+        eprintln!("failed to write {dot_path}: {err}");
+    }
+
+    let mut op_counts = std::collections::BTreeMap::<String, usize>::new();
+    for node in llir.node_indices() {
+        *op_counts.entry(format!("{}", llir[node])).or_default() += 1;
+    }
+
+    let mut summary = String::new();
+    let _ = writeln!(
+        summary,
+        "selected LLIR {label}: {} nodes, {} edges",
+        llir.node_count(),
+        llir.edge_count()
+    );
+    let _ = writeln!(summary, "dyn_map: {dyn_map:?}");
+    let _ = writeln!(summary, "\nop counts:");
+    for (op, count) in op_counts {
+        let _ = writeln!(summary, "  {count:5} {op}");
+    }
+    let _ = writeln!(summary, "\nnodes:");
+    for node in llir.node_indices().sorted_by_key(|n| n.index()) {
+        let inputs = llir
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|edge| edge.id())
+            .map(|edge| edge.source().index().to_string())
+            .join(", ");
+        let _ = writeln!(
+            summary,
+            "  n{} <- [{}] {}",
+            node.index(),
+            inputs,
+            llir[node]
+        );
+    }
+
+    if let Err(err) = std::fs::write(&summary_path, summary) {
+        eprintln!("failed to write {summary_path}: {err}");
+    } else {
+        println!("   LLIR dump {summary_path}");
+    }
+}
+
+fn random_choice_generation<'a, G: rand::Rng>(
+    egraph: &'a SerializedEGraph,
+    generation_size: usize,
+    prev_selected: &mut FxHashSet<u64>,
+    rng: &mut G,
+) -> Vec<crate::egglog_utils::EGraphChoiceSet<'a>> {
+    let mut generation = Vec::with_capacity(generation_size);
+    let max_attempts = generation_size.saturating_mul(100);
+    let mut attempts = 0;
+
+    while generation.len() < generation_size && attempts < max_attempts {
+        attempts += 1;
+        let genome = random_initial_choice(egraph, rng);
+        if prev_selected.insert(hash_choice_set(&genome)) {
+            generation.push(genome);
+        }
+    }
+
+    generation
+}
+
+fn panic_initial_filter_limit(filter_fails: usize, last_rejection: Option<&str>) -> ! {
+    if let Some(last_rejection) = last_rejection {
+        panic!(
+            "Failed to find a viable initial genome after {filter_fails} runtime filter failures; last rejection: {last_rejection}"
+        );
+    }
+    panic!("Failed to find a viable initial genome after {filter_fails} runtime filter failures");
 }
 
 /// A Luminal compute graph.
@@ -152,20 +379,22 @@ pub struct Graph {
     pub dyn_map: FxHashMap<char, usize>,
     /// Edge weights: (Input index, Output index, Input shape)
     pub graph: HLIRGraph,
-    /// E-Graph search spaces (one per unique group when graph breaks are used)
+    /// E-Graph search spaces. Bucketed compilation stores one egraph per
+    /// bucket combination; unbucketed compilation stores one egraph.
     egraphs: Vec<SerializedEGraph>,
-    /// Subgraph descriptors (one per chunk when graph breaks are used)
-    subgraph_descriptors: Vec<SubgraphDescriptor>,
-    /// Groups of structurally identical chunks
-    chunk_groups: Vec<ChunkGroup>,
+    egraph_contexts: Vec<SearchSpaceContext>,
     /// Available ops
     pub ops: Option<Vec<Arc<Box<dyn EgglogOp>>>>,
     /// Custom ops
     pub custom_ops: Vec<Box<dyn CustomOp>>,
-    /// Bucket definitions per dynamic dimension. Dimensions without buckets use a
-    /// single implicit bucket (current behavior). When set, search compiles a
-    /// separate LLIR per bucket combination and runtime dispatches automatically.
-    pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    /// Bucket definitions used by the currently built search space.
+    search_space_dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    /// Optional graph-wide interval assumptions for dynamic dimensions.
+    pub dim_intervals: DynDimIntervals,
+    /// Metadata for Input nodes: NodeIndex -> (label, dtype).
+    /// Stored as plain data so it survives cross-binary type identity mismatches
+    /// when external backend plugins are compiled separately.
+    pub input_meta: FxHashMap<NodeIndex, (String, DType)>,
 }
 
 impl Graph {
@@ -174,34 +403,613 @@ impl Graph {
         Graph::default()
     }
 
+    fn run_auto_loop_rolling_prepass(&mut self) {
+        let before = self.graph.node_count();
+        let inserted = self.auto_roll_loops_prepass();
+        if inserted == 0 {
+            println!(
+                "   {:>6}  no loop regions found (max body={})",
+                "Rolled".cyan().bold(),
+                before / 2,
+            );
+        }
+    }
+
+    /// Mutate the HLIR graph in place to fold N repeated body occurrences into
+    /// a single body plus loop-marker ops. See `auto_roll_loops_prepass`.
+    fn insert_loop_region_ops(&mut self, candidate: RollingCandidate) -> usize {
+        use crate::hlir::{LoopEnd, LoopInput, LoopOutput, LoopOutputSelect, LoopStart, Output};
+        use petgraph::visit::EdgeRef;
+
+        let nodes_before = self.graph.node_count();
+        let n_iters = candidate.occurrences.len();
+        let loop_id = 0usize;
+
+        // Build the body-node sets EXCLUDING `Output` HLIR nodes. An Output
+        // inside a rolled occurrence is a graph-external sink for that
+        // iteration's value, not body computation; we treat it as a cross-
+        // region consumer so each iteration's Output survives all the way
+        // through and gets rewired to its `LoopOutputSelect(i)` below.
+        let body_nodes: FxHashSet<NodeIndex> = candidate.occurrences[0]
+            .nodes
+            .iter()
+            .copied()
+            .filter(|&n| self.try_get_op::<Output>(n).is_none())
+            .collect();
+        let mut duplicate_body_nodes: FxHashSet<NodeIndex> = FxHashSet::default();
+        for occ in &candidate.occurrences[1..] {
+            for &n in &occ.nodes {
+                if self.try_get_op::<Output>(n).is_none() {
+                    duplicate_body_nodes.insert(n);
+                }
+            }
+        }
+
+        let n_boundary = candidate.occurrences[0].boundary_inputs.len();
+        let state_set: FxHashSet<usize> = candidate.state_param_indices.iter().copied().collect();
+
+        let mut state_out_pos_per_slot: Vec<usize> =
+            Vec::with_capacity(candidate.state_param_indices.len());
+        let mut state_output_positions: FxHashSet<usize> = FxHashSet::default();
+        for &p in &candidate.state_param_indices {
+            let next_val = candidate.occurrences[1].boundary_inputs[p];
+            let pos = candidate.occurrences[0]
+                .output_nodes
+                .iter()
+                .position(|&n| n == next_val)
+                .expect("state param must have a producer in output_nodes");
+            state_out_pos_per_slot.push(pos);
+            state_output_positions.insert(pos);
+        }
+
+        let mut created = 0usize;
+        let mut dtype_cache: FxHashMap<NodeIndex, DType> = FxHashMap::default();
+        // Track all NodeIndex slots we newly assign for loop-marker ops.
+        // StableGraph reuses freed node indices; removals later in this
+        // function might target slots that happen to coincide with a new
+        // loop-marker's NodeIndex, so we explicitly exclude those.
+        let mut added_loop_ops: FxHashSet<NodeIndex> = FxHashSet::default();
+
+        for (slot_idx, (&p, &out_pos)) in candidate
+            .state_param_indices
+            .iter()
+            .zip(state_out_pos_per_slot.iter())
+            .enumerate()
+        {
+            let initial = candidate.occurrences[0].boundary_inputs[p];
+            let body_state_out = candidate.occurrences[0].output_nodes[out_pos];
+            let last_state_out = candidate.occurrences[n_iters - 1].output_nodes[out_pos];
+            let dtype = self.infer_node_dtype_cached(initial, &mut dtype_cache);
+
+            let loop_start = self.graph.add_node(Box::new(LoopStart {
+                loop_id,
+                slot_idx,
+                iters: Expression::from(n_iters as i32),
+                dtype,
+            }));
+            added_loop_ops.insert(loop_start);
+            self.graph.add_edge(initial, loop_start, ());
+
+            let edges_out_of_initial: Vec<_> = self
+                .graph
+                .edges_directed(initial, Direction::Outgoing)
+                .filter(|e| body_nodes.contains(&e.target()))
+                .map(|e| (e.id(), e.target()))
+                .collect();
+            for (eid, dst) in edges_out_of_initial {
+                self.graph.remove_edge(eid);
+                self.graph.add_edge(loop_start, dst, ());
+            }
+
+            let loop_end = self.graph.add_node(Box::new(LoopEnd {
+                loop_id,
+                slot_idx,
+                dtype,
+            }));
+            added_loop_ops.insert(loop_end);
+            self.graph.add_edge(body_state_out, loop_end, ());
+
+            let external_edges: Vec<_> = self
+                .graph
+                .edges_directed(last_state_out, Direction::Outgoing)
+                .filter(|e| {
+                    let t = e.target();
+                    !body_nodes.contains(&t) && !duplicate_body_nodes.contains(&t)
+                })
+                .map(|e| (e.id(), e.target()))
+                .collect();
+            for (eid, dst) in external_edges {
+                self.graph.remove_edge(eid);
+                self.graph.add_edge(loop_end, dst, ());
+            }
+
+            created += 2;
+        }
+
+        for p in 0..n_boundary {
+            if state_set.contains(&p) {
+                continue;
+            }
+            let per_iter_sources: Vec<NodeIndex> = candidate
+                .occurrences
+                .iter()
+                .map(|occ| occ.boundary_inputs[p])
+                .collect();
+            if per_iter_sources.windows(2).all(|w| w[0] == w[1]) {
+                continue;
+            }
+
+            let body_input = candidate.occurrences[0].boundary_inputs[p];
+            let dtype = self.infer_node_dtype_cached(body_input, &mut dtype_cache);
+            let loop_input = self.graph.add_node(Box::new(LoopInput {
+                loop_id,
+                stream_id: p,
+                dtype,
+            }));
+            added_loop_ops.insert(loop_input);
+            for &src in &per_iter_sources {
+                self.graph.add_edge(src, loop_input, ());
+            }
+
+            let body_edges: Vec<_> = self
+                .graph
+                .edges_directed(body_input, Direction::Outgoing)
+                .filter(|e| body_nodes.contains(&e.target()))
+                .map(|e| (e.id(), e.target()))
+                .collect();
+            for (eid, dst) in body_edges {
+                self.graph.remove_edge(eid);
+                self.graph.add_edge(loop_input, dst, ());
+            }
+
+            created += 1;
+        }
+
+        let n_outputs = candidate.occurrences[0].output_nodes.len();
+        for q in 0..n_outputs {
+            if state_output_positions.contains(&q) {
+                continue;
+            }
+
+            // Per iteration, determine (body_producer, edges_to_rewire):
+            //  * If `output_nodes[q]` is an Output HLIR (graph sink): the
+            //    body producer is that Output's predecessor, and the edge to
+            //    rewire is the predecessor → Output edge itself.
+            //  * Otherwise: body producer is `output_nodes[q]`; the edges to
+            //    rewire are all of its outgoing edges whose target is OUTSIDE
+            //    the rolled region (post-loop consumers — Output HLIR or any
+            //    downstream computation, treated identically).
+            let mut per_iter_plan: Vec<(NodeIndex, Vec<(petgraph::graph::EdgeIndex, NodeIndex)>)> =
+                Vec::with_capacity(n_iters);
+            let mut complete = true;
+            for occ in &candidate.occurrences {
+                let node = occ.output_nodes[q];
+                if self.try_get_op::<Output>(node).is_some() {
+                    // Output HLIR sink. Its predecessor is the body producer;
+                    // the single (pred → Output) edge is what we rewire.
+                    let pred_edge = self
+                        .graph
+                        .edges_directed(node, Direction::Incoming)
+                        .next()
+                        .map(|e| (e.id(), e.source(), node));
+                    match pred_edge {
+                        Some((eid, pred, output)) => {
+                            per_iter_plan.push((pred, vec![(eid, output)]));
+                        }
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                } else {
+                    // Internal body producer. Cross-region edges = its
+                    // outgoing edges whose target is not in any iter's body.
+                    let edges: Vec<_> = self
+                        .graph
+                        .edges_directed(node, Direction::Outgoing)
+                        .filter(|e| {
+                            let t = e.target();
+                            !body_nodes.contains(&t) && !duplicate_body_nodes.contains(&t)
+                        })
+                        .map(|e| (e.id(), e.target()))
+                        .collect();
+                    if edges.is_empty() {
+                        // Nothing actually crosses the region for this iter.
+                        // Skip the whole stream — without a consumer the
+                        // Select would dangle.
+                        complete = false;
+                        break;
+                    }
+                    per_iter_plan.push((node, edges));
+                }
+            }
+            if !complete {
+                continue;
+            }
+
+            // Iter-0 body producer feeds the LoopOutput marker.
+            let body_output = per_iter_plan[0].0;
+            let dtype = self.infer_node_dtype_cached(body_output, &mut dtype_cache);
+
+            let loop_output = self.graph.add_node(Box::new(LoopOutput {
+                loop_id,
+                stream_id: q,
+                dtype,
+            }));
+            self.graph.add_edge(body_output, loop_output, ());
+            added_loop_ops.insert(loop_output);
+
+            // For each iter, create a LoopOutputSelect(i) and rewire the
+            // cross-region edges to flow through it.
+            for (i, (_, edges)) in per_iter_plan.into_iter().enumerate() {
+                let select = self.graph.add_node(Box::new(LoopOutputSelect {
+                    loop_id,
+                    stream_id: q,
+                    iter: i,
+                    dtype,
+                }));
+                self.graph.add_edge(loop_output, select, ());
+                added_loop_ops.insert(select);
+
+                for (edge_id, consumer) in edges {
+                    self.graph.remove_edge(edge_id);
+                    self.graph.add_edge(select, consumer, ());
+                }
+                created += 1;
+            }
+            created += 1; // for the LoopOutput marker itself
+        }
+
+        // Delete duplicate body nodes. Skip any node we just added as a
+        // loop-marker op (StableGraph may reuse NodeIndex slots, so an
+        // added marker could collide with a previously-freed body node id).
+        for &node in &duplicate_body_nodes {
+            if added_loop_ops.contains(&node) {
+                continue;
+            }
+            self.graph.remove_node(node);
+        }
+
+        if created > 0 {
+            let nodes_after = self.graph.node_count();
+            // Region partition: body_nodes is the surviving one-iteration body,
+            // `created` is the marker scaffold (LoopStart/End/Input/Output),
+            // and the rest is graph outside the loop region (embedding,
+            // weights, post-loop / lm-head).
+            let inside_body = body_nodes.len();
+            let inside_markers = created;
+            let outside = nodes_after - inside_body - inside_markers;
+            println!(
+                "   {:>6}  rolled HLIR: {} -> {} nodes ({} loop ops inserted, {} duplicate body nodes deleted)",
+                "Rolled".cyan().bold(),
+                nodes_before,
+                nodes_after,
+                created,
+                duplicate_body_nodes.len(),
+            );
+            println!(
+                "   {:>6}  region partition: {} inside ({} body + {} markers) / {} outside",
+                "Rolled".cyan().bold(),
+                inside_body + inside_markers,
+                inside_body,
+                inside_markers,
+                outside,
+            );
+        }
+        created
+    }
+
+    /// Best-effort dtype lookup for a NodeIndex in the HLIR graph.
+    fn infer_node_dtype_cached(
+        &self,
+        node: NodeIndex,
+        cache: &mut FxHashMap<NodeIndex, DType>,
+    ) -> DType {
+        if let Some(&dt) = cache.get(&node) {
+            return dt;
+        }
+
+        if let Some((_, dt)) = self.input_meta.get(&node) {
+            cache.insert(node, *dt);
+            return *dt;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::Input>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::Cast>(node) {
+            cache.insert(node, op.1);
+            return op.1;
+        }
+        for pred in self
+            .graph
+            .neighbors_directed(node, Direction::Incoming)
+            .collect::<Vec<_>>()
+        {
+            let dt = self.infer_node_dtype_cached(pred, cache);
+            if dt != DType::F32 || self.input_meta.contains_key(&pred) {
+                cache.insert(node, dt);
+                return dt;
+            }
+        }
+        cache.insert(node, DType::F32);
+        DType::F32
+    }
+
     /// Set a runtime dimension
     pub fn set_dim(&mut self, dimension: char, val: usize) {
         self.dyn_map.insert(dimension, val);
     }
 
-    /// Define buckets for a dynamic dimension.
+    pub fn set_dim_interval(&mut self, dimension: char, min: i64, max: i64) {
+        self.dim_intervals
+            .insert(dimension, DimInterval::new(min, max));
+    }
+
+    /// Attempt to discover repeated HLIR regions and build explicit region
+    /// descriptors for loop-carried state edges.
+    /// Returns the number of detected inter-region boundaries.
     ///
-    /// When buckets are set, `search()` compiles a separate optimized LLIR graph
-    /// for each bucket combination. At runtime, `execute()` dispatches to the
-    /// appropriate compiled graph based on the current `dyn_map` values.
-    ///
-    /// Buckets must not overlap and must cover all values that will be used at runtime.
-    pub fn set_dim_buckets(&mut self, dimension: char, buckets: &[DimBucket]) {
-        // Validate no overlapping ranges
-        for (i, a) in buckets.iter().enumerate() {
-            for b in buckets.iter().skip(i + 1) {
-                assert!(
-                    a.max < b.min || b.max < a.min,
-                    "Overlapping buckets for dim '{}': [{}, {}] and [{}, {}]",
-                    dimension,
-                    a.min,
-                    a.max,
-                    b.min,
-                    b.max,
+    /// This is a conservative prepass:
+    /// - only rolls candidates with at least one loop-carried state parameter
+    /// - only inserts when the carried edge shapes can be inferred
+    pub fn auto_roll_loops_prepass(&mut self) -> usize {
+        let max_region_size = self.graph.node_count() / 2;
+        if max_region_size < 1 {
+            return 0;
+        }
+        println!(
+            "   {:>6}  scanning {} HLIR nodes for loop regions (max body={})",
+            "Rolled".cyan().bold(),
+            self.graph.node_count(),
+            max_region_size,
+        );
+        let report = self.best_rolling_candidate(max_region_size);
+        let Some(candidate) = report.candidate else {
+            self.print_rolling_search_diagnostics(&report.diagnostics);
+            return 0;
+        };
+        println!(
+            "   {:>6}  candidate: body={} trips={} boundary_inputs={} state_params={:?}",
+            "Rolled".yellow().bold(),
+            candidate.occurrences[0].nodes.len(),
+            candidate.occurrences.len(),
+            candidate.occurrences[0].boundary_inputs.len(),
+            candidate.state_param_indices,
+        );
+        if let Some(rejected) = &report.diagnostics.best_rejected {
+            println!(
+                "   {:>6}  best rejected: body={} trips={} boundary_inputs={} state_params={} savings={}",
+                "Rolled".yellow().bold(),
+                rejected.window,
+                rejected.repetitions,
+                rejected.boundary_inputs,
+                rejected.state_params,
+                rejected.savings,
+            );
+        }
+        for run in report.diagnostics.top_runs.iter().take(5) {
+            println!("   {:>6}  run: {}", "Rolled".yellow().bold(), run);
+        }
+        if candidate.occurrences.len() < 2 {
+            return 0;
+        }
+
+        // Mutate the HLIR in place — insert LoopStart/LoopEnd/LoopInput/
+        // LoopOutput markers, delete N-1 duplicate bodies. The loop structure
+        // is encoded in the HLIR graph itself and the downstream single-root
+        // egglog path picks it up unchanged.
+        self.insert_loop_region_ops(candidate)
+    }
+
+    fn print_rolling_search_diagnostics(&self, diagnostics: &RollingSearchDiagnostics) {
+        let best_rejected = diagnostics
+            .best_rejected
+            .as_ref()
+            .map(|candidate| {
+                format!(
+                    "best rejected: body={} trips={} boundary_inputs={} state_params={} savings={}",
+                    candidate.window,
+                    candidate.repetitions,
+                    candidate.boundary_inputs,
+                    candidate.state_params,
+                    candidate.savings
+                )
+            })
+            .unwrap_or_else(|| "best rejected: none".to_string());
+        println!(
+            "   {:>6}  diagnostics: windows={} hash_matches={} repeated_runs={} rejected(zero_state={}); {}",
+            "Rolled".yellow().bold(),
+            diagnostics.windows_probed,
+            diagnostics.adjacent_hash_matches,
+            diagnostics.repeated_signature_runs,
+            diagnostics.rejected_zero_state_params,
+            best_rejected,
+        );
+        for run in diagnostics.top_runs.iter().take(5) {
+            println!("   {:>6}  run: {}", "Rolled".yellow().bold(), run);
+        }
+    }
+
+    fn best_rolling_candidate(&self, max_region_size: usize) -> RollingSearchReport {
+        let Some(full_topo) = stable_toposort_by_node_index(&self.graph) else {
+            return RollingSearchReport {
+                candidate: None,
+                diagnostics: RollingSearchDiagnostics::default(),
+            };
+        };
+        let topo: Vec<NodeIndex> = full_topo
+            .into_iter()
+            .filter(|n| {
+                self.try_get_op::<crate::hlir::Input>(*n).is_none()
+                    && self.try_get_op::<crate::hlir::Output>(*n).is_none()
+            })
+            .collect();
+        if topo.len() < 2 {
+            return RollingSearchReport {
+                candidate: None,
+                diagnostics: RollingSearchDiagnostics::default(),
+            };
+        }
+        let uses = build_uses(&self.graph);
+        let topo_index: FxHashMap<NodeIndex, usize> =
+            topo.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+        let max_window = max_region_size.min(topo.len() / 2);
+        let probe_windows = rolling_probe_window_sizes(max_window);
+        let node_hashes: Vec<u64> = topo
+            .iter()
+            .map(|&node| cheap_rolling_node_hash(&self.graph, node))
+            .collect();
+        let rolling_hash = RollingHash64::new(&node_hashes);
+        let mut diagnostics = RollingSearchDiagnostics::default();
+        let mut best_overall: Option<RollingCandidate> = None;
+        let mut discovered_runs: Vec<RollingRun> = Vec::new();
+
+        // Search all window sizes down to 1, using cheap rolling hashes only as a
+        // gate for expensive canonicalization. Candidate selection remains purely
+        // based on valid HLIR-op reduction.
+        for window in probe_windows {
+            let mut start = 0usize;
+            while start + window * 2 <= topo.len() {
+                diagnostics.windows_probed += 1;
+                let first_hash = rolling_hash.window_hash(start, window);
+                let second_hash = rolling_hash.window_hash(start + window, window);
+                if first_hash != second_hash {
+                    start += 1;
+                    continue;
+                }
+                diagnostics.adjacent_hash_matches += 1;
+
+                let mut occs = vec![];
+                let mut starts = vec![];
+                let first_nodes = topo[start..start + window].to_vec();
+                let Some((sig, first_boundary, first_outputs)) =
+                    canonicalize_occurrence(&self.graph, &first_nodes, &uses, &topo_index)
+                else {
+                    start += 1;
+                    continue;
+                };
+                starts.push(start);
+                occs.push(RollingOccurrence {
+                    nodes: first_nodes,
+                    boundary_inputs: first_boundary,
+                    output_nodes: first_outputs,
+                });
+
+                let mut pos = start + window;
+                while pos + window <= topo.len() {
+                    if rolling_hash.window_hash(pos, window) != first_hash {
+                        break;
+                    }
+                    let nodes = topo[pos..pos + window].to_vec();
+                    let Some((next_sig, boundary_inputs, output_nodes)) =
+                        canonicalize_occurrence(&self.graph, &nodes, &uses, &topo_index)
+                    else {
+                        break;
+                    };
+                    if next_sig != sig {
+                        break;
+                    }
+                    starts.push(pos);
+                    occs.push(RollingOccurrence {
+                        nodes,
+                        boundary_inputs,
+                        output_nodes,
+                    });
+                    pos += window;
+                }
+                if occs.len() < 2 {
+                    start += 1;
+                    continue;
+                }
+                diagnostics.repeated_signature_runs += 1;
+                discovered_runs.push(RollingRun {
+                    occurrences: occs.clone(),
+                    starts: starts.clone(),
+                    window,
+                });
+                let stride = starts
+                    .windows(2)
+                    .next()
+                    .map(|w| w[1].saturating_sub(w[0]))
+                    .unwrap_or(0);
+                let summary = format!(
+                    "body={} trips={} stride={} boundary_inputs={} state_params={} starts={:?}",
+                    window,
+                    occs.len(),
+                    stride,
+                    occs[0].boundary_inputs.len(),
+                    collect_state_params(&occs, &uses, &self.graph).len(),
+                    starts.iter().copied().take(4).collect::<Vec<_>>()
                 );
+                if occs.len() >= 20 && diagnostics.top_runs.len() < 16 {
+                    diagnostics.top_runs.push(summary);
+                }
+
+                let state_params = collect_state_params(&occs, &uses, &self.graph);
+                if state_params.is_empty() {
+                    let rejected = RollingRejectedCandidate {
+                        window,
+                        repetitions: occs.len(),
+                        boundary_inputs: occs[0].boundary_inputs.len(),
+                        state_params: state_params.len(),
+                        savings: window * (occs.len() - 1),
+                    };
+                    diagnostics.rejected_zero_state_params += 1;
+                    let replace = diagnostics.best_rejected.as_ref().is_none_or(|best| {
+                        (rejected.savings, rejected.repetitions, rejected.window)
+                            > (best.savings, best.repetitions, best.window)
+                    });
+                    if replace {
+                        diagnostics.best_rejected = Some(rejected);
+                    }
+                    start = pos.saturating_sub(window).max(start + 1);
+                    continue;
+                }
+
+                let savings = window * (occs.len() - 1);
+                let _ = sig;
+                let candidate = RollingCandidate {
+                    occurrences: occs,
+                    state_param_indices: state_params,
+                    savings,
+                };
+                let replace = best_overall.as_ref().is_none_or(|b| {
+                    (candidate.savings, candidate.occurrences.len())
+                        > (b.savings, b.occurrences.len())
+                });
+                if replace {
+                    best_overall = Some(candidate);
+                }
+                start = pos.saturating_sub(window).max(start + 1);
             }
         }
-        self.dim_buckets.insert(dimension, buckets.to_vec());
+        let mut grown_best = best_overall.take().map(|best| {
+            grow_rolling_candidate(&self.graph, &uses, &topo_index, best, &discovered_runs)
+        });
+        for run in &discovered_runs {
+            let state_param_indices = collect_state_params(&run.occurrences, &uses, &self.graph);
+            let seed = RollingCandidate {
+                occurrences: run.occurrences.clone(),
+                state_param_indices,
+                savings: 0,
+            };
+            let grown =
+                grow_rolling_candidate(&self.graph, &uses, &topo_index, seed, &discovered_runs);
+            if grown.state_param_indices.is_empty() {
+                continue;
+            }
+            let replace = grown_best.as_ref().is_none_or(|best| {
+                (grown.savings, grown.occurrences.len()) > (best.savings, best.occurrences.len())
+            });
+            if replace {
+                grown_best = Some(grown);
+            }
+        }
+        RollingSearchReport {
+            candidate: grown_best,
+            diagnostics,
+        }
     }
 
     /// Create a new tensor with shape S
@@ -211,12 +1019,14 @@ impl Graph {
 
     /// Create a new tensor with shape S and a name. This name will show up on the graph when displayed
     pub fn named_tensor(&mut self, name: impl ToString, shape: impl ToShape) -> GraphTensor {
+        let name = name.to_string();
         let id = self.graph.add_node(Box::new(crate::hlir::Input {
             node: 0,
-            label: name.to_string(),
+            label: name.clone(),
             dtype: DType::default(),
         }));
         self.get_op_mut::<crate::hlir::Input>(id).node = id.index();
+        self.input_meta.insert(id, (name.clone(), DType::default()));
         GraphTensor {
             id,
             graph_ref: self,
@@ -305,35 +1115,101 @@ impl Graph {
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn build_search_space<Rt: Runtime + 'static>(&mut self) {
+    pub fn build_search_space<Rt: Runtime + 'static>(&mut self, options: CompileOptions) {
+        self.run_auto_loop_rolling_prepass();
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<ReferenceRuntime>();
+        let dim_buckets = options.dim_buckets.clone();
+        let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
+        let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
 
-        let subgraphs = split_at_graph_breaks(self);
-
-        if subgraphs.len() <= 1 {
-            let (program, root) = hlir_to_egglog(self);
-            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
-
-            self.chunk_groups = vec![ChunkGroup {
-                representative: 0,
-                members: vec![0],
-            }];
-        } else {
-            println!(
-                "   {:>6}  {} chunks from graph breaks",
-                "Split".cyan().bold(),
-                subgraphs.len()
-            );
-            self.build_grouped_egraphs(&subgraphs, &ops, cleanup_hlir);
-        }
-        self.subgraph_descriptors = subgraphs;
+        let (program, root) = hlir_to_egglog(self);
+        let contexts = self.search_space_contexts(&dim_buckets);
+        self.egraphs = contexts
+            .iter()
+            .map(|context| {
+                let (contextual_program, use_interval_analysis) =
+                    self.egglog_program_with_interval_facts(&program, &context.intervals);
+                run_egglog_with_late_passes_and_interval_analysis(
+                    &contextual_program,
+                    &root,
+                    &ops,
+                    cleanup_hlir,
+                    &late_passes,
+                    use_interval_analysis,
+                )
+                .unwrap()
+            })
+            .collect();
+        self.egraph_contexts = contexts;
         self.ops = Some(ops);
+        self.search_space_dim_buckets = dim_buckets;
+    }
+
+    fn search_space_contexts(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> Vec<SearchSpaceContext> {
+        if dim_buckets.is_empty() {
+            return vec![SearchSpaceContext {
+                bucket_indices: FxHashMap::default(),
+                representative_dyn_map: self.dyn_map.clone(),
+                intervals: self.dim_intervals.clone(),
+            }];
+        }
+
+        self.bucket_combinations(dim_buckets)
+            .into_iter()
+            .map(|(bucket_indices, representative_dyn_map)| {
+                let mut intervals = self.dim_intervals.clone();
+                for (&dim, &idx) in &bucket_indices {
+                    let bucket = &dim_buckets[&dim][idx];
+                    let min = i64::try_from(bucket.min)
+                        .expect("DimBucket min must fit into i64 for interval analysis");
+                    let max = i64::try_from(bucket.max)
+                        .expect("DimBucket max must fit into i64 for interval analysis");
+                    let bucket_interval = DimInterval::new(min, max);
+                    intervals
+                        .entry(dim)
+                        .and_modify(|existing| {
+                            existing.min = existing.min.max(bucket_interval.min);
+                            existing.max = existing.max.min(bucket_interval.max);
+                            assert!(
+                                existing.min <= existing.max,
+                                "Bucket interval for dim '{dim}' does not overlap graph interval"
+                            );
+                        })
+                        .or_insert(bucket_interval);
+                }
+                SearchSpaceContext {
+                    bucket_indices,
+                    representative_dyn_map,
+                    intervals,
+                }
+            })
+            .collect()
+    }
+
+    fn egglog_program_with_interval_facts(
+        &self,
+        program: &str,
+        intervals: &DynDimIntervals,
+    ) -> (String, bool) {
+        let facts = crate::egglog_utils::base::interval_facts_egglog(intervals, []);
+        if facts.is_empty() {
+            (program.to_string(), false)
+        } else {
+            (format!("{facts}\n{program}"), true)
+        }
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(&mut self) {
+    pub fn build_search_space_exclude_ops<Rt: Runtime + 'static, Ex: IntoEgglogOp>(
+        &mut self,
+        options: CompileOptions,
+    ) {
+        self.run_auto_loop_rolling_prepass();
         let exclude_ops = Ex::into_vec()
             .into_iter()
             .map(|e| e.sort().name)
@@ -341,68 +1217,32 @@ impl Graph {
         let mut ops = Rt::Ops::into_vec();
         ops.retain(|o| !exclude_ops.contains(&o.sort().name));
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
-        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
+        let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<ReferenceRuntime>();
+        let dim_buckets = options.dim_buckets.clone();
+        let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
+        let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
 
-        let subgraphs = split_at_graph_breaks(self);
-        if subgraphs.len() <= 1 {
-            let (program, root) = hlir_to_egglog(self);
-            self.egraphs = vec![run_egglog(&program, &root, &ops, cleanup_hlir).unwrap()];
-            self.chunk_groups = vec![ChunkGroup {
-                representative: 0,
-                members: vec![0],
-            }];
-        } else {
-            self.build_grouped_egraphs(&subgraphs, &ops, cleanup_hlir);
-        }
-        self.subgraph_descriptors = subgraphs;
+        let (program, root) = hlir_to_egglog(self);
+        let contexts = self.search_space_contexts(&dim_buckets);
+        self.egraphs = contexts
+            .iter()
+            .map(|context| {
+                let (contextual_program, use_interval_analysis) =
+                    self.egglog_program_with_interval_facts(&program, &context.intervals);
+                run_egglog_with_late_passes_and_interval_analysis(
+                    &contextual_program,
+                    &root,
+                    &ops,
+                    cleanup_hlir,
+                    &late_passes,
+                    use_interval_analysis,
+                )
+                .unwrap()
+            })
+            .collect();
+        self.egraph_contexts = contexts;
         self.ops = Some(ops);
-    }
-
-    /// Build e-graphs for multi-chunk subgraphs, grouping structurally identical
-    /// chunks and only building one e-graph per unique group.
-    fn build_grouped_egraphs(
-        &mut self,
-        subgraphs: &[SubgraphDescriptor],
-        ops: &[Arc<Box<dyn EgglogOp>>],
-        cleanup_hlir: bool,
-    ) {
-        // Get egglog text for each subgraph
-        let egglog_texts: Vec<(String, String)> = subgraphs
-            .iter()
-            .map(|sg| hlir_subgraph_to_egglog(self, sg))
-            .collect();
-
-        // Group by normalized egglog hash
-        let mut hash_to_chunks: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-        for (i, (text, _)) in egglog_texts.iter().enumerate() {
-            let h = hash_egglog_normalized(text);
-            hash_to_chunks.entry(h).or_default().push(i);
-        }
-        let mut groups: Vec<ChunkGroup> = hash_to_chunks
-            .into_values()
-            .map(|members| ChunkGroup {
-                representative: members[0],
-                members,
-            })
-            .collect();
-        groups.sort_by_key(|g| g.representative);
-
-        println!(
-            "   {:>6}  {} unique groups from {} chunks",
-            "Graphs".cyan().bold(),
-            groups.len(),
-            subgraphs.len()
-        );
-
-        self.egraphs = groups
-            .iter()
-            .map(|g| {
-                let (ref program, ref root) = egglog_texts[g.representative];
-                run_egglog(program, root, ops, cleanup_hlir).unwrap()
-            })
-            .collect();
-
-        self.chunk_groups = groups;
+        self.search_space_dim_buckets = dim_buckets;
     }
 
     /// Get a reference to the first e-graph search space (if built)
@@ -415,37 +1255,77 @@ impl Graph {
         self.ops.as_ref()
     }
 
+    /// Build the search space and search it with one shared set of options.
+    ///
+    /// This is the usual compile entry point when runtime inputs such as
+    /// weights have already been loaded. Use `build_search_space` and `search`
+    /// directly when the two phases need to be separated.
     #[tracing::instrument(skip_all)]
-    pub fn search<R: Runtime>(&mut self, runtime: R, limit: usize) -> R {
+    pub fn compile<R: Runtime + 'static>(&mut self, runtime: R, options: CompileOptions) -> R {
         let mut rng = rand::rng();
-        self.search_options(runtime, SearchOptions::new(limit), &mut rng)
+        self.compile_with_rng(runtime, options, &mut rng)
     }
 
     #[tracing::instrument(skip_all)]
-    pub fn search_options<R: Runtime, G: rand::Rng>(
+    pub fn compile_with_rng<R: Runtime + 'static, G: rand::Rng>(
         &mut self,
-        mut runtime: R,
-        options: SearchOptions,
+        runtime: R,
+        options: CompileOptions,
         rng: &mut G,
     ) -> R {
-        if self.dim_buckets.is_empty() {
+        self.build_search_space::<R>(options.clone());
+        self.search_with_rng(runtime, options, rng)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn search<R: Runtime + 'static>(&mut self, runtime: R, options: CompileOptions) -> R {
+        let mut rng = rand::rng();
+        self.search_with_rng(runtime, options, &mut rng)
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub fn search_with_rng<R: Runtime + 'static, G: rand::Rng>(
+        &mut self,
+        mut runtime: R,
+        options: CompileOptions,
+        rng: &mut G,
+    ) -> R {
+        assert!(
+            options.dim_buckets.is_empty() || options.dim_buckets == self.search_space_dim_buckets,
+            "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
+        );
+
+        let search_started_at = std::time::Instant::now();
+        if self.search_space_dim_buckets.is_empty() {
             // No buckets: existing single-search path
-            let stitched =
-                self.search_single(&mut runtime, &options, rng, &self.dyn_map.clone(), None);
+            let stitched = self.search_single(
+                &mut runtime,
+                &options,
+                rng,
+                &self.dyn_map.clone(),
+                None,
+                None,
+                0,
+                search_started_at,
+            );
 
             runtime.clear_intermediate_buffers();
             runtime.load_llir(&stitched);
             runtime
         } else {
             // Bucketed search: compile one LLIR per bucket combination
-            let bucket_combos = self.bucket_combinations();
-            let n_combos = bucket_combos.len();
+            let bucket_contexts = self.search_space_contexts(&self.search_space_dim_buckets);
+            let n_combos = bucket_contexts.len();
             let mut bucket_llirs: Vec<BucketLLIR> = Vec::with_capacity(n_combos);
+            assert!(
+                self.egraphs.len() == n_combos,
+                "dim buckets must be configured before build_search_space; search space has {} egraphs but current bucket configuration has {n_combos} combinations",
+                self.egraphs.len(),
+            );
 
-            for (combo_idx, (bucket_indices, representative_dyn_map)) in
-                bucket_combos.into_iter().enumerate()
-            {
-                let bucket_label = self.format_bucket_label(&bucket_indices);
+            for (combo_idx, context) in bucket_contexts.into_iter().enumerate() {
+                let bucket_label = self
+                    .format_bucket_label(&self.search_space_dim_buckets, &context.bucket_indices);
                 println!(
                     "   {:>6}  Group {}/{}: {}",
                     "Search".cyan().bold(),
@@ -458,23 +1338,37 @@ impl Graph {
                     &mut runtime,
                     &options,
                     rng,
-                    &representative_dyn_map,
+                    &context.representative_dyn_map,
                     Some((combo_idx, n_combos)),
+                    Some(SearchProfileBucketContext {
+                        dim_buckets: self.search_space_dim_buckets.clone(),
+                        bucket_indices: context.bucket_indices.clone(),
+                        representative_dyn_map: context.representative_dyn_map.clone(),
+                    }),
+                    combo_idx,
+                    search_started_at,
                 );
-                bucket_llirs.push((bucket_indices, representative_dyn_map, stitched));
+                bucket_llirs.push((
+                    context.bucket_indices,
+                    context.representative_dyn_map,
+                    stitched,
+                ));
             }
 
             runtime.clear_intermediate_buffers();
-            runtime.load_llir_buckets(&self.dim_buckets, &bucket_llirs);
+            runtime.load_llir_buckets(&self.search_space_dim_buckets, &bucket_llirs);
             runtime
         }
     }
 
     /// Compute cartesian product of all bucket combinations.
     /// Returns Vec of (bucket_indices, representative_dyn_map).
-    fn bucket_combinations(&self) -> Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> {
+    fn bucket_combinations(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> {
         let mut dims: Vec<(char, &Vec<DimBucket>)> =
-            self.dim_buckets.iter().map(|(c, b)| (*c, b)).collect();
+            dim_buckets.iter().map(|(c, b)| (*c, b)).collect();
         dims.sort_by_key(|(c, _)| *c);
 
         let mut combos: Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> =
@@ -497,13 +1391,30 @@ impl Graph {
         combos
     }
 
+    fn late_pass_dyn_map(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+    ) -> FxHashMap<char, usize> {
+        let mut dyn_map = self.dyn_map.clone();
+        for (&dim, buckets) in dim_buckets {
+            if let Some(max) = buckets.iter().map(|bucket| bucket.max).max() {
+                dyn_map.insert(dim, max);
+            }
+        }
+        dyn_map
+    }
+
     /// Format a human-readable label for a bucket combination.
-    fn format_bucket_label(&self, bucket_indices: &FxHashMap<char, usize>) -> String {
+    fn format_bucket_label(
+        &self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_indices: &FxHashMap<char, usize>,
+    ) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut dims: Vec<_> = bucket_indices.iter().collect();
         dims.sort_by_key(|(c, _)| **c);
         for (dim, &idx) in dims {
-            let bucket = &self.dim_buckets[dim][idx];
+            let bucket = &dim_buckets[dim][idx];
             if bucket.min == bucket.max {
                 parts.push(format!("{}={}", dim, bucket.min));
             } else {
@@ -519,59 +1430,33 @@ impl Graph {
         parts.join(", ")
     }
 
-    /// Run the genetic search for all chunk groups using the given dyn_map for profiling.
-    /// Returns the stitched LLIR graph.
-    /// `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`, shows an extra
-    /// "Bucket" bar for bucket-level progress and renames the group-level "Bucket" to "Group".
-    fn search_single<R: Runtime, G: rand::Rng>(
-        &self,
+    /// Run the genetic search and return the unrolled LLIR for the winning
+    /// genome. `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`
+    /// adds a second "Bucket" progress bar.
+    #[allow(clippy::too_many_arguments)]
+    fn search_single<R: Runtime + 'static, G: rand::Rng>(
+        &mut self,
         runtime: &mut R,
-        options: &SearchOptions,
+        options: &CompileOptions,
         rng: &mut G,
         dyn_map: &FxHashMap<char, usize>,
         bucket_progress: Option<(usize, usize)>,
+        bucket_profile_context: Option<SearchProfileBucketContext>,
+        egraph_index: usize,
+        search_started_at: std::time::Instant,
     ) -> LLIRGraph {
+        let mut profile_dyn_map = dyn_map.clone();
+        for (&dim, &value) in &options.profile_dims {
+            profile_dyn_map.insert(dim, value);
+        }
         let limit = options.limit;
-        let n_chunks = self.subgraph_descriptors.len();
-        let n_groups = self.chunk_groups.len();
-        let multi_chunk = n_chunks > 1;
         let ops = self.ops.as_ref().unwrap();
+        let egraph = &self.egraphs[egraph_index];
+        let search_limit = count_choice_sets_up_to(egraph, limit);
         let start = std::time::Instant::now();
 
-        // Label for the group-level "total" bar: "Group" when in bucketed mode, "Bucket" otherwise
-        let group_total_label = if bucket_progress.is_some() {
-            "Group"
-        } else {
-            "Bucket"
-        };
-        // How many progress bar lines we render (for ANSI cursor management)
-        // multi_chunk without buckets: 2 lines (Graph + Bucket)
-        // multi_chunk with buckets: 3 lines (Graph + Group + Bucket)
-        // single chunk without buckets: 1 line (Search)
-        // single chunk with buckets: 2 lines (Search + Bucket)
-        let n_bar_lines =
-            if multi_chunk { 2 } else { 1 } + if bucket_progress.is_some() { 1 } else { 0 };
-
-        // Allocate dummy buffers for boundary inputs so groups can be profiled
-        for desc in &self.subgraph_descriptors {
-            for bi in &desc.boundary_inputs {
-                if !runtime.has_hlir_buffer(bi.break_node.index()) {
-                    let n_elements = bi
-                        .shape
-                        .n_elements()
-                        .exec(dyn_map)
-                        .expect("Failed to resolve boundary input shape");
-                    let n_bytes = n_elements * bi.dtype.bits() / 8;
-                    runtime.allocate_dummy_input(bi.break_node.index(), n_bytes);
-                }
-            }
-        }
-
-        // Search each group's representative.
-        let mut group_best_llirs: Vec<Option<LLIRGraph>> = (0..n_groups).map(|_| None).collect();
-        let mut group_best_genomes: Vec<Option<crate::egglog_utils::EGraphChoiceSet>> =
-            (0..n_groups).map(|_| None).collect();
-        let mut bars_drawn = false;
+        // Bar layout: one Search bar, plus an optional Bucket bar.
+        let n_bar_lines = 1 + if bucket_progress.is_some() { 1 } else { 0 };
 
         fn make_bar(searched: usize, total: usize) -> String {
             let bar_width = 24;
@@ -591,74 +1476,59 @@ impl Graph {
             }
         }
 
-        // Render progress bars. Prints the right number of lines depending on mode.
-        // Returns the number of lines printed (for ANSI cursor management).
-        let render_bars = |n_graphs: usize,
-                           limit: usize,
-                           group_idx: usize,
-                           n_groups: usize,
-                           multi_chunk: bool,
-                           group_total_label: &str,
-                           bucket_progress: Option<(usize, usize)>|
-         -> usize {
-            let mut lines = 0;
-            if multi_chunk {
-                print!(
-                    "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
-                    "Graph".cyan().bold(),
-                    make_bar(n_graphs, limit),
-                );
-                lines += 1;
-                print!(
-                    "\n\x1b[2K  {:>6}  {} {group_idx}/{n_groups}",
-                    group_total_label.cyan().bold(),
-                    make_bar(group_idx, n_groups),
-                );
-                lines += 1;
-            } else {
+        let render_bars =
+            |n_graphs: usize, limit: usize, bucket_progress: Option<(usize, usize)>| {
                 print!(
                     "\x1b[2K  {:>6}  {} {n_graphs}/{limit}",
                     "Search".cyan().bold(),
                     make_bar(n_graphs, limit),
                 );
-                lines += 1;
-            }
-            if let Some((bucket_idx, n_buckets)) = bucket_progress {
-                print!(
-                    "\n\x1b[2K  {:>6}  {} {}/{n_buckets}",
-                    "Bucket".cyan().bold(),
-                    make_bar(bucket_idx, n_buckets),
-                    bucket_idx,
-                );
-                lines += 1;
-            }
-            lines
-        };
-
-        for (group_idx, group) in self.chunk_groups.iter().enumerate() {
-            let egraph = &self.egraphs[group_idx];
-            let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-
-            // Clear intermediate buffers from previous group's profiling
-            runtime.clear_intermediate_buffers();
-
-            // Find a viable initial genome (may need multiple attempts if some panic)
-            let (mut best_genome, mut best_graph, mut best_metric, display, mut n_graphs);
-            let mut init_attempts = 0;
-            loop {
-                init_attempts += 1;
-                if init_attempts > 100 {
-                    panic!(
-                        "Failed to find a viable initial genome for group {group_idx} after 100 attempts"
+                if let Some((bucket_idx, n_buckets)) = bucket_progress {
+                    print!(
+                        "\n\x1b[2K  {:>6}  {} {}/{n_buckets}",
+                        "Bucket".cyan().bold(),
+                        make_bar(bucket_idx, n_buckets),
+                        bucket_idx,
                     );
                 }
-                let genome = random_initial_choice(egraph, rng);
-                prev_selected.insert(hash_choice_set(&genome));
+            };
 
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let graph = egglog_to_llir(
+        let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
+        let mut list_cache = FxHashMap::default();
+        let mut expr_cache = FxHashMap::default();
+        runtime.clear_intermediate_buffers();
+        let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
+        let profile_timed_out = |elapsed: std::time::Duration| {
+            options
+                .profile_timeout
+                .is_some_and(|timeout| elapsed >= timeout)
+        };
+
+        // Find a viable initial genome. Runtime-filtered candidates are dry
+        // failures, not searched graphs: they are never profiled and do not
+        // count toward the graph search limit.
+        let (mut best_genome, mut best_metric, display, mut n_graphs) = {
+            let mut invalid_attempts = 0usize;
+            let mut filter_fails = 0usize;
+            let mut last_filter_rejection: Option<String> = None;
+            let max_invalid_attempts = 100usize;
+            let max_filter_fails = options
+                .limit
+                .max(1)
+                .saturating_mul(options.generation_size.max(1))
+                .saturating_mul(100)
+                .max(10_000);
+
+            loop {
+                let mut generation = random_choice_generation(egraph, 1, &mut prev_selected, rng);
+                let Some(genome) = generation.pop() else {
+                    panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
+                };
+
+                list_cache.clear();
+                expr_cache.clear();
+                let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut graph = egglog_to_llir(
                         egraph,
                         genome.clone(),
                         ops,
@@ -667,77 +1537,121 @@ impl Graph {
                         &mut expr_cache,
                         None,
                     );
+                    // Collapse the rolled body to a single iteration before
+                    // profiling — one transformer block instead of N×block, so
+                    // per-candidate profile time scales with body size, not the
+                    // unrolled graph size.
+                    collapse_loops_to_first_iter(&mut graph);
+                    graph
+                }));
+                let Ok(graph) = graph_result else {
+                    invalid_attempts += 1;
+                    if invalid_attempts > max_invalid_attempts {
+                        panic!(
+                            "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
+                        );
+                    }
+                    continue;
+                };
+
+                let filter_result = self.candidate_filter_result(
+                    runtime,
+                    &graph,
+                    &profile_dyn_map,
+                    options,
+                    bucket_profile_context.as_ref(),
+                );
+                if !filter_result.accepted {
+                    filter_fails += 1;
+                    last_filter_rejection = filter_result.display;
+                    if filter_fails >= max_filter_fails {
+                        panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
+                    }
+                    continue;
+                }
+                let filter_display = filter_result.display;
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.clear_intermediate_buffers();
-                    let profile = runtime.profile(&graph, dyn_map, options.trials);
-                    let has_nan = runtime.has_nan_outputs(&graph, dyn_map);
-                    (graph, profile, has_nan)
+                    let profile_start = std::time::Instant::now();
+                    let (rep_metric, rep_display) =
+                        if let Some(bucket_context) = &bucket_profile_context {
+                            runtime.profile_with_bucket_context(
+                                &graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                                ProfileBucketContext {
+                                    dim_buckets: &bucket_context.dim_buckets,
+                                    bucket_indices: &bucket_context.bucket_indices,
+                                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                                },
+                            )
+                        } else {
+                            runtime.profile(
+                                &graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                            )
+                        };
+                    let timed_out = profile_timed_out(profile_start.elapsed());
+                    let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
+                    let invalid_profile = rep_display.starts_with("invalid ");
+                    (
+                        rep_metric,
+                        append_filter_display(rep_display, filter_display.as_deref()),
+                        has_nan,
+                        timed_out,
+                        invalid_profile,
+                    )
                 }));
 
                 match result {
-                    Ok((graph, (metric, disp), has_nan)) if !has_nan => {
-                        best_genome = genome;
-                        best_graph = graph;
-                        best_metric = metric;
-                        display = disp;
-                        n_graphs = 1;
-                        break;
+                    Ok((metric, disp, false, false, false)) => {
+                        break (genome, R::aggregate_profile_metrics(&[metric]), disp, 1);
                     }
                     Ok(_) | Err(_) => {
-                        list_cache.clear();
-                        expr_cache.clear();
-                        continue;
+                        invalid_attempts += 1;
+                        if invalid_attempts > max_invalid_attempts {
+                            panic!(
+                                "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
+                            );
+                        }
                     }
                 }
             }
+        };
 
-            // Print initial result and progress
-            {
-                let multiplier = if group.members.len() > 1 {
-                    format!(" ({}x)", group.members.len())
-                } else {
-                    String::new()
-                };
-                let msg = format!(
-                    "   {:>8} {}{multiplier}",
-                    format!("Graph {group_idx}").cyan().bold(),
-                    display,
-                );
-                if bars_drawn {
-                    // Move up past existing bar lines to overwrite them
-                    for _ in 1..n_bar_lines {
-                        print!("\x1b[1A");
-                    }
-                    print!("\r\x1b[2K");
-                }
-                println!("{msg}");
-                render_bars(
-                    n_graphs,
-                    limit,
-                    group_idx,
-                    n_groups,
-                    multi_chunk,
-                    group_total_label,
-                    bucket_progress,
-                );
-                std::io::stdout().flush().unwrap();
-                bars_drawn = true;
+        // Print initial result and progress
+        let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
+        println!("{msg}");
+        render_bars(n_graphs, search_limit, bucket_progress);
+        std::io::stdout().flush().unwrap();
+
+        // Track top-N parents for offspring generation
+        let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
+            vec![(best_metric.clone(), best_genome.clone())];
+        let mut resample_generation = false;
+
+        while n_graphs < search_limit {
+            if search_time_limit_reached() {
+                break;
             }
 
-            // Track top-N parents for offspring generation
-            let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
-                vec![(best_metric.clone(), best_genome.clone())];
-
-            while n_graphs < limit {
-                // Generate offspring from all parents, dividing budget evenly
-                let budget = (limit - n_graphs).min(options.generation_size);
+            // Generate offspring from all parents, dividing budget evenly
+            let budget = (search_limit - n_graphs).min(options.generation_size);
+            let all_offspring = if resample_generation {
+                random_choice_generation(egraph, budget, &mut prev_selected, rng)
+            } else {
                 let per_parent = budget.div_ceil(parents.len());
-                let mut all_offspring = Vec::new();
+                let mut offspring = Vec::new();
                 for (_, parent_genome) in &parents {
-                    let remaining = budget.saturating_sub(all_offspring.len());
+                    let remaining = budget.saturating_sub(offspring.len());
                     if remaining == 0 {
                         break;
                     }
-                    all_offspring.extend(extract_generation(
+                    offspring.extend(extract_reachable_generation(
                         egraph,
                         parent_genome,
                         per_parent.min(remaining),
@@ -746,185 +1660,251 @@ impl Graph {
                         rng,
                     ));
                 }
-                if all_offspring.is_empty() {
-                    break;
-                }
-
-                for genome in all_offspring {
-                    n_graphs += 1;
-                    list_cache.clear();
-                    expr_cache.clear();
-
-                    let profile_result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let llir_graph = egglog_to_llir(
-                                egraph,
-                                genome.clone(),
-                                ops,
-                                &self.custom_ops,
-                                &mut list_cache,
-                                &mut expr_cache,
-                                None,
-                            );
-                            runtime.clear_intermediate_buffers();
-                            let result = runtime.profile(&llir_graph, dyn_map, options.trials);
-                            let has_nan = runtime.has_nan_outputs(&llir_graph, dyn_map);
-                            (result, llir_graph, has_nan)
-                        }));
-
-                    let ((new_metric, display_metric), llir_graph) = match profile_result {
-                        Ok((result, graph, false)) => (result, graph),
-                        Ok((_, _, true)) | Err(_) => {
-                            // NaN or panic — redraw bars and skip
-                            for _ in 1..n_bar_lines {
-                                print!("\x1b[1A");
-                            }
-                            print!("\r\x1b[2K");
-                            render_bars(
-                                n_graphs,
-                                limit,
-                                group_idx,
-                                n_groups,
-                                multi_chunk,
-                                group_total_label,
-                                bucket_progress,
-                            );
-                            std::io::stdout().flush().unwrap();
-                            continue;
-                        }
-                    };
-
-                    // Update parents list (keep top-N for next generation)
-                    let dominated_by_all = parents.len() >= options.keep_best
-                        && !parents.last().unwrap().0.gt(&new_metric);
-                    if !dominated_by_all {
-                        let pos = parents
-                            .iter()
-                            .position(|(m, _)| {
-                                new_metric
-                                    .partial_cmp(m)
-                                    .is_some_and(|o| o == std::cmp::Ordering::Less)
-                            })
-                            .unwrap_or(parents.len());
-                        parents.insert(pos, (new_metric.clone(), genome.clone()));
-                        if parents.len() > options.keep_best {
-                            parents.truncate(options.keep_best);
-                        }
-                    }
-
-                    let new_best = best_metric.gt(&new_metric);
-                    if new_best {
-                        best_metric = new_metric;
-                        best_graph = llir_graph;
-                        best_genome = genome.clone();
-                    }
-
-                    if new_best {
-                        let msg = format!("   {:>6} {display_metric}", "Searched".green().bold());
-                        // Move cursor up to overwrite bars, print new best, re-render bars
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
-                        }
-                        print!("\r\x1b[2K");
-                        println!("{msg}");
-                    } else {
-                        // Just move cursor up to overwrite bars
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
-                        }
-                        print!("\r\x1b[2K");
-                    }
-                    render_bars(
-                        n_graphs,
-                        limit,
-                        group_idx,
-                        n_groups,
-                        multi_chunk,
-                        group_total_label,
-                        bucket_progress,
-                    );
-                    std::io::stdout().flush().unwrap();
-                }
+                offspring
+            };
+            if all_offspring.is_empty() {
+                break;
             }
 
-            group_best_llirs[group_idx] = Some(best_graph);
-            group_best_genomes[group_idx] = Some(best_genome);
+            let mut generation_found_non_timeout = false;
+
+            for genome in all_offspring {
+                if search_time_limit_reached() {
+                    break;
+                }
+                list_cache.clear();
+                expr_cache.clear();
+
+                let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut llir_graph = egglog_to_llir(
+                        egraph,
+                        genome.clone(),
+                        ops,
+                        &self.custom_ops,
+                        &mut list_cache,
+                        &mut expr_cache,
+                        None,
+                    );
+                    // Collapse the rolled body to a single iteration
+                    // before profiling — see initial-genome path.
+                    collapse_loops_to_first_iter(&mut llir_graph);
+                    llir_graph
+                }));
+                let Ok(llir_graph) = graph_result else {
+                    for _ in 1..n_bar_lines {
+                        print!("\x1b[1A");
+                    }
+                    print!("\r\x1b[2K");
+                    render_bars(n_graphs, search_limit, bucket_progress);
+                    std::io::stdout().flush().unwrap();
+                    continue;
+                };
+
+                let filter_result = self.candidate_filter_result(
+                    runtime,
+                    &llir_graph,
+                    &profile_dyn_map,
+                    options,
+                    bucket_profile_context.as_ref(),
+                );
+                if !filter_result.accepted {
+                    continue;
+                }
+                let filter_display = filter_result.display;
+
+                n_graphs += 1;
+                let profile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    runtime.clear_intermediate_buffers();
+                    let profile_start = std::time::Instant::now();
+                    let (rep_metric, rep_display) =
+                        if let Some(bucket_context) = &bucket_profile_context {
+                            runtime.profile_with_bucket_context(
+                                &llir_graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                                ProfileBucketContext {
+                                    dim_buckets: &bucket_context.dim_buckets,
+                                    bucket_indices: &bucket_context.bucket_indices,
+                                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                                },
+                            )
+                        } else {
+                            runtime.profile(
+                                &llir_graph,
+                                &profile_dyn_map,
+                                options.trials,
+                                options.profile_timeout,
+                            )
+                        };
+                    let timed_out = profile_timed_out(profile_start.elapsed());
+                    let has_nan =
+                        !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
+                    let invalid_profile = rep_display.starts_with("invalid ");
+                    (
+                        rep_metric,
+                        append_filter_display(rep_display, filter_display.as_deref()),
+                        has_nan,
+                        timed_out,
+                        invalid_profile,
+                    )
+                }));
+
+                let (new_metric, display_metric) = match profile_result {
+                    Ok((metric, display, false, false, false)) => {
+                        generation_found_non_timeout = true;
+                        (R::aggregate_profile_metrics(&[metric]), display)
+                    }
+                    Ok((_, _, _, true, _)) | Err(_) => {
+                        // Timed out or panicked — redraw bars and skip.
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        render_bars(n_graphs, search_limit, bucket_progress);
+                        std::io::stdout().flush().unwrap();
+                        continue;
+                    }
+                    Ok((_, _, true, false, _)) => {
+                        generation_found_non_timeout = true;
+                        // Completed profiling but produced NaNs — redraw bars and skip.
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        render_bars(n_graphs, search_limit, bucket_progress);
+                        std::io::stdout().flush().unwrap();
+                        continue;
+                    }
+                    Ok((_, _, false, false, true)) => {
+                        // Backend rejected this candidate during load/profile.
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        render_bars(n_graphs, search_limit, bucket_progress);
+                        std::io::stdout().flush().unwrap();
+                        continue;
+                    }
+                };
+
+                // Update parents list (keep top-N for next generation)
+                let dominated_by_all = parents.len() >= options.keep_best
+                    && !parents.last().unwrap().0.gt(&new_metric);
+                if !dominated_by_all {
+                    let pos = parents
+                        .iter()
+                        .position(|(m, _)| {
+                            new_metric
+                                .partial_cmp(m)
+                                .is_some_and(|o| o == std::cmp::Ordering::Less)
+                        })
+                        .unwrap_or(parents.len());
+                    parents.insert(pos, (new_metric.clone(), genome.clone()));
+                    if parents.len() > options.keep_best {
+                        parents.truncate(options.keep_best);
+                    }
+                }
+
+                let new_best = best_metric.gt(&new_metric);
+                if new_best {
+                    best_metric = new_metric;
+                    best_genome = genome.clone();
+                }
+
+                if new_best {
+                    let msg = format!("   {:>6} {display_metric}", "Searched".green().bold());
+                    for _ in 1..n_bar_lines {
+                        print!("\x1b[1A");
+                    }
+                    print!("\r\x1b[2K");
+                    println!("{msg}");
+                } else {
+                    for _ in 1..n_bar_lines {
+                        print!("\x1b[1A");
+                    }
+                    print!("\r\x1b[2K");
+                }
+                render_bars(n_graphs, search_limit, bucket_progress);
+                std::io::stdout().flush().unwrap();
+            }
+
+            resample_generation = !generation_found_non_timeout;
         }
 
         // Clear progress bars
-        if bars_drawn {
-            // Move up to first bar line and clear all bar lines
-            for _ in 1..n_bar_lines {
-                print!("\x1b[1A");
-            }
-            print!("\r");
-            for _ in 0..n_bar_lines {
-                println!("\x1b[2K");
-            }
-            // Move back up to where we started
-            for _ in 0..n_bar_lines {
-                print!("\x1b[1A");
-            }
-            print!("\r");
-            std::io::stdout().flush().unwrap();
+        for _ in 1..n_bar_lines {
+            print!("\x1b[1A");
         }
-
-        // Build per-chunk LLIRs
-        let mut chunk_best_llirs: Vec<Option<LLIRGraph>> = (0..n_chunks).map(|_| None).collect();
-
-        for (group_idx, group) in self.chunk_groups.iter().enumerate() {
-            let egraph = &self.egraphs[group_idx];
-            let genome = group_best_genomes[group_idx].as_ref().unwrap();
-
-            for &chunk_idx in &group.members {
-                if chunk_idx == group.representative {
-                    continue;
-                }
-                let (node_remap, custom_op_id_remap) = build_chunk_remaps(
-                    &self.subgraph_descriptors[group.representative],
-                    &self.subgraph_descriptors[chunk_idx],
-                    &self.graph,
-                );
-                let mut list_cache = FxHashMap::default();
-                let mut expr_cache = FxHashMap::default();
-                let custom_remap = if custom_op_id_remap.is_empty() {
-                    None
-                } else {
-                    Some(&custom_op_id_remap)
-                };
-                let mut llir = egglog_to_llir(
-                    egraph,
-                    genome.clone(),
-                    ops,
-                    &self.custom_ops,
-                    &mut list_cache,
-                    &mut expr_cache,
-                    custom_remap,
-                );
-                remap_llir_io_nodes(&mut llir, &node_remap, &self.graph);
-                chunk_best_llirs[chunk_idx] = Some(llir);
-            }
-
-            chunk_best_llirs[group.representative] = group_best_llirs[group_idx].take();
+        print!("\r");
+        for _ in 0..n_bar_lines {
+            println!("\x1b[2K");
         }
+        for _ in 0..n_bar_lines {
+            print!("\x1b[1A");
+        }
+        print!("\r");
+        std::io::stdout().flush().unwrap();
 
-        let chunk_best_llirs: Vec<LLIRGraph> = chunk_best_llirs
-            .into_iter()
-            .enumerate()
-            .map(|(i, opt)| opt.unwrap_or_else(|| panic!("Missing LLIR for chunk {i}")))
-            .collect();
-
-        let stitched = stitch_llir_graphs(&chunk_best_llirs, &self.subgraph_descriptors);
+        // Re-extract the winning genome WITHOUT the per-candidate
+        // single-iteration collapse, then run the real loop unroll. The
+        // resulting LLIR is the full N-iteration graph the runtime executes;
+        // the per-candidate collapsed form was used only for ranking.
+        let mut stitched = egglog_to_llir(
+            egraph,
+            best_genome,
+            ops,
+            &self.custom_ops,
+            &mut FxHashMap::default(),
+            &mut FxHashMap::default(),
+            None,
+        );
+        if std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some() {
+            let dump_label = bucket_progress
+                .map(|(bucket_idx, n_buckets)| {
+                    format!("pre-unroll-bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
+                })
+                .unwrap_or_else(|| "pre-unroll-single".to_string());
+            maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
+        }
+        unroll_loops_in_llir(&mut stitched);
 
         println!(
-            "   {:>6}  {} groups ({} chunks) in {}",
+            "   {:>6}  in {}",
             "Searched".green().bold(),
-            n_groups,
-            n_chunks,
             pretty_duration::pretty_duration(&start.elapsed(), None)
         );
 
+        let dump_label = bucket_progress
+            .map(|(bucket_idx, n_buckets)| {
+                format!("bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
+            })
+            .unwrap_or_else(|| "single".to_string());
+        maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
+
         stitched
+    }
+
+    fn candidate_filter_result<R: Runtime + 'static>(
+        &self,
+        runtime: &mut R,
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+        search_options: &CompileOptions,
+        bucket_profile_context: Option<&SearchProfileBucketContext>,
+    ) -> CandidateFilterResult {
+        runtime.filter_llir_candidate(
+            llir_graph,
+            CandidateFilterContext {
+                search_options,
+                dyn_map,
+                bucket_context: bucket_profile_context.map(|bucket_context| ProfileBucketContext {
+                    dim_buckets: &bucket_context.dim_buckets,
+                    bucket_indices: &bucket_context.bucket_indices,
+                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                }),
+            },
+        )
     }
 }
 
@@ -941,424 +1921,1165 @@ impl DerefMut for Graph {
     }
 }
 
-/// Describes a tensor value crossing a graph break boundary into a chunk.
-#[derive(Debug, Clone)]
-pub struct BoundaryInput {
-    /// The HLIR NodeIndex of the GraphBreak node (unique ID for matching)
-    pub break_node: NodeIndex,
-    /// Shape of the tensor at the boundary
-    pub shape: ShapeTracker,
-    /// DType of the tensor at the boundary
-    pub dtype: DType,
+fn build_uses(graph: &HLIRGraph) -> FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>> {
+    let mut uses: FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>> = FxHashMap::default();
+    for n in graph.node_indices() {
+        uses.entry(n).or_default();
+    }
+    for dst in graph.node_indices() {
+        let sources: Vec<_> = graph
+            .edges_directed(dst, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect();
+        for (port, src) in sources.into_iter().enumerate() {
+            if let Some(v) = uses.get_mut(&src) {
+                v.push((dst, port));
+            }
+        }
+    }
+    uses
 }
 
-/// Describes a subgraph (chunk) of the HLIR graph between graph breaks.
-#[derive(Debug, Clone)]
-pub struct SubgraphDescriptor {
-    /// HLIR nodes in this chunk (excludes GraphBreak nodes themselves)
-    pub nodes: FxHashSet<NodeIndex>,
-    /// Boundary inputs entering from prior chunks
-    pub boundary_inputs: Vec<BoundaryInput>,
-    /// GraphBreak node indices whose predecessor is in this chunk
-    pub boundary_outputs: Vec<NodeIndex>,
+fn stable_toposort_by_node_index(graph: &HLIRGraph) -> Option<Vec<NodeIndex>> {
+    let mut indegree: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    for n in graph.node_indices() {
+        indegree.insert(n, graph.edges_directed(n, Direction::Incoming).count());
+    }
+
+    let mut ready = std::collections::BTreeSet::new();
+    for (&node, &degree) in &indegree {
+        if degree == 0 {
+            ready.insert(node);
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(graph.node_count());
+    while let Some(node) = ready.pop_first() {
+        ordered.push(node);
+        for edge in graph.edges_directed(node, Direction::Outgoing) {
+            let target = edge.target();
+            let degree = indegree
+                .get_mut(&target)
+                .expect("toposort target must exist in indegree map");
+            *degree -= 1;
+            if *degree == 0 {
+                ready.insert(target);
+            }
+        }
+    }
+
+    (ordered.len() == graph.node_count()).then_some(ordered)
 }
 
-/// Split the HLIR graph at GraphBreak nodes into independent subgraphs.
-///
-/// Each non-GraphBreak node is assigned to a chunk based on the latest
-/// GraphBreak in its transitive dependency chain. Real Input nodes (weights,
-/// data) are included in every chunk that uses them.
-pub fn split_at_graph_breaks(graph: &Graph) -> Vec<SubgraphDescriptor> {
-    use crate::hlir::GraphBreak;
+fn append_filter_display(display: String, filter_display: Option<&str>) -> String {
+    if let Some(filter_display) = filter_display.filter(|s| !s.is_empty()) {
+        format!("{display} | {filter_display}")
+    } else {
+        display
+    }
+}
 
-    // Find all GraphBreak nodes
-    let break_nodes: FxHashSet<NodeIndex> = graph
-        .graph
-        .node_indices()
-        .filter(|n| graph.try_get_op::<GraphBreak>(*n).is_some())
+struct RollingHash64 {
+    prefix: Vec<u64>,
+    powers: Vec<u64>,
+}
+
+impl RollingHash64 {
+    const BASE: u64 = 1_000_000_007;
+
+    fn new(tokens: &[u64]) -> Self {
+        let mut prefix = Vec::with_capacity(tokens.len() + 1);
+        let mut powers = Vec::with_capacity(tokens.len() + 1);
+        prefix.push(0u64);
+        powers.push(1u64);
+        for &token in tokens {
+            let next_prefix = prefix
+                .last()
+                .copied()
+                .unwrap()
+                .wrapping_mul(Self::BASE)
+                .wrapping_add(token.wrapping_add(1));
+            prefix.push(next_prefix);
+            let next_power = powers.last().copied().unwrap().wrapping_mul(Self::BASE);
+            powers.push(next_power);
+        }
+        Self { prefix, powers }
+    }
+
+    fn window_hash(&self, start: usize, len: usize) -> u64 {
+        self.prefix[start + len].wrapping_sub(self.prefix[start].wrapping_mul(self.powers[len]))
+    }
+}
+
+fn cheap_rolling_node_hash(graph: &HLIRGraph, node: NodeIndex) -> u64 {
+    let op = rolling_op_signature(graph, node);
+    let mut hash: u64 = 1469598103934665603;
+    for byte in op.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    let in_degree = graph.neighbors_directed(node, Direction::Incoming).count() as u64;
+    let out_degree = graph.neighbors_directed(node, Direction::Outgoing).count() as u64;
+    hash ^= in_degree.wrapping_mul(0x9e3779b185ebca87);
+    hash = hash.rotate_left(13);
+    hash ^= out_degree.wrapping_mul(0xc2b2ae3d27d4eb4f);
+    hash
+}
+
+fn rolling_op_signature(graph: &HLIRGraph, node: NodeIndex) -> String {
+    if graph[node].as_any().is::<crate::hlir::Output>() {
+        return "Output".to_string();
+    }
+
+    // Use Debug, NOT Display — Display for many HLIR ops drops their
+    // shape/stride metadata (e.g. `Display for Mul` emits just "Mul"), so
+    // two structurally-different ops with the same kind would hash equal
+    // and get falsely grouped as a repeating pattern. Debug captures those
+    // fields. Output is the exception: its `node` field is only the source
+    // slot for runtime storage, so it must not participate in rolling
+    // identity.
+    format!("{:?}", graph[node])
+}
+
+fn rolling_probe_window_sizes(max_window: usize) -> Vec<usize> {
+    if max_window == 0 {
+        return vec![];
+    }
+    (1..=max_window).rev().collect()
+}
+
+fn canonicalize_occurrence(
+    graph: &HLIRGraph,
+    ordered_nodes: &[NodeIndex],
+    uses: &FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>>,
+    topo_index: &FxHashMap<NodeIndex, usize>,
+) -> Option<(String, Vec<NodeIndex>, Vec<NodeIndex>)> {
+    let region: FxHashSet<NodeIndex> = ordered_nodes.iter().copied().collect();
+    if region.is_empty() {
+        return None;
+    }
+    let internal_index: FxHashMap<NodeIndex, usize> = ordered_nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i))
         .collect();
+    let mut param_index: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    let mut boundary_inputs = vec![];
+    let mut node_parts = vec![];
 
-    if break_nodes.is_empty() {
-        // No breaks: single chunk with all nodes
-        return vec![SubgraphDescriptor {
-            nodes: graph.graph.node_indices().collect(),
-            boundary_inputs: vec![],
-            boundary_outputs: vec![],
-        }];
-    }
-
-    // Topological sort of the full graph
-    let topo = toposort(&graph.graph, None).expect("HLIR graph has a cycle");
-
-    // Assign each GraphBreak a sequential break index (0, 1, 2, ...)
-    // so chunk 0 is before break 0, chunk 1 is between break 0 and break 1, etc.
-    let mut break_index: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-    let mut next_break_idx = 0;
-    for &n in &topo {
-        if break_nodes.contains(&n) {
-            break_index.insert(n, next_break_idx);
-            next_break_idx += 1;
-        }
-    }
-    let n_chunks = next_break_idx + 1;
-
-    // Assign each non-break node to a chunk.
-    // A node's chunk = max over all predecessors' chunks.
-    // A GraphBreak's "output chunk" = break_index + 1 (it pushes successors to the next chunk).
-    let mut node_chunk: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-    for &n in &topo {
-        if break_nodes.contains(&n) {
-            continue; // GraphBreak nodes aren't in any chunk
-        }
-        let mut chunk = 0usize;
-        for pred in graph.graph.neighbors_directed(n, Direction::Incoming) {
-            if let Some(&bi) = break_index.get(&pred) {
-                // Predecessor is a GraphBreak: this node is in chunk bi+1
-                chunk = chunk.max(bi + 1);
-            } else if let Some(&pred_chunk) = node_chunk.get(&pred) {
-                chunk = chunk.max(pred_chunk);
-            }
-        }
-        node_chunk.insert(n, chunk);
-    }
-
-    // Build per-chunk node sets.
-    // For non-Input nodes: they go to their assigned chunk.
-    // For Input nodes (no predecessors): they go to EVERY chunk where they have
-    // at least one direct consumer. This avoids polluting chunk 0 with hundreds
-    // of weight tensors that are only used by later layers.
-    let mut chunk_nodes: Vec<FxHashSet<NodeIndex>> = vec![FxHashSet::default(); n_chunks];
-
-    let input_nodes: FxHashSet<NodeIndex> = graph
-        .graph
-        .node_indices()
-        .filter(|n| graph.try_get_op::<crate::hlir::Input>(*n).is_some())
-        .collect();
-
-    for (&node, &chunk) in &node_chunk {
-        if input_nodes.contains(&node) {
-            continue; // Handle Input nodes separately below
-        }
-        chunk_nodes[chunk].insert(node);
-    }
-
-    // Place each Input node in every chunk that has a consumer of it
-    for &inp in &input_nodes {
-        let mut target_chunks = FxHashSet::default();
-        for consumer in graph.graph.neighbors_directed(inp, Direction::Outgoing) {
-            if break_nodes.contains(&consumer) {
-                // Consumer is a GraphBreak — the chunk after it needs this input
-                let bi = break_index[&consumer];
-                let target_chunk = bi + 1;
-                if target_chunk < n_chunks {
-                    target_chunks.insert(target_chunk);
-                }
-            } else if let Some(&consumer_chunk) = node_chunk.get(&consumer) {
-                target_chunks.insert(consumer_chunk);
-            }
-        }
-        // If no consumers found (orphan input), put it in chunk 0
-        if target_chunks.is_empty() {
-            target_chunks.insert(0);
-        }
-        for chunk in target_chunks {
-            chunk_nodes[chunk].insert(inp);
-        }
-    }
-
-    // Closure: for each chunk, ensure all transitive predecessors of its nodes
-    // are included (except GraphBreak boundary nodes). This handles shared
-    // computation nodes (e.g. RoPE frequencies, sqrt(d_k)) that are assigned to
-    // an earlier chunk but used by later chunks.
-    for chunk_node in chunk_nodes.iter_mut().take(n_chunks) {
-        let mut to_visit: Vec<NodeIndex> = chunk_node.iter().copied().collect();
-        while let Some(node) = to_visit.pop() {
-            for pred in graph.graph.neighbors_directed(node, Direction::Incoming) {
-                if break_nodes.contains(&pred) {
-                    continue; // Boundary handled separately
-                }
-                if chunk_node.insert(pred) {
-                    // Newly added — also visit its predecessors
-                    to_visit.push(pred);
-                }
-            }
-        }
-    }
-
-    // Build SubgraphDescriptors
-    let mut descriptors: Vec<SubgraphDescriptor> = Vec::with_capacity(n_chunks);
-    for (chunk_idx, chunk_node) in chunk_nodes.iter().enumerate().take(n_chunks) {
-        let nodes = chunk_node.clone();
-
-        // Boundary inputs: GraphBreak nodes whose successors are in this chunk
-        let mut boundary_inputs = vec![];
-        for &brk in &break_nodes {
-            let bi = break_index[&brk];
-            if bi + 1 == chunk_idx {
-                // This break feeds into this chunk
-                // Get shape from the GraphBreak op itself
-                let shape = graph.get_op::<crate::hlir::GraphBreak>(brk).input_shape;
-                // Get dtype from the predecessor
-                let pred = graph
-                    .graph
-                    .neighbors_directed(brk, Direction::Incoming)
-                    .next()
-                    .expect("GraphBreak must have exactly one input");
-                let dtype = if let Some(inp) = graph.try_get_op::<crate::hlir::Input>(pred) {
-                    inp.dtype
-                } else {
-                    DType::F32 // Default; most intermediate values are F32
-                };
-                boundary_inputs.push(BoundaryInput {
-                    break_node: brk,
-                    shape,
-                    dtype,
+    for &node in ordered_nodes {
+        let op = rolling_op_signature(graph, node);
+        let inputs: Vec<NodeIndex> = graph
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect();
+        let mut inp_parts = vec![];
+        for src in inputs {
+            if let Some(&idx) = internal_index.get(&src) {
+                inp_parts.push(format!("n{idx}"));
+            } else {
+                let p = *param_index.entry(src).or_insert_with(|| {
+                    boundary_inputs.push(src);
+                    boundary_inputs.len() - 1
                 });
+                inp_parts.push(format!("p{p}"));
             }
         }
+        node_parts.push(format!("{op}({})", inp_parts.join(",")));
+    }
 
-        // Boundary outputs: GraphBreak nodes whose predecessor is in this chunk
-        let mut boundary_outputs = vec![];
-        for &brk in &break_nodes {
-            let bi = break_index[&brk];
-            if bi + 1 == chunk_idx + 1 {
-                // This break's predecessor should be in this chunk
-                let pred = graph
-                    .graph
-                    .neighbors_directed(brk, Direction::Incoming)
-                    .next()
-                    .expect("GraphBreak must have exactly one input");
-                if nodes.contains(&pred) || node_chunk.get(&pred) == Some(&chunk_idx) {
-                    boundary_outputs.push(brk);
+    let mut output_nodes: Vec<NodeIndex> = ordered_nodes
+        .iter()
+        .copied()
+        .filter(|n| {
+            uses.get(n)
+                .is_some_and(|out_uses| out_uses.iter().any(|(user, _)| !region.contains(user)))
+                || graph.externals(Direction::Outgoing).any(|root| root == *n)
+        })
+        .collect();
+    output_nodes.sort_by_key(|n| topo_index[n]);
+    let outputs: Vec<String> = output_nodes
+        .iter()
+        .filter_map(|n| internal_index.get(n).copied())
+        .map(|idx| format!("o{idx}"))
+        .collect();
+
+    let sig = format!("{}|{}", node_parts.join(";"), outputs.join(","));
+    Some((sig, boundary_inputs, output_nodes))
+}
+
+fn collect_state_params(
+    occurrences: &[RollingOccurrence],
+    uses: &FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>>,
+    graph: &HLIRGraph,
+) -> Vec<usize> {
+    if occurrences.len() < 2 {
+        return vec![];
+    }
+    let param_count = occurrences[0].boundary_inputs.len();
+    let mut state_params = vec![];
+
+    for p in 0..param_count {
+        let mut is_state = true;
+        for i in 1..occurrences.len() {
+            let earlier = &occurrences[i - 1];
+            let later = &occurrences[i];
+            let val = later.boundary_inputs.get(p).copied();
+            let Some(val) = val else {
+                is_state = false;
+                break;
+            };
+            if !earlier.output_nodes.contains(&val) {
+                is_state = false;
+                break;
+            }
+            let external_uses: Vec<_> = uses
+                .get(&val)
+                .map(|u| {
+                    u.iter()
+                        .copied()
+                        .filter(|(user, _)| !earlier.nodes.contains(user))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if external_uses.is_empty() {
+                is_state = false;
+                break;
+            }
+            if graph.externals(Direction::Outgoing).any(|root| root == val) {
+                is_state = false;
+                break;
+            }
+            if external_uses
+                .iter()
+                .any(|(user, _)| !later.nodes.contains(user))
+            {
+                is_state = false;
+                break;
+            }
+        }
+        if is_state {
+            state_params.push(p);
+        }
+    }
+    state_params
+}
+
+fn grow_rolling_candidate(
+    graph: &HLIRGraph,
+    uses: &FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>>,
+    topo_index: &FxHashMap<NodeIndex, usize>,
+    mut candidate: RollingCandidate,
+    discovered_runs: &[RollingRun],
+) -> RollingCandidate {
+    loop {
+        let candidate_starts: Vec<usize> = candidate
+            .occurrences
+            .iter()
+            .map(|occ| {
+                occ.nodes
+                    .first()
+                    .map(|n| topo_index[n])
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        let candidate_ends: Vec<usize> = candidate
+            .occurrences
+            .iter()
+            .map(|occ| occ.nodes.last().map(|n| topo_index[n] + 1).unwrap_or(0))
+            .collect();
+
+        let mut best_growth: Option<RollingCandidate> = None;
+        for run in discovered_runs {
+            for shift in 0..=1usize {
+                if run.occurrences.len() < candidate.occurrences.len() + shift {
+                    continue;
+                }
+                let aligned = (0..candidate.occurrences.len()).all(|i| {
+                    run.starts[i + shift] == candidate_ends[i]
+                        || run.starts[i + shift] + run.window == candidate_starts[i]
+                });
+                if !aligned {
+                    continue;
+                }
+
+                let mut merged_occs = Vec::with_capacity(candidate.occurrences.len());
+                // `i` indexes the candidate side while `i + shift` indexes the
+                // run side — explicit range is clearer than zip-with-skip.
+                #[allow(clippy::needless_range_loop)]
+                for i in 0..candidate.occurrences.len() {
+                    let run_occ = &run.occurrences[i + shift];
+                    let mut nodes = if run.starts[i + shift] + run.window == candidate_starts[i] {
+                        let mut n = run_occ.nodes.clone();
+                        n.extend(candidate.occurrences[i].nodes.iter().copied());
+                        n
+                    } else {
+                        let mut n = candidate.occurrences[i].nodes.clone();
+                        n.extend(run_occ.nodes.iter().copied());
+                        n
+                    };
+                    nodes.sort_by_key(|n| topo_index[n]);
+                    let Some((sig, boundary_inputs, output_nodes)) =
+                        canonicalize_occurrence(graph, &nodes, uses, topo_index)
+                    else {
+                        merged_occs.clear();
+                        break;
+                    };
+                    if i == 0 && sig.is_empty() {
+                        merged_occs.clear();
+                        break;
+                    }
+                    merged_occs.push(RollingOccurrence {
+                        nodes,
+                        boundary_inputs,
+                        output_nodes,
+                    });
+                }
+                if merged_occs.len() != candidate.occurrences.len() {
+                    continue;
+                }
+                let first_sig =
+                    canonicalize_occurrence(graph, &merged_occs[0].nodes, uses, topo_index)
+                        .map(|(sig, _, _)| sig);
+                let Some(first_sig) = first_sig else { continue };
+                if merged_occs.iter().skip(1).any(|occ| {
+                    canonicalize_occurrence(graph, &occ.nodes, uses, topo_index)
+                        .map(|(sig, _, _)| sig != first_sig)
+                        .unwrap_or(true)
+                }) {
+                    continue;
+                }
+                let state_param_indices = collect_state_params(&merged_occs, uses, graph);
+                if state_param_indices.is_empty() {
+                    continue;
+                }
+                let savings = merged_occs[0].nodes.len() * (merged_occs.len() - 1);
+                let _ = first_sig;
+                let grown = RollingCandidate {
+                    occurrences: merged_occs,
+                    state_param_indices,
+                    savings,
+                };
+                let replace = best_growth.as_ref().is_none_or(|best| {
+                    (
+                        grown.savings,
+                        grown.occurrences[0].nodes.len(),
+                        grown.occurrences.len(),
+                    ) > (
+                        best.savings,
+                        best.occurrences[0].nodes.len(),
+                        best.occurrences.len(),
+                    )
+                });
+                if replace {
+                    best_growth = Some(grown);
                 }
             }
         }
 
-        descriptors.push(SubgraphDescriptor {
-            nodes,
-            boundary_inputs,
-            boundary_outputs,
-        });
+        match best_growth {
+            Some(grown) if grown.savings > candidate.savings => candidate = grown,
+            _ => return candidate,
+        }
     }
-
-    descriptors
 }
 
-/// Clone a representative chunk's LLIR graph and remap Input/Output node indices
-/// to match a different (structurally identical) target chunk.
+/// Expand all loop-region markers in an LLIR graph into fully unrolled bodies.
 ///
-/// The remapping handles three categories of nodes:
-/// 1. **Boundary inputs**: Matched positionally via SubgraphDescriptor.boundary_inputs
-/// 2. **Boundary outputs**: Matched positionally via SubgraphDescriptor.boundary_outputs
-/// 3. **Weight/data inputs**: Chunk-specific Input nodes (in one subgraph but not the other) are sorted by index and matched positionally.
+/// Reads `LoopStart` / `LoopEnd` / `LoopInput` / `LoopOutput` metadata placed
+/// by the auto-roll prepass, clones the loop body `iters-1` additional times,
+/// threads loop-carried state between clones, routes per-iteration inputs and
+/// per-iteration outputs, and removes the four marker op types.
 ///
-/// Shared Input nodes (same NodeIndex in both subgraphs) need no remapping.
-/// Build remapping tables for cloning a representative chunk's LLIR to a target chunk.
-///
-/// Returns:
-/// - `node_remap`: maps rep HLIR node indices → target HLIR node indices (for Input/Output nodes)
-/// - `custom_op_id_remap`: maps rep CustomOpKind IDs → target CustomOpKind IDs
-fn build_chunk_remaps(
-    rep_desc: &SubgraphDescriptor,
-    target_desc: &SubgraphDescriptor,
-    hlir_graph: &HLIRGraph,
-) -> (FxHashMap<usize, usize>, FxHashMap<usize, usize>) {
-    let mut node_remap: FxHashMap<usize, usize> = FxHashMap::default();
+/// Incoming-edge ORDER is preserved for every affected node — ops read their
+/// inputs by edge-id order, so edges are rebuilt in position.
+pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
+    use crate::hlir::{
+        LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart, Output,
+    };
+    use petgraph::visit::EdgeRef;
+    use std::collections::BTreeMap;
 
-    // 1. Boundary inputs: positional match
-    for (r, t) in rep_desc
-        .boundary_inputs
-        .iter()
-        .zip(&target_desc.boundary_inputs)
-    {
-        node_remap.insert(r.break_node.index(), t.break_node.index());
+    let mut starts: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    let mut ends: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    let mut inputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    // Iteration-independent inputs. Keyed on LLIR NodeIndex (stream_id is not
+    // unique when a single LoopInput splits into multiple LoopInputStatics via
+    // egglog rewrites of the same stream).
+    let mut static_inputs: FxHashSet<NodeIndex> = FxHashSet::default();
+    // LoopOutput stream → its NodeIndex. Each stream has one LoopOutput.
+    let mut outputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    // (stream_id, iter) → LoopOutputSelect NodeIndex.
+    let mut output_selects: FxHashMap<NodeIndex, (usize /*stream*/, usize /*iter*/)> =
+        FxHashMap::default();
+
+    let mut iters = 0usize;
+    for n in llir.node_indices() {
+        let op = &llir[n];
+        if let Some(ls) = op.to_op::<LoopStart>() {
+            iters = iters.max(ls.iters.to_usize().unwrap_or(1));
+            starts.insert(ls.slot_idx, n);
+        } else if let Some(le) = op.to_op::<LoopEnd>() {
+            ends.insert(le.slot_idx, n);
+        } else if op.to_op::<LoopInputStatic>().is_some() {
+            // Must be checked before LoopInput because LoopInputStatic is a
+            // distinct op with its own sort name, but we want it recognized as
+            // a separate category here.
+            static_inputs.insert(n);
+        } else if let Some(li) = op.to_op::<LoopInput>() {
+            inputs.insert(li.stream_id, n);
+        } else if let Some(los) = op.to_op::<LoopOutputSelect>() {
+            output_selects.insert(n, (los.stream_id, los.iter));
+        } else if let Some(lo) = op.to_op::<LoopOutput>() {
+            outputs.insert(lo.stream_id, n);
+        }
+    }
+    if iters <= 1 || starts.is_empty() {
+        return;
     }
 
-    // 2. Boundary outputs: positional match
-    for (r, t) in rep_desc
-        .boundary_outputs
-        .iter()
-        .zip(&target_desc.boundary_outputs)
-    {
-        node_remap.insert(r.index(), t.index());
-    }
-
-    // 3. Weight/data inputs: chunk-specific Input HLIR nodes
-    let rep_input_nodes: FxHashSet<NodeIndex> = rep_desc
-        .nodes
-        .iter()
-        .filter(|n| {
-            hlir_graph
-                .node_weight(**n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Input>())
-                .is_some()
-        })
+    let loop_markers: FxHashSet<NodeIndex> = starts
+        .values()
         .copied()
-        .collect();
-    let target_input_nodes: FxHashSet<NodeIndex> = target_desc
-        .nodes
-        .iter()
-        .filter(|n| {
-            hlir_graph
-                .node_weight(**n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Input>())
-                .is_some()
-        })
-        .copied()
+        .chain(ends.values().copied())
+        .chain(inputs.values().copied())
+        .chain(static_inputs.iter().copied())
+        .chain(outputs.values().copied())
+        .chain(output_selects.keys().copied())
         .collect();
 
-    // Chunk-specific = in one subgraph but not the other
-    let rep_specific: Vec<usize> = rep_input_nodes
-        .difference(&target_input_nodes)
-        .map(|n| n.index())
-        .sorted()
-        .collect();
-    let target_specific: Vec<usize> = target_input_nodes
-        .difference(&rep_input_nodes)
-        .map(|n| n.index())
-        .sorted()
-        .collect();
-
-    assert_eq!(
-        rep_specific.len(),
-        target_specific.len(),
-        "Chunk-specific input count mismatch: rep has {}, target has {}",
-        rep_specific.len(),
-        target_specific.len()
-    );
-    for (r, t) in rep_specific.iter().zip(&target_specific) {
-        node_remap.insert(*r, *t);
-    }
-
-    // 4. Internal Output nodes: Output nodes may reference internal computation nodes
-    //    (e.g., scatter results marked with .output()). These need remapping too.
-    //    Match positionally by sorted `node` value, skipping those already remapped.
-    let rep_output_refs: Vec<usize> = rep_desc
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            hlir_graph
-                .node_weight(*n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Output>())
-                .map(|o| o.node)
+    let mut body_nodes: FxHashSet<NodeIndex> = FxHashSet::default();
+    let mut worklist: Vec<NodeIndex> = starts
+        .values()
+        .flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
         })
-        .filter(|n| !node_remap.contains_key(n))
-        .sorted()
+        .chain(inputs.values().flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        }))
+        .chain(static_inputs.iter().flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        }))
         .collect();
-    let target_output_refs: Vec<usize> = target_desc
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            hlir_graph
-                .node_weight(*n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Output>())
-                .map(|o| o.node)
-        })
-        .filter(|n| !node_remap.values().any(|v| v == n))
-        .sorted()
-        .collect();
-    assert_eq!(
-        rep_output_refs.len(),
-        target_output_refs.len(),
-        "Internal Output node count mismatch: rep has {}, target has {}",
-        rep_output_refs.len(),
-        target_output_refs.len()
-    );
-    for (r, t) in rep_output_refs.iter().zip(&target_output_refs) {
-        if r != t {
-            node_remap.insert(*r, *t);
+    while let Some(n) = worklist.pop() {
+        if body_nodes.contains(&n) || loop_markers.contains(&n) {
+            continue;
+        }
+        if llir[n].to_op::<Output>().is_some() {
+            continue;
+        }
+        body_nodes.insert(n);
+        for succ in llir
+            .neighbors_directed(n, Direction::Outgoing)
+            .collect::<Vec<_>>()
+        {
+            worklist.push(succ);
         }
     }
 
-    // 5. CustomOpKind ID remapping: match positionally by sorted HLIR node index
-    let mut custom_op_id_remap: FxHashMap<usize, usize> = FxHashMap::default();
-    let rep_custom_ops: Vec<usize> = rep_desc
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            hlir_graph
-                .node_weight(*n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::CustomOpKind>())
-                .map(|op| op.id)
-        })
-        .sorted()
-        .collect();
-    let target_custom_ops: Vec<usize> = target_desc
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            hlir_graph
-                .node_weight(*n)
-                .and_then(|w| w.as_any().downcast_ref::<crate::hlir::CustomOpKind>())
-                .map(|op| op.id)
-        })
-        .sorted()
-        .collect();
-    assert_eq!(
-        rep_custom_ops.len(),
-        target_custom_ops.len(),
-        "CustomOpKind count mismatch: rep has {}, target has {}",
-        rep_custom_ops.len(),
-        target_custom_ops.len()
-    );
-    for (r, t) in rep_custom_ops.iter().zip(&target_custom_ops) {
-        if r != t {
-            custom_op_id_remap.insert(*r, *t);
+    // start_meta[loop_start] = (initial, body_producer):
+    //   - `initial` = LoopStart's incoming (state at iter 0).
+    //   - `body_producer` = LoopEnd's incoming (state value the body
+    //     produces each iter).
+    //
+    // A state slot is **iteration-invariant** iff `body_producer` is not
+    // in `body_nodes` (the forward-walk set from input markers). Such a
+    // producer has no input-marker ancestor, so its value can't depend on
+    // per-iter state — egglog rewrites prove the body chain reduces to a
+    // constant or external value, and extraction picks that directly. A
+    // real example is gemma's RoPE frequency factors (`Log2(10000)`,
+    // `log2(e)`), which the kernel-rewrite chain folds onto the body slot.
+    // For these, every iter sees the same state, so per-iter cloning is
+    // skipped — `resolve_src` and `marker_post_sub` use `body_producer`
+    // directly, recognised by `clone_map.get(&body_producer).is_none()`.
+    let mut start_meta: FxHashMap<NodeIndex, (NodeIndex, NodeIndex)> = FxHashMap::default();
+    for (slot_idx, &start_node) in &starts {
+        let end_node = *ends
+            .get(slot_idx)
+            .unwrap_or_else(|| panic!("missing LoopEnd for slot {slot_idx}"));
+        let initial = llir
+            .neighbors_directed(start_node, Direction::Incoming)
+            .next()
+            .expect("LoopStart must have an initial-value producer");
+        let body_producer = llir
+            .neighbors_directed(end_node, Direction::Incoming)
+            .next()
+            .expect("LoopEnd must have a body producer");
+        start_meta.insert(start_node, (initial, body_producer));
+    }
+
+    let mut input_per_iter: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
+    for input_node in inputs.values() {
+        let srcs: Vec<NodeIndex> = llir
+            .edges_directed(*input_node, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect();
+        assert_eq!(
+            srcs.len(),
+            iters,
+            "LoopInput stream must have `iters` sources"
+        );
+        input_per_iter.insert(*input_node, srcs);
+    }
+    // LoopInputStatic: single shared source reused across all iterations.
+    let mut static_source: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    for &static_node in &static_inputs {
+        let srcs: Vec<NodeIndex> = llir
+            .edges_directed(static_node, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect();
+        assert_eq!(
+            srcs.len(),
+            1,
+            "LoopInputStatic must have exactly 1 source (got {})",
+            srcs.len()
+        );
+        static_source.insert(static_node, srcs[0]);
+    }
+
+    let mut clone_map: Vec<FxHashMap<NodeIndex, NodeIndex>> = vec![FxHashMap::default(); iters];
+    for &b in &body_nodes {
+        clone_map[0].insert(b, b);
+    }
+    for clone in clone_map.iter_mut().skip(1) {
+        for &b in &body_nodes {
+            let cloned = llir.add_node(llir[b].clone());
+            clone.insert(b, cloned);
         }
     }
 
-    (node_remap, custom_op_id_remap)
-}
-
-/// Apply Input/Output node index remapping to an LLIR graph (in-place modification).
-fn remap_llir_io_nodes(
-    llir: &mut LLIRGraph,
-    node_remap: &FxHashMap<usize, usize>,
-    hlir_graph: &HLIRGraph,
-) {
-    // We need to replace nodes in-place. Collect node indices first.
-    let node_indices: Vec<NodeIndex> = llir.node_indices().collect();
-    for node_idx in node_indices {
-        let op = &llir[node_idx];
-        let new_op = if let Some(input_op) = op.to_op::<crate::hlir::Input>() {
-            if let Some(&new_node) = node_remap.get(&input_op.node) {
-                // Look up the target HLIR Input's label so chunk copies get correct names
-                let new_label = hlir_graph
-                    .node_weight(NodeIndex::new(new_node))
-                    .and_then(|w| w.as_any().downcast_ref::<crate::hlir::Input>())
-                    .map(|inp| inp.label.clone())
-                    .unwrap_or_else(|| input_op.label.clone());
-                Some(LLIROp::new::<crate::hlir::Input>(Box::new(
-                    crate::hlir::Input {
-                        node: new_node,
-                        label: new_label,
-                        dtype: input_op.dtype,
-                    },
-                )))
+    let resolve_src = |src: NodeIndex, i: usize, clone_map: &[FxHashMap<NodeIndex, NodeIndex>]| {
+        if let Some(&(initial, body_producer)) = start_meta.get(&src) {
+            if i == 0 {
+                initial
             } else {
-                None
+                // Iteration-invariant slot fallback: `body_producer` not in
+                // `body_nodes` ⇒ not cloned per iter ⇒ all iters share it.
+                clone_map[i - 1]
+                    .get(&body_producer)
+                    .copied()
+                    .unwrap_or(body_producer)
             }
-        } else if let Some(output_op) = op.to_op::<crate::hlir::Output>() {
-            if let Some(&new_node) = node_remap.get(&output_op.node) {
-                Some(LLIROp::new::<crate::hlir::Output>(Box::new(
-                    crate::hlir::Output { node: new_node },
-                )))
-            } else {
-                None
-            }
+        } else if let Some(sources) = input_per_iter.get(&src) {
+            sources[i]
+        } else if let Some(&shared) = static_source.get(&src) {
+            // LoopInputStatic: same source for every iteration's clone.
+            shared
+        } else if body_nodes.contains(&src) {
+            clone_map[i][&src]
         } else {
-            None
-        };
-        if let Some(new_op) = new_op {
-            llir[node_idx] = new_op;
+            src
+        }
+    };
+
+    let body_incoming: FxHashMap<NodeIndex, Vec<NodeIndex>> = body_nodes
+        .iter()
+        .map(|&b| {
+            let srcs: Vec<NodeIndex> = llir
+                .edges_directed(b, Direction::Incoming)
+                .sorted_by_key(|e| e.id())
+                .map(|e| e.source())
+                .collect();
+            (b, srcs)
+        })
+        .collect();
+
+    // For iter 0, we rebuild each body node's incoming edges in place: we
+    // remove each old edge and immediately re-add a new edge with the
+    // resolved source. petgraph::stable_graph reuses freed edge indices
+    // LIFO, so interleaving remove+add for each edge causes the new edge
+    // to reuse exactly the freed slot, preserving edge-id ordering (which
+    // the runtime relies on for input positions).
+    for &b in &body_nodes {
+        let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
+            .edges_directed(b, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| (e.source(), e.id()))
+            .collect();
+        for (src, eid) in pairs {
+            let new_src = resolve_src(src, 0, &clone_map);
+            llir.remove_edge(eid);
+            llir.add_edge(new_src, b, ());
         }
     }
+    // For iter > 0 clones, there are no existing edges — add fresh ones in
+    // body_incoming order so edge-id ordering matches.
+    for i in 1..iters {
+        for &b in &body_nodes {
+            let target = clone_map[i][&b];
+            let srcs = &body_incoming[&b];
+            for &src in srcs {
+                let new_src = resolve_src(src, i, &clone_map);
+                llir.add_edge(new_src, target, ());
+            }
+        }
+    }
+
+    let post_loop_consumers: FxHashSet<NodeIndex> = loop_markers
+        .iter()
+        .flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        })
+        .filter(|n| !loop_markers.contains(n) && !body_nodes.contains(n))
+        .collect();
+
+    // Resolve each LoopOutput stream's body producer (its single incoming
+    // edge in the LLIR).
+    let mut output_body_producer: FxHashMap<usize /*stream_id*/, NodeIndex> = FxHashMap::default();
+    for (&stream_id, &output_node) in &outputs {
+        let body_producer = llir
+            .neighbors_directed(output_node, Direction::Incoming)
+            .next()
+            .expect("LoopOutput missing body producer during rewire");
+        output_body_producer.insert(stream_id, body_producer);
+    }
+
+    let mut marker_post_sub: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    for &end_node in ends.values() {
+        let body_producer = llir
+            .neighbors_directed(end_node, Direction::Incoming)
+            .next()
+            .expect("LoopEnd missing body producer during rewire");
+        // Same iteration-invariant fallback as `resolve_src`.
+        let sub = clone_map[iters - 1]
+            .get(&body_producer)
+            .copied()
+            .unwrap_or(body_producer);
+        marker_post_sub.insert(end_node, sub);
+    }
+    // Each LoopOutputSelect(stream, iter) routes to iter's clone of that
+    // stream's body producer. Same iteration-invariant fallback as for
+    // LoopEnd above: if the body producer isn't in `body_nodes`, it wasn't
+    // cloned per iter and every iter shares the single `body_producer`.
+    for (&select_node, &(stream_id, iter)) in &output_selects {
+        let body_producer = output_body_producer[&stream_id];
+        let sub = clone_map[iter]
+            .get(&body_producer)
+            .copied()
+            .unwrap_or(body_producer);
+        marker_post_sub.insert(select_node, sub);
+    }
+
+    for &consumer in &post_loop_consumers {
+        // Per-edge replace to preserve edge-id ordering via LIFO reuse.
+        let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
+            .edges_directed(consumer, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| (e.source(), e.id()))
+            .collect();
+        for (src, eid) in pairs {
+            let new_src = marker_post_sub.get(&src).copied().unwrap_or(src);
+            llir.remove_edge(eid);
+            llir.add_edge(new_src, consumer, ());
+        }
+    }
+
+    for &n in &loop_markers {
+        llir.remove_node(n);
+    }
+
+    debug_assert_eq!(
+        llir.node_indices()
+            .filter(|n| {
+                let op = &llir[*n];
+                op.to_op::<LoopStart>().is_some()
+                    || op.to_op::<LoopEnd>().is_some()
+                    || op.to_op::<LoopInput>().is_some()
+                    || op.to_op::<LoopInputStatic>().is_some()
+                    || op.to_op::<LoopOutput>().is_some()
+                    || op.to_op::<LoopOutputSelect>().is_some()
+            })
+            .count(),
+        0,
+        "unroll left stray loop marker ops in LLIR"
+    );
+
+    // Compact the graph into a freshly-allocated StableGraph so all edge
+    // IDs are re-assigned sequentially in our chosen insertion order.
+    // Without this, later kernel_to_host add_edge calls can reuse edge
+    // indices that our unroll freed via remove_node on loop markers,
+    // producing sort-by-edge-id orderings where a later-added scheduling
+    // edge ends up at a low index — which the runtime interprets as a
+    // primary input position and crashes looking up a buffer.
+    let compacted = compact_llir_preserving_input_order(llir);
+    *llir = compacted;
+}
+
+/// Collapse all loop markers in an LLIR graph down to a SINGLE iteration's
+/// body, with first-iteration inputs and outputs only. This is the cheap
+/// per-candidate form used by the genetic search — profiling one transformer
+/// block instead of N×block makes the search ~N× faster, and the relative
+/// cost of any extraction choice is preserved on the body shape.
+///
+/// LoopStart consumers re-route to the initial value, LoopInput consumers
+/// re-route to `sources[0]`, LoopInputStatic consumers re-route to the single
+/// shared source, LoopEnd's post-loop consumers re-route to the body producer
+/// directly, and each `LoopOutput` is replaced with a single `Output { node:
+/// targets[0] }`. After collapse the LLIR has no marker ops left and contains
+/// exactly the iter-0 body plus the surrounding non-loop graph.
+pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
+    use crate::hlir::{
+        LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart, Output,
+    };
+    use petgraph::visit::EdgeRef;
+    use std::collections::BTreeMap;
+
+    let mut starts: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    let mut ends: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    let mut inputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    let mut static_inputs: FxHashSet<NodeIndex> = FxHashSet::default();
+    let mut outputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
+    let mut output_selects: FxHashSet<NodeIndex> = FxHashSet::default();
+
+    for n in llir.node_indices() {
+        let op = &llir[n];
+        if op.to_op::<LoopStart>().is_some() {
+            starts.insert(op.to_op::<LoopStart>().unwrap().slot_idx, n);
+        } else if let Some(le) = op.to_op::<LoopEnd>() {
+            ends.insert(le.slot_idx, n);
+        } else if op.to_op::<LoopInputStatic>().is_some() {
+            static_inputs.insert(n);
+        } else if let Some(li) = op.to_op::<LoopInput>() {
+            inputs.insert(li.stream_id, n);
+        } else if op.to_op::<LoopOutputSelect>().is_some() {
+            output_selects.insert(n);
+        } else if let Some(lo) = op.to_op::<LoopOutput>() {
+            outputs.insert(lo.stream_id, n);
+        }
+    }
+    if starts.is_empty() {
+        return;
+    }
+
+    let loop_markers: FxHashSet<NodeIndex> = starts
+        .values()
+        .copied()
+        .chain(ends.values().copied())
+        .chain(inputs.values().copied())
+        .chain(static_inputs.iter().copied())
+        .chain(outputs.values().copied())
+        .chain(output_selects.iter().copied())
+        .collect();
+
+    // body_nodes = forward-reachable from any marker outgoing, stopping at
+    // markers and Output ops. This matches `unroll_loops_in_llir`.
+    let mut body_nodes: FxHashSet<NodeIndex> = FxHashSet::default();
+    let mut worklist: Vec<NodeIndex> = starts
+        .values()
+        .flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        })
+        .chain(inputs.values().flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        }))
+        .chain(static_inputs.iter().flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        }))
+        .collect();
+    while let Some(n) = worklist.pop() {
+        if body_nodes.contains(&n) || loop_markers.contains(&n) {
+            continue;
+        }
+        if llir[n].to_op::<Output>().is_some() {
+            continue;
+        }
+        body_nodes.insert(n);
+        for succ in llir
+            .neighbors_directed(n, Direction::Outgoing)
+            .collect::<Vec<_>>()
+        {
+            worklist.push(succ);
+        }
+    }
+
+    // Initial value per LoopStart, body producer per LoopEnd / LoopOutput.
+    let mut start_initial: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    for &start_node in starts.values() {
+        let initial = llir
+            .neighbors_directed(start_node, Direction::Incoming)
+            .next()
+            .expect("LoopStart must have an initial-value producer");
+        start_initial.insert(start_node, initial);
+    }
+    let mut input_first_source: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    for input_node in inputs.values() {
+        let first = llir
+            .edges_directed(*input_node, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .next()
+            .expect("LoopInput must have at least one source");
+        input_first_source.insert(*input_node, first);
+    }
+    let mut static_source: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    for &static_node in &static_inputs {
+        let src = llir
+            .neighbors_directed(static_node, Direction::Incoming)
+            .next()
+            .expect("LoopInputStatic must have a source");
+        static_source.insert(static_node, src);
+    }
+
+    // Resolve a source reference to its iter-0 equivalent.
+    let resolve_src = |src: NodeIndex| -> NodeIndex {
+        if let Some(&initial) = start_initial.get(&src) {
+            initial
+        } else if let Some(&first) = input_first_source.get(&src) {
+            first
+        } else if let Some(&shared) = static_source.get(&src) {
+            shared
+        } else {
+            src
+        }
+    };
+
+    // Rewrite every body node's incoming edges. Per-edge remove+add to keep
+    // edge-id ordering via LIFO reuse — runtime reads inputs sorted by edge
+    // id so position must be preserved.
+    for &b in &body_nodes {
+        let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
+            .edges_directed(b, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| (e.source(), e.id()))
+            .collect();
+        for (src, eid) in pairs {
+            let new_src = resolve_src(src);
+            llir.remove_edge(eid);
+            llir.add_edge(new_src, b, ());
+        }
+    }
+
+    // Per LoopOutput stream, find the body producer (its single incoming edge).
+    let mut output_body_producer: FxHashMap<usize, NodeIndex> = FxHashMap::default();
+    for (&stream_id, &output_node) in &outputs {
+        let body_producer = llir
+            .neighbors_directed(output_node, Direction::Incoming)
+            .next()
+            .expect("LoopOutput missing body producer during rewire");
+        output_body_producer.insert(stream_id, body_producer);
+    }
+
+    // Post-loop consumers reading from LoopEnd / LoopOutputSelect must
+    // instead read from the body producer (iter-0's value) directly. In the
+    // collapsed form every Select(i) — regardless of i — re-routes to iter-0's
+    // body producer; iter > 0 Selects don't have a real value to forward, so
+    // they alias iter 0's. This keeps post-loop graph topology unchanged.
+    let mut marker_post_sub: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    for &end_node in ends.values() {
+        let body_producer = llir
+            .neighbors_directed(end_node, Direction::Incoming)
+            .next()
+            .expect("LoopEnd missing body producer during rewire");
+        marker_post_sub.insert(end_node, body_producer);
+    }
+    for &select_node in &output_selects {
+        let stream_id = llir[select_node]
+            .to_op::<LoopOutputSelect>()
+            .map(|s| s.stream_id)
+            .expect("output_selects entries must be LoopOutputSelect");
+        if let Some(&body_producer) = output_body_producer.get(&stream_id) {
+            marker_post_sub.insert(select_node, body_producer);
+        }
+    }
+    let post_loop_consumers: FxHashSet<NodeIndex> = loop_markers
+        .iter()
+        .flat_map(|n| {
+            llir.neighbors_directed(*n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+        })
+        .filter(|n| !loop_markers.contains(n) && !body_nodes.contains(n))
+        .collect();
+    for &consumer in &post_loop_consumers {
+        let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
+            .edges_directed(consumer, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| (e.source(), e.id()))
+            .collect();
+        for (src, eid) in pairs {
+            let new_src = marker_post_sub.get(&src).copied().unwrap_or(src);
+            llir.remove_edge(eid);
+            llir.add_edge(new_src, consumer, ());
+        }
+    }
+
+    for &n in &loop_markers {
+        llir.remove_node(n);
+    }
+
+    let compacted = compact_llir_preserving_input_order(llir);
+    *llir = compacted;
+}
+
+/// Rebuild an LLIR graph into a fresh StableGraph, copying nodes and edges
+/// such that edge IDs are sequential in the insertion order we choose
+/// (per-node incoming edges in their original edge-id order). This erases
+/// any free-list reuse artifacts from prior `remove_edge` / `remove_node`
+/// calls.
+fn compact_llir_preserving_input_order(old: &LLIRGraph) -> LLIRGraph {
+    use petgraph::visit::EdgeRef;
+    let mut new_graph = LLIRGraph::default();
+    let mut old_to_new: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
+    // Topo sort to add nodes in a deterministic order. If the graph has
+    // cycles (shouldn't for LLIR), fall back to node_indices order.
+    let topo = match petgraph::algo::toposort(old, None) {
+        Ok(v) => v,
+        Err(_) => old.node_indices().collect(),
+    };
+    for n in &topo {
+        let new_n = new_graph.add_node(old[*n].clone());
+        old_to_new.insert(*n, new_n);
+    }
+    // Add edges in topo order, per-node incoming sorted by old edge id.
+    // This reassigns new edge indices sequentially so sort-by-id matches
+    // the intended input position.
+    for n in &topo {
+        let incoming: Vec<NodeIndex> = old
+            .edges_directed(*n, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| e.source())
+            .collect();
+        for src in incoming {
+            if let (Some(&new_src), Some(&new_dst)) = (old_to_new.get(&src), old_to_new.get(n)) {
+                new_graph.add_edge(new_src, new_dst, ());
+            }
+        }
+    }
+    new_graph
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::egglog_utils::hash_egglog_normalized;
+    use crate::tests::{assert_close, random_vec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct TestFilterRuntime {
+        reject_candidates: bool,
+    }
+
+    impl Runtime for TestFilterRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            (0, "0 ms".to_string())
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            _: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            if self.reject_candidates {
+                CandidateFilterResult::reject_with_display("test filter rejected candidate")
+            } else {
+                CandidateFilterResult::accept()
+            }
+        }
+    }
+
+    static PROFILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct CountingRuntime {
+        reject_candidates: bool,
+    }
+
+    impl Runtime for CountingRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let count = PROFILE_CALLS.fetch_add(1, Ordering::SeqCst);
+            (count, format!("{count} ms"))
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            _: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            if self.reject_candidates {
+                CandidateFilterResult::reject_with_display("test filter rejected candidate")
+            } else {
+                CandidateFilterResult::accept()
+            }
+        }
+    }
+
+    #[test]
+    fn compile_options_defaults_and_search_time_limit_builder() {
+        let opts = CompileOptions::default();
+        assert_eq!(opts.limit, 100);
+        assert_eq!(opts.search_time_limit, std::time::Duration::MAX);
+
+        let time_limit = std::time::Duration::from_millis(25);
+        let opts = CompileOptions::default()
+            .search_graph_limit(7)
+            .search_time_limit(time_limit);
+        assert_eq!(opts.limit, 7);
+        assert_eq!(opts.search_time_limit, time_limit);
+    }
+
+    #[test]
+    fn search_time_limit_stops_after_initial_viable_candidate() {
+        let mut cx = Graph::new();
+        let a = cx.tensor((4, 8));
+        let b = cx.tensor((8, 4));
+        let c = cx.tensor((4, 4));
+        let _ = (a.matmul(b) + c).relu().softmax(1).output();
+
+        cx.build_search_space::<CountingRuntime>(CompileOptions::default());
+
+        PROFILE_CALLS.store(0, Ordering::SeqCst);
+        let _ = cx.search(
+            CountingRuntime::default(),
+            CompileOptions::default().search_time_limit(std::time::Duration::ZERO),
+        );
+        assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn build_search_space_does_not_configure_runtime_filter() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+
+        cx.build_search_space::<TestFilterRuntime>(CompileOptions::default());
+        assert_eq!(cx.egraphs.len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "runtime filter failures")]
+    fn runtime_filter_rejects_candidates() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+        cx.build_search_space::<TestFilterRuntime>(CompileOptions::default());
+
+        let _ = cx.search(
+            TestFilterRuntime {
+                reject_candidates: true,
+            },
+            CompileOptions::default().search_graph_limit(1),
+        );
+    }
+
+    #[test]
+    fn runtime_filter_rejects_candidate_before_profile() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+        cx.build_search_space::<CountingRuntime>(CompileOptions::default());
+
+        PROFILE_CALLS.store(0, Ordering::SeqCst);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = cx.search(
+                CountingRuntime {
+                    reject_candidates: true,
+                },
+                CompileOptions::default().search_graph_limit(1),
+            );
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn compile_builds_search_space_and_searches_it() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+
+        let _ = cx.compile(
+            TestFilterRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
+
+        assert_eq!(cx.egraphs.len(), 1);
+    }
+
+    #[test]
+    fn bucketed_build_search_space_builds_one_egraph_per_bucket() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor('s').output();
+
+        cx.build_search_space::<TestFilterRuntime>(
+            CompileOptions::default()
+                .dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 4)]),
+        );
+
+        assert_eq!(cx.egraphs.len(), 2);
+        assert_eq!(cx.egraph_contexts.len(), 2);
+        assert_eq!(
+            cx.egraph_contexts[0].intervals[&'s'],
+            DimInterval::new(1, 1)
+        );
+        assert_eq!(
+            cx.egraph_contexts[1].intervals[&'s'],
+            DimInterval::new(2, 4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "search cannot change buckets after build")]
+    fn search_with_rng_dim_buckets_after_build_search_space_panics() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor('s').output();
+
+        cx.build_search_space::<TestFilterRuntime>(CompileOptions::default());
+        let mut rng = rand::rng();
+        let _ = cx.search_with_rng(
+            TestFilterRuntime::default(),
+            CompileOptions::default().search_graph_limit(1).dim_buckets(
+                's',
+                &[DimBucket::new(1, 1), DimBucket::new(2, 4).representative(4)],
+            ),
+            &mut rng,
+        );
+    }
 
     #[test]
     fn test_hash_egglog_normalized_same_structure() {
@@ -1419,161 +3140,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_chunk_remaps_and_remap_io() {
-        use petgraph::stable_graph::NodeIndex as NI;
-
-        // Build a simple LLIR: Input(node=10) -> Output(node=20), Input(node=100) -> Output(node=20)
-        let mut llir = LLIRGraph::default();
-        let input_node = llir.add_node(LLIROp::new::<crate::hlir::Input>(Box::new(
-            crate::hlir::Input {
-                node: 10,
-                label: "boundary".to_string(),
-                dtype: DType::F32,
-            },
-        )));
-        let weight_node = llir.add_node(LLIROp::new::<crate::hlir::Input>(Box::new(
-            crate::hlir::Input {
-                node: 100,
-                label: "weight_a".to_string(),
-                dtype: DType::F32,
-            },
-        )));
-        let output_node = llir.add_node(LLIROp::new::<crate::hlir::Output>(Box::new(
-            crate::hlir::Output { node: 20 },
-        )));
-        llir.add_edge(input_node, output_node, ());
-        llir.add_edge(weight_node, output_node, ());
-
-        // Build minimal HLIR graph with Input nodes for both rep and target
-        let mut hlir_graph = HLIRGraph::default();
-        while hlir_graph.node_count() < 10 {
-            hlir_graph.add_node(Box::new(crate::hlir::Input {
-                node: 0,
-                label: "pad".to_string(),
-                dtype: DType::F32,
-            }));
-        }
-        hlir_graph.add_node(Box::new(crate::hlir::Input {
-            node: 10,
-            label: "boundary".to_string(),
-            dtype: DType::F32,
-        }));
-        while hlir_graph.node_count() < 20 {
-            hlir_graph.add_node(Box::new(crate::hlir::Input {
-                node: 0,
-                label: "pad".to_string(),
-                dtype: DType::F32,
-            }));
-        }
-        hlir_graph.add_node(Box::new(crate::hlir::Input {
-            node: 20,
-            label: "brk".to_string(),
-            dtype: DType::F32,
-        }));
-        while hlir_graph.node_count() < 50 {
-            hlir_graph.add_node(Box::new(crate::hlir::Input {
-                node: 0,
-                label: "pad".to_string(),
-                dtype: DType::F32,
-            }));
-        }
-        hlir_graph.add_node(Box::new(crate::hlir::Input {
-            node: 50,
-            label: "boundary".to_string(),
-            dtype: DType::F32,
-        }));
-        while hlir_graph.node_count() < 60 {
-            hlir_graph.add_node(Box::new(crate::hlir::Input {
-                node: 0,
-                label: "pad".to_string(),
-                dtype: DType::F32,
-            }));
-        }
-        hlir_graph.add_node(Box::new(crate::hlir::Input {
-            node: 60,
-            label: "brk".to_string(),
-            dtype: DType::F32,
-        }));
-        while hlir_graph.node_count() < 100 {
-            hlir_graph.add_node(Box::new(crate::hlir::Input {
-                node: 0,
-                label: "pad".to_string(),
-                dtype: DType::F32,
-            }));
-        }
-        hlir_graph.add_node(Box::new(crate::hlir::Input {
-            node: 100,
-            label: "weight_a".to_string(),
-            dtype: DType::F32,
-        }));
-        while hlir_graph.node_count() < 200 {
-            hlir_graph.add_node(Box::new(crate::hlir::Input {
-                node: 0,
-                label: "pad".to_string(),
-                dtype: DType::F32,
-            }));
-        }
-        hlir_graph.add_node(Box::new(crate::hlir::Input {
-            node: 200,
-            label: "weight_b".to_string(),
-            dtype: DType::F32,
-        }));
-
-        let rep_desc = SubgraphDescriptor {
-            nodes: [NI::new(10), NI::new(100)].into_iter().collect(),
-            boundary_inputs: vec![BoundaryInput {
-                break_node: NI::new(10),
-                shape: ShapeTracker::new(()),
-                dtype: DType::F32,
-            }],
-            boundary_outputs: vec![NI::new(20)],
-        };
-        let target_desc = SubgraphDescriptor {
-            nodes: [NI::new(50), NI::new(200)].into_iter().collect(),
-            boundary_inputs: vec![BoundaryInput {
-                break_node: NI::new(50),
-                shape: ShapeTracker::new(()),
-                dtype: DType::F32,
-            }],
-            boundary_outputs: vec![NI::new(60)],
-        };
-
-        let (node_remap, custom_op_remap) =
-            build_chunk_remaps(&rep_desc, &target_desc, &hlir_graph);
-
-        // No custom ops in this test
-        assert!(custom_op_remap.is_empty());
-
-        // Apply IO remap
-        remap_llir_io_nodes(&mut llir, &node_remap, &hlir_graph);
-
-        // Verify remapped nodes
-        let mut input_nodes: Vec<(usize, String)> = vec![];
-        let mut output_nodes: Vec<usize> = vec![];
-        for node in llir.node_indices() {
-            let op = &llir[node];
-            if let Some(inp) = op.to_op::<crate::hlir::Input>() {
-                input_nodes.push((inp.node, inp.label.clone()));
-            }
-            if let Some(out) = op.to_op::<crate::hlir::Output>() {
-                output_nodes.push(out.node);
-            }
-        }
-        input_nodes.sort_by_key(|(n, _)| *n);
-        assert_eq!(input_nodes.len(), 2);
-        assert_eq!(
-            input_nodes[0].0, 50,
-            "Boundary input should be remapped to 50"
-        );
-        assert_eq!(
-            input_nodes[1].0, 200,
-            "Weight input should be remapped to 200"
-        );
-        assert_eq!(output_nodes, vec![60], "Output should be remapped to 60");
-        assert_eq!(llir.edge_count(), 2, "Should have 2 edges");
-    }
-
-    #[test]
     fn test_hash_egglog_normalized_custom_op_id() {
         // CustomOpKind lines differ only in the integer ID (layer index)
         let text_a = r#"(let t0 (Input 441 "boundary" (F32)))
@@ -1601,5 +3167,84 @@ mod tests {
             hash_egglog_normalized(text_b),
             "CustomOpKind with different input lists should hash differently"
         );
+    }
+
+    #[test]
+    fn test_auto_roll_loops_prepass_creates_regions_for_chain_recurrence() {
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let out = x.exp2().sin().exp2().sin().exp2().sin().output();
+
+        let inserted = cx.auto_roll_loops_prepass();
+        assert!(
+            inserted >= 2,
+            "expected at least two loop boundaries for 3 repeated bodies, got {inserted}"
+        );
+
+        let vals = random_vec(8);
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, vals.clone());
+        rt.execute(&cx.dyn_map);
+
+        let expected = vals
+            .into_iter()
+            .map(|v| v.exp2().sin().exp2().sin().exp2().sin())
+            .collect::<Vec<f32>>();
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn test_auto_roll_loops_prepass_rolls_recurrence_with_interleaved_outputs() {
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let mut y = x;
+        for _ in 0..10 {
+            y.exp2().output();
+            y = y.sin();
+        }
+        let y = y.output();
+
+        let before = cx.graph.node_count();
+        let inserted = cx.auto_roll_loops_prepass();
+        let after = cx.graph.node_count();
+        assert!(
+            inserted >= 2,
+            "expected loop markers for recurrence split by Output nodes, got {inserted}"
+        );
+        assert!(
+            after < before,
+            "expected rolling to reduce nodes for recurrence split by Output nodes ({before} -> {after})"
+        );
+
+        let vals = random_vec(8);
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, vals.clone());
+        rt.execute(&cx.dyn_map);
+
+        let expected = vals
+            .into_iter()
+            .map(|mut v| {
+                for _ in 0..10 {
+                    v = v.sin();
+                }
+                v
+            })
+            .collect::<Vec<f32>>();
+        assert_close(rt.get_f32(y.id), &expected);
+    }
+
+    #[test]
+    fn test_auto_roll_loops_prepass_skips_non_recurrent_branches() {
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let y = cx.tensor(8);
+        let _out = (x.exp().sin() + y.exp().sin()).output();
+
+        let inserted = cx.auto_roll_loops_prepass();
+        assert_eq!(inserted, 0, "branch-only reuse should not roll into loops");
     }
 }

@@ -67,5 +67,6 @@
         (set (dtype ?new_mul) ?dt)
         (set (dtype ?new_sum) ?dt)
     )
+    :ruleset matmul_flatten
     :name "batch-collapse merge A-contiguous B-broadcast"
 )

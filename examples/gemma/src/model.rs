@@ -36,14 +36,16 @@ impl KVCache {
         let mut k_caches = Vec::with_capacity(LAYERS);
         let mut v_caches = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
-            let k = cx
-                .named_tensor(format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            let v = cx
-                .named_tensor(format!("kv_cache.{l}.v"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                .persist();
-            k_caches.push(k);
-            v_caches.push(v);
+            k_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.k"),
+                (N_KV_HEADS, max_seq, HEAD_DIM),
+            ));
+            v_caches.push(persist(
+                cx,
+                format!("kv_cache.{l}.v"),
+                (N_KV_HEADS, max_seq, HEAD_DIM),
+            ));
         }
         Self {
             k_caches,
@@ -68,114 +70,11 @@ pub struct Gemma {
 
 impl Gemma {
     pub fn init(cx: &mut Graph) -> Self {
-        let mut w = vec![];
-        for l in 0..LAYERS {
-            let is_local = (l + 1) % SLIDING_WINDOW_PATTERN != 0;
-            let up = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.up_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
-                )
-                .persist();
-            let gate = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.gate_proj.weight"),
-                    (INTERMEDIATE, HIDDEN),
-                )
-                .persist();
-            let down = cx
-                .named_tensor(
-                    format!("model.layers.{l}.mlp.down_proj.weight"),
-                    (HIDDEN, INTERMEDIATE),
-                )
-                .persist();
-            let q_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_proj.weight"),
-                    (Q_DIM, HIDDEN),
-                )
-                .persist();
-            let k_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_proj.weight"),
-                    (KV_DIM, HIDDEN),
-                )
-                .persist();
-            let v_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.v_proj.weight"),
-                    (KV_DIM, HIDDEN),
-                )
-                .persist();
-            let o_proj = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.o_proj.weight"),
-                    (HIDDEN, Q_DIM),
-                )
-                .persist();
-            let q_norm = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.q_norm.weight"),
-                    HEAD_DIM,
-                )
-                .persist();
-            let k_norm = cx
-                .named_tensor(
-                    format!("model.layers.{l}.self_attn.k_norm.weight"),
-                    HEAD_DIM,
-                )
-                .persist();
-            w.push(GemmaLayer {
-                up,
-                gate,
-                down,
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                q_norm,
-                k_norm,
-                input_layernorm: gemma_norm(
-                    HIDDEN,
-                    &format!("model.layers.{l}.input_layernorm.weight"),
-                    cx,
-                ),
-                post_attention_layernorm: gemma_norm(
-                    HIDDEN,
-                    &format!("model.layers.{l}.post_attention_layernorm.weight"),
-                    cx,
-                ),
-                pre_feedforward_layernorm: gemma_norm(
-                    HIDDEN,
-                    &format!("model.layers.{l}.pre_feedforward_layernorm.weight"),
-                    cx,
-                ),
-                post_feedforward_layernorm: gemma_norm(
-                    HIDDEN,
-                    &format!("model.layers.{l}.post_feedforward_layernorm.weight"),
-                    cx,
-                ),
-                is_local,
-                rope_theta: if is_local {
-                    ROPE_THETA_LOCAL
-                } else {
-                    ROPE_THETA_GLOBAL
-                },
-                rope_scaling_factor: if is_local { 1.0 } else { 8.0 },
-            });
-        }
-        let lm_norm = gemma_norm(HIDDEN, "model.norm.weight", cx);
-        let embedding = cx
-            .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
-        let lm_head = cx
-            .named_tensor("lm_head.weight", (VOCAB_SIZE, HIDDEN))
-            .persist();
         Self {
-            embedding,
-            lm_head,
-            layers: w,
-            lm_norm,
+            embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)),
+            lm_head: persist(cx, "lm_head.weight", (VOCAB_SIZE, HIDDEN)),
+            layers: (0..LAYERS).map(|l| GemmaLayer::init(cx, l)).collect(),
+            lm_norm: gemma_norm(HIDDEN, "model.norm.weight", cx),
         }
     }
 
@@ -185,11 +84,7 @@ impl Gemma {
         pos_ids: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let seq = token_ids.dims1();
-        let mut x = self.embedding.gather(
-            (token_ids * HIDDEN).expand_dim(1, HIDDEN)
-                + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
-        );
+        let mut x = token_embedding(self.embedding, token_ids);
         let mut cache_outputs = Vec::with_capacity(LAYERS);
         for (i, layer) in self.layers.iter().enumerate() {
             let (x_new, k_out, v_out) = layer.forward(
@@ -199,7 +94,7 @@ impl Gemma {
                 kv_cache.v_caches[i],
                 kv_cache.max_seq,
             );
-            x = x_new.graph_break();
+            x = x_new;
             cache_outputs.push((k_out, v_out));
         }
         let logits = self.lm_norm.forward(x).matmul(self.lm_head.t());
@@ -224,6 +119,114 @@ struct GemmaLayer {
     is_local: bool,
     rope_theta: f32,
     rope_scaling_factor: f32,
+}
+
+impl GemmaLayer {
+    fn init(cx: &mut Graph, l: usize) -> Self {
+        let is_local = !(l + 1).is_multiple_of(SLIDING_WINDOW_PATTERN);
+        Self {
+            up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)),
+            gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN)),
+            down: layer_weight(cx, l, "mlp.down_proj", (HIDDEN, INTERMEDIATE)),
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)),
+            q_norm: layer_weight(cx, l, "self_attn.q_norm", HEAD_DIM),
+            k_norm: layer_weight(cx, l, "self_attn.k_norm", HEAD_DIM),
+            input_layernorm: layer_norm(cx, l, "input_layernorm"),
+            post_attention_layernorm: layer_norm(cx, l, "post_attention_layernorm"),
+            pre_feedforward_layernorm: layer_norm(cx, l, "pre_feedforward_layernorm"),
+            post_feedforward_layernorm: layer_norm(cx, l, "post_feedforward_layernorm"),
+            is_local,
+            rope_theta: if is_local {
+                ROPE_THETA_LOCAL
+            } else {
+                ROPE_THETA_GLOBAL
+            },
+            rope_scaling_factor: if is_local { 1.0 } else { 8.0 },
+        }
+    }
+
+    pub fn forward(
+        &self,
+        x: GraphTensor,
+        pos_ids: GraphTensor,
+        k_cache_in: GraphTensor,
+        v_cache_in: GraphTensor,
+        max_seq: usize,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let x_attn = self.input_layernorm.forward(x);
+        let q = x_attn.matmul(self.q_proj.t());
+        let k = x_attn.matmul(self.k_proj.t());
+        let v = x_attn.matmul(self.v_proj.t());
+
+        let q_rope = gemma_rotary_embeddings(
+            qk_norm(q, self.q_norm, N_HEADS),
+            pos_ids,
+            N_HEADS,
+            self.rope_theta,
+            self.rope_scaling_factor,
+        );
+        let k_rope = gemma_rotary_embeddings(
+            qk_norm(k, self.k_norm, N_KV_HEADS),
+            pos_ids,
+            N_KV_HEADS,
+            self.rope_theta,
+            self.rope_scaling_factor,
+        );
+
+        let (attn_out, k_cache_out, v_cache_out) = hlir_attention(
+            q_rope,
+            k_rope,
+            v,
+            k_cache_in,
+            v_cache_in,
+            max_seq,
+            self.is_local,
+        );
+
+        let attn_proj = attn_out.matmul(self.o_proj.t());
+        let x = x + self.post_attention_layernorm.forward(attn_proj);
+
+        let x_ff = self.pre_feedforward_layernorm.forward(x);
+        let mlp_out = (gemma_gelu(x_ff.matmul(self.gate.t())) * x_ff.matmul(self.up.t()))
+            .matmul(self.down.t());
+        (
+            x + self.post_feedforward_layernorm.forward(mlp_out),
+            k_cache_out,
+            v_cache_out,
+        )
+    }
+}
+
+fn persist(
+    cx: &mut Graph,
+    name: impl ToString,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    cx.named_tensor(name, shape).persist()
+}
+
+fn layer_weight(
+    cx: &mut Graph,
+    layer: usize,
+    suffix: &str,
+    shape: impl luminal::prelude::ToShape,
+) -> GraphTensor {
+    persist(cx, format!("model.layers.{layer}.{suffix}.weight"), shape)
+}
+
+fn layer_norm(cx: &mut Graph, layer: usize, name: &str) -> LayerNorm {
+    gemma_norm(HIDDEN, &format!("model.layers.{layer}.{name}.weight"), cx)
+}
+
+fn token_embedding(embedding: GraphTensor, token_ids: GraphTensor) -> GraphTensor {
+    let seq = token_ids.dims1();
+    embedding.gather(
+        (token_ids * HIDDEN).expand_dim(1, HIDDEN)
+            + token_ids.graph().arange(HIDDEN).expand_dim(0, seq),
+    )
 }
 
 /// GELU using the identity: 0.5*x*(1+tanh(a)) = x*sigmoid(2*a)
@@ -315,8 +318,13 @@ fn hlir_attention(
     let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
 
     // Slice to valid range
-    let k_full = k_cache_out.slice((.., ..total_seq, ..));
-    let v_full = v_cache_out.slice((.., ..total_seq, ..));
+    let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
+    let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
+    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
+    // cannot yet propagate expression-bound assertions, so `slice` reports
+    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
+    k_full.shape.dims[1] = total_seq;
+    v_full.shape.dims[1] = total_seq;
 
     // GQA expand: [N_KV_HEADS, total_seq, HEAD_DIM] -> [N_HEADS, total_seq, HEAD_DIM]
     let k_3d = k_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);
@@ -357,60 +365,4 @@ fn hlir_attention(
     let out = attn_out.transpose(0, 1).merge_dims(1, 2);
 
     (out, k_cache_out, v_cache_out)
-}
-
-impl GemmaLayer {
-    pub fn forward(
-        &self,
-        x: GraphTensor,
-        pos_ids: GraphTensor,
-        k_cache_in: GraphTensor,
-        v_cache_in: GraphTensor,
-        max_seq: usize,
-    ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let x_attn = self.input_layernorm.forward(x);
-        let q = x_attn.matmul(self.q_proj.t());
-        let k = x_attn.matmul(self.k_proj.t());
-        let v = x_attn.matmul(self.v_proj.t());
-
-        // QK-norm + RoPE
-        let q_normed = qk_norm(q, self.q_norm, N_HEADS);
-        let k_normed = qk_norm(k, self.k_norm, N_KV_HEADS);
-        let q_rope = gemma_rotary_embeddings(
-            q_normed,
-            pos_ids,
-            N_HEADS,
-            self.rope_theta,
-            self.rope_scaling_factor,
-        );
-        let k_rope = gemma_rotary_embeddings(
-            k_normed,
-            pos_ids,
-            N_KV_HEADS,
-            self.rope_theta,
-            self.rope_scaling_factor,
-        );
-
-        let (attn_out, k_cache_out, v_cache_out) = hlir_attention(
-            q_rope,
-            k_rope,
-            v,
-            k_cache_in,
-            v_cache_in,
-            max_seq,
-            self.is_local,
-        );
-
-        // O projection + post-attention norm + residual
-        let attn_proj = attn_out.matmul(self.o_proj.t());
-        let attn_normed = self.post_attention_layernorm.forward(attn_proj);
-        let x = x + attn_normed;
-
-        // Pre-feedforward norm + MLP + post-feedforward norm + residual
-        let x_ff = self.pre_feedforward_layernorm.forward(x);
-        let mlp_out = (gemma_gelu(x_ff.matmul(self.gate.t())) * x_ff.matmul(self.up.t()))
-            .matmul(self.down.t());
-        let mlp_normed = self.post_feedforward_layernorm.forward(mlp_out);
-        (x + mlp_normed, k_cache_out, v_cache_out)
-    }
 }

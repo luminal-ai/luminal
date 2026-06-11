@@ -10,22 +10,14 @@ use itertools::Itertools;
 use luminal::{
     egglog_utils::{
         api::{Rule, SortDef, sort},
-        base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
+        base::{DTYPE, ELIST, EXPRESSION, OP_KIND, STRING},
         extract_dtype, extract_expr, extract_expr_list,
     },
     op::*,
     prelude::*,
 };
 
-pub type Ops = (
-    KernelMeanReduce,
-    KernelBatchMatVec,
-    KernelBatchMatMul,
-    KernelScatterNoCopy,
-    KernelSoftmax,
-    KernelExp,
-    KernelSigmoid,
-);
+pub type Ops = (KernelMeanReduce, KernelScatterNoCopy, KernelSoftmax);
 
 #[derive(Default, Debug, Clone)]
 
@@ -128,7 +120,8 @@ impl KernelOp for KernelMeanReduce {
         let dtype = cuda_dtype(self.dtype);
         let includes = dtype_includes(&[self.dtype]);
         let n_outputs: Expression = self.out_shape.iter().copied().product();
-        let threads_per_block = 256; // 8 warps per block
+        let threads_per_block: usize = 256; // 8 warps per block
+        let n_warps = threads_per_block / 32;
         let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -149,12 +142,24 @@ extern \"C\" {{
         long long iters = {iters};
         long long iter_stride = {iter_stride};
 
-        {dtype} sum = 0;
-        for (long long i = 0; i < iters; i++) {{
-            sum += in[in_start + i * iter_stride];
-        }}
+        float thread_sum = 0.0f;
+        for (long long i = threadIdx.x; i < iters; i += {threads_per_block})
+            thread_sum += (float)in[in_start + i * iter_stride];
 
-        out[{out_index}] = ({dtype})(sum / ({dtype})iters);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+
+        __shared__ float warp_sums[{n_warps}];
+        int lane = threadIdx.x & 31;
+        int warp = threadIdx.x >> 5;
+        if (lane == 0) warp_sums[warp] = thread_sum;
+        __syncthreads();
+
+        if (threadIdx.x == 0) {{
+            float sum = 0.0f;
+            for (int w = 0; w < {n_warps}; w++) sum += warp_sums[w];
+            out[{out_index}] = ({dtype})(sum / (float)iters);
+        }}
     }}
 }}",
             dtype = dtype,
@@ -167,6 +172,8 @@ extern \"C\" {{
                 .substitute('z', Expression::from(1))
                 .simplify()
                 .to_kernel(),
+            threads_per_block = threads_per_block,
+            n_warps = n_warps,
         );
 
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
@@ -183,9 +190,9 @@ extern \"C\" {{
             func,
             module,
             kernel,
-            (n_outputs, 1.into(), 1.into()), // grid
-            (1.into(), 1.into(), 1.into()),  // blocks (single-threaded)
-            0.into(),                        // shmem size
+            (n_outputs, 1.into(), 1.into()),                // grid
+            (threads_per_block.into(), 1.into(), 1.into()), // block
+            0.into(),                                       // shmem size
             FxHashMap::default(),
         )
     }
@@ -279,6 +286,9 @@ impl EgglogOp for KernelScatterNoCopy {
     fn rewrites(&self) -> Vec<Rule> {
         // Match KernelScatter and rewrite to KernelScatterNoCopy with ConsumedBuffer on dest.
         // ConsumedBuffer wraps dest to signal in-place modification.
+        // This is only valid when the destination buffer can also represent
+        // the scatter output layout. If dest is a strided/broadcast view,
+        // regular Scatter must first materialize a contiguous output copy.
         //
         // Two-phase resolution:
         // 1. During (run): cleanup rules delete ConsumedBuffer if dest is shared (another op uses it)
@@ -289,12 +299,31 @@ impl EgglogOp for KernelScatterNoCopy {
         // If ConsumedBuffer was deleted (shared case), cascade cleanup removes the dependent
         // ICons and KernelScatterNoCopy Op, leaving only KernelScatter.
         let mut rules = vec![
+            Rule::raw("(relation consumed_buffer_ilist_contains (IList IR))"),
+            Rule::raw(
+                "(rule
+                    ((= ?list (ICons ?head ?tail)))
+                    ((consumed_buffer_ilist_contains ?list ?head))
+                    :ruleset cleanup
+                    :name \"consumed-buffer-ilist-contains-head\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    ((= ?list (ICons ?head ?tail))
+                     (consumed_buffer_ilist_contains ?tail ?item))
+                    ((consumed_buffer_ilist_contains ?list ?item))
+                    :ruleset cleanup
+                    :name \"consumed-buffer-ilist-contains-tail\"
+                )",
+            ),
             // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
             Rule::raw(
                 "(rule
                     (
                         (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
                             (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+                        (= ?dst ?os)
                         (= ?dty (dtype ?src))
                     )
                     (
@@ -304,6 +333,7 @@ impl EgglogOp for KernelScatterNoCopy {
                         (union ?scatter ?nocopy)
                         (set (dtype ?nocopy) ?dty)
                     )
+                    :ruleset buffer_reuse
                     :name \"scatter to scatter-no-copy\"
                 )",
             ),
@@ -313,6 +343,7 @@ impl EgglogOp for KernelScatterNoCopy {
                     ((= ?cb (ConsumedBuffer ?a))
                      (= ?dt (dtype ?a)))
                     ((set (dtype ?cb) ?dt))
+                    :ruleset dtype_prop
                     :name \"consumed-buffer-dtype\"
                 )",
             ),
@@ -322,13 +353,28 @@ impl EgglogOp for KernelScatterNoCopy {
             "(rule
                 ((= ?cb (ConsumedBuffer ?a))
                  (= ?op1 (Op ?k1 ?ilist1))
-                 (= ?ilist1 (ICons ?cb ?rest1))
+                 (consumed_buffer_ilist_contains ?ilist1 ?cb)
                  (= ?op2 (Op ?k2 ?ilist2))
                  (!= ?op1 ?op2)
-                 (= ?ilist2 (ICons ?a ?t2)))
+                 (consumed_buffer_ilist_contains ?ilist2 ?a))
                 ((delete (ConsumedBuffer ?a)))
                 :ruleset cleanup
-                :name \"consumed-buffer-cleanup-pos\"
+                :name \"consumed-buffer-cleanup-shared-op-use\"
+            )",
+        ));
+        // If a valid no-copy scatter survives cleanup, it dominates the copying scatter.
+        // This must run before base_cleanup resolves ConsumedBuffer back to the destination.
+        rules.push(Rule::raw(
+            "(rule
+                ((= ?cb (ConsumedBuffer ?dest))
+                 (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
+                 (= ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?cb (ICons ?indexes (ICons ?src (INil)))))))
+                ((delete (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
+                     (ICons ?dest (ICons ?indexes (ICons ?src (INil)))))))
+                :ruleset post_cleanup
+                :name \"scatter-no-copy-dominates-valid-consumed-buffer\"
             )",
         ));
         // Surviving ConsumedBuffers are valid — union with source and delete.
@@ -455,8 +501,8 @@ extern \"C\" {{
             func,
             module,
             scatter_kernel,
-            (n_src, 1.into(), 1.into()),
-            (1.into(), 1.into(), 1.into()),
+            (n_src.ceil_div(256), 1.into(), 1.into()),
+            (256.into(), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
         )
@@ -480,7 +526,7 @@ extern \"C\" {{
 
     fn output_bytes(&self) -> Expression {
         let elem_size: Expression = match self.dtype {
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::F32 | DType::Int => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
             DType::Bool
@@ -514,7 +560,7 @@ extern \"C\" {{
 
     fn bytes_loaded(&self) -> Expression {
         let data_elem_size: Expression = match self.dtype {
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::F32 | DType::Int => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
             DType::Bool
@@ -533,7 +579,7 @@ extern \"C\" {{
 
     fn bytes_stored(&self) -> Expression {
         let data_elem_size: Expression = match self.dtype {
-            DType::F64 => 8,
+            DType::F64 | DType::I64 => 8,
             DType::F32 | DType::Int => 4,
             DType::F16 | DType::Bf16 | DType::I16 | DType::U16 => 2,
             DType::Bool
@@ -564,567 +610,6 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "ScatterNoCopy"
-    }
-}
-
-// =============================================================================
-// KernelBatchMatVec: Fused batched matrix-vector product for attention
-// Matches: Mul(broadcast) + Sum pattern for [B, 1, K] x [B, K, N] -> [B, 1, N]
-// or [B, M, K] x [B, K, N] -> [B, M, N] with small M
-// Replaces the broadcast KernelMul + single-threaded KernelSumReduce pipeline
-// =============================================================================
-
-#[derive(Default, Debug, Clone)]
-pub struct KernelBatchMatVec {
-    // Output shape: the final reduced shape [B..., M, N]
-    out_shape: Vec<Expression>,
-    // K: the reduction dimension (was the Sum iters)
-    k_dim: Expression,
-    // Strides for input A (with K dim removed)
-    a_stride: Vec<Expression>,
-    a_k_stride: Expression,
-    // Strides for input B (with K dim removed)
-    b_stride: Vec<Expression>,
-    b_k_stride: Expression,
-    // Output strides
-    out_stride: Vec<Expression>,
-    dtype: DType,
-}
-
-impl EgglogOp for KernelBatchMatVec {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelBatchMatVec",
-            &[
-                ("out_shape", ELIST),
-                ("k_dim", EXPRESSION),
-                ("a_stride", ELIST),
-                ("a_k_stride", EXPRESSION),
-                ("b_stride", ELIST),
-                ("b_k_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
-            "(rule
-                (
-                    ; Match Mul node (broadcast multiply)
-                    (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-
-                    ; Match Sum that reduces the Mul (k dimension)
-                    (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
-
-                    ; Output shape must have 3+ dimensions (batched)
-                    (= ?out_shape (ECons ?batch_or_d0 (ECons ?d1 (ECons ?d2 ?rest))))
-
-                    ; k_stride must be contiguous
-                    (= ?k_stride (MIter))
-
-                    ; Get A's k-dimension stride (second from end in Mul's a_stride)
-                    (= ?a_k_stride (nth_from_end ?a_stride 1))
-
-                    ; Get B's k-dimension stride (second from end in Mul's b_stride)
-                    (= ?b_k_stride (nth_from_end ?b_stride 1))
-
-                    ; A's k stride must be contiguous (row-major A)
-                    (= ?a_k_stride (MIter))
-
-                    ; B's k stride must be contiguous (col-major B)
-                    (= ?b_k_stride (MIter))
-
-                    ; Must be F32
-                    (= (F32) (dtype ?a))
-                    (= (F32) (dtype ?b))
-                )
-                (
-                    ; Remove the k-dimension from A strides for the kernel
-                    (let ?a_kern_stride (RemoveNthFromEnd ?a_stride 1))
-                    ; Remove the k-dimension from B strides
-                    (let ?b_kern_stride (RemoveNthFromEnd ?b_stride 1))
-
-                    (let ?bmv (Op (KernelBatchMatVec
-                        ?out_shape ?k
-                        ?a_kern_stride ?a_k_stride
-                        ?b_kern_stride ?b_k_stride
-                        ?sum_out_stride (F32)) (ICons ?a (ICons ?b (INil)))))
-                    (union ?sum ?bmv)
-                    (set (dtype ?bmv) (F32))
-                )
-                :name \"batch mat-vec\"
-            )"
-        )]
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                k_dim: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                a_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                a_k_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                b_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                b_k_stride: extract_expr(egraph, kind_children[5], expr_cache).unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[6], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[7]),
-            })),
-            input_enodes, // A, B
-        )
-    }
-}
-
-impl KernelOp for KernelBatchMatVec {
-    fn compile(
-        &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    ) -> (
-        CudaFunction,
-        Arc<CudaModule>,
-        String,
-        (Expression, Expression, Expression),
-        (Expression, Expression, Expression),
-        Expression,
-        FxHashMap<char, CudaSlice<u8>>,
-    ) {
-        let vars: FxHashSet<char> = self
-            .out_shape
-            .iter()
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.a_stride.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.b_stride.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.k_dim.dyn_vars())
-            .chain(self.a_k_stride.dyn_vars())
-            .chain(self.b_k_stride.dyn_vars())
-            .collect();
-
-        let n_outputs: Expression = self.out_shape.iter().copied().product();
-        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
-        let dyn_dims_param = if vars.is_empty() {
-            ""
-        } else {
-            ", const int* dyn_dims"
-        };
-
-        // Each output element is a dot product of length K.
-        // We launch one block of 256 threads per output element.
-        // Threads cooperatively reduce K using warp shuffles.
-        let a_idx = flatten_strides(&self.out_shape, &self.a_stride).to_kernel();
-        let b_idx = flatten_strides(&self.out_shape, &self.b_stride).to_kernel();
-        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
-        let k_expr = self.k_dim.to_kernel();
-        let a_k_stride_expr = self
-            .a_k_stride
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
-        let b_k_stride_expr = self
-            .b_k_stride
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
-
-        let kernel = format!(
-            "
-#define WARP_SIZE 32
-#define THREADS_PER_BLOCK 256
-#define FULL_MASK 0xffffffff
-{dyn_defines}
-extern \"C\" {{
-    __global__ void batch_matvec(float *out, const float *A, const float *B{dyn_dims_param}) {{
-        __shared__ float warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
-        long long const_z = blockIdx.x;
-        int tid = threadIdx.x;
-        int lane_id = tid % WARP_SIZE;
-        int warp_id = tid / WARP_SIZE;
-
-        long long a_base = {a_idx};
-        long long b_base = {b_idx};
-        long long K = {k_expr};
-        long long a_k_stride = {a_k_stride_expr};
-        long long b_k_stride = {b_k_stride_expr};
-
-        float partial = 0.0f;
-        for (long long k = tid; k < K; k += THREADS_PER_BLOCK) {{
-            partial += A[a_base + k * a_k_stride] * B[b_base + k * b_k_stride];
-        }}
-
-        #pragma unroll
-        for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            partial += __shfl_down_sync(FULL_MASK, partial, s);
-        }}
-
-        if (lane_id == 0) {{
-            warp_sums[warp_id] = partial;
-        }}
-        __syncthreads();
-
-        if (warp_id == 0) {{
-            int cnt = THREADS_PER_BLOCK / WARP_SIZE;
-            float block_sum = tid < cnt ? warp_sums[tid] : 0.0f;
-
-            #pragma unroll
-            for (int s = cnt / 2; s > 0; s /= 2) {{
-                block_sum += __shfl_down_sync(FULL_MASK, block_sum, s);
-            }}
-
-            if (tid == 0) {{
-                out[{out_idx}] = block_sum;
-            }}
-        }}
-    }}
-}}"
-        );
-
-        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
-            (module.clone(), func.clone())
-        } else {
-            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-            let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("batch_matvec").unwrap();
-            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-            (module, func)
-        };
-
-        (
-            func,
-            module,
-            kernel,
-            (n_outputs, 1.into(), 1.into()), // grid: one block per output
-            (256.into(), 1.into(), 1.into()), // block: 256 threads
-            32.into(),                       // shared mem for warp_sums
-            FxHashMap::default(),
-        )
-    }
-
-    fn output_size(&self) -> Expression {
-        self.out_shape.iter().copied().product()
-    }
-
-    fn output_bytes(&self) -> Expression {
-        self.output_size() * 4
-    }
-
-    fn bytes_loaded(&self) -> Expression {
-        let n = self.output_size();
-        // Each output loads K elements from A and K elements from B
-        n * self.k_dim * 2 * 4
-    }
-
-    fn bytes_stored(&self) -> Expression {
-        self.output_size() * 4
-    }
-
-    fn flops(&self) -> Expression {
-        // Each output: K multiply-adds = 2*K FLOPs
-        self.output_size() * self.k_dim * 2
-    }
-
-    fn output_dtype(&self) -> DType {
-        self.dtype
-    }
-
-    fn kernel_name(&self) -> &'static str {
-        "BatchMatVec"
-    }
-}
-
-// =============================================================================
-// KernelBatchMatMul: General batched matmul with arbitrary strides
-// Like KernelBatchMatVec but handles non-contiguous K strides (e.g., transposed
-// inputs) and non-uniform batch strides (e.g., GQA expansion). One block of 256
-// threads per output element; threads cooperatively reduce along K.
-// =============================================================================
-
-#[derive(Default, Debug, Clone)]
-pub struct KernelBatchMatMul {
-    out_shape: Vec<Expression>,
-    k_dim: Expression,
-    a_stride: Vec<Expression>,
-    a_k_stride: Expression,
-    b_stride: Vec<Expression>,
-    b_k_stride: Expression,
-    out_stride: Vec<Expression>,
-    dtype: DType,
-}
-
-impl EgglogOp for KernelBatchMatMul {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelBatchMatMul",
-            &[
-                ("out_shape", ELIST),
-                ("k_dim", EXPRESSION),
-                ("a_stride", ELIST),
-                ("a_k_stride", EXPRESSION),
-                ("b_stride", ELIST),
-                ("b_k_stride", EXPRESSION),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        2
-    }
-
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
-            "(rule
-                (
-                    ; Match Mul node (broadcast multiply)
-                    (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-
-                    ; Match Sum that reduces the Mul (k dimension)
-                    (= ?sum (Op (Sum ?out_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
-
-                    ; Output shape must have 3+ dimensions (batched)
-                    (= ?out_shape (ECons ?batch_or_d0 (ECons ?d1 (ECons ?d2 ?rest))))
-
-                    ; k_stride must be contiguous in the Sum output
-                    (= ?k_stride (MIter))
-
-                    ; K must be > 1 (K=1 is a degenerate outer product, not a real matmul)
-                    (!= ?k (MNum 1))
-
-                    ; Get A's and B's k-dimension strides (no contiguity requirement)
-                    (= ?a_k_stride (nth_from_end ?a_stride 1))
-                    (= ?b_k_stride (nth_from_end ?b_stride 1))
-
-                    ; One of A's non-k strides must be 0 (broadcast along n)
-                    (= (MNum 0) (nth_from_end ?a_stride 0))
-
-                    ; One of B's non-k strides must be 0 (broadcast along m)
-                    (= (MNum 0) (nth_from_end ?b_stride 2))
-
-                    ; Must be F32
-                    (= (F32) (dtype ?a))
-                    (= (F32) (dtype ?b))
-                )
-                (
-                    (let ?a_kern_stride (RemoveNthFromEnd ?a_stride 1))
-                    (let ?b_kern_stride (RemoveNthFromEnd ?b_stride 1))
-
-                    (let ?bmm (Op (KernelBatchMatMul
-                        ?out_shape ?k
-                        ?a_kern_stride ?a_k_stride
-                        ?b_kern_stride ?b_k_stride
-                        ?sum_out_stride (F32)) (ICons ?a (ICons ?b (INil)))))
-                    (union ?sum ?bmm)
-                    (set (dtype ?bmm) (F32))
-                )
-                :name \"batch matmul\"
-            )"
-        )]
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
-                    .unwrap(),
-                k_dim: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                a_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                a_k_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                b_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
-                    .unwrap(),
-                b_k_stride: extract_expr(egraph, kind_children[5], expr_cache).unwrap(),
-                out_stride: extract_expr_list(egraph, kind_children[6], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[7]),
-            })),
-            input_enodes,
-        )
-    }
-}
-
-impl KernelOp for KernelBatchMatMul {
-    fn compile(
-        &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    ) -> (
-        CudaFunction,
-        Arc<CudaModule>,
-        String,
-        (Expression, Expression, Expression),
-        (Expression, Expression, Expression),
-        Expression,
-        FxHashMap<char, CudaSlice<u8>>,
-    ) {
-        let vars: FxHashSet<char> = self
-            .out_shape
-            .iter()
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.a_stride.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.b_stride.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.k_dim.dyn_vars())
-            .chain(self.a_k_stride.dyn_vars())
-            .chain(self.b_k_stride.dyn_vars())
-            .collect();
-
-        let n_outputs: Expression = self.out_shape.iter().copied().product();
-        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
-        let dyn_dims_param = if vars.is_empty() {
-            ""
-        } else {
-            ", const int* dyn_dims"
-        };
-
-        let a_idx = flatten_strides(&self.out_shape, &self.a_stride).to_kernel();
-        let b_idx = flatten_strides(&self.out_shape, &self.b_stride).to_kernel();
-        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
-        let k_expr = self.k_dim.to_kernel();
-        let a_k_stride_expr = self
-            .a_k_stride
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
-        let b_k_stride_expr = self
-            .b_k_stride
-            .substitute('z', Expression::from(1))
-            .simplify()
-            .to_kernel();
-
-        let kernel = format!(
-            "
-#define WARP_SIZE 32
-#define THREADS_PER_BLOCK 256
-#define FULL_MASK 0xffffffff
-{dyn_defines}
-extern \"C\" {{
-    __global__ void batch_matmul(float *out, const float *A, const float *B{dyn_dims_param}) {{
-        __shared__ float warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
-        long long const_z = blockIdx.x;
-        int tid = threadIdx.x;
-        int lane_id = tid % WARP_SIZE;
-        int warp_id = tid / WARP_SIZE;
-
-        long long a_base = {a_idx};
-        long long b_base = {b_idx};
-        long long K = {k_expr};
-        long long a_k_stride = {a_k_stride_expr};
-        long long b_k_stride = {b_k_stride_expr};
-
-        float partial = 0.0f;
-        for (long long k = tid; k < K; k += THREADS_PER_BLOCK) {{
-            partial += A[a_base + k * a_k_stride] * B[b_base + k * b_k_stride];
-        }}
-
-        #pragma unroll
-        for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            partial += __shfl_down_sync(FULL_MASK, partial, s);
-        }}
-
-        if (lane_id == 0) {{
-            warp_sums[warp_id] = partial;
-        }}
-        __syncthreads();
-
-        if (warp_id == 0) {{
-            int cnt = THREADS_PER_BLOCK / WARP_SIZE;
-            float block_sum = tid < cnt ? warp_sums[tid] : 0.0f;
-
-            #pragma unroll
-            for (int s = cnt / 2; s > 0; s /= 2) {{
-                block_sum += __shfl_down_sync(FULL_MASK, block_sum, s);
-            }}
-
-            if (tid == 0) {{
-                out[{out_idx}] = block_sum;
-            }}
-        }}
-    }}
-}}"
-        );
-
-        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
-            (module.clone(), func.clone())
-        } else {
-            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-            let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("batch_matmul").unwrap();
-            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-            (module, func)
-        };
-
-        (
-            func,
-            module,
-            kernel,
-            (n_outputs, 1.into(), 1.into()),
-            (256.into(), 1.into(), 1.into()),
-            32.into(),
-            FxHashMap::default(),
-        )
-    }
-
-    fn output_size(&self) -> Expression {
-        self.out_shape.iter().copied().product()
-    }
-
-    fn output_bytes(&self) -> Expression {
-        self.output_size() * 4
-    }
-
-    fn bytes_loaded(&self) -> Expression {
-        let n = self.output_size();
-        n * self.k_dim * 2 * 4
-    }
-
-    fn bytes_stored(&self) -> Expression {
-        self.output_size() * 4
-    }
-
-    fn flops(&self) -> Expression {
-        self.output_size() * self.k_dim * 2
-    }
-
-    fn output_dtype(&self) -> DType {
-        self.dtype
-    }
-
-    fn kernel_name(&self) -> &'static str {
-        "BatchMatMul"
     }
 }
 
@@ -1178,6 +663,7 @@ impl EgglogOp for KernelSoftmax {
                     (union ?sm ?ksm)
                     (set (dtype ?ksm) (F32))
                 )
+                :ruleset kernel_lower
                 :name \"softmax-to-kernel-f32\"
             )",
             ),
@@ -1283,9 +769,21 @@ impl KernelOp for KernelSoftmax {
 #define FULL_MASK 0xffffffff
 #define NEG_INF_F __int_as_float(0xff800000)
 {dyn_defines}
+#define LOG2E 1.4426950408889634f
+
 extern \"C\" {{
+    // Online normalizer calculation for softmax (Milakov & Gimelshein 2018).
+
+    // Merge two partial (max, sum) pairs using the online softmax rule.
+    __device__ __forceinline__ void merge_md(float *m, float *d, float m2, float d2) {{
+        float new_m = fmaxf(*m, m2);
+        *d = *d * exp2f((*m - new_m) * LOG2E) + d2 * exp2f((m2 - new_m) * LOG2E);
+        *m = new_m;
+    }}
+
     __global__ void fused_softmax(float *out, const float *inp{dyn_dims_param}) {{
-        __shared__ float shared[THREADS_PER_BLOCK / WARP_SIZE];
+        __shared__ float sh_m[THREADS_PER_BLOCK / WARP_SIZE];
+        __shared__ float sh_d[THREADS_PER_BLOCK / WARP_SIZE];
         long long const_z = blockIdx.x;
         int tid = threadIdx.x;
         int lane_id = tid % WARP_SIZE;
@@ -1297,55 +795,36 @@ extern \"C\" {{
         long long in_stride = {in_reduce_stride};
         long long out_stride = {out_reduce_stride};
 
-        // Pass 1: find max
-        float max_val = NEG_INF_F;
+        // Pass 1: one read of inp produces (global_max, global_sum).
+        float m = NEG_INF_F, d = 0.0f;
         for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
-            max_val = fmaxf(max_val, inp[in_base + i * in_stride]);
+            merge_md(&m, &d, inp[in_base + i * in_stride], 1.0f);
         }}
+        // Warp reduce: collapse 32 threads within each warp down to lane 0.
         #pragma unroll
         for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            max_val = fmaxf(max_val, __shfl_down_sync(FULL_MASK, max_val, s));
+            merge_md(&m, &d, __shfl_down_sync(FULL_MASK, m, s), __shfl_down_sync(FULL_MASK, d, s));
         }}
-        if (lane_id == 0) shared[warp_id] = max_val;
+        if (lane_id == 0) {{ sh_m[warp_id] = m; sh_d[warp_id] = d; }}
         __syncthreads();
+        // Block reduce: warp 0 collapses the 8 warp results down to one.
         if (warp_id == 0) {{
-            max_val = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? shared[tid] : NEG_INF_F;
+            m = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? sh_m[tid] : NEG_INF_F;
+            d = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? sh_d[tid] : 0.0f;
             #pragma unroll
             for (int s = (THREADS_PER_BLOCK / WARP_SIZE) / 2; s > 0; s /= 2) {{
-                max_val = fmaxf(max_val, __shfl_down_sync(FULL_MASK, max_val, s));
+                merge_md(&m, &d, __shfl_down_sync(FULL_MASK, m, s), __shfl_down_sync(FULL_MASK, d, s));
             }}
-            shared[0] = max_val;
+            sh_m[0] = m;
+            sh_d[0] = d;
         }}
         __syncthreads();
-        max_val = shared[0];
+        float global_max = sh_m[0];
+        float inv_sum = 1.0f / sh_d[0];
 
-        // Pass 2: compute exp2 and sum
-        float sum_val = 0.0f;
+        // Pass 2: write final softmax values.
         for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
-            float v = exp2f((inp[in_base + i * in_stride] - max_val) * 1.4426950408889634f);
-            out[out_base + i * out_stride] = v;  // store exp temporarily
-            sum_val += v;
-        }}
-        #pragma unroll
-        for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
-            sum_val += __shfl_down_sync(FULL_MASK, sum_val, s);
-        }}
-        if (lane_id == 0) shared[warp_id] = sum_val;
-        __syncthreads();
-        if (warp_id == 0) {{
-            sum_val = tid < (THREADS_PER_BLOCK / WARP_SIZE) ? shared[tid] : 0.0f;
-            #pragma unroll
-            for (int s = (THREADS_PER_BLOCK / WARP_SIZE) / 2; s > 0; s /= 2) {{
-                sum_val += __shfl_down_sync(FULL_MASK, sum_val, s);
-            }}
-            shared[0] = sum_val;
-        }}
-        __syncthreads();
-        float inv_sum = 1.0f / shared[0];
-
-        // Pass 3: normalize
-        for (long long i = tid; i < N; i += THREADS_PER_BLOCK) {{
-            out[out_base + i * out_stride] *= inv_sum;
+            out[out_base + i * out_stride] = exp2f((inp[in_base + i * in_stride] - global_max) * LOG2E) * inv_sum;
         }}
     }}
 }}"
@@ -1397,372 +876,5 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "Softmax"
-    }
-}
-
-// KernelExp: native exp (uses expf instead of exp2f * constant)
-// Single-kernel alternative to the 3-kernel Constant+Mul+Exp2 path.
-// Improves numerical precision by avoiding the truncated log2(e) constant.
-
-#[derive(Default, Debug, Clone)]
-pub struct KernelExp {
-    shape: Vec<Expression>,
-    in_strides: Vec<Expression>,
-    out_strides: Vec<Expression>,
-    dtype: DType,
-}
-
-impl EgglogOp for KernelExp {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelExp",
-            &[
-                ("shape", ELIST),
-                ("strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Match Exp2(Mul(x, log2e_constant)) directly.
-            // This matches the pattern created by frontend exp() = (self * (1/ln(2))).exp2()
-            Rule::raw(
-                "(rule
-                (
-                    (= ?mul (Op (Mul ?shape ?x_stride ?const_stride ?inter_stride) (ICons ?x (ICons ?exp_const (INil)))))
-                    (= ?exp2 (Op (Exp2 ?shape ?inter_stride ?out_stride) (ICons ?mul (INil))))
-                    (= ?dt (dtype ?x))
-                    (= ?cv (Op (Constant ?val) (INil)))
-                    (= ?exp_const ?cv)
-                    (> ?val 1.44)
-                    (< ?val 1.45)
-                )
-                (
-                    (let ?kexp (Op (KernelExp ?shape ?x_stride ?out_stride ?dt) (ICons ?x (INil))))
-                    (union ?exp2 ?kexp)
-                    (set (dtype ?kexp) ?dt)
-                )
-                :name \"direct-exp-fusion\"
-            )",
-            ),
-        ]
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                in_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[3]),
-            })),
-            input_enodes,
-        )
-    }
-}
-
-impl KernelOp for KernelExp {
-    fn compile(
-        &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    ) -> (
-        CudaFunction,
-        Arc<CudaModule>,
-        String,
-        (Expression, Expression, Expression),
-        (Expression, Expression, Expression),
-        Expression,
-        FxHashMap<char, CudaSlice<u8>>,
-    ) {
-        let vars = self
-            .shape
-            .iter()
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.in_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.out_strides.iter().flat_map(|e| e.dyn_vars()))
-            .collect::<FxHashSet<_>>();
-        let dtype = cuda_dtype(self.dtype);
-        let includes = dtype_includes(&[self.dtype]);
-        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
-        let dyn_dims_param = if vars.is_empty() {
-            ""
-        } else {
-            ", const int* dyn_dims"
-        };
-        let n_elements = self
-            .shape
-            .iter()
-            .copied()
-            .product::<Expression>()
-            .to_kernel();
-        let out_idx = flatten_strides(&self.shape, &self.out_strides).to_kernel();
-        let in_idx = flatten_strides(&self.shape, &self.in_strides).to_kernel();
-        let kernel = format!(
-            "{includes}
-{dyn_defines}
-extern \"C\" {{
-    __global__ void exp_k({dtype} *out, const {dtype} *in{dyn_dims_param}) {{
-        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-        if (const_z >= {n_elements}) return;
-        out[{out_idx}] = expf(in[{in_idx}]);
-    }}
-}}"
-        );
-        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
-            (module.clone(), func.clone())
-        } else {
-            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-            let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("exp_k").unwrap();
-            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-            (module, func)
-        };
-        let out_size = self.shape.iter().copied().product::<Expression>();
-        (
-            func,
-            module,
-            kernel,
-            (out_size.ceil_div(256), 1.into(), 1.into()),
-            (out_size.min(256), 1.into(), 1.into()),
-            0.into(),
-            FxHashMap::default(),
-        )
-    }
-
-    fn output_size(&self) -> Expression {
-        self.shape.iter().copied().product()
-    }
-
-    fn output_bytes(&self) -> Expression {
-        (self.output_size() * self.dtype.bits()).ceil_div(8)
-    }
-
-    fn bytes_loaded(&self) -> Expression {
-        self.output_bytes()
-    }
-
-    fn bytes_stored(&self) -> Expression {
-        self.output_bytes()
-    }
-
-    fn flops(&self) -> Expression {
-        self.shape.iter().copied().product()
-    }
-
-    fn output_dtype(&self) -> DType {
-        self.dtype
-    }
-
-    fn kernel_name(&self) -> &'static str {
-        "Exp"
-    }
-}
-
-// KernelSigmoid: fused sigmoid = 1/(1+exp(-x))
-// Single-kernel alternative to the 5-kernel Neg+Exp+Const+Add+Recip path.
-
-#[derive(Default, Debug, Clone)]
-pub struct KernelSigmoid {
-    shape: Vec<Expression>,
-    in_strides: Vec<Expression>,
-    out_strides: Vec<Expression>,
-    dtype: DType,
-}
-
-impl EgglogOp for KernelSigmoid {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelSigmoid",
-            &[
-                ("shape", ELIST),
-                ("strides", ELIST),
-                ("out_strides", ELIST),
-                ("dtype", DTYPE),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        1
-    }
-
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Match the HLIR pattern directly: Recip(Add(Exp2(Mul(Mul(x, -1), log2e)), 1))
-            Rule::raw(
-                "(rule
-                (
-                    (= ?neg1 (Op (Constant ?nv) (INil)))
-                    (< ?nv -0.99)
-                    (> ?nv -1.01)
-                    (= ?neg_x (Op (Mul ?shape ?x_stride ?neg_stride ?neg_out_stride) (ICons ?x (ICons ?neg1 (INil)))))
-                    (= ?log2e (Op (Constant ?lv) (INil)))
-                    (> ?lv 1.44)
-                    (< ?lv 1.45)
-                    (= ?scaled (Op (Mul ?shape ?neg_out_stride ?log2e_stride ?scaled_stride) (ICons ?neg_x (ICons ?log2e (INil)))))
-                    (= ?exp2 (Op (Exp2 ?shape ?scaled_stride ?exp_stride) (ICons ?scaled (INil))))
-                    (= ?one (Op (Constant ?ov) (INil)))
-                    (> ?ov 0.99)
-                    (< ?ov 1.01)
-                    (= ?plus_one (Op (Add ?shape ?exp_stride ?one_stride ?add_stride) (ICons ?exp2 (ICons ?one (INil)))))
-                    (= ?sig_out (Op (Recip ?shape ?add_stride ?out_stride) (ICons ?plus_one (INil))))
-                    (= ?dt (dtype ?x))
-                )
-                (
-                    (let ?ksig (Op (KernelSigmoid ?shape ?x_stride ?out_stride ?dt) (ICons ?x (INil))))
-                    (union ?sig_out ?ksig)
-                    (set (dtype ?ksig) ?dt)
-                )
-                :name \"direct-sigmoid-fusion\"
-            )",
-            ),
-        ]
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
-                in_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
-                    .unwrap(),
-                out_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
-                    .unwrap(),
-                dtype: extract_dtype(egraph, kind_children[3]),
-            })),
-            input_enodes,
-        )
-    }
-}
-
-impl KernelOp for KernelSigmoid {
-    fn compile(
-        &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    ) -> (
-        CudaFunction,
-        Arc<CudaModule>,
-        String,
-        (Expression, Expression, Expression),
-        (Expression, Expression, Expression),
-        Expression,
-        FxHashMap<char, CudaSlice<u8>>,
-    ) {
-        let vars = self
-            .shape
-            .iter()
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.in_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.out_strides.iter().flat_map(|e| e.dyn_vars()))
-            .collect::<FxHashSet<_>>();
-        let dtype = cuda_dtype(self.dtype);
-        let includes = dtype_includes(&[self.dtype]);
-        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
-        let dyn_dims_param = if vars.is_empty() {
-            ""
-        } else {
-            ", const int* dyn_dims"
-        };
-        let n_elements = self
-            .shape
-            .iter()
-            .copied()
-            .product::<Expression>()
-            .to_kernel();
-        let out_idx = flatten_strides(&self.shape, &self.out_strides).to_kernel();
-        let in_idx = flatten_strides(&self.shape, &self.in_strides).to_kernel();
-        let kernel = format!(
-            "{includes}
-{dyn_defines}
-extern \"C\" {{
-    __global__ void sigmoid_k({dtype} *out, const {dtype} *in{dyn_dims_param}) {{
-        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-        if (const_z >= {n_elements}) return;
-        out[{out_idx}] = 1.0f / (1.0f + expf(-in[{in_idx}]));
-    }}
-}}"
-        );
-        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
-            (module.clone(), func.clone())
-        } else {
-            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-            let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("sigmoid_k").unwrap();
-            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-            (module, func)
-        };
-        let out_size = self.shape.iter().copied().product::<Expression>();
-        (
-            func,
-            module,
-            kernel,
-            (out_size.ceil_div(256), 1.into(), 1.into()),
-            (out_size.min(256), 1.into(), 1.into()),
-            0.into(),
-            FxHashMap::default(),
-        )
-    }
-
-    fn output_size(&self) -> Expression {
-        self.shape.iter().copied().product()
-    }
-
-    fn output_bytes(&self) -> Expression {
-        (self.output_size() * self.dtype.bits()).ceil_div(8)
-    }
-
-    fn bytes_loaded(&self) -> Expression {
-        self.output_bytes()
-    }
-
-    fn bytes_stored(&self) -> Expression {
-        self.output_bytes()
-    }
-
-    fn flops(&self) -> Expression {
-        // neg + exp + add + recip = ~4 ops per element
-        self.shape.iter().copied().product::<Expression>() * 4
-    }
-
-    fn output_dtype(&self) -> DType {
-        self.dtype
-    }
-
-    fn kernel_name(&self) -> &'static str {
-        "Sigmoid"
     }
 }

@@ -3,7 +3,9 @@ use std::fmt::Debug;
 use crate::egglog_utils::{
     extract_generation, hash_choice_set, random_initial_choice, validate_choice_set,
 };
-use crate::hlir::Output;
+use crate::hlir::{
+    Add as ReferenceAdd, LessThan as ReferenceLessThan, Output, ReferenceData, ReferenceOp,
+};
 use crate::prelude::*;
 use candle_core::{Device, Tensor};
 use proptest::prelude::*;
@@ -23,8 +25,8 @@ proptest! {
         let a = (b * c + g).output();
         let d = (b * c / e).sin().output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), CompileOptions::default().search_graph_limit(1));
 
         rt.set_data(b.id, vals.clone());
         rt.set_data(c.id, vals.clone());
@@ -57,8 +59,8 @@ proptest! {
 
         let a = b.matmul(c).output();
 
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), CompileOptions::default().search_graph_limit(1));
         let lhs = lhs.into_iter().take(m * k).collect::<Vec<f32>>();
         let rhs = rhs.into_iter().take(k * n).collect::<Vec<f32>>();
         rt.set_data(b.id, lhs.clone());
@@ -81,8 +83,8 @@ proptest! {
         let mut cx = Graph::new();
         let a = cx.tensor((2, 2));
         let b = (a.permute((1, 0)) * 1.0).output();
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), CompileOptions::default().search_graph_limit(1));
         rt.set_data(a.id, values.clone());
         rt.execute(&cx.dyn_map);
 
@@ -98,8 +100,8 @@ proptest! {
         let kth_largest = a.gather(a.topk_indexes(k, 1).slice((.., (k - 1)..k)).squeeze(1));
         let mask = a.ge(kth_largest.expand_dim(1, cols)).cast(crate::dtype::DType::F32);
         let filtered = (a * mask).output();
-        cx.build_search_space::<NativeRuntime>();
-        let mut rt = cx.search(NativeRuntime::default(), 1);
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), CompileOptions::default().search_graph_limit(1));
         let values = values.into_iter().take(rows * cols).collect::<Vec<f32>>();
         rt.set_data(a.id, values.clone());
         rt.execute(&cx.dyn_map);
@@ -191,7 +193,7 @@ fn fuzz_test_genome_validity() {
     let _out = f.output();
 
     // Build search space
-    cx.build_search_space::<NativeRuntime>();
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
     let ops = cx.egglog_ops().unwrap();
 
@@ -334,7 +336,7 @@ fn fuzz_test_genome_execution() {
     let b = cx.tensor((2, 3));
     let c = (a + b).relu().output();
 
-    cx.build_search_space::<NativeRuntime>();
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     let egraph = cx.egraph().unwrap();
     let ops = cx.egglog_ops().unwrap();
 
@@ -382,7 +384,7 @@ fn fuzz_test_genome_execution() {
                 None,
             );
 
-            let mut rt = NativeRuntime::default();
+            let mut rt = ReferenceRuntime::default();
             rt.load_llir(&llir_graph);
             rt.set_data(a.id, test_input_a.clone());
             rt.set_data(b.id, test_input_b.clone());
@@ -431,13 +433,44 @@ fn fuzz_test_genome_execution() {
 // --- Consumed-input semantics tests ---
 
 #[test]
+#[should_panic(expected = "Add inputs must have the same dtype")]
+fn reference_add_rejects_mixed_dtypes() {
+    let op = ReferenceAdd {
+        shape: vec![2.into()],
+        a_strides: vec![1.into()],
+        b_strides: vec![1.into()],
+        input_shapes: vec![],
+    };
+    let a = ReferenceData::F32(vec![1.0, 2.0]);
+    let b = ReferenceData::Int(vec![1, 2]);
+    op.execute(vec![&a, &b], &FxHashMap::default());
+}
+
+#[test]
+#[should_panic(expected = "LessThan inputs must have the same dtype")]
+fn reference_less_than_rejects_mixed_dtypes() {
+    let op = ReferenceLessThan {
+        shape: vec![2.into()],
+        a_strides: vec![1.into()],
+        b_strides: vec![1.into()],
+        input_shapes: vec![],
+    };
+    let a = ReferenceData::F32(vec![1.0, 2.0]);
+    let b = ReferenceData::Int(vec![1, 2]);
+    op.execute(vec![&a, &b], &FxHashMap::default());
+}
+
+#[test]
 #[should_panic]
 fn test_inputs_consumed_after_execute() {
     let mut cx = Graph::new();
     let a = cx.tensor(3);
     let _b = (a * 2.0).output();
-    cx.build_search_space::<NativeRuntime>();
-    let mut rt = cx.search(NativeRuntime::default(), 1);
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = cx.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
     rt.execute(&cx.dyn_map);
     // Second execute should panic — input 'a' was consumed
@@ -452,8 +485,11 @@ fn test_passthrough_preserves_weights() {
     let y = (w * x).output();
     w.persist();
 
-    cx.build_search_space::<NativeRuntime>();
-    let mut rt = cx.search(NativeRuntime::default(), 1);
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = cx.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
 
     // Iteration 1
     rt.set_data(w.id, vec![1.0, 2.0, 3.0]);
@@ -474,8 +510,11 @@ fn test_only_outputs_remain() {
     let mut cx = Graph::new();
     let a = cx.tensor(3);
     let _b = (a * 2.0).output();
-    cx.build_search_space::<NativeRuntime>();
-    let mut rt = cx.search(NativeRuntime::default(), 1);
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = cx.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
     rt.set_data(a.id, vec![1.0, 2.0, 3.0]);
     rt.execute(&cx.dyn_map);
     let output_count = rt
@@ -484,4 +523,60 @@ fn test_only_outputs_remain() {
         .filter(|n| (**rt.graph[*n]).as_any().is::<Output>())
         .count();
     assert_eq!(rt.buffers.len(), output_count);
+}
+
+fn build_repeated_block_graph(
+    layers: usize,
+    width: usize,
+) -> (Graph, NodeIndex, Vec<NodeIndex>, NodeIndex) {
+    let mut cx = Graph::new();
+    let x = cx.tensor(width);
+    let mut state = x;
+    let mut weight_nodes = Vec::with_capacity(layers * 2);
+    for i in 0..layers {
+        let w = cx.named_tensor(format!("w_{i}"), width);
+        let b = cx.named_tensor(format!("b_{i}"), width);
+        weight_nodes.push(w.id);
+        weight_nodes.push(b.id);
+        state = ((state * w) + b).sin();
+    }
+    let y = state.output();
+    (cx, x.id, weight_nodes, y.id)
+}
+
+fn repeated_block_reference(layers: usize, input: &[f32], weights: &[Vec<f32>]) -> Vec<f32> {
+    let mut state = input.to_vec();
+    for i in 0..layers {
+        let w = &weights[i * 2];
+        let b = &weights[i * 2 + 1];
+        for ((s, wi), bi) in state.iter_mut().zip(w.iter()).zip(b.iter()) {
+            *s = (*s * *wi + *bi).sin();
+        }
+    }
+    state
+}
+
+#[test]
+fn integration_auto_loop_rolling_matches_reference_runtime() {
+    let layers = 12;
+    let width = 16;
+    let input = random_vec(width);
+    let weights: Vec<Vec<f32>> = (0..layers * 2).map(|_| random_vec(width)).collect();
+
+    let reference = repeated_block_reference(layers, &input, &weights);
+
+    let (mut graph, input_id, weight_ids, output_id) = build_repeated_block_graph(layers, width);
+    graph.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = graph.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
+    rt.set_data(input_id, input);
+    for (node, data) in weight_ids.iter().zip(weights.iter()) {
+        rt.set_data(*node, data.clone());
+    }
+    rt.execute(&graph.dyn_map);
+    let out = rt.get_f32(output_id);
+
+    assert_close(&reference, out);
 }

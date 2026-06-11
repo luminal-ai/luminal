@@ -1,18 +1,14 @@
 [package]
 name = "gemma"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [features]
-default = ["cuda"]
-cuda = ["dep:luminal_cuda_lite"]
-metal = ["dep:luminal_metal"]
 
 [dependencies]
 luminal = { path = "../.." }
 luminal_nn = { path = "../../crates/luminal_nn" }
-luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }
-luminal_metal = { path = "../../crates/luminal_metal", optional = true }
+luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 luminal_tracing = {path="../../crates/luminal_tracing"}
 tokenizers = "0.22.2"
 tracing = "0.1.43"

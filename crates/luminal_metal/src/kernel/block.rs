@@ -2,14 +2,14 @@ use super::MetalKernelOp;
 use itertools::Itertools;
 use luminal::{
     egglog_utils::{
-        api::{sort, SortDef},
+        api::{SortDef, sort},
         base::{ELIST, EXPRESSION, F64 as EggF64, IR},
     },
     graph::LLIRGraph,
     hlir::Output,
     op::{EgglogOp, LLIROp},
     prelude::{
-        petgraph::{algo::toposort, visit::EdgeRef, Direction},
+        petgraph::{Direction, algo::toposort, visit::EdgeRef},
         *,
     },
 };
@@ -770,7 +770,7 @@ mod tests {
             _device: &Device,
             _input_dtypes: &[DType],
             _output_dtype: DType,
-        ) -> ComputePipelineState {
+        ) -> Option<ComputePipelineState> {
             unreachable!("test kernel op should never compile")
         }
 
@@ -778,7 +778,7 @@ mod tests {
             self.output_size
         }
 
-        fn encode(
+        fn encode_compute(
             &self,
             _encoder: &ComputeCommandEncoderRef,
             _pipeline: &ComputePipelineState,

@@ -1,3 +1,4 @@
+pub mod dyn_backend;
 pub mod host;
 pub mod kernel;
 pub mod runtime;
@@ -8,6 +9,8 @@ use std::{
 };
 
 pub use cudarc;
+
+use cudarc::{cublaslt::CudaBlasLT, driver::CudaStream};
 
 #[cfg(test)]
 mod tests;
@@ -30,6 +33,7 @@ fn cuda_dtype(dtype: DType) -> &'static str {
         DType::Bf16 => "__nv_bfloat16",
         DType::TF32 => "float", // TF32 uses float storage, tensor cores handle the format
         DType::Int => "int",
+        DType::I64 => "long long",
         DType::I16 => "short",
         DType::U16 => "unsigned short",
         DType::I8 => "signed char",
@@ -137,6 +141,25 @@ fn cuda_driver_diagnostics() -> (Option<i32>, Option<i32>) {
     (driver_version, None)
 }
 
+pub(crate) fn try_create_cublaslt(
+    stream: Arc<CudaStream>,
+) -> std::result::Result<Arc<CudaBlasLT>, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CudaBlasLT::new(stream))) {
+        Ok(Ok(handle)) => Ok(Arc::new(handle)),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(payload) => {
+            let message = if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else if let Some(message) = payload.downcast_ref::<&str>() {
+                message.to_string()
+            } else {
+                "cuBLASLt initialization panicked".to_string()
+            };
+            Err(message)
+        }
+    }
+}
+
 fn cuda_nvrtc_compile_options(target_arch: &str) -> Vec<String> {
     let mut options = cuda_nvrtc_include_paths()
         .into_iter()
@@ -186,9 +209,9 @@ fn get_cubin(program: nvrtc_sys::nvrtcProgram) -> Result<Vec<u8>, NvrtcError> {
     }
 
     let mut cubin = Vec::with_capacity(cubin_size);
-    cubin.resize(cubin_size, 0);
-    unsafe { nvrtc_sys::nvrtcGetCUBIN(program, cubin.as_mut_ptr()) }.result()?;
-    Ok(cubin.into_iter().map(|byte| byte as u8).collect())
+    cubin.resize(cubin_size, 0u8);
+    unsafe { nvrtc_sys::nvrtcGetCUBIN(program, cubin.as_mut_ptr() as *mut _) }.result()?;
+    Ok(cubin)
 }
 
 pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(

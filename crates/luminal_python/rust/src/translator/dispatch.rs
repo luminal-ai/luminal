@@ -5,6 +5,8 @@ use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
 use super::Translator;
+use super::attention::SdpaVariant;
+use super::reduction::ArgExtremum;
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_node(&mut self, node: &Node) -> Result<()> {
@@ -51,6 +53,7 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.sub.Scalar" => self.translate_binary_scalar_op(node, BinaryOp::Sub)?,
             "torch.ops.aten.div.Tensor" => self.translate_binary_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Scalar" => self.translate_binary_scalar_op(node, BinaryOp::Div)?,
+            "torch.ops.aten.div.Tensor_mode" => self.translate_div_tensor_mode(node)?,
 
             // Unary ops
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
@@ -67,10 +70,14 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.sigmoid.default" => self.translate_unary_op(node, |a| a.sigmoid())?,
             "torch.ops.aten.relu.default" => self.translate_unary_op(node, |a| a.relu())?,
             "torch.ops.aten.tanh.default" => self.translate_unary_op(node, |a| a.tanh())?,
+            "torch.ops.aten.silu.default" => self.translate_unary_op(node, |a| a.silu())?,
+            "torch.ops.aten.gelu.default" => self.translate_unary_op(node, |a| a.gelu())?,
             "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
             "torch.ops.aten.log.default" => self.translate_unary_op(node, |a| a.log())?,
             "torch.ops.aten.log2.default" => self.translate_unary_op(node, |a| a.log2())?,
             "torch.ops.aten.exp2.default" => self.translate_unary_op(node, |a| a.exp2())?,
+            "torch.ops.aten.sign.default" => self.translate_sign(node)?,
+            "torch.ops.aten.bitwise_not.default" => self.translate_bitwise_not(node)?,
 
             // Cast
             "torch.ops.aten._to_copy.default" => self.translate_to_copy(node)?,
@@ -109,6 +116,7 @@ impl<'a> Translator<'a> {
                 let a = self.get_input_tensor(node, 0)?;
                 if !a.shape.is_contiguous() { a + 0.0 } else { a }
             }
+            "torch.ops.aten.argsort.default" => self.translate_argsort(node)?,
 
             // Matmul
             "torch.ops.aten.mm.default" | "torch.ops.aten.bmm.default" => {
@@ -140,6 +148,7 @@ impl<'a> Translator<'a> {
 
             // Slice/index ops
             "torch.ops.aten.slice.Tensor" => self.translate_slice(node)?,
+            "torch.ops.aten.select.int" => self.translate_select(node)?,
             "torch.ops.aten.cat.default" => self.translate_cat(node)?,
             "torch.ops.aten.index.Tensor" => self.translate_index_tensor(node)?,
 
@@ -159,12 +168,18 @@ impl<'a> Translator<'a> {
 
             // Where
             "torch.ops.aten.where.self" => self.translate_where(node)?,
+            "torch.ops.aten.where.ScalarOther" => self.translate_where_scalar_other(node)?,
+            "torch.ops.aten.masked_fill.Scalar" => self.translate_masked_fill_scalar(node)?,
 
             // Pow
             "torch.ops.aten.pow.Tensor_Scalar" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let exp = self.get_float_arg(node, 1)?;
-                a.pow(exp as f32)
+                if (exp - 2.0).abs() < f64::EPSILON {
+                    a * a
+                } else {
+                    a.pow(exp as f32)
+                }
             }
             "torch.ops.aten.pow.Tensor_Tensor" => {
                 let a = self.get_input_tensor(node, 0)?;
@@ -176,6 +191,29 @@ impl<'a> Translator<'a> {
             // Creation ops
             "torch.ops.aten.arange.start_step" => self.translate_arange(node)?,
             "torch.ops.aten.full.default" => self.translate_full(node)?,
+            "torch.ops.aten.full_like.default" => self.translate_full_like(node)?,
+            // `empty` and `empty_permuted` allocate uninitialised tensors of
+            // a given shape; the caller fills them. We lower to zeros with
+            // the same shape+dtype — downstream reads are officially UB on
+            // PyTorch's side, and downstream writes overwrite our zeros.
+            // Qwen3MoE's MoE block uses `empty_permuted` to allocate the
+            // expert-output staging tensor before scatter-adding into it.
+            "torch.ops.aten.empty.memory_format" | "torch.ops.aten.empty_permuted.default" => {
+                self.translate_empty(node)?
+            }
+            // Qwen3-MoE's expert-balance counts tokens-per-expert via histc.
+            "torch.ops.aten.histc.default" => self.translate_histc(node)?,
+
+            // Grouped matmul (MoE expert dispatch).
+            // aten._grouped_mm is the native op; transformers::grouped_mm_fallback
+            // is a Python-implemented custom_op (transformers/integrations/moe.py)
+            // used by HF MoE when _grouped_mm isn't available for the activation
+            // dtype. Both have identical (input, weight, offs) signature; route
+            // both through the same batched-matmul + group-mask lowering.
+            "torch.ops.aten._grouped_mm.default"
+            | "torch.ops.transformers.grouped_mm_fallback.default" => {
+                self.translate_grouped_mm(node)?
+            }
             "torch.ops.aten.scalar_tensor.default" => {
                 let val = self.get_float_arg(node, 0)? as f32;
                 self.graph.constant_float(val)
@@ -187,6 +225,16 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.le.Scalar" => self.translate_scalar_comparison(node, |a, s| a.le(s))?,
 
             // Tensor comparisons
+            "torch.ops.aten.eq.Scalar" => {
+                let a = self.get_input_tensor(node, 0)?;
+                let val = self.get_float_arg(node, 1)? as f32;
+                let scalar = self
+                    .graph
+                    .constant_float(val)
+                    .cast(a.dtype)
+                    .expand_rhs(a.shape);
+                a.eq(scalar)
+            }
             "torch.ops.aten.ne.Scalar" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let val = self.get_float_arg(node, 1)? as f32;
@@ -204,6 +252,13 @@ impl<'a> Translator<'a> {
                 let (a, b) = broadcast_binary(a, b);
                 a.eq(b)
             }
+            "torch.ops.aten.ne.Tensor" => {
+                let a = self.get_input_tensor(node, 0)?;
+                let b = self.get_input_tensor(node, 1)?;
+                let (a, b) = ensure_same_dtype(a, b);
+                let (a, b) = broadcast_binary(a, b);
+                a.ne(b)
+            }
             "torch.ops.aten.le.Tensor" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
@@ -219,7 +274,11 @@ impl<'a> Translator<'a> {
                 let b = b.cast(DType::F32);
                 (a * b).cast(DType::Bool)
             }
-            "torch.ops.aten.logical_or.default" => {
+            "torch.ops.aten.bitwise_or.Tensor" | "torch.ops.aten.logical_or.default" => {
+                // Both arms use the same bool-OR lowering. Gemma-4's sliding+full
+                // attention mask fusion emits bitwise_or on boolean tensors; the
+                // integer semantics of bitwise_or aren't exercised by any op in
+                // the test suite, so we rely on inputs being boolean-typed.
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
@@ -238,18 +297,27 @@ impl<'a> Translator<'a> {
 
             // Clamp
             "torch.ops.aten.clamp.default" => self.translate_clamp(node)?,
+            "torch.ops.aten.clamp.Tensor" => self.translate_clamp_tensor(node)?,
 
             // Cumsum
             "torch.ops.aten.cumsum.default" => {
                 let a = self.get_input_tensor(node, 0)?;
-                let dim = self.get_int_arg(node, 1)?;
-                let dim = normalize_dim(dim, a.shape.len());
                 let a = if a.dtype == DType::Bool {
                     a.cast(DType::Int)
                 } else {
                     a
                 };
-                a.cumsum(dim)
+                // Rank-0 (scalar) input: cumsum of a single element is the element
+                // itself. PyTorch eager treats `dim=0` on a 0-d as an identity op,
+                // and the underlying `cumop` indexes `shape.dims[axis]` which would
+                // panic with empty dims.
+                if a.shape.is_empty() {
+                    a
+                } else {
+                    let dim = self.get_int_arg(node, 1)?;
+                    let dim = normalize_dim(dim, a.shape.len());
+                    a.cumsum(dim)
+                }
             }
 
             // Floor / Ceil / Erf (approximations)
@@ -262,12 +330,14 @@ impl<'a> Translator<'a> {
             }
             "torch.ops.aten.ceil.default" => {
                 let a = self.get_input_tensor(node, 0)?;
-                // ceil(x) = -floor(-x)
-                let neg_a = a * (-1.0);
-                let trunc = neg_a.cast(DType::Int).cast(DType::F32);
-                let adjust = neg_a.lt(trunc).cast(DType::F32);
-                let floor_neg = trunc - adjust;
-                floor_neg * (-1.0)
+                // ceil(x) = trunc(x) + (x > trunc(x)).
+                // Cast-to-Int rounds toward zero, so for any positive fractional
+                // `x` the trunc sits below `x` and we add 1; for negatives we
+                // have `trunc >= x` and adjust=0. Avoids the two extra
+                // mul-by-(-1) nodes that the `-floor(-x)` lowering emits.
+                let trunc = a.cast(DType::Int).cast(DType::F32);
+                let adjust = a.gt(trunc).cast(DType::F32);
+                trunc + adjust
             }
             "torch.ops.aten.erf.default" => {
                 let a = self.get_input_tensor(node, 0)?;
@@ -343,17 +413,67 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.max.default" => self.translate_reduction(node, ReductionOp::Max)?,
             "torch.ops.aten.min.default" => self.translate_reduction(node, ReductionOp::Min)?,
             "torch.ops.aten.amin.default" => self.translate_reduction(node, ReductionOp::Min)?,
+            "torch.ops.aten.prod.default" => self.translate_reduction(node, ReductionOp::Prod)?,
+
+            // Argmax / argmin — built on top of `stable_argsort` (LUM-496).
+            // PyTorch's argmax/argmin returns int64; the dtype is preserved
+            // through the LUM-486 boundary widening.
+            "torch.ops.aten.argmax.default" => {
+                self.translate_argextremum(node, ArgExtremum::Max)?
+            }
+            "torch.ops.aten.argmin.default" => {
+                self.translate_argextremum(node, ArgExtremum::Min)?
+            }
 
             // Gather (axis-aware)
             "torch.ops.aten.gather.default" => self.translate_gather(node)?,
 
             // Scatter ops
             "torch.ops.aten.scatter.src" => self.translate_scatter_src(node)?,
-            "torch.ops.aten.index_put.default" => self.translate_index_put(node)?,
+            "torch.ops.aten.scatter.value" => self.translate_scatter_value(node)?,
+            "torch.ops.aten.index_put_.default" | "torch.ops.aten.index_put.default" => {
+                self.translate_index_put(node)?
+            }
+
+            // Integer routing math
+            "torch.ops.aten.floor_divide.default" => self.translate_floor_divide(node)?,
+
+            // Triangular
+            "torch.ops.aten.tril.default" => self.translate_tril(node)?,
+            "torch.ops.aten.triu.default" => self.translate_triu(node)?,
 
             // TopK — handles its own output storage, returns early
             "torch.ops.aten.topk.default" => {
                 self.translate_topk(node)?;
+                return Ok(());
+            }
+
+            // Sort — handles its own output storage, returns early
+            "torch.ops.aten.sort.default" => {
+                self.translate_sort(node)?;
+                return Ok(());
+            }
+
+            // Scaled dot-product attention — each variant binds args slightly
+            // differently but all lower to matmul+softmax via translate_sdpa.
+            "torch.ops.aten._scaled_dot_product_efficient_attention.default" => {
+                self.translate_sdpa(node, SdpaVariant::Efficient)?;
+                return Ok(());
+            }
+            "torch.ops.aten._scaled_dot_product_flash_attention.default" => {
+                self.translate_sdpa(node, SdpaVariant::Flash)?;
+                return Ok(());
+            }
+            "torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default" => {
+                self.translate_sdpa(node, SdpaVariant::FlashForCpu)?;
+                return Ok(());
+            }
+            "torch.ops.aten._scaled_dot_product_cudnn_attention.default" => {
+                self.translate_sdpa(node, SdpaVariant::Cudnn)?;
+                return Ok(());
+            }
+            "torch.ops.aten.scaled_dot_product_attention.default" => {
+                self.translate_sdpa(node, SdpaVariant::Unified)?;
                 return Ok(());
             }
 
@@ -366,6 +486,28 @@ impl<'a> Translator<'a> {
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
                 a % b
+            }
+            // Remainder (Python-style modulo). For float tensors aten.remainder
+            // returns the same value as `%` would in luminal (Mod follows the
+            // language's % semantics on f32). The Tensor variant accepts a
+            // tensor RHS that may be rank-0; broadcast both operands so a
+            // scalar RHS is expanded to match the LHS shape before mod.
+            "torch.ops.aten.remainder.Tensor" => {
+                let a = self.get_input_tensor(node, 0)?;
+                let b = self.get_input_tensor(node, 1)?;
+                let (a, b) = ensure_same_dtype(a, b);
+                let (a, b) = broadcast_binary(a, b);
+                a % b
+            }
+            "torch.ops.aten.remainder.Scalar" => {
+                let a = self.get_input_tensor(node, 0)?;
+                let val = self.get_float_arg(node, 1)? as f32;
+                let scalar = self
+                    .graph
+                    .constant_float(val)
+                    .cast(a.dtype)
+                    .expand_rhs(a.shape);
+                a % scalar
             }
             // Prod reduction
             "torch.ops.aten.prod.dim_int" => self.translate_reduction(node, ReductionOp::Prod)?,
