@@ -278,9 +278,18 @@ pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
     }
     // Post-mortem aid: with LUMINAL_DUMP_KERNEL_SRC set, the file holds the
     // source currently inside nvrtcCompileProgram — if a compile hangs, the
-    // last-written file is the culprit.
-    if std::env::var_os("LUMINAL_DUMP_KERNEL_SRC").is_some() {
-        let _ = std::fs::write("/tmp/luminal_last_kernel.cu", src.as_ref());
+    // last-written file is the culprit. A path value (starting with '/')
+    // appends every compile as a numbered file there instead, so the exact
+    // in-process compile sequence can be replayed standalone.
+    if let Ok(dump) = std::env::var("LUMINAL_DUMP_KERNEL_SRC") {
+        if let Some(dir) = dump.starts_with('/').then_some(dump.as_str()) {
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(format!("{dir}/{n:05}.cu"), src.as_ref());
+        } else if !dump.is_empty() {
+            let _ = std::fs::write("/tmp/luminal_last_kernel.cu", src.as_ref());
+        }
     }
 
     let source = CString::new(src.as_ref().as_bytes())
