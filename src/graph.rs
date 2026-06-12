@@ -858,7 +858,7 @@ impl Graph {
         let probe_windows = rolling_probe_window_sizes(max_window);
         let node_hashes: Vec<u64> = topo
             .iter()
-            .map(|&node| cheap_rolling_node_hash(&self.graph, node))
+            .map(|&node| cheap_rolling_node_hash(&self.graph, node, &self.custom_ops))
             .collect();
         let rolling_hash = RollingHash64::new(&node_hashes);
         let mut diagnostics = RollingSearchDiagnostics::default();
@@ -884,7 +884,7 @@ impl Graph {
                 let mut starts = vec![];
                 let first_nodes = topo[start..start + window].to_vec();
                 let Some((sig, first_boundary, first_outputs)) =
-                    canonicalize_occurrence(&self.graph, &first_nodes, &uses, &topo_index)
+                    canonicalize_occurrence(&self.graph, &first_nodes, &uses, &topo_index, &self.custom_ops)
                 else {
                     start += 1;
                     continue;
@@ -903,7 +903,7 @@ impl Graph {
                     }
                     let nodes = topo[pos..pos + window].to_vec();
                     let Some((next_sig, boundary_inputs, output_nodes)) =
-                        canonicalize_occurrence(&self.graph, &nodes, &uses, &topo_index)
+                        canonicalize_occurrence(&self.graph, &nodes, &uses, &topo_index, &self.custom_ops)
                     else {
                         break;
                     };
@@ -985,7 +985,7 @@ impl Graph {
             }
         }
         let mut grown_best = best_overall.take().map(|best| {
-            grow_rolling_candidate(&self.graph, &uses, &topo_index, best, &discovered_runs)
+            grow_rolling_candidate(&self.graph, &uses, &topo_index, best, &discovered_runs, &self.custom_ops)
         });
         for run in &discovered_runs {
             let state_param_indices = collect_state_params(&run.occurrences, &uses, &self.graph);
@@ -995,7 +995,7 @@ impl Graph {
                 savings: 0,
             };
             let grown =
-                grow_rolling_candidate(&self.graph, &uses, &topo_index, seed, &discovered_runs);
+                grow_rolling_candidate(&self.graph, &uses, &topo_index, seed, &discovered_runs, &self.custom_ops);
             if grown.state_param_indices.is_empty() {
                 continue;
             }
@@ -2012,8 +2012,12 @@ impl RollingHash64 {
     }
 }
 
-fn cheap_rolling_node_hash(graph: &HLIRGraph, node: NodeIndex) -> u64 {
-    let op = rolling_op_signature(graph, node);
+fn cheap_rolling_node_hash(
+    graph: &HLIRGraph,
+    node: NodeIndex,
+    custom_ops: &[Box<dyn CustomOp>],
+) -> u64 {
+    let op = rolling_op_signature(graph, node, custom_ops);
     let mut hash: u64 = 1469598103934665603;
     for byte in op.as_bytes() {
         hash ^= u64::from(*byte);
@@ -2027,9 +2031,22 @@ fn cheap_rolling_node_hash(graph: &HLIRGraph, node: NodeIndex) -> u64 {
     hash
 }
 
-fn rolling_op_signature(graph: &HLIRGraph, node: NodeIndex) -> String {
+fn rolling_op_signature(
+    graph: &HLIRGraph,
+    node: NodeIndex,
+    custom_ops: &[Box<dyn CustomOp>],
+) -> String {
     if graph[node].as_any().is::<crate::hlir::Output>() {
         return "Output".to_string();
+    }
+    if let Some(kind) = graph[node].as_any().downcast_ref::<CustomOpKind>() {
+        // The `id` is a global custom_ops index and differs for every call
+        // (e.g. one rope per layer), which would make structurally identical
+        // layer bodies hash differently and defeat loop rolling. Hash the
+        // referenced op's content instead: identical custom ops (same kernel
+        // parameters) compare equal across layers, distinct ones stay
+        // distinct.
+        return format!("CustomOp({:?}, {:?})", custom_ops[kind.id], kind.dtype);
     }
 
     // Use Debug, NOT Display — Display for many HLIR ops drops their
@@ -2054,6 +2071,7 @@ fn canonicalize_occurrence(
     ordered_nodes: &[NodeIndex],
     uses: &FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>>,
     topo_index: &FxHashMap<NodeIndex, usize>,
+    custom_ops: &[Box<dyn CustomOp>],
 ) -> Option<(String, Vec<NodeIndex>, Vec<NodeIndex>)> {
     let region: FxHashSet<NodeIndex> = ordered_nodes.iter().copied().collect();
     if region.is_empty() {
@@ -2069,7 +2087,7 @@ fn canonicalize_occurrence(
     let mut node_parts = vec![];
 
     for &node in ordered_nodes {
-        let op = rolling_op_signature(graph, node);
+        let op = rolling_op_signature(graph, node, custom_ops);
         let inputs: Vec<NodeIndex> = graph
             .edges_directed(node, Direction::Incoming)
             .sorted_by_key(|e| e.id())
@@ -2173,6 +2191,7 @@ fn grow_rolling_candidate(
     topo_index: &FxHashMap<NodeIndex, usize>,
     mut candidate: RollingCandidate,
     discovered_runs: &[RollingRun],
+    custom_ops: &[Box<dyn CustomOp>],
 ) -> RollingCandidate {
     loop {
         let candidate_starts: Vec<usize> = candidate
@@ -2222,7 +2241,7 @@ fn grow_rolling_candidate(
                     };
                     nodes.sort_by_key(|n| topo_index[n]);
                     let Some((sig, boundary_inputs, output_nodes)) =
-                        canonicalize_occurrence(graph, &nodes, uses, topo_index)
+                        canonicalize_occurrence(graph, &nodes, uses, topo_index, custom_ops)
                     else {
                         merged_occs.clear();
                         break;
@@ -2241,11 +2260,11 @@ fn grow_rolling_candidate(
                     continue;
                 }
                 let first_sig =
-                    canonicalize_occurrence(graph, &merged_occs[0].nodes, uses, topo_index)
+                    canonicalize_occurrence(graph, &merged_occs[0].nodes, uses, topo_index, custom_ops)
                         .map(|(sig, _, _)| sig);
                 let Some(first_sig) = first_sig else { continue };
                 if merged_occs.iter().skip(1).any(|occ| {
-                    canonicalize_occurrence(graph, &occ.nodes, uses, topo_index)
+                    canonicalize_occurrence(graph, &occ.nodes, uses, topo_index, custom_ops)
                         .map(|(sig, _, _)| sig != first_sig)
                         .unwrap_or(true)
                 }) {

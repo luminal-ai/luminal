@@ -256,6 +256,23 @@ impl ShapeTracker {
             .max(1)
     }
 
+    /// The number of physical elements this view can address: max linear
+    /// offset + 1. Differs from `n_physical_elements` for sliced views, where
+    /// the addressed span exceeds the count of viewed elements (e.g. a
+    /// (3,4)-slice of (3,16) views 12 elements but addresses offsets 0..36).
+    /// Stride expressions are nondecreasing in z, so each axis peaks at
+    /// `dim - 1`.
+    pub fn physical_span(&self) -> Expression {
+        self.dims
+            .into_iter()
+            .zip(&self.strides)
+            .map(|(d, s)| s.substitute('z', d - 1))
+            .sum::<Expression>()
+            .max(0)
+            .simplify()
+            + 1
+    }
+
     /// The number of dimensions
     pub fn len(&self) -> usize {
         self.dims.len()

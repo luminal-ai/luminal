@@ -30,6 +30,15 @@ const EGGLOG_RULESETS: &[&str] = &[
     "fusion_pair",
     "fusion_grow",
     "fusion_merge",
+    // One-shot structural fusion rules (large joins), run once in the
+    // dedicated "fuse late" phase instead of inside the saturating main
+    // cycles. The _pre ruleset holds producer stages (e.g. the RoPE angle
+    // relation) consumed by rules in the main late ruleset.
+    "kernel_fuse_late_pre",
+    "kernel_fuse_late",
+    // Expensive one-shot rules that consume facts produced by the earlier
+    // fuse-late runs; scheduled exactly once at the end of the phase.
+    "kernel_fuse_late2",
 ];
 
 #[derive(Debug, Clone)]
@@ -252,6 +261,22 @@ fn egglog_main_cycle_phases(cycle: usize, use_interval_analysis: bool) -> Vec<Eg
 
 fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
     vec![
+        // One-shot structural fusion rules with large joins. Running them
+        // once here (dtype facts present, raw HLIR rows not yet deleted by
+        // the cleanup phases) instead of inside the saturating main cycles
+        // avoids re-evaluating tens-of-seconds joins on every iteration.
+        // `seq` so each ruleset's join runs exactly once: producer stages
+        // first, then the consumer rules.
+        EgglogSchedulePhase {
+            name: "fuse late".to_string(),
+            // The second `kernel_fuse_late` run consumes relation facts the
+            // first run produced (e.g. rope_rotated); semi-naive evaluation
+            // makes it a cheap delta join.
+            // Depth = the longest relation cascade: invf(pre) → angles →
+            // rotation → concat each consume the previous run's facts.
+            schedule: "(seq kernel_fuse_late_pre kernel_fuse_late kernel_fuse_late kernel_fuse_late kernel_fuse_late2)"
+                .to_string(),
+        },
         EgglogSchedulePhase {
             name: "final expr".to_string(),
             schedule: expr_schedule(use_interval_analysis).to_string(),

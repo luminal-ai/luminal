@@ -381,7 +381,12 @@ impl GraphTensor {
 
     /// Sort and retrieve top-k **indexes**
     pub fn topk_indexes(self, k: usize, axis: usize) -> GraphTensor {
-        self.argsort(axis, true).slice_along(..k, axis)
+        // Stable sort is required: with exact value ties (e.g. softmax rows
+        // where several entries underflow to exactly 0.0), the unstable
+        // argsort produces duplicate ranks and the rank→index scatter emits
+        // garbage — nondeterministically across search candidates, since tie
+        // outcomes depend on each candidate's float details (FTZ, fusion).
+        self.stable_argsort(axis, true).slice_along(..k, axis)
     }
 
     /// Sort and retrieve top-k **values** (largest first)
