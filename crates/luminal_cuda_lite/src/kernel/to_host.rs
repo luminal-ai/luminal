@@ -806,16 +806,46 @@ impl HostOp for CudaGraphOp {
 
         let buffer_nodes = self.extra_buffer_nodes();
         let buffer_set: FxHashSet<_> = buffer_nodes.iter().copied().collect();
+
+        // Per-buffer precompute so the all-pairs loop below is O(1) per
+        // pair: `users_bits[a]` marks a's user steps, `common_reach[a]`
+        // is the intersection of `reachable` over a's users — i.e. the
+        // steps strictly after *every* use of a. "All users of a are
+        // ordered before step s" then collapses to two bit probes.
+        // (The previous per-pair `users_ordered_before` walk was
+        // O(B^2 * users) and took tens of minutes on rolled prefill
+        // candidates with thousands of steps.)
+        let per_buffer: FxHashMap<NodeIndex, (FixedBitSet, FixedBitSet)> = buffer_nodes
+            .iter()
+            .filter_map(|&node| {
+                let steps = users.get(&node)?;
+                if steps.is_empty() {
+                    return None;
+                }
+                let mut users_bits = FixedBitSet::with_capacity(n_steps);
+                let mut common_reach = FixedBitSet::with_capacity(n_steps);
+                common_reach.insert_range(..);
+                for &u in steps {
+                    users_bits.insert(u);
+                    common_reach.intersect_with(&reachable[u]);
+                }
+                Some((node, (users_bits, common_reach)))
+            })
+            .collect();
+        let ordered_before = |a: NodeIndex, b: NodeIndex| -> bool {
+            let Some(&b_producer) = producer_step.get(&b) else {
+                return false;
+            };
+            let Some((users_bits, common_reach)) = per_buffer.get(&a) else {
+                return false;
+            };
+            common_reach.contains(b_producer) && !users_bits.contains(b_producer)
+        };
+
         let mut conflicts = Vec::new();
         for (i, &a) in buffer_nodes.iter().enumerate() {
             for &b in buffer_nodes.iter().skip(i + 1) {
-                let a_before_b = producer_step.get(&b).is_some_and(|&b_producer| {
-                    users_ordered_before(&users, &reachable, a, b_producer)
-                });
-                let b_before_a = producer_step.get(&a).is_some_and(|&a_producer| {
-                    users_ordered_before(&users, &reachable, b, a_producer)
-                });
-                if !(a_before_b || b_before_a) {
+                if !(ordered_before(a, b) || ordered_before(b, a)) {
                     conflicts.push((a, b));
                 }
             }
@@ -844,19 +874,6 @@ impl HostOp for CudaGraphOp {
     }
 }
 
-fn users_ordered_before(
-    users: &FxHashMap<NodeIndex, Vec<usize>>,
-    reachable: &[FixedBitSet],
-    node: NodeIndex,
-    before_step: usize,
-) -> bool {
-    users.get(&node).is_some_and(|steps| {
-        !steps.is_empty()
-            && steps.iter().all(|&user_step| {
-                user_step != before_step && reachable[user_step].contains(before_step)
-            })
-    })
-}
 
 fn cublaslt_step_indices(steps: &[CompiledStep], n_cublaslt: usize) -> Vec<usize> {
     let mut indices = vec![usize::MAX; n_cublaslt];
