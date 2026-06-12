@@ -92,7 +92,7 @@ fn main() {
     println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(5);
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(20);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());

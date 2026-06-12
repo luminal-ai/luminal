@@ -1564,6 +1564,16 @@ impl Graph {
                 if !filter_result.accepted {
                     filter_fails += 1;
                     last_filter_rejection = filter_result.display;
+                    // Rejections are otherwise silent until the 10k-fail
+                    // panic; surface them early — a structural rejection
+                    // (e.g. every candidate over the memory cap) loops
+                    // here for hours looking like a hang.
+                    if filter_fails <= 5 || filter_fails % 100 == 0 {
+                        eprintln!(
+                            "   Search  initial-genome filter reject #{filter_fails}: {}",
+                            last_filter_rejection.as_deref().unwrap_or("(no reason)")
+                        );
+                    }
                     if filter_fails >= max_filter_fails {
                         panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
                     }
