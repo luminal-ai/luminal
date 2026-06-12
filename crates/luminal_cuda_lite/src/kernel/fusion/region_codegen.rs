@@ -350,40 +350,51 @@ fn region_structural_hashes(
         hashes.insert(fs, h.finish());
     }
 
-    // Interior nodes bottom-up: a node hashes once all its predecessors
-    // have. A predecessor outside the region only occurs in malformed
-    // regions (codegen rejects them later at local lookup); once the
-    // worklist stalls, such predecessors hash as a constant tag so the
-    // loop always terminates.
-    let mut pending: Vec<NodeIndex> = interior.to_vec();
-    let mut stalled = false;
-    while !pending.is_empty() {
-        let before = pending.len();
-        pending.retain(|&n| {
-            let mut child_hashes: Vec<u64> = Vec::new();
-            for src in llir_graph.neighbors_directed(n, Direction::Incoming) {
-                match hashes.get(&src) {
-                    Some(&h) => child_hashes.push(h),
-                    None if stalled => child_hashes.push(0x4558_5445_524e_414c), // "EXTERNAL"
-                    None => return true,
+    // Interior nodes bottom-up in one Kahn pass over the region-induced
+    // subgraph (in-degree counts only in-region predecessors, so FS
+    // leaves and external/malformed predecessors never gate readiness —
+    // the latter hash as a constant tag). O(V + E); rolled prefill
+    // regions have thousands of interior nodes in long chains, so
+    // anything multi-pass is quadratic and stalls the search.
+    let interior_set: FxHashSet<NodeIndex> = interior.iter().copied().collect();
+    let mut indeg: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    for &n in interior {
+        let d = llir_graph
+            .neighbors_directed(n, Direction::Incoming)
+            .filter(|p| interior_set.contains(p))
+            .count();
+        indeg.insert(n, d);
+    }
+    let mut queue: std::collections::VecDeque<NodeIndex> = interior
+        .iter()
+        .copied()
+        .filter(|n| indeg[n] == 0)
+        .collect();
+    while let Some(n) = queue.pop_front() {
+        let mut child_hashes: Vec<u64> = llir_graph
+            .neighbors_directed(n, Direction::Incoming)
+            .map(|src| hashes.get(&src).copied().unwrap_or(0x4558_5445_524e_414c)) // "EXTERNAL"
+            .collect();
+        child_hashes.sort_unstable();
+        let op_ref = llir_graph[n].to_dialect::<dyn KernelOp>().unwrap();
+        let (op_name, dt) = if let Some(e) = (***op_ref).downcast_ref::<CudaUnaryElementwise>() {
+            (e.op.as_str(), e.dtype)
+        } else if let Some(e) = (***op_ref).downcast_ref::<CudaBinaryElementwise>() {
+            (e.op.as_str(), e.dtype)
+        } else {
+            (op_ref.kernel_name(), op_ref.output_dtype())
+        };
+        let mut h = DefaultHasher::new();
+        (op_name, cuda_dtype(dt), &child_hashes).hash(&mut h);
+        hashes.insert(n, h.finish());
+        for succ in llir_graph.neighbors_directed(n, Direction::Outgoing) {
+            if let Some(d) = indeg.get_mut(&succ) {
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(succ);
                 }
             }
-            child_hashes.sort_unstable();
-            let op_ref = llir_graph[n].to_dialect::<dyn KernelOp>().unwrap();
-            let (op_name, dt) = if let Some(e) = (***op_ref).downcast_ref::<CudaUnaryElementwise>()
-            {
-                (e.op.as_str(), e.dtype)
-            } else if let Some(e) = (***op_ref).downcast_ref::<CudaBinaryElementwise>() {
-                (e.op.as_str(), e.dtype)
-            } else {
-                (op_ref.kernel_name(), op_ref.output_dtype())
-            };
-            let mut h = DefaultHasher::new();
-            (op_name, cuda_dtype(dt), &child_hashes).hash(&mut h);
-            hashes.insert(n, h.finish());
-            false
-        });
-        stalled = pending.len() == before;
+        }
     }
     hashes
 }
@@ -414,26 +425,27 @@ fn canonicalize_region(
             (n, d)
         })
         .collect();
-    let mut ready: Vec<NodeIndex> = interior
-        .iter()
-        .copied()
-        .filter(|n| indeg[n] == 0)
-        .collect();
-    let mut interior_topo: Vec<NodeIndex> = Vec::with_capacity(interior.len());
-    while !ready.is_empty() {
-        let pos = ready
+    // Min-heap keyed by (structural hash, NodeIndex): O(V log V) — regions
+    // from rolled prefill graphs have thousands of interior nodes.
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, NodeIndex)>> =
+        interior
             .iter()
-            .enumerate()
-            .min_by_key(|&(_, &n)| (hashes.get(&n).copied().unwrap_or(0), n.index()))
-            .map(|(i, _)| i)
-            .unwrap();
-        let n = ready.remove(pos);
+            .copied()
+            .filter(|n| indeg[n] == 0)
+            .map(|n| std::cmp::Reverse((hashes.get(&n).copied().unwrap_or(0), n.index(), n)))
+            .collect();
+    let mut interior_topo: Vec<NodeIndex> = Vec::with_capacity(interior.len());
+    while let Some(std::cmp::Reverse((_, _, n))) = ready.pop() {
         interior_topo.push(n);
         for succ in llir_graph.neighbors_directed(n, Direction::Outgoing) {
             if let Some(d) = indeg.get_mut(&succ) {
                 *d -= 1;
                 if *d == 0 {
-                    ready.push(succ);
+                    ready.push(std::cmp::Reverse((
+                        hashes.get(&succ).copied().unwrap_or(0),
+                        succ.index(),
+                        succ,
+                    )));
                 }
             }
         }
