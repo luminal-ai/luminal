@@ -1008,3 +1008,80 @@ extern "C" __global__ void fused_k(float* out, const float* a, const float* b, l
          speedup: {speedup:.2}x"
     );
 }
+
+// =========================================================================
+// Cast fusion: explicit HLIR Casts are the only dtype changes inside a
+// region (grow-FE-Cast and grow-Cast-FS in markers.rs).
+// =========================================================================
+
+#[test]
+fn test_cast_after_unary_fuses() {
+    // grow-FE-Cast: `a.sin().cast(Bf16)` should be reachable as one region
+    // with the cast as an interior elementwise node, instead of a separate
+    // KernelCast kernel reading the region's f32 output buffer.
+    let mut cx = Graph::new();
+    let a = cx.tensor(16);
+    let _b = a.sin().cast(luminal::dtype::DType::Bf16).output();
+
+    let regions = extract_all_fused_regions(&mut cx);
+    let expected = sorted_names(&["FusedCast", "FusedSin"]);
+    assert!(
+        regions
+            .iter()
+            .any(|r| r.internal_ops_sorted == expected && r.start_count == 1 && r.end_count == 1),
+        "expected a marker region of {expected:?} with 1 FusionStart, got: {regions:#?}"
+    );
+}
+
+#[test]
+fn test_cast_producer_absorbed_into_region() {
+    // grow-Cast-FS: a bf16 input cast to f32 then consumed by a unary chain
+    // should pull the cast inside the region.
+    let mut cx = Graph::new();
+    let a = cx.tensor(16).as_dtype(luminal::dtype::DType::Bf16);
+    let _b = a.cast(luminal::dtype::DType::F32).sin().output();
+
+    let regions = extract_all_fused_regions(&mut cx);
+    let expected = sorted_names(&["FusedCast", "FusedSin"]);
+    assert!(
+        regions
+            .iter()
+            .any(|r| r.internal_ops_sorted == expected && r.start_count == 1 && r.end_count == 1),
+        "expected a marker region of {expected:?} with 1 FusionStart, got: {regions:#?}"
+    );
+}
+
+#[test]
+fn test_cast_fusion_preserves_output() {
+    // End-to-end numerical check across all genome candidates: an f32 sin
+    // rounded through bf16 must match candle whether the casts fuse into
+    // the region or run as standalone KernelCast kernels.
+    let seed = 0xCA57u64;
+    let gen_lambda = |n, s| random_f32_vec(n, s, -1.0, 1.0);
+    let tol = dtype_epsilon(luminal::dtype::DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
+    test_binary_cuda::<f32>(
+        16,
+        16,
+        |a, b| {
+            (a + b)
+                .sin()
+                .cast(luminal::dtype::DType::Bf16)
+                .cast(luminal::dtype::DType::F32)
+        },
+        |a, b| {
+            (a + b)
+                .unwrap()
+                .sin()
+                .unwrap()
+                .to_dtype(candle_core::DType::BF16)
+                .unwrap()
+                .to_dtype(candle_core::DType::F32)
+                .unwrap()
+        },
+        gen_lambda,
+        gen_lambda,
+        seed,
+        tol,
+        tol,
+    );
+}

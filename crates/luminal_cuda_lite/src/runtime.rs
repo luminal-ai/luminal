@@ -113,7 +113,6 @@ struct ArenaSlot {
     capacity_bytes: usize,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct NonFiniteBufferReport {
     pub(crate) node: NodeIndex,
@@ -319,7 +318,6 @@ impl CudaRuntime {
         dst
     }
 
-    #[cfg(test)]
     pub(crate) fn first_nonfinite_f32_buffer_in_nodes(
         &self,
         nodes: impl IntoIterator<Item = NodeIndex>,
@@ -2053,13 +2051,31 @@ impl CudaRuntime {
     }
 
     fn buffer_map_for_cuda_graph(
+        &self,
         bucket: &CompiledBucket,
         cuda_graph: &CudaGraphOp,
         allow_missing_inputs: bool,
     ) -> anyhow::Result<Option<FxHashMap<NodeIndex, DeviceBuffer>>> {
         let mut buffer_map: FxHashMap<NodeIndex, DeviceBuffer> = FxHashMap::default();
         for node in cuda_graph.extra_buffer_nodes() {
-            let Some(buf) = Self::cached_device_buffer_for_node(bucket, node) else {
+            // The HLIR sync caches input buffers only for the one LLIR node in
+            // hlir_to_llir, but convex partitioning duplicates Input nodes
+            // across CudaGraphOps — fall back to the full resolution (which
+            // follows llir_to_hlir into hlir_buffers) for the copies.
+            let buf = Self::cached_device_buffer_for_node(bucket, node).or_else(|| {
+                if std::env::var_os("LUMINAL_DISABLE_INPUT_BUFFER_FALLBACK").is_some() {
+                    return None;
+                }
+                Self::resolve_runtime_buffer(
+                    bucket,
+                    &self.cuda_stream,
+                    &self.hlir_buffers,
+                    &self.external_buffers,
+                    &self.external_output_buffers,
+                    node,
+                )
+            });
+            let Some(buf) = buf else {
                 if allow_missing_inputs {
                     return Ok(None);
                 }
@@ -2089,6 +2105,35 @@ impl CudaRuntime {
         }
     }
 
+    /// Post-mortem aid for sticky CUDA errors during search: keep the most
+    /// recent candidate's LLIR on disk so a crash identifies the genome that
+    /// was executing. Gated on LUMINAL_SEARCH_DUMP_LAST_LLIR.
+    fn dump_candidate_llir_for_postmortem(
+        llir_graph: &LLIRGraph,
+        dyn_map: &FxHashMap<char, usize>,
+    ) {
+        if std::env::var_os("LUMINAL_SEARCH_DUMP_LAST_LLIR").is_none() {
+            return;
+        }
+        let summary = llir_graph
+            .node_indices()
+            .map(|idx| {
+                let inputs = llir_graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                    .map(|edge| edge.source().index().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} <- [{}]: {:?}", idx.index(), inputs, &llir_graph[idx])
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(
+            "/tmp/luminal_search_last_candidate_llir.txt",
+            format!("dyn_map: {dyn_map:?}\n{summary}"),
+        );
+    }
+
+
     fn materialize_bucket_cuda_graphs(
         &self,
         bucket_idx: usize,
@@ -2102,7 +2147,7 @@ impl CudaRuntime {
                 continue;
             };
             let Some(buffer_map) =
-                Self::buffer_map_for_cuda_graph(bucket, cuda_graph, allow_missing_inputs)?
+                self.buffer_map_for_cuda_graph(bucket, cuda_graph, allow_missing_inputs)?
             else {
                 continue;
             };
@@ -2626,6 +2671,7 @@ impl Runtime for CudaRuntime {
         trials: usize,
         timeout: Option<std::time::Duration>,
     ) -> (Self::ProfileMetric, String) {
+        Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         // Clear active bucket's arena before loading new LLIR for profiling.
         if !self.compiled_buckets.is_empty() {
             self.active_mut().arena = None;
@@ -2649,6 +2695,7 @@ impl Runtime for CudaRuntime {
         if bucket_context.dim_buckets.is_empty() {
             return self.profile(llir_graph, dyn_map, trials, timeout);
         }
+        Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         if !self.compiled_buckets.is_empty() {
             self.active_mut().arena = None;
         }
@@ -2767,8 +2814,9 @@ impl Runtime for CudaRuntime {
                 host_op_launches += 1;
             }
 
-            #[cfg(test)]
-            if std::env::var_os("LUMINAL_CUDA_CHECK_NONFINITE_INTERNAL").is_some() {
+            if !self.profiling
+                && std::env::var_os("LUMINAL_CUDA_CHECK_NONFINITE_INTERNAL").is_some()
+            {
                 let mut produced_nodes = exec_op.internal.extra_buffer_nodes();
                 produced_nodes.push(exec_op.output);
                 if let Some(report) = self.first_nonfinite_f32_buffer_in_nodes(produced_nodes) {
@@ -2930,8 +2978,10 @@ impl CudaRuntime {
         let mut exec_graph = StableGraph::default();
         let mut node_to_exec = FxHashMap::default();
 
-        // Clone llir_graph so we can modify it
-        let mut llir_graph = llir_graph.clone();
+        // Clone llir_graph so we can modify it. Apply LLIR peepholes first:
+        // fuse RoPE → in-place KV scatter pairs into single kernels.
+        let mut llir_graph = crate::kernel::rope::fuse_rope_scatter(llir_graph)
+            .unwrap_or_else(|| llir_graph.clone());
 
         // Compile kernel subgraphs into CudaGraphOps (which implement HostOp)
         crate::kernel::kernel_to_host(&mut llir_graph, &self.cuda_stream, &mut self.kernel_cache);

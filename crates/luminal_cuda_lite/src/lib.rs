@@ -1,3 +1,8 @@
+// Allow files path-included into this crate's tests (e.g. the llama example
+// model in search_equivalence_fuzz.rs) to keep their normal
+// `use luminal_cuda_lite::...` imports.
+extern crate self as luminal_cuda_lite;
+
 pub mod dyn_backend;
 pub mod host;
 pub mod kernel;
@@ -144,20 +149,41 @@ fn cuda_driver_diagnostics() -> (Option<i32>, Option<i32>) {
 pub(crate) fn try_create_cublaslt(
     stream: Arc<CudaStream>,
 ) -> std::result::Result<Arc<CudaBlasLT>, String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CudaBlasLT::new(stream))) {
-        Ok(Ok(handle)) => Ok(Arc::new(handle)),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(payload) => {
-            let message = if let Some(message) = payload.downcast_ref::<String>() {
-                message.clone()
-            } else if let Some(message) = payload.downcast_ref::<&str>() {
-                message.to_string()
-            } else {
-                "cuBLASLt initialization panicked".to_string()
-            };
-            Err(message)
-        }
+    // One process-wide handle per stream, held forever. Per-op handles were
+    // created/destroyed thousands of times across search candidates;
+    // `cublasLtDestroy` racing live work on other threads (or running after
+    // its CUDA context is gone, via LLIR-graph drop order) corrupts
+    // libcublasLt's internal state — observed as SIGSEGV in
+    // pthread_mutex_unlock under cublasLtDestroy, flaky fuzz failures, and
+    // nvrtc spinning forever on trivial kernels later in the process. The
+    // cache keeps a permanent Arc so Drop (and thus cublasLtDestroy) never
+    // runs; a handle is ~KBs and streams are process-stable.
+    static HANDLES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, Arc<CudaBlasLT>>>,
+    > = std::sync::OnceLock::new();
+    let key = stream.cu_stream() as usize;
+    let handles = HANDLES.get_or_init(Default::default);
+    let mut handles = handles.lock().unwrap();
+    if let Some(handle) = handles.get(&key) {
+        return Ok(handle.clone());
     }
+    let created =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CudaBlasLT::new(stream))) {
+            Ok(Ok(handle)) => Arc::new(handle),
+            Ok(Err(err)) => return Err(err.to_string()),
+            Err(payload) => {
+                let message = if let Some(message) = payload.downcast_ref::<String>() {
+                    message.clone()
+                } else if let Some(message) = payload.downcast_ref::<&str>() {
+                    message.to_string()
+                } else {
+                    "cuBLASLt initialization panicked".to_string()
+                };
+                return Err(message);
+            }
+        };
+    handles.insert(key, created.clone());
+    Ok(created)
 }
 
 fn cuda_nvrtc_compile_options(target_arch: &str) -> Vec<String> {
@@ -231,6 +257,31 @@ pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
     })?;
     let target_arch = format!("sm_{major}{minor}");
     let nvrtc_options = cuda_nvrtc_compile_options(&target_arch);
+
+    // nvrtc compile time grows super-linearly with source size; pathological
+    // fusion-region candidates have produced multi-megabyte kernels that sit
+    // in nvrtcCompileProgram for an hour. Reject them as candidates instead
+    // of compiling (the search treats the panic as an invalid genome).
+    const MAX_KERNEL_SOURCE_BYTES: usize = 512 * 1024;
+    let src_len = src.as_ref().len();
+    if src_len > MAX_KERNEL_SOURCE_BYTES {
+        if std::env::var_os("LUMINAL_DUMP_KERNEL_SRC").is_some() {
+            let _ = std::fs::write("/tmp/luminal_oversized_kernel.cu", src.as_ref());
+        }
+        panic!(
+            "kernel source too large for nvrtc ({src_len} bytes > {MAX_KERNEL_SOURCE_BYTES}); \
+             set LUMINAL_DUMP_KERNEL_SRC=1 to dump it to /tmp/luminal_oversized_kernel.cu"
+        );
+    }
+    if src_len > 128 * 1024 {
+        eprintln!("nvrtc: compiling a large kernel ({src_len} bytes)");
+    }
+    // Post-mortem aid: with LUMINAL_DUMP_KERNEL_SRC set, the file holds the
+    // source currently inside nvrtcCompileProgram — if a compile hangs, the
+    // last-written file is the culprit.
+    if std::env::var_os("LUMINAL_DUMP_KERNEL_SRC").is_some() {
+        let _ = std::fs::write("/tmp/luminal_last_kernel.cu", src.as_ref());
+    }
 
     let source = CString::new(src.as_ref().as_bytes())
         .expect("CUDA source code cannot contain null terminators");

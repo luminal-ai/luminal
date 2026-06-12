@@ -1127,10 +1127,15 @@ pub(crate) fn prepare_cublaslt_matmul(
             .find(|(cached_spec, _)| cached_spec == spec)
             .map(|(_, heuristic)| unsafe { std::ptr::read(heuristic) })
     };
+    const AUTOTUNE_CANDIDATES: usize = 16;
+    let mut candidates: Vec<cublasLtMatmulHeuristicResult_t> = Vec::new();
+    let from_cache = cached_heuristic.is_some();
     if let Some(cached) = cached_heuristic {
         heuristic = cached;
     } else {
         let mut algo_count: i32 = 0;
+        let mut results: [cublasLtMatmulHeuristicResult_t; AUTOTUNE_CANDIDATES] =
+            unsafe { std::mem::zeroed() };
         unsafe {
             cublasLtMatmulPreferenceCreate(&mut resources.preference).result()?;
             cublasLtMatmulPreferenceSetAttribute(
@@ -1149,8 +1154,8 @@ pub(crate) fn prepare_cublaslt_matmul(
                 resources.c_desc,
                 resources.d_desc,
                 resources.preference,
-                1,
-                &mut heuristic,
+                AUTOTUNE_CANDIDATES as i32,
+                results.as_mut_ptr(),
                 &mut algo_count,
             )
             .result()?;
@@ -1159,13 +1164,11 @@ pub(crate) fn prepare_cublaslt_matmul(
                 return Err(anyhow::anyhow!("No suitable cuBLASLT algorithm found"));
             }
         }
-        heuristic_cache
-            .lock()
-            .unwrap()
-            .push((*spec, unsafe { std::ptr::read(&heuristic) }));
+        candidates.extend_from_slice(&results[..algo_count as usize]);
+        heuristic = candidates[0];
     }
 
-    Ok(PreparedCuBlasLtMatmul {
+    let mut prepared = PreparedCuBlasLtMatmul {
         cublaslt: cublaslt.clone(),
         spec: *spec,
         resources,
@@ -1178,7 +1181,83 @@ pub(crate) fn prepare_cublaslt_matmul(
         default_b_scale_ptr,
         _c_scale: c_scale,
         _d_scale: d_scale,
-    })
+    };
+
+    if !from_cache {
+        if candidates.len() > 1 && autotune_allowed(stream, ptrs) {
+            if let Some(best) = autotune_select(stream, &mut prepared, &candidates, ptrs) {
+                prepared.heuristic = best;
+            }
+        }
+        heuristic_cache
+            .lock()
+            .unwrap()
+            .push((*spec, unsafe { std::ptr::read(&prepared.heuristic) }));
+    }
+
+    Ok(prepared)
+}
+
+/// Autotuning launches real matmuls, which is only safe when the stream is
+/// not mid-capture (the benchmark kernels would be recorded into the graph)
+/// and the operand pointers are live.
+fn autotune_allowed(stream: &Arc<CudaStream>, ptrs: LtMatmulPointers) -> bool {
+    // Opt-in: measured on Llama 3 8B decode, the heuristic's first choice was
+    // already within noise of the benchmarked best (the GEMV slack is fixed
+    // per-launch cost, not algorithm choice), while the one-time benchmark
+    // sweep added ~60ms to first-step latency.
+    if !std::env::var_os("LUMINAL_CUBLASLT_AUTOTUNE").is_some_and(|v| v == "1") {
+        return false;
+    }
+    if ptrs.a == 0 || ptrs.b == 0 || ptrs.d == 0 {
+        return false;
+    }
+    let mut status = cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE;
+    let ok = unsafe {
+        cudarc::driver::sys::cuStreamIsCapturing(stream.cu_stream(), &mut status)
+            == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+    };
+    ok && status == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE
+}
+
+/// Benchmark each heuristic candidate with the real operands and return the
+/// fastest. The D buffer is scratch from the runtime's perspective (it is
+/// rewritten every step), so benchmarking writes are harmless. Runs once per
+/// `LtMatmulSpec` (results are cached by the caller).
+fn autotune_select(
+    stream: &Arc<CudaStream>,
+    prepared: &mut PreparedCuBlasLtMatmul,
+    candidates: &[cublasLtMatmulHeuristicResult_t],
+    ptrs: LtMatmulPointers,
+) -> Option<cublasLtMatmulHeuristicResult_t> {
+    const REPS: usize = 3;
+    let mut best: Option<(f64, usize)> = None;
+    for (idx, candidate) in candidates.iter().enumerate() {
+        prepared.heuristic = unsafe { std::ptr::read(candidate) };
+        // Warmup + validity check: a candidate may fail at execution.
+        if prepared.enqueue(stream, ptrs).is_err() {
+            continue;
+        }
+        if stream.synchronize().is_err() {
+            return None;
+        }
+        let start = std::time::Instant::now();
+        let mut failed = false;
+        for _ in 0..REPS {
+            if prepared.enqueue(stream, ptrs).is_err() {
+                failed = true;
+                break;
+            }
+        }
+        if failed || stream.synchronize().is_err() {
+            continue;
+        }
+        let elapsed = start.elapsed().as_secs_f64() / REPS as f64;
+        if best.is_none_or(|(b, _)| elapsed < b) {
+            best = Some((elapsed, idx));
+        }
+    }
+    best.map(|(_, idx)| unsafe { std::ptr::read(&candidates[idx]) })
 }
 
 fn run_cublaslt_matmul(

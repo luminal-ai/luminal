@@ -235,13 +235,13 @@ extern \"C\" {{
 
 #[derive(Debug, Clone)]
 pub struct KernelScatterNoCopy {
-    dest_shape: Vec<Expression>,
-    dest_strides: Vec<Expression>,
-    index_shape: Vec<Expression>,
-    index_strides: Vec<Expression>,
-    src_strides: Vec<Expression>,
-    out_strides: Vec<Expression>,
-    dtype: DType,
+    pub(crate) dest_shape: Vec<Expression>,
+    pub(crate) dest_strides: Vec<Expression>,
+    pub(crate) index_shape: Vec<Expression>,
+    pub(crate) index_strides: Vec<Expression>,
+    pub(crate) src_strides: Vec<Expression>,
+    pub(crate) out_strides: Vec<Expression>,
+    pub(crate) dtype: DType,
 }
 
 impl Default for KernelScatterNoCopy {

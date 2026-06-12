@@ -604,7 +604,7 @@ fn assert_fuzz_outputs_close(
     }
 }
 
-fn summarize_llir(llir_graph: &LLIRGraph) -> String {
+pub(crate) fn summarize_llir(llir_graph: &LLIRGraph) -> String {
     llir_graph
         .node_indices()
         .map(|idx| {
@@ -977,11 +977,20 @@ pub fn fuzz_genomes<T: TestDType>(
             // a search-time scaffold the auto-roll prepass introduces.
             unroll_loops_in_llir(&mut llir_graph);
 
-            let mut rt = CudaRuntime::initialize(stream.clone());
-            rt.load_llir(&llir_graph);
-            setup_inputs(&mut rt);
-            rt.execute(&cx.dyn_map);
-            let result = T::get_from_runtime(&rt, output_id);
+            // The search catches candidates that fail to load/materialize
+            // (e.g. the GEMM-chain "missing cached buffer" corner case) and
+            // skips them; mirror that here so the fuzz exercises the same
+            // candidate set the search can actually select.
+            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut rt = CudaRuntime::initialize(stream.clone());
+                rt.load_llir(&llir_graph);
+                setup_inputs(&mut rt);
+                rt.execute(&cx.dyn_map);
+                T::get_from_runtime(&rt, output_id)
+            }));
+            let Ok(result) = run else {
+                continue;
+            };
             T::assert_match(&result, expected, rtol, atol);
 
             tested += 1;

@@ -336,8 +336,17 @@ fn is_region_elementwise(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
         })
 }
 
+/// Convert a local to its in-register compute form. 16-bit and FP8 locals
+/// are widened to float for compute; each node's local then rounds back to
+/// the node's own dtype on store (see `elementwise_init_expr`). Per-op this
+/// is numerically identical to native 16-bit arithmetic (exact widening,
+/// one rounding per node) and avoids relying on device operator overloads.
+/// `dtype` is the dtype of the local's *producer* node, not the consumer.
 fn elementwise_value(local: &str, dtype: DType) -> String {
-    if matches!(dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0) {
+    if matches!(
+        dtype,
+        DType::F16 | DType::Bf16 | DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0
+    ) {
         format!("static_cast<float>({local})")
     } else {
         local.to_string()
@@ -345,16 +354,17 @@ fn elementwise_value(local: &str, dtype: DType) -> String {
 }
 
 fn elementwise_init_expr(expr: &str, dtype: DType, cuda_ty: &str) -> String {
-    if matches!(dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0) {
-        format!("{cuda_ty}({expr})")
-    } else {
-        expr.to_string()
+    match dtype {
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0 => format!("{cuda_ty}({expr})"),
+        DType::F16 | DType::Bf16 => format!("({cuda_ty})({expr})"),
+        _ => expr.to_string(),
     }
 }
 
-fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
-    let a = || elementwise_value(locals[0], dtype);
-    let b = || elementwise_value(locals[1], dtype);
+/// `locals` are already widened to compute form by `elementwise_value`.
+fn elementwise_body(op: &str, locals: &[&str]) -> String {
+    let a = || locals[0].to_string();
+    let b = || locals[1].to_string();
     match op {
         "Sin" => format!("sinf({})", a()),
         "Sqrt" => format!("sqrtf({})", a()),
@@ -364,6 +374,9 @@ fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
         "Log2" => format!("log2f({})", a()),
         "Recip" => format!("1.0f / {}", a()),
         "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", a()),
+        // Dtype conversion happens in the widen (input) / round (store)
+        // helpers, so the cast body is the identity.
+        "Cast" => a(),
         "Add" => format!("{} + {}", a(), b()),
         "Mul" => format!("{} * {}", a(), b()),
         other => panic!("region_codegen: unknown elementwise op {other}"),
@@ -428,8 +441,27 @@ pub(crate) fn compile_region(
         }
     }
 
+    // Per-node dtypes: regions are dtype-uniform except at explicit Cast
+    // nodes, so every FS leaf, interior node, and the FE carry their own
+    // dtype. Locals and kernel parameters are typed per node.
+    let node_dtype = |idx: NodeIndex| -> DType {
+        let op = llir_graph[idx].to_dialect::<dyn KernelOp>().unwrap();
+        if let Some(fs) = (***op).downcast_ref::<FusionStart>() {
+            fs.dtype
+        } else if let Some(elem) = (***op).downcast_ref::<CudaUnaryElementwise>() {
+            elem.dtype
+        } else if let Some(elem) = (***op).downcast_ref::<CudaBinaryElementwise>() {
+            elem.dtype
+        } else {
+            op.output_dtype()
+        }
+    };
+
     let cuda_ty = cuda_dtype(dtype);
-    let includes = dtype_includes(&[dtype]);
+    let mut region_dtypes: Vec<DType> = vec![dtype];
+    region_dtypes.extend(region.fs_nodes.iter().map(|&n| node_dtype(n)));
+    region_dtypes.extend(region.elementwise_topo.iter().map(|&n| node_dtype(n)));
+    let includes = dtype_includes(&region_dtypes);
     let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&all_vars);
     let dyn_dims_param = if all_vars.is_empty() {
         ""
@@ -447,8 +479,9 @@ pub(crate) fn compile_region(
     // `region.fs_nodes` order. The `external_inputs` list (parallel to
     // `fs_nodes`) is what the host wires into the launch params.
     let mut signature_params: Vec<String> = vec![format!("{cuda_ty} *out")];
-    for i in 0..region.fs_nodes.len() {
-        signature_params.push(format!("const {cuda_ty} *in{i}"));
+    for (i, &fs_idx) in region.fs_nodes.iter().enumerate() {
+        let fs_ty = cuda_dtype(node_dtype(fs_idx));
+        signature_params.push(format!("const {fs_ty} *in{i}"));
     }
     let signature = signature_params.join(", ");
 
@@ -480,9 +513,10 @@ pub(crate) fn compile_region(
     for (i, &fs_idx) in region.fs_nodes.iter().enumerate() {
         let fs_op = llir_graph[fs_idx].to_dialect::<dyn KernelOp>().unwrap();
         let fs_struct: &FusionStart = (***fs_op).downcast_ref::<FusionStart>().unwrap();
+        let fs_ty = cuda_dtype(fs_struct.dtype);
         let read_idx = flatten_strides(out_shape, &fs_struct.strides).to_kernel();
         body.push_str(&format!(
-            "        {cuda_ty} {name} = in{i}[{read_idx}];\n",
+            "        {fs_ty} {name} = in{i}[{read_idx}];\n",
             name = local_name(fs_idx),
         ));
     }
@@ -504,27 +538,25 @@ pub(crate) fn compile_region(
                 );
             };
 
-        let mut input_locals: Vec<String> = llir_graph
-            .edges_directed(op_idx, Direction::Incoming)
-            .map(|e| (e.id(), e.source()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|(_, src)| local_name(src))
-            .collect();
         // Sort by edge id like the rest of the codegen does for stable
-        // input ordering.
+        // input ordering. Each input local is widened to compute form based
+        // on its producer's dtype.
         let mut edges: Vec<(_, NodeIndex)> = llir_graph
             .edges_directed(op_idx, Direction::Incoming)
             .map(|e| (e.id(), e.source()))
             .collect();
         edges.sort_by_key(|(eid, _)| *eid);
-        input_locals = edges.into_iter().map(|(_, src)| local_name(src)).collect();
+        let input_locals: Vec<String> = edges
+            .into_iter()
+            .map(|(_, src)| elementwise_value(&local_name(src), node_dtype(src)))
+            .collect();
         let inputs_ref: Vec<&str> = input_locals.iter().map(|s| s.as_str()).collect();
 
-        let expr = elementwise_body(elem_name, &inputs_ref, elem_dtype);
-        let expr = elementwise_init_expr(&expr, elem_dtype, cuda_ty);
+        let elem_ty = cuda_dtype(elem_dtype);
+        let expr = elementwise_body(elem_name, &inputs_ref);
+        let expr = elementwise_init_expr(&expr, elem_dtype, elem_ty);
         body.push_str(&format!(
-            "        {cuda_ty} {name} = {expr};\n",
+            "        {elem_ty} {name} = {expr};\n",
             name = local_name(op_idx),
         ));
     }

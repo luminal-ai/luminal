@@ -1,9 +1,14 @@
 // FlashInfer batch decode + prefill wrapper for luminal_cuda.
 // JIT-compiled at runtime with -DLUMINAL_HEAD_DIM=N.
 //
-// Decode: instantiated for f32 (scalar vectorized dot products, no tensor cores).
-// Prefill: instantiated for f16 (requires tensor core MMA + ldmatrix).
-//   The C API accepts fp32 buffers; cast kernels convert fp32↔fp16 at the boundary.
+// Decode: instantiated for f32, f16 and bf16 (scalar vectorized dot products,
+//   no tensor cores needed).
+// Prefill: instantiated for f16 and bf16 (tensor core MMA + ldmatrix
+//   physically require 16-bit inputs; there is no f32 prefill).
+//
+// Every data-carrying C API entry point takes a `dtype` code selecting the
+// kernel instantiation: 0 = f32, 1 = f16, 2 = bf16. Q / K / V / output
+// pointers are `void*` and must all be the same dtype.
 //
 // NHD layout. GQA group_size and page_size are runtime parameters.
 
@@ -39,39 +44,44 @@
 #include <cstring>
 #include <vector>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 using namespace flashinfer;
 
-// ── Decode types (f32) ──
-using DTypeQ = float;
-using DTypeKV = float;
-using DTypeO = float;
 using IdType = int32_t;
-
-// ── Prefill types (f16 compute, fp32 external interface) ──
-using PrefillDTypeQ = half;
-using PrefillDTypeKV = half;
-using PrefillDTypeO = half;
 
 constexpr uint32_t HEAD_DIM = LUMINAL_HEAD_DIM;
 constexpr PosEncodingMode POS_ENCODING_MODE = PosEncodingMode::kNone;
 
+// Sliding-window attention is a kernel-variant template flag; the actual
+// window size (window_left) is a runtime parameter. Compiled as a separate
+// .so when -DLUMINAL_USE_SWA=1.
+#ifndef LUMINAL_USE_SWA
+#define LUMINAL_USE_SWA 0
+#endif
+constexpr bool USE_SWA = LUMINAL_USE_SWA != 0;
+
+// dtype codes shared with the Rust side (jit.rs / mod.rs).
+constexpr int LUMINAL_DTYPE_F32 = 0;
+constexpr int LUMINAL_DTYPE_F16 = 1;
+constexpr int LUMINAL_DTYPE_BF16 = 2;
+
 // Attention variants
 using Variant = DefaultAttention</*use_custom_mask=*/false,
-                                  /*use_sliding_window=*/false,
+                                  /*use_sliding_window=*/USE_SWA,
                                   /*use_logits_soft_cap=*/false,
                                   /*use_alibi=*/false>;
 
 using CausalVariant = DefaultAttention</*use_custom_mask=*/false,
-                                        /*use_sliding_window=*/false,
+                                        /*use_sliding_window=*/USE_SWA,
                                         /*use_logits_soft_cap=*/false,
                                         /*use_alibi=*/false>;
 
-// Decode params (f32)
-using DecodeParams = BatchDecodeParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+template <typename T>
+using DecodeParamsT = BatchDecodeParams<T, T, T, IdType>;
 
-// Prefill params (f16)
-using PrefillParams = BatchPrefillPagedParams<PrefillDTypeQ, PrefillDTypeKV, PrefillDTypeO, IdType>;
+template <typename T>
+using PrefillParamsT = BatchPrefillPagedParams<T, T, T, IdType>;
 
 // Forward declarations
 namespace flashinfer {
@@ -89,35 +99,38 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                     cudaStream_t stream);
 }
 
-// Explicit instantiation: decode kernel (f32)
+// Explicit instantiation: decode kernels (f32 only up to HEAD_DIM 256 —
+// f32 at 512 needs vec_bits 512 which exceeds cp.async's 256-bit limit)
+#if LUMINAL_HEAD_DIM <= 256
 template cudaError_t flashinfer::BatchDecodeWithPagedKVCacheDispatched<
-    HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParams>(
-    DecodeParams params, DTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
+    HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParamsT<float>>(
+    DecodeParamsT<float> params, float* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
+#endif
 
-// Explicit instantiation: prefill kernels (f16, causal mask, CTA_TILE_Q=16/64/128)
-template cudaError_t flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-    16, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, false, MaskMode::kCausal, CausalVariant, PrefillParams>(
-    PrefillParams params, PrefillDTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
+template cudaError_t flashinfer::BatchDecodeWithPagedKVCacheDispatched<
+    HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParamsT<half>>(
+    DecodeParamsT<half> params, half* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
 
-template cudaError_t flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-    64, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, false, MaskMode::kCausal, CausalVariant, PrefillParams>(
-    PrefillParams params, PrefillDTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
+template cudaError_t flashinfer::BatchDecodeWithPagedKVCacheDispatched<
+    HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParamsT<__nv_bfloat16>>(
+    DecodeParamsT<__nv_bfloat16> params, __nv_bfloat16* tmp_v, float* tmp_s, bool enable_pdl,
+    cudaStream_t stream);
 
-template cudaError_t flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-    128, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, false, MaskMode::kCausal, CausalVariant, PrefillParams>(
-    PrefillParams params, PrefillDTypeO* tmp_v, float* tmp_s, bool enable_pdl, cudaStream_t stream);
+// Explicit instantiation: prefill kernels (f16 + bf16, causal mask, CTA_TILE_Q=16/64/128)
+#define LUMINAL_INSTANTIATE_PREFILL(T, CTA_TILE_Q)                                          \
+  template cudaError_t flashinfer::BatchPrefillWithPagedKVCacheDispatched<                  \
+      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, false, MaskMode::kCausal,          \
+      CausalVariant, PrefillParamsT<T>>(PrefillParamsT<T> params, T* tmp_v, float* tmp_s,   \
+                                        bool enable_pdl, cudaStream_t stream);
 
-// ── fp32 ↔ fp16 cast kernels ──
+LUMINAL_INSTANTIATE_PREFILL(half, 16)
+LUMINAL_INSTANTIATE_PREFILL(half, 64)
+LUMINAL_INSTANTIATE_PREFILL(half, 128)
+LUMINAL_INSTANTIATE_PREFILL(__nv_bfloat16, 16)
+LUMINAL_INSTANTIATE_PREFILL(__nv_bfloat16, 64)
+LUMINAL_INSTANTIATE_PREFILL(__nv_bfloat16, 128)
 
-__global__ void cast_f32_to_f16_kernel(const float* src, half* dst, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __float2half(src[i]);
-}
-
-__global__ void cast_f16_to_f32_kernel(const half* src, float* dst, size_t n) {
-    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[i] = __half2float(src[i]);
-}
+#undef LUMINAL_INSTANTIATE_PREFILL
 
 __global__ void prepare_decode_metadata_kernel(
     const int32_t* current_c_ptr,
@@ -165,32 +178,31 @@ __global__ void prepare_decode_metadata_kernel(
     }
 }
 
-extern "C" {
+// ── dtype-templated decode plan / run implementations ──
 
-int flashinfer_batch_decode_plan(
+template <typename T>
+static int batch_decode_plan_t(
     void* float_workspace, size_t float_ws_size,
     void* int_workspace, size_t int_ws_size,
     void* page_locked_int_workspace,
     int32_t* indptr_h, int batch_size,
-    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int num_qo_heads, int num_kv_heads, int page_size,
     bool enable_cuda_graph,
     cudaStream_t stream,
     int64_t* plan_info_out, int* plan_info_len_out)
 {
-    (void)head_dim; // fixed at compile time
+    using Params = DecodeParamsT<T>;
 
     DecodePlanInfo plan_info;
     uint32_t group_size = num_qo_heads / num_kv_heads;
 
-    // We need to dispatch on GROUP_SIZE to get the right work estimation function
     cudaError_t status = cudaSuccess;
 
-    // Use a lambda to dispatch on group size
     auto do_plan = [&]<uint32_t GROUP_SIZE>() -> cudaError_t {
         auto work_estimation_func =
             BatchDecodeWithPagedKVCacheWorkEstimationDispatched<
-                GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParams>;
-        return DecodePlan<HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParams>(
+                GROUP_SIZE, HEAD_DIM, POS_ENCODING_MODE, Variant, Params>;
+        return DecodePlan<HEAD_DIM, POS_ENCODING_MODE, Variant, Params>(
             float_workspace, float_ws_size,
             int_workspace, page_locked_int_workspace,
             int_ws_size, plan_info, indptr_h,
@@ -200,10 +212,10 @@ int flashinfer_batch_decode_plan(
     };
 
     switch (group_size) {
-        case 1:  status = do_plan.operator()<1>();  break;
-        case 2:  status = do_plan.operator()<2>();  break;
-        case 4:  status = do_plan.operator()<4>();  break;
-        case 8:  status = do_plan.operator()<8>();  break;
+        case 1:  status = do_plan.template operator()<1>();  break;
+        case 2:  status = do_plan.template operator()<2>();  break;
+        case 4:  status = do_plan.template operator()<4>();  break;
+        case 8:  status = do_plan.template operator()<8>();  break;
         default: return -1; // unsupported group size
     }
 
@@ -215,28 +227,30 @@ int flashinfer_batch_decode_plan(
     return 0;
 }
 
-int flashinfer_batch_decode_run(
-    void* float_workspace, size_t float_ws_size,
+template <typename T>
+static int batch_decode_run_t(
+    void* float_workspace,
     void* int_workspace,
     int64_t* plan_info_vec, int plan_info_len,
-    float* q,
-    float* k_cache,
-    float* v_cache,
+    T* q,
+    T* k_cache,
+    T* v_cache,
     int32_t* kv_indptr,
     int32_t* kv_indices,
     int32_t* kv_last_page_len,
-    float* output,
+    T* output,
     int batch_size,
-    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int num_qo_heads, int num_kv_heads, int page_size,
+    float sm_scale, int window_left,
     cudaStream_t stream)
 {
-    (void)head_dim; // fixed at compile time
+    using Params = DecodeParamsT<T>;
 
     DecodePlanInfo plan_info;
     plan_info.FromVector(std::vector<int64_t>(plan_info_vec, plan_info_vec + plan_info_len));
 
     // Construct paged_kv_t with NHD layout
-    paged_kv_t<DTypeKV, IdType> paged_kv(
+    paged_kv_t<T, IdType> paged_kv(
         (uint32_t)num_kv_heads,
         (uint32_t)page_size,
         HEAD_DIM,
@@ -248,7 +262,7 @@ int flashinfer_batch_decode_run(
         kv_indptr,
         kv_last_page_len);
 
-    DecodeParams params;
+    Params params;
     params.q = q;
     params.q_rope_offset = nullptr;
     params.paged_kv = paged_kv;
@@ -261,9 +275,9 @@ int flashinfer_batch_decode_run(
     // are stride tricks, no data movement. So the actual memory layout is (batch, heads, dim).
     params.q_stride_n = num_qo_heads * HEAD_DIM;
     params.q_stride_h = HEAD_DIM;
-    params.window_left = -1; // no sliding window
+    params.window_left = window_left;
     params.logits_soft_cap = 0.0f;
-    params.sm_scale = 1.0f / sqrtf((float)HEAD_DIM);
+    params.sm_scale = sm_scale;
     params.rope_rcp_scale = 1.0f;
     params.rope_rcp_theta = 1.0f;
 
@@ -279,11 +293,11 @@ int flashinfer_batch_decode_run(
     params.block_valid_mask = nullptr;
     params.partition_kv = false;
 
-    DTypeO* tmp_v = nullptr;
+    T* tmp_v = nullptr;
     float* tmp_s = nullptr;
 
     if (plan_info.split_kv) {
-        tmp_v = GetPtrFromBaseOffset<DTypeO>(float_workspace, plan_info.v_offset);
+        tmp_v = GetPtrFromBaseOffset<T>(float_workspace, plan_info.v_offset);
         tmp_s = GetPtrFromBaseOffset<float>(float_workspace, plan_info.s_offset);
         if (plan_info.enable_cuda_graph) {
             params.block_valid_mask =
@@ -296,6 +310,204 @@ int flashinfer_batch_decode_run(
             params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
 
     return (int)status;
+}
+
+// ── dtype-templated prefill plan / run implementations ──
+
+template <typename T>
+static int batch_prefill_run_t(
+    void* float_workspace,
+    void* int_workspace,
+    int64_t* plan_info_vec, int plan_info_len,
+    T* q,
+    T* k_cache,
+    T* v_cache,
+    int32_t* qo_indptr,
+    int32_t* kv_indptr,
+    int32_t* kv_indices,
+    int32_t* kv_last_page_len,
+    T* output,
+    int batch_size,
+    int num_qo_heads, int num_kv_heads, int page_size,
+    float sm_scale, int window_left,
+    cudaStream_t stream)
+{
+    using Params = PrefillParamsT<T>;
+
+    PrefillPlanInfo plan_info;
+    plan_info.FromVector(std::vector<int64_t>(plan_info_vec, plan_info_vec + plan_info_len));
+
+    paged_kv_t<T, IdType> paged_kv(
+        (uint32_t)num_kv_heads,
+        (uint32_t)page_size,
+        HEAD_DIM,
+        (uint32_t)batch_size,
+        QKVLayout::kNHD,
+        k_cache,
+        v_cache,
+        kv_indices,
+        kv_indptr,
+        kv_last_page_len);
+
+    Params params;
+    params.q = q;
+    params.paged_kv = paged_kv;
+    params.maybe_custom_mask = nullptr;
+    params.q_indptr = qo_indptr;
+    params.maybe_mask_indptr = nullptr;
+    params.maybe_q_rope_offset = nullptr;
+    params.o = output;
+    params.lse = nullptr;
+    params.maybe_alibi_slopes = nullptr;
+    params.group_size = uint_fastdiv((uint32_t)(num_qo_heads / num_kv_heads));
+    params.num_qo_heads = (uint32_t)num_qo_heads;
+    // Q buffer memory layout is (total_q_tokens, heads, dim), matching decode.
+    params.q_stride_n = num_qo_heads * HEAD_DIM;
+    params.q_stride_h = HEAD_DIM;
+    params.window_left = window_left;
+    params.logits_soft_cap = 0.0f;
+    params.sm_scale = sm_scale;
+    params.rope_rcp_scale = 1.0f;
+    params.rope_rcp_theta = 1.0f;
+    params.maybe_prefix_len_ptr = nullptr;
+    params.maybe_token_pos_in_items_ptr = nullptr;
+    params.token_pos_in_items_len = 0;
+    params.maybe_max_item_len_ptr = nullptr;
+
+    params.request_indices =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.request_indices_offset);
+    params.qo_tile_indices =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.qo_tile_indices_offset);
+    params.kv_tile_indices =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_tile_indices_offset);
+    params.o_indptr = GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.o_indptr_offset);
+    params.kv_chunk_size_ptr =
+        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_chunk_size_ptr_offset);
+    params.merge_indptr = nullptr;
+    params.block_valid_mask = nullptr;
+    params.total_num_rows = nullptr;
+    params.max_total_num_rows = (uint32_t)plan_info.total_num_rows;
+    params.padded_batch_size = (uint32_t)plan_info.padded_batch_size;
+    params.partition_kv = false;
+
+    T* tmp_v = nullptr;
+    float* tmp_s = nullptr;
+    if (plan_info.split_kv) {
+        params.merge_indptr =
+            GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.merge_indptr_offset);
+        tmp_v = GetPtrFromBaseOffset<T>(float_workspace, plan_info.v_offset);
+        tmp_s = GetPtrFromBaseOffset<float>(float_workspace, plan_info.s_offset);
+        if (plan_info.enable_cuda_graph) {
+            params.block_valid_mask =
+                GetPtrFromBaseOffset<bool>(int_workspace, plan_info.block_valid_mask_offset);
+        }
+    }
+    if (plan_info.enable_cuda_graph) {
+        params.total_num_rows =
+            GetPtrFromBaseOffset<uint32_t>(int_workspace, plan_info.total_num_rows_offset);
+    }
+
+    cudaError_t status = cudaSuccess;
+    DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+        status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+            CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE,
+            /*use_fp16_qk_reduction=*/false, MaskMode::kCausal, CausalVariant, Params>(
+            params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
+    });
+
+    return (int)status;
+}
+
+extern "C" {
+
+int flashinfer_batch_decode_plan(
+    void* float_workspace, size_t float_ws_size,
+    void* int_workspace, size_t int_ws_size,
+    void* page_locked_int_workspace,
+    int32_t* indptr_h, int batch_size,
+    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    bool enable_cuda_graph,
+    cudaStream_t stream,
+    int64_t* plan_info_out, int* plan_info_len_out)
+{
+    (void)head_dim; // fixed at compile time
+
+    switch (dtype) {
+        case LUMINAL_DTYPE_F32:
+#if LUMINAL_HEAD_DIM <= 256
+            return batch_decode_plan_t<float>(
+                float_workspace, float_ws_size, int_workspace, int_ws_size,
+                page_locked_int_workspace, indptr_h, batch_size, num_qo_heads,
+                num_kv_heads, page_size, enable_cuda_graph, stream,
+                plan_info_out, plan_info_len_out);
+#else
+            return -2; // f32 unsupported at this HEAD_DIM
+#endif
+        case LUMINAL_DTYPE_F16:
+            return batch_decode_plan_t<half>(
+                float_workspace, float_ws_size, int_workspace, int_ws_size,
+                page_locked_int_workspace, indptr_h, batch_size, num_qo_heads,
+                num_kv_heads, page_size, enable_cuda_graph, stream,
+                plan_info_out, plan_info_len_out);
+        case LUMINAL_DTYPE_BF16:
+            return batch_decode_plan_t<__nv_bfloat16>(
+                float_workspace, float_ws_size, int_workspace, int_ws_size,
+                page_locked_int_workspace, indptr_h, batch_size, num_qo_heads,
+                num_kv_heads, page_size, enable_cuda_graph, stream,
+                plan_info_out, plan_info_len_out);
+        default:
+            return -1;
+    }
+}
+
+int flashinfer_batch_decode_run(
+    void* float_workspace, size_t float_ws_size,
+    void* int_workspace,
+    int64_t* plan_info_vec, int plan_info_len,
+    void* q,
+    void* k_cache,
+    void* v_cache,
+    int32_t* kv_indptr,
+    int32_t* kv_indices,
+    int32_t* kv_last_page_len,
+    void* output,
+    int batch_size,
+    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    float sm_scale, int window_left,
+    cudaStream_t stream)
+{
+    (void)float_ws_size;
+    (void)head_dim; // fixed at compile time
+
+    switch (dtype) {
+        case LUMINAL_DTYPE_F32:
+#if LUMINAL_HEAD_DIM <= 256
+            return batch_decode_run_t<float>(
+                float_workspace, int_workspace, plan_info_vec, plan_info_len,
+                (float*)q, (float*)k_cache, (float*)v_cache, kv_indptr, kv_indices,
+                kv_last_page_len, (float*)output, batch_size, num_qo_heads,
+                num_kv_heads, page_size, sm_scale, window_left, stream);
+#else
+            return -2; // f32 unsupported at this HEAD_DIM
+#endif
+        case LUMINAL_DTYPE_F16:
+            return batch_decode_run_t<half>(
+                float_workspace, int_workspace, plan_info_vec, plan_info_len,
+                (half*)q, (half*)k_cache, (half*)v_cache, kv_indptr, kv_indices,
+                kv_last_page_len, (half*)output, batch_size, num_qo_heads,
+                num_kv_heads, page_size, sm_scale, window_left, stream);
+        case LUMINAL_DTYPE_BF16:
+            return batch_decode_run_t<__nv_bfloat16>(
+                float_workspace, int_workspace, plan_info_vec, plan_info_len,
+                (__nv_bfloat16*)q, (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache,
+                kv_indptr, kv_indices, kv_last_page_len, (__nv_bfloat16*)output,
+                batch_size, num_qo_heads, num_kv_heads, page_size, sm_scale,
+                window_left, stream);
+        default:
+            return -1;
+    }
 }
 
 void flashinfer_prepare_decode_metadata(
@@ -335,32 +547,89 @@ void flashinfer_prepare_decode_metadata(
 }
 
 // ═══════════════════════════════════════════════════════════
-// BatchPrefill (fp16/bf16 only — tensor core MMA requires 16-bit inputs)
+// BatchPrefill (f16 / bf16 only — tensor core MMA requires 16-bit inputs)
 // ═══════════════════════════════════════════════════════════
-//
-// The prefill kernel templates are instantiated above for fp16. These C API
-// functions accept fp32 pointers (matching the current luminal pipeline) but
-// return -1 to indicate that fp32 prefill is not supported. When native fp16
-// support is added, these will accept fp16 pointers and call through to the
-// instantiated templates.
 
 int flashinfer_batch_prefill_plan(
-    void*, size_t, void*, size_t, void*,
-    int32_t*, int32_t*, int, int,
-    int, int, int, int, cudaStream_t,
-    int64_t*, int*)
+    void* float_workspace, size_t float_ws_size,
+    void* int_workspace, size_t int_ws_size,
+    void* page_locked_int_workspace,
+    int32_t* qo_indptr_h, int32_t* kv_indptr_h,
+    int total_num_rows, int batch_size,
+    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    int window_left,
+    cudaStream_t stream,
+    int64_t* plan_info_out, int* plan_info_len_out)
 {
-    return -1; // fp32 not supported — requires fp16/bf16
+    (void)head_dim; // fixed at compile time
+
+    if (dtype != LUMINAL_DTYPE_F16 && dtype != LUMINAL_DTYPE_BF16) {
+        return -1; // f32 prefill is physically unsupported (tensor cores are 16-bit)
+    }
+
+    PrefillPlanInfo plan_info;
+    cudaError_t status = PrefillPlan<IdType>(
+        float_workspace, float_ws_size,
+        int_workspace, page_locked_int_workspace, int_ws_size,
+        plan_info, qo_indptr_h, kv_indptr_h,
+        (uint32_t)total_num_rows, (uint32_t)batch_size,
+        (uint32_t)num_qo_heads, (uint32_t)num_kv_heads,
+        /*head_dim_qk=*/HEAD_DIM, /*head_dim_vo=*/HEAD_DIM,
+        (uint32_t)page_size,
+        /*enable_cuda_graph=*/false, /*sizeof_dtype_o=*/2,
+        window_left, /*fixed_split_size=*/-1, /*disable_split_kv=*/false,
+        /*num_colocated_ctas=*/0,
+        stream);
+
+    if (status != cudaSuccess) return (int)status;
+
+    auto vec = plan_info.ToVector();
+    *plan_info_len_out = (int)vec.size();
+    std::memcpy(plan_info_out, vec.data(), vec.size() * sizeof(int64_t));
+    return 0;
 }
 
 int flashinfer_batch_prefill_run(
-    void*, size_t, void*,
-    int64_t*, int,
-    float*, float*, float*,
-    int32_t*, int32_t*, int32_t*, int32_t*,
-    float*, int, int, int, int, int, int, cudaStream_t)
+    void* float_workspace, size_t float_ws_size,
+    void* int_workspace,
+    int64_t* plan_info_vec, int plan_info_len,
+    void* q,
+    void* k_cache,
+    void* v_cache,
+    int32_t* qo_indptr,
+    int32_t* kv_indptr,
+    int32_t* kv_indices,
+    int32_t* kv_last_page_len,
+    void* output,
+    int total_num_rows, int batch_size,
+    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    float sm_scale, int window_left,
+    cudaStream_t stream)
 {
-    return -1; // fp32 not supported — requires fp16/bf16
+    (void)float_ws_size;
+    (void)head_dim; // fixed at compile time
+    (void)total_num_rows;
+
+    switch (dtype) {
+        case LUMINAL_DTYPE_F16:
+            return batch_prefill_run_t<half>(
+                float_workspace, int_workspace, plan_info_vec, plan_info_len,
+                (half*)q, (half*)k_cache, (half*)v_cache, qo_indptr, kv_indptr,
+                kv_indices, kv_last_page_len, (half*)output, batch_size,
+                num_qo_heads, num_kv_heads, page_size, sm_scale, window_left,
+                stream);
+        case LUMINAL_DTYPE_BF16:
+            return batch_prefill_run_t<__nv_bfloat16>(
+                float_workspace, int_workspace, plan_info_vec, plan_info_len,
+                (__nv_bfloat16*)q, (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache,
+                qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
+                (__nv_bfloat16*)output, batch_size, num_qo_heads, num_kv_heads,
+                page_size, sm_scale, window_left, stream);
+        default:
+            return -1; // f32 prefill is physically unsupported
+    }
 }
 
 } // extern "C"
@@ -387,9 +656,11 @@ extern "C" void flashinfer_extract_slot_indices(
 // ── Output transpose: (batch, heads, dim) → (heads, batch, dim) ──
 // FlashInfer writes output as (batch, heads, dim) but Luminal expects (heads, batch, dim).
 // For batch=1 these are identical; for batch>1 we need an explicit transpose.
+// Pure data movement, so 16-bit dtypes share one uint16_t kernel.
 
+template <typename T>
 __global__ void transpose_bhd_to_hbd_kernel(
-    const float* src, float* dst, int batch, int heads, int dim) {
+    const T* src, T* dst, int batch, int heads, int dim) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = batch * heads * dim;
     if (idx >= total) return;
@@ -404,13 +675,19 @@ __global__ void transpose_bhd_to_hbd_kernel(
 }
 
 extern "C" void flashinfer_transpose_output(
-    const float* src, float* dst,
+    const void* src, void* dst,
     int batch, int heads, int dim,
+    int dtype,
     cudaStream_t stream) {
     int total = batch * heads * dim;
     if (total == 0) return;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    transpose_bhd_to_hbd_kernel<<<blocks, threads, 0, stream>>>(
-        src, dst, batch, heads, dim);
+    if (dtype == LUMINAL_DTYPE_F32) {
+        transpose_bhd_to_hbd_kernel<float><<<blocks, threads, 0, stream>>>(
+            (const float*)src, (float*)dst, batch, heads, dim);
+    } else {
+        transpose_bhd_to_hbd_kernel<uint16_t><<<blocks, threads, 0, stream>>>(
+            (const uint16_t*)src, (uint16_t*)dst, batch, heads, dim);
+    }
 }

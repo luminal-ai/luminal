@@ -22,6 +22,38 @@ use std::{
 
 // ── Function pointer types matching wrapper.h ──
 
+/// dtype codes shared with wrapper.cu's C API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum FlashInferDType {
+    F32 = 0,
+    F16 = 1,
+    Bf16 = 2,
+}
+
+impl FlashInferDType {
+    pub fn from_dtype(dtype: luminal::dtype::DType) -> Option<Self> {
+        match dtype {
+            luminal::dtype::DType::F32 => Some(Self::F32),
+            luminal::dtype::DType::F16 => Some(Self::F16),
+            luminal::dtype::DType::Bf16 => Some(Self::Bf16),
+            _ => None,
+        }
+    }
+
+    pub fn size_of(self) -> usize {
+        match self {
+            Self::F32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+
+    /// Prefill needs tensor cores, which only operate on 16-bit inputs.
+    pub fn supports_prefill(self) -> bool {
+        matches!(self, Self::F16 | Self::Bf16)
+    }
+}
+
 pub type PlanFn = unsafe extern "C" fn(
     float_workspace: *mut c_void,
     float_ws_size: usize,
@@ -34,6 +66,7 @@ pub type PlanFn = unsafe extern "C" fn(
     num_kv_heads: i32,
     page_size: i32,
     head_dim: i32,
+    dtype: i32,
     enable_cuda_graph: bool,
     stream: *mut c_void,
     plan_info_out: *mut i64,
@@ -46,18 +79,21 @@ pub type RunFn = unsafe extern "C" fn(
     int_workspace: *mut c_void,
     plan_info_vec: *mut i64,
     plan_info_len: i32,
-    q: *mut f32,
-    k_cache: *mut f32,
-    v_cache: *mut f32,
+    q: *mut c_void,
+    k_cache: *mut c_void,
+    v_cache: *mut c_void,
     kv_indptr: *mut i32,
     kv_indices: *mut i32,
     kv_last_page_len: *mut i32,
-    output: *mut f32,
+    output: *mut c_void,
     batch_size: i32,
     num_qo_heads: i32,
     num_kv_heads: i32,
     page_size: i32,
     head_dim: i32,
+    dtype: i32,
+    sm_scale: f32,
+    window_left: i32,
     stream: *mut c_void,
 ) -> i32;
 
@@ -83,11 +119,12 @@ pub type PrepareDecodeMetadataFn = unsafe extern "C" fn(
 );
 
 pub type TransposeOutputFn = unsafe extern "C" fn(
-    src: *const f32,
-    dst: *mut f32,
+    src: *const c_void,
+    dst: *mut c_void,
     batch: i32,
     heads: i32,
     dim: i32,
+    dtype: i32,
     stream: *mut c_void,
 );
 
@@ -105,6 +142,8 @@ pub type PrefillPlanFn = unsafe extern "C" fn(
     num_kv_heads: i32,
     page_size: i32,
     head_dim: i32,
+    dtype: i32,
+    window_left: i32,
     stream: *mut c_void,
     plan_info_out: *mut i64,
     plan_info_len_out: *mut i32,
@@ -116,20 +155,23 @@ pub type PrefillRunFn = unsafe extern "C" fn(
     int_workspace: *mut c_void,
     plan_info_vec: *mut i64,
     plan_info_len: i32,
-    q: *mut f32,
-    k_cache: *mut f32,
-    v_cache: *mut f32,
+    q: *mut c_void,
+    k_cache: *mut c_void,
+    v_cache: *mut c_void,
     qo_indptr: *mut i32,
     kv_indptr: *mut i32,
     kv_indices: *mut i32,
     kv_last_page_len: *mut i32,
-    output: *mut f32,
+    output: *mut c_void,
     total_num_rows: i32,
     batch_size: i32,
     num_qo_heads: i32,
     num_kv_heads: i32,
     page_size: i32,
     head_dim: i32,
+    dtype: i32,
+    sm_scale: f32,
+    window_left: i32,
     stream: *mut c_void,
 ) -> i32;
 
@@ -157,23 +199,33 @@ pub struct FlashInferLib {
 unsafe impl Send for FlashInferLib {}
 unsafe impl Sync for FlashInferLib {}
 
-static FLASHINFER_LIB: OnceLock<FlashInferLib> = OnceLock::new();
+/// One compiled wrapper per (HEAD_DIM, use_sliding_window) pair — gemma
+/// needs head dims 256 (sliding) and 512 (full) in one process. Libraries
+/// are leaked: each .so stays mapped for the process lifetime anyway.
+static FLASHINFER_LIBS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, bool), &'static FlashInferLib>>,
+> = OnceLock::new();
 
-/// Ensure the FlashInfer library is compiled and loaded for the given HEAD_DIM.
-/// Returns a reference to the loaded library. Thread-safe via OnceLock.
-pub fn ensure_compiled(head_dim: usize) -> &'static FlashInferLib {
-    FLASHINFER_LIB.get_or_init(|| {
-        assert!(
-            matches!(head_dim, 64 | 128 | 256),
-            "FlashInfer: unsupported HEAD_DIM={} (must be 64, 128, or 256 for f32)",
-            head_dim
-        );
-        let so_path = compile_or_cache(head_dim);
-        unsafe {
-            FlashInferLib::load(&so_path)
-                .unwrap_or_else(|e| panic!("Failed to load FlashInfer library: {e}"))
-        }
-    })
+/// Ensure the FlashInfer library is compiled and loaded for the given
+/// HEAD_DIM and sliding-window variant. Thread-safe.
+pub fn ensure_compiled(head_dim: usize, use_swa: bool) -> &'static FlashInferLib {
+    let libs = FLASHINFER_LIBS.get_or_init(Default::default);
+    let mut libs = libs.lock().unwrap();
+    if let Some(lib) = libs.get(&(head_dim, use_swa)) {
+        return lib;
+    }
+    assert!(
+        matches!(head_dim, 64 | 128 | 256 | 512),
+        "FlashInfer: unsupported HEAD_DIM={} (must be 64, 128, 256, or 512; 512 is 16-bit only)",
+        head_dim
+    );
+    let so_path = compile_or_cache(head_dim, use_swa);
+    let lib: &'static FlashInferLib = Box::leak(Box::new(unsafe {
+        FlashInferLib::load(&so_path)
+            .unwrap_or_else(|e| panic!("Failed to load FlashInfer library: {e}"))
+    }));
+    libs.insert((head_dim, use_swa), lib);
+    lib
 }
 
 impl FlashInferLib {
@@ -209,8 +261,8 @@ impl FlashInferLib {
     }
 }
 
-/// Compile wrapper.cu for the given HEAD_DIM, or return cached .so path.
-fn compile_or_cache(head_dim: usize) -> PathBuf {
+/// Compile wrapper.cu for the given HEAD_DIM/variant, or return cached .so path.
+fn compile_or_cache(head_dim: usize, use_swa: bool) -> PathBuf {
     let cache_dir = cache_directory();
     std::fs::create_dir_all(&cache_dir).expect("Failed to create FlashInfer cache directory");
 
@@ -222,8 +274,8 @@ fn compile_or_cache(head_dim: usize) -> PathBuf {
     // discarded automatically when wrapper.cu or wrapper.h change.
     let wrapper_hash = wrapper_source_hash();
     let so_name = format!(
-        "libflashinfer_hd{}_{}_w{:016x}.so",
-        head_dim, arch, wrapper_hash
+        "libflashinfer_hd{}_swa{}_{}_w{:016x}.so",
+        head_dim, use_swa as u8, arch, wrapper_hash
     );
     let so_path = cache_dir.join(&so_name);
 
@@ -256,6 +308,7 @@ fn compile_or_cache(head_dim: usize) -> PathBuf {
             "-o",
             so_path.to_str().unwrap(),
             &format!("-DLUMINAL_HEAD_DIM={}", head_dim),
+            &format!("-DLUMINAL_USE_SWA={}", use_swa as u8),
             wrapper_cu_path.to_str().unwrap(),
             "-I",
             flashinfer_include.to_str().unwrap(),

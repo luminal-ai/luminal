@@ -226,6 +226,27 @@ impl EgglogOp for GLUMoE {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
+        // The GLUMoE host op (per-step D2H routing sync + host cuBLASLt
+        // loop) never wins in real decode but its profile-time cost at
+        // search dims occasionally beats KernelMoEGemv, poisoning selection
+        // (29.7ms gemma runs). Kill-switch for benches/models that want the
+        // candidate gone.
+        if std::env::var("LUMINAL_DISABLE_FUSED")
+            .map(|v| v.contains("glumoe"))
+            .unwrap_or(false)
+        {
+            return vec![Rule::raw(
+                "(rule
+                (
+                    (= ?e (Op (GLUMoE ?gu_io ?dn_io ?gu_matmul_k ?dn_matmul_k ?output_k ?gu_within_range ?dn_within_range ?mode) ?inputs))
+                )
+                (
+                    (set (dtype ?e) (F32))
+                )
+                :ruleset dtype_prop
+            )",
+            )];
+        }
         vec![
             Rule::raw(
                 "(rule

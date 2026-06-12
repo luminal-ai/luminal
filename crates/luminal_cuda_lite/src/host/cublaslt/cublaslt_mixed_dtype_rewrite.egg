@@ -19,7 +19,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             (F16) (F16) (F16) (F16)
             ?compute_type ?scale_dtype
-            ?alpha ?beta ?epilogue)
+            ?alpha 0.0 ?epilogue)
             ?inputs))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?matmul (INil))))
     )
@@ -32,7 +32,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             (F16) (F16) (F32) (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta ?epilogue)
+            ?alpha 0.0 ?epilogue)
             ?inputs))
         (union ?cast ?fused)
         (set (dtype ?fused) (F32))
@@ -52,7 +52,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             (Bf16) (Bf16) (Bf16) (Bf16)
             ?compute_type ?scale_dtype
-            ?alpha ?beta ?epilogue)
+            ?alpha 0.0 ?epilogue)
             ?inputs))
         (= ?cast (Op (Cast ?size (F32)) (ICons ?matmul (INil))))
     )
@@ -65,7 +65,7 @@
             ?stride_a ?stride_b ?stride_c ?stride_d
             (Bf16) (Bf16) (F32) (F32)
             ?compute_type ?scale_dtype
-            ?alpha ?beta ?epilogue)
+            ?alpha 0.0 ?epilogue)
             ?inputs))
         (union ?cast ?fused)
         (set (dtype ?fused) (F32))
