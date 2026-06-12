@@ -1718,68 +1718,6 @@ fn is_search_choice_eclass(label: &str) -> bool {
     label.contains("IR") || label.contains("IList") || label.contains("OpKind")
 }
 
-/// Kind labels whose alternatives only rewire the *interior* of a fused
-/// elementwise region (or move a cast across its FS/FE boundary). Every
-/// variant materializes the same buffers and the regions are bandwidth-
-/// bound, so the choice is performance-noise — but each one doubles the
-/// genome space and, worse, makes every candidate emit textually fresh
-/// region kernels (one measured gemma search nvrtc-compiled 200k+ unique
-/// kernels with only ~2k distinct memory interfaces among them).
-const REGION_INTERIOR_KINDS: [&str; 4] = [
-    "CudaUnaryElementwise",
-    "CudaBinaryElementwise",
-    "FusionStart",
-    "FusionEnd",
-];
-
-/// If every variant of this choice eclass is region-interior plumbing,
-/// return one deterministic pick; otherwise `None` (a real search choice).
-/// Preference: a fused (`Cuda*Elementwise`) variant over a bare marker —
-/// absorbing a cast into the region usually erases a standalone kernel and
-/// its buffer. Ties resolve by NodeId, which is stable for all candidates
-/// extracted from one serialized egraph — that stability is what lets
-/// structurally identical regions hit the compile cache across candidates.
-fn frozen_region_choice<'a>(
-    egraph: &'a SerializedEGraph,
-    label: &str,
-    enodes: &'a [NodeId],
-) -> Option<&'a NodeId> {
-    if label.contains("IList") || enodes.len() < 2 {
-        return None;
-    }
-    // Resolve each variant to its kind label(s): `Op` enodes via their
-    // OpKind child eclass, OpKind enodes directly.
-    let mut preferred: Option<&NodeId> = None;
-    let mut fallback: Option<&NodeId> = None;
-    for n in enodes {
-        let (lbl, children) = egraph.enodes.get(n)?;
-        let kind_labels: Vec<&str> = if lbl == "Op" && !children.is_empty() {
-            egraph.eclasses.get(&children[0])?
-                .1
-                .iter()
-                .map(|kn| egraph.enodes.get(kn).map(|(l, _)| l.as_str()))
-                .collect::<Option<Vec<_>>>()?
-        } else {
-            vec![lbl.as_str()]
-        };
-        if !kind_labels
-            .iter()
-            .all(|l| REGION_INTERIOR_KINDS.contains(l))
-        {
-            return None;
-        }
-        let is_fused = kind_labels
-            .iter()
-            .any(|l| l.starts_with("Cuda"));
-        let slot = if is_fused { &mut preferred } else { &mut fallback };
-        match slot {
-            Some(cur) if cur.as_ref() <= n.as_ref() => {}
-            _ => *slot = Some(n),
-        }
-    }
-    preferred.or(fallback)
-}
-
 fn extractor_list_len(egraph: &SerializedEGraph, eclass_id: &ClassId) -> Option<usize> {
     let mut len = 0usize;
     let mut cur_eclass: ClassId = eclass_id.clone();
@@ -1837,9 +1775,7 @@ pub fn count_choice_sets_up_to(egraph: &SerializedEGraph, limit: usize) -> usize
 
     let mut count = 1usize;
     for (label, enodes) in egraph.eclasses.values() {
-        if !is_search_choice_eclass(label)
-            || frozen_region_choice(egraph, label, enodes).is_some()
-        {
+        if !is_search_choice_eclass(label) {
             continue;
         }
 
@@ -1858,13 +1794,6 @@ pub fn random_initial_choice<'a>(
     let mut choices = FxHashMap::default();
     for (eclass, (label, enodes)) in &egraph.eclasses {
         if !is_search_choice_eclass(label) {
-            continue;
-        }
-        // Region-interior plumbing is not a search choice — fix it
-        // deterministically so all candidates share region wirings (and
-        // therefore region kernel sources).
-        if let Some(frozen) = frozen_region_choice(egraph, label, enodes) {
-            choices.insert(eclass, frozen);
             continue;
         }
         // Use synth-injected enodes when available — they point at
@@ -2083,11 +2012,7 @@ fn reachable_mutable_choice_classes<'a>(
         return mutable_classes;
     };
     if let Some((label, enodes)) = egraph.eclasses.get(root) {
-        if is_search_choice_eclass(label)
-            && enodes.len() > 1
-            && frozen_region_choice(egraph, label, enodes).is_none()
-            && class_seen.insert(root)
-        {
+        if is_search_choice_eclass(label) && enodes.len() > 1 && class_seen.insert(root) {
             mutable_classes.push(root);
         }
     }
@@ -2105,10 +2030,7 @@ fn reachable_mutable_choice_classes<'a>(
                 continue;
             };
             if is_search_choice_eclass(label) {
-                if enodes.len() > 1
-                    && frozen_region_choice(egraph, label, enodes).is_none()
-                    && class_seen.insert(child_class)
-                {
+                if enodes.len() > 1 && class_seen.insert(child_class) {
                     mutable_classes.push(child_class);
                 }
                 if let Some(chosen_node) = choices.get(child_class) {

@@ -231,6 +231,27 @@ impl EgglogOp for FusionEnd {
              ) :ruleset cleanup :name \"cleanup-nested-FS-FE-cast\")",
         ));
 
+        // Genome freeze: grow-Cast-FS leaves each cast-bearing FS eclass
+        // with two extraction-equivalent variants — the bare FS reading the
+        // materialized cast output, and the absorbed CudaCast reading the
+        // original buffer and converting in-register. Both wirings move
+        // the same bytes for the bandwidth-bound regions they sit in, but
+        // each pair doubles the search genome and makes candidates emit
+        // textually fresh region kernels. Delete the bare-FS variant once
+        // growth is done (cleanup runs after the fusion_grow cycles, so
+        // the row is not re-derived); the premise proves the absorbed
+        // survivor exists in the same eclass, so the eclass never empties.
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
+                (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
+                (= ?fs_c (Op (CudaUnaryElementwise \"Cast\" ?shape ?is ?os ?dt_out)
+                             (ICons ?fs_x (INil))))
+             ) (
+                (delete (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
+             ) :ruleset cleanup :name \"cleanup-FS-with-absorbed-cast\")",
+        ));
+
         // Grow FE → binary consumer, left and right orientations.
         for (hlir, opcode) in binaries {
             rules.push(Rule::raw(format!(
