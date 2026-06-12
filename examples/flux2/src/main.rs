@@ -25,6 +25,14 @@
 //!   2. Load transformer, run the diffusion loop, **drop the runtime**.
 //!   3. Load VAE, decode, dump PNG.
 
+// glibc malloc degrades into an allocating livelock inside
+// nvrtcCompileProgram after heavy search heap churn (hundreds of
+// thousands of compiles). jemalloc built with unprefixed symbols
+// interposes malloc for the whole process, including dlopened CUDA
+// libraries like libnvrtc — a Rust-only global allocator would not.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hf;
 #[allow(dead_code)]
 mod quant;

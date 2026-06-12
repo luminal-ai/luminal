@@ -7,5 +7,6 @@ edition = "2024"
 
 [dependencies]
 luminal = { path = "../.." }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite" }
 rand = "0.9.2"
