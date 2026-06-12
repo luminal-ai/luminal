@@ -1689,6 +1689,108 @@ fn gemma_mini_paged_attention(
     out.transpose(0, 1).merge_dims(1, 2)
 }
 
+/// Census of search choice eclasses on a realistic mini attention chunk:
+/// how many genome bits select among *elementwise-only* alternatives
+/// (fused-region interior wiring — performance-equivalent for the
+/// bandwidth-bound regions they land in) versus structural alternatives
+/// the search genuinely needs to explore. Run with --nocapture.
+#[test]
+#[ignore = "debug instrument: choice-eclass census for search-space analysis"]
+fn egraph_choice_eclass_census() {
+    const HD: usize = 64;
+    const HEADS: usize = 2;
+    const KVH: usize = 1;
+    let mut cx = Graph::default();
+    let q = cx.tensor(('s', HEADS * HD)).as_dtype(DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let scatter_idx = cx.tensor('s').as_dtype(DType::Int);
+    let gather_idx = cx.tensor('c').as_dtype(DType::Int);
+    let q_pos = cx.tensor('s').as_dtype(DType::Int);
+    let out = gemma_mini_paged_attention(
+        q, k, v, k_cache, v_cache, scatter_idx, gather_idx, q_pos, HD,
+        KVH * HD, HEADS / KVH, HEADS, Some(8),
+    );
+    let _out = out.cast(DType::F32).output();
+
+    let (program, root) = hlir_to_egglog(&mut cx);
+    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
+    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
+    // cleanup=true: census the egraph the search actually extracts from.
+    let egraph = run_egglog(&program, &root, &ops, true).expect("egglog failed");
+
+    let elementwise_labels = [
+        "Add",
+        "Mul",
+        "Cast",
+        "Exp2",
+        "Log2",
+        "Sin",
+        "Sqrt",
+        "Recip",
+        "CudaUnaryElementwise",
+        "CudaBinaryElementwise",
+        "FusionStart",
+        "FusionEnd",
+    ];
+    let mut multi = 0usize;
+    let mut elementwise_only = 0usize;
+    let mut profile_hist: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut choice_product_log2 = 0f64;
+    let mut frozen_product_log2 = 0f64;
+    for (label, enodes) in egraph.eclasses.values() {
+        let searchable =
+            label.contains("IR") || label.contains("IList") || label.contains("OpKind");
+        if !searchable || enodes.len() < 2 {
+            continue;
+        }
+        multi += 1;
+        choice_product_log2 += (enodes.len() as f64).log2();
+        // Resolve each variant to its op *kind*: an `Op` enode's first
+        // child is its OpKind eclass; use that eclass's enode labels.
+        // Non-Op variants (list cons, kind constructors) keep their own
+        // label.
+        let mut labels: Vec<&str> = enodes
+            .iter()
+            .flat_map(|n| {
+                let (lbl, children) = &egraph.enodes[n];
+                if lbl == "Op" && !children.is_empty() {
+                    egraph.eclasses[&children[0]]
+                        .1
+                        .iter()
+                        .map(|kn| egraph.enodes[kn].0.as_str())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![lbl.as_str()]
+                }
+            })
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        let ew_only = labels
+            .iter()
+            .all(|l| elementwise_labels.contains(l) || l.starts_with("ICons") || l.starts_with("INil"));
+        if ew_only {
+            elementwise_only += 1;
+        } else {
+            frozen_product_log2 += (enodes.len() as f64).log2();
+        }
+        *profile_hist.entry(format!("{labels:?}")).or_insert(0) += 1;
+    }
+    println!("multi-alternative choice eclasses: {multi}");
+    println!("  elementwise-only (freezable):    {elementwise_only}");
+    println!("  search-space log2: {choice_product_log2:.0} -> {frozen_product_log2:.0} bits after freezing");
+    println!("top label profiles:");
+    let mut hist: Vec<_> = profile_hist.into_iter().collect();
+    hist.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    for (profile, count) in hist.into_iter().take(25) {
+        println!("  {count:5}  {profile}");
+    }
+}
+
 #[test]
 #[ignore = "debug instrument: dump gemma sliding paged attention egglog"]
 fn dump_gemma_sliding_attention_egglog() {
