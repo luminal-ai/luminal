@@ -235,42 +235,7 @@ impl EgglogOp for FlashInferAttention {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        let text = include_str!["flashinfer_attention.egg"];
-        // Debug bisect: LUMINAL_DISABLE_FI=gemma and/or =legacy drops the
-        // corresponding attention island rules (relations/facts and the
-        // cache-pair/const-like rules are always kept).
-        let disable = std::env::var("LUMINAL_DISABLE_FI").unwrap_or_default();
-        if disable.is_empty() {
-            return vec![Rule::raw(text)];
-        }
-        let legacy = [
-            "FlashInfer batch decode attention",
-            "FlashInfer direct causal attention",
-            "FlashInfer causal triu-gather attention\"",
-            "FlashInfer causal triu-gather attention 16-bit prefill",
-        ];
-        let mut gemma: Vec<&str> = Vec::new();
-        if disable.contains("gemmafull") || disable.contains("gemma,") || disable.ends_with("gemma") {
-            gemma.push("FlashInfer gemma scale-free triu-gather attention");
-        }
-        if disable.contains("gemmasliding") || disable.contains("gemma,") || disable.ends_with("gemma") {
-            gemma.push("FlashInfer gemma sliding triu-gather attention");
-        }
-        let mut out = String::new();
-        for (i, block) in text.split("\n(rule").enumerate() {
-            if i == 0 {
-                out.push_str(block);
-                continue;
-            }
-            let drop = (disable.contains("legacy")
-                && legacy.iter().any(|n| block.contains(n)))
-                || (disable.contains("gemma") && gemma.iter().any(|n| block.contains(n)));
-            if !drop {
-                out.push_str("\n(rule");
-                out.push_str(block);
-            }
-        }
-        vec![Rule::raw(out)]
+        vec![Rule::raw(include_str!["flashinfer_attention.egg"])]
     }
 
     fn extract<'a>(

@@ -36,10 +36,15 @@
 (flashinfer_head_dim_ok_16bit (MNum 256))
 (flashinfer_head_dim_ok_16bit (MNum 512))
 
-; Mask-chain facts staged for the attention island rules (see the gemma
-; variants at the bottom of this file).
+; Mask-chain facts staged for the attention island rules. Every island rule
+; anchors at one of these tiny relations instead of inlining its mask atoms:
+; the mask-fact joins are small and run once in kernel_fuse_late_pre, and the
+; island joins stay narrow on rolled bodies with many distinct attention
+; instances (inlined, the gemma body ground for 35+ minutes in fuse-late).
 (relation fi_triu_mask (IR IR))
 (relation fi_window_term (IR IR f64))
+(relation fi_scaled_offset_mask (IR))
+(relation fi_direct_causal_mask (IR IR))
 
 ; A constant-valued eclass regardless of dtype: either a plain HLIR Constant
 ; (f32 graphs) or a folded dtype-typed KernelConstant (the frontend emits
@@ -182,16 +187,22 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
         ; FlashInfer needs qo_indptr/kv_indptr to be recoverable from the mask
         ; expression. Do not match examples that pass a precomputed mask Input.
-        (= ?mask (Op (Add ?inner_mask_shape ?inner_mask_a_strides ?inner_mask_b_strides ?inner_mask_out_strides)
-            (ICons ?mask_scaled_allowed (ICons ?mask_offset (INil)))))
-        (= ?mask_scaled_allowed (Op (Mul ?allowed_shape ?allowed_strides ?scale_const_strides ?scaled_allowed_strides)
-            (ICons ?mask_allowed (ICons ?mask_scale_const (INil)))))
-        (const_like ?mask_scale_const ?mask_scale_val)
-        (> ?mask_scale_val 9999999999.0)
-        (< ?mask_scale_val 10000000001.0)
+        ; Mask spelling staged as a fact — see "FlashInfer scaled-offset mask
+        ; fact".
+        (fi_scaled_offset_mask ?mask)
 
         ; ── K GQA broadcast: Mul(K_gathered, 1.0) with zero-stride constant ──
         ; Shape: (nheads, hdim, c) — 3D
@@ -221,7 +232,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 0.0 -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -314,25 +325,20 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
-        (= ?mask (Op (Mul
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?blocked_strides
-            ?neg_scale_strides
-            ?mask_out_strides)
-            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
-        (const_like ?neg_mask_scale ?neg_mask_scale_val)
-        (< ?neg_mask_scale_val -9999999999.0)
-        (> ?neg_mask_scale_val -10000000001.0)
-        (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
-            (ICons ?blocked_bool (INil))))
-        (= ?blocked_bool (Op (LessThan
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?q_pos_cmp_strides
-            ?col_cmp_strides
-            ?blocked_out_strides)
-            (ICons ?q_pos (ICons ?col_offsets (INil)))))
-        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+        ; Mask spelling staged as a fact — see "FlashInfer direct causal mask
+        ; fact".
+        (fi_direct_causal_mask ?mask ?q_pos)
 
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
@@ -357,7 +363,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 0.0 -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -452,66 +458,24 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
         ; Mask indices are row-aligned triangular-mask rows plus arange(c).
-        (= ?mask (Op (Gather
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?mask_idx_strides
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?mask_src_strides)
-            (ICons ?mask_indices (ICons ?scaled_blocked (INil)))))
-        (= ?mask_indices (Op (Add
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?row_idx_strides
-            ?col_idx_strides
-            ?mask_idx_out_strides)
-            (ICons ?row_offsets (ICons ?col_offsets (INil)))))
-        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
-        (= ?row_offsets (Op (Mul
-            (ECons (MVar "s") (ENil))
-            ?q_pos_strides
-            ?ctx_scalar_strides
-            ?row_offsets_out_strides)
-            (ICons ?q_pos (ICons ?ctx_scalar (INil)))))
-        (= ?ctx_scalar (Op (Iota (MVar "c") (MNum 1)) (INil)))
-
-        ; The source square is an upper-triangular blocked mask. The LessThan
-        ; strides prove row_index < col_index; multiplying by -1e10 turns
-        ; blocked positions into additive -inf and leaves the prefix at zero.
-        (= ?scaled_blocked (Op (Mul
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?blocked_strides
-            ?neg_scale_strides
-            ?scaled_blocked_strides)
-            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
-        (const_like ?neg_mask_scale ?neg_mask_scale_val)
-        (< ?neg_mask_scale_val -9999999999.0)
-        (> ?neg_mask_scale_val -10000000001.0)
-        (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
-            (ICons ?blocked_bool (INil))))
-        (= ?blocked_bool (Op (LessThan
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?tri_row_strides
-            ?tri_col_strides
-            ?blocked_out_strides)
-            (ICons ?tri_iota_f32 (ICons ?tri_iota_minus_zero (INil)))))
-        (= ?tri_iota_minus_zero (Op (Add
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?tri_minus_zero_a_strides
-            ?tri_minus_zero_b_strides
-            ?tri_minus_zero_out_strides)
-            (ICons ?tri_iota_f32 (ICons ?zero_offset (INil)))))
-        (= ?zero_offset (Op (Mul
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?zero_offset_a_strides
-            ?zero_offset_b_strides
-            ?zero_offset_out_strides)
-            (ICons ?zero_const (ICons ?neg_one_const (INil)))))
-        (= ?zero_const (Op (Constant 0.000000) (INil)))
-        (= ?neg_one_const (Op (Constant -1.000000) (INil)))
-        (= ?tri_iota_f32 (Op (Cast ?tri_iota_cast_size (F32))
-            (ICons ?tri_iota (INil))))
-        (= ?tri_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+        ; Triu-gather causal mask, staged as a fact in kernel_fuse_late_pre
+        ; (see "FlashInfer triu mask fact"). Anchoring this rule at the
+        ; tiny fact relation instead of inlining the ~20 mask atoms keeps
+        ; the join narrow on rolled bodies with many distinct attention
+        ; instances (gemma: 35+ min / OOM as a single inlined join).
+        (fi_triu_mask ?mask ?q_pos)
 
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
@@ -536,7 +500,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 0.0 -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -629,66 +593,24 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
         ; Mask indices are row-aligned triangular-mask rows plus arange(c).
-        (= ?mask (Op (Gather
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?mask_idx_strides
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?mask_src_strides)
-            (ICons ?mask_indices (ICons ?scaled_blocked (INil)))))
-        (= ?mask_indices (Op (Add
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?row_idx_strides
-            ?col_idx_strides
-            ?mask_idx_out_strides)
-            (ICons ?row_offsets (ICons ?col_offsets (INil)))))
-        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
-        (= ?row_offsets (Op (Mul
-            (ECons (MVar "s") (ENil))
-            ?q_pos_strides
-            ?ctx_scalar_strides
-            ?row_offsets_out_strides)
-            (ICons ?q_pos (ICons ?ctx_scalar (INil)))))
-        (= ?ctx_scalar (Op (Iota (MVar "c") (MNum 1)) (INil)))
-
-        ; The source square is an upper-triangular blocked mask. The LessThan
-        ; strides prove row_index < col_index; multiplying by -1e10 turns
-        ; blocked positions into additive -inf and leaves the prefix at zero.
-        (= ?scaled_blocked (Op (Mul
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?blocked_strides
-            ?neg_scale_strides
-            ?scaled_blocked_strides)
-            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
-        (const_like ?neg_mask_scale ?neg_mask_scale_val)
-        (< ?neg_mask_scale_val -9999999999.0)
-        (> ?neg_mask_scale_val -10000000001.0)
-        (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
-            (ICons ?blocked_bool (INil))))
-        (= ?blocked_bool (Op (LessThan
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?tri_row_strides
-            ?tri_col_strides
-            ?blocked_out_strides)
-            (ICons ?tri_iota_f32 (ICons ?tri_iota_minus_zero (INil)))))
-        (= ?tri_iota_minus_zero (Op (Add
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?tri_minus_zero_a_strides
-            ?tri_minus_zero_b_strides
-            ?tri_minus_zero_out_strides)
-            (ICons ?tri_iota_f32 (ICons ?zero_offset (INil)))))
-        (= ?zero_offset (Op (Mul
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
-            ?zero_offset_a_strides
-            ?zero_offset_b_strides
-            ?zero_offset_out_strides)
-            (ICons ?zero_const (ICons ?neg_one_const (INil)))))
-        (= ?zero_const (Op (Constant 0.000000) (INil)))
-        (= ?neg_one_const (Op (Constant -1.000000) (INil)))
-        (= ?tri_iota_f32 (Op (Cast ?tri_iota_cast_size (F32))
-            (ICons ?tri_iota (INil))))
-        (= ?tri_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+        ; Triu-gather causal mask, staged as a fact in kernel_fuse_late_pre
+        ; (see "FlashInfer triu mask fact"). Anchoring this rule at the
+        ; tiny fact relation instead of inlining the ~20 mask atoms keeps
+        ; the join narrow on rolled bodies with many distinct attention
+        ; instances (gemma: 35+ min / OOM as a single inlined join).
+        (fi_triu_mask ?mask ?q_pos)
 
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
@@ -713,7 +635,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 0.0 -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -794,6 +716,56 @@
     )
     :ruleset kernel_fuse_late_pre
     :name "FlashInfer triu mask fact"
+)
+
+(rule
+    (
+        ; Legacy decode mask spelling: Add(Mul(allowed, 1e10), offset). The
+        ; "batch decode attention" island rule anchors at this fact.
+        (= ?mask (Op (Add ?inner_mask_shape ?inner_mask_a_strides ?inner_mask_b_strides ?inner_mask_out_strides)
+            (ICons ?mask_scaled_allowed (ICons ?mask_offset (INil)))))
+        (= ?mask_scaled_allowed (Op (Mul ?allowed_shape ?allowed_strides ?scale_const_strides ?scaled_allowed_strides)
+            (ICons ?mask_allowed (ICons ?mask_scale_const (INil)))))
+        (const_like ?mask_scale_const ?mask_scale_val)
+        (> ?mask_scale_val 9999999999.0)
+        (< ?mask_scale_val 10000000001.0)
+    )
+    (
+        (fi_scaled_offset_mask ?mask)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer scaled-offset mask fact"
+)
+
+(rule
+    (
+        ; Direct causal mask spelling:
+        ;   (q_pos[:, None] < arange(c)[None, :]).cast(F32) * -1e10
+        ; The "direct causal attention" island rule anchors at this fact.
+        (= ?mask (Op (Mul
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?blocked_strides
+            ?neg_scale_strides
+            ?mask_out_strides)
+            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
+        (const_like ?neg_mask_scale ?neg_mask_scale_val)
+        (< ?neg_mask_scale_val -9999999999.0)
+        (> ?neg_mask_scale_val -10000000001.0)
+        (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
+            (ICons ?blocked_bool (INil))))
+        (= ?blocked_bool (Op (LessThan
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?q_pos_cmp_strides
+            ?col_cmp_strides
+            ?blocked_out_strides)
+            (ICons ?q_pos (ICons ?col_offsets (INil)))))
+        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+    )
+    (
+        (fi_direct_causal_mask ?mask ?q_pos)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer direct causal mask fact"
 )
 
 (rule
