@@ -96,8 +96,14 @@ fn is_expert_weight(name: &str) -> bool {
     name.contains(".experts.")
 }
 
+/// Tensors that stay F32 in the bf16 pipeline: norm weights (norms compute
+/// in F32 via explicit casts), the MoE router, and the per-layer scalar.
+fn keep_f32(name: &str) -> bool {
+    name.contains("norm") || name.contains("router") || name.ends_with(".layer_scalar")
+}
+
 pub fn combine_safetensors(model_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined.safetensors");
+    let output_path = model_dir.join("model_combined_bf16_v1.safetensors");
     if output_path.exists() {
         return Ok(output_path);
     }
@@ -195,17 +201,33 @@ pub fn combine_safetensors(model_dir: &Path) -> Result<PathBuf, Box<dyn std::err
         }
     }
 
-    println!("Saving combined model (BF16 experts + F32 rest)...");
+    println!("Saving combined model (BF16 weights, F32 norms/router)...");
+    // Convert non-expert F32 tensors to BF16 at serialization time, except
+    // the keep_f32 set (norms, router, layer_scalar).
+    let bf16_converted: HashMap<String, Vec<u8>> = all_tensors
+        .iter()
+        .filter_map(|(name, stored)| match &stored.data {
+            TensorData::F32(data) if !keep_f32(name) => {
+                let bf16_data: Vec<bf16> = data.iter().map(|x| bf16::from_f32(*x)).collect();
+                Some((name.clone(), bytemuck::cast_slice(&bf16_data).to_vec()))
+            }
+            _ => None,
+        })
+        .collect();
     let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
         .iter()
         .map(|(name, stored)| {
-            let view = match &stored.data {
-                TensorData::F32(data) => {
-                    let bytes: &[u8] = bytemuck::cast_slice(data);
-                    TensorView::new(Dtype::F32, stored.shape.clone(), bytes).unwrap()
-                }
-                TensorData::BF16(bytes) => {
-                    TensorView::new(Dtype::BF16, stored.shape.clone(), bytes).unwrap()
+            let view = if let Some(bytes) = bf16_converted.get(name) {
+                TensorView::new(Dtype::BF16, stored.shape.clone(), bytes).unwrap()
+            } else {
+                match &stored.data {
+                    TensorData::F32(data) => {
+                        let bytes: &[u8] = bytemuck::cast_slice(data);
+                        TensorView::new(Dtype::F32, stored.shape.clone(), bytes).unwrap()
+                    }
+                    TensorData::BF16(bytes) => {
+                        TensorView::new(Dtype::BF16, stored.shape.clone(), bytes).unwrap()
+                    }
                 }
             };
             (name.clone(), view)
