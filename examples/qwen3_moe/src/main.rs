@@ -82,6 +82,7 @@ fn main() {
         );
 
     println!("Building E-Graph...");
+    let phase = std::time::Instant::now();
     if std::env::var_os("QWEN_EXCLUDE_GEMV").is_some() {
         println!("(excluding KernelGemv candidates)");
         cx.build_search_space_exclude_ops::<CudaRuntime, luminal_cuda_lite::kernel::gemv::KernelGemv>(
@@ -90,6 +91,7 @@ fn main() {
     } else {
         cx.build_search_space::<CudaRuntime>(build_options);
     }
+    println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(5);
