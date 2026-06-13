@@ -166,6 +166,9 @@ impl<'a> Translator<'a> {
             // LayerNorm
             "torch.ops.aten.native_layer_norm.default" => self.translate_layer_norm(node)?,
 
+            // GroupNorm
+            "torch.ops.aten.native_group_norm.default" => self.translate_group_norm(node)?,
+
             // Where
             "torch.ops.aten.where.self" => self.translate_where(node)?,
             "torch.ops.aten.where.ScalarOther" => self.translate_where_scalar_other(node)?,

@@ -106,6 +106,94 @@ impl<'a> Translator<'a> {
         Ok(result)
     }
 
+    /// Translate `aten.native_group_norm.default`.
+    ///
+    /// Schema: `native_group_norm(input, weight?, bias?, N, C, HxW, num_groups, eps)
+    /// -> (out, mean, rstd)`. We only produce the normalized `out`; the `mean`/`rstd`
+    /// outputs exist solely for the backward pass and are never consumed by inference
+    /// graphs, so (like `translate_layer_norm`) we return a single tensor and let the
+    /// dispatcher assign it to output[0] while the unused outputs are DCE'd.
+    ///
+    /// GroupNorm splits the `C` channels into `num_groups` groups and normalizes each
+    /// `(batch, group)` slice jointly over its `group_size * spatial` elements, then
+    /// applies a per-channel affine. We compose this from existing primitives (no new
+    /// op): reshape so each group's volume is a single contiguous axis, `layer_norm`
+    /// over that one axis, reshape back, then the affine.
+    ///
+    /// The per-group volume is flattened into ONE axis before normalizing rather than
+    /// reducing over multiple axes: the multi-axis reduction form is dropped by the
+    /// e-graph during cleanup when composed into deep conv chains (see the note in
+    /// `examples/flux2/src/vae.rs`). Reshapes use `Expression` extents throughout, so
+    /// dynamic batch and dynamic spatial dims are preserved.
+    pub(crate) fn translate_group_norm(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let num_groups = self.get_int_arg(node, 6)? as usize;
+        let eps = self.get_float_arg(node, 7).unwrap_or(1e-5) as f32;
+
+        let orig_dims = input.dims();
+        let ndim = orig_dims.len();
+        anyhow::ensure!(
+            ndim >= 2,
+            "group_norm expects input rank >= 2 (N, C, ...), got {ndim}"
+        );
+
+        // Channel count must be static to size the groups (it always is — channel
+        // count is a model-config constant).
+        let c = orig_dims[1]
+            .to_usize()
+            .ok_or_else(|| anyhow::anyhow!("group_norm requires a static channel dim"))?;
+        anyhow::ensure!(
+            num_groups != 0 && c % num_groups == 0,
+            "group_norm: num_channels ({c}) must be a positive multiple of num_groups ({num_groups})"
+        );
+        let group_size = c / num_groups;
+
+        // Per-group volume V = group_size * (product of spatial dims). Spatial extents
+        // stay symbolic so dynamic spatial dims flow through.
+        let spatial: Expression = orig_dims[2..].iter().cloned().product();
+        let group_volume = spatial * Expression::from(group_size);
+
+        // Flatten everything after the batch dim into one axis: (N, C, ...) -> (N, M),
+        // where M = C * spatial. Group volumes are contiguous in this layout.
+        let mut t = input;
+        while t.shape.len() > 2 {
+            t = t.merge_dims(1, 2);
+        }
+        // (N, M) -> (N, num_groups, group_volume): M / group_volume == num_groups.
+        t = t.split_dims(1, group_volume);
+
+        // Normalize over the single per-group axis (matches PyTorch: biased variance,
+        // eps inside the sqrt).
+        t = t.layer_norm(2, eps);
+
+        // Reshape back to the original (N, C, ...spatial).
+        t = t.merge_dims(1, 2); // (N, num_groups, V) -> (N, M)
+        // Peel the trailing (non-batch) dims back off one at a time, left to right.
+        let trailing = &orig_dims[1..];
+        for i in 0..trailing.len().saturating_sub(1) {
+            let suffix: Expression = trailing[i + 1..].iter().cloned().product();
+            t = t.split_dims(1 + i, suffix);
+        }
+
+        // Per-channel affine on the channel axis (axis 1). weight/bias are shape (C,);
+        // broadcast them onto every axis except the channel axis.
+        let non_channel_axes: Vec<usize> = (0..ndim).filter(|&a| a != 1).collect();
+        if let Some(weight_name) = node.inputs.get(1).and_then(|i| i.arg.as_tensor_name()) {
+            let w = self.get_tensor(weight_name)?;
+            let w = w.expand_to_shape_on_axes(t.shape, non_channel_axes.clone());
+            let (r, w) = broadcast_binary(t, w);
+            t = r * w;
+        }
+        if let Some(bias_name) = node.inputs.get(2).and_then(|i| i.arg.as_tensor_name()) {
+            let b = self.get_tensor(bias_name)?;
+            let b = b.expand_to_shape_on_axes(t.shape, non_channel_axes);
+            let (r, b) = broadcast_binary(t, b);
+            t = r + b;
+        }
+
+        Ok(t)
+    }
+
     pub(crate) fn translate_sign(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         let zero = self

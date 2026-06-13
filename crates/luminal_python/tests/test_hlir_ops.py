@@ -81,6 +81,12 @@ from test_models import (
     # IsNaN model
     IsNaNTestModel,
     # LayerNormalization model
+    ConvGroupNormSiLUModel,
+    GroupNorm3DModel,
+    GroupNormGroups1Model,
+    GroupNormGroupsEqChannelsModel,
+    GroupNormNoAffineModel,
+    GroupNormTestModel,
     LayerNormTestModel,
     LessBroadcastModel,
     # LessOrEqual models
@@ -1976,6 +1982,82 @@ def test_layernorm(device: torch.device):
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((2, 4), device=device)
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
+
+
+# ========== GroupNorm (aten.native_group_norm) Node Tests ==========
+
+
+def _check_groupnorm(model: torch.nn.Module, x: torch.Tensor, atol: float = 1e-4):
+    model = model.eval()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    with torch.no_grad():
+        ref = model(x)
+        out = compiled(x)
+    max_diff = torch.max(torch.abs(out - ref)).item()
+    assert torch.allclose(out, ref, atol=atol), f"max_diff={max_diff:.3e}"
+
+
+def test_groupnorm(device: torch.device):
+    """Baseline GroupNorm (2 groups / 4 channels) on 4D (N, C, H, W)."""
+    _check_groupnorm(
+        GroupNormTestModel().to(device), torch.randn(2, 4, 8, 8, device=device)
+    )
+
+
+def test_groupnorm_one_group(device: torch.device):
+    """GroupNorm with a single group (normalizes over all channels + spatial)."""
+    _check_groupnorm(
+        GroupNormGroups1Model().to(device), torch.randn(2, 8, 6, 6, device=device)
+    )
+
+
+def test_groupnorm_groups_eq_channels(device: torch.device):
+    """GroupNorm with one group per channel (InstanceNorm-like)."""
+    _check_groupnorm(
+        GroupNormGroupsEqChannelsModel().to(device),
+        torch.randn(2, 8, 5, 5, device=device),
+    )
+
+
+def test_groupnorm_no_affine(device: torch.device):
+    """GroupNorm affine=False — weight/bias are None at the aten boundary."""
+    _check_groupnorm(
+        GroupNormNoAffineModel().to(device), torch.randn(3, 4, 7, 7, device=device)
+    )
+
+
+def test_groupnorm_3d(device: torch.device):
+    """GroupNorm on 3D input (N, C, L) — single spatial dim."""
+    _check_groupnorm(
+        GroupNorm3DModel().to(device), torch.randn(2, 6, 16, device=device)
+    )
+
+
+def test_groupnorm_conv_silu_block(device: torch.device):
+    """Conv2d -> GroupNorm -> SiLU (SD ResNet block); guards e-graph composition."""
+    _check_groupnorm(
+        ConvGroupNormSiLUModel().to(device),
+        torch.randn(2, 4, 16, 16, device=device),
+        atol=1e-3,
+    )
+
+
+def test_groupnorm_dynamic_shapes(device: torch.device):
+    """One compiled graph reused across dynamic batch and spatial sizes."""
+    model = GroupNormTestModel().to(device).eval()
+    torch._dynamo.reset()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    first = torch.randn(2, 4, 8, 8, device=device)
+    torch._dynamo.mark_dynamic(first, 0)  # dynamic batch
+    torch._dynamo.mark_dynamic(first, 2)  # dynamic height
+    for n, h in [(2, 8), (1, 8), (3, 12), (2, 16)]:
+        x = torch.randn(n, 4, h, 8, device=device)
+        with torch.no_grad():
+            ref = model(x)
+            out = compiled(x)
+        assert torch.allclose(out, ref, atol=1e-4), (
+            f"n={n} h={h}: max_diff={torch.max(torch.abs(out - ref)).item():.3e}"
+        )
 
 
 # ========== PT2 Gemm Node Tests ==========
