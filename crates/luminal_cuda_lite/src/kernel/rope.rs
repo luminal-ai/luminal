@@ -608,7 +608,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
         FxHashMap::default();
     let mut fused_ropes: FxHashSet<luminal::prelude::NodeIndex> = FxHashSet::default();
 
-    let debug = std::env::var_os("LUMINAL_DEBUG_ROPE_SCATTER").is_some();
     for node in llir.node_indices() {
         let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() else {
             continue;
@@ -623,9 +622,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
         };
         let inputs = sorted_inputs(llir, node);
         if inputs.len() != 3 {
-            if debug {
-                eprintln!("rope-scatter: {node:?} input arity {}", inputs.len());
-            }
             continue;
         }
         let src = inputs[2];
@@ -633,9 +629,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
             continue;
         }
         let Some(src_kernel) = llir[src].to_dialect::<dyn KernelOp>() else {
-            if debug {
-                eprintln!("rope-scatter: {node:?} src {src:?} not a kernel: {:?}", llir[src]);
-            }
             continue;
         };
         let Some(rope) = src_kernel
@@ -644,22 +637,13 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
             .as_any()
             .downcast_ref::<RoPEHalfKernel>()
         else {
-            if debug {
-                eprintln!("rope-scatter: {node:?} src {src:?} not RoPEHalf: {:?}", llir[src]);
-            }
             continue;
         };
         // The scatter must be the rope's only consumer.
         if llir.edges_directed(src, Direction::Outgoing).count() != 1 {
-            if debug {
-                eprintln!("rope-scatter: {node:?} rope has multiple consumers");
-            }
             continue;
         }
         if scatter.dtype != rope.dtype {
-            if debug {
-                eprintln!("rope-scatter: {node:?} dtype mismatch");
-            }
             continue;
         }
         // Scatter grid must be the rope output shape (s, h·d)…
@@ -667,14 +651,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
             || scatter.index_shape[1].to_usize() != Some(rope.h * rope.d)
             || scatter.index_shape[0].simplify() != rope.s.simplify()
         {
-            if debug {
-                eprintln!(
-                    "rope-scatter: {node:?} index shape mismatch {:?} vs s={:?} h*d={}",
-                    scatter.index_shape,
-                    rope.s,
-                    rope.h * rope.d
-                );
-            }
             continue;
         }
         // …read contiguously (identity layout over the rope output).
@@ -691,11 +667,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
         let src_flat = flatten_strides(&scatter.index_shape, &scatter.src_strides).simplify();
         let contig_flat = flatten_strides(&scatter.index_shape, &contig).simplify();
         if src_flat != contig_flat {
-            if debug {
-                eprintln!(
-                    "rope-scatter: {node:?} src not contiguous: {src_flat:?} vs {contig_flat:?}"
-                );
-            }
             continue;
         }
 
@@ -752,9 +723,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
             continue;
         };
         if llir.edges_directed(src, Direction::Outgoing).count() != 1 {
-            if debug {
-                eprintln!("rope-scatter(fused): {node:?} rope has multiple consumers");
-            }
             continue;
         }
         if scatter.dtype != DType::Bf16 {
@@ -769,12 +737,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
             || scatter.index_shape[1].simplify() != kvd
             || scatter.index_shape[0].simplify() != seq.simplify()
         {
-            if debug {
-                eprintln!(
-                    "rope-scatter(fused): {node:?} index shape mismatch {:?} vs ({:?}, {:?})",
-                    scatter.index_shape, seq, kvd
-                );
-            }
             continue;
         }
         // …and the source must be read through exactly the deinterleave view
@@ -788,11 +750,6 @@ pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<lu
         let src_flat = flatten_strides(&scatter.index_shape, &scatter.src_strides).simplify();
         let expected_flat = flatten_strides(&scatter.index_shape, &expected).simplify();
         if src_flat != expected_flat {
-            if debug {
-                eprintln!(
-                    "rope-scatter(fused): {node:?} src view mismatch: {src_flat:?} vs {expected_flat:?}"
-                );
-            }
             continue;
         }
 
@@ -910,15 +867,6 @@ impl EgglogOp for KernelRoPE {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        let disable = std::env::var("LUMINAL_DISABLE_FUSED").unwrap_or_default();
-        if disable.contains("rope")
-            && !disable.contains("roperot")
-            && !disable.contains("ropecat")
-        {
-            return vec![];
-        }
-        let skip_rotation = disable.contains("roperot");
-        let skip_concat = skip_rotation || disable.contains("ropecat");
         // Two-stage match via an intermediate relation. A single ~45-atom
         // join blew up egglog's query planner on real graphs (4m56s on the
         // 279-node mini layer); splitting at the angle chain keeps each join
@@ -1036,7 +984,6 @@ impl EgglogOp for KernelRoPE {
                 :ruleset kernel_fuse_late
                 :name \"kernel rope rotation stage\"
             )";
-        let rotation_stage = if skip_rotation { "" } else { rotation_stage };
 
         // Stage-2 conditions in dependency order, segmented so the
         // LUMINAL_ROPE_RULE_DEBUG=<n> mode can emit cumulative-prefix rules
@@ -1125,11 +1072,8 @@ impl EgglogOp for KernelRoPE {
             return rules;
         }
 
-        let concat_rule = if skip_concat {
-            String::new()
-        } else {
-            format!(
-                "(rule
+        let concat_rule = format!(
+            "(rule
                 (
                     {}
                 )
@@ -1142,9 +1086,8 @@ impl EgglogOp for KernelRoPE {
                 :ruleset kernel_fuse_late
                 :name \"kernel rope half bf16\"
             )",
-                segments.join("\n")
-            )
-        };
+            segments.join("\n")
+        );
         vec![Rule::raw(format!(
             "{angle_stage}\n{rotation_stage}\n{concat_rule}"
         ))]

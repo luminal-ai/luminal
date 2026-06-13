@@ -28,11 +28,8 @@ fn env_bool(name: &str) -> bool {
 
 fn main() {
     let max_seq_len = 4096;
-    let gen_tokens = 30;
-    let search_graphs = std::env::var("LUMINAL_SEARCH_GRAPHS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
+    let gen_tokens = 500;
+    let search_graphs = 500;
     let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
     let print_token_ids = env_bool("PRINT_TOKEN_IDS");
 

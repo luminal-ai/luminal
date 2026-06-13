@@ -28,7 +28,7 @@ fn qwen3_chat_prompt(user_prompt: &str) -> String {
 
 fn main() {
     let max_seq_len = 4096;
-    let gen_tokens = 30;
+    let gen_tokens = 500;
     let search_graphs = 200;
     let prompt = "What is the capital of France?";
 
@@ -91,18 +91,11 @@ fn main() {
 
     println!("Building E-Graph...");
     let phase = std::time::Instant::now();
-    if std::env::var_os("QWEN_EXCLUDE_GEMV").is_some() {
-        println!("(excluding KernelGemv candidates)");
-        cx.build_search_space_exclude_ops::<CudaRuntime, luminal_cuda_lite::kernel::gemv::KernelGemv>(
-            build_options,
-        );
-    } else {
-        cx.build_search_space::<CudaRuntime>(build_options);
-    }
+    cx.build_search_space::<CudaRuntime>(build_options);
     println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(5);
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(20);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());

@@ -159,7 +159,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn main() {
     let num_slots = env_usize("NUM_SLOTS", 8192);
     let search_graphs = 100;
-    let gen_tokens = 30;
+    let gen_tokens = 500;
     let prompt_a = "Explain what a neural network is in a paragraph.";
     let prompt_b = "What is the capital of France?";
 

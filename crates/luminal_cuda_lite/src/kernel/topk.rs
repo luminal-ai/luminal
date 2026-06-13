@@ -45,12 +45,6 @@ impl EgglogOp for KernelStableSortIdx {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        if std::env::var("LUMINAL_DISABLE_FUSED")
-            .map(|v| v.contains("topk"))
-            .unwrap_or(false)
-        {
-            return vec![];
-        }
         // Mirrors the exact emission of stable_argsort(axis=1, descending):
         //   a_val = x·1.0 viewed (rows, E_j, E_i→0)   strides (z·E, z, 0)
         //   b_val = x·1.0 viewed (rows, 0, E_i)       strides (z·E, 0, z)

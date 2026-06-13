@@ -461,12 +461,6 @@ impl EgglogOp for KernelRMSNorm {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        if std::env::var("LUMINAL_DISABLE_FUSED")
-            .map(|v| v.contains("rms"))
-            .unwrap_or(false)
-        {
-            return vec![];
-        }
         // Two relation-staged parts (pre → late): the rinv core (anchored by
         // the rare Sqrt→Recip pair and the eps Constant) emits a fact; the
         // weight-mul tail joins with ?rin/?xf bound, so each variant's pins
@@ -626,12 +620,6 @@ impl EgglogOp for KernelRMSNormQuant {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        if std::env::var("LUMINAL_DISABLE_FUSED")
-            .map(|v| v.contains("rms"))
-            .unwrap_or(false)
-        {
-            return vec![];
-        }
         vec![Rule::raw(
             "(rule
                 (

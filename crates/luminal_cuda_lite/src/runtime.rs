@@ -2063,9 +2063,6 @@ impl CudaRuntime {
             // across CudaGraphOps — fall back to the full resolution (which
             // follows llir_to_hlir into hlir_buffers) for the copies.
             let buf = Self::cached_device_buffer_for_node(bucket, node).or_else(|| {
-                if std::env::var_os("LUMINAL_DISABLE_INPUT_BUFFER_FALLBACK").is_some() {
-                    return None;
-                }
                 Self::resolve_runtime_buffer(
                     bucket,
                     &self.cuda_stream,

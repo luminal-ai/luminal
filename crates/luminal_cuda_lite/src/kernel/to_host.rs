@@ -1445,20 +1445,6 @@ impl CudaGraphOp {
                     let signature = resolved.signature_for_graph_plan(plan_c);
                     let needs_recapture = explicit_indptr
                         || state.flashinfer_ops[idx].signature != Some(signature.clone());
-                    if needs_recapture
-                        && idx == 0
-                        && std::env::var_os("LUMINAL_DEBUG_FI_SIGNATURE").is_some()
-                        && let Some(old) = state.flashinfer_ops[idx].signature.as_ref()
-                    {
-                        eprintln!(
-                            "FI sig change (op0): explicit={explicit_indptr} dyn={dyn_map:?} n_ops={}\n  old spec: {:?}\n  new spec: {:?}\n  old ptrs: {:?}\n  new ptrs: {:?}",
-                            state.flashinfer_ops.len(),
-                            old.spec,
-                            signature.spec,
-                            old.ptrs,
-                            signature.ptrs
-                        );
-                    }
                     if needs_recapture {
                         let needs_prepare = state.flashinfer_ops[idx]
                             .signature

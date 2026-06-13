@@ -223,52 +223,8 @@ pub(crate) fn build_compile_units(
                     .next()
                     .unwrap_or_else(|| {
                         // Dump the malformed structure: which FE
-                        // triggered the walk, every node in fs_topo and
-                        // interior_topo, and each FS's incoming /
-                        // outgoing degree. Helps localize whether the
-                        // missing edge came from extraction or a
-                        // downstream LLIR transform.
-                        if std::env::var("LUMINAL_DEBUG_FUSION_PANIC").is_ok() {
-                            eprintln!(
-                                "FusionStart panic: fe={} (kernel={:?})",
-                                node.index(),
-                                llir_graph.node_weight(node).and_then(|op| {
-                                    op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
-                                }),
-                            );
-                            eprintln!("  fs_topo ({}):", fs_topo.len());
-                            for &f in &fs_topo {
-                                let in_deg = llir_graph
-                                    .neighbors_directed(f, Direction::Incoming)
-                                    .count();
-                                let out_deg = llir_graph
-                                    .neighbors_directed(f, Direction::Outgoing)
-                                    .count();
-                                let kn = llir_graph
-                                    .node_weight(f)
-                                    .and_then(|op| {
-                                        op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
-                                    })
-                                    .unwrap_or("?");
-                                eprintln!(
-                                    "    fs={} kind={} in_deg={} out_deg={}",
-                                    f.index(),
-                                    kn,
-                                    in_deg,
-                                    out_deg,
-                                );
-                            }
-                            eprintln!("  interior_topo ({}):", interior_topo.len());
-                            for &i in &interior_topo {
-                                let kn = llir_graph
-                                    .node_weight(i)
-                                    .and_then(|op| {
-                                        op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
-                                    })
-                                    .unwrap_or("?");
-                                eprintln!("    interior={} kind={}", i.index(), kn);
-                            }
-                        }
+                        // triggered the walk. A malformed region (an FS leaf
+                        // with no external producer) should never reach here.
                         panic!("FusionStart with no predecessor")
                     })
             })
