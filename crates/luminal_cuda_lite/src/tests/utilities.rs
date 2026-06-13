@@ -149,7 +149,7 @@ impl CudaFuzzInput {
         }
     }
 
-    fn apply_native(&self, rt: &mut NativeRuntime) {
+    fn apply_reference(&self, rt: &mut ReferenceRuntime) {
         match self {
             Self::F32(id, data) => rt.set_data(*id, data.clone()),
             Self::Bf16(id, data) => rt.set_data(*id, data.clone()),
@@ -191,7 +191,7 @@ pub struct SearchEquivalenceFuzzConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchEquivalenceReference {
     FirstCudaExtraction,
-    NativeRuntime,
+    ReferenceRuntime,
 }
 
 impl Default for SearchEquivalenceFuzzConfig {
@@ -258,8 +258,8 @@ impl<'a> CudaSearchEquivalenceFuzzer<'a> {
         self
     }
 
-    pub fn native_reference(mut self) -> Self {
-        self.config.reference = SearchEquivalenceReference::NativeRuntime;
+    pub fn reference_runtime(mut self) -> Self {
+        self.config.reference = SearchEquivalenceReference::ReferenceRuntime;
         self
     }
 
@@ -320,34 +320,34 @@ pub fn fuzz_cuda_search_space_equivalence(
         "fuzz harness needs at least one output"
     );
 
-    let native_reference_outputs = if config.reference == SearchEquivalenceReference::NativeRuntime
-    {
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut native_rng = StdRng::seed_from_u64(config.seed);
-        let mut native_rt = cx.search_with_rng(
-            NativeRuntime::default(),
-            CompileOptions::default().search_graph_limit(1),
-            &mut native_rng,
-        );
-        for input in inputs {
-            input.apply_native(&mut native_rt);
-        }
-        native_rt.execute(&cx.dyn_map);
-        Some(
-            outputs
-                .iter()
-                .map(|out| native_rt.get_f32(out.id).clone())
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
+    let reference_runtime_outputs =
+        if config.reference == SearchEquivalenceReference::ReferenceRuntime {
+            cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+            let mut reference_rng = StdRng::seed_from_u64(config.seed);
+            let mut reference_rt = cx.search_with_rng(
+                ReferenceRuntime::default(),
+                CompileOptions::default().search_graph_limit(1),
+                &mut reference_rng,
+            );
+            for input in inputs {
+                input.apply_reference(&mut reference_rt);
+            }
+            reference_rt.execute(&cx.dyn_map);
+            Some(
+                outputs
+                    .iter()
+                    .map(|out| reference_rt.get_f32(out.id).clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
 
     cx.build_search_space::<CudaRuntime>(config.build_options);
 
     let egraph = cx.egraph().expect("search space should be built");
     let ops = cx.egglog_ops().expect("search ops should be built");
-    let seed = if native_reference_outputs.is_some() {
+    let seed = if reference_runtime_outputs.is_some() {
         config.seed.wrapping_add(0xC0DA_C0DA)
     } else {
         config.seed
@@ -358,9 +358,9 @@ pub fn fuzz_cuda_search_space_equivalence(
     prev_selected.insert(hash_choice_set(&base));
 
     let mut skipped_invalid = 0usize;
-    let reference_is_cuda = native_reference_outputs.is_none();
+    let reference_is_cuda = reference_runtime_outputs.is_none();
     let (reference_hash, reference_outputs, reference_llir_summary, mut tested) =
-        if let Some(reference_outputs) = native_reference_outputs {
+        if let Some(reference_outputs) = reference_runtime_outputs {
             (0, reference_outputs, None, 0usize)
         } else {
             let mut attempts = 0usize;

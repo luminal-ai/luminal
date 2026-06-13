@@ -15,7 +15,7 @@ All other functionality is split into crates in the `crates/` directory. For ins
 - When outputs are incorrect, first root-cause the failing compiler/runtime path. Prefer isolating the bad LLIR/HLIR graph, rewrite, op lowering, shape/stride assumption, layout contract, or runtime implementation that caused the mismatch.
 - Avoid narrow special-case fixes. A fix should state and enforce the general invariant it relies on, or explicitly document why the affected operation is only valid for a restricted layout/shape and ensure rewrites enforce that restriction.
 - For e-graph/search issues, assume all selectable LLIR graphs are intended to be semantically equivalent. If two selectable graphs disagree, debug the equivalence violation rather than selecting around the bad graph.
-- Add regression tests at the level where the bug occurred. Prefer tests that compare against a semantic reference such as `NativeRuntime` or a small independent reference, and use fixed seeds for any randomized search/fuzz test so failures are reproducible.
+- Add regression tests at the level where the bug occurred. Prefer tests that compare against a semantic reference such as `ReferenceRuntime` or a small independent reference, and use fixed seeds for any randomized search/fuzz test so failures are reproducible.
 
 ## Compiler Rewrite Boundary
 - All graph pattern matching and op selection must be expressed in egglog rewrites. Do not add Rust-side LLIR graph post-passes that search for op patterns, fuse kernels, select backend ops, or otherwise rewrite extracted graphs after egglog. If a backend needs a fused/specialized op, add the match and rewrite in egglog and let extraction produce that op directly.

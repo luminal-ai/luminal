@@ -504,7 +504,7 @@ fn elementwise_body(op: &str, locals: &[&str]) -> String {
         "Exp" => format!("expf({})", a()),
         "Exp2" => format!("exp2f({})", a()),
         "Log2" => format!("log2f({})", a()),
-        "Recip" => format!("1.0f / {}", a()),
+        "Recip" => format!("static_cast<{}>(1.0f) / {}", cuda_dtype(dtype), a()),
         "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", a()),
         // Dtype conversion happens in the widen (input) / round (store)
         // helpers, so the cast body is the identity.

@@ -178,15 +178,15 @@ a different (broken) e-node from the same e-class.
 ### What the symptom was
 
 `test_onehot` panicked at `src/hlir.rs:1625` in `get_f32()`: the output buffer was
-`NativeData::Int` instead of the expected `NativeData::F32`.
+`ReferenceData::Int` instead of the expected `ReferenceData::F32`.
 
 ### What the actual root cause was
 
 The Cast parser's `* 1.0` workaround for `Int → F32` casts used `input * one_expanded`
 (Int GraphTensor on the left, F32 constant on the right). However, `Mul for GraphTensor`
 always uses `self.dtype` (the **left** operand's dtype) for the result, and the native
-runtime's `Mul::execute` dispatches on the **first** input's `NativeData` variant. So
-`Int * F32` produced `DType::Int` / `NativeData::Int` — the exact opposite of the intended
+runtime's `Mul::execute` dispatches on the **first** input's `ReferenceData` variant. So
+`Int * F32` produced `DType::Int` / `ReferenceData::Int` — the exact opposite of the intended
 F32 output.
 
 ### Why it was hard to find
@@ -220,7 +220,7 @@ constant must be the left operand.
 
 ### What the symptom was
 
-`test_scatter_nd` passed on native backend but failed on CUDA with "does not produce an
+`test_scatter_nd` passed on reference backend but failed on CUDA with "does not produce an
 egraph". The CUDA compilation could not extract a valid program from the e-graph.
 
 ### What the actual root cause was
@@ -237,13 +237,13 @@ matching dtypes. `F32 != Int` → the rule never fires → the Mul node gets **n
 
 Every downstream op checks `(= ?dty (dtype ?upstream))`. Without dtype on the Mul, no
 CUDA kernel rewrite rules fire for any downstream op (KernelMul, KernelAdd, KernelLessThan,
-etc.). When `cleanup_hlir` runs (enabled for CUDA, disabled for native), it deletes all
+etc.). When `cleanup_hlir` runs (enabled for CUDA, disabled for reference), it deletes all
 unrewritten HLIR ops, leaving empty e-classes → egraph extraction fails.
 
 ### Why it was hard to find
 
-1. **Works on native**: `cleanup_hlir = false` for NativeRuntime, so unrewritten HLIR ops
-   are never deleted. NativeOp dispatches on actual runtime data, not egglog dtype.
+1. **Works on reference**: `cleanup_hlir = false` for ReferenceRuntime, so unrewritten HLIR ops
+   are never deleted. ReferenceOp dispatches on actual runtime data, not egglog dtype.
 2. **Cascading failure**: The root cause (missing dtype on one Mul) silently propagated
    through every downstream op, making it look like a systemic CUDA issue rather than a
    single dtype mismatch.
@@ -320,7 +320,7 @@ The resulting Mul had input A with 4D strides and input B with 1D strides.
 ### Why it was hard to find
 
 1. **Only triggered by 1B model**: The tiny model's Where inputs all had matching ranks (no scalars).
-2. **CUDA-only**: The native runtime's `bin_fn` uses `StridedIterator` which handles mismatched
+2. **CUDA-only**: The reference runtime's `bin_fn` uses `StridedIterator` which handles mismatched
    strides more gracefully. CUDA's `KernelMul::compile` calls `flatten_strides` which asserts
    `range.len() == strides.len()`.
 3. **Delayed crash**: The mismatch was created during ONNX parsing but only manifested during
@@ -344,7 +344,7 @@ with matching shape tracker dimensions.
 
 1. **Symptom**: `test_topk_values` failed on CUDA — rows 0-1 were correct but rows 2+ returned
    the value at column 0 of each row (all three top-k positions got the same value).
-   Native backend was fine.
+   Reference backend was fine.
 
 2. **Root cause**: `gather_elements` was called with a non-contiguous index tensor produced by
    `argsort(axis=1) → slice_along(..k, axis=1)`. The slice creates a ShapeTracker view of the
@@ -568,7 +568,7 @@ is easier to verify and less likely to confuse source/destination ordering. Also
 
 6 CUDA tests (`test_pow`, `test_pow_broadcast`, `test_div`, `test_mod`, `test_mod_broadcast`,
 `test_erf`) consistently failed with `Failed to find a viable initial genome for group 0 after
-100 attempts`. All 6 passed on native backend.
+100 attempts`. All 6 passed on reference backend.
 
 ### What the actual root cause was
 
@@ -589,8 +589,8 @@ The `has_nan_outputs` check rejected every candidate genome, exhausting all 100 
 
 1. **No panic, no crash — silent NaN rejection**: The error message said "Failed to find a
    viable initial genome" which suggested an egglog rewrite issue, not a data issue.
-2. **Works on native**: `NativeRuntime::has_nan_outputs()` returns `false` by default (no NaN
-   check), so zero inputs never caused problems on native.
+2. **Works on reference**: `ReferenceRuntime::has_nan_outputs()` returns `false` by default (no NaN
+   check), so zero inputs never caused problems on reference.
 3. **torch.compile vs direct export difference**: Directly exporting a model via
    `torch.onnx.export(model, ...)` produces initializers. But `torch.compile`'s backend
    receives a `GraphModule` where weights are graph inputs, not initializers. The ONNX file

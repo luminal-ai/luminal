@@ -37,7 +37,7 @@ const GEMMA_RMS_NORM_EPS: f32 = 1e-6;
 
 #[derive(Debug, Clone, Copy)]
 enum Backend {
-    Native,
+    Reference,
     Cuda,
 }
 
@@ -87,9 +87,9 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--backend" => {
                 args.backend = match iter.next().as_deref() {
-                    Some("native") => Backend::Native,
+                    Some("reference") => Backend::Reference,
                     Some("cuda") => Backend::Cuda,
-                    other => panic!("invalid --backend {other:?}; use native|cuda"),
+                    other => panic!("invalid --backend {other:?}; use reference|cuda"),
                 };
             }
             "--mode" => {
@@ -120,7 +120,7 @@ fn parse_args() -> Args {
                     "Usage: egglog_saturation [OPTIONS]\n\
                      \n\
                      Options:\n\
-                       --backend native|cuda          default: cuda\n\
+                       --backend reference|cuda       default: cuda\n\
                        --mode current|steps|full-default|full-cycle\n\
                        --case mul|unary-chain:N|gelu|softmax|layer-norm|matmul|attention|qwen-moe|gemma-moe\n\
                        --passes N                    default: 256\n\
@@ -540,7 +540,7 @@ fn run(args: Args) {
     let (program, root) = hlir_to_egglog(&graph);
 
     let mut ops = match args.backend {
-        Backend::Native => <NativeRuntime as Runtime>::Ops::into_vec(),
+        Backend::Reference => <ReferenceRuntime as Runtime>::Ops::into_vec(),
         Backend::Cuda => <CudaRuntime as Runtime>::Ops::into_vec(),
     };
     ops.extend(<HLIROps as IntoEgglogOp>::into_vec());

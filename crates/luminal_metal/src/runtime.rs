@@ -4,7 +4,7 @@ use itertools::Itertools;
 use luminal::{
     dtype::DType,
     graph::{BucketLLIR, DimBucket, Graph, LLIRGraph},
-    hlir::{Input, NativeData, Output},
+    hlir::{Input, Output, ReferenceData},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
         FxHashMap, NodeIndex, ToId,
@@ -42,7 +42,7 @@ pub struct MetalRuntime {
     device: Device,
     command_queue: CommandQueue,
     /// Host-side input tensors provided by the user.
-    input_data: FxHashMap<NodeIndex, NativeData>,
+    input_data: FxHashMap<NodeIndex, ReferenceData>,
     /// Buffers for HLIR input tensors (set by user)
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
     /// Buffers for LLIR intermediate/output tensors
@@ -208,7 +208,7 @@ impl MetalRuntime {
         }
     }
 
-    pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
+    pub fn set_data(&mut self, id: impl ToId, data: impl Into<ReferenceData>) {
         let id = id.to_id();
         let data = data.into();
         if let Some(dtype) = self.input_dtype(id) {
@@ -513,7 +513,7 @@ impl RuntimeStats for MetalRuntime {
 }
 
 impl MetalRuntime {
-    fn create_input_buffer(&self, data: &NativeData, dtype: DType) -> Buffer {
+    fn create_input_buffer(&self, data: &ReferenceData, dtype: DType) -> Buffer {
         match dtype {
             DType::F32 => {
                 let values = data.to_f32_vec();

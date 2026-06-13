@@ -210,7 +210,7 @@ extern \"C\" {{
         long long in_start = {in_index};
         long long iters = {iters};
 
-        {accum_dtype} max_value = NEG_INF_F;
+        {accum_dtype} max_value = ({accum_dtype})NEG_INF_F;
         for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
             max_value = fmaxf(max_value, {load_value});
         }}
