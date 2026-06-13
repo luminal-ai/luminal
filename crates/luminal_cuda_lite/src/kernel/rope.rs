@@ -985,9 +985,7 @@ impl EgglogOp for KernelRoPE {
                 :name \"kernel rope rotation stage\"
             )";
 
-        // Stage-2 conditions in dependency order, segmented so the
-        // LUMINAL_ROPE_RULE_DEBUG=<n> mode can emit cumulative-prefix rules
-        // (junk-marker actions) whose presence localizes a dead atom.
+        // Stage-2 conditions in dependency order, segmented for readability.
         let segments: Vec<&str> = vec![
             "
                     (rope_rotated ?x0out ?x1out ?x ?pos ?e_hd ?e_hd2 ?e_w ?e_seq ?ln_theta ?inv_hd)",
@@ -1027,50 +1025,6 @@ impl EgglogOp for KernelRoPE {
                     (= ?hdd ?e_hd)
                     (= ?seqd ?e_seq)",
         ];
-
-        if let Some(max_n) = std::env::var("LUMINAL_ROPE_RULE_DEBUG")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            // Split the stage-2 condition text into individual atoms
-            // (balanced parens at depth 0, comments stripped) and emit one
-            // cumulative prefix rule per atom, each creating a junk
-            // KernelRoPE whose ln_theta field marks the deepest prefix that
-            // matched.
-            let full = segments.join("\n");
-            let no_comments = full
-                .lines()
-                .map(|l| l.split(';').next().unwrap_or(""))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let mut atoms = Vec::new();
-            let mut depth = 0usize;
-            let mut cur = String::new();
-            for c in no_comments.chars() {
-                if depth == 0 && c != '(' {
-                    continue;
-                }
-                cur.push(c);
-                if c == '(' {
-                    depth += 1;
-                } else if c == ')' {
-                    depth -= 1;
-                    if depth == 0 {
-                        atoms.push(std::mem::take(&mut cur));
-                    }
-                }
-            }
-            let mut rules = vec![Rule::raw(angle_stage)];
-            // prefix 1 is the relation atom alone, which binds no ?cat /
-            // ?a3_sh; start markers from prefix 2.
-            rules.extend((2..=atoms.len().min(max_n)).map(|n| {
-                Rule::raw(format!(
-                    "(rule ({}) ((let ?junk{n} (Op (KernelRoPE ?a3_sh (MNum 1) {n}.0 0.0) (ICons ?cat (INil))))) :ruleset kernel_fuse_late :name \"rope dbg {n:02}\")",
-                    atoms[..n].join("\n")
-                ))
-            }));
-            return rules;
-        }
 
         let concat_rule = format!(
             "(rule
