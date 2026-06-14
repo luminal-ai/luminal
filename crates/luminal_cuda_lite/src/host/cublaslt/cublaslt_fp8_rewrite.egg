@@ -196,6 +196,33 @@
 
 (rule
     (
+        ; Stage the tensor-wide fp8 scale product (a_scale · b_scale), keyed
+        ; by its FusionEnd. ANCHORED at the scalar Mul: its two scalar
+        ; FusionStart operands are read from the Mul's input list, never
+        ; enumerated. Without this fact, the fused-output-scale rule below
+        ; matched ?fs_a_scale / ?fs_b_scale as free scalar-FusionStart atoms
+        ; and egglog enumerated their K² cross-product on graphs with many
+        ; scalar fusion boundaries (adaLN modulation + softmax) — a
+        ; super-linear compile-time blowup that OOMs the real FLUX compile.
+        (= ?scale_product_inner (Op (CudaBinaryElementwise
+            "Mul" (ENil) (ENil) (ENil) (ENil) (F32))
+            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
+        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?a_scale (INil))))
+        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?b_scale (INil))))
+        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
+            (ICons ?scale_product_inner (INil))))
+    )
+    (
+        (cublaslt_fp8_scale_product ?scale_product ?a_scale ?b_scale)
+    )
+    :ruleset fusion_grow
+    :name "cublaslt fp8 scale-product fact"
+)
+
+(rule
+    (
         ; Fusion growth can make the live path consume a raw FP8 cuBLASLt
         ; candidate through an internal CudaBinaryElementwise scale multiply,
         ; instead of the original HLIR output-scale Mul. The scalar scale
@@ -224,25 +251,16 @@
         (= ?out_shape (ECons ?out_m (ECons ?out_n (ENil))))
         (= ?scale_strides (ECons (MNum 0) (ECons (MNum 0) (ENil))))
 
-        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?a_scale (INil))))
-        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?b_scale (INil))))
-        (= ?scale_product_inner (Op (CudaBinaryElementwise
-            "Mul"
-            (ENil)
-            (ENil)
-            (ENil)
-            (ENil)
-            (F32))
-            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
-        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
-            (ICons ?scale_product_inner (INil))))
+        ; ?fused_scale = Mul(fs_cast, fs_scale) is the rare anchor (one per
+        ; fp8 gemm). fs_scale wraps the scale-product FusionEnd; the staged
+        ; fact yields its two scalar operands without re-matching the scalar
+        ; FusionStart pair (see "cublaslt fp8 scale-product fact").
         (= ?fs_scale (Op (FusionStart
             ?out_shape
             ?scale_strides
             (F32))
             (ICons ?scale_product (INil))))
+        (cublaslt_fp8_scale_product ?scale_product ?a_scale ?b_scale)
         (= ?fused_scale (Op (CudaBinaryElementwise
             "Mul"
             ?out_shape

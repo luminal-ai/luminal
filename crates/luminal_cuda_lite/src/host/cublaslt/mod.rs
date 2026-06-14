@@ -192,7 +192,12 @@ impl EgglogOp for CuBlasLt {
                  (relation cublaslt_fp8_f32_output_pair (DType DType))
                  (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E4M3))
                  (cublaslt_fp8_f32_output_pair (F8E4M3) (F8E5M2))
-                 (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))",
+                 (cublaslt_fp8_f32_output_pair (F8E5M2) (F8E4M3))
+                 ; (scale_product FusionEnd, a_scale, b_scale) — staged by the
+                 ; fp8 scale-product fact rule so the fused-output-scale rule
+                 ; looks the scalars up instead of enumerating scalar
+                 ; FusionStart pairs (a K² blowup on scalar-rich graphs).
+                 (relation cublaslt_fp8_scale_product (IR IR IR))",
             ),
             Rule::raw(include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
             Rule::raw(include_str!["cublaslt_RmCm_rewrite.egg"]), // row col
