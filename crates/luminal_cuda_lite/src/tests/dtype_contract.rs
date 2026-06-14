@@ -258,6 +258,52 @@ fn test_bf16_roundtrip_matches_candle() {
     );
 }
 
+#[test]
+fn test_bf16_reciprocal_region_compiles() {
+    // Regression: a bf16 reciprocal inside a fused region must lower to
+    // `1.0f / static_cast<float>(x)` (operands are widened to float by
+    // elementwise_value, result rounds back to bf16 at store). A
+    // `static_cast<bf16>(1.0f)` numerator makes the body `bf16 / float`,
+    // which NVRTC rejects as an ambiguous `operator/` against cuda_bf16.h's
+    // overloads — a region-kernel PTX compile failure that broke the MoE CI
+    // search (qwen3_moe / gemma4_moe) on the bf16 path.
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let n = 64usize;
+    let mut cx = Graph::default();
+    let a = cx.tensor(n);
+    let out = ((a.cast(DType::Bf16).reciprocal()) * 1.0_f32)
+        .cast(DType::F32)
+        .output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    // Positive inputs away from zero so the reciprocal is well-conditioned.
+    let input = random_f32_vec(n, 7, 1.0, 4.0);
+    let mut rt = CudaRuntime::initialize(stream.clone());
+    rt.set_data(a, input.clone());
+    // Reaching execute() means every region kernel compiled — the actual
+    // regression check (the old code panicked at PTX compile during search).
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(out.id);
+
+    let device = Device::new_cuda(0).expect("Candle CUDA device required for test");
+    let ref_t = Tensor::from_slice(&input, n, &device)
+        .unwrap()
+        .to_dtype(candle_core::DType::BF16)
+        .unwrap();
+    let ref_out = ref_t
+        .recip()
+        .unwrap()
+        .to_dtype(candle_core::DType::F32)
+        .unwrap();
+    let expected = ref_out.to_vec1::<f32>().unwrap();
+
+    let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
+    assert_close(&result, &expected, tol, tol);
+}
+
 /// Regression test for the FS/FE extraction cycle created by the
 /// grow-FE-Cast + grow-Cast-FS pair before cleanup-nested-FS-FE-cast
 /// existed: f32 norm-style sandwiches between bf16 residuals

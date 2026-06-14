@@ -491,7 +491,7 @@ fn elementwise_init_expr(expr: &str, dtype: DType, cuda_ty: &str) -> String {
 }
 
 /// `locals` are already widened to compute form by `elementwise_value`.
-fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
+fn elementwise_body(op: &str, locals: &[&str]) -> String {
     let a = || locals[0].to_string();
     let b = || locals[1].to_string();
     match op {
@@ -501,7 +501,12 @@ fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
         "Exp" => format!("expf({})", a()),
         "Exp2" => format!("exp2f({})", a()),
         "Log2" => format!("log2f({})", a()),
-        "Recip" => format!("static_cast<{}>(1.0f) / {}", cuda_dtype(dtype), a()),
+        // Operands are widened to `float` by `elementwise_value` (16-bit/fp8
+        // → static_cast<float>), so a float reciprocal is unambiguous and the
+        // result rounds back to the node dtype at store (elementwise_init_expr).
+        // A `static_cast<dtype>(1.0f)` numerator would make this `bf16 / float`
+        // — ambiguous in NVRTC against cuda_bf16.h's operator/ overloads.
+        "Recip" => format!("1.0f / {}", a()),
         "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", a()),
         // Dtype conversion happens in the widen (input) / round (store)
         // helpers, so the cast body is the identity.
@@ -685,7 +690,7 @@ pub(crate) fn region_kernel_source(
         let inputs_ref: Vec<&str> = input_locals.iter().map(|s| s.as_str()).collect();
 
         let elem_ty = cuda_dtype(elem_dtype);
-        let expr = elementwise_body(elem_name, &inputs_ref, elem_dtype);
+        let expr = elementwise_body(elem_name, &inputs_ref);
         let expr = elementwise_init_expr(&expr, elem_dtype, elem_ty);
         body.push_str(&format!(
             "        {elem_ty} {name} = {expr};\n",
