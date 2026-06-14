@@ -626,6 +626,14 @@ pub fn gpu_compute_cap() -> Option<(i32, i32)> {
     ctx.compute_capability().ok()
 }
 
+/// FlashInfer needs Ampere+ (sm_80; its kernels use cp.async). Tests that
+/// directly execute FlashInfer (bypassing the search, which gates the rule
+/// itself) must skip on older arches like the T4 (sm_75), where the kernel
+/// symbol is absent at launch (CUDA_ERROR_NOT_FOUND).
+pub fn gpu_supports_flashinfer() -> bool {
+    crate::device_compute_major() >= 8
+}
+
 /// Check if the current GPU supports the given dtype for tensor core / WMMA operations.
 pub fn gpu_supports_dtype(dtype: luminal::dtype::DType) -> bool {
     let Some((major, minor)) = gpu_compute_cap() else {

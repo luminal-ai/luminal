@@ -346,6 +346,9 @@ fn flashinfer_op_registers_via_into_egglog() {
 
 #[test]
 fn flashinfer_egg_rule_parses() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Rule::raw() returns the rule with no validation; egglog parses it at
     // graph build. Smoke-test by running it through the egglog frontend via
     // a tiny program string.
@@ -391,6 +394,9 @@ fn flashinfer_graph_signature_is_stable_when_c_moves_within_capacity() {
 
 #[test]
 fn flashinfer_bs1_ctx4() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -408,6 +414,9 @@ fn flashinfer_bs1_ctx4() {
 
 #[test]
 fn flashinfer_bs2_supersequence() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -448,6 +457,9 @@ fn flashinfer_bs2_supersequence() {
 
 #[test]
 fn flashinfer_noncontiguous_page_table() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -494,6 +506,9 @@ fn flashinfer_noncontiguous_page_table() {
 
 #[test]
 fn flashinfer_compact_decode_indices_match_reference() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -988,6 +1003,9 @@ fn flashinfer_rule_rejects_mixed_cache_provenance() {
 
 #[test]
 fn flashinfer_rule_fires_on_full_paged_attention() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Default Llama-shaped test dims (HEAD_DIM=64, N_HEADS=8, N_KV_HEADS=2).
     let (cx, _) = build_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM);
     let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer(&cx);
@@ -1000,6 +1018,9 @@ fn flashinfer_rule_fires_on_full_paged_attention() {
 
 #[test]
 fn flashinfer_rule_fires_on_same_rolled_cache_provenance() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let (cx, _) = build_paged_attention_graph_with_mask_and_cache_provenance(
         N_HEADS,
         N_KV_HEADS,
@@ -1024,6 +1045,9 @@ fn flashinfer_rule_fires_on_same_rolled_cache_provenance() {
 
 #[test]
 fn flashinfer_rule_fires_on_triu_gather_causal_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let (cx, _) = build_paged_attention_graph_with_mask(
         N_HEADS,
         N_KV_HEADS,
@@ -1040,6 +1064,9 @@ fn flashinfer_rule_fires_on_triu_gather_causal_mask() {
 
 #[test]
 fn flashinfer_rule_fires_on_direct_causal_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let (cx, _) = build_paged_attention_graph_with_mask(
         N_HEADS,
         N_KV_HEADS,
@@ -1071,6 +1098,9 @@ fn flashinfer_derived_causal_rule_rejects_prefill_bucket() {
 
 #[test]
 fn cuda_graph_captures_flashinfer_decode_island() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -1190,6 +1220,9 @@ fn cuda_graph_captures_flashinfer_decode_island() {
 
 #[test]
 fn flashinfer_rule_fires_on_non_llama_dims() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Different head counts: HEAD_DIM=64, N_HEADS=16, N_KV_HEADS=4 (group=4).
     // Exercises the model-agnostic structural variables in the rule.
     let (cx, _) = build_paged_attention_graph(16, 4, 64);
@@ -1203,6 +1236,9 @@ fn flashinfer_rule_fires_on_non_llama_dims() {
 
 #[test]
 fn flashinfer_rule_fires_on_mha() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // MHA: KV_GROUPS=1 (n_heads == n_kv_heads). The GQA broadcast still
     // structurally appears (expand_dim(1, 1) + merge), so the rule should
     // still match.
@@ -1227,6 +1263,9 @@ fn flashinfer_rule_fires_on_mha() {
 
 #[test]
 fn flashinfer_extraction_reachable_from_search_space() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -1508,6 +1547,9 @@ fn round_to_bf16(data: &[f32]) -> Vec<f32> {
 
 #[test]
 fn flashinfer_bf16_decode_bs1_ctx4() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -1533,6 +1575,9 @@ fn flashinfer_bf16_decode_bs1_ctx4() {
 
 #[test]
 fn flashinfer_bf16_decode_bs2_supersequence() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -1579,6 +1624,9 @@ fn flashinfer_bf16_decode_bs2_supersequence() {
 
 #[test]
 fn flashinfer_bf16_prefill_causal() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Single-sequence causal prefill via the derived 4-input path: s q tokens
     // over a c-token context whose last s slots are the q tokens themselves.
     // Reference: row j attends kv[0..=c-s+j], computed row-by-row with the
@@ -1614,6 +1662,9 @@ fn flashinfer_bf16_prefill_causal() {
 
 #[test]
 fn flashinfer_f32_prefill_still_rejected() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // The derived 4-input path with s>1 and f32 must keep failing cleanly:
     // tensor cores are 16-bit, so there is no f32 prefill kernel.
     let Some(stream) = get_cuda_stream() else {
@@ -1847,6 +1898,9 @@ fn dump_gemma_sliding_attention_egglog() {
 
 #[test]
 fn flashinfer_rule_fires_on_gemma_sliding_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     const HD: usize = 64;
     const HEADS: usize = 2;
     const KVH: usize = 1;
@@ -1885,6 +1939,9 @@ fn flashinfer_rule_fires_on_gemma_sliding_mask() {
 
 #[test]
 fn flashinfer_rule_fires_on_gemma_scale_free_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     const HD: usize = 64;
     const HEADS: usize = 2;
     const KVH: usize = 1;

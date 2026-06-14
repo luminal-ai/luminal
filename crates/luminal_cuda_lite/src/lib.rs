@@ -146,6 +146,31 @@ fn cuda_driver_diagnostics() -> (Option<i32>, Option<i32>) {
     (driver_version, None)
 }
 
+/// Compute-capability major version of CUDA device 0, detected once per
+/// process. Used to gate Ampere+ features (FlashInfer needs sm_80 for
+/// cp.async / async-copy) so older arches — e.g. a T4 (sm_75) — fall back
+/// instead of launching kernels whose symbols aren't in the cubin
+/// (`CUDA_ERROR_NOT_FOUND`). Defaults to 8 (Ampere) if detection fails, so
+/// detection problems don't silently disable the feature on capable GPUs.
+pub(crate) fn device_compute_major() -> i32 {
+    static MAJOR: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *MAJOR.get_or_init(|| {
+        // Override to validate the older-arch fallback path (e.g. force a
+        // sm_80+ GPU to behave like a T4) without that hardware.
+        if let Some(forced) = std::env::var("LUMINAL_COMPUTE_MAJOR")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+        {
+            return forced;
+        }
+        CudaContext::new(0)
+            .ok()
+            .and_then(|ctx| ctx.compute_capability().ok())
+            .map(|(major, _minor)| major)
+            .unwrap_or(8)
+    })
+}
+
 pub(crate) fn try_create_cublaslt(
     stream: Arc<CudaStream>,
 ) -> std::result::Result<Arc<CudaBlasLT>, String> {

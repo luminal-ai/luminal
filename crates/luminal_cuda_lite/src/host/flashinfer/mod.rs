@@ -235,6 +235,16 @@ impl EgglogOp for FlashInferAttention {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
+        // FlashInfer requires Ampere+ (sm_80; the kernels use cp.async /
+        // async-copy). On older arches — e.g. a T4 (sm_75) — emit no rules so
+        // the search never selects FlashInfer and attention stays on the HLIR
+        // chain. Without this the rule fires, the search picks it, and the
+        // JIT'd kernel's symbol is absent on launch (CUDA_ERROR_NOT_FOUND).
+        // All of this egg's relations (const_like, fi_*, flashinfer_*) are
+        // self-contained, so dropping it leaves no dangling references.
+        if crate::device_compute_major() < 8 {
+            return vec![];
+        }
         vec![Rule::raw(include_str!["flashinfer_attention.egg"])]
     }
 
