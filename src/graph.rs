@@ -1575,13 +1575,21 @@ impl Graph {
                     continue;
                 };
 
-                let filter_result = self.candidate_filter_result(
-                    runtime,
-                    &graph,
-                    &profile_dyn_map,
-                    options,
-                    bucket_profile_context.as_ref(),
-                );
+                // A candidate whose LLIR fails to compile (e.g. an egglog
+                // rule that mis-fires and produces an inconsistent kernel op)
+                // must be rejected like any other, not abort the search.
+                let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.candidate_filter_result(
+                        runtime,
+                        &graph,
+                        &profile_dyn_map,
+                        options,
+                        bucket_profile_context.as_ref(),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    CandidateFilterResult::reject_with_display("candidate compile panicked")
+                });
                 if !filter_result.accepted {
                     filter_fails += 1;
                     last_filter_rejection = filter_result.display;
@@ -1731,13 +1739,18 @@ impl Graph {
                     continue;
                 };
 
-                let filter_result = self.candidate_filter_result(
-                    runtime,
-                    &llir_graph,
-                    &profile_dyn_map,
-                    options,
-                    bucket_profile_context.as_ref(),
-                );
+                let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.candidate_filter_result(
+                        runtime,
+                        &llir_graph,
+                        &profile_dyn_map,
+                        options,
+                        bucket_profile_context.as_ref(),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    CandidateFilterResult::reject_with_display("candidate compile panicked")
+                });
                 if !filter_result.accepted {
                     continue;
                 }
