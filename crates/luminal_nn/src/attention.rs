@@ -166,9 +166,9 @@ mod tests {
         let indices = cx.tensor(3).as_dtype(DType::Int);
         let result = gather_rows(data, indices, 3).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -195,9 +195,9 @@ mod tests {
         let dest = cx.tensor((4, 3));
         let result = scatter_rows(src, indices, dest, 3).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -224,9 +224,9 @@ mod tests {
         let updated_cache = scatter_rows(kv_new, scatter_idx, cache, 4);
         let gathered = gather_rows(updated_cache, gather_idx, 4).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -280,9 +280,9 @@ mod tests {
         let k_cache_new = k_cache_new.output();
         let v_cache_new = v_cache_new.output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -356,9 +356,9 @@ mod tests {
         );
         let attn_out = attn_out.output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -431,9 +431,9 @@ mod tests {
         );
         let attn_out = attn_out.output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 

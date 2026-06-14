@@ -1642,7 +1642,7 @@ class ArgsortStableDuplicatesModel(torch.nn.Module):
 
 
 class TinyMoERoutingModel(torch.nn.Module):
-    """Minimal deterministic MoE-style routing proof for PT2/native and CUDA.
+    """Minimal deterministic MoE-style routing proof for PT2/reference and CUDA.
 
     ``idx_dtype`` casts the integer-valued outputs (routed_indices, dispatch,
     group_ids) to the requested dtype so the test can sweep int32 and int64

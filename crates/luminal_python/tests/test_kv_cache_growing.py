@@ -180,7 +180,7 @@ def test_dynamic_kv_cache_torch_compile_matches_reference_and_reuses_decode_grap
 
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="R1 full-width 1-layer is too memory-heavy for CPU native backend",
+    reason="R1 full-width 1-layer is too memory-heavy for CPU reference backend",
 )
 @pytest.mark.slow
 def test_kv_cache_growing_r1_mla(device: torch.device):

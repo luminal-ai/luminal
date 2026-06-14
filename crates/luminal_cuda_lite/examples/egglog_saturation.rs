@@ -43,7 +43,7 @@ const GEMMA_RMS_NORM_EPS: f32 = 1e-6;
 
 #[derive(Debug, Clone, Copy)]
 enum Backend {
-    Native,
+    Reference,
     Cuda,
 }
 
@@ -102,9 +102,9 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--backend" => {
                 args.backend = match iter.next().as_deref() {
-                    Some("native") => Backend::Native,
+                    Some("reference") => Backend::Reference,
                     Some("cuda") => Backend::Cuda,
-                    other => panic!("invalid --backend {other:?}; use native|cuda"),
+                    other => panic!("invalid --backend {other:?}; use reference|cuda"),
                 };
             }
             "--mode" => {
@@ -135,7 +135,7 @@ fn parse_args() -> Args {
                     "Usage: egglog_saturation [OPTIONS]\n\
                      \n\
                      Options:\n\
-                       --backend native|cuda          default: cuda\n\
+                       --backend reference|cuda       default: cuda\n\
                        --mode current|steps|full-default|full-cycle\n\
                        --case mul|unary-chain:N|gelu|softmax|layer-norm|matmul|attention|qwen-moe|gemma-moe|flux-block:N\n\
                        --passes N                    default: 256\n\
@@ -248,7 +248,11 @@ fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
         let k = h.matmul(kw).split_dims(1, hd).permute((1, 0, 2));
         let v = h.matmul(vw).split_dims(1, hd).permute((1, 0, 2));
         let scores = (q.matmul(k.permute((0, 2, 1))) * attn_scale).softmax(2);
-        let attn = scores.matmul(v).permute((1, 0, 2)).merge_dims(1, 2).matmul(ow);
+        let attn = scores
+            .matmul(v)
+            .permute((1, 0, 2))
+            .merge_dims(1, 2)
+            .matmul(ow);
         x = x + gate1 * attn;
         // ── gelu MLP sublayer ──
         let h2 = x.layer_norm(1, 1e-5) * (scale2 + 1.0) + shift2;
@@ -603,7 +607,7 @@ fn run(args: Args) {
     let (program, root) = hlir_to_egglog(&graph);
 
     let mut ops = match args.backend {
-        Backend::Native => <NativeRuntime as Runtime>::Ops::into_vec(),
+        Backend::Reference => <ReferenceRuntime as Runtime>::Ops::into_vec(),
         Backend::Cuda => <CudaRuntime as Runtime>::Ops::into_vec(),
     };
     ops.extend(<HLIROps as IntoEgglogOp>::into_vec());

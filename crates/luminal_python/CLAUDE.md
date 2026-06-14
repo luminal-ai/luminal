@@ -18,7 +18,7 @@ Each entry should cover:
 The goal is to build a living record of codebase-specific pitfalls that future sessions can
 consult before writing new egglog rules, CUDA kernels, or optimizer passes.
 1. If you want to run tests:
-   - `./run_test.sh` - runs tests with the native backend
+   - `./run_test.sh` - runs tests with the reference backend
    - `./run_tests_cuda.sh` - runs tests with the CUDA backend
 
 ## Testing Best Practices
@@ -71,7 +71,7 @@ class AddTestModel(torch.nn.Module):
 ```python
 # WRONG - bypasses the PyTorch integration
 model_path = create_pt2_model(...)
-graph_result = luminal.process_pt(model_path, backend='native')
+graph_result = luminal.process_pt(model_path, backend='reference')
 ```
 
 **✓ DO create PyTorch models and use torch.compile:**

@@ -318,8 +318,8 @@ impl HLIROp for Input {
     }
 }
 
-impl NativeOp for Input {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Input {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -375,8 +375,8 @@ impl HLIROp for Output {
     }
 }
 
-impl NativeOp for Output {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Output {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -418,8 +418,8 @@ impl HLIROp for CustomOpKind {
     }
 }
 
-impl NativeOp for CustomOpKind {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for CustomOpKind {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -529,8 +529,8 @@ impl HLIROp for LoopStart {
     }
 }
 
-impl NativeOp for LoopStart {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LoopStart {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!("LoopStart is driven by the runtime loop compiler")
     }
 }
@@ -613,8 +613,8 @@ impl HLIROp for LoopEnd {
     }
 }
 
-impl NativeOp for LoopEnd {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LoopEnd {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!("LoopEnd is driven by the runtime loop compiler")
     }
 }
@@ -740,8 +740,8 @@ impl HLIROp for LoopInput {
     }
 }
 
-impl NativeOp for LoopInput {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LoopInput {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!("LoopInput is driven by the runtime loop compiler")
     }
 }
@@ -830,8 +830,8 @@ impl HLIROp for LoopInputStatic {
     }
 }
 
-impl NativeOp for LoopInputStatic {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LoopInputStatic {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!("LoopInputStatic is driven by the runtime loop compiler")
     }
 }
@@ -917,8 +917,8 @@ impl HLIROp for LoopOutput {
     }
 }
 
-impl NativeOp for LoopOutput {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LoopOutput {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!("LoopOutput is driven by the runtime loop compiler")
     }
 }
@@ -1018,8 +1018,8 @@ impl HLIROp for LoopOutputSelect {
     }
 }
 
-impl NativeOp for LoopOutputSelect {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LoopOutputSelect {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         unimplemented!("LoopOutputSelect is driven by the runtime loop compiler")
     }
 }
@@ -1065,7 +1065,7 @@ impl EgglogOp for Constant {
         _: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self(
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
                 egraph.enodes[kind_children[0]]
                     .0
                     .replace("\"", "")
@@ -1077,9 +1077,9 @@ impl EgglogOp for Constant {
     }
 }
 
-impl NativeOp for Constant {
-    fn execute(&self, _: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
-        NativeData::F32(vec![self.0])
+impl ReferenceOp for Constant {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+        ReferenceData::F32(vec![self.0])
     }
 }
 
@@ -1124,7 +1124,7 @@ impl EgglogOp for Iota {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self(
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
                 extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
                 extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
             ))),
@@ -1132,11 +1132,11 @@ impl EgglogOp for Iota {
         )
     }
 }
-impl NativeOp for Iota {
-    fn execute(&self, _: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Iota {
+    fn execute(&self, _: Vec<&ReferenceData>, dyn_map: &FxHashMap<char, usize>) -> ReferenceData {
         let length = self.1.exec(dyn_map).unwrap();
         let expr = self.0.resolve_vars(dyn_map);
-        NativeData::Int(
+        ReferenceData::Int(
             (0..length)
                 .map(|i| expr.exec_single_var(i) as i32)
                 .collect(),
@@ -1186,7 +1186,7 @@ impl EgglogOp for Cast {
         ec: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self(
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
                 extract_expr(egraph, kind_children[0], ec).unwrap(),
                 extract_dtype(egraph, kind_children[1]),
             ))),
@@ -1194,84 +1194,86 @@ impl EgglogOp for Cast {
         )
     }
 }
-impl NativeOp for Cast {
-    fn execute(&self, input: Vec<&NativeData>, _: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Cast {
+    fn execute(&self, input: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
         match self.1 {
-            DType::F32 => NativeData::F32(match &input[0] {
-                NativeData::F32(f) => f.clone(),
-                NativeData::F16(f) => f.iter().map(|f| f.to_f32()).collect(),
-                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32()).collect(),
-                NativeData::Int(i) => i.iter().map(|i| *i as f32).collect(),
-                NativeData::I64(i) => i.iter().map(|i| *i as f32).collect(),
-                NativeData::F64(f) => f.iter().map(|f| *f as f32).collect(),
-                NativeData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
+            DType::F32 => ReferenceData::F32(match &input[0] {
+                ReferenceData::F32(f) => f.clone(),
+                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32()).collect(),
+                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32()).collect(),
+                ReferenceData::Int(i) => i.iter().map(|i| *i as f32).collect(),
+                ReferenceData::I64(i) => i.iter().map(|i| *i as f32).collect(),
+                ReferenceData::F64(f) => f.iter().map(|f| *f as f32).collect(),
+                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
             }),
-            DType::F64 => NativeData::F64(match &input[0] {
-                NativeData::F64(f) => f.clone(),
-                NativeData::F32(f) => f.iter().map(|f| *f as f64).collect(),
-                NativeData::F16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
-                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
-                NativeData::Int(i) => i.iter().map(|i| *i as f64).collect(),
-                NativeData::I64(i) => i.iter().map(|i| *i as f64).collect(),
-                NativeData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
+            DType::F64 => ReferenceData::F64(match &input[0] {
+                ReferenceData::F64(f) => f.clone(),
+                ReferenceData::F32(f) => f.iter().map(|f| *f as f64).collect(),
+                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
+                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
+                ReferenceData::Int(i) => i.iter().map(|i| *i as f64).collect(),
+                ReferenceData::I64(i) => i.iter().map(|i| *i as f64).collect(),
+                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
             }),
-            DType::Int => NativeData::Int(match &input[0] {
-                NativeData::F32(f) => f.iter().map(|f| *f as i32).collect(),
-                NativeData::F16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
-                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
-                NativeData::Int(i) => i.clone(),
+            DType::Int => ReferenceData::Int(match &input[0] {
+                ReferenceData::F32(f) => f.iter().map(|f| *f as i32).collect(),
+                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
+                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
+                ReferenceData::Int(i) => i.clone(),
                 // Saturating `Cast(I64 -> Int)`. This is the explicit
                 // graph node — `Cast` IS the user/translator-emitted
                 // operation, not an implicit bridge. Values outside the
                 // i32 range wrap via Rust's `as i32`, matching
                 // `tensor.to(torch.int32)` semantics on overflow.
-                NativeData::I64(i) => i.iter().map(|i| *i as i32).collect(),
-                NativeData::F64(f) => f.iter().map(|f| *f as i32).collect(),
-                NativeData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
+                ReferenceData::I64(i) => i.iter().map(|i| *i as i32).collect(),
+                ReferenceData::F64(f) => f.iter().map(|f| *f as i32).collect(),
+                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
             }),
-            DType::I64 => NativeData::I64(match &input[0] {
-                NativeData::I64(i) => i.clone(),
-                NativeData::Int(i) => i.iter().map(|i| *i as i64).collect(),
-                NativeData::F32(f) => f.iter().map(|f| *f as i64).collect(),
-                NativeData::F64(f) => f.iter().map(|f| *f as i64).collect(),
-                NativeData::F16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
-                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
-                NativeData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
+            DType::I64 => ReferenceData::I64(match &input[0] {
+                ReferenceData::I64(i) => i.clone(),
+                ReferenceData::Int(i) => i.iter().map(|i| *i as i64).collect(),
+                ReferenceData::F32(f) => f.iter().map(|f| *f as i64).collect(),
+                ReferenceData::F64(f) => f.iter().map(|f| *f as i64).collect(),
+                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
+                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
+                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
             }),
-            DType::F16 => NativeData::F16(match &input[0] {
-                NativeData::F32(f) => f.iter().copied().map(f16::from_f32).collect(),
-                NativeData::F16(f) => f.clone(),
-                NativeData::Bf16(f) => f.iter().map(|f| f16::from_f32(f.to_f32())).collect(),
-                NativeData::Int(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
-                NativeData::I64(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
-                NativeData::F64(f) => f.iter().map(|f| f16::from_f64(*f)).collect(),
-                NativeData::Bool(b) => b
+            DType::F16 => ReferenceData::F16(match &input[0] {
+                ReferenceData::F32(f) => f.iter().copied().map(f16::from_f32).collect(),
+                ReferenceData::F16(f) => f.clone(),
+                ReferenceData::Bf16(f) => f.iter().map(|f| f16::from_f32(f.to_f32())).collect(),
+                ReferenceData::Int(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
+                ReferenceData::I64(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
+                ReferenceData::F64(f) => f.iter().map(|f| f16::from_f64(*f)).collect(),
+                ReferenceData::Bool(b) => b
                     .iter()
                     .map(|b| f16::from_f32(if *b { 1.0 } else { 0.0 }))
                     .collect(),
             }),
-            DType::Bf16 => NativeData::Bf16(match &input[0] {
-                NativeData::F32(f) => f.iter().copied().map(bf16::from_f32).collect(),
-                NativeData::F16(f) => f.iter().map(|f| bf16::from_f32(f.to_f32())).collect(),
-                NativeData::Bf16(f) => f.clone(),
-                NativeData::Int(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
-                NativeData::I64(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
-                NativeData::F64(f) => f.iter().map(|f| bf16::from_f64(*f)).collect(),
-                NativeData::Bool(b) => b
+            DType::Bf16 => ReferenceData::Bf16(match &input[0] {
+                ReferenceData::F32(f) => f.iter().copied().map(bf16::from_f32).collect(),
+                ReferenceData::F16(f) => f.iter().map(|f| bf16::from_f32(f.to_f32())).collect(),
+                ReferenceData::Bf16(f) => f.clone(),
+                ReferenceData::Int(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
+                ReferenceData::I64(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
+                ReferenceData::F64(f) => f.iter().map(|f| bf16::from_f64(*f)).collect(),
+                ReferenceData::Bool(b) => b
                     .iter()
                     .map(|b| bf16::from_f32(if *b { 1.0 } else { 0.0 }))
                     .collect(),
             }),
-            DType::Bool => NativeData::Bool(match &input[0] {
-                NativeData::F32(f) => f.iter().map(|f| *f != 0.0).collect(),
-                NativeData::F16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
-                NativeData::Bf16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
-                NativeData::Int(i) => i.iter().map(|i| *i != 0).collect(),
-                NativeData::I64(i) => i.iter().map(|i| *i != 0).collect(),
-                NativeData::F64(f) => f.iter().map(|f| *f != 0.0).collect(),
-                NativeData::Bool(b) => b.clone(),
+            DType::Bool => ReferenceData::Bool(match &input[0] {
+                ReferenceData::F32(f) => f.iter().map(|f| *f != 0.0).collect(),
+                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
+                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
+                ReferenceData::Int(i) => i.iter().map(|i| *i != 0).collect(),
+                ReferenceData::I64(i) => i.iter().map(|i| *i != 0).collect(),
+                ReferenceData::F64(f) => f.iter().map(|f| *f != 0.0).collect(),
+                ReferenceData::Bool(b) => b.clone(),
             }),
-            other => unimplemented!("Cast to {other} is not yet supported in native interpreter"),
+            other => {
+                unimplemented!("Cast to {other} is not yet supported in reference interpreter")
+            }
         }
     }
 }
@@ -1279,35 +1281,37 @@ impl NativeOp for Cast {
 // Unary Op (A -> A)
 
 fn unary_impl(
-    inp: &NativeData,
+    inp: &ReferenceData,
     shape: &[Expression],
     strides: &[Expression],
     dyn_map: &FxHashMap<char, usize>,
     f32_fn: fn(f32) -> f32,
     f16_fn: fn(f16) -> f16,
     bf16_fn: fn(bf16) -> bf16,
-) -> NativeData {
+) -> ReferenceData {
     let ind = StridedIterator::new(shape, strides, dyn_map);
     match &inp {
-        NativeData::F32(f) => NativeData::F32(ind.map(|i| f32_fn(f[i])).collect()),
-        NativeData::F16(f) => NativeData::F16(ind.map(|i| f16_fn(f[i])).collect()),
-        NativeData::Bf16(f) => NativeData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
-        NativeData::Int(_) => panic!("unary_impl: no Int kernel — cast to F32 at the call site"),
-        NativeData::I64(_) => panic!("unary_impl: no I64 kernel — cast to F32 at the call site"),
+        ReferenceData::F32(f) => ReferenceData::F32(ind.map(|i| f32_fn(f[i])).collect()),
+        ReferenceData::F16(f) => ReferenceData::F16(ind.map(|i| f16_fn(f[i])).collect()),
+        ReferenceData::Bf16(f) => ReferenceData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
+        ReferenceData::Int(_) => panic!("unary_impl: no Int kernel — cast to F32 at the call site"),
+        ReferenceData::I64(_) => panic!("unary_impl: no I64 kernel — cast to F32 at the call site"),
         // No F64 transcendental kernel. Refuse loudly rather than
         // silently bridging through F32 — the caller asked for double
         // precision and that's not what an F32 bridge delivers. Fix at
         // the call site: cast inputs to F32 (`x.to(torch.float32)`) and
         // accept the precision, or wait for a native F64 transcendental
         // kernel.
-        NativeData::F64(_) => panic!(
+        ReferenceData::F64(_) => panic!(
             "unary_impl: no F64 transcendental kernel — cast inputs to F32 \
              at the call site (`x.to(torch.float32)`), or wait for the F64 \
              transcendental kernel follow-up. Silent F32 bridging is \
              intentionally rejected: it would hide a precision downgrade \
              behind an `F64` dtype tag."
         ),
-        NativeData::Bool(_) => panic!("unary_impl: no Bool kernel — cast to F32 at the call site"),
+        ReferenceData::Bool(_) => {
+            panic!("unary_impl: no Bool kernel — cast to F32 at the call site")
+        }
     }
 }
 
@@ -1355,7 +1359,7 @@ impl EgglogOp for Log2 {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1365,8 +1369,12 @@ impl EgglogOp for Log2 {
         )
     }
 }
-impl NativeOp for Log2 {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Log2 {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1423,7 +1431,7 @@ impl EgglogOp for Exp2 {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1433,8 +1441,12 @@ impl EgglogOp for Exp2 {
         )
     }
 }
-impl NativeOp for Exp2 {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Exp2 {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1492,7 +1504,7 @@ impl EgglogOp for Sin {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1502,8 +1514,12 @@ impl EgglogOp for Sin {
         )
     }
 }
-impl NativeOp for Sin {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Sin {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1561,7 +1577,7 @@ impl EgglogOp for Recip {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1571,8 +1587,12 @@ impl EgglogOp for Recip {
         )
     }
 }
-impl NativeOp for Recip {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Recip {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1630,7 +1650,7 @@ impl EgglogOp for Sqrt {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1640,8 +1660,12 @@ impl EgglogOp for Sqrt {
         )
     }
 }
-impl NativeOp for Sqrt {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Sqrt {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1763,7 +1787,7 @@ impl EgglogOp for Add {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1776,33 +1800,37 @@ impl EgglogOp for Add {
     }
 }
 
-impl NativeOp for Add {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Add {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
             StridedIterator::new(&self.shape, &self.b_strides, dyn_map),
         );
         match (a, b) {
-            (NativeData::F32(a), NativeData::F32(b)) => {
-                NativeData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            (ReferenceData::F32(a), ReferenceData::F32(b)) => {
+                ReferenceData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
             }
-            (NativeData::F16(a), NativeData::F16(b)) => {
-                NativeData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            (ReferenceData::F16(a), ReferenceData::F16(b)) => {
+                ReferenceData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
             }
-            (NativeData::Bf16(a), NativeData::Bf16(b)) => {
-                NativeData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            (ReferenceData::Bf16(a), ReferenceData::Bf16(b)) => {
+                ReferenceData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
             }
-            (NativeData::Int(a), NativeData::Int(b)) => {
-                NativeData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            (ReferenceData::Int(a), ReferenceData::Int(b)) => {
+                ReferenceData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
             }
-            (NativeData::I64(a), NativeData::I64(b)) => {
-                NativeData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            (ReferenceData::I64(a), ReferenceData::I64(b)) => {
+                ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
             }
-            (NativeData::F64(a), NativeData::F64(b)) => {
-                NativeData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            (ReferenceData::F64(a), ReferenceData::F64(b)) => {
+                ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
             }
-            (NativeData::Bool(_), NativeData::Bool(_)) => {
+            (ReferenceData::Bool(_), ReferenceData::Bool(_)) => {
                 panic!("Cannot add Bool tensors, cast to F32 first")
             }
             _ => panic!("Add inputs must have the same dtype"),
@@ -1859,7 +1887,7 @@ impl EgglogOp for Mul {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1872,33 +1900,37 @@ impl EgglogOp for Mul {
     }
 }
 
-impl NativeOp for Mul {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Mul {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
             StridedIterator::new(&self.shape, &self.b_strides, dyn_map),
         );
         match (a, b) {
-            (NativeData::F32(a), NativeData::F32(b)) => {
-                NativeData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            (ReferenceData::F32(a), ReferenceData::F32(b)) => {
+                ReferenceData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
             }
-            (NativeData::F16(a), NativeData::F16(b)) => {
-                NativeData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            (ReferenceData::F16(a), ReferenceData::F16(b)) => {
+                ReferenceData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
             }
-            (NativeData::Bf16(a), NativeData::Bf16(b)) => {
-                NativeData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            (ReferenceData::Bf16(a), ReferenceData::Bf16(b)) => {
+                ReferenceData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
             }
-            (NativeData::Int(a), NativeData::Int(b)) => {
-                NativeData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            (ReferenceData::Int(a), ReferenceData::Int(b)) => {
+                ReferenceData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
             }
-            (NativeData::I64(a), NativeData::I64(b)) => {
-                NativeData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            (ReferenceData::I64(a), ReferenceData::I64(b)) => {
+                ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
             }
-            (NativeData::F64(a), NativeData::F64(b)) => {
-                NativeData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            (ReferenceData::F64(a), ReferenceData::F64(b)) => {
+                ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
             }
-            (NativeData::Bool(_), NativeData::Bool(_)) => {
+            (ReferenceData::Bool(_), ReferenceData::Bool(_)) => {
                 panic!("Cannot multiply Bool tensors, cast to F32 first")
             }
             _ => panic!("Mul inputs must have the same dtype"),
@@ -1955,7 +1987,7 @@ impl EgglogOp for Mod {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -1968,33 +2000,37 @@ impl EgglogOp for Mod {
     }
 }
 
-impl NativeOp for Mod {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Mod {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
             StridedIterator::new(&self.shape, &self.b_strides, dyn_map),
         );
         match (a, b) {
-            (NativeData::F32(a), NativeData::F32(b)) => {
-                NativeData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            (ReferenceData::F32(a), ReferenceData::F32(b)) => {
+                ReferenceData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
             }
-            (NativeData::F16(a), NativeData::F16(b)) => {
-                NativeData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            (ReferenceData::F16(a), ReferenceData::F16(b)) => {
+                ReferenceData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
             }
-            (NativeData::Bf16(a), NativeData::Bf16(b)) => {
-                NativeData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            (ReferenceData::Bf16(a), ReferenceData::Bf16(b)) => {
+                ReferenceData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
             }
-            (NativeData::Int(a), NativeData::Int(b)) => {
-                NativeData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            (ReferenceData::Int(a), ReferenceData::Int(b)) => {
+                ReferenceData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
             }
-            (NativeData::I64(a), NativeData::I64(b)) => {
-                NativeData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            (ReferenceData::I64(a), ReferenceData::I64(b)) => {
+                ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
             }
-            (NativeData::F64(a), NativeData::F64(b)) => {
-                NativeData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            (ReferenceData::F64(a), ReferenceData::F64(b)) => {
+                ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
             }
-            (NativeData::Bool(_), NativeData::Bool(_)) => panic!("Cannot mod Bool tensors"),
+            (ReferenceData::Bool(_), ReferenceData::Bool(_)) => panic!("Cannot mod Bool tensors"),
             _ => panic!("Mod inputs must have the same dtype"),
         }
     }
@@ -2050,7 +2086,7 @@ impl EgglogOp for LessThan {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
                     .unwrap(),
@@ -2063,34 +2099,38 @@ impl EgglogOp for LessThan {
     }
 }
 
-impl NativeOp for LessThan {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for LessThan {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
             StridedIterator::new(&self.shape, &self.b_strides, dyn_map),
         );
         match (a, b) {
-            (NativeData::F32(a), NativeData::F32(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            (ReferenceData::F32(a), ReferenceData::F32(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
-            (NativeData::F16(a), NativeData::F16(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            (ReferenceData::F16(a), ReferenceData::F16(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
-            (NativeData::Bf16(a), NativeData::Bf16(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            (ReferenceData::Bf16(a), ReferenceData::Bf16(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
-            (NativeData::Int(a), NativeData::Int(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            (ReferenceData::Int(a), ReferenceData::Int(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
-            (NativeData::I64(a), NativeData::I64(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            (ReferenceData::I64(a), ReferenceData::I64(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
-            (NativeData::F64(a), NativeData::F64(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            (ReferenceData::F64(a), ReferenceData::F64(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
-            (NativeData::Bool(a), NativeData::Bool(b)) => {
-                NativeData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| !x & y))
+            (ReferenceData::Bool(a), ReferenceData::Bool(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| !x & y))
             }
             _ => panic!("LessThan inputs must have the same dtype"),
         }
@@ -2189,7 +2229,7 @@ impl EgglogOp for Gather {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 index_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
                     .unwrap(),
                 index_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
@@ -2204,47 +2244,51 @@ impl EgglogOp for Gather {
         )
     }
 }
-impl NativeOp for Gather {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Gather {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let (indexes, data) = (inputs[0], inputs[1]);
         let indexes_ind = StridedIterator::new(&self.index_shape, &self.index_strides, dyn_map);
         let data_ind =
             StridedIterator::new(&self.data_shape, &self.data_strides, dyn_map).collect_vec();
-        let NativeData::Int(indexes) = indexes else {
+        let ReferenceData::Int(indexes) = indexes else {
             panic!("indexes must be int!")
         };
         match data {
-            NativeData::F32(a) => NativeData::F32(
+            ReferenceData::F32(a) => ReferenceData::F32(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
-            NativeData::F16(a) => NativeData::F16(
+            ReferenceData::F16(a) => ReferenceData::F16(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
-            NativeData::Bf16(a) => NativeData::Bf16(
+            ReferenceData::Bf16(a) => ReferenceData::Bf16(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
-            NativeData::Int(a) => NativeData::Int(
+            ReferenceData::Int(a) => ReferenceData::Int(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
-            NativeData::I64(a) => NativeData::I64(
+            ReferenceData::I64(a) => ReferenceData::I64(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
-            NativeData::F64(a) => NativeData::F64(
+            ReferenceData::F64(a) => ReferenceData::F64(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
             ),
-            NativeData::Bool(a) => NativeData::Bool(
+            ReferenceData::Bool(a) => ReferenceData::Bool(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
@@ -2349,7 +2393,7 @@ impl EgglogOp for Scatter {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 dest_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
                     .unwrap(),
                 dest_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
@@ -2365,15 +2409,19 @@ impl EgglogOp for Scatter {
         )
     }
 }
-impl NativeOp for Scatter {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Scatter {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let (dest, indexes, src) = (inputs[0], inputs[1], inputs[2]);
         let dest_ind =
             StridedIterator::new(&self.dest_shape, &self.dest_strides, dyn_map).collect_vec();
         let index_ind = StridedIterator::new(&self.index_shape, &self.index_strides, dyn_map);
         let src_ind =
             StridedIterator::new(&self.index_shape, &self.src_strides, dyn_map).collect_vec();
-        let NativeData::Int(indexes) = indexes else {
+        let ReferenceData::Int(indexes) = indexes else {
             panic!("indexes must be int!")
         };
         macro_rules! scatter_impl {
@@ -2385,17 +2433,17 @@ impl NativeOp for Scatter {
                         output[idx] = $src_data[src_ind[src_idx]];
                     }
                 }
-                NativeData::$variant(output)
+                ReferenceData::$variant(output)
             }};
         }
         match (dest, src) {
-            (NativeData::F32(d), NativeData::F32(s)) => scatter_impl!(F32, d, s),
-            (NativeData::F64(d), NativeData::F64(s)) => scatter_impl!(F64, d, s),
-            (NativeData::F16(d), NativeData::F16(s)) => scatter_impl!(F16, d, s),
-            (NativeData::Bf16(d), NativeData::Bf16(s)) => scatter_impl!(Bf16, d, s),
-            (NativeData::Int(d), NativeData::Int(s)) => scatter_impl!(Int, d, s),
-            (NativeData::I64(d), NativeData::I64(s)) => scatter_impl!(I64, d, s),
-            (NativeData::Bool(d), NativeData::Bool(s)) => scatter_impl!(Bool, d, s),
+            (ReferenceData::F32(d), ReferenceData::F32(s)) => scatter_impl!(F32, d, s),
+            (ReferenceData::F64(d), ReferenceData::F64(s)) => scatter_impl!(F64, d, s),
+            (ReferenceData::F16(d), ReferenceData::F16(s)) => scatter_impl!(F16, d, s),
+            (ReferenceData::Bf16(d), ReferenceData::Bf16(s)) => scatter_impl!(Bf16, d, s),
+            (ReferenceData::Int(d), ReferenceData::Int(s)) => scatter_impl!(Int, d, s),
+            (ReferenceData::I64(d), ReferenceData::I64(s)) => scatter_impl!(I64, d, s),
+            (ReferenceData::Bool(d), ReferenceData::Bool(s)) => scatter_impl!(Bool, d, s),
             _ => panic!("dest and src must have the same dtype!"),
         }
     }
@@ -2471,7 +2519,7 @@ impl EgglogOp for SumReduce {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 dim: 0,
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
@@ -2485,8 +2533,12 @@ impl EgglogOp for SumReduce {
     }
 }
 
-impl NativeOp for SumReduce {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for SumReduce {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         // Resolve dyn vars in iter_stride, then evaluate z-stride at each iteration
         let mut resolved_stride = self.iter_stride;
@@ -2495,7 +2547,7 @@ impl NativeOp for SumReduce {
         }
         let iters = self.iters.exec(dyn_map).unwrap();
         match inputs[0] {
-            NativeData::F32(a) => NativeData::F32(
+            ReferenceData::F32(a) => ReferenceData::F32(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2503,7 +2555,7 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
-            NativeData::F16(a) => NativeData::F16(
+            ReferenceData::F16(a) => ReferenceData::F16(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2511,7 +2563,7 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
-            NativeData::Bf16(a) => NativeData::Bf16(
+            ReferenceData::Bf16(a) => ReferenceData::Bf16(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2519,7 +2571,7 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
-            NativeData::Int(a) => NativeData::Int(
+            ReferenceData::Int(a) => ReferenceData::Int(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2527,7 +2579,7 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
-            NativeData::I64(a) => NativeData::I64(
+            ReferenceData::I64(a) => ReferenceData::I64(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2535,7 +2587,7 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
-            NativeData::F64(a) => NativeData::F64(
+            ReferenceData::F64(a) => ReferenceData::F64(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2543,7 +2595,7 @@ impl NativeOp for SumReduce {
                 })
                 .collect(),
             ),
-            NativeData::Bool(_) => panic!("Cannot sum Bool tensors, cast to F32 first"),
+            ReferenceData::Bool(_) => panic!("Cannot sum Bool tensors, cast to F32 first"),
         }
     }
 }
@@ -2604,7 +2656,7 @@ impl EgglogOp for MaxReduce {
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 dim: 0,
                 shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
                 iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
@@ -2618,8 +2670,12 @@ impl EgglogOp for MaxReduce {
     }
 }
 
-impl NativeOp for MaxReduce {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for MaxReduce {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         // Resolve dyn vars in iter_stride, then evaluate z-stride at each iteration
         let mut resolved_stride = self.iter_stride;
@@ -2628,7 +2684,7 @@ impl NativeOp for MaxReduce {
         }
         let iters = self.iters.exec(dyn_map).unwrap();
         match inputs[0] {
-            NativeData::F32(a) => NativeData::F32(
+            ReferenceData::F32(a) => ReferenceData::F32(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2637,7 +2693,7 @@ impl NativeOp for MaxReduce {
                 })
                 .collect(),
             ),
-            NativeData::F16(a) => NativeData::F16(
+            ReferenceData::F16(a) => ReferenceData::F16(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2646,7 +2702,7 @@ impl NativeOp for MaxReduce {
                 })
                 .collect(),
             ),
-            NativeData::Bf16(a) => NativeData::Bf16(
+            ReferenceData::Bf16(a) => ReferenceData::Bf16(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2655,7 +2711,7 @@ impl NativeOp for MaxReduce {
                 })
                 .collect(),
             ),
-            NativeData::Int(a) => NativeData::Int(
+            ReferenceData::Int(a) => ReferenceData::Int(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2664,7 +2720,7 @@ impl NativeOp for MaxReduce {
                 })
                 .collect(),
             ),
-            NativeData::I64(a) => NativeData::I64(
+            ReferenceData::I64(a) => ReferenceData::I64(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2673,7 +2729,7 @@ impl NativeOp for MaxReduce {
                 })
                 .collect(),
             ),
-            NativeData::F64(a) => NativeData::F64(
+            ReferenceData::F64(a) => ReferenceData::F64(
                 ind.map(|start| {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
@@ -2682,7 +2738,7 @@ impl NativeOp for MaxReduce {
                 })
                 .collect(),
             ),
-            NativeData::Bool(_) => panic!("Cannot max-reduce Bool tensors"),
+            ReferenceData::Bool(_) => panic!("Cannot max-reduce Bool tensors"),
         }
     }
 }
@@ -2690,12 +2746,12 @@ impl NativeOp for MaxReduce {
 // Fused Softmax: softmax(x, axis) = exp(x - max(x)) / sum(exp(x - max(x)))
 // A single HLIR op that replaces the 6-op decomposed chain.
 // On CUDA, KernelSoftmax provides a fused 3-pass kernel.
-// On native, NativeOp implements softmax directly.
+// On reference, ReferenceOp implements softmax directly.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Softmax {
     pub axis: usize,
     pub input_shape: ShapeTracker,
-    // Extracted fields (populated during egglog extraction, used by NativeOp)
+    // Extracted fields (populated during egglog extraction, used by ReferenceOp)
     pub shape: Vec<Expression>,
     pub in_strides: Vec<Expression>,
     pub reduce_dim: Expression,
@@ -2765,7 +2821,7 @@ impl EgglogOp for Softmax {
         let reduce_dim = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
         let reduce_stride = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
         (
-            LLIROp::new::<dyn NativeOp>(Box::new(Self {
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
                 axis: 0,
                 input_shape: ShapeTracker::default(),
                 shape,
@@ -2778,10 +2834,14 @@ impl EgglogOp for Softmax {
     }
 }
 
-impl NativeOp for Softmax {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData {
+impl ReferenceOp for Softmax {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
         match inputs[0] {
-            NativeData::F32(a) => {
+            ReferenceData::F32(a) => {
                 // Use extracted fields (populated during egglog extraction)
                 let dims: Vec<usize> = self
                     .shape
@@ -2834,19 +2894,23 @@ impl NativeOp for Softmax {
                     }
                 }
 
-                NativeData::F32(out)
+                ReferenceData::F32(out)
             }
             _ => panic!("Softmax only supports F32"),
         }
     }
 }
 
-pub trait NativeOp: Debug + AsAny + Send + Sync {
-    fn execute(&self, inputs: Vec<&NativeData>, dyn_map: &FxHashMap<char, usize>) -> NativeData;
+pub trait ReferenceOp: Debug + AsAny + Send + Sync {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData;
 }
 
 #[derive(Debug, Clone)]
-pub enum NativeData {
+pub enum ReferenceData {
     F32(Vec<f32>),
     F16(Vec<f16>),
     Bf16(Vec<bf16>),
@@ -2856,42 +2920,42 @@ pub enum NativeData {
     Bool(Vec<bool>),
 }
 
-impl NativeData {
+impl ReferenceData {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
     pub fn len(&self) -> usize {
         match self {
-            NativeData::F32(v) => v.len(),
-            NativeData::F16(v) => v.len(),
-            NativeData::Bf16(v) => v.len(),
-            NativeData::Int(v) => v.len(),
-            NativeData::I64(v) => v.len(),
-            NativeData::F64(v) => v.len(),
-            NativeData::Bool(v) => v.len(),
+            ReferenceData::F32(v) => v.len(),
+            ReferenceData::F16(v) => v.len(),
+            ReferenceData::Bf16(v) => v.len(),
+            ReferenceData::Int(v) => v.len(),
+            ReferenceData::I64(v) => v.len(),
+            ReferenceData::F64(v) => v.len(),
+            ReferenceData::Bool(v) => v.len(),
         }
     }
     pub fn to_f32_vec(&self) -> Vec<f32> {
         match self {
-            NativeData::F32(v) => v.clone(),
-            NativeData::F16(v) => v.iter().map(|v| v.to_f32()).collect(),
-            NativeData::Bf16(v) => v.iter().map(|v| v.to_f32()).collect(),
-            NativeData::Int(v) => v.iter().map(|v| *v as f32).collect(),
-            NativeData::I64(v) => v.iter().map(|v| *v as f32).collect(),
-            NativeData::F64(v) => v.iter().map(|v| *v as f32).collect(),
-            NativeData::Bool(v) => v.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect(),
+            ReferenceData::F32(v) => v.clone(),
+            ReferenceData::F16(v) => v.iter().map(|v| v.to_f32()).collect(),
+            ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32()).collect(),
+            ReferenceData::Int(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::I64(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::F64(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::Bool(v) => v.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect(),
         }
     }
 
     pub fn to_f16_vec(&self) -> Vec<f16> {
         match self {
-            NativeData::F32(v) => v.iter().copied().map(f16::from_f32).collect(),
-            NativeData::F16(v) => v.clone(),
-            NativeData::Bf16(v) => v.iter().map(|v| f16::from_f32(v.to_f32())).collect(),
-            NativeData::Int(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
-            NativeData::I64(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
-            NativeData::F64(v) => v.iter().map(|v| f16::from_f64(*v)).collect(),
-            NativeData::Bool(v) => v
+            ReferenceData::F32(v) => v.iter().copied().map(f16::from_f32).collect(),
+            ReferenceData::F16(v) => v.clone(),
+            ReferenceData::Bf16(v) => v.iter().map(|v| f16::from_f32(v.to_f32())).collect(),
+            ReferenceData::Int(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
+            ReferenceData::I64(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
+            ReferenceData::F64(v) => v.iter().map(|v| f16::from_f64(*v)).collect(),
+            ReferenceData::Bool(v) => v
                 .iter()
                 .map(|v| f16::from_f32(if *v { 1.0 } else { 0.0 }))
                 .collect(),
@@ -2900,111 +2964,111 @@ impl NativeData {
 
     pub fn to_i32_vec(&self) -> Vec<i32> {
         match self {
-            NativeData::F32(v) => v.iter().map(|v| *v as i32).collect(),
-            NativeData::F16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
-            NativeData::Bf16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
-            NativeData::Int(v) => v.clone(),
-            NativeData::I64(v) => v.iter().map(|v| *v as i32).collect(),
-            NativeData::F64(v) => v.iter().map(|v| *v as i32).collect(),
-            NativeData::Bool(v) => v.iter().map(|v| if *v { 1 } else { 0 }).collect(),
+            ReferenceData::F32(v) => v.iter().map(|v| *v as i32).collect(),
+            ReferenceData::F16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
+            ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
+            ReferenceData::Int(v) => v.clone(),
+            ReferenceData::I64(v) => v.iter().map(|v| *v as i32).collect(),
+            ReferenceData::F64(v) => v.iter().map(|v| *v as i32).collect(),
+            ReferenceData::Bool(v) => v.iter().map(|v| if *v { 1 } else { 0 }).collect(),
         }
     }
 
     pub fn to_bool_vec(&self) -> Vec<bool> {
         match self {
-            NativeData::F32(v) => v.iter().map(|v| *v != 0.0).collect(),
-            NativeData::F16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
-            NativeData::Bf16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
-            NativeData::Int(v) => v.iter().map(|v| *v != 0).collect(),
-            NativeData::I64(v) => v.iter().map(|v| *v != 0).collect(),
-            NativeData::F64(v) => v.iter().map(|v| *v != 0.0).collect(),
-            NativeData::Bool(v) => v.clone(),
+            ReferenceData::F32(v) => v.iter().map(|v| *v != 0.0).collect(),
+            ReferenceData::F16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
+            ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
+            ReferenceData::Int(v) => v.iter().map(|v| *v != 0).collect(),
+            ReferenceData::I64(v) => v.iter().map(|v| *v != 0).collect(),
+            ReferenceData::F64(v) => v.iter().map(|v| *v != 0.0).collect(),
+            ReferenceData::Bool(v) => v.clone(),
         }
     }
 }
 
-impl From<Vec<f32>> for NativeData {
+impl From<Vec<f32>> for ReferenceData {
     fn from(value: Vec<f32>) -> Self {
-        NativeData::F32(value)
+        ReferenceData::F32(value)
     }
 }
-impl From<Vec<f16>> for NativeData {
+impl From<Vec<f16>> for ReferenceData {
     fn from(value: Vec<f16>) -> Self {
-        NativeData::F16(value)
+        ReferenceData::F16(value)
     }
 }
-impl From<Vec<bf16>> for NativeData {
+impl From<Vec<bf16>> for ReferenceData {
     fn from(value: Vec<bf16>) -> Self {
-        NativeData::Bf16(value)
+        ReferenceData::Bf16(value)
     }
 }
-impl From<Vec<i32>> for NativeData {
+impl From<Vec<i32>> for ReferenceData {
     fn from(value: Vec<i32>) -> Self {
-        NativeData::Int(value)
+        ReferenceData::Int(value)
     }
 }
-impl From<Vec<i64>> for NativeData {
+impl From<Vec<i64>> for ReferenceData {
     fn from(value: Vec<i64>) -> Self {
-        NativeData::I64(value)
+        ReferenceData::I64(value)
     }
 }
-// No `From<Vec<f64>> for NativeData` impl. Adding it makes plain
+// No `From<Vec<f64>> for ReferenceData` impl. Adding it makes plain
 // float literals (`vec![1.0, 2.0, 3.0]` passed to `set_data`)
 // ambiguous between `Vec<f32>` and `Vec<f64>` and forces every test
 // site to spell out `Vec::<f32>::from([...])`. Callers that need to
-// construct an F64 buffer can do `NativeData::F64(my_vec)` directly.
-impl From<Vec<bool>> for NativeData {
+// construct an F64 buffer can do `ReferenceData::F64(my_vec)` directly.
+impl From<Vec<bool>> for ReferenceData {
     fn from(value: Vec<bool>) -> Self {
-        NativeData::Bool(value)
+        ReferenceData::Bool(value)
     }
 }
 
-macro_rules! impl_native_data_from_ref {
+macro_rules! impl_reference_data_from_ref {
     ($ty:ty, $variant:ident) => {
-        impl From<&[$ty]> for NativeData {
+        impl From<&[$ty]> for ReferenceData {
             fn from(value: &[$ty]) -> Self {
-                NativeData::$variant(value.to_vec())
+                ReferenceData::$variant(value.to_vec())
             }
         }
 
-        impl From<&Vec<$ty>> for NativeData {
+        impl From<&Vec<$ty>> for ReferenceData {
             fn from(value: &Vec<$ty>) -> Self {
-                NativeData::$variant(value.clone())
+                ReferenceData::$variant(value.clone())
             }
         }
     };
 }
 
-macro_rules! impl_native_data_from_array_ref {
+macro_rules! impl_reference_data_from_array_ref {
     ($ty:ty, $variant:ident) => {
-        impl<const N: usize> From<&[$ty; N]> for NativeData {
+        impl<const N: usize> From<&[$ty; N]> for ReferenceData {
             fn from(value: &[$ty; N]) -> Self {
-                NativeData::$variant(value.to_vec())
+                ReferenceData::$variant(value.to_vec())
             }
         }
     };
 }
 
-impl_native_data_from_ref!(f32, F32);
-impl_native_data_from_ref!(f16, F16);
-impl_native_data_from_ref!(bf16, Bf16);
-impl_native_data_from_ref!(i32, Int);
-impl_native_data_from_ref!(bool, Bool);
+impl_reference_data_from_ref!(f32, F32);
+impl_reference_data_from_ref!(f16, F16);
+impl_reference_data_from_ref!(bf16, Bf16);
+impl_reference_data_from_ref!(i32, Int);
+impl_reference_data_from_ref!(bool, Bool);
 
-impl_native_data_from_array_ref!(f32, F32);
-impl_native_data_from_array_ref!(f16, F16);
-impl_native_data_from_array_ref!(bf16, Bf16);
-impl_native_data_from_array_ref!(i32, Int);
-impl_native_data_from_array_ref!(bool, Bool);
+impl_reference_data_from_array_ref!(f32, F32);
+impl_reference_data_from_array_ref!(f16, F16);
+impl_reference_data_from_array_ref!(bf16, Bf16);
+impl_reference_data_from_array_ref!(i32, Int);
+impl_reference_data_from_array_ref!(bool, Bool);
 
 #[derive(Default)]
-pub struct NativeRuntime {
-    pub buffers: FxHashMap<NodeIndex, NativeData>,
-    pub graph: StableGraph<Arc<Box<dyn NativeOp>>, ()>,
+pub struct ReferenceRuntime {
+    pub buffers: FxHashMap<NodeIndex, ReferenceData>,
+    pub graph: StableGraph<Arc<Box<dyn ReferenceOp>>, ()>,
 }
 
-impl NativeRuntime {
-    pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
+impl ReferenceRuntime {
+    pub fn set_data(&mut self, id: impl ToId, data: impl Into<ReferenceData>) {
         let id = id.to_id();
         let local_id = self
             .graph
@@ -3021,7 +3085,7 @@ impl NativeRuntime {
     }
 }
 
-impl Runtime for NativeRuntime {
+impl Runtime for ReferenceRuntime {
     type Ops = ();
     type CompileArg = ();
     type ExecReturn = ();
@@ -3049,10 +3113,10 @@ impl Runtime for NativeRuntime {
     }
 
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
-        // Extract nativeop graph
+        // Extract reference-op graph
         let mut graph = StableGraph::new();
         for node in llir_graph.node_weights() {
-            if let Some(op) = node.to_dialect::<dyn NativeOp>() {
+            if let Some(op) = node.to_dialect::<dyn ReferenceOp>() {
                 graph.add_node(op.clone());
             } else if let Some(input) = node.to_op::<Input>() {
                 graph.add_node(Arc::new(Box::new(input.clone())));
@@ -3089,7 +3153,7 @@ impl Runtime for NativeRuntime {
                 continue;
             }
 
-            let span = info_span!("native_op", op = %format!("{:?}", self.graph[node]));
+            let span = info_span!("reference_op", op = %format!("{:?}", self.graph[node]));
             let _entered = span.enter();
             let inputs = self
                 .graph
@@ -3111,7 +3175,7 @@ impl Runtime for NativeRuntime {
     }
 }
 
-impl NativeRuntime {
+impl ReferenceRuntime {
     pub fn get_f32(&self, id: impl ToId) -> &Vec<f32> {
         let id = id.to_id();
         let output_id = self
@@ -3126,7 +3190,7 @@ impl NativeRuntime {
                 }
             })
             .unwrap();
-        let NativeData::F32(f) = self.buffers.get(&output_id).unwrap() else {
+        let ReferenceData::F32(f) = self.buffers.get(&output_id).unwrap() else {
             panic!()
         };
         f

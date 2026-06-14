@@ -183,9 +183,9 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -241,9 +241,9 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -298,9 +298,9 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -358,9 +358,9 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -406,9 +406,9 @@ mod tests {
         };
         let output = moe.forward(input).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
