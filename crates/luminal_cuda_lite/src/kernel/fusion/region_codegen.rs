@@ -321,11 +321,8 @@ fn region_structural_hashes(
             .count();
         indeg.insert(n, d);
     }
-    let mut queue: std::collections::VecDeque<NodeIndex> = interior
-        .iter()
-        .copied()
-        .filter(|n| indeg[n] == 0)
-        .collect();
+    let mut queue: std::collections::VecDeque<NodeIndex> =
+        interior.iter().copied().filter(|n| indeg[n] == 0).collect();
     while let Some(n) = queue.pop_front() {
         let mut child_hashes: Vec<u64> = llir_graph
             .neighbors_directed(n, Direction::Incoming)

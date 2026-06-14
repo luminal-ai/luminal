@@ -262,7 +262,25 @@ fn build_mini_qwen_stage(act: DType, stage: usize) -> MiniQwen {
     if stage == 1 {
         // Keep both rope outputs live: concat along the feature dim.
         let out = to_f32_out(q_rope.concat_along(k_rope, 1));
-        return MiniQwen { cx, out, x, pos, k_cache, v_cache, q_w, k_w, v_w, o_w, attn_norm_w, mlp_norm_w, q_norm_w, k_norm_w, router_w, gate_up_w, down_w };
+        return MiniQwen {
+            cx,
+            out,
+            x,
+            pos,
+            k_cache,
+            v_cache,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            attn_norm_w,
+            mlp_norm_w,
+            q_norm_w,
+            k_norm_w,
+            router_w,
+            gate_up_w,
+            down_w,
+        };
     }
 
     let attn_out = if act == DType::F32 {
@@ -279,18 +297,72 @@ fn build_mini_qwen_stage(act: DType, stage: usize) -> MiniQwen {
     };
     if stage == 2 {
         let out = to_f32_out(attn_out);
-        return MiniQwen { cx, out, x, pos, k_cache, v_cache, q_w, k_w, v_w, o_w, attn_norm_w, mlp_norm_w, q_norm_w, k_norm_w, router_w, gate_up_w, down_w };
+        return MiniQwen {
+            cx,
+            out,
+            x,
+            pos,
+            k_cache,
+            v_cache,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            attn_norm_w,
+            mlp_norm_w,
+            q_norm_w,
+            k_norm_w,
+            router_w,
+            gate_up_w,
+            down_w,
+        };
     }
     xr += attn_out.matmul(o_w.t());
     if stage == 3 {
         let out = to_f32_out(xr);
-        return MiniQwen { cx, out, x, pos, k_cache, v_cache, q_w, k_w, v_w, o_w, attn_norm_w, mlp_norm_w, q_norm_w, k_norm_w, router_w, gate_up_w, down_w };
+        return MiniQwen {
+            cx,
+            out,
+            x,
+            pos,
+            k_cache,
+            v_cache,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            attn_norm_w,
+            mlp_norm_w,
+            q_norm_w,
+            k_norm_w,
+            router_w,
+            gate_up_w,
+            down_w,
+        };
     }
 
     let x_mlp = norm_in_f32(xr, mlp_norm_w);
     if stage == 4 {
         let out = to_f32_out(x_mlp);
-        return MiniQwen { cx, out, x, pos, k_cache, v_cache, q_w, k_w, v_w, o_w, attn_norm_w, mlp_norm_w, q_norm_w, k_norm_w, router_w, gate_up_w, down_w };
+        return MiniQwen {
+            cx,
+            out,
+            x,
+            pos,
+            k_cache,
+            v_cache,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            attn_norm_w,
+            mlp_norm_w,
+            q_norm_w,
+            k_norm_w,
+            router_w,
+            gate_up_w,
+            down_w,
+        };
     }
     let mlp_out = if act == DType::F32 {
         moe(x_mlp, router_w, gate_up_w, down_w)
@@ -299,7 +371,25 @@ fn build_mini_qwen_stage(act: DType, stage: usize) -> MiniQwen {
     };
     if stage == 5 {
         let out = to_f32_out(mlp_out);
-        return MiniQwen { cx, out, x, pos, k_cache, v_cache, q_w, k_w, v_w, o_w, attn_norm_w, mlp_norm_w, q_norm_w, k_norm_w, router_w, gate_up_w, down_w };
+        return MiniQwen {
+            cx,
+            out,
+            x,
+            pos,
+            k_cache,
+            v_cache,
+            q_w,
+            k_w,
+            v_w,
+            o_w,
+            attn_norm_w,
+            mlp_norm_w,
+            q_norm_w,
+            k_norm_w,
+            router_w,
+            gate_up_w,
+            down_w,
+        };
     }
     let out_t = xr + mlp_out;
     let out = if act == DType::F32 {
@@ -333,10 +423,7 @@ fn build_mini_qwen_stage(act: DType, stage: usize) -> MiniQwen {
 /// occasionally selects the known GEMM-chain materialization corner case
 /// ("missing cached buffer", see pure_matmul_chain test); retry until a
 /// loadable candidate is drawn.
-fn reference_run<T>(
-    attempts: usize,
-    f: impl Fn() -> T,
-) -> T {
+fn reference_run<T>(attempts: usize, f: impl Fn() -> T) -> T {
     for _ in 0..attempts {
         if let Ok(v) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(&f)) {
             return v;
@@ -365,9 +452,8 @@ struct MiniData {
 fn mini_data() -> MiniData {
     // All 16-bit-stored weights are pre-rounded through bf16 so the F32 and
     // bf16 graphs consume identical values.
-    let round = |v: Vec<f32>| -> Vec<f32> {
-        v.into_iter().map(|x| bf16::from_f32(x).to_f32()).collect()
-    };
+    let round =
+        |v: Vec<f32>| -> Vec<f32> { v.into_iter().map(|x| bf16::from_f32(x).to_f32()).collect() };
     MiniData {
         x: round(random_f32_vec(S * H, 0x71, -1.0, 1.0)),
         pos: (0..S as i32).collect(),
@@ -396,6 +482,7 @@ fn mini_data() -> MiniData {
 }
 
 fn set_inputs(m: &MiniQwen, d: &MiniData, act: DType, rt: &mut CudaRuntime) {
+    #[allow(clippy::type_complexity)]
     let as_act = |v: &Vec<f32>| -> Box<dyn Fn(&mut CudaRuntime, GraphTensor)> {
         let v = v.clone();
         if act == DType::F32 {
@@ -562,15 +649,7 @@ fn mini_attention_f32_genomes_agree() {
     drop(rt);
 
     crate::tests::utilities::fuzz_genomes::<f32>(
-        &cx,
-        &stream,
-        set,
-        out.id,
-        &reference,
-        1e-4,
-        1e-4,
-        40,
-        0x94,
+        &cx, &stream, set, out.id, &reference, 1e-4, 1e-4, 40, 0x94,
     );
 }
 
@@ -586,7 +665,8 @@ fn mini_qwen_f32_stage_bisect() {
             m.cx.build_search_space::<CudaRuntime>(CompileOptions::default());
             let mut rt = CudaRuntime::initialize(stream.clone());
             set_inputs(&m, &d, DType::F32, &mut rt);
-            rt = m.cx.search(rt, CompileOptions::default().search_graph_limit(1));
+            rt =
+                m.cx.search(rt, CompileOptions::default().search_graph_limit(1));
             set_inputs(&m, &d, DType::F32, &mut rt);
             rt.execute(&m.cx.dyn_map);
             let n_out = m.out.shape.n_elements().to_usize().unwrap_or(S * H);
@@ -615,15 +695,15 @@ fn mini_qwen_stage5_exclude_moe_gemv() {
         return;
     };
     let d = mini_data();
-    let (m, reference, n_out) = reference_run(5, || {
+    let (m, reference, _n_out) = reference_run(5, || {
         let mut m = build_mini_qwen_stage(DType::F32, 5);
-        m.cx
-            .build_search_space_exclude_ops::<CudaRuntime, crate::kernel::moe_gemv::KernelMoEGemv>(
-                CompileOptions::default(),
-            );
+        m.cx.build_search_space_exclude_ops::<CudaRuntime, crate::kernel::moe_gemv::KernelMoEGemv>(
+            CompileOptions::default(),
+        );
         let mut rt = CudaRuntime::initialize(stream.clone());
         set_inputs(&m, &d, DType::F32, &mut rt);
-        rt = m.cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt =
+            m.cx.search(rt, CompileOptions::default().search_graph_limit(1));
         set_inputs(&m, &d, DType::F32, &mut rt);
         rt.execute(&m.cx.dyn_map);
         let n_out = m.out.shape.n_elements().to_usize().unwrap();
@@ -649,15 +729,15 @@ fn mini_qwen_stage5_exclude_glumoe() {
         return;
     };
     let d = mini_data();
-    let (m, reference, n_out) = reference_run(5, || {
+    let (m, reference, _n_out) = reference_run(5, || {
         let mut m = build_mini_qwen_stage(DType::F32, 5);
-        m.cx
-            .build_search_space_exclude_ops::<CudaRuntime, crate::host::moe::GLUMoE>(
-                CompileOptions::default(),
-            );
+        m.cx.build_search_space_exclude_ops::<CudaRuntime, crate::host::moe::GLUMoE>(
+            CompileOptions::default(),
+        );
         let mut rt = CudaRuntime::initialize(stream.clone());
         set_inputs(&m, &d, DType::F32, &mut rt);
-        rt = m.cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt =
+            m.cx.search(rt, CompileOptions::default().search_graph_limit(1));
         set_inputs(&m, &d, DType::F32, &mut rt);
         rt.execute(&m.cx.dyn_map);
         let n_out = m.out.shape.n_elements().to_usize().unwrap();
@@ -686,8 +766,7 @@ fn rms_norm_rule_fires_on_mini_layer() {
         return;
     };
     let mut m = build_mini_qwen(DType::Bf16);
-    m.cx
-        .build_search_space::<CudaRuntime>(CompileOptions::default());
+    m.cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = m.cx.egraph().unwrap();
     let kinds_of = |class| {
         egraph
@@ -725,7 +804,7 @@ fn dump_norm_chain_egglog() {
     let x = cx.tensor((3, 64)).as_dtype(DType::Bf16);
     let w = cx.tensor(64);
     let _out = norm_in_f32(x, w).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&mut cx);
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
 }
 
@@ -735,7 +814,7 @@ fn dump_argsort_chain_egglog() {
     let mut cx = Graph::default();
     let x = cx.tensor((3, 8));
     let _out = x.stable_argsort(1, true).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&mut cx);
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
 }
 
@@ -760,13 +839,9 @@ fn rope_rule_fires_and_matches() {
     let has = egraph.enodes.values().any(|(h, ch)| {
         h == "Op"
             && !ch.is_empty()
-            && egraph
-                .eclasses
-                .get(&ch[0])
-                .is_some_and(|(_l, ns)| {
-                    ns.iter()
-                        .any(|n| egraph.enodes[n].0.contains("KernelRoPE"))
-                })
+            && egraph.eclasses.get(&ch[0]).is_some_and(|(_l, ns)| {
+                ns.iter().any(|n| egraph.enodes[n].0.contains("KernelRoPE"))
+            })
     });
     assert!(has, "rope rule should fire on the bf16 rotary chain");
 
@@ -777,10 +852,15 @@ fn rope_rule_fires_and_matches() {
     for s in 0..S {
         for h in 0..N_HEADS {
             for i in 0..half_dim {
-                let freq = ((2 * i) as f32 / HEAD_DIM as f32) * 1_000_000_f32.ln() * 1.442695;
+                let freq = ((2 * i) as f32 / HEAD_DIM as f32)
+                    * 1_000_000_f32.ln()
+                    * std::f32::consts::LOG2_E;
                 let inv_freq = 1.0 / freq.exp2();
                 let angle = pos_data[s] as f32 * inv_freq;
-                let (cb, sb) = (bf((-angle + std::f32::consts::FRAC_PI_2).sin()), bf(angle.sin()));
+                let (cb, sb) = (
+                    bf((-angle + std::f32::consts::FRAC_PI_2).sin()),
+                    bf(angle.sin()),
+                );
                 let x0 = bf(x_data[s * Q_DIM + h * HEAD_DIM + i]);
                 let x1 = bf(x_data[s * Q_DIM + h * HEAD_DIM + half_dim + i]);
                 expected[s * Q_DIM + h * HEAD_DIM + i] = bf(bf(x0 * cb) + bf(-bf(x1 * sb)));
@@ -857,7 +937,7 @@ fn dump_rotary_post_egglog() {
 
     // Probe: find the final-gather Op (kind = the 2D-data Gather), then dump
     // every enode in its data-input eclass.
-    for (_id, (label, children)) in &egraph.enodes {
+    for (label, children) in egraph.enodes.values() {
         if label != "Op" || children.len() != 2 {
             continue;
         }
@@ -919,7 +999,7 @@ fn dump_rotary_post_egglog() {
         }
     }
 
-    for (_id, (label, children)) in &egraph.enodes {
+    for (label, children) in egraph.enodes.values() {
         if label.contains("KernelRoPE") {
             println!(
                 "KernelRoPE marker: ln_theta[{}]",
@@ -1000,7 +1080,7 @@ fn dump_rotary_chain_egglog() {
     let x = cx.tensor((S, Q_DIM)).cast(DType::Bf16);
     let pos = cx.tensor(S).as_dtype(DType::Int);
     let _out = rotary(x, pos, N_HEADS).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&mut cx);
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
 }
 
@@ -1021,13 +1101,10 @@ fn stable_ranks_rule_fires_and_matches() {
     let has = egraph.enodes.values().any(|(h, ch)| {
         h == "Op"
             && !ch.is_empty()
-            && egraph
-                .eclasses
-                .get(&ch[0])
-                .is_some_and(|(_l, ns)| {
-                    ns.iter()
-                        .any(|n| egraph.enodes[n].0.contains("KernelStableSortIdx"))
-                })
+            && egraph.eclasses.get(&ch[0]).is_some_and(|(_l, ns)| {
+                ns.iter()
+                    .any(|n| egraph.enodes[n].0.contains("KernelStableSortIdx"))
+            })
     });
     assert!(has, "stable ranks rule should fire on the topk chain");
 

@@ -134,7 +134,11 @@ extern "C" __global__ void rms_norm_k(
             func,
             module,
             "rms_norm_k".to_string(),
-            (self.rows, Expression::from(1usize), Expression::from(1usize)),
+            (
+                self.rows,
+                Expression::from(1usize),
+                Expression::from(1usize),
+            ),
             (
                 Expression::from(TPB),
                 Expression::from(1usize),
@@ -335,7 +339,11 @@ extern "C" __global__ void rms_norm_quant_k(
             func,
             module,
             "rms_norm_quant_k".to_string(),
-            (self.rows, Expression::from(1usize), Expression::from(1usize)),
+            (
+                self.rows,
+                Expression::from(1usize),
+                Expression::from(1usize),
+            ),
             (
                 Expression::from(TPB),
                 Expression::from(1usize),
@@ -567,7 +575,8 @@ impl EgglogOp for KernelRMSNorm {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
         let eps: f64 = egraph.enodes[kind_children[1]]
             .0
             .replace('"', "")
@@ -669,7 +678,8 @@ impl EgglogOp for KernelRMSNormQuant {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
         let eps: f64 = egraph.enodes[kind_children[1]]
             .0
             .replace('"', "")

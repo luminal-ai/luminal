@@ -181,8 +181,7 @@ pub fn combine_safetensors(model_dir: &Path) -> Result<PathBuf, Box<dyn std::err
                 // stores BF16 for the bf16-activation pipeline.
                 let f32_bytes = tensor_to_f32_bytes(&tensor);
                 let f32_slice: &[f32] = bytemuck::cast_slice(&f32_bytes);
-                let bf16_data: Vec<bf16> =
-                    f32_slice.iter().map(|x| bf16::from_f32(*x)).collect();
+                let bf16_data: Vec<bf16> = f32_slice.iter().map(|x| bf16::from_f32(*x)).collect();
                 all_tensors.insert(
                     name.to_string(),
                     StoredTensor {

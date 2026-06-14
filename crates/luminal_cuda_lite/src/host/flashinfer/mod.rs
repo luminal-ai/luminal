@@ -356,7 +356,10 @@ impl FlashInferAttention {
         let out_buf = get_buf("output", self_node)?;
 
         let dtype = FlashInferDType::from_dtype(self.dtype).ok_or_else(|| {
-            anyhow::anyhow!("FlashInferAttention does not support dtype {:?}", self.dtype)
+            anyhow::anyhow!(
+                "FlashInferAttention does not support dtype {:?}",
+                self.dtype
+            )
         })?;
         let kv_dim = self.num_kv_heads * self.head_dim;
         let kv_bytes = kv_dim * dtype.size_of();
@@ -537,8 +540,7 @@ impl FlashInferAttention {
         };
         let last_page_len_ptr = last_page_len.device_ptr(stream).0;
         let temp_output_bytes =
-            (spec.total_q_tokens * spec.num_qo_heads * spec.head_dim * spec.dtype.size_of())
-                .max(1);
+            (spec.total_q_tokens * spec.num_qo_heads * spec.head_dim * spec.dtype.size_of()).max(1);
         let temp_output = unsafe { stream.alloc::<u8>(temp_output_bytes)? };
         let temp_output_ptr = temp_output.device_ptr(stream).0;
 
@@ -817,7 +819,10 @@ pub(crate) fn flashinfer_graph_plan_capacity(actual_c: usize, max_kv_pages: usiz
     // two of the current context (min 256); when c outgrows the tier, the
     // signature changes and the island recaptures with the next tier — a few
     // recaptures per sequence instead of µs lost on every step.
-    required.next_power_of_two().max(256).min(max_kv_pages.max(required))
+    required
+        .next_power_of_two()
+        .max(256)
+        .min(max_kv_pages.max(required))
 }
 
 impl HostOp for FlashInferAttention {

@@ -883,9 +883,13 @@ impl Graph {
                 let mut occs = vec![];
                 let mut starts = vec![];
                 let first_nodes = topo[start..start + window].to_vec();
-                let Some((sig, first_boundary, first_outputs)) =
-                    canonicalize_occurrence(&self.graph, &first_nodes, &uses, &topo_index, &self.custom_ops)
-                else {
+                let Some((sig, first_boundary, first_outputs)) = canonicalize_occurrence(
+                    &self.graph,
+                    &first_nodes,
+                    &uses,
+                    &topo_index,
+                    &self.custom_ops,
+                ) else {
                     start += 1;
                     continue;
                 };
@@ -902,9 +906,13 @@ impl Graph {
                         break;
                     }
                     let nodes = topo[pos..pos + window].to_vec();
-                    let Some((next_sig, boundary_inputs, output_nodes)) =
-                        canonicalize_occurrence(&self.graph, &nodes, &uses, &topo_index, &self.custom_ops)
-                    else {
+                    let Some((next_sig, boundary_inputs, output_nodes)) = canonicalize_occurrence(
+                        &self.graph,
+                        &nodes,
+                        &uses,
+                        &topo_index,
+                        &self.custom_ops,
+                    ) else {
                         break;
                     };
                     if next_sig != sig {
@@ -985,7 +993,14 @@ impl Graph {
             }
         }
         let mut grown_best = best_overall.take().map(|best| {
-            grow_rolling_candidate(&self.graph, &uses, &topo_index, best, &discovered_runs, &self.custom_ops)
+            grow_rolling_candidate(
+                &self.graph,
+                &uses,
+                &topo_index,
+                best,
+                &discovered_runs,
+                &self.custom_ops,
+            )
         });
         for run in &discovered_runs {
             let state_param_indices = collect_state_params(&run.occurrences, &uses, &self.graph);
@@ -994,8 +1009,14 @@ impl Graph {
                 state_param_indices,
                 savings: 0,
             };
-            let grown =
-                grow_rolling_candidate(&self.graph, &uses, &topo_index, seed, &discovered_runs, &self.custom_ops);
+            let grown = grow_rolling_candidate(
+                &self.graph,
+                &uses,
+                &topo_index,
+                seed,
+                &discovered_runs,
+                &self.custom_ops,
+            );
             if grown.state_param_indices.is_empty() {
                 continue;
             }
@@ -2269,9 +2290,14 @@ fn grow_rolling_candidate(
                 if merged_occs.len() != candidate.occurrences.len() {
                     continue;
                 }
-                let first_sig =
-                    canonicalize_occurrence(graph, &merged_occs[0].nodes, uses, topo_index, custom_ops)
-                        .map(|(sig, _, _)| sig);
+                let first_sig = canonicalize_occurrence(
+                    graph,
+                    &merged_occs[0].nodes,
+                    uses,
+                    topo_index,
+                    custom_ops,
+                )
+                .map(|(sig, _, _)| sig);
                 let Some(first_sig) = first_sig else { continue };
                 if merged_occs.iter().skip(1).any(|occ| {
                     canonicalize_occurrence(graph, &occ.nodes, uses, topo_index, custom_ops)

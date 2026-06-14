@@ -165,6 +165,7 @@ fn main() {
     print!("{}", tokenizer.decode(&[next_token], true).unwrap());
     std::io::stdout().flush().unwrap();
 
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 1..gen_tokens {
         let start = std::time::Instant::now();
         cx.set_dim('s', 1);

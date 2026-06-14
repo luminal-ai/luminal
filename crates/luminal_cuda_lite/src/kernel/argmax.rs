@@ -156,15 +156,19 @@ impl KernelOp for KernelArgmax {
             .collect::<FxHashSet<_>>();
         let ty = cuda_dtype(self.dtype);
         let includes = dtype_includes(&[self.dtype]);
-        let (dyn_defines, _sorted_dims) =
-            crate::kernel::hlir::generate_dyn_dims_defines(&vars);
+        let (dyn_defines, _sorted_dims) = crate::kernel::hlir::generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
         } else {
             ", const int* dyn_dims"
         };
         let cols = self.cols.to_kernel();
-        let n_rows: Expression = self.out_shape.iter().copied().product::<Expression>().max(1);
+        let n_rows: Expression = self
+            .out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .max(1);
 
         // Tie rule: highest index wins, matching both the decomposed chain
         // (max over index*one_hot) and the CPU sampler's `max_by` (last max).
@@ -253,7 +257,11 @@ extern \"C\" {{
     }
 
     fn output_size(&self) -> Expression {
-        self.out_shape.iter().copied().product::<Expression>().max(1)
+        self.out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .max(1)
     }
 
     fn output_bytes(&self) -> Expression {

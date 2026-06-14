@@ -193,12 +193,7 @@ fn test_bf16_cast_sum_cast_fuses_with_f32_accumulator() {
     // f32 accumulation error is far below one bf16 ulp of the result; allow
     // a couple ulps for the final rounding.
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
-    assert_close(
-        &result,
-        &expected,
-        bf16::from_f32(tol),
-        bf16::from_f32(tol),
-    );
+    assert_close(&result, &expected, bf16::from_f32(tol), bf16::from_f32(tol));
 
     fuzz_genomes::<bf16>(
         &cx,
@@ -314,7 +309,17 @@ fn bf16_cast_sandwich_extraction_is_acyclic() {
 
 fn mini_layer(x: GraphTensor, weights: &[GraphTensor; 9], bf16: bool) -> GraphTensor {
     let act = if bf16 { DType::Bf16 } else { DType::F32 };
-    let [attn_norm_w, wq, wk, wv, wo, mlp_norm_w, w_gate, w_up, w_down] = *weights;
+    let [
+        attn_norm_w,
+        wq,
+        wk,
+        wv,
+        wo,
+        mlp_norm_w,
+        w_gate,
+        w_up,
+        w_down,
+    ] = *weights;
     let norm = |t: GraphTensor, w: GraphTensor| {
         let tf = if bf16 { t.cast(DType::F32) } else { t };
         let n = tf.std_norm(tf.shape.last_axis(), 1e-5);
@@ -357,12 +362,12 @@ fn run_mini_transformer(bf16: bool, weight_data: &[Vec<f32>], x_data: &[f32]) ->
     ];
     let weights: [GraphTensor; 9] = std::array::from_fn(|i| {
         let (r, c) = shapes[i];
-        let t = if r == 1 {
+
+        if r == 1 {
             cx.tensor(c) // norm weights stay f32
         } else {
             cx.tensor((r, c)).as_dtype(act)
-        };
-        t
+        }
     });
     let mut out = mini_layer(x, &weights, bf16);
     if bf16 {
@@ -449,7 +454,10 @@ fn probe_bf16_subpaths() {
         .map(|v| bf16::from_f32(v).to_f32())
         .collect();
 
-    let run = |name: &str, bf16_mode: bool, f: &dyn Fn(GraphTensor, GraphTensor) -> GraphTensor| -> Vec<f32> {
+    let run = |name: &str,
+               bf16_mode: bool,
+               f: &dyn Fn(GraphTensor, GraphTensor) -> GraphTensor|
+     -> Vec<f32> {
         let act = if bf16_mode { DType::Bf16 } else { DType::F32 };
         let mut cx = Graph::default();
         let x = cx.tensor((4, N)).as_dtype(act);
@@ -463,8 +471,14 @@ fn probe_bf16_subpaths() {
         let mut rt = CudaRuntime::initialize(stream.clone());
         let setd = |rt: &mut CudaRuntime| {
             if bf16_mode {
-                rt.set_data(x, data.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>());
-                rt.set_data(w, wdata.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>());
+                rt.set_data(
+                    x,
+                    data.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
+                );
+                rt.set_data(
+                    w,
+                    wdata.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
+                );
             } else {
                 rt.set_data(x, data.clone());
                 rt.set_data(w, wdata.clone());
@@ -479,23 +493,43 @@ fn probe_bf16_subpaths() {
         r
     };
 
+    #[allow(clippy::type_complexity)]
     let cases: Vec<(&str, Box<dyn Fn(GraphTensor, GraphTensor) -> GraphTensor>)> = vec![
-        ("norm_sandwich", Box::new(|x: GraphTensor, _w| {
-            let tf = if x.dtype == DType::F32 { x } else { x.cast(DType::F32) };
-            let n = tf.std_norm(tf.shape.last_axis(), 1e-5);
-            if x.dtype == DType::F32 { n } else { n.cast(DType::Bf16) }
-        })),
+        (
+            "norm_sandwich",
+            Box::new(|x: GraphTensor, _w| {
+                let tf = if x.dtype == DType::F32 {
+                    x
+                } else {
+                    x.cast(DType::F32)
+                };
+                let n = tf.std_norm(tf.shape.last_axis(), 1e-5);
+                if x.dtype == DType::F32 {
+                    n
+                } else {
+                    n.cast(DType::Bf16)
+                }
+            }),
+        ),
         ("matmul", Box::new(|x: GraphTensor, w| x.matmul(w.t()))),
         ("softmax", Box::new(|x: GraphTensor, _w| x.softmax(1))),
         ("swish", Box::new(|x: GraphTensor, _w| x.swish())),
-        ("residual_mm", Box::new(|x: GraphTensor, w| x + x.matmul(w.t()))),
-        ("residual_mm_flip", Box::new(|x: GraphTensor, w| x.matmul(w.t()) + x)),
-        ("mm_plus_relu_x", Box::new(|x: GraphTensor, w| {
-            x.matmul(w.t()) + x.relu()
-        })),
-        ("mm_plus_mm", Box::new(|x: GraphTensor, w| {
-            x.matmul(w.t()) + x.matmul(w.t() * 1.0)
-        })),
+        (
+            "residual_mm",
+            Box::new(|x: GraphTensor, w| x + x.matmul(w.t())),
+        ),
+        (
+            "residual_mm_flip",
+            Box::new(|x: GraphTensor, w| x.matmul(w.t()) + x),
+        ),
+        (
+            "mm_plus_relu_x",
+            Box::new(|x: GraphTensor, w| x.matmul(w.t()) + x.relu()),
+        ),
+        (
+            "mm_plus_mm",
+            Box::new(|x: GraphTensor, w| x.matmul(w.t()) + x.matmul(w.t() * 1.0)),
+        ),
     ];
 
     let mut failures = Vec::new();
@@ -591,11 +625,26 @@ fn pure_matmul_chain_cuda_graph_materializes() {
     const INT: usize = 14336;
     let mut cx = Graph::default();
     let x0 = cx.tensor((1, N)).as_dtype(DType::Bf16);
-    let wq = cx.named_tensor("w0", (N, N)).as_dtype(DType::Bf16).persist();
-    let wo = cx.named_tensor("w1", (N, N)).as_dtype(DType::Bf16).persist();
-    let wg = cx.named_tensor("w2", (INT, N)).as_dtype(DType::Bf16).persist();
-    let wu = cx.named_tensor("w3", (INT, N)).as_dtype(DType::Bf16).persist();
-    let wd = cx.named_tensor("w4", (N, INT)).as_dtype(DType::Bf16).persist();
+    let wq = cx
+        .named_tensor("w0", (N, N))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let wo = cx
+        .named_tensor("w1", (N, N))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let wg = cx
+        .named_tensor("w2", (INT, N))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let wu = cx
+        .named_tensor("w3", (INT, N))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let wd = cx
+        .named_tensor("w4", (N, INT))
+        .as_dtype(DType::Bf16)
+        .persist();
     let attn = x0.matmul(wq.t()).matmul(wo.t());
     let x1 = x0 + attn;
     let g = x1.matmul(wg.t());
@@ -671,7 +720,7 @@ fn fused_rms_norm_matches_decomposed() {
     let mut cx = Graph::default();
     let x = cx.tensor((ROWS, COLS));
     let w = cx.tensor(COLS);
-    let out = (x.std_norm(1, 1e-5_f32) * w.expand_lhs(&[Expression::from(ROWS)])).output();
+    let out = (x.std_norm(1, 1e-5_f32) * w.expand_lhs([Expression::from(ROWS)])).output();
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let mut rt = CudaRuntime::initialize(stream.clone());
     rt.set_data(x, x_data.clone());
@@ -815,6 +864,7 @@ fn gemv_m1_matches_reference() {
     gemv_m1_case(384, 512, 0xA1);
 }
 
+#[allow(non_snake_case)]
 fn gemv_m1_case(n: usize, k: usize, seed: u64) {
     let K: usize = k;
     let N: usize = n;
@@ -1104,8 +1154,7 @@ fn rope_scatter_fusion_matches_reference() {
                 let sn = sin_data[s * HALF + j];
                 let row = idx_data[s] as usize;
                 expected[row * KVD + h * D + j] = bf16::from_f32(x0 * c - x1 * sn).to_f32();
-                expected[row * KVD + h * D + j + HALF] =
-                    bf16::from_f32(x1 * c + x0 * sn).to_f32();
+                expected[row * KVD + h * D + j + HALF] = bf16::from_f32(x1 * c + x0 * sn).to_f32();
             }
         }
     }
@@ -1285,10 +1334,7 @@ fn moe_gemv_matches_hlir_reference() {
     let idx_data: Vec<i32> = vec![0, 3, 2, 2, 1, 0];
 
     // Mirrors the MoE examples' gather_experts helper.
-    fn gather_experts(
-        top_k_indices: GraphTensor,
-        weights: GraphTensor,
-    ) -> GraphTensor {
+    fn gather_experts(top_k_indices: GraphTensor, weights: GraphTensor) -> GraphTensor {
         let (_, d1, d2) = weights.dims3();
         let io = d1 * d2;
         let base = top_k_indices * io;
@@ -1326,10 +1372,7 @@ fn moe_gemv_matches_hlir_reference() {
         } else {
             x.expand_dim(1, K).unsqueeze(2) // [S,K,1,D]
         };
-        let out = x_exp
-            .matmul(gathered.transpose(2, 3))
-            .squeeze(2)
-            .output(); // [S,K,O]
+        let out = x_exp.matmul(gathered.transpose(2, 3)).squeeze(2).output(); // [S,K,O]
 
         cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         assert!(

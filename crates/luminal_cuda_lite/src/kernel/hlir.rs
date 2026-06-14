@@ -173,7 +173,11 @@ impl KernelOp for KernelMaxReduce {
             self.dtype,
             DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0 | DType::F16 | DType::Bf16
         );
-        let accum_dtype = if low_precision_storage { "float" } else { dtype };
+        let accum_dtype = if low_precision_storage {
+            "float"
+        } else {
+            dtype
+        };
         let includes = dtype_includes(&[self.dtype]);
         let n_outputs: Expression = self.out_shape.iter().copied().product();
         let threads_per_block = 256; // 8 warps per block

@@ -95,16 +95,15 @@ pub struct KVCache {
 }
 
 impl KVCache {
-    pub fn new(cx: &mut Graph, num_slots: usize) -> Self {
-        Self::new_with_config(cx, num_slots, LlamaConfig::default())
-    }
-
-    pub fn new_with_config(cx: &mut Graph, num_slots: usize, config: LlamaConfig) -> Self {
-        Self::new_with_config_dtype(cx, num_slots, config, DType::F32)
-    }
-
     pub fn new_dtype(cx: &mut Graph, num_slots: usize, dtype: DType) -> Self {
         Self::new_with_config_dtype(cx, num_slots, LlamaConfig::default(), dtype)
+    }
+
+    // Used by the cuda_lite search-equivalence fuzz (which path-includes this
+    // model); the example binary itself only calls `new_dtype`.
+    #[allow(dead_code)]
+    pub fn new_with_config(cx: &mut Graph, num_slots: usize, config: LlamaConfig) -> Self {
+        Self::new_with_config_dtype(cx, num_slots, config, DType::F32)
     }
 
     pub fn new_with_config_dtype(
@@ -247,8 +246,7 @@ impl Llama {
         new_token: GraphTensor,
         repetition_penalty: f32,
     ) -> (GraphTensor, GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
-        let (logits, cache_outputs) =
-            self.forward(input, q_pos, scatter_idx, gather_idx, kv_cache);
+        let (logits, cache_outputs) = self.forward(input, q_pos, scatter_idx, gather_idx, kv_cache);
         let cx = unsafe { &mut *logits.graph_ref };
         let s = logits.dims()[0];
         let vocab = self.config.vocab_size;
@@ -352,7 +350,7 @@ impl LlamaLayer {
         } else {
             (None, None)
         };
-        let mut unfused_weight = |cx: &mut Graph, suffix: &str, shape: (usize, usize)| {
+        let unfused_weight = |cx: &mut Graph, suffix: &str, shape: (usize, usize)| {
             if fused {
                 // Placeholder: unnamed, unreachable, never loaded.
                 cx.tensor((1, 1)).as_dtype(precision.weight_dtype())
@@ -487,7 +485,7 @@ impl LlamaLayer {
             // o-projection onto the generic matmul fallback (~38µs vs ~8µs
             // measured). A `* 1.0` materialization barrier (one ~2µs fused
             // region) makes it contiguous so cuBLASLt matches.
-            attn_out = attn_out * 1.0;
+            attn_out *= 1.0;
         }
         x += linear_matmul(attn_out, self.o_proj, self.o_proj_scales);
 
@@ -591,7 +589,12 @@ fn layer_linear_weight(
     shape: impl luminal::prelude::ToShape,
     precision: LlamaPrecision,
 ) -> GraphTensor {
-    linear_weight(cx, format!("model.layers.{layer}.{suffix}"), shape, precision)
+    linear_weight(
+        cx,
+        format!("model.layers.{layer}.{suffix}"),
+        shape,
+        precision,
+    )
 }
 
 /// Norms always compute in F32 per the dtype contract. The F32 pipeline uses
@@ -648,7 +651,14 @@ fn layer_linear_scales(
 const RMS_NORM_EPS: f32 = 1e-5;
 
 fn rms_norm(cx: &mut Graph, dim: usize, weight_name: impl ToString) -> LayerNorm {
-    LayerNorm::new(dim, Some(&weight_name.to_string()), None, false, RMS_NORM_EPS, cx)
+    LayerNorm::new(
+        dim,
+        Some(&weight_name.to_string()),
+        None,
+        false,
+        RMS_NORM_EPS,
+        cx,
+    )
 }
 
 fn token_embedding(embedding: GraphTensor, token_ids: GraphTensor, hidden: usize) -> GraphTensor {
@@ -677,7 +687,11 @@ fn linear_matmul_prequant(
     let out = q.matmul(weight.t()).cast(DType::F32);
     let output_scale = expand_scalar(in_scale * weight_scale, out);
     let out = out * output_scale;
-    if act == DType::F32 { out } else { out.cast(act) }
+    if act == DType::F32 {
+        out
+    } else {
+        out.cast(act)
+    }
 }
 
 fn linear_matmul(

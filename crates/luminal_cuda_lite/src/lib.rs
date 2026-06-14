@@ -265,9 +265,7 @@ pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
     const MAX_KERNEL_SOURCE_BYTES: usize = 512 * 1024;
     let src_len = src.as_ref().len();
     if src_len > MAX_KERNEL_SOURCE_BYTES {
-        panic!(
-            "kernel source too large for nvrtc ({src_len} bytes > {MAX_KERNEL_SOURCE_BYTES})"
-        );
+        panic!("kernel source too large for nvrtc ({src_len} bytes > {MAX_KERNEL_SOURCE_BYTES})");
     }
     if src_len > 128 * 1024 {
         eprintln!("nvrtc: compiling a large kernel ({src_len} bytes)");

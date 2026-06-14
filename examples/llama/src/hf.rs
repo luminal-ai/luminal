@@ -397,31 +397,30 @@ pub fn combine_safetensors_fp8_bf16(
 /// concatenation is a plain byte concat. The originals are removed; the bf16
 /// model graph references only the fused names.
 fn fuse_projection_tensors(all_tensors: &mut HashMap<String, StoredTensor>) {
-    let fuse = |tensors: &mut HashMap<String, StoredTensor>,
-                parts: &[String],
-                fused_name: String| {
-        let mut shape: Option<Vec<usize>> = None;
-        let mut data = Vec::new();
-        for part in parts {
-            let t = tensors
-                .remove(part)
-                .unwrap_or_else(|| panic!("missing tensor {part} for fusion"));
-            match &mut shape {
-                None => {
-                    assert_eq!(t.shape.len(), 2, "{part} must be 2-D");
-                    shape = Some(t.shape.clone());
+    let fuse =
+        |tensors: &mut HashMap<String, StoredTensor>, parts: &[String], fused_name: String| {
+            let mut shape: Option<Vec<usize>> = None;
+            let mut data = Vec::new();
+            for part in parts {
+                let t = tensors
+                    .remove(part)
+                    .unwrap_or_else(|| panic!("missing tensor {part} for fusion"));
+                match &mut shape {
+                    None => {
+                        assert_eq!(t.shape.len(), 2, "{part} must be 2-D");
+                        shape = Some(t.shape.clone());
+                    }
+                    Some(shape) => {
+                        assert_eq!(shape[1], t.shape[1], "{part} in_features mismatch");
+                        shape[0] += t.shape[0];
+                    }
                 }
-                Some(shape) => {
-                    assert_eq!(shape[1], t.shape[1], "{part} in_features mismatch");
-                    shape[0] += t.shape[0];
-                }
+                data.extend_from_slice(&t.data);
             }
-            data.extend_from_slice(&t.data);
-        }
-        let shape = shape.unwrap();
-        let dtype = Dtype::BF16;
-        tensors.insert(fused_name, StoredTensor { shape, dtype, data });
-    };
+            let shape = shape.unwrap();
+            let dtype = Dtype::BF16;
+            tensors.insert(fused_name, StoredTensor { shape, dtype, data });
+        };
 
     let mut layer = 0usize;
     loop {
@@ -521,80 +520,77 @@ fn fuse_projection_tensors_fp8(all_tensors: &mut HashMap<String, StoredTensor>) 
         f32::from_le_bytes(t.data[..4].try_into().unwrap())
     };
 
-    let fuse = |tensors: &mut HashMap<String, StoredTensor>,
-                parts: &[String],
-                fused_prefix: String| {
-        let w_scales: Vec<f32> = parts
-            .iter()
-            .map(|p| read_scalar(&tensors[&format!("{p}.weight_scale")]))
-            .collect();
-        let in_scales: Vec<f32> = parts
-            .iter()
-            .map(|p| read_scalar(&tensors[&format!("{p}.input_scale")]))
-            .collect();
-        let shared_w = w_scales.iter().copied().fold(f32::MIN, f32::max);
-        let shared_in = in_scales.iter().copied().fold(f32::MIN, f32::max);
+    let fuse =
+        |tensors: &mut HashMap<String, StoredTensor>, parts: &[String], fused_prefix: String| {
+            let w_scales: Vec<f32> = parts
+                .iter()
+                .map(|p| read_scalar(&tensors[&format!("{p}.weight_scale")]))
+                .collect();
+            let in_scales: Vec<f32> = parts
+                .iter()
+                .map(|p| read_scalar(&tensors[&format!("{p}.input_scale")]))
+                .collect();
+            let shared_w = w_scales.iter().copied().fold(f32::MIN, f32::max);
+            let shared_in = in_scales.iter().copied().fold(f32::MIN, f32::max);
 
-        let mut shape: Option<Vec<usize>> = None;
-        let mut data = Vec::new();
-        for (part, &old_w) in parts.iter().zip(&w_scales) {
-            let t = tensors
-                .remove(&format!("{part}.weight"))
-                .unwrap_or_else(|| panic!("missing tensor {part}.weight for fp8 fusion"));
-            assert_eq!(t.dtype, Dtype::F8_E4M3, "{part} must be e4m3");
-            match &mut shape {
-                None => {
-                    assert_eq!(t.shape.len(), 2, "{part} must be 2-D");
-                    shape = Some(t.shape.clone());
+            let mut shape: Option<Vec<usize>> = None;
+            let mut data = Vec::new();
+            for (part, &old_w) in parts.iter().zip(&w_scales) {
+                let t = tensors
+                    .remove(&format!("{part}.weight"))
+                    .unwrap_or_else(|| panic!("missing tensor {part}.weight for fp8 fusion"));
+                assert_eq!(t.dtype, Dtype::F8_E4M3, "{part} must be e4m3");
+                match &mut shape {
+                    None => {
+                        assert_eq!(t.shape.len(), 2, "{part} must be 2-D");
+                        shape = Some(t.shape.clone());
+                    }
+                    Some(shape) => {
+                        assert_eq!(shape[1], t.shape[1], "{part} in_features mismatch");
+                        shape[0] += t.shape[0];
+                    }
                 }
-                Some(shape) => {
-                    assert_eq!(shape[1], t.shape[1], "{part} in_features mismatch");
-                    shape[0] += t.shape[0];
+                if old_w == shared_w {
+                    data.extend_from_slice(&t.data);
+                } else {
+                    data.extend(
+                        t.data
+                            .iter()
+                            .map(|&b| f8e4m3_encode(f8e4m3_decode(b) * (old_w / shared_w))),
+                    );
                 }
             }
-            if old_w == shared_w {
-                data.extend_from_slice(&t.data);
-            } else {
-                data.extend(
-                    t.data
-                        .iter()
-                        .map(|&b| f8e4m3_encode(f8e4m3_decode(b) * (old_w / shared_w))),
-                );
+            // Keep the scalar scale tensors' original shape for the loader.
+            let scale_shape = tensors[&format!("{}.weight_scale", parts[0])].shape.clone();
+            for part in parts {
+                tensors.remove(&format!("{part}.weight_scale"));
+                tensors.remove(&format!("{part}.input_scale"));
             }
-        }
-        // Keep the scalar scale tensors' original shape for the loader.
-        let scale_shape = tensors[&format!("{}.weight_scale", parts[0])]
-            .shape
-            .clone();
-        for part in parts {
-            tensors.remove(&format!("{part}.weight_scale"));
-            tensors.remove(&format!("{part}.input_scale"));
-        }
-        tensors.insert(
-            format!("{fused_prefix}.weight"),
-            StoredTensor {
-                shape: shape.unwrap(),
-                dtype: Dtype::F8_E4M3,
-                data,
-            },
-        );
-        tensors.insert(
-            format!("{fused_prefix}.weight_scale"),
-            StoredTensor {
-                shape: scale_shape.clone(),
-                dtype: Dtype::F32,
-                data: shared_w.to_le_bytes().to_vec(),
-            },
-        );
-        tensors.insert(
-            format!("{fused_prefix}.input_scale"),
-            StoredTensor {
-                shape: scale_shape,
-                dtype: Dtype::F32,
-                data: shared_in.to_le_bytes().to_vec(),
-            },
-        );
-    };
+            tensors.insert(
+                format!("{fused_prefix}.weight"),
+                StoredTensor {
+                    shape: shape.unwrap(),
+                    dtype: Dtype::F8_E4M3,
+                    data,
+                },
+            );
+            tensors.insert(
+                format!("{fused_prefix}.weight_scale"),
+                StoredTensor {
+                    shape: scale_shape.clone(),
+                    dtype: Dtype::F32,
+                    data: shared_w.to_le_bytes().to_vec(),
+                },
+            );
+            tensors.insert(
+                format!("{fused_prefix}.input_scale"),
+                StoredTensor {
+                    shape: scale_shape,
+                    dtype: Dtype::F32,
+                    data: shared_in.to_le_bytes().to_vec(),
+                },
+            );
+        };
 
     let mut layer = 0usize;
     loop {
@@ -622,6 +618,27 @@ fn fuse_projection_tensors_fp8(all_tensors: &mut HashMap<String, StoredTensor>) 
         layer += 1;
     }
     info!("Fused FP8 projections (shared requantized scales) for {layer} layers");
+}
+
+/// Downloads a model from HuggingFace and prepares it for use.
+///
+/// Returns the path to the model directory containing:
+/// - tokenizer.json
+/// - a combined safetensors file for the requested weight format
+pub fn prepare_hf_model(
+    repo_id: &str,
+    weight_format: WeightFormat,
+) -> Result<PreparedModel, Box<dyn std::error::Error>> {
+    let model_dir = download_hf_model(repo_id)?;
+    let weights_path = match weight_format {
+        WeightFormat::Fp32 => combine_safetensors_to_fp32(&model_dir)?,
+        WeightFormat::Bf16 => combine_safetensors_to_bf16(&model_dir)?,
+        WeightFormat::Fp8 => combine_safetensors_fp8_bf16(&model_dir)?,
+    };
+    Ok(PreparedModel {
+        model_dir,
+        weight_files: vec![weights_path],
+    })
 }
 
 #[cfg(test)]
@@ -657,25 +674,4 @@ mod fp8_codec_tests {
         // Smallest subnormal survives.
         assert_eq!(f8e4m3_decode(f8e4m3_encode(2f32.powi(-9))), 2f32.powi(-9));
     }
-}
-
-/// Downloads a model from HuggingFace and prepares it for use.
-///
-/// Returns the path to the model directory containing:
-/// - tokenizer.json
-/// - a combined safetensors file for the requested weight format
-pub fn prepare_hf_model(
-    repo_id: &str,
-    weight_format: WeightFormat,
-) -> Result<PreparedModel, Box<dyn std::error::Error>> {
-    let model_dir = download_hf_model(repo_id)?;
-    let weights_path = match weight_format {
-        WeightFormat::Fp32 => combine_safetensors_to_fp32(&model_dir)?,
-        WeightFormat::Bf16 => combine_safetensors_to_bf16(&model_dir)?,
-        WeightFormat::Fp8 => combine_safetensors_fp8_bf16(&model_dir)?,
-    };
-    Ok(PreparedModel {
-        model_dir,
-        weight_files: vec![weights_path],
-    })
 }

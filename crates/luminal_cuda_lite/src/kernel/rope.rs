@@ -367,8 +367,8 @@ pub fn apply_rope_half(
         dtype: x.dtype,
     };
     let cx = unsafe { &mut *x.graph_ref };
-    let out = cx.custom_op(RoPEHalfCustom(kern), vec![x, cos, sin], (s, h * d), x.dtype);
-    out
+
+    cx.custom_op(RoPEHalfCustom(kern), vec![x, cos, sin], (s, h * d), x.dtype)
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -420,8 +420,7 @@ impl KernelOp for RoPEScatterKernel {
             .into_iter()
             .chain(self.dest_size.dyn_vars())
             .collect();
-        let (dyn_defines, _sorted) =
-            crate::kernel::hlir::generate_dyn_dims_defines(&vars);
+        let (dyn_defines, _sorted) = crate::kernel::hlir::generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
         } else {
@@ -588,7 +587,9 @@ extern "C" __global__ void rope_scatter_kernel(
 pub static ROPE_SCATTER_FUSIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-pub(crate) fn fuse_rope_scatter(llir: &luminal::prelude::LLIRGraph) -> Option<luminal::prelude::LLIRGraph> {
+pub(crate) fn fuse_rope_scatter(
+    llir: &luminal::prelude::LLIRGraph,
+) -> Option<luminal::prelude::LLIRGraph> {
     use crate::kernel::other_ops::KernelScatterNoCopy;
     use luminal::prelude::petgraph::{Direction, visit::EdgeRef};
     use luminal::shape::flatten_strides;
@@ -1059,7 +1060,8 @@ impl EgglogOp for KernelRoPE {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
         let width = extract_expr(egraph, kind_children[1], expr_cache)
             .unwrap()
             .to_usize()

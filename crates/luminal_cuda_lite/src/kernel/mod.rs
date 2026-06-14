@@ -11,19 +11,19 @@ use uuid::Uuid;
 
 pub mod argmax;
 pub mod conv2d;
-pub mod gemv;
-pub mod moe_gemv;
-pub mod topk;
-pub mod quant_f8;
 pub mod cuda_graph;
 pub mod fusion;
+pub mod gemv;
 pub mod generic_matmul;
 pub mod hlir;
 pub mod matmul2d;
+pub mod moe_gemv;
 pub mod other_ops;
+pub mod quant_f8;
 pub mod rms_norm;
 pub mod rope;
 pub mod swiglu;
+pub mod topk;
 
 pub use conv2d::KernelConv2D;
 pub use cuda_graph::*;

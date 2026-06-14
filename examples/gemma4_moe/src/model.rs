@@ -75,7 +75,6 @@ pub fn cache_bytes_for_layer(layer: usize, max_seq: usize) -> usize {
 pub struct KVCache {
     pub k_caches: Vec<GraphTensor>,
     pub v_caches: Vec<GraphTensor>,
-    pub max_seq: usize,
 }
 
 impl KVCache {
@@ -95,11 +94,7 @@ impl KVCache {
                     .as_dtype(DType::Bf16),
             );
         }
-        Self {
-            k_caches,
-            v_caches,
-            max_seq,
-        }
+        Self { k_caches, v_caches }
     }
 }
 
@@ -158,6 +153,7 @@ impl Gemma4MoE {
     /// seen-token mask, then argmax. Per-step host I/O is one token id each
     /// way. `new_token` (the previously sampled id, -1 for none) is inserted
     /// into the mask BEFORE the penalty read.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_sampling(
         &self,
         token_ids: GraphTensor,
@@ -348,7 +344,10 @@ impl Gemma4Layer {
             x.cast(DType::F32),
             norm_in_f32(&self.pre_feedforward_layernorm_2, x).cast(DType::F32),
         );
-        let moe_out = norm_in_f32(&self.post_feedforward_layernorm_2, moe_out.cast(DType::Bf16));
+        let moe_out = norm_in_f32(
+            &self.post_feedforward_layernorm_2,
+            moe_out.cast(DType::Bf16),
+        );
 
         let ff_out = norm_in_f32(&self.post_feedforward_layernorm, dense_ff + moe_out);
         let x = x + ff_out;
@@ -580,9 +579,7 @@ fn paged_attention(
         let q_f = q_pos.cast(DType::F32);
         let win_lo = q_f - (SLIDING_WINDOW_SIZE - 1) as f32;
         let col_f = cx.arange(ctx).cast(DType::F32);
-        let too_old = col_f
-            .expand_dim(0, seq)
-            .lt(win_lo.expand_dim(1, ctx));
+        let too_old = col_f.expand_dim(0, seq).lt(win_lo.expand_dim(1, ctx));
         attn_mask + too_old.cast(scores.dtype) * -1e10
     } else {
         attn_mask

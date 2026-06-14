@@ -152,10 +152,13 @@ impl EgglogOp for KernelMoEGemv {
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         (
             LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
+                    .unwrap(),
                 k_dim: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
-                w_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap(),
-                x_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap(),
+                w_shape: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                x_strides: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
+                    .unwrap(),
                 topk_strides: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
                     .unwrap(),
             }) as Box<dyn KernelOp>),

@@ -181,6 +181,7 @@ fn main() {
     let mut t_set = Duration::ZERO;
     let mut t_exec = Duration::ZERO;
     let mut t_get = Duration::ZERO;
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 1..gen_tokens {
         let start = std::time::Instant::now();
         cx.set_dim('s', 1);

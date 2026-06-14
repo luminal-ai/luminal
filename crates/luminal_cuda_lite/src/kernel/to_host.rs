@@ -874,7 +874,6 @@ impl HostOp for CudaGraphOp {
     }
 }
 
-
 fn cublaslt_step_indices(steps: &[CompiledStep], n_cublaslt: usize) -> Vec<usize> {
     let mut indices = vec![usize::MAX; n_cublaslt];
     for (step, graph_step) in steps.iter().enumerate() {
@@ -1470,11 +1469,13 @@ impl CudaGraphOp {
                                 );
                                 profile.cublaslt_prepare += timer.elapsed();
                                 profile.prepared_count += 1;
-                                state.flashinfer_prepare_cache.push(CachedFlashInferPrepare {
-                                    spec: signature.spec.clone(),
-                                    prepared: Rc::clone(&prepared),
-                                    owner: op_node,
-                                });
+                                state
+                                    .flashinfer_prepare_cache
+                                    .push(CachedFlashInferPrepare {
+                                        spec: signature.spec.clone(),
+                                        prepared: Rc::clone(&prepared),
+                                        owner: op_node,
+                                    });
                                 (Some(prepared), Some(true))
                             }
                         } else {
@@ -1754,6 +1755,7 @@ impl CudaGraphOp {
         Ok((captured_nodes, exit_node))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_flashinfer_decode_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -2343,11 +2345,13 @@ impl CudaGraphOp {
                                     .prepare_resolved_for_graph(stream, resolved, true)?,
                             )
                         };
-                        state.flashinfer_prepare_cache.push(CachedFlashInferPrepare {
-                            spec: signature.spec.clone(),
-                            prepared: Rc::clone(&prepared),
-                            owner: op_node,
-                        });
+                        state
+                            .flashinfer_prepare_cache
+                            .push(CachedFlashInferPrepare {
+                                spec: signature.spec.clone(),
+                                prepared: Rc::clone(&prepared),
+                                owner: op_node,
+                            });
                         (prepared, true)
                     };
 

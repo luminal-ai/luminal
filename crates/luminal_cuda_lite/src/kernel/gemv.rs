@@ -15,9 +15,9 @@ use crate::{
     compile_module_image_for_current_device, cuda_dtype,
     kernel::{KernelOp, hlir::dtype_includes, hlir::generate_dyn_dims_defines},
 };
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 #[allow(unused_imports)]
 use luminal::dtype::DType;
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
         api::{Rule, SortDef, sort},
@@ -58,7 +58,10 @@ impl EgglogOp for KernelGemv {
         // graphs, and an interval-pinned dyn dim (the decode bucket proves
         // s in [1,1]; `lower`/`upper` have no rows for literals).
         let m_variants: [(&str, &str); 2] = [
-            ("static", "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))"),
+            (
+                "static",
+                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))",
+            ),
             (
                 "dyn",
                 "(= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -174,11 +177,7 @@ impl KernelOp for KernelGemv {
 
         // 16-byte vectorized lane loads (8 × 16-bit) when K is statically a
         // multiple of 8; scalar loop otherwise. F32 accumulation throughout.
-        let vectorized = self
-            .k
-            .to_usize()
-            .map(|k| k % 8 == 0)
-            .unwrap_or(false);
+        let vectorized = self.k.to_usize().map(|k| k % 8 == 0).unwrap_or(false);
         let body = if vectorized {
             format!(
                 r#"
@@ -280,7 +279,6 @@ extern \"C\" {{
     }
 }
 
-
 // ═══════════════════════════════════════════════════════════
 // Tensor-core scaled FP8 GEMV:
 //   out_bf16[n] = (Σ_k x_f8[k]·w_f8[n,k]) · in_scale·w_scale
@@ -325,7 +323,10 @@ impl EgglogOp for KernelGemvF8 {
 
     fn rewrites(&self) -> Vec<Rule> {
         let m_variants: [(&str, &str); 2] = [
-            ("static", "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))"),
+            (
+                "static",
+                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))",
+            ),
             (
                 "dyn",
                 "(= ?out_shape (ECons ?m (ECons ?n (ENil))))

@@ -980,7 +980,7 @@ pub(crate) fn prepare_cublaslt_matmul(
     }
 
     let mut resources = LtRawDescriptors::default();
-    let mut heuristic: cublasLtMatmulHeuristicResult_t = unsafe { std::mem::zeroed() };
+    let heuristic: cublasLtMatmulHeuristicResult_t;
 
     let workspace = unsafe { stream.alloc::<u8>(spec.workspace_size)? };
     let (workspace_ptr, workspace_guard) = workspace.device_ptr(stream);
@@ -1184,10 +1184,11 @@ pub(crate) fn prepare_cublaslt_matmul(
     };
 
     if !from_cache {
-        if candidates.len() > 1 && autotune_allowed(stream, ptrs) {
-            if let Some(best) = autotune_select(stream, &mut prepared, &candidates, ptrs) {
-                prepared.heuristic = best;
-            }
+        if candidates.len() > 1
+            && autotune_allowed(stream, ptrs)
+            && let Some(best) = autotune_select(stream, &mut prepared, &candidates, ptrs)
+        {
+            prepared.heuristic = best;
         }
         heuristic_cache
             .lock()
@@ -1206,7 +1207,7 @@ fn autotune_allowed(stream: &Arc<CudaStream>, ptrs: LtMatmulPointers) -> bool {
     // already within noise of the benchmarked best (the GEMV slack is fixed
     // per-launch cost, not algorithm choice), while the one-time benchmark
     // sweep added ~60ms to first-step latency.
-    if !std::env::var_os("LUMINAL_CUBLASLT_AUTOTUNE").is_some_and(|v| v == "1") {
+    if std::env::var_os("LUMINAL_CUBLASLT_AUTOTUNE").is_none_or(|v| v != "1") {
         return false;
     }
     if ptrs.a == 0 || ptrs.b == 0 || ptrs.d == 0 {

@@ -2130,7 +2130,6 @@ impl CudaRuntime {
         );
     }
 
-
     fn materialize_bucket_cuda_graphs(
         &self,
         bucket_idx: usize,

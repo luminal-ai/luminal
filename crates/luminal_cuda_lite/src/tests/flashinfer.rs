@@ -1434,7 +1434,10 @@ fn run_flashinfer_bf16(
     );
 
     let mut buffers = FxHashMap::default();
-    buffers.insert(q_n, DeviceBuffer::new(q_buf.device_ptr(stream).0, q.len() * 2));
+    buffers.insert(
+        q_n,
+        DeviceBuffer::new(q_buf.device_ptr(stream).0, q.len() * 2),
+    );
     buffers.insert(
         k_n,
         DeviceBuffer::new(k_buf.device_ptr(stream).0, k_cache.len() * 2),
@@ -1448,7 +1451,10 @@ fn run_flashinfer_bf16(
         DeviceBuffer::new(idx_buf.device_ptr(stream).0, kv_indices.len() * 4),
     );
     let out_ptr = out_buf.device_ptr(stream).0;
-    buffers.insert(out_n, DeviceBuffer::new(out_ptr, total_q_tokens * HIDDEN * 2));
+    buffers.insert(
+        out_n,
+        DeviceBuffer::new(out_ptr, total_q_tokens * HIDDEN * 2),
+    );
 
     let mut dyn_map = FxHashMap::default();
     dyn_map.insert('s', total_q_tokens);
@@ -1710,12 +1716,23 @@ fn egraph_choice_eclass_census() {
     let gather_idx = cx.tensor('c').as_dtype(DType::Int);
     let q_pos = cx.tensor('s').as_dtype(DType::Int);
     let out = gemma_mini_paged_attention(
-        q, k, v, k_cache, v_cache, scatter_idx, gather_idx, q_pos, HD,
-        KVH * HD, HEADS / KVH, HEADS, Some(8),
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        Some(8),
     );
     let _out = out.cast(DType::F32).output();
 
-    let (program, root) = hlir_to_egglog(&mut cx);
+    let (program, root) = hlir_to_egglog(&cx);
     let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
     ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
     // cleanup=true: census the egraph the search actually extracts from.
@@ -1770,9 +1787,9 @@ fn egraph_choice_eclass_census() {
             .collect();
         labels.sort_unstable();
         labels.dedup();
-        let ew_only = labels
-            .iter()
-            .all(|l| elementwise_labels.contains(l) || l.starts_with("ICons") || l.starts_with("INil"));
+        let ew_only = labels.iter().all(|l| {
+            elementwise_labels.contains(l) || l.starts_with("ICons") || l.starts_with("INil")
+        });
         if ew_only {
             elementwise_only += 1;
         } else {
@@ -1782,7 +1799,9 @@ fn egraph_choice_eclass_census() {
     }
     println!("multi-alternative choice eclasses: {multi}");
     println!("  elementwise-only (freezable):    {elementwise_only}");
-    println!("  search-space log2: {choice_product_log2:.0} -> {frozen_product_log2:.0} bits after freezing");
+    println!(
+        "  search-space log2: {choice_product_log2:.0} -> {frozen_product_log2:.0} bits after freezing"
+    );
     println!("top label profiles:");
     let mut hist: Vec<_> = profile_hist.into_iter().collect();
     hist.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
@@ -1807,11 +1826,22 @@ fn dump_gemma_sliding_attention_egglog() {
     let gather_idx = cx.tensor('c').as_dtype(DType::Int);
     let q_pos = cx.tensor('s').as_dtype(DType::Int);
     let out = gemma_mini_paged_attention(
-        q, k, v, k_cache, v_cache, scatter_idx, gather_idx, q_pos, HD,
-        KVH * HD, HEADS / KVH, HEADS, Some(8),
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        Some(8),
     );
     let _out = out.cast(DType::F32).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&mut cx);
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
 }
 
@@ -1830,8 +1860,19 @@ fn flashinfer_rule_fires_on_gemma_sliding_mask() {
     let gather_idx = cx.tensor('c').as_dtype(DType::Int);
     let q_pos = cx.tensor('s').as_dtype(DType::Int);
     let out = gemma_mini_paged_attention(
-        q, k, v, k_cache, v_cache, scatter_idx, gather_idx, q_pos, HD,
-        KVH * HD, HEADS / KVH, HEADS, Some(8),
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        Some(8),
     );
     let _ = out.cast(DType::F32).output();
     let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
@@ -1857,8 +1898,19 @@ fn flashinfer_rule_fires_on_gemma_scale_free_mask() {
     let gather_idx = cx.tensor('c').as_dtype(DType::Int);
     let q_pos = cx.tensor('s').as_dtype(DType::Int);
     let out = gemma_mini_paged_attention(
-        q, k, v, k_cache, v_cache, scatter_idx, gather_idx, q_pos, HD,
-        KVH * HD, HEADS / KVH, HEADS, None,
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        None,
     );
     let _ = out.cast(DType::F32).output();
     let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
@@ -1888,15 +1940,23 @@ fn gemma_fi_rules_six_instances_build_time() {
         let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
         let sliding = if i % 2 == 0 { Some(8) } else { None };
         let out = gemma_mini_paged_attention(
-            q, k, v, k_cache, v_cache, scatter_idx, gather_idx, q_pos, HD,
-            KVH * HD, HEADS / KVH, HEADS, sliding,
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            scatter_idx,
+            gather_idx,
+            q_pos,
+            HD,
+            KVH * HD,
+            HEADS / KVH,
+            HEADS,
+            sliding,
         );
         outs.push(out);
     }
-    let total = outs
-        .into_iter()
-        .reduce(|a, b| a + b)
-        .unwrap();
+    let total = outs.into_iter().reduce(|a, b| a + b).unwrap();
     let _ = total.cast(DType::F32).output();
     let start = std::time::Instant::now();
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -1918,6 +1978,6 @@ fn dump_llama_swiglu_chain_egglog() {
     let scale_e = scale.expand_dim(0, 's').expand_dim(1, I);
     let q = (hf / scale_e).cast(DType::F8E4M3);
     let _ = q.cast(DType::F32).output();
-    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&mut cx);
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
 }

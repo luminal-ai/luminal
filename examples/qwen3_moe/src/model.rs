@@ -24,7 +24,6 @@ pub const TOP_K: usize = 8;
 pub struct KVCache {
     pub k_caches: Vec<GraphTensor>,
     pub v_caches: Vec<GraphTensor>,
-    pub max_seq: usize,
 }
 
 impl KVCache {
@@ -35,19 +34,13 @@ impl KVCache {
         let mut v_caches = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
             k_caches.push(
-                persist(cx, format!("kv_cache.{l}.k"), (max_seq, KV_DIM))
-                    .as_dtype(DType::Bf16),
+                persist(cx, format!("kv_cache.{l}.k"), (max_seq, KV_DIM)).as_dtype(DType::Bf16),
             );
             v_caches.push(
-                persist(cx, format!("kv_cache.{l}.v"), (max_seq, KV_DIM))
-                    .as_dtype(DType::Bf16),
+                persist(cx, format!("kv_cache.{l}.v"), (max_seq, KV_DIM)).as_dtype(DType::Bf16),
             );
         }
-        Self {
-            k_caches,
-            v_caches,
-            max_seq,
-        }
+        Self { k_caches, v_caches }
     }
 }
 
@@ -427,6 +420,7 @@ fn qwen_rotary_embeddings(
 /// caches, gather via a flat row index, GQA broadcast, triu causal mask) —
 /// the FlashInfer rewrites match this exact pattern; the HLIR chain remains
 /// the fallback candidate.
+#[allow(clippy::too_many_arguments)]
 fn attention(
     q_rope: GraphTensor,
     k_rope: GraphTensor,

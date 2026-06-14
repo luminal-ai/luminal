@@ -137,7 +137,11 @@ impl CustomOp for SwigluCustom {
 /// `silu(x[:, :I]) * x[:, I:]` for a fused `(rows, 2I)` gate_up projection.
 pub fn fused_swiglu(x: GraphTensor, intermediate: usize) -> GraphTensor {
     let x_dims = x.dims();
-    assert_eq!(x_dims.len(), 2, "swiglu x must be 2-D (rows, 2*intermediate)");
+    assert_eq!(
+        x_dims.len(),
+        2,
+        "swiglu x must be 2-D (rows, 2*intermediate)"
+    );
     let rows = x_dims[0];
     assert_eq!(
         x_dims[1].to_usize().expect("swiglu cols must be static"),
@@ -150,12 +154,7 @@ pub fn fused_swiglu(x: GraphTensor, intermediate: usize) -> GraphTensor {
         dtype: x.dtype,
     };
     let cx = unsafe { &mut *x.graph_ref };
-    cx.custom_op(
-        SwigluCustom(kern),
-        vec![x],
-        (rows, intermediate),
-        x.dtype,
-    )
+    cx.custom_op(SwigluCustom(kern), vec![x], (rows, intermediate), x.dtype)
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -294,7 +293,11 @@ pub fn fused_swiglu_quant(
 ) -> GraphTensor {
     assert_eq!(in_scale.dtype, DType::F32, "quant scale must be F32");
     let x_dims = x.dims();
-    assert_eq!(x_dims.len(), 2, "swiglu x must be 2-D (rows, 2*intermediate)");
+    assert_eq!(
+        x_dims.len(),
+        2,
+        "swiglu x must be 2-D (rows, 2*intermediate)"
+    );
     let rows = x_dims[0];
     assert_eq!(
         x_dims[1].to_usize().expect("swiglu cols must be static"),
@@ -422,7 +425,8 @@ impl EgglogOp for KernelSwiglu {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
         let kern = SwigluKernel {
             rows: out_shape[0],
             intermediate: out_shape[1].to_usize().expect("swiglu I must be static"),
@@ -486,7 +490,8 @@ impl EgglogOp for KernelSwigluQuant {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape = extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
         let kern = SwigluQuantKernel {
             rows: out_shape[0],
             intermediate: out_shape[1].to_usize().expect("swiglu I must be static"),
