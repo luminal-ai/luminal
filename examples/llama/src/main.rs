@@ -34,9 +34,8 @@ const REPETITION_PENALTY: f32 = 1.05;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlamaWeightMode {
     Fp32,
-    Fp8,
     Bf16,
-    Fp8Fast,
+    Fp8,
 }
 
 impl LlamaWeightMode {
@@ -45,40 +44,38 @@ impl LlamaWeightMode {
             // The Llama 3 checkpoint is natively bf16, so the bf16 pipeline
             // uses the same repo with a passthrough conversion.
             Self::Fp32 | Self::Bf16 => FP32_REPO_ID,
-            Self::Fp8 | Self::Fp8Fast => FP8_REPO_ID,
+            Self::Fp8 => FP8_REPO_ID,
         }
     }
 
     fn weight_format(self) -> WeightFormat {
         match self {
             Self::Fp32 => WeightFormat::Fp32,
-            Self::Fp8 => WeightFormat::Fp8,
             Self::Bf16 => WeightFormat::Bf16,
-            Self::Fp8Fast => WeightFormat::Fp8Bf16,
+            Self::Fp8 => WeightFormat::Fp8,
         }
     }
 
     fn kv_dtype(self) -> luminal::dtype::DType {
         match self {
-            Self::Fp32 | Self::Fp8 => luminal::dtype::DType::F32,
-            Self::Bf16 | Self::Fp8Fast => luminal::dtype::DType::Bf16,
+            Self::Fp32 => luminal::dtype::DType::F32,
+            Self::Bf16 | Self::Fp8 => luminal::dtype::DType::Bf16,
         }
     }
 
     fn kv_element_bytes(self) -> usize {
         match self {
-            Self::Fp32 | Self::Fp8 => 4,
-            Self::Bf16 | Self::Fp8Fast => 2,
+            Self::Fp32 => 4,
+            Self::Bf16 | Self::Fp8 => 2,
         }
     }
 }
 
 fn print_usage(program: &str) {
-    println!("Usage: {program} [--fp8|--bf16|--fp8-fast]");
+    println!("Usage: {program} [--bf16|--fp8]");
     println!();
-    println!("  --fp8     Use {FP8_REPO_ID} with FP8 projection weights");
     println!("  --bf16    Native bf16 weights, activations and KV cache");
-    println!("  --fp8-fast FP8 linear weights with bf16 activations and KV cache");
+    println!("  --fp8     FP8 linear weights with bf16 activations and KV cache");
     println!("  -h,--help Show this help");
 }
 
@@ -90,7 +87,6 @@ fn parse_args() -> LlamaWeightMode {
         match arg.as_str() {
             "--fp8" => mode = LlamaWeightMode::Fp8,
             "--bf16" => mode = LlamaWeightMode::Bf16,
-            "--fp8-fast" => mode = LlamaWeightMode::Fp8Fast,
             "-h" | "--help" => {
                 print_usage(&program);
                 std::process::exit(0);
@@ -313,9 +309,8 @@ fn main() {
     let kv_cache = KVCache::new_dtype(&mut cx, MAX_SEQ_LEN, weight_mode.kv_dtype());
     let llama = match weight_mode {
         LlamaWeightMode::Fp32 => Llama::init(&mut cx),
-        LlamaWeightMode::Fp8 => Llama::init_fp8(&mut cx),
         LlamaWeightMode::Bf16 => Llama::init_bf16(&mut cx),
-        LlamaWeightMode::Fp8Fast => Llama::init_fp8_bf16(&mut cx),
+        LlamaWeightMode::Fp8 => Llama::init_fp8(&mut cx),
     };
     let (token_ids, seen_out, cache_outputs) = llama.forward_with_sampling(
         input,

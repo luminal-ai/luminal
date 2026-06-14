@@ -22,39 +22,33 @@ pub const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // 1024
 pub enum LlamaPrecision {
     /// F32 weights and activations.
     F32,
-    /// F8E4M3 linear weights with F32 activations and scales.
-    Fp8,
     /// Bf16 weights and activations; norms computed in F32 via explicit
     /// casts, logits cast to F32 at the head.
     Bf16,
     /// F8E4M3 linear weights with Bf16 activations, KV cache and attention.
     /// Linears run x.cast(F32)/scale → cast(F8) → matmul → cast(F32) × scale
     /// → cast(Bf16); everything else matches the Bf16 pipeline.
-    Fp8Bf16,
+    Fp8,
 }
 
 impl LlamaPrecision {
     fn weight_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 | Self::Fp8Bf16 => DType::F8E4M3,
+            Self::Fp8 => DType::F8E4M3,
             Self::Bf16 => DType::Bf16,
         }
     }
 
     fn act_dtype(self) -> DType {
         match self {
-            Self::F32 | Self::Fp8 => DType::F32,
-            Self::Bf16 | Self::Fp8Bf16 => DType::Bf16,
+            Self::F32 => DType::F32,
+            Self::Bf16 | Self::Fp8 => DType::Bf16,
         }
     }
 
-    pub fn kv_dtype(self) -> DType {
-        self.act_dtype()
-    }
-
     fn is_fp8(self) -> bool {
-        matches!(self, Self::Fp8 | Self::Fp8Bf16)
+        matches!(self, Self::Fp8)
     }
 }
 
@@ -167,25 +161,8 @@ impl Llama {
         Self::init_with_precision(cx, LlamaConfig::default(), LlamaPrecision::Bf16)
     }
 
-    pub fn init_fp8_bf16(cx: &mut Graph) -> Self {
-        Self::init_with_precision(cx, LlamaConfig::default(), LlamaPrecision::Fp8Bf16)
-    }
-
     pub fn init_with_config(cx: &mut Graph, config: LlamaConfig) -> Self {
         Self::init_with_precision(cx, config, LlamaPrecision::F32)
-    }
-
-    pub fn init_with_config_and_fp8(
-        cx: &mut Graph,
-        config: LlamaConfig,
-        fp8_linears: bool,
-    ) -> Self {
-        let precision = if fp8_linears {
-            LlamaPrecision::Fp8
-        } else {
-            LlamaPrecision::F32
-        };
-        Self::init_with_precision(cx, config, precision)
     }
 
     pub fn init_with_precision(
@@ -354,10 +331,7 @@ impl LlamaLayer {
         // head groups straight out of the fused QKV row via pitch/offset.
         // The fp8 converter requantizes the parts to one shared per-fusion
         // scale, so the fused weight carries a single scale pair.
-        let fused = matches!(
-            precision,
-            LlamaPrecision::Bf16 | LlamaPrecision::Fp8Bf16
-        );
+        let fused = matches!(precision, LlamaPrecision::Bf16 | LlamaPrecision::Fp8);
         let (qkv, gate_up) = if fused {
             (
                 Some(layer_linear_weight(

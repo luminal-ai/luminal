@@ -27,11 +27,10 @@ struct StoredTensor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightFormat {
     Fp32,
-    Fp8,
     Bf16,
     /// FP8 linear weights with bf16 embeddings/lm_head and F32 norms — the
     /// fp8 + bf16-activation pipeline.
-    Fp8Bf16,
+    Fp8,
 }
 
 pub struct PreparedModel {
@@ -245,65 +244,6 @@ pub fn combine_safetensors_to_fp32(
     file.write_all(&serialized)?;
 
     info!("Combined FP32 model saved successfully!");
-    Ok(output_path)
-}
-
-/// Combines sharded safetensors files into one file while preserving FP8 tensors.
-///
-/// Non-FP8 tensors are converted to FP32 so the existing embedding, norm, and
-/// output-head graph inputs can still load without changing their dtypes.
-pub fn combine_safetensors_preserve_fp8(
-    model_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined_fp8.safetensors");
-
-    if output_path.exists() {
-        return Ok(output_path);
-    }
-
-    let shard_files = model_shard_files(model_dir)?;
-    info!(
-        "Loading {} shard files (preserving FP8 tensors)...",
-        shard_files.len()
-    );
-
-    let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
-
-    for shard_path in &shard_files {
-        info!(
-            "  Loading {}...",
-            shard_path.file_name().unwrap().to_string_lossy()
-        );
-        let file = File::open(shard_path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let st = SafeTensors::deserialize(&mmap)?;
-
-        for name in st.names() {
-            let tensor = st.tensor(name)?;
-            all_tensors.insert(name.to_string(), stored_tensor_from_view(&tensor, true));
-        }
-    }
-
-    info!("Extracted {} language model tensors", all_tensors.len());
-    info!(
-        "Saving mixed FP8/FP32 model to {}...",
-        output_path.display()
-    );
-
-    let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
-        .iter()
-        .map(|(name, stored)| {
-            let view = TensorView::new(stored.dtype, stored.shape.clone(), &stored.data).unwrap();
-            (name.clone(), view)
-        })
-        .collect();
-
-    let serialized = safetensors::serialize(&tensor_views, None)?;
-
-    let mut file = File::create(&output_path)?;
-    file.write_all(&serialized)?;
-
-    info!("Combined mixed FP8/FP32 model saved successfully!");
     Ok(output_path)
 }
 
@@ -731,9 +671,8 @@ pub fn prepare_hf_model(
     let model_dir = download_hf_model(repo_id)?;
     let weights_path = match weight_format {
         WeightFormat::Fp32 => combine_safetensors_to_fp32(&model_dir)?,
-        WeightFormat::Fp8 => combine_safetensors_preserve_fp8(&model_dir)?,
         WeightFormat::Bf16 => combine_safetensors_to_bf16(&model_dir)?,
-        WeightFormat::Fp8Bf16 => combine_safetensors_fp8_bf16(&model_dir)?,
+        WeightFormat::Fp8 => combine_safetensors_fp8_bf16(&model_dir)?,
     };
     Ok(PreparedModel {
         model_dir,
