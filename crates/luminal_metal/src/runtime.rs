@@ -1,4 +1,6 @@
-use crate::kernel::{DYN_SLOT_COUNT, MetalEncodeContext, MetalKernelOp, MpsKernelCache};
+use crate::kernel::{
+    DYN_SLOT_COUNT, MetalEncodeContext, MetalKernelOp, MpsKernelCache, metal_pipeline_cache_stats,
+};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
@@ -78,7 +80,48 @@ pub struct MetalRuntime {
     active_bucket: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetalRuntimeDebugStats {
+    pub compiled_buckets: usize,
+    pub active_bucket: usize,
+    pub execution_steps: usize,
+    pub pipelines: usize,
+    pub input_buffers: usize,
+    pub intermediate_buffers: usize,
+    pub intermediate_allocated_bytes: usize,
+    pub intermediate_logical_bytes: usize,
+    pub pipeline_cache_hits: usize,
+    pub pipeline_cache_misses: usize,
+    pub pipeline_cache_entries: usize,
+}
+
 impl MetalRuntime {
+    pub fn debug_stats(&self) -> MetalRuntimeDebugStats {
+        let pipeline_cache = metal_pipeline_cache_stats();
+        MetalRuntimeDebugStats {
+            compiled_buckets: self.compiled_buckets.len(),
+            active_bucket: self.active_bucket,
+            execution_steps: self.execution_plan.len(),
+            pipelines: self.pipelines.len(),
+            input_buffers: self.hlir_buffers.len(),
+            intermediate_buffers: self.buffers.len(),
+            intermediate_allocated_bytes: self
+                .buffers
+                .values()
+                .map(|buffer| buffer.length() as usize)
+                .sum(),
+            intermediate_logical_bytes: self
+                .buffer_lengths
+                .values()
+                .copied()
+                .map(|bytes| bytes as usize)
+                .sum(),
+            pipeline_cache_hits: pipeline_cache.hits,
+            pipeline_cache_misses: pipeline_cache.misses,
+            pipeline_cache_entries: pipeline_cache.entries,
+        }
+    }
+
     fn input_dtype(&self, id: NodeIndex) -> Option<DType> {
         self.llir_graph.node_indices().find_map(|node| {
             self.llir_graph[node]

@@ -24,6 +24,14 @@ use metal::{
 };
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 pub type MetalOps = (
     // Unary ops
@@ -54,7 +62,74 @@ pub type MetalOps = (
     MetalCast,
 );
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetalPipelineCacheStats {
+    pub hits: usize,
+    pub misses: usize,
+    pub entries: usize,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct PipelineCacheKey {
+    device: usize,
+    function_hash: u64,
+    function_len: usize,
+    source_hash: u64,
+    source_len: usize,
+}
+
+struct PipelineCacheEntry {
+    function_name: String,
+    source: String,
+    pipeline: ComputePipelineState,
+}
+
+static PIPELINE_CACHE: OnceLock<Mutex<FxHashMap<PipelineCacheKey, Vec<PipelineCacheEntry>>>> =
+    OnceLock::new();
+static PIPELINE_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+static PIPELINE_CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
+
+fn pipeline_cache() -> &'static Mutex<FxHashMap<PipelineCacheKey, Vec<PipelineCacheEntry>>> {
+    PIPELINE_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn hash_str(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub fn metal_pipeline_cache_stats() -> MetalPipelineCacheStats {
+    MetalPipelineCacheStats {
+        hits: PIPELINE_CACHE_HITS.load(Ordering::Relaxed),
+        misses: PIPELINE_CACHE_MISSES.load(Ordering::Relaxed),
+        entries: pipeline_cache()
+            .lock()
+            .unwrap()
+            .values()
+            .map(Vec::len)
+            .sum(),
+    }
+}
+
 fn compile_shader(device: &Device, source: &str, function_name: &str) -> ComputePipelineState {
+    let key = PipelineCacheKey {
+        device: device.as_ptr() as usize,
+        function_hash: hash_str(function_name),
+        function_len: function_name.len(),
+        source_hash: hash_str(source),
+        source_len: source.len(),
+    };
+
+    if let Some(entries) = pipeline_cache().lock().unwrap().get(&key)
+        && let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.function_name == function_name && entry.source == source)
+    {
+        PIPELINE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return entry.pipeline.clone();
+    }
+
     let options = metal::CompileOptions::new();
     options.set_language_version(MTLLanguageVersion::V2_4);
     let library = device
@@ -65,11 +140,27 @@ fn compile_shader(device: &Device, source: &str, function_name: &str) -> Compute
     let function = library
         .get_function(function_name, None)
         .expect("Failed to get function from library");
-    device
+    let pipeline = device
         .new_compute_pipeline_state_with_function(&function)
         .unwrap_or_else(|err| {
             panic!("Failed to create Metal compute pipeline state for {function_name}: {err:?}\n{source}")
-        })
+        });
+    let mut cache = pipeline_cache().lock().unwrap();
+    let entries = cache.entry(key).or_default();
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.function_name == function_name && entry.source == source)
+    {
+        PIPELINE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return entry.pipeline.clone();
+    }
+    PIPELINE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    entries.push(PipelineCacheEntry {
+        function_name: function_name.to_string(),
+        source: source.to_string(),
+        pipeline: pipeline.clone(),
+    });
+    pipeline
 }
 
 fn lower_dynamic_consts(mut code: String) -> String {
