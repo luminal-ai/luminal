@@ -52,6 +52,33 @@ impl<'a> Translator<'a> {
         Ok(f(a))
     }
 
+    /// Translate `aten.gelu`, honoring the `approximate` kwarg. PyTorch's default
+    /// (`approximate="none"`) is the exact erf form; `"tanh"` selects the tanh
+    /// approximation. Mapping both to a single `gelu()` (as before) silently used the
+    /// tanh approximation even when the model asked for exact, which accumulates
+    /// visible error in deep GELU-heavy stacks (ViT, Whisper).
+    pub(crate) fn translate_gelu(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, 0)?;
+        // PT2 serializes string args as {"as_string": "<value>"}; drill into the JSON.
+        let approximate = node.inputs.iter().find_map(|input| {
+            if input.name == "approximate"
+                && let Argument::Other(val) = &input.arg
+            {
+                if let Some(s) = val.as_str() {
+                    return Some(s.to_string());
+                }
+                if let Some(s) = val.get("as_string").and_then(|v| v.as_str()) {
+                    return Some(s.to_string());
+                }
+            }
+            None
+        });
+        Ok(match approximate.as_deref() {
+            Some("tanh") => a.gelu(),
+            _ => a.gelu_erf(),
+        })
+    }
+
     pub(crate) fn translate_to_copy(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         for input in &node.inputs {

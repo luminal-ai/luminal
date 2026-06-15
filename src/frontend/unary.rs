@@ -303,12 +303,40 @@ impl GraphTensor {
         self.relu() - (self * -neg_slope).relu()
     }
 
-    /// The Gaussian Error Linear Unit activation function
+    /// The Gaussian Error Linear Unit activation function (tanh approximation).
     #[allow(clippy::excessive_precision)]
     pub fn gelu(self) -> GraphTensor {
         // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
         let scaled = 1.5957691216 * self * (1. + 0.044715 * self * self);
         self * scaled.sigmoid()
+    }
+
+    /// The exact (erf-based) Gaussian Error Linear Unit: `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    ///
+    /// This matches PyTorch's default `aten.gelu` (`approximate="none"`), unlike
+    /// [`gelu`](Self::gelu) which is the tanh approximation (`approximate="tanh"`).
+    /// `erf` is composed from existing primitives via the Abramowitz & Stegun 7.1.26
+    /// rational+exp approximation (max abs error ~1.5e-7), so this is a single,
+    /// deterministic elementwise composition with no special-cased kernel.
+    #[allow(clippy::excessive_precision)]
+    pub fn gelu_erf(self) -> GraphTensor {
+        // erf(u), u = x / sqrt(2), via A&S 7.1.26:
+        //   t = 1 / (1 + p*|u|)
+        //   erf(u) = sign(u) * (1 - (a1 t + a2 t^2 + a3 t^3 + a4 t^4 + a5 t^5) * exp(-u^2))
+        const INV_SQRT2: f32 = 0.7071067811865476;
+        const P: f32 = 0.3275911;
+        const A1: f32 = 0.254829592;
+        const A2: f32 = -0.284496736;
+        const A3: f32 = 1.421413741;
+        const A4: f32 = -1.453152027;
+        const A5: f32 = 1.061405429;
+
+        let u = INV_SQRT2 * self;
+        let t = (1. + P * u.abs()).reciprocal();
+        // Horner form of the degree-5 polynomial in t.
+        let poly = ((((A5 * t + A4) * t + A3) * t + A2) * t + A1) * t;
+        let erf = u.sign() * (1. - poly * (-(u * u)).exp());
+        0.5 * self * (1. + erf)
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis

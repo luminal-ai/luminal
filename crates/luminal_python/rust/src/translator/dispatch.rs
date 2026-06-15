@@ -71,7 +71,7 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.relu.default" => self.translate_unary_op(node, |a| a.relu())?,
             "torch.ops.aten.tanh.default" => self.translate_unary_op(node, |a| a.tanh())?,
             "torch.ops.aten.silu.default" => self.translate_unary_op(node, |a| a.silu())?,
-            "torch.ops.aten.gelu.default" => self.translate_unary_op(node, |a| a.gelu())?,
+            "torch.ops.aten.gelu.default" => self.translate_gelu(node)?,
             "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
             "torch.ops.aten.log.default" => self.translate_unary_op(node, |a| a.log())?,
             "torch.ops.aten.log2.default" => self.translate_unary_op(node, |a| a.log2())?,

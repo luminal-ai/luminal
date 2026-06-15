@@ -80,6 +80,10 @@ from test_models import (
     GreaterWithConstantModel,
     # IsNaN model
     IsNaNTestModel,
+    # GELU models
+    GeluTestModel,
+    GeluTanhModel,
+    LinearGeluBatchedModel,
     # LayerNormalization model
     LayerNormTestModel,
     LessBroadcastModel,
@@ -1976,6 +1980,58 @@ def test_layernorm(device: torch.device):
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.rand((2, 4), device=device)
     assert torch.allclose(model_compiled(x), model(x), atol=1e-5)
+
+
+# ========== GELU Node Tests ==========
+
+
+def test_gelu_exact_2d(device: torch.device):
+    """nn.GELU (default exact erf) — tight parity vs eager (proves erf path)."""
+    model = GeluTestModel().to(device).eval()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.randn(8, 16, device=device)
+    with torch.no_grad():
+        ref, out = model(x), compiled(x)
+    assert torch.allclose(out, ref, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(out - ref)).item():.3e}"
+    )
+
+
+def test_gelu_exact_3d(device: torch.device):
+    """nn.GELU (default exact erf) on 3D input."""
+    model = GeluTestModel().to(device).eval()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.randn(2, 8, 16, device=device)
+    with torch.no_grad():
+        ref, out = model(x), compiled(x)
+    assert torch.allclose(out, ref, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(out - ref)).item():.3e}"
+    )
+
+
+def test_gelu_tanh(device: torch.device):
+    """nn.GELU(approximate='tanh') — must match eager's tanh approximation."""
+    model = GeluTanhModel().to(device).eval()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.randn(8, 16, device=device)
+    with torch.no_grad():
+        ref, out = model(x), compiled(x)
+    assert torch.allclose(out, ref, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(out - ref)).item():.3e}"
+    )
+
+
+def test_gelu_linear_batched(device: torch.device):
+    """Linear -> GELU on (B, S, H): batched-matmul MLP path, now exact GELU."""
+    model = LinearGeluBatchedModel().to(device).eval()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.randn(2, 4, 16, device=device)
+    with torch.no_grad():
+        ref, out = model(x), compiled(x)
+    # matmul fp noise dominates; GELU exactness proven by test_gelu_exact_*.
+    assert torch.allclose(out, ref, atol=1e-3), (
+        f"max_diff={torch.max(torch.abs(out - ref)).item():.3e}"
+    )
 
 
 # ========== PT2 Gemm Node Tests ==========

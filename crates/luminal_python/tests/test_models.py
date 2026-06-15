@@ -1567,6 +1567,46 @@ class LayerNormTestModel(torch.nn.Module):
         return self.norm(x)
 
 
+# ========== GELU Node Test Models ==========
+# nn.GELU() defaults to the exact erf form; nn.GELU(approximate="tanh") selects
+# the tanh approximation. The translator dispatches on the `approximate` kwarg, so
+# both should match PyTorch eager tightly.
+
+
+class GeluTestModel(torch.nn.Module):
+    """nn.GELU (default = exact erf)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.act = torch.nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x)
+
+
+class GeluTanhModel(torch.nn.Module):
+    """nn.GELU(approximate="tanh") — the tanh approximation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.act = torch.nn.GELU(approximate="tanh")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x)
+
+
+class LinearGeluBatchedModel(torch.nn.Module):
+    """Linear -> GELU on 3D (B, S, H) — the transformer-MLP shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = torch.nn.Linear(16, 32)
+        self.act = torch.nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.fc(x))
+
+
 # ========== Gemm Node Test Models ==========
 
 
