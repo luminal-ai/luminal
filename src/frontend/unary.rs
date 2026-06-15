@@ -323,7 +323,7 @@ impl GraphTensor {
         // erf(u), u = x / sqrt(2), via A&S 7.1.26:
         //   t = 1 / (1 + p*|u|)
         //   erf(u) = sign(u) * (1 - (a1 t + a2 t^2 + a3 t^3 + a4 t^4 + a5 t^5) * exp(-u^2))
-        const INV_SQRT2: f32 = 0.7071067811865476;
+        const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
         const P: f32 = 0.3275911;
         const A1: f32 = 0.254829592;
         const A2: f32 = -0.284496736;
