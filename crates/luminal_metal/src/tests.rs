@@ -451,6 +451,34 @@ fn metal_simple_add() {
     assert_eq!(out, vec![6.0, 8.0, 10.0, 12.0]);
 }
 
+#[test]
+fn metal_bufferization_reuses_dead_intermediates() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(4);
+    let output = (((input + input) * input) + input).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &[1.0, 2.0, 3.0, 4.0]);
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+
+    let stats = rt.debug_stats();
+    assert!(
+        stats.intermediate_allocated_bytes < stats.intermediate_logical_bytes,
+        "expected bufferization to reduce physical bytes below logical bytes, stats: {stats:?}"
+    );
+    assert!(
+        stats.intermediate_buffers < rt.buffers.len(),
+        "expected fewer physical buffers than logical buffer mappings, stats: {stats:?}, logical={}",
+        rt.buffers.len()
+    );
+
+    rt.execute(&cx.dyn_map);
+    let out = rt.get_f32(output);
+    assert_eq!(out, vec![3.0, 10.0, 21.0, 36.0]);
+}
+
 /// Simple deterministic test for mul
 #[test]
 fn metal_simple_mul() {

@@ -9,12 +9,15 @@ use luminal::{
     hlir::{Input, Output, ReferenceData},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
-        FxHashMap, NodeIndex, ToId,
+        FxHashMap, FxHashSet, NodeIndex, ToId,
         petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef},
     },
 };
 use memmap2::MmapOptions;
-use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions};
+use metal::{
+    Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptions,
+    foreign_types::ForeignType,
+};
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use safetensors::{Dtype, SafeTensors};
@@ -39,6 +42,11 @@ struct MetalCompiledBucket {
     output_data_lineage_map: FxHashMap<NodeIndex, NodeIndex>,
     output_data_map: FxHashMap<NodeIndex, NodeIndex>,
     execution_plan: Vec<MetalExecutionStep>,
+}
+
+struct ReusableBuffer {
+    buffer: Buffer,
+    capacity: u64,
 }
 
 pub struct MetalRuntime {
@@ -98,18 +106,16 @@ pub struct MetalRuntimeDebugStats {
 impl MetalRuntime {
     pub fn debug_stats(&self) -> MetalRuntimeDebugStats {
         let pipeline_cache = metal_pipeline_cache_stats();
+        let (intermediate_buffers, intermediate_allocated_bytes) =
+            self.unique_intermediate_buffer_stats();
         MetalRuntimeDebugStats {
             compiled_buckets: self.compiled_buckets.len(),
             active_bucket: self.active_bucket,
             execution_steps: self.execution_plan.len(),
             pipelines: self.pipelines.len(),
             input_buffers: self.hlir_buffers.len(),
-            intermediate_buffers: self.buffers.len(),
-            intermediate_allocated_bytes: self
-                .buffers
-                .values()
-                .map(|buffer| buffer.length() as usize)
-                .sum(),
+            intermediate_buffers,
+            intermediate_allocated_bytes,
             intermediate_logical_bytes: self
                 .buffer_lengths
                 .values()
@@ -120,6 +126,62 @@ impl MetalRuntime {
             pipeline_cache_misses: pipeline_cache.misses,
             pipeline_cache_entries: pipeline_cache.entries,
         }
+    }
+
+    fn buffer_identity(buffer: &Buffer) -> usize {
+        buffer.as_ptr() as usize
+    }
+
+    fn unique_intermediate_buffer_stats(&self) -> (usize, usize) {
+        let mut seen = FxHashSet::default();
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for buffer in self.buffers.values() {
+            if seen.insert(Self::buffer_identity(buffer)) {
+                count += 1;
+                bytes += buffer.length() as usize;
+            }
+        }
+        (count, bytes)
+    }
+
+    fn drain_unique_intermediate_buffers(&mut self) -> Vec<ReusableBuffer> {
+        let mut seen = FxHashSet::default();
+        let mut buffers = Vec::new();
+        for (_, buffer) in self.buffers.drain() {
+            if seen.insert(Self::buffer_identity(&buffer)) {
+                buffers.push(ReusableBuffer {
+                    capacity: buffer.length(),
+                    buffer,
+                });
+            }
+        }
+        self.buffer_lengths.clear();
+        buffers
+    }
+
+    fn take_best_fit_buffer(
+        buffers: &mut Vec<ReusableBuffer>,
+        requested_capacity: u64,
+    ) -> Option<ReusableBuffer> {
+        let best_idx = buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.capacity >= requested_capacity)
+            .min_by_key(|(_, candidate)| candidate.capacity)
+            .map(|(idx, _)| idx)?;
+        Some(buffers.swap_remove(best_idx))
+    }
+
+    fn remove_logical_buffers_sharing(&mut self, buffer: &Buffer) {
+        let identity = Self::buffer_identity(buffer);
+        self.buffers.retain(|node, existing| {
+            let keep = Self::buffer_identity(existing) != identity;
+            if !keep {
+                self.buffer_lengths.remove(node);
+            }
+            keep
+        });
     }
 
     fn input_dtype(&self, id: NodeIndex) -> Option<DType> {
@@ -294,6 +356,7 @@ impl MetalRuntime {
                 .remove(&data_id)
                 .expect("Cannot find output tensor in runtime!");
             self.buffer_lengths.remove(&data_id);
+            self.remove_logical_buffers_sharing(&output_buffer);
 
             if let Some(Input { node, .. }) = self.llir_graph[lineage_id].to_op::<Input>() {
                 let hlir_id = NodeIndex::new(*node);
@@ -323,6 +386,7 @@ impl MetalRuntime {
 
         if let Some(buffer) = self.buffers.remove(&data_id) {
             self.buffer_lengths.remove(&data_id);
+            self.remove_logical_buffers_sharing(&buffer);
             return buffer;
         }
 
@@ -550,10 +614,7 @@ impl Runtime for MetalRuntime {
     }
 
     fn intermediate_buffer_bytes(&self) -> usize {
-        self.buffers
-            .values()
-            .map(|buffer| buffer.length() as usize)
-            .sum()
+        self.unique_intermediate_buffer_stats().1
     }
 
     fn load_llir_buckets(
@@ -638,40 +699,78 @@ impl MetalRuntime {
     }
 
     fn allocate_active_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
-        let mut planned = Vec::new();
         let capacity_dyn_map = self.active_capacity_dyn_map(dyn_map);
+        let mut reusable_buffers = self.drain_unique_intermediate_buffers();
+        let mut active_buffers: FxHashMap<NodeIndex, ReusableBuffer> = FxHashMap::default();
+        let mut last_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        let mut output_nodes = FxHashSet::default();
 
-        for node in self.llir_graph.node_indices() {
-            if self.llir_graph[node].to_op::<Input>().is_some() {
-                continue;
-            }
-
-            if let Some(kernel_op) = self.llir_graph[node].to_dialect::<dyn MetalKernelOp>() {
-                if kernel_op.output_aliases_input().is_some() {
-                    continue;
-                }
-                let dtype = self.node_dtypes.get(&node).copied().unwrap_or(DType::F32);
-                let requested_bytes =
-                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, dyn_map);
-                let allocation_bytes =
-                    Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, &capacity_dyn_map)
-                        .max(requested_bytes);
-                let needs_buffer = self
-                    .buffers
-                    .get(&node)
-                    .is_none_or(|buffer| requested_bytes > buffer.length());
-
-                planned.push((node, requested_bytes, allocation_bytes, needs_buffer));
+        for &node in self.output_data_map.values() {
+            let data_node = self.follow_aliases(node);
+            if self.llir_graph[data_node].to_op::<Input>().is_none() {
+                output_nodes.insert(data_node);
+                last_use.insert(data_node, usize::MAX);
             }
         }
 
-        for (node, requested_bytes, allocation_bytes, needs_buffer) in planned {
-            self.buffer_lengths.insert(node, requested_bytes);
-            if needs_buffer {
-                let buffer = self
-                    .device
-                    .new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared);
-                self.buffers.insert(node, buffer);
+        for (step_idx, step) in self.execution_plan.iter().enumerate() {
+            for &input_node in &step.input_nodes {
+                let data_node = self.follow_aliases(input_node);
+                if self.llir_graph[data_node].to_op::<Input>().is_none() {
+                    last_use
+                        .entry(data_node)
+                        .and_modify(|last| *last = (*last).max(step_idx))
+                        .or_insert(step_idx);
+                }
+            }
+        }
+
+        for (step_idx, step) in self.execution_plan.iter().enumerate() {
+            let expired_nodes: Vec<_> = active_buffers
+                .iter()
+                .filter_map(|(&node, _)| {
+                    let node_last_use = last_use.get(&node).copied().unwrap_or(step_idx);
+                    (node_last_use < step_idx).then_some(node)
+                })
+                .collect();
+            for node in expired_nodes {
+                if let Some(buffer) = active_buffers.remove(&node) {
+                    reusable_buffers.push(buffer);
+                }
+            }
+
+            let kernel_op = self.llir_graph[step.node]
+                .to_dialect::<dyn MetalKernelOp>()
+                .expect("Execution plan referenced a non-Metal op");
+            if kernel_op.output_aliases_input().is_some() {
+                continue;
+            }
+
+            let dtype = self
+                .node_dtypes
+                .get(&step.node)
+                .copied()
+                .unwrap_or(DType::F32);
+            let requested_bytes = Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, dyn_map);
+            let allocation_bytes =
+                Self::output_bytes(kernel_op.as_ref().as_ref(), dtype, &capacity_dyn_map)
+                    .max(requested_bytes);
+            let reusable = Self::take_best_fit_buffer(&mut reusable_buffers, allocation_bytes)
+                .unwrap_or_else(|| ReusableBuffer {
+                    buffer: self
+                        .device
+                        .new_buffer(allocation_bytes, MTLResourceOptions::StorageModeShared),
+                    capacity: allocation_bytes,
+                });
+
+            self.buffer_lengths.insert(step.node, requested_bytes);
+            self.buffers.insert(step.node, reusable.buffer.clone());
+            active_buffers.insert(step.node, reusable);
+        }
+
+        for node in output_nodes {
+            if let Some(buffer) = active_buffers.remove(&node) {
+                reusable_buffers.push(buffer);
             }
         }
     }
