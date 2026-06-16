@@ -9,7 +9,6 @@
 //     F32 accumulator
 // =========================================================================
 
-use candle_core::{Device, Tensor};
 use half::bf16;
 use luminal::dtype::DType;
 use luminal::prelude::*;
@@ -231,16 +230,18 @@ fn test_bf16_roundtrip_matches_candle() {
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out.id);
 
-    let device = Device::new_cuda(0).expect("Candle CUDA device required for test");
-    let ref_t = Tensor::from_slice(&input, n, &device)
-        .unwrap()
-        .to_dtype(candle_core::DType::BF16)
-        .unwrap();
-    let ref_out = ((ref_t * 2.0).unwrap() + 1.0)
-        .unwrap()
-        .to_dtype(candle_core::DType::F32)
-        .unwrap();
-    let expected = ref_out.to_vec1::<f32>().unwrap();
+    // Reference in pure-Rust bf16 (candle's CUDA bf16 kernels are unavailable
+    // on some arches, e.g. the A100 CI). Matches the region's widen-to-float /
+    // round-to-bf16-per-op model: cast → ×2 → +1 → cast(F32).
+    let expected: Vec<f32> = input
+        .iter()
+        .map(|&x| {
+            let b = bf16::from_f32(x);
+            let m = bf16::from_f32(b.to_f32() * 2.0);
+            let a = bf16::from_f32(m.to_f32() + 1.0);
+            a.to_f32()
+        })
+        .collect();
 
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
     assert_close(&result, &expected, tol, tol);
@@ -288,17 +289,17 @@ fn test_bf16_reciprocal_region_compiles() {
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out.id);
 
-    let device = Device::new_cuda(0).expect("Candle CUDA device required for test");
-    let ref_t = Tensor::from_slice(&input, n, &device)
-        .unwrap()
-        .to_dtype(candle_core::DType::BF16)
-        .unwrap();
-    let ref_out = ref_t
-        .recip()
-        .unwrap()
-        .to_dtype(candle_core::DType::F32)
-        .unwrap();
-    let expected = ref_out.to_vec1::<f32>().unwrap();
+    // Reference in pure-Rust bf16 (candle's CUDA bf16 kernels are unavailable
+    // on some arches, e.g. the A100 CI). Matches the region's widen-to-float /
+    // round-to-bf16-per-op model: cast → reciprocal → ×1 → cast(F32).
+    let expected: Vec<f32> = input
+        .iter()
+        .map(|&x| {
+            let b = bf16::from_f32(x);
+            let r = bf16::from_f32(1.0 / b.to_f32());
+            bf16::from_f32(r.to_f32() * 1.0).to_f32()
+        })
+        .collect();
 
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
     assert_close(&result, &expected, tol, tol);
