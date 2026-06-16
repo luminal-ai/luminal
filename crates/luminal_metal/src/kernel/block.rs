@@ -468,10 +468,10 @@ fn match_rms_norm_chain(llir_graph: &LLIRGraph, final_mul: NodeIndex) -> Option<
     {
         return None;
     }
-    if let Some(scale_node) = extra_scale_node {
-        if !has_unique_kernel_successor(llir_graph, scale_node) {
-            return None;
-        }
+    if let Some(scale_node) = extra_scale_node
+        && !has_unique_kernel_successor(llir_graph, scale_node)
+    {
+        return None;
     }
 
     let mut internal_nodes = vec![square, sum_node, add, sqrt, recip];
