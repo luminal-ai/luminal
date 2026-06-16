@@ -2262,6 +2262,13 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
+                    ; Genuine 1D-token embedding: token_ids has one batch dim, so
+                    ; its stride is length 1, matching batch_shape =
+                    ; RemoveNthFromEnd(idx_shape) (also length 1). Without this,
+                    ; the rule mis-fires on 2D/non-embedding gathers whose token
+                    ; stride is 2D, producing a KernelEmbed whose batch_shape and
+                    ; token_stride lengths differ -> flatten_strides panic.
+                    (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                     (= ?embed_dt (dtype ?embed_table))
@@ -2283,6 +2290,13 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
+                    ; Genuine 1D-token embedding: token_ids has one batch dim, so
+                    ; its stride is length 1, matching batch_shape =
+                    ; RemoveNthFromEnd(idx_shape) (also length 1). Without this,
+                    ; the rule mis-fires on 2D/non-embedding gathers whose token
+                    ; stride is 2D, producing a KernelEmbed whose batch_shape and
+                    ; token_stride lengths differ -> flatten_strides panic.
+                    (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                     (= ?embed_dt (dtype ?embed_table))
@@ -2304,6 +2318,11 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
+                    ; Same length guard as the cast-mul variant: only fire for
+                    ; genuine 1D token embeddings (token stride length 1) so
+                    ; batch_shape and token_stride lengths agree and the rule
+                    ; doesn't mis-fire on non-embedding 2D gathers.
+                    (= (len ?token_stride) 1)
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                     (= ?embed_dt (dtype ?embed_table))
                 )
@@ -2324,6 +2343,11 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
+                    ; Same length guard as the cast-mul variant: only fire for
+                    ; genuine 1D token embeddings (token stride length 1) so
+                    ; batch_shape and token_stride lengths agree and the rule
+                    ; doesn't mis-fire on non-embedding 2D gathers.
+                    (= (len ?token_stride) 1)
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
                     (= ?embed_dt (dtype ?embed_table))
                 )
