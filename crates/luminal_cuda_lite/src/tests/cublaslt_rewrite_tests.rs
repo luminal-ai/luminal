@@ -2635,7 +2635,9 @@ fn cublaslt_gelu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
     let b = cx.tensor((k, n));
     let bias = cx.tensor(n);
     let bias_expanded = bias.expand_dim(0, m);
-    let out = (a.matmul(b) + bias_expanded).gelu_fast_tanh_approximation().output();
+    let out = (a.matmul(b) + bias_expanded)
+        .gelu_fast_tanh_approximation()
+        .output();
     let llir = extract_forced_cublaslt_llir_where(
         &mut cx,
         "functional gelu column bias epilogue",
@@ -2680,7 +2682,9 @@ fn cublaslt_gelu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bia
     let b = cx.tensor((batch, k, n));
     let bias = cx.tensor(n);
     let bias_expanded = bias.expand_dim(0, m).expand_dim(0, batch);
-    let out = (a.matmul(b) + bias_expanded).gelu_fast_tanh_approximation().output();
+    let out = (a.matmul(b) + bias_expanded)
+        .gelu_fast_tanh_approximation()
+        .output();
     let llir = extract_forced_cublaslt_llir_where(
         &mut cx,
         "functional batched gelu column bias epilogue",
@@ -3226,7 +3230,9 @@ fn build_2d_matmul_relu_graph(case: LayoutCase, dtype: DType) -> Graph {
 }
 
 fn build_2d_matmul_gelu_graph(case: LayoutCase, dtype: DType) -> Graph {
-    build_same_dtype_2d_graph(case, dtype, |_, a, b, _, _, _| a.matmul(b).gelu_fast_tanh_approximation())
+    build_same_dtype_2d_graph(case, dtype, |_, a, b, _, _, _| {
+        a.matmul(b).gelu_fast_tanh_approximation()
+    })
 }
 
 fn build_batched_matmul_graph(case: LayoutCase, dtype: DType) -> Graph {
@@ -3384,7 +3390,9 @@ fn build_batched_matmul_relu_graph(case: LayoutCase, dtype: DType) -> Graph {
 }
 
 fn build_batched_matmul_gelu_graph(case: LayoutCase, dtype: DType) -> Graph {
-    build_same_dtype_batched_graph(case, dtype, |_, a, b, _, _, _, _| a.matmul(b).gelu_fast_tanh_approximation())
+    build_same_dtype_batched_graph(case, dtype, |_, a, b, _, _, _, _| {
+        a.matmul(b).gelu_fast_tanh_approximation()
+    })
 }
 
 fn extract_forced_cublaslt_llir(mut cx: Graph, case_name: &str) -> LLIRGraph {
