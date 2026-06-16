@@ -89,7 +89,12 @@ fn main() {
     println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(20);
+    // ~52 GB of bf16/F32 weights + the ~13 GB the search leaves resident
+    // before the stitched-graph allocation leave only ~12 GB of an 80 GB
+    // A100 for intermediates. Cap below that so the search can only select a
+    // genome whose arena fits (candidates run 3-18 GiB with GLUMoE enabled;
+    // a higher cap lets it pick an 18 GiB genome that OOMs at execution).
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(10);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
