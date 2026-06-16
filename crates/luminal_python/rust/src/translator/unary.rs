@@ -74,8 +74,8 @@ impl<'a> Translator<'a> {
             None
         });
         Ok(match approximate.as_deref() {
-            Some("tanh") => a.gelu(),
-            _ => a.gelu_erf(),
+            Some("tanh") => a.gelu_fast_tanh_approximation(),
+            _ => a.gelu(),
         })
     }
 

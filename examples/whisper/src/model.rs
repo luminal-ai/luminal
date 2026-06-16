@@ -255,7 +255,7 @@ impl EncoderLayer {
         let x = x + h;
 
         let h = self.final_ln.forward(x);
-        let h = linear_with_bias(h, self.fc1, self.fc1_b).gelu_erf();
+        let h = linear_with_bias(h, self.fc1, self.fc1_b).gelu();
         let h = linear_with_bias(h, self.fc2, self.fc2_b);
         x + h
     }
@@ -315,7 +315,7 @@ impl DecoderLayer {
         let x = x + h;
 
         let h = self.final_ln.forward(x);
-        let h = linear_with_bias(h, self.fc1, self.fc1_b).gelu_erf();
+        let h = linear_with_bias(h, self.fc1, self.fc1_b).gelu();
         let h = linear_with_bias(h, self.fc2, self.fc2_b);
         (x + h, k_out, v_out)
     }
@@ -390,8 +390,8 @@ impl WhisperEncoder {
 
     /// Input mel spectrogram: (N_MELS, 3000). Output: (N_AUDIO_CTX=1500, N_AUDIO_STATE).
     pub fn forward(&self, mel: GraphTensor) -> GraphTensor {
-        let h = conv1d_bias(mel, self.conv1_w, self.conv1_b, 3, 1, 1).gelu_erf();
-        let h = conv1d_bias(h, self.conv2_w, self.conv2_b, 3, 2, 1).gelu_erf();
+        let h = conv1d_bias(mel, self.conv1_w, self.conv1_b, 3, 1, 1).gelu();
+        let h = conv1d_bias(h, self.conv2_w, self.conv2_b, 3, 2, 1).gelu();
         // h: (N_AUDIO_STATE, N_AUDIO_CTX) -> (N_AUDIO_CTX, N_AUDIO_STATE)
         let mut x = h.transpose(0, 1) + self.positional_embedding;
         for layer in &self.layers {

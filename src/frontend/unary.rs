@@ -303,23 +303,16 @@ impl GraphTensor {
         self.relu() - (self * -neg_slope).relu()
     }
 
-    /// The Gaussian Error Linear Unit activation function (tanh approximation).
+    /// The Gaussian Error Linear Unit activation function: `0.5 * x * (1 + erf(x / sqrt(2)))`.
+    ///
+    /// This is the exact (erf-based) form, matching PyTorch's default `aten.gelu`
+    /// (`approximate="none"`). `erf` is composed from existing primitives via the
+    /// Abramowitz & Stegun 7.1.26 rational+exp approximation (max abs error ~1.5e-7),
+    /// so this is a single, deterministic elementwise composition with no
+    /// special-cased kernel. For the cheaper tanh approximation, see
+    /// [`gelu_fast_tanh_approximation`](Self::gelu_fast_tanh_approximation).
     #[allow(clippy::excessive_precision)]
     pub fn gelu(self) -> GraphTensor {
-        // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
-        let scaled = 1.5957691216 * self * (1. + 0.044715 * self * self);
-        self * scaled.sigmoid()
-    }
-
-    /// The exact (erf-based) Gaussian Error Linear Unit: `0.5 * x * (1 + erf(x / sqrt(2)))`.
-    ///
-    /// This matches PyTorch's default `aten.gelu` (`approximate="none"`), unlike
-    /// [`gelu`](Self::gelu) which is the tanh approximation (`approximate="tanh"`).
-    /// `erf` is composed from existing primitives via the Abramowitz & Stegun 7.1.26
-    /// rational+exp approximation (max abs error ~1.5e-7), so this is a single,
-    /// deterministic elementwise composition with no special-cased kernel.
-    #[allow(clippy::excessive_precision)]
-    pub fn gelu_erf(self) -> GraphTensor {
         // erf(u), u = x / sqrt(2), via A&S 7.1.26:
         //   t = 1 / (1 + p*|u|)
         //   erf(u) = sign(u) * (1 - (a1 t + a2 t^2 + a3 t^3 + a4 t^4 + a5 t^5) * exp(-u^2))
@@ -337,6 +330,18 @@ impl GraphTensor {
         let poly = ((((A5 * t + A4) * t + A3) * t + A2) * t + A1) * t;
         let erf = u.sign() * (1. - poly * (-(u * u)).exp());
         0.5 * self * (1. + erf)
+    }
+
+    /// The tanh approximation of GELU (PyTorch's `approximate="tanh"`):
+    /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`.
+    ///
+    /// Cheaper than the exact [`gelu`](Self::gelu) (fewer ops, ~3e-4 max error) and
+    /// what cuBLASLt's GELU epilogue / the GLUMoE Gemma-GELU recognition match.
+    #[allow(clippy::excessive_precision)]
+    pub fn gelu_fast_tanh_approximation(self) -> GraphTensor {
+        // Based on https://github.com/tinygrad/tinygrad/blob/9fc4465557831b614b56dd645eebc940ca0fa1bb/tinygrad/tensor.py#L1162C26-L1162C104
+        let scaled = 1.5957691216 * self * (1. + 0.044715 * self * self);
+        self * scaled.sigmoid()
     }
 
     /// Compute the sorted indexes of this tensor along a certian axis
@@ -565,7 +570,13 @@ pub(super) mod tests {
         #[test]
         fn test_activations(size in 1usize..128) {
             test_unary(size, |a| a.relu(), |a| a.relu().unwrap());
-            test_unary(size, |a| a.gelu(), |a| a.gelu().unwrap());
+            // Exact GELU vs candle's exact erf GELU; tanh approximation vs candle's tanh GELU.
+            test_unary(size, |a| a.gelu(), |a| a.gelu_erf().unwrap());
+            test_unary(
+                size,
+                |a| a.gelu_fast_tanh_approximation(),
+                |a| a.gelu().unwrap(),
+            );
             test_unary(size, |a| a.swish(), |a| a.silu().unwrap());
             test_unary(size, |a| a.tanh(), |a| a.tanh().unwrap());
         }
