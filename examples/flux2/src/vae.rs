@@ -750,8 +750,8 @@ mod tests {
             },
         );
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), one_search());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn nearest_upsample_2x_matches_reference_native() {
+    fn nearest_upsample_2x_matches_reference_runtime() {
         let mut cx = Graph::default();
         let input_t = cx.named_tensor("input", (2usize, 3usize, 4usize));
         let out = nearest_upsample_2x(input_t).output();
@@ -769,8 +769,8 @@ mod tests {
         let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 - 11.0).collect();
         let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), one_search());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.execute(&cx.dyn_map);
 
@@ -801,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn group_norm_matches_reference_native() {
+    fn group_norm_matches_reference_runtime() {
         let mut cx = Graph::default();
         let input_t = cx.named_tensor("input", (4usize, 2usize, 3usize));
         let weight_t = cx.named_tensor("weight", 4usize);
@@ -824,8 +824,8 @@ mod tests {
             },
         );
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-        let mut rt = cx.search(NativeRuntime::default(), one_search());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(ReferenceRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);

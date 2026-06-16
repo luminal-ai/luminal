@@ -21,7 +21,7 @@ let b = cx.tensor((1, 4));
 let c = a.matmul(b).output();
 
 // Compile
-let mut rt = cx.compile(NativeRuntime::default(), CompileOptions::default());
+let mut rt = cx.compile(ReferenceRuntime::default(), CompileOptions::default());
 
 // Set input tensors
 rt.set_data(a, vec![1.0, 2.0, 3.0]);

@@ -3,7 +3,7 @@
 //! `TypedData` wraps raw bytes with a `DType` tag, enabling multi-dtype data flow
 //! through the PT2 path without forcing everything to f32.
 
-use luminal::hlir::NativeData;
+use luminal::hlir::ReferenceData;
 use luminal::prelude::*;
 
 /// A dtype-tagged byte buffer. All weight, constant, and input data flows through this type.
@@ -35,7 +35,7 @@ impl TypedData {
         }
     }
 
-    /// Read element at `idx` as f64 (used by From<TypedData> for NativeData fallback).
+    /// Read element at `idx` as f64 (used by From<TypedData> for ReferenceData fallback).
     fn as_f64(&self, idx: usize) -> f64 {
         match self.dtype {
             DType::F32 => {
@@ -151,7 +151,7 @@ impl TypedData {
     /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype
     /// code) to `TypedData`. Supported dtypes preserve their raw bytes —
     /// no width changes at the FFI boundary. Narrow integer widths
-    /// (`Byte` / `Char` / `Short`) panic: luminal's `NativeData` has no
+    /// (`Byte` / `Char` / `Short`) panic: luminal's `ReferenceData` has no
     /// narrower-integer variants yet, so the only way they could pass
     /// through is via implicit widening to `i32`, which the no-implicit-
     /// cast directive forbids. Cast at the call site
@@ -231,8 +231,8 @@ impl TypedData {
     }
 }
 
-/// Convert TypedData to NativeData for the native runtime.
-impl From<TypedData> for NativeData {
+/// Convert TypedData to ReferenceData for the reference runtime.
+impl From<TypedData> for ReferenceData {
     fn from(td: TypedData) -> Self {
         match td.dtype {
             DType::F32 | DType::TF32 => {
@@ -241,10 +241,10 @@ impl From<TypedData> for NativeData {
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
-                NativeData::F32(data)
+                ReferenceData::F32(data)
             }
             DType::F64 => {
-                // Downcast f64 -> f32 for native runtime (which only has F32 variant for floats > 32-bit)
+                // Downcast f64 -> f32 for the reference runtime (which only has F32 variant for floats > 32-bit)
                 let data: Vec<f32> = td
                     .bytes
                     .chunks_exact(8)
@@ -252,7 +252,7 @@ impl From<TypedData> for NativeData {
                         f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
                     })
                     .collect();
-                NativeData::F32(data)
+                ReferenceData::F32(data)
             }
             DType::F16 => {
                 let data: Vec<half::f16> = td
@@ -260,7 +260,7 @@ impl From<TypedData> for NativeData {
                     .chunks_exact(2)
                     .map(|b| half::f16::from_le_bytes([b[0], b[1]]))
                     .collect();
-                NativeData::F16(data)
+                ReferenceData::F16(data)
             }
             DType::Bf16 => {
                 let data: Vec<half::bf16> = td
@@ -268,7 +268,7 @@ impl From<TypedData> for NativeData {
                     .chunks_exact(2)
                     .map(|b| half::bf16::from_le_bytes([b[0], b[1]]))
                     .collect();
-                NativeData::Bf16(data)
+                ReferenceData::Bf16(data)
             }
             DType::Int => {
                 let data: Vec<i32> = td
@@ -276,20 +276,20 @@ impl From<TypedData> for NativeData {
                     .chunks_exact(4)
                     .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .collect();
-                NativeData::Int(data)
+                ReferenceData::Int(data)
             }
             DType::Bool => {
                 let data: Vec<bool> = td.bytes.iter().map(|&b| b != 0).collect();
-                NativeData::Bool(data)
+                ReferenceData::Bool(data)
             }
-            // Integer types that map to NativeData::Int
+            // Integer types that map to ReferenceData::Int
             DType::I8 => {
                 let data: Vec<i32> = td.bytes.iter().map(|&b| b as i8 as i32).collect();
-                NativeData::Int(data)
+                ReferenceData::Int(data)
             }
             DType::U8 => {
                 let data: Vec<i32> = td.bytes.iter().map(|&b| b as i32).collect();
-                NativeData::Int(data)
+                ReferenceData::Int(data)
             }
             DType::I16 => {
                 let data: Vec<i32> = td
@@ -297,7 +297,7 @@ impl From<TypedData> for NativeData {
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
                     .collect();
-                NativeData::Int(data)
+                ReferenceData::Int(data)
             }
             DType::U16 => {
                 let data: Vec<i32> = td
@@ -305,21 +305,21 @@ impl From<TypedData> for NativeData {
                     .chunks_exact(2)
                     .map(|b| u16::from_le_bytes([b[0], b[1]]) as i32)
                     .collect();
-                NativeData::Int(data)
+                ReferenceData::Int(data)
             }
-            // Sub-byte and F8 types: store as raw f32 for native runtime (best effort)
+            // Sub-byte and F8 types: store as raw f32 for reference runtime (best effort)
             _ => {
-                // For exotic types, the native runtime can't handle them natively.
+                // For exotic types, the reference runtime can't handle them directly.
                 // Store as f32 with element-wise conversion.
                 let data: Vec<f32> = (0..td.n_elements()).map(|i| td.as_f64(i) as f32).collect();
-                NativeData::F32(data)
+                ReferenceData::F32(data)
             }
         }
     }
 }
 
-/// Convert &TypedData to NativeData (clone the bytes).
-impl From<&TypedData> for NativeData {
+/// Convert &TypedData to ReferenceData (clone the bytes).
+impl From<&TypedData> for ReferenceData {
     fn from(td: &TypedData) -> Self {
         td.clone().into()
     }

@@ -289,7 +289,7 @@ fn moe_architecture_search_space_equivalence_fuzz() {
 }
 
 #[test]
-fn moe_architecture_native_reference_fuzz() {
+fn moe_architecture_reference_runtime_fuzz() {
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -347,7 +347,7 @@ fn moe_architecture_native_reference_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .native_reference()
+        .reference_runtime()
         .input_f32(input.id, random_f32_vec(SEQ * HIDDEN, 301, -0.15, 0.15))
         .input_f32(
             router.id,
@@ -361,7 +361,7 @@ fn moe_architecture_native_reference_fuzz() {
             down_weights.id,
             random_bf16_vec(NUM_EXPERTS * HIDDEN * MOE_INTERMEDIATE, 304, -0.1, 0.1),
         )
-        .output_f32(out.id, "qwen_swiglu_moe_native_reference", 6e-2, 6e-2)
+        .output_f32(out.id, "qwen_swiglu_moe_reference_runtime", 6e-2, 6e-2)
         .run();
-    eprintln!("moe native-reference fuzz report: {report:?}");
+    eprintln!("moe reference-runtime fuzz report: {report:?}");
 }

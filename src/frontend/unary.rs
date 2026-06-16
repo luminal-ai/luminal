@@ -492,9 +492,9 @@ pub(super) mod tests {
         let a = cx.tensor(shape.clone());
         let b = func(a).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 

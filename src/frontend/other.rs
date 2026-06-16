@@ -125,9 +125,9 @@ mod tests {
         let mut cx = Graph::new();
         let b = func(&mut cx).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -213,9 +213,9 @@ mod tests {
         let c = cx.tensor((2, 3));
         let stacked = cx.stack(&[a, b, c], 0).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 

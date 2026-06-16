@@ -178,15 +178,15 @@ a different (broken) e-node from the same e-class.
 ### What the symptom was
 
 `test_onehot` panicked at `src/hlir.rs:1625` in `get_f32()`: the output buffer was
-`NativeData::Int` instead of the expected `NativeData::F32`.
+`ReferenceData::Int` instead of the expected `ReferenceData::F32`.
 
 ### What the actual root cause was
 
 The Cast parser's `* 1.0` workaround for `Int → F32` casts used `input * one_expanded`
 (Int GraphTensor on the left, F32 constant on the right). However, `Mul for GraphTensor`
 always uses `self.dtype` (the **left** operand's dtype) for the result, and the native
-runtime's `Mul::execute` dispatches on the **first** input's `NativeData` variant. So
-`Int * F32` produced `DType::Int` / `NativeData::Int` — the exact opposite of the intended
+runtime's `Mul::execute` dispatches on the **first** input's `ReferenceData` variant. So
+`Int * F32` produced `DType::Int` / `ReferenceData::Int` — the exact opposite of the intended
 F32 output.
 
 ### Why it was hard to find
@@ -220,7 +220,7 @@ constant must be the left operand.
 
 ### What the symptom was
 
-`test_scatter_nd` passed on native backend but failed on CUDA with "does not produce an
+`test_scatter_nd` passed on reference backend but failed on CUDA with "does not produce an
 egraph". The CUDA compilation could not extract a valid program from the e-graph.
 
 ### What the actual root cause was
@@ -237,13 +237,13 @@ matching dtypes. `F32 != Int` → the rule never fires → the Mul node gets **n
 
 Every downstream op checks `(= ?dty (dtype ?upstream))`. Without dtype on the Mul, no
 CUDA kernel rewrite rules fire for any downstream op (KernelMul, KernelAdd, KernelLessThan,
-etc.). When `cleanup_hlir` runs (enabled for CUDA, disabled for native), it deletes all
+etc.). When `cleanup_hlir` runs (enabled for CUDA, disabled for reference), it deletes all
 unrewritten HLIR ops, leaving empty e-classes → egraph extraction fails.
 
 ### Why it was hard to find
 
-1. **Works on native**: `cleanup_hlir = false` for NativeRuntime, so unrewritten HLIR ops
-   are never deleted. NativeOp dispatches on actual runtime data, not egglog dtype.
+1. **Works on reference**: `cleanup_hlir = false` for ReferenceRuntime, so unrewritten HLIR ops
+   are never deleted. ReferenceOp dispatches on actual runtime data, not egglog dtype.
 2. **Cascading failure**: The root cause (missing dtype on one Mul) silently propagated
    through every downstream op, making it look like a systemic CUDA issue rather than a
    single dtype mismatch.
@@ -320,7 +320,7 @@ The resulting Mul had input A with 4D strides and input B with 1D strides.
 ### Why it was hard to find
 
 1. **Only triggered by 1B model**: The tiny model's Where inputs all had matching ranks (no scalars).
-2. **CUDA-only**: The native runtime's `bin_fn` uses `StridedIterator` which handles mismatched
+2. **CUDA-only**: The reference runtime's `bin_fn` uses `StridedIterator` which handles mismatched
    strides more gracefully. CUDA's `KernelMul::compile` calls `flatten_strides` which asserts
    `range.len() == strides.len()`.
 3. **Delayed crash**: The mismatch was created during ONNX parsing but only manifested during
@@ -344,7 +344,7 @@ with matching shape tracker dimensions.
 
 1. **Symptom**: `test_topk_values` failed on CUDA — rows 0-1 were correct but rows 2+ returned
    the value at column 0 of each row (all three top-k positions got the same value).
-   Native backend was fine.
+   Reference backend was fine.
 
 2. **Root cause**: `gather_elements` was called with a non-contiguous index tensor produced by
    `argsort(axis=1) → slice_along(..k, axis=1)`. The slice creates a ShapeTracker view of the
@@ -568,7 +568,7 @@ is easier to verify and less likely to confuse source/destination ordering. Also
 
 6 CUDA tests (`test_pow`, `test_pow_broadcast`, `test_div`, `test_mod`, `test_mod_broadcast`,
 `test_erf`) consistently failed with `Failed to find a viable initial genome for group 0 after
-100 attempts`. All 6 passed on native backend.
+100 attempts`. All 6 passed on reference backend.
 
 ### What the actual root cause was
 
@@ -589,8 +589,8 @@ The `has_nan_outputs` check rejected every candidate genome, exhausting all 100 
 
 1. **No panic, no crash — silent NaN rejection**: The error message said "Failed to find a
    viable initial genome" which suggested an egglog rewrite issue, not a data issue.
-2. **Works on native**: `NativeRuntime::has_nan_outputs()` returns `false` by default (no NaN
-   check), so zero inputs never caused problems on native.
+2. **Works on reference**: `ReferenceRuntime::has_nan_outputs()` returns `false` by default (no NaN
+   check), so zero inputs never caused problems on reference.
 3. **torch.compile vs direct export difference**: Directly exporting a model via
    `torch.onnx.export(model, ...)` produces initializers. But `torch.compile`'s backend
    receives a `GraphModule` where weights are graph inputs, not initializers. The ONNX file
@@ -865,3 +865,19 @@ Also: search-time dummy-1 inputs are not the same shape as runtime inputs. Anyth
    - Added `aten.gelu.default → a.gelu()` and `aten.silu.default → a.silu()` to `dispatch.rs`.
    - Worked around the `-Infinity` issue at the model level by using a finite `-1e10` for the causal mask in the example (matches the Rust example's convention). The cleaner fix (parsing `"-Infinity"`/`"Infinity"`/`"NaN"` strings in `get_float_arg` / `translate_full`) is left for a follow-up.
 6. **Principle**: when adding a new model that goes through the PT2 backend, expect to plug small holes in `dispatch.rs` and `translator/tensor.rs::translate_full`. The trace points at the python frame, not the Rust dispatch arm — open `dispatch.rs`, ctrl-F the offending op name, and add the one-liner. For float-shaped sentinel values (`-inf`, `inf`, `nan`), the export pipeline currently only accepts finite floats; either rewrite the model or extend the parser.
+
+---
+
+## Nondeterministic bf16 miscompile: `cublaslt_mixed_dtype_rewrite` + beta fusion (c_dtype/C-buffer mismatch)
+
+1. **Symptom**: Llama-3.1-8B in bf16 (load native dtype, no `torch_dtype=f32`) produced garbage logits — ~20x the bf16 rounding floor, 0% next-token agreement, sometimes NaN — while fp32 was bit-exact and the 1B model was fine. Critically it was **nondeterministic**: the *same* model/input recompiled gave ~60-80% broken (err 4-6), ~10% NaN, ~30% correct (`tests/_bf16_nondeterminism.py` quantifies this).
+
+2. **Root cause**: `cublaslt_mixed_dtype_rewrite.egg` rewrites `Cast(F32)(bf16_matmul)` into a cuBLASLt matmul that outputs F32 directly, setting **both `c_dtype` and `d_dtype` to F32**. In a transformer the residual stream does `h = residual + o_proj(x)` and the next RMSNorm casts `h` to f32. With **beta fusion running first**, the residual is fused as the matmul's C input (beta=1, C = a **bf16** tensor, c_dtype=Bf16). Then `Cast(F32)` triggers `mixed_dtype`, which flips `c_dtype` to F32 while the C buffer stays bf16. At runtime cuBLASLt reads the **2-byte bf16 C as a 4-byte f32** (`mod.rs:1295` aliases `c=d` only for beta=0; with beta=1 there is a real bf16 C input) → corrupted C → wrong output.
+
+3. **Why it was hard**: (a) Nondeterministic, so it looked like a precision/flaky issue, not a logic bug. (b) Every op and submodule was *correct in isolation* — even the full attention core and the full decoder layer — because compiling a small graph rarely drew the bad candidate; the bug is emergent from the **whole-graph extraction**. (c) The luminal extraction is a **performance-driven genetic search** (`graph.rs:1500+`) that picks among e-graph candidates by *profiled runtime on dummy data with no correctness check*; once the unsound F32-output candidate exists, the search selects it ~80% of the time, and timing jitter (not the RNG — seeding didn't help) decides each run. (d) Diffing broken-vs-correct *kernel sources* was a dead end: they were semantically identical (cosmetic statement reordering); the divergence was in **buffer/dtype wiring**, not codegen text.
+
+4. **How it was found**: throwaway instrumentation in the cuda_lite runtime — an intermediate value tracer that dumped each op's output, plus a kernel-source dump hooked into `compile_module_image_for_current_device`; statistical broken-vs-ok kernel-set diffing pointed at the F32-output cuBLASLt path on the hidden-state (16384) matmuls; a minimal reproducer nailed it: `matmul+cast` (beta=0) = **0/12 broken**, `matmul+residual+cast` (beta!=0) = **11/12 broken**.
+
+5. **Fix**: guard both rules in `cublaslt_mixed_dtype_rewrite.egg` to only fire on `beta == 0.0` (no C input) — changed `?alpha ?beta ?epilogue` → `?alpha 0.0 ?epilogue`. The mixed-first ordering was already safe because beta fusion has its own `(= ?c_dtype (dtype ?c))` guard; only the beta-first-then-cast ordering (residual fused as a bf16 C *before* the cast) was dangerous. Result: nondeterminism loop 12/20 → **0/20 broken**, minimal repro 11/12 → **0/12**. **Do not delete the rule outright** — it still serves the legitimate case `(a[bf16]·b[bf16]).cast(F32) + c[F32]` (an f32 C added *after* the cast, so `c == d == f32`, which cuBLASLt supports): there `mixed_dtype` fires on the `beta=0` matmul and the f32 C beta-fuses cleanly. The guard preserves that; full removal was tried and **breaks** the (default-`#[ignore]`d) Rust tests `cublaslt_rewrites_cover_{,batched_}mixed_low_precision_inputs_f32_output_and_c` in `tests/cublaslt_rewrite_tests.rs`. A separate lesson: the Python pytest suite does **not** cover these Rust `cargo test` cases, so validating an egglog rewrite change requires running both — and `git log`-ing a file's origin commit to see what it was added for.
+
+6. **Principle**: a cuBLASLt op's `c_dtype` **must** equal its actual C buffer's dtype, and any rewrite that changes output/C dtypes must respect whether a real C (beta!=0) input is present — never flip `c_dtype` on a matmul that has a fused C. More generally: **e-graph rewrites must be exactly numerically equivalent**, because the extraction search optimizes for *speed* and will happily pick a faster-but-wrong candidate — it has no reference-correctness check. When a backend bug is nondeterministic and "every part works alone," suspect a non-equivalent rewrite creating a bad candidate that the search sometimes extracts; quantify the rate, then bisect with minimal reproducers and kernel/trace dumps rather than chasing individual ops.

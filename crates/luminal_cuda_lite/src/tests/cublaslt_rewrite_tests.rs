@@ -1311,70 +1311,6 @@ fn cublaslt_rewrites_cover_batched_scaled_alpha_beta() {
 }
 
 #[test]
-#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
-fn cublaslt_rewrites_cover_mixed_low_precision_inputs_f32_output_and_c() {
-    for (dtype, compute_type) in [(DType::F16, "32F"), (DType::Bf16, "32F_FAST_16BF")] {
-        let expected_tuple = (
-            dtype,
-            dtype,
-            DType::F32,
-            DType::F32,
-            compute_type,
-            DType::F32,
-        );
-        assert_cublaslt_rewrite(
-            build_2d_cast_matmul_plus_c_graph(
-                LayoutCase {
-                    name: "mixed dtype row-major",
-                    a_col_major: false,
-                    b_col_major: false,
-                },
-                dtype,
-                DType::F32,
-                false,
-            ),
-            "mixed dtype f32 output",
-            |llir| {
-                cublaslt_type_tuples(llir).contains(&expected_tuple)
-                    && cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
-            },
-        );
-    }
-}
-
-#[test]
-#[ignore = "expensive CUDA rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
-fn cublaslt_rewrites_cover_batched_mixed_low_precision_inputs_f32_output_and_c() {
-    for (dtype, compute_type) in [(DType::F16, "32F"), (DType::Bf16, "32F_FAST_16BF")] {
-        let expected_tuple = (
-            dtype,
-            dtype,
-            DType::F32,
-            DType::F32,
-            compute_type,
-            DType::F32,
-        );
-        assert_cublaslt_rewrite(
-            build_batched_cast_matmul_plus_c_graph(
-                LayoutCase {
-                    name: "batched mixed dtype row-major",
-                    a_col_major: false,
-                    b_col_major: false,
-                },
-                dtype,
-                DType::F32,
-                false,
-            ),
-            "batched mixed dtype f32 output",
-            |llir| {
-                cublaslt_type_tuples(llir).contains(&expected_tuple)
-                    && cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
-            },
-        );
-    }
-}
-
-#[test]
 #[ignore = "expensive CUDA FP8 rewrite sweep; run with cargo test -p luminal_cuda_lite -- --ignored"]
 fn cublaslt_fp8_supported_pairs_execute_2d_matmul_f32_output() {
     for (a_dtype, b_dtype) in CUBLASLT_FP8_F32_PAIRS {
@@ -3138,18 +3074,6 @@ fn build_2d_scaled_alpha_beta_graph(case: LayoutCase, dtype: DType, commuted: bo
     })
 }
 
-fn build_2d_cast_matmul_plus_c_graph(
-    case: LayoutCase,
-    input_dtype: DType,
-    output_dtype: DType,
-    commuted: bool,
-) -> Graph {
-    build_2d_layout_graph(case, input_dtype, input_dtype, |cx, a, b, m, n, _| {
-        let c = cx.tensor((m, n)).as_dtype(output_dtype);
-        add_commuted(a.matmul(b).cast(output_dtype), c, commuted)
-    })
-}
-
 fn build_2d_matmul_plus_column_bias_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
         let bias = cx.tensor(n).as_dtype(dtype).expand_dim(0, m);
@@ -3285,23 +3209,6 @@ fn build_batched_scaled_alpha_beta_graph(case: LayoutCase, dtype: DType, commute
         let c = cx.tensor((batch, m, n)).as_dtype(dtype);
         add_commuted(a.matmul(b) * 1.5, c * 0.5, commuted)
     })
-}
-
-fn build_batched_cast_matmul_plus_c_graph(
-    case: LayoutCase,
-    input_dtype: DType,
-    output_dtype: DType,
-    commuted: bool,
-) -> Graph {
-    build_batched_layout_graph(
-        case,
-        input_dtype,
-        input_dtype,
-        |cx, a, b, batch, m, n, _| {
-            let c = cx.tensor((batch, m, n)).as_dtype(output_dtype);
-            add_commuted(a.matmul(b).cast(output_dtype), c, commuted)
-        },
-    )
 }
 
 fn build_batched_matmul_plus_column_bias_graph(
