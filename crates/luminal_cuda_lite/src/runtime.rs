@@ -269,6 +269,27 @@ impl CudaRuntime {
         self.set_max_memory_bytes(Some(max_memory_gib.saturating_mul(1024 * 1024 * 1024)));
     }
 
+    /// Return memory the async allocator pool retains back to the device.
+    ///
+    /// Allocations go through `cuMemAllocAsync`, whose pool keeps freed blocks
+    /// cached instead of returning them. Search profiling grows and frees many
+    /// arena generations, leaving several GB resident in the pool afterward —
+    /// enough to OOM the final stitched-graph allocation on a memory-tight GPU
+    /// (e.g. a 26B model + arena on an 80 GB A100). Call this after search,
+    /// before the first real execute: sync so pending frees complete, then
+    /// trim the device pool to zero. Live buffers (weights, the active arena)
+    /// are in use and untouched.
+    pub fn release_pooled_memory(&self) {
+        let _ = self.cuda_stream.synchronize();
+        unsafe {
+            if let Ok(dev) = result::device::get(0)
+                && let Ok(pool) = result::device::get_default_mem_pool(dev)
+            {
+                let _ = result::mem_pool::trim_to(pool, 0);
+            }
+        }
+    }
+
     /// Get the active compiled bucket.
     fn active(&self) -> &CompiledBucket {
         &self.compiled_buckets[self.active_bucket]

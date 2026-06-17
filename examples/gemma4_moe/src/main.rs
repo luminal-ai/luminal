@@ -89,12 +89,10 @@ fn main() {
     println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
 
     println!("Loading weights...");
-    // ~52 GB of bf16/F32 weights + the ~13 GB the search leaves resident
-    // before the stitched-graph allocation leave only ~12 GB of an 80 GB
-    // A100 for intermediates. Cap below that so the search can only select a
-    // genome whose arena fits (candidates run 3-18 GiB with GLUMoE enabled;
-    // a higher cap lets it pick an 18 GiB genome that OOMs at execution).
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(10);
+    // ~52 GB of weights leave room for the arena on an 80 GB A100 only after
+    // release_pooled_memory() (below) reclaims what search profiling leaves in
+    // the async allocator pool — without that trim even a 10 GiB arena OOMs.
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(12);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
@@ -120,6 +118,11 @@ fn main() {
         .search_graph_limit(search_graphs)
         .profile_timeout(Duration::from_secs(2));
     runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+
+    // Search profiling leaves several GB cached in the async allocator pool;
+    // reclaim it before the first real execute so the stitched-graph arena
+    // allocation has room alongside the 52 GB of weights on an 80 GB A100.
+    runtime.release_pooled_memory();
 
     // Pre-size the gather index buffer to its maximum so per-step set_data
     // reuses the same device pointer — growth reallocation would invalidate

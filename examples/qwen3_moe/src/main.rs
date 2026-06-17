@@ -125,6 +125,10 @@ fn main() {
     let search_options = CompileOptions::default().search_graph_limit(search_graphs);
     runtime = cx.search_with_rng(runtime, search_options, &mut rng);
 
+    // Reclaim memory the async allocator pool retains from search profiling so
+    // the stitched-graph arena fits alongside the weights (see gemma4_moe).
+    runtime.release_pooled_memory();
+
     // Pre-size the gather index buffer to its maximum so per-step set_data
     // reuses the same device pointer — otherwise every growth reallocates,
     // the pointer change invalidates the FlashInfer capture signatures, and
