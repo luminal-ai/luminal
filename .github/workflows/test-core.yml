@@ -9,6 +9,7 @@ on:
 
 env:
     CARGO_TERM_COLOR: always
+    LUMINAL_LOG: "1"
 
 jobs:
     core_unit_test:
