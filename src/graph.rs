@@ -448,9 +448,6 @@ impl Graph {
 
     fn run_auto_loop_rolling_prepass(&mut self, options: &CompileOptions) {
         let log = options.rolling_log_enabled();
-        if !log {
-            return;
-        }
         let before = self.graph.node_count();
         let inserted = self.auto_roll_loops_prepass_with_log(log);
         if inserted == 0 {
@@ -802,9 +799,6 @@ impl Graph {
     /// - only inserts when the carried edge shapes can be inferred
     pub fn auto_roll_loops_prepass(&mut self) -> usize {
         let log = log_channel_enabled(false, "ROLLING_LOG");
-        if !log {
-            return 0;
-        }
         self.auto_roll_loops_prepass_with_log(log)
     }
 
@@ -3340,5 +3334,32 @@ mod tests {
 
         let inserted = cx.auto_roll_loops_prepass_with_log(true);
         assert_eq!(inserted, 0, "branch-only reuse should not roll into loops");
+    }
+
+    #[test]
+    fn test_auto_roll_loops_prepass_runs_when_logging_is_disabled() {
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let out = x.exp2().sin().exp2().sin().exp2().sin().output();
+
+        let before = cx.graph.node_count();
+        let inserted = cx.auto_roll_loops_prepass();
+        let after = cx.graph.node_count();
+
+        assert!(
+            inserted >= 2,
+            "expected loop rolling to run without ROLLING_LOG, got {inserted}"
+        );
+        assert!(
+            after < before,
+            "expected loop rolling to reduce nodes ({before} -> {after})"
+        );
+        assert!(
+            cx.graph
+                .neighbors_directed(out.id, Direction::Outgoing)
+                .next()
+                .is_none(),
+            "output should remain a graph root"
+        );
     }
 }
