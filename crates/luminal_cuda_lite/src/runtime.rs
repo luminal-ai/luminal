@@ -2481,6 +2481,10 @@ impl CudaRuntime {
         // Rebind CUDA context to thread after cleanup to ensure valid state
         let _ = self.cuda_stream.context().bind_to_thread();
 
+        // Reclaim search-profiling residue from the async allocator pool before
+        // the stitched-graph arena allocates (see try_load_llir_buckets).
+        self.release_pooled_memory();
+
         let bucket = self.compile_bucket(llir_graph);
         self.compiled_buckets = vec![bucket];
         self.active_bucket = 0;
@@ -2517,6 +2521,12 @@ impl CudaRuntime {
             representative_dyn_maps.push(representative_dyn_map.clone());
             self.compiled_buckets.push(bucket);
         }
+        // Reclaim what search profiling left resident in the async allocator
+        // pool before allocating the stitched-graph arenas. This load runs
+        // inside search() (the final stitch), before the example gets a chance
+        // to call release_pooled_memory() itself, so on a memory-tight GPU the
+        // arena allocation below would otherwise OOM against the pool residue.
+        self.release_pooled_memory();
         for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
             self.prepare_bucket_buffers(idx, representative_dyn_map);
             self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)?;

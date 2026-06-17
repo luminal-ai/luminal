@@ -1313,6 +1313,15 @@ mod tests {
     }
 
     #[test]
+    fn test_singleton_interval_substitutes_dynamic_var() {
+        let s = expr('s');
+        let intervals = [('s', DimInterval::new(1, 1))].into_iter().collect();
+
+        assert_eq!((s + 127).simplify_with_intervals(&intervals), expr(128));
+        assert_eq!((s.lt(2)).simplify_with_intervals(&intervals), expr(1));
+    }
+
+    #[test]
     fn test_interval_simplification_requires_proof() {
         let s = expr('s');
         let intervals = [('s', DimInterval::new(0, 256))].into_iter().collect();
