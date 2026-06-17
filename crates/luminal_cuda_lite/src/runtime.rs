@@ -1300,10 +1300,18 @@ impl CudaRuntime {
     }
 
     fn assign_fixed_arena_slots(bucket: &mut CompiledBucket, mut planned: Vec<PlannedBuffer>) {
+        // Size-major assignment order: place the largest buffers first so they
+        // pack among themselves (per-layer giants have pairwise-disjoint
+        // lifetimes and collapse into a few slots), then let small buffers fill
+        // in around them. The previous start-major order interleaved big and
+        // small buffers: each big buffer first-fit into a different
+        // small-polluted slot, pushing that slot's capacity to the big size —
+        // ~100 slots × ~0.5-2 GiB on qwen3-30b-a3b's PT2 graph ≈ a 54 GiB arena
+        // for an ~2 GiB actual working set (which then OOMs / is slow to alloc).
         planned.sort_by_key(|buf| {
             (
-                buf.start,
                 std::cmp::Reverse(buf.bytes),
+                buf.start,
                 std::cmp::Reverse(buf.end.saturating_sub(buf.start)),
                 buf.node.index(),
             )
