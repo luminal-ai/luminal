@@ -1,6 +1,7 @@
 use crate::egglog_utils::{
     count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation, hash_choice_set,
-    hlir_to_egglog, random_initial_choice, run_egglog_with_late_passes_and_interval_analysis,
+    hlir_to_egglog, log_channel_enabled, random_initial_choice,
+    run_egglog_with_late_passes_interval_analysis_and_log,
 };
 use crate::shape::{DimInterval, DynDimIntervals};
 use crate::{
@@ -173,6 +174,15 @@ pub struct CompileOptions {
     /// Bucket definitions per dynamic dimension. Dimensions without buckets use
     /// a single implicit bucket.
     pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    /// Enable egglog progress logging. Quiet by default; overridden by
+    /// `EGGLOG_LOG=1` or `LUMINAL_LOG=1`.
+    pub egglog_log: bool,
+    /// Enable automatic loop rolling and its diagnostics. Disabled by default;
+    /// overridden by `ROLLING_LOG=1` or `LUMINAL_LOG=1`.
+    pub rolling_log: bool,
+    /// Enable search progress logging. Enabled by default; overridden by
+    /// `SEARCH_LOG=0`/`1` or `LUMINAL_LOG=1`.
+    pub search_log: bool,
 }
 
 impl CompileOptions {
@@ -234,6 +244,36 @@ impl CompileOptions {
         self.dim_buckets.insert(dimension, buckets.to_vec());
         self
     }
+
+    /// Enable or disable egglog progress logging.
+    pub fn egglog_log(mut self, enabled: bool) -> Self {
+        self.egglog_log = enabled;
+        self
+    }
+
+    /// Enable or disable automatic loop rolling and its diagnostics.
+    pub fn rolling_log(mut self, enabled: bool) -> Self {
+        self.rolling_log = enabled;
+        self
+    }
+
+    /// Enable or disable search progress logging.
+    pub fn search_log(mut self, enabled: bool) -> Self {
+        self.search_log = enabled;
+        self
+    }
+
+    fn egglog_log_enabled(&self) -> bool {
+        log_channel_enabled(self.egglog_log, "EGGLOG_LOG")
+    }
+
+    fn rolling_log_enabled(&self) -> bool {
+        log_channel_enabled(self.rolling_log, "ROLLING_LOG")
+    }
+
+    fn search_log_enabled(&self) -> bool {
+        log_channel_enabled(self.search_log, "SEARCH_LOG")
+    }
 }
 
 impl Default for CompileOptions {
@@ -248,6 +288,9 @@ impl Default for CompileOptions {
             profile_timeout: Some(std::time::Duration::from_secs(1)),
             profile_dims: FxHashMap::default(),
             dim_buckets: FxHashMap::default(),
+            egglog_log: false,
+            rolling_log: false,
+            search_log: true,
         }
     }
 }
@@ -403,9 +446,13 @@ impl Graph {
         Graph::default()
     }
 
-    fn run_auto_loop_rolling_prepass(&mut self) {
+    fn run_auto_loop_rolling_prepass(&mut self, options: &CompileOptions) {
+        let log = options.rolling_log_enabled();
+        if !log {
+            return;
+        }
         let before = self.graph.node_count();
-        let inserted = self.auto_roll_loops_prepass();
+        let inserted = self.auto_roll_loops_prepass_with_log(log);
         if inserted == 0 {
             println!(
                 "   {:>6}  no loop regions found (max body={})",
@@ -417,7 +464,7 @@ impl Graph {
 
     /// Mutate the HLIR graph in place to fold N repeated body occurrences into
     /// a single body plus loop-marker ops. See `auto_roll_loops_prepass`.
-    fn insert_loop_region_ops(&mut self, candidate: RollingCandidate) -> usize {
+    fn insert_loop_region_ops(&mut self, candidate: RollingCandidate, log: bool) -> usize {
         use crate::hlir::{LoopEnd, LoopInput, LoopOutput, LoopOutputSelect, LoopStart, Output};
         use petgraph::visit::EdgeRef;
 
@@ -670,7 +717,7 @@ impl Graph {
             self.graph.remove_node(node);
         }
 
-        if created > 0 {
+        if log && created > 0 {
             let nodes_after = self.graph.node_count();
             // Region partition: body_nodes is the surviving one-iteration body,
             // `created` is the marker scaffold (LoopStart/End/Input/Output),
@@ -754,42 +801,56 @@ impl Graph {
     /// - only rolls candidates with at least one loop-carried state parameter
     /// - only inserts when the carried edge shapes can be inferred
     pub fn auto_roll_loops_prepass(&mut self) -> usize {
+        let log = log_channel_enabled(false, "ROLLING_LOG");
+        if !log {
+            return 0;
+        }
+        self.auto_roll_loops_prepass_with_log(log)
+    }
+
+    fn auto_roll_loops_prepass_with_log(&mut self, log: bool) -> usize {
         let max_region_size = self.graph.node_count() / 2;
         if max_region_size < 1 {
             return 0;
         }
-        println!(
-            "   {:>6}  scanning {} HLIR nodes for loop regions (max body={})",
-            "Rolled".cyan().bold(),
-            self.graph.node_count(),
-            max_region_size,
-        );
-        let report = self.best_rolling_candidate(max_region_size);
-        let Some(candidate) = report.candidate else {
-            self.print_rolling_search_diagnostics(&report.diagnostics);
-            return 0;
-        };
-        println!(
-            "   {:>6}  candidate: body={} trips={} boundary_inputs={} state_params={:?}",
-            "Rolled".yellow().bold(),
-            candidate.occurrences[0].nodes.len(),
-            candidate.occurrences.len(),
-            candidate.occurrences[0].boundary_inputs.len(),
-            candidate.state_param_indices,
-        );
-        if let Some(rejected) = &report.diagnostics.best_rejected {
+        if log {
             println!(
-                "   {:>6}  best rejected: body={} trips={} boundary_inputs={} state_params={} savings={}",
-                "Rolled".yellow().bold(),
-                rejected.window,
-                rejected.repetitions,
-                rejected.boundary_inputs,
-                rejected.state_params,
-                rejected.savings,
+                "   {:>6}  scanning {} HLIR nodes for loop regions (max body={})",
+                "Rolled".cyan().bold(),
+                self.graph.node_count(),
+                max_region_size,
             );
         }
-        for run in report.diagnostics.top_runs.iter().take(5) {
-            println!("   {:>6}  run: {}", "Rolled".yellow().bold(), run);
+        let report = self.best_rolling_candidate(max_region_size);
+        let Some(candidate) = report.candidate else {
+            if log {
+                self.print_rolling_search_diagnostics(&report.diagnostics);
+            }
+            return 0;
+        };
+        if log {
+            println!(
+                "   {:>6}  candidate: body={} trips={} boundary_inputs={} state_params={:?}",
+                "Rolled".yellow().bold(),
+                candidate.occurrences[0].nodes.len(),
+                candidate.occurrences.len(),
+                candidate.occurrences[0].boundary_inputs.len(),
+                candidate.state_param_indices,
+            );
+            if let Some(rejected) = &report.diagnostics.best_rejected {
+                println!(
+                    "   {:>6}  best rejected: body={} trips={} boundary_inputs={} state_params={} savings={}",
+                    "Rolled".yellow().bold(),
+                    rejected.window,
+                    rejected.repetitions,
+                    rejected.boundary_inputs,
+                    rejected.state_params,
+                    rejected.savings,
+                );
+            }
+            for run in report.diagnostics.top_runs.iter().take(5) {
+                println!("   {:>6}  run: {}", "Rolled".yellow().bold(), run);
+            }
         }
         if candidate.occurrences.len() < 2 {
             return 0;
@@ -799,7 +860,7 @@ impl Graph {
         // LoopOutput markers, delete N-1 duplicate bodies. The loop structure
         // is encoded in the HLIR graph itself and the downstream single-root
         // egglog path picks it up unchanged.
-        self.insert_loop_region_ops(candidate)
+        self.insert_loop_region_ops(candidate, log)
     }
 
     fn print_rolling_search_diagnostics(&self, diagnostics: &RollingSearchDiagnostics) {
@@ -1116,7 +1177,7 @@ impl Graph {
 
     #[tracing::instrument(skip_all)]
     pub fn build_search_space<Rt: Runtime + 'static>(&mut self, options: CompileOptions) {
-        self.run_auto_loop_rolling_prepass();
+        self.run_auto_loop_rolling_prepass(&options);
         let mut ops = Rt::Ops::into_vec();
         ops.extend(<crate::hlir::HLIROps as IntoEgglogOp>::into_vec());
         let cleanup_hlir = TypeId::of::<Rt>() != TypeId::of::<NativeRuntime>();
@@ -1131,13 +1192,14 @@ impl Graph {
             .map(|context| {
                 let (contextual_program, use_interval_analysis) =
                     self.egglog_program_with_interval_facts(&program, &context.intervals);
-                run_egglog_with_late_passes_and_interval_analysis(
+                run_egglog_with_late_passes_interval_analysis_and_log(
                     &contextual_program,
                     &root,
                     &ops,
                     cleanup_hlir,
                     &late_passes,
                     use_interval_analysis,
+                    options.egglog_log_enabled(),
                 )
                 .unwrap()
             })
@@ -1209,7 +1271,7 @@ impl Graph {
         &mut self,
         options: CompileOptions,
     ) {
-        self.run_auto_loop_rolling_prepass();
+        self.run_auto_loop_rolling_prepass(&options);
         let exclude_ops = Ex::into_vec()
             .into_iter()
             .map(|e| e.sort().name)
@@ -1229,13 +1291,14 @@ impl Graph {
             .map(|context| {
                 let (contextual_program, use_interval_analysis) =
                     self.egglog_program_with_interval_facts(&program, &context.intervals);
-                run_egglog_with_late_passes_and_interval_analysis(
+                run_egglog_with_late_passes_interval_analysis_and_log(
                     &contextual_program,
                     &root,
                     &ops,
                     cleanup_hlir,
                     &late_passes,
                     use_interval_analysis,
+                    options.egglog_log_enabled(),
                 )
                 .unwrap()
             })
@@ -1296,6 +1359,7 @@ impl Graph {
         );
 
         let search_started_at = std::time::Instant::now();
+        let search_log = options.search_log_enabled();
         if self.search_space_dim_buckets.is_empty() {
             // No buckets: existing single-search path
             let stitched = self.search_single(
@@ -1326,13 +1390,15 @@ impl Graph {
             for (combo_idx, context) in bucket_contexts.into_iter().enumerate() {
                 let bucket_label = self
                     .format_bucket_label(&self.search_space_dim_buckets, &context.bucket_indices);
-                println!(
-                    "   {:>6}  Group {}/{}: {}",
-                    "Search".cyan().bold(),
-                    combo_idx + 1,
-                    n_combos,
-                    bucket_label,
-                );
+                if search_log {
+                    println!(
+                        "   {:>6}  Group {}/{}: {}",
+                        "Search".cyan().bold(),
+                        combo_idx + 1,
+                        n_combos,
+                        bucket_label,
+                    );
+                }
 
                 let stitched = self.search_single(
                     &mut runtime,
@@ -1454,6 +1520,7 @@ impl Graph {
         let egraph = &self.egraphs[egraph_index];
         let search_limit = count_choice_sets_up_to(egraph, limit);
         let start = std::time::Instant::now();
+        let search_log = options.search_log_enabled();
 
         // Bar layout: one Search bar, plus an optional Bucket bar.
         let n_bar_lines = 1 + if bucket_progress.is_some() { 1 } else { 0 };
@@ -1624,10 +1691,12 @@ impl Graph {
         };
 
         // Print initial result and progress
-        let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
-        println!("{msg}");
-        render_bars(n_graphs, search_limit, bucket_progress);
-        std::io::stdout().flush().unwrap();
+        if search_log {
+            let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
+            println!("{msg}");
+            render_bars(n_graphs, search_limit, bucket_progress);
+            std::io::stdout().flush().unwrap();
+        }
 
         // Track top-N parents for offspring generation
         let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
@@ -1691,12 +1760,14 @@ impl Graph {
                     llir_graph
                 }));
                 let Ok(llir_graph) = graph_result else {
-                    for _ in 1..n_bar_lines {
-                        print!("\x1b[1A");
+                    if search_log {
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        render_bars(n_graphs, search_limit, bucket_progress);
+                        std::io::stdout().flush().unwrap();
                     }
-                    print!("\r\x1b[2K");
-                    render_bars(n_graphs, search_limit, bucket_progress);
-                    std::io::stdout().flush().unwrap();
                     continue;
                 };
 
@@ -1757,33 +1828,39 @@ impl Graph {
                     }
                     Ok((_, _, _, true, _)) | Err(_) => {
                         // Timed out or panicked — redraw bars and skip.
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
+                        if search_log {
+                            for _ in 1..n_bar_lines {
+                                print!("\x1b[1A");
+                            }
+                            print!("\r\x1b[2K");
+                            render_bars(n_graphs, search_limit, bucket_progress);
+                            std::io::stdout().flush().unwrap();
                         }
-                        print!("\r\x1b[2K");
-                        render_bars(n_graphs, search_limit, bucket_progress);
-                        std::io::stdout().flush().unwrap();
                         continue;
                     }
                     Ok((_, _, true, false, _)) => {
                         generation_found_non_timeout = true;
                         // Completed profiling but produced NaNs — redraw bars and skip.
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
+                        if search_log {
+                            for _ in 1..n_bar_lines {
+                                print!("\x1b[1A");
+                            }
+                            print!("\r\x1b[2K");
+                            render_bars(n_graphs, search_limit, bucket_progress);
+                            std::io::stdout().flush().unwrap();
                         }
-                        print!("\r\x1b[2K");
-                        render_bars(n_graphs, search_limit, bucket_progress);
-                        std::io::stdout().flush().unwrap();
                         continue;
                     }
                     Ok((_, _, false, false, true)) => {
                         // Backend rejected this candidate during load/profile.
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
+                        if search_log {
+                            for _ in 1..n_bar_lines {
+                                print!("\x1b[1A");
+                            }
+                            print!("\r\x1b[2K");
+                            render_bars(n_graphs, search_limit, bucket_progress);
+                            std::io::stdout().flush().unwrap();
                         }
-                        print!("\r\x1b[2K");
-                        render_bars(n_graphs, search_limit, bucket_progress);
-                        std::io::stdout().flush().unwrap();
                         continue;
                     }
                 };
@@ -1813,38 +1890,44 @@ impl Graph {
                 }
 
                 if new_best {
-                    let msg = format!("   {:>6} {display_metric}", "Searched".green().bold());
-                    for _ in 1..n_bar_lines {
-                        print!("\x1b[1A");
+                    if search_log {
+                        let msg = format!("   {:>6} {display_metric}", "Searched".green().bold());
+                        for _ in 1..n_bar_lines {
+                            print!("\x1b[1A");
+                        }
+                        print!("\r\x1b[2K");
+                        println!("{msg}");
                     }
-                    print!("\r\x1b[2K");
-                    println!("{msg}");
-                } else {
+                } else if search_log {
                     for _ in 1..n_bar_lines {
                         print!("\x1b[1A");
                     }
                     print!("\r\x1b[2K");
                 }
-                render_bars(n_graphs, search_limit, bucket_progress);
-                std::io::stdout().flush().unwrap();
+                if search_log {
+                    render_bars(n_graphs, search_limit, bucket_progress);
+                    std::io::stdout().flush().unwrap();
+                }
             }
 
             resample_generation = !generation_found_non_timeout;
         }
 
         // Clear progress bars
-        for _ in 1..n_bar_lines {
-            print!("\x1b[1A");
+        if search_log {
+            for _ in 1..n_bar_lines {
+                print!("\x1b[1A");
+            }
+            print!("\r");
+            for _ in 0..n_bar_lines {
+                println!("\x1b[2K");
+            }
+            for _ in 0..n_bar_lines {
+                print!("\x1b[1A");
+            }
+            print!("\r");
+            std::io::stdout().flush().unwrap();
         }
-        print!("\r");
-        for _ in 0..n_bar_lines {
-            println!("\x1b[2K");
-        }
-        for _ in 0..n_bar_lines {
-            print!("\x1b[1A");
-        }
-        print!("\r");
-        std::io::stdout().flush().unwrap();
 
         // Re-extract the winning genome WITHOUT the per-candidate
         // single-iteration collapse, then run the real loop unroll. The
@@ -1869,11 +1952,13 @@ impl Graph {
         }
         unroll_loops_in_llir(&mut stitched);
 
-        println!(
-            "   {:>6}  in {}",
-            "Searched".green().bold(),
-            pretty_duration::pretty_duration(&start.elapsed(), None)
-        );
+        if search_log {
+            println!(
+                "   {:>6}  in {}",
+                "Searched".green().bold(),
+                pretty_duration::pretty_duration(&start.elapsed(), None)
+            );
+        }
 
         let dump_label = bucket_progress
             .map(|(bucket_idx, n_buckets)| {
@@ -2957,13 +3042,22 @@ mod tests {
         let opts = CompileOptions::default();
         assert_eq!(opts.limit, 100);
         assert_eq!(opts.search_time_limit, std::time::Duration::MAX);
+        assert!(!opts.egglog_log);
+        assert!(!opts.rolling_log);
+        assert!(opts.search_log);
 
         let time_limit = std::time::Duration::from_millis(25);
         let opts = CompileOptions::default()
             .search_graph_limit(7)
-            .search_time_limit(time_limit);
+            .search_time_limit(time_limit)
+            .egglog_log(true)
+            .rolling_log(true)
+            .search_log(false);
         assert_eq!(opts.limit, 7);
         assert_eq!(opts.search_time_limit, time_limit);
+        assert!(opts.egglog_log);
+        assert!(opts.rolling_log);
+        assert!(!opts.search_log);
     }
 
     #[test]
@@ -3175,7 +3269,7 @@ mod tests {
         let x = cx.tensor(8);
         let out = x.exp2().sin().exp2().sin().exp2().sin().output();
 
-        let inserted = cx.auto_roll_loops_prepass();
+        let inserted = cx.auto_roll_loops_prepass_with_log(true);
         assert!(
             inserted >= 2,
             "expected at least two loop boundaries for 3 repeated bodies, got {inserted}"
@@ -3207,7 +3301,7 @@ mod tests {
         let y = y.output();
 
         let before = cx.graph.node_count();
-        let inserted = cx.auto_roll_loops_prepass();
+        let inserted = cx.auto_roll_loops_prepass_with_log(true);
         let after = cx.graph.node_count();
         assert!(
             inserted >= 2,
@@ -3244,7 +3338,7 @@ mod tests {
         let y = cx.tensor(8);
         let _out = (x.exp().sin() + y.exp().sin()).output();
 
-        let inserted = cx.auto_roll_loops_prepass();
+        let inserted = cx.auto_roll_loops_prepass_with_log(true);
         assert_eq!(inserted, 0, "branch-only reuse should not roll into loops");
     }
 }

@@ -32,6 +32,23 @@ const EGGLOG_RULESETS: &[&str] = &[
     "fusion_merge",
 ];
 
+fn parse_log_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+pub fn log_channel_enabled(option_enabled: bool, channel_env: &str) -> bool {
+    if std::env::var("LUMINAL_LOG").is_ok_and(|value| parse_log_flag(&value)) {
+        return true;
+    }
+    if let Ok(value) = std::env::var(channel_env) {
+        return parse_log_flag(&value);
+    }
+    option_enabled
+}
+
 #[derive(Debug, Clone)]
 struct EgglogSchedulePhase {
     name: String,
@@ -706,10 +723,8 @@ fn metric_duration(duration: Duration) -> String {
     pretty_duration::pretty_duration(&duration, None)
 }
 
-/// Verbose per-rule / per-ruleset printing. Off by default — the cycle
-/// header, summary header, and final timing line stay; the breakdown
-/// tables and `print_serialized_shape` ("Egglog extract root shape …")
-/// are suppressed unless `EGGLOG_DEBUG=1`.
+/// Extra per-rule / per-ruleset printing. Requires the normal egglog log
+/// channel plus `EGGLOG_DEBUG=1`.
 fn egglog_debug() -> bool {
     std::env::var("EGGLOG_DEBUG").is_ok_and(|v| !v.is_empty() && v != "0")
 }
@@ -891,7 +906,10 @@ fn print_slow_phase_detail(
     }
 }
 
-fn print_run_summary(run_report: &EgglogRunReport) {
+fn print_run_summary_with_log(run_report: &EgglogRunReport, log: bool) {
+    if !log {
+        return;
+    }
     eprintln!(
         "{}",
         format!(
@@ -978,8 +996,8 @@ fn print_run_summary(run_report: &EgglogRunReport) {
     }
 }
 
-fn print_serialized_shape(s: &egglog::SerializeOutput) {
-    if !egglog_debug() {
+fn print_serialized_shape_with_log(s: &egglog::SerializeOutput, log: bool) {
+    if !log || !egglog_debug() {
         return;
     }
     let mut classes = FxHashSet::default();
@@ -1013,6 +1031,7 @@ fn run_schedule_phase(
     egraph: &mut egglog::EGraph,
     phases: &mut Vec<EgglogPhaseReport>,
     phase: &EgglogSchedulePhase,
+    log: bool,
 ) -> Result<bool, egglog::Error> {
     let command = format!("(run-schedule {})", phase.schedule);
     let tuples_before = egraph.num_tuples();
@@ -1032,22 +1051,24 @@ fn run_schedule_phase(
     let updated = report.updated;
     let iterations = report.iterations.len();
     let tuple_delta = tuples_after as isize - tuples_before as isize;
-    eprintln!(
-        "{}",
-        format!(
-            "   Egglog {:<28} {:>10} | tuples {} -> {} ({:+}) | updated={} | iterations={}",
-            phase.name,
-            metric_duration(elapsed),
-            tuples_before,
-            tuples_after,
-            tuple_delta,
-            updated,
-            iterations,
-        )
-        .cyan()
-    );
+    if log {
+        eprintln!(
+            "{}",
+            format!(
+                "   Egglog {:<28} {:>10} | tuples {} -> {} ({:+}) | updated={} | iterations={}",
+                phase.name,
+                metric_duration(elapsed),
+                tuples_before,
+                tuples_after,
+                tuple_delta,
+                updated,
+                iterations,
+            )
+            .cyan()
+        );
+    }
 
-    if egglog_debug() {
+    if log && egglog_debug() {
         let mut rulesets = report
             .search_and_apply_time_per_ruleset
             .keys()
@@ -1162,8 +1183,29 @@ pub fn run_egglog_with_report_late_passes_and_interval_analysis(
     late_passes: &[LateEgglogPass],
     use_interval_analysis: bool,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    run_egglog_with_report_late_passes_interval_analysis_and_log(
+        program,
+        root,
+        ops,
+        cleanup,
+        late_passes,
+        use_interval_analysis,
+        log_channel_enabled(false, "EGGLOG_LOG"),
+    )
+}
+
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with_report_late_passes_interval_analysis_and_log(
+    program: &str,
+    root: &str,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+    cleanup: bool,
+    late_passes: &[LateEgglogPass],
+    use_interval_analysis: bool,
+    log: bool,
+) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
     let op_parts = OpTextParts::new_with_late_passes(ops, cleanup, late_passes);
-    run_egglog_with_report_parts_impl(program, root, &op_parts, use_interval_analysis)
+    run_egglog_with_report_parts_impl(program, root, &op_parts, use_interval_analysis, log)
 }
 
 /// Same as [`run_egglog_with_report`], but takes pre-computed [`OpTextParts`].
@@ -1176,7 +1218,13 @@ pub fn run_egglog_with_report_parts(
     root: &str,
     op_parts: &OpTextParts,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
-    run_egglog_with_report_parts_impl(program, root, op_parts, false)
+    run_egglog_with_report_parts_impl(
+        program,
+        root,
+        op_parts,
+        false,
+        log_channel_enabled(false, "EGGLOG_LOG"),
+    )
 }
 
 fn run_egglog_with_report_parts_impl(
@@ -1184,13 +1232,14 @@ fn run_egglog_with_report_parts_impl(
     root: &str,
     op_parts: &OpTextParts,
     use_interval_analysis: bool,
+    log: bool,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
     #[cfg(debug_assertions)]
     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         static WARNED_DEBUG_EGGLOG: AtomicBool = AtomicBool::new(false);
-        if !WARNED_DEBUG_EGGLOG.swap(true, Ordering::Relaxed) {
+        if log && !WARNED_DEBUG_EGGLOG.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "{}",
                 "   Egglog warning: running in a debug build; model-sized saturation can be very slow. Use `cargo run --release ...` for CUDA model examples."
@@ -1219,23 +1268,25 @@ fn run_egglog_with_report_parts_impl(
     let setup_run_elapsed = setup_run_start.elapsed();
     let setup_tuples_after = egraph.num_tuples();
 
-    eprintln!(
-        "{}",
-        format!(
-            "   Egglog {:<28} {:>10} | text {} parse {} run {} | lines {} bytes {} | tuples {} -> {} ({:+})",
-            "setup",
-            metric_duration(setup_start.elapsed()),
-            metric_duration(setup_text_elapsed),
-            metric_duration(parse_elapsed),
-            metric_duration(setup_run_elapsed),
-            setup_lines,
-            setup_code.len(),
-            setup_tuples_before,
-            setup_tuples_after,
-            setup_tuples_after as isize - setup_tuples_before as isize,
-        )
-        .cyan()
-    );
+    if log {
+        eprintln!(
+            "{}",
+            format!(
+                "   Egglog {:<28} {:>10} | text {} parse {} run {} | lines {} bytes {} | tuples {} -> {} ({:+})",
+                "setup",
+                metric_duration(setup_start.elapsed()),
+                metric_duration(setup_text_elapsed),
+                metric_duration(parse_elapsed),
+                metric_duration(setup_run_elapsed),
+                setup_lines,
+                setup_code.len(),
+                setup_tuples_before,
+                setup_tuples_after,
+                setup_tuples_after as isize - setup_tuples_before as isize,
+            )
+            .cyan()
+        );
+    }
 
     trace!("{}", "Egglog running...".green());
     let mut phases = Vec::new();
@@ -1243,7 +1294,7 @@ fn run_egglog_with_report_parts_impl(
     for cycle in 1..=MAIN_SCHEDULE_MAX_CYCLES {
         let mut cycle_updated = false;
         for phase in egglog_main_cycle_phases(cycle, use_interval_analysis) {
-            cycle_updated |= run_schedule_phase(&mut egraph, &mut phases, &phase)?;
+            cycle_updated |= run_schedule_phase(&mut egraph, &mut phases, &phase, log)?;
         }
         if egraph.num_tuples() > MAIN_SCHEDULE_MAX_TUPLES {
             return Err(egglog::Error::BackendError(format!(
@@ -1263,10 +1314,10 @@ fn run_egglog_with_report_parts_impl(
         )));
     }
     for phase in egglog_final_phases(use_interval_analysis) {
-        run_schedule_phase(&mut egraph, &mut phases, &phase)?;
+        run_schedule_phase(&mut egraph, &mut phases, &phase, log)?;
     }
     for phase in &op_parts.late_phases {
-        run_schedule_phase(&mut egraph, &mut phases, phase)?;
+        run_schedule_phase(&mut egraph, &mut phases, phase, log)?;
     }
     let full_report = stage_report(&egraph, full_start.elapsed());
     trace_stage_report("---- Egglog Rule Matches ----", &full_report);
@@ -1276,7 +1327,7 @@ fn run_egglog_with_report_parts_impl(
         phases,
         total_time: total_start.elapsed(),
     };
-    print_run_summary(&run_report);
+    print_run_summary_with_log(&run_report, log);
     trace!(
         "{}",
         format!(
@@ -1293,7 +1344,7 @@ fn run_egglog_with_report_parts_impl(
         include_temporary_functions: false,
         max_calls_per_function: None,
     });
-    print_serialized_shape(&s);
+    print_serialized_shape_with_log(&s, log);
     // Convert to SerializedEGraph
     let mut classes = FxHashMap::default();
     for (node_id, node) in s.egraph.nodes.iter().filter(|(_, node)| !node.subsumed) {
@@ -1493,6 +1544,28 @@ pub fn run_egglog_with_late_passes_and_interval_analysis(
         cleanup,
         late_passes,
         use_interval_analysis,
+    )
+    .map(|(egraph, _)| egraph)
+}
+
+#[tracing::instrument(skip_all)]
+pub fn run_egglog_with_late_passes_interval_analysis_and_log(
+    program: &str,
+    root: &str,
+    ops: &[Arc<Box<dyn EgglogOp>>],
+    cleanup: bool,
+    late_passes: &[LateEgglogPass],
+    use_interval_analysis: bool,
+    log: bool,
+) -> Result<SerializedEGraph, egglog::Error> {
+    run_egglog_with_report_late_passes_interval_analysis_and_log(
+        program,
+        root,
+        ops,
+        cleanup,
+        late_passes,
+        use_interval_analysis,
+        log,
     )
     .map(|(egraph, _)| egraph)
 }
