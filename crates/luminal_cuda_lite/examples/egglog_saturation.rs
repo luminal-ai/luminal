@@ -253,12 +253,12 @@ fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
             .permute((1, 0, 2))
             .merge_dims(1, 2)
             .matmul(ow);
-        x = x + gate1 * attn;
+        x += gate1 * attn;
         // ── gelu MLP sublayer ──
         let h2 = x.layer_norm(1, 1e-5) * (scale2 + 1.0) + shift2;
         let up = cx.tensor((dim, mlp)).as_dtype(DType::F16);
         let down = cx.tensor((mlp, dim)).as_dtype(DType::F16);
-        x = x + gate2 * h2.matmul(up).gelu().matmul(down);
+        x += gate2 * h2.matmul(up).gelu().matmul(down);
     }
     x
 }

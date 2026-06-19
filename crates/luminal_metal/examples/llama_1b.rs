@@ -503,7 +503,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
     let search_options = CompileOptions::default()
         .search_graph_limit(SEARCH_GRAPHS)
-        .profile_timeout(Duration::from_secs(10));
+        .candidate_timeout(Duration::from_secs(10));
     runtime = cx.search(runtime, search_options);
     println!(
         "  Search/compile: {:.2} s",
