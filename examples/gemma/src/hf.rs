@@ -16,7 +16,8 @@ struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
 
-/// Stored tensor data with shape and converted FP32 bytes
+/// Stored tensor data with shape and F32 values (the conversion staging form;
+/// linears are converted to bf16 at serialization time, norms stay F32).
 struct StoredTensor {
     shape: Vec<usize>,
     data: Vec<f32>,
@@ -70,7 +71,14 @@ fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
     }
 }
 
-/// Combines sharded safetensors files into a single FP32 file with Gemma-specific transformations.
+/// Norm weights stay F32 in the bf16 pipeline: the model computes norms in F32
+/// (explicit casts) and only the linear/embedding weights are bf16.
+fn keep_f32(name: &str) -> bool {
+    name.contains("norm")
+}
+
+/// Combines sharded safetensors into a single bf16 file with Gemma-specific
+/// transformations.
 ///
 /// This function:
 /// 1. Loads tensors from shard(s)
@@ -79,11 +87,11 @@ fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
 /// 4. Pre-scales embeddings by sqrt(hidden_size)
 /// 5. Creates lm_head from unscaled embeddings
 /// 6. Pre-adds 1.0 to RMSNorm weights
-/// 7. Converts all to FP32 and writes combined file
-pub fn combine_safetensors_to_fp32(
+/// 7. Stores linear/embedding weights as BF16, norm weights as F32
+pub fn combine_safetensors_to_bf16(
     model_dir: &Path,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined.safetensors");
+    let output_path = model_dir.join("model_combined_bf16_v1.safetensors");
 
     // Skip if already combined
     if output_path.exists() {
@@ -95,7 +103,7 @@ pub fn combine_safetensors_to_fp32(
 
     // Determine which shard files to load
     let shard_files: Vec<PathBuf> = if single_shard_path.exists() && !index_path.exists() {
-        println!("Single shard model detected, converting to FP32...");
+        println!("Single shard model detected, converting to BF16...");
         vec![single_shard_path]
     } else if index_path.exists() {
         let index_content = std::fs::read_to_string(&index_path)?;
@@ -106,7 +114,7 @@ pub fn combine_safetensors_to_fp32(
         files.dedup();
 
         println!(
-            "Loading {} shard files (converting to FP32)...",
+            "Loading {} shard files (converting to BF16, norms F32)...",
             files.len()
         );
         files.into_iter().map(|f| model_dir.join(f)).collect()
@@ -114,7 +122,7 @@ pub fn combine_safetensors_to_fp32(
         return Err("No model.safetensors or model.safetensors.index.json found".into());
     };
 
-    // Load and convert all tensors
+    // Load and stage all tensors as F32 (converted to bf16 at serialization).
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
 
     for shard_path in &shard_files {
@@ -176,13 +184,12 @@ pub fn combine_safetensors_to_fp32(
         };
         let scaled_data: Vec<f32> = embed_tensor.data.iter().map(|x| x * embed_scale).collect();
 
-        // Now we can mutate
         all_tensors.insert("lm_head.weight".to_string(), lm_head);
         all_tensors.get_mut(embed_key).unwrap().data = scaled_data;
     }
 
-    // Gemma 3 RMSNorm uses (1 + weight) instead of just weight
-    // Pre-add 1.0 to all norm weights so the model can use simple multiplication
+    // Gemma 3 RMSNorm uses (1 + weight) instead of just weight. Pre-add 1.0 to
+    // all norm weights so the model can use simple multiplication.
     println!("Pre-adding 1.0 to RMSNorm weights (Gemma uses 1+weight pattern)...");
     let norm_patterns = [
         "input_layernorm.weight",
@@ -207,14 +214,30 @@ pub fn combine_safetensors_to_fp32(
     }
     println!("  Transformed {} norm weight tensors", norm_keys.len());
 
-    // Serialize to combined file
-    println!("Saving combined FP32 model to {}...", output_path.display());
+    println!(
+        "Saving combined model (BF16 linears, F32 norms) to {}...",
+        output_path.display()
+    );
+
+    // Convert non-norm tensors to BF16 at serialization time; norms stay F32.
+    let bf16_converted: HashMap<String, Vec<u8>> = all_tensors
+        .iter()
+        .filter(|(name, _)| !keep_f32(name))
+        .map(|(name, stored)| {
+            let bf16_data: Vec<bf16> = stored.data.iter().map(|x| bf16::from_f32(*x)).collect();
+            (name.clone(), bytemuck::cast_slice(&bf16_data).to_vec())
+        })
+        .collect();
 
     let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
         .iter()
         .map(|(name, stored)| {
-            let data_bytes: &[u8] = bytemuck::cast_slice(&stored.data);
-            let view = TensorView::new(Dtype::F32, stored.shape.clone(), data_bytes).unwrap();
+            let view = if let Some(bytes) = bf16_converted.get(name) {
+                TensorView::new(Dtype::BF16, stored.shape.clone(), bytes).unwrap()
+            } else {
+                let data_bytes: &[u8] = bytemuck::cast_slice(&stored.data);
+                TensorView::new(Dtype::F32, stored.shape.clone(), data_bytes).unwrap()
+            };
             (name.clone(), view)
         })
         .collect();
@@ -224,7 +247,7 @@ pub fn combine_safetensors_to_fp32(
     let mut file = File::create(&output_path)?;
     file.write_all(&serialized)?;
 
-    println!("Combined FP32 model saved successfully!");
+    println!("Combined BF16 model saved successfully!");
     Ok(output_path)
 }
 
@@ -232,9 +255,9 @@ pub fn combine_safetensors_to_fp32(
 ///
 /// Returns the path to the model directory containing:
 /// - tokenizer.json
-/// - model_combined.safetensors (FP32)
+/// - model_combined_bf16_v1.safetensors (BF16 linears, F32 norms)
 pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let model_dir = download_hf_model(repo_id)?;
-    combine_safetensors_to_fp32(&model_dir)?;
+    combine_safetensors_to_bf16(&model_dir)?;
     Ok(model_dir)
 }
