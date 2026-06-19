@@ -912,6 +912,31 @@ impl Neg for Expression {
     }
 }
 
+/// True when `body` (a postfix token slice equal to some Add expression with
+/// its trailing `Add` token removed) evaluates so that its first token — known
+/// to be a `Num` — remains a standalone bottom-of-stack operand that the
+/// trailing `Add` combines with the rest. Every non-leaf `Term` is binary, so a
+/// stack simulation that tracks which entry is still the bare leading `Num`
+/// suffices: the leading `Num` is absorbed the moment a binary op pops it.
+fn leading_num_is_top_add_operand(body: &[Term]) -> bool {
+    let mut bare: Vec<bool> = Vec::with_capacity(body.len());
+    for (i, term) in body.iter().enumerate() {
+        match term {
+            Term::Num(_) | Term::Var(_) => bare.push(i == 0),
+            _ => {
+                // Binary operator: consumes the top two operands.
+                if bare.len() < 2 {
+                    return false;
+                }
+                bare.pop();
+                bare.pop();
+                bare.push(false);
+            }
+        }
+    }
+    bare.len() == 2 && bare[0]
+}
+
 impl<E: Into<Expression>> Add<E> for Expression {
     type Output = Self;
     fn add(self, rhs: E) -> Self::Output {
@@ -929,15 +954,22 @@ impl<E: Into<Expression>> Add<E> for Expression {
             return (a + b).into();
         }
 
-        // Shortcut: if we're adding an integer to an Add expression with an integer operand, fold them together: ((...)+X)+Y -> (...+(X+Y))
+        // Shortcut: if we're adding an integer to an Add expression whose
+        // leading token is the top-level Add's constant operand, fold them:
+        // ((...)+X)+Y -> (...+(X+Y)). The leading Num is only that operand when
+        // it survives postfix evaluation as the bottom-most standalone value —
+        // otherwise it is a Num buried inside the first subexpression (e.g. the
+        // 11 in `(11*16) + rest`) and folding Y into it corrupts the value.
         if let Some(z) = rhs.as_num() {
             let self_terms = self.terms.read();
             if self_terms.last() == Some(&Term::Add) {
-                if let Some(Term::Num(n)) = self_terms.first() {
-                    if let Some(folded) = n.checked_add(z) {
-                        let mut new_terms = self_terms.clone();
-                        new_terms[0] = Term::Num(folded);
-                        return Expression::new(new_terms);
+                if let Some(&Term::Num(n)) = self_terms.first() {
+                    if leading_num_is_top_add_operand(&self_terms[..self_terms.len() - 1]) {
+                        if let Some(folded) = n.checked_add(z) {
+                            let mut new_terms = self_terms.clone();
+                            new_terms[0] = Term::Num(folded);
+                            return Expression::new(new_terms);
+                        }
                     }
                 }
             }
@@ -1310,6 +1342,21 @@ mod tests {
         assert_eq!(s.lt(128).simplify_with_intervals(&intervals), expr(1));
         assert_eq!(s.gte(128).simplify_with_intervals(&intervals), expr(0));
         assert_eq!(s.min(128).simplify_with_intervals(&intervals), s);
+    }
+
+    #[test]
+    fn test_add_num_does_not_fold_into_nested_num() {
+        // Regression: adding an integer to `(a*b) + rest` must not fold the
+        // integer into the `a` of the multiplication. `(11*16) + 15` is 191,
+        // not `11*(16+15) = 341`. The Add fast-path used to fold into the
+        // leading Num token regardless of whether it was a top-level operand.
+        let empty = FxHashMap::default();
+        // (11*16) + 15 must be 191, not 11*(16+15) = 341.
+        assert_eq!((expr(11) * 16 + 15).exec(&empty), Some(191));
+        // A symbolic chain `(s*384 + (11*16)) + 15` must keep the constant 191.
+        let s = expr('s');
+        let chain = (s * 384 + expr(11) * 16) + 15;
+        assert_eq!(chain.substitute('s', 2).exec(&empty), Some(768 + 191));
     }
 
     #[test]
