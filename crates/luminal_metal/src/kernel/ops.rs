@@ -1795,6 +1795,15 @@ impl EgglogOp for MPSBatchedMatmul {
                 ]),
                 ilist(vec![mul_op.clone()]),
             );
+            let rhs_cols = match rhs_layout {
+                MPSMatrixLayout::RowMajor => n.clone(),
+                MPSMatrixLayout::TransposedRowMajor => k.clone(),
+            };
+            let mps_matrix_row_byte_guards = vec![
+                eq(lhs_row_stride.clone(), mul(k.clone(), z.clone())),
+                eq(rhs_row_stride.clone(), mul(rhs_cols, z.clone())),
+                eq(out_row_stride.clone(), mul(n.clone(), z.clone())),
+            ];
             let mps_op = MPSBatchedMatmul::default().sort().call([
                 ("batch", batch),
                 ("m", m),
@@ -1816,6 +1825,7 @@ impl EgglogOp for MPSBatchedMatmul {
             rule(union(sum_op.clone(), mps_op.clone()))
                 .set(dtype(mps_op), dt.clone())
                 .fact(eq(dt, dtype(sum_op)))
+                .when(mps_matrix_row_byte_guards)
                 .ruleset("kernel_lower")
                 .name(name)
         };

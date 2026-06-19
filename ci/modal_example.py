@@ -87,12 +87,30 @@ def run_example(example: str):
         **os.environ,
         "CUDARC_CUDA_VERSION": CUDARC_CUDA_VERSION,
         "HF_HOME": HF_CACHE_PATH,
+        # Reduce buffering so more child output reaches the pipe before a crash.
+        "PYTHONUNBUFFERED": "1",
+        "RUST_BACKTRACE": "1",
     }
-    output = run_and_capture(
-        ["cargo", "run", "--release", *EXAMPLE_CARGO_ARGS.get(example, [])],
-        cwd=f"{WORKDIR}/examples/{example}",
-        env=run_env,
-    )
+    try:
+        output = run_and_capture(
+            ["cargo", "run", "--release", *EXAMPLE_CARGO_ARGS.get(example, [])],
+            cwd=f"{WORKDIR}/examples/{example}",
+            env=run_env,
+        )
+    except subprocess.CalledProcessError as e:
+        # Surface the captured output in the exception message, which CI shows
+        # reliably (unlike the streamed remote stdout), so crashes aren't opaque.
+        captured = e.output or "(no output captured before crash)"
+        print(
+            f"\n===== Captured output from '{example}' before failure "
+            f"(rc={e.returncode}) =====\n{captured}\n===== end captured output =====",
+            flush=True,
+        )
+        tail = captured[-4000:]
+        raise RuntimeError(
+            f"Example '{example}' failed (exit/signal {e.returncode}). "
+            f"Last {len(tail)} chars of output:\n{tail}"
+        ) from e
     validate_output(example, output)
 
     hf_cache.commit()

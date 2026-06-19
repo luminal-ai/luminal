@@ -43,7 +43,9 @@ dev = [
     "snakeviz",
     "maturin-import-hook>=0.3.0",
     "pytest-randomly>=4.0.1",
-    "transformers>=4.40.0",
+    # <5.11: 5.12 changed DeepSeekV3 MLA RoPE tracing to a mul the translator
+    # can't broadcast yet (test_kv_cache_growing_r1_mla); unpin once handled.
+    "transformers>=4.40.0,<5.11",
     "diffusers>=0.35.0",
     "modal>=1.3.5",
 ]

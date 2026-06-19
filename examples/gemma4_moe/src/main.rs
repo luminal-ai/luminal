@@ -114,9 +114,8 @@ fn main() {
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    let search_options = CompileOptions::default()
-        .search_graph_limit(search_graphs)
-        .profile_timeout(Duration::from_secs(2));
+    // Profiling timeouts use the CompileOptions defaults (5s candidate / 1s execution).
+    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
     runtime = cx.search_with_rng(runtime, search_options, &mut rng);
 
     // Search profiling leaves several GB cached in the async allocator pool;
