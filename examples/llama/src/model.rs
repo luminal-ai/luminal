@@ -20,7 +20,9 @@ pub const KV_DIM: usize = N_KV_HEADS * HEAD_DIM; // 1024
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlamaPrecision {
-    /// F32 weights and activations.
+    /// F32 weights and activations. Used only by the search-equivalence fuzz
+    /// test fixture (`init_with_config`); the example ships bf16/fp8.
+    #[allow(dead_code)]
     F32,
     /// Bf16 weights and activations; norms computed in F32 via explicit
     /// casts, logits cast to F32 at the head.
@@ -148,10 +150,6 @@ pub struct Llama {
 }
 
 impl Llama {
-    pub fn init(cx: &mut Graph) -> Self {
-        Self::init_with_config(cx, LlamaConfig::default())
-    }
-
     pub fn init_fp8(cx: &mut Graph) -> Self {
         Self::init_with_precision(cx, LlamaConfig::default(), LlamaPrecision::Fp8)
     }
@@ -160,6 +158,11 @@ impl Llama {
         Self::init_with_precision(cx, LlamaConfig::default(), LlamaPrecision::Bf16)
     }
 
+    /// F32 reference build at a custom config. The example ships bf16/fp8 only;
+    /// this is retained as the numerically-stable fixture for the backend
+    /// search-equivalence fuzz test (`luminal_cuda_lite`), which references this
+    /// module via `#[path]`.
+    #[allow(dead_code)]
     pub fn init_with_config(cx: &mut Graph, config: LlamaConfig) -> Self {
         Self::init_with_precision(cx, config, LlamaPrecision::F32)
     }

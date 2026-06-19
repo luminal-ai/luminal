@@ -26,7 +26,6 @@ struct StoredTensor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightFormat {
-    Fp32,
     Bf16,
     /// FP8 linear weights with bf16 embeddings/lm_head and F32 norms — the
     /// fp8 + bf16-activation pipeline.
@@ -137,34 +136,6 @@ fn stored_tensor_bf16(name: &str, tensor: &safetensors::tensor::TensorView) -> S
     }
 }
 
-fn stored_tensor_from_view(
-    tensor: &safetensors::tensor::TensorView,
-    preserve_fp8: bool,
-) -> StoredTensor {
-    let shape = tensor.shape().to_vec();
-    let dtype = tensor.dtype();
-    match dtype {
-        Dtype::F32 if preserve_fp8 => StoredTensor {
-            shape,
-            dtype,
-            data: tensor.data().to_vec(),
-        },
-        Dtype::F8_E4M3 | Dtype::F8_E5M2 | Dtype::F8_E8M0 if preserve_fp8 => StoredTensor {
-            shape,
-            dtype,
-            data: tensor.data().to_vec(),
-        },
-        Dtype::F32 | Dtype::F16 | Dtype::BF16 => StoredTensor {
-            shape,
-            dtype: Dtype::F32,
-            data: tensor_to_f32_bytes(tensor),
-        },
-        other => {
-            panic!("Unsupported dtype for model preparation: {other:?}");
-        }
-    }
-}
-
 fn model_shard_files(model_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let index_path = model_dir.join("model.safetensors.index.json");
     let single_shard_path = model_dir.join("model.safetensors");
@@ -183,68 +154,6 @@ fn model_shard_files(model_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::erro
     } else {
         Err("No model.safetensors or model.safetensors.index.json found".into())
     }
-}
-
-/// Combines sharded safetensors files into a single FP32 file.
-///
-/// This function:
-/// 1. Loads tensors from shard(s)
-/// 2. Converts all to FP32
-/// 3. Writes combined file
-pub fn combine_safetensors_to_fp32(
-    model_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined.safetensors");
-
-    // Skip if already combined
-    if output_path.exists() {
-        return Ok(output_path);
-    }
-
-    let shard_files = model_shard_files(model_dir)?;
-    info!(
-        "Loading {} shard files (converting to FP32)...",
-        shard_files.len()
-    );
-
-    // Load and convert all tensors
-    let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
-
-    for shard_path in &shard_files {
-        info!(
-            "  Loading {}...",
-            shard_path.file_name().unwrap().to_string_lossy()
-        );
-        let file = File::open(shard_path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        let st = SafeTensors::deserialize(&mmap)?;
-
-        for name in st.names() {
-            let tensor = st.tensor(name)?;
-            all_tensors.insert(name.to_string(), stored_tensor_from_view(&tensor, false));
-        }
-    }
-
-    info!("Extracted {} language model tensors", all_tensors.len());
-
-    // Serialize to combined file
-    info!("Saving combined FP32 model to {}...", output_path.display());
-
-    let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
-        .iter()
-        .map(|(name, stored)| {
-            let view = TensorView::new(stored.dtype, stored.shape.clone(), &stored.data).unwrap();
-            (name.clone(), view)
-        })
-        .collect();
-
-    let serialized = safetensors::serialize(&tensor_views, None)?;
-
-    let mut file = File::create(&output_path)?;
-    file.write_all(&serialized)?;
-
-    info!("Combined FP32 model saved successfully!");
-    Ok(output_path)
 }
 
 /// Combines sharded safetensors into a bf16 file (norm weights kept F32).
@@ -631,7 +540,6 @@ pub fn prepare_hf_model(
 ) -> Result<PreparedModel, Box<dyn std::error::Error>> {
     let model_dir = download_hf_model(repo_id)?;
     let weights_path = match weight_format {
-        WeightFormat::Fp32 => combine_safetensors_to_fp32(&model_dir)?,
         WeightFormat::Bf16 => combine_safetensors_to_bf16(&model_dir)?,
         WeightFormat::Fp8 => combine_safetensors_fp8_bf16(&model_dir)?,
     };

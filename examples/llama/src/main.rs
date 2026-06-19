@@ -19,7 +19,7 @@ use std::{env, io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const FP32_REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
+const BF16_REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
 const FP8_REPO_ID: &str = "nvidia/Llama-3.1-8B-Instruct-FP8";
 const MAX_SEQ_LEN: usize = 4096;
 const GEN_TOKENS: usize = 500;
@@ -33,7 +33,6 @@ const REPETITION_PENALTY: f32 = 1.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlamaWeightMode {
-    Fp32,
     Bf16,
     Fp8,
 }
@@ -41,46 +40,37 @@ enum LlamaWeightMode {
 impl LlamaWeightMode {
     fn repo_id(self) -> &'static str {
         match self {
-            // The Llama 3 checkpoint is natively bf16, so the bf16 pipeline
-            // uses the same repo with a passthrough conversion.
-            Self::Fp32 | Self::Bf16 => FP32_REPO_ID,
+            Self::Bf16 => BF16_REPO_ID,
             Self::Fp8 => FP8_REPO_ID,
         }
     }
 
     fn weight_format(self) -> WeightFormat {
         match self {
-            Self::Fp32 => WeightFormat::Fp32,
             Self::Bf16 => WeightFormat::Bf16,
             Self::Fp8 => WeightFormat::Fp8,
         }
     }
 
     fn kv_dtype(self) -> luminal::dtype::DType {
-        match self {
-            Self::Fp32 => luminal::dtype::DType::F32,
-            Self::Bf16 | Self::Fp8 => luminal::dtype::DType::Bf16,
-        }
+        luminal::dtype::DType::Bf16
     }
 
     fn kv_element_bytes(self) -> usize {
-        match self {
-            Self::Fp32 => 4,
-            Self::Bf16 | Self::Fp8 => 2,
-        }
+        2
     }
 }
 
 fn print_usage(program: &str) {
     println!("Usage: {program} [--bf16|--fp8]");
     println!();
-    println!("  --bf16    Native bf16 weights, activations and KV cache");
+    println!("  --bf16    Native bf16 weights, activations and KV cache (default)");
     println!("  --fp8     FP8 linear weights with bf16 activations and KV cache");
     println!("  -h,--help Show this help");
 }
 
 fn parse_args() -> LlamaWeightMode {
-    let mut mode = LlamaWeightMode::Fp32;
+    let mut mode = LlamaWeightMode::Bf16;
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "llama".to_string());
     for arg in args {
@@ -308,7 +298,6 @@ fn main() {
     let new_token_t = cx.named_tensor("new_token", 1).as_dtype(DType::Int);
     let kv_cache = KVCache::new_dtype(&mut cx, MAX_SEQ_LEN, weight_mode.kv_dtype());
     let llama = match weight_mode {
-        LlamaWeightMode::Fp32 => Llama::init(&mut cx),
         LlamaWeightMode::Bf16 => Llama::init_bf16(&mut cx),
         LlamaWeightMode::Fp8 => Llama::init_fp8(&mut cx),
     };
