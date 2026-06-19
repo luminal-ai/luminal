@@ -174,10 +174,11 @@ where
     cx.build_search_space::<R>(compile_options);
 
     println!("Loading weights...");
-    let weights_path = model_dir.join("model_combined.safetensors");
+    let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
-    let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
+    // KV cache is bf16: 2 bytes per element.
+    let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * 2;
     for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
