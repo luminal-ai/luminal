@@ -37,12 +37,20 @@ impl KVCache {
             // KV cache stored bf16 (2 bytes/elem); the scatter writes bf16
             // k_rope/v rows directly.
             k_caches.push(
-                persist(cx, format!("kv_cache.{l}.k"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                    .as_dtype(DType::Bf16),
+                persist(
+                    cx,
+                    format!("kv_cache.{l}.k"),
+                    (N_KV_HEADS, max_seq, HEAD_DIM),
+                )
+                .as_dtype(DType::Bf16),
             );
             v_caches.push(
-                persist(cx, format!("kv_cache.{l}.v"), (N_KV_HEADS, max_seq, HEAD_DIM))
-                    .as_dtype(DType::Bf16),
+                persist(
+                    cx,
+                    format!("kv_cache.{l}.v"),
+                    (N_KV_HEADS, max_seq, HEAD_DIM),
+                )
+                .as_dtype(DType::Bf16),
             );
         }
         Self {
@@ -123,8 +131,10 @@ impl QwenLayer {
     fn init(cx: &mut Graph, l: usize) -> Self {
         Self {
             up: layer_weight(cx, l, "mlp.up_proj", (INTERMEDIATE, HIDDEN)).as_dtype(DType::Bf16),
-            gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN)).as_dtype(DType::Bf16),
-            down: layer_weight(cx, l, "mlp.down_proj", (HIDDEN, INTERMEDIATE)).as_dtype(DType::Bf16),
+            gate: layer_weight(cx, l, "mlp.gate_proj", (INTERMEDIATE, HIDDEN))
+                .as_dtype(DType::Bf16),
+            down: layer_weight(cx, l, "mlp.down_proj", (HIDDEN, INTERMEDIATE))
+                .as_dtype(DType::Bf16),
             q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)).as_dtype(DType::Bf16),
             k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)).as_dtype(DType::Bf16),
             v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)).as_dtype(DType::Bf16),

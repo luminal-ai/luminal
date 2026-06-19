@@ -403,7 +403,9 @@ fn paged_attention(
 
     // Fold the attention scale into Q so the QK Sum is scale-free — matches the
     // gemma scale-free FlashInfer rules (which have a sliding-window variant).
-    let q = (q_rope * ATTN_SCALE).split_dims(1, HEAD_DIM).transpose(0, 1);
+    let q = (q_rope * ATTN_SCALE)
+        .split_dims(1, HEAD_DIM)
+        .transpose(0, 1);
     let k = k.split_dims(1, HEAD_DIM).permute((1, 2, 0));
     let v_ctx = v_ctx.split_dims(1, HEAD_DIM).transpose(0, 1);
 
