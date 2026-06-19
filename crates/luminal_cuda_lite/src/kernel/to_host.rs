@@ -36,7 +36,7 @@ use crate::{
         },
         flashinfer::{
             FlashInferAttention, FlashInferDecodeCaptureSignature, FlashInferDecodePointers,
-            PreparedFlashInferDecode,
+            FlashInferDecodeSpec, PreparedFlashInferDecode,
         },
     },
     kernel::{
@@ -122,6 +122,11 @@ struct CompiledFlashInferDecode {
     ptrs: Option<FlashInferDecodePointers>,
     signature: Option<FlashInferDecodeCaptureSignature>,
     recapture_count: usize,
+    /// True if this island owns its shared prepared plan's metadata kernel.
+    /// Per-layer attention islands share one prepared plan (same spec), and
+    /// only the topologically-first user enqueues the kv-metadata preparation
+    /// kernel + per-step `current_c` upload; the rest read the shared buffers.
+    metadata_owner: bool,
 }
 
 impl CompiledFlashInferDecode {
@@ -137,6 +142,7 @@ impl CompiledFlashInferDecode {
             ptrs: None,
             signature: None,
             recapture_count: 0,
+            metadata_owner: true,
         }
     }
 
@@ -152,7 +158,19 @@ impl CompiledFlashInferDecode {
 
 struct PendingFlashInferDecodeRecapture {
     prepared: Option<Rc<PreparedFlashInferDecode>>,
+    /// Owner status for the new `prepared`; `None` keeps the island's
+    /// existing ownership (ptrs-only recapture).
+    metadata_owner: Option<bool>,
     signature: FlashInferDecodeCaptureSignature,
+}
+
+/// Prepared FlashInfer plans shared across attention islands with identical
+/// specs (the per-layer islands of one decode step). The owner island is the
+/// first (topological) user; it carries the metadata kernel in its capture.
+struct CachedFlashInferPrepare {
+    spec: FlashInferDecodeSpec,
+    prepared: Rc<PreparedFlashInferDecode>,
+    owner: NodeIndex,
 }
 
 #[derive(Clone)]
@@ -177,6 +195,7 @@ struct RecaptureProfile {
     graph_take: Duration,
     recapture_total: Duration,
     recapture_get_downstream: Duration,
+    recapture_rewire_exit: Duration,
     recapture_remove_downstream: Duration,
     recapture_destroy_exit: Duration,
     recapture_destroy_captured: Duration,
@@ -225,6 +244,7 @@ impl RecaptureProfile {
             + self.capture_collect_nodes
             + self.capture_exit_node;
         let graph_edit_sum = self.recapture_get_downstream
+            + self.recapture_rewire_exit
             + self.recapture_remove_downstream
             + self.recapture_destroy_exit
             + self.recapture_destroy_captured
@@ -243,7 +263,7 @@ impl RecaptureProfile {
             + self.exec_instantiate
             + self.exec_kernel_node_update;
         eprintln!(
-            "CUDA_RECAP_PROFILE dyn={dyn_map:?} kernels={kernels} cublaslt={cublaslt} pending={} spec_changes={} ptr_changes={} recaptures={} prepared={} prepare_cache_hits={} captured_nodes={} update_success={} update_failed={} instantiates={} total_ms={:.3} accounted_ms={:.3} unaccounted_ms={:.3} dyn_upload_ms={:.3} build_graph_ms={:.3} collect_ptrs_ms={:.3} pre_execute_ms={:.3} kernel_param_build_ms={:.3} source_kernel_update_ms={:.3} cublaslt_resolve_ms={:.3} cublaslt_prepare_ms={:.3} graph_take_ms={:.3} recapture_total_ms={:.3} graph_edit_sum_ms={:.3} get_downstream_ms={:.3} remove_downstream_ms={:.3} destroy_exit_ms={:.3} destroy_captured_ms={:.3} add_downstream_ms={:.3} capture_sum_ms={:.3} capture_join_ms={:.3} capture_begin_ms={:.3} capture_enqueue_ms={:.3} capture_end_ms={:.3} capture_collect_ms={:.3} capture_exit_node_ms={:.3} exec_update_ms={:.3} exec_instantiate_ms={:.3} exec_kernel_node_update_ms={:.3}",
+            "CUDA_RECAP_PROFILE dyn={dyn_map:?} kernels={kernels} cublaslt={cublaslt} pending={} spec_changes={} ptr_changes={} recaptures={} prepared={} prepare_cache_hits={} captured_nodes={} update_success={} update_failed={} instantiates={} total_ms={:.3} accounted_ms={:.3} unaccounted_ms={:.3} dyn_upload_ms={:.3} build_graph_ms={:.3} collect_ptrs_ms={:.3} pre_execute_ms={:.3} kernel_param_build_ms={:.3} source_kernel_update_ms={:.3} cublaslt_resolve_ms={:.3} cublaslt_prepare_ms={:.3} graph_take_ms={:.3} recapture_total_ms={:.3} graph_edit_sum_ms={:.3} get_downstream_ms={:.3} rewire_exit_ms={:.3} remove_downstream_ms={:.3} destroy_exit_ms={:.3} destroy_captured_ms={:.3} add_downstream_ms={:.3} capture_sum_ms={:.3} capture_join_ms={:.3} capture_begin_ms={:.3} capture_enqueue_ms={:.3} capture_end_ms={:.3} capture_collect_ms={:.3} capture_exit_node_ms={:.3} exec_update_ms={:.3} exec_instantiate_ms={:.3} exec_kernel_node_update_ms={:.3}",
             self.pending_count,
             self.spec_changes,
             self.ptr_changes,
@@ -269,6 +289,7 @@ impl RecaptureProfile {
             Self::ms(self.recapture_total),
             Self::ms(graph_edit_sum),
             Self::ms(self.recapture_get_downstream),
+            Self::ms(self.recapture_rewire_exit),
             Self::ms(self.recapture_remove_downstream),
             Self::ms(self.recapture_destroy_exit),
             Self::ms(self.recapture_destroy_captured),
@@ -406,6 +427,7 @@ struct CudaGraphOpState {
     step_reachability: Vec<FixedBitSet>,
     /// Prepared cuBLASLt resources currently referenced by captured islands.
     cublaslt_prepare_cache: Vec<CachedCuBlasLtPrepare>,
+    flashinfer_prepare_cache: Vec<CachedFlashInferPrepare>,
     /// Shared device buffer for dynamic dimensions
     dyn_dims_buffer: Option<CudaSlice<i32>>,
     /// CUDA graph handle
@@ -446,6 +468,7 @@ impl CudaGraphOpState {
             flashinfer_step_indices,
             step_reachability,
             cublaslt_prepare_cache: Vec::new(),
+            flashinfer_prepare_cache: Vec::new(),
             dyn_dims_buffer: None,
             cuda_graph: None,
             cuda_graph_exec: None,
@@ -783,16 +806,46 @@ impl HostOp for CudaGraphOp {
 
         let buffer_nodes = self.extra_buffer_nodes();
         let buffer_set: FxHashSet<_> = buffer_nodes.iter().copied().collect();
+
+        // Per-buffer precompute so the all-pairs loop below is O(1) per
+        // pair: `users_bits[a]` marks a's user steps, `common_reach[a]`
+        // is the intersection of `reachable` over a's users — i.e. the
+        // steps strictly after *every* use of a. "All users of a are
+        // ordered before step s" then collapses to two bit probes.
+        // (The previous per-pair `users_ordered_before` walk was
+        // O(B^2 * users) and took tens of minutes on rolled prefill
+        // candidates with thousands of steps.)
+        let per_buffer: FxHashMap<NodeIndex, (FixedBitSet, FixedBitSet)> = buffer_nodes
+            .iter()
+            .filter_map(|&node| {
+                let steps = users.get(&node)?;
+                if steps.is_empty() {
+                    return None;
+                }
+                let mut users_bits = FixedBitSet::with_capacity(n_steps);
+                let mut common_reach = FixedBitSet::with_capacity(n_steps);
+                common_reach.insert_range(..);
+                for &u in steps {
+                    users_bits.insert(u);
+                    common_reach.intersect_with(&reachable[u]);
+                }
+                Some((node, (users_bits, common_reach)))
+            })
+            .collect();
+        let ordered_before = |a: NodeIndex, b: NodeIndex| -> bool {
+            let Some(&b_producer) = producer_step.get(&b) else {
+                return false;
+            };
+            let Some((users_bits, common_reach)) = per_buffer.get(&a) else {
+                return false;
+            };
+            common_reach.contains(b_producer) && !users_bits.contains(b_producer)
+        };
+
         let mut conflicts = Vec::new();
         for (i, &a) in buffer_nodes.iter().enumerate() {
             for &b in buffer_nodes.iter().skip(i + 1) {
-                let a_before_b = producer_step.get(&b).is_some_and(|&b_producer| {
-                    users_ordered_before(&users, &reachable, a, b_producer)
-                });
-                let b_before_a = producer_step.get(&a).is_some_and(|&a_producer| {
-                    users_ordered_before(&users, &reachable, b, a_producer)
-                });
-                if !(a_before_b || b_before_a) {
+                if !(ordered_before(a, b) || ordered_before(b, a)) {
                     conflicts.push((a, b));
                 }
             }
@@ -819,20 +872,6 @@ impl HostOp for CudaGraphOp {
     fn stats_name(&self) -> Option<&'static str> {
         Some("CudaGraph")
     }
-}
-
-fn users_ordered_before(
-    users: &FxHashMap<NodeIndex, Vec<usize>>,
-    reachable: &[FixedBitSet],
-    node: NodeIndex,
-    before_step: usize,
-) -> bool {
-    users.get(&node).is_some_and(|steps| {
-        !steps.is_empty()
-            && steps.iter().all(|&user_step| {
-                user_step != before_step && reachable[user_step].contains(before_step)
-            })
-    })
 }
 
 fn cublaslt_step_indices(steps: &[CompiledStep], n_cublaslt: usize) -> Vec<usize> {
@@ -1410,31 +1449,61 @@ impl CudaGraphOp {
                             .signature
                             .as_ref()
                             .is_none_or(|old| explicit_indptr || old.spec != signature.spec);
-                        let prepared = if needs_prepare {
-                            let timer = Instant::now();
-                            let prepared = state.flashinfer_ops[idx]
-                                .flashinfer()
-                                .prepare_resolved_for_graph(stream, resolved, true)?;
-                            profile.cublaslt_prepare += timer.elapsed();
-                            profile.prepared_count += 1;
-                            Some(Rc::new(prepared))
+                        let (prepared, metadata_owner) = if needs_prepare {
+                            let op_node = state.flashinfer_ops[idx].node;
+                            if let Some(cached) = state
+                                .flashinfer_prepare_cache
+                                .iter()
+                                .find(|entry| entry.spec == signature.spec)
+                            {
+                                (
+                                    Some(Rc::clone(&cached.prepared)),
+                                    Some(cached.owner == op_node),
+                                )
+                            } else {
+                                let timer = Instant::now();
+                                let prepared = Rc::new(
+                                    state.flashinfer_ops[idx]
+                                        .flashinfer()
+                                        .prepare_resolved_for_graph(stream, resolved, true)?,
+                                );
+                                profile.cublaslt_prepare += timer.elapsed();
+                                profile.prepared_count += 1;
+                                state
+                                    .flashinfer_prepare_cache
+                                    .push(CachedFlashInferPrepare {
+                                        spec: signature.spec.clone(),
+                                        prepared: Rc::clone(&prepared),
+                                        owner: op_node,
+                                    });
+                                (Some(prepared), Some(true))
+                            }
                         } else {
-                            if let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref() {
+                            if state.flashinfer_ops[idx].metadata_owner
+                                && let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref()
+                            {
                                 prepared.update_current_c(stream, current_c)?;
                             }
-                            None
+                            (None, None)
                         };
                         pending_recaptures.push((
                             idx,
                             PendingFlashInferDecodeRecapture {
                                 prepared,
+                                metadata_owner,
                                 signature,
                             },
                         ));
-                    } else if let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref() {
+                    } else if state.flashinfer_ops[idx].metadata_owner
+                        && let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref()
+                    {
                         prepared.update_current_c(stream, current_c)?;
                     }
                 }
+                // Drop shared-plan cache entries no longer referenced by any island.
+                state
+                    .flashinfer_prepare_cache
+                    .retain(|entry| Rc::strong_count(&entry.prepared) > 1);
 
                 profile.pending_count += pending_recaptures.len();
                 if !pending_recaptures.is_empty() {
@@ -1597,7 +1666,7 @@ impl CudaGraphOp {
             .collect()
     }
 
-    fn capture_cublaslt_island(
+    fn capture_cublaslt_island_nodes(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
         capture_stream: &Arc<CudaStream>,
@@ -1605,7 +1674,7 @@ impl CudaGraphOp {
         prepared: &PreparedCuBlasLtMatmul,
         ptrs: LtMatmulPointers,
         mut profile: Option<&mut RecaptureProfile>,
-    ) -> anyhow::Result<(Vec<CUgraphNode>, CUgraphNode)> {
+    ) -> anyhow::Result<(Vec<CUgraphNode>, Vec<CUgraphNode>)> {
         let timer = Instant::now();
         capture_stream
             .join(stream)
@@ -1637,7 +1706,7 @@ impl CudaGraphOp {
         let timer = Instant::now();
         let mut captured_nodes = Self::collect_cublaslt_island_nodes(graph, entry_node)?;
         captured_nodes.sort_by_key(|node| *node as usize);
-        if let Some(profile) = profile.as_deref_mut() {
+        if let Some(profile) = profile {
             profile.capture_collect_nodes += timer.elapsed();
             profile.captured_nodes += captured_nodes.len();
         }
@@ -1657,6 +1726,27 @@ impl CudaGraphOp {
             exit_deps.push(entry_node);
         }
 
+        Ok((captured_nodes, exit_deps))
+    }
+
+    fn capture_cublaslt_island(
+        graph: &mut CudaGraphHandle,
+        stream: &Arc<CudaStream>,
+        capture_stream: &Arc<CudaStream>,
+        entry_node: CUgraphNode,
+        prepared: &PreparedCuBlasLtMatmul,
+        ptrs: LtMatmulPointers,
+        mut profile: Option<&mut RecaptureProfile>,
+    ) -> anyhow::Result<(Vec<CUgraphNode>, CUgraphNode)> {
+        let (captured_nodes, exit_deps) = Self::capture_cublaslt_island_nodes(
+            graph,
+            stream,
+            capture_stream,
+            entry_node,
+            prepared,
+            ptrs,
+            profile.as_deref_mut(),
+        )?;
         let timer = Instant::now();
         let exit_node = graph.add_empty_node(&exit_deps)?;
         if let Some(profile) = profile {
@@ -1665,6 +1755,7 @@ impl CudaGraphOp {
         Ok((captured_nodes, exit_node))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_flashinfer_decode_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -1672,6 +1763,7 @@ impl CudaGraphOp {
         entry_node: CUgraphNode,
         prepared: &PreparedFlashInferDecode,
         ptrs: FlashInferDecodePointers,
+        include_metadata: bool,
         mut profile: Option<&mut RecaptureProfile>,
     ) -> anyhow::Result<(Vec<CUgraphNode>, CUgraphNode)> {
         let timer = Instant::now();
@@ -1689,7 +1781,7 @@ impl CudaGraphOp {
             profile.capture_begin += timer.elapsed();
         }
         let timer = Instant::now();
-        let enqueue_result = prepared.enqueue(capture_stream, ptrs);
+        let enqueue_result = prepared.enqueue(capture_stream, ptrs, include_metadata);
         if let Some(profile) = profile.as_deref_mut() {
             profile.capture_enqueue += timer.elapsed();
         }
@@ -1774,37 +1866,26 @@ impl CudaGraphOp {
             .ok_or_else(|| anyhow::anyhow!("cuBLASLt graph island is missing its exit node"))?;
         let old_captured_nodes = op.captured_nodes.clone();
         let timer = Instant::now();
-        let downstream = graph
-            .dependent_nodes(old_exit)
-            .map_err(|err| anyhow::anyhow!("cuBLASLt recapture get downstream failed: {err:?}"))?;
+        let old_exit_deps = graph
+            .dependencies(old_exit)
+            .map_err(|err| anyhow::anyhow!("cuBLASLt recapture get exit deps failed: {err:?}"))?;
         if let Some(profile) = profile.as_deref_mut() {
             profile.recapture_get_downstream += timer.elapsed();
         }
 
-        if !downstream.is_empty() {
-            let from_old = vec![old_exit; downstream.len()];
+        if !old_exit_deps.is_empty() {
+            let to_exit = vec![old_exit; old_exit_deps.len()];
             let timer = Instant::now();
             graph
-                .remove_dependencies(&from_old, &downstream)
+                .remove_dependencies(&old_exit_deps, &to_exit)
                 .map_err(|err| {
-                    anyhow::anyhow!(
-                        "cuBLASLt recapture remove downstream dependencies failed: {err:?}"
-                    )
+                    anyhow::anyhow!("cuBLASLt recapture remove exit dependencies failed: {err:?}")
                 })?;
             if let Some(profile) = profile.as_deref_mut() {
-                profile.recapture_remove_downstream += timer.elapsed();
+                profile.recapture_rewire_exit += timer.elapsed();
             }
         }
 
-        let timer = Instant::now();
-        unsafe {
-            graph.destroy_node(old_exit).map_err(|err| {
-                anyhow::anyhow!("cuBLASLt recapture destroy old exit failed: {err:?}")
-            })?;
-        }
-        if let Some(profile) = profile.as_deref_mut() {
-            profile.recapture_destroy_exit += timer.elapsed();
-        }
         let timer = Instant::now();
         Self::destroy_nodes_after_dependents(graph, &old_captured_nodes)?;
         if let Some(profile) = profile.as_deref_mut() {
@@ -1814,7 +1895,7 @@ impl CudaGraphOp {
             .as_ref()
             .or(op.prepared.as_ref())
             .ok_or_else(|| anyhow::anyhow!("cuBLASLt recapture is missing prepared resources"))?;
-        let (new_captured_nodes, new_exit) = Self::capture_cublaslt_island(
+        let (new_captured_nodes, new_exit_deps) = Self::capture_cublaslt_island_nodes(
             graph,
             stream,
             capture_stream,
@@ -1824,23 +1905,21 @@ impl CudaGraphOp {
             profile.as_deref_mut(),
         )?;
 
-        if !downstream.is_empty() {
-            let from_new = vec![new_exit; downstream.len()];
+        if !new_exit_deps.is_empty() {
+            let to_exit = vec![old_exit; new_exit_deps.len()];
             let timer = Instant::now();
             graph
-                .add_dependencies(&from_new, &downstream)
+                .add_dependencies(&new_exit_deps, &to_exit)
                 .map_err(|err| {
-                    anyhow::anyhow!(
-                        "cuBLASLt recapture add downstream dependencies failed: {err:?}"
-                    )
+                    anyhow::anyhow!("cuBLASLt recapture add exit dependencies failed: {err:?}")
                 })?;
             if let Some(profile) = profile.as_deref_mut() {
-                profile.recapture_add_downstream += timer.elapsed();
+                profile.recapture_rewire_exit += timer.elapsed();
             }
         }
 
         op.entry_node = Some(entry_node);
-        op.exit_node = Some(new_exit);
+        op.exit_node = Some(old_exit);
         op.captured_nodes = new_captured_nodes;
         if let Some(prepared) = prepared {
             op.prepared = Some(prepared);
@@ -1865,8 +1944,12 @@ impl CudaGraphOp {
         let recapture_timer = Instant::now();
         let PendingFlashInferDecodeRecapture {
             prepared,
+            metadata_owner,
             signature,
         } = recapture;
+        if let Some(owner) = metadata_owner {
+            op.metadata_owner = owner;
+        }
         let ptrs = signature.ptrs;
         let entry_node = op
             .entry_node
@@ -1923,6 +2006,7 @@ impl CudaGraphOp {
             entry_node,
             prepared_ref,
             ptrs,
+            op.metadata_owner,
             profile.as_deref_mut(),
         )?;
 
@@ -2246,12 +2330,29 @@ impl CudaGraphOp {
                     let plan_c = resolved.graph_plan_capacity(None);
                     let signature = resolved.signature_for_graph_plan(plan_c);
                     let ptrs = signature.ptrs;
-                    let prepared = {
-                        let op = &state.flashinfer_ops[idx];
-                        Rc::new(
-                            op.flashinfer()
-                                .prepare_resolved_for_graph(stream, resolved, true)?,
-                        )
+                    let op_node = state.flashinfer_ops[idx].node;
+                    let (prepared, metadata_owner) = if let Some(cached) = state
+                        .flashinfer_prepare_cache
+                        .iter()
+                        .find(|entry| entry.spec == signature.spec)
+                    {
+                        (Rc::clone(&cached.prepared), cached.owner == op_node)
+                    } else {
+                        let prepared = {
+                            let op = &state.flashinfer_ops[idx];
+                            Rc::new(
+                                op.flashinfer()
+                                    .prepare_resolved_for_graph(stream, resolved, true)?,
+                            )
+                        };
+                        state
+                            .flashinfer_prepare_cache
+                            .push(CachedFlashInferPrepare {
+                                spec: signature.spec.clone(),
+                                prepared: Rc::clone(&prepared),
+                                owner: op_node,
+                            });
+                        (prepared, true)
                     };
 
                     let capture_stream = self.capture_stream()?;
@@ -2262,17 +2363,18 @@ impl CudaGraphOp {
                         entry_node,
                         &prepared,
                         ptrs,
+                        metadata_owner,
                         None,
                     )?;
 
                     let op = &mut state.flashinfer_ops[idx];
-                    let op_node = op.node;
                     op.entry_node = Some(entry_node);
                     op.exit_node = Some(exit_node);
                     op.captured_nodes = captured_nodes;
                     op.prepared = Some(prepared);
                     op.ptrs = Some(ptrs);
                     op.signature = Some(signature);
+                    op.metadata_owner = metadata_owner;
                     state.producer_to_graph_node.insert(op_node, exit_node);
                     if serialize_internal_steps {
                         previous_graph_node = Some(exit_node);

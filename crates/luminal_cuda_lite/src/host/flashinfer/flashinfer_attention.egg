@@ -21,6 +21,53 @@
 
 (relation flashinfer_cache_pair (IR IR))
 
+; Head dims the JIT-compiled FlashInfer kernels support (jit.rs asserts the
+; same set). Rules must not capture islands for other dims (e.g. gemma-4's
+; 512-dim full-attention layers stay on the HLIR chain).
+(relation flashinfer_head_dim_ok (Expression))
+(flashinfer_head_dim_ok (MNum 64))
+(flashinfer_head_dim_ok (MNum 128))
+(flashinfer_head_dim_ok (MNum 256))
+; 512 is 16-bit only (the f32 kernel instantiation is gated out of the
+; wrapper at HEAD_DIM > 256) — used by rules that pin a 16-bit dtype.
+(relation flashinfer_head_dim_ok_16bit (Expression))
+(flashinfer_head_dim_ok_16bit (MNum 64))
+(flashinfer_head_dim_ok_16bit (MNum 128))
+(flashinfer_head_dim_ok_16bit (MNum 256))
+(flashinfer_head_dim_ok_16bit (MNum 512))
+
+; Mask-chain facts staged for the attention island rules. Every island rule
+; anchors at one of these tiny relations instead of inlining its mask atoms:
+; the mask-fact joins are small and run once in kernel_fuse_late_pre, and the
+; island joins stay narrow on rolled bodies with many distinct attention
+; instances (inlined, the gemma body ground for 35+ minutes in fuse-late).
+(relation fi_triu_mask (IR IR))
+(relation fi_window_term (IR IR f64))
+(relation fi_scaled_offset_mask (IR))
+(relation fi_direct_causal_mask (IR IR))
+
+; A constant-valued eclass regardless of dtype: either a plain HLIR Constant
+; (f32 graphs) or a folded dtype-typed KernelConstant (the frontend emits
+; `constant(v).cast(dt)` for non-f32 scalars, and the kernel_lower fold rule
+; unions a KernelConstant into the Cast's eclass).
+(relation const_like (IR f64))
+(rule ((= ?e (Op (Constant ?v) (INil))))
+    ((const_like ?e ?v))
+    :ruleset matmul_backend
+    :name "FlashInfer const-like hlir"
+)
+(rule ((= ?e (Op (KernelConstant ?v ?cdt) (INil))))
+    ((const_like ?e ?v))
+    :ruleset matmul_backend
+    :name "FlashInfer const-like kernel"
+)
+
+; Dtypes with a tensor-core prefill runtime (16-bit only).
+(relation flashinfer_prefill_dt (DType))
+(flashinfer_prefill_dt (F16))
+(flashinfer_prefill_dt (Bf16))
+
+
 ; K and V cache sources must come from the same cache-update provenance.
 ; This prevents a rolled loop-body K cache from pairing with the one remaining
 ; unrolled V cache outside the loop, which is shape-compatible but not the
@@ -57,6 +104,25 @@
     (
         ; ── Second matmul: Mul(softmax_out, V_gqa) ──
         ; Shape: (nheads, s, hdim, c) — 4D
+        ; softmax internals connect the mask chain to the second matmul —
+        ; without this the two halves join as a cross-product across the
+        ; distinct layer instances of rolled multi-layer bodies.
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
         (= ?mul2 (Op (Mul
             (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
             ?mul2_a_strides
@@ -76,7 +142,7 @@
 
         ; ── V GQA broadcast: Mul(V_gathered, 1.0) with zero-stride constant ──
         ; Shape: (nheads, c, hdim) — 3D
-        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+        (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
             (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
@@ -121,20 +187,26 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
         ; FlashInfer needs qo_indptr/kv_indptr to be recoverable from the mask
         ; expression. Do not match examples that pass a precomputed mask Input.
-        (= ?mask (Op (Add ?inner_mask_shape ?inner_mask_a_strides ?inner_mask_b_strides ?inner_mask_out_strides)
-            (ICons ?mask_scaled_allowed (ICons ?mask_offset (INil)))))
-        (= ?mask_scaled_allowed (Op (Mul ?allowed_shape ?allowed_strides ?scale_const_strides ?scaled_allowed_strides)
-            (ICons ?mask_allowed (ICons ?mask_scale_const (INil)))))
-        (= ?mask_scale_const (Op (Constant ?mask_scale_val) (INil)))
-        (> ?mask_scale_val 9999999999.0)
-        (< ?mask_scale_val 10000000001.0)
+        ; Mask spelling staged as a fact — see "FlashInfer scaled-offset mask
+        ; fact".
+        (fi_scaled_offset_mask ?mask)
 
         ; ── K GQA broadcast: Mul(K_gathered, 1.0) with zero-stride constant ──
         ; Shape: (nheads, hdim, c) — 3D
-        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+        (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
             (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
             ?k_gqa_a_strides
@@ -156,15 +228,16 @@
         (= ?dt (dtype ?k_cache))
         (= ?dt (dtype ?v_cache))
         (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok ?hdim)
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s"))
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
     )
-    :ruleset matmul_backend
+    :ruleset kernel_fuse_late2
     :name "FlashInfer batch decode attention"
 )
 
@@ -182,6 +255,25 @@
         (> ?s_lower 0)
         (< ?s_upper 2)
 
+        ; softmax internals connect the mask chain to the second matmul —
+        ; without this the two halves join as a cross-product across the
+        ; distinct layer instances of rolled multi-layer bodies.
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
         (= ?mul2 (Op (Mul
             (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
             ?mul2_a_strides
@@ -197,7 +289,7 @@
             ?out_out_strides)
             (ICons ?mul2 (INil))))
 
-        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+        (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
             (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
@@ -233,27 +325,22 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
-        (= ?mask (Op (Mul
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?blocked_strides
-            ?neg_scale_strides
-            ?mask_out_strides)
-            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
-        (= ?neg_mask_scale (Op (Constant ?neg_mask_scale_val) (INil)))
-        (< ?neg_mask_scale_val -9999999999.0)
-        (> ?neg_mask_scale_val -10000000001.0)
-        (= ?blocked_f32 (Op (Cast ?blocked_cast_size (F32))
-            (ICons ?blocked_bool (INil))))
-        (= ?blocked_bool (Op (LessThan
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
-            ?q_pos_cmp_strides
-            ?col_cmp_strides
-            ?blocked_out_strides)
-            (ICons ?q_pos (ICons ?col_offsets (INil)))))
-        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+        ; Mask spelling staged as a fact — see "FlashInfer direct causal mask
+        ; fact".
+        (fi_direct_causal_mask ?mask ?q_pos)
 
-        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+        (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
             (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
             ?k_gqa_a_strides
@@ -272,15 +359,16 @@
         (= ?dt (dtype ?k_cache))
         (= ?dt (dtype ?v_cache))
         (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok ?hdim)
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s"))
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
     )
-    :ruleset matmul_backend
+    :ruleset kernel_fuse_late2
     :name "FlashInfer direct causal attention"
 )
 
@@ -300,6 +388,25 @@
         (> ?s_lower 0)
         (< ?s_upper 2)
 
+        ; softmax internals connect the mask chain to the second matmul —
+        ; without this the two halves join as a cross-product across the
+        ; distinct layer instances of rolled multi-layer bodies.
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
         (= ?mul2 (Op (Mul
             (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
             ?mul2_a_strides
@@ -315,7 +422,7 @@
             ?out_out_strides)
             (ICons ?mul2 (INil))))
 
-        (= ?v_gqa_const (Op (Constant 1.000000) (INil)))
+        (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
             (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
@@ -351,9 +458,204 @@
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
 
         ; Mask indices are row-aligned triangular-mask rows plus arange(c).
-        (= ?mask (Op (Gather
+        ; Triu-gather causal mask, staged as a fact in kernel_fuse_late_pre
+        ; (see "FlashInfer triu mask fact"). Anchoring this rule at the
+        ; tiny fact relation instead of inlining the ~20 mask atoms keeps
+        ; the join narrow on rolled bodies with many distinct attention
+        ; instances (gemma: 35+ min / OOM as a single inlined join).
+        (fi_triu_mask ?mask ?q_pos)
+
+        (const_like ?k_gqa_const 1.000000)
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok ?hdim)
+    )
+    (
+        (let ?fi (Op (FlashInferAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer causal triu-gather attention"
+)
+
+(rule
+    (
+        ; Same attention skeleton as above, but accept a causal mask produced
+        ; by gathering rows from a square upper-triangular blocked mask:
+        ;   triu(c, 1).cast(F32) * -1e10
+        ;   gather(q_pos * c + arange(c))
+        ; This proves each query row exposes only a prefix of the gathered KV
+        ; sequence. 16-bit variant: matches prefill buckets too, since the
+        ; tensor-core prefill runtime exists for f16/bf16.
+        ; No s==1 guard: 16-bit dtypes have a tensor-core prefill runtime, so
+        ; this matches every bucket. The runtime picks decode vs prefill from
+        ; total_q_tokens at execute time.
+        (flashinfer_prefill_dt ?dt)
+
+        ; softmax internals connect the mask chain to the second matmul —
+        ; without this the two halves join as a cross-product across the
+        ; distinct layer instances of rolled multi-layer bodies.
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (const_like ?v_gqa_const 1.000000)
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?scaled_qk (ICons ?mask (INil)))))
+        ; The mask-add's first operand is the QK score scaled by a broadcast
+        ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
+        ; `Mul(scores, const(1/s))`). This atom CONNECTS the Q/K/QK component
+        ; to the mask/softmax/output component; without it the premise graph
+        ; has two disconnected halves whose join cross-products across the
+        ; distinct layer instances of rolled multi-layer bodies (the gemma
+        ; 530GB egglog OOM), and Q could pair with another instance's mask.
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
+
+        ; Mask indices are row-aligned triangular-mask rows plus arange(c).
+        ; Triu-gather causal mask, staged as a fact in kernel_fuse_late_pre
+        ; (see "FlashInfer triu mask fact"). Anchoring this rule at the
+        ; tiny fact relation instead of inlining the ~20 mask atoms keeps
+        ; the join narrow on rolled bodies with many distinct attention
+        ; instances (gemma: 35+ min / OOM as a single inlined join).
+        (fi_triu_mask ?mask ?q_pos)
+
+        (const_like ?k_gqa_const 1.000000)
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok ?hdim)
+    )
+    (
+        (let ?fi (Op (FlashInferAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer causal triu-gather attention 16-bit prefill"
+)
+
+; ── Gemma-4 variants ──
+;
+; Scale-free scores (attention scaling 1.0) and, on sliding layers, a window
+; term added to the causal mask. The mask chains are staged into relation
+; facts (anchored at their -1e10 constants), and the attention skeleton
+; matches the softmax internals so the whole rule is ONE connected chain —
+; an unconnected ?masked/?soft pair cross-products across the distinct layer
+; instances of a rolled multi-layer body and never finishes joining.
+
+(rule
+    (
+        (= ?cmask (Op (Gather
             (ECons (MVar "s") (ECons (MVar "c") (ENil)))
             ?mask_idx_strides
             (ECons (MVar "c") (ECons (MVar "c") (ENil)))
@@ -374,19 +676,16 @@
             (ICons ?q_pos (ICons ?ctx_scalar (INil)))))
         (= ?ctx_scalar (Op (Iota (MVar "c") (MNum 1)) (INil)))
 
-        ; The source square is an upper-triangular blocked mask. The LessThan
-        ; strides prove row_index < col_index; multiplying by -1e10 turns
-        ; blocked positions into additive -inf and leaves the prefix at zero.
         (= ?scaled_blocked (Op (Mul
             (ECons (MVar "c") (ECons (MVar "c") (ENil)))
             ?blocked_strides
             ?neg_scale_strides
             ?scaled_blocked_strides)
             (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
-        (= ?neg_mask_scale (Op (Constant ?neg_mask_scale_val) (INil)))
+        (const_like ?neg_mask_scale ?neg_mask_scale_val)
         (< ?neg_mask_scale_val -9999999999.0)
         (> ?neg_mask_scale_val -10000000001.0)
-        (= ?blocked_f32 (Op (Cast ?blocked_cast_size (F32))
+        (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
             (ICons ?blocked_bool (INil))))
         (= ?blocked_bool (Op (LessThan
             (ECons (MVar "c") (ECons (MVar "c") (ENil)))
@@ -411,8 +710,190 @@
         (= ?tri_iota_f32 (Op (Cast ?tri_iota_cast_size (F32))
             (ICons ?tri_iota (INil))))
         (= ?tri_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+    )
+    (
+        (fi_triu_mask ?cmask ?q_pos)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer triu mask fact"
+)
 
-        (= ?k_gqa_const (Op (Constant 1.000000) (INil)))
+(rule
+    (
+        ; Legacy decode mask spelling: Add(Mul(allowed, 1e10), offset). The
+        ; "batch decode attention" island rule anchors at this fact.
+        (= ?mask (Op (Add ?inner_mask_shape ?inner_mask_a_strides ?inner_mask_b_strides ?inner_mask_out_strides)
+            (ICons ?mask_scaled_allowed (ICons ?mask_offset (INil)))))
+        (= ?mask_scaled_allowed (Op (Mul ?allowed_shape ?allowed_strides ?scale_const_strides ?scaled_allowed_strides)
+            (ICons ?mask_allowed (ICons ?mask_scale_const (INil)))))
+        (const_like ?mask_scale_const ?mask_scale_val)
+        (> ?mask_scale_val 9999999999.0)
+        (< ?mask_scale_val 10000000001.0)
+    )
+    (
+        (fi_scaled_offset_mask ?mask)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer scaled-offset mask fact"
+)
+
+(rule
+    (
+        ; Direct causal mask spelling:
+        ;   (q_pos[:, None] < arange(c)[None, :]).cast(F32) * -1e10
+        ; The "direct causal attention" island rule anchors at this fact.
+        (= ?mask (Op (Mul
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?blocked_strides
+            ?neg_scale_strides
+            ?mask_out_strides)
+            (ICons ?blocked_f32 (ICons ?neg_mask_scale (INil)))))
+        (const_like ?neg_mask_scale ?neg_mask_scale_val)
+        (< ?neg_mask_scale_val -9999999999.0)
+        (> ?neg_mask_scale_val -10000000001.0)
+        (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
+            (ICons ?blocked_bool (INil))))
+        (= ?blocked_bool (Op (LessThan
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?q_pos_cmp_strides
+            ?col_cmp_strides
+            ?blocked_out_strides)
+            (ICons ?q_pos (ICons ?col_offsets (INil)))))
+        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+    )
+    (
+        (fi_direct_causal_mask ?mask ?q_pos)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer direct causal mask fact"
+)
+
+(rule
+    (
+        ; window term: (col < q_pos - (W-1)) cast * -1e10; the constant W-1
+        ; is FlashInfer's window_left.
+        (= ?wterm (Op (Mul
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?wt_a_strides
+            ?wt_b_strides
+            ?wt_out_strides)
+            (ICons ?w_bool_cast (ICons ?w_negbig (INil)))))
+        (const_like ?w_negbig ?w_negbig_val)
+        (< ?w_negbig_val -9999999999.0)
+        (> ?w_negbig_val -10000000001.0)
+        (= ?w_bool_cast (Op (Cast ?w_cast_size ?w_cast_dt)
+            (ICons ?w_lt (INil))))
+        (= ?w_lt (Op (LessThan
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons (MNum 0) (ECons (MIter) (ENil)))
+            (ECons (MIter) (ECons (MNum 0) (ENil)))
+            ?w_lt_out_strides)
+            (ICons ?w_col_f (ICons ?w_lo (INil)))))
+        (= ?w_col_f (Op (Cast ?w_col_cast_size (F32)) (ICons ?w_col_iota (INil))))
+        (= ?w_col_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?w_lo (Op (Add
+            (ECons (MVar "s") (ENil))
+            ?w_lo_a_strides
+            ?w_lo_b_strides
+            ?w_lo_out_strides)
+            (ICons ?w_qpos_f (ICons ?w_neg (INil)))))
+        (= ?w_qpos_f (Op (Cast ?w_qpos_cast_size (F32)) (ICons ?w_qpos (INil))))
+        (= ?w_neg (Op (Mul
+            (ECons (MVar "s") (ENil))
+            (ECons (MNum 0) (ENil))
+            (ECons (MNum 0) (ENil))
+            ?w_neg_out_strides)
+            (ICons ?w_window (ICons ?w_negone (INil)))))
+        (= ?w_window (Op (Constant ?window_left) (INil)))
+        (= ?w_negone (Op (Constant -1.000000) (INil)))
+    )
+    (
+        (fi_window_term ?wterm ?w_qpos ?window_left)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer window term fact"
+)
+
+(rule
+    (
+        ; Gemma-4 full attention: scale-free, causal triu-gather mask.
+        ; 16-bit only (covers head_dim 512); no s==1 guard — the tensor-core
+        ; prefill runtime handles s>1.
+        (= ?s_lower (lower (MVar "s")))
+        (= ?s_upper (upper (MVar "s")))
+        (> ?s_lower 0)
+        (< ?s_upper 2)
+
+        (flashinfer_prefill_dt ?dt)
+        (fi_triu_mask ?mask ?q_pos)
+        ; mask Add → softmax internals → second matmul: one connected chain.
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?qk (ICons ?mask (INil)))))
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (const_like ?v_gqa_const 1.000000)
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        ; SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+        (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
             (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
             ?k_gqa_a_strides
@@ -431,14 +912,133 @@
         (= ?dt (dtype ?k_cache))
         (= ?dt (dtype ?v_cache))
         (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok_16bit ?hdim)
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s"))
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 1.0 -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
     )
-    :ruleset matmul_backend
-    :name "FlashInfer causal triu-gather attention"
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer gemma scale-free triu-gather attention"
+)
+
+(rule
+    (
+        ; Gemma-4 sliding-window attention: scale-free, causal triu-gather
+        ; mask + window term; window_left carried onto the op.
+        (= ?s_lower (lower (MVar "s")))
+        (= ?s_upper (upper (MVar "s")))
+        (> ?s_lower 0)
+        (< ?s_upper 2)
+
+        (flashinfer_prefill_dt ?dt)
+        (= ?mask (Op (Add
+            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            ?wm_a_strides
+            ?wm_b_strides
+            ?wm_out_strides)
+            (ICons ?cmask (ICons ?wterm (INil)))))
+        (fi_triu_mask ?cmask ?q_pos)
+        (fi_window_term ?wterm ?q_pos2 ?window_left)
+        (= ?q_pos ?q_pos2)
+        ; mask Add → softmax internals → second matmul: one connected chain.
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?qk (ICons ?mask (INil)))))
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (const_like ?v_gqa_const 1.000000)
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        ; SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+        (const_like ?k_gqa_const 1.000000)
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok_16bit ?hdim)
+    )
+    (
+        (let ?fi (Op (FlashInferAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 1.0 ?window_left)
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer gemma sliding triu-gather attention"
 )

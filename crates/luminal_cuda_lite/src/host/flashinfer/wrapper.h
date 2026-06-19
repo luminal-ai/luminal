@@ -8,6 +8,9 @@
 extern "C" {
 #endif
 
+// dtype codes shared with the Rust side: 0 = f32, 1 = f16, 2 = bf16.
+// Q / K / V / output buffers must all use the same dtype.
+
 // Plan phase: CPU-side scheduling. Must call before each new batch config.
 // Returns 0 on success, non-zero on failure.
 int flashinfer_batch_decode_plan(
@@ -16,6 +19,7 @@ int flashinfer_batch_decode_plan(
     void* page_locked_int_workspace,
     int32_t* indptr_h, int batch_size,
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
     bool enable_cuda_graph,
     cudaStream_t stream,
     int64_t* plan_info_out, int* plan_info_len_out);
@@ -26,15 +30,17 @@ int flashinfer_batch_decode_run(
     void* float_workspace, size_t float_ws_size,
     void* int_workspace,
     int64_t* plan_info_vec, int plan_info_len,
-    float* q,                    // [batch_size, num_qo_heads, head_dim]
-    float* k_cache,              // [num_pages, page_size, num_kv_heads, head_dim] (NHD)
-    float* v_cache,              // same layout
+    void* q,                     // [batch_size, num_qo_heads, head_dim]
+    void* k_cache,               // [num_pages, page_size, num_kv_heads, head_dim] (NHD)
+    void* v_cache,               // same layout
     int32_t* kv_indptr,          // [batch_size + 1]
     int32_t* kv_indices,         // [total_pages]
     int32_t* kv_last_page_len,   // [batch_size]
-    float* output,               // [batch_size, num_qo_heads, head_dim]
+    void* output,                // [batch_size, num_qo_heads, head_dim]
     int batch_size,
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    float sm_scale, int window_left,
     cudaStream_t stream);
 
 // Copy compact slot/page indices into FlashInfer's page table.
@@ -59,14 +65,16 @@ void flashinfer_prepare_decode_metadata(
 
 // Transpose output from (batch, heads, dim) to (heads, batch, dim).
 void flashinfer_transpose_output(
-    const float* src, float* dst,
+    const void* src, void* dst,
     int batch, int heads, int dim,
+    int dtype,
     cudaStream_t stream);
 
-// ── BatchPrefill with Paged KV Cache ──
+// ── BatchPrefill with Paged KV Cache (f16 / bf16 only) ──
 
-// Plan phase for batch prefill.
-// Returns 0 on success, non-zero on failure.
+// Plan phase for batch prefill. qo_indptr_h / kv_indptr_h are HOST arrays.
+// Returns 0 on success, non-zero on failure. Returns -1 for f32 (tensor core
+// MMA requires 16-bit inputs).
 int flashinfer_batch_prefill_plan(
     void* float_workspace, size_t float_ws_size,
     void* int_workspace, size_t int_ws_size,
@@ -74,25 +82,29 @@ int flashinfer_batch_prefill_plan(
     int32_t* qo_indptr_h, int32_t* kv_indptr_h,
     int total_num_rows, int batch_size,
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    int window_left,
     cudaStream_t stream,
     int64_t* plan_info_out, int* plan_info_len_out);
 
-// Run phase for batch prefill.
+// Run phase for batch prefill (causal mask). Indptr arrays are on DEVICE.
 // Returns 0 on success, non-zero on failure.
 int flashinfer_batch_prefill_run(
     void* float_workspace, size_t float_ws_size,
     void* int_workspace,
     int64_t* plan_info_vec, int plan_info_len,
-    float* q,                    // [total_num_rows, num_qo_heads, head_dim]
-    float* k_cache,              // [num_pages, page_size, num_kv_heads, head_dim] (NHD)
-    float* v_cache,              // same layout
-    int32_t* qo_indptr,         // [batch_size + 1] on GPU
-    int32_t* kv_indptr,         // [batch_size + 1] on GPU
+    void* q,                     // [total_num_rows, num_qo_heads, head_dim]
+    void* k_cache,               // [num_pages, page_size, num_kv_heads, head_dim] (NHD)
+    void* v_cache,               // same layout
+    int32_t* qo_indptr,          // [batch_size + 1] on GPU
+    int32_t* kv_indptr,          // [batch_size + 1] on GPU
     int32_t* kv_indices,         // [total_pages]
     int32_t* kv_last_page_len,   // [batch_size]
-    float* output,               // [total_num_rows, num_qo_heads, head_dim]
+    void* output,                // [total_num_rows, num_qo_heads, head_dim]
     int total_num_rows, int batch_size,
     int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    float sm_scale, int window_left,
     cudaStream_t stream);
 
 #ifdef __cplusplus

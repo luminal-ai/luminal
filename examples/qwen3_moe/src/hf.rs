@@ -74,6 +74,12 @@ fn tensor_to_f32_bytes(tensor: &safetensors::tensor::TensorView) -> Vec<u8> {
     bytemuck::cast_slice(&f32_data).to_vec()
 }
 
+/// Tensors that stay F32 in the bf16 pipeline: norm weights (norms compute
+/// in F32 via explicit casts) and the MoE router.
+fn keep_f32(name: &str) -> bool {
+    name.contains("norm") || name.ends_with("mlp.gate.weight")
+}
+
 /// Check if a tensor name is an expert weight (large, should be stored as BF16)
 fn is_expert_weight(name: &str) -> bool {
     name.contains(".mlp.experts.")
@@ -85,7 +91,7 @@ fn is_expert_weight(name: &str) -> bool {
 ///
 /// Expert weights are stored as BF16 (saves ~60GB), non-expert weights as F32 (~6GB).
 pub fn combine_safetensors(model_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined.safetensors");
+    let output_path = model_dir.join("model_combined_bf16_v1.safetensors");
 
     // Skip if already combined
     if output_path.exists() {
@@ -157,8 +163,10 @@ pub fn combine_safetensors(model_dir: &Path) -> Result<PathBuf, Box<dyn std::err
                         dtype: Dtype::BF16,
                     },
                 );
-            } else {
-                // Non-expert weights as F32
+            } else if keep_f32(name) {
+                // Norm weights and the router stay F32: norms are computed in
+                // F32 per the dtype contract, and routing softmax/top-k
+                // numerics shouldn't shift with the activation dtype.
                 let data = tensor_to_f32_bytes(&tensor);
                 all_tensors.insert(
                     name.to_string(),
@@ -166,6 +174,20 @@ pub fn combine_safetensors(model_dir: &Path) -> Result<PathBuf, Box<dyn std::err
                         shape,
                         data,
                         dtype: Dtype::F32,
+                    },
+                );
+            } else {
+                // Everything else (dense projections, embeddings, lm_head)
+                // stores BF16 for the bf16-activation pipeline.
+                let f32_bytes = tensor_to_f32_bytes(&tensor);
+                let f32_slice: &[f32] = bytemuck::cast_slice(&f32_bytes);
+                let bf16_data: Vec<bf16> = f32_slice.iter().map(|x| bf16::from_f32(*x)).collect();
+                all_tensors.insert(
+                    name.to_string(),
+                    StoredTensor {
+                        shape,
+                        data: bytemuck::cast_slice(&bf16_data).to_vec(),
+                        dtype: Dtype::BF16,
                     },
                 );
             }

@@ -256,6 +256,23 @@ impl ShapeTracker {
             .max(1)
     }
 
+    /// The number of physical elements this view can address: max linear
+    /// offset + 1. Differs from `n_physical_elements` for sliced views, where
+    /// the addressed span exceeds the count of viewed elements (e.g. a
+    /// (3,4)-slice of (3,16) views 12 elements but addresses offsets 0..36).
+    /// Stride expressions are nondecreasing in z, so each axis peaks at
+    /// `dim - 1`.
+    pub fn physical_span(&self) -> Expression {
+        self.dims
+            .into_iter()
+            .zip(&self.strides)
+            .map(|(d, s)| s.substitute('z', d - 1))
+            .sum::<Expression>()
+            .max(0)
+            .simplify()
+            + 1
+    }
+
     /// The number of dimensions
     pub fn len(&self) -> usize {
         self.dims.len()
@@ -500,6 +517,29 @@ fn fresh_split_var(expressions: &[Expression], excluded: &[char]) -> char {
 mod tests {
     use crate::prelude::*;
     use proptest::prelude::*;
+    #[test]
+    fn test_contiguous_physical_span_equals_n_elements() {
+        // A fully contiguous tensor addresses exactly n_elements offsets, so
+        // physical_span must equal n_elements (modulo the symbolic max guard).
+        let s = expr('s');
+        let tracker = ShapeTracker::new([s, expr(2), expr(12), expr(16)]);
+        assert!(tracker.is_contiguous());
+        let span = tracker.physical_span();
+        let n_elem = tracker.n_elements();
+        // A contiguous view addresses exactly n_elements offsets. Evaluate at a
+        // few concrete sizes: span and n_elements must agree (regression for the
+        // Add fold bug that over-counted the constant as 533 instead of 383).
+        for s in 1usize..=4 {
+            let map: crate::prelude::FxHashMap<char, usize> = [('s', s)].into_iter().collect();
+            assert_eq!(
+                span.exec(&map),
+                n_elem.exec(&map),
+                "span and n_elements disagree at s={s}: span={span:?} n_elem={n_elem:?}"
+            );
+            assert_eq!(span.exec(&map), Some(384 * s));
+        }
+    }
+
     #[test]
     fn test_idx_expr() {
         let mut tracker = ShapeTracker::new([expr(10), expr(5), expr(3)]);

@@ -9,6 +9,8 @@ mod conv2d_rewrite;
 #[cfg(test)]
 mod cublaslt_rewrite_tests;
 #[cfg(test)]
+mod dtype_contract;
+#[cfg(test)]
 mod flashinfer;
 #[cfg(test)]
 mod fusion;
@@ -22,6 +24,7 @@ mod op_functional_tests;
 mod performance_tests;
 #[cfg(test)]
 mod qwen3_moe_rewrite;
+mod qwen_bf16_repro;
 #[cfg(test)]
 mod rope_test;
 #[cfg(test)]

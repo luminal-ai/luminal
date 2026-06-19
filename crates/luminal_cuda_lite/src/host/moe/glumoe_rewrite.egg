@@ -208,8 +208,6 @@
             ?gu_within_range ?dn_within_range (MNum 0))
             (ICons ?x (ICons ?topk_idx (ICons ?topk_vals (ICons ?gate_up_w (ICons ?down_w (ICons ?topk_vals (INil)))))))))
         (union ?output ?glumoe)
-        (subsume (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
-        (subsume (Op (KernelSum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride (F32)) (ICons ?weighted (INil))))
     )
     :ruleset glumoe
     :name "GLUMoE fused expert computation (swiglu)"
@@ -239,8 +237,6 @@
             ?gu_within_range ?dn_within_range (MNum 2))
             (ICons ?x (ICons ?topk_idx (ICons ?topk_vals (ICons ?gate_up_w (ICons ?down_w (ICons ?topk_vals (INil)))))))))
         (union ?output ?glumoe)
-        (subsume (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
-        (subsume (Op (KernelSum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride (F32)) (ICons ?weighted (INil))))
     )
     :ruleset glumoe
     :name "GLUMoE fused expert computation (normalized swiglu)"
@@ -273,8 +269,6 @@
             ?gu_within_range ?dn_within_range (MNum 1))
             (ICons ?x (ICons ?topk_idx (ICons ?topk_vals (ICons ?gate_up_w (ICons ?down_w (ICons ?per_expert_scale (INil)))))))))
         (union ?output ?glumoe)
-        (subsume (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
-        (subsume (Op (KernelSum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride (F32)) (ICons ?weighted (INil))))
     )
     :ruleset glumoe
     :name "GLUMoE fused expert computation (gemma_gelu)"

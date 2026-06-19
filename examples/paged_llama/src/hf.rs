@@ -16,10 +16,11 @@ struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
 }
 
-/// Stored tensor data with shape and converted FP32 bytes
+/// Stored tensor data with shape, dtype and serialized bytes.
 struct StoredTensor {
     shape: Vec<usize>,
-    data: Vec<f32>,
+    dtype: Dtype,
+    data: Vec<u8>,
 }
 
 /// Downloads model files from HuggingFace and returns the cache directory path.
@@ -70,29 +71,50 @@ fn tensor_to_f32(tensor: &safetensors::tensor::TensorView) -> Vec<f32> {
     }
 }
 
-/// Combines sharded safetensors files into a single FP32 file.
-///
-/// This function:
-/// 1. Loads tensors from shard(s)
-/// 2. Converts all to FP32
-/// 3. Writes combined file
-pub fn combine_safetensors_to_fp32(
-    model_dir: &Path,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let output_path = model_dir.join("model_combined.safetensors");
+fn tensor_to_f32_bytes(tensor: &safetensors::tensor::TensorView) -> Vec<u8> {
+    let fp32 = tensor_to_f32(tensor);
+    bytemuck::cast_slice(&fp32).to_vec()
+}
 
-    // Skip if already combined
-    if output_path.exists() {
-        return Ok(output_path);
+fn tensor_to_bf16_bytes(tensor: &safetensors::tensor::TensorView) -> Vec<u8> {
+    match tensor.dtype() {
+        Dtype::BF16 => tensor.data().to_vec(),
+        _ => tensor_to_f32(tensor)
+            .into_iter()
+            .flat_map(|x| bf16::from_f32(x).to_le_bytes())
+            .collect(),
     }
+}
 
+/// Norm weights stay F32 in the bf16 pipeline: the model computes norms in
+/// F32 (explicit casts) and only the linear/embedding weights are bf16.
+fn keep_f32_in_bf16_pipeline(name: &str) -> bool {
+    name.contains("norm")
+}
+
+fn stored_tensor_bf16(name: &str, tensor: &safetensors::tensor::TensorView) -> StoredTensor {
+    let shape = tensor.shape().to_vec();
+    if keep_f32_in_bf16_pipeline(name) {
+        StoredTensor {
+            shape,
+            dtype: Dtype::F32,
+            data: tensor_to_f32_bytes(tensor),
+        }
+    } else {
+        StoredTensor {
+            shape,
+            dtype: Dtype::BF16,
+            data: tensor_to_bf16_bytes(tensor),
+        }
+    }
+}
+
+fn model_shard_files(model_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let index_path = model_dir.join("model.safetensors.index.json");
     let single_shard_path = model_dir.join("model.safetensors");
 
-    // Determine which shard files to load
-    let shard_files: Vec<PathBuf> = if single_shard_path.exists() && !index_path.exists() {
-        println!("Single shard model detected, converting to FP32...");
-        vec![single_shard_path]
+    if single_shard_path.exists() && !index_path.exists() {
+        Ok(vec![single_shard_path])
     } else if index_path.exists() {
         let index_content = std::fs::read_to_string(&index_path)?;
         let index: SafetensorsIndex = serde_json::from_str(&index_content)?;
@@ -101,14 +123,30 @@ pub fn combine_safetensors_to_fp32(
         files.sort();
         files.dedup();
 
-        println!(
-            "Loading {} shard files (converting to FP32)...",
-            files.len()
-        );
-        files.into_iter().map(|f| model_dir.join(f)).collect()
+        Ok(files.into_iter().map(|f| model_dir.join(f)).collect())
     } else {
-        return Err("No model.safetensors or model.safetensors.index.json found".into());
-    };
+        Err("No model.safetensors or model.safetensors.index.json found".into())
+    }
+}
+
+/// Combines sharded safetensors into a single BF16 file (norm weights kept
+/// F32). The paged_llama model is bf16-only: linears, embedding and lm_head
+/// are bf16; norms compute in F32 from F32 weights.
+pub fn combine_safetensors_to_bf16(
+    model_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output_path = model_dir.join("model_combined_bf16_v1.safetensors");
+
+    // Skip if already combined
+    if output_path.exists() {
+        return Ok(output_path);
+    }
+
+    let shard_files = model_shard_files(model_dir)?;
+    println!(
+        "Loading {} shard files (converting to BF16, norms F32)...",
+        shard_files.len()
+    );
 
     // Load and convert all tensors
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
@@ -124,29 +162,17 @@ pub fn combine_safetensors_to_fp32(
 
         for name in st.names() {
             let tensor = st.tensor(name)?;
-            let shape: Vec<usize> = tensor.shape().to_vec();
-            let fp32_data = tensor_to_f32(&tensor);
-
-            all_tensors.insert(
-                name.to_string(),
-                StoredTensor {
-                    shape,
-                    data: fp32_data,
-                },
-            );
+            all_tensors.insert(name.to_string(), stored_tensor_bf16(name, &tensor));
         }
     }
 
     println!("Extracted {} language model tensors", all_tensors.len());
-
-    // Serialize to combined file
-    println!("Saving combined FP32 model to {}...", output_path.display());
+    println!("Saving combined BF16 model to {}...", output_path.display());
 
     let tensor_views: HashMap<String, TensorView<'_>> = all_tensors
         .iter()
         .map(|(name, stored)| {
-            let data_bytes: &[u8] = bytemuck::cast_slice(&stored.data);
-            let view = TensorView::new(Dtype::F32, stored.shape.clone(), data_bytes).unwrap();
+            let view = TensorView::new(stored.dtype, stored.shape.clone(), &stored.data).unwrap();
             (name.clone(), view)
         })
         .collect();
@@ -156,7 +182,7 @@ pub fn combine_safetensors_to_fp32(
     let mut file = File::create(&output_path)?;
     file.write_all(&serialized)?;
 
-    println!("Combined FP32 model saved successfully!");
+    println!("Combined BF16 model saved successfully!");
     Ok(output_path)
 }
 
@@ -164,9 +190,9 @@ pub fn combine_safetensors_to_fp32(
 ///
 /// Returns the path to the model directory containing:
 /// - tokenizer.json
-/// - model_combined.safetensors (FP32)
+/// - model_combined_bf16_v1.safetensors (BF16 linears/embeddings, F32 norms)
 pub fn prepare_hf_model(repo_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let model_dir = download_hf_model(repo_id)?;
-    combine_safetensors_to_fp32(&model_dir)?;
+    combine_safetensors_to_bf16(&model_dir)?;
     Ok(model_dir)
 }

@@ -205,23 +205,14 @@ pub(crate) fn build_compile_units(
             }
         }
 
-        // Topological order on the interior + FS nodes (so the kernel
-        // emits `let v = ...;` lines after their inputs are bound). We
-        // use the parent graph's toposort filtered to in-region nodes.
-        let mut region_set: FxHashSet<NodeIndex> = FxHashSet::default();
-        region_set.extend(interior.iter().copied());
-        region_set.extend(fs_nodes.iter().copied());
-        let topo = toposort(llir_graph, None).expect("LLIR cycle in region detection");
-        let interior_topo: Vec<NodeIndex> = topo
-            .iter()
-            .copied()
-            .filter(|n| region_set.contains(n) && interior.contains(n))
-            .collect();
-        let fs_topo: Vec<NodeIndex> = topo
-            .iter()
-            .copied()
-            .filter(|n| region_set.contains(n) && fs_nodes.contains(n))
-            .collect();
+        // Canonical orders for interior + FS nodes. `egglog_to_llir`
+        // reissues NodeIndexes for every search candidate, so any
+        // NodeIndex-driven order (like the previous global-toposort
+        // filter) renumbers the kernel's inputs and locals across
+        // candidates, defeating the source-keyed compile cache for
+        // regions that are structurally identical. Order by content
+        // instead — see `canonicalize_region`.
+        let (interior_topo, fs_topo) = canonicalize_region(llir_graph, node, &interior, &fs_nodes);
 
         // External producer for each FS leaf, in the same order.
         let external_inputs: Vec<NodeIndex> = fs_topo
@@ -232,52 +223,8 @@ pub(crate) fn build_compile_units(
                     .next()
                     .unwrap_or_else(|| {
                         // Dump the malformed structure: which FE
-                        // triggered the walk, every node in fs_topo and
-                        // interior_topo, and each FS's incoming /
-                        // outgoing degree. Helps localize whether the
-                        // missing edge came from extraction or a
-                        // downstream LLIR transform.
-                        if std::env::var("LUMINAL_DEBUG_FUSION_PANIC").is_ok() {
-                            eprintln!(
-                                "FusionStart panic: fe={} (kernel={:?})",
-                                node.index(),
-                                llir_graph.node_weight(node).and_then(|op| {
-                                    op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
-                                }),
-                            );
-                            eprintln!("  fs_topo ({}):", fs_topo.len());
-                            for &f in &fs_topo {
-                                let in_deg = llir_graph
-                                    .neighbors_directed(f, Direction::Incoming)
-                                    .count();
-                                let out_deg = llir_graph
-                                    .neighbors_directed(f, Direction::Outgoing)
-                                    .count();
-                                let kn = llir_graph
-                                    .node_weight(f)
-                                    .and_then(|op| {
-                                        op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
-                                    })
-                                    .unwrap_or("?");
-                                eprintln!(
-                                    "    fs={} kind={} in_deg={} out_deg={}",
-                                    f.index(),
-                                    kn,
-                                    in_deg,
-                                    out_deg,
-                                );
-                            }
-                            eprintln!("  interior_topo ({}):", interior_topo.len());
-                            for &i in &interior_topo {
-                                let kn = llir_graph
-                                    .node_weight(i)
-                                    .and_then(|op| {
-                                        op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name())
-                                    })
-                                    .unwrap_or("?");
-                                eprintln!("    interior={} kind={}", i.index(), kn);
-                            }
-                        }
+                        // triggered the walk. A malformed region (an FS leaf
+                        // with no external producer) should never reach here.
                         panic!("FusionStart with no predecessor")
                     })
             })
@@ -319,6 +266,188 @@ pub(crate) fn build_compile_units(
 }
 
 // =========================================================================
+// Region canonicalization.
+//
+// The emitted kernel string must be a function of the region's *structure*
+// only, never of NodeIndexes: every search candidate reissues NodeIndexes,
+// and structurally identical regions recur constantly across candidates
+// (one gemma search was measured compiling 200k+ kernels where ~20% were
+// the same program with inputs/locals renumbered by NodeIndex churn).
+// =========================================================================
+
+/// Structural hash per region node. Captures exactly the text-relevant
+/// content: FS leaves hash (read index expression, dtype); interior
+/// elementwise nodes hash (op name, dtype, child hashes). Child hashes are
+/// sorted — the only binary region ops, Add and Mul, are commutative, so
+/// operand order is presentation, not structure. NodeIndexes never enter a
+/// hash.
+fn region_structural_hashes(
+    llir_graph: &LLIRGraph,
+    fe_node: NodeIndex,
+    interior: &[NodeIndex],
+    fs_nodes: &[NodeIndex],
+) -> FxHashMap<NodeIndex, u64> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let fe_op = llir_graph[fe_node].to_dialect::<dyn KernelOp>().unwrap();
+    let fe_struct: &FusionEnd = (***fe_op)
+        .downcast_ref::<FusionEnd>()
+        .expect("region root must be FusionEnd");
+    let out_shape: &[Expression] = &fe_struct.shape;
+
+    let mut hashes: FxHashMap<NodeIndex, u64> = FxHashMap::default();
+    for &fs in fs_nodes {
+        let fs_op = llir_graph[fs].to_dialect::<dyn KernelOp>().unwrap();
+        let fs_struct: &FusionStart = (***fs_op).downcast_ref::<FusionStart>().unwrap();
+        let read_idx = flatten_strides(out_shape, &fs_struct.strides).to_kernel();
+        let mut h = DefaultHasher::new();
+        ("FS", read_idx.as_str(), cuda_dtype(fs_struct.dtype)).hash(&mut h);
+        hashes.insert(fs, h.finish());
+    }
+
+    // Interior nodes bottom-up in one Kahn pass over the region-induced
+    // subgraph (in-degree counts only in-region predecessors, so FS
+    // leaves and external/malformed predecessors never gate readiness —
+    // the latter hash as a constant tag). O(V + E); rolled prefill
+    // regions have thousands of interior nodes in long chains, so
+    // anything multi-pass is quadratic and stalls the search.
+    let interior_set: FxHashSet<NodeIndex> = interior.iter().copied().collect();
+    let mut indeg: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    for &n in interior {
+        let d = llir_graph
+            .neighbors_directed(n, Direction::Incoming)
+            .filter(|p| interior_set.contains(p))
+            .count();
+        indeg.insert(n, d);
+    }
+    let mut queue: std::collections::VecDeque<NodeIndex> =
+        interior.iter().copied().filter(|n| indeg[n] == 0).collect();
+    while let Some(n) = queue.pop_front() {
+        let mut child_hashes: Vec<u64> = llir_graph
+            .neighbors_directed(n, Direction::Incoming)
+            .map(|src| hashes.get(&src).copied().unwrap_or(0x4558_5445_524e_414c)) // "EXTERNAL"
+            .collect();
+        child_hashes.sort_unstable();
+        let op_ref = llir_graph[n].to_dialect::<dyn KernelOp>().unwrap();
+        let (op_name, dt) = if let Some(e) = (***op_ref).downcast_ref::<CudaUnaryElementwise>() {
+            (e.op.as_str(), e.dtype)
+        } else if let Some(e) = (***op_ref).downcast_ref::<CudaBinaryElementwise>() {
+            (e.op.as_str(), e.dtype)
+        } else {
+            (op_ref.kernel_name(), op_ref.output_dtype())
+        };
+        let mut h = DefaultHasher::new();
+        (op_name, cuda_dtype(dt), &child_hashes).hash(&mut h);
+        hashes.insert(n, h.finish());
+        for succ in llir_graph.neighbors_directed(n, Direction::Outgoing) {
+            if let Some(d) = indeg.get_mut(&succ) {
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(succ);
+                }
+            }
+        }
+    }
+    hashes
+}
+
+/// Canonical orders for a region's interior and FS nodes:
+/// - interior: topological (Kahn over the region-induced subgraph), ties
+///   broken by structural hash;
+/// - FS leaves: sorted by (read index expression, dtype), ties broken by
+///   first use in the canonical body. Two FS leaves tied on all keys are
+///   textually interchangeable loads feeding commutative ops, so their
+///   relative order cannot change the emitted kernel.
+fn canonicalize_region(
+    llir_graph: &LLIRGraph,
+    fe_node: NodeIndex,
+    interior: &[NodeIndex],
+    fs_nodes: &[NodeIndex],
+) -> (Vec<NodeIndex>, Vec<NodeIndex>) {
+    let hashes = region_structural_hashes(llir_graph, fe_node, interior, fs_nodes);
+    let interior_set: FxHashSet<NodeIndex> = interior.iter().copied().collect();
+
+    let mut indeg: FxHashMap<NodeIndex, usize> = interior
+        .iter()
+        .map(|&n| {
+            let d = llir_graph
+                .neighbors_directed(n, Direction::Incoming)
+                .filter(|p| interior_set.contains(p))
+                .count();
+            (n, d)
+        })
+        .collect();
+    // Min-heap keyed by (structural hash, NodeIndex): O(V log V) — regions
+    // from rolled prefill graphs have thousands of interior nodes.
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, NodeIndex)>> =
+        interior
+            .iter()
+            .copied()
+            .filter(|n| indeg[n] == 0)
+            .map(|n| std::cmp::Reverse((hashes.get(&n).copied().unwrap_or(0), n.index(), n)))
+            .collect();
+    let mut interior_topo: Vec<NodeIndex> = Vec::with_capacity(interior.len());
+    while let Some(std::cmp::Reverse((_, _, n))) = ready.pop() {
+        interior_topo.push(n);
+        for succ in llir_graph.neighbors_directed(n, Direction::Outgoing) {
+            if let Some(d) = indeg.get_mut(&succ) {
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(std::cmp::Reverse((
+                        hashes.get(&succ).copied().unwrap_or(0),
+                        succ.index(),
+                        succ,
+                    )));
+                }
+            }
+        }
+    }
+    debug_assert_eq!(interior_topo.len(), interior.len());
+
+    // First use of each FS leaf, walking consumers in canonical body order
+    // with operands in hash order (matching emission).
+    let mut first_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    for &n in interior_topo.iter().chain(std::iter::once(&fe_node)) {
+        let mut srcs: Vec<NodeIndex> = llir_graph
+            .neighbors_directed(n, Direction::Incoming)
+            .collect();
+        srcs.sort_by_key(|s| (hashes.get(s).copied().unwrap_or(0), s.index()));
+        for s in srcs {
+            if !interior_set.contains(&s) && hashes.contains_key(&s) {
+                let next = first_use.len();
+                first_use.entry(s).or_insert(next);
+            }
+        }
+    }
+
+    let fe_op = llir_graph[fe_node].to_dialect::<dyn KernelOp>().unwrap();
+    let fe_struct: &FusionEnd = (***fe_op).downcast_ref::<FusionEnd>().unwrap();
+    let fs_keys: FxHashMap<NodeIndex, (String, &'static str)> = fs_nodes
+        .iter()
+        .map(|&fs| {
+            let fs_op = llir_graph[fs].to_dialect::<dyn KernelOp>().unwrap();
+            let fs_struct: &FusionStart = (***fs_op).downcast_ref::<FusionStart>().unwrap();
+            let read_idx = flatten_strides(&fe_struct.shape, &fs_struct.strides).to_kernel();
+            (fs, (read_idx, cuda_dtype(fs_struct.dtype)))
+        })
+        .collect();
+    let mut fs_topo = fs_nodes.to_vec();
+    fs_topo.sort_by(|a, b| {
+        fs_keys[a]
+            .cmp(&fs_keys[b])
+            .then_with(|| {
+                first_use
+                    .get(a)
+                    .unwrap_or(&usize::MAX)
+                    .cmp(first_use.get(b).unwrap_or(&usize::MAX))
+            })
+            .then_with(|| a.index().cmp(&b.index()))
+    });
+    (interior_topo, fs_topo)
+}
+
+// =========================================================================
 // Per-elementwise body templates.
 //
 // Each entry takes the names of the local variables holding the op's
@@ -336,8 +465,17 @@ fn is_region_elementwise(llir_graph: &LLIRGraph, node: NodeIndex) -> bool {
         })
 }
 
+/// Convert a local to its in-register compute form. 16-bit and FP8 locals
+/// are widened to float for compute; each node's local then rounds back to
+/// the node's own dtype on store (see `elementwise_init_expr`). Per-op this
+/// is numerically identical to native 16-bit arithmetic (exact widening,
+/// one rounding per node) and avoids relying on device operator overloads.
+/// `dtype` is the dtype of the local's *producer* node, not the consumer.
 fn elementwise_value(local: &str, dtype: DType) -> String {
-    if matches!(dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0) {
+    if matches!(
+        dtype,
+        DType::F16 | DType::Bf16 | DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0
+    ) {
         format!("static_cast<float>({local})")
     } else {
         local.to_string()
@@ -345,16 +483,17 @@ fn elementwise_value(local: &str, dtype: DType) -> String {
 }
 
 fn elementwise_init_expr(expr: &str, dtype: DType, cuda_ty: &str) -> String {
-    if matches!(dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0) {
-        format!("{cuda_ty}({expr})")
-    } else {
-        expr.to_string()
+    match dtype {
+        DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0 => format!("{cuda_ty}({expr})"),
+        DType::F16 | DType::Bf16 => format!("({cuda_ty})({expr})"),
+        _ => expr.to_string(),
     }
 }
 
-fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
-    let a = || elementwise_value(locals[0], dtype);
-    let b = || elementwise_value(locals[1], dtype);
+/// `locals` are already widened to compute form by `elementwise_value`.
+fn elementwise_body(op: &str, locals: &[&str]) -> String {
+    let a = || locals[0].to_string();
+    let b = || locals[1].to_string();
     match op {
         "Sin" => format!("sinf({})", a()),
         "Sqrt" => format!("sqrtf({})", a()),
@@ -362,8 +501,16 @@ fn elementwise_body(op: &str, locals: &[&str], dtype: DType) -> String {
         "Exp" => format!("expf({})", a()),
         "Exp2" => format!("exp2f({})", a()),
         "Log2" => format!("log2f({})", a()),
-        "Recip" => format!("static_cast<{}>(1.0f) / {}", cuda_dtype(dtype), a()),
+        // Operands are widened to `float` by `elementwise_value` (16-bit/fp8
+        // → static_cast<float>), so a float reciprocal is unambiguous and the
+        // result rounds back to the node dtype at store (elementwise_init_expr).
+        // A `static_cast<dtype>(1.0f)` numerator would make this `bf16 / float`
+        // — ambiguous in NVRTC against cuda_bf16.h's operator/ overloads.
+        "Recip" => format!("1.0f / {}", a()),
         "Sigmoid" => format!("1.0f / (1.0f + expf(-{}))", a()),
+        // Dtype conversion happens in the widen (input) / round (store)
+        // helpers, so the cast body is the identity.
+        "Cast" => a(),
         "Add" => format!("{} + {}", a(), b()),
         "Mul" => format!("{} * {}", a(), b()),
         other => panic!("region_codegen: unknown elementwise op {other}"),
@@ -385,13 +532,14 @@ pub(crate) struct CompiledRegion {
     pub constants: FxHashMap<char, CudaSlice<u8>>,
 }
 
-#[allow(clippy::type_complexity)]
-pub(crate) fn compile_region(
+/// Generate the fused kernel source plus launch geometry for a region.
+/// Pure — no CUDA calls — so canonicalization invariants are testable
+/// without a device. The string this returns is the compile-cache key:
+/// it must depend only on region structure, never on NodeIndexes.
+pub(crate) fn region_kernel_source(
     region: &RegionUnit,
     llir_graph: &LLIRGraph,
-    stream: &Arc<CudaStream>,
-    compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-) -> CompiledRegion {
+) -> (String, Expression) {
     // Resolve FE: shape, strides (for the write), dtype.
     let fe_op = llir_graph[region.fe_node]
         .to_dialect::<dyn KernelOp>()
@@ -428,8 +576,27 @@ pub(crate) fn compile_region(
         }
     }
 
+    // Per-node dtypes: regions are dtype-uniform except at explicit Cast
+    // nodes, so every FS leaf, interior node, and the FE carry their own
+    // dtype. Locals and kernel parameters are typed per node.
+    let node_dtype = |idx: NodeIndex| -> DType {
+        let op = llir_graph[idx].to_dialect::<dyn KernelOp>().unwrap();
+        if let Some(fs) = (***op).downcast_ref::<FusionStart>() {
+            fs.dtype
+        } else if let Some(elem) = (***op).downcast_ref::<CudaUnaryElementwise>() {
+            elem.dtype
+        } else if let Some(elem) = (***op).downcast_ref::<CudaBinaryElementwise>() {
+            elem.dtype
+        } else {
+            op.output_dtype()
+        }
+    };
+
     let cuda_ty = cuda_dtype(dtype);
-    let includes = dtype_includes(&[dtype]);
+    let mut region_dtypes: Vec<DType> = vec![dtype];
+    region_dtypes.extend(region.fs_nodes.iter().map(|&n| node_dtype(n)));
+    region_dtypes.extend(region.elementwise_topo.iter().map(|&n| node_dtype(n)));
+    let includes = dtype_includes(&region_dtypes);
     let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&all_vars);
     let dyn_dims_param = if all_vars.is_empty() {
         ""
@@ -447,8 +614,9 @@ pub(crate) fn compile_region(
     // `region.fs_nodes` order. The `external_inputs` list (parallel to
     // `fs_nodes`) is what the host wires into the launch params.
     let mut signature_params: Vec<String> = vec![format!("{cuda_ty} *out")];
-    for i in 0..region.fs_nodes.len() {
-        signature_params.push(format!("const {cuda_ty} *in{i}"));
+    for (i, &fs_idx) in region.fs_nodes.iter().enumerate() {
+        let fs_ty = cuda_dtype(node_dtype(fs_idx));
+        signature_params.push(format!("const {fs_ty} *in{i}"));
     }
     let signature = signature_params.join(", ");
 
@@ -480,9 +648,10 @@ pub(crate) fn compile_region(
     for (i, &fs_idx) in region.fs_nodes.iter().enumerate() {
         let fs_op = llir_graph[fs_idx].to_dialect::<dyn KernelOp>().unwrap();
         let fs_struct: &FusionStart = (***fs_op).downcast_ref::<FusionStart>().unwrap();
+        let fs_ty = cuda_dtype(fs_struct.dtype);
         let read_idx = flatten_strides(out_shape, &fs_struct.strides).to_kernel();
         body.push_str(&format!(
-            "        {cuda_ty} {name} = in{i}[{read_idx}];\n",
+            "        {fs_ty} {name} = in{i}[{read_idx}];\n",
             name = local_name(fs_idx),
         ));
     }
@@ -504,27 +673,27 @@ pub(crate) fn compile_region(
                 );
             };
 
-        let mut input_locals: Vec<String> = llir_graph
-            .edges_directed(op_idx, Direction::Incoming)
-            .map(|e| (e.id(), e.source()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|(_, src)| local_name(src))
-            .collect();
-        // Sort by edge id like the rest of the codegen does for stable
-        // input ordering.
+        // Operand order must be canonical, not edge-id order: edge ids
+        // track LLIR construction order, which varies across search
+        // candidates. All binary region ops (Add / Mul) are commutative,
+        // so ordering operands by their producer's local position is both
+        // safe and NodeIndex-invariant given canonical region orders.
         let mut edges: Vec<(_, NodeIndex)> = llir_graph
             .edges_directed(op_idx, Direction::Incoming)
             .map(|e| (e.id(), e.source()))
             .collect();
-        edges.sort_by_key(|(eid, _)| *eid);
-        input_locals = edges.into_iter().map(|(_, src)| local_name(src)).collect();
+        edges.sort_by_key(|&(eid, src)| (local_idx_map.get(&src).copied(), eid));
+        let input_locals: Vec<String> = edges
+            .into_iter()
+            .map(|(_, src)| elementwise_value(&local_name(src), node_dtype(src)))
+            .collect();
         let inputs_ref: Vec<&str> = input_locals.iter().map(|s| s.as_str()).collect();
 
-        let expr = elementwise_body(elem_name, &inputs_ref, elem_dtype);
-        let expr = elementwise_init_expr(&expr, elem_dtype, cuda_ty);
+        let elem_ty = cuda_dtype(elem_dtype);
+        let expr = elementwise_body(elem_name, &inputs_ref);
+        let expr = elementwise_init_expr(&expr, elem_dtype, elem_ty);
         body.push_str(&format!(
-            "        {cuda_ty} {name} = {expr};\n",
+            "        {elem_ty} {name} = {expr};\n",
             name = local_name(op_idx),
         ));
     }
@@ -550,6 +719,19 @@ pub(crate) fn compile_region(
          }}"
     );
 
+    let out_size = out_shape.iter().copied().product::<Expression>();
+    (kernel, out_size)
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn compile_region(
+    region: &RegionUnit,
+    llir_graph: &LLIRGraph,
+    stream: &Arc<CudaStream>,
+    compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+) -> CompiledRegion {
+    let (kernel, out_size) = region_kernel_source(region, llir_graph);
+
     let (module, function) = if let Some((m, f)) = compile_cache.get(&kernel) {
         (m.clone(), f.clone())
     } else {
@@ -565,8 +747,6 @@ pub(crate) fn compile_region(
         compile_cache.insert(kernel.clone(), (module.clone(), function.clone()));
         (module, function)
     };
-
-    let out_size = out_shape.iter().copied().product::<Expression>();
 
     CompiledRegion {
         function,
@@ -636,5 +816,139 @@ mod tests {
         // predecessor` because `fs_node`'s incoming-edges iterator is
         // empty.
         let _ = build_compile_units(&topo, &llir, &absorbed);
+    }
+
+    use crate::kernel::fusion::elementwise::CudaUnaryElementwise;
+    use luminal::prelude::DType;
+
+    /// Build the test region used by the canonicalization tests:
+    ///
+    ///   P_sqrt → FS_a (f32) ──┐
+    ///   P_sin  → FS_b (bf16) ─┤→ Mul → Add → FE (f32, shape [8])
+    ///   P_exp  → FS_c (f32) ──┘         ↑
+    ///            (FS_c feeds Add's second operand)
+    ///
+    /// `order` permutes node insertion and `flip_edges` reverses the
+    /// operand-edge insertion order, so the two graphs differ in every
+    /// NodeIndex and edge id while being structurally identical.
+    fn build_test_region(reversed: bool) -> (LLIRGraph, Vec<NodeIndex>) {
+        let shape: Vec<Expression> = vec![8.into()];
+        let z: Vec<Expression> = vec![Expression::from('z')];
+        let fs = |dt: DType| FusionStart {
+            shape: shape.clone(),
+            strides: z.clone(),
+            dtype: dt,
+        };
+        let bin = |op: &str, dt: DType| CudaBinaryElementwise {
+            op: op.to_string(),
+            out_shape: shape.clone(),
+            a_stride: z.clone(),
+            b_stride: z.clone(),
+            out_stride: z.clone(),
+            dtype: dt,
+        };
+        let unary = |op: &str| CudaUnaryElementwise {
+            op: op.to_string(),
+            shape: shape.clone(),
+            in_strides: z.clone(),
+            out_strides: z.clone(),
+            dtype: DType::F32,
+        };
+        let fe = FusionEnd {
+            shape: shape.clone(),
+            strides: z.clone(),
+            dtype: DType::F32,
+        };
+
+        let mut g: LLIRGraph = LLIRGraph::default();
+        let mut add_nodes = |g: &mut LLIRGraph| {
+            let p_sqrt = g.add_node(llir_of(unary("Sqrt")));
+            let p_sin = g.add_node(llir_of(unary("Sin")));
+            let p_exp = g.add_node(llir_of(unary("Exp")));
+            let fs_a = g.add_node(llir_of(fs(DType::F32)));
+            let fs_b = g.add_node(llir_of(fs(DType::Bf16)));
+            let fs_c = g.add_node(llir_of(fs(DType::F32)));
+            let mul = g.add_node(llir_of(bin("Mul", DType::F32)));
+            let add = g.add_node(llir_of(bin("Add", DType::F32)));
+            let fe_n = g.add_node(llir_of(fe.clone()));
+            vec![p_sqrt, p_sin, p_exp, fs_a, fs_b, fs_c, mul, add, fe_n]
+        };
+        // Insert nodes in reverse for the permuted graph so every
+        // NodeIndex differs. (StableGraph indices follow insertion order.)
+        let nodes = if reversed {
+            let p_exp = g.add_node(llir_of(unary("Exp")));
+            let fe_n = g.add_node(llir_of(fe.clone()));
+            let add = g.add_node(llir_of(bin("Add", DType::F32)));
+            let fs_c = g.add_node(llir_of(fs(DType::F32)));
+            let mul = g.add_node(llir_of(bin("Mul", DType::F32)));
+            let fs_b = g.add_node(llir_of(fs(DType::Bf16)));
+            let fs_a = g.add_node(llir_of(fs(DType::F32)));
+            let p_sin = g.add_node(llir_of(unary("Sin")));
+            let p_sqrt = g.add_node(llir_of(unary("Sqrt")));
+            vec![p_sqrt, p_sin, p_exp, fs_a, fs_b, fs_c, mul, add, fe_n]
+        } else {
+            add_nodes(&mut g)
+        };
+        let [p_sqrt, p_sin, p_exp, fs_a, fs_b, fs_c, mul, add, fe_n]: [NodeIndex; 9] =
+            nodes.clone().try_into().unwrap();
+
+        let mut edges: Vec<(NodeIndex, NodeIndex)> = vec![
+            (p_sqrt, fs_a),
+            (p_sin, fs_b),
+            (p_exp, fs_c),
+            (fs_a, mul),
+            (fs_b, mul),
+            (mul, add),
+            (fs_c, add),
+            (add, fe_n),
+        ];
+        if reversed {
+            edges.reverse();
+        }
+        for (a, b) in edges {
+            g.add_edge(a, b, ());
+        }
+        (g, nodes)
+    }
+
+    fn region_source_and_producers(g: &LLIRGraph) -> (String, Vec<String>) {
+        let topo = toposort(g, None).unwrap();
+        let absorbed = globally_absorbed_markers(g);
+        let units = build_compile_units(&topo, g, &absorbed);
+        let region = units
+            .iter()
+            .find_map(|u| match u {
+                CompileUnit::Region(r) => Some(r),
+                _ => None,
+            })
+            .expect("no region built");
+        let (kernel, _) = region_kernel_source(region, g);
+        // Producer identity per input slot, via the producer's unary op
+        // name (Sqrt / Sin / Exp).
+        let producers = region
+            .external_inputs
+            .iter()
+            .map(|&p| {
+                (***g[p].to_dialect::<dyn KernelOp>().unwrap())
+                    .downcast_ref::<CudaUnaryElementwise>()
+                    .unwrap()
+                    .op
+                    .clone()
+            })
+            .collect();
+        (kernel, producers)
+    }
+
+    /// Structurally identical regions must emit byte-identical kernel
+    /// sources (the compile-cache key) and bind the same producers to the
+    /// same input slots, regardless of NodeIndex / edge-id churn.
+    #[test]
+    fn region_kernel_source_is_nodeindex_invariant() {
+        let (g1, _) = build_test_region(false);
+        let (g2, _) = build_test_region(true);
+        let (k1, p1) = region_source_and_producers(&g1);
+        let (k2, p2) = region_source_and_producers(&g2);
+        assert_eq!(k1, k2, "kernel source must not depend on NodeIndexes");
+        assert_eq!(p1, p2, "input-slot → producer binding must match");
     }
 }

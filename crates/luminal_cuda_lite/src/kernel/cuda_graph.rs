@@ -337,13 +337,24 @@ impl CudaGraphExecHandle {
             errorNode: std::ptr::null_mut(),
             errorFromNode: std::ptr::null_mut(),
         };
-        unsafe {
-            sys::cuGraphExecUpdate_v2(self.cu_graph_exec, graph.cu_graph, &mut result).result()?;
-        }
-        if result.result != CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS {
-            return Err(DriverError(
-                sys::CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE,
-            ));
+        let status =
+            unsafe { sys::cuGraphExecUpdate_v2(self.cu_graph_exec, graph.cu_graph, &mut result) };
+        if status != sys::CUresult::CUDA_SUCCESS
+            || result.result != CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS
+        {
+            if std::env::var_os("LUMINAL_CUDA_DEBUG_CUBLASLT_RECAPTURE").is_some() {
+                let node_count = graph.nodes().map(|nodes| nodes.len()).ok();
+                eprintln!(
+                    "CudaGraph exec update rejected: status={status:?} result={:?} error_node={:?} error_from_node={:?} source_nodes={node_count:?}",
+                    result.result, result.errorNode, result.errorFromNode,
+                );
+            }
+            let err = if status == sys::CUresult::CUDA_SUCCESS {
+                sys::CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE
+            } else {
+                status
+            };
+            return Err(DriverError(err));
         }
         Ok(())
     }

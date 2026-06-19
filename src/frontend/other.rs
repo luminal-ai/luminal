@@ -90,9 +90,12 @@ impl GraphTensor {
         if self.dtype == dtype {
             return self;
         }
+        // Cast converts the addressed span of the underlying buffer and the
+        // view passes through unchanged; sliced views address beyond
+        // n_physical_elements, so size by span.
         let id = self
             .graph()
-            .add_op(Cast(self.shape.n_physical_elements(), dtype), &[self.id]);
+            .add_op(Cast(self.shape.physical_span(), dtype), &[self.id]);
         let mut shape = self.shape;
         shape.element_stride_bits = dtype.bits();
         GraphTensor::from_id(id, shape, self.graph_ref, dtype)

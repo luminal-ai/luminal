@@ -455,6 +455,13 @@ pub fn interval_facts_egglog(
             term_to_egglog(&interval_upper(var_expr)),
             interval.max
         ));
+        if interval.min == interval.max {
+            out.push_str(&format!(
+                "(union {} {})\n",
+                term_to_egglog(&mvar(str(&var.to_string()))),
+                term_to_egglog(&num(i64(interval.min)))
+            ));
+        }
     }
     out
 }
