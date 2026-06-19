@@ -21,6 +21,9 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
 
+/// KV cache element size in bytes (bf16 = 2).
+const KV_ELEMENT_BYTES: usize = 2;
+
 fn llama3_chat_prompt(user_prompt: &str) -> String {
     format!(
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{user_prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
@@ -229,10 +232,11 @@ fn main() {
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
-    let weights_path = model_dir.join("model_combined.safetensors");
+    let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    // KV cache is bf16: 2 bytes/element.
+    let cache_bytes = num_slots * KV_DIM * KV_ELEMENT_BYTES;
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
@@ -253,7 +257,7 @@ fn main() {
     runtime = cx.search(runtime, search_options);
 
     // Re-initialize KV cache after search (search consumes buffers)
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    let cache_bytes = num_slots * KV_DIM * KV_ELEMENT_BYTES;
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
