@@ -76,6 +76,18 @@ pub trait Runtime {
     {
         vec![]
     }
+    /// Backend-provided egglog text spliced in immediately after the op
+    /// constructor definitions and before the rewrite rules. Core keeps this
+    /// empty; runtimes can use it to declare shared egglog relations/functions
+    /// that their rewrite rules read and write across multiple ops — declarations
+    /// that the per-op rewrite hook cannot emit exactly-once — without adding
+    /// those declarations to Luminal core.
+    fn extra_egglog() -> String
+    where
+        Self: Sized,
+    {
+        String::new()
+    }
     fn initialize(arg: Self::CompileArg) -> Self;
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn;

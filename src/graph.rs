@@ -1208,6 +1208,7 @@ impl Graph {
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
+        let extra_egglog = Rt::extra_egglog();
 
         let (program, root) = hlir_to_egglog(self);
         let contexts = self.search_space_contexts(&dim_buckets);
@@ -1222,6 +1223,7 @@ impl Graph {
                     &ops,
                     cleanup_hlir,
                     &late_passes,
+                    &extra_egglog,
                     use_interval_analysis,
                     options.egglog_log_enabled(),
                 )
@@ -1307,6 +1309,7 @@ impl Graph {
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
+        let extra_egglog = Rt::extra_egglog();
 
         let (program, root) = hlir_to_egglog(self);
         let contexts = self.search_space_contexts(&dim_buckets);
@@ -1321,6 +1324,7 @@ impl Graph {
                     &ops,
                     cleanup_hlir,
                     &late_passes,
+                    &extra_egglog,
                     use_interval_analysis,
                     options.egglog_log_enabled(),
                 )
