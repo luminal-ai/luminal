@@ -5,7 +5,7 @@ This document describes the core design, semantics, and contracts of the Luminal
 ## Compile Flow
 
 ```
-Frontend Program (PyTorch Core Aten IR, GraphTensor API, StableHLO, etc.)
+Frontend Program (PyTorch Core Aten IR, GraphTensor API, StableHLO (future), etc.)
     -> HLIR Graph
     -> Loop-rolled HLIR Graph
     -> Egglog Saturation (including backend-specific rewrites)
@@ -20,13 +20,9 @@ Frontend Program (PyTorch Core Aten IR, GraphTensor API, StableHLO, etc.)
 
 ## Global Contracts
 
-- Every selectable LLIR graph for a given HLIR graph must be semantically
-  equivalent for all valid inputs, dtypes, shapes, strides, and dynamic dims.
-- `dyn_map` binds symbolic runtime dimensions. Any expression using a dynamic
-  variable must be valid for all values admitted by graph intervals or buckets.
+- Every selectable LLIR graph for a given HLIR graph must be semantically equivalent for all valid inputs, dtypes, shapes, strides, and dynamic dims.
 - `ReferenceRuntime` is the full semantic reference backend, ran on CPU. All HLIR semantics are supported. Performance is not a priority, correctness is.
-- Frontend-exported programs are specifications of intended semantics. Do not
-  change them to hide compiler, search, runtime, or backend bugs.
+- Frontend-exported (HLIR) programs are specifications of intended semantics. Do not change them to hide compiler, search, runtime, or backend bugs.
 
 ## Frontend
 
@@ -111,12 +107,22 @@ Search samples choices from the saturated e-graph using a genetic algorithm, ext
 - Search may rank performance only after semantic equivalence is established.
   It must not select around a known incorrect candidate.
 
+## Dynamism
+
+Runtime dynamism is expressed through dynamic variables which can be used in expressions. Since tensor dimensions are represented as expressions, tensor dimension expressons containing dynamic variables vary at runtime.
+
+Each execution of a backend uses a cooresponding `dyn_map`, which is a mapping from dynamic variables to concrete values. For example: `{'c': 5, 'b': 8, 'p': 3048}`.
+
+Buckets are specifiable for each runtime variable, and at compile time seperate compiles will be done for each possible bucket combination. At runtime these compiled executables are dynamically dispatched depending on the current concrete values for each dynamic variable.
+
 ## Backend
 
 A backend is a specific execution environment. Through implementing the Runtime trait, a backend provides:
 
-- A set of LLIR (Low-Level Intermediate Representation) ops.
+- A set of LLIR ops.
 - A set of rewrites that rewrite from HLIR patterns to LLIR patterns, LLIR patterns to other LLIR patterns, or any mix of the two.
-- A load_llir function which converts LLIR graphs (looped and unlooped) into executables.
-- A stable runtime API for driving the backend.
-- A profiling function.
+- `.set_data(NodeIndex, T)` and `.get_data(NodeIndex) -> T` for setting and retriving inputs and outputs respectively.
+- `initialize()` to set up the backend, and load any fixed state.
+- `load_llir(llir_graph)` to initialize an LLIR graph in the backend. This is where an LLIR graph is converted to an executable artifact.
+- `execute()` to execute the already-loaded executable artifact.
+- `profile(llir_graph)` to return a fitness metric minimized by search for a given LLIR graph.
