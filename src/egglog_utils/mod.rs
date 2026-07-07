@@ -14,6 +14,17 @@ pub use egraph_serialize::{ClassId, NodeId};
 pub mod api;
 pub mod base;
 
+/// Create an egglog `EGraph` with egglog-experimental's named-argument macros
+/// registered on its parser. This lets declarations use `:field` schemas and
+/// call sites use `:field`/`...` syntax (positional syntax keeps working too).
+/// All luminal egglog runs should go through this rather than
+/// `egglog::EGraph::default()` so named-argument syntax parses everywhere.
+pub fn new_egraph() -> egglog::EGraph {
+    let mut egraph = egglog::EGraph::default();
+    egglog_experimental::register_named_args(&mut egraph.parser);
+    egraph
+}
+
 const MAIN_SCHEDULE_MAX_CYCLES: usize = 256;
 const MAIN_SCHEDULE_MAX_TUPLES: usize = 10_000_000;
 const SLOW_PHASE_TIME: Duration = Duration::from_secs(1);
@@ -118,10 +129,16 @@ fn op_defs_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
     let mut opkind_variants = Vec::new();
     for o in ops {
         let s = o.sort();
+        // Emit named-field schema (`(Op :field Sort ...)`) so the hand-written
+        // .egg rules can match/build these ops by field name and skip the rest
+        // with `...`. Positional calls keep working against named schemas.
         let variant_str = format!(
             "({} {})",
             s.name,
-            s.fields.iter().map(|f| &f.sort).join(" ")
+            s.fields
+                .iter()
+                .map(|f| format!(":{} {}", f.name, f.sort))
+                .join(" ")
         );
         if s.class == "IR" {
             ir_variants.push(variant_str);
@@ -1294,7 +1311,7 @@ fn run_egglog_with_report_parts_impl(
     let setup_code = egglog_setup_with_options(program, op_parts, use_interval_analysis);
     let setup_text_elapsed = setup_text_start.elapsed();
     let setup_lines = setup_code.lines().count();
-    let mut egraph = egglog::EGraph::default();
+    let mut egraph = new_egraph();
     // NOTE(egglog 2.0 bump): `ReportLevel::WithPlan` calls `Plan::to_report`, which is
     // `todo!()` for decomposed query plans in egglog rev 5294cdc. Luminal's rules produce
     // decomposed plans, so anything above `TimeOnly` panics. `TimeOnly` keeps timing/update

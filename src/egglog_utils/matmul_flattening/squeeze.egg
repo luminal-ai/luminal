@@ -12,9 +12,12 @@
 
 (rule
     (
-        ; Match Mul + Sum pattern (Op wrapper syntax)
-        (= ?mul (Op (Mul ?mul_shape ?a_stride ?b_stride ?mul_out_stride) (ICons ?a (ICons ?b (INil)))))
-        (= ?sum (Op (Sum ?sum_shape ?k ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
+        ; Match Mul + Sum pattern (Op wrapper syntax). Op kinds are declared with
+        ; named fields, so we address them by name instead of by position.
+        (= ?mul (Op (Mul :shape ?mul_shape :a_strides ?a_stride :b_strides ?b_stride :out_strides ?mul_out_stride)
+                    (ICons ?a (ICons ?b (INil)))))
+        (= ?sum (Op (Sum :shape ?sum_shape :iters ?k :strides ?sum_in_stride :iter_stride ?k_stride :out_strides ?sum_out_stride)
+                    (ICons ?mul (INil))))
 
         ; Sum output shape starts with 1
         (= ?sum_shape (ECons (MNum 1) ?rest_sum_shape))
@@ -38,15 +41,18 @@
     )
     (
         ; Create collapsed Mul (drop outermost dim from all lists)
-        (let ?new_mul (Op (Mul ?rest_mul_shape
-            ?rest_as
-            ?rest_bs
-            ?rest_mos)
+        (let ?new_mul (Op (Mul :shape ?rest_mul_shape
+                               :a_strides ?rest_as
+                               :b_strides ?rest_bs
+                               :out_strides ?rest_mos)
             (ICons ?a (ICons ?b (INil)))))
 
         ; Create collapsed Sum
-        (let ?new_sum (Op (Sum ?rest_sum_shape ?k
-            ?rest_sis ?k_stride ?rest_sos)
+        (let ?new_sum (Op (Sum :shape ?rest_sum_shape
+                               :iters ?k
+                               :strides ?rest_sis
+                               :iter_stride ?k_stride
+                               :out_strides ?rest_sos)
             (ICons ?new_mul (INil))))
 
         ; Direct union — no wrapper needed

@@ -956,8 +956,10 @@ impl Program {
                             .unwrap();
                         let mut arg_sorts = String::new();
                         for field in &variant.fields {
-                            arg_sorts.push(' ');
-                            arg_sorts.push_str(&field.sort);
+                            // Emit named-field schema: ` :field Sort`. Named
+                            // declarations let both generated calls and the
+                            // hand-written .egg rules address fields by name.
+                            arg_sorts.push_str(&format!(" :{} {}", field.name, field.sort));
                         }
                         out.push_str(&format!("        ({}{})\n", variant.name, arg_sorts));
                     }
@@ -981,8 +983,10 @@ impl Program {
                             .unwrap();
                         let mut arg_sorts = String::new();
                         for field in &variant.fields {
-                            arg_sorts.push(' ');
-                            arg_sorts.push_str(&field.sort);
+                            // Emit named-field schema: ` :field Sort`. Named
+                            // declarations let both generated calls and the
+                            // hand-written .egg rules address fields by name.
+                            arg_sorts.push_str(&format!(" :{} {}", field.name, field.sort));
                         }
                         out.push_str(&format!("  ({}{})\n", variant.name, arg_sorts));
                     }
