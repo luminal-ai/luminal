@@ -1,5 +1,5 @@
 use colored::Colorize;
-use egglog::{ast::Span, prelude::RustSpan, var};
+use egglog::var;
 use itertools::Itertools;
 use petgraph::{Direction, graph::NodeIndex};
 use rand::Rng;
@@ -1295,7 +1295,11 @@ fn run_egglog_with_report_parts_impl(
     let setup_text_elapsed = setup_text_start.elapsed();
     let setup_lines = setup_code.lines().count();
     let mut egraph = egglog::EGraph::default();
-    egraph.set_report_level(ReportLevel::WithPlan);
+    // NOTE(egglog 2.0 bump): `ReportLevel::WithPlan` calls `Plan::to_report`, which is
+    // `todo!()` for decomposed query plans in egglog rev 5294cdc. Luminal's rules produce
+    // decomposed plans, so anything above `TimeOnly` panics. `TimeOnly` keeps timing/update
+    // counts (all the core pipeline needs) and avoids the unimplemented plan-report path.
+    egraph.set_report_level(ReportLevel::TimeOnly);
     let setup_start = std::time::Instant::now();
     let setup_tuples_before = egraph.num_tuples();
     let parse_start = std::time::Instant::now();
