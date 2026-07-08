@@ -115,6 +115,16 @@ pub enum Literal {
 pub enum Term {
     Var(Var),
     App { variant: String, args: Vec<Term> },
+    /// A named / partial application, emitted as `(variant :f1 t1 :f2 t2 ...)`.
+    /// When `ellipsis` is true (the common case), fields not listed are filled
+    /// with fresh variables by egglog-experimental's named-argument macro, so a
+    /// rule can address the fields it cares about and ignore the rest. Requires
+    /// the constructor to be declared with named fields.
+    AppNamed {
+        variant: String,
+        fields: Vec<(String, Term)>,
+        ellipsis: bool,
+    },
     Lit(Literal),
 }
 
@@ -340,6 +350,18 @@ fn replace_in_term(term: &Term, replacements: &[(Term, Term)]) -> Term {
                 .map(|a| replace_in_term(a, replacements))
                 .collect(),
         },
+        Term::AppNamed {
+            variant,
+            fields,
+            ellipsis,
+        } => Term::AppNamed {
+            variant: variant.clone(),
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), replace_in_term(t, replacements)))
+                .collect(),
+            ellipsis: *ellipsis,
+        },
         other => other.clone(),
     }
 }
@@ -550,6 +572,32 @@ impl SortDef {
             args: ordered,
         }
     }
+
+    /// Match or build this sort by naming only the fields you care about; the
+    /// rest are filled with fresh variables via a trailing `...`. Emits
+    /// `(Variant :f1 t1 ... :fn tn ...)`. This replaces the `new_call()` +
+    /// `args[field]` idiom for rules that touch only a handful of an op's
+    /// fields — the generated pattern no longer has to bind (and name) every
+    /// field just to reach one. Requires the sort to be declared with named
+    /// fields; panics on an unknown field name.
+    pub fn match_fields(&self, fields: &[(&str, Term)]) -> Term {
+        for (name, _) in fields {
+            assert!(
+                self.fields.iter().any(|f| f.name == *name),
+                "sort `{}` has no field `{}`",
+                self.name,
+                name
+            );
+        }
+        Term::AppNamed {
+            variant: self.name.clone(),
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.clone()))
+                .collect(),
+            ellipsis: true,
+        }
+    }
 }
 
 // ========== Free-standing Builders ==========
@@ -751,6 +799,23 @@ pub fn term_to_egglog(term: &Term) -> String {
             for arg in args {
                 out.push(' ');
                 out.push_str(&term_to_egglog(arg));
+            }
+            out.push(')');
+            out
+        }
+        Term::AppNamed {
+            variant,
+            fields,
+            ellipsis,
+        } => {
+            let mut out = String::new();
+            out.push('(');
+            out.push_str(variant);
+            for (name, t) in fields {
+                out.push_str(&format!(" :{} {}", name, term_to_egglog(t)));
+            }
+            if *ellipsis {
+                out.push_str(" ...");
             }
             out.push(')');
             out

@@ -18,23 +18,24 @@ use itertools::Itertools;
 /// Helper: build a dtype propagation rule for a direct IR op.
 /// Matches the op, reads dtype from the named IR source field, and sets it on the op.
 fn dtype_propagation_rule(sort: &SortDef, dtype_source: &str) -> Rule {
-    let (args, op_match) = sort.new_call();
     let e = v("__e");
+    let src = v("__src");
     let dty = v("__dty");
     Rule::new()
-        .fact(eq(e.clone(), op_match))
-        .fact(eq(dty.clone(), dtype(args[dtype_source].clone())))
+        // (Op :<dtype_source> ?__src ...)  — only bind the one field we read.
+        .fact(eq(e.clone(), sort.match_fields(&[(dtype_source, src.clone())])))
+        .fact(eq(dty.clone(), dtype(src)))
         .action(Action::Set(dtype(e), dty))
         .ruleset("dtype_prop")
 }
 
 /// Helper: build a dtype-from-field rule for a direct IR op.
 fn dtype_from_field_rule(sort: &SortDef, dtype_field: &str) -> Rule {
-    let (args, op_match) = sort.new_call();
     let e = v("__e");
+    let d = v("__d");
     Rule::new()
-        .fact(eq(e.clone(), op_match))
-        .action(Action::Set(dtype(e), args[dtype_field].clone()))
+        .fact(eq(e.clone(), sort.match_fields(&[(dtype_field, d.clone())])))
+        .action(Action::Set(dtype(e), d))
         .ruleset("dtype_prop")
 }
 
@@ -42,7 +43,6 @@ fn dtype_from_field_rule(sort: &SortDef, dtype_field: &str) -> Rule {
 
 /// Dtype propagation for a normalized op: inherits from first IList input.
 fn dtype_propagation_op(kind_sort: &SortDef) -> Rule {
-    let (_, kind_term) = kind_sort.new_call();
     let e = v("__e");
     let first_inp = v("__first_inp");
     let tail = v("__tail");
@@ -50,8 +50,9 @@ fn dtype_propagation_op(kind_sort: &SortDef) -> Rule {
     Rule::new()
         .fact(eq(
             e.clone(),
+            // (Op (<Kind> ...) (ICons ?__first_inp ?__tail)) — kind fields ignored.
             op_term(
-                kind_term,
+                kind_sort.match_fields(&[]),
                 Term::App {
                     variant: "ICons".to_string(),
                     args: vec![first_inp.clone(), tail],
@@ -65,22 +66,26 @@ fn dtype_propagation_op(kind_sort: &SortDef) -> Rule {
 
 /// Dtype from a field on the OpKind (e.g., Cast's dtype field).
 fn dtype_from_kind_field(kind_sort: &SortDef, field_name: &str) -> Rule {
-    let (args, kind_term) = kind_sort.new_call();
     let e = v("__e");
+    let d = v("__d");
     let inputs = v("__inputs");
     Rule::new()
-        .fact(eq(e.clone(), op_term(kind_term, inputs)))
-        .action(Action::Set(dtype(e), args[field_name].clone()))
+        // (Op (<Kind> :<field_name> ?__d ...) ?__inputs)
+        .fact(eq(
+            e.clone(),
+            op_term(kind_sort.match_fields(&[(field_name, d.clone())]), inputs),
+        ))
+        .action(Action::Set(dtype(e), d))
         .ruleset("dtype_prop")
 }
 
 /// Fixed dtype for a normalized op (e.g., Iota always Int).
 fn dtype_fixed_op(kind_sort: &SortDef, dtype_sort: &SortDef) -> Rule {
-    let (_, kind_term) = kind_sort.new_call();
     let e = v("__e");
     let inputs = v("__inputs");
     Rule::new()
-        .fact(eq(e.clone(), op_term(kind_term, inputs)))
+        // (Op (<Kind> ...) ?__inputs) — match the kind, ignore all its fields.
+        .fact(eq(e.clone(), op_term(kind_sort.match_fields(&[]), inputs)))
         .action(Action::Set(dtype(e), dtype_sort.call(())))
         .ruleset("dtype_prop")
 }
@@ -2190,7 +2195,7 @@ impl EgglogOp for Gather {
         // padding gathers + per-concat make_contiguous gathers) leave the
         // outermost Gathers with no dtype set, which in turn blocks the
         // KernelGather kernel-rewrite from firing.
-        let (_, kind_term) = self.sort().new_call();
+        let kind_term = self.sort().match_fields(&[]);
         let e = v("__e");
         let indexes = v("__indexes");
         let data = v("__data");
@@ -2347,7 +2352,7 @@ impl EgglogOp for Scatter {
     }
     fn rewrites(&self) -> Vec<Rule> {
         // Scatter inherits dtype from third input (src), not first (dest).
-        let (_, kind_term) = self.sort().new_call();
+        let kind_term = self.sort().match_fields(&[]);
         let e = v("__e");
         let dest = v("__dest");
         let indexes = v("__indexes");
