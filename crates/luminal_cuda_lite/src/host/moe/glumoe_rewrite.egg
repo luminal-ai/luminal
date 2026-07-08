@@ -45,10 +45,10 @@
 
 (rule
     (
-        (= ?iota_base (Op (Iota ?io ?iota_base_range) (INil)))
-        (= ?mul_base (Op (Mul ?mul_base_shape ?mul_base_a_stride ?mul_base_b_stride ?mul_base_out_stride) (ICons ?topk_idx (ICons ?iota_base (INil)))))
+        (= ?iota_base (Op (Iota :expr ?io ...) (INil)))
+        (= ?mul_base (Op (Mul ...) (ICons ?topk_idx (ICons ?iota_base (INil)))))
         (= ?iota_within (Op (Iota (MIter) ?iota_within_range) (INil)))
-        (= ?add_idx (Op (Add ?add_shape ?add_a_stride ?add_b_stride ?add_out_stride) (ICons ?mul_base (ICons ?iota_within (INil)))))
+        (= ?add_idx (Op (Add ...) (ICons ?mul_base (ICons ?iota_within (INil)))))
     )
     (
         (set (glumoe_expert_index ?add_idx)
@@ -62,8 +62,8 @@
     (
         (= ?index_state (glumoe_expert_index ?idx))
         (= ?index_state (MkGLUMoEExpertIndexState ?io ?within_range ?topk_idx))
-        (= ?gathered (Op (Gather ?gather_idx_shape ?gather_idx_stride ?gather_data_shape ?gather_data_stride) (ICons ?idx (ICons ?weights (INil)))))
-        (= ?f32 (Op (Cast ?f32_size (F32)) (ICons ?gathered (INil))))
+        (= ?gathered (Op (Gather ...) (ICons ?idx (ICons ?weights (INil)))))
+        (= ?f32 (Op (Cast :dtype (F32) ...) (ICons ?gathered (INil))))
     )
     (
         (set (glumoe_expert_gather ?f32)
@@ -77,8 +77,8 @@
     (
         (= ?gather_state (glumoe_expert_gather ?gu_f32))
         (= ?gather_state (MkGLUMoEExpertGatherState ?gu_io ?gu_iota_within_range ?topk_idx ?gate_up_w))
-        (= ?gu_matmul_mul (Op (Mul ?gu_matmul_mul_shape ?gu_matmul_a_stride ?gu_matmul_b_stride ?gu_matmul_mul_out_stride) (ICons ?x (ICons ?gu_f32 (INil)))))
-        (= ?gu_matmul (Op (Sum ?gu_matmul_out_shape ?gu_matmul_k ?gu_matmul_in_stride ?gu_matmul_k_stride ?gu_matmul_out_stride) (ICons ?gu_matmul_mul (INil))))
+        (= ?gu_matmul_mul (Op (Mul ...) (ICons ?x (ICons ?gu_f32 (INil)))))
+        (= ?gu_matmul (Op (Sum :iters ?gu_matmul_k ...) (ICons ?gu_matmul_mul (INil))))
     )
     (
         (set (glumoe_gate_up ?gu_matmul)
@@ -94,19 +94,19 @@
         (= ?gate_up_state (glumoe_gate_up ?gu_matmul))
         (= ?gate_up_state (MkGLUMoEGateUpState ?gu_io ?gu_matmul_k ?gu_within_range ?x ?topk_idx ?gate_up_w))
 
-        (= ?up_iota (Op (Iota ?up_iota_expr ?up_iota_range) (INil)))
-        (= ?up_slice (Op (Gather ?up_gather_idx_shape ?up_gather_idx_stride ?up_gather_data_shape ?up_gather_data_stride) (ICons ?up_iota (ICons ?gu_matmul (INil)))))
+        (= ?up_iota (Op (Iota ...) (INil)))
+        (= ?up_slice (Op (Gather ...) (ICons ?up_iota (ICons ?gu_matmul (INil)))))
 
         (= ?neg1 (Op (Constant -1.000000) (INil)))
-        (= ?neg_gate (Op (Mul ?silu_shape1 ?silu_a_stride1 ?silu_b_stride1 ?silu_out_stride1) (ICons ?gu_matmul (ICons ?neg1 (INil)))))
+        (= ?neg_gate (Op (Mul ...) (ICons ?gu_matmul (ICons ?neg1 (INil)))))
         (= ?log2e (Op (Constant 1.442695) (INil)))
-        (= ?scaled (Op (Mul ?silu_shape2 ?silu_a_stride2 ?silu_b_stride2 ?silu_out_stride2) (ICons ?neg_gate (ICons ?log2e (INil)))))
-        (= ?exp2_val (Op (Exp2 ?silu_shape3 ?silu_in_stride3 ?silu_out_stride3) (ICons ?scaled (INil))))
+        (= ?scaled (Op (Mul ...) (ICons ?neg_gate (ICons ?log2e (INil)))))
+        (= ?exp2_val (Op (Exp2 ...) (ICons ?scaled (INil))))
         (= ?one (Op (Constant 1.000000) (INil)))
-        (= ?plus1 (Op (Add ?silu_shape4 ?silu_a_stride4 ?silu_b_stride4 ?silu_out_stride4) (ICons ?exp2_val (ICons ?one (INil)))))
-        (= ?sigmoid (Op (Recip ?silu_shape5 ?silu_in_stride5 ?silu_out_stride5) (ICons ?plus1 (INil))))
-        (= ?silu_out (Op (Mul ?silu_shape6 ?silu_a_stride6 ?silu_b_stride6 ?silu_out_stride6) (ICons ?gu_matmul (ICons ?sigmoid (INil)))))
-        (= ?swiglu_out (Op (Mul ?swiglu_shape ?swiglu_a_stride ?swiglu_b_stride ?swiglu_out_stride) (ICons ?silu_out (ICons ?up_slice (INil)))))
+        (= ?plus1 (Op (Add ...) (ICons ?exp2_val (ICons ?one (INil)))))
+        (= ?sigmoid (Op (Recip ...) (ICons ?plus1 (INil))))
+        (= ?silu_out (Op (Mul ...) (ICons ?gu_matmul (ICons ?sigmoid (INil)))))
+        (= ?swiglu_out (Op (Mul ...) (ICons ?silu_out (ICons ?up_slice (INil)))))
     )
     (
         (set (glumoe_swiglu ?swiglu_out) (MkGLUMoESwiGLUState ?gate_up_state))
@@ -121,26 +121,26 @@
         (= ?gate_up_state (glumoe_gate_up ?gu_matmul))
         (= ?gate_up_state (MkGLUMoEGateUpState ?gu_io ?gu_matmul_k ?gu_within_range ?x ?topk_idx ?gate_up_w))
 
-        (= ?up_iota (Op (Iota ?up_iota_expr ?up_iota_range) (INil)))
-        (= ?up_slice (Op (Gather ?up_gather_idx_shape ?up_gather_idx_stride ?up_gather_data_shape ?up_gather_data_stride) (ICons ?up_iota (ICons ?gu_matmul (INil)))))
+        (= ?up_iota (Op (Iota ...) (INil)))
+        (= ?up_slice (Op (Gather ...) (ICons ?up_iota (ICons ?gu_matmul (INil)))))
 
         (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
-        (= ?gelu_inner_scaled (Op (Mul ?gelu_inner_scaled_shape ?gelu_inner_scaled_a_stride ?gelu_inner_scaled_b_stride ?gelu_inner_scaled_out_stride) (ICons ?gu_matmul (ICons ?gelu_coeff_inner (INil)))))
-        (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?gu_matmul (INil)))))
+        (= ?gelu_inner_scaled (Op (Mul ...) (ICons ?gu_matmul (ICons ?gelu_coeff_inner (INil)))))
+        (= ?gelu_inner_quad (Op (Mul ...) (ICons ?gelu_inner_scaled (ICons ?gu_matmul (INil)))))
         (= ?gelu_one (Op (Constant 1.000000) (INil)))
-        (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
+        (= ?gelu_poly (Op (Add ...) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
         (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
-        (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?gu_matmul (ICons ?gelu_coeff_outer (INil)))))
-        (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
+        (= ?gelu_outer_scaled (Op (Mul ...) (ICons ?gu_matmul (ICons ?gelu_coeff_outer (INil)))))
+        (= ?gelu_scaled (Op (Mul ...) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
         (= ?neg1 (Op (Constant -1.000000) (INil)))
-        (= ?gelu_neg (Op (Mul ?gelu_neg_shape ?gelu_neg_a_stride ?gelu_neg_b_stride ?gelu_neg_out_stride) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
+        (= ?gelu_neg (Op (Mul ...) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
         (= ?log2e (Op (Constant 1.442695) (INil)))
-        (= ?gelu_exp_scaled (Op (Mul ?gelu_exp_scaled_shape ?gelu_exp_scaled_a_stride ?gelu_exp_scaled_b_stride ?gelu_exp_scaled_out_stride) (ICons ?gelu_neg (ICons ?log2e (INil)))))
-        (= ?gelu_exp2_val (Op (Exp2 ?gelu_exp_shape ?gelu_exp_in_stride ?gelu_exp_out_stride) (ICons ?gelu_exp_scaled (INil))))
-        (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
-        (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
-        (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?gu_matmul (ICons ?gelu_sigmoid (INil)))))
-        (= ?gemma_out (Op (Mul ?geglu_shape ?geglu_a_stride ?geglu_b_stride ?geglu_out_stride) (ICons ?gelu_out (ICons ?up_slice (INil)))))
+        (= ?gelu_exp_scaled (Op (Mul ...) (ICons ?gelu_neg (ICons ?log2e (INil)))))
+        (= ?gelu_exp2_val (Op (Exp2 ...) (ICons ?gelu_exp_scaled (INil))))
+        (= ?gelu_plus1 (Op (Add ...) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
+        (= ?gelu_sigmoid (Op (Recip ...) (ICons ?gelu_plus1 (INil))))
+        (= ?gelu_out (Op (Mul ...) (ICons ?gu_matmul (ICons ?gelu_sigmoid (INil)))))
+        (= ?gemma_out (Op (Mul ...) (ICons ?gelu_out (ICons ?up_slice (INil)))))
     )
     (
         (set (glumoe_gemma_gelu ?gemma_out) (MkGLUMoEGemmaGELUState ?gate_up_state))
@@ -157,8 +157,8 @@
 
         (= ?gather_state (glumoe_expert_gather ?dn_f32))
         (= ?gather_state (MkGLUMoEExpertGatherState ?dn_io ?dn_iota_within_range ?topk_idx ?down_w))
-        (= ?dn_matmul_mul (Op (Mul ?dn_matmul_mul_shape ?dn_matmul_a_stride ?dn_matmul_b_stride ?dn_matmul_mul_out_stride) (ICons ?swiglu_out (ICons ?dn_f32 (INil)))))
-        (= ?dn_matmul (Op (Sum ?dn_matmul_out_shape ?dn_matmul_k ?dn_matmul_in_stride ?dn_matmul_k_stride ?dn_matmul_out_stride) (ICons ?dn_matmul_mul (INil))))
+        (= ?dn_matmul_mul (Op (Mul ...) (ICons ?swiglu_out (ICons ?dn_f32 (INil)))))
+        (= ?dn_matmul (Op (Sum :iters ?dn_matmul_k ...) (ICons ?dn_matmul_mul (INil))))
     )
     (
         (set (glumoe_swiglu_down ?dn_matmul)
@@ -176,8 +176,8 @@
 
         (= ?gather_state (glumoe_expert_gather ?dn_f32))
         (= ?gather_state (MkGLUMoEExpertGatherState ?dn_io ?dn_iota_within_range ?topk_idx ?down_w))
-        (= ?dn_matmul_mul (Op (Mul ?dn_matmul_mul_shape ?dn_matmul_a_stride ?dn_matmul_b_stride ?dn_matmul_mul_out_stride) (ICons ?gemma_out (ICons ?dn_f32 (INil)))))
-        (= ?dn_matmul (Op (Sum ?dn_matmul_out_shape ?dn_matmul_k ?dn_matmul_in_stride ?dn_matmul_k_stride ?dn_matmul_out_stride) (ICons ?dn_matmul_mul (INil))))
+        (= ?dn_matmul_mul (Op (Mul ...) (ICons ?gemma_out (ICons ?dn_f32 (INil)))))
+        (= ?dn_matmul (Op (Sum :iters ?dn_matmul_k ...) (ICons ?dn_matmul_mul (INil))))
     )
     (
         (set (glumoe_gemma_down ?dn_matmul)
@@ -195,12 +195,12 @@
         (= ?swiglu_state (MkGLUMoESwiGLUState ?gate_up_state))
         (= ?gate_up_state (MkGLUMoEGateUpState ?gu_io ?gu_matmul_k ?gu_within_range ?x ?topk_idx ?gate_up_w))
 
-        (= ?topk_row_offsets (Op (Iota ?topk_row_offsets_expr ?topk_row_offsets_range) (INil)))
-        (= ?topk_flat_idx (Op (Add ?topk_flat_idx_shape ?topk_flat_idx_a_stride ?topk_flat_idx_b_stride ?topk_flat_idx_out_stride) (ICons ?topk_row_offsets (ICons ?topk_idx (INil)))))
-        (= ?topk_vals (Op (Gather ?topk_vals_gather_idx_shape ?topk_vals_gather_idx_stride ?topk_vals_gather_data_shape ?topk_vals_gather_data_stride) (ICons ?topk_flat_idx (ICons ?routing_weights (INil)))))
+        (= ?topk_row_offsets (Op (Iota ...) (INil)))
+        (= ?topk_flat_idx (Op (Add ...) (ICons ?topk_row_offsets (ICons ?topk_idx (INil)))))
+        (= ?topk_vals (Op (Gather ...) (ICons ?topk_flat_idx (ICons ?routing_weights (INil)))))
 
-        (= ?weighted (Op (Mul ?weighted_shape ?weighted_a_stride ?weighted_b_stride ?weighted_out_stride) (ICons ?dn_matmul (ICons ?topk_vals (INil)))))
-        (= ?output (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
+        (= ?weighted (Op (Mul ...) (ICons ?dn_matmul (ICons ?topk_vals (INil)))))
+        (= ?output (Op (Sum :iters ?output_k ...) (ICons ?weighted (INil))))
     )
     (
         (let ?glumoe (Op (GLUMoE
@@ -221,15 +221,15 @@
         (= ?swiglu_state (MkGLUMoESwiGLUState ?gate_up_state))
         (= ?gate_up_state (MkGLUMoEGateUpState ?gu_io ?gu_matmul_k ?gu_within_range ?x ?topk_idx ?gate_up_w))
 
-        (= ?topk_row_offsets (Op (Iota ?topk_row_offsets_expr ?topk_row_offsets_range) (INil)))
-        (= ?topk_flat_idx (Op (Add ?topk_flat_idx_shape ?topk_flat_idx_a_stride ?topk_flat_idx_b_stride ?topk_flat_idx_out_stride) (ICons ?topk_row_offsets (ICons ?topk_idx (INil)))))
-        (= ?topk_vals (Op (Gather ?topk_vals_gather_idx_shape ?topk_vals_gather_idx_stride ?topk_vals_gather_data_shape ?topk_vals_gather_data_stride) (ICons ?topk_flat_idx (ICons ?routing_weights (INil)))))
-        (= ?topk_norm (Op (Sum ?topk_norm_shape ?output_k ?topk_norm_in_stride ?topk_norm_k_stride ?topk_norm_out_stride) (ICons ?topk_vals (INil))))
-        (= ?topk_norm_factor (Op (Recip ?topk_norm_recip_shape ?topk_norm_recip_in_stride ?topk_norm_recip_out_stride) (ICons ?topk_norm (INil))))
-        (= ?normed_topk (Op (Mul ?normed_topk_shape ?normed_topk_a_stride ?normed_topk_b_stride ?normed_topk_out_stride) (ICons ?topk_vals (ICons ?topk_norm_factor (INil)))))
+        (= ?topk_row_offsets (Op (Iota ...) (INil)))
+        (= ?topk_flat_idx (Op (Add ...) (ICons ?topk_row_offsets (ICons ?topk_idx (INil)))))
+        (= ?topk_vals (Op (Gather ...) (ICons ?topk_flat_idx (ICons ?routing_weights (INil)))))
+        (= ?topk_norm (Op (Sum :iters ?output_k ...) (ICons ?topk_vals (INil))))
+        (= ?topk_norm_factor (Op (Recip ...) (ICons ?topk_norm (INil))))
+        (= ?normed_topk (Op (Mul ...) (ICons ?topk_vals (ICons ?topk_norm_factor (INil)))))
 
-        (= ?weighted (Op (Mul ?weighted_shape ?weighted_a_stride ?weighted_b_stride ?weighted_out_stride) (ICons ?dn_matmul (ICons ?normed_topk (INil)))))
-        (= ?output (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
+        (= ?weighted (Op (Mul ...) (ICons ?dn_matmul (ICons ?normed_topk (INil)))))
+        (= ?output (Op (Sum :iters ?output_k ...) (ICons ?weighted (INil))))
     )
     (
         (let ?glumoe (Op (GLUMoE
@@ -251,17 +251,17 @@
         (= ?gate_up_state (MkGLUMoEGateUpState ?gu_io ?gu_matmul_k ?gu_within_range ?x ?topk_idx ?gate_up_w))
 
         ; Gemma expert weights: topk_weights = normed_topk * per_expert_scale.gather(topk_idx)
-        (= ?per_expert_vals (Op (Gather ?scale_gather_idx_shape ?scale_gather_idx_stride ?scale_gather_data_shape ?scale_gather_data_stride) (ICons ?topk_idx (ICons ?per_expert_scale (INil)))))
-        (= ?topk_row_offsets (Op (Iota ?topk_row_offsets_expr ?topk_row_offsets_range) (INil)))
-        (= ?topk_flat_idx (Op (Add ?topk_flat_idx_shape ?topk_flat_idx_a_stride ?topk_flat_idx_b_stride ?topk_flat_idx_out_stride) (ICons ?topk_row_offsets (ICons ?topk_idx (INil)))))
-        (= ?topk_vals (Op (Gather ?topk_vals_gather_idx_shape ?topk_vals_gather_idx_stride ?topk_vals_gather_data_shape ?topk_vals_gather_data_stride) (ICons ?topk_flat_idx (ICons ?routing_weights (INil)))))
-        (= ?topk_norm (Op (Sum ?topk_norm_shape ?output_k ?topk_norm_in_stride ?topk_norm_k_stride ?topk_norm_out_stride) (ICons ?topk_vals (INil))))
-        (= ?topk_norm_factor (Op (Recip ?topk_norm_recip_shape ?topk_norm_recip_in_stride ?topk_norm_recip_out_stride) (ICons ?topk_norm (INil))))
-        (= ?normed_topk (Op (Mul ?normed_topk_shape ?normed_topk_a_stride ?normed_topk_b_stride ?normed_topk_out_stride) (ICons ?topk_vals (ICons ?topk_norm_factor (INil)))))
-        (= ?expert_weights (Op (Mul ?expert_weights_shape ?expert_weights_a_stride ?expert_weights_b_stride ?expert_weights_out_stride) (ICons ?normed_topk (ICons ?per_expert_vals (INil)))))
+        (= ?per_expert_vals (Op (Gather ...) (ICons ?topk_idx (ICons ?per_expert_scale (INil)))))
+        (= ?topk_row_offsets (Op (Iota ...) (INil)))
+        (= ?topk_flat_idx (Op (Add ...) (ICons ?topk_row_offsets (ICons ?topk_idx (INil)))))
+        (= ?topk_vals (Op (Gather ...) (ICons ?topk_flat_idx (ICons ?routing_weights (INil)))))
+        (= ?topk_norm (Op (Sum :iters ?output_k ...) (ICons ?topk_vals (INil))))
+        (= ?topk_norm_factor (Op (Recip ...) (ICons ?topk_norm (INil))))
+        (= ?normed_topk (Op (Mul ...) (ICons ?topk_vals (ICons ?topk_norm_factor (INil)))))
+        (= ?expert_weights (Op (Mul ...) (ICons ?normed_topk (ICons ?per_expert_vals (INil)))))
 
-        (= ?weighted (Op (Mul ?weighted_shape ?weighted_a_stride ?weighted_b_stride ?weighted_out_stride) (ICons ?dn_matmul (ICons ?expert_weights (INil)))))
-        (= ?output (Op (Sum ?output_shape ?output_k ?output_in_stride ?output_k_stride ?output_out_stride) (ICons ?weighted (INil))))
+        (= ?weighted (Op (Mul ...) (ICons ?dn_matmul (ICons ?expert_weights (INil)))))
+        (= ?output (Op (Sum :iters ?output_k ...) (ICons ?weighted (INil))))
     )
     (
         (let ?glumoe (Op (GLUMoE

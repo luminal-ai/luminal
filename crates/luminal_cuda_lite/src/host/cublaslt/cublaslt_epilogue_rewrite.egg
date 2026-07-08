@@ -60,11 +60,7 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add
-            ?shape
-            ?zeroed_strides
-            ?positive_strides
-            ?relu_strides)
+        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -140,11 +136,7 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add
-            ?shape
-            ?zeroed_strides
-            ?positive_strides
-            ?relu_strides)
+        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -220,11 +212,7 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add
-            ?shape
-            ?zeroed_strides
-            ?positive_strides
-            ?relu_strides)
+        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -300,11 +288,7 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add
-            ?shape
-            ?zeroed_strides
-            ?positive_strides
-            ?relu_strides)
+        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -347,21 +331,21 @@
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
-        (= ?gelu_inner_scaled (Op (Mul ?gelu_inner_scaled_shape ?gelu_inner_scaled_a_stride ?gelu_inner_scaled_b_stride ?gelu_inner_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_inner (INil)))))
-        (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
+        (= ?gelu_inner_scaled (Op (Mul ...) (ICons ?matmul (ICons ?gelu_coeff_inner (INil)))))
+        (= ?gelu_inner_quad (Op (Mul ...) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
         (= ?gelu_one (Op (Constant 1.000000) (INil)))
-        (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
+        (= ?gelu_poly (Op (Add ...) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
         (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
-        (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
-        (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
+        (= ?gelu_outer_scaled (Op (Mul ...) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
+        (= ?gelu_scaled (Op (Mul ...) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
         (= ?neg1 (Op (Constant -1.000000) (INil)))
-        (= ?gelu_neg (Op (Mul ?gelu_neg_shape ?gelu_neg_a_stride ?gelu_neg_b_stride ?gelu_neg_out_stride) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
+        (= ?gelu_neg (Op (Mul ...) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
         (= ?log2e (Op (Constant 1.442695) (INil)))
-        (= ?gelu_exp_scaled (Op (Mul ?gelu_exp_scaled_shape ?gelu_exp_scaled_a_stride ?gelu_exp_scaled_b_stride ?gelu_exp_scaled_out_stride) (ICons ?gelu_neg (ICons ?log2e (INil)))))
-        (= ?gelu_exp2_val (Op (Exp2 ?gelu_exp_shape ?gelu_exp_in_stride ?gelu_exp_out_stride) (ICons ?gelu_exp_scaled (INil))))
-        (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
-        (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
-        (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
+        (= ?gelu_exp_scaled (Op (Mul ...) (ICons ?gelu_neg (ICons ?log2e (INil)))))
+        (= ?gelu_exp2_val (Op (Exp2 ...) (ICons ?gelu_exp_scaled (INil))))
+        (= ?gelu_plus1 (Op (Add ...) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
+        (= ?gelu_sigmoid (Op (Recip ...) (ICons ?gelu_plus1 (INil))))
+        (= ?gelu_out (Op (Mul ...) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
     )
     (
         (let ?fused (Op (cublaslt
@@ -397,21 +381,21 @@
             (ICons ?a (ICons ?b ?matmul_tail))))
 
         (= ?gelu_coeff_inner (Op (Constant 0.044715) (INil)))
-        (= ?gelu_inner_scaled (Op (Mul ?gelu_inner_scaled_shape ?gelu_inner_scaled_a_stride ?gelu_inner_scaled_b_stride ?gelu_inner_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_inner (INil)))))
-        (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
+        (= ?gelu_inner_scaled (Op (Mul ...) (ICons ?matmul (ICons ?gelu_coeff_inner (INil)))))
+        (= ?gelu_inner_quad (Op (Mul ...) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
         (= ?gelu_one (Op (Constant 1.000000) (INil)))
-        (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
+        (= ?gelu_poly (Op (Add ...) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
         (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
-        (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
-        (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
+        (= ?gelu_outer_scaled (Op (Mul ...) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
+        (= ?gelu_scaled (Op (Mul ...) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
         (= ?neg1 (Op (Constant -1.000000) (INil)))
-        (= ?gelu_neg (Op (Mul ?gelu_neg_shape ?gelu_neg_a_stride ?gelu_neg_b_stride ?gelu_neg_out_stride) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
+        (= ?gelu_neg (Op (Mul ...) (ICons ?gelu_scaled (ICons ?neg1 (INil)))))
         (= ?log2e (Op (Constant 1.442695) (INil)))
-        (= ?gelu_exp_scaled (Op (Mul ?gelu_exp_scaled_shape ?gelu_exp_scaled_a_stride ?gelu_exp_scaled_b_stride ?gelu_exp_scaled_out_stride) (ICons ?gelu_neg (ICons ?log2e (INil)))))
-        (= ?gelu_exp2_val (Op (Exp2 ?gelu_exp_shape ?gelu_exp_in_stride ?gelu_exp_out_stride) (ICons ?gelu_exp_scaled (INil))))
-        (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
-        (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
-        (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
+        (= ?gelu_exp_scaled (Op (Mul ...) (ICons ?gelu_neg (ICons ?log2e (INil)))))
+        (= ?gelu_exp2_val (Op (Exp2 ...) (ICons ?gelu_exp_scaled (INil))))
+        (= ?gelu_plus1 (Op (Add ...) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
+        (= ?gelu_sigmoid (Op (Recip ...) (ICons ?gelu_plus1 (INil))))
+        (= ?gelu_out (Op (Mul ...) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
     )
     (
         (let ?fused (Op (cublaslt

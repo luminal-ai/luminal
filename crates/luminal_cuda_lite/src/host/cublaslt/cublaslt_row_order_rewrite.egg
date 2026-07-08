@@ -5,11 +5,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -58,11 +54,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -111,11 +103,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -164,11 +152,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
@@ -217,11 +201,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?batch (nth_from_end ?out_shape 2))
@@ -284,11 +264,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?batch (nth_from_end ?out_shape 2))
@@ -351,11 +327,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?batch (nth_from_end ?out_shape 2))
@@ -418,11 +390,7 @@
 
 (rule
     (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
+        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
             (ICons ?a (ICons ?b (INil)))))
 
         (= ?batch (nth_from_end ?out_shape 2))

@@ -2466,6 +2466,53 @@ mod tests {
         assert_eq!(program.matches(marker).count(), 1, "spliced exactly once");
     }
 
+    // The luminal_cuda_lite rewrite files match core op kinds using named
+    // arguments + `...`. Verify every one of them parses against luminal's
+    // *real* named op schemas (emitted by our own pipeline), so a wrong field
+    // name or bad arity is caught here even though luminal_cuda_lite itself
+    // needs CUDA to build. Named-argument resolution happens at parse time, so
+    // this catches the exact risk of the positional->named conversion.
+    #[test]
+    fn cuda_lite_rewrites_parse_against_named_schemas() {
+        fn egg_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    egg_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "egg") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let ops = <HLIROps as IntoEgglogOp>::into_vec();
+        // Cuda-lite kinds matched by the rewrite files but declared outside core
+        // HLIROps. Declaring them (with their real field names) registers their
+        // named-argument macros so wrong field names in the rewrites are caught.
+        let cuda_kinds = "\
+            (datatype UnusedCudaKindSort\n\
+               (GenericMatmul :out_shape EList :mul_shape EList :k Expression \
+                 :lhs_strides EList :rhs_strides EList :sum_input_strides EList \
+                 :sum_iter_stride Expression :out_strides EList :dtype DType))";
+        let context = format!("{cuda_kinds}\n{}", super::full_egglog("", &ops, false));
+
+        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/luminal_cuda_lite/src/host");
+        let mut files = Vec::new();
+        egg_files(&host, &mut files);
+        assert!(files.len() >= 8, "expected to find the cuda_lite rewrite files");
+
+        for path in files {
+            let egg = std::fs::read_to_string(&path).unwrap();
+            let program = format!("{context}\n{egg}");
+            let mut egraph = super::new_egraph();
+            egraph
+                .parser
+                .get_program_from_string(path.to_str().map(String::from), &program)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e}", path.display()));
+        }
+    }
+
     fn eclass(id: &str, label: &str, n_nodes: usize) -> (ClassId, (String, Vec<NodeId>)) {
         (
             ClassId::from(id),
