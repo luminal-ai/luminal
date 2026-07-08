@@ -1040,7 +1040,7 @@ impl Display for Constant {
 
 impl HLIROp for Constant {
     fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
-        format!("(Op (Constant {:.6}) (INil))", self.0)
+        format!("(Op (Constant {:?}) (INil))", self.0)
     }
 }
 
@@ -3088,5 +3088,48 @@ impl Iterator for StridedIterator {
 
         self.done = true;
         Some(fin)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_tripped(v: f32) -> f32 {
+        let s = Constant(v).to_egglog(&[]);
+        let inner = &s["(Op (Constant ".len()..s.len() - ") (INil))".len()];
+        // The egglog Constant sort stores f64: text -> f64 -> f32 is the
+        // path a constant takes through the e-graph and back.
+        inner
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("unparseable constant text {inner:?}")) as f32
+    }
+
+    /// f32 -> serialized text -> f64 (egglog) -> f32 must be the identity.
+    /// `{:.6}` zeroed sub-5e-7 constants (gelu's sign epsilon -> NaN at
+    /// x==0) and shifted transcendental coefficients (LUM-631).
+    #[test]
+    fn constant_to_egglog_round_trips_exactly() {
+        let adversarial = [
+            0.0f32,
+            -0.0,
+            1e-10,
+            -1e-10,
+            f32::EPSILON,
+            f32::MIN_POSITIVE,
+            1e-45,       // smallest subnormal
+            1.595_769_2, // tanh-gelu outer coeff (frontend 1.5957691216 as f32)
+            0.044715,
+            std::f32::consts::LOG2_E,
+            std::f32::consts::FRAC_PI_2,
+            std::f32::consts::PI,
+            1e38,
+            -1e-38,
+            0.1,
+            1.0 / 3.0,
+        ];
+        for &v in &adversarial {
+            assert_eq!(round_tripped(v).to_bits(), v.to_bits(), "constant {v:?}");
+        }
     }
 }

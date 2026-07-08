@@ -351,7 +351,10 @@
         (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
         (= ?gelu_one (Op (Constant 1.000000) (INil)))
         (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
-        (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
+        ; sqrt(2/pi): tolerance window, not exact text match
+        (= ?gelu_coeff_outer (Op (Constant ?gelu_outer_val) (INil)))
+        (> ?gelu_outer_val 1.59576)
+        (< ?gelu_outer_val 1.59578)
         (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
         (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
         (= ?neg1 (Op (Constant -1.000000) (INil)))
@@ -401,7 +404,10 @@
         (= ?gelu_inner_quad (Op (Mul ?gelu_inner_quad_shape ?gelu_inner_quad_a_stride ?gelu_inner_quad_b_stride ?gelu_inner_quad_out_stride) (ICons ?gelu_inner_scaled (ICons ?matmul (INil)))))
         (= ?gelu_one (Op (Constant 1.000000) (INil)))
         (= ?gelu_poly (Op (Add ?gelu_poly_shape ?gelu_poly_a_stride ?gelu_poly_b_stride ?gelu_poly_out_stride) (ICons ?gelu_inner_quad (ICons ?gelu_one (INil)))))
-        (= ?gelu_coeff_outer (Op (Constant 1.595769) (INil)))
+        ; sqrt(2/pi): tolerance window, not exact text match
+        (= ?gelu_coeff_outer (Op (Constant ?gelu_outer_val) (INil)))
+        (> ?gelu_outer_val 1.59576)
+        (< ?gelu_outer_val 1.59578)
         (= ?gelu_outer_scaled (Op (Mul ?gelu_outer_scaled_shape ?gelu_outer_scaled_a_stride ?gelu_outer_scaled_b_stride ?gelu_outer_scaled_out_stride) (ICons ?matmul (ICons ?gelu_coeff_outer (INil)))))
         (= ?gelu_scaled (Op (Mul ?gelu_scaled_shape ?gelu_scaled_a_stride ?gelu_scaled_b_stride ?gelu_scaled_out_stride) (ICons ?gelu_outer_scaled (ICons ?gelu_poly (INil)))))
         (= ?neg1 (Op (Constant -1.000000) (INil)))

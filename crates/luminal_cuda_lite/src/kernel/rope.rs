@@ -926,7 +926,10 @@ impl EgglogOp for KernelRoPE {
                     (= ?m1c (Op (Constant -1.000000) (INil)))
                     (= ?shift (Op (Add ?sh_sh ?sh_a ?sh_b ?sh_o)
                         (ICons ?neg (ICons ?hpi (INil)))))
-                    (= ?hpi (Op (Constant 1.570796) (INil)))
+                    ; pi/2: tolerance window, not exact text match
+                    (= ?hpi (Op (Constant ?hpi_val) (INil)))
+                    (> ?hpi_val 1.57078)
+                    (< ?hpi_val 1.57081)
                     (= ?cosv (Op (Sin ?s2_sh ?s2_in ?s2_out) (ICons ?shift (INil))))
                     (= ?cosb (Op (Cast ?cb_size (Bf16)) (ICons ?cosv (INil))))
                 )
