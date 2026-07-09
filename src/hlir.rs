@@ -144,16 +144,6 @@ pub fn binary_sort(name: &str) -> SortDef {
 /// and unions `LoopEnd` with the chain
 ///   `u0 = <kind>(initial, s0); u1 = <kind>(u0, s1); … u_{N-1}`.
 /// (or symmetric for state at position 1.)
-/// Parse raw egglog rule text (text-authored rules and included `.egg` files)
-/// into commands, on the schema-aware `parser`. The text counterpart to the
-/// `egglog!` quasiquote — used where rules are runtime-formatted strings rather
-/// than fixed syntax, so the quasiquote (which needs literal tokens) can't apply.
-fn raw_rules(parser: &mut Parser, text: &str) -> Vec<Command> {
-    parser
-        .get_program_from_string(None, text)
-        .expect("raw egglog rules should parse")
-}
-
 pub fn binary_op_unroll_rules(
     parser: &mut Parser,
     op_kind: &str,

@@ -4,7 +4,6 @@
 //! query. This is the feature the hand-written matmul-flatten rules rely on.
 
 use egglog::prelude::*; // egglog!/expr! quasiquotes
-use luminal::egglog_utils::api::{SortClass, sort, term_to_egglog, v};
 use luminal::egglog_utils::new_egraph;
 
 /// End-to-end: the forked-egglog `egglog!`/`expr!` quasiquotes, driven with
@@ -71,25 +70,6 @@ fn quote_splices_runtime_kind_and_field() {
     )
     .unwrap();
     egraph.run_program(rule).unwrap();
-}
-
-/// `SortDef::match_fields` emits a partial named pattern with a trailing `...`,
-/// so generated rules bind only the fields they use instead of every field.
-#[test]
-fn match_fields_emits_named_ellipsis() {
-    let kind = sort(
-        SortClass::new("OpKind"),
-        "Cast",
-        &[("size", SortClass::new("EList")), ("dtype", SortClass::new("DType"))],
-    );
-
-    // Name one field, ellipsis the rest.
-    assert_eq!(
-        term_to_egglog(&kind.match_fields(&[("dtype", v("?d"))])),
-        "(Cast :dtype ?d ...)"
-    );
-    // Name none — match the kind, ignore all fields.
-    assert_eq!(term_to_egglog(&kind.match_fields(&[])), "(Cast ...)");
 }
 
 #[test]

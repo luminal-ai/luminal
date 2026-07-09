@@ -25,6 +25,19 @@ pub fn new_egraph() -> egglog::EGraph {
     egraph
 }
 
+/// Parse raw egglog rule text (text-authored rules, included `.egg` files,
+/// runtime-formatted rules) into commands on a schema-aware `parser`. This is
+/// the text counterpart to the `egglog!` quasiquote, for rules whose egglog is
+/// a runtime string rather than fixed tokens. Used by op `rewrites_commands`.
+pub fn raw_rules(
+    parser: &mut egglog::ast::Parser,
+    text: impl AsRef<str>,
+) -> Vec<egglog::ast::Command> {
+    parser
+        .get_program_from_string(None, text.as_ref())
+        .expect("raw egglog rules should parse")
+}
+
 const MAIN_SCHEDULE_MAX_CYCLES: usize = 256;
 const MAIN_SCHEDULE_MAX_TUPLES: usize = 10_000_000;
 const SLOW_PHASE_TIME: Duration = Duration::from_secs(1);

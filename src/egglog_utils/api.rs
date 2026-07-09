@@ -573,31 +573,6 @@ impl SortDef {
         }
     }
 
-    /// Match or build this sort by naming only the fields you care about; the
-    /// rest are filled with fresh variables via a trailing `...`. Emits
-    /// `(Variant :f1 t1 ... :fn tn ...)`. This replaces the `new_call()` +
-    /// `args[field]` idiom for rules that touch only a handful of an op's
-    /// fields — the generated pattern no longer has to bind (and name) every
-    /// field just to reach one. Requires the sort to be declared with named
-    /// fields; panics on an unknown field name.
-    pub fn match_fields(&self, fields: &[(&str, Term)]) -> Term {
-        for (name, _) in fields {
-            assert!(
-                self.fields.iter().any(|f| f.name == *name),
-                "sort `{}` has no field `{}`",
-                self.name,
-                name
-            );
-        }
-        Term::AppNamed {
-            variant: self.name.clone(),
-            fields: fields
-                .iter()
-                .map(|(n, t)| (n.to_string(), t.clone()))
-                .collect(),
-            ellipsis: true,
-        }
-    }
 }
 
 // ========== Free-standing Builders ==========
