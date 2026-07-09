@@ -3,8 +3,75 @@
 //! named calls, leading-positional + `...`, and `...` fresh-var binding in a
 //! query. This is the feature the hand-written matmul-flatten rules rely on.
 
+use egglog::prelude::*; // egglog!/expr! quasiquotes
 use luminal::egglog_utils::api::{SortClass, sort, term_to_egglog, v};
 use luminal::egglog_utils::new_egraph;
+
+/// End-to-end: the forked-egglog `egglog!`/`expr!` quasiquotes, driven with
+/// luminal's experimental parser, expand named args + `...` (no text strings).
+#[test]
+fn quote_macros_with_named_args_in_luminal() {
+    let mut egraph = new_egraph();
+
+    // Declare a named constructor and build/run a program via `egglog!`.
+    let prog = egglog!(
+        egraph.parser,
+        (datatype Vehicle (MyCar :color i64 :numwheel i64))
+        (let c1 (MyCar :numwheel 4 :color 7))
+        (let c2 (MyCar 7 4))
+        (run 0)
+        (check (= c1 c2))
+    )
+    .unwrap();
+    egraph.run_program(prog).unwrap();
+
+    // A rule matching `:color` and `...`-ing the rest, built with the macro.
+    let rule = egglog!(
+        egraph.parser,
+        (relation SawColor (i64))
+        (rule ((MyCar :color c ...)) ((SawColor c)))
+        (run 1)
+        (check (SawColor 7))
+    )
+    .unwrap();
+    egraph.run_program(rule).unwrap();
+
+    // `expr!` builds a single term against the experimental parser too.
+    let e = expr!(egraph.parser, (MyCar :numwheel 4 :color 7)).unwrap();
+    assert_eq!(format!("{e}"), "(MyCar 7 4)"); // named -> positional
+}
+
+/// Step-2 mechanism: a rule generator only knows the constructor and field
+/// names at runtime, so it splices them with `#kind` (head) and `:#field`
+/// (keyword) into an `egglog!` scaffold. The schema-aware parser then expands
+/// the named args + `...` exactly as if they'd been written literally.
+#[test]
+fn quote_splices_runtime_kind_and_field() {
+    let mut egraph = new_egraph();
+
+    // Declare a named constructor + seed a value. Parsing the datatype on
+    // `egraph.parser` registers MyCar's named-call macro (parse-time effect).
+    let setup = egglog!(
+        egraph.parser,
+        (datatype Vehicle (MyCar :color i64 :numwheel i64))
+        (relation SawColor (i64))
+        (let c (MyCar :color 7 :numwheel 4))
+    )
+    .unwrap();
+    egraph.run_program(setup).unwrap();
+
+    // Runtime names — exactly what a per-op generator has in hand.
+    let kind = "MyCar";
+    let field = "color";
+    let rule = egglog!(
+        egraph.parser,
+        (rule ((= ?e (#kind :#field ?c ...))) ((SawColor ?c)))
+        (run 1)
+        (check (SawColor 7))
+    )
+    .unwrap();
+    egraph.run_program(rule).unwrap();
+}
 
 /// `SortDef::match_fields` emits a partial named pattern with a trailing `...`,
 /// so generated rules bind only the fields they use instead of every field.

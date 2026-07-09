@@ -272,6 +272,21 @@ pub trait EgglogOp: Debug {
     fn rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
         vec![]
     }
+    /// Op rewrite rules as parsed egglog `Command`s. This is what the pipeline
+    /// consumes. The default bridges the legacy [`rewrites`](Self::rewrites)
+    /// `Rule` DSL through text (parsed on a schema-aware `parser`), so ops that
+    /// have not yet been ported keep working unchanged; ported ops override
+    /// this to build rules with the `egglog!` quasiquote directly.
+    fn rewrites_commands(&self, parser: &mut egglog::ast::Parser) -> Vec<egglog::ast::Command> {
+        self.rewrites()
+            .iter()
+            .flat_map(|r| {
+                parser
+                    .get_program_from_string(None, &r.to_egglog_string())
+                    .expect("op rewrite rule should parse")
+            })
+            .collect()
+    }
     fn cleanup(&self) -> bool;
 
     /// Additional IR datatype variants this op needs (e.g. `"(ConsumedBuffer IR)"`).

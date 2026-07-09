@@ -195,7 +195,11 @@ pub struct OpTextParts {
     /// when an alternative survives in the same eclass.
     pub(crate) cleanable_op_names: FxHashSet<String>,
     late_program: String,
-    rewrites: String,
+    /// Op rewrite rules as parsed egglog `Command`s (`Send + Clone`, so this
+    /// shares across the parallel bucketed runs). Run directly at the run-site;
+    /// never concatenated into the setup text, because `...`-expanded rules
+    /// carry `@…` gensym vars that the parser refuses to re-read.
+    rewrites: Vec<egglog::ast::Command>,
     late_phases: Vec<EgglogSchedulePhase>,
     late_postprocesses: Vec<EGraphPostprocess>,
 }
@@ -215,8 +219,27 @@ impl OpTextParts {
             .filter(|op| op.cleanup())
             .map(|op| op.sort().name.to_string())
             .collect();
+
+        let op_defs = op_defs_string(ops);
+        // Rule generators emit `egglog!` with `#kind`/`:#field` splices whose
+        // named args + `...` only expand against a parser that knows each op
+        // kind's schema. Build that parser once (named-arg macros + every op's
+        // declaration) and drive `rewrites_commands` through it. The resulting
+        // `Command`s are kept as-is and `run` directly at the run-site — never
+        // re-serialized to text — so `...`-expanded fresh vars (egglog's `@…`
+        // gensyms) stay inside the e-graph and never hit the parser again.
+        let mut rewrite_parser = egglog::ast::Parser::default();
+        egglog_experimental::register_named_args(&mut rewrite_parser);
+        rewrite_parser
+            .get_program_from_string(None, &op_defs)
+            .expect("op definitions should parse");
+        let rewrites: Vec<egglog::ast::Command> = ops
+            .iter()
+            .flat_map(|o| o.rewrites_commands(&mut rewrite_parser))
+            .collect();
+
         Self {
-            op_defs: op_defs_string(ops),
+            op_defs,
             // Default empty; the backend's Runtime::extra_egglog() is spliced in
             // by the Rt-aware callers (build_search_space) after construction.
             extra_egglog: String::new(),
@@ -227,11 +250,7 @@ impl OpTextParts {
             // We always emit an empty cleanup ruleset and instead do
             // conditional cleanup in Rust after egglog finishes.
             cleanups: String::new(),
-            rewrites: ops
-                .iter()
-                .flat_map(|o| o.rewrites())
-                .map(|r| r.to_egglog_string())
-                .join("\n"),
+            rewrites,
             cleanable_op_names: if cleanup {
                 cleanable_op_names
             } else {
@@ -257,8 +276,18 @@ impl OpTextParts {
     }
 }
 
+/// Whole egglog program as text, for debugging / visualization only. Best
+/// effort: op rewrite rules are `Display`ed from their parsed `Command`s, so
+/// rules that used `...` appear in expanded form with `@…` gensym vars — fine
+/// to read, but not guaranteed to re-parse. The real run-site never uses this;
+/// it runs `parts.rewrites` directly (see `run_egglog_with_report_parts_impl`).
 fn full_egglog_with(program: &str, parts: &OpTextParts) -> String {
-    let mut chunks = vec![egglog_setup_with(program, parts), egglog_schedule_program()];
+    let rewrites_text = parts.rewrites.iter().map(|c| c.to_string()).join("\n");
+    let mut chunks = vec![
+        egglog_setup_with(program, parts),
+        rewrites_text,
+        egglog_schedule_program(),
+    ];
     chunks.extend(
         parts
             .late_phases
@@ -381,6 +410,9 @@ fn egglog_setup_with(program: &str, parts: &OpTextParts) -> String {
     egglog_setup_with_options(program, parts, false)
 }
 
+/// The setup program as text, **excluding** op rewrite rules. Rewrites are
+/// parsed egglog `Command`s (`parts.rewrites`) run directly at the run-site, so
+/// they are not part of this text (see [`OpTextParts::rewrites`]).
 fn egglog_setup_with_options(
     program: &str,
     parts: &OpTextParts,
@@ -398,7 +430,6 @@ fn egglog_setup_with_options(
         parts.extra_egglog.clone(),
         parts.cleanups.clone(),
         base::base_cleanup_egglog(),
-        parts.rewrites.clone(),
         parts.late_program.clone(),
         program.to_string(),
     ]
@@ -1320,7 +1351,13 @@ fn run_egglog_with_report_parts_impl(
     let setup_start = std::time::Instant::now();
     let setup_tuples_before = egraph.num_tuples();
     let parse_start = std::time::Instant::now();
-    let commands = egraph.parser.get_program_from_string(None, &setup_code)?;
+    let mut commands = egraph.parser.get_program_from_string(None, &setup_code)?;
+    // Op rewrite rules are pre-parsed `Command`s (built via `egglog!` against a
+    // schema-aware parser). Run them directly here rather than round-tripping
+    // through text, so `...`-expanded `@…` gensyms never reach the parser.
+    // Order is irrelevant: these are rule *definitions*, all installed before
+    // any `(run-schedule …)` fires later in this function.
+    commands.extend(op_parts.rewrites.iter().cloned());
     let parse_elapsed = parse_start.elapsed();
     trace!("{}", "Egglog setup running...".green());
     let setup_run_start = std::time::Instant::now();
@@ -2494,7 +2531,12 @@ mod tests {
                (GenericMatmul :out_shape EList :mul_shape EList :k Expression \
                  :lhs_strides EList :rhs_strides EList :sum_input_strides EList \
                  :sum_iter_stride Expression :out_strides EList :dtype DType))";
-        let context = format!("{cuda_kinds}\n{}", super::full_egglog("", &ops, false));
+        // Context = the declarations only (base + op schemas), which is what the
+        // .egg files need to parse against. Use the setup text (no rewrite rules)
+        // rather than `full_egglog`, so it stays re-parseable — the op rewrites
+        // are now `Command`s and their `...` expansions carry `@…` gensyms.
+        let parts = OpTextParts::new(&ops, false);
+        let context = format!("{cuda_kinds}\n{}", egglog_setup_with_options("", &parts, false));
 
         let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("crates/luminal_cuda_lite/src/host");

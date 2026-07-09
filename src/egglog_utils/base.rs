@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use super::api::*;
 use crate::shape::{self, ToShape};
+use egglog::prelude::egglog;
 use rustc_hash::FxHashSet;
 
 // ---- Sort classes (pub const) ----
@@ -522,946 +523,184 @@ pub fn base_expression_egglog_with_intervals() -> String {
     base_expression_egglog_impl(true)
 }
 
-/// Generate the egglog program equivalent to `base.egg`.
-///
-/// This builds the Expression, EList, and DType datatypes along with all
-/// algebraic rewrites, replacement rules, and list helper functions.
+/// The base Expression/EList/DType datatypes plus every algebraic rewrite,
+/// replacement rule, and list helper — authored directly as egglog via the
+/// `egglog!` quasiquote (this replaced a large hand-rolled `Program`/`Rule`
+/// builder). Base constructors are only ever *built* positionally, so the
+/// datatypes are declared positionally and a default parser suffices; the
+/// parsed commands are rendered back to text so the existing text-concatenation
+/// setup pipeline is unchanged.
 fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
-    let s = BaseSorts::new();
-
-    // Build the program
-    let mut p = Program {
-        mutual_recursive: true,
-        ..Default::default()
-    };
-
-    // Rulesets
-    p.add_ruleset("expr");
-    if use_interval_analysis {
-        p.add_ruleset("interval_expr");
-    }
-    p.add_ruleset("dtype_prop");
-    p.add_ruleset("cleanup");
-    p.add_ruleset("post_cleanup");
-
-    // Register all sorts
-    s.register(&mut p);
-    // Always define interval functions so backend rewrites can use interval
-    // facts as optional guards. When interval analysis is disabled these
-    // functions simply have no values, so guarded rules do not fire.
-    p.add_function(FunctionDef {
-        name: "lower".to_string(),
-        args: vec![EXPRESSION.name.to_string()],
-        ret: I64.name.to_string(),
-        merge: Some("(max old new)".to_string()),
-    });
-    p.add_function(FunctionDef {
-        name: "upper".to_string(),
-        args: vec![EXPRESSION.name.to_string()],
-        ret: I64.name.to_string(),
-        merge: Some("(min old new)".to_string()),
-    });
-
-    // ---- Algebraic rewrites ----
-    // Commutativity
-    p.add_rule(rewrite("mul-comm", mul(v("a"), v("b")), mul(v("b"), v("a"))).ruleset("expr"));
-    p.add_rule(rewrite("add-comm", add(v("a"), v("b")), add(v("b"), v("a"))).ruleset("expr"));
-
-    // Constant folding: add
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), add(num(v("a")), num(v("b")))),
-                peq(v("?ans"), padd(v("a"), v("b"))),
-            ])
-            .actions(vec![
-                Action::Union(v("?e"), num(v("?ans"))),
-                Action::Subsume(add(num(v("a")), num(v("b")))),
-            ])
-            .ruleset("expr"),
-    );
-
-    // Constant folding: sub
-    p.add_rule(
-        rewrite(
-            "sub-const",
-            sub(num(v("a")), num(v("b"))),
-            num(psub(v("a"), v("b"))),
-        )
-        .ruleset("expr"),
-    );
-
-    // Constant folding: mul
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), mul(num(v("?a")), num(v("?b")))),
-                peq(v("?prod"), pmul(v("?a"), v("?b"))),
-            ])
-            .actions(vec![
-                union(v("?e"), num(v("?prod"))),
-                subsume(mul(num(v("?a")), num(v("?b")))),
-            ])
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?expr"), mul(mul(v("?x"), num(v("?a"))), num(v("?b")))),
-                peq(v("?prod"), pmul(v("?a"), v("?b"))),
-            ])
-            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
-            .ruleset("expr")
-            .name("fold-right-associated-const-mul"),
-    );
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?expr"), mul(num(v("?b")), mul(v("?x"), num(v("?a"))))),
-                peq(v("?prod"), pmul(v("?a"), v("?b"))),
-            ])
-            .union(v("?expr"), mul(v("?x"), num(v("?prod"))))
-            .ruleset("expr")
-            .name("fold-left-associated-const-mul"),
-    );
-
-    // Constant folding: div (with conditions)
-    p.add_rule(
-        rewrite(
-            "div-const",
-            div(num(v("a")), num(v("b"))),
-            num(pdiv(v("a"), v("b"))),
-        )
-        .when(vec![pneq(i64(0), v("b"))])
-        .ruleset("expr"),
-    );
-
-    // Cancel common factor in division: (a*b)/(a*c) → b/c
-    //
-    // DISABLED: this rule rewrites to a `div` whose operands are themselves
-    // typically `mul`s of stride/shape factors, so the new tree matches the
-    // same `div-cancel-factor` pattern again. Combined with `mul-comm` (4
-    // orderings of a*b/c*d) it drives a combinatorial blow-up on the deep
-    // `flatten_strides` index expressions produced by stacked unfold-based
-    // convolutions. At 7 backbone YOLO v11 layers it accounts for ~66k
-    // matches in a single early-stage saturate. Productive simplifications
-    // (`div-self`, `mod-mul-self`, `div-const`, `merge-dims`) cover the
-    // cases we actually need without the explosion.
-    // p.add_rule(
-    //     rewrite(
-    //         "div-cancel-factor",
-    //         div(mul(v("a"), v("b")), mul(v("a"), v("c"))),
-    //         div(v("b"), v("c")),
-    //     )
-    //     .ruleset("expr"),
-    // );
-
-    // Division self-cancel: a/a → 1
-    p.add_rule(rewrite("div-self", div(v("a"), v("a")), num(i64(1))).ruleset("expr"));
-    p.add_rule(
-        rewrite(
-            "div-mul-num-self",
-            div(mul(v("?x"), num(v("?n"))), num(v("?n"))),
-            v("?x"),
-        )
-        .when(vec![pgte(v("?n"), i64(1))])
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "div-mul-num-plus-rem",
-            div(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
-            v("?x"),
-        )
-        .when(vec![
-            pgte(v("?n"), i64(1)),
-            pgte(v("?r"), i64(0)),
-            plt(v("?r"), v("?n")),
-        ])
-        .ruleset("expr"),
-    );
-
-    // Constant folding: ceildiv
-    p.add_rule(
-        rewrite(
-            "ceildiv-const",
-            ceildiv(num(v("a")), num(v("b"))),
-            num(pdiv(v("a"), v("b"))),
-        )
-        .when(vec![
-            pneq(i64(0), v("b")),
-            peq(i64(0), pmod(v("a"), v("b"))),
-        ])
-        .ruleset("expr"),
-    );
-
-    // Constant folding: max, min, and
-    p.add_rule(
-        rewrite(
-            "max-const",
-            max(num(v("a")), num(v("b"))),
-            num(pmax(v("a"), v("b"))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "min-const",
-            min(num(v("a")), num(v("b"))),
-            num(pmin(v("a"), v("b"))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "and-const",
-            and(num(v("a")), num(v("b"))),
-            num(pand(v("a"), v("b"))),
-        )
-        .ruleset("expr"),
-    );
-
-    // Float <-> Num for -1
-    p.add_rule(rewrite("float-neg1-to-num", float(f64(-1.0)), num(i64(-1))).ruleset("expr"));
-    p.add_rule(rewrite("num-neg1-to-float", num(i64(-1)), float(f64(-1.0))).ruleset("expr"));
-
-    // Identity/zero rules
-    p.add_rule(rewrite("add-zero", add(v("a"), num(i64(0))), v("a")).ruleset("expr"));
-    p.add_rule(
-        Rule::new()
-            .fact(peq(v("?e"), mul(v("?a"), num(i64(1)))))
-            .union(v("?e"), v("?a"))
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        Rule::new()
-            .fact(peq(v("?e"), mul(v("?a"), num(i64(0)))))
-            .union(v("?e"), num(i64(0)))
-            .subsume(mul(v("?a"), num(i64(0))))
-            .ruleset("expr"),
-    );
-    p.add_rule(rewrite("div-one", div(v("a"), num(i64(1))), v("a")).ruleset("expr"));
-    p.add_rule(
-        rewrite(
-            "mod-mul-self",
-            modd(mul(v("?x"), v("?y")), v("?y")),
-            num(i64(0)),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "mod-const",
-            modd(num(v("a")), num(v("b"))),
-            num(pmod(v("a"), v("b"))),
-        )
-        .when(vec![pneq(i64(0), v("b"))])
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "mod-mul-num-plus-rem",
-            modd(add(mul(v("?x"), num(v("?n"))), num(v("?r"))), num(v("?n"))),
-            num(v("?r")),
-        )
-        .when(vec![
-            pgte(v("?n"), i64(1)),
-            pgte(v("?r"), i64(0)),
-            plt(v("?r"), v("?n")),
-        ])
-        .ruleset("expr"),
-    );
-
-    p.add_rule(
-        rewrite(
-            "mod-mod-larger",
-            modd(modd(v("?x"), num(v("?y"))), num(v("?z"))),
-            modd(v("?x"), num(v("?y"))),
-        )
-        .when(vec![
-            pgte(v("?z"), v("?y")),
-            peq(i64(0), pmod(v("?y"), v("?z"))),
-        ])
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "mod-mod-smaller",
-            modd(modd(v("?x"), num(v("?y"))), num(v("?z"))),
-            modd(v("?x"), num(v("?z"))),
-        )
-        .when(vec![
-            pgte(v("?y"), v("?z")),
-            peq(i64(0), pmod(v("?z"), v("?y"))),
-        ])
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "merge-dims",
-            add(mul(div(v("?z"), v("?x")), v("?x")), modd(v("?z"), v("?x"))),
-            v("?z"),
-        )
-        .ruleset("expr"),
-    );
+    let mut commands = egglog!(
+        (ruleset expr)
+        (ruleset dtype_prop)
+        (ruleset cleanup)
+        (ruleset post_cleanup)
+        (datatype*
+            (Expression
+                (MNum i64)
+                (MFloat f64)
+                (MIter)
+                (MVar String)
+                (MAdd Expression Expression)
+                (MSub Expression Expression)
+                (MMul Expression Expression)
+                (MCeilDiv Expression Expression)
+                (MDiv Expression Expression)
+                (MMod Expression Expression)
+                (MMin Expression Expression)
+                (MMax Expression Expression)
+                (MAnd Expression Expression)
+                (MOr Expression Expression)
+                (MGte Expression Expression)
+                (MLt Expression Expression)
+                (MFloorTo Expression Expression)
+                (MReplace Expression Expression Expression))
+            (EList
+                (ECons Expression EList)
+                (ENil)
+                (MReplaceList EList Expression Expression)
+                (ReplaceNthFromEnd EList Expression i64)
+                (RemoveNthFromEnd EList i64)
+                (RowMajor EList))
+            (DType
+                (F32) (F64) (F16) (Bf16) (Int) (Int64) (Bool)
+                (F4E2M1) (F8E4M3) (F8E5M2) (F8UE8M0)
+                (I4) (U4) (I8) (U8) (I16) (U16) (TF32) (F6E2M3) (F6E3M2)))
+        (function lower (Expression) i64 :merge (max old new))
+        (function upper (Expression) i64 :merge (min old new))
+        (rule ((= ?__rw (MMul ?a ?b))) ((union ?__rw (MMul ?b ?a))) :ruleset expr :name "mul-comm")
+        (rule ((= ?__rw (MAdd ?a ?b))) ((union ?__rw (MAdd ?b ?a))) :ruleset expr :name "add-comm")
+        (rule ((= ?e (MAdd (MNum ?a) (MNum ?b))) (= ?ans (+ ?a ?b))) ((union ?e (MNum ?ans)) (subsume (MAdd (MNum ?a) (MNum ?b)))) :ruleset expr)
+        (rule ((= ?__rw (MSub (MNum ?a) (MNum ?b)))) ((union ?__rw (MNum (- ?a ?b)))) :ruleset expr :name "sub-const")
+        (rule ((= ?e (MMul (MNum ?a) (MNum ?b))) (= ?prod (* ?a ?b))) ((union ?e (MNum ?prod)) (subsume (MMul (MNum ?a) (MNum ?b)))) :ruleset expr)
+        (rule ((= ?expr (MMul (MMul ?x (MNum ?a)) (MNum ?b))) (= ?prod (* ?a ?b))) ((union ?expr (MMul ?x (MNum ?prod)))) :ruleset expr :name "fold-right-associated-const-mul")
+        (rule ((= ?expr (MMul (MNum ?b) (MMul ?x (MNum ?a)))) (= ?prod (* ?a ?b))) ((union ?expr (MMul ?x (MNum ?prod)))) :ruleset expr :name "fold-left-associated-const-mul")
+        (rule ((= ?__rw (MDiv (MNum ?a) (MNum ?b))) (!= 0 ?b)) ((union ?__rw (MNum (/ ?a ?b)))) :ruleset expr :name "div-const")
+        (rule ((= ?__rw (MDiv ?a ?a))) ((union ?__rw (MNum 1))) :ruleset expr :name "div-self")
+        (rule ((= ?__rw (MDiv (MMul ?x (MNum ?n)) (MNum ?n))) (>= ?n 1)) ((union ?__rw ?x)) :ruleset expr :name "div-mul-num-self")
+        (rule ((= ?__rw (MDiv (MAdd (MMul ?x (MNum ?n)) (MNum ?r)) (MNum ?n))) (>= ?n 1) (>= ?r 0) (< ?r ?n)) ((union ?__rw ?x)) :ruleset expr :name "div-mul-num-plus-rem")
+        (rule ((= ?__rw (MCeilDiv (MNum ?a) (MNum ?b))) (!= 0 ?b) (= 0 (% ?a ?b))) ((union ?__rw (MNum (/ ?a ?b)))) :ruleset expr :name "ceildiv-const")
+        (rule ((= ?__rw (MMax (MNum ?a) (MNum ?b)))) ((union ?__rw (MNum (max ?a ?b)))) :ruleset expr :name "max-const")
+        (rule ((= ?__rw (MMin (MNum ?a) (MNum ?b)))) ((union ?__rw (MNum (min ?a ?b)))) :ruleset expr :name "min-const")
+        (rule ((= ?__rw (MAnd (MNum ?a) (MNum ?b)))) ((union ?__rw (MNum (& ?a ?b)))) :ruleset expr :name "and-const")
+        (rule ((= ?__rw (MFloat -1.0))) ((union ?__rw (MNum -1))) :ruleset expr :name "float-neg1-to-num")
+        (rule ((= ?__rw (MNum -1))) ((union ?__rw (MFloat -1.0))) :ruleset expr :name "num-neg1-to-float")
+        (rule ((= ?__rw (MAdd ?a (MNum 0)))) ((union ?__rw ?a)) :ruleset expr :name "add-zero")
+        (rule ((= ?e (MMul ?a (MNum 1)))) ((union ?e ?a)) :ruleset expr)
+        (rule ((= ?e (MMul ?a (MNum 0)))) ((union ?e (MNum 0)) (subsume (MMul ?a (MNum 0)))) :ruleset expr)
+        (rule ((= ?__rw (MDiv ?a (MNum 1)))) ((union ?__rw ?a)) :ruleset expr :name "div-one")
+        (rule ((= ?__rw (MMod (MMul ?x ?y) ?y))) ((union ?__rw (MNum 0))) :ruleset expr :name "mod-mul-self")
+        (rule ((= ?__rw (MMod (MNum ?a) (MNum ?b))) (!= 0 ?b)) ((union ?__rw (MNum (% ?a ?b)))) :ruleset expr :name "mod-const")
+        (rule ((= ?__rw (MMod (MAdd (MMul ?x (MNum ?n)) (MNum ?r)) (MNum ?n))) (>= ?n 1) (>= ?r 0) (< ?r ?n)) ((union ?__rw (MNum ?r))) :ruleset expr :name "mod-mul-num-plus-rem")
+        (rule ((= ?__rw (MMod (MMod ?x (MNum ?y)) (MNum ?z))) (>= ?z ?y) (= 0 (% ?y ?z))) ((union ?__rw (MMod ?x (MNum ?y)))) :ruleset expr :name "mod-mod-larger")
+        (rule ((= ?__rw (MMod (MMod ?x (MNum ?y)) (MNum ?z))) (>= ?y ?z) (= 0 (% ?z ?y))) ((union ?__rw (MMod ?x (MNum ?z)))) :ruleset expr :name "mod-mod-smaller")
+        (rule ((= ?__rw (MAdd (MMul (MDiv ?z ?x) ?x) (MMod ?z ?x)))) ((union ?__rw ?z)) :ruleset expr :name "merge-dims")
+        (rule ((= ?__rw (MDiv (MDiv ?a (MNum ?b)) (MNum ?c))) (>= ?b 1) (>= ?c 1) (< ?b 3037000500) (< ?c 3037000500)) ((union ?__rw (MDiv ?a (MNum (* ?b ?c))))) :ruleset expr :name "div-div-num")
+        (rule ((= ?__rw (MAdd (MDiv ?a ?b) ?c))) ((union ?__rw (MDiv (MAdd ?a (MMul ?c ?b)) ?b))) :ruleset expr :name "add-div")
+        (rule ((= ?__rw (MAdd ?a (MSub ?b ?a)))) ((union ?__rw ?b)) :ruleset expr :name "add-sub-cancel")
+        (rule ((= ?__rw (MAdd (MSub ?b ?a) ?a))) ((union ?__rw ?b)) :ruleset expr :name "add-sub-cancel2")
+        (rule ((= ?__rw (MSub ?a ?a))) ((union ?__rw (MNum 0))) :ruleset expr :name "sub-self")
+        (rule ((= ?__rw (MAdd (MSub ?a (MNum ?b)) (MNum ?c)))) ((union ?__rw (MSub ?a (MNum (- ?b ?c))))) :ruleset expr :name "add-sub-const")
+        (rule ((= ?__rw (MAdd (MNum ?c) (MSub ?a (MNum ?b))))) ((union ?__rw (MSub ?a (MNum (- ?b ?c))))) :ruleset expr :name "add-sub-const2")
+        (rule ((= ?__rw (MSub (MAdd ?a (MNum ?b)) (MNum ?c)))) ((union ?__rw (MAdd ?a (MNum (- ?b ?c))))) :ruleset expr :name "sub-add-const")
+        (rule ((= ?__rw (MSub (MSub ?a (MNum ?b)) (MNum ?c)))) ((union ?__rw (MSub ?a (MNum (+ ?b ?c))))) :ruleset expr :name "sub-sub-const")
+        (rule ((= ?__rw (MAdd (MMul ?a ?b) (MMul ?a ?c)))) ((union ?__rw (MMul ?a (MAdd ?b ?c)))) :ruleset expr :name "factor")
+        (rule ((= ?__rw (MAdd ?a ?a))) ((union ?__rw (MMul (MNum 2) ?a))) :ruleset expr :name "double")
+        (rule ((= ?e (MAdd (MAdd ?a (MNum ?b)) (MNum ?c))) (= ?ans (+ ?b ?c))) ((union ?e (MAdd ?a (MNum ?ans))) (subsume (MAdd (MAdd ?a (MNum ?b)) (MNum ?c)))) :ruleset expr)
+        (rule ((= ?__rw (MAdd (MAdd (MNum ?b) (MVar ?v)) (MNum ?c)))) ((union ?__rw (MAdd (MVar ?v) (MNum (+ ?b ?c))))) :ruleset expr :name "add-assoc-var")
+        (rule ((= ?__rw (MAdd (MAdd (MNum ?b) (MMul ?n ?a)) (MNum ?c)))) ((union ?__rw (MAdd (MMul ?n ?a) (MNum (+ ?b ?c))))) :ruleset expr :name "add-assoc-mul")
+        (rule ((= ?__rw (MAdd (MMul (MNum ?n) ?a) ?a))) ((union ?__rw (MMul (MNum (+ ?n 1)) ?a)) (subsume (MAdd (MMul (MNum ?n) ?a) ?a))) :ruleset expr :name "combine-like-1")
+        (rule ((= ?__rw (MAdd ?a (MMul (MNum ?n) ?a)))) ((union ?__rw (MMul (MNum (+ ?n 1)) ?a)) (subsume (MAdd ?a (MMul (MNum ?n) ?a)))) :ruleset expr :name "combine-like-2")
+        (rule ((= ?__rw (MAdd (MMul ?a (MNum ?n)) ?a))) ((union ?__rw (MMul (MNum (+ ?n 1)) ?a)) (subsume (MAdd (MMul ?a (MNum ?n)) ?a))) :ruleset expr :name "combine-like-3")
+        (rule ((= ?__rw (MAdd ?a (MMul ?a (MNum ?n))))) ((union ?__rw (MMul (MNum (+ ?n 1)) ?a)) (subsume (MAdd ?a (MMul ?a (MNum ?n))))) :ruleset expr :name "combine-like-4")
+        (rule ((= ?__rw (MAdd (MAdd ?a (MVar ?v)) (MVar ?v)))) ((union ?__rw (MAdd ?a (MMul (MNum 2) (MVar ?v)))) (subsume (MAdd (MAdd ?a (MVar ?v)) (MVar ?v)))) :ruleset expr :name "combine-var-1")
+        (rule ((= ?__rw (MAdd (MAdd (MVar ?v) ?a) (MVar ?v)))) ((union ?__rw (MAdd ?a (MMul (MNum 2) (MVar ?v)))) (subsume (MAdd (MAdd (MVar ?v) ?a) (MVar ?v)))) :ruleset expr :name "combine-var-2")
+        (rule ((= ?__rw (MAdd (MAdd (MMul (MNum ?n) ?a) ?b) ?a))) ((union ?__rw (MAdd (MMul (MNum (+ ?n 1)) ?a) ?b)) (subsume (MAdd (MAdd (MMul (MNum ?n) ?a) ?b) ?a))) :ruleset expr :name "accum-1")
+        (rule ((= ?__rw (MAdd (MAdd ?b (MMul (MNum ?n) ?a)) ?a))) ((union ?__rw (MAdd ?b (MMul (MNum (+ ?n 1)) ?a))) (subsume (MAdd (MAdd ?b (MMul (MNum ?n) ?a)) ?a))) :ruleset expr :name "accum-2")
+        (rule ((= ?__rw (MReplace ?x ?y ?z)) (= ?x ?y)) ((union ?__rw ?z)) :ruleset expr :name "replace-match")
+        (rule ((= ?__rw (MReplace (MAdd ?a ?b) ?x ?y))) ((union ?__rw (MAdd (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MAdd")
+        (rule ((= ?__rw (MReplace (MSub ?a ?b) ?x ?y))) ((union ?__rw (MSub (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MSub")
+        (rule ((= ?__rw (MReplace (MMul ?a ?b) ?x ?y))) ((union ?__rw (MMul (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MMul")
+        (rule ((= ?__rw (MReplace (MDiv ?a ?b) ?x ?y))) ((union ?__rw (MDiv (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MDiv")
+        (rule ((= ?__rw (MReplace (MCeilDiv ?a ?b) ?x ?y))) ((union ?__rw (MCeilDiv (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MCeilDiv")
+        (rule ((= ?__rw (MReplace (MMod ?a ?b) ?x ?y))) ((union ?__rw (MMod (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MMod")
+        (rule ((= ?__rw (MReplace (MMin ?a ?b) ?x ?y))) ((union ?__rw (MMin (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MMin")
+        (rule ((= ?__rw (MReplace (MMax ?a ?b) ?x ?y))) ((union ?__rw (MMax (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MMax")
+        (rule ((= ?__rw (MReplace (MFloorTo ?a ?b) ?x ?y))) ((union ?__rw (MFloorTo (MReplace ?a ?x ?y) (MReplace ?b ?x ?y)))) :ruleset expr :name "replace-MFloorTo")
+        (rule ((= ?__rw (MReplace (MNum ?n) ?x ?y))) ((union ?__rw (MNum ?n))) :ruleset expr :name "replace-num")
+        (rule ((= ?__rw (MReplace (MVar ?z) ?find ?replace)) (!= ?find (MVar ?z))) ((union ?__rw (MVar ?z))) :ruleset expr :name "replace-var-miss")
+        (rule ((= ?__rw (MReplace (MIter) ?find ?replace)) (!= ?find (MIter))) ((union ?__rw (MIter))) :ruleset expr :name "replace-iter-miss")
+        (function len (EList) i64 :merge new)
+        (rule ((= ?e (ENil))) ((set (len ?e) 0)) :ruleset expr)
+        (rule ((= ?e (ECons ?expr ?list)) (= ?prev_len (len ?list))) ((set (len ?e) (+ ?prev_len 1))) :ruleset expr)
+        (function nth_from_end (EList i64) Expression :merge new)
+        (rule ((= ?e (ECons ?expr ?list)) (= ?list_len (len ?list))) ((set (nth_from_end ?e ?list_len) ?expr)) :ruleset expr)
+        (rule ((= ?e (ECons ?expr ?list)) (= ?other_nth (nth_from_end ?list ?n))) ((set (nth_from_end ?e ?n) ?other_nth)) :ruleset expr)
+        (function n_elements (EList) Expression :merge new)
+        (rule ((= ?e (ENil))) ((set (n_elements ?e) (MNum 1))) :ruleset expr)
+        (rule ((= ?e (ECons ?dim ?other)) (= ?other_elems (n_elements ?other))) ((set (n_elements ?e) (MMul ?dim ?other_elems))) :ruleset expr)
+        (rule ((= ?other (ECons ?other_dim ?other_other)) (= ?list (ECons ?d ?other)) (= ?e (RowMajor ?list)) (= ?n_elems (n_elements ?other))) ((union ?e (ECons (MMul ?n_elems (MIter)) (RowMajor ?other)))) :ruleset expr)
+        (rule ((= ?__rw (RowMajor (ECons ?dim (ENil))))) ((union ?__rw (ECons (MIter) (ENil)))) :ruleset expr :name "rowmajor-base")
+        (rule ((= ?__rw (MReplaceList (ECons ?expr ?list) ?from ?to))) ((union ?__rw (ECons (MReplace ?expr ?from ?to) (MReplaceList ?list ?from ?to)))) :ruleset expr :name "replace-list-cons")
+        (rule ((= ?e (ReplaceNthFromEnd (ECons ?expr ?list) ?to ?ind)) (= ?ind (len ?list))) ((union ?e (ECons ?to ?list))) :ruleset expr)
+        (rule ((= ?e (ReplaceNthFromEnd (ECons ?expr ?list) ?to ?ind)) (< ?ind (len ?list))) ((union ?e (ECons ?expr (ReplaceNthFromEnd ?list ?to ?ind)))) :ruleset expr)
+        (rule ((= ?e (RemoveNthFromEnd (ECons ?expr ?list) ?ind)) (= ?ind (len ?list))) ((union ?e ?list)) :ruleset expr)
+        (rule ((= ?e (RemoveNthFromEnd (ECons ?expr ?list) ?ind)) (< ?ind (len ?list))) ((union ?e (ECons ?expr (RemoveNthFromEnd ?list ?ind)))) :ruleset expr)
+    )
+    .expect("base expression egglog program should parse");
 
     if use_interval_analysis {
-        // ---- Interval analysis and interval-guarded simplifications ----
-        p.add_rule(
-            Rule::new()
-                .fact(peq(v("?e"), num(v("?n"))))
-                .set(interval_lower(v("?e")), v("?n"))
-                .set(interval_upper(v("?e")), v("?n"))
-                .ruleset("interval_expr")
-                .name("interval-num-exact"),
-        );
-        p.add_rule(
-            Rule::new()
-                .facts(vec![
-                    peq(v("?e"), add(v("?a"), v("?b"))),
-                    peq(v("?lo_a"), interval_lower(v("?a"))),
-                    peq(v("?lo_b"), interval_lower(v("?b"))),
-                    peq(v("?sum"), padd(v("?lo_a"), v("?lo_b"))),
-                ])
-                .set(interval_lower(v("?e")), v("?sum"))
-                .when(vec![
-                    pgte(v("?lo_a"), i64(0)),
-                    pgte(v("?lo_b"), i64(0)),
-                    pgte(psub(i64(i64::MAX), v("?lo_b")), v("?lo_a")),
-                ])
-                .ruleset("interval_expr")
-                .name("interval-add-lower-nonnegative"),
-        );
-        p.add_rule(
-            Rule::new()
-                .facts(vec![
-                    peq(v("?e"), add(v("?a"), v("?b"))),
-                    peq(v("?hi_a"), interval_upper(v("?a"))),
-                    peq(v("?hi_b"), interval_upper(v("?b"))),
-                    peq(v("?sum"), padd(v("?hi_a"), v("?hi_b"))),
-                ])
-                .set(interval_upper(v("?e")), v("?sum"))
-                .when(vec![
-                    plt(v("?hi_a"), i64(i64::MAX)),
-                    plt(v("?hi_b"), i64(i64::MAX)),
-                    pgte(psub(i64(i64::MAX), v("?hi_b")), v("?hi_a")),
-                ])
-                .ruleset("interval_expr")
-                .name("interval-add-upper-finite"),
-        );
-        p.add_rule(
-            Rule::new()
-                .facts(vec![
-                    peq(v("?e"), min(v("?a"), v("?b"))),
-                    peq(v("?lo_a"), interval_lower(v("?a"))),
-                    peq(v("?lo_b"), interval_lower(v("?b"))),
-                ])
-                .set(interval_lower(v("?e")), pmin(v("?lo_a"), v("?lo_b")))
-                .ruleset("interval_expr")
-                .name("interval-min-lower"),
-        );
-        p.add_rule(
-            Rule::new()
-                .facts(vec![
-                    peq(v("?e"), min(v("?a"), v("?b"))),
-                    peq(v("?hi_a"), interval_upper(v("?a"))),
-                    peq(v("?hi_b"), interval_upper(v("?b"))),
-                ])
-                .set(interval_upper(v("?e")), pmin(v("?hi_a"), v("?hi_b")))
-                .ruleset("interval_expr")
-                .name("interval-min-upper"),
-        );
-        p.add_rule(
-            Rule::new()
-                .facts(vec![
-                    peq(v("?e"), max(v("?a"), v("?b"))),
-                    peq(v("?lo_a"), interval_lower(v("?a"))),
-                    peq(v("?lo_b"), interval_lower(v("?b"))),
-                ])
-                .set(interval_lower(v("?e")), pmax(v("?lo_a"), v("?lo_b")))
-                .ruleset("interval_expr")
-                .name("interval-max-lower"),
-        );
-        p.add_rule(
-            Rule::new()
-                .facts(vec![
-                    peq(v("?e"), max(v("?a"), v("?b"))),
-                    peq(v("?hi_a"), interval_upper(v("?a"))),
-                    peq(v("?hi_b"), interval_upper(v("?b"))),
-                ])
-                .set(interval_upper(v("?e")), pmax(v("?hi_a"), v("?hi_b")))
-                .ruleset("interval_expr")
-                .name("interval-max-upper"),
-        );
-        p.add_rule(
-            rewrite("interval-lt-true", lt(v("?x"), num(v("?n"))), num(i64(1)))
-                .when(vec![
-                    peq(v("?hi"), interval_upper(v("?x"))),
-                    plt(v("?hi"), v("?n")),
-                ])
-                .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite("interval-lt-false", lt(v("?x"), num(v("?n"))), num(i64(0)))
-                .when(vec![
-                    peq(v("?lo"), interval_lower(v("?x"))),
-                    pgte(v("?lo"), v("?n")),
-                ])
-                .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite("interval-gte-true", gte(v("?x"), num(v("?n"))), num(i64(1)))
-                .when(vec![
-                    peq(v("?lo"), interval_lower(v("?x"))),
-                    pgte(v("?lo"), v("?n")),
-                ])
-                .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite(
-                "interval-gte-false",
-                gte(v("?x"), num(v("?n"))),
-                num(i64(0)),
+        commands.extend(
+            egglog!(
+                (ruleset interval_expr)
+                (rule ((= ?e (MNum ?n))) ((set (lower ?e) ?n) (set (upper ?e) ?n)) :ruleset interval_expr :name "interval-num-exact")
+                (rule ((= ?e (MAdd ?a ?b)) (= ?lo_a (lower ?a)) (= ?lo_b (lower ?b)) (= ?sum (+ ?lo_a ?lo_b)) (>= ?lo_a 0) (>= ?lo_b 0) (>= (- 9223372036854775807 ?lo_b) ?lo_a)) ((set (lower ?e) ?sum)) :ruleset interval_expr :name "interval-add-lower-nonnegative")
+                (rule ((= ?e (MAdd ?a ?b)) (= ?hi_a (upper ?a)) (= ?hi_b (upper ?b)) (= ?sum (+ ?hi_a ?hi_b)) (< ?hi_a 9223372036854775807) (< ?hi_b 9223372036854775807) (>= (- 9223372036854775807 ?hi_b) ?hi_a)) ((set (upper ?e) ?sum)) :ruleset interval_expr :name "interval-add-upper-finite")
+                (rule ((= ?e (MMin ?a ?b)) (= ?lo_a (lower ?a)) (= ?lo_b (lower ?b))) ((set (lower ?e) (min ?lo_a ?lo_b))) :ruleset interval_expr :name "interval-min-lower")
+                (rule ((= ?e (MMin ?a ?b)) (= ?hi_a (upper ?a)) (= ?hi_b (upper ?b))) ((set (upper ?e) (min ?hi_a ?hi_b))) :ruleset interval_expr :name "interval-min-upper")
+                (rule ((= ?e (MMax ?a ?b)) (= ?lo_a (lower ?a)) (= ?lo_b (lower ?b))) ((set (lower ?e) (max ?lo_a ?lo_b))) :ruleset interval_expr :name "interval-max-lower")
+                (rule ((= ?e (MMax ?a ?b)) (= ?hi_a (upper ?a)) (= ?hi_b (upper ?b))) ((set (upper ?e) (max ?hi_a ?hi_b))) :ruleset interval_expr :name "interval-max-upper")
+                (rule ((= ?__rw (MLt ?x (MNum ?n))) (= ?hi (upper ?x)) (< ?hi ?n)) ((union ?__rw (MNum 1))) :ruleset interval_expr :name "interval-lt-true")
+                (rule ((= ?__rw (MLt ?x (MNum ?n))) (= ?lo (lower ?x)) (>= ?lo ?n)) ((union ?__rw (MNum 0))) :ruleset interval_expr :name "interval-lt-false")
+                (rule ((= ?__rw (MGte ?x (MNum ?n))) (= ?lo (lower ?x)) (>= ?lo ?n)) ((union ?__rw (MNum 1))) :ruleset interval_expr :name "interval-gte-true")
+                (rule ((= ?__rw (MGte ?x (MNum ?n))) (= ?hi (upper ?x)) (< ?hi ?n)) ((union ?__rw (MNum 0))) :ruleset interval_expr :name "interval-gte-false")
+                (rule ((= ?__rw (MMin ?x (MNum ?n))) (= ?hi (upper ?x)) (>= ?n ?hi)) ((union ?__rw ?x)) :ruleset interval_expr :name "interval-min-right-identity")
+                (rule ((= ?__rw (MMax ?x (MNum ?n))) (= ?lo (lower ?x)) (>= ?lo ?n)) ((union ?__rw ?x)) :ruleset interval_expr :name "interval-max-right-identity")
+                (rule ((= ?__rw (MMod ?x (MNum ?n))) (>= ?n 1) (= ?lo (lower ?x)) (= ?hi (upper ?x)) (>= ?lo 0) (< ?hi ?n)) ((union ?__rw ?x)) :ruleset interval_expr :name "interval-mod-small")
+                (rule ((= ?__rw (MDiv ?x (MNum ?n))) (>= ?n 1) (= ?lo (lower ?x)) (= ?hi (upper ?x)) (>= ?lo 0) (< ?hi ?n)) ((union ?__rw (MNum 0))) :ruleset interval_expr :name "interval-div-small")
             )
-            .when(vec![
-                peq(v("?hi"), interval_upper(v("?x"))),
-                plt(v("?hi"), v("?n")),
-            ])
-            .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite(
-                "interval-min-right-identity",
-                min(v("?x"), num(v("?n"))),
-                v("?x"),
-            )
-            .when(vec![
-                peq(v("?hi"), interval_upper(v("?x"))),
-                pgte(v("?n"), v("?hi")),
-            ])
-            .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite(
-                "interval-max-right-identity",
-                max(v("?x"), num(v("?n"))),
-                v("?x"),
-            )
-            .when(vec![
-                peq(v("?lo"), interval_lower(v("?x"))),
-                pgte(v("?lo"), v("?n")),
-            ])
-            .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite("interval-mod-small", modd(v("?x"), num(v("?n"))), v("?x"))
-                .when(vec![
-                    pgte(v("?n"), i64(1)),
-                    peq(v("?lo"), interval_lower(v("?x"))),
-                    peq(v("?hi"), interval_upper(v("?x"))),
-                    pgte(v("?lo"), i64(0)),
-                    plt(v("?hi"), v("?n")),
-                ])
-                .ruleset("interval_expr"),
-        );
-        p.add_rule(
-            rewrite(
-                "interval-div-small",
-                div(v("?x"), num(v("?n"))),
-                num(i64(0)),
-            )
-            .when(vec![
-                pgte(v("?n"), i64(1)),
-                peq(v("?lo"), interval_lower(v("?x"))),
-                peq(v("?hi"), interval_upper(v("?x"))),
-                pgte(v("?lo"), i64(0)),
-                plt(v("?hi"), v("?n")),
-            ])
-            .ruleset("interval_expr"),
+            .expect("base interval egglog program should parse"),
         );
     }
 
-    // `div-div`, restricted to nested constant divisors only. The original
-    // unconstrained form `(a/b)/c → a/(b*c)` produces a new `div` whose
-    // denominator matches the same rule again as soon as `a` is itself a
-    // `div`, and `flatten_strides` produces 4-deep div chains for every
-    // conv. Under `(saturate expr)` the unrestricted version is the single
-    // biggest match generator on YOLO v11 (~200k matches at 7 layers,
-    // growing super-linearly). Restricting both divisors to numeric
-    // literals keeps the productive constant-folding case
-    // (e.g. `((w+7)/2)/2 → (w+7)/4`) while completely avoiding the
-    // explosion on stride/index expressions whose denominators are
-    // composite expressions like `c_in*H*W`.
-    p.add_rule(
-        rewrite(
-            "div-div-num",
-            div(div(v("a"), num(v("?b"))), num(v("?c"))),
-            div(v("a"), num(pmul(v("?b"), v("?c")))),
-        )
-        .when(vec![
-            pgte(v("?b"), i64(1)),
-            pgte(v("?c"), i64(1)),
-            plt(v("?b"), i64(3_037_000_500)),
-            plt(v("?c"), i64(3_037_000_500)),
-        ])
-        .ruleset("expr"),
-    );
-
-    p.add_rule(
-        rewrite(
-            "add-div",
-            add(div(v("a"), v("b")), v("c")),
-            div(add(v("a"), mul(v("c"), v("b"))), v("b")),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(rewrite("add-sub-cancel", add(v("a"), sub(v("b"), v("a"))), v("b")).ruleset("expr"));
-    p.add_rule(
-        rewrite("add-sub-cancel2", add(sub(v("b"), v("a")), v("a")), v("b")).ruleset("expr"),
-    );
-    p.add_rule(rewrite("sub-self", sub(v("a"), v("a")), num(i64(0))).ruleset("expr"));
-    p.add_rule(
-        rewrite(
-            "add-sub-const",
-            add(sub(v("a"), num(v("?b"))), num(v("?c"))),
-            sub(v("a"), num(psub(v("?b"), v("?c")))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "add-sub-const2",
-            add(num(v("?c")), sub(v("a"), num(v("?b")))),
-            sub(v("a"), num(psub(v("?b"), v("?c")))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "sub-add-const",
-            sub(add(v("a"), num(v("?b"))), num(v("?c"))),
-            add(v("a"), num(psub(v("?b"), v("?c")))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "sub-sub-const",
-            sub(sub(v("a"), num(v("?b"))), num(v("?c"))),
-            sub(v("a"), num(padd(v("?b"), v("?c")))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "factor",
-            add(mul(v("a"), v("b")), mul(v("a"), v("c"))),
-            mul(v("a"), add(v("b"), v("c"))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(rewrite("double", add(v("a"), v("a")), mul(num(i64(2)), v("a"))).ruleset("expr"));
-
-    // Constant folding through associativity
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), add(add(v("?a"), num(v("?b"))), num(v("?c")))),
-                peq(v("?ans"), padd(v("?b"), v("?c"))),
-            ])
-            .union(v("?e"), add(v("?a"), num(v("?ans"))))
-            .subsume(add(add(v("?a"), num(v("?b"))), num(v("?c"))))
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "add-assoc-var",
-            add(add(num(v("?b")), mvar(v("?v"))), num(v("?c"))),
-            add(mvar(v("?v")), num(padd(v("?b"), v("?c")))),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "add-assoc-mul",
-            add(add(num(v("?b")), mul(v("?n"), v("?a"))), num(v("?c"))),
-            add(mul(v("?n"), v("?a")), num(padd(v("?b"), v("?c")))),
-        )
-        .ruleset("expr"),
-    );
-
-    // Combine like terms: (n*a) + a -> (n+1)*a
-    p.add_rule(
-        rewrite(
-            "combine-like-1",
-            add(mul(num(v("?n")), v("?a")), v("?a")),
-            mul(num(padd(v("?n"), i64(1))), v("?a")),
-        )
-        .subsume(add(mul(num(v("?n")), v("?a")), v("?a")))
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "combine-like-2",
-            add(v("?a"), mul(num(v("?n")), v("?a"))),
-            mul(num(padd(v("?n"), i64(1))), v("?a")),
-        )
-        .subsume(add(v("?a"), mul(num(v("?n")), v("?a"))))
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "combine-like-3",
-            add(mul(v("?a"), num(v("?n"))), v("?a")),
-            mul(num(padd(v("?n"), i64(1))), v("?a")),
-        )
-        .subsume(add(mul(v("?a"), num(v("?n"))), v("?a")))
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "combine-like-4",
-            add(v("?a"), mul(v("?a"), num(v("?n")))),
-            mul(num(padd(v("?n"), i64(1))), v("?a")),
-        )
-        .subsume(add(v("?a"), mul(v("?a"), num(v("?n")))))
-        .ruleset("expr"),
-    );
-
-    // Combine repeated variables: ((a + v) + v) -> (a + 2*v)
-    p.add_rule(
-        rewrite(
-            "combine-var-1",
-            add(add(v("?a"), mvar(v("?v"))), mvar(v("?v"))),
-            add(v("?a"), mul(num(i64(2)), mvar(v("?v")))),
-        )
-        .subsume(add(add(v("?a"), mvar(v("?v"))), mvar(v("?v"))))
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "combine-var-2",
-            add(add(mvar(v("?v")), v("?a")), mvar(v("?v"))),
-            add(v("?a"), mul(num(i64(2)), mvar(v("?v")))),
-        )
-        .subsume(add(add(mvar(v("?v")), v("?a")), mvar(v("?v"))))
-        .ruleset("expr"),
-    );
-
-    // Accumulate: ((n*a + b) + a) -> ((n+1)*a + b)
-    p.add_rule(
-        rewrite(
-            "accum-1",
-            add(add(mul(num(v("?n")), v("?a")), v("?b")), v("?a")),
-            add(mul(num(padd(v("?n"), i64(1))), v("?a")), v("?b")),
-        )
-        .subsume(add(add(mul(num(v("?n")), v("?a")), v("?b")), v("?a")))
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "accum-2",
-            add(add(v("?b"), mul(num(v("?n")), v("?a"))), v("?a")),
-            add(v("?b"), mul(num(padd(v("?n"), i64(1))), v("?a"))),
-        )
-        .subsume(add(add(v("?b"), mul(num(v("?n")), v("?a"))), v("?a")))
-        .ruleset("expr"),
-    );
-
-    // ---- Replacement over expressions ----
-    p.add_rule(
-        rewrite("replace-match", replace(v("?x"), v("?y"), v("?z")), v("?z"))
-            .when(vec![peq(v("?x"), v("?y"))])
-            .ruleset("expr"),
-    );
-
-    // Replacement distributes over binary ops
-    #[allow(clippy::type_complexity)]
-    let binary_ops: Vec<(&str, Box<dyn Fn(Term, Term) -> Term>)> = vec![
-        ("MAdd", Box::new(&add)),
-        ("MSub", Box::new(&sub)),
-        ("MMul", Box::new(&mul)),
-        ("MDiv", Box::new(&div)),
-        ("MCeilDiv", Box::new(&ceildiv)),
-        ("MMod", Box::new(&modd)),
-        ("MMin", Box::new(&min)),
-        ("MMax", Box::new(&max)),
-        ("MFloorTo", Box::new(&floorto)),
-    ];
-    for (name, op) in &binary_ops {
-        p.add_rule(
-            rewrite(
-                &format!("replace-{}", name),
-                replace(op(v("?a"), v("?b")), v("?x"), v("?y")),
-                op(
-                    replace(v("?a"), v("?x"), v("?y")),
-                    replace(v("?b"), v("?x"), v("?y")),
-                ),
-            )
-            .ruleset("expr"),
-        );
-    }
-
-    p.add_rule(
-        rewrite(
-            "replace-num",
-            replace(num(v("?n")), v("?x"), v("?y")),
-            num(v("?n")),
-        )
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "replace-var-miss",
-            replace(mvar(v("?z")), v("?find"), v("?replace")),
-            mvar(v("?z")),
-        )
-        .when(vec![pneq(v("?find"), mvar(v("?z")))])
-        .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "replace-iter-miss",
-            replace(iter(), v("?find"), v("?replace")),
-            iter(),
-        )
-        .when(vec![pneq(v("?find"), iter())])
-        .ruleset("expr"),
-    );
-
-    // ---- EList helper functions ----
-    p.add_function(FunctionDef {
-        name: "len".into(),
-        args: vec!["EList".into()],
-        ret: "i64".into(),
-        merge: Some("new".into()),
-    });
-    p.add_rule(
-        Rule::new()
-            .fact(peq(v("?e"), nil()))
-            .action(Action::Set(len_f(v("?e")), i64(0)))
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), cons(v("?expr"), v("?list"))),
-                peq(v("?prev_len"), len_f(v("?list"))),
-            ])
-            .action(Action::Set(len_f(v("?e")), padd(v("?prev_len"), i64(1))))
-            .ruleset("expr"),
-    );
-
-    p.add_function(FunctionDef {
-        name: "nth_from_end".into(),
-        args: vec!["EList".into(), "i64".into()],
-        ret: "Expression".into(),
-        merge: Some("new".into()),
-    });
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), cons(v("?expr"), v("?list"))),
-                peq(v("?list_len"), len_f(v("?list"))),
-            ])
-            .action(Action::Set(nth_f(v("?e"), v("?list_len")), v("?expr")))
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), cons(v("?expr"), v("?list"))),
-                peq(v("?other_nth"), nth_f(v("?list"), v("?n"))),
-            ])
-            .action(Action::Set(nth_f(v("?e"), v("?n")), v("?other_nth")))
-            .ruleset("expr"),
-    );
-
-    p.add_function(FunctionDef {
-        name: "n_elements".into(),
-        args: vec!["EList".into()],
-        ret: "Expression".into(),
-        merge: Some("new".into()),
-    });
-    p.add_rule(
-        Rule::new()
-            .fact(peq(v("?e"), nil()))
-            .action(Action::Set(nelem_f(v("?e")), num(i64(1))))
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), cons(v("?dim"), v("?other"))),
-                peq(v("?other_elems"), nelem_f(v("?other"))),
-            ])
-            .action(Action::Set(
-                nelem_f(v("?e")),
-                mul(v("?dim"), v("?other_elems")),
-            ))
-            .ruleset("expr"),
-    );
-
-    // RowMajor rules (z-strides: base stride is MIter/'z', not 1)
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?other"), cons(v("?other_dim"), v("?other_other"))),
-                peq(v("?list"), cons(v("?d"), v("?other"))),
-                peq(v("?e"), rowmajor(v("?list"))),
-                peq(v("?n_elems"), nelem_f(v("?other"))),
-            ])
-            .action(Action::Union(
-                v("?e"),
-                cons(mul(v("?n_elems"), iter()), rowmajor(v("?other"))),
-            ))
-            .ruleset("expr"),
-    );
-    p.add_rule(
-        rewrite(
-            "rowmajor-base",
-            rowmajor(cons(v("?dim"), nil())),
-            cons(iter(), nil()),
-        )
-        .ruleset("expr"),
-    );
-
-    // MReplaceList / ReplaceNthFromEnd / RemoveNthFromEnd
-    p.add_rule(
-        rewrite(
-            "replace-list-cons",
-            replace_list(cons(v("?expr"), v("?list")), v("?from"), v("?to")),
-            cons(
-                replace(v("?expr"), v("?from"), v("?to")),
-                replace_list(v("?list"), v("?from"), v("?to")),
-            ),
-        )
-        .ruleset("expr"),
-    );
-
-    // ReplaceNthFromEnd: match case (ind == len list)
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(
-                    v("?e"),
-                    replace_nth(cons(v("?expr"), v("?list")), v("?to"), v("?ind")),
-                ),
-                peq(v("?ind"), len_f(v("?list"))),
-            ])
-            .action(Action::Union(v("?e"), cons(v("?to"), v("?list"))))
-            .ruleset("expr"),
-    );
-    // ReplaceNthFromEnd: recurse case (ind < len list)
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(
-                    v("?e"),
-                    replace_nth(cons(v("?expr"), v("?list")), v("?to"), v("?ind")),
-                ),
-                plt(v("?ind"), len_f(v("?list"))),
-            ])
-            .action(Action::Union(
-                v("?e"),
-                cons(v("?expr"), replace_nth(v("?list"), v("?to"), v("?ind"))),
-            ))
-            .ruleset("expr"),
-    );
-
-    // RemoveNthFromEnd: match case (ind == len list)
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), remove_nth(cons(v("?expr"), v("?list")), v("?ind"))),
-                peq(v("?ind"), len_f(v("?list"))),
-            ])
-            .action(Action::Union(v("?e"), v("?list")))
-            .ruleset("expr"),
-    );
-    // RemoveNthFromEnd: recurse case (ind < len list)
-    p.add_rule(
-        Rule::new()
-            .facts(vec![
-                peq(v("?e"), remove_nth(cons(v("?expr"), v("?list")), v("?ind"))),
-                plt(v("?ind"), len_f(v("?list"))),
-            ])
-            .action(Action::Union(
-                v("?e"),
-                cons(v("?expr"), remove_nth(v("?list"), v("?ind"))),
-            ))
-            .ruleset("expr"),
-    );
-
-    p.to_egglog_string()
+    commands
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// Generate the cleanup rules that delete intermediate helper nodes
-/// (MReplace, MReplaceList, ReplaceNthFromEnd, RemoveNthFromEnd, RowMajor,
-/// and the helper functions len, nth_from_end, n_elements).
+/// The base "cleanup" ruleset: rules that delete intermediate helper nodes
+/// (MReplace, MReplaceList, ReplaceNthFromEnd, RemoveNthFromEnd, RowMajor, and
+/// the helper functions len, nth_from_end, n_elements) once simplification has
+/// consumed them. Authored via `egglog!` and rendered to text like the base
+/// program above.
 pub fn base_cleanup_egglog() -> String {
-    let mut p = Program::default();
-    p.add_ruleset("base_cleanup");
-
-    // Delete sort-based intermediates
-    #[allow(clippy::type_complexity)]
-    let sort_cleanups: &[(&str, &dyn Fn(Vec<Term>) -> Term, &[&str])] = &[
-        (
-            "MReplace",
-            &|a| replace(a[0].clone(), a[1].clone(), a[2].clone()),
-            &["a", "b", "c"],
-        ),
-        (
-            "MReplaceList",
-            &|a| replace_list(a[0].clone(), a[1].clone(), a[2].clone()),
-            &["a", "b", "c"],
-        ),
-        (
-            "ReplaceNthFromEnd",
-            &|a| replace_nth(a[0].clone(), a[1].clone(), a[2].clone()),
-            &["a", "b", "c"],
-        ),
-        (
-            "RemoveNthFromEnd",
-            &|a| remove_nth(a[0].clone(), a[1].clone()),
-            &["a", "b"],
-        ),
-        ("RowMajor", &|a| rowmajor(a[0].clone()), &["x"]),
-    ];
-    for (name, ctor, vars) in sort_cleanups {
-        let args: Vec<Term> = vars.iter().map(v).collect();
-        let term = ctor(args);
-        p.add_rule(
-            Rule::new()
-                .fact(peq(v("?m"), term.clone()))
-                .action(Action::Delete(term))
-                .ruleset("base_cleanup"),
-        );
-        let _ = name; // used only for clarity
-    }
-
-    // Delete function-based intermediates
-    #[allow(clippy::type_complexity)]
-    let fn_cleanups: &[(&str, fn(Vec<Term>) -> Term, usize)] = &[
-        ("len", |a| len_f(a[0].clone()), 1),
-        ("nth_from_end", |a| nth_f(a[0].clone(), a[1].clone()), 2),
-        ("n_elements", |a| nelem_f(a[0].clone()), 1),
-    ];
-    for (_name, ctor, arity) in fn_cleanups {
-        let var_names: Vec<&str> = match arity {
-            1 => vec!["?x"],
-            2 => vec!["?x", "?y"],
-            _ => unreachable!(),
-        };
-        let args: Vec<Term> = var_names.iter().map(v).collect();
-        let term = ctor(args);
-        p.add_rule(
-            Rule::new()
-                .fact(peq(v("?m"), term.clone()))
-                .action(Action::Delete(term))
-                .ruleset("base_cleanup"),
-        );
-    }
-
-    p.to_egglog_string()
+    egglog!(
+        (ruleset base_cleanup)
+        (rule ((= ?m (MReplace ?a ?b ?c))) ((delete (MReplace ?a ?b ?c))) :ruleset base_cleanup)
+        (rule ((= ?m (MReplaceList ?a ?b ?c))) ((delete (MReplaceList ?a ?b ?c))) :ruleset base_cleanup)
+        (rule ((= ?m (ReplaceNthFromEnd ?a ?b ?c))) ((delete (ReplaceNthFromEnd ?a ?b ?c))) :ruleset base_cleanup)
+        (rule ((= ?m (RemoveNthFromEnd ?a ?b))) ((delete (RemoveNthFromEnd ?a ?b))) :ruleset base_cleanup)
+        (rule ((= ?m (RowMajor ?x))) ((delete (RowMajor ?x))) :ruleset base_cleanup)
+        (rule ((= ?m (len ?x))) ((delete (len ?x))) :ruleset base_cleanup)
+        (rule ((= ?m (nth_from_end ?x ?y))) ((delete (nth_from_end ?x ?y))) :ruleset base_cleanup)
+        (rule ((= ?m (n_elements ?x))) ((delete (n_elements ?x))) :ruleset base_cleanup)
+    )
+    .expect("base cleanup egglog program should parse")
+    .iter()
+    .map(|c| c.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
 }

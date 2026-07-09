@@ -1,14 +1,15 @@
 use std::fmt::Display;
 use std::{fmt::Debug, sync::Arc};
 
-use crate::egglog_utils::api::{Term, eq, v};
 use crate::egglog_utils::{
-    api::{Action, Rule, SortDef, sort},
+    api::{SortDef, sort},
     base::*,
     *,
 };
 use crate::op::*;
 use crate::prelude::*;
+use egglog::ast::{Command, Parser};
+use egglog::prelude::egglog;
 
 use as_any::AsAny;
 use itertools::Itertools;
@@ -17,77 +18,73 @@ use itertools::Itertools;
 
 /// Helper: build a dtype propagation rule for a direct IR op.
 /// Matches the op, reads dtype from the named IR source field, and sets it on the op.
-fn dtype_propagation_rule(sort: &SortDef, dtype_source: &str) -> Rule {
-    let e = v("__e");
-    let src = v("__src");
-    let dty = v("__dty");
-    Rule::new()
-        // (Op :<dtype_source> ?__src ...)  — only bind the one field we read.
-        .fact(eq(e.clone(), sort.match_fields(&[(dtype_source, src.clone())])))
-        .fact(eq(dty.clone(), dtype(src)))
-        .action(Action::Set(dtype(e), dty))
-        .ruleset("dtype_prop")
+/// `#kind` / `:#dtype_source` splice the op's runtime constructor + field names;
+/// `...` binds the fields we don't read to fresh vars (expanded at parse time).
+fn dtype_propagation_rule(parser: &mut Parser, sort: &SortDef, dtype_source: &str) -> Vec<Command> {
+    let kind = sort.name.as_str();
+    egglog!(
+        *parser,
+        (rule ((= ?__e (#kind :#dtype_source ?__src ...))
+               (= ?__dty (dtype ?__src)))
+              ((set (dtype ?__e) ?__dty))
+            :ruleset dtype_prop)
+    )
+    .expect("dtype propagation rule should parse")
 }
 
 /// Helper: build a dtype-from-field rule for a direct IR op.
-fn dtype_from_field_rule(sort: &SortDef, dtype_field: &str) -> Rule {
-    let e = v("__e");
-    let d = v("__d");
-    Rule::new()
-        .fact(eq(e.clone(), sort.match_fields(&[(dtype_field, d.clone())])))
-        .action(Action::Set(dtype(e), d))
-        .ruleset("dtype_prop")
+fn dtype_from_field_rule(parser: &mut Parser, sort: &SortDef, dtype_field: &str) -> Vec<Command> {
+    let kind = sort.name.as_str();
+    egglog!(
+        *parser,
+        (rule ((= ?__e (#kind :#dtype_field ?__d ...)))
+              ((set (dtype ?__e) ?__d))
+            :ruleset dtype_prop)
+    )
+    .expect("dtype-from-field rule should parse")
 }
 
 // --- Dtype helpers for normalized ops (Op OpKind IList) ---
 
 /// Dtype propagation for a normalized op: inherits from first IList input.
-fn dtype_propagation_op(kind_sort: &SortDef) -> Rule {
-    let e = v("__e");
-    let first_inp = v("__first_inp");
-    let tail = v("__tail");
-    let dty = v("__dty");
-    Rule::new()
-        .fact(eq(
-            e.clone(),
-            // (Op (<Kind> ...) (ICons ?__first_inp ?__tail)) — kind fields ignored.
-            op_term(
-                kind_sort.match_fields(&[]),
-                Term::App {
-                    variant: "ICons".to_string(),
-                    args: vec![first_inp.clone(), tail],
-                },
-            ),
-        ))
-        .fact(eq(dty.clone(), dtype(first_inp)))
-        .action(Action::Set(dtype(e), dty))
-        .ruleset("dtype_prop")
+fn dtype_propagation_op(parser: &mut Parser, kind_sort: &SortDef) -> Vec<Command> {
+    let kind = kind_sort.name.as_str();
+    egglog!(
+        *parser,
+        // (Op (<Kind> ...) (ICons ?__first_inp ?__tail)) — kind fields ignored.
+        (rule ((= ?__e (Op (#kind ...) (ICons ?__first_inp ?__tail)))
+               (= ?__dty (dtype ?__first_inp)))
+              ((set (dtype ?__e) ?__dty))
+            :ruleset dtype_prop)
+    )
+    .expect("dtype propagation op rule should parse")
 }
 
 /// Dtype from a field on the OpKind (e.g., Cast's dtype field).
-fn dtype_from_kind_field(kind_sort: &SortDef, field_name: &str) -> Rule {
-    let e = v("__e");
-    let d = v("__d");
-    let inputs = v("__inputs");
-    Rule::new()
+fn dtype_from_kind_field(parser: &mut Parser, kind_sort: &SortDef, field_name: &str) -> Vec<Command> {
+    let kind = kind_sort.name.as_str();
+    egglog!(
+        *parser,
         // (Op (<Kind> :<field_name> ?__d ...) ?__inputs)
-        .fact(eq(
-            e.clone(),
-            op_term(kind_sort.match_fields(&[(field_name, d.clone())]), inputs),
-        ))
-        .action(Action::Set(dtype(e), d))
-        .ruleset("dtype_prop")
+        (rule ((= ?__e (Op (#kind :#field_name ?__d ...) ?__inputs)))
+              ((set (dtype ?__e) ?__d))
+            :ruleset dtype_prop)
+    )
+    .expect("dtype-from-kind-field rule should parse")
 }
 
 /// Fixed dtype for a normalized op (e.g., Iota always Int).
-fn dtype_fixed_op(kind_sort: &SortDef, dtype_sort: &SortDef) -> Rule {
-    let e = v("__e");
-    let inputs = v("__inputs");
-    Rule::new()
+fn dtype_fixed_op(parser: &mut Parser, kind_sort: &SortDef, dtype_sort: &SortDef) -> Vec<Command> {
+    let kind = kind_sort.name.as_str();
+    let dt = dtype_sort.name.as_str();
+    egglog!(
+        *parser,
         // (Op (<Kind> ...) ?__inputs) — match the kind, ignore all its fields.
-        .fact(eq(e.clone(), op_term(kind_sort.match_fields(&[]), inputs)))
-        .action(Action::Set(dtype(e), dtype_sort.call(())))
-        .ruleset("dtype_prop")
+        (rule ((= ?__e (Op (#kind ...) ?__inputs)))
+              ((set (dtype ?__e) (#dt)))
+            :ruleset dtype_prop)
+    )
+    .expect("dtype fixed op rule should parse")
 }
 
 /// Build an IList egglog string from input variable names.
@@ -147,17 +144,34 @@ pub fn binary_sort(name: &str) -> SortDef {
 /// and unions `LoopEnd` with the chain
 ///   `u0 = <kind>(initial, s0); u1 = <kind>(u0, s1); … u_{N-1}`.
 /// (or symmetric for state at position 1.)
-pub fn binary_op_unroll_rules(op_kind: &str, max_trips: usize) -> Vec<Rule> {
-    let mut rules = Vec::with_capacity((max_trips.saturating_sub(1)) * 2);
-    for n_iters in 2..=max_trips {
-        for state_pos in 0..2 {
-            rules.push(binary_op_unroll_rule(op_kind, n_iters, state_pos));
-        }
-    }
-    rules
+/// Parse raw egglog rule text (text-authored rules and included `.egg` files)
+/// into commands, on the schema-aware `parser`. The text counterpart to the
+/// `egglog!` quasiquote — used where rules are runtime-formatted strings rather
+/// than fixed syntax, so the quasiquote (which needs literal tokens) can't apply.
+fn raw_rules(parser: &mut Parser, text: &str) -> Vec<Command> {
+    parser
+        .get_program_from_string(None, text)
+        .expect("raw egglog rules should parse")
 }
 
-fn binary_op_unroll_rule(op_kind: &str, n_iters: usize, state_pos: usize) -> Rule {
+pub fn binary_op_unroll_rules(
+    parser: &mut Parser,
+    op_kind: &str,
+    max_trips: usize,
+) -> Vec<Command> {
+    let mut cmds = Vec::new();
+    for n_iters in 2..=max_trips {
+        for state_pos in 0..2 {
+            cmds.extend(raw_rules(
+                parser,
+                &binary_op_unroll_rule(op_kind, n_iters, state_pos),
+            ));
+        }
+    }
+    cmds
+}
+
+fn binary_op_unroll_rule(op_kind: &str, n_iters: usize, state_pos: usize) -> String {
     // Swap (state, per_iter) → (input0, input1) by `state_pos`. Both the
     // body match pattern and the unrolled chain bodies follow this mapping
     // so a/b stride positions stay aligned.
@@ -186,7 +200,7 @@ fn binary_op_unroll_rule(op_kind: &str, n_iters: usize, state_pos: usize) -> Rul
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Rule::raw(format!(
+    format!(
         "(rule
             (
                 (= ?ls (LoopStart ?initial ?loop_id ?slot_idx (MNum {n_iters}) ?dt))
@@ -203,7 +217,7 @@ fn binary_op_unroll_rule(op_kind: &str, n_iters: usize, state_pos: usize) -> Rul
         )",
         body_pat = order("?ls", "?li"),
         last = n_iters - 1,
-    ))
+    )
 }
 
 /// Reduce op kind: (shape: EList, iters: Expression, strides: EList, iter_stride: Expression, out_strides: EList), IList: [inp]
@@ -284,8 +298,8 @@ impl EgglogOp for Input {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_field_rule(parser, &self.sort(), "dtype")
     }
 
     fn extract<'a>(
@@ -348,8 +362,8 @@ impl EgglogOp for Output {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_rule(&self.sort(), "inp")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_rule(parser, &self.sort(), "inp")
     }
 
     fn extract<'a>(
@@ -402,8 +416,8 @@ impl EgglogOp for CustomOpKind {
         sort(OP_KIND, "CustomOpKind", &[("id", I64), ("dtype", DTYPE)])
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_kind_field(parser, &self.sort(), "dtype")
     }
 
     fn cleanup(&self) -> bool {
@@ -484,8 +498,8 @@ impl EgglogOp for LoopStart {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_field_rule(parser, &self.sort(), "dtype")
     }
 
     fn extract<'a>(
@@ -574,8 +588,8 @@ impl EgglogOp for LoopEnd {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_field_rule(parser, &self.sort(), "dtype")
     }
 
     fn extract<'a>(
@@ -653,16 +667,16 @@ impl EgglogOp for LoopInput {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
         // Declare the `identical_inputs` relation and the three-way unification
         // chain between `LoopInput`, `LoopInputStatic`, and an inlined source.
         // Running alongside fusion rules (e.g. GLUMoE) so that fusion patterns
         // that expect raw op kinds at boundary positions can match via the
         // unioned eclass.
-        vec![
-            dtype_from_kind_field(&self.sort(), "dtype"),
-            Rule::raw(
-                r#"
+        let mut cmds = dtype_from_kind_field(parser, &self.sort(), "dtype");
+        cmds.extend(raw_rules(
+            parser,
+            r#"
             (relation identical_inputs (IList))
 
             ; All four rules live in the `expr` ruleset, which the schedule
@@ -698,8 +712,8 @@ impl EgglogOp for LoopInput {
                   :ruleset expr
                   :name "LoopInputStatic inline")
             "#,
-            ),
-        ]
+        ));
+        cmds
     }
 
     fn extract<'a>(
@@ -788,8 +802,8 @@ impl EgglogOp for LoopInputStatic {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_kind_field(parser, &self.sort(), "dtype")
     }
 
     fn extract<'a>(
@@ -875,8 +889,8 @@ impl EgglogOp for LoopOutput {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_kind_field(parser, &self.sort(), "dtype")
     }
 
     fn extract<'a>(
@@ -969,8 +983,8 @@ impl EgglogOp for LoopOutputSelect {
         false
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_kind_field(parser, &self.sort(), "dtype")
     }
 
     fn extract<'a>(
@@ -1057,8 +1071,8 @@ impl EgglogOp for Constant {
         true
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_fixed_op(&self.sort(), &SORTS.f32_dt)]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_fixed_op(parser, &self.sort(), &SORTS.f32_dt)
     }
     fn extract<'a>(
         &'a self,
@@ -1116,8 +1130,8 @@ impl EgglogOp for Iota {
         true
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_fixed_op(&self.sort(), &SORTS.int_dt)]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_fixed_op(parser, &self.sort(), &SORTS.int_dt)
     }
     fn extract<'a>(
         &'a self,
@@ -1178,8 +1192,8 @@ impl EgglogOp for Cast {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_from_kind_field(parser, &self.sort(), "dtype")
     }
     fn extract<'a>(
         &'a self,
@@ -1351,8 +1365,8 @@ impl EgglogOp for Log2 {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_op(parser, &self.sort())
     }
     fn extract<'a>(
         &'a self,
@@ -1423,8 +1437,8 @@ impl EgglogOp for Exp2 {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_op(parser, &self.sort())
     }
     fn extract<'a>(
         &'a self,
@@ -1496,8 +1510,8 @@ impl EgglogOp for Sin {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_op(parser, &self.sort())
     }
     fn extract<'a>(
         &'a self,
@@ -1569,8 +1583,8 @@ impl EgglogOp for Recip {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_op(parser, &self.sort())
     }
     fn extract<'a>(
         &'a self,
@@ -1642,8 +1656,8 @@ impl EgglogOp for Sqrt {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_op(parser, &self.sort())
     }
     fn extract<'a>(
         &'a self,
@@ -1777,10 +1791,10 @@ impl EgglogOp for Add {
     fn n_inputs(&self) -> usize {
         2
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        let mut r = vec![dtype_propagation_op(&self.sort())];
-        r.extend(binary_op_unroll_rules("Add", 4));
-        r
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let mut cmds = dtype_propagation_op(parser, &self.sort());
+        cmds.extend(binary_op_unroll_rules(parser, "Add", 4));
+        cmds
     }
     fn extract<'a>(
         &'a self,
@@ -1877,10 +1891,10 @@ impl EgglogOp for Mul {
     fn n_inputs(&self) -> usize {
         2
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        let mut r = vec![dtype_propagation_op(&self.sort())];
-        r.extend(binary_op_unroll_rules("Mul", 4));
-        r
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let mut cmds = dtype_propagation_op(parser, &self.sort());
+        cmds.extend(binary_op_unroll_rules(parser, "Mul", 4));
+        cmds
     }
     fn extract<'a>(
         &'a self,
@@ -1977,10 +1991,10 @@ impl EgglogOp for Mod {
     fn n_inputs(&self) -> usize {
         2
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        let mut r = vec![dtype_propagation_op(&self.sort())];
-        r.extend(binary_op_unroll_rules("Mod", 4));
-        r
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let mut cmds = dtype_propagation_op(parser, &self.sort());
+        cmds.extend(binary_op_unroll_rules(parser, "Mod", 4));
+        cmds
     }
     fn extract<'a>(
         &'a self,
@@ -2075,11 +2089,11 @@ impl EgglogOp for LessThan {
     fn n_inputs(&self) -> usize {
         2
     }
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
         // Comparisons output Bool, not the input dtype.
-        let mut r = vec![dtype_fixed_op(&self.sort(), &SORTS.bool_dt)];
-        r.extend(binary_op_unroll_rules("LessThan", 4));
-        r
+        let mut cmds = dtype_fixed_op(parser, &self.sort(), &SORTS.bool_dt);
+        cmds.extend(binary_op_unroll_rules(parser, "LessThan", 4));
+        cmds
     }
     fn extract<'a>(
         &'a self,
@@ -2186,7 +2200,7 @@ impl EgglogOp for Gather {
     fn n_inputs(&self) -> usize {
         2
     }
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
         // Gather inherits dtype from second input (data), not first (indexes).
         // Use a custom rule instead of the generic first-input propagation.
         // **Must be in `dtype_prop` ruleset** — without it, Gather dtype
@@ -2195,34 +2209,16 @@ impl EgglogOp for Gather {
         // padding gathers + per-concat make_contiguous gathers) leave the
         // outermost Gathers with no dtype set, which in turn blocks the
         // KernelGather kernel-rewrite from firing.
-        let kind_term = self.sort().match_fields(&[]);
-        let e = v("__e");
-        let indexes = v("__indexes");
-        let data = v("__data");
-        let tail = v("__tail");
-        let dty = v("__dty");
-        vec![
-            Rule::new()
-                .fact(eq(
-                    e.clone(),
-                    op_term(
-                        kind_term,
-                        Term::App {
-                            variant: "ICons".to_string(),
-                            args: vec![
-                                indexes,
-                                Term::App {
-                                    variant: "ICons".to_string(),
-                                    args: vec![data.clone(), tail],
-                                },
-                            ],
-                        },
-                    ),
-                ))
-                .fact(eq(dty.clone(), dtype(data)))
-                .action(Action::Set(dtype(e), dty))
-                .ruleset("dtype_prop"),
-        ]
+        let sort = self.sort();
+        let kind = sort.name.as_str();
+        egglog!(
+            *parser,
+            (rule ((= ?__e (Op (#kind ...) (ICons ?__indexes (ICons ?__data ?__tail))))
+                   (= ?__dty (dtype ?__data)))
+                  ((set (dtype ?__e) ?__dty))
+                :ruleset dtype_prop)
+        )
+        .expect("Gather dtype rule should parse")
     }
     fn extract<'a>(
         &'a self,
@@ -2350,43 +2346,18 @@ impl EgglogOp for Scatter {
     fn n_inputs(&self) -> usize {
         3
     }
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
         // Scatter inherits dtype from third input (src), not first (dest).
-        let kind_term = self.sort().match_fields(&[]);
-        let e = v("__e");
-        let dest = v("__dest");
-        let indexes = v("__indexes");
-        let src = v("__src");
-        let tail = v("__tail");
-        let dty = v("__dty");
-        vec![
-            Rule::new()
-                .fact(eq(
-                    e.clone(),
-                    op_term(
-                        kind_term,
-                        Term::App {
-                            variant: "ICons".to_string(),
-                            args: vec![
-                                dest,
-                                Term::App {
-                                    variant: "ICons".to_string(),
-                                    args: vec![
-                                        indexes,
-                                        Term::App {
-                                            variant: "ICons".to_string(),
-                                            args: vec![src.clone(), tail],
-                                        },
-                                    ],
-                                },
-                            ],
-                        },
-                    ),
-                ))
-                .fact(eq(dty.clone(), dtype(src)))
-                .action(Action::Set(dtype(e), dty))
-                .ruleset("dtype_prop"),
-        ]
+        let sort = self.sort();
+        let kind = sort.name.as_str();
+        egglog!(
+            *parser,
+            (rule ((= ?__e (Op (#kind ...) (ICons ?__dest (ICons ?__indexes (ICons ?__src ?__tail)))))
+                   (= ?__dty (dtype ?__src)))
+                  ((set (dtype ?__e) ?__dty))
+                :ruleset dtype_prop)
+        )
+        .expect("Scatter dtype rule should parse")
     }
     fn extract<'a>(
         &'a self,
@@ -2500,19 +2471,23 @@ impl EgglogOp for SumReduce {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            dtype_propagation_op(&self.sort()),
-            // Batch-collapse rules: rewrite N-dim Mul+Sum → (N-1)-dim Mul+Sum
-            // so that 2D cuBLAS rules can match. Fires recursively.
-            Rule::raw(include_str!("egglog_utils/matmul_flattening/squeeze.egg")),
-            Rule::raw(include_str!(
-                "egglog_utils/matmul_flattening/batch_merge_a_contig.egg"
-            )),
-            Rule::raw(include_str!(
-                "egglog_utils/matmul_flattening/batch_merge_b_contig.egg"
-            )),
-        ]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        // Batch-collapse rules: rewrite N-dim Mul+Sum → (N-1)-dim Mul+Sum
+        // so that 2D cuBLAS rules can match. Fires recursively.
+        let mut cmds = dtype_propagation_op(parser, &self.sort());
+        cmds.extend(raw_rules(
+            parser,
+            include_str!("egglog_utils/matmul_flattening/squeeze.egg"),
+        ));
+        cmds.extend(raw_rules(
+            parser,
+            include_str!("egglog_utils/matmul_flattening/batch_merge_a_contig.egg"),
+        ));
+        cmds.extend(raw_rules(
+            parser,
+            include_str!("egglog_utils/matmul_flattening/batch_merge_b_contig.egg"),
+        ));
+        cmds
     }
     fn extract<'a>(
         &'a self,
@@ -2648,8 +2623,8 @@ impl EgglogOp for MaxReduce {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_propagation_op(&self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        dtype_propagation_op(parser, &self.sort())
     }
     fn extract<'a>(
         &'a self,
