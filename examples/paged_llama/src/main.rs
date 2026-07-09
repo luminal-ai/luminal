@@ -1,3 +1,11 @@
+// glibc malloc degrades into an allocating livelock inside
+// nvrtcCompileProgram after heavy search heap churn (hundreds of
+// thousands of compiles). jemalloc built with unprefixed symbols
+// interposes malloc for the whole process, including dlopened CUDA
+// libraries like libnvrtc — a Rust-only global allocator would not.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hf;
 mod model;
 
@@ -12,6 +20,9 @@ use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
+
+/// KV cache element size in bytes (bf16 = 2).
+const KV_ELEMENT_BYTES: usize = 2;
 
 fn llama3_chat_prompt(user_prompt: &str) -> String {
     format!(
@@ -151,7 +162,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn main() {
     let num_slots = env_usize("NUM_SLOTS", 8192);
     let search_graphs = 100;
-    let gen_tokens = 30;
+    let gen_tokens = 500;
     let prompt_a = "Explain what a neural network is in a paragraph.";
     let prompt_b = "What is the capital of France?";
 
@@ -221,10 +232,11 @@ fn main() {
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
-    let weights_path = model_dir.join("model_combined.safetensors");
+    let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    // KV cache is bf16: 2 bytes/element.
+    let cache_bytes = num_slots * KV_DIM * KV_ELEMENT_BYTES;
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
@@ -245,7 +257,7 @@ fn main() {
     runtime = cx.search(runtime, search_options);
 
     // Re-initialize KV cache after search (search consumes buffers)
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    let cache_bytes = num_slots * KV_DIM * KV_ELEMENT_BYTES;
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);

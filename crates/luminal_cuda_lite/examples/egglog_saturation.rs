@@ -27,6 +27,12 @@ const EGGLOG_RULESETS: &[&str] = &[
     "fusion_pair",
     "fusion_grow",
     "fusion_merge",
+    // One-shot structural-fusion rulesets (FlashInfer mask facts, RoPE/RMS
+    // cascades) that ops emit into. Declared so their rules register even
+    // though this measurement harness's schedule doesn't run the late phase.
+    "kernel_fuse_late_pre",
+    "kernel_fuse_late",
+    "kernel_fuse_late2",
 ];
 const MOE_SEQ: usize = 2;
 const MOE_HIDDEN: usize = 16;
@@ -60,6 +66,15 @@ enum Case {
     Attention,
     QwenMoe,
     GemmaMoe,
+    /// N stacked Flux-schnell-style DiT blocks: adaLN modulation (shift/scale/gate
+    /// from a conditioning Linear, broadcast over seq) wrapping multi-head
+    /// attention + a gelu MLP, with gated residuals. Reproduces the cuBLASLt fp8
+    /// rules' compile-time blowup: the modulation broadcasts + softmax are a rich
+    /// scalar-`FusionStart` source, and the `cublaslt scaled fp8 fused
+    /// output-scale` rule matches two scalar FusionStarts as free atoms — a K²
+    /// cross-product that explodes super-linearly with block count (0 matches),
+    /// which is why the real 57-block FLUX.1-schnell compile OOMs.
+    FluxBlock(usize),
 }
 
 #[derive(Debug)]
@@ -122,7 +137,7 @@ fn parse_args() -> Args {
                      Options:\n\
                        --backend reference|cuda       default: cuda\n\
                        --mode current|steps|full-default|full-cycle\n\
-                       --case mul|unary-chain:N|gelu|softmax|layer-norm|matmul|attention|qwen-moe|gemma-moe\n\
+                       --case mul|unary-chain:N|gelu|softmax|layer-norm|matmul|attention|qwen-moe|gemma-moe|flux-block:N\n\
                        --passes N                    default: 256\n\
                        --no-cleanup                  omit backend/HLIR cleanup rules\n\
                        --skip-roll                   skip auto loop rolling prepass"
@@ -139,6 +154,9 @@ fn parse_args() -> Args {
 fn parse_case(s: &str) -> Case {
     if let Some(n) = s.strip_prefix("unary-chain:") {
         return Case::UnaryChain(n.parse().expect("invalid unary-chain length"));
+    }
+    if let Some(n) = s.strip_prefix("flux-block:") {
+        return Case::FluxBlock(n.parse().expect("invalid flux-block count"));
     }
     match s {
         "mul" => Case::Mul,
@@ -191,9 +209,58 @@ fn build_case(case: Case) -> Graph {
         }
         Case::QwenMoe => build_qwen_moe(&mut cx),
         Case::GemmaMoe => build_gemma_moe(&mut cx),
+        Case::FluxBlock(blocks) => build_flux_block(&mut cx, blocks),
     };
     let _ = out.output();
     cx
+}
+
+/// N stacked Flux-schnell-style DiT blocks (adaLN modulation + MHA + gelu MLP).
+/// See `Case::FluxBlock` for why this reproduces the fp8 rule compile-time blowup.
+fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
+    let seq = 16usize;
+    let dim = 64usize;
+    let heads = 4usize;
+    let hd = dim / heads;
+    let mlp = dim * 2;
+    let attn_scale = 1.0f32 / (hd as f32).sqrt();
+    let mut x = cx.tensor((seq, dim)).as_dtype(DType::F16);
+    for _ in 0..blocks {
+        // adaLN modulation: a Linear from a conditioning vector produces 6 (dim,)
+        // chunks (shift/scale/gate ×2), each broadcast over seq.
+        let temb = cx.tensor((1, dim)).as_dtype(DType::F16);
+        let mod_lin = cx.tensor((dim, dim * 6)).as_dtype(DType::F16);
+        let m = temb.matmul(mod_lin); // (1, 6*dim)
+        let chunk = |mm: GraphTensor, i: usize| {
+            mm.slice((.., i * dim..(i + 1) * dim))
+                .squeeze(0)
+                .expand_lhs((seq,))
+        };
+        let (shift1, scale1, gate1) = (chunk(m, 0), chunk(m, 1), chunk(m, 2));
+        let (shift2, scale2, gate2) = (chunk(m, 3), chunk(m, 4), chunk(m, 5));
+        // ── attention sublayer ──
+        let h = x.layer_norm(1, 1e-5) * (scale1 + 1.0) + shift1;
+        let qw = cx.tensor((dim, dim)).as_dtype(DType::F16);
+        let kw = cx.tensor((dim, dim)).as_dtype(DType::F16);
+        let vw = cx.tensor((dim, dim)).as_dtype(DType::F16);
+        let ow = cx.tensor((dim, dim)).as_dtype(DType::F16);
+        let q = h.matmul(qw).split_dims(1, hd).permute((1, 0, 2));
+        let k = h.matmul(kw).split_dims(1, hd).permute((1, 0, 2));
+        let v = h.matmul(vw).split_dims(1, hd).permute((1, 0, 2));
+        let scores = (q.matmul(k.permute((0, 2, 1))) * attn_scale).softmax(2);
+        let attn = scores
+            .matmul(v)
+            .permute((1, 0, 2))
+            .merge_dims(1, 2)
+            .matmul(ow);
+        x += gate1 * attn;
+        // ── gelu MLP sublayer ──
+        let h2 = x.layer_norm(1, 1e-5) * (scale2 + 1.0) + shift2;
+        let up = cx.tensor((dim, mlp)).as_dtype(DType::F16);
+        let down = cx.tensor((mlp, dim)).as_dtype(DType::F16);
+        x += gate2 * h2.matmul(up).gelu().matmul(down);
+    }
+    x
 }
 
 fn build_qwen_moe(cx: &mut Graph) -> GraphTensor {

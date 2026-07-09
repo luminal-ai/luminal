@@ -896,6 +896,9 @@ impl Graph {
     }
 
     fn best_rolling_candidate(&self, max_region_size: usize) -> RollingSearchReport {
+        // The signature memo is keyed by NodeIndex; clear it so entries from a
+        // prior (now-mutated) graph state can't leak into this read-only search.
+        clear_rolling_sig_cache();
         let Some(full_topo) = stable_toposort_by_node_index(&self.graph) else {
             return RollingSearchReport {
                 candidate: None,
@@ -918,7 +921,25 @@ impl Graph {
         let uses = build_uses(&self.graph);
         let topo_index: FxHashMap<NodeIndex, usize> =
             topo.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-        let max_window = max_region_size.min(topo.len() / 2);
+        // Cap the largest probed window. A useful rolling candidate is one
+        // repeating unit — a transformer layer (≈3.4k HLIR nodes for a gpt-oss
+        // MoE layer; ≈6.7k for a 2-minibatch dual-branch layer). With two
+        // structurally-similar branches (default + minibatch prefill share
+        // weights) the cheap rolling hash matches MANY large windows spanning
+        // both branches; each triggers an O(window) `canonicalize_occurrence`
+        // that ultimately fails the signature check. Probing windows all the way
+        // to `topo.len()/2` made those dead-end canonicalizes dominate (still
+        // minutes even after the externals-scan fix below). Capping the window
+        // comfortably above one layer skips them without changing the selected
+        // candidate (the per-layer roll has the best savings = window·(reps−1)
+        // and lives at a small window). A real body larger than the cap just
+        // isn't rolled (correctness preserved). Tunable via LUMINAL_MAX_ROLL_BODY.
+        let roll_body_cap = std::env::var("LUMINAL_MAX_ROLL_BODY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(8192);
+        let max_window = max_region_size.min(topo.len() / 2).min(roll_body_cap);
         let probe_windows = rolling_probe_window_sizes(max_window);
         let node_hashes: Vec<u64> = topo
             .iter()
@@ -1019,7 +1040,7 @@ impl Graph {
                 }
 
                 let state_params = collect_state_params(&occs, &uses, &self.graph);
-                if state_params.is_empty() {
+                if state_params.is_empty() || !candidate_is_rollable(&occs, &state_params) {
                     let rejected = RollingRejectedCandidate {
                         window,
                         repetitions: occs.len(),
@@ -1057,14 +1078,23 @@ impl Graph {
             }
         }
         let mut grown_best = best_overall.take().map(|best| {
-            grow_rolling_candidate(
+            // `best` is already rollable (gated above). Growing only ever
+            // extends occurrences, which could re-introduce a cross-occurrence
+            // dependency; if it does, keep the validated (smaller) seed.
+            let seed = best.clone();
+            let grown = grow_rolling_candidate(
                 &self.graph,
                 &uses,
                 &topo_index,
                 best,
                 &discovered_runs,
                 &self.custom_ops,
-            )
+            );
+            if candidate_is_rollable(&grown.occurrences, &grown.state_param_indices) {
+                grown
+            } else {
+                seed
+            }
         });
         for run in &discovered_runs {
             let state_param_indices = collect_state_params(&run.occurrences, &uses, &self.graph);
@@ -1081,7 +1111,9 @@ impl Graph {
                 &discovered_runs,
                 &self.custom_ops,
             );
-            if grown.state_param_indices.is_empty() {
+            if grown.state_param_indices.is_empty()
+                || !candidate_is_rollable(&grown.occurrences, &grown.state_param_indices)
+            {
                 continue;
             }
             let replace = grown_best.as_ref().is_none_or(|best| {
@@ -1208,6 +1240,7 @@ impl Graph {
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
+        let extra_egglog = Rt::extra_egglog();
 
         let (program, root) = hlir_to_egglog(self);
         let contexts = self.search_space_contexts(&dim_buckets);
@@ -1222,6 +1255,7 @@ impl Graph {
                     &ops,
                     cleanup_hlir,
                     &late_passes,
+                    &extra_egglog,
                     use_interval_analysis,
                     options.egglog_log_enabled(),
                 )
@@ -1307,6 +1341,7 @@ impl Graph {
         let dim_buckets = options.dim_buckets.clone();
         let late_pass_dyn_map = self.late_pass_dyn_map(&dim_buckets);
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
+        let extra_egglog = Rt::extra_egglog();
 
         let (program, root) = hlir_to_egglog(self);
         let contexts = self.search_space_contexts(&dim_buckets);
@@ -1321,6 +1356,7 @@ impl Graph {
                     &ops,
                     cleanup_hlir,
                     &late_passes,
+                    &extra_egglog,
                     use_interval_analysis,
                     options.egglog_log_enabled(),
                 )
@@ -1649,16 +1685,34 @@ impl Graph {
                     continue;
                 };
 
-                let filter_result = self.candidate_filter_result(
-                    runtime,
-                    &graph,
-                    &profile_dyn_map,
-                    options,
-                    bucket_profile_context.as_ref(),
-                );
+                // A candidate whose LLIR fails to compile (e.g. an egglog
+                // rule that mis-fires and produces an inconsistent kernel op)
+                // must be rejected like any other, not abort the search.
+                let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.candidate_filter_result(
+                        runtime,
+                        &graph,
+                        &profile_dyn_map,
+                        options,
+                        bucket_profile_context.as_ref(),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    CandidateFilterResult::reject_with_display("candidate compile panicked")
+                });
                 if !filter_result.accepted {
                     filter_fails += 1;
                     last_filter_rejection = filter_result.display;
+                    // Rejections are otherwise silent until the 10k-fail
+                    // panic; surface them early — a structural rejection
+                    // (e.g. every candidate over the memory cap) loops
+                    // here for hours looking like a hang.
+                    if filter_fails <= 5 || filter_fails % 100 == 0 {
+                        eprintln!(
+                            "   Search  initial-genome filter reject #{filter_fails}: {}",
+                            last_filter_rejection.as_deref().unwrap_or("(no reason)")
+                        );
+                    }
                     if filter_fails >= max_filter_fails {
                         panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
                     }
@@ -1811,13 +1865,18 @@ impl Graph {
                     continue;
                 };
 
-                let filter_result = self.candidate_filter_result(
-                    runtime,
-                    &llir_graph,
-                    &profile_dyn_map,
-                    options,
-                    bucket_profile_context.as_ref(),
-                );
+                let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.candidate_filter_result(
+                        runtime,
+                        &llir_graph,
+                        &profile_dyn_map,
+                        options,
+                        bucket_profile_context.as_ref(),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    CandidateFilterResult::reject_with_display("candidate compile panicked")
+                });
                 if !filter_result.accepted {
                     continue;
                 }
@@ -2156,7 +2215,41 @@ fn cheap_rolling_node_hash(
     hash
 }
 
+thread_local! {
+    // Memoized per-node rolling signatures. `rolling_op_signature_uncached`
+    // Debug-formats the op (allocating + recursing over its shape/stride
+    // metadata), and the rolling search calls it for the SAME node across many
+    // overlapping windows — O(window) per `canonicalize_occurrence`, summed over
+    // every (window, start) hash-match. On a 36-layer dual-branch graph that
+    // re-formatting dominated the prepass (16+ min). The signature is a pure
+    // function of (node, custom_ops) while the graph + custom_ops are read-only
+    // (the search phase never mutates them), so memoize it keyed by node. Cleared
+    // at the start of each `best_rolling_candidate` so stale NodeIndex→signature
+    // entries can never leak across a graph mutation.
+    static ROLLING_SIG_CACHE: std::cell::RefCell<FxHashMap<NodeIndex, String>> =
+        std::cell::RefCell::new(FxHashMap::default());
+}
+
+fn clear_rolling_sig_cache() {
+    ROLLING_SIG_CACHE.with(|c| c.borrow_mut().clear());
+}
+
 fn rolling_op_signature(
+    graph: &HLIRGraph,
+    node: NodeIndex,
+    custom_ops: &[Box<dyn CustomOp>],
+) -> String {
+    ROLLING_SIG_CACHE.with(|c| {
+        if let Some(sig) = c.borrow().get(&node) {
+            return sig.clone();
+        }
+        let sig = rolling_op_signature_uncached(graph, node, custom_ops);
+        c.borrow_mut().insert(node, sig.clone());
+        sig
+    })
+}
+
+fn rolling_op_signature_uncached(
     graph: &HLIRGraph,
     node: NodeIndex,
     custom_ops: &[Box<dyn CustomOp>],
@@ -2239,7 +2332,16 @@ fn canonicalize_occurrence(
         .filter(|n| {
             uses.get(n)
                 .is_some_and(|out_uses| out_uses.iter().any(|(user, _)| !region.contains(user)))
-                || graph.externals(Direction::Outgoing).any(|root| root == *n)
+                // A node is an Outgoing-external (graph sink) iff it has no
+                // outgoing edges. The previous `graph.externals(Outgoing).any(..)`
+                // re-scanned EVERY node in the graph for each node in the window,
+                // making this O(window × graph) per canonicalize — the dominant
+                // cost that stalled the dual-branch rolling prepass. Check the
+                // node's own out-edges instead (O(out-degree)).
+                || graph
+                    .edges_directed(*n, Direction::Outgoing)
+                    .next()
+                    .is_none()
         })
         .collect();
     output_nodes.sort_by_key(|n| topo_index[n]);
@@ -2308,6 +2410,50 @@ fn collect_state_params(
         }
     }
     state_params
+}
+
+/// A rolling candidate is only valid to collapse into a single loop body if
+/// every boundary-input parameter is either:
+///   - a loop-carried state param (its value is produced by the IMMEDIATELY
+///     preceding occurrence — already enforced by `collect_state_params`), or
+///   - fed from OUTSIDE the candidate's occurrences (an external producer, e.g.
+///     a per-iteration weight tensor — these may legitimately differ across
+///     occurrences; the loop indexes them by iteration).
+///
+/// If a NON-state boundary input is produced by ANOTHER occurrence in the
+/// candidate, that's a cross-occurrence dependency that is not the adjacent
+/// loop-carry (e.g. occurrence `i` consuming occurrence `i-2`'s output, as
+/// happens when minibatch-pipelined prefill is rolled at the per-minibatch
+/// granularity: stream-0 of layer L+1 depends on stream-0 of layer L, skipping
+/// stream-1). Collapsing the duplicate bodies folds that `i ← i-2` edge back
+/// onto the single rolled body, creating a directed cycle that makes the egglog
+/// Kahn toposort drop nodes and panic. Rejecting such candidates lets the search
+/// fall back to a coarser, valid window (e.g. rolling whole layers — both
+/// minibatch streams together — where the only cross-occurrence edges are the
+/// adjacent layer-to-layer state).
+fn candidate_is_rollable(occurrences: &[RollingOccurrence], state_params: &[usize]) -> bool {
+    if occurrences.len() < 2 {
+        return false;
+    }
+    let state_set: FxHashSet<usize> = state_params.iter().copied().collect();
+    let all_occ_nodes: FxHashSet<NodeIndex> = occurrences
+        .iter()
+        .flat_map(|o| o.nodes.iter().copied())
+        .collect();
+    let param_count = occurrences[0].boundary_inputs.len();
+    for p in 0..param_count {
+        if state_set.contains(&p) {
+            continue;
+        }
+        for occ in occurrences {
+            if let Some(&src) = occ.boundary_inputs.get(p) {
+                if all_occ_nodes.contains(&src) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn grow_rolling_candidate(
@@ -3011,6 +3157,39 @@ fn compact_llir_preserving_input_order(old: &LLIRGraph) -> LLIRGraph {
 mod tests {
     use super::*;
     use crate::egglog_utils::hash_egglog_normalized;
+
+    // A rolling candidate is only collapsible if every non-state boundary input
+    // is fed from OUTSIDE the candidate's occurrences. A non-state input produced
+    // by another occurrence (e.g. occ `i` consuming occ `i-2`'s output) is a
+    // non-adjacent cross-occurrence dependency that, once the bodies are folded
+    // into one, becomes a directed cycle — which makes the egglog Kahn toposort
+    // drop nodes and panic. `candidate_is_rollable` must reject those.
+    #[test]
+    fn candidate_is_rollable_rejects_cross_occurrence_dep() {
+        let n = NodeIndex::new;
+        let occ = |body: usize, input: usize| RollingOccurrence {
+            nodes: vec![n(body)],
+            boundary_inputs: vec![n(input)],
+            output_nodes: vec![n(body)],
+        };
+
+        // Both occurrences' inputs come from outside the candidate (100, 101) →
+        // rollable.
+        let rollable = vec![occ(0, 100), occ(1, 101)];
+        assert!(candidate_is_rollable(&rollable, &[]));
+
+        // Occurrence 1's input is node 0, which lives INSIDE occurrence 0, and
+        // param 0 is not a state param → reject.
+        let cyclic = vec![occ(0, 100), occ(1, 0)];
+        assert!(!candidate_is_rollable(&cyclic, &[]));
+
+        // Same shape, but param 0 is declared a loop-carried state param → the
+        // adjacent loop-carry is allowed.
+        assert!(candidate_is_rollable(&cyclic, &[0]));
+
+        // Fewer than two occurrences is never rollable.
+        assert!(!candidate_is_rollable(&[occ(0, 100)], &[]));
+    }
     use crate::tests::{assert_close, random_vec};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3339,6 +3518,11 @@ mod tests {
                 unimplemented!()
             }
         }
+
+        // The signature cache is keyed by NodeIndex and only cleared by
+        // best_rolling_candidate; drop entries another test on this thread
+        // may have left behind for the same indices.
+        clear_rolling_sig_cache();
 
         let mut cx = Graph::new();
         cx.custom_ops.push(Box::new(TestCustomOp { name: "rope" }));

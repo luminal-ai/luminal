@@ -54,6 +54,7 @@ pub type Ops = (
     KernelGather,
     KernelScatter,
     KernelSumReduce,
+    KernelCastSumReduce,
     KernelMaxReduce,
     KernelConstant,
     KernelCast,
@@ -165,6 +166,18 @@ impl KernelOp for KernelMaxReduce {
             .collect::<FxHashSet<_>>();
 
         let dtype = cuda_dtype(self.dtype);
+        // Sub-32-bit float storage reduces through a float accumulator.
+        // Exact for max: selection never rounds, and the final store writes a
+        // value already representable in the storage dtype.
+        let low_precision_storage = matches!(
+            self.dtype,
+            DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0 | DType::F16 | DType::Bf16
+        );
+        let accum_dtype = if low_precision_storage {
+            "float"
+        } else {
+            dtype
+        };
         let includes = dtype_includes(&[self.dtype]);
         let n_outputs: Expression = self.out_shape.iter().copied().product();
         let threads_per_block = 256; // 8 warps per block
@@ -176,6 +189,11 @@ impl KernelOp for KernelMaxReduce {
         };
 
         let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+        let load_value = if low_precision_storage {
+            format!("static_cast<float>(in[in_start + {iter_stride_of_i}])")
+        } else {
+            format!("in[in_start + {iter_stride_of_i}]")
+        };
 
         let kernel = format!(
             "{includes}
@@ -186,7 +204,7 @@ impl KernelOp for KernelMaxReduce {
 {dyn_defines}
 extern \"C\" {{
     __global__ void reduce_max_k({dtype} *out, const {dtype} *in{dyn_dims_param}) {{
-        __shared__ {dtype} warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
+        __shared__ {accum_dtype} warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
         long long const_z = blockIdx.x;
 
         int tid = threadIdx.x;
@@ -196,9 +214,9 @@ extern \"C\" {{
         long long in_start = {in_index};
         long long iters = {iters};
 
-        {dtype} max_value = ({dtype})NEG_INF_F;
+        {accum_dtype} max_value = ({accum_dtype})NEG_INF_F;
         for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
-            max_value = fmaxf(max_value, in[in_start + {iter_stride_of_i}]);
+            max_value = fmaxf(max_value, {load_value});
         }}
 
         #pragma unroll
@@ -213,7 +231,7 @@ extern \"C\" {{
 
         if (warp_id == 0) {{
             int cnt = THREADS_PER_BLOCK / WARP_SIZE;
-            {dtype} block_max = tid < cnt ? warp_sums[tid] : ({dtype})NEG_INF_F;
+            {accum_dtype} block_max = tid < cnt ? warp_sums[tid] : ({accum_dtype})NEG_INF_F;
 
             #pragma unroll
             for (int s = cnt / 2; s > 0; s /= 2) {{
@@ -221,16 +239,17 @@ extern \"C\" {{
             }}
 
             if (tid == 0) {{
-                out[{out_index}] = block_max;
+                out[{out_index}] = ({dtype})block_max;
             }}
         }}
     }}
 }}",
             dtype = dtype,
+            accum_dtype = accum_dtype,
             in_index = flatten_strides(&self.out_shape, &self.in_stride).to_kernel(),
             out_index = flatten_strides(&self.out_shape, &self.out_stride).to_kernel(),
             iters = self.iters.to_kernel(),
-            iter_stride_of_i = iter_stride_of_i,
+            load_value = load_value,
         );
 
         let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
@@ -379,7 +398,13 @@ impl KernelOp for KernelSumReduce {
             .collect::<FxHashSet<_>>();
 
         let dtype = cuda_dtype(self.dtype);
-        let uses_fp8_storage = matches!(self.dtype, DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0);
+        // Sub-32-bit float storage accumulates in float — the reduction
+        // analogue of cuBLASLt's COMPUTE_32F_FAST_16BF policy for 16-bit
+        // GEMMs (16-bit IO, F32 accumulation, one rounding at the store).
+        let uses_fp8_storage = matches!(
+            self.dtype,
+            DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0 | DType::F16 | DType::Bf16
+        );
         let accum_dtype = if uses_fp8_storage { "float" } else { dtype };
         let includes = dtype_includes(&[self.dtype]);
         let n_outputs: Expression = self.out_shape.iter().copied().product();
@@ -512,6 +537,243 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "SumReduce"
+    }
+}
+
+/// Fused `Cast(F32) → SumReduce → Cast(16-bit)` with an F32 accumulator.
+///
+/// The dtype contract requires accumulation precision to be expressed as
+/// explicit casts in HLIR: a 16-bit tensor summed with F32 accumulation is
+/// written `x.cast(F32).sum(..).cast(dt)`. Lowered naively that is three
+/// kernels and two F32-sized intermediate buffers. This op matches the
+/// explicit pattern and unions a single kernel (16-bit loads, F32 Kahan
+/// accumulation, 16-bit store) into the outer Cast's eclass — same dtype,
+/// same semantics, one kernel.
+#[derive(Default, Debug, Clone)]
+pub struct KernelCastSumReduce {
+    out_shape: Vec<Expression>,
+    iters: Expression,
+    in_stride: Vec<Expression>,
+    iter_stride: Expression,
+    out_stride: Vec<Expression>,
+    dtype: DType,
+}
+
+impl EgglogOp for KernelCastSumReduce {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelCastSum",
+            &[
+                ("shape", ELIST),
+                ("iters", EXPRESSION),
+                ("strides", ELIST),
+                ("iter_stride", EXPRESSION),
+                ("out_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        1
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        // The inner Cast is positionwise (out[z] = (float)in[z]), so the
+        // SumReduce's shape/strides over the cast output apply unchanged to
+        // the 16-bit input.
+        ["F16", "Bf16"]
+            .into_iter()
+            .map(|dt| {
+                Rule::raw(format!(
+                    "(rule (
+                        (= ?x_cast (Op (Cast ?cast_size (F32)) (ICons ?x (INil))))
+                        (= ({dt}) (dtype ?x))
+                        (= ?sum (Op (Sum ?shape ?iters ?strides ?iter_stride ?out_strides) (ICons ?x_cast (INil))))
+                        (= ?out_cast (Op (Cast ?out_size ({dt})) (ICons ?sum (INil))))
+                     ) (
+                        (let ?ks (Op (KernelCastSum ?shape ?iters ?strides ?iter_stride ?out_strides ({dt})) (ICons ?x (INil))))
+                        (union ?out_cast ?ks)
+                        (set (dtype ?ks) ({dt}))
+                     ) :ruleset kernel_specialize :name \"kernel-cast-sum-{dt}\")"
+                ))
+            })
+            .collect()
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
+                    .unwrap(),
+                iters: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
+                in_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                iter_stride: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+                out_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
+                    .unwrap(),
+                dtype: extract_dtype(egraph, kind_children[5]),
+            }) as Box<dyn KernelOp>),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelCastSumReduce {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .out_shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.in_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.iters.dyn_vars())
+            .chain(self.iter_stride.dyn_vars())
+            .collect::<FxHashSet<_>>();
+
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
+        let n_outputs: Expression = self.out_shape.iter().copied().product();
+        let threads_per_block = 256; // 8 warps per block
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+
+        let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+
+        let kernel = format!(
+            "{includes}
+#define WARP_SIZE 32
+#define THREADS_PER_BLOCK 256
+#define FULL_MASK 0xffffffff
+{dyn_defines}
+extern \"C\" {{
+    __global__ void cast_reduce_sum_k({dtype} *out, const {dtype} *in_data{dyn_dims_param}) {{
+        __shared__ float warp_sums[THREADS_PER_BLOCK / WARP_SIZE];
+        long long const_z = blockIdx.x;
+
+        int tid = threadIdx.x;
+        int lane_id = tid % WARP_SIZE;
+        int warp_id = tid / WARP_SIZE;
+
+        long long in_start = {in_index};
+        long long iters = {iters};
+
+        float partial = 0.0f;
+        float comp = 0.0f;   // Kahan compensation
+        for (long long i = tid; i < iters; i += THREADS_PER_BLOCK) {{
+            float y = static_cast<float>(in_data[in_start + {iter_stride_of_i}]) - comp;
+            float t = partial + y;
+            comp = (t - partial) - y;
+            partial = t;
+        }}
+
+        #pragma unroll
+        for (int s = WARP_SIZE / 2; s > 0; s /= 2) {{
+            partial += __shfl_down_sync(FULL_MASK, partial, s);
+        }}
+
+        if (lane_id == 0) {{
+            warp_sums[warp_id] = partial;
+        }}
+        __syncthreads();
+
+        if (warp_id == 0) {{
+            int cnt = THREADS_PER_BLOCK / WARP_SIZE;
+            float block_sum = tid < cnt ? warp_sums[tid] : 0.0f;
+
+            #pragma unroll
+            for (int s = cnt / 2; s > 0; s /= 2) {{
+                block_sum += __shfl_down_sync(FULL_MASK, block_sum, s);
+            }}
+
+            if (tid == 0) {{
+                out[{out_index}] = ({dtype})block_sum;
+            }}
+        }}
+    }}
+}}",
+            dtype = dtype,
+            in_index = flatten_strides(&self.out_shape, &self.in_stride).to_kernel(),
+            out_index = flatten_strides(&self.out_shape, &self.out_stride).to_kernel(),
+            iters = self.iters.to_kernel(),
+        );
+
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("cast_reduce_sum_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+
+        (
+            func,
+            module,
+            kernel,
+            (n_outputs, 1.into(), 1.into()),                // grid
+            (threads_per_block.into(), 1.into(), 1.into()), // blocks (warp-parallel)
+            32.into(),                                      // shmem for warp_sums
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        (self.out_shape.iter().copied().product::<Expression>() * self.iters * self.dtype.bits())
+            .ceil_div(8)
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        self.out_shape.iter().copied().product::<Expression>() * self.iters
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "CastSumReduce"
     }
 }
 
@@ -1543,11 +1805,16 @@ extern \"C\" {{
 #[derive(Default, Debug, Clone)]
 pub struct KernelConstant {
     value: f32,
+    dtype: DType,
 }
 
 impl EgglogOp for KernelConstant {
     fn sort(&self) -> SortDef {
-        sort(OP_KIND, "KernelConstant", &[("value", F64)])
+        sort(
+            OP_KIND,
+            "KernelConstant",
+            &[("value", F64), ("dtype", DTYPE)],
+        )
     }
 
     fn n_inputs(&self) -> usize {
@@ -1555,16 +1822,38 @@ impl EgglogOp for KernelConstant {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        let (args, const_kind) = luminal::hlir::Constant::default().sort().new_call();
+        let (mut args, const_kind) = luminal::hlir::Constant::default().sort().new_call();
         let hlir_inputs = v("?__inputs");
         let hlir_op = op_term(const_kind, hlir_inputs.clone());
+        args.add("dtype", app(&SORTS.f32_dt, vec![]));
         let kernel_kind = self.sort().call(&args);
         let kernel_op = op_term(kernel_kind, hlir_inputs);
-        vec![
+        let mut rules = vec![
             rule(union(hlir_op, kernel_op.clone()))
                 .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![]))
                 .ruleset("kernel_lower"),
-        ]
+        ];
+        // Fold an explicit Cast around a Constant into a dtype-typed
+        // KernelConstant. HLIR constants are always F32 (the frontend emits
+        // `constant(v).cast(dt)` for non-F32 dtypes), so this is the only
+        // way a non-F32 constant reaches the kernel level. The fused op is
+        // unioned into the Cast's eclass, whose dtype it matches exactly.
+        // F32 included: the frontend emits `constant(v).cast(F32)` identity
+        // casts for scalars on f32 tensors; folding gives downstream rules a
+        // constant-valued enode (see const_like) in the cast's eclass.
+        for dt in ["F16", "Bf16", "F32"] {
+            rules.push(Rule::raw(format!(
+                "(rule (
+                    (= ?c (Op (Constant ?val) (INil)))
+                    (= ?cast (Op (Cast ?size ({dt})) (ICons ?c (INil))))
+                 ) (
+                    (let ?kc (Op (KernelConstant ?val ({dt})) (INil)))
+                    (union ?cast ?kc)
+                    (set (dtype ?kc) ({dt}))
+                 ) :ruleset kernel_lower :name \"kernel-constant-cast-{dt}\")"
+            )));
+        }
+        rules
     }
 
     fn cleanup(&self) -> bool {
@@ -1586,6 +1875,7 @@ impl EgglogOp for KernelConstant {
                     .replace("\"", "")
                     .parse::<f32>()
                     .unwrap(),
+                dtype: extract_dtype(egraph, kind_children[1]),
             })),
             vec![],
         )
@@ -1617,11 +1907,13 @@ impl KernelOp for KernelConstant {
         } else {
             format!("{:.10}f", self.value)
         };
+        let cuda_ty = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
         let kernel = format!(
-            "
+            "{includes}
 extern \"C\" {{
-    __global__ void constant_k(float *out) {{
-        out[0] = {value_str};
+    __global__ void constant_k({cuda_ty} *out) {{
+        out[0] = ({cuda_ty})({value_str});
     }}
 }}"
         );
@@ -1650,8 +1942,7 @@ extern \"C\" {{
     }
 
     fn output_bytes(&self) -> Expression {
-        // Constant always outputs F32
-        4.into()
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
     }
 
     fn bytes_loaded(&self) -> Expression {
@@ -1664,6 +1955,10 @@ extern \"C\" {{
 
     fn flops(&self) -> Expression {
         0.into()
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
     }
 
     fn kernel_name(&self) -> &'static str {
@@ -1935,6 +2230,7 @@ pub struct KernelEmbed {
     token_stride: Vec<Expression>, // stride for token_ids input
     out_stride: Vec<Expression>,   // stride for output
     embed_dim: Expression,         // embedding dimension
+    dtype: DType,                  // embedding table / output dtype
 }
 
 impl EgglogOp for KernelEmbed {
@@ -1947,6 +2243,7 @@ impl EgglogOp for KernelEmbed {
                 ("token_stride", ELIST),
                 ("out_stride", ELIST),
                 ("embed_dim", EXPRESSION),
+                ("dtype", DTYPE),
             ],
         )
     }
@@ -1965,15 +2262,23 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
+                    ; Genuine 1D-token embedding: token_ids has one batch dim, so
+                    ; its stride is length 1, matching batch_shape =
+                    ; RemoveNthFromEnd(idx_shape) (also length 1). Without this,
+                    ; the rule mis-fires on 2D/non-embedding gathers whose token
+                    ; stride is 2D, producing a KernelEmbed whose batch_shape and
+                    ; token_stride lengths differ -> flatten_strides panic.
+                    (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (= ?embed_dt (dtype ?embed_table))
                 )
                 (
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
+                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
+                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
-                    (set (dtype ?ke) (F32))
+                    (set (dtype ?ke) ?embed_dt)
                 )
                 :ruleset kernel_specialize
                 :name \"kernel embed with cast mul\"
@@ -1985,15 +2290,23 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_cast_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids_cast (ICons ?mul_const (INil)))))
+                    ; Genuine 1D-token embedding: token_ids has one batch dim, so
+                    ; its stride is length 1, matching batch_shape =
+                    ; RemoveNthFromEnd(idx_shape) (also length 1). Without this,
+                    ; the rule mis-fires on 2D/non-embedding gathers whose token
+                    ; stride is 2D, producing a KernelEmbed whose batch_shape and
+                    ; token_stride lengths differ -> flatten_strides panic.
+                    (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (= ?embed_dt (dtype ?embed_table))
                 )
                 (
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
+                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
+                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
-                    (set (dtype ?ke) (F32))
+                    (set (dtype ?ke) ?embed_dt)
                 )
                 :ruleset kernel_specialize
                 :name \"kernel embed with cast mul reversed\"
@@ -2005,14 +2318,20 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?mul_stride ?iota_stride ?add_out_stride) (ICons ?mul_result (ICons ?iota_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
+                    ; Same length guard as the cast-mul variant: only fire for
+                    ; genuine 1D token embeddings (token stride length 1) so
+                    ; batch_shape and token_stride lengths agree and the rule
+                    ; doesn't mis-fire on non-embedding 2D gathers.
+                    (= (len ?token_stride) 1)
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (= ?embed_dt (dtype ?embed_table))
                 )
                 (
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids (ICons ?embed_table (INil)))))
+                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
+                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
-                    (set (dtype ?ke) (F32))
+                    (set (dtype ?ke) ?embed_dt)
                 )
                 :ruleset kernel_specialize
                 :name \"kernel embed with mul\"
@@ -2024,14 +2343,20 @@ impl EgglogOp for KernelEmbed {
                     (= (len ?idx_shape) 2)
                     (= ?indices (Op (Add ?add_shape ?iota_stride ?mul_stride ?add_out_stride) (ICons ?iota_result (ICons ?mul_result (INil)))))
                     (= ?mul_result (Op (Mul ?mul_shape ?token_stride ?mul_const_stride ?mul_out_stride) (ICons ?token_ids (ICons ?mul_const (INil)))))
+                    ; Same length guard as the cast-mul variant: only fire for
+                    ; genuine 1D token embeddings (token stride length 1) so
+                    ; batch_shape and token_stride lengths agree and the rule
+                    ; doesn't mis-fire on non-embedding 2D gathers.
+                    (= (len ?token_stride) 1)
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
-                    (= ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
-                    (= ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (= ?embed_dt (dtype ?embed_table))
                 )
                 (
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim) (ICons ?token_ids (ICons ?embed_table (INil)))))
+                    (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
+                    (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
-                    (set (dtype ?ke) (F32))
+                    (set (dtype ?ke) ?embed_dt)
                 )
                 :ruleset kernel_specialize
                 :name \"kernel embed with mul reversed\"
@@ -2060,6 +2385,7 @@ impl EgglogOp for KernelEmbed {
                 out_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
                     .unwrap(),
                 embed_dim: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
+                dtype: extract_dtype(egraph, kind_children[4]),
             })),
             input_enodes, // token_ids, embedding_table
         )
@@ -2105,11 +2431,13 @@ impl KernelOp for KernelEmbed {
         let embed_dim_expr = self.embed_dim.to_kernel();
         let total_threads = batch_size * self.embed_dim;
         let n_elements = total_threads.to_kernel();
+        let cuda_ty = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
         let kernel = format!(
-            "
+            "{includes}
 {dyn_defines}
 extern \"C\" {{
-    __global__ void embed(float *out, const int *token_ids, const float *embed_table{dyn_dims_param}) {{
+    __global__ void embed({cuda_ty} *out, const int *token_ids, const {cuda_ty} *embed_table{dyn_dims_param}) {{
         long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= {n_elements}) return;
         long long embed_dim = {embed_dim_expr};
@@ -2155,8 +2483,7 @@ extern \"C\" {{
     }
 
     fn output_bytes(&self) -> Expression {
-        // Embed outputs F32
-        self.output_size() * 4
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
     }
 
     fn bytes_loaded(&self) -> Expression {
@@ -2166,13 +2493,17 @@ extern \"C\" {{
             .copied()
             .product::<Expression>()
             .max(1);
-        // Load: 1 token ID (4 bytes) per batch + 1 embedding row (embed_dim * 4 bytes) per batch
-        batch_size * (4 + self.embed_dim * 4)
+        // Load: 1 token ID (4 bytes) per batch + 1 embedding row per batch
+        batch_size * ((self.embed_dim * self.dtype.bits()).ceil_div(8) + 4)
     }
 
     fn bytes_stored(&self) -> Expression {
         // Store: 1 embedding row per batch element
-        self.output_size() * 4
+        self.output_bytes()
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
     }
 
     fn flops(&self) -> Expression {

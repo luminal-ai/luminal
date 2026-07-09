@@ -174,6 +174,84 @@ impl EgglogOp for FusionEnd {
             )));
         }
 
+        // Grow FE → Cast consumer: Cast(FE(inner)) → FE(CudaCast(inner)).
+        // Cast is the one region op whose output dtype differs from its
+        // input's; the new FE takes the cast's target dtype. HLIR Cast is
+        // positionwise (out[z] = (T)in[z]), so it preserves the producer's
+        // layout and the FE's shape/strides carry over unchanged.
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
+                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?fe (INil))))
+             ) (
+                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
+                               (ICons ?inner (INil))))
+                (let ?new_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?elem (INil))))
+                (union ?cast ?new_fe)
+                (set (dtype ?new_fe) ?dt_out)
+             ) :ruleset fusion_grow :name \"grow-FE-Cast\")",
+        ));
+
+        // Absorb a Cast producer through a FusionStart boundary:
+        // FS(Cast(x)) → CudaCast(FS(x)). The region reads x with the same
+        // strides it would have used on the cast's output (cast preserves
+        // layout) and converts in-register.
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
+                (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
+                (= ?dt_in (dtype ?x))
+             ) (
+                (let ?fs_x (Op (FusionStart ?shape ?s ?dt_in) (ICons ?x (INil))))
+                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
+                               (ICons ?fs_x (INil))))
+                (union ?fs_c ?elem)
+             ) :ruleset fusion_grow :name \"grow-Cast-FS\")",
+        ));
+
+        // Cast variant of the nested-FS-FE cleanup. Without it, the
+        // grow-FE-Cast + grow-Cast-FS pair congruence-merges an FS eclass
+        // with the FE eclass it wraps (FS(dt_in)(FE-result) vs the fused
+        // cast elem reading the FE's interior), leaving a 2-node FS/FE
+        // cycle that extraction can select. Deleting the redundant
+        // FS-wrapping-FE enode breaks the cycle; the fused form remains.
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
+                (= ?bad_fs (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
+                (= ?bad_elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
+                                 (ICons ?bad_fs (INil))))
+                (= ?bad_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?bad_elem (INil))))
+                (= ?good_elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
+                                  (ICons ?inner (INil))))
+                (= ?good_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?good_elem (INil))))
+                (= ?bad_fe ?good_fe)
+             ) (
+                (delete (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
+             ) :ruleset cleanup :name \"cleanup-nested-FS-FE-cast\")",
+        ));
+
+        // Genome freeze: grow-Cast-FS leaves each cast-bearing FS eclass
+        // with two extraction-equivalent variants — the bare FS reading the
+        // materialized cast output, and the absorbed CudaCast reading the
+        // original buffer and converting in-register. Both wirings move
+        // the same bytes for the bandwidth-bound regions they sit in, but
+        // each pair doubles the search genome and makes candidates emit
+        // textually fresh region kernels. Delete the bare-FS variant once
+        // growth is done (cleanup runs after the fusion_grow cycles, so
+        // the row is not re-derived); the premise proves the absorbed
+        // survivor exists in the same eclass, so the eclass never empties.
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
+                (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
+                (= ?fs_c (Op (CudaUnaryElementwise \"Cast\" ?shape ?is ?os ?dt_out)
+                             (ICons ?fs_x (INil))))
+             ) (
+                (delete (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
+             ) :ruleset cleanup :name \"cleanup-FS-with-absorbed-cast\")",
+        ));
+
         // Grow FE → binary consumer, left and right orientations.
         for (hlir, opcode) in binaries {
             rules.push(Rule::raw(format!(

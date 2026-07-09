@@ -10,7 +10,11 @@ impl ReLU {
     }
 }
 
-/// Gaussian Error Linear Unit activation function
+/// Gaussian Error Linear Unit activation function.
+///
+/// Uses the exact erf form (`gelu`), matching PyTorch's `nn.GELU()` default
+/// (`approximate="none"`). For the cheaper tanh approximation, call
+/// `GraphTensor::gelu_fast_tanh_approximation()`.
 #[derive(Default)]
 pub struct GeLU;
 

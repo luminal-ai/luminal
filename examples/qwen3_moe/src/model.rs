@@ -4,7 +4,7 @@ use luminal::{
     prelude::{F32Pow, GraphTensor},
     shape::Expression,
 };
-use luminal_nn::LayerNorm;
+use luminal_nn::{LayerNorm, gather_rows, scatter_rows};
 
 // Qwen3-30B-A3B hyperparams
 pub const LAYERS: usize = 48;
@@ -24,30 +24,23 @@ pub const TOP_K: usize = 8;
 pub struct KVCache {
     pub k_caches: Vec<GraphTensor>,
     pub v_caches: Vec<GraphTensor>,
-    pub max_seq: usize,
 }
 
 impl KVCache {
     pub fn new(cx: &mut Graph, max_seq: usize) -> Self {
+        // Row-paged layout (num_slots, KV_DIM) in bf16 — the spelling the
+        // FlashInfer attention rewrites match.
         let mut k_caches = Vec::with_capacity(LAYERS);
         let mut v_caches = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
-            k_caches.push(persist(
-                cx,
-                format!("kv_cache.{l}.k"),
-                (N_KV_HEADS, max_seq, HEAD_DIM),
-            ));
-            v_caches.push(persist(
-                cx,
-                format!("kv_cache.{l}.v"),
-                (N_KV_HEADS, max_seq, HEAD_DIM),
-            ));
+            k_caches.push(
+                persist(cx, format!("kv_cache.{l}.k"), (max_seq, KV_DIM)).as_dtype(DType::Bf16),
+            );
+            v_caches.push(
+                persist(cx, format!("kv_cache.{l}.v"), (max_seq, KV_DIM)).as_dtype(DType::Bf16),
+            );
         }
-        Self {
-            k_caches,
-            v_caches,
-            max_seq,
-        }
+        Self { k_caches, v_caches }
     }
 }
 
@@ -61,17 +54,21 @@ pub struct Qwen3MoE {
 impl Qwen3MoE {
     pub fn init(cx: &mut Graph) -> Self {
         Self {
-            embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN)),
+            embedding: persist(cx, "model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
+                .as_dtype(DType::Bf16),
             layers: (0..LAYERS).map(|l| Qwen3MoELayer::init(cx, l)).collect(),
             lm_norm: rms_norm(cx, "model.norm.weight"),
-            lm_head: persist(cx, "lm_head.weight", (VOCAB_SIZE, HIDDEN)),
+            lm_head: persist(cx, "lm_head.weight", (VOCAB_SIZE, HIDDEN)).as_dtype(DType::Bf16),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         token_ids: GraphTensor,
         pos_ids: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
         kv_cache: &KVCache,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         let mut x = token_embedding(self.embedding, token_ids);
@@ -80,15 +77,56 @@ impl Qwen3MoE {
             let (x_new, k_out, v_out) = layer.forward(
                 x,
                 pos_ids,
+                scatter_idx,
+                gather_idx,
                 kv_cache.k_caches[i],
                 kv_cache.v_caches[i],
-                kv_cache.max_seq,
             );
             x = x_new;
             cache_outputs.push((k_out, v_out));
         }
-        let logits = self.lm_norm.forward(x).matmul(self.lm_head.t());
+        let logits = norm_in_f32(&self.lm_norm, x)
+            .matmul(self.lm_head.t())
+            .cast(DType::F32);
         (logits, cache_outputs)
+    }
+
+    /// Forward + on-device sampling: repetition penalty against a persistent
+    /// seen-token mask, then argmax. Host I/O per step is one 4-byte token id
+    /// each way. `new_token` is the previously sampled id (-1 for none); it
+    /// is inserted into the mask BEFORE the penalty read, matching the
+    /// CPU insert-after-sample semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_sampling(
+        &self,
+        token_ids: GraphTensor,
+        pos_ids: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
+        kv_cache: &KVCache,
+        seen_mask: GraphTensor,
+        new_token: GraphTensor,
+        repetition_penalty: f32,
+    ) -> (GraphTensor, GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
+        let (logits, cache_outputs) =
+            self.forward(token_ids, pos_ids, scatter_idx, gather_idx, kv_cache);
+        let cx = unsafe { &mut *logits.graph_ref };
+        let s = logits.dims()[0];
+
+        // seen[new_token] = 1.0 (in place; no-op for -1).
+        let one = cx.constant_float(1.0).expand_dim(0, 1);
+        let seen_out = one.scatter(new_token, seen_mask);
+
+        // CPU-equivalent penalty: seen & logit > 0 → /p, seen & logit <= 0 → *p.
+        let p = repetition_penalty;
+        let seen_b = seen_out.expand_dim(0, s);
+        let zero = cx.constant_float(0.0).expand_rhs(logits.dims());
+        let pos = zero.lt(logits).cast(DType::F32);
+        let factor = seen_b * (pos * (1.0 / p - 1.0) + (-pos + 1.0) * (p - 1.0)) + 1.0;
+        let penalized = logits * factor;
+
+        let sampled = penalized.argmax(1);
+        (sampled, seen_out, cache_outputs)
     }
 }
 
@@ -114,10 +152,10 @@ struct QwenMoE {
 impl Qwen3MoELayer {
     fn init(cx: &mut Graph, l: usize) -> Self {
         Self {
-            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)),
-            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)),
-            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)),
-            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)),
+            q_proj: layer_weight(cx, l, "self_attn.q_proj", (Q_DIM, HIDDEN)).as_dtype(DType::Bf16),
+            k_proj: layer_weight(cx, l, "self_attn.k_proj", (KV_DIM, HIDDEN)).as_dtype(DType::Bf16),
+            v_proj: layer_weight(cx, l, "self_attn.v_proj", (KV_DIM, HIDDEN)).as_dtype(DType::Bf16),
+            o_proj: layer_weight(cx, l, "self_attn.o_proj", (HIDDEN, Q_DIM)).as_dtype(DType::Bf16),
             q_norm: layer_weight(cx, l, "self_attn.q_norm", HEAD_DIM),
             k_norm: layer_weight(cx, l, "self_attn.k_norm", HEAD_DIM),
             attn_rms: rms_norm(cx, format!("model.layers.{l}.input_layernorm.weight")),
@@ -145,36 +183,50 @@ impl Qwen3MoELayer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         mut x: GraphTensor,
         pos_ids: GraphTensor,
+        scatter_idx: GraphTensor,
+        gather_idx: GraphTensor,
         k_cache_in: GraphTensor,
         v_cache_in: GraphTensor,
-        max_seq: usize,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        // Attention
-        let x_attn = self.attn_rms.forward(x);
+        // Attention. Activations are bf16; norms, QK-norm, RoPE and the
+        // attention block compute in F32 via explicit casts (dtype contract).
+        let x_attn = norm_in_f32(&self.attn_rms, x);
         let q = x_attn.matmul(self.q_proj.t());
         let k = x_attn.matmul(self.k_proj.t());
         let v = x_attn.matmul(self.v_proj.t());
 
-        // QK-norm: per-head RMS normalization
+        // QK-norm: per-head RMS normalization (F32 inside, bf16 out)
         let q_normed = qk_norm(q, self.q_norm, N_HEADS);
         let k_normed = qk_norm(k, self.k_norm, N_KV_HEADS);
 
-        // RoPE
+        // RoPE (angles in F32; rotation in the activation dtype)
         let q_rope = qwen_rotary_embeddings(q_normed, pos_ids, N_HEADS);
         let k_rope = qwen_rotary_embeddings(k_normed, pos_ids, N_KV_HEADS);
 
-        let (attn_out, k_cache_out, v_cache_out) =
-            attention(q_rope, k_rope, v, k_cache_in, v_cache_in, max_seq);
+        // bf16 attention: scores/softmax compute in the attention island
+        // (FlashInfer when matched), KV cache is bf16.
+        let (attn_out, k_cache_out, v_cache_out) = attention(
+            q_rope,
+            k_rope,
+            v,
+            k_cache_in,
+            v_cache_in,
+            scatter_idx,
+            gather_idx,
+            pos_ids,
+        );
         x += attn_out.matmul(self.o_proj.t());
 
-        // MoE FFN
-        let x_mlp = self.mlp_rms.forward(x);
-        let mlp_out = self.moe.forward(x_mlp);
-        (x + mlp_out, k_cache_out, v_cache_out)
+        // MoE FFN: router and expert math in F32 (cast at the block edge),
+        // result cast back to bf16 for the residual.
+        let x_mlp = norm_in_f32(&self.mlp_rms, x);
+        let mlp_out = self.moe.forward(x_mlp.cast(DType::F32));
+        (x + mlp_out.cast(DType::Bf16), k_cache_out, v_cache_out)
     }
 }
 
@@ -294,14 +346,34 @@ fn gather_experts(
     weights.gather(expert_flat_idx)
 }
 
-/// Per-head RMS normalization for QK-norm.
+/// RMS norm computed in F32 with explicit casts when the input is 16-bit.
+fn norm_in_f32(norm: &LayerNorm, x: GraphTensor) -> GraphTensor {
+    if x.dtype == DType::F32 {
+        norm.forward(x)
+    } else {
+        norm.forward(x.cast(DType::F32)).cast(x.dtype)
+    }
+}
+
+/// Per-head RMS normalization for QK-norm (F32 inside, input dtype out).
 fn qk_norm(x: GraphTensor, weight: GraphTensor, n_heads: usize) -> GraphTensor {
+    let dtype = x.dtype;
     let seq = x.dims()[0];
+    let x = if dtype == DType::F32 {
+        x
+    } else {
+        x.cast(DType::F32)
+    };
     let reshaped = x.split_dims(1, HEAD_DIM);
     let normed = reshaped.std_norm(2, RMS_NORM_EPS);
     let w = weight.expand_dim(0, n_heads).expand_dim(0, seq);
     let result = normed * w;
-    result.merge_dims(1, 2)
+    let result = result.merge_dims(1, 2);
+    if dtype == DType::F32 {
+        result
+    } else {
+        result.cast(dtype)
+    }
 }
 
 fn qwen_rotary_embeddings(
@@ -325,8 +397,16 @@ fn qwen_rotary_embeddings(
     let x0 = input.slice((.., .., ..HEAD_DIM / 2));
     let x1 = input.slice((.., .., HEAD_DIM / 2..));
 
-    let cos = emb.cos().expand_dim(0, n_heads);
-    let sin = emb.sin().expand_dim(0, n_heads);
+    // Angles are computed in F32; cast to the activation dtype so the
+    // rotation kernels stay uniform.
+    let mut cos = emb.cos();
+    let mut sin = emb.sin();
+    if x0.dtype != DType::F32 {
+        cos = cos.cast(x0.dtype);
+        sin = sin.cast(x0.dtype);
+    }
+    let cos = cos.expand_dim(0, n_heads);
+    let sin = sin.expand_dim(0, n_heads);
     let x0_out = x0 * cos - x1 * sin;
     let x1_out = x1 * cos + x0 * sin;
 
@@ -336,59 +416,45 @@ fn qwen_rotary_embeddings(
         .merge_dims(1, 2)
 }
 
-/// Attention with pre-allocated KV cache using scatter.
+/// Paged attention in the llama HLIR spelling (scatter_rows into 2D bf16
+/// caches, gather via a flat row index, GQA broadcast, triu causal mask) —
+/// the FlashInfer rewrites match this exact pattern; the HLIR chain remains
+/// the fallback candidate.
+#[allow(clippy::too_many_arguments)]
 fn attention(
     q_rope: GraphTensor,
     k_rope: GraphTensor,
     v: GraphTensor,
-    k_cache_in: GraphTensor,
-    v_cache_in: GraphTensor,
-    max_seq: usize,
+    k_cache: GraphTensor,
+    v_cache: GraphTensor,
+    scatter_idx: GraphTensor,
+    gather_idx: GraphTensor,
+    q_pos: GraphTensor,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let cx = q_rope.graph();
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, KV_DIM);
+    let v_cache_out = scatter_rows(v, scatter_idx, v_cache, KV_DIM);
+
+    let k = gather_rows(k_cache_out, gather_idx, KV_DIM);
+    let v_ctx = gather_rows(v_cache_out, gather_idx, KV_DIM);
+
+    let q = (q_rope * 1.0).split_dims(1, HEAD_DIM).transpose(0, 1);
+    let k = k.split_dims(1, HEAD_DIM).permute((1, 2, 0));
+    let v_ctx = v_ctx.split_dims(1, HEAD_DIM).transpose(0, 1);
+
+    let k = k.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0;
+    let v_ctx = v_ctx.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0;
+
+    let scores = q.matmul(k) / (HEAD_DIM as f32).sqrt();
+    let ctx = Expression::from('c');
     let seq = q_rope.dims()[0];
-    let prev = Expression::from('p');
-    let total_seq = prev + seq;
+    let causal_square = scores.graph().triu(ctx, 1).cast(scores.dtype) * -1e10;
+    let row_offsets = (q_pos * ctx).expand_dim(1, ctx);
+    let col_offsets = scores.graph().arange(ctx).expand_dim(0, seq);
+    let attn_mask = causal_square.gather(row_offsets + col_offsets);
+    let masked_scores = scores + attn_mask.expand_dim(0, N_HEADS);
+    let weights = masked_scores.softmax(2);
+    let out = weights.matmul(v_ctx);
+    let attn_out = out.transpose(0, 1).merge_dims(1, 2);
 
-    let k_new = k_rope.split_dims(1, HEAD_DIM).transpose(0, 1);
-    let v_new = v.split_dims(1, HEAD_DIM).transpose(0, 1);
-
-    let h_offset = cx.arange(N_KV_HEADS) * (max_seq * HEAD_DIM);
-    let p_offset = (cx.arange(seq) + prev) * HEAD_DIM;
-    let d_offset = cx.arange(HEAD_DIM);
-    let scatter_idx = h_offset.expand_dim(1, seq).expand_dim(2, HEAD_DIM)
-        + p_offset.expand_dim(0, N_KV_HEADS).expand_dim(2, HEAD_DIM)
-        + d_offset.expand_dim(0, N_KV_HEADS).expand_dim(1, seq);
-
-    let k_cache_out = k_new.scatter(scatter_idx, k_cache_in);
-    let v_cache_out = v_new.scatter(scatter_idx, v_cache_in);
-
-    let mut k_full = k_cache_out.slice((.., ..total_seq, ..));
-    let mut v_full = v_cache_out.slice((.., ..total_seq, ..));
-    // LUM-545: model invariant `prev + seq <= max_seq`, but the frontend
-    // cannot yet propagate expression-bound assertions, so `slice` reports
-    // `min(max_seq, p+s)`. Normalize the visible cache axis to `total_seq`.
-    k_full.shape.dims[1] = total_seq;
-    v_full.shape.dims[1] = total_seq;
-
-    // GQA expand
-    let k_3d = k_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);
-    let v_3d = v_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);
-
-    let q = q_rope.split_dims(1, HEAD_DIM).transpose(0, 1);
-
-    let scores = q.matmul(k_3d.transpose(1, 2)) / (HEAD_DIM as f32).sqrt();
-
-    // Causal mask
-    let q_abs = cx.arange(seq).cast(DType::F32) + prev;
-    let k_pos = cx.arange(total_seq).cast(DType::F32);
-    let mask = k_pos.expand_dim(0, seq).gt(q_abs.expand_dim(1, total_seq));
-    let mask_3d = mask.cast(DType::F32).expand_dim(0, N_HEADS);
-    let masked_scores = scores + mask_3d * (-1e10f32);
-
-    let attn_weights = masked_scores.softmax(2);
-    let attn_out = attn_weights.matmul(v_3d);
-    let out = attn_out.transpose(0, 1).merge_dims(1, 2);
-
-    (out, k_cache_out, v_cache_out)
+    (attn_out, k_cache_out, v_cache_out)
 }

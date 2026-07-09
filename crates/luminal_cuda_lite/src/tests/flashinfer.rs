@@ -152,6 +152,9 @@ fn run_flashinfer(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        dtype: luminal::dtype::DType::F32,
+        sm_scale: 0.0,
+        window_left: -1,
         plan_info: Mutex::new(Vec::new()),
     };
 
@@ -223,6 +226,9 @@ fn run_flashinfer_with_compact_decode_indices(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        dtype: luminal::dtype::DType::F32,
+        sm_scale: 0.0,
+        window_left: -1,
         plan_info: Mutex::new(Vec::new()),
     };
 
@@ -275,6 +281,9 @@ fn resolve_flashinfer_decode_for_signature_test(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        dtype: luminal::dtype::DType::F32,
+        sm_scale: 0.0,
+        window_left: -1,
         plan_info: Mutex::new(Vec::new()),
     };
     let nodes: Vec<NodeIndex> = (0..5).map(NodeIndex::new).collect();
@@ -337,6 +346,9 @@ fn flashinfer_op_registers_via_into_egglog() {
 
 #[test]
 fn flashinfer_egg_rule_parses() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Rule::raw() returns the rule with no validation; egglog parses it at
     // graph build. Smoke-test by running it through the egglog frontend via
     // a tiny program string.
@@ -382,6 +394,9 @@ fn flashinfer_graph_signature_is_stable_when_c_moves_within_capacity() {
 
 #[test]
 fn flashinfer_bs1_ctx4() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -399,6 +414,9 @@ fn flashinfer_bs1_ctx4() {
 
 #[test]
 fn flashinfer_bs2_supersequence() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -439,6 +457,9 @@ fn flashinfer_bs2_supersequence() {
 
 #[test]
 fn flashinfer_noncontiguous_page_table() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -485,6 +506,9 @@ fn flashinfer_noncontiguous_page_table() {
 
 #[test]
 fn flashinfer_compact_decode_indices_match_reference() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -979,6 +1003,9 @@ fn flashinfer_rule_rejects_mixed_cache_provenance() {
 
 #[test]
 fn flashinfer_rule_fires_on_full_paged_attention() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Default Llama-shaped test dims (HEAD_DIM=64, N_HEADS=8, N_KV_HEADS=2).
     let (cx, _) = build_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM);
     let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer(&cx);
@@ -991,6 +1018,9 @@ fn flashinfer_rule_fires_on_full_paged_attention() {
 
 #[test]
 fn flashinfer_rule_fires_on_same_rolled_cache_provenance() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let (cx, _) = build_paged_attention_graph_with_mask_and_cache_provenance(
         N_HEADS,
         N_KV_HEADS,
@@ -1015,6 +1045,9 @@ fn flashinfer_rule_fires_on_same_rolled_cache_provenance() {
 
 #[test]
 fn flashinfer_rule_fires_on_triu_gather_causal_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let (cx, _) = build_paged_attention_graph_with_mask(
         N_HEADS,
         N_KV_HEADS,
@@ -1031,6 +1064,9 @@ fn flashinfer_rule_fires_on_triu_gather_causal_mask() {
 
 #[test]
 fn flashinfer_rule_fires_on_direct_causal_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let (cx, _) = build_paged_attention_graph_with_mask(
         N_HEADS,
         N_KV_HEADS,
@@ -1062,6 +1098,9 @@ fn flashinfer_derived_causal_rule_rejects_prefill_bucket() {
 
 #[test]
 fn cuda_graph_captures_flashinfer_decode_island() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -1181,6 +1220,9 @@ fn cuda_graph_captures_flashinfer_decode_island() {
 
 #[test]
 fn flashinfer_rule_fires_on_non_llama_dims() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // Different head counts: HEAD_DIM=64, N_HEADS=16, N_KV_HEADS=4 (group=4).
     // Exercises the model-agnostic structural variables in the rule.
     let (cx, _) = build_paged_attention_graph(16, 4, 64);
@@ -1194,6 +1236,9 @@ fn flashinfer_rule_fires_on_non_llama_dims() {
 
 #[test]
 fn flashinfer_rule_fires_on_mha() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     // MHA: KV_GROUPS=1 (n_heads == n_kv_heads). The GQA broadcast still
     // structurally appears (expand_dim(1, 1) + merge), so the rule should
     // still match.
@@ -1218,6 +1263,9 @@ fn flashinfer_rule_fires_on_mha() {
 
 #[test]
 fn flashinfer_extraction_reachable_from_search_space() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
@@ -1365,4 +1413,628 @@ fn extract_forced_flashinfer_llir(cx: &mut Graph, case_name: &str) -> LLIRGraph 
         "expected to extract FlashInferAttention for {case_name}; last error: {}",
         last_error.unwrap_or_else(|| "no candidate could be forced".into())
     );
+}
+
+// ─── Layer 4: bf16 decode + prefill ──────────────────────────────────────
+//
+// bf16 reuses the same plan/run wiring as f32 with dtype-dispatched kernels.
+// Decode is the same scalar kernel family; prefill is tensor-core MMA and
+// only exists for 16-bit dtypes. References are computed in f32 and compared
+// with bf16-scale tolerances.
+
+fn f32s_to_bf16_bytes(data: &[f32]) -> Vec<u8> {
+    data.iter()
+        .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+        .collect()
+}
+
+fn bf16_bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
+/// Run FlashInferAttention.execute() with bf16 Q/K/V buffers. With
+/// `kv_indptr = Some(..)` uses the 6-input explicit-indptr form; otherwise
+/// the 4-input derived causal form (decode at s=1, single-sequence prefill
+/// at s>1). Returns f32 output in (batch-or-rows, heads, dim) layout.
+#[allow(clippy::too_many_arguments)]
+fn run_flashinfer_bf16(
+    stream: &Arc<CudaStream>,
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    kv_indptr: Option<&[i32]>,
+    kv_indices: &[i32],
+    total_q_tokens: usize,
+) -> Vec<f32> {
+    let q_buf = copy_to_dev(stream, &f32s_to_bf16_bytes(q));
+    let k_buf = copy_to_dev(stream, &f32s_to_bf16_bytes(k_cache));
+    let v_buf = copy_to_dev(stream, &f32s_to_bf16_bytes(v_cache));
+    let idx_buf = copy_to_dev(stream, kv_indices);
+    let out_buf = alloc_dev(stream, total_q_tokens * HIDDEN * 2);
+
+    let fi = FlashInferAttention {
+        num_qo_heads: N_HEADS,
+        num_kv_heads: N_KV_HEADS,
+        head_dim: HEAD_DIM,
+        page_size: 1,
+        batch_dim: Expression::from('s'),
+        dtype: luminal::dtype::DType::Bf16,
+        sm_scale: 0.0,
+        window_left: -1,
+        plan_info: Mutex::new(Vec::new()),
+    };
+
+    let nodes: Vec<NodeIndex> = (0..7).map(NodeIndex::new).collect();
+    let (q_n, k_n, v_n, idx_n, qo_n, kv_n, out_n) = (
+        nodes[0], nodes[1], nodes[2], nodes[3], nodes[4], nodes[5], nodes[6],
+    );
+
+    let mut buffers = FxHashMap::default();
+    buffers.insert(
+        q_n,
+        DeviceBuffer::new(q_buf.device_ptr(stream).0, q.len() * 2),
+    );
+    buffers.insert(
+        k_n,
+        DeviceBuffer::new(k_buf.device_ptr(stream).0, k_cache.len() * 2),
+    );
+    buffers.insert(
+        v_n,
+        DeviceBuffer::new(v_buf.device_ptr(stream).0, v_cache.len() * 2),
+    );
+    buffers.insert(
+        idx_n,
+        DeviceBuffer::new(idx_buf.device_ptr(stream).0, kv_indices.len() * 4),
+    );
+    let out_ptr = out_buf.device_ptr(stream).0;
+    buffers.insert(
+        out_n,
+        DeviceBuffer::new(out_ptr, total_q_tokens * HIDDEN * 2),
+    );
+
+    let mut dyn_map = FxHashMap::default();
+    dyn_map.insert('s', total_q_tokens);
+    dyn_map.insert('c', kv_indices.len());
+
+    let _qo_buf;
+    let _kv_buf;
+    let inputs: Vec<NodeIndex> = if let Some(kv_indptr) = kv_indptr {
+        let batch_size = kv_indptr.len() - 1;
+        let qo_indptr: Vec<i32> = (0..=batch_size as i32).collect();
+        _qo_buf = copy_to_dev(stream, &qo_indptr);
+        _kv_buf = copy_to_dev(stream, kv_indptr);
+        buffers.insert(
+            qo_n,
+            DeviceBuffer::new(_qo_buf.device_ptr(stream).0, qo_indptr.len() * 4),
+        );
+        buffers.insert(
+            kv_n,
+            DeviceBuffer::new(_kv_buf.device_ptr(stream).0, kv_indptr.len() * 4),
+        );
+        dyn_map.insert('r', kv_indptr.len());
+        vec![q_n, k_n, v_n, idx_n, qo_n, kv_n]
+    } else {
+        vec![q_n, k_n, v_n, idx_n]
+    };
+
+    fi.execute(stream, out_n, &inputs, &buffers, &dyn_map)
+        .expect("FlashInferAttention bf16 execute failed");
+    stream.synchronize().unwrap();
+
+    let mut out_bytes = vec![0u8; total_q_tokens * HIDDEN * 2];
+    unsafe {
+        cudarc::driver::result::memcpy_dtoh_async(&mut out_bytes, out_ptr, stream.cu_stream())
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let raw = bf16_bytes_to_f32s(&out_bytes);
+    transpose_hbd_to_bhd(&raw, N_HEADS, total_q_tokens, HEAD_DIM)
+}
+
+// bf16 rounds inputs to 8 mantissa bits, so compare against an f32 reference
+// computed from bf16-rounded inputs with tolerances a few bf16 ulps wide.
+const BF16_RTOL: f32 = 3e-2;
+const BF16_ATOL: f32 = 3e-3;
+
+fn round_to_bf16(data: &[f32]) -> Vec<f32> {
+    data.iter()
+        .map(|v| half::bf16::from_f32(*v).to_f32())
+        .collect()
+}
+
+#[test]
+fn flashinfer_bf16_decode_bs1_ctx4() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let batch_size = 1;
+    let context_len = 4;
+    let q = round_to_bf16(&deterministic_f32(batch_size * HIDDEN, 0.011, 0.1));
+    let k = round_to_bf16(&deterministic_f32(context_len * KV_DIM, 0.021, 0.1));
+    let v = round_to_bf16(&deterministic_f32(context_len * KV_DIM, 0.031, 0.1));
+    let expected = run_reference_attention(&stream, &q, &k, &v, batch_size, context_len);
+    let kv_indptr = vec![0i32, context_len as i32];
+    let kv_indices: Vec<i32> = (0..context_len as i32).collect();
+    let result = run_flashinfer_bf16(
+        &stream,
+        &q,
+        &k,
+        &v,
+        Some(&kv_indptr),
+        &kv_indices,
+        batch_size,
+    );
+    assert_close(&result, &expected, BF16_RTOL, BF16_ATOL);
+}
+
+#[test]
+fn flashinfer_bf16_decode_bs2_supersequence() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let batch_size = 2;
+    let ctx0 = 8;
+    let ctx1 = 3;
+    let total_ctx = ctx0 + ctx1;
+
+    let q = round_to_bf16(&deterministic_f32(batch_size * HIDDEN, 0.014, 0.1));
+    let k = round_to_bf16(&deterministic_f32(total_ctx * KV_DIM, 0.022, 0.1));
+    let v = round_to_bf16(&deterministic_f32(total_ctx * KV_DIM, 0.032, 0.1));
+
+    let expected0 = run_reference_attention(
+        &stream,
+        &q[..HIDDEN],
+        &k[..ctx0 * KV_DIM],
+        &v[..ctx0 * KV_DIM],
+        1,
+        ctx0,
+    );
+    let expected1 = run_reference_attention(
+        &stream,
+        &q[HIDDEN..],
+        &k[ctx0 * KV_DIM..],
+        &v[ctx0 * KV_DIM..],
+        1,
+        ctx1,
+    );
+    let expected: Vec<f32> = expected0.into_iter().chain(expected1).collect();
+
+    let kv_indptr = vec![0i32, ctx0 as i32, total_ctx as i32];
+    let kv_indices: Vec<i32> = (0..total_ctx as i32).collect();
+    let result = run_flashinfer_bf16(
+        &stream,
+        &q,
+        &k,
+        &v,
+        Some(&kv_indptr),
+        &kv_indices,
+        batch_size,
+    );
+    assert_close(&result, &expected, BF16_RTOL, BF16_ATOL);
+}
+
+#[test]
+fn flashinfer_bf16_prefill_causal() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    // Single-sequence causal prefill via the derived 4-input path: s q tokens
+    // over a c-token context whose last s slots are the q tokens themselves.
+    // Reference: row j attends kv[0..=c-s+j], computed row-by-row with the
+    // dense reference graph.
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let s = 4usize;
+    let c = 6usize; // 2 tokens of pre-existing context + 4 new
+
+    let q = round_to_bf16(&deterministic_f32(s * HIDDEN, 0.013, 0.1));
+    let k = round_to_bf16(&deterministic_f32(c * KV_DIM, 0.023, 0.1));
+    let v = round_to_bf16(&deterministic_f32(c * KV_DIM, 0.033, 0.1));
+
+    let mut expected = Vec::with_capacity(s * HIDDEN);
+    for j in 0..s {
+        let visible = c - s + j + 1;
+        let row = run_reference_attention(
+            &stream,
+            &q[j * HIDDEN..(j + 1) * HIDDEN],
+            &k[..visible * KV_DIM],
+            &v[..visible * KV_DIM],
+            1,
+            visible,
+        );
+        expected.extend(row);
+    }
+
+    let kv_indices: Vec<i32> = (0..c as i32).collect();
+    let result = run_flashinfer_bf16(&stream, &q, &k, &v, None, &kv_indices, s);
+    assert_close(&result, &expected, BF16_RTOL, BF16_ATOL);
+}
+
+#[test]
+fn flashinfer_f32_prefill_still_rejected() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    // The derived 4-input path with s>1 and f32 must keep failing cleanly:
+    // tensor cores are 16-bit, so there is no f32 prefill kernel.
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let s = 3usize;
+    let c = 3usize;
+    let q = deterministic_f32(s * HIDDEN, 0.011, 0.1);
+    let k = deterministic_f32(c * KV_DIM, 0.021, 0.1);
+    let v = deterministic_f32(c * KV_DIM, 0.031, 0.1);
+    let kv_indices: Vec<i32> = (0..c as i32).collect();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_flashinfer_with_compact_decode_indices(&stream, &q, &k, &v, &kv_indices)
+    }));
+    assert!(
+        result.is_err(),
+        "f32 s={s} derived prefill should error (no f32 prefill kernel)"
+    );
+}
+
+#[test]
+#[ignore = "one-time JIT compile check for the gemma variants (~2 min each cold)"]
+fn jit_compiles_gemma_variants() {
+    // sliding layers: head_dim 256 with the sliding-window kernel variant
+    let _ = crate::host::flashinfer::jit::ensure_compiled(256, true);
+    // full layers: head_dim 512 (16-bit only; f32 instantiation is gated out)
+    let _ = crate::host::flashinfer::jit::ensure_compiled(512, false);
+}
+
+/// Gemma-4 paged attention spelling at mini dims (scale-free scores; sliding
+/// window mask term). Mirrors examples/gemma4_moe/src/model.rs
+/// `paged_attention` exactly — used to derive the egg rule variants.
+#[allow(clippy::too_many_arguments)]
+fn gemma_mini_paged_attention(
+    q_rope: GraphTensor,
+    k_rope: GraphTensor,
+    v: GraphTensor,
+    k_cache: GraphTensor,
+    v_cache: GraphTensor,
+    scatter_idx: GraphTensor,
+    gather_idx: GraphTensor,
+    q_pos: GraphTensor,
+    head_dim: usize,
+    kv_dim: usize,
+    kv_groups: usize,
+    n_heads: usize,
+    sliding_window: Option<usize>,
+) -> GraphTensor {
+    use luminal_nn::{gather_rows, scatter_rows};
+    let cx = q_rope.graph();
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, kv_dim);
+    let v_cache_out = scatter_rows(v, scatter_idx, v_cache, kv_dim);
+    let k = gather_rows(k_cache_out, gather_idx, kv_dim);
+    let v_ctx = gather_rows(v_cache_out, gather_idx, kv_dim);
+    let q = (q_rope * 1.0).split_dims(1, head_dim).transpose(0, 1);
+    let k = k.split_dims(1, head_dim).permute((1, 2, 0));
+    let v_ctx = v_ctx.split_dims(1, head_dim).transpose(0, 1);
+    let k = k.expand_dim(1, kv_groups).merge_dims(0, 1) * 1.0;
+    let v_ctx = v_ctx.expand_dim(1, kv_groups).merge_dims(0, 1) * 1.0;
+    let scores = q.matmul(k);
+    let ctx = Expression::from('c');
+    let seq = q_rope.dims()[0];
+    let causal_square = scores.graph().triu(ctx, 1).cast(scores.dtype) * -1e10;
+    let row_offsets = (q_pos * ctx).expand_dim(1, ctx);
+    let col_offsets = scores.graph().arange(ctx).expand_dim(0, seq);
+    let attn_mask = causal_square.gather(row_offsets + col_offsets);
+    let attn_mask = if let Some(w) = sliding_window {
+        let q_f = q_pos.cast(DType::F32);
+        let win_lo = q_f - (w - 1) as f32;
+        let col_f = cx.arange(ctx).cast(DType::F32);
+        let too_old = col_f.expand_dim(0, seq).lt(win_lo.expand_dim(1, ctx));
+        attn_mask + too_old.cast(scores.dtype) * -1e10
+    } else {
+        attn_mask
+    };
+    let masked_scores = scores + attn_mask.expand_dim(0, n_heads);
+    let weights = masked_scores.softmax(2);
+    let out = weights.matmul(v_ctx);
+    out.transpose(0, 1).merge_dims(1, 2)
+}
+
+/// Census of search choice eclasses on a realistic mini attention chunk:
+/// how many genome bits select among *elementwise-only* alternatives
+/// (fused-region interior wiring — performance-equivalent for the
+/// bandwidth-bound regions they land in) versus structural alternatives
+/// the search genuinely needs to explore. Run with --nocapture.
+#[test]
+#[ignore = "debug instrument: choice-eclass census for search-space analysis"]
+fn egraph_choice_eclass_census() {
+    const HD: usize = 64;
+    const HEADS: usize = 2;
+    const KVH: usize = 1;
+    let mut cx = Graph::default();
+    let q = cx.tensor(('s', HEADS * HD)).as_dtype(DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let scatter_idx = cx.tensor('s').as_dtype(DType::Int);
+    let gather_idx = cx.tensor('c').as_dtype(DType::Int);
+    let q_pos = cx.tensor('s').as_dtype(DType::Int);
+    let out = gemma_mini_paged_attention(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        Some(8),
+    );
+    let _out = out.cast(DType::F32).output();
+
+    let (program, root) = hlir_to_egglog(&cx);
+    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
+    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
+    // cleanup=true: census the egraph the search actually extracts from.
+    let egraph = run_egglog(&program, &root, &ops, true).expect("egglog failed");
+
+    let elementwise_labels = [
+        "Add",
+        "Mul",
+        "Cast",
+        "Exp2",
+        "Log2",
+        "Sin",
+        "Sqrt",
+        "Recip",
+        "CudaUnaryElementwise",
+        "CudaBinaryElementwise",
+        "FusionStart",
+        "FusionEnd",
+    ];
+    let mut multi = 0usize;
+    let mut elementwise_only = 0usize;
+    let mut profile_hist: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut choice_product_log2 = 0f64;
+    let mut frozen_product_log2 = 0f64;
+    for (label, enodes) in egraph.eclasses.values() {
+        let searchable =
+            label.contains("IR") || label.contains("IList") || label.contains("OpKind");
+        if !searchable || enodes.len() < 2 {
+            continue;
+        }
+        multi += 1;
+        choice_product_log2 += (enodes.len() as f64).log2();
+        // Resolve each variant to its op *kind*: an `Op` enode's first
+        // child is its OpKind eclass; use that eclass's enode labels.
+        // Non-Op variants (list cons, kind constructors) keep their own
+        // label.
+        let mut labels: Vec<&str> = enodes
+            .iter()
+            .flat_map(|n| {
+                let (lbl, children) = &egraph.enodes[n];
+                if lbl == "Op" && !children.is_empty() {
+                    egraph.eclasses[&children[0]]
+                        .1
+                        .iter()
+                        .map(|kn| egraph.enodes[kn].0.as_str())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![lbl.as_str()]
+                }
+            })
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        let ew_only = labels.iter().all(|l| {
+            elementwise_labels.contains(l) || l.starts_with("ICons") || l.starts_with("INil")
+        });
+        if ew_only {
+            elementwise_only += 1;
+        } else {
+            frozen_product_log2 += (enodes.len() as f64).log2();
+        }
+        *profile_hist.entry(format!("{labels:?}")).or_insert(0) += 1;
+    }
+    println!("multi-alternative choice eclasses: {multi}");
+    println!("  elementwise-only (freezable):    {elementwise_only}");
+    println!(
+        "  search-space log2: {choice_product_log2:.0} -> {frozen_product_log2:.0} bits after freezing"
+    );
+    println!("top label profiles:");
+    let mut hist: Vec<_> = profile_hist.into_iter().collect();
+    hist.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    for (profile, count) in hist.into_iter().take(25) {
+        println!("  {count:5}  {profile}");
+    }
+}
+
+#[test]
+#[ignore = "debug instrument: dump gemma sliding paged attention egglog"]
+fn dump_gemma_sliding_attention_egglog() {
+    const HD: usize = 64;
+    const HEADS: usize = 2;
+    const KVH: usize = 1;
+    let mut cx = Graph::default();
+    let q = cx.tensor(('s', HEADS * HD)).as_dtype(DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let scatter_idx = cx.tensor('s').as_dtype(DType::Int);
+    let gather_idx = cx.tensor('c').as_dtype(DType::Int);
+    let q_pos = cx.tensor('s').as_dtype(DType::Int);
+    let out = gemma_mini_paged_attention(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        Some(8),
+    );
+    let _out = out.cast(DType::F32).output();
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
+    println!("{program}");
+}
+
+#[test]
+fn flashinfer_rule_fires_on_gemma_sliding_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    const HD: usize = 64;
+    const HEADS: usize = 2;
+    const KVH: usize = 1;
+    let mut cx = Graph::default();
+    let q = cx.tensor(('s', HEADS * HD)).as_dtype(DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let scatter_idx = cx.tensor('s').as_dtype(DType::Int);
+    let gather_idx = cx.tensor('c').as_dtype(DType::Int);
+    let q_pos = cx.tensor('s').as_dtype(DType::Int);
+    let out = gemma_mini_paged_attention(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        Some(8),
+    );
+    let _ = out.cast(DType::F32).output();
+    let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
+    assert!(
+        has_flashinfer,
+        "FlashInferAttention was NOT found for the gemma sliding mask. \
+         OpKinds present: {op_kinds:?}"
+    );
+}
+
+#[test]
+fn flashinfer_rule_fires_on_gemma_scale_free_mask() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    const HD: usize = 64;
+    const HEADS: usize = 2;
+    const KVH: usize = 1;
+    let mut cx = Graph::default();
+    let q = cx.tensor(('s', HEADS * HD)).as_dtype(DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+    let scatter_idx = cx.tensor('s').as_dtype(DType::Int);
+    let gather_idx = cx.tensor('c').as_dtype(DType::Int);
+    let q_pos = cx.tensor('s').as_dtype(DType::Int);
+    let out = gemma_mini_paged_attention(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
+        scatter_idx,
+        gather_idx,
+        q_pos,
+        HD,
+        KVH * HD,
+        HEADS / KVH,
+        HEADS,
+        None,
+    );
+    let _ = out.cast(DType::F32).output();
+    let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer_with_decode_interval(&cx);
+    assert!(
+        has_flashinfer,
+        "FlashInferAttention was NOT found for the gemma scale-free mask. \
+         OpKinds present: {op_kinds:?}"
+    );
+}
+
+#[test]
+#[ignore = "perf repro: gemma FI rule join cost with 6 distinct attention instances"]
+fn gemma_fi_rules_six_instances_build_time() {
+    const HD: usize = 64;
+    const HEADS: usize = 2;
+    const KVH: usize = 1;
+    let mut cx = Graph::default();
+    let scatter_idx = cx.tensor('s').as_dtype(DType::Int);
+    let gather_idx = cx.tensor('c').as_dtype(DType::Int);
+    let q_pos = cx.tensor('s').as_dtype(DType::Int);
+    let mut outs = Vec::new();
+    for i in 0..6 {
+        let q = cx.tensor(('s', HEADS * HD)).as_dtype(DType::Bf16);
+        let k = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+        let v = cx.tensor(('s', KVH * HD)).as_dtype(DType::Bf16);
+        let k_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+        let v_cache = cx.tensor((16, KVH * HD)).as_dtype(DType::Bf16);
+        let sliding = if i % 2 == 0 { Some(8) } else { None };
+        let out = gemma_mini_paged_attention(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            scatter_idx,
+            gather_idx,
+            q_pos,
+            HD,
+            KVH * HD,
+            HEADS / KVH,
+            HEADS,
+            sliding,
+        );
+        outs.push(out);
+    }
+    let total = outs.into_iter().reduce(|a, b| a + b).unwrap();
+    let _ = total.cast(DType::F32).output();
+    let start = std::time::Instant::now();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    println!("six-instance gemma FI build: {:?}", start.elapsed());
+}
+
+#[test]
+#[ignore = "debug instrument: dump llama swiglu(+quant) chain egglog"]
+fn dump_llama_swiglu_chain_egglog() {
+    const I: usize = 8;
+    let mut cx = Graph::default();
+    let xgu = cx.tensor(('s', 2 * I)).as_dtype(DType::Bf16);
+    let scale = cx.tensor(()).as_dtype(DType::F32);
+    let gate = xgu.slice((.., ..I));
+    let up = xgu.slice((.., I..));
+    let h = gate.swish() * up;
+    // quant tail (the llama fp8 spelling)
+    let hf = h.cast(DType::F32);
+    let scale_e = scale.expand_dim(0, 's').expand_dim(1, I);
+    let q = (hf / scale_e).cast(DType::F8E4M3);
+    let _ = q.cast(DType::F32).output();
+    let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
+    println!("{program}");
 }

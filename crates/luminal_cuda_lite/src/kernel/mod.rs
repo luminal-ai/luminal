@@ -9,14 +9,21 @@ use luminal_tracing::schema::{
 };
 use uuid::Uuid;
 
+pub mod argmax;
 pub mod conv2d;
 pub mod cuda_graph;
 pub mod fusion;
+pub mod gemv;
 pub mod generic_matmul;
 pub mod hlir;
 pub mod matmul2d;
+pub mod moe_gemv;
 pub mod other_ops;
+pub mod quant_f8;
+pub mod rms_norm;
 pub mod rope;
+pub mod swiglu;
+pub mod topk;
 
 pub use conv2d::KernelConv2D;
 pub use cuda_graph::*;
@@ -25,10 +32,22 @@ pub use matmul2d::{
     Matmul2DCustom, Matmul2DKernel, linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t,
     matmul_3d, matmul_3d_t,
 };
+pub use rms_norm::{RMSNormCustom, RMSNormKernel, fused_rms_norm};
 pub use rope::{RoPECustom, RoPEKernel, apply_rope};
 
 pub type Ops = (
     hlir::Ops,
+    argmax::KernelArgmax,
+    gemv::KernelGemv,
+    gemv::KernelGemvF8,
+    moe_gemv::KernelMoEGemv,
+    rms_norm::KernelRMSNorm,
+    rms_norm::KernelRMSNormQuant,
+    rope::KernelRoPE,
+    swiglu::KernelSwiglu,
+    swiglu::KernelSwigluQuant,
+    topk::KernelStableSortIdx,
+    quant_f8::KernelQuantF8,
     other_ops::Ops,
     conv2d::KernelConv2D,
     GenericMatmul,

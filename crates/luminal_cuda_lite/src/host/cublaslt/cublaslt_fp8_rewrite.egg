@@ -196,6 +196,33 @@
 
 (rule
     (
+        ; Stage the tensor-wide fp8 scale product (a_scale · b_scale), keyed
+        ; by its FusionEnd. ANCHORED at the scalar Mul: its two scalar
+        ; FusionStart operands are read from the Mul's input list, never
+        ; enumerated. Without this fact, the fused-output-scale rule below
+        ; matched ?fs_a_scale / ?fs_b_scale as free scalar-FusionStart atoms
+        ; and egglog enumerated their K² cross-product on graphs with many
+        ; scalar fusion boundaries (adaLN modulation + softmax) — a
+        ; super-linear compile-time blowup that OOMs the real FLUX compile.
+        (= ?scale_product_inner (Op (CudaBinaryElementwise
+            "Mul" (ENil) (ENil) (ENil) (ENil) (F32))
+            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
+        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?a_scale (INil))))
+        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?b_scale (INil))))
+        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
+            (ICons ?scale_product_inner (INil))))
+    )
+    (
+        (cublaslt_fp8_scale_product ?scale_product ?a_scale ?b_scale)
+    )
+    :ruleset fusion_grow
+    :name "cublaslt fp8 scale-product fact"
+)
+
+(rule
+    (
         ; Fusion growth can make the live path consume a raw FP8 cuBLASLt
         ; candidate through an internal CudaBinaryElementwise scale multiply,
         ; instead of the original HLIR output-scale Mul. The scalar scale
@@ -224,25 +251,16 @@
         (= ?out_shape (ECons ?out_m (ECons ?out_n (ENil))))
         (= ?scale_strides (ECons (MNum 0) (ECons (MNum 0) (ENil))))
 
-        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?a_scale (INil))))
-        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?b_scale (INil))))
-        (= ?scale_product_inner (Op (CudaBinaryElementwise
-            "Mul"
-            (ENil)
-            (ENil)
-            (ENil)
-            (ENil)
-            (F32))
-            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
-        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
-            (ICons ?scale_product_inner (INil))))
+        ; ?fused_scale = Mul(fs_cast, fs_scale) is the rare anchor (one per
+        ; fp8 gemm). fs_scale wraps the scale-product FusionEnd; the staged
+        ; fact yields its two scalar operands without re-matching the scalar
+        ; FusionStart pair (see "cublaslt fp8 scale-product fact").
         (= ?fs_scale (Op (FusionStart
             ?out_shape
             ?scale_strides
             (F32))
             (ICons ?scale_product (INil))))
+        (cublaslt_fp8_scale_product ?scale_product ?a_scale ?b_scale)
         (= ?fused_scale (Op (CudaBinaryElementwise
             "Mul"
             ?out_shape
@@ -808,4 +826,177 @@
     )
     :ruleset matmul_backend
     :name "cublaslt fp8 e4m3/e5m2 batched row-major x column-major f32 output"
+)
+
+; Fold a trailing Cast(Bf16) into a scaled FP8 matmul's output dtype.
+; cuBLASLt supports BF16 C/D with FP8 A/B; beta is pinned to 0.0 so no C
+; operand exists whose physical dtype could disagree (same hazard as the
+; mixed-dtype fold guard).
+(rule
+    (
+        (= ?matmul (Op (cublaslt_scaled
+            ?m ?n ?k ?ta ?tb ?ao ?bo ?co ?do
+            ?lda ?ldb ?ldc ?ldd ?batch
+            ?sa ?sb ?sc ?sd
+            ?adt ?bdt (F32) (F32)
+            ?compute ?scale ?alpha 0.0 ?epilogue)
+            ?inputs))
+        (= ?cast (Op (Cast ?size (Bf16)) (ICons ?matmul (INil))))
+    )
+    (
+        (let ?fused (Op (cublaslt_scaled
+            ?m ?n ?k ?ta ?tb ?ao ?bo ?co ?do
+            ?lda ?ldb ?ldc ?ldd ?batch
+            ?sa ?sb ?sc ?sd
+            ?adt ?bdt (Bf16) (Bf16)
+            ?compute ?scale ?alpha 0.0 ?epilogue)
+            ?inputs))
+        (union ?cast ?fused)
+        (set (dtype ?fused) (Bf16))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt scaled fp8 bf16 output"
+)
+
+; Variant of the scaled FP8 rule for a pre-quantized activation produced by a
+; fused F8E4M3 custom op (rms-norm-quant custom (x, w, scale)). CONVENTION: f8-producing
+; custom ops put the quantization input scale as their LAST input; the rule
+; matches by arity and reads the scale from that slot. The dequant chain on
+; the output side is unchanged.
+(rule
+    (
+        (= ?a (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?cw (ICons ?input_scale (INil))))))
+        (= ?a_dtype (dtype ?a))
+
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
+            (ICons ?input_scale2 (ICons ?weight_scale (INil)))))
+        (= ?input_scale ?input_scale2)
+        (= ?scaled (Op (Mul
+            ?out_shape
+            ?cast_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?cast (ICons ?scale_product (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= ?b_dtype (dtype ?b))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_scaled
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+        (union ?scaled ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+:ruleset matmul_backend
+:name "cublaslt scaled fp8 RmCm f32 output, custom quantized activation arity 3"
+)
+
+
+; Variant of the scaled FP8 rule for a pre-quantized activation produced by a
+; fused F8E4M3 custom op (swiglu-quant custom (x, scale)). CONVENTION: f8-producing
+; custom ops put the quantization input scale as their LAST input; the rule
+; matches by arity and reads the scale from that slot. The dequant chain on
+; the output side is unchanged.
+(rule
+    (
+        (= ?a (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?input_scale (INil)))))
+        (= ?a_dtype (dtype ?a))
+
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
+            (ICons ?input_scale2 (ICons ?weight_scale (INil)))))
+        (= ?input_scale ?input_scale2)
+        (= ?scaled (Op (Mul
+            ?out_shape
+            ?cast_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?cast (ICons ?scale_product (INil)))))
+        (= ?cast_strides ?scaled_out_strides)
+
+        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
+        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
+        (= ?k_stride (MIter))
+
+        (= ?a_m_stride (MMul (MIter) ?k))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_k_stride (MIter))
+
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+        (= ?b_k_stride (MIter))
+
+        (= ?b_dtype (dtype ?b))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_scaled
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            (MNum 1)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            (MNum 0)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+        (union ?scaled ?sgemm)
+        (set (dtype ?sgemm) (F32))
+    )
+:ruleset matmul_backend
+:name "cublaslt scaled fp8 RmCm f32 output, custom quantized activation arity 2"
 )

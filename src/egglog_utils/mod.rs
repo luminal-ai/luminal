@@ -30,6 +30,15 @@ const EGGLOG_RULESETS: &[&str] = &[
     "fusion_pair",
     "fusion_grow",
     "fusion_merge",
+    // One-shot structural fusion rules (large joins), run once in the
+    // dedicated "fuse late" phase instead of inside the saturating main
+    // cycles. The _pre ruleset holds producer stages (e.g. the RoPE angle
+    // relation) consumed by rules in the main late ruleset.
+    "kernel_fuse_late_pre",
+    "kernel_fuse_late",
+    // Expensive one-shot rules that consume facts produced by the earlier
+    // fuse-late runs; scheduled exactly once at the end of the phase.
+    "kernel_fuse_late2",
 ];
 
 fn parse_log_flag(value: &str) -> bool {
@@ -159,6 +168,10 @@ pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool)
 /// trait objects in `ops`.
 pub struct OpTextParts {
     op_defs: String,
+    /// Backend-provided egglog text (see [`crate::op::Runtime::extra_egglog`]),
+    /// spliced in right after `op_defs` and before the rewrite rules. Empty for
+    /// core / the reference backend.
+    extra_egglog: String,
     cleanups: String,
     /// Names of op kinds that are eligible for cleanup (cleanup() == true).
     /// Used by the Rust post-processing pass to safely strip HLIR ops only
@@ -187,6 +200,9 @@ impl OpTextParts {
             .collect();
         Self {
             op_defs: op_defs_string(ops),
+            // Default empty; the backend's Runtime::extra_egglog() is spliced in
+            // by the Rt-aware callers (build_search_space) after construction.
+            extra_egglog: String::new(),
             // The egglog `cleanup` ruleset deletes HLIR ops unconditionally,
             // even when no kernel rewrite fired in their eclass. On large
             // graphs (e.g. YOLO v11) that produces empty eclasses and the
@@ -269,6 +285,22 @@ fn egglog_main_cycle_phases(cycle: usize, use_interval_analysis: bool) -> Vec<Eg
 
 fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> {
     vec![
+        // One-shot structural fusion rules with large joins. Running them
+        // once here (dtype facts present, raw HLIR rows not yet deleted by
+        // the cleanup phases) instead of inside the saturating main cycles
+        // avoids re-evaluating tens-of-seconds joins on every iteration.
+        // `seq` so each ruleset's join runs exactly once: producer stages
+        // first, then the consumer rules.
+        EgglogSchedulePhase {
+            name: "fuse late".to_string(),
+            // The second `kernel_fuse_late` run consumes relation facts the
+            // first run produced (e.g. rope_rotated); semi-naive evaluation
+            // makes it a cheap delta join.
+            // Depth = the longest relation cascade: invf(pre) → angles →
+            // rotation → concat each consume the previous run's facts.
+            schedule: "(seq kernel_fuse_late_pre kernel_fuse_late kernel_fuse_late kernel_fuse_late kernel_fuse_late2)"
+                .to_string(),
+        },
         EgglogSchedulePhase {
             name: "final expr".to_string(),
             schedule: expr_schedule(use_interval_analysis).to_string(),
@@ -346,6 +378,7 @@ fn egglog_setup_with_options(
         egglog_ruleset_declarations(),
         base_program,
         parts.op_defs.clone(),
+        parts.extra_egglog.clone(),
         parts.cleanups.clone(),
         base::base_cleanup_egglog(),
         parts.rewrites.clone(),
@@ -1183,28 +1216,34 @@ pub fn run_egglog_with_report_late_passes_and_interval_analysis(
     late_passes: &[LateEgglogPass],
     use_interval_analysis: bool,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
+    // This convenience wrapper doesn't expose the backend extra-egglog hook;
+    // the Rt-aware path (Graph::build_search_space) is what threads it.
     run_egglog_with_report_late_passes_interval_analysis_and_log(
         program,
         root,
         ops,
         cleanup,
         late_passes,
+        "",
         use_interval_analysis,
         log_channel_enabled(false, "EGGLOG_LOG"),
     )
 }
 
 #[tracing::instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_egglog_with_report_late_passes_interval_analysis_and_log(
     program: &str,
     root: &str,
     ops: &[Arc<Box<dyn EgglogOp>>],
     cleanup: bool,
     late_passes: &[LateEgglogPass],
+    extra_egglog: &str,
     use_interval_analysis: bool,
     log: bool,
 ) -> Result<(SerializedEGraph, EgglogRunReport), egglog::Error> {
-    let op_parts = OpTextParts::new_with_late_passes(ops, cleanup, late_passes);
+    let mut op_parts = OpTextParts::new_with_late_passes(ops, cleanup, late_passes);
+    op_parts.extra_egglog = extra_egglog.to_string();
     run_egglog_with_report_parts_impl(program, root, &op_parts, use_interval_analysis, log)
 }
 
@@ -1549,12 +1588,14 @@ pub fn run_egglog_with_late_passes_and_interval_analysis(
 }
 
 #[tracing::instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_egglog_with_late_passes_interval_analysis_and_log(
     program: &str,
     root: &str,
     ops: &[Arc<Box<dyn EgglogOp>>],
     cleanup: bool,
     late_passes: &[LateEgglogPass],
+    extra_egglog: &str,
     use_interval_analysis: bool,
     log: bool,
 ) -> Result<SerializedEGraph, egglog::Error> {
@@ -1564,6 +1605,7 @@ pub fn run_egglog_with_late_passes_interval_analysis_and_log(
         ops,
         cleanup,
         late_passes,
+        extra_egglog,
         use_interval_analysis,
         log,
     )
@@ -2374,11 +2416,34 @@ pub fn egglog_to_llir_from_root<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        LateEgglogPass, SerializedEGraph, count_choice_sets_up_to, run_egglog_with_late_passes,
+        LateEgglogPass, OpTextParts, SerializedEGraph, count_choice_sets_up_to,
+        egglog_setup_with_options, run_egglog_with_late_passes,
     };
     use crate::prelude::FxHashMap;
     use crate::{hlir::HLIROps, op::IntoEgglogOp};
     use egraph_serialize::{ClassId, NodeId};
+
+    // The backend extra-egglog hook (Runtime::extra_egglog) is carried on
+    // OpTextParts.extra_egglog and must be spliced into the program exactly once,
+    // after the op constructor defs and before the rewrite rules.
+    #[test]
+    fn extra_egglog_is_spliced_between_op_defs_and_rewrites() {
+        let marker = "(function tron_is_attn_softmax (IR IR) bool :merge (or old new))";
+
+        // Default: no extra egglog → marker absent.
+        let parts = OpTextParts::new(&[], false);
+        assert!(parts.extra_egglog.is_empty());
+        let plain = egglog_setup_with_options("", &parts, false);
+        assert!(!plain.contains(marker));
+
+        // With a backend declaration set, it appears in the program exactly once.
+        // (Its position — after op_defs, before the rewrite rules — is fixed by
+        // the array-literal order in egglog_setup_with_options.)
+        let mut parts = OpTextParts::new(&[], false);
+        parts.extra_egglog = marker.to_string();
+        let program = egglog_setup_with_options("", &parts, false);
+        assert_eq!(program.matches(marker).count(), 1, "spliced exactly once");
+    }
 
     fn eclass(id: &str, label: &str, n_nodes: usize) -> (ClassId, (String, Vec<NodeId>)) {
         (

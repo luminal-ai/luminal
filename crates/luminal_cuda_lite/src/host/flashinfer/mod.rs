@@ -4,10 +4,11 @@ pub mod jit;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use luminal::{
+    dtype::DType,
     egglog_utils::{
         api::{Rule, SortDef, sort},
-        base::{EXPRESSION, OP_KIND},
-        extract_expr,
+        base::{DTYPE, EXPRESSION, F64, OP_KIND},
+        extract_dtype, extract_expr,
     },
     op::{EgglogOp, LLIROp},
     prelude::{
@@ -16,15 +17,20 @@ use luminal::{
     },
 };
 
+use jit::FlashInferDType;
+
 use crate::{
     cudarc::driver::{CudaSlice, CudaStream, DevicePtr, result},
     host::{DeviceBuffer, HostOp},
 };
 
-/// FlashInfer attention op (batch decode, fp32).
+/// FlashInfer attention op (batch decode for f32/f16/bf16, batch prefill for
+/// f16/bf16).
 ///
 /// Replaces the full paged-GQA attention pattern (gather → broadcast → Q*K^T →
-/// scale → mask → softmax → *V) with a single FlashInfer fused kernel.
+/// scale → mask → softmax → *V) with a single FlashInfer fused kernel. Decode
+/// (one q token per sequence) works in every dtype; prefill (multiple q tokens
+/// per sequence) requires tensor cores and is therefore 16-bit only.
 ///
 /// Runtime graph inputs: Q, K_pool, V_pool, compact gather_idx, and optionally
 /// qo_indptr + kv_indptr for standalone multi-sequence execution. The additive
@@ -36,6 +42,12 @@ pub struct FlashInferAttention {
     pub head_dim: usize,
     pub page_size: usize,
     pub batch_dim: Expression,
+    pub dtype: DType,
+    /// Softmax scale; 0.0 = default `1/sqrt(head_dim)`.
+    pub sm_scale: f64,
+    /// Sliding-window size in FlashInfer's `window_left` convention
+    /// (number of previous kv positions visible); -1 = no window.
+    pub window_left: i64,
 
     pub plan_info: Mutex<Vec<i64>>,
 }
@@ -51,7 +63,23 @@ pub(crate) struct FlashInferDecodeSpec {
     head_dim: usize,
     kv_dim: usize,
     max_kv_pages: usize,
+    dtype: FlashInferDType,
+    /// f32 bits of the softmax scale actually passed to the kernel.
+    sm_scale_bits: u32,
+    /// FlashInfer window_left; -1 = no sliding window. Part of the spec so
+    /// the shared prepare cache and capture signatures distinguish kernel
+    /// variants.
+    window_left: i32,
     kv_indptr_host: Vec<i32>,
+    qo_indptr_host: Vec<i32>,
+}
+
+impl FlashInferDecodeSpec {
+    /// Prefill = more q tokens than sequences. Requires 16-bit dtype (the
+    /// prepare path rejects f32 prefill before this matters).
+    fn is_prefill(&self) -> bool {
+        self.total_q_tokens > self.batch_size
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +89,7 @@ pub(crate) struct FlashInferDecodePointers {
     v_cache: u64,
     gather_idx: u64,
     output: u64,
+    pub(crate) explicit_qo_indptr: Option<u64>,
     pub(crate) explicit_kv_indptr: Option<u64>,
 }
 
@@ -122,13 +151,15 @@ pub(crate) struct PreparedFlashInferDecode {
     _page_locked_workspace_ptr: *mut u8,
     _owned_kv_indptr: Option<CudaSlice<i32>>,
     owned_kv_indptr_ptr: Option<u64>,
+    _owned_qo_indptr: Option<CudaSlice<i32>>,
+    owned_qo_indptr_ptr: Option<u64>,
     current_c: Option<Mutex<CudaSlice<i32>>>,
     current_c_ptr: Option<u64>,
     _indices: CudaSlice<i32>,
     indices_ptr: u64,
     _last_page_len: CudaSlice<i32>,
     last_page_len_ptr: u64,
-    _temp_output: CudaSlice<f32>,
+    _temp_output: CudaSlice<u8>,
     temp_output_ptr: u64,
 }
 
@@ -170,6 +201,9 @@ impl Default for FlashInferAttention {
             head_dim: 0,
             page_size: 0,
             batch_dim: Expression::default(),
+            dtype: DType::F32,
+            sm_scale: 0.0,
+            window_left: -1,
             plan_info: Mutex::new(Vec::new()),
         }
     }
@@ -186,6 +220,9 @@ impl EgglogOp for FlashInferAttention {
                 ("head_dim", EXPRESSION),
                 ("page_size", EXPRESSION),
                 ("batch_dim", EXPRESSION),
+                ("dtype", DTYPE),
+                ("sm_scale", F64),
+                ("window_left", F64),
             ],
         )
     }
@@ -198,6 +235,16 @@ impl EgglogOp for FlashInferAttention {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
+        // FlashInfer requires Ampere+ (sm_80; the kernels use cp.async /
+        // async-copy). On older arches — e.g. a T4 (sm_75) — emit no rules so
+        // the search never selects FlashInfer and attention stays on the HLIR
+        // chain. Without this the rule fires, the search picks it, and the
+        // JIT'd kernel's symbol is absent on launch (CUDA_ERROR_NOT_FOUND).
+        // All of this egg's relations (const_like, fi_*, flashinfer_*) are
+        // self-contained, so dropping it leaves no dangling references.
+        if crate::device_compute_major() < 8 {
+            return vec![];
+        }
         vec![Rule::raw(include_str!["flashinfer_attention.egg"])]
     }
 
@@ -226,6 +273,22 @@ impl EgglogOp for FlashInferAttention {
             .exec(&FxHashMap::default())
             .unwrap();
         let batch_dim = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
+        let dtype = extract_dtype(egraph, kind_children[5]);
+        let sm_scale: f64 = egraph.enodes[kind_children[6]]
+            .0
+            .replace('"', "")
+            .parse()
+            .unwrap();
+        let window_left = egraph.enodes[kind_children[7]]
+            .0
+            .replace('"', "")
+            .parse::<f64>()
+            .unwrap()
+            .round() as i64;
+        assert!(
+            FlashInferDType::from_dtype(dtype).is_some(),
+            "FlashInferAttention extracted with unsupported dtype {dtype:?}"
+        );
 
         let extracted = Self {
             num_qo_heads,
@@ -233,6 +296,9 @@ impl EgglogOp for FlashInferAttention {
             head_dim,
             page_size,
             batch_dim,
+            dtype,
+            sm_scale,
+            window_left,
             plan_info: Mutex::new(Vec::new()),
         };
 
@@ -240,7 +306,7 @@ impl EgglogOp for FlashInferAttention {
         // first execute. Pays the ~30s cold-cache nvcc cost during compile
         // rather than during the GA profiling loop, where it would dominate
         // the candidate's measured runtime and make the GA reject FlashInfer.
-        let _ = jit::ensure_compiled(head_dim);
+        let _ = jit::ensure_compiled(head_dim, window_left >= 0);
 
         let flat_idx_node = input_enodes[3];
         let gather_idx = find_indptrs::try_find_compact_gather_idx(egraph, flat_idx_node)
@@ -299,30 +365,54 @@ impl FlashInferAttention {
         let gather_idx_buf = get_buf("gather_idx", inputs[3])?;
         let out_buf = get_buf("output", self_node)?;
 
+        let dtype = FlashInferDType::from_dtype(self.dtype).ok_or_else(|| {
+            anyhow::anyhow!(
+                "FlashInferAttention does not support dtype {:?}",
+                self.dtype
+            )
+        })?;
         let kv_dim = self.num_kv_heads * self.head_dim;
-        let kv_bytes = kv_dim * std::mem::size_of::<f32>();
+        let kv_bytes = kv_dim * dtype.size_of();
         let max_kv_pages = k_buf
             .len()
             .checked_div(kv_bytes)
             .zip(v_buf.len().checked_div(kv_bytes))
             .map(|(k_pages, v_pages)| k_pages.min(v_pages).max(c))
             .unwrap_or(c);
-        let (kv_indptr_host, batch_size, explicit_kv_indptr) = if inputs.len() >= 6 {
-            let r = *dyn_map
-                .get(&'r')
-                .ok_or_else(|| anyhow::anyhow!("FlashInferAttention requires dynamic dim 'r'"))?;
-            let kv_indptr_buf = get_buf("kv_indptr", inputs[5])?;
-            // Host contents are read during prepare, where stream synchronization
-            // is allowed. The pointer is part of the capture signature.
-            (
-                Vec::with_capacity(r),
-                r.saturating_sub(1),
-                Some(kv_indptr_buf.ptr()),
-            )
-        } else {
-            (Vec::new(), total_q_tokens, None)
-        };
+        let (kv_indptr_host, batch_size, explicit_qo_indptr, explicit_kv_indptr) =
+            if inputs.len() >= 6 {
+                let r = *dyn_map.get(&'r').ok_or_else(|| {
+                    anyhow::anyhow!("FlashInferAttention requires dynamic dim 'r'")
+                })?;
+                let qo_indptr_buf = get_buf("qo_indptr", inputs[4])?;
+                let kv_indptr_buf = get_buf("kv_indptr", inputs[5])?;
+                // Host contents are read during prepare, where stream synchronization
+                // is allowed. The pointers are part of the capture signature.
+                (
+                    Vec::with_capacity(r),
+                    r.saturating_sub(1),
+                    Some(qo_indptr_buf.ptr()),
+                    Some(kv_indptr_buf.ptr()),
+                )
+            } else {
+                // Derived causal path: one q token per sequence is decode
+                // (batch == total_q_tokens). Multiple q tokens with a 16-bit
+                // dtype is single-sequence prefill (batch = 1). f32 keeps the
+                // decode fiction and is rejected in prepare, preserving the
+                // old behavior.
+                let batch_size = if total_q_tokens > 1 && dtype.supports_prefill() {
+                    1
+                } else {
+                    total_q_tokens
+                };
+                (Vec::new(), batch_size, None, None)
+            };
 
+        let sm_scale = if self.sm_scale == 0.0 {
+            1.0 / (self.head_dim as f32).sqrt()
+        } else {
+            self.sm_scale as f32
+        };
         Ok(FlashInferResolvedDecode {
             spec: FlashInferDecodeSpec {
                 total_q_tokens,
@@ -334,7 +424,11 @@ impl FlashInferAttention {
                 head_dim: self.head_dim,
                 kv_dim,
                 max_kv_pages,
+                dtype,
+                sm_scale_bits: sm_scale.to_bits(),
+                window_left: self.window_left as i32,
                 kv_indptr_host,
+                qo_indptr_host: Vec::new(),
             },
             ptrs: FlashInferDecodePointers {
                 q: q_buf.ptr(),
@@ -342,6 +436,7 @@ impl FlashInferAttention {
                 v_cache: v_buf.ptr(),
                 gather_idx: gather_idx_buf.ptr(),
                 output: out_buf.ptr(),
+                explicit_qo_indptr,
                 explicit_kv_indptr,
             },
         })
@@ -353,28 +448,44 @@ impl FlashInferAttention {
         mut resolved: FlashInferResolvedDecode,
         enable_cuda_graph: bool,
     ) -> anyhow::Result<PreparedFlashInferDecode> {
-        let lib = jit::ensure_compiled(self.head_dim);
+        let lib = jit::ensure_compiled(self.head_dim, self.window_left >= 0);
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
         let spec = &mut resolved.spec;
+        let is_prefill = spec.is_prefill();
+        if is_prefill && !spec.dtype.supports_prefill() {
+            anyhow::bail!(
+                "FlashInfer prefill requires f16/bf16 (tensor core MMA); got {:?} with s={} batch={}",
+                spec.dtype,
+                spec.total_q_tokens,
+                spec.batch_size
+            );
+        }
 
         let mut current_c = None;
         let mut current_c_ptr = None;
+
+        let read_device_i32s = |ptr: u64, n: usize| -> anyhow::Result<Vec<i32>> {
+            let mut host_bytes = vec![0u8; n * std::mem::size_of::<i32>()];
+            unsafe {
+                result::memcpy_dtoh_async(&mut host_bytes, ptr, stream.cu_stream())?;
+            }
+            stream.synchronize()?;
+            Ok(bytes_to_i32_vec(host_bytes))
+        };
 
         let (owned_kv_indptr, owned_kv_indptr_ptr) = if let Some(kv_indptr_ptr) =
             resolved.ptrs.explicit_kv_indptr
         {
             let r = spec.batch_size + 1;
-            let mut kv_indptr_host_bytes = vec![0u8; r * std::mem::size_of::<i32>()];
-            unsafe {
-                result::memcpy_dtoh_async(
-                    &mut kv_indptr_host_bytes,
-                    kv_indptr_ptr,
-                    stream.cu_stream(),
-                )?;
-            }
-            stream.synchronize()?;
-            spec.kv_indptr_host = bytes_to_i32_vec(kv_indptr_host_bytes);
+            spec.kv_indptr_host = read_device_i32s(kv_indptr_ptr, r)?;
             (None, None)
+        } else if is_prefill {
+            // Single-sequence prefill: s q tokens attending causally to a
+            // c-token context whose last s slots are the q tokens themselves.
+            spec.kv_indptr_host = vec![0, spec.c as i32];
+            let dev = stream.clone_htod(&spec.kv_indptr_host)?;
+            let ptr = dev.device_ptr(stream).0;
+            (Some(dev), Some(ptr))
         } else if enable_cuda_graph && spec.total_q_tokens == 1 {
             let actual_c = spec.c;
             let plan_c = flashinfer_graph_plan_capacity(actual_c, spec.max_kv_pages);
@@ -395,7 +506,7 @@ impl FlashInferAttention {
             }
             if spec.total_q_tokens != 1 {
                 anyhow::bail!(
-                    "FlashInfer derived causal decode without explicit indptrs requires s=1, got s={}",
+                    "FlashInfer derived causal decode without explicit indptrs requires s=1, got s={} (f32 prefill is unsupported — tensor cores are 16-bit)",
                     spec.total_q_tokens
                 );
             }
@@ -405,10 +516,26 @@ impl FlashInferAttention {
             (Some(dev), Some(ptr))
         };
 
+        // Prefill also needs qo_indptr (host for plan, device for run).
+        let (owned_qo_indptr, owned_qo_indptr_ptr) = if is_prefill {
+            if let Some(qo_indptr_ptr) = resolved.ptrs.explicit_qo_indptr {
+                let r = spec.batch_size + 1;
+                spec.qo_indptr_host = read_device_i32s(qo_indptr_ptr, r)?;
+                (None, None)
+            } else {
+                spec.qo_indptr_host = vec![0, spec.total_q_tokens as i32];
+                let dev = stream.clone_htod(&spec.qo_indptr_host)?;
+                let ptr = dev.device_ptr(stream).0;
+                (Some(dev), Some(ptr))
+            }
+        } else {
+            (None, None)
+        };
+
         let total_pages = spec.kv_indptr_host.last().copied().unwrap_or_default();
         if total_pages < 0 || total_pages as usize > spec.c {
             anyhow::bail!(
-                "FlashInfer derived decode describes {total_pages} KV pages, but compact gather_idx has only {}; fp32 FlashInfer currently supports decode-style causal masks, not single-sequence prefill",
+                "FlashInfer describes {total_pages} KV pages, but compact gather_idx has only {}",
                 spec.c
             );
         }
@@ -422,9 +549,9 @@ impl FlashInferAttention {
             stream.clone_htod(&last_page_len_host)?
         };
         let last_page_len_ptr = last_page_len.device_ptr(stream).0;
-        let temp_output = unsafe {
-            stream.alloc::<f32>((spec.total_q_tokens * spec.num_qo_heads * spec.head_dim).max(1))?
-        };
+        let temp_output_bytes =
+            (spec.total_q_tokens * spec.num_qo_heads * spec.head_dim * spec.dtype.size_of()).max(1);
+        let temp_output = unsafe { stream.alloc::<u8>(temp_output_bytes)? };
         let temp_output_ptr = temp_output.device_ptr(stream).0;
 
         let (float_workspace, float_workspace_ptr, int_workspace, int_workspace_ptr) =
@@ -440,28 +567,55 @@ impl FlashInferAttention {
 
         let mut plan_info_buf = [0i64; 16];
         let mut plan_info_len: i32 = 0;
-        let plan_ret = unsafe {
-            (lib.plan)(
-                float_workspace_ptr as *mut std::ffi::c_void,
-                FLOAT_WORKSPACE_SIZE,
-                int_workspace_ptr as *mut std::ffi::c_void,
-                INT_WORKSPACE_SIZE,
-                page_locked_workspace.0 as *mut std::ffi::c_void,
-                spec.kv_indptr_host.as_mut_ptr(),
-                spec.batch_size as i32,
-                spec.num_qo_heads as i32,
-                spec.num_kv_heads as i32,
-                spec.page_size as i32,
-                spec.head_dim as i32,
-                enable_cuda_graph,
-                cu_stream,
-                plan_info_buf.as_mut_ptr(),
-                &mut plan_info_len,
-            )
+        let plan_ret = if is_prefill {
+            unsafe {
+                (lib.prefill_plan)(
+                    float_workspace_ptr as *mut std::ffi::c_void,
+                    FLOAT_WORKSPACE_SIZE,
+                    int_workspace_ptr as *mut std::ffi::c_void,
+                    INT_WORKSPACE_SIZE,
+                    page_locked_workspace.0 as *mut std::ffi::c_void,
+                    spec.qo_indptr_host.as_mut_ptr(),
+                    spec.kv_indptr_host.as_mut_ptr(),
+                    spec.total_q_tokens as i32,
+                    spec.batch_size as i32,
+                    spec.num_qo_heads as i32,
+                    spec.num_kv_heads as i32,
+                    spec.page_size as i32,
+                    spec.head_dim as i32,
+                    spec.dtype as i32,
+                    spec.window_left,
+                    cu_stream,
+                    plan_info_buf.as_mut_ptr(),
+                    &mut plan_info_len,
+                )
+            }
+        } else {
+            unsafe {
+                (lib.plan)(
+                    float_workspace_ptr as *mut std::ffi::c_void,
+                    FLOAT_WORKSPACE_SIZE,
+                    int_workspace_ptr as *mut std::ffi::c_void,
+                    INT_WORKSPACE_SIZE,
+                    page_locked_workspace.0 as *mut std::ffi::c_void,
+                    spec.kv_indptr_host.as_mut_ptr(),
+                    spec.batch_size as i32,
+                    spec.num_qo_heads as i32,
+                    spec.num_kv_heads as i32,
+                    spec.page_size as i32,
+                    spec.head_dim as i32,
+                    spec.dtype as i32,
+                    enable_cuda_graph,
+                    cu_stream,
+                    plan_info_buf.as_mut_ptr(),
+                    &mut plan_info_len,
+                )
+            }
         };
         if plan_ret != 0 {
             return Err(anyhow::anyhow!(
-                "FlashInfer decode plan failed with error code {plan_ret}"
+                "FlashInfer {} plan failed with error code {plan_ret}",
+                if is_prefill { "prefill" } else { "decode" }
             ));
         }
 
@@ -476,6 +630,8 @@ impl FlashInferAttention {
             _page_locked_workspace_ptr: page_locked_workspace.0,
             _owned_kv_indptr: owned_kv_indptr,
             owned_kv_indptr_ptr,
+            _owned_qo_indptr: owned_qo_indptr,
+            owned_qo_indptr_ptr,
             current_c,
             current_c_ptr,
             _indices: indices,
@@ -507,10 +663,19 @@ impl PreparedFlashInferDecode {
         Ok(())
     }
 
+    /// Enqueue the attention kernels onto `stream`.
+    ///
+    /// `include_metadata` controls whether the kv-metadata preparation kernel
+    /// (indices/indptr/valid-mask derived from `gather_idx` + `current_c`) is
+    /// launched first. When several islands share one prepared plan (same
+    /// spec, same gather index), only the topologically-first owner needs to
+    /// launch it — the metadata buffers live in the shared workspaces and the
+    /// kernel only reads `plan_info`, never mutates it.
     pub(crate) fn enqueue(
         &self,
         stream: &Arc<CudaStream>,
         ptrs: FlashInferDecodePointers,
+        include_metadata: bool,
     ) -> anyhow::Result<()> {
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
         let kv_indptr_ptr = ptrs
@@ -519,7 +684,9 @@ impl PreparedFlashInferDecode {
             .ok_or_else(|| anyhow::anyhow!("FlashInfer decode is missing kv_indptr pointer"))?;
 
         let mut plan_info = self.plan_info.clone();
-        if let Some(current_c_ptr) = self.current_c_ptr {
+        if !include_metadata {
+            // Owner island already enqueued the metadata kernels this capture.
+        } else if let Some(current_c_ptr) = self.current_c_ptr {
             unsafe {
                 (self.lib.prepare_decode_metadata)(
                     self.int_workspace_ptr as *mut std::ffi::c_void,
@@ -546,44 +713,100 @@ impl PreparedFlashInferDecode {
             }
         }
 
-        let run_ret = unsafe {
-            (self.lib.run)(
-                self.float_workspace_ptr as *mut std::ffi::c_void,
-                FLOAT_WORKSPACE_SIZE,
-                self.int_workspace_ptr as *mut std::ffi::c_void,
-                plan_info.as_mut_ptr(),
-                plan_info.len() as i32,
-                ptrs.q as *mut f32,
-                ptrs.k_cache as *mut f32,
-                ptrs.v_cache as *mut f32,
-                kv_indptr_ptr as *mut i32,
-                self.indices_ptr as *mut i32,
-                self.last_page_len_ptr as *mut i32,
-                self.temp_output_ptr as *mut f32,
-                self.spec.batch_size as i32,
-                self.spec.num_qo_heads as i32,
-                self.spec.num_kv_heads as i32,
-                self.spec.page_size as i32,
-                self.spec.head_dim as i32,
-                cu_stream,
-            )
+        // At total_q_tokens == 1 the (batch, heads, dim) → (heads, batch, dim)
+        // output transpose is a byte-identity, so the kernel writes the real
+        // output buffer directly and the transpose launch is skipped — one
+        // fewer graph node per attention island per step.
+        let direct_output = self.spec.total_q_tokens == 1;
+        let run_output_ptr = if direct_output {
+            ptrs.output
+        } else {
+            self.temp_output_ptr
+        };
+
+        let run_ret = if self.spec.is_prefill() {
+            let qo_indptr_ptr = ptrs
+                .explicit_qo_indptr
+                .or(self.owned_qo_indptr_ptr)
+                .ok_or_else(|| anyhow::anyhow!("FlashInfer prefill is missing qo_indptr"))?;
+            unsafe {
+                (self.lib.prefill_run)(
+                    self.float_workspace_ptr as *mut std::ffi::c_void,
+                    FLOAT_WORKSPACE_SIZE,
+                    self.int_workspace_ptr as *mut std::ffi::c_void,
+                    plan_info.as_mut_ptr(),
+                    plan_info.len() as i32,
+                    ptrs.q as *mut std::ffi::c_void,
+                    ptrs.k_cache as *mut std::ffi::c_void,
+                    ptrs.v_cache as *mut std::ffi::c_void,
+                    qo_indptr_ptr as *mut i32,
+                    kv_indptr_ptr as *mut i32,
+                    self.indices_ptr as *mut i32,
+                    self.last_page_len_ptr as *mut i32,
+                    run_output_ptr as *mut std::ffi::c_void,
+                    self.spec.total_q_tokens as i32,
+                    self.spec.batch_size as i32,
+                    self.spec.num_qo_heads as i32,
+                    self.spec.num_kv_heads as i32,
+                    self.spec.page_size as i32,
+                    self.spec.head_dim as i32,
+                    self.spec.dtype as i32,
+                    f32::from_bits(self.spec.sm_scale_bits),
+                    self.spec.window_left,
+                    cu_stream,
+                )
+            }
+        } else {
+            unsafe {
+                (self.lib.run)(
+                    self.float_workspace_ptr as *mut std::ffi::c_void,
+                    FLOAT_WORKSPACE_SIZE,
+                    self.int_workspace_ptr as *mut std::ffi::c_void,
+                    plan_info.as_mut_ptr(),
+                    plan_info.len() as i32,
+                    ptrs.q as *mut std::ffi::c_void,
+                    ptrs.k_cache as *mut std::ffi::c_void,
+                    ptrs.v_cache as *mut std::ffi::c_void,
+                    kv_indptr_ptr as *mut i32,
+                    self.indices_ptr as *mut i32,
+                    self.last_page_len_ptr as *mut i32,
+                    run_output_ptr as *mut std::ffi::c_void,
+                    self.spec.batch_size as i32,
+                    self.spec.num_qo_heads as i32,
+                    self.spec.num_kv_heads as i32,
+                    self.spec.page_size as i32,
+                    self.spec.head_dim as i32,
+                    self.spec.dtype as i32,
+                    f32::from_bits(self.spec.sm_scale_bits),
+                    self.spec.window_left,
+                    cu_stream,
+                )
+            }
         };
 
         if run_ret != 0 {
             return Err(anyhow::anyhow!(
-                "FlashInfer decode run failed with error code {run_ret}"
+                "FlashInfer {} run failed with error code {run_ret}",
+                if self.spec.is_prefill() {
+                    "prefill"
+                } else {
+                    "decode"
+                }
             ));
         }
 
-        unsafe {
-            (self.lib.transpose_output)(
-                self.temp_output_ptr as *const f32,
-                ptrs.output as *mut f32,
-                self.spec.total_q_tokens as i32,
-                self.spec.num_qo_heads as i32,
-                self.spec.head_dim as i32,
-                cu_stream,
-            );
+        if !direct_output {
+            unsafe {
+                (self.lib.transpose_output)(
+                    self.temp_output_ptr as *const std::ffi::c_void,
+                    ptrs.output as *mut std::ffi::c_void,
+                    self.spec.total_q_tokens as i32,
+                    self.spec.num_qo_heads as i32,
+                    self.spec.head_dim as i32,
+                    self.spec.dtype as i32,
+                    cu_stream,
+                );
+            }
         }
 
         Ok(())
@@ -599,7 +822,17 @@ pub(crate) fn flashinfer_graph_plan_capacity(actual_c: usize, max_kv_pages: usiz
     {
         return capacity.max(required);
     }
-    max_kv_pages.max(required)
+    // Tiered capacity instead of the full KV pool: planning at the pool size
+    // (e.g. 4096) makes the decode kernel split KV into a padded grid that is
+    // mostly invalid blocks at short contexts (measured 6.3µs decode + 2.3µs
+    // merge per layer at c≈200 planned for 4096). Plan at the next power of
+    // two of the current context (min 256); when c outgrows the tier, the
+    // signature changes and the island recaptures with the next tier — a few
+    // recaptures per sequence instead of µs lost on every step.
+    required
+        .next_power_of_two()
+        .max(256)
+        .min(max_kv_pages.max(required))
 }
 
 impl HostOp for FlashInferAttention {
@@ -625,7 +858,7 @@ impl HostOp for FlashInferAttention {
             self.head_dim,
         )
         .entered();
-        prepared.enqueue(stream, ptrs)
+        prepared.enqueue(stream, ptrs, true)
     }
 
     fn output_size(&self) -> Expression {
@@ -633,7 +866,7 @@ impl HostOp for FlashInferAttention {
     }
 
     fn output_bytes(&self) -> Expression {
-        self.output_size() * 4
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
     }
 
     fn stats_name(&self) -> Option<&'static str> {
