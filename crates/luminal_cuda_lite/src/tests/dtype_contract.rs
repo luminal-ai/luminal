@@ -1463,3 +1463,22 @@ fn moe_gemv_matches_hlir_reference() {
         );
     }
 }
+
+#[test]
+fn test_embed_rule_rejects_non_embedding_gather() {
+    // Strided gather whose stride (8) differs from the flattened table's
+    // last dim (320): KernelEmbed must not match (LUM-679).
+    let (rows, cols, seq_len) = (40usize, 8usize, 6usize);
+    let mut cx = Graph::default();
+    let idx = cx.tensor(seq_len).as_dtype(DType::Int);
+    let table = cx.tensor(rows * cols).as_dtype(DType::F32); // 1-D flattened
+    let _out = table
+        .gather((idx * cols).expand_dim(1, cols) + cx.arange(cols).expand_dim(0, seq_len))
+        .output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_enode(&cx, "KernelEmbed", None),
+        "embed rewrite must not match a gather whose stride differs from the table row length"
+    );
+}

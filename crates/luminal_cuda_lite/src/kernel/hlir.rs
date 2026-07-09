@@ -2270,7 +2270,9 @@ impl EgglogOp for KernelEmbed {
                     ; token_stride lengths differ -> flatten_strides panic.
                     (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_iota_expr ?embed_dim)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
@@ -2298,7 +2300,9 @@ impl EgglogOp for KernelEmbed {
                     ; token_stride lengths differ -> flatten_strides panic.
                     (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_iota_expr ?embed_dim)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
@@ -2323,7 +2327,9 @@ impl EgglogOp for KernelEmbed {
                     ; batch_shape and token_stride lengths agree and the rule
                     ; doesn't mis-fire on non-embedding 2D gathers.
                     (= (len ?token_stride) 1)
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_iota_expr ?embed_dim)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
@@ -2348,7 +2354,9 @@ impl EgglogOp for KernelEmbed {
                     ; batch_shape and token_stride lengths agree and the rule
                     ; doesn't mis-fire on non-embedding 2D gathers.
                     (= (len ?token_stride) 1)
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
                     (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_iota_expr ?embed_dim)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
