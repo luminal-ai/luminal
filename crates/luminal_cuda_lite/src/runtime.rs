@@ -2149,7 +2149,7 @@ impl CudaRuntime {
                     .map(|edge| edge.source().index().to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                format!("{} <- [{}]: {:?}", idx.index(), inputs, &llir_graph[idx])
+                format!("{} <- [{}]: {:?}", idx.index(), inputs, llir_graph[idx])
             })
             .collect::<Vec<_>>()
             .join("\n");
