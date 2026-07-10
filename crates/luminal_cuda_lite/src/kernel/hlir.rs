@@ -2229,7 +2229,8 @@ pub struct KernelEmbed {
     batch_shape: Vec<Expression>,  // batch dimensions (e.g., [seq_len])
     token_stride: Vec<Expression>, // stride for token_ids input
     out_stride: Vec<Expression>,   // stride for output
-    embed_dim: Expression,         // embedding dimension
+    embed_dim: Expression,         // row length copied per token
+    row_stride: Expression,        // table row pitch (== embed_dim for embeddings)
     dtype: DType,                  // embedding table / output dtype
 }
 
@@ -2243,6 +2244,7 @@ impl EgglogOp for KernelEmbed {
                 ("token_stride", ELIST),
                 ("out_stride", ELIST),
                 ("embed_dim", EXPRESSION),
+                ("row_stride", EXPRESSION),
                 ("dtype", DTYPE),
             ],
         )
@@ -2270,13 +2272,16 @@ impl EgglogOp for KernelEmbed {
                     ; token_stride lengths differ -> flatten_strides panic.
                     (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
+                    (= ?iota_result (Op (Iota (MIter) ?arange_range) (INil)))
+                    (= ?embed_dim (nth_from_end ?idx_shape 0))
+                    (= ?embed_dim ?arange_range)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?mul_iota_expr ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
                     (set (dtype ?ke) ?embed_dt)
                 )
@@ -2298,13 +2303,16 @@ impl EgglogOp for KernelEmbed {
                     ; token_stride lengths differ -> flatten_strides panic.
                     (= (len ?token_cast_stride) 1)
                     (= ?token_ids_cast (Op (Cast ?cast_size ?cast_dtype) (ICons ?token_ids (INil))))
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
+                    (= ?iota_result (Op (Iota (MIter) ?arange_range) (INil)))
+                    (= ?embed_dim (nth_from_end ?idx_shape 0))
+                    (= ?embed_dim ?arange_range)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_cast_stride ?out_stride_batch ?embed_dim ?mul_iota_expr ?embed_dt) (ICons ?token_ids_cast (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
                     (set (dtype ?ke) ?embed_dt)
                 )
@@ -2323,13 +2331,16 @@ impl EgglogOp for KernelEmbed {
                     ; batch_shape and token_stride lengths agree and the rule
                     ; doesn't mis-fire on non-embedding 2D gathers.
                     (= (len ?token_stride) 1)
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
+                    (= ?iota_result (Op (Iota (MIter) ?arange_range) (INil)))
+                    (= ?embed_dim (nth_from_end ?idx_shape 0))
+                    (= ?embed_dim ?arange_range)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?mul_iota_expr ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
                     (set (dtype ?ke) ?embed_dt)
                 )
@@ -2348,13 +2359,16 @@ impl EgglogOp for KernelEmbed {
                     ; batch_shape and token_stride lengths agree and the rule
                     ; doesn't mis-fire on non-embedding 2D gathers.
                     (= (len ?token_stride) 1)
-                    (= ?embed_dim (nth_from_end ?embed_shape 0))
+                    (= ?mul_const (Op (Iota ?mul_iota_expr ?mul_iota_range) (INil)))
+                    (= ?iota_result (Op (Iota (MIter) ?arange_range) (INil)))
+                    (= ?embed_dim (nth_from_end ?idx_shape 0))
+                    (= ?embed_dim ?arange_range)
                     (= ?embed_dt (dtype ?embed_table))
                 )
                 (
                     (let ?batch_shape (RemoveNthFromEnd ?idx_shape 0))
                     (let ?out_stride_batch (RemoveNthFromEnd ?add_out_stride 0))
-                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
+                    (let ?ke (Op (KernelEmbed ?batch_shape ?token_stride ?out_stride_batch ?embed_dim ?mul_iota_expr ?embed_dt) (ICons ?token_ids (ICons ?embed_table (INil)))))
                     (union ?gather ?ke)
                     (set (dtype ?ke) ?embed_dt)
                 )
@@ -2385,7 +2399,8 @@ impl EgglogOp for KernelEmbed {
                 out_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
                     .unwrap(),
                 embed_dim: extract_expr(egraph, kind_children[3], expr_cache).unwrap(),
-                dtype: extract_dtype(egraph, kind_children[4]),
+                row_stride: extract_expr(egraph, kind_children[4], expr_cache).unwrap(),
+                dtype: extract_dtype(egraph, kind_children[5]),
             })),
             input_enodes, // token_ids, embedding_table
         )
@@ -2419,6 +2434,7 @@ impl KernelOp for KernelEmbed {
             .chain(self.token_stride.iter().flat_map(|e| e.dyn_vars()))
             .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
             .chain(self.embed_dim.dyn_vars())
+            .chain(self.row_stride.dyn_vars())
             .collect::<FxHashSet<_>>();
         let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
@@ -2429,6 +2445,7 @@ impl KernelOp for KernelEmbed {
         let token_offset_expr = flatten_strides(&self.batch_shape, &self.token_stride).to_kernel();
         let out_offset_expr = flatten_strides(&self.batch_shape, &self.out_stride).to_kernel();
         let embed_dim_expr = self.embed_dim.to_kernel();
+        let row_stride_expr = self.row_stride.to_kernel();
         let total_threads = batch_size * self.embed_dim;
         let n_elements = total_threads.to_kernel();
         let cuda_ty = cuda_dtype(self.dtype);
@@ -2441,13 +2458,14 @@ extern \"C\" {{
         long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= {n_elements}) return;
         long long embed_dim = {embed_dim_expr};
+        long long row_stride = {row_stride_expr};
         long long batch_idx = idx / embed_dim;
         long long embed_idx = idx % embed_dim;
         long long const_z = batch_idx;
         long long token_offset = {token_offset_expr};
         long long out_offset = {out_offset_expr};
         int token_id = token_ids[token_offset];
-        out[out_offset + embed_idx] = embed_table[(long long)token_id * embed_dim + embed_idx];
+        out[out_offset + embed_idx] = embed_table[(long long)token_id * row_stride + embed_idx];
     }}
 }}"
         );
