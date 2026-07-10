@@ -627,15 +627,7 @@ impl Expression {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(*n),
-                Term::Var(c) =>
-                {
-                    #[allow(clippy::needless_borrow)]
-                    if let Some(n) = variables.get(&c) {
-                        stack.push(*n as i64)
-                    } else {
-                        return None;
-                    }
-                }
+                Term::Var(c) => stack.push(*variables.get(c)? as i64),
                 _ => {
                     let a = stack.pop().unwrap();
                     let b = stack.pop().unwrap();
