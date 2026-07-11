@@ -19,7 +19,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, ELIST, OP_KIND},
         extract_dtype, extract_expr_list,
     },
@@ -63,12 +63,15 @@ impl EgglogOp for FusionStart {
     fn n_inputs(&self) -> usize {
         1
     }
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // No idempotence rule. `FusionStart(FusionStart(x)) ≡ FusionStart(x)`
         // would unify nested markers and create eclass cycles via the
         // pair-fuse rules; without it, occasional re-firings produce extra
         // semantically-correct identity layers, bounded by the run schedule.
         Vec::new()
+    };
+        __rules.into_iter().flatten().collect()
     }
     fn cleanup(&self) -> bool {
         false
@@ -141,7 +144,8 @@ impl EgglogOp for FusionEnd {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Generic region growth works directly from HLIR elementwise ops into
         // `Cuda*Elementwise` region nodes. The concrete HLIR op still appears in
         // the egraph, so fusion remains a normal nondestructive alternative, but
@@ -160,7 +164,7 @@ impl EgglogOp for FusionEnd {
 
         // Grow FE → unary consumer: U(FE(inner)) → FE(CudaUnary(inner)).
         for (hlir, opcode) in unaries {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
                     (= ?u (Op ({hlir} ?shape ?s ?s) (ICons ?fe (INil))))
@@ -179,7 +183,7 @@ impl EgglogOp for FusionEnd {
         // input's; the new FE takes the cast's target dtype. HLIR Cast is
         // positionwise (out[z] = (T)in[z]), so it preserves the producer's
         // layout and the FE's shape/strides carry over unchanged.
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
                 (= ?cast (Op (Cast ?size ?dt_out) (ICons ?fe (INil))))
@@ -196,7 +200,7 @@ impl EgglogOp for FusionEnd {
         // FS(Cast(x)) → CudaCast(FS(x)). The region reads x with the same
         // strides it would have used on the cast's output (cast preserves
         // layout) and converts in-register.
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
                 (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
@@ -215,7 +219,7 @@ impl EgglogOp for FusionEnd {
         // cast elem reading the FE's interior), leaving a 2-node FS/FE
         // cycle that extraction can select. Deleting the redundant
         // FS-wrapping-FE enode breaks the cycle; the fused form remains.
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
                 (= ?bad_fs (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
@@ -241,7 +245,7 @@ impl EgglogOp for FusionEnd {
         // growth is done (cleanup runs after the fusion_grow cycles, so
         // the row is not re-derived); the premise proves the absorbed
         // survivor exists in the same eclass, so the eclass never empties.
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
                 (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
@@ -254,7 +258,7 @@ impl EgglogOp for FusionEnd {
 
         // Grow FE → binary consumer, left and right orientations.
         for (hlir, opcode) in binaries {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                     (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
@@ -268,7 +272,7 @@ impl EgglogOp for FusionEnd {
                     (set (dtype ?new_fe) ?dt)
                  ) :ruleset fusion_grow :name \"grow-FE-B-lhs-{hlir}\")"
             )));
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
                     (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
@@ -288,7 +292,7 @@ impl EgglogOp for FusionEnd {
         // makes a region that initially treats `producer(...)` as an external
         // input able to pull that producer inside later.
         for (hlir, opcode) in unaries {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?u (Op ({hlir} ?shape ?s ?s) (ICons ?x (INil))))
                     (= ?fs_u (Op (FusionStart ?shape ?s ?dt) (ICons ?u (INil))))
@@ -299,7 +303,7 @@ impl EgglogOp for FusionEnd {
                     (union ?fs_u ?elem)
                  ) :ruleset fusion_grow :name \"grow-U-FS-{hlir}\")"
             )));
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
                     (= ?bad_fs (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
@@ -316,7 +320,7 @@ impl EgglogOp for FusionEnd {
             )));
         }
         for (hlir, opcode) in binaries {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
                                  (ICons ?a (ICons ?b (INil)))))
@@ -329,7 +333,7 @@ impl EgglogOp for FusionEnd {
                     (union ?fs_bin ?elem)
                  ) :ruleset fusion_grow :name \"grow-B-FS-{hlir}\")"
             )));
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?inner_fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                     (= ?bad_fs (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
@@ -345,7 +349,7 @@ impl EgglogOp for FusionEnd {
                     (delete (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
                  ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-lhs-{hlir}\")"
             )));
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?inner_fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
                     (= ?bad_fs (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
@@ -365,7 +369,7 @@ impl EgglogOp for FusionEnd {
 
         // Merge two FEs at a binary: B(FE(ia), FE(ib)) → FE(CudaBinary(ia, ib)).
         for (hlir, opcode) in binaries {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?fe_a (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
                     (= ?fe_b (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
@@ -387,7 +391,7 @@ impl EgglogOp for FusionEnd {
         // `Cycle(NodeIndex(_))`. Grow rules already compose adjacent regions
         // correctly without dissolve.
 
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
                 (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
@@ -396,7 +400,7 @@ impl EgglogOp for FusionEnd {
                 (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
              ) :ruleset cleanup :name \"delete-malformed-FE-unary-shape\")",
         ));
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
                 (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
@@ -405,7 +409,7 @@ impl EgglogOp for FusionEnd {
                 (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
              ) :ruleset cleanup :name \"delete-malformed-FE-unary-strides\")",
         ));
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
                 (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
@@ -414,7 +418,7 @@ impl EgglogOp for FusionEnd {
                 (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
              ) :ruleset cleanup :name \"delete-malformed-FE-binary-shape\")",
         ));
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
                 (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
@@ -423,7 +427,7 @@ impl EgglogOp for FusionEnd {
                 (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
              ) :ruleset cleanup :name \"delete-malformed-FE-binary-strides\")",
         ));
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
                 (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
@@ -432,7 +436,7 @@ impl EgglogOp for FusionEnd {
                 (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
              ) :ruleset cleanup :name \"delete-malformed-FE-nested-shape\")",
         ));
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                 (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
                 (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
@@ -443,6 +447,8 @@ impl EgglogOp for FusionEnd {
         ));
 
         rules
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

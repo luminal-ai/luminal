@@ -128,18 +128,28 @@
 
         ; ── Second matmul: Sum (reduction over c) → output ──
         ; Shape: (nheads, s, hdim) — reduces c
-        (= ?output (Op (Sum :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil)))) :iters (MVar "c") :iter_stride (MIter) ...)
+        (= ?output (Op (Sum
+                           :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+                           :iters (MVar "c")
+                           :iter_stride (MIter)
+                           ...)
             (ICons ?mul2 (INil))))
 
         ; ── V GQA broadcast: Mul(V_gathered, 1.0) with zero-stride constant ──
         ; Shape: (nheads, c, hdim) — 3D
         (const_like ?v_gqa_const 1.000000)
-        (= ?v_gqa (Op (Mul :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?v_gqa (Op (Mul
+                          :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
         ; ── V Gather: rows from V_cache (2D) ──
         ; Shape: (c, kvdim), Source: (num_slots, kvdim)
-        (= ?v_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil))) :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil))) ...)
+        (= ?v_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil)))
+                               :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         ; ── First matmul: Mul(Q, K_gqa) ──
@@ -149,13 +159,19 @@
 
         ; ── First matmul: Sum (reduction over hdim) → QK scores ──
         ; Shape: (nheads, s, c) — reduces hdim
-        (= ?qk (Op (Sum :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :iter_stride (MIter) ...)
+        (= ?qk (Op (Sum
+                       :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                       :iter_stride (MIter)
+                       ...)
             (ICons ?mul1 (INil))))
 
         ; ── Mask Add: Add(scaled_QK, mask) ──
         ; Shape: (nheads, s, c) — 3D
         ; Mask is broadcast from (s, c) via zero-stride in first dim (nheads).
-        (= ?masked (Op (Add :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) ?mask_rest_strides) ...)
+        (= ?masked (Op (Add
+                           :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                           :b_strides (ECons (MNum 0) ?mask_rest_strides)
+                           ...)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
         ; The mask-add's first operand is the QK score scaled by a broadcast
         ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
@@ -177,12 +193,18 @@
         ; ── K GQA broadcast: Mul(K_gathered, 1.0) with zero-stride constant ──
         ; Shape: (nheads, hdim, c) — 3D
         (const_like ?k_gqa_const 1.000000)
-        (= ?k_gqa (Op (Mul :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?k_gqa (Op (Mul
+                          :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
         ; ── K Gather: rows from K_cache (2D) ──
         ; Shape: (c, kvdim), Source: (num_slots, kvdim)
-        (= ?k_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil))) :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil))) ...)
+        (= ?k_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+                               :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?k_cache (INil)))))
 
         ; ── Dtype consistency ──
@@ -239,23 +261,39 @@
         (= ?mul2 (Op (Mul :shape (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil))))) ...)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
-        (= ?output (Op (Sum :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil)))) :iters (MVar "c") :iter_stride (MIter) ...)
+        (= ?output (Op (Sum
+                           :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+                           :iters (MVar "c")
+                           :iter_stride (MIter)
+                           ...)
             (ICons ?mul2 (INil))))
 
         (const_like ?v_gqa_const 1.000000)
-        (= ?v_gqa (Op (Mul :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?v_gqa (Op (Mul
+                          :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
-        (= ?v_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil))) :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil))) ...)
+        (= ?v_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil)))
+                               :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         (= ?mul1 (Op (Mul :shape (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil))))) ...)
             (ICons ?q (ICons ?k_gqa (INil)))))
 
-        (= ?qk (Op (Sum :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :iter_stride (MIter) ...)
+        (= ?qk (Op (Sum
+                       :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                       :iter_stride (MIter)
+                       ...)
             (ICons ?mul1 (INil))))
 
-        (= ?masked (Op (Add :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) ?mask_rest_strides) ...)
+        (= ?masked (Op (Add
+                           :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                           :b_strides (ECons (MNum 0) ?mask_rest_strides)
+                           ...)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
         ; The mask-add's first operand is the QK score scaled by a broadcast
         ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
@@ -273,10 +311,16 @@
         (fi_direct_causal_mask ?mask ?q_pos)
 
         (const_like ?k_gqa_const 1.000000)
-        (= ?k_gqa (Op (Mul :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?k_gqa (Op (Mul
+                          :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
-        (= ?k_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil))) :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil))) ...)
+        (= ?k_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+                               :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?k_cache (INil)))))
 
         (= ?dt (dtype ?q))
@@ -334,23 +378,39 @@
         (= ?mul2 (Op (Mul :shape (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil))))) ...)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
-        (= ?output (Op (Sum :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil)))) :iters (MVar "c") :iter_stride (MIter) ...)
+        (= ?output (Op (Sum
+                           :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+                           :iters (MVar "c")
+                           :iter_stride (MIter)
+                           ...)
             (ICons ?mul2 (INil))))
 
         (const_like ?v_gqa_const 1.000000)
-        (= ?v_gqa (Op (Mul :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?v_gqa (Op (Mul
+                          :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
-        (= ?v_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil))) :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil))) ...)
+        (= ?v_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil)))
+                               :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         (= ?mul1 (Op (Mul :shape (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil))))) ...)
             (ICons ?q (ICons ?k_gqa (INil)))))
 
-        (= ?qk (Op (Sum :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :iter_stride (MIter) ...)
+        (= ?qk (Op (Sum
+                       :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                       :iter_stride (MIter)
+                       ...)
             (ICons ?mul1 (INil))))
 
-        (= ?masked (Op (Add :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) ?mask_rest_strides) ...)
+        (= ?masked (Op (Add
+                           :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                           :b_strides (ECons (MNum 0) ?mask_rest_strides)
+                           ...)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
         ; The mask-add's first operand is the QK score scaled by a broadcast
         ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
@@ -372,10 +432,16 @@
         (fi_triu_mask ?mask ?q_pos)
 
         (const_like ?k_gqa_const 1.000000)
-        (= ?k_gqa (Op (Mul :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?k_gqa (Op (Mul
+                          :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
-        (= ?k_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil))) :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil))) ...)
+        (= ?k_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+                               :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?k_cache (INil)))))
 
         (= ?dt (dtype ?q))
@@ -431,23 +497,39 @@
         (= ?mul2 (Op (Mul :shape (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil))))) ...)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
-        (= ?output (Op (Sum :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil)))) :iters (MVar "c") :iter_stride (MIter) ...)
+        (= ?output (Op (Sum
+                           :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+                           :iters (MVar "c")
+                           :iter_stride (MIter)
+                           ...)
             (ICons ?mul2 (INil))))
 
         (const_like ?v_gqa_const 1.000000)
-        (= ?v_gqa (Op (Mul :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?v_gqa (Op (Mul
+                          :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
-        (= ?v_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil))) :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil))) ...)
+        (= ?v_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil)))
+                               :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         (= ?mul1 (Op (Mul :shape (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil))))) ...)
             (ICons ?q (ICons ?k_gqa (INil)))))
 
-        (= ?qk (Op (Sum :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :iter_stride (MIter) ...)
+        (= ?qk (Op (Sum
+                       :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                       :iter_stride (MIter)
+                       ...)
             (ICons ?mul1 (INil))))
 
-        (= ?masked (Op (Add :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) ?mask_rest_strides) ...)
+        (= ?masked (Op (Add
+                           :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                           :b_strides (ECons (MNum 0) ?mask_rest_strides)
+                           ...)
             (ICons ?scaled_qk (ICons ?mask (INil)))))
         ; The mask-add's first operand is the QK score scaled by a broadcast
         ; constant (1/sqrt(head_dim) — the frontend lowers `scores / s` to
@@ -469,10 +551,16 @@
         (fi_triu_mask ?mask ?q_pos)
 
         (const_like ?k_gqa_const 1.000000)
-        (= ?k_gqa (Op (Mul :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?k_gqa (Op (Mul
+                          :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
-        (= ?k_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil))) :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil))) ...)
+        (= ?k_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+                               :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?k_cache (INil)))))
 
         (= ?dt (dtype ?q))
@@ -503,7 +591,10 @@
 
 (rule
     (
-        (= ?cmask (Op (Gather :index_shape (ECons (MVar "s") (ECons (MVar "c") (ENil))) :data_shape (ECons (MVar "c") (ECons (MVar "c") (ENil))) ...)
+        (= ?cmask (Op (Gather
+                          :index_shape (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+                          :data_shape (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+                          ...)
             (ICons ?mask_indices (ICons ?scaled_blocked (INil)))))
         (= ?mask_indices (Op (Add :shape (ECons (MVar "s") (ECons (MVar "c") (ENil))) ...)
             (ICons ?row_offsets (ICons ?col_offsets (INil)))))
@@ -610,7 +701,11 @@
         (= ?w_lo (Op (Add :shape (ECons (MVar "s") (ENil)) ...)
             (ICons ?w_qpos_f (ICons ?w_neg (INil)))))
         (= ?w_qpos_f (Op (Cast :dtype (F32) ...) (ICons ?w_qpos (INil))))
-        (= ?w_neg (Op (Mul :shape (ECons (MVar "s") (ENil)) :a_strides (ECons (MNum 0) (ENil)) :b_strides (ECons (MNum 0) (ENil)) ...)
+        (= ?w_neg (Op (Mul
+                          :shape (ECons (MVar "s") (ENil))
+                          :a_strides (ECons (MNum 0) (ENil))
+                          :b_strides (ECons (MNum 0) (ENil))
+                          ...)
             (ICons ?w_window (ICons ?w_negone (INil)))))
         (= ?w_window (Op (Constant ?window_left) (INil)))
         (= ?w_negone (Op (Constant -1.000000) (INil)))
@@ -635,7 +730,10 @@
         (flashinfer_prefill_dt ?dt)
         (fi_triu_mask ?mask ?q_pos)
         ; mask Add → softmax internals → second matmul: one connected chain.
-        (= ?masked (Op (Add :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) ?mask_rest_strides) ...)
+        (= ?masked (Op (Add
+                           :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                           :b_strides (ECons (MNum 0) ?mask_rest_strides)
+                           ...)
             (ICons ?qk (ICons ?mask (INil)))))
         (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
@@ -656,26 +754,45 @@
         (= ?mul2 (Op (Mul :shape (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil))))) ...)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
-        (= ?output (Op (Sum :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil)))) :iters (MVar "c") :iter_stride (MIter) ...)
+        (= ?output (Op (Sum
+                           :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+                           :iters (MVar "c")
+                           :iter_stride (MIter)
+                           ...)
             (ICons ?mul2 (INil))))
 
         (const_like ?v_gqa_const 1.000000)
-        (= ?v_gqa (Op (Mul :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?v_gqa (Op (Mul
+                          :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
-        (= ?v_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil))) :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil))) ...)
+        (= ?v_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil)))
+                               :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         ; SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
-        (= ?qk (Op (Sum :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :iter_stride (MIter) ...)
+        (= ?qk (Op (Sum
+                       :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                       :iter_stride (MIter)
+                       ...)
             (ICons ?mul1 (INil))))
         (= ?mul1 (Op (Mul :shape (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil))))) ...)
             (ICons ?q (ICons ?k_gqa (INil)))))
         (const_like ?k_gqa_const 1.000000)
-        (= ?k_gqa (Op (Mul :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?k_gqa (Op (Mul
+                          :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
-        (= ?k_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil))) :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil))) ...)
+        (= ?k_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+                               :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?k_cache (INil)))))
 
         (= ?dt (dtype ?q))
@@ -711,7 +828,10 @@
         (fi_window_term ?wterm ?q_pos2 ?window_left)
         (= ?q_pos ?q_pos2)
         ; mask Add → softmax internals → second matmul: one connected chain.
-        (= ?masked (Op (Add :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) ?mask_rest_strides) ...)
+        (= ?masked (Op (Add
+                           :shape (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                           :b_strides (ECons (MNum 0) ?mask_rest_strides)
+                           ...)
             (ICons ?qk (ICons ?mask (INil)))))
         (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
@@ -732,26 +852,45 @@
         (= ?mul2 (Op (Mul :shape (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil))))) ...)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
-        (= ?output (Op (Sum :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil)))) :iters (MVar "c") :iter_stride (MIter) ...)
+        (= ?output (Op (Sum
+                           :shape (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+                           :iters (MVar "c")
+                           :iter_stride (MIter)
+                           ...)
             (ICons ?mul2 (INil))))
 
         (const_like ?v_gqa_const 1.000000)
-        (= ?v_gqa (Op (Mul :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?v_gqa (Op (Mul
+                          :shape (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
-        (= ?v_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil))) :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil))) ...)
+        (= ?v_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim (ENil)))
+                               :data_shape (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         ; SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
-        (= ?qk (Op (Sum :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil)))) :iter_stride (MIter) ...)
+        (= ?qk (Op (Sum
+                       :shape (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+                       :iter_stride (MIter)
+                       ...)
             (ICons ?mul1 (INil))))
         (= ?mul1 (Op (Mul :shape (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil))))) ...)
             (ICons ?q (ICons ?k_gqa (INil)))))
         (const_like ?k_gqa_const 1.000000)
-        (= ?k_gqa (Op (Mul :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil)))) :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))) ...)
+        (= ?k_gqa (Op (Mul
+                          :shape (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+                          :b_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+                          ...)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
-        (= ?k_gathered (Op (Gather :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil))) :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil))) ...)
+        (= ?k_gathered (Op (Gather
+                               :index_shape (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+                               :data_shape (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+                               ...)
             (ICons ?k_idx (ICons ?k_cache (INil)))))
 
         (= ?dt (dtype ?q))

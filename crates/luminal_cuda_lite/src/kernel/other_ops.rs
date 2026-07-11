@@ -9,7 +9,7 @@ use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use itertools::Itertools;
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, ELIST, EXPRESSION, OP_KIND, STRING},
         extract_dtype, extract_expr, extract_expr_list,
     },
@@ -49,11 +49,14 @@ impl EgglogOp for KernelMeanReduce {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Disabled: the e-graph union introduced by this rule can cause the search
         // to select genomes with accumulated FP precision issues over many layers.
         // The unfused Sum + Mul(Recip(Cast(Iota))) path produces equivalent results.
         vec![]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -283,7 +286,8 @@ impl EgglogOp for KernelScatterNoCopy {
         3
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Match KernelScatter and rewrite to KernelScatterNoCopy with ConsumedBuffer on dest.
         // ConsumedBuffer wraps dest to signal in-place modification.
         // This is only valid when the destination buffer can also represent
@@ -299,8 +303,8 @@ impl EgglogOp for KernelScatterNoCopy {
         // If ConsumedBuffer was deleted (shared case), cascade cleanup removes the dependent
         // ICons and KernelScatterNoCopy Op, leaving only KernelScatter.
         let mut rules = vec![
-            Rule::raw("(relation consumed_buffer_ilist_contains (IList IR))"),
-            Rule::raw(
+            raw_rules(parser, "(relation consumed_buffer_ilist_contains (IList IR))"),
+            raw_rules(parser, 
                 "(rule
                     ((= ?list (ICons ?head ?tail)))
                     ((consumed_buffer_ilist_contains ?list ?head))
@@ -308,7 +312,7 @@ impl EgglogOp for KernelScatterNoCopy {
                     :name \"consumed-buffer-ilist-contains-head\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?list (ICons ?head ?tail))
                      (consumed_buffer_ilist_contains ?tail ?item))
@@ -318,7 +322,7 @@ impl EgglogOp for KernelScatterNoCopy {
                 )",
             ),
             // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
@@ -338,7 +342,7 @@ impl EgglogOp for KernelScatterNoCopy {
                 )",
             ),
             // Dtype propagation for ConsumedBuffer
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?cb (ConsumedBuffer ?a))
                      (= ?dt (dtype ?a)))
@@ -349,7 +353,7 @@ impl EgglogOp for KernelScatterNoCopy {
             ),
         ];
         // Cleanup: delete ConsumedBuffer when inner buffer is used by a DIFFERENT Op.
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule
                 ((= ?cb (ConsumedBuffer ?a))
                  (= ?op1 (Op ?k1 ?ilist1))
@@ -364,7 +368,7 @@ impl EgglogOp for KernelScatterNoCopy {
         ));
         // If a valid no-copy scatter survives cleanup, it dominates the copying scatter.
         // This must run before base_cleanup resolves ConsumedBuffer back to the destination.
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule
                 ((= ?cb (ConsumedBuffer ?dest))
                  (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
@@ -380,7 +384,7 @@ impl EgglogOp for KernelScatterNoCopy {
         // Surviving ConsumedBuffers are valid — union with source and delete.
         // Runs in base_cleanup (after all (run) iterations).
         // TODO: figure out how to validate this is a valid ConsumedBuffer independantly so we can run it in the cleanup ruleset, rather than base_cleanup
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule
                 ((= ?cb (ConsumedBuffer ?a)))
                 ((union ?cb ?a)
@@ -390,6 +394,8 @@ impl EgglogOp for KernelScatterNoCopy {
             )",
         ));
         rules
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

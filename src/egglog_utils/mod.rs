@@ -38,6 +38,18 @@ pub fn raw_rules(
         .expect("raw egglog rules should parse")
 }
 
+/// A parser with egglog-experimental's named-arg macros registered and every op
+/// kind's schema parsed, so that `#kind`/`:#field`/`...` in rule generators
+/// (via `rewrites_commands`) expand against the real op schemas.
+pub fn schema_parser(ops: &[Arc<Box<dyn EgglogOp>>]) -> egglog::ast::Parser {
+    let mut parser = egglog::ast::Parser::default();
+    egglog_experimental::register_named_args(&mut parser);
+    parser
+        .get_program_from_string(None, &op_defs_string(ops))
+        .expect("op definitions should parse");
+    parser
+}
+
 const MAIN_SCHEDULE_MAX_CYCLES: usize = 256;
 const MAIN_SCHEDULE_MAX_TUPLES: usize = 10_000_000;
 const SLOW_PHASE_TIME: Duration = Duration::from_secs(1);

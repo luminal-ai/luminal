@@ -3,6 +3,7 @@
 //! CudaGraphOp wraps a subgraph of KernelOps into a single executable unit
 //! that can be executed like any other HostOp.
 
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::Arc;
 use std::{
     cell::RefCell,
@@ -16,7 +17,7 @@ use cudarc::driver::{
 use fixedbitset::FixedBitSet;
 use itertools::Itertools;
 use luminal::{
-    egglog_utils::{api::Rule, base::OP_KIND},
+    egglog_utils::base::OP_KIND,
     graph::LLIRGraph,
     hlir::{LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart},
     op::{EgglogOp, LLIROp},
@@ -636,8 +637,11 @@ impl EgglogOp for CudaGraphOp {
         luminal::egglog_utils::api::sort(OP_KIND, "CudaGraphOp", &[])
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn extract<'a>(

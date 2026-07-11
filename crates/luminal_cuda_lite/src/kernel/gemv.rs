@@ -20,7 +20,7 @@ use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::dtype::DType;
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, EXPRESSION, OP_KIND},
         extract_dtype, extract_expr,
     },
@@ -51,7 +51,8 @@ impl EgglogOp for KernelGemv {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Same structural anchors as "cublaslt row-major × column-major",
         // restricted to m == 1 (decode GEMV) and 16-bit dtypes.
         // Two m-shape variants per dtype: a literal (MNum 1) for static
@@ -75,7 +76,7 @@ impl EgglogOp for KernelGemv {
             .into_iter()
             .flat_map(|(variant, m_cond)| ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt)))
             .map(|(variant, m_cond, dt)| {
-                Rule::raw(format!(
+                raw_rules(parser, format!(
                     "(rule
                         (
                             (= ?sum (Op (GenericMatmul
@@ -119,6 +120,8 @@ impl EgglogOp for KernelGemv {
                 ))
             })
             .collect()
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -321,7 +324,8 @@ impl EgglogOp for KernelGemvF8 {
         4
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let m_variants: [(&str, &str); 2] = [
             (
                 "static",
@@ -358,7 +362,7 @@ impl EgglogOp for KernelGemvF8 {
             .into_iter()
             .flat_map(|m| a_variants.into_iter().map(move |a| (m, a)))
             .map(|((variant, m_cond), (a_variant, a_cond))| {
-                Rule::raw(format!(
+                raw_rules(parser, format!(
                     "(rule
                     (
                         ; A is a pre-quantized f8 activation with its input
@@ -411,6 +415,8 @@ impl EgglogOp for KernelGemvF8 {
                 ))
             })
             .collect()
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

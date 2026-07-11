@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use super::api::*;
-use crate::shape::{self, ToShape};
+use crate::shape;
 use egglog::prelude::egglog;
 use rustc_hash::FxHashSet;
 
@@ -158,49 +158,6 @@ pub fn remove_nth(list: Term, ind: Term) -> Term {
 }
 pub fn rowmajor(list: Term) -> Term {
     SORTS.row_major.call(("list", list))
-}
-
-// ---- Conversions from shape types to egglog terms ----
-
-/// Convert a shape `Expression` into an egglog `Term`.
-pub fn expr_to_term(expr: &shape::Expression) -> Term {
-    let mut stack = Vec::new();
-    for term in expr.terms.read().iter() {
-        let t = match term {
-            shape::Term::Num(n) => num(i64(*n)),
-            shape::Term::Var(c) => mvar(str(&c.to_string())),
-            op => {
-                let a = stack.pop().unwrap();
-                let b = stack.pop().unwrap();
-                match op {
-                    shape::Term::Add => add(a, b),
-                    shape::Term::Sub => sub(a, b),
-                    shape::Term::Mul => mul(a, b),
-                    shape::Term::Div => div(a, b),
-                    shape::Term::CeilDiv => ceildiv(a, b),
-                    shape::Term::Mod => modd(a, b),
-                    shape::Term::Min => min(a, b),
-                    shape::Term::Max => max(a, b),
-                    shape::Term::And => and(a, b),
-                    shape::Term::Or => or(a, b),
-                    shape::Term::Gte => gte(a, b),
-                    shape::Term::Lt => lt(a, b),
-                    _ => unreachable!(),
-                }
-            }
-        };
-        stack.push(t);
-    }
-    stack.pop().unwrap()
-}
-
-/// Convert a shape (anything implementing `ToShape`) into an egglog `EList` term.
-pub fn shape_to_elist(shape: impl ToShape) -> Term {
-    shape
-        .to_shape()
-        .iter()
-        .rev()
-        .fold(nil(), |acc, expr| cons(expr_to_term(expr), acc))
 }
 
 /// All sort classes, sort definitions, and convenience term constructors
@@ -366,62 +323,6 @@ impl BaseSorts {
             f_nelem: func("n_elements", &["list"]),
         }
     }
-
-    /// Register all sort classes and variants into a Program.
-    pub fn register(&self, p: &mut Program) {
-        p.add_class(EXPRESSION);
-        p.add_class(ELIST);
-        p.add_class(DTYPE);
-
-        for s in [
-            &self.m_num,
-            &self.m_float,
-            &self.m_iter,
-            &self.m_var,
-            &self.m_add,
-            &self.m_sub,
-            &self.m_mul,
-            &self.m_ceildiv,
-            &self.m_div,
-            &self.m_mod,
-            &self.m_min,
-            &self.m_max,
-            &self.m_and,
-            &self.m_or,
-            &self.m_gte,
-            &self.m_lt,
-            &self.m_floorto,
-            &self.m_replace,
-            &self.e_cons,
-            &self.e_nil,
-            &self.m_replace_list,
-            &self.replace_nth_from_end,
-            &self.remove_nth_from_end,
-            &self.row_major,
-            &self.f32_dt,
-            &self.f64_dt,
-            &self.f16_dt,
-            &self.bf16_dt,
-            &self.int_dt,
-            &self.int64_dt,
-            &self.bool_dt,
-            &self.f4e2m1_dt,
-            &self.f8e4m3_dt,
-            &self.f8e5m2_dt,
-            &self.f8ue8m0_dt,
-            &self.i4_dt,
-            &self.u4_dt,
-            &self.i8_dt,
-            &self.u8_dt,
-            &self.i16_dt,
-            &self.u16_dt,
-            &self.tf32_dt,
-            &self.f6e2m3_dt,
-            &self.f6e3m2_dt,
-        ] {
-            p.add_sort(s);
-        }
-    }
 }
 
 pub fn dtype(e: Term) -> Term {
@@ -448,19 +349,19 @@ pub fn interval_facts_egglog(
         let var_expr = mvar(str(&var.to_string()));
         out.push_str(&format!(
             "(set {} {})\n",
-            term_to_egglog(&interval_lower(var_expr.clone())),
+            sexp_to_string(&interval_lower(var_expr.clone())),
             interval.min
         ));
         out.push_str(&format!(
             "(set {} {})\n",
-            term_to_egglog(&interval_upper(var_expr)),
+            sexp_to_string(&interval_upper(var_expr)),
             interval.max
         ));
         if interval.min == interval.max {
             out.push_str(&format!(
                 "(union {} {})\n",
-                term_to_egglog(&mvar(str(&var.to_string()))),
-                term_to_egglog(&num(i64(interval.min)))
+                sexp_to_string(&mvar(str(&var.to_string()))),
+                sexp_to_string(&num(i64(interval.min)))
             ));
         }
     }
@@ -471,24 +372,17 @@ pub fn interval_facts_egglog(
 
 /// Build an `(Op kind inputs)` IR term.
 pub fn op_term(kind: Term, inputs: Term) -> Term {
-    Term::App {
-        variant: "Op".to_string(),
-        args: vec![kind, inputs],
-    }
+    call_named("Op", vec![kind, inputs])
 }
 
 /// Build an IList from IR terms: `(ICons t1 (ICons t2 (INil)))`.
 pub fn ilist(terms: Vec<Term>) -> Term {
-    terms.into_iter().rev().fold(
-        Term::App {
-            variant: "INil".to_string(),
-            args: vec![],
-        },
-        |tail, head| Term::App {
-            variant: "ICons".to_string(),
-            args: vec![head, tail],
-        },
-    )
+    terms
+        .into_iter()
+        .rev()
+        .fold(call_named("INil", vec![]), |tail, head| {
+            call_named("ICons", vec![head, tail])
+        })
 }
 
 /// Construct a normalized Op call from an OpKind SortDef + named args + input terms.

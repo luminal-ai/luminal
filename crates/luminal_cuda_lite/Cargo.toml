@@ -10,6 +10,9 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 luminal = { path = "../.." }
 luminal_tracing = { path = "../luminal_tracing" }
+# Needed so the `egglog!` quasiquote (which expands to `::egglog::…`) resolves
+# when used in rule generators here.
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "f0c356ff36481880079d13bd64afa25ba7053eae" }
 cudarc = {version="0.19.4", features=["cuda-version-from-build-system", "fallback-latest"]}
 anyhow = "1.0"
 as-any = "0.3.2"

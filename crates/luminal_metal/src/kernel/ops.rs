@@ -3,7 +3,7 @@ use luminal::{
     egglog_utils::{
         SerializedEGraph,
         api::{
-            Args, Rule, SortDef, Term as EggTerm, app, eq, i64 as lit_i64, rule, sort, union, v,
+            Args, SortDef, Term as EggTerm, app, eq, i64 as lit_i64, sort, v,
         },
         base::{
             DTYPE, ELIST, EXPRESSION, F64, I64, IR, OP_KIND, SORTS, add, cons, div, dtype, ilist,
@@ -18,6 +18,7 @@ use luminal::{
     prelude::*,
     shape::flatten_strides,
 };
+use egglog::{egglog, sexp}; // the `egglog!` / `sexp!` quasiquote macros
 use metal::{
     Buffer, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLLanguageVersion, MTLSize,
     foreign_types::{ForeignType, ForeignTypeRef},
@@ -144,32 +145,48 @@ fn call_sort_from_args(sort: &SortDef, args: &Args) -> EggTerm {
     sort.call(filtered_args)
 }
 
-fn unary_dtype_rewrite(hlir_sort: &SortDef, metal_sort: &SortDef) -> Rule {
+fn unary_dtype_rewrite(
+    parser: &mut Parser,
+    hlir_sort: &SortDef,
+    metal_sort: &SortDef,
+) -> Vec<Command> {
     let (args, hlir_match) = new_op_call(hlir_sort, &["inp"]);
     let metal_op = op_term(
         call_sort_from_args(metal_sort, &args),
         args["__inputs"].clone(),
     );
-    let dt = v("?__dt");
-    rule(union(hlir_match.clone(), metal_op.clone()))
-        .subsume(hlir_match)
-        .set(dtype(metal_op), dt.clone())
-        .fact(eq(dt, dtype(args["inp"].clone())))
-        .ruleset("kernel_lower")
+    let inp = args["inp"].clone();
+    egglog!(
+        *parser,
+        (rule ((= ?__dt (dtype #inp)))
+              ((union #(hlir_match.clone()) #(metal_op.clone()))
+               (subsume #hlir_match)
+               (set (dtype #metal_op) ?__dt))
+            :ruleset kernel_lower)
+    )
+    .expect("metal unary dtype rewrite should parse")
 }
 
-fn binary_dtype_rewrite(hlir_sort: &SortDef, metal_sort: &SortDef) -> Rule {
+fn binary_dtype_rewrite(
+    parser: &mut Parser,
+    hlir_sort: &SortDef,
+    metal_sort: &SortDef,
+) -> Vec<Command> {
     let (args, hlir_match) = new_op_call(hlir_sort, &["inp_a", "inp_b"]);
     let metal_op = op_term(
         call_sort_from_args(metal_sort, &args),
         args["__inputs"].clone(),
     );
-    let dt = v("?__dt");
-    rule(union(hlir_match.clone(), metal_op.clone()))
-        .subsume(hlir_match)
-        .set(dtype(metal_op), dt.clone())
-        .fact(eq(dt, dtype(args["inp_a"].clone())))
-        .ruleset("kernel_lower")
+    let inp_a = args["inp_a"].clone();
+    egglog!(
+        *parser,
+        (rule ((= ?__dt (dtype #inp_a)))
+              ((union #(hlir_match.clone()) #(metal_op.clone()))
+               (subsume #hlir_match)
+               (set (dtype #metal_op) ?__dt))
+            :ruleset kernel_lower)
+    )
+    .expect("metal binary dtype rewrite should parse")
 }
 
 // ============================================================================
@@ -250,11 +267,14 @@ macro_rules! metal_unary_op {
                 unary_sort($op_name)
             }
 
-            fn rewrites(&self) -> Vec<Rule> {
+            fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
                 let hlir_name = ($op_name).strip_prefix("Metal").unwrap_or($op_name);
                 let hlir_sort = unary_sort(hlir_name);
-                vec![unary_dtype_rewrite(&hlir_sort, &self.sort())]
-            }
+                vec![unary_dtype_rewrite(parser, &hlir_sort, &self.sort())]
+            };
+        __rules.into_iter().flatten().collect()
+    }
 
             fn cleanup(&self) -> bool {
                 false
@@ -398,7 +418,8 @@ impl EgglogOp for MetalAdd {
         binary_sort("MetalAdd")
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (args2, hlir_match2) = new_op_call(&Add::default().sort(), &["inp_a", "inp_b"]);
         let metal_op2 = op_term(
             call_sort_from_args(&self.sort(), &args2),
@@ -406,12 +427,15 @@ impl EgglogOp for MetalAdd {
         );
 
         vec![
-            binary_dtype_rewrite(&Add::default().sort(), &self.sort()),
-            rule(union(hlir_match2.clone(), metal_op2.clone()))
-                .subsume(hlir_match2)
-                .set(dtype(metal_op2), app(&SORTS.f32_dt, vec![]))
-                .ruleset("kernel_lower"),
+            binary_dtype_rewrite(parser, &Add::default().sort(), &self.sort()),
+            egglog!(
+                *parser,
+                (rule () ((union #(hlir_match2.clone()) #(metal_op2.clone())) (subsume #hlir_match2) (set (dtype #metal_op2) (F32))) :ruleset kernel_lower)
+            )
+            .expect("MetalAdd kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -544,8 +568,11 @@ impl EgglogOp for MetalMul {
         binary_sort("MetalMul")
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![binary_dtype_rewrite(&Mul::default().sort(), &self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![binary_dtype_rewrite(parser, &Mul::default().sort(), &self.sort())]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -686,8 +713,11 @@ impl EgglogOp for MetalMod {
         binary_sort("MetalMod")
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![binary_dtype_rewrite(&Mod::default().sort(), &self.sort())]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![binary_dtype_rewrite(parser, &Mod::default().sort(), &self.sort())]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -824,11 +854,14 @@ impl EgglogOp for MetalLessThan {
         binary_sort("MetalLessThan")
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![binary_dtype_rewrite(
             &LessThan::default().sort(),
             &self.sort(),
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -973,11 +1006,14 @@ impl EgglogOp for MetalSumReduce {
         reduce_sort("MetalSum")
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![unary_dtype_rewrite(
             &SumReduce::default().sort(),
             &self.sort(),
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1144,11 +1180,14 @@ impl EgglogOp for MetalMaxReduce {
         reduce_sort("MetalMax")
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![unary_dtype_rewrite(
             &MaxReduce::default().sort(),
             &self.sort(),
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1324,7 +1363,8 @@ impl EgglogOp for MPSMatmul {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let zero = num(lit_i64(0));
         let z = iter();
         let expr_list = |terms: Vec<EggTerm>| {
@@ -1413,10 +1453,11 @@ impl EgglogOp for MPSMatmul {
             ]);
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
-            rule(union(sum_op.clone(), mps_op.clone()))
-                .set(dtype(mps_op), dt.clone())
-                .fact(eq(dt, dtype(sum_op)))
-                .ruleset("kernel_lower")
+            egglog!(
+                *parser,
+                (rule ((= #(dt.clone()) (dtype #(sum_op.clone())))) ((union #sum_op #(mps_op.clone())) (set (dtype #mps_op) #dt)) :ruleset kernel_lower)
+            )
+            .expect("Metal MPS-sum kernel-lowering rule should parse")
                 .name(name)
         };
 
@@ -1449,7 +1490,7 @@ impl EgglogOp for MPSMatmul {
                 1,
                 1,
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
                      (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
@@ -1461,6 +1502,8 @@ impl EgglogOp for MPSMatmul {
                 )",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1701,7 +1744,8 @@ impl EgglogOp for MPSBatchedMatmul {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let zero = num(lit_i64(0));
         let z = iter();
         let expr_list = |terms: Vec<EggTerm>| {
@@ -1822,11 +1866,11 @@ impl EgglogOp for MPSBatchedMatmul {
             ]);
             let dt = v(format!("?{}_dt", name.replace('-', "_")));
 
-            rule(union(sum_op.clone(), mps_op.clone()))
-                .set(dtype(mps_op), dt.clone())
-                .fact(eq(dt, dtype(sum_op)))
-                .when(mps_matrix_row_byte_guards)
-                .ruleset("kernel_lower")
+            egglog!(
+                *parser,
+                (rule ((= #(dt.clone()) (dtype #(sum_op.clone()))) #..mps_matrix_row_byte_guards) ((union #sum_op #(mps_op.clone())) (set (dtype #mps_op) #dt)) :ruleset kernel_lower)
+            )
+            .expect("Metal MPS-sum (row-guarded) kernel-lowering rule should parse")
                 .name(name)
         };
 
@@ -1861,7 +1905,7 @@ impl EgglogOp for MPSBatchedMatmul {
                 ),
                 1,
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
                      (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
@@ -1873,6 +1917,8 @@ impl EgglogOp for MPSBatchedMatmul {
                 )",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -2093,7 +2139,8 @@ impl EgglogOp for GenericMatmul {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let mul_shape = v("?generic_matmul_mul_shape");
         let out_shape = v("?generic_matmul_out_shape");
         let k = v("?generic_matmul_k");
@@ -2140,12 +2187,13 @@ impl EgglogOp for GenericMatmul {
         let dt = v("?generic_matmul_dt");
 
         vec![
-            rule(union(sum_op.clone(), generic_op.clone()))
-                .set(dtype(generic_op.clone()), dt.clone())
-                .fact(eq(dt, dtype(sum_op)))
-                .ruleset("matmul_backend")
+            egglog!(
+                *parser,
+                (rule ((= #(dt.clone()) (dtype #(sum_op.clone())))) ((union #sum_op #(generic_op.clone())) (set (dtype #generic_op) #dt)) :ruleset matmul_backend)
+            )
+            .expect("Metal MPS generic-matmul rule should parse")
                 .name("generic-matmul-metal-mul-sum"),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?mul (Op (MetalMul ?shape ?as ?bs ?os) ?inputs))
                      (= ?sum (Op (MetalSum ?sshape ?sk ?ssi ?sks ?sso) (ICons ?mul (INil))))
@@ -2157,6 +2205,8 @@ impl EgglogOp for GenericMatmul {
                 )",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -2359,15 +2409,19 @@ impl EgglogOp for MetalConstant {
         sort(IR, "MetalConstant", &[("value", F64)])
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (args, const_match) = new_op_call(&Constant::default().sort(), &[]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
         vec![
-            rule(union(const_match.clone(), metal_op.clone()))
-                .subsume(const_match)
-                .set(dtype(metal_op), app(&SORTS.f32_dt, vec![]))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule () ((union #(const_match.clone()) #(metal_op.clone())) (subsume #const_match) (set (dtype #metal_op) (F32))) :ruleset kernel_lower)
+            )
+            .expect("MetalConstant kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -2471,15 +2525,19 @@ impl EgglogOp for MetalIota {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (args, iota_match) = new_op_call(&Iota::default().sort(), &[]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
         vec![
-            rule(union(iota_match.clone(), metal_op.clone()))
-                .subsume(iota_match)
-                .set(dtype(metal_op), app(&SORTS.int_dt, vec![]))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule () ((union #(iota_match.clone()) #(metal_op.clone())) (subsume #iota_match) (set (dtype #metal_op) (Int))) :ruleset kernel_lower)
+            )
+            .expect("MetalIota kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -2597,7 +2655,8 @@ impl EgglogOp for MetalGather {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (gather_args, gather_match) =
             new_op_call(&Gather::default().sort(), &["indexes", "data"]);
         let out_strides = SORTS
@@ -2621,12 +2680,14 @@ impl EgglogOp for MetalGather {
         ];
         let metal_op = self.sort().call(metal_args);
         vec![
-            rule(union(gather_match.clone(), metal_op.clone()))
-                .subsume(gather_match)
-                .set(dtype(metal_op), dt.clone())
-                .fact(eq(dt, dtype(gather_args["data"].clone())))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule ((= #(dt.clone()) (dtype #(gather_args["data"].clone())))) ((union #(gather_match.clone()) #(metal_op.clone())) (subsume #gather_match) (set (dtype #metal_op) #dt)) :ruleset kernel_lower)
+            )
+            .expect("MetalGather kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -2809,7 +2870,8 @@ impl EgglogOp for MetalScatter {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (scatter_args, scatter_match) =
             new_op_call(&Scatter::default().sort(), &["dest", "indexes", "src"]);
         let out_strides = SORTS
@@ -2841,12 +2903,14 @@ impl EgglogOp for MetalScatter {
         ];
         let metal_op = self.sort().call(metal_args);
         vec![
-            rule(union(scatter_match.clone(), metal_op.clone()))
-                .subsume(scatter_match)
-                .set(dtype(metal_op), dt.clone())
-                .fact(eq(dt, dtype(scatter_args["src"].clone())))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule ((= #(dt.clone()) (dtype #(scatter_args["src"].clone())))) ((union #(scatter_match.clone()) #(metal_op.clone())) (subsume #scatter_match) (set (dtype #metal_op) #dt)) :ruleset kernel_lower)
+            )
+            .expect("MetalScatter kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -3082,10 +3146,11 @@ impl EgglogOp for MetalScatterNoCopy {
         vec!["(ConsumedBuffer IR)".to_string()]
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
-            Rule::raw("(relation consumed_buffer_ilist_contains (IList IR))"),
-            Rule::raw(
+            raw_rules(parser, "(relation consumed_buffer_ilist_contains (IList IR))"),
+            raw_rules(parser, 
                 "(rule
                     ((= ?list (ICons ?head ?tail)))
                     ((consumed_buffer_ilist_contains ?list ?head))
@@ -3093,7 +3158,7 @@ impl EgglogOp for MetalScatterNoCopy {
                     :name \"metal-consumed-buffer-ilist-contains-head\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?list (ICons ?head ?tail))
                      (consumed_buffer_ilist_contains ?tail ?item))
@@ -3102,7 +3167,7 @@ impl EgglogOp for MetalScatterNoCopy {
                     :name \"metal-consumed-buffer-ilist-contains-tail\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?scatter (MetalScatter ?ds ?dst ?dest ?indexes ?is ?istr ?src ?ss ?os))
                      (= ?dst ?os)
@@ -3116,7 +3181,7 @@ impl EgglogOp for MetalScatterNoCopy {
                     :name \"metal-scatter-to-scatter-no-copy\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?cb (ConsumedBuffer ?a))
                      (= ?dt (dtype ?a)))
@@ -3125,7 +3190,7 @@ impl EgglogOp for MetalScatterNoCopy {
                     :name \"metal-consumed-buffer-dtype\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?cb (ConsumedBuffer ?a))
                      (= ?op1 (Op ?k1 ?ilist1))
@@ -3138,7 +3203,7 @@ impl EgglogOp for MetalScatterNoCopy {
                     :name \"metal-consumed-buffer-cleanup-shared-op-use\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?cb (ConsumedBuffer ?dest))
                      (= ?scatter (MetalScatter ?ds ?dst ?dest ?indexes ?is ?istr ?src ?ss ?os))
@@ -3149,7 +3214,7 @@ impl EgglogOp for MetalScatterNoCopy {
                     :name \"metal-scatter-no-copy-dominates-valid-consumed-buffer\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     ((= ?cb (ConsumedBuffer ?a)))
                     ((union ?cb ?a)
@@ -3159,6 +3224,8 @@ impl EgglogOp for MetalScatterNoCopy {
                 )",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -3333,15 +3400,19 @@ impl EgglogOp for MetalCast {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (args, cast_match) = new_op_call(&Cast::default().sort(), &["inp"]);
         let metal_op = call_sort_from_args(&self.sort(), &args);
         vec![
-            rule(union(cast_match.clone(), metal_op.clone()))
-                .subsume(cast_match)
-                .set(dtype(metal_op), args["dtype"].clone())
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule () ((union #(cast_match.clone()) #(metal_op.clone())) (subsume #cast_match) (set (dtype #metal_op) #(args["dtype"].clone()))) :ruleset kernel_lower)
+            )
+            .expect("MetalCast kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

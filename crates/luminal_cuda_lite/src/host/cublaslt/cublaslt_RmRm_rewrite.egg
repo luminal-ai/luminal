@@ -12,7 +12,13 @@
 (rule
     (
         ; Match the generic matmul produced from Mul -> Sum.
-        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
+        (= ?sum (Op (GenericMatmul
+                        :out_shape ?out_shape
+                        :k ?k
+                        :lhs_strides ?a_stride
+                        :rhs_strides ?b_stride
+                        :sum_iter_stride ?k_stride
+                        ...)
             (ICons ?a (ICons ?b (INil)))))
 
         ; Match exactly 2D output shape
@@ -77,7 +83,13 @@
 ; Leading dimensions may differ from k/n when batch slices are non-contiguous.
 (rule
     (
-        (= ?sum (Op (GenericMatmul :out_shape ?out_shape :k ?k :lhs_strides ?a_stride :rhs_strides ?b_stride :sum_iter_stride ?k_stride ...)
+        (= ?sum (Op (GenericMatmul
+                        :out_shape ?out_shape
+                        :k ?k
+                        :lhs_strides ?a_stride
+                        :rhs_strides ?b_stride
+                        :sum_iter_stride ?k_stride
+                        ...)
             (ICons ?a (ICons ?b (INil)))))
 
         ; Output shape: [batch, m, n]

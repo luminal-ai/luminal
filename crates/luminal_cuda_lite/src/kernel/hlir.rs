@@ -8,7 +8,7 @@ use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use itertools::Itertools;
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, Term, app, eq, rule, set, sort, union, v},
+        api::{SortDef, app, call_named, sort, v},
         base::{DTYPE, ELIST, EXPRESSION, F64, OP_KIND, SORTS, dtype, ilist, op_term},
         extract_dtype, extract_expr, extract_expr_list,
     },
@@ -16,6 +16,7 @@ use luminal::{
     op::*,
     prelude::*,
 };
+use egglog::{egglog, sexp}; // the `egglog!` / `sexp!` quasiquote macros
 
 /// Generates CUDA include directives based on the dtypes used in a kernel
 pub fn dtype_includes(dtypes: &[DType]) -> String {
@@ -63,19 +64,29 @@ pub type Ops = (
 
 /// Build a rewrite that matches an HLIR op, reads dtype(s) from the given source fields,
 /// and unions with a kernel op that has the same fields plus the dtype(s) appended.
-pub fn kernel_rewrite<H: Default + EgglogOp, L: Default + EgglogOp>() -> Rule {
+pub fn kernel_rewrite<H: Default + EgglogOp, L: Default + EgglogOp>(
+    parser: &mut Parser,
+) -> Vec<Command> {
+    // Build the hlir/llir op patterns as `Sexp` fragments (no `Term`): fields
+    // are shared by name (`?__<field>`) and spliced with `#..`; llir adds a
+    // `dtype` field (`?__dtype`) that the guard binds from the hlir op.
     let hlir = H::default().sort();
     let llir = L::default().sort();
-    let (mut args, hlir_kind_term) = hlir.new_call();
-    let inputs = v("?__inputs");
-    let hlir_op = op_term(hlir_kind_term, inputs.clone());
-    let dt = v("?__dt");
-    args.add("dtype", dt.clone());
-    let llir_kind_term = llir.call(&args);
-    let llir_op = op_term(llir_kind_term, inputs);
-    rule(union(hlir_op.clone(), llir_op))
-        .fact(eq(dt, dtype(hlir_op)))
-        .ruleset("kernel_lower")
+    let hk = hlir.name.as_str();
+    let lk = llir.name.as_str();
+    let hlir_fields: Vec<String> =
+        hlir.fields.iter().map(|f| format!("?__{}", f.name)).collect();
+    let llir_fields: Vec<String> =
+        llir.fields.iter().map(|f| format!("?__{}", f.name)).collect();
+    let hlir_op = sexp!((Op (#hk #..hlir_fields) ?__inputs));
+    let llir_op = sexp!((Op (#lk #..llir_fields) ?__inputs));
+    egglog!(
+        *parser,
+        (rule ((= ?__dtype (dtype #(hlir_op.clone()))))
+              ((union #hlir_op #llir_op))
+            :ruleset kernel_lower)
+    )
+    .expect("kernel_rewrite rule should parse")
 }
 
 #[derive(Default, Debug, Clone)]
@@ -108,8 +119,11 @@ impl EgglogOp for KernelMaxReduce {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![kernel_rewrite::<MaxReduce, Self>()]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![kernel_rewrite::<MaxReduce, Self>(parser)]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -332,8 +346,11 @@ impl EgglogOp for KernelSumReduce {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![kernel_rewrite::<SumReduce, Self>()]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![kernel_rewrite::<SumReduce, Self>(parser)]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -579,14 +596,15 @@ impl EgglogOp for KernelCastSumReduce {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // The inner Cast is positionwise (out[z] = (float)in[z]), so the
         // SumReduce's shape/strides over the cast output apply unchanged to
         // the 16-bit input.
         ["F16", "Bf16"]
             .into_iter()
             .map(|dt| {
-                Rule::raw(format!(
+                raw_rules(parser, format!(
                     "(rule (
                         (= ?x_cast (Op (Cast ?cast_size (F32)) (ICons ?x (INil))))
                         (= ({dt}) (dtype ?x))
@@ -600,6 +618,8 @@ impl EgglogOp for KernelCastSumReduce {
                 ))
             })
             .collect()
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -807,7 +827,8 @@ impl EgglogOp for KernelGather {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Match HLIR Gather (now in Op format) and rewrite to KernelGather.
         // Mirror the IList pattern used by `Gather`'s own dtype propagation
         // rule (`src/hlir.rs`): use a `?__tail` variable instead of a
@@ -821,16 +842,13 @@ impl EgglogOp for KernelGather {
         let indexes = v("?__indexes");
         let data = v("?__data");
         let tail = v("?__tail");
-        let gather_inputs = Term::App {
-            variant: "ICons".to_string(),
-            args: vec![
+        let gather_inputs = call_named(
+            "ICons",
+            vec![
                 indexes.clone(),
-                Term::App {
-                    variant: "ICons".to_string(),
-                    args: vec![data.clone(), tail],
-                },
+                call_named("ICons", vec![data.clone(), tail]),
             ],
-        };
+        );
         let gather_op = op_term(gather_kind_term, gather_inputs);
 
         let out_strides = SORTS
@@ -854,10 +872,14 @@ impl EgglogOp for KernelGather {
         let kernel_kind_term = self.sort().call(kernel_kind_args);
         let kernel_op = op_term(kernel_kind_term, ilist(vec![indexes, data.clone()]));
         vec![
-            rule(union(gather_op, kernel_op))
-                .fact(eq(dt, dtype(data)))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule ((= #dt (dtype #data))) ((union #gather_op #kernel_op)) :ruleset kernel_lower)
+            )
+            .expect("Gather kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1054,7 +1076,8 @@ impl EgglogOp for KernelScatter {
         3
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Match HLIR Scatter (now in Op format) and rewrite to KernelScatter
         let hlir_scatter = luminal::hlir::Scatter::default().sort();
         let (scatter_args, scatter_kind_term) = hlir_scatter.new_call();
@@ -1093,10 +1116,14 @@ impl EgglogOp for KernelScatter {
         let kernel_kind_term = self.sort().call(kernel_kind_args);
         let kernel_op = op_term(kernel_kind_term, ilist(vec![dest, indexes, src.clone()]));
         vec![
-            rule(union(scatter_op, kernel_op))
-                .fact(eq(dt, dtype(src)))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule ((= #dt (dtype #src))) ((union #scatter_op #kernel_op)) :ruleset kernel_lower)
+            )
+            .expect("Scatter kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1340,17 +1367,22 @@ impl EgglogOp for KernelIota {
         0
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (args, hlir_iota_kind) = luminal::hlir::Iota::default().sort().new_call();
         let hlir_inputs = v("?__inputs");
         let hlir_op = op_term(hlir_iota_kind, hlir_inputs.clone());
         let kernel_kind = self.sort().call(&args);
         let kernel_op = op_term(kernel_kind, hlir_inputs);
         vec![
-            rule(union(hlir_op, kernel_op.clone()))
-                .set(dtype(kernel_op), app(&SORTS.int_dt, vec![]))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule () ((union #hlir_op #(kernel_op.clone())) (set (dtype #kernel_op) (Int))) :ruleset kernel_lower)
+            )
+            .expect("Iota kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1488,8 +1520,11 @@ impl EgglogOp for KernelMod {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![kernel_rewrite::<Mod, Self>()]
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![kernel_rewrite::<Mod, Self>(parser)]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1650,7 +1685,8 @@ impl EgglogOp for KernelLessThan {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let hlir = LessThan::default().sort();
         let (mut args, hlir_kind_term) = hlir.new_call();
         // LessThan's dtype is Bool (output type), but the kernel needs the INPUT dtype
@@ -1664,10 +1700,14 @@ impl EgglogOp for KernelLessThan {
         let kernel_kind_term = self.sort().call(&args);
         let kernel_op = op_term(kernel_kind_term, hlir_inputs);
         vec![
-            rule(union(hlir_op, kernel_op))
-                .fact(eq(dt, dtype(inp_a)))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule ((= #dt (dtype #inp_a))) ((union #hlir_op #kernel_op)) :ruleset kernel_lower)
+            )
+            .expect("LessThan kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1821,7 +1861,8 @@ impl EgglogOp for KernelConstant {
         0
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let (mut args, const_kind) = luminal::hlir::Constant::default().sort().new_call();
         let hlir_inputs = v("?__inputs");
         let hlir_op = op_term(const_kind, hlir_inputs.clone());
@@ -1829,9 +1870,11 @@ impl EgglogOp for KernelConstant {
         let kernel_kind = self.sort().call(&args);
         let kernel_op = op_term(kernel_kind, hlir_inputs);
         let mut rules = vec![
-            rule(union(hlir_op, kernel_op.clone()))
-                .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![]))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule () ((union #hlir_op #(kernel_op.clone())) (set (dtype #kernel_op) (F32))) :ruleset kernel_lower)
+            )
+            .expect("Constant kernel-lowering rule should parse"),
         ];
         // Fold an explicit Cast around a Constant into a dtype-typed
         // KernelConstant. HLIR constants are always F32 (the frontend emits
@@ -1842,7 +1885,7 @@ impl EgglogOp for KernelConstant {
         // casts for scalars on f32 tensors; folding gives downstream rules a
         // constant-valued enode (see const_like) in the cast's eclass.
         for dt in ["F16", "Bf16", "F32"] {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?c (Op (Constant ?val) (INil)))
                     (= ?cast (Op (Cast ?size ({dt})) (ICons ?c (INil))))
@@ -1854,6 +1897,8 @@ impl EgglogOp for KernelConstant {
             )));
         }
         rules
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -1986,7 +2031,8 @@ impl EgglogOp for KernelCast {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Match HLIR Cast and rewrite to KernelCast
         let hlir_cast = luminal::hlir::Cast::default().sort();
         let (mut cast_args, cast_kind_term) = hlir_cast.new_call();
@@ -2001,10 +2047,14 @@ impl EgglogOp for KernelCast {
         let kernel_kind_term = self.sort().call(&cast_args);
         let kernel_op = op_term(kernel_kind_term, cast_inputs);
         vec![
-            rule(union(cast_op, kernel_op))
-                .fact(eq(in_dty, dtype(inp)))
-                .ruleset("kernel_lower"),
+            egglog!(
+                *parser,
+                (rule ((= #in_dty (dtype #inp))) ((union #cast_op #kernel_op)) :ruleset kernel_lower)
+            )
+            .expect("Cast kernel-lowering rule should parse"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -2252,11 +2302,12 @@ impl EgglogOp for KernelEmbed {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
             // Match Gather with Add(Mul(Cast(token_ids), const), Iota) indices
             // Now uses (Op (OpKind ...) (ICons ...)) format
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
                     (= (len ?idx_shape) 2)
@@ -2284,7 +2335,7 @@ impl EgglogOp for KernelEmbed {
                 :name \"kernel embed with cast mul\"
             )"),
             // Match Gather with Add(Iota, Mul(Cast(token_ids), const)) indices (reversed order)
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
                     (= (len ?idx_shape) 2)
@@ -2312,7 +2363,7 @@ impl EgglogOp for KernelEmbed {
                 :name \"kernel embed with cast mul reversed\"
             )"),
             // Match Gather with Add(Mul(token_ids, const), Iota) indices (no Cast)
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
                     (= (len ?idx_shape) 2)
@@ -2337,7 +2388,7 @@ impl EgglogOp for KernelEmbed {
                 :name \"kernel embed with mul\"
             )"),
             // Match Gather with Add(Iota, Mul(token_ids, const)) indices (reversed order, no Cast)
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 (
                     (= ?gather (Op (Gather ?idx_shape ?idx_stride ?embed_shape ?embed_stride) (ICons ?indices (ICons ?embed_table (INil)))))
                     (= (len ?idx_shape) 2)
@@ -2362,6 +2413,8 @@ impl EgglogOp for KernelEmbed {
                 :name \"kernel embed with mul reversed\"
             )"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

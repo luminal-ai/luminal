@@ -23,9 +23,9 @@ as-any = "0.3.1"
 serde = { version = "1.0.202", features = ["derive"] }
 generational-box = "0.5.6"
 serde_json = "1.0.140"
-egglog = {git="https://github.com/egraphs-good/egglog.git", rev="857237af22cc490cf274b636580f859323e0d3f7"}
-egglog-ast = {git="https://github.com/egraphs-good/egglog.git", rev="857237af22cc490cf274b636580f859323e0d3f7"}
-egglog-reports = {git="https://github.com/egraphs-good/egglog.git", rev="857237af22cc490cf274b636580f859323e0d3f7"}
+egglog = {git="https://github.com/egraphs-good/egglog.git", rev="f0c356ff36481880079d13bd64afa25ba7053eae"}
+egglog-ast = {git="https://github.com/egraphs-good/egglog.git", rev="f0c356ff36481880079d13bd64afa25ba7053eae"}
+egglog-reports = {git="https://github.com/egraphs-good/egglog.git", rev="f0c356ff36481880079d13bd64afa25ba7053eae"}
 egglog-experimental = { path = "../egglog-experimental", default-features = false }
 egraph-serialize = { version = "0.3.0", default-features = false, features = ["graphviz", "serde"]}
 tracing = "0.1.43"
@@ -58,10 +58,3 @@ members = [
 
 [patch.crates-io]
 candle-kernels = { git = "https://github.com/huggingface/candle.git", rev = "a0dbd8b8aef6bde9adca3e8ad90791609d64974b" }
-
-# Local dev against the forked egglog (quasiquote `:#field` keyword-splice etc.)
-# not yet pushed. Remove and bump the `rev` above once egglog is pushed.
-[patch."https://github.com/egraphs-good/egglog.git"]
-egglog = { path = "../egglog-quote" }
-egglog-ast = { path = "../egglog-quote/egglog-ast" }
-egglog-reports = { path = "../egglog-quote/egglog-reports" }

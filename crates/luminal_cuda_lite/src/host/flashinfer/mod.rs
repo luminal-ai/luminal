@@ -1,12 +1,13 @@
 pub mod find_indptrs;
 pub mod jit;
 
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, EXPRESSION, F64, OP_KIND},
         extract_dtype, extract_expr,
     },
@@ -234,7 +235,8 @@ impl EgglogOp for FlashInferAttention {
         5
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // FlashInfer requires Ampere+ (sm_80; the kernels use cp.async /
         // async-copy). On older arches — e.g. a T4 (sm_75) — emit no rules so
         // the search never selects FlashInfer and attention stays on the HLIR
@@ -245,7 +247,9 @@ impl EgglogOp for FlashInferAttention {
         if crate::device_compute_major() < 8 {
             return vec![];
         }
-        vec![Rule::raw(include_str!["flashinfer_attention.egg"])]
+        vec![raw_rules(parser, include_str!["flashinfer_attention.egg"])]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn extract<'a>(

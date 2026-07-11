@@ -60,7 +60,11 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
+        (= ?relu (Op (Add
+                         :shape ?shape
+                         :a_strides ?zeroed_strides
+                         :b_strides ?positive_strides
+                         ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -136,7 +140,11 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
+        (= ?relu (Op (Add
+                         :shape ?shape
+                         :a_strides ?zeroed_strides
+                         :b_strides ?positive_strides
+                         ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -212,7 +220,11 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
+        (= ?relu (Op (Add
+                         :shape ?shape
+                         :a_strides ?zeroed_strides
+                         :b_strides ?positive_strides
+                         ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (
@@ -288,7 +300,11 @@
             ?matmul_strides
             ?positive_strides)
             (ICons ?not_mask (ICons ?matmul (INil)))))
-        (= ?relu (Op (Add :shape ?shape :a_strides ?zeroed_strides :b_strides ?positive_strides ...)
+        (= ?relu (Op (Add
+                         :shape ?shape
+                         :a_strides ?zeroed_strides
+                         :b_strides ?positive_strides
+                         ...)
             (ICons ?zeroed (ICons ?positive (INil)))))
     )
     (

@@ -14,6 +14,8 @@ pub mod tests;
 pub mod prelude {
     pub use crate::dtype::DType;
     pub use crate::egglog_utils::SerializedEGraph;
+    pub use crate::egglog_utils::raw_rules;
+    pub use ::egglog::ast::{Command, Parser};
     pub use crate::frontend::binary::F32Pow;
     pub use crate::frontend::*;
     pub use crate::graph::*;

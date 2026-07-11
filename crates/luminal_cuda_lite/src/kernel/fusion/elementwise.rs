@@ -11,7 +11,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, ELIST, OP_KIND, STRING},
         extract_dtype, extract_expr_list,
     },
@@ -65,7 +65,8 @@ impl EgglogOp for CudaUnaryElementwise {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         let mut rules = Vec::new();
         for (hlir, opcode) in [
             ("Sin", "Sin"),
@@ -74,7 +75,7 @@ impl EgglogOp for CudaUnaryElementwise {
             ("Log2", "Log2"),
             ("Recip", "Recip"),
         ] {
-            rules.push(Rule::raw(format!(
+            rules.push(raw_rules(parser, format!(
                 "(rule (
                     (= ?u (Op ({hlir} ?shape ?s ?out_s) (ICons ?x (INil))))
                     (= ?dt (dtype ?u))
@@ -89,7 +90,7 @@ impl EgglogOp for CudaUnaryElementwise {
             )));
         }
 
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule (
                     (= ?sqrt (Op (Sqrt ?shape ?x_stride ?sqrt_stride) (ICons ?x (INil))))
                     (= ?recip (Op (Recip ?shape ?sqrt_stride ?out_stride) (ICons ?sqrt (INil))))
@@ -104,7 +105,7 @@ impl EgglogOp for CudaUnaryElementwise {
                  ) :ruleset kernel_lower :name \"cuda-elem-rsqrt-from-sqrt-recip\")",
         ));
 
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(rule
                 (
                     (= ?mul (Op (Mul ?shape ?x_stride ?const_stride ?inter_stride) (ICons ?x (ICons ?exp_const (INil)))))
@@ -128,7 +129,7 @@ impl EgglogOp for CudaUnaryElementwise {
             )",
         ));
 
-        rules.push(Rule::raw(
+        rules.push(raw_rules(parser, 
             "(datatype*
                 (CudaSigmoidScaledState
                     (MkCudaSigmoidScaledState IR EList EList DType)
@@ -181,6 +182,8 @@ impl EgglogOp for CudaUnaryElementwise {
         ));
 
         rules
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -278,9 +281,10 @@ impl EgglogOp for CudaBinaryElementwise {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule (
                     (= ?bin (Op (Add ?shape ?a_s ?b_s ?out_s) (ICons ?a (ICons ?b (INil)))))
                     (= ?dt (dtype ?bin))
@@ -294,7 +298,7 @@ impl EgglogOp for CudaBinaryElementwise {
                     (set (dtype ?fe) ?dt)
                  ) :ruleset kernel_lower :name \"cuda-elem-singleton-Add\")",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule (
                     (= ?bin (Op (Mul ?shape ?a_s ?b_s ?out_s) (ICons ?a (ICons ?b (INil)))))
                     (= ?dt (dtype ?a))
@@ -309,6 +313,8 @@ impl EgglogOp for CudaBinaryElementwise {
                  ) :ruleset kernel_lower :name \"cuda-elem-singleton-Mul\")",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

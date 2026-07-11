@@ -352,11 +352,13 @@ fn flashinfer_egg_rule_parses() {
     // Rule::raw() returns the rule with no validation; egglog parses it at
     // graph build. Smoke-test by running it through the egglog frontend via
     // a tiny program string.
+    let ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
+    let mut parser = luminal::egglog_utils::schema_parser(&ops);
     let op = FlashInferAttention::default();
-    let rewrites = op.rewrites();
+    let rewrites = op.rewrites_commands(&mut parser);
     assert_eq!(rewrites.len(), 1);
     // The rule must mention FlashInferAttention to be the right one.
-    let s = format!("{:?}", rewrites[0]);
+    let s = format!("{}", rewrites[0]);
     assert!(
         s.contains("FlashInferAttention"),
         "rewrite is not the FlashInfer rule: {s}"
@@ -885,11 +887,12 @@ fn flashinfer_dump_paged_attn_egglog() {
     eprintln!("==== Ops rewrites count ====");
     let mut fi_rewrites = 0usize;
     let mut total_rewrites = 0usize;
+    let mut parser = luminal::egglog_utils::schema_parser(&ops_vec);
     for op in &ops_vec {
-        let rws = op.rewrites();
+        let rws = op.rewrites_commands(&mut parser);
         total_rewrites += rws.len();
         for r in &rws {
-            let s = format!("{r:?}");
+            let s = format!("{r}");
             if s.contains("FlashInferAttention") {
                 fi_rewrites += 1;
                 eprintln!("FOUND FlashInfer rewrite ({} chars)", s.len());

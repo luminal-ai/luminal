@@ -7,6 +7,7 @@
 //! dtype in/out — same compute precision as the widened decomposed chain,
 //! rounded once at the store.
 
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -331,7 +332,7 @@ pub fn fused_swiglu_quant(
 
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{ELIST, OP_KIND},
         extract_expr_list,
     },
@@ -396,8 +397,9 @@ impl EgglogOp for KernelSwiglu {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(format!(
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![raw_rules(parser, format!(
             "(rule
                 ({}
                 )
@@ -411,6 +413,8 @@ impl EgglogOp for KernelSwiglu {
             )",
             swiglu_chain_atoms()
         ))]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -453,8 +457,9 @@ impl EgglogOp for KernelSwigluQuant {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(format!(
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![raw_rules(parser, format!(
             "(rule
                 ({}
 
@@ -476,6 +481,8 @@ impl EgglogOp for KernelSwigluQuant {
             )",
             swiglu_chain_atoms()
         ))]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

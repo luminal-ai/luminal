@@ -36,7 +36,7 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{ELIST, EXPRESSION, OP_KIND},
         extract_expr, extract_expr_list,
     },
@@ -83,8 +83,9 @@ impl EgglogOp for KernelMoEGemv {
         3
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![raw_rules(parser, 
             "(rule
                 (
                     ; expert flat index: topk · (O·D) + within-expert iota.
@@ -136,6 +137,8 @@ impl EgglogOp for KernelMoEGemv {
                 :name \"kernel moe gemv from expert gather\"
             )",
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

@@ -21,7 +21,7 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{ELIST, OP_KIND},
         extract_expr_list,
     },
@@ -44,7 +44,8 @@ impl EgglogOp for KernelStableSortIdx {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Mirrors the exact emission of stable_argsort(axis=1, descending):
         //   a_val = x·1.0 viewed (rows, E_j, E_i→0)   strides (z·E, z, 0)
         //   b_val = x·1.0 viewed (rows, 0, E_i)       strides (z·E, 0, z)
@@ -62,7 +63,7 @@ impl EgglogOp for KernelStableSortIdx {
         // multiplies the join by the instance count). Each stage walks a
         // chain from a strongly-pinned anchor; later stages key every atom
         // off relation-bound variables.
-        vec![Rule::raw(
+        vec![raw_rules(parser, 
             "(relation stable_ranks_part (IR IR IR IR IR EList))
             (relation stable_ranks (IR IR EList))
             (rule
@@ -164,6 +165,8 @@ impl EgglogOp for KernelStableSortIdx {
                 :name \"kernel stable ranks descending\"
             )",
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
