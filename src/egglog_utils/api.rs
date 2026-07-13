@@ -27,7 +27,7 @@ pub struct Field {
 /// This is a direct alias for egglog's pre-parse [`Sexp`]. Builders below
 /// construct `Sexp` values that splice straight into `egglog!`/`sexp!`
 /// quasiquotes via `ToSexp` (identity for `Sexp`), and render back to source
-/// text via [`sexp_to_string`]. (Formerly a bespoke luminal `Term` enum with a
+/// text via `Sexp`'s `Display`. (Formerly a bespoke luminal `Term` enum with a
 /// hand-rolled `Rule`/`Program`/`term_to_egglog` DSL — all now deleted in favor
 /// of the quasiquote.)
 pub type Term = Sexp;
@@ -37,57 +37,6 @@ pub type Term = Sexp;
 /// used in diagnostics.
 fn sp() -> Span {
     egglog::span!()
-}
-
-// ========== Rendering back to text ==========
-
-/// Render a [`Sexp`] (a built [`Term`]) back to egglog source text. Used on the
-/// setup path where term text is concatenated into a program string (e.g.
-/// [`crate::egglog_utils::base::interval_facts_egglog`]).
-pub fn sexp_to_string(sexp: &Sexp) -> String {
-    match sexp {
-        Sexp::Literal(lit, _) => literal_to_string(lit),
-        Sexp::Atom(a, _) => a.clone(),
-        Sexp::List(items, _) => {
-            let inner = items
-                .iter()
-                .map(sexp_to_string)
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("({inner})")
-        }
-    }
-}
-
-fn literal_to_string(lit: &Literal) -> String {
-    match lit {
-        Literal::Int(v) => v.to_string(),
-        Literal::Float(v) => {
-            let s = v.to_string();
-            if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
-                s
-            } else {
-                format!("{s}.0")
-            }
-        }
-        Literal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-        Literal::String(s) => {
-            let mut escaped = String::with_capacity(s.len() + 2);
-            escaped.push('"');
-            for c in s.chars() {
-                match c {
-                    '\\' => escaped.push_str("\\\\"),
-                    '"' => escaped.push_str("\\\""),
-                    '\n' => escaped.push_str("\\n"),
-                    '\t' => escaped.push_str("\\t"),
-                    c => escaped.push(c),
-                }
-            }
-            escaped.push('"');
-            escaped
-        }
-        Literal::Unit => "()".to_string(),
-    }
 }
 
 // ========== Args ==========

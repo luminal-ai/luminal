@@ -349,19 +349,19 @@ pub fn interval_facts_egglog(
         let var_expr = mvar(str(&var.to_string()));
         out.push_str(&format!(
             "(set {} {})\n",
-            sexp_to_string(&interval_lower(var_expr.clone())),
+            interval_lower(var_expr.clone()),
             interval.min
         ));
         out.push_str(&format!(
             "(set {} {})\n",
-            sexp_to_string(&interval_upper(var_expr)),
+            interval_upper(var_expr),
             interval.max
         ));
         if interval.min == interval.max {
             out.push_str(&format!(
                 "(union {} {})\n",
-                sexp_to_string(&mvar(str(&var.to_string()))),
-                sexp_to_string(&num(i64(interval.min)))
+                mvar(str(&var.to_string())),
+                num(i64(interval.min))
             ));
         }
     }
