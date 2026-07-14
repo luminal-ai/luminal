@@ -11,6 +11,7 @@
 //! Layout: x `(rows, cols)` contiguous in `dtype` with dynamic `rows`;
 //! w `(cols,)` F32. One block per row; F32 warp + block reduction.
 
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -447,7 +448,7 @@ pub struct KernelRMSNorm {
 
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{ELIST, F64, OP_KIND},
         extract_expr_list,
     },
@@ -468,7 +469,8 @@ impl EgglogOp for KernelRMSNorm {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Two relation-staged parts (pre → late): the rinv core (anchored by
         // the rare Sqrt→Recip pair and the eps Constant) emits a fact; the
         // weight-mul tail joins with ?rin/?xf bound, so each variant's pins
@@ -560,7 +562,9 @@ impl EgglogOp for KernelRMSNorm {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        vec![Rule::raw(format!("{core}\n{tails}"))]
+        vec![raw_rules(parser, format!("{core}\n{tails}"))]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {
@@ -628,8 +632,9 @@ impl EgglogOp for KernelRMSNormQuant {
         3
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![raw_rules(parser, 
             "(rule
                 (
                     (rms_rinv ?rin ?xf ?xb ?eps ?cols)
@@ -664,6 +669,8 @@ impl EgglogOp for KernelRMSNormQuant {
                 :name \"kernel rms norm quant f8\"
             )",
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{EXPRESSION, OP_KIND},
         extract_expr,
     },
@@ -225,9 +225,10 @@ impl EgglogOp for GLUMoE {
         )
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                 (
                     (= ?e (Op (GLUMoE ?gu_io ?dn_io ?gu_matmul_k ?dn_matmul_k ?output_k ?gu_within_range ?dn_within_range ?mode) ?inputs))
@@ -238,8 +239,10 @@ impl EgglogOp for GLUMoE {
                 :ruleset dtype_prop
             )",
             ),
-            Rule::raw(include_str!["glumoe_rewrite.egg"]),
+            raw_rules(parser, include_str!["glumoe_rewrite.egg"]),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn n_inputs(&self) -> usize {

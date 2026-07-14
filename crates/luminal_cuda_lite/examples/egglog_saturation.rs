@@ -447,10 +447,11 @@ fn op_cleanups_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
 }
 
 fn setup_program(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool) -> String {
+    let mut parser = luminal::egglog_utils::schema_parser(ops);
     let rewrites = ops
         .iter()
-        .flat_map(|op| op.rewrites())
-        .map(|rule| rule.to_egglog_string())
+        .flat_map(|op| op.rewrites_commands(&mut parser))
+        .map(|c| c.to_string())
         .join("\n");
     [
         EGGLOG_RULESETS

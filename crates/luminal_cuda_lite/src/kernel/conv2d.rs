@@ -4,6 +4,7 @@
 //! to a one-thread-per-output CUDA kernel. It avoids materializing unfold/im2col
 //! intermediates while keeping model code free of custom ops.
 
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -11,7 +12,7 @@ use luminal::prelude::FxHashMap;
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
         extract_dtype, extract_expr, extract_expr_list,
     },
@@ -73,7 +74,8 @@ impl EgglogOp for KernelConv2D {
         3
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
             // 1x1 convs in Flux2's VAE are represented without `unfold`:
             //
@@ -85,7 +87,7 @@ impl EgglogOp for KernelConv2D {
             // The lowered form is still the same Mul -> KernelSum -> Add
             // matmul skeleton, but the lhs FusionStart reads directly from the
             // original input instead of a KernelGather window tensor.
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
@@ -141,7 +143,7 @@ impl EgglogOp for KernelConv2D {
                     :name \"kernel conv2d 1x1 from cuda lowered matmul bias\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
@@ -224,7 +226,7 @@ impl EgglogOp for KernelConv2D {
             // `[C_out, H_out, W_out]` output view, and channel-only bias
             // broadcast. Once expression/list canonicalization can prove those
             // equalities, tighten this rule and its regression tests.
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
@@ -281,7 +283,7 @@ impl EgglogOp for KernelConv2D {
                     :name \"kernel conv2d from cuda lowered unfold matmul bias\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
@@ -349,7 +351,7 @@ impl EgglogOp for KernelConv2D {
             // The kernel consumes the pre-unfold input directly. That input may
             // already be a padded HLIR tensor, so the rewrite is still correct
             // for Flux2's padded convs while removing the large patch matrix.
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?add_out_stride) (ICons ?sum (ICons ?bias (INil)))))
@@ -408,7 +410,7 @@ impl EgglogOp for KernelConv2D {
                     :name \"kernel conv2d from unfold matmul bias\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?add_out_stride) (ICons ?bias (ICons ?sum (INil)))))
@@ -464,7 +466,7 @@ impl EgglogOp for KernelConv2D {
                     :name \"kernel conv2d from bias unfold matmul\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?add (Op (Add ?shape ?as ?bs ?os) ?inputs))
@@ -474,7 +476,7 @@ impl EgglogOp for KernelConv2D {
                     :ruleset cleanup
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser, 
                 "(rule
                     (
                         (= ?fe (Op (FusionEnd ?shape ?os ?dt) ?inputs))
@@ -485,6 +487,8 @@ impl EgglogOp for KernelConv2D {
                 )",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

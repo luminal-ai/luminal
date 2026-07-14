@@ -269,7 +269,12 @@ impl std::fmt::Display for ExecutionStats {
 
 pub trait EgglogOp: Debug {
     fn sort(&self) -> crate::egglog_utils::api::SortDef;
-    fn rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
+    /// Op rewrite rules as parsed egglog `Command`s, built with the `egglog!`
+    /// quasiquote against a schema-aware `parser` (see [`schema_parser`]). This
+    /// is what the pipeline consumes; ops with no rewrites keep the default.
+    ///
+    /// [`schema_parser`]: crate::egglog_utils::schema_parser
+    fn rewrites_commands(&self, _parser: &mut egglog::ast::Parser) -> Vec<egglog::ast::Command> {
         vec![]
     }
     fn cleanup(&self) -> bool;

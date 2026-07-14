@@ -1,3 +1,4 @@
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(test)]
@@ -7,7 +8,7 @@ use half::{bf16, f16};
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, EXPRESSION, F64, OP_KIND, STRING},
         extract_dtype, extract_expr,
     },
@@ -178,9 +179,10 @@ impl EgglogOp for CuBlasLt {
         2 + c_input + bias_input + scale_inputs
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
-            Rule::raw(
+            raw_rules(parser, 
                 "(relation cublaslt_base_dtype (DType))
                  (cublaslt_base_dtype (F32))
                  (cublaslt_base_dtype (F16))
@@ -199,54 +201,54 @@ impl EgglogOp for CuBlasLt {
                  ; FusionStart pairs (a K² blowup on scalar-rich graphs).
                  (relation cublaslt_fp8_scale_product (IR IR IR))",
             ),
-            Rule::raw(include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
-            Rule::raw(include_str!["cublaslt_RmCm_rewrite.egg"]), // row col
-            Rule::raw(include_str!["cublaslt_CmRm_rewrite.egg"]), // col row
-            Rule::raw(include_str!["cublaslt_CmCm_rewrite.egg"]), // col col
-            Rule::raw(include_str!["cublaslt_fp8_rewrite.egg"]),
-            Rule::raw(include_str!["cublaslt_scale_rewrite.egg"]),
-            Rule::raw(include_str!["cublaslt_beta_rewrite.egg"]),
-            Rule::raw(include_str!["cublaslt_epilogue_rewrite.egg"]),
-            Rule::raw(include_str!["cublaslt_row_order_rewrite.egg"]),
+            raw_rules(parser, include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
+            raw_rules(parser, include_str!["cublaslt_RmCm_rewrite.egg"]), // row col
+            raw_rules(parser, include_str!["cublaslt_CmRm_rewrite.egg"]), // col row
+            raw_rules(parser, include_str!["cublaslt_CmCm_rewrite.egg"]), // col col
+            raw_rules(parser, include_str!["cublaslt_fp8_rewrite.egg"]),
+            raw_rules(parser, include_str!["cublaslt_scale_rewrite.egg"]),
+            raw_rules(parser, include_str!["cublaslt_beta_rewrite.egg"]),
+            raw_rules(parser, include_str!["cublaslt_epilogue_rewrite.egg"]),
+            raw_rules(parser, include_str!["cublaslt_row_order_rewrite.egg"]),
             // cuBLASLt now specializes GenericMatmul, so cleanup should prune
             // the matmul output alternatives directly. Do not delete the
             // broadcast Mul here; it may still have non-matmul consumers.
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
                  (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
                 ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
                 :ruleset cleanup
                 :name \"delete-sum-when-cublaslt-exists\"
             )"),
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
                  (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
                 ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
                 :ruleset cleanup
                 :name \"delete-kernel-sum-when-cublaslt-exists\"
             )"),
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
                  (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
                 ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
                 :ruleset cleanup
                 :name \"delete-sum-when-scaled-cublaslt-exists\"
             )"),
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
                  (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
                 ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
                 :ruleset cleanup
                 :name \"delete-kernel-sum-when-scaled-cublaslt-exists\"
             )"),
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
                  (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
                 ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
                 :ruleset cleanup
                 :name \"prefer-cublaslt-over-generic-matmul\"
             )"),
-            Rule::raw("(rule
+            raw_rules(parser, "(rule
                 ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
                  (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
                 ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
@@ -254,6 +256,8 @@ impl EgglogOp for CuBlasLt {
                 :name \"prefer-scaled-cublaslt-over-generic-matmul\"
             )"),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     #[allow(unused_variables)]

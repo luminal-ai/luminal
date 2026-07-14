@@ -10,7 +10,7 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
         extract_dtype, extract_expr, extract_expr_list,
     },
@@ -55,9 +55,10 @@ impl EgglogOp for GenericMatmul {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         vec![
-            Rule::raw(
+            raw_rules(parser,
                 "(rule
                     (
                         (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
@@ -85,7 +86,7 @@ impl EgglogOp for GenericMatmul {
                     :name \"generic-matmul-cuda-mul-sum\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser,
                 "(rule
                     (
                         (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
@@ -104,7 +105,7 @@ impl EgglogOp for GenericMatmul {
                     :name \"delete-sum-when-generic-matmul-exists\"
                 )",
             ),
-            Rule::raw(
+            raw_rules(parser,
                 "(rule
                     (
                         (= ?kernel_sum (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
@@ -120,6 +121,8 @@ impl EgglogOp for GenericMatmul {
                 )",
             ),
         ]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

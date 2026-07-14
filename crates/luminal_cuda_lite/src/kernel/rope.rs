@@ -12,6 +12,7 @@
 //!
 //! Layout: x `(S, H, D)`, cos/sin `(S, D)` (broadcast across H).
 
+use luminal::prelude::{Command, Parser, raw_rules};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
@@ -841,7 +842,7 @@ pub struct KernelRoPE {
 
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{ELIST, EXPRESSION, F64, OP_KIND},
         extract_expr, extract_expr_list,
     },
@@ -867,7 +868,8 @@ impl EgglogOp for KernelRoPE {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // Two-stage match via an intermediate relation. A single ~45-atom
         // join blew up egglog's query planner on real graphs (4m56s on the
         // 279-node mini layer); splitting at the angle chain keeps each join
@@ -1043,9 +1045,11 @@ impl EgglogOp for KernelRoPE {
             )",
             segments.join("\n")
         );
-        vec![Rule::raw(format!(
+        vec![raw_rules(parser, format!(
             "{angle_stage}\n{rotation_stage}\n{concat_rule}"
         ))]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

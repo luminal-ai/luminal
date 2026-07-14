@@ -22,7 +22,7 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{EXPRESSION, OP_KIND},
         extract_expr,
     },
@@ -46,8 +46,9 @@ impl EgglogOp for KernelQuantF8 {
         2
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
+        vec![raw_rules(parser, 
             "(rule
                 (
                     (= ?xf (Op (Cast ?xf_size (F32)) (ICons ?x (INil))))
@@ -67,6 +68,8 @@ impl EgglogOp for KernelQuantF8 {
                 :name \"kernel quant f8 from bf16\"
             )",
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

@@ -25,7 +25,7 @@ use crate::{
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{SortDef, sort},
         base::{DTYPE, ELIST, EXPRESSION, OP_KIND},
         extract_dtype, extract_expr, extract_expr_list,
     },
@@ -57,13 +57,14 @@ impl EgglogOp for KernelArgmax {
         1
     }
 
-    fn rewrites(&self) -> Vec<Rule> {
+    fn rewrites_commands(&self, parser: &mut Parser) -> Vec<Command> {
+        let __rules: ::std::vec::Vec<::std::vec::Vec<Command>> = {
         // The scalar constants (-1, +1) sit behind frontend-emitted identity
         // casts; the kernel_lower fold unions a KernelConstant into each
         // Cast(Constant) eclass (F32 included), which is matched directly
         // here (const_like lives in the flashinfer host-op file, which loads
         // after kernel ops).
-        vec![Rule::raw(
+        vec![raw_rules(parser, 
             "(rule
                 (
                     ; final Max over cols of (one_hot * iota)
@@ -108,6 +109,8 @@ impl EgglogOp for KernelArgmax {
                 :name \"kernel argmax last axis\"
             )",
         )]
+    };
+        __rules.into_iter().flatten().collect()
     }
 
     fn cleanup(&self) -> bool {

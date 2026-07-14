@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::egglog_utils::{self, SerializedEGraph, extract_expr};
-use egglog::{ast::Span, prelude::RustSpan, var};
+use egglog::var;
 
 type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
 
@@ -688,7 +688,7 @@ impl Expression {
         program.push('\n');
         program.push_str("(check (= expr_lhs expr_rhs))\n");
 
-        let mut egraph = egglog::EGraph::default();
+        let mut egraph = egglog_utils::new_egraph();
         let commands = egraph
             .parser
             .get_program_from_string(None, &program)
@@ -1198,7 +1198,7 @@ fn egglog_simplify(e: Expression) -> Expression {
             (saturate cleanup)
         )",
     );
-    let mut egraph = egglog::EGraph::default();
+    let mut egraph = egglog_utils::new_egraph();
     let commands = egraph
         .parser
         .get_program_from_string(None, &program)
@@ -1250,7 +1250,7 @@ fn egglog_simplify_with_intervals(e: Expression, intervals: &DynDimIntervals) ->
             (saturate cleanup)
         )",
     );
-    let mut egraph = egglog::EGraph::default();
+    let mut egraph = egglog_utils::new_egraph();
     let commands = egraph
         .parser
         .get_program_from_string(None, &program)

@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 luminal = { path = "../.." }
+# Needed so the `egglog!`/`sexp!` quasiquotes (which expand to `::egglog::…`)
+# resolve when used in rule generators here.
+egglog = { git = "https://github.com/egraphs-good/egglog.git", rev = "9d58d2e4922b28c12aeb032420d09bae1df69718" }
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
 as-any = "0.3.2"

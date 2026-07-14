@@ -1,5 +1,5 @@
 use colored::Colorize;
-use egglog::{ast::Span, prelude::RustSpan, var};
+use egglog::var;
 use itertools::Itertools;
 use petgraph::{Direction, graph::NodeIndex};
 use rand::Rng;
@@ -13,6 +13,42 @@ pub use egraph_serialize::{ClassId, NodeId};
 
 pub mod api;
 pub mod base;
+
+/// Create an egglog `EGraph` with egglog-experimental's named-argument macros
+/// registered on its parser. This lets declarations use `:field` schemas and
+/// call sites use `:field`/`...` syntax (positional syntax keeps working too).
+/// All luminal egglog runs should go through this rather than
+/// `egglog::EGraph::default()` so named-argument syntax parses everywhere.
+pub fn new_egraph() -> egglog::EGraph {
+    let mut egraph = egglog::EGraph::default();
+    egglog_experimental::register_named_args(&mut egraph.parser);
+    egraph
+}
+
+/// Parse raw egglog rule text (text-authored rules, included `.egg` files,
+/// runtime-formatted rules) into commands on a schema-aware `parser`. This is
+/// the text counterpart to the `egglog!` quasiquote, for rules whose egglog is
+/// a runtime string rather than fixed tokens. Used by op `rewrites_commands`.
+pub fn raw_rules(
+    parser: &mut egglog::ast::Parser,
+    text: impl AsRef<str>,
+) -> Vec<egglog::ast::Command> {
+    parser
+        .get_program_from_string(None, text.as_ref())
+        .expect("raw egglog rules should parse")
+}
+
+/// A parser with egglog-experimental's named-arg macros registered and every op
+/// kind's schema parsed, so that `#kind`/`:#field`/`...` in rule generators
+/// (via `rewrites_commands`) expand against the real op schemas.
+pub fn schema_parser(ops: &[Arc<Box<dyn EgglogOp>>]) -> egglog::ast::Parser {
+    let mut parser = egglog::ast::Parser::default();
+    egglog_experimental::register_named_args(&mut parser);
+    parser
+        .get_program_from_string(None, &op_defs_string(ops))
+        .expect("op definitions should parse");
+    parser
+}
 
 const MAIN_SCHEDULE_MAX_CYCLES: usize = 256;
 const MAIN_SCHEDULE_MAX_TUPLES: usize = 10_000_000;
@@ -118,10 +154,16 @@ fn op_defs_string(ops: &[Arc<Box<dyn EgglogOp>>]) -> String {
     let mut opkind_variants = Vec::new();
     for o in ops {
         let s = o.sort();
+        // Emit named-field schema (`(Op :field Sort ...)`) so the hand-written
+        // .egg rules can match/build these ops by field name and skip the rest
+        // with `...`. Positional calls keep working against named schemas.
         let variant_str = format!(
             "({} {})",
             s.name,
-            s.fields.iter().map(|f| &f.sort).join(" ")
+            s.fields
+                .iter()
+                .map(|f| format!(":{} {}", f.name, f.sort))
+                .join(" ")
         );
         if s.class == "IR" {
             ir_variants.push(variant_str);
@@ -178,7 +220,11 @@ pub struct OpTextParts {
     /// when an alternative survives in the same eclass.
     pub(crate) cleanable_op_names: FxHashSet<String>,
     late_program: String,
-    rewrites: String,
+    /// Op rewrite rules as parsed egglog `Command`s (`Send + Clone`, so this
+    /// shares across the parallel bucketed runs). Run directly at the run-site;
+    /// never concatenated into the setup text, because `...`-expanded rules
+    /// carry `@…` gensym vars that the parser refuses to re-read.
+    rewrites: Vec<egglog::ast::Command>,
     late_phases: Vec<EgglogSchedulePhase>,
     late_postprocesses: Vec<EGraphPostprocess>,
 }
@@ -198,8 +244,27 @@ impl OpTextParts {
             .filter(|op| op.cleanup())
             .map(|op| op.sort().name.to_string())
             .collect();
+
+        let op_defs = op_defs_string(ops);
+        // Rule generators emit `egglog!` with `#kind`/`:#field` splices whose
+        // named args + `...` only expand against a parser that knows each op
+        // kind's schema. Build that parser once (named-arg macros + every op's
+        // declaration) and drive `rewrites_commands` through it. The resulting
+        // `Command`s are kept as-is and `run` directly at the run-site — never
+        // re-serialized to text — so `...`-expanded fresh vars (egglog's `@…`
+        // gensyms) stay inside the e-graph and never hit the parser again.
+        let mut rewrite_parser = egglog::ast::Parser::default();
+        egglog_experimental::register_named_args(&mut rewrite_parser);
+        rewrite_parser
+            .get_program_from_string(None, &op_defs)
+            .expect("op definitions should parse");
+        let rewrites: Vec<egglog::ast::Command> = ops
+            .iter()
+            .flat_map(|o| o.rewrites_commands(&mut rewrite_parser))
+            .collect();
+
         Self {
-            op_defs: op_defs_string(ops),
+            op_defs,
             // Default empty; the backend's Runtime::extra_egglog() is spliced in
             // by the Rt-aware callers (build_search_space) after construction.
             extra_egglog: String::new(),
@@ -210,11 +275,7 @@ impl OpTextParts {
             // We always emit an empty cleanup ruleset and instead do
             // conditional cleanup in Rust after egglog finishes.
             cleanups: String::new(),
-            rewrites: ops
-                .iter()
-                .flat_map(|o| o.rewrites())
-                .map(|r| r.to_egglog_string())
-                .join("\n"),
+            rewrites,
             cleanable_op_names: if cleanup {
                 cleanable_op_names
             } else {
@@ -240,8 +301,18 @@ impl OpTextParts {
     }
 }
 
+/// Whole egglog program as text, for debugging / visualization only. Best
+/// effort: op rewrite rules are `Display`ed from their parsed `Command`s, so
+/// rules that used `...` appear in expanded form with `@…` gensym vars — fine
+/// to read, but not guaranteed to re-parse. The real run-site never uses this;
+/// it runs `parts.rewrites` directly (see `run_egglog_with_report_parts_impl`).
 fn full_egglog_with(program: &str, parts: &OpTextParts) -> String {
-    let mut chunks = vec![egglog_setup_with(program, parts), egglog_schedule_program()];
+    let rewrites_text = parts.rewrites.iter().map(|c| c.to_string()).join("\n");
+    let mut chunks = vec![
+        egglog_setup_with(program, parts),
+        rewrites_text,
+        egglog_schedule_program(),
+    ];
     chunks.extend(
         parts
             .late_phases
@@ -364,6 +435,9 @@ fn egglog_setup_with(program: &str, parts: &OpTextParts) -> String {
     egglog_setup_with_options(program, parts, false)
 }
 
+/// The setup program as text, **excluding** op rewrite rules. Rewrites are
+/// parsed egglog `Command`s (`parts.rewrites`) run directly at the run-site, so
+/// they are not part of this text (see [`OpTextParts::rewrites`]).
 fn egglog_setup_with_options(
     program: &str,
     parts: &OpTextParts,
@@ -381,7 +455,6 @@ fn egglog_setup_with_options(
         parts.extra_egglog.clone(),
         parts.cleanups.clone(),
         base::base_cleanup_egglog(),
-        parts.rewrites.clone(),
         parts.late_program.clone(),
         program.to_string(),
     ]
@@ -1294,12 +1367,22 @@ fn run_egglog_with_report_parts_impl(
     let setup_code = egglog_setup_with_options(program, op_parts, use_interval_analysis);
     let setup_text_elapsed = setup_text_start.elapsed();
     let setup_lines = setup_code.lines().count();
-    let mut egraph = egglog::EGraph::default();
-    egraph.set_report_level(ReportLevel::WithPlan);
+    let mut egraph = new_egraph();
+    // NOTE(egglog 2.0 bump): `ReportLevel::WithPlan` calls `Plan::to_report`, which is
+    // `todo!()` for decomposed query plans in egglog rev 5294cdc. Luminal's rules produce
+    // decomposed plans, so anything above `TimeOnly` panics. `TimeOnly` keeps timing/update
+    // counts (all the core pipeline needs) and avoids the unimplemented plan-report path.
+    egraph.set_report_level(ReportLevel::TimeOnly);
     let setup_start = std::time::Instant::now();
     let setup_tuples_before = egraph.num_tuples();
     let parse_start = std::time::Instant::now();
-    let commands = egraph.parser.get_program_from_string(None, &setup_code)?;
+    let mut commands = egraph.parser.get_program_from_string(None, &setup_code)?;
+    // Op rewrite rules are pre-parsed `Command`s (built via `egglog!` against a
+    // schema-aware parser). Run them directly here rather than round-tripping
+    // through text, so `...`-expanded `@…` gensyms never reach the parser.
+    // Order is irrelevant: these are rule *definitions*, all installed before
+    // any `(run-schedule …)` fires later in this function.
+    commands.extend(op_parts.rewrites.iter().cloned());
     let parse_elapsed = parse_start.elapsed();
     trace!("{}", "Egglog setup running...".green());
     let setup_run_start = std::time::Instant::now();
@@ -2443,6 +2526,58 @@ mod tests {
         parts.extra_egglog = marker.to_string();
         let program = egglog_setup_with_options("", &parts, false);
         assert_eq!(program.matches(marker).count(), 1, "spliced exactly once");
+    }
+
+    // The luminal_cuda_lite rewrite files match core op kinds using named
+    // arguments + `...`. Verify every one of them parses against luminal's
+    // *real* named op schemas (emitted by our own pipeline), so a wrong field
+    // name or bad arity is caught here even though luminal_cuda_lite itself
+    // needs CUDA to build. Named-argument resolution happens at parse time, so
+    // this catches the exact risk of the positional->named conversion.
+    #[test]
+    fn cuda_lite_rewrites_parse_against_named_schemas() {
+        fn egg_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    egg_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "egg") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let ops = <HLIROps as IntoEgglogOp>::into_vec();
+        // Cuda-lite kinds matched by the rewrite files but declared outside core
+        // HLIROps. Declaring them (with their real field names) registers their
+        // named-argument macros so wrong field names in the rewrites are caught.
+        let cuda_kinds = "\
+            (datatype UnusedCudaKindSort\n\
+               (GenericMatmul :out_shape EList :mul_shape EList :k Expression \
+                 :lhs_strides EList :rhs_strides EList :sum_input_strides EList \
+                 :sum_iter_stride Expression :out_strides EList :dtype DType))";
+        // Context = the declarations only (base + op schemas), which is what the
+        // .egg files need to parse against. Use the setup text (no rewrite rules)
+        // rather than `full_egglog`, so it stays re-parseable — the op rewrites
+        // are now `Command`s and their `...` expansions carry `@…` gensyms.
+        let parts = OpTextParts::new(&ops, false);
+        let context = format!("{cuda_kinds}\n{}", egglog_setup_with_options("", &parts, false));
+
+        let host = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("crates/luminal_cuda_lite/src/host");
+        let mut files = Vec::new();
+        egg_files(&host, &mut files);
+        assert!(files.len() >= 8, "expected to find the cuda_lite rewrite files");
+
+        for path in files {
+            let egg = std::fs::read_to_string(&path).unwrap();
+            let program = format!("{context}\n{egg}");
+            let mut egraph = super::new_egraph();
+            egraph
+                .parser
+                .get_program_from_string(path.to_str().map(String::from), &program)
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e}", path.display()));
+        }
     }
 
     fn eclass(id: &str, label: &str, n_nodes: usize) -> (ClassId, (String, Vec<NodeId>)) {
