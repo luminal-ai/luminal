@@ -481,7 +481,6 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
 
     from luminal.pt2 import (
         _build_dynamic_shapes_from_gm,
-        _reinternalize_lifted_params,
         _strip_symint_placeholders,
     )
 
@@ -542,7 +541,7 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
 
         gm = capture["gm"]
         example_inputs = capture["example_inputs"]
-        gm, user_inputs, _, _ = _reinternalize_lifted_params(gm, example_inputs)
+        user_inputs = list(example_inputs)
         user_inputs, _, strip_ok = _strip_symint_placeholders(gm, user_inputs)
         dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
 
@@ -551,15 +550,16 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
             "Expected the first backend trace to preserve a dynamic shape spec"
         )
         args_spec = dynamic_shapes.get("args")
-        assert args_spec is not None and len(args_spec) == 1, (
-            f"expected one user-input dynamic spec, got {dynamic_shapes}"
+        assert args_spec is not None, f"expected an args spec, got {dynamic_shapes}"
+        # Weights flow as inputs, so the spec covers every arg; exactly one
+        # (input_ids) may be dynamic, and only on its sequence axis.
+        dyn_specs = [spec for spec in args_spec if spec is not None]
+        assert len(dyn_specs) == 1, (
+            f"expected exactly one dynamic input, got {dynamic_shapes}"
         )
-        assert args_spec[0] is not None, (
-            f"expected a per-dim dynamic spec for input_ids, got {dynamic_shapes}"
-        )
-        assert set(args_spec[0].keys()) == {1}, (
+        assert set(dyn_specs[0].keys()) == {1}, (
             "Expected only the token sequence axis (dim=1) to be dynamic, "
-            f"got {dynamic_shapes}"
+            f"got {dyn_specs[0]}"
         )
 
         _assert_bf16_logits_match(
