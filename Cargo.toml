@@ -27,6 +27,7 @@ egglog = {git="https://github.com/egraphs-good/egglog.git", rev="9d58d2e4922b28c
 egglog-ast = {git="https://github.com/egraphs-good/egglog.git", rev="9d58d2e4922b28c12aeb032420d09bae1df69718"}
 egglog-reports = {git="https://github.com/egraphs-good/egglog.git", rev="9d58d2e4922b28c12aeb032420d09bae1df69718"}
 egglog-experimental = { path = "../egglog-experimental", default-features = false }
+egglog-static = { path = "../egglog-quote/static-macro" }
 egraph-serialize = { version = "0.3.0", default-features = false, features = ["graphviz", "serde"]}
 tracing = "0.1.43"
 paste = "1.0.15"
@@ -58,3 +59,12 @@ members = [
 
 [patch.crates-io]
 candle-kernels = { git = "https://github.com/huggingface/candle.git", rev = "a0dbd8b8aef6bde9adca3e8ad90791609d64974b" }
+
+# TEMPORARY (local dev, demo only): point the egglog family at the local
+# egglog-quote checkout on branch `luminal-egglog-static-demo` (= luminal's
+# pinned 9d58d2e + egglog-static). For the real branch, push that and bump the
+# git revs above instead of patching.
+[patch."https://github.com/egraphs-good/egglog.git"]
+egglog = { path = "../egglog-quote" }
+egglog-ast = { path = "../egglog-quote/egglog-ast" }
+egglog-reports = { path = "../egglog-quote/egglog-reports" }

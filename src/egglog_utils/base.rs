@@ -2,8 +2,51 @@ use std::sync::LazyLock;
 
 use super::api::*;
 use crate::shape;
-use egglog::prelude::egglog;
+use egglog_static::egglog_static;
 use rustc_hash::FxHashSet;
+
+// The base egglog schema (datatypes + helper functions), declared once and
+// type-checked at compile time by `egglog_header!`. Rewrite rulesets check
+// their fragments against it via `egglog_static!(luminal_base; …)`, and
+// `luminal_base_schema()` yields these declarations as commands to run.
+egglog_static::egglog_header!(luminal_base
+    (datatype*
+        (Expression
+            (MNum i64)
+            (MFloat f64)
+            (MIter)
+            (MVar String)
+            (MAdd Expression Expression)
+            (MSub Expression Expression)
+            (MMul Expression Expression)
+            (MCeilDiv Expression Expression)
+            (MDiv Expression Expression)
+            (MMod Expression Expression)
+            (MMin Expression Expression)
+            (MMax Expression Expression)
+            (MAnd Expression Expression)
+            (MOr Expression Expression)
+            (MGte Expression Expression)
+            (MLt Expression Expression)
+            (MFloorTo Expression Expression)
+            (MReplace Expression Expression Expression))
+        (EList
+            (ECons Expression EList)
+            (ENil)
+            (MReplaceList EList Expression Expression)
+            (ReplaceNthFromEnd EList Expression i64)
+            (RemoveNthFromEnd EList i64)
+            (RowMajor EList))
+        (DType
+            (F32) (F64) (F16) (Bf16) (Int) (Int64) (Bool)
+            (F4E2M1) (F8E4M3) (F8E5M2) (F8UE8M0)
+            (I4) (U4) (I8) (U8) (I16) (U16) (TF32) (F6E2M3) (F6E3M2)))
+    (function lower (Expression) i64 :merge (max old new))
+    (function upper (Expression) i64 :merge (min old new))
+    (function len (EList) i64 :merge new)
+    (function nth_from_end (EList i64) Expression :merge new)
+    (function n_elements (EList) Expression :merge new)
+);
 
 // ---- Sort classes (pub const) ----
 
@@ -425,44 +468,18 @@ pub fn base_expression_egglog_with_intervals() -> String {
 /// parsed commands are rendered back to text so the existing text-concatenation
 /// setup pipeline is unchanged.
 fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
-    let mut commands = egglog!(
-        (ruleset expr)
-        (ruleset dtype_prop)
-        (ruleset cleanup)
-        (ruleset post_cleanup)
-        (datatype*
-            (Expression
-                (MNum i64)
-                (MFloat f64)
-                (MIter)
-                (MVar String)
-                (MAdd Expression Expression)
-                (MSub Expression Expression)
-                (MMul Expression Expression)
-                (MCeilDiv Expression Expression)
-                (MDiv Expression Expression)
-                (MMod Expression Expression)
-                (MMin Expression Expression)
-                (MMax Expression Expression)
-                (MAnd Expression Expression)
-                (MOr Expression Expression)
-                (MGte Expression Expression)
-                (MLt Expression Expression)
-                (MFloorTo Expression Expression)
-                (MReplace Expression Expression Expression))
-            (EList
-                (ECons Expression EList)
-                (ENil)
-                (MReplaceList EList Expression Expression)
-                (ReplaceNthFromEnd EList Expression i64)
-                (RemoveNthFromEnd EList i64)
-                (RowMajor EList))
-            (DType
-                (F32) (F64) (F16) (Bf16) (Int) (Int64) (Bool)
-                (F4E2M1) (F8E4M3) (F8E5M2) (F8UE8M0)
-                (I4) (U4) (I8) (U8) (I16) (U16) (TF32) (F6E2M3) (F6E3M2)))
-        (function lower (Expression) i64 :merge (max old new))
-        (function upper (Expression) i64 :merge (min old new))
+    // The datatypes + helper functions come from the shared `luminal_base`
+    // schema (checked once at compile time). Run those, then extend with the
+    // rewrite rules — each is `egglog_static!`-checked against that schema, so a
+    // bad constructor or arity is a build error, not a run-time failure.
+    let mut commands = luminal_base_schema().expect("base schema should typecheck");
+    commands.extend(
+        egglog_static!(
+            luminal_base;
+            (ruleset expr)
+            (ruleset dtype_prop)
+            (ruleset cleanup)
+            (ruleset post_cleanup)
         (rule ((= ?__rw (MMul ?a ?b))) ((union ?__rw (MMul ?b ?a))) :ruleset expr :name "mul-comm")
         (rule ((= ?__rw (MAdd ?a ?b))) ((union ?__rw (MAdd ?b ?a))) :ruleset expr :name "add-comm")
         (rule ((= ?e (MAdd (MNum ?a) (MNum ?b))) (= ?ans (+ ?a ?b))) ((union ?e (MNum ?ans)) (subsume (MAdd (MNum ?a) (MNum ?b)))) :ruleset expr)
@@ -525,13 +542,10 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
         (rule ((= ?__rw (MReplace (MNum ?n) ?x ?y))) ((union ?__rw (MNum ?n))) :ruleset expr :name "replace-num")
         (rule ((= ?__rw (MReplace (MVar ?z) ?find ?replace)) (!= ?find (MVar ?z))) ((union ?__rw (MVar ?z))) :ruleset expr :name "replace-var-miss")
         (rule ((= ?__rw (MReplace (MIter) ?find ?replace)) (!= ?find (MIter))) ((union ?__rw (MIter))) :ruleset expr :name "replace-iter-miss")
-        (function len (EList) i64 :merge new)
         (rule ((= ?e (ENil))) ((set (len ?e) 0)) :ruleset expr)
         (rule ((= ?e (ECons ?expr ?list)) (= ?prev_len (len ?list))) ((set (len ?e) (+ ?prev_len 1))) :ruleset expr)
-        (function nth_from_end (EList i64) Expression :merge new)
         (rule ((= ?e (ECons ?expr ?list)) (= ?list_len (len ?list))) ((set (nth_from_end ?e ?list_len) ?expr)) :ruleset expr)
         (rule ((= ?e (ECons ?expr ?list)) (= ?other_nth (nth_from_end ?list ?n))) ((set (nth_from_end ?e ?n) ?other_nth)) :ruleset expr)
-        (function n_elements (EList) Expression :merge new)
         (rule ((= ?e (ENil))) ((set (n_elements ?e) (MNum 1))) :ruleset expr)
         (rule ((= ?e (ECons ?dim ?other)) (= ?other_elems (n_elements ?other))) ((set (n_elements ?e) (MMul ?dim ?other_elems))) :ruleset expr)
         (rule ((= ?other (ECons ?other_dim ?other_other)) (= ?list (ECons ?d ?other)) (= ?e (RowMajor ?list)) (= ?n_elems (n_elements ?other))) ((union ?e (ECons (MMul ?n_elems (MIter)) (RowMajor ?other)))) :ruleset expr)
@@ -541,12 +555,14 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
         (rule ((= ?e (ReplaceNthFromEnd (ECons ?expr ?list) ?to ?ind)) (< ?ind (len ?list))) ((union ?e (ECons ?expr (ReplaceNthFromEnd ?list ?to ?ind)))) :ruleset expr)
         (rule ((= ?e (RemoveNthFromEnd (ECons ?expr ?list) ?ind)) (= ?ind (len ?list))) ((union ?e ?list)) :ruleset expr)
         (rule ((= ?e (RemoveNthFromEnd (ECons ?expr ?list) ?ind)) (< ?ind (len ?list))) ((union ?e (ECons ?expr (RemoveNthFromEnd ?list ?ind)))) :ruleset expr)
-    )
-    .expect("base expression egglog program should parse");
+        )
+        .expect("base rules should typecheck"),
+    );
 
     if use_interval_analysis {
         commands.extend(
-            egglog!(
+            egglog_static!(
+                luminal_base;
                 (ruleset interval_expr)
                 (rule ((= ?e (MNum ?n))) ((set (lower ?e) ?n) (set (upper ?e) ?n)) :ruleset interval_expr :name "interval-num-exact")
                 (rule ((= ?e (MAdd ?a ?b)) (= ?lo_a (lower ?a)) (= ?lo_b (lower ?b)) (= ?sum (+ ?lo_a ?lo_b)) (>= ?lo_a 0) (>= ?lo_b 0) (>= (- 9223372036854775807 ?lo_b) ?lo_a)) ((set (lower ?e) ?sum)) :ruleset interval_expr :name "interval-add-lower-nonnegative")
@@ -581,7 +597,8 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
 /// consumed them. Authored via `egglog!` and rendered to text like the base
 /// program above.
 pub fn base_cleanup_egglog() -> String {
-    egglog!(
+    egglog_static!(
+        luminal_base;
         (ruleset base_cleanup)
         (rule ((= ?m (MReplace ?a ?b ?c))) ((delete (MReplace ?a ?b ?c))) :ruleset base_cleanup)
         (rule ((= ?m (MReplaceList ?a ?b ?c))) ((delete (MReplaceList ?a ?b ?c))) :ruleset base_cleanup)
