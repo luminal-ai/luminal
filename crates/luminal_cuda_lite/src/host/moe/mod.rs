@@ -1,3 +1,6 @@
+pub mod decode;
+pub mod fused;
+
 use std::sync::{Arc, OnceLock};
 
 use luminal::{
