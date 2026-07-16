@@ -170,6 +170,9 @@ impl<'a> Translator<'a> {
             // GroupNorm
             "torch.ops.aten.native_group_norm.default" => self.translate_group_norm(node)?,
 
+            // RMSNorm
+            "torch.ops.aten._fused_rms_norm.default" => self.translate_fused_rms_norm(node)?,
+
             // Where
             "torch.ops.aten.where.self" => self.translate_where(node)?,
             "torch.ops.aten.where.ScalarOther" => self.translate_where_scalar_other(node)?,

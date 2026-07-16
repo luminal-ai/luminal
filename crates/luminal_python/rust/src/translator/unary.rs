@@ -133,6 +133,39 @@ impl<'a> Translator<'a> {
         Ok(result)
     }
 
+    /// `aten._fused_rms_norm` (F.rms_norm on CUDA): frontend `std_norm` +
+    /// optional affine. Only `out` is consumed; `rstd` is DCE'd.
+    pub(crate) fn translate_fused_rms_norm(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let normalized_shape = self.get_ints_arg(node, 1)?;
+
+        let ndim = input.shape.len();
+        let num_norm_dims = normalized_shape.len();
+        anyhow::ensure!(
+            num_norm_dims <= ndim,
+            "rms_norm normalized_shape rank {num_norm_dims} exceeds input rank {ndim}"
+        );
+        let axes: Vec<usize> = ((ndim - num_norm_dims)..ndim).collect();
+
+        // eps (arg 3): eager resolves None to the fp32 machine epsilon
+        // regardless of input dtype.
+        let eps = self.get_float_arg(node, 3).unwrap_or(f32::EPSILON as f64) as f32;
+
+        // Eager's fused kernel computes entirely in fp32 and casts the result
+        // to the input dtype; matching it also handles mixed-dtype weights.
+        let out_dtype = input.dtype;
+        let mut result = input.cast(DType::F32).std_norm(axes, eps);
+
+        // Apply weight (arg 2) if present and not None.
+        if let Some(weight_name) = node.inputs.get(2).and_then(|i| i.arg.as_tensor_name()) {
+            let w = self.get_tensor(weight_name)?.cast(DType::F32);
+            let (r, w) = broadcast_binary(result, w);
+            result = r * w;
+        }
+
+        Ok(result.cast(out_dtype))
+    }
+
     /// Translate `aten.native_group_norm.default`.
     ///
     /// Schema: `native_group_norm(input, weight?, bias?, N, C, HxW, num_groups, eps)
