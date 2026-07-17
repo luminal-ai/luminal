@@ -2480,6 +2480,18 @@ class SdpaWithBiasModel(torch.nn.Module):
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
 
 
+class RepeatModel(torch.nn.Module):
+    """`Tensor.repeat(*repeats)` — tiles `repeats[d]` copies along each dim;
+    when `len(repeats) > ndim`, size-1 leading dims are prepended first."""
+
+    def __init__(self, repeats: tuple[int, ...]) -> None:
+        super().__init__()
+        self.repeats = repeats
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.repeat(*self.repeats)
+
+
 # ========== Nearest Upsample Test Models ==========
 
 

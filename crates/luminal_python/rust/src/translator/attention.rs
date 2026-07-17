@@ -137,10 +137,22 @@ impl<'a> Translator<'a> {
             let (scores_b, mask_b) = broadcast_binary(scores, neg_large);
             scores = scores_b + mask_b;
         }
-        if let Some(bias) = additive {
-            let (scores_b, bias_b) = ensure_same_dtype(scores, bias);
-            let (scores_b, bias_b) = broadcast_binary(scores_b, bias_b);
-            scores = scores_b + bias_b;
+        if let Some(mask) = additive {
+            // torch.nn.functional.scaled_dot_product_attention's attn_mask
+            // contract: "A boolean mask where a value of True indicates that
+            // the element should take part in attention. A float mask ...
+            // that is added to the attention score." Convert the bool
+            // keep-mask to an additive offset (-1e9 where false) before adding.
+            let mask_offset = if mask.dtype == DType::Bool {
+                let keep = mask.cast(DType::F32);
+                let one = keep.graph().constant_float(1.0).expand_rhs(keep.shape);
+                (one - keep) * -1e9_f32
+            } else {
+                mask
+            };
+            let (scores_b, offset_b) = ensure_same_dtype(scores, mask_offset);
+            let (scores_b, offset_b) = broadcast_binary(scores_b, offset_b);
+            scores = scores_b + offset_b;
         }
 
         let attn = scores.softmax(q_ndim - 1);

@@ -65,6 +65,28 @@ impl<'a> Translator<'a> {
         })
     }
 
+    /// `aten.repeat`: tile the tensor `repeats[d]` times along each dim.
+    /// Leading entries beyond the input rank prepend new dims (torch
+    /// semantics); the tiling itself delegates to the core `repeat` view.
+    pub(crate) fn translate_repeat(&mut self, node: &Node) -> Result<GraphTensor> {
+        let mut t = self.get_input_tensor(node, 0)?;
+        let repeats = self.get_ints_arg(node, 1)?;
+        anyhow::ensure!(
+            repeats.len() >= t.shape.len(),
+            "repeat expects at least as many repeats ({}) as dims ({})",
+            repeats.len(),
+            t.shape.len()
+        );
+        anyhow::ensure!(
+            repeats.iter().all(|&r| r >= 1),
+            "repeat counts must be >= 1, got {repeats:?}"
+        );
+        for _ in 0..(repeats.len() - t.shape.len()) {
+            t = t.unsqueeze(0);
+        }
+        Ok(t.repeat(repeats.iter().map(|&r| r as usize).collect::<Vec<_>>()))
+    }
+
     pub(crate) fn translate_upsample_nearest2d(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
         let input_dimensions = input.dims();

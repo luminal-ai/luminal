@@ -1801,6 +1801,60 @@ def test_unsqueeze_middle(device: torch.device):
     assert torch.allclose(output, original)
 
 
+# ========== Repeat Tests (aten.repeat.default) ==========
+
+
+def test_repeat_1d(device: torch.device):
+    """(3,).repeat(4) -> (12,): tiling order must be abab, not aabb."""
+    from test_models import RepeatModel
+
+    model: torch.nn.Module = RepeatModel((4,)).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.rand(3, device=device)
+    assert torch.equal(model_compiled(x), model(x))
+
+
+def test_repeat_2d_both_axes(device: torch.device):
+    """(2, 3).repeat(2, 3) -> (4, 9): tiling on every axis."""
+    from test_models import RepeatModel
+
+    model: torch.nn.Module = RepeatModel((2, 3)).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.rand((2, 3), device=device)
+    assert torch.equal(model_compiled(x), model(x))
+
+
+def test_repeat_identity_axis(device: torch.device):
+    """(2, 3).repeat(1, 2): the `r == 1` skip on the first axis."""
+    from test_models import RepeatModel
+
+    model: torch.nn.Module = RepeatModel((1, 2)).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.rand((2, 3), device=device)
+    assert torch.equal(model_compiled(x), model(x))
+
+
+def test_repeat_leading_dims(device: torch.device):
+    """(2, 3).repeat(4, 1, 1) -> (4, 2, 3): `len(repeats) > ndim` prepends
+    dims (the whisper positional-embedding batch broadcast)."""
+    from test_models import RepeatModel
+
+    model: torch.nn.Module = RepeatModel((4, 1, 1)).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.rand((2, 3), device=device)
+    assert torch.equal(model_compiled(x), model(x))
+
+
+def test_repeat_leading_and_tile(device: torch.device):
+    """(3,).repeat(2, 3) -> (2, 9): prepend a dim AND tile the original."""
+    from test_models import RepeatModel
+
+    model: torch.nn.Module = RepeatModel((2, 3)).to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x: torch.Tensor = torch.rand(3, device=device)
+    assert torch.equal(model_compiled(x), model(x))
+
+
 # ========== Greater Tests ==========
 
 
