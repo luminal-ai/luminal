@@ -601,6 +601,7 @@ fn probe_bf16_subpaths() {
 /// bounds how much of a decode step is launch/serialization overhead for a
 /// ~1100-node graph.
 #[test]
+#[cfg(luminal_cuda_ge_12_3)]
 #[ignore = "perf measurement, run explicitly with --ignored --nocapture"]
 fn bench_cuda_graph_node_overhead() {
     use crate::compile_module_image_for_current_device;

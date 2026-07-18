@@ -1277,6 +1277,14 @@ fn run_cublaslt_matmul(
 
 #[cfg(test)]
 pub(crate) fn cublaslt_graph_capture_supported(stream: &Arc<CudaStream>) -> bool {
+    if !cfg!(luminal_cuda_ge_12_3) {
+        return false;
+    }
+    cublaslt_graph_capture_probe(stream)
+}
+
+#[cfg(all(test, luminal_cuda_ge_12_3))]
+fn cublaslt_graph_capture_probe(stream: &Arc<CudaStream>) -> bool {
     fn probe(stream: &Arc<CudaStream>) -> anyhow::Result<()> {
         let capture_stream = stream.context().new_stream()?;
         let cublaslt = try_create_cublaslt(stream.clone())
