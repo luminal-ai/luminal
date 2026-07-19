@@ -76,12 +76,10 @@ pub trait Runtime {
     {
         vec![]
     }
-    /// Backend-provided egglog text spliced in immediately after the op
-    /// constructor definitions and before the rewrite rules. Core keeps this
-    /// empty; runtimes can use it to declare shared egglog relations/functions
-    /// that their rewrite rules read and write across multiple ops — declarations
-    /// that the per-op rewrite hook cannot emit exactly-once — without adding
-    /// those declarations to Luminal core.
+    /// Backend-provided egglog text spliced after the op constructor and
+    /// op-owned declarations, before the rewrite rules. Core keeps this empty;
+    /// runtimes can use it for backend-wide program text that is not naturally
+    /// owned by one registered op, without adding it to Luminal core.
     fn extra_egglog() -> String
     where
         Self: Sized,
@@ -269,6 +267,15 @@ impl std::fmt::Display for ExecutionStats {
 
 pub trait EgglogOp: Debug {
     fn sort(&self) -> crate::egglog_utils::api::SortDef;
+
+    /// Shared egglog declarations required by this op's rewrites. These are
+    /// emitted once, before any rewrite text, so relations/functions shared by
+    /// multiple ops do not depend on tuple registration order. Identical
+    /// declaration strings are deduplicated while preserving first-seen order.
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec![]
+    }
+
     fn rewrites(&self) -> Vec<crate::egglog_utils::api::Rule> {
         vec![]
     }

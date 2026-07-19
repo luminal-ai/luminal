@@ -74,22 +74,12 @@ impl EgglogOp for KernelGemv {
                             (< ?m_upper 2)",
             ),
         ];
-        let mut rules = vec![Rule::raw(
-            "; Shared semantic witnesses produced by GenericMatmul and consumed
-             ; by GEMV/cuBLASLt rewrites. KernelGemv is registered before those
-             ; consumers, so these declarations are emitted exactly once.
-             (relation generic_matmul_exact_2d
-                (IR Expression Expression Expression DType))
-             (relation generic_matmul_exact_3d
-                (IR Expression Expression Expression Expression DType))",
-        )];
-        rules.extend(
-            m_variants
-                .into_iter()
-                .flat_map(|(variant, m_cond)| {
-                    ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt))
-                })
-                .map(|(variant, m_cond, dt)| {
+        m_variants
+            .into_iter()
+            .flat_map(|(variant, m_cond)| {
+                ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt))
+            })
+            .map(|(variant, m_cond, dt)| {
                 Rule::raw(format!(
                     "(rule
                         (
@@ -135,9 +125,8 @@ impl EgglogOp for KernelGemv {
                         :name \"kernel gemv m1 {dt} {variant}\"
                     )"
                 ))
-            }),
-        );
-        rules
+            })
+            .collect()
     }
 
     fn cleanup(&self) -> bool {

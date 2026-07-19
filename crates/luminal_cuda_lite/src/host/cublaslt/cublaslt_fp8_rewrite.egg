@@ -435,92 +435,40 @@
     :name "cublaslt scaled fp8 bf16 output"
 )
 
-; Variant of the scaled FP8 rule for a pre-quantized activation produced by a
-; fused F8E4M3 custom op (rms-norm-quant custom (x, w, scale)). CONVENTION: f8-producing
-; custom ops put the quantization input scale as their LAST input; the rule
-; matches by arity and reads the scale from that slot. The dequant chain on
-; the output side is unchanged.
+; Stage pre-quantized activations by producer shape. F8-producing custom ops
+; put their tensor-wide quantization scale in the final input slot. Keeping
+; the small arity-specific joins here lets the full matmul/layout join below
+; run once for every supported producer instead of duplicating its body.
 (rule
     (
         (= ?a_fp8 (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?cw (ICons ?input_scale (INil))))))
         (= ?a_dtype (dtype ?a_fp8))
-        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
-        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
-
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
-            (ICons ?a (ICons ?b (INil)))))
-        (= ?matmul_dtype (F32))
-        (generic_matmul_exact_2d ?sum ?m ?n ?k (F32))
-        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
-            (ICons ?input_scale2 (ICons ?weight_scale (INil)))))
-        (= ?input_scale ?input_scale2)
-        (= ?scaled (Op (Mul
-            ?out_shape
-            ?sum_strides
-            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
-            ?scaled_out_strides)
-            (ICons ?sum (ICons ?scale_product (INil)))))
-        (= ?sum_strides ?scaled_out_strides)
-
-        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
-        (= ?sum_strides
-            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
-        (!= ?m (MNum 0))
-        (!= ?n (MNum 0))
-        (!= ?k (MNum 1))
-
-        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
-        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
-        (= ?k_stride (MIter))
-
-        (= ?a_m_stride (MMul (MIter) ?k))
-        (= ?a_n_stride (MNum 0))
-        (= ?a_k_stride (MIter))
-
-        (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-        (= ?b_k_stride (MIter))
-
-        (= ?b_dtype (dtype ?b_fp8))
-        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
     )
     (
-        (let ?sgemm (Op (cublaslt_scaled
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            (MNum 1)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b_fp8 (ICons ?a_fp8 (ICons ?weight_scale (ICons ?input_scale (INil)))))))
-        (union ?scaled ?sgemm)
-        (set (dtype ?sgemm) (F32))
+        (cublaslt_fp8_scaled_activation ?a_fp8 ?input_scale ?a_dtype)
     )
 :ruleset matmul_backend
-:name "cublaslt scaled fp8 RmCm f32 output, custom quantized activation arity 3"
+:name "stage cublaslt fp8 custom quantized activation arity 3"
 )
 
-
-; Variant of the scaled FP8 rule for a pre-quantized activation produced by a
-; fused F8E4M3 custom op (swiglu-quant custom (x, scale)). CONVENTION: f8-producing
-; custom ops put the quantization input scale as their LAST input; the rule
-; matches by arity and reads the scale from that slot. The dequant chain on
-; the output side is unchanged.
 (rule
     (
         (= ?a_fp8 (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?input_scale (INil)))))
         (= ?a_dtype (dtype ?a_fp8))
+    )
+    (
+        (cublaslt_fp8_scaled_activation ?a_fp8 ?input_scale ?a_dtype)
+    )
+:ruleset matmul_backend
+:name "stage cublaslt fp8 custom quantized activation arity 2"
+)
+
+; Consume every staged custom quantizer through one exact scaled-FP8 matmul
+; rewrite. The relation retains both the physical activation and its scale;
+; the explicit F32 casts and GenericMatmul remain as the semantic fallback.
+(rule
+    (
+        (cublaslt_fp8_scaled_activation ?a_fp8 ?input_scale ?a_dtype)
         (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
         (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
 
@@ -585,5 +533,5 @@
         (set (dtype ?sgemm) (F32))
     )
 :ruleset matmul_backend
-:name "cublaslt scaled fp8 RmCm f32 output, custom quantized activation arity 2"
+:name "cublaslt scaled fp8 RmCm f32 output, staged custom quantized activation"
 )

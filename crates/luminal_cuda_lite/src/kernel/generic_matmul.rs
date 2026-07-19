@@ -19,6 +19,11 @@ use luminal::{
     shape::flatten_strides,
 };
 
+const MATMUL_BACKEND_RELATION_DECLARATIONS: &str = "(relation generic_matmul_exact_2d
+        (IR Expression Expression Expression DType))
+     (relation generic_matmul_exact_3d
+        (IR Expression Expression Expression Expression DType))";
+
 #[derive(Default, Debug, Clone)]
 pub struct GenericMatmul {
     out_shape: Vec<Expression>,
@@ -53,6 +58,10 @@ impl EgglogOp for GenericMatmul {
 
     fn n_inputs(&self) -> usize {
         2
+    }
+
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec![MATMUL_BACKEND_RELATION_DECLARATIONS.to_string()]
     }
 
     fn rewrites(&self) -> Vec<Rule> {

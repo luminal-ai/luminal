@@ -168,9 +168,13 @@ pub fn full_egglog(program: &str, ops: &[Arc<Box<dyn EgglogOp>>], cleanup: bool)
 /// trait objects in `ops`.
 pub struct OpTextParts {
     op_defs: String,
+    /// Declarations owned by registered ops, deduplicated and emitted before
+    /// every per-op rewrite. Unlike backend extras, these travel with a raw op
+    /// list through direct `run_egglog` callers as well as Runtime compilation.
+    op_declarations: String,
     /// Backend-provided egglog text (see [`crate::op::Runtime::extra_egglog`]),
-    /// spliced in right after `op_defs` and before the rewrite rules. Empty for
-    /// core / the reference backend.
+    /// spliced after `op_defs` and `op_declarations`, before the rewrite rules.
+    /// Empty for core / the reference backend.
     extra_egglog: String,
     cleanups: String,
     /// Names of op kinds that are eligible for cleanup (cleanup() == true).
@@ -198,8 +202,15 @@ impl OpTextParts {
             .filter(|op| op.cleanup())
             .map(|op| op.sort().name.to_string())
             .collect();
+        let mut seen_declarations = FxHashSet::default();
+        let op_declarations = ops
+            .iter()
+            .flat_map(|op| op.egglog_declarations())
+            .filter(|declaration| seen_declarations.insert(declaration.clone()))
+            .join("\n");
         Self {
             op_defs: op_defs_string(ops),
+            op_declarations,
             // Default empty; the backend's Runtime::extra_egglog() is spliced in
             // by the Rt-aware callers (build_search_space) after construction.
             extra_egglog: String::new(),
@@ -378,6 +389,7 @@ fn egglog_setup_with_options(
         egglog_ruleset_declarations(),
         base_program,
         parts.op_defs.clone(),
+        parts.op_declarations.clone(),
         parts.extra_egglog.clone(),
         parts.cleanups.clone(),
         base::base_cleanup_egglog(),
@@ -2677,14 +2689,61 @@ mod tests {
         egglog_setup_with_options, random_initial_choice, run_egglog_with_late_passes,
         validate_choice_set,
     };
+    use crate::egglog_utils::api::{Rule, SortDef, sort};
+    use crate::egglog_utils::base::OP_KIND;
     use crate::prelude::FxHashMap;
-    use crate::{hlir::HLIROps, op::IntoEgglogOp};
+    use crate::{
+        hlir::HLIROps,
+        op::{EgglogOp, IntoEgglogOp},
+    };
     use egraph_serialize::{ClassId, NodeId};
     use rand::{SeedableRng, rngs::StdRng};
 
+    const TEST_OP_DECLARATION: &str = "(relation op_owned_test_relation ())";
+
+    #[derive(Debug, Default)]
+    struct OpOwnedDeclarationTest;
+
+    impl EgglogOp for OpOwnedDeclarationTest {
+        fn sort(&self) -> SortDef {
+            sort(OP_KIND, "OpOwnedDeclarationTest", &[])
+        }
+
+        fn egglog_declarations(&self) -> Vec<String> {
+            vec![TEST_OP_DECLARATION.to_string()]
+        }
+
+        fn rewrites(&self) -> Vec<Rule> {
+            vec![Rule::raw(
+                "(rule ((op_owned_test_relation)) ()
+                    :ruleset expr
+                    :name \"consume op-owned declaration\")",
+            )]
+        }
+
+        fn cleanup(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn op_owned_declarations_are_deduplicated_before_rewrites() {
+        let ops = <(OpOwnedDeclarationTest, OpOwnedDeclarationTest)>::into_vec();
+        let parts = OpTextParts::new(&ops, false);
+        let program = egglog_setup_with_options("", &parts, false);
+
+        assert_eq!(program.matches(TEST_OP_DECLARATION).count(), 1);
+        assert!(
+            program.find(TEST_OP_DECLARATION).unwrap()
+                < program
+                    .find(":name \"consume op-owned declaration\"")
+                    .unwrap()
+        );
+    }
+
     // The backend extra-egglog hook (Runtime::extra_egglog) is carried on
     // OpTextParts.extra_egglog and must be spliced into the program exactly once,
-    // after the op constructor defs and before the rewrite rules.
+    // after op-owned declarations and before the rewrite rules.
     #[test]
     fn extra_egglog_is_spliced_between_op_defs_and_rewrites() {
         let marker = "(function tron_is_attn_softmax (IR IR) bool :merge (or old new))";
@@ -2696,8 +2755,8 @@ mod tests {
         assert!(!plain.contains(marker));
 
         // With a backend declaration set, it appears in the program exactly once.
-        // (Its position — after op_defs, before the rewrite rules — is fixed by
-        // the array-literal order in egglog_setup_with_options.)
+        // (Its position — after op declarations, before rewrite rules — is
+        // fixed by the array-literal order in egglog_setup_with_options.)
         let mut parts = OpTextParts::new(&[], false);
         parts.extra_egglog = marker.to_string();
         let program = egglog_setup_with_options("", &parts, false);

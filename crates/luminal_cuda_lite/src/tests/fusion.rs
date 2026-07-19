@@ -137,6 +137,9 @@ fn semantically_equal_ununified_fusion_end_metadata_survives_cleanup() {
         (let root (OutputJoin join3 join2))
     "#;
 
+    // Deliberately exercise the direct runner instead of Graph's Runtime-aware
+    // path: shared declarations required by CUDA op rewrites must travel with
+    // the op list itself.
     let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
     ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
     let egraph = run_egglog(program, "root", &ops, false)

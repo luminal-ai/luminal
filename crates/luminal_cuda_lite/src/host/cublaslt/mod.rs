@@ -198,7 +198,12 @@ impl EgglogOp for CuBlasLt {
                  ; fp8 scale-product fact rule so the fused-output-scale rule
                  ; looks the scalars up instead of enumerating scalar
                  ; FusionStart pairs (a K² blowup on scalar-rich graphs).
-                 (relation cublaslt_fp8_scale_product (IR IR IR))",
+                 (relation cublaslt_fp8_scale_product (IR IR IR))
+                 ; (quantized activation, tensor-wide input scale, dtype).
+                 ; Producer-specific rules stage this once so the expensive
+                 ; matmul consumer does not duplicate its full join per
+                 ; quantizer arity.
+                 (relation cublaslt_fp8_scaled_activation (IR IR DType))",
             ),
             Rule::raw(include_str!["cublaslt_RmRm_rewrite.egg"]), // row row
             Rule::raw(include_str!["cublaslt_RmCm_rewrite.egg"]), // row col
@@ -1430,66 +1435,38 @@ fn epilogue_uses_bias(epilogue: cublasLtEpilogue_t) -> bool {
 }
 
 impl CuBlasLt {
-    fn get_cublaslt(&self, stream: &Arc<CudaStream>) -> anyhow::Result<Arc<CudaBlasLT>> {
-        if let Some(cublaslt) = self.cublaslt.get() {
-            return Ok(cublaslt.clone());
-        }
-        let created = try_create_cublaslt(stream.clone()).map_err(|message| {
-            anyhow::anyhow!("cuBLASLt unavailable on this machine: {message}")
-        })?;
-        let _ = self.cublaslt.set(created.clone());
-        Ok(created)
-    }
+    const WORKSPACE_SIZE_BYTES: usize = 32 * 1024 * 1024;
 
-    pub(crate) fn graph_inputs(&self) -> usize {
-        self.n_inputs()
-    }
-
-    pub(crate) fn graph_spec_dyn_vars(&self) -> FxHashSet<char> {
-        [
-            &self.m,
-            &self.n,
-            &self.k,
-            &self.lda,
-            &self.ldb,
-            &self.ldc,
-            &self.ldd,
-            &self.batch_count,
-            &self.stride_a,
-            &self.stride_b,
-            &self.stride_c,
-            &self.stride_d,
-        ]
-        .into_iter()
-        .flat_map(|expr| expr.dyn_vars())
-        .collect()
-    }
-
-    /// Resolve the prepare-cache key without requiring operand pointers. This
-    /// mirrors `resolve_for_graph`'s dimension/layout contract and is used by
-    /// allocation preflight before any arena exists.
-    pub(crate) fn prepare_key_for_resources(
+    /// Resolve the pointer-free cuBLASLt contract shared by resource planning,
+    /// CUDA-graph preparation, and ordinary host execution. Keeping dimension,
+    /// layout, dtype, and scalar resolution here prevents those paths from
+    /// silently preparing different descriptors for the same extracted op.
+    fn resolve_matmul_spec(
         &self,
         dyn_map: &FxHashMap<char, usize>,
-    ) -> anyhow::Result<CuBlasLtPrepareKey> {
+    ) -> anyhow::Result<LtMatmulSpec> {
         let resolve = |expression: &Expression, name: &str| -> anyhow::Result<usize> {
             expression
                 .substitute('z', Expression::from(1))
                 .exec(dyn_map)
-                .ok_or_else(|| anyhow::anyhow!("unresolved cuBLASLt resource dimension {name}"))
+                .ok_or_else(|| anyhow::anyhow!("unresolved cuBLASLt dimension {name}"))
         };
+
+        assert!(
+            self.d_dtype.bits() >= 8,
+            "cuBLAS LT does not support sub-byte dtype {}",
+            self.d_dtype
+        );
+
         let m = resolve(&self.m, "m")? as u64;
         let n = resolve(&self.n, "n")? as u64;
         let k = resolve(&self.k, "k")? as u64;
-        let lda = resolve(&self.lda, "lda")? as i64;
-        let ldb = resolve(&self.ldb, "ldb")? as i64;
-        let ldc = resolve(&self.ldc, "ldc")? as i64;
-        let ldd = resolve(&self.ldd, "ldd")? as i64;
         let batch_count = resolve(&self.batch_count, "batch_count")? as i32;
         let stride_a = resolve(&self.stride_a, "stride_a")? as i64;
         let stride_b = resolve(&self.stride_b, "stride_b")? as i64;
         let stride_c = resolve(&self.stride_c, "stride_c")? as i64;
         let stride_d = resolve(&self.stride_d, "stride_d")? as i64;
+
         let (a_rows, a_cols) = if self.a_layout == cublasOperation_t::CUBLAS_OP_N {
             (m, k)
         } else {
@@ -1500,11 +1477,23 @@ impl CuBlasLt {
         } else {
             (n, k)
         };
-        let lda = clamp_ld_for_order(lda, a_rows, a_cols, self.a_order);
-        let ldb = clamp_ld_for_order(ldb, b_rows, b_cols, self.b_order);
-        let ldc = clamp_ld_for_order(ldc, m, n, self.c_order);
-        let ldd = clamp_ld_for_order(ldd, m, n, self.d_order);
-        let spec = LtMatmulSpec {
+
+        let lda = clamp_ld_for_order(
+            resolve(&self.lda, "lda")? as i64,
+            a_rows,
+            a_cols,
+            self.a_order,
+        );
+        let ldb = clamp_ld_for_order(
+            resolve(&self.ldb, "ldb")? as i64,
+            b_rows,
+            b_cols,
+            self.b_order,
+        );
+        let ldc = clamp_ld_for_order(resolve(&self.ldc, "ldc")? as i64, m, n, self.c_order);
+        let ldd = clamp_ld_for_order(resolve(&self.ldd, "ldd")? as i64, m, n, self.d_order);
+
+        Ok(LtMatmulSpec {
             problem: LtMatmulProblem {
                 m,
                 n,
@@ -1552,9 +1541,55 @@ impl CuBlasLt {
                 beta: LtScalar::from_f64(self.scale_dtype, self.beta)?,
                 epilogue: self.epilogue,
             },
-            workspace_size: 32 * 1024 * 1024,
-        };
-        Ok(CuBlasLtPrepareKey { spec })
+            workspace_size: Self::WORKSPACE_SIZE_BYTES,
+        })
+    }
+
+    fn get_cublaslt(&self, stream: &Arc<CudaStream>) -> anyhow::Result<Arc<CudaBlasLT>> {
+        if let Some(cublaslt) = self.cublaslt.get() {
+            return Ok(cublaslt.clone());
+        }
+        let created = try_create_cublaslt(stream.clone()).map_err(|message| {
+            anyhow::anyhow!("cuBLASLt unavailable on this machine: {message}")
+        })?;
+        let _ = self.cublaslt.set(created.clone());
+        Ok(created)
+    }
+
+    pub(crate) fn graph_inputs(&self) -> usize {
+        self.n_inputs()
+    }
+
+    pub(crate) fn graph_spec_dyn_vars(&self) -> FxHashSet<char> {
+        [
+            &self.m,
+            &self.n,
+            &self.k,
+            &self.lda,
+            &self.ldb,
+            &self.ldc,
+            &self.ldd,
+            &self.batch_count,
+            &self.stride_a,
+            &self.stride_b,
+            &self.stride_c,
+            &self.stride_d,
+        ]
+        .into_iter()
+        .flat_map(|expr| expr.dyn_vars())
+        .collect()
+    }
+
+    /// Resolve the prepare-cache key without requiring operand pointers. This
+    /// mirrors `resolve_for_graph`'s dimension/layout contract and is used by
+    /// allocation preflight before any arena exists.
+    pub(crate) fn prepare_key_for_resources(
+        &self,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<CuBlasLtPrepareKey> {
+        Ok(CuBlasLtPrepareKey {
+            spec: self.resolve_matmul_spec(dyn_map)?,
+        })
     }
 
     pub(crate) fn resolve_for_graph(
@@ -1564,37 +1599,7 @@ impl CuBlasLt {
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<CuBlasLtResolvedGraphCall> {
-        let resolve = |e: &Expression| -> Expression { e.substitute('z', Expression::from(1)) };
-        let m = resolve(&self.m).exec(dyn_map).unwrap() as u64;
-        let n = resolve(&self.n).exec(dyn_map).unwrap() as u64;
-        let k = resolve(&self.k).exec(dyn_map).unwrap() as u64;
-        let a_layout = self.a_layout;
-        let b_layout = self.b_layout;
-        let lda = resolve(&self.lda).exec(dyn_map).unwrap() as i64;
-        let ldb = resolve(&self.ldb).exec(dyn_map).unwrap() as i64;
-        let ldc = resolve(&self.ldc).exec(dyn_map).unwrap() as i64;
-        let ldd = resolve(&self.ldd).exec(dyn_map).unwrap() as i64;
-        let batch_count = resolve(&self.batch_count).exec(dyn_map).unwrap() as i32;
-        let stride_a = resolve(&self.stride_a).exec(dyn_map).unwrap() as i64;
-        let stride_b = resolve(&self.stride_b).exec(dyn_map).unwrap() as i64;
-        let stride_c = resolve(&self.stride_c).exec(dyn_map).unwrap() as i64;
-        let stride_d = resolve(&self.stride_d).exec(dyn_map).unwrap() as i64;
-
-        let a_cuda_dtype = dtype_to_cuda_dtype(self.a_dtype);
-        let b_cuda_dtype = dtype_to_cuda_dtype(self.b_dtype);
-        let c_cuda_dtype = dtype_to_cuda_dtype(self.c_dtype);
-        let d_cuda_dtype = dtype_to_cuda_dtype(self.d_dtype);
-        let scale_cuda_dtype = dtype_to_cuda_dtype(self.scale_dtype);
-        let element_size = (self.d_dtype.bits() / 8) as u64;
-        assert!(
-            element_size > 0,
-            "cuBLAS LT does not support sub-byte dtype {}",
-            self.d_dtype
-        );
-
-        let alpha = LtScalar::from_f64(self.scale_dtype, self.alpha)?;
-        let beta = LtScalar::from_f64(self.scale_dtype, self.beta)?;
-
+        let spec = self.resolve_matmul_spec(dyn_map)?;
         let ptrs = resolve_cublaslt_pointers(
             self_node,
             inputs,
@@ -1605,20 +1610,14 @@ impl CuBlasLt {
             self.b_scale_input,
         )?;
 
-        let (a_rows, a_cols) = if a_layout == cublasOperation_t::CUBLAS_OP_N {
-            (m, k)
-        } else {
-            (k, m)
-        };
-        let (b_rows, b_cols) = if b_layout == cublasOperation_t::CUBLAS_OP_N {
-            (k, n)
-        } else {
-            (n, k)
-        };
-        let lda = clamp_ld_for_order(lda, a_rows, a_cols, self.a_order);
-        let ldb = clamp_ld_for_order(ldb, b_rows, b_cols, self.b_order);
-        let ldc = clamp_ld_for_order(ldc, m, n, self.c_order);
-        let ldd = clamp_ld_for_order(ldd, m, n, self.d_order);
+        let LtMatmulProblem {
+            m,
+            n,
+            k,
+            batch_count,
+        } = spec.problem;
+        let (lda, ldb, ldc, ldd) = (spec.a.ld, spec.b.ld, spec.c.ld, spec.d.ld);
+        let (a_layout, b_layout) = (spec.trans_a, spec.trans_b);
 
         let _span = span!(
             Level::TRACE,
@@ -1630,60 +1629,6 @@ impl CuBlasLt {
             ?self.epilogue,
         )
         .entered();
-
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
-        let c_spec = LtMatrixSpec {
-            dtype: c_cuda_dtype,
-            rows: m,
-            cols: n,
-            ld: ldc,
-            batch_stride: stride_c,
-            order: self.c_order,
-        };
-        let d_spec = LtMatrixSpec {
-            dtype: d_cuda_dtype,
-            rows: m,
-            cols: n,
-            ld: ldd,
-            batch_stride: stride_d,
-            order: self.d_order,
-        };
-        let spec = LtMatmulSpec {
-            problem: LtMatmulProblem {
-                m,
-                n,
-                k,
-                batch_count,
-            },
-            trans_a: a_layout,
-            trans_b: b_layout,
-            a: LtMatrixSpec {
-                dtype: a_cuda_dtype,
-                rows: a_rows,
-                cols: a_cols,
-                ld: lda,
-                batch_stride: stride_a,
-                order: self.a_order,
-            },
-            b: LtMatrixSpec {
-                dtype: b_cuda_dtype,
-                rows: b_rows,
-                cols: b_cols,
-                ld: ldb,
-                batch_stride: stride_b,
-                order: self.b_order,
-            },
-            c: c_spec,
-            d: d_spec,
-            compute: LtComputeSpec {
-                compute_type: self.compute_type,
-                scale_dtype: scale_cuda_dtype,
-                alpha,
-                beta,
-                epilogue: self.epilogue,
-            },
-            workspace_size: WORKSPACE_SIZE,
-        };
 
         Ok(CuBlasLtResolvedGraphCall { spec, ptrs })
     }
@@ -1761,39 +1706,7 @@ impl HostOp for CuBlasLt {
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()> {
-        // GEMM parameters — resolve z→1 for element stride before exec
-        let resolve = |e: &Expression| -> Expression { e.substitute('z', Expression::from(1)) };
-        let m = resolve(&self.m).exec(dyn_map).unwrap() as u64;
-        let n = resolve(&self.n).exec(dyn_map).unwrap() as u64;
-        let k = resolve(&self.k).exec(dyn_map).unwrap() as u64;
-        let a_layout = self.a_layout;
-        let b_layout = self.b_layout;
-        let lda = resolve(&self.lda).exec(dyn_map).unwrap() as i64;
-        let ldb = resolve(&self.ldb).exec(dyn_map).unwrap() as i64;
-        let ldc = resolve(&self.ldc).exec(dyn_map).unwrap() as i64;
-        let ldd = resolve(&self.ldd).exec(dyn_map).unwrap() as i64;
-        let batch_count = resolve(&self.batch_count).exec(dyn_map).unwrap() as i32;
-        let stride_a = resolve(&self.stride_a).exec(dyn_map).unwrap() as i64;
-        let stride_b = resolve(&self.stride_b).exec(dyn_map).unwrap() as i64;
-        let stride_c = resolve(&self.stride_c).exec(dyn_map).unwrap() as i64;
-        let stride_d = resolve(&self.stride_d).exec(dyn_map).unwrap() as i64;
-
-        // Get CUDA types based on the explicit cuBLASLt type tuple.
-        let a_cuda_dtype = dtype_to_cuda_dtype(self.a_dtype);
-        let b_cuda_dtype = dtype_to_cuda_dtype(self.b_dtype);
-        let c_cuda_dtype = dtype_to_cuda_dtype(self.c_dtype);
-        let d_cuda_dtype = dtype_to_cuda_dtype(self.d_dtype);
-        let scale_cuda_dtype = dtype_to_cuda_dtype(self.scale_dtype);
-        let element_size = (self.d_dtype.bits() / 8) as u64;
-        assert!(
-            element_size > 0,
-            "cuBLAS LT does not support sub-byte dtype {}",
-            self.d_dtype
-        );
-
-        let alpha = LtScalar::from_f64(self.scale_dtype, self.alpha)?;
-        let beta = LtScalar::from_f64(self.scale_dtype, self.beta)?;
-
+        let spec = self.resolve_matmul_spec(dyn_map)?;
         let ptrs = resolve_cublaslt_pointers(
             self_node,
             inputs,
@@ -1804,20 +1717,14 @@ impl HostOp for CuBlasLt {
             self.b_scale_input,
         )?;
 
-        let (a_rows, a_cols) = if a_layout == cublasOperation_t::CUBLAS_OP_N {
-            (m, k)
-        } else {
-            (k, m)
-        };
-        let (b_rows, b_cols) = if b_layout == cublasOperation_t::CUBLAS_OP_N {
-            (k, n)
-        } else {
-            (n, k)
-        };
-        let lda = clamp_ld_for_order(lda, a_rows, a_cols, self.a_order);
-        let ldb = clamp_ld_for_order(ldb, b_rows, b_cols, self.b_order);
-        let ldc = clamp_ld_for_order(ldc, m, n, self.c_order);
-        let ldd = clamp_ld_for_order(ldd, m, n, self.d_order);
+        let LtMatmulProblem {
+            m,
+            n,
+            k,
+            batch_count,
+        } = spec.problem;
+        let (lda, ldb, ldc, ldd) = (spec.a.ld, spec.b.ld, spec.c.ld, spec.d.ld);
+        let (a_layout, b_layout) = (spec.trans_a, spec.trans_b);
 
         let _span = span!(
             Level::TRACE,
@@ -1831,61 +1738,6 @@ impl HostOp for CuBlasLt {
         .entered();
 
         let cublaslt = self.get_cublaslt(stream)?;
-
-        // Allocate workspace (32 MiB)
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
-        let c_spec = LtMatrixSpec {
-            dtype: c_cuda_dtype,
-            rows: m,
-            cols: n,
-            ld: ldc,
-            batch_stride: stride_c,
-            order: self.c_order,
-        };
-        let d_spec = LtMatrixSpec {
-            dtype: d_cuda_dtype,
-            rows: m,
-            cols: n,
-            ld: ldd,
-            batch_stride: stride_d,
-            order: self.d_order,
-        };
-        let spec = LtMatmulSpec {
-            problem: LtMatmulProblem {
-                m,
-                n,
-                k,
-                batch_count,
-            },
-            trans_a: a_layout,
-            trans_b: b_layout,
-            a: LtMatrixSpec {
-                dtype: a_cuda_dtype,
-                rows: a_rows,
-                cols: a_cols,
-                ld: lda,
-                batch_stride: stride_a,
-                order: self.a_order,
-            },
-            b: LtMatrixSpec {
-                dtype: b_cuda_dtype,
-                rows: b_rows,
-                cols: b_cols,
-                ld: ldb,
-                batch_stride: stride_b,
-                order: self.b_order,
-            },
-            c: c_spec,
-            d: d_spec,
-            compute: LtComputeSpec {
-                compute_type: self.compute_type,
-                scale_dtype: scale_cuda_dtype,
-                alpha,
-                beta,
-                epilogue: self.epilogue,
-            },
-            workspace_size: WORKSPACE_SIZE,
-        };
 
         run_cublaslt_matmul(stream, &cublaslt, &spec, ptrs)?;
 
@@ -1910,7 +1762,6 @@ impl HostOp for CuBlasLt {
         _buffer_lengths: &FxHashMap<NodeIndex, usize>,
         _dyn_map: &FxHashMap<char, usize>,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
         let scale_bytes = [self.a_dtype, self.b_dtype, self.c_dtype, self.d_dtype]
             .into_iter()
             .map(dtype_to_cuda_dtype)
@@ -1918,7 +1769,7 @@ impl HostOp for CuBlasLt {
             .count()
             * std::mem::size_of::<f32>();
         Ok(HostDeviceMemoryPlan {
-            transient_peak_bytes: WORKSPACE_SIZE + scale_bytes,
+            transient_peak_bytes: Self::WORKSPACE_SIZE_BYTES + scale_bytes,
             ..Default::default()
         })
     }
@@ -1927,6 +1778,75 @@ impl HostOp for CuBlasLt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matmul_spec_resolution_is_shared_with_resource_prepare_key() {
+        let op = CuBlasLt {
+            m: Expression::from('m'),
+            n: Expression::from(5),
+            k: Expression::from(7),
+            a_order: cublasLtOrder_t::CUBLASLT_ORDER_ROW,
+            lda: Expression::from(1),
+            ldb: Expression::from(1),
+            ldc: Expression::from(1),
+            ldd: Expression::from(1),
+            ..Default::default()
+        };
+        let dyn_map = FxHashMap::from_iter([('m', 3)]);
+
+        let spec = op.resolve_matmul_spec(&dyn_map).unwrap();
+        let prepare_key = op.prepare_key_for_resources(&dyn_map).unwrap();
+
+        assert_eq!(prepare_key.spec, spec);
+        assert_eq!(spec.problem.m, 3);
+        assert_eq!(spec.problem.n, 5);
+        assert_eq!(spec.problem.k, 7);
+        assert_eq!(spec.a.ld, 7, "row-order A must clamp ld to columns");
+        assert_eq!(spec.b.ld, 5, "column-order B must clamp ld to rows");
+        assert_eq!(spec.c.ld, 3);
+        assert_eq!(spec.d.ld, 3);
+        assert_eq!(spec.workspace_size, CuBlasLt::WORKSPACE_SIZE_BYTES);
+    }
+
+    #[test]
+    fn matmul_spec_resolution_reports_missing_dynamic_dimension() {
+        let op = CuBlasLt {
+            m: Expression::from('m'),
+            ..Default::default()
+        };
+
+        let error = op
+            .resolve_matmul_spec(&FxHashMap::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unresolved cuBLASLt dimension m"), "{error}");
+    }
+
+    #[test]
+    fn staged_arity_two_fp8_activation_reaches_scaled_cublaslt() {
+        use crate::kernel::swiglu::fused_swiglu_quant;
+
+        let mut cx = Graph::default();
+        let activation = cx.tensor((1usize, 32usize)).as_dtype(DType::Bf16);
+        let input_scale = cx.tensor(());
+        let weight_scale = cx.tensor(());
+        let weight = cx.tensor((8usize, 16usize)).as_dtype(DType::F8E4M3);
+        let quantized = fused_swiglu_quant(activation, 16, input_scale);
+        let matmul = quantized.matmul(weight.t()).cast(DType::F32);
+        (matmul * (input_scale * weight_scale).expand_rhs(matmul.dims())).output();
+
+        cx.build_search_space::<crate::runtime::CudaRuntime>(CompileOptions::default());
+
+        assert!(
+            cx.egraph()
+                .unwrap()
+                .enodes
+                .values()
+                .any(|(label, _)| label == "cublaslt_scaled"),
+            "arity-two FP8 custom activation should reach the shared scaled-cuBLASLt consumer"
+        );
+    }
 
     #[test]
     fn lt_scalar_packs_f32_scale_values() {
