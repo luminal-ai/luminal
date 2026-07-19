@@ -30,6 +30,17 @@ fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
     let search_graphs = 500;
+    let search_memory_mib = match std::env::var("SEARCH_MEMORY_MIB") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .expect("SEARCH_MEMORY_MIB must be a positive integer"),
+        Err(std::env::VarError::NotPresent) => 5 * 1024,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("SEARCH_MEMORY_MIB must be valid UTF-8")
+        }
+    };
     let prompt = "Explain what a neural network is in simple terms:";
 
     tracing_subscriber::registry()
@@ -98,8 +109,10 @@ fn main() {
     println!("Loading weights...");
     // Widened semantic search produces legal prefill plans with a ~4.7 GiB
     // proven intermediate lower bound; keep headroom while rejecting the much
-    // larger pathological unfused plans.
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(5);
+    // larger pathological unfused plans. Allow constrained machines and
+    // resource-regression checks to override the measured default explicitly.
+    println!("Search memory cap: {search_memory_mib} MiB");
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_mib(search_memory_mib);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
