@@ -1,6 +1,6 @@
 use luminal::prelude::*;
 
-/// A simple unbiased linear layer
+/// A simple linear layer
 pub struct Linear {
     pub weight: GraphTensor,
     pub bias: Option<GraphTensor>,
@@ -40,11 +40,11 @@ impl Linear {
         } else {
             self.weight
         });
-        if let Some(_bias) = self.bias {
-            todo!()
-            // output += bias.expand(output.shape);
+        if let Some(bias) = self.bias {
+            output + bias.expand_lhs(&output.dims()[..output.dims().len() - 1])
+        } else {
+            output
         }
-        output
     }
 }
 

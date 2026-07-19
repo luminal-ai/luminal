@@ -21,13 +21,17 @@ impl ConvND {
     pub fn new(
         ch_in: usize,
         ch_out: usize,
-        kernel: Vec<usize>,
-        stride: Vec<usize>,
-        dilation: Vec<usize>,
-        padding: Vec<usize>,
+        kernel: impl AsRef<[usize]>,
+        stride: impl AsRef<[usize]>,
+        dilation: impl AsRef<[usize]>,
+        padding: impl AsRef<[usize]>,
         bias: bool,
         cx: &mut Graph,
     ) -> Self {
+        let kernel = kernel.as_ref().to_vec();
+        let stride = stride.as_ref().to_vec();
+        let dilation = dilation.as_ref().to_vec();
+        let padding = padding.as_ref().to_vec();
         assert!(
             !kernel.is_empty(),
             "ConvND requires at least one spatial dimension in the kernel",
