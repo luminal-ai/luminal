@@ -25,7 +25,7 @@ mod view;
 
 pub use autograd::{Backward, backward};
 pub use optim::{AdamW, Optimizer, OptimizerStep, SGD};
-pub use reference::{rebind_buffer, restore_inputs, snapshot_inputs};
+pub use reference::{Trainer, rebind_buffer, restore_inputs, snapshot_inputs};
 pub use view::unview;
 
 pub mod prelude {

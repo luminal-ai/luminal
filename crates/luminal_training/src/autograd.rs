@@ -12,7 +12,7 @@ use luminal::hlir as hl;
 use luminal::prelude::petgraph::algo::toposort;
 use luminal::prelude::*;
 
-use crate::view::{is_static_injective, reinterpret, unview, zeros_flat};
+use crate::view::{reinterpret, static_scatter_add, unview};
 
 /// Extension trait adding reverse-mode autograd to [`Graph`].
 pub trait Backward {
@@ -454,25 +454,19 @@ fn vjp(
             let l = data_view.n_elements().simplify();
             let g_flat = reinterpret(g, &[m]);
             let idx_flat = reinterpret(src_tensor(0, index_view), &[m]);
-            // Exact scatter adjoint when the index map is statically
-            // injective (each data element read at most once — true for the
-            // gathers that slices/shifted-window reads lower to): writes
-            // never collide, so overwrite-Scatter IS the scatter-add.
+            // Exact scatter decomposition of the adjoint when the full index
+            // map (iota expression composed with the index view's own read
+            // pattern) is static: one Scatter if injective, a small sum of
+            // per-residue-class Scatters for structured overlaps like unfold.
             let scatter_local = match (m.as_num(), l.as_num(), index_iota) {
-                (Some(ms), Some(ls), Some(iota_expr))
-                    if is_static_injective(
-                        &[index_view.index_expression(), iota_expr],
-                        ms as usize,
-                        ls as usize,
-                    ) =>
-                {
-                    let dest = zeros_flat(cx, l, g_flat.dtype);
-                    Some(g_flat.scatter(idx_flat, dest))
+                (Some(ms), Some(ls), Some(iota_expr)) => {
+                    let f = iota_expr.substitute('z', index_view.index_expression());
+                    static_scatter_add(g_flat, idx_flat, f.simplify(), ms as usize, ls as usize)
                 }
                 _ => None,
             };
-            // Otherwise: one-hot contraction — always correct, handles
-            // duplicate indices (which accumulate), O(L·M) work.
+            // Otherwise (runtime indices, dynamic shapes, or inseparable
+            // duplicates): one-hot contraction — always correct, O(L·M).
             let local_flat = scatter_local.unwrap_or_else(|| {
                 let rows = cx.iota('z', l); // (L,) Int
                 let onehot = rows

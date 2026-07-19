@@ -140,43 +140,84 @@ pub fn unview(g: GraphTensor, view: ShapeTracker, producer_dims: &[Expression]) 
     }
 }
 
-/// Upper bound on how many index-expression evaluations the static
-/// injectivity check will do at graph-build time. Beyond this, both adjoint
+/// Upper bound on how many index-expression evaluations the static-map
+/// analysis will do at graph-build time. Beyond this, both adjoint
 /// strategies are hopeless anyway; fall back to the one-hot.
-const MAX_STATIC_INJECTIVITY_CHECK: usize = 1 << 24;
+const MAX_STATIC_MAP: usize = 1 << 24;
 
-/// Statically decide whether the composed index map `z ↦ chain(z)` over the
-/// domain `0..m` is injective into `[0, l)`. Evaluated exactly, element by
-/// element, at graph-build time — possible only when the domain size and
-/// every expression in the chain are static.
+/// Residue classes are tracked in a u64 bitmask per target element.
+const MAX_CLASSES: usize = 64;
+
+/// Build the exact adjoint of reading through a static index map:
+/// `out[j] = Σ_{z : f(z) = j} g[z]`, for `f` over the domain `0..m` into
+/// `[0, l)`, with `g` the flattened (m,) gradient.
 ///
-/// When a read map is injective, no two logical positions share a physical
-/// source, so its exact adjoint (a scatter-ADD) coincides with the
-/// overwrite-`Scatter` op HLIR already has: writes never collide. That turns
-/// the O(N·M) one-hot adjoint into an O(N+M) scatter.
-pub(crate) fn is_static_injective(chain: &[Expression], m: usize, l: usize) -> bool {
-    if m > MAX_STATIC_INJECTIVITY_CHECK {
-        return false;
+/// The map is evaluated once at graph-build time. If it's injective, one
+/// overwrite-`Scatter` into zeros is exact — writes never collide. If not,
+/// the domain is split into `b` residue classes (`z mod b`) such that `f`
+/// restricted to each class *is* injective — the structured non-injective
+/// maps that appear in practice separate this way (`unfold`'s overlapping
+/// windows by kernel position, pad's clamped edges by parity) — and the
+/// adjoint is the sum of one Scatter per class: O(m + b·l) instead of the
+/// O(m·l) one-hot. Returns None when `f` isn't static or no `b` up to
+/// [`MAX_CLASSES`] separates it; callers fall back to the one-hot.
+pub(crate) fn static_scatter_add(
+    g_flat: GraphTensor,
+    idx_flat: GraphTensor,
+    f: Expression,
+    m: usize,
+    l: usize,
+) -> Option<GraphTensor> {
+    if m > MAX_STATIC_MAP || !f.dyn_vars().iter().all(|c| *c == 'z') {
+        return None;
     }
-    if chain
-        .iter()
-        .any(|e| !e.dyn_vars().iter().all(|c| *c == 'z'))
-    {
-        return false;
-    }
-    let mut seen = vec![false; l];
-    for i in 0..m {
-        let mut v = i;
-        for e in chain {
-            match e.exec_single_var_checked(v) {
-                Some(x) => v = x,
-                None => return false,
-            }
+    let mut vals = Vec::with_capacity(m);
+    for z in 0..m {
+        let v = f.exec_single_var_checked(z)?;
+        if v >= l {
+            return None;
         }
-        if v >= l || seen[v] {
+        vals.push(v);
+    }
+    let b = (1..=MAX_CLASSES).find(|b| m.is_multiple_of(*b) && classes_injective(&vals, *b, l))?;
+    let cx = g_flat.graph();
+    let mut acc: Option<GraphTensor> = None;
+    for k in 0..b {
+        // Class k covers domain positions z = z'·b + k: column k of the
+        // (m/b, b)-reshaped gradient and index tensors. Slicing the existing
+        // index tensor (rather than building per-class iota expressions)
+        // keeps the e-graph small — composed index expressions are large and
+        // expensive for egglog to chew on.
+        let (g_k, idx_k) = if b == 1 {
+            (g_flat, idx_flat)
+        } else {
+            let gc = reinterpret(g_flat, &[(m / b).into(), b.into()]);
+            let ic = reinterpret(idx_flat, &[(m / b).into(), b.into()]);
+            (
+                gc.slice((0.., k..k + 1)).squeeze(1), // (m/b,)
+                ic.slice((0.., k..k + 1)).squeeze(1), // (m/b,) Int
+            )
+        };
+        let dest = zeros_flat(cx, l.into(), g_flat.dtype);
+        let scattered = g_k.scatter(idx_k, dest); // (l,)
+        acc = Some(match acc {
+            Some(a) => a + scattered,
+            None => scattered,
+        });
+    }
+    acc
+}
+
+/// Is `vals` (the evaluated index map) injective within every `z mod b`
+/// residue class?
+fn classes_injective(vals: &[usize], b: usize, l: usize) -> bool {
+    let mut masks = vec![0u64; l];
+    for (z, &v) in vals.iter().enumerate() {
+        let bit = 1u64 << (z % b);
+        if masks[v] & bit != 0 {
             return false;
         }
-        seen[v] = true;
+        masks[v] |= bit;
     }
     true
 }
@@ -198,9 +239,8 @@ pub(crate) fn zeros_flat(cx: &mut Graph, n: Expression, dtype: DType) -> GraphTe
 
 /// General fallback: `grad_producer[j] = Σ_{i : index_expr(i) = j} g[i]`.
 ///
-/// When the view's index map is statically injective, this is one `Scatter`
-/// of the flattened gradient into zeros (exact — writes never collide).
-/// Otherwise it's built as a one-hot (N_physical × M_logical) mask contracted
+/// Prefers the exact scatter decomposition from [`static_scatter_add`];
+/// otherwise builds a one-hot (N_physical × M_logical) mask contracted
 /// against the flattened gradient: always correct, O(N·M) work.
 fn scatter_add_through_view(
     g: GraphTensor,
@@ -215,16 +255,14 @@ fn scatter_add_through_view(
         .product::<Expression>()
         .simplify();
     let g_flat = reinterpret(g, &[m]);
-    if let (Some(ms), Some(ns)) = (m.as_num(), n.as_num()) {
-        let e = view.index_expression();
-        if is_static_injective(&[e], ms as usize, ns as usize) {
-            let idx = cx.iota(e, m); // (M,) Int: logical -> physical
-            let dest = zeros_flat(cx, n, g_flat.dtype);
-            return reinterpret(g_flat.scatter(idx, dest), producer_dims);
-        }
-    }
     // Physical index for each logical position of the view.
     let phys_idx = cx.iota(view.index_expression(), m); // (M,) Int
+    if let (Some(ms), Some(ns)) = (m.as_num(), n.as_num()) {
+        let e = view.index_expression();
+        if let Some(flat) = static_scatter_add(g_flat, phys_idx, e, ms as usize, ns as usize) {
+            return reinterpret(flat, producer_dims);
+        }
+    }
     let rows = cx.iota('z', n); // (N,) Int
     let onehot = rows
         .expand_dim(1, m)

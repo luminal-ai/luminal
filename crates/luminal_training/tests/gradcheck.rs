@@ -410,3 +410,65 @@ fn mlp_training_decreases_loss() {
         "SGD failed to reduce loss: first {first_loss}, last {last_loss}"
     );
 }
+
+#[test]
+fn grad_unfold_windows() {
+    // unfold extracts overlapping windows through one non-injective gather
+    // (every interior pixel appears in up to k*k windows). The autograd
+    // decomposes its adjoint into per-residue-class scatters; finite
+    // differences verify the overlapping contributions accumulate exactly.
+    gradcheck(&[&[4, 4]], &[seq(16, -1.0, 1.0)], |_, p| {
+        let h = p[0].sin(); // interior: gradient must flow through unfold
+        let u = h.unfold((2, 2), (1, 1), (1, 1)); // (3,3,2,2) windows
+        (u * u).sum(vec![0, 1, 2, 3])
+    });
+}
+
+/// Finite-difference check of the weight gradient through luminal_nn's
+/// unfold-based ConvND (standalone: ConvND owns its weight tensor, so the
+/// shared harness can't inject it as a parameter).
+#[test]
+fn grad_convnd_weight() {
+    let mut cx = Graph::new();
+    let x = cx.tensor((1, 1, 3, 3));
+    let conv = luminal_nn::ConvND::new(
+        1,
+        2,
+        vec![2, 2],
+        vec![1, 1],
+        vec![1, 1],
+        vec![0, 0],
+        false,
+        &mut cx,
+    );
+    let out = conv.forward(x); // (1,2,2,2)
+    let loss = (out * out).sum(vec![0, 1, 2, 3]);
+    let grads = cx.backward(loss, &[conv.weight]);
+    let (loss_out, grad_out) = (loss.output(), grads[0].output());
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = cx.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
+    let x_data = seq(9, -1.0, 1.0);
+    let w_data = seq(8, -0.5, 0.5);
+    let run = |rt: &mut ReferenceRuntime, w: &[f32]| -> f32 {
+        rt.set_data(x.id, x_data.clone());
+        rt.set_data(conv.weight.id, w.to_vec());
+        rt.execute(&cx.dyn_map);
+        rt.get_f32(loss_out.id)[0]
+    };
+    run(&mut rt, &w_data);
+    let analytic = rt.get_f32(grad_out.id).clone();
+    for i in 0..w_data.len() {
+        let (mut wp, mut wm) = (w_data.clone(), w_data.clone());
+        wp[i] += EPS;
+        wm[i] -= EPS;
+        let numeric = (run(&mut rt, &wp) - run(&mut rt, &wm)) / (2.0 * EPS);
+        assert!(
+            (numeric - analytic[i]).abs() <= TOL * (1.0 + numeric.abs()),
+            "weight {i}: analytic {} vs numeric {numeric}",
+            analytic[i]
+        );
+    }
+}
