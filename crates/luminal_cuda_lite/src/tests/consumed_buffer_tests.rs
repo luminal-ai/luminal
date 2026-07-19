@@ -3,37 +3,27 @@ use luminal::prelude::*;
 use luminal_nn::{gather_rows, scatter_rows};
 use rand::SeedableRng;
 
-use luminal::egglog_utils::{
-    NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
-};
+use luminal::egglog_utils::{random_initial_choice, validate_choice_set};
 
 use crate::kernel::KernelOp;
 use crate::resource::{ResourceViolation, plan_static_llir_resources};
 use crate::runtime::CudaRuntime;
+use crate::tests::utilities::{
+    ForcedExtractionConfig, egraph_has_op_alternatives,
+    extract_forced_kernel_llir as extract_forced_kernel_llir_with_config, extract_llir_for_choices,
+    op_ir_nodes,
+};
 
 /// Helper: build search space and extract all possible kernel names across many random choices.
 fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
-    let custom_ops = &cx.custom_ops;
-
     let mut all_names = Vec::new();
     let mut rng = rand::rngs::StdRng::seed_from_u64(0x5CA7_7E12);
     // Try many random extractions to cover both alternatives
     for _ in 0..20 {
         let choices = random_initial_choice(egraph, &mut rng);
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let llir = extract_llir_for_choices(cx, choices);
         for op in llir.node_weights() {
             if let Some(k) = op.to_dialect::<dyn KernelOp>() {
                 let name = k.kernel_name().to_string();
@@ -46,68 +36,18 @@ fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     all_names
 }
 
-fn egraph_has_op_alternatives(cx: &Graph, kind_labels: &[&str]) -> bool {
-    let egraph = cx.egraph().expect("egraph not built");
-    egraph.eclasses.values().any(|(sort, nodes)| {
-        sort == "IR"
-            && kind_labels.iter().all(|kind_label| {
-                nodes.iter().any(|node| {
-                    let Some((label, children)) = egraph.enodes.get(node) else {
-                        return false;
-                    };
-                    label == "Op"
-                        && children.first().is_some_and(|kind_class| {
-                            egraph.eclasses[kind_class]
-                                .1
-                                .iter()
-                                .any(|kind_node| egraph.enodes[kind_node].0.as_str() == *kind_label)
-                        })
-                })
-            })
-    })
-}
-
 fn extract_forced_kernel_llir(
     cx: &Graph,
     egglog_kind: &str,
     runtime_kernel_name: &str,
 ) -> LLIRGraph {
-    let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
-    let kernel_nodes = op_ir_nodes(egraph, egglog_kind);
-    assert!(
-        !kernel_nodes.is_empty(),
-        "expected at least one {egglog_kind} candidate"
-    );
-
-    for (idx, kernel_node) in kernel_nodes.iter().enumerate() {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5CA7_0000 + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        choices.insert(&egraph.node_to_class[*kernel_node], kernel_node);
-        if validate_choice_set(egraph, &choices, ops).is_err() {
-            continue;
-        }
-
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
-        if llir.node_weights().any(|op| {
-            op.to_dialect::<dyn KernelOp>()
-                .is_some_and(|kernel| kernel.kernel_name() == runtime_kernel_name)
-        }) {
-            return llir;
-        }
-    }
-
-    panic!("could not extract a valid {egglog_kind} candidate");
+    extract_forced_kernel_llir_with_config(
+        cx,
+        egglog_kind,
+        runtime_kernel_name,
+        ForcedExtractionConfig::new(0x5CA7_0000),
+        false,
+    )
 }
 
 fn extract_forced_all_kernel_llir(
@@ -144,17 +84,7 @@ fn extract_forced_all_kernel_llir(
             continue;
         }
 
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let llir = extract_llir_for_choices(cx, choices);
         let selected_count = llir
             .node_weights()
             .filter_map(|op| op.to_dialect::<dyn KernelOp>())
@@ -168,27 +98,6 @@ fn extract_forced_all_kernel_llir(
     }
 
     panic!("could not extract all {expected_count} {egglog_kind} candidates");
-}
-
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    egraph
-        .eclasses
-        .values()
-        .filter(|(sort, _)| sort == "IR")
-        .flat_map(|(_, nodes)| nodes)
-        .filter(|node| {
-            let Some((label, children)) = egraph.enodes.get(*node) else {
-                return false;
-            };
-            label == "Op"
-                && children.first().is_some_and(|kind_class| {
-                    egraph.eclasses[kind_class]
-                        .1
-                        .iter()
-                        .any(|kind_node| egraph.enodes[kind_node].0 == kind_label)
-                })
-        })
-        .collect()
 }
 
 /// When dest is not shared, copying and in-place scatter are both semantically

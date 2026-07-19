@@ -3,8 +3,8 @@ use cudarc::driver::CudaContext;
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::egglog_utils::{
-    EGraphChoiceSet, egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
-    validate_choice_set,
+    EGraphChoiceSet, NodeId, SerializedEGraph, egglog_to_llir, extract_generation, hash_choice_set,
+    random_initial_choice, validate_choice_set,
 };
 use luminal::prelude::{
     petgraph::{Direction, algo::toposort, visit::EdgeRef},
@@ -14,7 +14,11 @@ use num_traits::{Num, Signed};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 
-use crate::runtime::{CudaRuntime, ToCudaInput};
+use crate::{
+    kernel::KernelOp,
+    resource::plan_static_llir_resources,
+    runtime::{CudaRuntime, ToCudaInput},
+};
 
 /// Safety factor multiplied with epsilon for tolerance calculations
 pub const TOLERANCE_SAFETY_FACTOR: f32 = 2.0;
@@ -618,6 +622,195 @@ pub(crate) fn summarize_llir(llir_graph: &LLIRGraph) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Deterministic background-choice schedule for forcing one selected Op enode.
+///
+/// Tests retain their original seed ranges, retry counts, and per-node strides.
+/// Candidate enumeration order is determined by the serialized egraph, so those
+/// parameters provide reproducibility without promising an identical candidate
+/// to seed mapping across egraph or helper refactors.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ForcedExtractionConfig {
+    seed_base: u64,
+    attempts_per_node: u64,
+    node_seed_stride: u64,
+}
+
+impl ForcedExtractionConfig {
+    pub(crate) const fn new(seed_base: u64) -> Self {
+        Self {
+            seed_base,
+            attempts_per_node: 1,
+            node_seed_stride: 1,
+        }
+    }
+
+    pub(crate) const fn attempts_per_node(mut self, attempts_per_node: u64) -> Self {
+        self.attempts_per_node = attempts_per_node;
+        self
+    }
+
+    pub(crate) const fn node_seed_stride(mut self, node_seed_stride: u64) -> Self {
+        self.node_seed_stride = node_seed_stride;
+        self
+    }
+}
+
+/// Return `Op` IR enodes whose OpKind eclass contains `kind_label`.
+pub(crate) fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
+    egraph
+        .eclasses
+        .values()
+        .filter(|(sort, _)| sort == "IR")
+        .flat_map(|(_, nodes)| nodes)
+        .filter(|node| {
+            let Some((label, children)) = egraph.enodes.get(*node) else {
+                return false;
+            };
+            label == "Op"
+                && children.first().is_some_and(|kind_class| {
+                    egraph.eclasses[kind_class]
+                        .1
+                        .iter()
+                        .any(|kind_node| egraph.enodes[kind_node].0 == kind_label)
+                })
+        })
+        .collect()
+}
+
+/// Whether one IR eclass contains every requested backend OpKind alternative.
+pub(crate) fn egraph_has_op_alternatives(cx: &Graph, kind_labels: &[&str]) -> bool {
+    let egraph = cx.egraph().expect("search space should be built");
+    egraph.eclasses.values().any(|(sort, nodes)| {
+        sort == "IR"
+            && kind_labels.iter().all(|kind_label| {
+                nodes.iter().any(|node| {
+                    let Some((label, children)) = egraph.enodes.get(node) else {
+                        return false;
+                    };
+                    label == "Op"
+                        && children.first().is_some_and(|kind_class| {
+                            egraph.eclasses[kind_class]
+                                .1
+                                .iter()
+                                .any(|kind_node| egraph.enodes[kind_node].0.as_str() == *kind_label)
+                        })
+                })
+            })
+    })
+}
+
+/// Extract one LLIR from a previously validated egraph choice set.
+pub(crate) fn extract_llir_for_choices(cx: &Graph, choices: EGraphChoiceSet<'_>) -> LLIRGraph {
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    let ops = cx
+        .egglog_ops()
+        .expect("search space should have registered egglog ops");
+    let mut list_cache = FxHashMap::default();
+    let mut expr_cache = FxHashMap::default();
+    egglog_to_llir(
+        egraph,
+        choices,
+        ops,
+        &cx.custom_ops,
+        &mut list_cache,
+        &mut expr_cache,
+        None,
+    )
+}
+
+/// Try deterministic random backgrounds while forcing each supplied Op enode.
+///
+/// The predicate checks the extracted LLIR rather than only the forced eclass:
+/// downstream alternatives can bypass a forced node or make it unreachable.
+/// The predicate therefore verifies the requested property in the extracted
+/// graph; it does not prove that the particular forced enode stayed reachable.
+pub(crate) fn try_extract_forced_nodes_llir_where(
+    cx: &Graph,
+    candidate_nodes: &[&NodeId],
+    config: ForcedExtractionConfig,
+    mut matches: impl FnMut(&LLIRGraph) -> bool,
+) -> Result<LLIRGraph, String> {
+    if candidate_nodes.is_empty() {
+        return Err("no matching Op enodes appeared in the egraph".into());
+    }
+
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    let ops = cx
+        .egglog_ops()
+        .expect("search space should have registered egglog ops");
+    let mut last_error = None;
+
+    for (node_index, &forced_node) in candidate_nodes.iter().enumerate() {
+        for attempt in 0..config.attempts_per_node {
+            let seed = config
+                .seed_base
+                .wrapping_add((node_index as u64).wrapping_mul(config.node_seed_stride))
+                .wrapping_add(attempt);
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut choices = random_initial_choice(egraph, &mut rng);
+            choices.insert(&egraph.node_to_class[forced_node], forced_node);
+
+            if let Err(error) = validate_choice_set(egraph, &choices, ops) {
+                last_error = Some(error);
+                continue;
+            }
+
+            let llir = extract_llir_for_choices(cx, choices);
+            if matches(&llir) {
+                return Ok(llir);
+            }
+            last_error = Some("forced choice was not reachable in the requested LLIR shape".into());
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "no forced choice produced a valid LLIR".into()))
+}
+
+/// Force any Op enode with one of `kind_labels` and require an LLIR predicate.
+pub(crate) fn try_extract_forced_op_llir_where(
+    cx: &Graph,
+    kind_labels: &[&str],
+    config: ForcedExtractionConfig,
+    matches: impl FnMut(&LLIRGraph) -> bool,
+) -> Result<LLIRGraph, String> {
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    let candidate_nodes = kind_labels
+        .iter()
+        .flat_map(|kind_label| op_ir_nodes(egraph, kind_label))
+        .collect::<Vec<_>>();
+    try_extract_forced_nodes_llir_where(cx, &candidate_nodes, config, matches)
+}
+
+pub(crate) fn llir_kernel_names(llir: &LLIRGraph) -> Vec<&'static str> {
+    llir.node_indices()
+        .filter_map(|node| {
+            llir[node]
+                .to_dialect::<dyn KernelOp>()
+                .map(|kernel| kernel.kernel_name())
+        })
+        .collect()
+}
+
+/// Force a kernel implementation while preserving the caller's deterministic
+/// choice schedule. Some semantic-contract tests additionally require the
+/// selected graph to pass the static CUDA legality/resource preflight.
+pub(crate) fn extract_forced_kernel_llir(
+    cx: &Graph,
+    egglog_kind: &str,
+    runtime_kernel_name: &str,
+    config: ForcedExtractionConfig,
+    require_static_resource_plan: bool,
+) -> LLIRGraph {
+    try_extract_forced_op_llir_where(cx, &[egglog_kind], config, |llir| {
+        llir_kernel_names(llir).contains(&runtime_kernel_name)
+            && (!require_static_resource_plan
+                || plan_static_llir_resources(llir, &FxHashMap::default()).is_ok())
+    })
+    .unwrap_or_else(|error| {
+        panic!("could not extract a valid {egglog_kind}/{runtime_kernel_name} candidate: {error}")
+    })
 }
 
 /// Get the GPU compute capability as (major, minor).

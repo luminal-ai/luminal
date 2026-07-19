@@ -1,15 +1,13 @@
 use half::bf16;
-use luminal::{
-    egglog_utils::{
-        NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
-    },
-    prelude::*,
+use luminal::prelude::*;
+
+use crate::runtime::CudaRuntime;
+
+use super::utilities::{
+    ForcedExtractionConfig, assert_close,
+    extract_forced_kernel_llir as extract_forced_kernel_llir_with_config, get_cuda_stream,
+    gpu_supports_dtype, llir_kernel_names,
 };
-use rand::{SeedableRng, rngs::StdRng};
-
-use crate::{kernel::KernelOp, runtime::CudaRuntime};
-
-use super::utilities::{assert_close, get_cuda_stream, gpu_supports_dtype};
 
 #[test]
 fn generic_matmul_covers_noncontiguous_merged_head_projection() {
@@ -178,86 +176,17 @@ fn seeded_data(len: usize, scale: f32, bias: f32) -> Vec<f32> {
 }
 
 fn extract_forced_kernel_llir(cx: &mut Graph, egglog_kind: &str) -> LLIRGraph {
-    let egraph = cx.egraph().expect("search space should have an e-graph");
-    let ops = cx
-        .egglog_ops()
-        .expect("search space should have registered egglog ops");
-    let kernel_nodes = op_ir_nodes(egraph, egglog_kind);
-    assert!(
-        !kernel_nodes.is_empty(),
-        "expected at least one {egglog_kind} candidate"
-    );
     let runtime_kernel_name = match egglog_kind {
         "KernelGemvF8" => "GemvF8",
         other => other,
     };
-
-    for (idx, kernel_node) in kernel_nodes.iter().enumerate() {
-        // Forcing the target eclass is necessary but not sufficient: choices
-        // in downstream cast/fusion eclasses can bypass it or form a rejected
-        // correlated cycle. Try a bounded deterministic seed set until the
-        // target is both legal and dataflow-reachable in the extracted LLIR.
-        for attempt in 0..128u64 {
-            let mut rng = StdRng::seed_from_u64(
-                0x9EEE_0000u64
-                    .wrapping_add((idx as u64) << 16)
-                    .wrapping_add(attempt),
-            );
-            let mut choices = random_initial_choice(egraph, &mut rng);
-            let kernel_class = &egraph.node_to_class[*kernel_node];
-            choices.insert(kernel_class, kernel_node);
-
-            if validate_choice_set(egraph, &choices, ops).is_err() {
-                continue;
-            }
-
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            let llir = egglog_to_llir(
-                egraph,
-                choices,
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
-            if llir_kernel_names(&llir).contains(&runtime_kernel_name) {
-                return llir;
-            }
-        }
-    }
-
-    panic!("could not extract a valid {egglog_kind} candidate");
-}
-
-fn llir_kernel_names(llir: &LLIRGraph) -> Vec<&'static str> {
-    llir.node_indices()
-        .filter_map(|node| {
-            llir[node]
-                .to_dialect::<dyn KernelOp>()
-                .map(|kernel| kernel.kernel_name())
-        })
-        .collect()
-}
-
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    let op_kind_classes = egraph
-        .enodes
-        .iter()
-        .filter(|(_, (label, _))| label == kind_label)
-        .map(|(node, _)| egraph.node_to_class[node].clone())
-        .collect::<Vec<_>>();
-
-    egraph
-        .enodes
-        .iter()
-        .filter_map(|(node, (label, children))| {
-            (label == "Op"
-                && children
-                    .first()
-                    .is_some_and(|kind| op_kind_classes.contains(kind)))
-            .then_some(node)
-        })
-        .collect()
+    extract_forced_kernel_llir_with_config(
+        cx,
+        egglog_kind,
+        runtime_kernel_name,
+        ForcedExtractionConfig::new(0x9EEE_0000)
+            .attempts_per_node(128)
+            .node_seed_stride(1 << 16),
+        false,
+    )
 }

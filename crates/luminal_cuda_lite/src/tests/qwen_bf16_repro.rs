@@ -14,7 +14,9 @@ use luminal::dtype::DType;
 use luminal::prelude::*;
 
 use crate::runtime::CudaRuntime;
-use crate::tests::dtype_contract::{egraph_has_op_alternatives, extract_forced_kernel_llir};
+use crate::tests::utilities::{
+    ForcedExtractionConfig, egraph_has_op_alternatives, extract_forced_kernel_llir,
+};
 use crate::tests::utilities::{get_cuda_stream, random_f32_vec, random_i32_vec};
 
 const S: usize = 3;
@@ -916,7 +918,15 @@ fn rope_scatter_fused_and_materialized_alternatives_coexist() {
         "materialized KernelRoPE+scatter and exact-deinterleave fusion must coexist"
     );
 
-    let fused = extract_forced_kernel_llir(&cx, "KernelRoPEScatterFused", "RoPEScatterFused");
+    let fused = extract_forced_kernel_llir(
+        &cx,
+        "KernelRoPEScatterFused",
+        "RoPEScatterFused",
+        ForcedExtractionConfig::new(0xA11C_E000)
+            .attempts_per_node(64)
+            .node_seed_stride(64),
+        true,
+    );
     assert!(fused.node_weights().any(|op| {
         op.to_dialect::<dyn KernelOp>()
             .is_some_and(|kernel| kernel.kernel_name() == "RoPEScatterFused")

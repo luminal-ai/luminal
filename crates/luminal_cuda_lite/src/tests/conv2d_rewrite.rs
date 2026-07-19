@@ -1,14 +1,12 @@
-use luminal::{
-    egglog_utils::{
-        NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
-    },
-    prelude::*,
+use luminal::{egglog_utils::SerializedEGraph, prelude::*};
+
+use crate::runtime::CudaRuntime;
+
+use super::utilities::{
+    ForcedExtractionConfig, assert_close,
+    extract_forced_kernel_llir as extract_forced_kernel_llir_with_config, get_cuda_stream,
+    llir_kernel_names, op_ir_nodes, try_extract_forced_nodes_llir_where,
 };
-use rand::{SeedableRng, rngs::StdRng};
-
-use crate::{kernel::KernelOp, runtime::CudaRuntime};
-
-use super::utilities::{assert_close, get_cuda_stream};
 
 fn conv2d_bias_hlir(
     x: GraphTensor,
@@ -570,50 +568,17 @@ fn reference_conv2d(input: &[f32], weight: &[f32], bias: &[f32], case: ConvCase)
 }
 
 fn extract_forced_kernel_llir(cx: &mut Graph, kernel_name: &str) -> LLIRGraph {
-    let egraph = cx.egraph().expect("search space should have an e-graph");
-    let ops = cx
-        .egglog_ops()
-        .expect("search space should have registered egglog ops");
-    let kernel_nodes = op_ir_nodes(egraph, "KernelConv2D");
-    assert!(
-        !kernel_nodes.is_empty(),
-        "expected at least one {kernel_name} candidate"
-    );
-
-    for (idx, kernel_node) in kernel_nodes.iter().enumerate() {
-        let mut rng = StdRng::seed_from_u64(0xC0_2D00 + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        let kernel_class = &egraph.node_to_class[*kernel_node];
-        choices.insert(kernel_class, kernel_node);
-
-        if validate_choice_set(egraph, &choices, ops).is_err() {
-            continue;
-        }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
-        if llir_kernel_names(&llir).contains(&kernel_name) {
-            return llir;
-        }
-    }
-
-    panic!("could not extract a valid {kernel_name} candidate");
+    extract_forced_kernel_llir_with_config(
+        cx,
+        "KernelConv2D",
+        kernel_name,
+        ForcedExtractionConfig::new(0xC0_2D00),
+        false,
+    )
 }
 
 fn extract_forced_decomposed_llir(cx: &mut Graph) -> LLIRGraph {
     let egraph = cx.egraph().expect("search space should have an e-graph");
-    let ops = cx
-        .egglog_ops()
-        .expect("search space should have registered egglog ops");
     let conv_classes = op_ir_nodes(egraph, "KernelConv2D")
         .into_iter()
         .map(|node| egraph.node_to_class[node].clone())
@@ -622,71 +587,15 @@ fn extract_forced_decomposed_llir(cx: &mut Graph) -> LLIRGraph {
         .into_iter()
         .filter(|node| conv_classes.contains(&egraph.node_to_class[*node]))
         .collect::<Vec<_>>();
-    assert!(
-        !fallback_nodes.is_empty(),
-        "expected a decomposed FusionEnd in the KernelConv2D e-class"
-    );
-
-    for (idx, fallback_node) in fallback_nodes.iter().enumerate() {
-        for attempt in 0..32_u64 {
-            let mut rng = StdRng::seed_from_u64(0xDEC0_2D00 + idx as u64 * 32 + attempt);
-            let mut choices = random_initial_choice(egraph, &mut rng);
-            let fallback_class = &egraph.node_to_class[*fallback_node];
-            choices.insert(fallback_class, *fallback_node);
-
-            if validate_choice_set(egraph, &choices, ops).is_err() {
-                continue;
-            }
-
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            let llir = egglog_to_llir(
-                egraph,
-                choices,
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
-            if !llir_kernel_names(&llir).contains(&"GenericConv2D") {
-                return llir;
-            }
-        }
-    }
-
-    panic!("could not extract the decomposed Conv2D fallback");
-}
-
-fn llir_kernel_names(llir: &LLIRGraph) -> Vec<&'static str> {
-    llir.node_indices()
-        .filter_map(|node| {
-            llir[node]
-                .to_dialect::<dyn KernelOp>()
-                .map(|kernel| kernel.kernel_name())
-        })
-        .collect()
-}
-
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    let op_kind_classes = egraph
-        .enodes
-        .iter()
-        .filter(|(_, (label, _))| label == kind_label)
-        .map(|(node, _)| egraph.node_to_class[node].clone())
-        .collect::<Vec<_>>();
-
-    egraph
-        .enodes
-        .iter()
-        .filter_map(|(node, (label, children))| {
-            (label == "Op"
-                && children
-                    .first()
-                    .is_some_and(|kind| op_kind_classes.contains(kind)))
-            .then_some(node)
-        })
-        .collect()
+    try_extract_forced_nodes_llir_where(
+        cx,
+        &fallback_nodes,
+        ForcedExtractionConfig::new(0xDEC0_2D00)
+            .attempts_per_node(32)
+            .node_seed_stride(32),
+        |llir| !llir_kernel_names(llir).contains(&"GenericConv2D"),
+    )
+    .unwrap_or_else(|error| panic!("could not extract the decomposed Conv2D fallback: {error}"))
 }
 
 fn op_kinds_share_class(egraph: &SerializedEGraph, a: &str, b: &str) -> bool {

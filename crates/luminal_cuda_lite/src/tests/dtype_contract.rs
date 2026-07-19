@@ -11,19 +11,19 @@
 
 use half::bf16;
 use luminal::dtype::DType;
-use luminal::egglog_utils::{
-    NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
-};
 use luminal::prelude::*;
-use rand::SeedableRng;
 
 use crate::kernel::KernelOp;
-use crate::resource::plan_static_llir_resources;
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::{
-    TOLERANCE_SAFETY_FACTOR, assert_close, dtype_epsilon, fuzz_genomes, get_cuda_stream,
+    ForcedExtractionConfig, TOLERANCE_SAFETY_FACTOR, assert_close, dtype_epsilon,
+    egraph_has_op_alternatives, extract_forced_kernel_llir, fuzz_genomes, get_cuda_stream,
     random_f32_vec, random_i32_vec,
 };
+
+const DTYPE_FORCED_EXTRACTION: ForcedExtractionConfig = ForcedExtractionConfig::new(0xA11C_E000)
+    .attempts_per_node(64)
+    .node_seed_stride(64);
 
 /// True if the built e-graph contains an enode with head `label` one of
 /// whose children's eclasses contains an enode with head `child_label`.
@@ -44,95 +44,6 @@ fn egraph_has_enode(cx: &Graph, label: &str, child_label: Option<&str>) -> bool 
                 .any(|n| egraph.enodes[n].0.contains(child_label))
         })
     })
-}
-
-pub(super) fn egraph_has_op_alternatives(cx: &Graph, kind_labels: &[&str]) -> bool {
-    let egraph = cx.egraph().expect("search space should be built");
-    egraph.eclasses.values().any(|(sort, nodes)| {
-        sort == "IR"
-            && kind_labels.iter().all(|kind_label| {
-                nodes.iter().any(|node| {
-                    let Some((label, children)) = egraph.enodes.get(node) else {
-                        return false;
-                    };
-                    label == "Op"
-                        && children.first().is_some_and(|kind_class| {
-                            egraph.eclasses[kind_class]
-                                .1
-                                .iter()
-                                .any(|kind_node| egraph.enodes[kind_node].0.as_str() == *kind_label)
-                        })
-                })
-            })
-    })
-}
-
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    egraph
-        .eclasses
-        .values()
-        .filter(|(sort, _)| sort == "IR")
-        .flat_map(|(_, nodes)| nodes)
-        .filter(|node| {
-            let Some((label, children)) = egraph.enodes.get(*node) else {
-                return false;
-            };
-            label == "Op"
-                && children.first().is_some_and(|kind_class| {
-                    egraph.eclasses[kind_class]
-                        .1
-                        .iter()
-                        .any(|kind_node| egraph.enodes[kind_node].0 == kind_label)
-                })
-        })
-        .collect()
-}
-
-pub(super) fn extract_forced_kernel_llir(
-    cx: &Graph,
-    egglog_kind: &str,
-    runtime_kernel_name: &str,
-) -> LLIRGraph {
-    let egraph = cx.egraph().expect("search space should be built");
-    let ops = cx.egglog_ops().expect("egglog ops should be built");
-    let kernel_nodes = op_ir_nodes(egraph, egglog_kind);
-    assert!(
-        !kernel_nodes.is_empty(),
-        "expected a {egglog_kind} alternative"
-    );
-
-    for (node_index, kernel_node) in kernel_nodes.iter().enumerate() {
-        for background in 0..64 {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(
-                0xA11C_E000 + (node_index as u64) * 64 + background,
-            );
-            let mut choices = random_initial_choice(egraph, &mut rng);
-            choices.insert(&egraph.node_to_class[*kernel_node], kernel_node);
-            if validate_choice_set(egraph, &choices, ops).is_err() {
-                continue;
-            }
-            let mut list_cache = Default::default();
-            let mut expr_cache = Default::default();
-            let llir = egglog_to_llir(
-                egraph,
-                choices,
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
-            if llir.node_weights().any(|op| {
-                op.to_dialect::<dyn KernelOp>()
-                    .is_some_and(|kernel| kernel.kernel_name() == runtime_kernel_name)
-            }) && plan_static_llir_resources(&llir, &FxHashMap::default()).is_ok()
-            {
-                return llir;
-            }
-        }
-    }
-
-    panic!("could not extract a valid {egglog_kind} candidate");
 }
 
 #[test]
@@ -1408,12 +1319,24 @@ fn rope_scatter_fusion_matches_reference() {
         egraph_has_op_alternatives(&cx, &["KernelScatterNoCopy", "KernelRoPEHalfScatter"]),
         "materialized and fused RoPEHalf+scatter must coexist"
     );
-    let fused = extract_forced_kernel_llir(&cx, "KernelRoPEHalfScatter", "RoPEScatter");
+    let fused = extract_forced_kernel_llir(
+        &cx,
+        "KernelRoPEHalfScatter",
+        "RoPEScatter",
+        DTYPE_FORCED_EXTRACTION,
+        true,
+    );
     assert!(fused.node_weights().any(|op| {
         op.to_dialect::<dyn KernelOp>()
             .is_some_and(|kernel| kernel.kernel_name() == "RoPEScatter")
     }));
-    let materialized = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
+    let materialized = extract_forced_kernel_llir(
+        &cx,
+        "KernelScatterNoCopy",
+        "ScatterNoCopy",
+        DTYPE_FORCED_EXTRACTION,
+        true,
+    );
     let materialized_names: Vec<_> = materialized
         .node_weights()
         .filter_map(|op| op.to_dialect::<dyn KernelOp>())

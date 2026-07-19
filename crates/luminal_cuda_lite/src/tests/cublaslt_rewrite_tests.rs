@@ -1,9 +1,6 @@
 use luminal::{
     dtype::DType,
-    egglog_utils::{
-        ClassId, NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice,
-        validate_choice_set,
-    },
+    egglog_utils::{ClassId, NodeId, SerializedEGraph, random_initial_choice, validate_choice_set},
     prelude::*,
 };
 use rand::{SeedableRng, rngs::StdRng};
@@ -20,7 +17,10 @@ use crate::{
     runtime::CudaRuntime,
 };
 
-use super::utilities::{assert_close, get_cuda_stream, gpu_supports_dtype, random_f32_vec};
+use super::utilities::{
+    ForcedExtractionConfig, assert_close, extract_llir_for_choices, get_cuda_stream,
+    gpu_supports_dtype, op_ir_nodes, random_f32_vec, try_extract_forced_op_llir_where,
+};
 
 // Broad cuBLASLt rewrite coverage is intentionally opt-in: these tests rerun the
 // egglog optimizer across many layout and epilogue combinations and dominate the
@@ -3531,52 +3531,15 @@ fn extract_forced_cublaslt_llir_where(
 ) -> LLIRGraph {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
-    let egraph = cx.egraph().expect("search space should have an e-graph");
-    let ops = cx
-        .egglog_ops()
-        .expect("search space should have registered egglog ops");
-    let cublaslt_nodes = cublaslt_ir_nodes(egraph);
-    assert!(
-        !cublaslt_nodes.is_empty(),
-        "expected a cublasLt rewrite candidate for {case_name}, but no cublaslt Op appeared"
-    );
-
-    let mut last_error = None;
-    for (idx, cublaslt_node) in cublaslt_nodes.iter().enumerate() {
-        let mut rng = StdRng::seed_from_u64(0x00C0_B1A5 + idx as u64);
-        let mut choices = random_initial_choice(egraph, &mut rng);
-        let cublaslt_class = &egraph.node_to_class[*cublaslt_node];
-        choices.insert(cublaslt_class, cublaslt_node);
-
-        if let Err(err) = validate_choice_set(egraph, &choices, ops) {
-            last_error = Some(err);
-            continue;
-        }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
-
-        if !cublaslt_type_tuples(&llir).is_empty() && matches(&llir) {
-            return llir;
-        }
-
-        last_error =
-            Some("forced cublaslt candidate did not satisfy requested extracted shape".into());
-    }
-
-    panic!(
-        "expected to extract a CuBlasLt HostOp for {case_name}; last error: {}",
-        last_error.unwrap_or_else(|| "no candidate could be forced".into())
-    );
+    try_extract_forced_op_llir_where(
+        cx,
+        &["cublaslt", "cublaslt_scaled"],
+        ForcedExtractionConfig::new(0x00C0_B1A5),
+        |llir| !cublaslt_type_tuples(llir).is_empty() && matches(llir),
+    )
+    .unwrap_or_else(|error| {
+        panic!("expected to extract a CuBlasLt HostOp for {case_name}: {error}")
+    })
 }
 
 /// Force exactly one cuBLASLt alternative in every distinct IR e-class.
@@ -3640,17 +3603,7 @@ fn extract_forced_distinct_cublaslt_classes_llir_where(
                 continue;
             }
 
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            let llir = egglog_to_llir(
-                egraph,
-                choices,
-                ops,
-                &cx.custom_ops,
-                &mut list_cache,
-                &mut expr_cache,
-                None,
-            );
+            let llir = extract_llir_for_choices(cx, choices);
             if cublaslt_type_tuples(&llir).len() == nodes_by_class.len() && matches(&llir) {
                 return llir;
             }
@@ -3693,17 +3646,7 @@ fn assert_no_forced_cublaslt_llir_where(
             continue;
         }
 
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let llir = extract_llir_for_choices(cx, choices);
 
         assert!(
             !llir_has_cublaslt(&llir) || !matches(&llir),
@@ -3737,17 +3680,7 @@ fn assert_no_cublaslt_llir_where(
             continue;
         }
 
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let llir = extract_llir_for_choices(cx, choices);
 
         assert!(
             !llir_has_cublaslt(&llir) || !matches(&llir),
@@ -3764,27 +3697,6 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
     op_ir_nodes(egraph, "cublaslt")
         .into_iter()
         .chain(op_ir_nodes(egraph, "cublaslt_scaled"))
-        .collect()
-}
-
-fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
-    let op_kind_classes = egraph
-        .enodes
-        .iter()
-        .filter(|(_, (label, _))| label == kind_label)
-        .map(|(node, _)| egraph.node_to_class[node].clone())
-        .collect::<Vec<_>>();
-
-    egraph
-        .enodes
-        .iter()
-        .filter_map(|(node, (label, children))| {
-            (label == "Op"
-                && children
-                    .first()
-                    .is_some_and(|kind| op_kind_classes.contains(kind)))
-            .then_some(node)
-        })
         .collect()
 }
 
