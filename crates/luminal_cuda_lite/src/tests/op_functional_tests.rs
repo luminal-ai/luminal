@@ -12,8 +12,8 @@ use crate::runtime::CudaRuntime;
 #[allow(unused_imports)]
 use super::utilities::{
     GENOME_FUZZ_COUNT, TOLERANCE_SAFETY_FACTOR, assert_close, dtype_epsilon, fuzz_genomes,
-    gen_slice_range, get_cuda_stream, gpu_supports_dtype, random_f32_vec, random_i32_vec,
-    test_binary_cuda, test_mod, test_unary_cuda, to_candle_dtype,
+    gen_slice_range, get_cuda_stream, gpu_supports_dtype, op_ir_nodes, random_f32_vec,
+    random_i32_vec, test_binary_cuda, test_mod, test_unary_cuda, to_candle_dtype,
 };
 
 // The property-based op tests each build/search CUDA graphs for multiple random
@@ -631,6 +631,80 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
         tol,
         GENOME_FUZZ_COUNT,
         seed,
+    );
+}
+
+#[test]
+fn flattened_dynamic_row_gather_is_not_an_embedding() {
+    // PT2 fancy indexing lowers `table[dynamic_rows]` by flattening the source
+    // and gathering `row * WIDTH + col`.  That index expression is
+    // syntactically embedding-like, but the flattened source shape is [ROWS *
+    // WIDTH], not [ROWS, WIDTH].  KernelEmbed used to match it anyway, derive
+    // `embed_dim = ROWS * WIDTH`, and read the wrong rows (often OOB).  Qwen3
+    // MoE hits this exact path when it gathers 32 routed hidden states from a
+    // [4, 2048] token matrix.
+    const ROWS: usize = 4;
+    const WIDTH: usize = 2048;
+    const PICKS: usize = 32;
+    const SEED: u64 = 0xE6BE_DD1A;
+
+    let mut cx = Graph::default();
+    let dynamic_rows = cx.tensor(PICKS).as_dtype(DType::Int);
+    let table = cx.tensor((ROWS, WIDTH));
+    let flat_table = table.flatten();
+    let flat_indices =
+        (dynamic_rows * WIDTH).expand_dim(1, WIDTH) + cx.arange(WIDTH).expand_dim(0, PICKS);
+    let output = flat_table.gather(flat_indices).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        op_ir_nodes(egraph, "KernelEmbed").is_empty(),
+        "a flattened dynamic row gather must not expose KernelEmbed as a selectable alternative"
+    );
+    assert!(
+        !op_ir_nodes(egraph, "KernelGather").is_empty(),
+        "the dynamic row gather should retain its general KernelGather lowering"
+    );
+
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let row_data: Vec<i32> = (0..PICKS).map(|i| ((i * 3 + 1) % ROWS) as i32).collect();
+    let table_data: Vec<f32> = (0..ROWS * WIDTH)
+        .map(|i| (i / WIDTH) as f32 * 10_000.0 + (i % WIDTH) as f32)
+        .collect();
+    let expected: Vec<f32> = row_data
+        .iter()
+        .flat_map(|&row| {
+            let start = row as usize * WIDTH;
+            table_data[start..start + WIDTH].iter().copied()
+        })
+        .collect();
+
+    let mut rt = CudaRuntime::initialize(stream.clone());
+    rt.set_data(dynamic_rows, row_data.clone());
+    rt.set_data(table, table_data.clone());
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(10));
+    rt.execute(&cx.dyn_map);
+    assert_close(&rt.get_f32(output.id), &expected, 0.0, 0.0);
+
+    // Walk fixed-seed extractable candidates too: this regression originally
+    // passed or failed nondeterministically depending on whether KernelGather
+    // or the invalid KernelEmbed alternative won extraction.
+    fuzz_genomes::<f32>(
+        &cx,
+        &stream,
+        |rt| {
+            rt.set_data(dynamic_rows, row_data.clone());
+            rt.set_data(table, table_data.clone());
+        },
+        output.id,
+        &expected,
+        0.0,
+        0.0,
+        GENOME_FUZZ_COUNT,
+        SEED,
     );
 }
 
