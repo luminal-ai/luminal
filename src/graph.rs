@@ -4656,6 +4656,52 @@ mod tests {
     }
 
     #[test]
+    fn test_rolling_op_signature_custom_op_content() {
+        #[derive(Debug)]
+        struct TestCustomOp {
+            #[allow(dead_code)]
+            name: &'static str,
+        }
+        impl CustomOp for TestCustomOp {
+            fn to_llir_op(&self) -> LLIROp {
+                unimplemented!()
+            }
+        }
+
+        // The signature cache is keyed by NodeIndex and only cleared by
+        // best_rolling_candidate; drop entries another test on this thread
+        // may have left behind for the same indices.
+        clear_rolling_sig_cache();
+
+        let mut cx = Graph::new();
+        cx.custom_ops.push(Box::new(TestCustomOp { name: "rope" }));
+        cx.custom_ops.push(Box::new(TestCustomOp { name: "rope" }));
+        cx.custom_ops.push(Box::new(TestCustomOp { name: "topk" }));
+        let ids: Vec<_> = (0..3)
+            .map(|id| {
+                cx.add_op(
+                    CustomOpKind {
+                        id,
+                        dtype: DType::F32,
+                    },
+                    &[],
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            rolling_op_signature(&cx.graph, ids[0], &cx.custom_ops),
+            rolling_op_signature(&cx.graph, ids[1], &cx.custom_ops),
+            "separate instances of the same custom op should sign the same"
+        );
+        assert_ne!(
+            rolling_op_signature(&cx.graph, ids[0], &cx.custom_ops),
+            rolling_op_signature(&cx.graph, ids[2], &cx.custom_ops),
+            "different custom ops should sign differently"
+        );
+    }
+
+    #[test]
     fn test_auto_roll_loops_prepass_creates_regions_for_chain_recurrence() {
         let mut cx = Graph::new();
         let x = cx.tensor(8);

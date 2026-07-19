@@ -1,0 +1,15 @@
+[package]
+name = "luminal_training"
+version = "0.1.0"
+edition.workspace = true
+description = "Training utilities for luminal: reverse-mode autograd over HLIR graphs."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+luminal = { path = "../.." }
+itertools = "0.11.0"
+
+[dev-dependencies]
+rand = "0.9.2"
+mnist = { version = "0.6", features = ["download"] }
+luminal_nn = { path = "../luminal_nn" }

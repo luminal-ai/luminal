@@ -94,6 +94,17 @@ def _run_hf_qwen3_moe_test(config, device: torch.device, atol: float):
 # ────────────────────────────────────────────────────────────────────────
 
 
+# Disabled: extreme slowdown in egglog matching on these whole-model MoE
+# compiles (99.5% of test time is inside process_pt2). Re-enable when the
+# upstream fix lands:
+#   https://github.com/egraphs-good/egglog/issues/946#issuecomment-4917917418
+#   https://github.com/egraphs-good/egglog/issues/872
+_EGGLOG_SLOWDOWN = pytest.mark.skip(
+    reason="egglog matching slowdown (egglog#946, egglog#872)"
+)
+
+
+@_EGGLOG_SLOWDOWN
 def test_hf_qwen3_moe_tiny(device: torch.device):
     """HuggingFace Qwen3MoeForCausalLM — tiny: 2 experts, top-1 routing.
 
@@ -115,6 +126,7 @@ def test_hf_qwen3_moe_tiny(device: torch.device):
     _run_hf_qwen3_moe_test(config, device, atol=1e-5)
 
 
+@_EGGLOG_SLOWDOWN
 def test_hf_qwen3_moe_small(device: torch.device):
     """HuggingFace Qwen3MoeForCausalLM — small: 4 experts, top-2 routing."""
     config = _make_qwen3_moe_config(
@@ -131,6 +143,7 @@ def test_hf_qwen3_moe_small(device: torch.device):
     _run_hf_qwen3_moe_test(config, device, atol=1e-4)
 
 
+@_EGGLOG_SLOWDOWN
 def test_hf_qwen3_moe_medium(device: torch.device):
     """HuggingFace Qwen3MoeForCausalLM — medium: 8 experts, top-2, 2 layers.
 

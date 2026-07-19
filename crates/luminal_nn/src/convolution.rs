@@ -21,13 +21,17 @@ impl ConvND {
     pub fn new(
         ch_in: usize,
         ch_out: usize,
-        kernel: Vec<usize>,
-        stride: Vec<usize>,
-        dilation: Vec<usize>,
-        padding: Vec<usize>,
+        kernel: impl AsRef<[usize]>,
+        stride: impl AsRef<[usize]>,
+        dilation: impl AsRef<[usize]>,
+        padding: impl AsRef<[usize]>,
         bias: bool,
         cx: &mut Graph,
     ) -> Self {
+        let kernel = kernel.as_ref().to_vec();
+        let stride = stride.as_ref().to_vec();
+        let dilation = dilation.as_ref().to_vec();
+        let padding = padding.as_ref().to_vec();
         assert!(
             !kernel.is_empty(),
             "ConvND requires at least one spatial dimension in the kernel",
@@ -118,12 +122,8 @@ impl ConvND {
             dilation_shape[axis] = self.dilation[i];
         }
 
+        // unfold yields [window..., kernel...] — windows already in front.
         let unfolded = padded.unfold(kernel_shape, stride_shape, dilation_shape);
-
-        // Move window dimensions to the front for easier indexing.
-        let mut order: Vec<usize> = (rank..2 * rank).collect();
-        order.extend(0..rank);
-        let unfolded = unfolded.permute(order);
         let unfolded_dims = unfolded.dims();
 
         // Capture output spatial dimensions from the unfolded view.
@@ -166,11 +166,14 @@ impl ConvND {
 
         let mut out = patches.matmul(self.weight.permute((1, 0)));
 
-        // Restore batch and spatial dimensions.
-        for dim in self.input_batch_dims(&input_dims, batch_len).iter().rev() {
+        // Restore batch and spatial dimensions. The collapse loops merged
+        // k dims into 1, so restore splits k-1 times: splitting by every dim
+        // including the outermost would leave a spurious leading 1-dim.
+        let batch_dims = self.input_batch_dims(&input_dims, batch_len);
+        for dim in batch_dims.iter().skip(1).rev() {
             out = out.split_dims(0, *dim);
         }
-        for dim in output_dims.iter().rev() {
+        for dim in output_dims.iter().skip(1).rev() {
             out = out.split_dims(batch_len, *dim);
         }
 
@@ -404,5 +407,73 @@ mod tests {
         // width: (6 - dilation*(3-1) -1 + 1 +1)/2 +1 = 3
         let inferred = conv.infer_output_shape(&[1, 3, 5, 6]);
         assert_eq!(inferred, vec![1, 2, 4, 3]);
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::ConvND;
+    use luminal::prelude::*;
+
+    /// ConvND forward vs a naive host-side convolution, on the reference
+    /// runtime. Covers multi-channel input/output and a batch dimension.
+    #[test]
+    fn convnd_2d_matches_naive() {
+        let (b, ci, co, h, w, k) = (2usize, 2usize, 3usize, 4usize, 4usize, 2usize);
+        let (oh, ow) = (h - k + 1, w - k + 1);
+        let x_data: Vec<f32> = (0..b * ci * h * w)
+            .map(|i| (i as f32 * 0.13).sin())
+            .collect();
+        let w_data: Vec<f32> = (0..co * ci * k * k)
+            .map(|i| (i as f32 * 0.29).cos())
+            .collect();
+
+        let mut cx = Graph::new();
+        let x = cx.tensor((b, ci, h, w));
+        let conv = ConvND::new(
+            ci,
+            co,
+            vec![k, k],
+            vec![1, 1],
+            vec![1, 1],
+            vec![0, 0],
+            false,
+            &mut cx,
+        );
+        let out = conv.forward(x).output();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
+        rt.set_data(x.id, x_data.clone());
+        rt.set_data(conv.weight.id, w_data.clone());
+        rt.execute(&cx.dyn_map);
+        let got = rt.get_f32(out.id).clone();
+
+        // Naive conv; weight layout is (co, ci * k * k), ci-major.
+        let mut want = vec![0.0f32; b * co * oh * ow];
+        for bi in 0..b {
+            for o in 0..co {
+                for y in 0..oh {
+                    for xx in 0..ow {
+                        let mut acc = 0.0;
+                        for c in 0..ci {
+                            for dy in 0..k {
+                                for dx in 0..k {
+                                    let xv = x_data[((bi * ci + c) * h + y + dy) * w + xx + dx];
+                                    let wv = w_data[(o * ci + c) * k * k + dy * k + dx];
+                                    acc += xv * wv;
+                                }
+                            }
+                        }
+                        want[((bi * co + o) * oh + y) * ow + xx] = acc;
+                    }
+                }
+            }
+        }
+        for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+            assert!((g - e).abs() < 1e-4, "element {i}: got {g}, want {e}");
+        }
     }
 }

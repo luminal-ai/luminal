@@ -635,32 +635,32 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
 }
 
 #[test]
-fn flattened_dynamic_row_gather_is_not_an_embedding() {
+fn flattened_dynamic_row_gather_embed_candidates_are_equivalent() {
     // PT2 fancy indexing lowers `table[dynamic_rows]` by flattening the source
-    // and gathering `row * WIDTH + col`.  That index expression is
-    // syntactically embedding-like, but the flattened source shape is [ROWS *
-    // WIDTH], not [ROWS, WIDTH].  KernelEmbed used to match it anyway, derive
-    // `embed_dim = ROWS * WIDTH`, and read the wrong rows (often OOB).  Qwen3
-    // MoE hits this exact path when it gathers 32 routed hidden states from a
-    // [4, 2048] token matrix.
+    // and gathering `row * WIDTH + col`. KernelEmbed must derive the physical
+    // row stride from that multiplier rather than from the flattened source
+    // shape. Qwen3 MoE hits the unpadded form of this path when it gathers 32
+    // routed hidden states from a [4, 2048] token matrix; the padding here also
+    // proves that physical row stride and copied row width stay independent.
     const ROWS: usize = 4;
     const WIDTH: usize = 2048;
+    const ROW_STRIDE: usize = WIDTH + 8;
     const PICKS: usize = 32;
     const SEED: u64 = 0xE6BE_DD1A;
 
     let mut cx = Graph::default();
     let dynamic_rows = cx.tensor(PICKS).as_dtype(DType::Int);
-    let table = cx.tensor((ROWS, WIDTH));
+    let table = cx.tensor((ROWS, ROW_STRIDE));
     let flat_table = table.flatten();
     let flat_indices =
-        (dynamic_rows * WIDTH).expand_dim(1, WIDTH) + cx.arange(WIDTH).expand_dim(0, PICKS);
+        (dynamic_rows * ROW_STRIDE).expand_dim(1, WIDTH) + cx.arange(WIDTH).expand_dim(0, PICKS);
     let output = flat_table.gather(flat_indices).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("search space should have an e-graph");
     assert!(
-        op_ir_nodes(egraph, "KernelEmbed").is_empty(),
-        "a flattened dynamic row gather must not expose KernelEmbed as a selectable alternative"
+        !op_ir_nodes(egraph, "KernelEmbed").is_empty(),
+        "a contiguous flattened row gather should expose the row-strided KernelEmbed fast path"
     );
     assert!(
         !op_ir_nodes(egraph, "KernelGather").is_empty(),
@@ -671,13 +671,13 @@ fn flattened_dynamic_row_gather_is_not_an_embedding() {
         return;
     };
     let row_data: Vec<i32> = (0..PICKS).map(|i| ((i * 3 + 1) % ROWS) as i32).collect();
-    let table_data: Vec<f32> = (0..ROWS * WIDTH)
-        .map(|i| (i / WIDTH) as f32 * 10_000.0 + (i % WIDTH) as f32)
+    let table_data: Vec<f32> = (0..ROWS * ROW_STRIDE)
+        .map(|i| (i / ROW_STRIDE) as f32 * 10_000.0 + (i % ROW_STRIDE) as f32)
         .collect();
     let expected: Vec<f32> = row_data
         .iter()
         .flat_map(|&row| {
-            let start = row as usize * WIDTH;
+            let start = row as usize * ROW_STRIDE;
             table_data[start..start + WIDTH].iter().copied()
         })
         .collect();
@@ -691,7 +691,7 @@ fn flattened_dynamic_row_gather_is_not_an_embedding() {
 
     // Walk fixed-seed extractable candidates too: this regression originally
     // passed or failed nondeterministically depending on whether KernelGather
-    // or the invalid KernelEmbed alternative won extraction.
+    // or a KernelEmbed with the wrong physical row stride won extraction.
     fuzz_genomes::<f32>(
         &cx,
         &stream,
@@ -705,6 +705,53 @@ fn flattened_dynamic_row_gather_is_not_an_embedding() {
         0.0,
         GENOME_FUZZ_COUNT,
         SEED,
+    );
+}
+
+#[test]
+fn kernel_embed_rejects_noncontiguous_index_view() {
+    // Keep the dimensions square so permuting the complete index grid preserves
+    // its [batch, width] shape. The producer Add is contiguous, but Gather reads
+    // its transposed view; KernelEmbed addresses the producer layout directly
+    // and therefore must not be selectable.
+    const SIDE: usize = 4;
+
+    let mut cx = Graph::default();
+    let dynamic_rows = cx.tensor(SIDE).as_dtype(DType::Int);
+    let table = cx.tensor(SIDE * SIDE);
+    let flat_indices =
+        (dynamic_rows * SIDE).expand_dim(1, SIDE) + cx.arange(SIDE).expand_dim(0, SIDE);
+    let _output = table.gather(flat_indices.permute((1, 0))).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        op_ir_nodes(egraph, "KernelEmbed").is_empty(),
+        "KernelEmbed must not bypass a non-contiguous view of its index tensor"
+    );
+}
+
+#[test]
+fn kernel_embed_rejects_noncontiguous_table_view() {
+    // Gather maps logical flat indexes through the table's ShapeTracker. The
+    // specialized kernel directly addresses storage, so it is valid only when
+    // that logical-to-physical mapping is row-major.
+    const ROWS: usize = 4;
+    const WIDTH: usize = 4;
+
+    let mut cx = Graph::default();
+    let dynamic_rows = cx.tensor(ROWS).as_dtype(DType::Int);
+    let storage = cx.tensor((WIDTH, ROWS));
+    let table = storage.permute((1, 0));
+    let flat_indices =
+        (dynamic_rows * WIDTH).expand_dim(1, WIDTH) + cx.arange(WIDTH).expand_dim(0, ROWS);
+    let _output = table.gather(flat_indices).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        op_ir_nodes(egraph, "KernelEmbed").is_empty(),
+        "KernelEmbed must not bypass a non-contiguous view of its table"
     );
 }
 

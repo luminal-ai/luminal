@@ -318,6 +318,22 @@ impl<'a> Translator<'a> {
             .collect()
     }
 
+    /// Shape of the node's first output, from its tensor metadata (for ops
+    /// whose output size isn't reliably readable from the args).
+    pub(crate) fn output_meta_shape(&self, node: &Node) -> Result<Vec<Expression>> {
+        let name = node
+            .outputs
+            .first()
+            .and_then(|output| output.as_tensor.as_ref())
+            .map(|tensor| tensor.name.clone())
+            .unwrap_or_default();
+
+        let meta = self
+            .tensor_meta(&name)
+            .context("Missing tensor meta for output shape")?;
+        self.tensor_meta_to_shape(meta)
+    }
+
     pub(crate) fn dim_size_to_expr(&self, dim: &DimSize) -> Result<Expression> {
         match dim {
             DimSize::Int(i) => Ok(Expression::from(i.as_int)),

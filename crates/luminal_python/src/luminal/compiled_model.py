@@ -85,20 +85,24 @@ class CompiledModel:
         Returns:
             Tuple of PyTorch tensors containing the model outputs
         """
-        # Extract user inputs (torch.compile may pass lifted weights as extra args)
+        # Drop stripped SymInt args, if any.
         if self._user_indices is not None:
             user_inputs = [inputs[i] for i in self._user_indices]
         else:
-            if len(inputs) != len(self._input_names):
-                raise ValueError(
-                    f"Expected {len(self._input_names)} inputs, got {len(inputs)}"
-                )
             user_inputs = inputs
+        # Positional binding against input_names: never zip-truncate silently.
+        if len(user_inputs) != len(self._input_names):
+            raise ValueError(
+                f"Expected {len(self._input_names)} inputs, got {len(user_inputs)}"
+            )
 
-        # Use the first *user* input for device detection — when torch.compile
-        # has lifted SymInts or weights into the call args, `inputs[0]` may not
-        # be a tensor. user_inputs has been filtered to actual tensors.
-        input_device = user_inputs[0].device if user_inputs else torch.device("cpu")
+        # Device for outputs: prefer any CUDA input — inputs include lifted
+        # weights, and user_inputs[0] may be a CPU-resident weight (offloaded
+        # models) while activations live on the GPU.
+        input_device = next(
+            (t.device for t in user_inputs if t.is_cuda),
+            user_inputs[0].device if user_inputs else torch.device("cpu"),
+        )
 
         # Auto-detect dynamic dims from input shapes
         if self._has_dynamic_dims:

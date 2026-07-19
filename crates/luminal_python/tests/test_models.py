@@ -2478,3 +2478,44 @@ class SdpaWithBiasModel(torch.nn.Module):
         bias: torch.Tensor,
     ) -> torch.Tensor:
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+
+
+# ========== Nearest Upsample Test Models ==========
+
+
+class UpsampleNearestScaleModel(torch.nn.Module):
+    """`F.interpolate(scale_factor=..., mode="nearest")` — the
+    `scale_factors` overload (the SD UNet path)."""
+
+    def __init__(self, scale_factor: float = 2.0) -> None:
+        super().__init__()
+        self.scale_factor = scale_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(
+            x, scale_factor=self.scale_factor, mode="nearest"
+        )
+
+
+class UpsampleNearestScaleHWModel(torch.nn.Module):
+    """Non-square per-axis scale, `scale_factor=(sh, sw)`."""
+
+    def __init__(self, scale_h: float = 2.0, scale_w: float = 3.0) -> None:
+        super().__init__()
+        self.scale = (scale_h, scale_w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(
+            x, scale_factor=self.scale, mode="nearest"
+        )
+
+
+class UpsampleNearestSizeModel(torch.nn.Module):
+    """`F.interpolate(size=...)` — the `output_size` overload."""
+
+    def __init__(self, size: tuple[int, int] = (16, 16)) -> None:
+        super().__init__()
+        self.size = size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(x, size=self.size, mode="nearest")

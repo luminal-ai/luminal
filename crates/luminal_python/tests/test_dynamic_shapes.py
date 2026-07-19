@@ -68,30 +68,28 @@ def _explicit_mark_dynamic_mode():
 def _first_trace_dynamic_shapes(capture_holder):
     from luminal.pt2 import (
         _build_dynamic_shapes_from_gm,
-        _reinternalize_lifted_params,
         _strip_symint_placeholders,
     )
 
     gm = copy.deepcopy(capture_holder["gm"]).eval()
     example_inputs = capture_holder["example_inputs"]
-    gm, user_inputs, _, _ = _reinternalize_lifted_params(gm, example_inputs)
+    user_inputs = list(example_inputs)
     user_inputs, _, strip_ok = _strip_symint_placeholders(gm, user_inputs)
     dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
     return strip_ok, dynamic_shapes
 
 
-def _assert_input_dynamic_dims(dynamic_shapes, input_index, expected_dims):
+def _assert_single_dynamic_input(dynamic_shapes, expected_dims):
+    """Exactly one arg is dynamic, with the expected dims (position among
+    the args is a Dynamo ordering detail — weights are in the list too)."""
     args_spec = dynamic_shapes.get("args")
-    assert args_spec is not None and len(args_spec) > input_index, (
-        f"expected dynamic spec for input {input_index}, got {dynamic_shapes}"
+    assert args_spec is not None, f"expected an args spec, got {dynamic_shapes}"
+    dyn_specs = [spec for spec in args_spec if spec is not None]
+    assert len(dyn_specs) == 1, (
+        f"expected exactly one dynamic input, got {dynamic_shapes}"
     )
-    spec = args_spec[input_index]
-    assert spec is not None, (
-        f"expected a per-dim dynamic spec for input {input_index}, got {dynamic_shapes}"
-    )
-    assert set(spec.keys()) == set(expected_dims), (
-        f"expected dynamic dims {set(expected_dims)} for input {input_index}, "
-        f"got {dynamic_shapes}"
+    assert set(dyn_specs[0].keys()) == set(expected_dims), (
+        f"expected dynamic dims {set(expected_dims)}, got {dynamic_shapes}"
     )
 
 
@@ -306,7 +304,7 @@ def test_mark_dynamic_seq_via_torch_compile_starts_dynamic(device: torch.device)
         strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
         assert strip_ok, "Expected explicit mark_dynamic SymInts to be rewritten"
         assert dynamic_shapes is not None
-        _assert_input_dynamic_dims(dynamic_shapes, 0, {1})
+        _assert_single_dynamic_input(dynamic_shapes, {1})
 
         assert len(counts) == 1, (
             "Explicit mark_dynamic should produce one dynamic backend trace from the start, "
@@ -360,7 +358,7 @@ def test_mark_dynamic_seq_with_lifted_weights_single_compile(device: torch.devic
         strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
         assert strip_ok
         assert dynamic_shapes is not None
-        _assert_input_dynamic_dims(dynamic_shapes, 0, {1})
+        _assert_single_dynamic_input(dynamic_shapes, {1})
 
         assert len(counts) == 1, (
             "Explicit mark_dynamic should avoid a second compile for lifted-weight models, "
@@ -407,7 +405,7 @@ def test_mark_dynamic_seq_preserves_affine_output_shape(device: torch.device):
         strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
         assert strip_ok
         assert dynamic_shapes is not None
-        _assert_input_dynamic_dims(dynamic_shapes, 0, {1})
+        _assert_single_dynamic_input(dynamic_shapes, {1})
 
         assert len(counts) == 1, (
             "Explicit mark_dynamic should keep affine output-shape models on one compile, "
@@ -455,7 +453,7 @@ def test_mark_dynamic_two_dim_via_torch_compile_starts_dynamic(device: torch.dev
         strip_ok, dynamic_shapes = _first_trace_dynamic_shapes(capture)
         assert strip_ok
         assert dynamic_shapes is not None
-        _assert_input_dynamic_dims(dynamic_shapes, 0, {0, 1})
+        _assert_single_dynamic_input(dynamic_shapes, {0, 1})
 
         assert len(counts) == 1, (
             "Explicitly marked batch+seq dims should compile once from the first call, "
