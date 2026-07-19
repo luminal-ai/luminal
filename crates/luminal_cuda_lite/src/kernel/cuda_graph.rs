@@ -29,10 +29,16 @@
 //!
 //! The devcontainer CUDA image (12.8) enables all thresholds and the island-capture path.
 //!
-//! # Follow-up CI
+//! # Local testing
 //!
-//! Cross-build cfg branches with separate `CARGO_TARGET_DIR` values, e.g.
-//! `CUDARC_CUDA_VERSION=12000 cargo check -p luminal_cuda_lite` (planned CI matrix PR).
+//! **Tier 1 (host / devcontainer):** `make help`, `make cuda-lite-test` (default workspace
+//! `target/`). Synthetic API paths: `make cuda-lite-test CUDARC_VERSION=12000` (isolated
+//! `target/cuda-lite/<version>/`; does not change the installed toolkit).
+//!
+//! **Tier 2 (real toolkit):** `make cuda-devel-image` → `luminal-docker:cuda-$(CUDA_TAG)`
+//! (push: `make cuda-devel-image-push`), then `make cuda-lite-docker-test CUDA_TAG=13.3.0`.
+//! Runs `luminal_cuda_lite` tests with native `nvcc`. Container `libcuda.so` comes from the
+//! host driver. CI still uses the prebuilt `ghcr.io/luminal-ai/luminal-docker:cuda` (12.8).
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
