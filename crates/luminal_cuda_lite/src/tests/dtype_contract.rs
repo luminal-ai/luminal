@@ -967,7 +967,7 @@ fn gemv_m1_matches_reference() {
 }
 
 #[test]
-fn gemv_m1_bf16_preserves_all_legal_backends() {
+fn gemv_m1_bf16_preserves_only_wide_accumulator_backends() {
     let mut cx = Graph::default();
     let x = cx.tensor((1, 64)).as_dtype(DType::Bf16);
     let w = cx.tensor((96, 64)).as_dtype(DType::Bf16);
@@ -975,11 +975,50 @@ fn gemv_m1_bf16_preserves_all_legal_backends() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_op_alternatives(
-            &cx,
-            &["KernelSum", "GenericMatmul", "KernelGemv", "cublaslt"],
-        ),
-        "m=1 bf16 matmul should retain the lowered reduction, generic matmul, warp GEMV, and cuBLASLt choices in one output e-class"
+        egraph_has_op_alternatives(&cx, &["GenericMatmul", "KernelGemv", "cublaslt"]),
+        "m=1 bf16 matmul should retain every F32-accumulating backend choice"
+    );
+    assert!(
+        !egraph_has_op_alternatives(&cx, &["KernelSum", "GenericMatmul"]),
+        "a materialized BF16 Mul followed by KernelSum rounds every product and must not remain selectable beside F32-accumulating matmul backends"
+    );
+}
+
+#[test]
+fn low_precision_multirow_matmul_excludes_product_rounding_reduction() {
+    // This is the Llama LM-head shape that exposed the violation in a full
+    // model search: materializing [4, 128256, 2048] low-precision products
+    // changes matmul semantics and consumes roughly 2 GiB before reduction.
+    // Building the egraph is shape-symbolic and does not allocate that tensor.
+    for dtype in [DType::F16, DType::Bf16] {
+        let mut cx = Graph::default();
+        let x = cx.tensor((4, 2048)).as_dtype(dtype);
+        let w = cx.tensor((128_256, 2048)).as_dtype(dtype);
+        x.matmul(w.t()).output();
+
+        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+        assert!(
+            egraph_has_op_alternatives(&cx, &["GenericMatmul", "cublaslt"]),
+            "{dtype:?} multi-row matmul should retain its fused CUDA backends"
+        );
+        assert!(
+            !egraph_has_op_alternatives(&cx, &["KernelSum", "GenericMatmul"]),
+            "{dtype:?} multi-row matmul must not retain the product-materializing reduction"
+        );
+    }
+}
+
+#[test]
+fn gemv_m1_f32_keeps_decomposed_matmul_search_choice() {
+    let mut cx = Graph::default();
+    let x = cx.tensor((1, 64));
+    let w = cx.tensor((96, 64));
+    x.matmul(w.t()).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(&cx, &["KernelSum", "GenericMatmul", "cublaslt"]),
+        "F32 matmul should keep both decomposed and fused CUDA choices"
     );
 }
 

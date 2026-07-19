@@ -22,7 +22,10 @@ use luminal::{
 const MATMUL_BACKEND_RELATION_DECLARATIONS: &str = "(relation generic_matmul_exact_2d
         (IR Expression Expression Expression DType))
      (relation generic_matmul_exact_3d
-        (IR Expression Expression Expression Expression DType))";
+        (IR Expression Expression Expression Expression DType))
+     (relation low_precision_matmul_dtype (DType))
+     (low_precision_matmul_dtype (F16))
+     (low_precision_matmul_dtype (Bf16))";
 
 #[derive(Default, Debug, Clone)]
 pub struct GenericMatmul {
@@ -65,8 +68,9 @@ impl EgglogOp for GenericMatmul {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
-            "; cuBLASLt and GEMV implement only the canonical materialized
+        vec![
+            Rule::raw(
+                "; cuBLASLt and GEMV implement only the canonical materialized
              ; matmul reduction. Operand broadcast strides alone are not a
              ; sufficient witness: a movement-only view between Mul and Sum
              ; can permute the reduction's surviving axes while leaving both
@@ -142,7 +146,70 @@ impl EgglogOp for GenericMatmul {
                     :ruleset matmul_backend
                     :name \"generic-matmul-cuda-mul-sum\"
                 )",
-        )]
+            ),
+
+            // A low-precision materialized Mul followed by a separate reduction is
+            // not the floating-point matmul contract implemented by GenericMatmul,
+            // GEMV, or cuBLASLt: it rounds every product to F16/BF16 before the
+            // reduction instead of accumulating products in F32. Keep search wide
+            // across the F32-accumulating backends, not across a numerically
+            // different product-materialization algorithm. F32 keeps its
+            // decomposed alternative because there is no low-precision product
+            // rounding to eliminate.
+            //
+            // GraphTensor::matmul is already decomposed to Mul + Sum at this IR
+            // boundary, so there is no separate provenance marker to distinguish
+            // it from the same contraction authored directly. The shared
+            // GenericMatmul e-class is therefore the witness that this contraction
+            // has the backend matmul accumulator contract. A future first-class
+            // contraction marker could make that provenance explicit.
+            //
+            // Both forms must be covered because cleanup can observe either the
+            // original HLIR Sum or its CUDA KernelSum lowering depending on rule
+            // scheduling.
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
+                            (ICons ?lhs (ICons ?rhs (INil)))))
+                        (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
+                            (ICons ?mul (INil))))
+                        (= ?sum (Op (GenericMatmul
+                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?dt)
+                            ?generic_inputs))
+                        (= ?dt (dtype ?sum))
+                        (= ?dt (dtype ?mul))
+                        (low_precision_matmul_dtype ?dt)
+                    )
+                    (
+                        (delete (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
+                            (ICons ?mul (INil))))
+                    )
+                    :ruleset cleanup
+                    :name \"delete-low-precision-sum-when-wide-accum-matmul-exists\"
+                )
+
+                (rule
+                    (
+                        (= ?kernel_sum (Op (KernelSum
+                            ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
+                            ?sum_inputs))
+                        (= ?kernel_sum (Op (GenericMatmul
+                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?dt)
+                            ?generic_inputs))
+                        (= ?dt (dtype ?kernel_sum))
+                        (low_precision_matmul_dtype ?dt)
+                    )
+                    (
+                        (delete (Op (KernelSum
+                            ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
+                            ?sum_inputs))
+                    )
+                    :ruleset cleanup
+                    :name \"delete-low-precision-kernel-sum-when-wide-accum-matmul-exists\"
+                )",
+            ),
+        ]
     }
 
     fn cleanup(&self) -> bool {
