@@ -1285,6 +1285,7 @@ impl CudaGraphOp {
             profile.source_kernel_update += timer.elapsed();
 
             let mut recaptured_cublaslt = false;
+            #[cfg(luminal_cuda_ge_12_3)]
             if !state.cublaslt_ops.is_empty() {
                 let mut pending_recaptures = Vec::new();
                 let mut prepared_cache_plan = state.cublaslt_prepare_cache.clone();
@@ -1424,6 +1425,7 @@ impl CudaGraphOp {
                 }
             }
 
+            #[cfg(luminal_cuda_ge_12_3)]
             if !state.flashinfer_ops.is_empty() {
                 let mut pending_recaptures = Vec::new();
                 for idx in 0..state.flashinfer_ops.len() {
@@ -1666,6 +1668,7 @@ impl CudaGraphOp {
             .collect()
     }
 
+    #[cfg(luminal_cuda_ge_12_3)]
     fn capture_cublaslt_island_nodes(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -1729,6 +1732,7 @@ impl CudaGraphOp {
         Ok((captured_nodes, exit_deps))
     }
 
+    #[cfg(luminal_cuda_ge_12_3)]
     fn capture_cublaslt_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -1755,6 +1759,7 @@ impl CudaGraphOp {
         Ok((captured_nodes, exit_node))
     }
 
+    #[cfg(luminal_cuda_ge_12_3)]
     #[allow(clippy::too_many_arguments)]
     fn capture_flashinfer_decode_island(
         graph: &mut CudaGraphHandle,
@@ -1825,6 +1830,7 @@ impl CudaGraphOp {
         Ok((captured_nodes, exit_node))
     }
 
+    #[cfg(luminal_cuda_ge_12_3)]
     fn collect_cublaslt_island_nodes(
         graph: &CudaGraphHandle,
         entry_node: CUgraphNode,
@@ -1844,6 +1850,7 @@ impl CudaGraphOp {
         Ok(seen.into_iter().collect())
     }
 
+    #[cfg(luminal_cuda_ge_12_3)]
     fn recapture_cublaslt_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -1933,6 +1940,7 @@ impl CudaGraphOp {
         Ok(())
     }
 
+    #[cfg(luminal_cuda_ge_12_3)]
     fn recapture_flashinfer_decode_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -2252,6 +2260,7 @@ impl CudaGraphOp {
                         previous_graph_node = Some(graph_node);
                     }
                 }
+                #[cfg(luminal_cuda_ge_12_3)]
                 CompiledStep::CuBlasLt(idx) => {
                     let mut deps = Self::graph_deps_for_inputs(
                         &state.producer_to_graph_node,
@@ -2309,6 +2318,7 @@ impl CudaGraphOp {
                         previous_graph_node = Some(exit_node);
                     }
                 }
+                #[cfg(luminal_cuda_ge_12_3)]
                 CompiledStep::FlashInferDecode(idx) => {
                     let mut deps = Self::graph_deps_for_inputs(
                         &state.producer_to_graph_node,
@@ -2379,6 +2389,10 @@ impl CudaGraphOp {
                     if serialize_internal_steps {
                         previous_graph_node = Some(exit_node);
                     }
+                }
+                #[cfg(not(luminal_cuda_ge_12_3))]
+                CompiledStep::CuBlasLt(_) | CompiledStep::FlashInferDecode(_) => {
+                    unreachable!("cuBLASLt / FlashInfer graph islands require CUDA 12.3+");
                 }
             }
         }
@@ -2455,10 +2469,15 @@ pub fn kernel_to_host(
     let graph_packagable_ops = llir_graph
         .node_indices()
         .filter(|n| {
-            llir_graph[*n].to_dialect::<dyn KernelOp>().is_some()
-                || llir_graph[*n].to_dialect::<dyn HostOp>().is_some_and(|op| {
+            if llir_graph[*n].to_dialect::<dyn KernelOp>().is_some() {
+                return true;
+            }
+            #[cfg(luminal_cuda_ge_12_3)]
+            {
+                if let Some(op) = llir_graph[*n].to_dialect::<dyn HostOp>() {
                     let host = op.as_ref().as_ref();
-                    host.as_any()
+                    return host
+                        .as_any()
                         .downcast_ref::<CuBlasLt>()
                         .is_some_and(|cublaslt| cublaslt.graph_inputs() > 0)
                         || host
@@ -2468,8 +2487,10 @@ pub fn kernel_to_host(
                                 let incoming =
                                     llir_graph.edges_directed(*n, Direction::Incoming).count();
                                 incoming == flashinfer.graph_inputs() || incoming == 6
-                            })
-                })
+                            });
+                }
+            }
+            false
         })
         .collect::<FxHashSet<_>>();
 

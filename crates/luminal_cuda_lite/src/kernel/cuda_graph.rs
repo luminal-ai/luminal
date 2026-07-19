@@ -1,5 +1,38 @@
 #![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 //! CUDA Graph API wrappers for explicit graph construction and surgical updates.
+//!
+//! # Build-time API selection
+//!
+//! Driver graph API variants are chosen at **compile time** via custom cfgs emitted by
+//! [`build.rs`](../../build.rs) from `CUDARC_CUDA_VERSION` (preferred, shared with cudarc)
+//! or `nvcc --version`. There is no runtime dispatch: a binary built against newer graph
+//! APIs is not safe on an older driver (cudarc dynamic-loading resolves symbols at runtime
+//! and panics if they are missing).
+//!
+//! Luminal maintains an **API-threshold ladder** (not a mirror of cudarc's release table).
+//! Newer toolkit versions (e.g. 13.4, 14.x) receive all `ge_*` cfgs their version qualifies
+//! for; add a new ladder rung only when compilation reveals a driver API variant that needs
+//! a separate `#[cfg]` branch. cudarc binding support is independent — pin
+//! `CUDARC_CUDA_VERSION` or upgrade cudarc when its binding set lags the host toolkit.
+//!
+//! | cfg | CUDA toolkit | APIs |
+//! | --- | --- | --- |
+//! | `luminal_cuda_ge_12_0` | ≥ 12.0 | kernel / exec `_v2` graph APIs |
+//! | `luminal_cuda_ge_12_3` | ≥ 12.3 | dependency `_v2`, `cuStreamBeginCaptureToGraph`, cuBLASLt / FlashInfer graph islands |
+//! | `luminal_cuda_ge_12_8` | ≥ 12.8 | `cuEventElapsedTime_v2` |
+//!
+//! To add a new gate: extend `API_LADDER` in [`build_support/cuda_version.rs`](../../build_support/cuda_version.rs),
+//! declare `cargo:rustc-check-cfg` in `build.rs`, and branch in this module.
+//!
+//! Below 12.3, cuBLASLt and FlashInfer are **not** captured into CUDA graphs; they remain
+//! standalone [`HostOp`](crate::host::HostOp) nodes in the execution graph.
+//!
+//! The devcontainer CUDA image (12.8) enables all thresholds and the island-capture path.
+//!
+//! # Follow-up CI
+//!
+//! Cross-build cfg branches with separate `CARGO_TARGET_DIR` values, e.g.
+//! `CUDARC_CUDA_VERSION=12000 cargo check -p luminal_cuda_lite` (planned CI matrix PR).
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
@@ -60,7 +93,17 @@ impl CudaGraphHandle {
 
         let mut node = MaybeUninit::uninit();
         unsafe {
+            #[cfg(luminal_cuda_ge_12_0)]
             sys::cuGraphAddKernelNode_v2(
+                node.as_mut_ptr(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                dependencies.len(),
+                &params,
+            )
+            .result()?;
+            #[cfg(not(luminal_cuda_ge_12_0))]
+            sys::cuGraphAddKernelNode(
                 node.as_mut_ptr(),
                 self.cu_graph,
                 dependencies.as_ptr(),
@@ -98,7 +141,12 @@ impl CudaGraphHandle {
             ctx: std::ptr::null_mut(),
         };
 
-        unsafe { sys::cuGraphKernelNodeSetParams_v2(node, &params).result() }
+        unsafe {
+            #[cfg(luminal_cuda_ge_12_0)]
+            return sys::cuGraphKernelNodeSetParams_v2(node, &params).result();
+            #[cfg(not(luminal_cuda_ge_12_0))]
+            return sys::cuGraphKernelNodeSetParams(node, &params).result();
+        }
     }
 
     /// Adds an empty dependency node to the graph.
@@ -134,10 +182,22 @@ impl CudaGraphHandle {
     ) -> Result<(), DriverError> {
         assert_eq!(from.len(), to.len());
         self.ctx.bind_to_thread()?;
+        #[cfg(luminal_cuda_ge_12_3)]
+        unsafe {
+            sys::cuGraphAddDependencies_v2(
+                self.cu_graph,
+                from.as_ptr(),
+                to.as_ptr(),
+                std::ptr::null(),
+                from.len(),
+            )
+            .result()
+        }
+        #[cfg(not(luminal_cuda_ge_12_3))]
         unsafe {
             sys::cuGraphAddDependencies(self.cu_graph, from.as_ptr(), to.as_ptr(), from.len())
+                .result()
         }
-        .result()
     }
 
     /// Removes dependency edges from the mutable graph.
@@ -148,10 +208,22 @@ impl CudaGraphHandle {
     ) -> Result<(), DriverError> {
         assert_eq!(from.len(), to.len());
         self.ctx.bind_to_thread()?;
+        #[cfg(luminal_cuda_ge_12_3)]
+        unsafe {
+            sys::cuGraphRemoveDependencies_v2(
+                self.cu_graph,
+                from.as_ptr(),
+                to.as_ptr(),
+                std::ptr::null(),
+                from.len(),
+            )
+            .result()
+        }
+        #[cfg(not(luminal_cuda_ge_12_3))]
         unsafe {
             sys::cuGraphRemoveDependencies(self.cu_graph, from.as_ptr(), to.as_ptr(), from.len())
+                .result()
         }
-        .result()
     }
 
     /// Returns all nodes currently in the graph.
@@ -176,6 +248,17 @@ impl CudaGraphHandle {
     pub fn dependencies(&self, node: CUgraphNode) -> Result<Vec<CUgraphNode>, DriverError> {
         self.ctx.bind_to_thread()?;
         let mut count = 0usize;
+        #[cfg(luminal_cuda_ge_12_3)]
+        unsafe {
+            sys::cuGraphNodeGetDependencies_v2(
+                node,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
+        }
+        #[cfg(not(luminal_cuda_ge_12_3))]
         unsafe {
             sys::cuGraphNodeGetDependencies(node, std::ptr::null_mut(), &mut count).result()?;
         }
@@ -183,6 +266,17 @@ impl CudaGraphHandle {
             return Ok(Vec::new());
         }
         let mut deps = vec![std::ptr::null_mut(); count];
+        #[cfg(luminal_cuda_ge_12_3)]
+        unsafe {
+            sys::cuGraphNodeGetDependencies_v2(
+                node,
+                deps.as_mut_ptr(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
+        }
+        #[cfg(not(luminal_cuda_ge_12_3))]
         unsafe {
             sys::cuGraphNodeGetDependencies(node, deps.as_mut_ptr(), &mut count).result()?;
         }
@@ -194,6 +288,17 @@ impl CudaGraphHandle {
     pub fn dependent_nodes(&self, node: CUgraphNode) -> Result<Vec<CUgraphNode>, DriverError> {
         self.ctx.bind_to_thread()?;
         let mut count = 0usize;
+        #[cfg(luminal_cuda_ge_12_3)]
+        unsafe {
+            sys::cuGraphNodeGetDependentNodes_v2(
+                node,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
+        }
+        #[cfg(not(luminal_cuda_ge_12_3))]
         unsafe {
             sys::cuGraphNodeGetDependentNodes(node, std::ptr::null_mut(), &mut count).result()?;
         }
@@ -201,6 +306,17 @@ impl CudaGraphHandle {
             return Ok(Vec::new());
         }
         let mut deps = vec![std::ptr::null_mut(); count];
+        #[cfg(luminal_cuda_ge_12_3)]
+        unsafe {
+            sys::cuGraphNodeGetDependentNodes_v2(
+                node,
+                deps.as_mut_ptr(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
+        }
+        #[cfg(not(luminal_cuda_ge_12_3))]
         unsafe {
             sys::cuGraphNodeGetDependentNodes(node, deps.as_mut_ptr(), &mut count).result()?;
         }
@@ -209,6 +325,10 @@ impl CudaGraphHandle {
     }
 
     /// Begins stream capture that appends captured work into this graph.
+    ///
+    /// Requires CUDA 12.3+ (`luminal_cuda_ge_12_3`). Below that threshold, cuBLASLt /
+    /// FlashInfer islands are not captured into graphs.
+    #[cfg(luminal_cuda_ge_12_3)]
     pub fn begin_capture_to_graph(
         &mut self,
         stream: &CudaStream,
@@ -229,6 +349,7 @@ impl CudaGraphHandle {
     }
 
     /// Ends stream capture previously started by begin_capture_to_graph.
+    #[cfg(luminal_cuda_ge_12_3)]
     pub fn end_capture(&mut self, stream: &CudaStream) -> Result<(), DriverError> {
         self.ctx.bind_to_thread()?;
         let mut graph = MaybeUninit::uninit();
@@ -325,38 +446,79 @@ impl CudaGraphExecHandle {
             ctx: std::ptr::null_mut(),
         };
 
-        unsafe { sys::cuGraphExecKernelNodeSetParams_v2(self.cu_graph_exec, node, &params) }
-            .result()
+        unsafe {
+            #[cfg(luminal_cuda_ge_12_0)]
+            {
+                sys::cuGraphExecKernelNodeSetParams_v2(self.cu_graph_exec, node, &params).result()
+            }
+            #[cfg(not(luminal_cuda_ge_12_0))]
+            {
+                sys::cuGraphExecKernelNodeSetParams(self.cu_graph_exec, node, &params).result()
+            }
+        }
     }
 
     /// Attempts to update this executable graph from an already-mutated source graph.
     pub fn update_from_graph(&mut self, graph: &CudaGraphHandle) -> Result<(), DriverError> {
         self.ctx.bind_to_thread()?;
-        let mut result = CUgraphExecUpdateResultInfo {
-            result: CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS,
-            errorNode: std::ptr::null_mut(),
-            errorFromNode: std::ptr::null_mut(),
-        };
-        let status =
-            unsafe { sys::cuGraphExecUpdate_v2(self.cu_graph_exec, graph.cu_graph, &mut result) };
-        if status != sys::CUresult::CUDA_SUCCESS
-            || result.result != CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS
+        #[cfg(luminal_cuda_ge_12_0)]
         {
-            if std::env::var_os("LUMINAL_CUDA_DEBUG_CUBLASLT_RECAPTURE").is_some() {
-                let node_count = graph.nodes().map(|nodes| nodes.len()).ok();
-                eprintln!(
-                    "CudaGraph exec update rejected: status={status:?} result={:?} error_node={:?} error_from_node={:?} source_nodes={node_count:?}",
-                    result.result, result.errorNode, result.errorFromNode,
-                );
-            }
-            let err = if status == sys::CUresult::CUDA_SUCCESS {
-                sys::CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE
-            } else {
-                status
+            let mut result = CUgraphExecUpdateResultInfo {
+                result: CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS,
+                errorNode: std::ptr::null_mut(),
+                errorFromNode: std::ptr::null_mut(),
             };
-            return Err(DriverError(err));
+            let status = unsafe {
+                sys::cuGraphExecUpdate_v2(self.cu_graph_exec, graph.cu_graph, &mut result)
+            };
+            if status != sys::CUresult::CUDA_SUCCESS
+                || result.result != CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS
+            {
+                if std::env::var_os("LUMINAL_CUDA_DEBUG_CUBLASLT_RECAPTURE").is_some() {
+                    let node_count = graph.nodes().map(|nodes| nodes.len()).ok();
+                    eprintln!(
+                        "CudaGraph exec update rejected: status={status:?} result={:?} error_node={:?} error_from_node={:?} source_nodes={node_count:?}",
+                        result.result, result.errorNode, result.errorFromNode,
+                    );
+                }
+                let err = if status == sys::CUresult::CUDA_SUCCESS {
+                    sys::CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE
+                } else {
+                    status
+                };
+                return Err(DriverError(err));
+            }
+            Ok(())
         }
-        Ok(())
+        #[cfg(not(luminal_cuda_ge_12_0))]
+        {
+            let mut error_node = std::ptr::null_mut();
+            let mut result = CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS;
+            let status = unsafe {
+                sys::cuGraphExecUpdate(
+                    self.cu_graph_exec,
+                    graph.cu_graph,
+                    &mut error_node,
+                    &mut result,
+                )
+            };
+            if status != sys::CUresult::CUDA_SUCCESS
+                || result != CUgraphExecUpdateResult::CU_GRAPH_EXEC_UPDATE_SUCCESS
+            {
+                if std::env::var_os("LUMINAL_CUDA_DEBUG_CUBLASLT_RECAPTURE").is_some() {
+                    eprintln!(
+                        "CudaGraph exec update rejected: status={status:?} result={result:?} error_node={error_node:?}"
+                    );
+                }
+                let err = if status == sys::CUresult::CUDA_SUCCESS {
+                    sys::CUresult::CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE
+                } else {
+                    status
+                };
+                return Err(DriverError(err));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -571,7 +733,10 @@ pub fn event_elapsed_ms(
     ctx.bind_to_thread()?;
     let mut ms: f32 = 0.0;
     unsafe {
+        #[cfg(luminal_cuda_ge_12_8)]
         sys::cuEventElapsedTime_v2(&mut ms, start, end).result()?;
+        #[cfg(not(luminal_cuda_ge_12_8))]
+        sys::cuEventElapsedTime(&mut ms, start, end).result()?;
     }
     Ok(ms)
 }

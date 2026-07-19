@@ -238,6 +238,8 @@ impl CudaRuntime {
     pub fn new() -> Result<Self, cudarc::driver::DriverError> {
         let ctx = cudarc::driver::CudaContext::new(0)?;
         ctx.bind_to_thread()?;
+        // cudarc omits `CudaContext::set_flags` for the `cuda-12000` feature (exactly 12.0).
+        #[cfg(not(all(luminal_cuda_ge_12_0, not(luminal_cuda_ge_12_3))))]
         ctx.set_flags(cudarc::driver::sys::CUctx_flags::CU_CTX_SCHED_BLOCKING_SYNC)?;
         let stream = ctx.default_stream();
 
