@@ -11,7 +11,8 @@ pub mod runtime;
 use std::{
     cell::Cell,
     ffi::{CStr, CString},
-    path::Path,
+    os::raw::c_int,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -161,44 +162,118 @@ fn format_cuda_version(version: i32) -> String {
     format!("{}.{}", version / 1000, (version % 1000) / 10)
 }
 
-fn cuda_nvrtc_include_paths() -> Vec<String> {
-    let mut include_paths = Vec::new();
-    for env_var in ["CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"] {
-        if let Ok(root) = std::env::var(env_var) {
-            let path = format!("{root}/include");
+fn cuda_nvrtc_include_paths() -> &'static [String] {
+    static INCLUDE_PATHS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    INCLUDE_PATHS.get_or_init(|| {
+        let mut include_paths = Vec::new();
+        for env_var in ["CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"] {
+            if let Ok(root) = std::env::var(env_var) {
+                let path = format!("{root}/include");
+                if Path::new(&path).exists() && !include_paths.contains(&path) {
+                    include_paths.push(path);
+                }
+            }
+        }
+        for path in CUDA_NVRTC_INCLUDE_PATHS {
+            let path = path.to_string();
             if Path::new(&path).exists() && !include_paths.contains(&path) {
                 include_paths.push(path);
             }
         }
-    }
-    for path in CUDA_NVRTC_INCLUDE_PATHS {
-        let path = path.to_string();
-        if Path::new(&path).exists() && !include_paths.contains(&path) {
-            include_paths.push(path);
-        }
-    }
 
-    // NVRTC parses the CUDA headers itself, so using headers from a newer
-    // toolkit than the dynamically loaded compiler can make otherwise-valid
-    // kernels fail before code generation (FP8 headers are particularly
-    // sensitive to this). Prefer the include tree whose CUDA_VERSION matches
-    // the loaded NVRTC, while preserving the configured order as a tie-break.
-    if let Some(nvrtc_version) = loaded_nvrtc_version() {
-        include_paths.sort_by_key(|path| {
-            cuda_header_version(path)
-                .map(|header_version| header_version.abs_diff(nvrtc_version))
-                .unwrap_or(u32::MAX)
-        });
-    }
-    include_paths
+        // NVRTC parses the CUDA headers itself, so using headers from a newer
+        // toolkit than the dynamically loaded compiler can make otherwise-valid
+        // kernels fail before code generation (FP8 headers are particularly
+        // sensitive to this). Prefer the include tree whose CUDA_VERSION matches
+        // the loaded NVRTC, while preserving the configured order as a tie-break.
+        // The loaded compiler and process environment are stable after startup;
+        // cache the filesystem scan instead of rereading cuda.h for every kernel.
+        if let Some(nvrtc_version) = loaded_nvrtc_version() {
+            include_paths.sort_by_key(|path| {
+                cuda_header_version(path)
+                    .map(|header_version| header_version.abs_diff(nvrtc_version))
+                    .unwrap_or(u32::MAX)
+            });
+        }
+        include_paths
+    })
 }
 
+type NvrtcVersionFn = unsafe extern "C" fn(*mut c_int, *mut c_int) -> nvrtc_sys::nvrtcResult;
+
 fn loaded_nvrtc_version() -> Option<u32> {
-    let (mut major, mut minor) = (0, 0);
-    unsafe { nvrtc_sys::nvrtcVersion(&mut major, &mut minor) }
-        .result()
-        .ok()?;
-    Some((major as u32) * 1000 + (minor as u32) * 10)
+    static VERSION: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| query_nvrtc_version(nvrtc_library_candidates()))
+}
+
+fn query_nvrtc_version(candidates: impl IntoIterator<Item = PathBuf>) -> Option<u32> {
+    for candidate in candidates {
+        // Do not call cudarc's generated nvrtcVersion wrapper here. Under its
+        // fallback dynamic loader, the wrapper panics when the library or
+        // symbol is absent. Opening the library and resolving the symbol
+        // directly keeps version detection optional without manipulating the
+        // process-global panic hook.
+        let Ok(library) = (unsafe { libloading::Library::new(candidate) }) else {
+            continue;
+        };
+        let Ok(version_fn) = (unsafe { library.get::<NvrtcVersionFn>(b"nvrtcVersion\0") }) else {
+            continue;
+        };
+        let (mut major, mut minor) = (0, 0);
+        if unsafe { version_fn(&mut major, &mut minor) }
+            .result()
+            .is_ok()
+            && let Some(version) = encode_nvrtc_version(major, minor)
+        {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn encode_nvrtc_version(major: c_int, minor: c_int) -> Option<u32> {
+    let major = u32::try_from(major).ok()?;
+    let minor = u32::try_from(minor).ok()?;
+    major.checked_mul(1000)?.checked_add(minor.checked_mul(10)?)
+}
+
+fn nvrtc_library_candidates() -> Vec<PathBuf> {
+    use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+
+    let pointer_width = if cfg!(target_pointer_width = "32") {
+        "32"
+    } else {
+        "64"
+    };
+    let major = driver_sys::CUDA_VERSION / 1000;
+    let minor = (driver_sys::CUDA_VERSION % 1000) / 10;
+
+    // Keep this sequence identical to cudarc 0.19's dynamic NVRTC loader.
+    // Version probing must resolve the same library that compile_ptx will use;
+    // searching extra toolkit versions or CUDA_HOME paths can silently pair a
+    // compiler with the wrong headers and kernel-parameter ABI limit.
+    [
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}{minor}{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}{minor}_0{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}0_{minor}{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_10{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_11{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_12{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}0_0{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{pointer_width}_9{DLL_SUFFIX}"),
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.{major}"),
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.12"),
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.11"),
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.10"),
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.9"),
+        format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.1"),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
 fn cuda_header_version(include_path: &str) -> Option<u32> {
@@ -230,6 +305,62 @@ mod nvrtc_header_tests {
             parse_cuda_header_version("#define SOMETHING_ELSE 1\n"),
             None
         );
+    }
+
+    #[test]
+    fn nvrtc_version_encoding_is_checked() {
+        assert_eq!(encode_nvrtc_version(12, 1), Some(12010));
+        assert_eq!(encode_nvrtc_version(13, 3), Some(13030));
+        assert_eq!(encode_nvrtc_version(-1, 3), None);
+        assert_eq!(encode_nvrtc_version(13, -1), None);
+        assert_eq!(encode_nvrtc_version(c_int::MAX, 0), None);
+    }
+
+    #[test]
+    fn missing_nvrtc_library_is_optional() {
+        let missing = std::env::temp_dir().join(format!(
+            "luminal-missing-nvrtc-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        assert_eq!(query_nvrtc_version([missing]), None);
+    }
+
+    #[test]
+    fn nvrtc_probe_matches_cudarc_loader_order() {
+        use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
+
+        let pointer_width = if cfg!(target_pointer_width = "32") {
+            "32"
+        } else {
+            "64"
+        };
+        let major = driver_sys::CUDA_VERSION / 1000;
+        let minor = (driver_sys::CUDA_VERSION % 1000) / 10;
+        let expected = [
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}{minor}{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}{minor}_0{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}0_{minor}{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_10{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_11{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_12{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_{major}0_0{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{pointer_width}_9{DLL_SUFFIX}"),
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.{major}"),
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.12"),
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.11"),
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.10"),
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.9"),
+            format!("{DLL_PREFIX}nvrtc{DLL_SUFFIX}.1"),
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+        assert_eq!(nvrtc_library_candidates(), expected);
     }
 }
 
@@ -312,7 +443,7 @@ pub(crate) fn try_create_cublaslt(
 
 fn cuda_nvrtc_compile_options(target_arch: &str) -> Vec<String> {
     let mut options = cuda_nvrtc_include_paths()
-        .into_iter()
+        .iter()
         .map(|path| format!("--include-path={path}"))
         .collect::<Vec<_>>();
     options.push(format!("--gpu-architecture={target_arch}"));

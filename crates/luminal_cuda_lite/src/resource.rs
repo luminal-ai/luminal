@@ -10,7 +10,7 @@
 //! for candidates that are legal but costly.
 
 use cudarc::driver::{
-    CudaStream,
+    CudaStream, sys,
     sys::CUdevice_attribute::{
         CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y,
         CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z, CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X,
@@ -47,6 +47,12 @@ use crate::{
 /// pathological source compile once it has started.
 pub(crate) const DEFAULT_MAX_KERNEL_SOURCE_BYTES: usize = 512 * 1024;
 
+const LEGACY_MAX_KERNEL_PARAMETER_BYTES: usize = 4_096;
+const EXTENDED_MAX_KERNEL_PARAMETER_BYTES: usize = 32_764;
+/// CUDA 12.1 introduced the extended kernel-parameter ABI. A driver that
+/// reports CUDA 12.1 support corresponds to the required R530+ driver family.
+const MIN_EXTENDED_KERNEL_PARAMETER_ABI_VERSION: u32 = 12_010;
+
 /// User-selected hard caps. `None` disables the corresponding configured cap;
 /// device legality limits still apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +73,11 @@ impl Default for CandidateResourceCaps {
 /// Hard limits of the CUDA device used for search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CudaDeviceResourceLimits {
-    /// Hard bytes available to all candidate-planned allocations. Initially
+    /// Physical-memory ceiling used by candidate-plan accounting. Initially
     /// total VRAM; the runtime subtracts owned resident HLIR allocations before
-    /// validating retained arenas, host-op state, and shared workspaces.
+    /// validating retained arenas, host-op state, and shared workspaces. This
+    /// is not current free memory: external allocations, CUDA context state,
+    /// and allocator overhead/reservations are intentionally not accounted.
     pub max_candidate_memory_bytes: usize,
     pub max_threads_per_block: usize,
     pub max_block_dim: [usize; 3],
@@ -90,9 +98,11 @@ impl CudaDeviceResourceLimits {
         };
         let (compute_major, _) = context.compute_capability()?;
 
-        // CUDA's kernel-parameter ABI allows 32,764 bytes on Volta and newer;
-        // older architectures have the original 4 KiB parameter space.
-        let max_kernel_parameter_bytes = if compute_major >= 7 { 32_764 } else { 4_096 };
+        let max_kernel_parameter_bytes = kernel_parameter_abi_limit(
+            compute_major,
+            crate::loaded_nvrtc_version(),
+            loaded_driver_api_version(),
+        );
 
         Ok(Self {
             max_candidate_memory_bytes: total_memory_bytes,
@@ -112,6 +122,33 @@ impl CudaDeviceResourceLimits {
             )?,
             max_kernel_parameter_bytes,
         })
+    }
+}
+
+fn loaded_driver_api_version() -> Option<u32> {
+    let mut version = 0;
+    unsafe { sys::cuDriverGetVersion(&mut version) }
+        .result()
+        .ok()?;
+    u32::try_from(version).ok()
+}
+
+fn kernel_parameter_abi_limit(
+    compute_major: i32,
+    nvrtc_version: Option<u32>,
+    driver_api_version: Option<u32>,
+) -> usize {
+    // The larger ABI requires all three parts of NVIDIA's contract. Treat a
+    // failed version query conservatively as the legacy 4 KiB ABI rather than
+    // accepting a launch that can fail with CUDA_ERROR_NOT_SUPPORTED.
+    if compute_major >= 7
+        && nvrtc_version.is_some_and(|version| version >= MIN_EXTENDED_KERNEL_PARAMETER_ABI_VERSION)
+        && driver_api_version
+            .is_some_and(|version| version >= MIN_EXTENDED_KERNEL_PARAMETER_ABI_VERSION)
+    {
+        EXTENDED_MAX_KERNEL_PARAMETER_BYTES
+    } else {
+        LEGACY_MAX_KERNEL_PARAMETER_BYTES
     }
 }
 
@@ -268,7 +305,7 @@ impl std::fmt::Display for ResourceViolation {
             ),
             Self::CandidateDeviceMemory { required, limit } => write!(
                 f,
-                "candidate device memory requires {required} bytes, available device limit is {limit} bytes"
+                "accounted candidate allocations require {required} bytes, planned-capacity ceiling is {limit} bytes"
             ),
             Self::KernelSource {
                 name,
@@ -848,6 +885,42 @@ mod tests {
             max_shared_memory_per_block: 48 * 1024,
             max_kernel_parameter_bytes: 32_764,
         }
+    }
+
+    #[test]
+    fn extended_kernel_parameter_abi_requires_arch_nvrtc_and_driver_support() {
+        let extended = EXTENDED_MAX_KERNEL_PARAMETER_BYTES;
+        let legacy = LEGACY_MAX_KERNEL_PARAMETER_BYTES;
+
+        assert_eq!(
+            kernel_parameter_abi_limit(7, Some(12_010), Some(12_010)),
+            extended
+        );
+        assert_eq!(
+            kernel_parameter_abi_limit(6, Some(13_030), Some(13_030)),
+            legacy,
+            "pre-Volta hardware retains the 4 KiB ABI"
+        );
+        assert_eq!(
+            kernel_parameter_abi_limit(9, Some(12_000), Some(13_030)),
+            legacy,
+            "pre-12.1 NVRTC cannot emit the extended ABI"
+        );
+        assert_eq!(
+            kernel_parameter_abi_limit(9, Some(13_030), Some(12_000)),
+            legacy,
+            "a pre-R530 driver cannot launch the extended ABI"
+        );
+        assert_eq!(
+            kernel_parameter_abi_limit(9, None, Some(13_030)),
+            legacy,
+            "an unavailable NVRTC version query must fall back conservatively"
+        );
+        assert_eq!(
+            kernel_parameter_abi_limit(9, Some(13_030), None),
+            legacy,
+            "an unavailable driver version query must fall back conservatively"
+        );
     }
 
     fn plan(intermediate_bytes: usize) -> CandidateResourcePlan {

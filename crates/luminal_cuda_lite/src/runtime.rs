@@ -8,7 +8,7 @@ use crate::{
         validate_resource_plan, validate_static_llir_semantics,
     },
 };
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result};
+use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result, sys};
 
 use fixedbitset::FixedBitSet;
 use half::{bf16, f16};
@@ -44,6 +44,42 @@ const MIN_ARENA_ALLOCATION_BYTES: usize = 16 * 1024 * 1024;
 pub enum CudaInput {
     Buffer { buf: CudaSlice<u8>, len: usize },
     Ptr(u64),
+}
+
+/// Input facts that can change hard-resource accounting. Payload bytes and
+/// pointer identity are deliberately excluded: replacing data or a pointer at
+/// the same logical length/capacity only requires refreshing launch bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResourceInputFootprint {
+    logical_bytes: usize,
+    owned_capacity_bytes: Option<usize>,
+}
+
+impl ResourceInputFootprint {
+    fn owned(logical_bytes: usize, capacity_bytes: usize) -> Self {
+        Self {
+            logical_bytes,
+            owned_capacity_bytes: Some(capacity_bytes),
+        }
+    }
+
+    fn external(logical_bytes: usize) -> Self {
+        Self {
+            logical_bytes,
+            owned_capacity_bytes: None,
+        }
+    }
+}
+
+fn resource_input_signature_changed(
+    previous: &FxHashMap<NodeIndex, ResourceInputFootprint>,
+    current_input_count: usize,
+    mut changed_inputs: impl Iterator<Item = (NodeIndex, Option<ResourceInputFootprint>)>,
+) -> bool {
+    if previous.len() != current_input_count {
+        return true;
+    }
+    changed_inputs.any(|(node, current)| previous.get(&node).copied() != current)
 }
 
 impl CudaInput {
@@ -134,6 +170,10 @@ pub(crate) struct CompiledBucket {
     pub(crate) node_to_exec: FxHashMap<NodeIndex, NodeIndex>,
     /// Single reusable arena for all intermediate buffers in this bucket.
     pub(crate) arena: Option<CudaSlice<u8>>,
+    /// Memory pool that owns `arena`, queried from the allocated pointer. CUDA
+    /// returns an async allocation to its allocation pool even if another pool
+    /// becomes current before release, so reclamation retains this association.
+    arena_pool: Option<sys::CUmemoryPool>,
     pub(crate) arena_bytes: usize,
     pub(crate) logical_buffer_offsets: FxHashMap<NodeIndex, usize>,
     pub(crate) logical_buffer_bytes: FxHashMap<NodeIndex, usize>,
@@ -179,6 +219,7 @@ impl CompiledBucket {
             exec_graph: StableGraph::default(),
             node_to_exec: FxHashMap::default(),
             arena: None,
+            arena_pool: None,
             arena_bytes: 0,
             logical_buffer_offsets: FxHashMap::default(),
             logical_buffer_bytes: FxHashMap::default(),
@@ -211,9 +252,32 @@ impl CompiledBucket {
     }
 }
 
+#[derive(Default)]
+struct ArenaReleasePlan {
+    arenas_released: usize,
+    pools_to_trim: Vec<sys::CUmemoryPool>,
+}
+
+impl ArenaReleasePlan {
+    fn record_arena(&mut self, pool: Option<sys::CUmemoryPool>) {
+        self.arenas_released += 1;
+        if let Some(pool) = pool
+            && !self.pools_to_trim.contains(&pool)
+        {
+            self.pools_to_trim.push(pool);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.arenas_released == 0
+    }
+}
+
 pub struct CudaRuntime {
     // Shared state across all buckets
-    pub hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
+    // Keep this private: every mutation must go through the buffer APIs so
+    // `changed_hlir` and resource-input validation stay in sync with the map.
+    hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
     cuda_stream: Arc<CudaStream>,
     changed_hlir: FxHashSet<NodeIndex>,
     pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
@@ -225,6 +289,9 @@ pub struct CudaRuntime {
     max_intermediate_memory_bytes: Option<usize>,
     max_kernel_source_bytes: Option<usize>,
     device_resource_limits: Option<CudaDeviceResourceLimits>,
+    /// Resource-relevant input state covered by the most recent aggregate
+    /// retained-bucket validation.
+    last_resource_input_signature: FxHashMap<NodeIndex, ResourceInputFootprint>,
 
     // Per-bucket compiled state
     compiled_buckets: Vec<CompiledBucket>,
@@ -257,6 +324,15 @@ impl CudaRuntime {
         let stream = ctx.default_stream();
 
         Ok(Self::initialize(stream))
+    }
+
+    /// Read-only view of installed HLIR inputs.
+    ///
+    /// Mutations must use `set_data`, `set_buffer`, `set_device_ptr`, or
+    /// `remove_buffer` so cached launch bindings and resource validation are
+    /// invalidated together.
+    pub fn hlir_buffers(&self) -> &FxHashMap<NodeIndex, CudaInput> {
+        &self.hlir_buffers
     }
 
     /// Configure the search/runtime intermediate-arena cap. This intentionally
@@ -320,12 +396,48 @@ impl CudaRuntime {
     /// are in use and untouched.
     pub fn release_pooled_memory(&self) {
         let _ = self.cuda_stream.synchronize();
+        let _ = Self::trim_current_memory_pool(&self.cuda_stream);
+    }
+
+    fn take_bucket_arena(bucket: &mut CompiledBucket, releases: &mut ArenaReleasePlan) {
+        let arena = bucket.arena.take();
+        let pool = bucket.arena_pool.take();
+        if let Some(arena) = arena {
+            releases.record_arena(pool);
+            // Enqueue the stream-ordered free before finish_arena_releases
+            // synchronizes and trims the pool that owns this allocation.
+            drop(arena);
+        } else {
+            debug_assert!(pool.is_none(), "arena pool recorded without an arena");
+        }
+    }
+
+    fn finish_arena_releases(
+        stream: &Arc<CudaStream>,
+        releases: ArenaReleasePlan,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        if releases.is_empty() {
+            return Ok(());
+        }
+        stream.synchronize()?;
+        for pool in releases.pools_to_trim {
+            unsafe { result::mem_pool::trim_to(pool, 0)? };
+        }
+        Ok(())
+    }
+
+    fn trim_current_memory_pool(
+        stream: &Arc<CudaStream>,
+    ) -> Result<(), cudarc::driver::DriverError> {
+        let context = stream.context();
+        if !context.has_async_alloc() {
+            return Ok(());
+        }
         unsafe {
-            if let Ok(dev) = result::device::get(0)
-                && let Ok(pool) = result::device::get_default_mem_pool(dev)
-            {
-                let _ = result::mem_pool::trim_to(pool, 0);
-            }
+            // Explicit release asks to trim whichever pool is current now.
+            // Arena turnover uses the pool recorded at allocation instead.
+            let pool = result::device::get_mem_pool(context.cu_device())?;
+            result::mem_pool::trim_to(pool, 0)
         }
     }
 
@@ -454,6 +566,7 @@ impl CudaRuntime {
 
     #[cfg(test)]
     pub(crate) fn preserve_intermediate_buffers_for_debug(&mut self) {
+        let mut releases = ArenaReleasePlan::default();
         for bucket in &mut self.compiled_buckets {
             bucket.preserve_intermediate_buffers_for_debug = true;
             bucket.logical_buffer_offsets.clear();
@@ -462,9 +575,11 @@ impl CudaRuntime {
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
             bucket.hlir_synced = false;
-            bucket.arena = None;
+            Self::take_bucket_arena(bucket, &mut releases);
             bucket.arena_bytes = 0;
         }
+        Self::finish_arena_releases(&self.cuda_stream, releases)
+            .expect("failed to release CUDA arenas for debug preservation");
     }
 
     fn resolve_runtime_buffer(
@@ -1094,12 +1209,15 @@ impl CudaRuntime {
     /// Free all intermediate buffers to reclaim GPU memory.
     /// They will be re-allocated on the next `execute()` call.
     pub fn free_intermediate_buffers(&mut self) {
+        let mut releases = ArenaReleasePlan::default();
         for bucket in &mut self.compiled_buckets {
-            bucket.arena = None;
+            Self::take_bucket_arena(bucket, &mut releases);
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
             bucket.hlir_synced = false;
         }
+        Self::finish_arena_releases(&self.cuda_stream, releases)
+            .expect("failed to release CUDA intermediate arenas");
     }
 
     #[tracing::instrument(skip_all)]
@@ -1150,7 +1268,15 @@ impl CudaRuntime {
         }
 
         if bucket.arena_bytes == 0 {
-            bucket.arena = None;
+            let timer = std::time::Instant::now();
+            let mut releases = ArenaReleasePlan::default();
+            Self::take_bucket_arena(bucket, &mut releases);
+            let arena_released = !releases.is_empty();
+            Self::finish_arena_releases(stream, releases)
+                .expect("failed to release an unused CUDA arena");
+            if arena_released {
+                sync_time += timer.elapsed();
+            }
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
             if profile_alloc {
@@ -1180,8 +1306,39 @@ impl CudaRuntime {
             } else {
                 bucket.arena_bytes
             };
+            if bucket.arena.is_some() {
+                // Allocation assignment evaluates its RHS before dropping the
+                // previous arena. Drop the old arena, finish its stream-ordered
+                // free, and trim the async pool before growth so physical
+                // capacity does not retain an accidental old+new replacement
+                // peak. Synchronous allocators release during drop.
+                let timer = std::time::Instant::now();
+                let mut releases = ArenaReleasePlan::default();
+                Self::take_bucket_arena(bucket, &mut releases);
+                Self::finish_arena_releases(stream, releases)
+                    .expect("failed to release the old CUDA arena before replacement");
+                sync_time += timer.elapsed();
+            }
             let timer = std::time::Instant::now();
-            bucket.arena = Some(unsafe { stream.alloc(allocation_bytes).unwrap() });
+            let arena = unsafe { stream.alloc(allocation_bytes).unwrap() };
+            let arena_pool = if stream.context().has_async_alloc() {
+                let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+                unsafe {
+                    sys::cuPointerGetAttribute(
+                        (&mut pool as *mut sys::CUmemoryPool).cast(),
+                        sys::CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE,
+                        arena.device_ptr(stream).0,
+                    )
+                    .result()
+                    .expect("failed to query CUDA arena allocation pool");
+                }
+                assert!(!pool.is_null(), "CUDA async arena has no allocation pool");
+                Some(pool)
+            } else {
+                None
+            };
+            bucket.arena = Some(arena);
+            bucket.arena_pool = arena_pool;
             cuda_alloc_time += timer.elapsed();
             allocated_bytes = allocation_bytes;
             allocated_new_arena = true;
@@ -1630,7 +1787,6 @@ impl CudaRuntime {
         }
 
         if logical_bytes.is_empty() {
-            bucket.arena = None;
             return;
         }
         let total_spec_count = logical_bytes.len();
@@ -1893,11 +2049,12 @@ impl CudaRuntime {
         let timer = std::time::Instant::now();
         let allocation_dyn_map = self.bucket_capacity_dyn_map(bucket_idx, dyn_map);
         let allocation_dyn_map_time = timer.elapsed();
+        let resource_inputs_changed = self.resource_inputs_changed_since_validation();
         let needs_resource_validation = {
             let bucket = &self.compiled_buckets[bucket_idx];
             !bucket.resource_validation_complete
                 || bucket.last_resource_validation_dyn_map != allocation_dyn_map
-                || !self.changed_hlir.is_empty()
+                || resource_inputs_changed
         };
         if needs_resource_validation
             && let Err(violation) =
@@ -2360,6 +2517,48 @@ impl CudaRuntime {
             .collect()
     }
 
+    fn resource_input_footprint(
+        &self,
+        node: NodeIndex,
+        input: &CudaInput,
+    ) -> ResourceInputFootprint {
+        match input {
+            CudaInput::Buffer { buf, len } => ResourceInputFootprint::owned(*len, buf.num_bytes()),
+            CudaInput::Ptr(_) => ResourceInputFootprint::external(
+                self.external_buffers
+                    .get(&node)
+                    .map(|buffer| buffer.len())
+                    .unwrap_or(0),
+            ),
+        }
+    }
+
+    fn current_resource_input_signature(&self) -> FxHashMap<NodeIndex, ResourceInputFootprint> {
+        self.hlir_buffers
+            .iter()
+            .map(|(&node, input)| (node, self.resource_input_footprint(node, input)))
+            .collect()
+    }
+
+    fn resource_inputs_changed_since_validation(&self) -> bool {
+        // All supported input mutation paths add the affected node to
+        // changed_hlir. Restrict the potentially large signature comparison to
+        // that set so a token update does not rescan every model weight. A
+        // removal without a replacement is caught by the map-length check; a
+        // replacement/addition is itself in changed_hlir.
+        resource_input_signature_changed(
+            &self.last_resource_input_signature,
+            self.hlir_buffers.len(),
+            self.changed_hlir.iter().map(|&node| {
+                let current = self
+                    .hlir_buffers
+                    .get(&node)
+                    .map(|input| self.resource_input_footprint(node, input));
+                (node, current)
+            }),
+        )
+    }
+
     /// Loading can preflight an LLIR before its graph inputs are installed.
     /// Represent only those known boundary inputs with zero-length sentinels;
     /// an absent intermediate or alias must remain absent so HostOp planning
@@ -2574,6 +2773,7 @@ impl CudaRuntime {
         let bucket = &mut self.compiled_buckets[bucket_idx];
         bucket.last_resource_validation_dyn_map = allocation_dyn_map.clone();
         bucket.resource_validation_complete = true;
+        self.last_resource_input_signature = self.current_resource_input_signature();
         Ok(())
     }
 
@@ -2584,6 +2784,9 @@ impl CudaRuntime {
         // rather than logical length. External pointers are deliberately
         // omitted because several HLIR ids may be overlapping views of the
         // same allocation; double-counting them could reject a legal candidate.
+        // Context state, allocator overhead/reservations, and unrelated device
+        // allocations are also unknown, so this remains a necessary
+        // planned-capacity check rather than an available-memory guarantee.
         let resident_owned_bytes = self
             .hlir_buffers
             .values()
@@ -2872,13 +3075,24 @@ impl CudaRuntime {
         // Rebind CUDA context to thread after cleanup to ensure valid state
         let _ = self.cuda_stream.context().bind_to_thread();
 
-        // Reclaim search-profiling residue from the async allocator pool before
-        // the stitched-graph arena allocates (see try_load_llir_buckets).
-        self.release_pooled_memory();
-
+        // Drop old arenas before replacing executable state, retaining the pool
+        // each allocation belongs to even if another pool is current now.
+        let mut releases = ArenaReleasePlan::default();
+        for old_bucket in &mut self.compiled_buckets {
+            Self::take_bucket_arena(old_bucket, &mut releases);
+        }
         self.compiled_buckets = vec![bucket];
         self.active_bucket = 0;
         self.dim_buckets.clear();
+        Self::finish_arena_releases(&self.cuda_stream, releases)?;
+        // Reclaim search-profiling residue from the async allocator pool before
+        // the stitched-graph arena allocates (see try_load_llir_buckets).
+        self.release_pooled_memory();
+        self.last_resource_input_signature = if input_lengths_complete {
+            self.current_resource_input_signature()
+        } else {
+            FxHashMap::default()
+        };
 
         // Mark all HLIR inputs as changed so their pointers get re-cached in execute
         self.changed_hlir.extend(self.hlir_buffers.keys().copied());
@@ -2952,8 +3166,18 @@ impl CudaRuntime {
         // Only now replace the old executable state.
         let _ = self.cuda_stream.synchronize();
         let _ = self.cuda_stream.context().bind_to_thread();
+        let mut releases = ArenaReleasePlan::default();
+        for old_bucket in &mut self.compiled_buckets {
+            Self::take_bucket_arena(old_bucket, &mut releases);
+        }
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets = compiled_buckets;
+        Self::finish_arena_releases(&self.cuda_stream, releases)?;
+        self.last_resource_input_signature = if input_lengths_complete {
+            self.current_resource_input_signature()
+        } else {
+            FxHashMap::default()
+        };
 
         // Reclaim what search profiling left resident in the async allocator
         // pool before allocating the stitched-graph arenas. This load runs
@@ -3067,6 +3291,7 @@ impl Runtime for CudaRuntime {
             max_intermediate_memory_bytes: None,
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             device_resource_limits,
+            last_resource_input_signature: FxHashMap::default(),
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
@@ -3108,13 +3333,15 @@ impl Runtime for CudaRuntime {
     }
 
     fn clear_intermediate_buffers(&mut self) {
-        let _ = self.cuda_stream.synchronize();
+        let mut releases = ArenaReleasePlan::default();
         for bucket in &mut self.compiled_buckets {
-            bucket.arena = None;
+            Self::take_bucket_arena(bucket, &mut releases);
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
             bucket.hlir_synced = false;
         }
+        Self::finish_arena_releases(&self.cuda_stream, releases)
+            .expect("failed to clear CUDA intermediate arenas");
     }
 
     fn intermediate_buffer_bytes(&self) -> usize {
@@ -3179,7 +3406,10 @@ impl Runtime for CudaRuntime {
         Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         // Clear active bucket's arena before loading new LLIR for profiling.
         if !self.compiled_buckets.is_empty() {
-            self.active_mut().arena = None;
+            let mut releases = ArenaReleasePlan::default();
+            Self::take_bucket_arena(self.active_mut(), &mut releases);
+            Self::finish_arena_releases(&self.cuda_stream, releases)
+                .expect("failed to release the previous CUDA profiling arena");
         }
         if let Err(e) = self.try_load_llir(llir_graph) {
             return Self::invalid_profile_metric(e);
@@ -3202,7 +3432,10 @@ impl Runtime for CudaRuntime {
         }
         Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         if !self.compiled_buckets.is_empty() {
-            self.active_mut().arena = None;
+            let mut releases = ArenaReleasePlan::default();
+            Self::take_bucket_arena(self.active_mut(), &mut releases);
+            Self::finish_arena_releases(&self.cuda_stream, releases)
+                .expect("failed to release the previous CUDA profiling arena");
         }
         let bucket_llirs = vec![(
             bucket_context.bucket_indices.clone(),
@@ -3239,9 +3472,12 @@ impl Runtime for CudaRuntime {
             if idx != self.active_bucket {
                 // Free the old bucket's intermediates to avoid holding 2 full sets in GPU memory
                 let old = self.active_bucket;
-                self.compiled_buckets[old].arena = None;
+                let mut releases = ArenaReleasePlan::default();
+                Self::take_bucket_arena(&mut self.compiled_buckets[old], &mut releases);
                 self.compiled_buckets[old].cached_buffer_ptrs.clear();
                 self.compiled_buckets[old].cached_device_buffers.clear();
+                Self::finish_arena_releases(&self.cuda_stream, releases)
+                    .expect("failed to release the previous CUDA bucket arena");
                 self.active_bucket = idx;
                 // Mark bucket as needing HLIR sync since it may have missed changes
                 self.compiled_buckets[idx].hlir_synced = false;
@@ -4178,6 +4414,77 @@ fn intersects(a: &FixedBitSet, b: &FixedBitSet) -> bool {
 #[cfg(test)]
 mod arena_plan_tests {
     use super::*;
+
+    #[test]
+    fn arena_release_plan_retains_and_deduplicates_allocation_pools() {
+        let pool = std::ptr::NonNull::<sys::CUmemPoolHandle_st>::dangling().as_ptr();
+        let mut releases = ArenaReleasePlan::default();
+
+        releases.record_arena(Some(pool));
+        releases.record_arena(Some(pool));
+        releases.record_arena(None);
+
+        assert_eq!(releases.arenas_released, 3);
+        assert_eq!(releases.pools_to_trim, vec![pool]);
+    }
+
+    #[test]
+    fn resource_input_footprint_tracks_lengths_and_owned_capacity_only() {
+        let owned = ResourceInputFootprint::owned(8, 64);
+        assert_eq!(owned, ResourceInputFootprint::owned(8, 64));
+        assert_ne!(owned, ResourceInputFootprint::owned(16, 64));
+        assert_ne!(owned, ResourceInputFootprint::owned(8, 128));
+        assert_ne!(owned, ResourceInputFootprint::external(8));
+
+        // External pointer identity and payload contents are intentionally not
+        // represented. An equally sized replacement cannot change a HostOp
+        // resource plan or the runtime-owned allocation total.
+        assert_eq!(
+            ResourceInputFootprint::external(32),
+            ResourceInputFootprint::external(32)
+        );
+        assert_ne!(
+            ResourceInputFootprint::external(32),
+            ResourceInputFootprint::external(64)
+        );
+    }
+
+    #[test]
+    fn resource_signature_checks_only_changed_inputs_after_count_guard() {
+        let a = NodeIndex::new(1);
+        let b = NodeIndex::new(2);
+        let c = NodeIndex::new(3);
+        let previous = FxHashMap::from_iter([
+            (a, ResourceInputFootprint::owned(8, 64)),
+            (b, ResourceInputFootprint::external(32)),
+        ]);
+
+        assert!(!resource_input_signature_changed(
+            &previous,
+            2,
+            [(a, Some(ResourceInputFootprint::owned(8, 64)))].into_iter(),
+        ));
+        assert!(resource_input_signature_changed(
+            &previous,
+            2,
+            [(a, Some(ResourceInputFootprint::owned(16, 64)))].into_iter(),
+        ));
+        assert!(resource_input_signature_changed(
+            &previous,
+            1,
+            std::iter::empty(),
+        ));
+        assert!(resource_input_signature_changed(
+            &previous,
+            2,
+            [(c, Some(ResourceInputFootprint::external(32)))].into_iter(),
+        ));
+        assert!(resource_input_signature_changed(
+            &previous,
+            2,
+            [(b, None)].into_iter(),
+        ));
+    }
 
     #[test]
     fn set_data_reuses_hlir_buffer_when_payload_fits() {
