@@ -217,7 +217,7 @@ fn fuzz_test_genome_validity() {
     let mut expr_cache = FxHashMap::default();
 
     // Test initial random choice
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(egraph, &mut rng, ops);
     println!("Initial choice has {} entries", initial.len());
     prev_selected.insert(hash_choice_set(&initial));
 
@@ -344,7 +344,7 @@ fn fuzz_test_genome_execution() {
     let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
 
     // Generate and test multiple genomes
-    let initial = random_initial_choice(egraph, &mut rng);
+    let initial = random_initial_choice(egraph, &mut rng, ops);
     prev_selected.insert(hash_choice_set(&initial));
 
     let test_input_a = vec![1.0f32, -2.0, 3.0, -4.0, 5.0, -6.0];

@@ -1,0 +1,16 @@
+[package]
+name = "cpu"
+version = "0.1.0"
+edition = "2021"
+description = "CPU backend for the Luminal ML framework"
+
+[dependencies]
+luminal = { path = "../.." }
+luminal_cpu = { path = "../../crates/luminal_cpu" }
+itertools = "0.13"
+rustc-hash = "2.0"
+matrixmultiply = "0.3"
+
+[[example]]
+name = "cpu"
+path = "src/main.rs"

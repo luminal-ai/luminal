@@ -18,7 +18,7 @@ fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     let mut all_names = Vec::new();
     // Try many random extractions to cover both alternatives
     for _ in 0..20 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
+        let choices = random_initial_choice(egraph, &mut rand::rng(), ops);
         let mut list_cache = Default::default();
         let mut expr_cache = Default::default();
         let llir = egglog_to_llir(
@@ -211,7 +211,7 @@ fn test_scatter_execution_correctness() {
     let mut tested_nocopy = false;
 
     for _ in 0..50 {
-        let choices = random_initial_choice(egraph, &mut rng);
+        let choices = random_initial_choice(egraph, &mut rng, ops);
         if validate_choice_set(egraph, &choices, ops).is_err() {
             continue;
         }
