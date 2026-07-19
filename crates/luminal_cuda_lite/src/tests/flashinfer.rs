@@ -1219,6 +1219,31 @@ fn cuda_graph_captures_flashinfer_decode_island() {
 }
 
 #[test]
+fn bucket_load_defers_flashinfer_prebuild_until_inputs_are_installed() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let (mut cx, _) = build_paged_attention_graph_with_mask(
+        N_HEADS,
+        N_KV_HEADS,
+        HEAD_DIM,
+        TestMaskKind::TriuGather,
+    );
+    cx.set_dim('s', 1);
+    cx.set_dim('c', 4);
+    cx.set_dim_interval('s', 1, 1);
+    let llir = extract_forced_flashinfer_llir(&mut cx, "deferred bucket FlashInfer prebuild");
+
+    let bucket_llirs = vec![(FxHashMap::default(), cx.dyn_map.clone(), llir)];
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir_buckets(&FxHashMap::default(), &bucket_llirs);
+}
+
+#[test]
 fn flashinfer_rule_fires_on_non_llama_dims() {
     if !crate::tests::utilities::gpu_supports_flashinfer() {
         return;

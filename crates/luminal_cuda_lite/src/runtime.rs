@@ -2961,9 +2961,11 @@ impl CudaRuntime {
         // to call release_pooled_memory() itself, so on a memory-tight GPU the
         // arena allocation below would otherwise OOM against the pool residue.
         self.release_pooled_memory();
-        for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
-            self.prepare_bucket_buffers(idx, representative_dyn_map);
-            self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)?;
+        if input_lengths_complete {
+            for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
+                self.prepare_bucket_buffers(idx, representative_dyn_map);
+                self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)?;
+            }
         }
         // The first real execution for model workloads is usually prefill, which
         // lands in the largest/range bucket rather than the singleton decode
