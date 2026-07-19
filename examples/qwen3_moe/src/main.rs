@@ -26,6 +26,24 @@ fn qwen3_chat_prompt(user_prompt: &str) -> String {
     )
 }
 
+fn promote_persistent_state(
+    runtime: &mut CudaRuntime,
+    seen_out: GraphTensor,
+    seen_mask: GraphTensor,
+    cache_outputs: &[(GraphTensor, GraphTensor)],
+    kv_cache: &KVCache,
+) {
+    let seen_buf = runtime.remove_buffer(seen_out);
+    runtime.set_buffer(seen_mask, seen_buf);
+
+    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        let k_buf = runtime.remove_buffer(*k_out);
+        let v_buf = runtime.remove_buffer(*v_out);
+        runtime.set_buffer(kv_cache.k_caches[layer], k_buf);
+        runtime.set_buffer(kv_cache.v_caches[layer], v_buf);
+    }
+}
+
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
@@ -150,9 +168,9 @@ fn main() {
     const EOS_TOKEN: u32 = 151645; // <|im_end|>
     const STOP_TOKEN: u32 = 151643; // <|endoftext|>
 
-    // KV caches update in place (the cache scatters write through to the
-    // cache input buffers via the in-place alias machinery) and sampling
-    // runs on-device — per-step host I/O is one token id each way.
+    // Sampling runs on-device, and each execute's selected cache/seen outputs
+    // are promoted back into the persistent input slots before the next step.
+    // Per-step host I/O is one token id each way.
     let prefill_start = std::time::Instant::now();
     let plen = prompt_tokens.len();
     cx.set_dim('s', plen);
@@ -166,6 +184,13 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..plen as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.execute(&cx.dyn_map);
+    promote_persistent_state(
+        &mut runtime,
+        seen_out,
+        seen_mask_t,
+        &cache_outputs,
+        &kv_cache,
+    );
     prev_seq = plen;
 
     // One sampled id per row; index from the START of the (possibly larger)
@@ -193,6 +218,13 @@ fn main() {
         t_set += start.elapsed();
         let e = std::time::Instant::now();
         runtime.execute(&cx.dyn_map);
+        promote_persistent_state(
+            &mut runtime,
+            seen_out,
+            seen_mask_t,
+            &cache_outputs,
+            &kv_cache,
+        );
         t_exec += e.elapsed();
 
         prev_seq += 1;

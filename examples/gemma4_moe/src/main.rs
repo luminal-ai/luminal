@@ -26,6 +26,24 @@ fn env_bool(name: &str) -> bool {
         .is_some_and(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn promote_persistent_state(
+    runtime: &mut CudaRuntime,
+    seen_out: GraphTensor,
+    seen_mask: GraphTensor,
+    cache_outputs: &[(GraphTensor, GraphTensor)],
+    kv_cache: &KVCache,
+) {
+    let seen_buf = runtime.remove_buffer(seen_out);
+    runtime.set_buffer(seen_mask, seen_buf);
+
+    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        let k_buf = runtime.remove_buffer(*k_out);
+        let v_buf = runtime.remove_buffer(*v_out);
+        runtime.set_buffer(kv_cache.k_caches[layer], k_buf);
+        runtime.set_buffer(kv_cache.v_caches[layer], v_buf);
+    }
+}
+
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
@@ -144,8 +162,9 @@ fn main() {
 
     const EOS_TOKEN: u32 = 1;
 
-    // KV caches update in place; sampling runs on-device — per-step host
-    // I/O is one token id each way.
+    // Sampling runs on-device, and each execute's selected cache/seen outputs
+    // are promoted back into the persistent input slots before the next step.
+    // Per-step host I/O is one token id each way.
     let prefill_start = std::time::Instant::now();
     let plen = prompt_tokens.len();
     cx.set_dim('s', plen);
@@ -159,6 +178,13 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..plen as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.execute(&cx.dyn_map);
+    promote_persistent_state(
+        &mut runtime,
+        seen_out,
+        seen_mask_t,
+        &cache_outputs,
+        &kv_cache,
+    );
     prev_seq = prompt_tokens.len();
 
     let ids = runtime.get_i32(token_ids);
@@ -179,6 +205,13 @@ fn main() {
         runtime.set_data(gather_idx_t, (0..=prev_seq as i32).collect::<Vec<_>>());
         runtime.set_data(new_token_t, vec![next_token as i32]);
         runtime.execute(&cx.dyn_map);
+        promote_persistent_state(
+            &mut runtime,
+            seen_out,
+            seen_mask_t,
+            &cache_outputs,
+            &kv_cache,
+        );
 
         prev_seq += 1;
         let ids = runtime.get_i32(token_ids);

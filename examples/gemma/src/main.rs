@@ -26,6 +26,26 @@ fn gemma3_chat_prompt(user_prompt: &str) -> String {
     format!("<bos><start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n")
 }
 
+fn rebind_persistent_state(
+    runtime: &mut CudaRuntime,
+    seen_out: GraphTensor,
+    seen_mask: GraphTensor,
+    cache_outputs: &[(GraphTensor, GraphTensor)],
+    kv_cache: &KVCache,
+) {
+    let seen = runtime.remove_buffer(seen_out);
+    runtime.set_buffer(seen_mask, seen);
+
+    debug_assert_eq!(cache_outputs.len(), kv_cache.k_caches.len());
+    debug_assert_eq!(cache_outputs.len(), kv_cache.v_caches.len());
+    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        let k = runtime.remove_buffer(*k_out);
+        let v = runtime.remove_buffer(*v_out);
+        runtime.set_buffer(kv_cache.k_caches[layer], k);
+        runtime.set_buffer(kv_cache.v_caches[layer], v);
+    }
+}
+
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
@@ -179,6 +199,13 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..prompt_len as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.execute(&cx.dyn_map);
+    rebind_persistent_state(
+        &mut runtime,
+        seen_out,
+        seen_mask_t,
+        &cache_outputs,
+        &kv_cache,
+    );
     prev_seq = prompt_len;
 
     let ids = runtime.get_i32(token_ids);
@@ -204,6 +231,13 @@ fn main() {
         runtime.set_data(gather_idx_t, (0..=prev_seq as i32).collect::<Vec<_>>());
         runtime.set_data(new_token_t, vec![next_token as i32]);
         runtime.execute(&cx.dyn_map);
+        rebind_persistent_state(
+            &mut runtime,
+            seen_out,
+            seen_mask_t,
+            &cache_outputs,
+            &kv_cache,
+        );
 
         prev_seq += 1;
         let ids = runtime.get_i32(token_ids);
