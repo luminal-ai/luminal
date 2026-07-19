@@ -292,3 +292,55 @@ fn sgd_momentum_trains_xor() {
         "XOR with momentum SGD failed: first {first}, last {last}"
     );
 }
+
+/// Zero-copy loop: weights and optimizer state stay resident in the runtime
+/// and are rebound from Output to Input slots between steps. Must produce
+/// bit-identical weights to the clone-out-and-refeed loop.
+#[test]
+fn zero_copy_rebind_matches_copy_loop() {
+    let n = 4;
+    let w0 = seq(n, -1.0, 1.0);
+    let target = seq(n, 0.5, 1.5);
+    let opt = AdamW::new(0.05).weight_decay(0.01);
+    let steps = 7;
+
+    // Reference: the copy-based OptTrainer loop.
+    let expected = {
+        let mut cx = Graph::new();
+        let (w, tgt, loss) = quadratic_setup(&mut cx, n);
+        let mut t =
+            OptTrainer::new(&mut cx, loss, &[w], vec![w0.clone()], &opt).feed(tgt, target.clone());
+        for _ in 0..steps {
+            t.train_step(&opt);
+        }
+        t.weights[0].clone()
+    };
+
+    // Zero-copy: feed weights/state once, then rebind buffers between steps.
+    let mut cx = Graph::new();
+    let (w, tgt, loss) = quadratic_setup(&mut cx, n);
+    let grads = cx.backward(loss, &[w]);
+    let step = opt.build(&mut cx, &[w], &grads);
+    let _ = loss.output();
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut rt = cx.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
+    rt.set_data(w.id, w0);
+    for (s, v) in step.state_in.iter().zip(&step.state_init) {
+        rt.set_data(s.id, v.clone());
+    }
+    for t in 0..steps {
+        rt.set_data(tgt.id, target.clone());
+        for (s, v) in step.scalar_in.iter().zip(opt.scalar_values(t)) {
+            rt.set_data(s.id, vec![v]);
+        }
+        rt.execute(&cx.dyn_map);
+        if t < steps - 1 {
+            step.rebind(&mut rt, &[w]);
+        }
+    }
+    let final_w = rt.get_f32(step.new_params[0].id).clone();
+    assert_eq!(final_w, expected, "zero-copy loop diverged from copy loop");
+}

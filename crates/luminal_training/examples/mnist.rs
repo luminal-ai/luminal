@@ -2,8 +2,10 @@
 //!
 //! The whole training step — forward conv net, backward pass from
 //! `cx.backward`, and the AdamW update — is one compiled luminal graph.
-//! The host loop only shuttles batches, weights, and optimizer state in and
-//! out each iteration.
+//! Weights and optimizer state stay resident in the runtime: after each
+//! step the updated buffers are rebound from the graph's outputs to its
+//! input slots without copying, so the host loop only feeds batches and
+//! the step-size scalars.
 //!
 //! Run with:
 //! ```sh
@@ -21,7 +23,7 @@
 //! cheap even for interior layers.
 
 use luminal::prelude::*;
-use luminal_training::{AdamW, Backward, Optimizer};
+use luminal_training::{AdamW, Backward, Optimizer, restore_inputs, snapshot_inputs};
 use mnist::MnistBuilder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -165,7 +167,7 @@ fn main() {
         let scale = (2.0 / fan_in as f32).sqrt();
         (0..n).map(|_| rng.random_range(-scale..scale)).collect()
     };
-    let mut weights = vec![
+    let init_weights = vec![
         he(&mut rng, C1 * K * K, K * K),
         vec![0.0; C1],
         he(&mut rng, C2 * C1 * K * K, C1 * K * K),
@@ -173,15 +175,28 @@ fn main() {
         he(&mut rng, FEATURES * CLASSES, FEATURES),
         vec![0.0; CLASSES],
     ];
-    let mut state = step.state_init.clone();
+    println!(
+        "model parameters: {}",
+        init_weights.iter().map(|w| w.len()).sum::<usize>()
+    );
+    // Feed weights and optimizer state once; from here on they live inside
+    // the runtime and are rebound between steps without copying.
+    for (p, w) in params.iter().zip(&init_weights) {
+        rt.set_data(p.id, w.clone());
+    }
+    for (st, v) in step.state_in.iter().zip(&step.state_init) {
+        rt.set_data(st.id, v.clone());
+    }
+    // Everything that must survive an eval execute (evals consume the
+    // resident input buffers).
+    let resident: Vec<GraphTensor> = params
+        .iter()
+        .copied()
+        .chain(step.state_in.iter().copied())
+        .collect();
 
-    let run_batch = |rt: &mut ReferenceRuntime,
-                     weights: &[Vec<f32>],
-                     state: &[Vec<f32>],
-                     xs: &[Vec<f32>],
-                     ys: &[u8],
-                     t: usize,
-                     dyn_map: &FxHashMap<char, usize>| {
+    // Feed one batch of per-step data (weights/state are already resident).
+    let feed_batch = |rt: &mut ReferenceRuntime, xs: &[Vec<f32>], ys: &[u8], t: usize| {
         let x_data: Vec<f32> = xs.iter().flat_map(|v| v.iter().copied()).collect();
         let mut y_data = vec![0.0f32; BATCH * CLASSES];
         for (i, &l) in ys.iter().enumerate() {
@@ -189,16 +204,9 @@ fn main() {
         }
         rt.set_data(x.id, x_data);
         rt.set_data(y.id, y_data);
-        for (p, w) in params.iter().zip(weights) {
-            rt.set_data(p.id, w.clone());
-        }
-        for (s, v) in step.state_in.iter().zip(state) {
-            rt.set_data(s.id, v.clone());
-        }
         for (s, v) in step.scalar_in.iter().zip(opt.scalar_values(t)) {
             rt.set_data(s.id, vec![v]);
         }
-        rt.execute(dyn_map);
     };
 
     // --- Train --------------------------------------------------------------
@@ -211,17 +219,20 @@ fn main() {
             // Spot-check accuracy on 10 random test images with the current
             // weights. The batch is fixed at BATCH, so the 10 samples repeat
             // cyclically to fill it and only the first 10 are scored. The
-            // eval execute doesn't read back params/state, so training is
-            // unaffected.
+            // eval execute consumes the resident weight/state buffers, so
+            // snapshot them first and restore after.
+            let snap = snapshot_inputs(&rt, &resident);
             let sample: Vec<usize> = (0..10).map(|_| rng.random_range(0..test_x.len())).collect();
             let xs: Vec<Vec<f32>> = (0..BATCH).map(|i| test_x[sample[i % 10]].clone()).collect();
             let ys: Vec<u8> = (0..BATCH).map(|i| test_y[sample[i % 10]]).collect();
-            run_batch(&mut rt, &weights, &state, &xs, &ys, t, &dyn_map);
+            feed_batch(&mut rt, &xs, &ys, t);
+            rt.execute(&dyn_map);
             let logits_v = rt.get_f32(logits_out.id).clone();
             let correct = (0..10)
                 .filter(|&i| argmax(&logits_v[i * CLASSES..(i + 1) * CLASSES]) == ys[i] as usize)
                 .count();
             println!("  eval @ step {t:>4}: {correct}/10 random test images correct");
+            restore_inputs(&mut rt, &resident, &snap);
         }
         if t * BATCH % train_x.len() < BATCH {
             // reshuffle each epoch
@@ -234,19 +245,12 @@ fn main() {
             .map(|i| train_x[order[base + i]].clone())
             .collect();
         let ys: Vec<u8> = (0..BATCH).map(|i| train_y[order[base + i]]).collect();
-        run_batch(&mut rt, &weights, &state, &xs, &ys, t, &dyn_map);
+        feed_batch(&mut rt, &xs, &ys, t);
+        rt.execute(&dyn_map);
         let loss_v = rt.get_f32(loss_out.id)[0];
         assert!(loss_v.is_finite(), "loss diverged at step {t}");
-        weights = step
-            .new_params
-            .iter()
-            .map(|p| rt.get_f32(p.id).clone())
-            .collect();
-        state = step
-            .state_out
-            .iter()
-            .map(|s| rt.get_f32(s.id).clone())
-            .collect();
+        // Advance: move updated params + state into the input slots, no copy.
+        step.rebind(&mut rt, &params);
         if t % 25 == 0 || t == STEPS - 1 {
             println!(
                 "step {t:>4} | loss {loss_v:.4} | {:.0} ms/step",
@@ -256,13 +260,16 @@ fn main() {
     }
 
     // --- Evaluate -----------------------------------------------------------
+    let final_snap = snapshot_inputs(&rt, &resident);
     let mut correct = 0;
     let mut total = 0;
     for chunk in 0..(EVAL_IMAGES / BATCH) {
         let base = chunk * BATCH;
         let xs: Vec<Vec<f32>> = (0..BATCH).map(|i| test_x[base + i].clone()).collect();
         let ys: Vec<u8> = (0..BATCH).map(|i| test_y[base + i]).collect();
-        run_batch(&mut rt, &weights, &state, &xs, &ys, STEPS, &dyn_map);
+        restore_inputs(&mut rt, &resident, &final_snap);
+        feed_batch(&mut rt, &xs, &ys, STEPS);
+        rt.execute(&dyn_map);
         let logits_v = rt.get_f32(logits_out.id).clone();
         for (i, &label) in ys.iter().enumerate() {
             if argmax(&logits_v[i * CLASSES..(i + 1) * CLASSES]) == label as usize {
