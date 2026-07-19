@@ -17,6 +17,7 @@ LUMINAL_DOCKER_CUDA_IMAGE_REMOTE ?= $(LUMINAL_DOCKER_REGISTRY)/$(LUMINAL_DOCKER_
 CUDA_DOCKER_TARGET := $(CUDA_LITE_TARGET_BASE)/docker-$(CUDA_TAG)
 
 .PHONY: help \
+	clean \
 	cuda-lite-test \
 	cuda-lite-test-version \
 	cuda-lite-test-unit \
@@ -34,19 +35,25 @@ CUDA_DOCKER_TARGET := $(CUDA_LITE_TARGET_BASE)/docker-$(CUDA_TAG)
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*## "}; /^[a-zA-Z0-9_-]+:.*## / {printf "  %-28s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
+clean: ## Remove all workspace build artifacts (cargo clean)
+	cargo clean
+
 cuda-lite-test: cuda-lite-test-version cuda-lite-test-unit cuda-lite-test-graph ## Default luminal_cuda_lite smoke (version + unit + graph)
 
 cuda-lite-test-version: ## luminal_cuda_lite CPU parser tests (cuda_version_detect)
 	cargo test -p $(CUDA_PKG) --test cuda_version_detect
 
 cuda-lite-test-unit: ## luminal_cuda_lite GPU unit suite (skips #[ignore])
-	cargo test -p $(CUDA_PKG)
+	mkdir -p "$(CUDA_LITE_TARGET_BASE)/tmp"
+	TMPDIR="$(CUDA_LITE_TARGET_BASE)/tmp" cargo test -p $(CUDA_PKG)
 
 cuda-lite-test-graph: ## luminal_cuda_lite cuda_graph::tests smoke
-	cargo test -p $(CUDA_PKG) cuda_graph::tests
+	mkdir -p "$(CUDA_LITE_TARGET_BASE)/tmp"
+	TMPDIR="$(CUDA_LITE_TARGET_BASE)/tmp" cargo test -p $(CUDA_PKG) cuda_graph::tests
 
 cuda-lite-test-ignored: ## luminal_cuda_lite expensive GPU sweeps (--ignored)
-	cargo test -p $(CUDA_PKG) -- --ignored
+	mkdir -p "$(CUDA_LITE_TARGET_BASE)/tmp"
+	TMPDIR="$(CUDA_LITE_TARGET_BASE)/tmp" cargo test -p $(CUDA_PKG) -- --ignored
 
 cuda-lite-test-all: cuda-lite-test-version cuda-lite-test-unit cuda-lite-test-graph cuda-lite-test-ignored ## luminal_cuda_lite full run including ignored
 
