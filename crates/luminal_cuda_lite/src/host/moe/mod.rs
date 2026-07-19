@@ -33,6 +33,7 @@ use crate::{
         },
     },
     host::{DeviceBuffer, HostOp},
+    resource::{HostDeviceMemoryPlan, ResourceViolation, eval_resource_expression},
     try_create_cublaslt,
 };
 
@@ -670,6 +671,37 @@ impl HostOp for GLUMoE {
 
     fn output_bytes(&self) -> Expression {
         Expression::from('s') * self.gu_matmul_k * 4 // F32
+    }
+
+    fn device_memory_plan(
+        &self,
+        _self_node: NodeIndex,
+        _inputs: &[NodeIndex],
+        _buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
+        let x_bf16 = eval_resource_expression(
+            Expression::from('s') * self.gu_matmul_k * 2,
+            dyn_map,
+            "GLUMoE BF16 input scratch",
+        )?;
+        let gate_up = eval_resource_expression(
+            (self.gu_io / self.gu_matmul_k) * 2,
+            dyn_map,
+            "GLUMoE gate/up scratch",
+        )?;
+        let hidden =
+            eval_resource_expression(self.dn_matmul_k * 2, dyn_map, "GLUMoE hidden scratch")?;
+        let transient_peak_bytes = [WORKSPACE_SIZE, x_bf16, gate_up, hidden]
+            .into_iter()
+            .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+            .ok_or(ResourceViolation::ArithmeticOverflow {
+                resource: "GLUMoE temporary device memory",
+            })?;
+        Ok(HostDeviceMemoryPlan {
+            transient_peak_bytes,
+            ..Default::default()
+        })
     }
 
     fn stats_name(&self) -> Option<&'static str> {

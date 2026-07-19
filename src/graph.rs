@@ -171,6 +171,12 @@ pub struct CompileOptions {
     pub candidate_timeout: Option<std::time::Duration>,
     /// Caps how long profiling runs a single trial; not a rejection criterion.
     pub execution_timeout: Option<std::time::Duration>,
+    /// Dynamic dimension values applied after search-space construction and
+    /// before search. These values persist in [`Graph::dyn_map`] and provide
+    /// the base representative values for unbucketed dimensions. Per-bucket
+    /// representatives override them during bucketed search, and
+    /// [`CompileOptions::profile_dims`] override them only while profiling.
+    pub search_dims: FxHashMap<char, usize>,
     /// Optional profiling dimension overrides.
     pub profile_dims: FxHashMap<char, usize>,
     /// Bucket definitions per dynamic dimension. Dimensions without buckets use
@@ -236,6 +242,15 @@ impl CompileOptions {
         self
     }
 
+    /// Set a dynamic dimension after search-space construction and before
+    /// search. This is equivalent to calling [`Graph::set_dim`] between
+    /// [`Graph::build_search_space`] and [`Graph::search`], while still using
+    /// the unified [`Graph::compile`] API.
+    pub fn search_dim(mut self, dim: char, value: usize) -> Self {
+        self.search_dims.insert(dim, value);
+        self
+    }
+
     /// Override a dynamic dimension value used during search profiling.
     pub fn profile_dim(mut self, dim: char, value: usize) -> Self {
         self.profile_dims.insert(dim, value);
@@ -295,6 +310,7 @@ impl Default for CompileOptions {
             keep_best: 1,
             candidate_timeout: Some(std::time::Duration::from_secs(5)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
+            search_dims: FxHashMap::default(),
             profile_dims: FxHashMap::default(),
             dim_buckets: FxHashMap::default(),
             egglog_log: false,
@@ -1413,6 +1429,10 @@ impl Graph {
         options: CompileOptions,
         rng: &mut G,
     ) -> R {
+        for (&dim, &value) in &options.search_dims {
+            self.set_dim(dim, value);
+        }
+
         assert!(
             options.dim_buckets.is_empty() || options.dim_buckets == self.search_space_dim_buckets,
             "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
@@ -3191,7 +3211,63 @@ mod tests {
         assert!(!candidate_is_rollable(&[occ(0, 100)], &[]));
     }
     use crate::tests::{assert_close, random_vec};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static SEARCH_DIM_LATE_PASS_CALLED: AtomicBool = AtomicBool::new(false);
+    static SEARCH_DIM_LATE_PASS_SAW_C: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Default)]
+    struct SearchDimRecordingRuntime {
+        profile_dyn_maps: Vec<FxHashMap<char, usize>>,
+        bucket_representative_dyn_maps: Vec<FxHashMap<char, usize>>,
+    }
+
+    impl Runtime for SearchDimRecordingRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn late_egglog_passes(
+            _: &[Arc<Box<dyn EgglogOp>>],
+            _: &CompileOptions,
+            dyn_map: &FxHashMap<char, usize>,
+        ) -> Vec<crate::egglog_utils::LateEgglogPass> {
+            SEARCH_DIM_LATE_PASS_CALLED.store(true, Ordering::SeqCst);
+            SEARCH_DIM_LATE_PASS_SAW_C.store(dyn_map.contains_key(&'c'), Ordering::SeqCst);
+            vec![]
+        }
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn load_llir_buckets(
+            &mut self,
+            _: &FxHashMap<char, Vec<DimBucket>>,
+            bucket_llirs: &[BucketLLIR],
+        ) {
+            self.bucket_representative_dyn_maps = bucket_llirs
+                .iter()
+                .map(|(_, representative_dyn_map, _)| representative_dyn_map.clone())
+                .collect();
+        }
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            dyn_map: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            self.profile_dyn_maps.push(dyn_map.clone());
+            (0, "0 ms".to_string())
+        }
+    }
 
     #[derive(Default)]
     struct TestFilterRuntime {
@@ -3288,19 +3364,55 @@ mod tests {
         assert!(!opts.egglog_log);
         assert!(!opts.rolling_log);
         assert!(opts.search_log);
+        assert!(opts.search_dims.is_empty());
 
         let time_limit = std::time::Duration::from_millis(25);
         let opts = CompileOptions::default()
             .search_graph_limit(7)
             .search_time_limit(time_limit)
+            .search_dim('c', 16)
             .egglog_log(true)
             .rolling_log(true)
             .search_log(false);
         assert_eq!(opts.limit, 7);
         assert_eq!(opts.search_time_limit, time_limit);
+        assert_eq!(opts.search_dims[&'c'], 16);
         assert!(opts.egglog_log);
         assert!(opts.rolling_log);
         assert!(!opts.search_log);
+    }
+
+    #[test]
+    fn compile_applies_search_dims_after_build_with_documented_precedence() {
+        SEARCH_DIM_LATE_PASS_CALLED.store(false, Ordering::SeqCst);
+        SEARCH_DIM_LATE_PASS_SAW_C.store(false, Ordering::SeqCst);
+
+        let mut cx = Graph::new();
+        let _ = cx.tensor(('s', 'c')).output();
+        let options = CompileOptions::default()
+            .dim_buckets('s', &[DimBucket::new(1, 4).representative(3)])
+            .search_dim('s', 4)
+            .search_dim('c', 16)
+            .profile_dim('s', 2)
+            .profile_dim('c', 7)
+            .search_graph_limit(1)
+            .search_log(false);
+
+        let runtime = cx.compile(SearchDimRecordingRuntime::default(), options);
+
+        assert!(SEARCH_DIM_LATE_PASS_CALLED.load(Ordering::SeqCst));
+        assert!(
+            !SEARCH_DIM_LATE_PASS_SAW_C.load(Ordering::SeqCst),
+            "search-only dimensions must not leak into build-time late passes"
+        );
+        assert_eq!(runtime.profile_dyn_maps.len(), 1);
+        assert_eq!(runtime.profile_dyn_maps[0][&'s'], 2);
+        assert_eq!(runtime.profile_dyn_maps[0][&'c'], 7);
+        assert_eq!(runtime.bucket_representative_dyn_maps.len(), 1);
+        assert_eq!(runtime.bucket_representative_dyn_maps[0][&'s'], 3);
+        assert_eq!(runtime.bucket_representative_dyn_maps[0][&'c'], 16);
+        assert_eq!(cx.dyn_map[&'s'], 4);
+        assert_eq!(cx.dyn_map[&'c'], 16);
     }
 
     #[test]
@@ -3424,12 +3536,12 @@ mod tests {
         let text_a = r#"(let t0 (Input 42 "boundary" (F32)))
 (let t1 (Input 100 "layers.0.wq.weight" (F32)))
 (let t2 (Add (ECons 128 (ECons 4096 (ENil))) t1 (ECons 1 (ECons 128 (ENil))) t0 (ECons 1 (ECons 1 (ENil))) (ECons 1 (ECons 128 (ENil)))))
-(let t3 (Output t2 42))
+(let t3 (Output t2 42 false))
 "#;
         let text_b = r#"(let t0 (Input 84 "boundary" (F32)))
 (let t1 (Input 200 "layers.1.wq.weight" (F32)))
 (let t2 (Add (ECons 128 (ECons 4096 (ENil))) t1 (ECons 1 (ECons 128 (ENil))) t0 (ECons 1 (ECons 1 (ENil))) (ECons 1 (ECons 128 (ENil)))))
-(let t3 (Output t2 84))
+(let t3 (Output t2 84 false))
 "#;
         assert_eq!(
             hash_egglog_normalized(text_a),
@@ -3477,15 +3589,26 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_egglog_normalized_distinguishes_persist_only_output() {
+        let observed = "(let t1 (Output t0 42 false))\n";
+        let persist_only = "(let t1 (Output t0 42 true))\n";
+        assert_ne!(
+            hash_egglog_normalized(observed),
+            hash_egglog_normalized(persist_only),
+            "persistence and observed-output semantics must not share a cached egraph"
+        );
+    }
+
+    #[test]
     fn test_hash_egglog_normalized_custom_op_id() {
         // CustomOpKind lines differ only in the integer ID (layer index)
         let text_a = r#"(let t0 (Input 441 "boundary" (F32)))
 (let t1 (Op (CustomOpKind 1 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
-(let t2 (Output t1 585))
+(let t2 (Output t1 585 false))
 "#;
         let text_b = r#"(let t0 (Input 585 "boundary" (F32)))
 (let t1 (Op (CustomOpKind 2 (F32)) (ICons t74 (ICons t120 (ICons t28 (INil))))))
-(let t2 (Output t1 729))
+(let t2 (Output t1 729 false))
 "#;
         assert_eq!(
             hash_egglog_normalized(text_a),

@@ -14,6 +14,7 @@ use luminal::dtype::DType;
 use luminal::prelude::*;
 
 use crate::runtime::CudaRuntime;
+use crate::tests::dtype_contract::{egraph_has_op_alternatives, extract_forced_kernel_llir};
 use crate::tests::utilities::{get_cuda_stream, random_f32_vec, random_i32_vec};
 
 const S: usize = 3;
@@ -894,6 +895,32 @@ fn rope_rule_fires_and_matches() {
         crate::tests::utilities::GENOME_FUZZ_COUNT,
         0x72,
     );
+}
+
+#[test]
+fn rope_scatter_fused_and_materialized_alternatives_coexist() {
+    use crate::kernel::KernelOp;
+    use luminal_nn::scatter_rows;
+
+    let mut cx = Graph::default();
+    let x = cx.tensor((S, Q_DIM)).as_dtype(DType::Bf16);
+    let pos = cx.tensor(S).as_dtype(DType::Int);
+    let scatter_idx = cx.tensor(S).as_dtype(DType::Int);
+    let cache = cx.tensor((MAX_SEQ, Q_DIM)).as_dtype(DType::Bf16).persist();
+    let k_rope = rotary(x, pos, N_HEADS);
+    scatter_rows(k_rope, scatter_idx, cache, Q_DIM).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(&cx, &["KernelScatterNoCopy", "KernelRoPEScatterFused"]),
+        "materialized KernelRoPE+scatter and exact-deinterleave fusion must coexist"
+    );
+
+    let fused = extract_forced_kernel_llir(&cx, "KernelRoPEScatterFused", "RoPEScatterFused");
+    assert!(fused.node_weights().any(|op| {
+        op.to_dialect::<dyn KernelOp>()
+            .is_some_and(|kernel| kernel.kernel_name() == "RoPEScatterFused")
+    }));
 }
 
 #[test]

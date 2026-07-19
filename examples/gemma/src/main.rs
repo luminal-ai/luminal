@@ -81,7 +81,7 @@ fn main() {
 
     let max_prefill = (prompt_len + 16).next_power_of_two().min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default()
+    let compile_options = CompileOptions::default()
         .dim_buckets(
             's',
             &[
@@ -92,15 +92,14 @@ fn main() {
         .dim_buckets(
             'c',
             &[DimBucket::new(1, max_seq_len).representative(search_s)],
-        );
-
-    println!("Building E-Graph...");
-    let phase = std::time::Instant::now();
-    cx.build_search_space::<CudaRuntime>(build_options);
-    println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
+        )
+        .search_graph_limit(search_graphs);
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_mib(2048);
+    // Widened semantic search produces legal prefill plans with a ~4.7 GiB
+    // proven intermediate lower bound; keep headroom while rejecting the much
+    // larger pathological unfused plans.
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(5);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
@@ -122,8 +121,7 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
-    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
 
     // Reclaim memory left in the async allocator pool by search profiling
     // before the first real execute.

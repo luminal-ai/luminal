@@ -1,6 +1,12 @@
 use crate::{
     host::{DeviceBuffer, HostOp},
     kernel::{CudaGraphOp, CudaGraphTiming, KernelOp, record_cuda_graph_timings},
+    resource::{
+        CandidateResourceCaps, CandidateResourcePlan, CudaDeviceResourceLimits,
+        DEFAULT_MAX_KERNEL_SOURCE_BYTES, HostDeviceMemoryPlan, KernelResourcePlan,
+        ResourceViolation, SharedDeviceMemoryAllocation, plan_static_llir_resources,
+        validate_resource_plan, validate_static_llir_semantics,
+    },
 };
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result};
 
@@ -148,6 +154,11 @@ pub(crate) struct CompiledBucket {
     pub(crate) kernel_names: Vec<&'static str>,
     pub(crate) last_dyn_map: FxHashMap<char, usize>,
     pub(crate) last_allocation_dyn_map: FxHashMap<char, usize>,
+    /// Bucket-capacity dimensions used by the most recent hard-resource
+    /// validation. Kept separate from allocation state so validation cannot
+    /// accidentally suppress a required arena refresh.
+    last_resource_validation_dyn_map: FxHashMap<char, usize>,
+    resource_validation_complete: bool,
     pub(crate) intermediate_buffer_dims: FxHashSet<char>,
     pub(crate) cached_device_buffers: FxHashMap<NodeIndex, DeviceBuffer>,
     /// Which bucket index per dim this compilation targets
@@ -188,6 +199,8 @@ impl CompiledBucket {
             kernel_names: Vec::new(),
             last_dyn_map: FxHashMap::default(),
             last_allocation_dyn_map: FxHashMap::default(),
+            last_resource_validation_dyn_map: FxHashMap::default(),
+            resource_validation_complete: false,
             intermediate_buffer_dims: FxHashSet::default(),
             cached_device_buffers: FxHashMap::default(),
             bucket_indices: FxHashMap::default(),
@@ -210,6 +223,8 @@ pub struct CudaRuntime {
     /// When true, execute() skips input buffer consumption (used during search/profile)
     profiling: bool,
     max_intermediate_memory_bytes: Option<usize>,
+    max_kernel_source_bytes: Option<usize>,
+    device_resource_limits: Option<CudaDeviceResourceLimits>,
 
     // Per-bucket compiled state
     compiled_buckets: Vec<CompiledBucket>,
@@ -244,8 +259,11 @@ impl CudaRuntime {
         Ok(Self::initialize(stream))
     }
 
+    /// Configure the search/runtime intermediate-arena cap. This intentionally
+    /// does not cap host-op state or shared workspaces; the separate hard
+    /// device check always validates the complete candidate allocation plan.
     pub fn with_max_memory_bytes(mut self, max_memory_bytes: usize) -> Self {
-        self.max_intermediate_memory_bytes = Some(max_memory_bytes);
+        self.set_max_memory_bytes(Some(max_memory_bytes));
         self
     }
 
@@ -257,8 +275,13 @@ impl CudaRuntime {
         self.with_max_memory_bytes(max_memory_gib.saturating_mul(1024 * 1024 * 1024))
     }
 
+    /// Set or disable the intermediate-arena cap. Total planned device memory
+    /// remains subject to the CUDA device limit when this is `None`.
     pub fn set_max_memory_bytes(&mut self, max_memory_bytes: Option<usize>) {
         self.max_intermediate_memory_bytes = max_memory_bytes;
+        for bucket in &mut self.compiled_buckets {
+            bucket.resource_validation_complete = false;
+        }
     }
 
     pub fn set_max_memory_mib(&mut self, max_memory_mib: usize) {
@@ -267,6 +290,22 @@ impl CudaRuntime {
 
     pub fn set_max_memory_gib(&mut self, max_memory_gib: usize) {
         self.set_max_memory_bytes(Some(max_memory_gib.saturating_mul(1024 * 1024 * 1024)));
+    }
+
+    /// Configure a hard per-kernel generated CUDA source limit. The runtime
+    /// defaults to 512 KiB because NVRTC compilation is synchronous and cannot
+    /// be interrupted by `candidate_timeout`; pass `None` to the setter below
+    /// to disable the compile-viability budget explicitly.
+    pub fn with_max_kernel_source_bytes(mut self, max_kernel_source_bytes: usize) -> Self {
+        self.set_max_kernel_source_bytes(Some(max_kernel_source_bytes));
+        self
+    }
+
+    pub fn set_max_kernel_source_bytes(&mut self, max_kernel_source_bytes: Option<usize>) {
+        self.max_kernel_source_bytes = max_kernel_source_bytes;
+        for bucket in &mut self.compiled_buckets {
+            bucket.resource_validation_complete = false;
+        }
     }
 
     /// Return memory the async allocator pool retains back to the device.
@@ -570,7 +609,10 @@ impl CudaRuntime {
     ///
     /// # Safety
     /// The device pointer must point to a valid CUDA allocation on the same device
-    /// as this runtime's stream, with at least `n_bytes` bytes available.
+    /// as this runtime's stream, with at least `n_bytes` bytes available. Unless
+    /// aliasing is explicitly represented by the graph, its byte range must not
+    /// overlap another input or output range that may be read or written during
+    /// the same execution.
     pub unsafe fn set_device_ptr(&mut self, id: impl ToId, device_ptr: u64, n_bytes: usize) {
         debug_assert!(device_ptr != 0, "set_device_ptr called with null pointer");
         let id = id.to_id();
@@ -591,7 +633,9 @@ impl CudaRuntime {
     ///
     /// # Safety
     /// The device pointer must point to a valid CUDA allocation with at least `n_bytes` bytes,
-    /// and must remain valid through the next execute() call.
+    /// and must remain valid through the next execute() call. Unless aliasing is
+    /// explicitly represented by the graph, its byte range must not overlap an
+    /// input or another output range used by that execution.
     pub unsafe fn set_output_device_ptr(&mut self, id: impl ToId, device_ptr: u64, n_bytes: usize) {
         debug_assert!(
             device_ptr != 0,
@@ -1849,6 +1893,18 @@ impl CudaRuntime {
         let timer = std::time::Instant::now();
         let allocation_dyn_map = self.bucket_capacity_dyn_map(bucket_idx, dyn_map);
         let allocation_dyn_map_time = timer.elapsed();
+        let needs_resource_validation = {
+            let bucket = &self.compiled_buckets[bucket_idx];
+            !bucket.resource_validation_complete
+                || bucket.last_resource_validation_dyn_map != allocation_dyn_map
+                || !self.changed_hlir.is_empty()
+        };
+        if needs_resource_validation
+            && let Err(violation) =
+                self.validate_compiled_bucket_resources(bucket_idx, &allocation_dyn_map)
+        {
+            panic!("compiled CUDA plan violates a hard resource limit: {violation}");
+        }
         let (
             stabilize_intermediate_pointers,
             was_hlir_synced,
@@ -2201,12 +2257,12 @@ impl CudaRuntime {
 
     fn bucket_capacity_dyn_map_from_context(
         dyn_map: &FxHashMap<char, usize>,
-        bucket: &CompiledBucket,
+        bucket_indices: &FxHashMap<char, usize>,
         dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
     ) -> FxHashMap<char, usize> {
         let mut capacity_dyn_map = dyn_map.clone();
         for (dim, buckets) in dim_buckets {
-            let bucket_idx = bucket.bucket_indices.get(dim).copied().unwrap_or(0);
+            let bucket_idx = bucket_indices.get(dim).copied().unwrap_or(0);
             if let Some(dim_bucket) = buckets.get(bucket_idx) {
                 capacity_dyn_map.insert(*dim, dim_bucket.max);
             }
@@ -2241,6 +2297,305 @@ impl CudaRuntime {
         } else {
             bucket.arena_bytes
         }
+    }
+
+    fn candidate_allocation_dyn_map(
+        context: luminal::op::CandidateFilterContext<'_>,
+    ) -> FxHashMap<char, usize> {
+        if let Some(bucket_context) = context.bucket_context {
+            Self::bucket_capacity_dyn_map_from_context(
+                context.dyn_map,
+                bucket_context.bucket_indices,
+                bucket_context.dim_buckets,
+            )
+        } else {
+            context.dyn_map.clone()
+        }
+    }
+
+    fn compiled_kernel_resource_plans(
+        bucket: &CompiledBucket,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<Vec<KernelResourcePlan>, ResourceViolation> {
+        let mut plans = Vec::new();
+        for executable in bucket.exec_graph.node_weights() {
+            if let Some(cuda_graph) = executable.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                plans.extend(cuda_graph.resource_plans(dyn_map)?);
+            }
+        }
+        Ok(plans)
+    }
+
+    fn complete_resource_dyn_map(
+        bucket: &CompiledBucket,
+        mut dyn_map: FxHashMap<char, usize>,
+    ) -> FxHashMap<char, usize> {
+        for dim in bucket
+            .buffer_specs
+            .values()
+            .flat_map(|spec| spec.bytes.dyn_vars())
+        {
+            dyn_map.entry(dim).or_insert(1);
+        }
+        for executable in bucket.exec_graph.node_weights() {
+            if let Some(cuda_graph) = executable.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                for &dim in cuda_graph.resource_dyn_dims() {
+                    dyn_map.entry(dim).or_insert(1);
+                }
+            }
+        }
+        dyn_map
+    }
+
+    fn hlir_resource_buffer_lengths(&self) -> FxHashMap<NodeIndex, usize> {
+        self.hlir_buffers
+            .iter()
+            .filter_map(|(node, input)| {
+                let bytes = match input {
+                    CudaInput::Buffer { len, .. } => Some(*len),
+                    CudaInput::Ptr(_) => self.external_buffers.get(node).map(|buffer| buffer.len()),
+                }?;
+                Some((*node, bytes))
+            })
+            .collect()
+    }
+
+    /// Loading can preflight an LLIR before its graph inputs are installed.
+    /// Represent only those known boundary inputs with zero-length sentinels;
+    /// an absent intermediate or alias must remain absent so HostOp planning
+    /// still rejects broken buffer metadata. The boolean reports whether the
+    /// resulting plan used only installed input lengths.
+    fn hlir_resource_buffer_lengths_for_load(
+        &self,
+        buckets: &[CompiledBucket],
+    ) -> (FxHashMap<NodeIndex, usize>, bool) {
+        let mut lengths = self.hlir_resource_buffer_lengths();
+        let mut complete = true;
+        for hlir_node in buckets
+            .iter()
+            .flat_map(|bucket| bucket.llir_to_hlir.values())
+        {
+            if let Entry::Vacant(entry) = lengths.entry(*hlir_node) {
+                entry.insert(0);
+                complete = false;
+            }
+        }
+        (lengths, complete)
+    }
+
+    fn planned_resource_buffer_lengths(
+        bucket: &CompiledBucket,
+        hlir_buffer_lengths: &FxHashMap<NodeIndex, usize>,
+    ) -> FxHashMap<NodeIndex, usize> {
+        let mut buffers = bucket
+            .logical_buffer_bytes
+            .iter()
+            .map(|(node, bytes)| (*node, *bytes))
+            .collect::<FxHashMap<_, _>>();
+        for (llir_node, hlir_node) in &bucket.llir_to_hlir {
+            if let Some(&bytes) = hlir_buffer_lengths.get(hlir_node) {
+                buffers.insert(*llir_node, bytes);
+            }
+        }
+
+        // Alias outputs use the same range and length as their owning input.
+        // Iterate to a fixed point because aliases can be chained.
+        for _ in 0..bucket.output_alias_map.len() {
+            let mut changed = false;
+            for (alias, target) in &bucket.output_alias_map {
+                if buffers.contains_key(alias) {
+                    continue;
+                }
+                if let Some(bytes) = buffers.get(target).copied() {
+                    buffers.insert(*alias, bytes);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        buffers
+    }
+
+    fn compiled_host_device_memory_plans(
+        bucket: &CompiledBucket,
+        dyn_map: &FxHashMap<char, usize>,
+        buffer_lengths: &FxHashMap<NodeIndex, usize>,
+    ) -> Result<Vec<HostDeviceMemoryPlan>, ResourceViolation> {
+        bucket
+            .exec_graph
+            .node_weights()
+            .map(|executable| {
+                executable.internal.device_memory_plan(
+                    executable.output,
+                    &executable.inputs,
+                    buffer_lengths,
+                    dyn_map,
+                )
+            })
+            .collect()
+    }
+
+    fn aggregate_host_device_memory(
+        bucket_plans: &[Vec<HostDeviceMemoryPlan>],
+        resident_shared_allocations: &[SharedDeviceMemoryAllocation],
+    ) -> Result<(usize, usize, Vec<SharedDeviceMemoryAllocation>), ResourceViolation> {
+        fn insert_shared(
+            shared: &mut FxHashMap<&'static str, usize>,
+            allocation: &SharedDeviceMemoryAllocation,
+        ) -> Result<(), ResourceViolation> {
+            match shared.entry(allocation.key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(allocation.bytes);
+                    Ok(())
+                }
+                Entry::Occupied(entry) if *entry.get() == allocation.bytes => Ok(()),
+                Entry::Occupied(_) => Err(ResourceViolation::HostResourcePlanning {
+                    name: "shared device allocation contract",
+                }),
+            }
+        }
+
+        let mut persistent_bytes = 0usize;
+        let mut transient_peak_bytes = 0usize;
+        let mut shared = FxHashMap::<&'static str, usize>::default();
+
+        for allocation in resident_shared_allocations {
+            insert_shared(&mut shared, allocation)?;
+        }
+
+        for plans in bucket_plans {
+            let mut bucket_transient_peak = 0usize;
+            for plan in plans {
+                persistent_bytes = persistent_bytes.checked_add(plan.persistent_bytes).ok_or(
+                    ResourceViolation::ArithmeticOverflow {
+                        resource: "retained HostOp device memory",
+                    },
+                )?;
+                bucket_transient_peak = bucket_transient_peak.max(plan.transient_peak_bytes);
+                for allocation in &plan.shared_allocations {
+                    insert_shared(&mut shared, allocation)?;
+                }
+            }
+            // Only one bucket executes at a time, and standalone HostOps enqueue
+            // sequentially on one stream, so their temporary allocations peak
+            // rather than coexist.
+            transient_peak_bytes = transient_peak_bytes.max(bucket_transient_peak);
+        }
+
+        let mut shared_allocations = shared
+            .into_iter()
+            .map(|(key, bytes)| SharedDeviceMemoryAllocation { key, bytes })
+            .collect_vec();
+        shared_allocations.sort_by_key(|allocation| allocation.key);
+        Ok((persistent_bytes, transient_peak_bytes, shared_allocations))
+    }
+
+    fn aggregate_planned_arena_bytes(
+        buckets: &[CompiledBucket],
+    ) -> Result<usize, ResourceViolation> {
+        buckets.iter().try_fold(0usize, |total, bucket| {
+            total
+                .checked_add(Self::planned_allocation_bytes(bucket))
+                .ok_or(ResourceViolation::ArithmeticOverflow {
+                    resource: "retained bucket arena bytes",
+                })
+        })
+    }
+
+    /// Build one hard-resource plan for all buckets whose arenas remain live
+    /// together. This is deliberately independent of CUDA allocation so a
+    /// stitched graph can be rejected before replacing the working runtime.
+    fn retained_bucket_resource_plan(
+        buckets: &mut [CompiledBucket],
+        allocation_dyn_maps: &[FxHashMap<char, usize>],
+        hlir_buffer_lengths: &FxHashMap<NodeIndex, usize>,
+    ) -> Result<CandidateResourcePlan, ResourceViolation> {
+        assert_eq!(buckets.len(), allocation_dyn_maps.len());
+        let mut kernels = Vec::new();
+        let mut host_plans = Vec::with_capacity(buckets.len());
+        for (bucket, dyn_map) in buckets.iter_mut().zip(allocation_dyn_maps) {
+            Self::dry_plan_intermediate_buffers(bucket, dyn_map);
+            kernels.extend(Self::compiled_kernel_resource_plans(bucket, dyn_map)?);
+            let buffer_lengths = Self::planned_resource_buffer_lengths(bucket, hlir_buffer_lengths);
+            host_plans.push(Self::compiled_host_device_memory_plans(
+                bucket,
+                dyn_map,
+                &buffer_lengths,
+            )?);
+        }
+        let (host_persistent_bytes, host_transient_peak_bytes, shared_device_allocations) =
+            Self::aggregate_host_device_memory(
+                &host_plans,
+                &crate::host::flashinfer::resident_shared_device_memory_allocations(),
+            )?;
+        Ok(CandidateResourcePlan {
+            intermediate_lower_bound_bytes: 0,
+            planned_intermediate_bytes: Some(Self::aggregate_planned_arena_bytes(buckets)?),
+            host_persistent_bytes,
+            host_transient_peak_bytes,
+            shared_device_allocations,
+            kernels,
+        })
+    }
+
+    fn validate_compiled_bucket_resources(
+        &mut self,
+        bucket_idx: usize,
+        allocation_dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<(), ResourceViolation> {
+        let caps = CandidateResourceCaps {
+            max_intermediate_bytes: self.max_intermediate_memory_bytes,
+            max_kernel_source_bytes: self.max_kernel_source_bytes,
+        };
+        let device = self.candidate_device_resource_limits();
+        let hlir_buffer_lengths = self.hlir_resource_buffer_lengths();
+        let allocation_dyn_maps = self
+            .compiled_buckets
+            .iter()
+            .enumerate()
+            .map(|(idx, bucket)| {
+                if idx == bucket_idx {
+                    allocation_dyn_map.clone()
+                } else if !bucket.last_resource_validation_dyn_map.is_empty() {
+                    bucket.last_resource_validation_dyn_map.clone()
+                } else {
+                    Self::complete_resource_dyn_map(bucket, bucket.last_dyn_map.clone())
+                }
+            })
+            .collect_vec();
+        let plan = Self::retained_bucket_resource_plan(
+            &mut self.compiled_buckets,
+            &allocation_dyn_maps,
+            &hlir_buffer_lengths,
+        )?;
+        validate_resource_plan(&plan, caps, device)?;
+        let bucket = &mut self.compiled_buckets[bucket_idx];
+        bucket.last_resource_validation_dyn_map = allocation_dyn_map.clone();
+        bucket.resource_validation_complete = true;
+        Ok(())
+    }
+
+    fn candidate_device_resource_limits(&self) -> Option<CudaDeviceResourceLimits> {
+        let mut limits = self.device_resource_limits?;
+        // Owned HLIR inputs (normally weights and user inputs) must coexist
+        // with every candidate-planned allocation. Count allocation capacity
+        // rather than logical length. External pointers are deliberately
+        // omitted because several HLIR ids may be overlapping views of the
+        // same allocation; double-counting them could reject a legal candidate.
+        let resident_owned_bytes = self
+            .hlir_buffers
+            .values()
+            .filter_map(|input| match input {
+                CudaInput::Buffer { buf, .. } => Some(buf.num_bytes()),
+                CudaInput::Ptr(_) => None,
+            })
+            .fold(0usize, usize::saturating_add);
+        limits.max_candidate_memory_bytes = limits
+            .max_candidate_memory_bytes
+            .saturating_sub(resident_owned_bytes);
+        Some(limits)
     }
 
     /// Pre-allocate buffers and materialize CUDA graphs with the given dynamic
@@ -2430,17 +2785,7 @@ impl CudaRuntime {
         let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
 
         let duration_str = format_duration_precise(&duration);
-        let display = format!(
-            "{duration_str} | [KRN: {} HOST: {}]",
-            llir_graph
-                .node_weights()
-                .filter(|n| n.to_dialect::<dyn KernelOp>().is_some())
-                .count(),
-            llir_graph
-                .node_weights()
-                .filter(|n| n.to_dialect::<dyn HostOp>().is_some())
-                .count()
-        );
+        let display = duration_str;
         let display = if std::env::var_os("LUMINAL_SEARCH_OP_NAMES").is_some() {
             let mut kernel_counts = std::collections::BTreeMap::<&'static str, usize>::new();
             let mut host_counts = std::collections::BTreeMap::<String, usize>::new();
@@ -2475,6 +2820,44 @@ impl CudaRuntime {
     }
 
     fn try_load_llir(&mut self, llir_graph: &LLIRGraph) -> anyhow::Result<()> {
+        validate_static_llir_semantics(llir_graph)
+            .map_err(|violation| anyhow::anyhow!("invalid CUDA LLIR candidate: {violation}"))?;
+
+        // Compile and preflight the replacement before disturbing the current
+        // executable state. Reuse the latest dimensions when available; a
+        // never-executed dynamic graph is checked at one here and checked again
+        // with its real dimensions before its first allocation.
+        let previous_dyn_map = self
+            .compiled_buckets
+            .get(self.active_bucket)
+            .map(|bucket| bucket.last_dyn_map.clone())
+            .unwrap_or_default();
+        let mut bucket = self.compile_bucket(llir_graph);
+        let resource_dyn_map = Self::complete_resource_dyn_map(&bucket, previous_dyn_map);
+        let (hlir_buffer_lengths, input_lengths_complete) =
+            self.hlir_resource_buffer_lengths_for_load(std::slice::from_ref(&bucket));
+        let plan = Self::retained_bucket_resource_plan(
+            std::slice::from_mut(&mut bucket),
+            std::slice::from_ref(&resource_dyn_map),
+            &hlir_buffer_lengths,
+        )
+        .map_err(|violation| {
+            anyhow::anyhow!("could not plan replacement CUDA resources: {violation}")
+        })?;
+        validate_resource_plan(
+            &plan,
+            CandidateResourceCaps {
+                max_intermediate_bytes: self.max_intermediate_memory_bytes,
+                max_kernel_source_bytes: self.max_kernel_source_bytes,
+            },
+            self.candidate_device_resource_limits(),
+        )
+        .map_err(|violation| {
+            anyhow::anyhow!("replacement CUDA graph violates a hard resource limit: {violation}")
+        })?;
+        bucket.last_resource_validation_dyn_map = resource_dyn_map;
+        bucket.resource_validation_complete = input_lengths_complete;
+
         // Sync before clearing old data to ensure all operations complete
         let _ = self.cuda_stream.synchronize();
 
@@ -2493,7 +2876,6 @@ impl CudaRuntime {
         // the stitched-graph arena allocates (see try_load_llir_buckets).
         self.release_pooled_memory();
 
-        let bucket = self.compile_bucket(llir_graph);
         self.compiled_buckets = vec![bucket];
         self.active_bucket = 0;
         self.dim_buckets.clear();
@@ -2503,7 +2885,7 @@ impl CudaRuntime {
 
         // Prebuild CUDA graphs if we have a previous dyn_map (e.g., from search/profile)
         let bucket = &self.compiled_buckets[0];
-        if !bucket.last_dyn_map.is_empty() {
+        if bucket.resource_validation_complete && !bucket.last_dyn_map.is_empty() {
             let dyn_map = bucket.last_dyn_map.clone();
             self.try_prebuild_graphs(&dyn_map)?;
         }
@@ -2515,20 +2897,64 @@ impl CudaRuntime {
         dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) -> anyhow::Result<()> {
-        // Sync before clearing old data
-        let _ = self.cuda_stream.synchronize();
-        let _ = self.cuda_stream.context().bind_to_thread();
+        // Validate the entire stitched candidate before mutating the currently
+        // loaded runtime. A bad later bucket must not discard a previously
+        // usable graph after the earlier buckets have already compiled.
+        for (_, _, llir) in bucket_llirs {
+            validate_static_llir_semantics(llir)
+                .map_err(|violation| anyhow::anyhow!("invalid CUDA LLIR bucket: {violation}"))?;
+        }
 
-        self.dim_buckets = dim_buckets.clone();
-        self.compiled_buckets.clear();
-
+        // Compile and dry-plan the replacement while the current runtime is
+        // still intact. All bucket arenas remain resident after loading, so
+        // validate their aggregate bytes and every compiled kernel before the
+        // first arena allocation or replacement of the working graph.
+        let mut compiled_buckets = Vec::with_capacity(bucket_llirs.len());
         let mut representative_dyn_maps = Vec::with_capacity(bucket_llirs.len());
+        let mut allocation_dyn_maps = Vec::with_capacity(bucket_llirs.len());
         for (bucket_indices, representative_dyn_map, llir) in bucket_llirs {
             let mut bucket = self.compile_bucket(llir);
             bucket.bucket_indices = bucket_indices.clone();
+            allocation_dyn_maps.push(Self::bucket_capacity_dyn_map_from_context(
+                representative_dyn_map,
+                &bucket.bucket_indices,
+                dim_buckets,
+            ));
             representative_dyn_maps.push(representative_dyn_map.clone());
-            self.compiled_buckets.push(bucket);
+            compiled_buckets.push(bucket);
         }
+        let (hlir_buffer_lengths, input_lengths_complete) =
+            self.hlir_resource_buffer_lengths_for_load(&compiled_buckets);
+        let aggregate_plan = Self::retained_bucket_resource_plan(
+            &mut compiled_buckets,
+            &allocation_dyn_maps,
+            &hlir_buffer_lengths,
+        )
+        .map_err(|violation| {
+            anyhow::anyhow!("could not plan retained CUDA bucket resources: {violation}")
+        })?;
+        validate_resource_plan(
+            &aggregate_plan,
+            CandidateResourceCaps {
+                max_intermediate_bytes: self.max_intermediate_memory_bytes,
+                max_kernel_source_bytes: self.max_kernel_source_bytes,
+            },
+            self.candidate_device_resource_limits(),
+        )
+        .map_err(|violation| {
+            anyhow::anyhow!("stitched CUDA buckets violate a hard resource limit: {violation}")
+        })?;
+        for (bucket, dyn_map) in compiled_buckets.iter_mut().zip(&allocation_dyn_maps) {
+            bucket.last_resource_validation_dyn_map = dyn_map.clone();
+            bucket.resource_validation_complete = input_lengths_complete;
+        }
+
+        // Only now replace the old executable state.
+        let _ = self.cuda_stream.synchronize();
+        let _ = self.cuda_stream.context().bind_to_thread();
+        self.dim_buckets = dim_buckets.clone();
+        self.compiled_buckets = compiled_buckets;
+
         // Reclaim what search profiling left resident in the async allocator
         // pool before allocating the stitched-graph arenas. This load runs
         // inside search() (the final stitch), before the example gets a chance
@@ -2562,31 +2988,71 @@ impl Runtime for CudaRuntime {
         llir_graph: &LLIRGraph,
         context: luminal::op::CandidateFilterContext<'_>,
     ) -> luminal::op::CandidateFilterResult {
-        let mut bucket = self.compile_bucket(llir_graph);
-        let allocation_dyn_map = if let Some(bucket_context) = context.bucket_context {
-            bucket.bucket_indices = bucket_context.bucket_indices.clone();
-            Self::bucket_capacity_dyn_map_from_context(
-                context.dyn_map,
-                &bucket,
-                bucket_context.dim_buckets,
-            )
-        } else {
-            context.dyn_map.clone()
+        let allocation_dyn_map = Self::candidate_allocation_dyn_map(context);
+        let caps = CandidateResourceCaps {
+            max_intermediate_bytes: self.max_intermediate_memory_bytes,
+            max_kernel_source_bytes: self.max_kernel_source_bytes,
         };
-        Self::dry_plan_intermediate_buffers(&mut bucket, &allocation_dyn_map);
-        let planned_bytes = Self::planned_allocation_bytes(&bucket);
-        let display = format!("EST: {}", format_memory_bytes(planned_bytes));
-        if self
-            .max_intermediate_memory_bytes
-            .is_some_and(|max_memory_bytes| planned_bytes > max_memory_bytes)
+        let device_resource_limits = self.candidate_device_resource_limits();
+
+        // The first pass is pure LLIR accounting. In particular, it catches a
+        // single/search-created buffer larger than the device and oversized
+        // search-grown fused kernels before invoking NVRTC.
+        let mut resource_plan = match plan_static_llir_resources(llir_graph, &allocation_dyn_map) {
+            Ok(plan) => plan,
+            Err(violation) => {
+                return luminal::op::CandidateFilterResult::reject_with_display(format!(
+                    "candidate reject: {violation}"
+                ));
+            }
+        };
+        if let Err(violation) = validate_resource_plan(&resource_plan, caps, device_resource_limits)
         {
-            luminal::op::CandidateFilterResult::reject_with_display(display)
+            return luminal::op::CandidateFilterResult::reject_with_display(format!(
+                "resource reject: {violation}"
+            ));
+        }
+
+        let mut bucket = self.compile_bucket(llir_graph);
+        if let Some(bucket_context) = context.bucket_context {
+            bucket.bucket_indices = bucket_context.bucket_indices.clone();
+        }
+        let hlir_buffer_lengths = self.hlir_resource_buffer_lengths();
+        match Self::retained_bucket_resource_plan(
+            std::slice::from_mut(&mut bucket),
+            std::slice::from_ref(&allocation_dyn_map),
+            &hlir_buffer_lengths,
+        ) {
+            Ok(exact) => {
+                resource_plan.planned_intermediate_bytes = exact.planned_intermediate_bytes;
+                resource_plan.host_persistent_bytes = exact.host_persistent_bytes;
+                resource_plan.host_transient_peak_bytes = exact.host_transient_peak_bytes;
+                resource_plan.shared_device_allocations = exact.shared_device_allocations;
+                resource_plan.kernels.extend(exact.kernels);
+            }
+            Err(violation) => {
+                return luminal::op::CandidateFilterResult::reject_with_display(format!(
+                    "resource reject: {violation}"
+                ));
+            }
+        }
+        let planned_bytes = Self::planned_allocation_bytes(&bucket);
+        let display = format_memory_bytes(planned_bytes);
+        if let Err(violation) = validate_resource_plan(&resource_plan, caps, device_resource_limits)
+        {
+            luminal::op::CandidateFilterResult::reject_with_display(format!(
+                "{display}; resource reject: {violation}"
+            ))
         } else {
             luminal::op::CandidateFilterResult::accept_with_display(display)
         }
     }
 
     fn initialize(stream: Self::CompileArg) -> Self {
+        let device_resource_limits = Some(
+            CudaDeviceResourceLimits::query(&stream)
+                .expect("failed to query CUDA hard resource limits during runtime initialization"),
+        );
         Self {
             hlir_buffers: FxHashMap::default(),
             cuda_stream: stream,
@@ -2597,6 +3063,8 @@ impl Runtime for CudaRuntime {
             kernel_cache: FxHashMap::default(),
             profiling: false,
             max_intermediate_memory_bytes: None,
+            max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
+            device_resource_limits,
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
@@ -3009,14 +3477,24 @@ impl CudaRuntime {
 
     /// Compile a single LLIR graph into a CompiledBucket.
     fn compile_bucket(&mut self, llir_graph: &LLIRGraph) -> CompiledBucket {
+        let source_limit = self.max_kernel_source_bytes;
+        crate::with_kernel_source_limit(source_limit, || {
+            self.compile_bucket_with_current_source_limit(llir_graph)
+        })
+    }
+
+    fn compile_bucket_with_current_source_limit(
+        &mut self,
+        llir_graph: &LLIRGraph,
+    ) -> CompiledBucket {
         let mut bucket = CompiledBucket::new();
         let mut exec_graph = StableGraph::default();
         let mut node_to_exec = FxHashMap::default();
 
-        // Clone llir_graph so we can modify it. Apply LLIR peepholes first:
-        // fuse RoPE → in-place KV scatter pairs into single kernels.
-        let mut llir_graph = crate::kernel::rope::fuse_rope_scatter(llir_graph)
-            .unwrap_or_else(|| llir_graph.clone());
+        // Clone the selected LLIR so kernel grouping can modify it. Backend-op
+        // selection (including fused RoPE+scatter) has already happened in
+        // egglog; no Rust-side pattern rewrite is permitted here.
+        let mut llir_graph = llir_graph.clone();
 
         // Compile kernel subgraphs into CudaGraphOps (which implement HostOp)
         crate::kernel::kernel_to_host(&mut llir_graph, &self.cuda_stream, &mut self.kernel_cache);
@@ -3033,7 +3511,10 @@ impl CudaRuntime {
                 continue;
             }
 
-            if let Some(Output { node: hlir_node }) = llir_graph[node].to_op::<Output>() {
+            if let Some(Output {
+                node: hlir_node, ..
+            }) = llir_graph[node].to_op::<Output>()
+            {
                 let producer = llir_graph
                     .neighbors_directed(node, Direction::Incoming)
                     .next()
@@ -3803,7 +4284,7 @@ mod arena_plan_tests {
         representative_dyn_map.insert('s', 16);
         let capacity_dyn_map = CudaRuntime::bucket_capacity_dyn_map_from_context(
             &representative_dyn_map,
-            &bucket,
+            &bucket.bucket_indices,
             &dim_buckets,
         );
 
@@ -3815,6 +4296,111 @@ mod arena_plan_tests {
             CudaRuntime::planned_allocation_bytes(&bucket),
             bucket.arena_bytes
         );
+    }
+
+    #[test]
+    fn retained_bucket_plan_sums_every_live_arena_before_allocation() {
+        let mut buckets = Vec::new();
+        for (node, bytes) in [(NodeIndex::new(1), 64usize), (NodeIndex::new(2), 96usize)] {
+            let mut bucket = CompiledBucket::new();
+            bucket.buffer_specs.insert(
+                node,
+                BufferSpec {
+                    bytes: bytes.into(),
+                    dtype: DType::F32,
+                },
+            );
+            bucket.output_producers.insert(NodeIndex::new(100), node);
+            buckets.push(bucket);
+        }
+        let dyn_maps = vec![FxHashMap::default(), FxHashMap::default()];
+
+        let aggregate = CudaRuntime::retained_bucket_resource_plan(
+            &mut buckets,
+            &dyn_maps,
+            &FxHashMap::default(),
+        )
+        .unwrap();
+        let individual_bytes = buckets
+            .iter()
+            .map(CudaRuntime::planned_allocation_bytes)
+            .collect_vec();
+
+        assert_eq!(
+            aggregate.planned_intermediate_bytes,
+            Some(individual_bytes.iter().sum())
+        );
+        let limit = *individual_bytes.iter().max().unwrap();
+        assert!(individual_bytes.iter().all(|bytes| *bytes <= limit));
+        assert!(matches!(
+            validate_resource_plan(
+                &aggregate,
+                CandidateResourceCaps {
+                    max_intermediate_bytes: Some(limit),
+                    max_kernel_source_bytes: None,
+                },
+                None,
+            ),
+            Err(ResourceViolation::IntermediateMemory { .. })
+        ));
+    }
+
+    #[test]
+    fn host_memory_aggregation_preserves_lifetimes_and_shared_dedup() {
+        let shared = SharedDeviceMemoryAllocation {
+            key: "shared-workspace",
+            bytes: 64,
+        };
+        let buckets = vec![
+            vec![
+                HostDeviceMemoryPlan {
+                    persistent_bytes: 10,
+                    transient_peak_bytes: 100,
+                    shared_allocations: vec![shared.clone()],
+                },
+                HostDeviceMemoryPlan {
+                    persistent_bytes: 20,
+                    transient_peak_bytes: 40,
+                    shared_allocations: vec![shared.clone()],
+                },
+            ],
+            vec![HostDeviceMemoryPlan {
+                persistent_bytes: 30,
+                transient_peak_bytes: 80,
+                shared_allocations: vec![shared],
+            }],
+        ];
+
+        let (persistent, transient_peak, shared) =
+            CudaRuntime::aggregate_host_device_memory(&buckets, &[]).unwrap();
+
+        assert_eq!(persistent, 60, "retained plans coexist across buckets");
+        assert_eq!(transient_peak, 100, "only one HostOp executes at a time");
+        assert_eq!(shared.len(), 1, "the keyed workspace is counted once");
+        assert_eq!(shared[0].bytes, 64);
+    }
+
+    #[test]
+    fn resident_shared_memory_survives_into_non_host_and_flash_plans() {
+        let resident = crate::host::flashinfer::shared_device_memory_allocation();
+
+        let (_, _, non_flash_shared) = CudaRuntime::aggregate_host_device_memory(
+            &[Vec::new()],
+            std::slice::from_ref(&resident),
+        )
+        .unwrap();
+        assert_eq!(non_flash_shared, vec![resident.clone()]);
+
+        let flash_plan = HostDeviceMemoryPlan {
+            shared_allocations: vec![resident.clone()],
+            ..Default::default()
+        };
+        let (_, _, flash_shared) = CudaRuntime::aggregate_host_device_memory(
+            &[vec![flash_plan]],
+            std::slice::from_ref(&resident),
+        )
+        .unwrap();
+        assert_eq!(flash_shared, vec![resident], "shared key is charged once");
     }
 
     #[test]

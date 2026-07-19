@@ -76,7 +76,7 @@ fn main() {
         .next_power_of_two()
         .min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default()
+    let compile_options = CompileOptions::default()
         .dim_buckets(
             's',
             &[
@@ -87,12 +87,8 @@ fn main() {
         .dim_buckets(
             'c',
             &[DimBucket::new(1, max_seq_len).representative(search_s)],
-        );
-
-    println!("Building E-Graph...");
-    let phase = std::time::Instant::now();
-    cx.build_search_space::<CudaRuntime>(build_options);
-    println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
+        )
+        .search_graph_limit(search_graphs);
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(20);
@@ -122,8 +118,7 @@ fn main() {
         .unwrap_or(SEARCH_SEED);
     println!("Search seed: {search_seed}");
     let mut rng = SmallRng::seed_from_u64(search_seed);
-    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
-    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
 
     // Reclaim memory the async allocator pool retains from search profiling so
     // the stitched-graph arena fits alongside the weights (see gemma4_moe).

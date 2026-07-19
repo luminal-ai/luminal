@@ -133,7 +133,7 @@ extern "C" __global__ void rms_norm_k(
         (
             func,
             module,
-            "rms_norm_k".to_string(),
+            kernel,
             (
                 self.rows,
                 Expression::from(1usize),
@@ -338,7 +338,7 @@ extern "C" __global__ void rms_norm_quant_k(
         (
             func,
             module,
-            "rms_norm_quant_k".to_string(),
+            kernel,
             (
                 self.rows,
                 Expression::from(1usize),

@@ -324,11 +324,6 @@ fn main() {
     let yolo = YoloV11::init(&mut cx);
     let logits = yolo.forward(img).output();
 
-    println!("Building E-Graph...");
-    let t0 = Instant::now();
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    println!("  built E-Graph in {:?}", t0.elapsed());
-
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
@@ -343,9 +338,9 @@ fn main() {
 
     println!("Compiling (search_graphs={search_graphs})...");
     let t0 = Instant::now();
-    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
-    runtime = cx.search(runtime, search_options);
-    println!("  search took {:?}", t0.elapsed());
+    let compile_options = CompileOptions::default().search_graph_limit(search_graphs);
+    runtime = cx.compile(runtime, compile_options);
+    println!("  compile took {:?}", t0.elapsed());
 
     // Re-set anchors/strides/dfl/img after search (search may consume the inputs)
     runtime.set_data(yolo.detect.anchors, anchors_flat);

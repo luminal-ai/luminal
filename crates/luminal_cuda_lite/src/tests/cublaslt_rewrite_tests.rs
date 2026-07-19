@@ -7,7 +7,7 @@ use luminal::{
     prelude::*,
 };
 use rand::{SeedableRng, rngs::StdRng};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use crate::{
     host::{
@@ -516,7 +516,7 @@ fn cublaslt_rewrites_cover_flux2_linear_bias_epilogue() {
 }
 
 #[test]
-fn cublaslt_cleanup_prunes_flux2_broadcast_mul_fallback() {
+fn cublaslt_preserves_legal_matmul_backend_choices() {
     let mut cx = Graph::new();
     let q = cx.tensor((8usize, 4usize));
     let k = cx.tensor((8usize, 4usize));
@@ -529,8 +529,211 @@ fn cublaslt_cleanup_prunes_flux2_broadcast_mul_fallback() {
         "Flux2 q @ k.t() should have at least one cuBLASLt candidate"
     );
     assert!(
-        op_ir_nodes(egraph, "Mul").is_empty(),
-        "cuBLASLt cleanup should prune the broadcast Mul fallback once a cuBLASLt candidate exists"
+        ir_class_has_op_kinds(egraph, &["KernelSum", "GenericMatmul", "cublaslt"]),
+        "the lowered reduction, generic matmul, and cuBLASLt implementations should coexist in one output e-class"
+    );
+}
+
+/// Spell the frontend's 2D matmul decomposition while inserting a real
+/// movement permutation between the elementwise product and its reduction.
+/// The Mul still has logical shape [m, n, k] and canonical operand strides,
+/// but the Sum observes columns in split/transpose/merge order.
+fn matmul_with_permuted_reduction_columns(lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
+    let (m, _) = lhs.dims2();
+    let (_, n) = rhs.dims2();
+    let product = lhs.expand_dim(1, n) * rhs.permute((1, 0)).expand_dim(0, m);
+    product
+        .split_dims(1, 2usize)
+        .permute((0, 2, 1, 3))
+        .merge_dims(1, 2)
+        .sum(2)
+}
+
+/// Keep a tensor's [m, n] shape while changing its logical column mapping.
+fn permute_matmul_columns(tensor: GraphTensor) -> GraphTensor {
+    tensor
+        .split_dims(1, 2usize)
+        .permute((0, 2, 1))
+        .merge_dims(1, 2)
+}
+
+#[test]
+fn cublaslt_and_gemv_reject_permuted_mul_to_sum_layout() {
+    let mut cx = Graph::new();
+    let activation = cx.tensor((1usize, 5usize)).as_dtype(DType::Bf16);
+    let weight = cx.tensor((6usize, 5usize)).as_dtype(DType::Bf16);
+    matmul_with_permuted_reduction_columns(activation, weight.t()).output();
+
+    // Mirror GraphTensor::matmul's explicit FP8 -> F32 semantic promotion so
+    // the same malformed reduction also exercises the FP8 cuBLASLt/GEMV
+    // consumers, not only the ordinary 16-bit families.
+    let fp8_activation = cx.tensor((1usize, 5usize)).as_dtype(DType::F8E4M3);
+    let fp8_weight = cx.tensor((6usize, 5usize)).as_dtype(DType::F8E4M3);
+    matmul_with_permuted_reduction_columns(
+        fp8_activation.cast(DType::F32),
+        fp8_weight.t().cast(DType::F32),
+    )
+    .output();
+
+    // Exercise the scaled-quantized spelling consumed by KernelGemvF8 and
+    // cublaslt_scaled as well.
+    let raw_activation = cx.tensor((1usize, 5usize));
+    let input_scale = cx.tensor(());
+    let weight_scale = cx.tensor(());
+    let quantized = (raw_activation / input_scale.expand_rhs((1usize, 5usize))).cast(DType::F8E4M3);
+    let scaled_sum = matmul_with_permuted_reduction_columns(
+        quantized.cast(DType::F32),
+        fp8_weight.t().cast(DType::F32),
+    );
+    (scaled_sum * (input_scale * weight_scale).expand_rhs((1usize, 6usize)))
+        .cast(DType::Bf16)
+        .output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+
+    assert!(
+        cublaslt_ir_nodes(egraph).is_empty(),
+        "cuBLASLt must not replace a reduction whose surviving columns are permuted"
+    );
+    assert!(
+        op_ir_nodes(egraph, "KernelGemv").is_empty(),
+        "GEMV must not replace a reduction whose surviving columns are permuted"
+    );
+    assert!(
+        op_ir_nodes(egraph, "KernelGemvF8").is_empty(),
+        "FP8 GEMV must not replace a reduction whose surviving columns are permuted"
+    );
+    assert!(
+        ir_class_has_op_kinds(egraph, &["KernelSum", "GenericMatmul"]),
+        "the semantic reduction and GenericMatmul fallback must remain selectable"
+    );
+}
+
+#[test]
+fn cublaslt_post_matmul_fusions_reject_permuted_output_layout() {
+    let mut alpha_cx = Graph::new();
+    let a = alpha_cx.tensor((4usize, 5usize));
+    let b = alpha_cx.tensor((5usize, 6usize));
+    (permute_matmul_columns(a.matmul(b)) * 1.5).output();
+    assert_no_forced_cublaslt_llir_where(&mut alpha_cx, "permuted matmul alpha", |llir| {
+        cublaslt_scale_value_tuples(llir).contains(&(1.5, 0.0))
+    });
+
+    let mut beta_cx = Graph::new();
+    let a = beta_cx.tensor((4usize, 5usize));
+    let b = beta_cx.tensor((5usize, 6usize));
+    let c = beta_cx.tensor((4usize, 6usize));
+    (permute_matmul_columns(a.matmul(b)) + c).output();
+    assert_no_forced_cublaslt_llir_where(&mut beta_cx, "permuted matmul beta", |llir| {
+        cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
+    });
+}
+
+#[test]
+fn cublaslt_beta_rejects_clamped_c_leading_dimension() {
+    let z = Expression::from('z');
+
+    let mut ld_cx = Graph::new();
+    let a = ld_cx.tensor((4usize, 5usize));
+    let b = ld_cx.tensor((5usize, 6usize));
+    let mut c = ld_cx.tensor((4usize, 6usize));
+    // Logical rows overlap: ldc=3 is smaller than the six columns. Runtime
+    // clamping ldc to six would silently change which C values are added.
+    c.shape = ShapeTracker::new_strided((4usize, 6usize), (z * 3usize, z));
+    (a.matmul(b) + c).output();
+    assert_no_forced_cublaslt_llir_where(&mut ld_cx, "too-small C leading dimension", |llir| {
+        cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
+    });
+}
+
+#[test]
+fn cublaslt_beta_preserves_batched_broadcast_c() {
+    let mut cx = Graph::new();
+    let a = cx.tensor((2usize, 4usize, 5usize));
+    let b = cx.tensor((2usize, 5usize, 6usize));
+    let c = cx.tensor((4usize, 6usize)).expand_dim(0, 2usize);
+    (a.matmul(b) + c).output();
+
+    assert_cublaslt_rewrite(cx, "batched broadcast C", |llir| {
+        cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
+    });
+}
+
+#[test]
+fn cublaslt_epilogues_reject_permuted_output_layout() {
+    let mut relu_cx = Graph::new();
+    let a = relu_cx.tensor((4usize, 5usize));
+    let b = relu_cx.tensor((5usize, 6usize));
+    permute_matmul_columns(a.matmul(b)).relu().output();
+    assert_no_forced_cublaslt_epilogue_rewrite(relu_cx, "permuted matmul relu", "RELU", None);
+
+    let mut gelu_cx = Graph::new();
+    let a = gelu_cx.tensor((4usize, 5usize));
+    let b = gelu_cx.tensor((5usize, 6usize));
+    permute_matmul_columns(a.matmul(b))
+        .gelu_fast_tanh_approximation()
+        .output();
+    assert_no_forced_cublaslt_epilogue_rewrite(gelu_cx, "permuted matmul gelu", "GELU", None);
+}
+
+#[test]
+fn cublaslt_rank4_matmuls_do_not_drop_leading_batch_axes() {
+    let (outer, batch, m, n, k) = (2usize, 3usize, 7usize, 11usize, 5usize);
+    let mut cx = Graph::new();
+
+    // Exercise every physical A/B layout family in one search space. The
+    // current cuBLASLt descriptors encode one strided-batch dimension, so a
+    // rank-4 matmul must stay on the semantic reduction/GenericMatmul paths
+    // until a rewrite explicitly proves that both leading axes can flatten.
+    for case in LAYOUT_CASES {
+        let a = cx.tensor(if case.a_col_major {
+            (outer, batch, k, m)
+        } else {
+            (outer, batch, m, k)
+        });
+        let b = cx.tensor(if case.b_col_major {
+            (outer, batch, n, k)
+        } else {
+            (outer, batch, k, n)
+        });
+        let a = if case.a_col_major {
+            a.transpose(2, 3)
+        } else {
+            a
+        };
+        let b = if case.b_col_major {
+            b.transpose(2, 3)
+        } else {
+            b
+        };
+        a.matmul(b).output();
+    }
+
+    // Also cover promoted FP8 operands and the scaled-linear spelling. These
+    // could otherwise reach both the ordinary F32 and FP8-specific batched
+    // rules after GraphTensor::matmul inserts its semantic F32 casts.
+    let activation = cx.tensor((outer, batch, m, k));
+    let weight_storage = cx.tensor((outer, batch, n, k)).as_dtype(DType::F8E4M3);
+    let input_scale = cx.tensor(());
+    let weight_scale = cx.tensor(());
+    let quantized = (activation / input_scale.expand_rhs((outer, batch, m, k))).cast(DType::F8E4M3);
+    let dequant_scale = (input_scale * weight_scale).expand_rhs((outer, batch, m, n));
+    (quantized.matmul(weight_storage.transpose(2, 3)) * dequant_scale).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        cublaslt_ir_nodes(egraph).is_empty(),
+        "a one-axis strided-batch descriptor must not represent rank-4 matmul by dropping the leading batch axis"
+    );
+    assert!(
+        op_ir_nodes(egraph, "GenericMatmul").len() > LAYOUT_CASES.len(),
+        "all rank-4 matmuls must retain their semantic GenericMatmul fallback"
+    );
+    assert!(
+        op_ir_nodes(egraph, "KernelSum").len() > LAYOUT_CASES.len(),
+        "all rank-4 matmuls must retain their lowered reduction fallback"
     );
 }
 
@@ -648,7 +851,7 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
     let b = cx.tensor((k, n));
     let first = a.matmul(b);
     let out = (a + first.sin()).matmul(b).output();
-    let llir = extract_forced_cublaslt_llir_where(
+    let llir = extract_forced_distinct_cublaslt_classes_llir_where(
         &mut cx,
         "ordered matching cuBLASLt prepared reuse",
         |llir| {
@@ -1468,10 +1671,9 @@ fn cublaslt_fp8_scaled_candidate_reaches_fused_output_scale_consumer() {
         dataflow_reachable_cublaslt_scaled_count(egraph) > 0,
         "scaled cuBLASLt must remain reachable when fusion growth consumes the output-scale multiply internally"
     );
-    assert_eq!(
-        dataflow_reachable_cublaslt_raw_fp8_count(egraph),
-        0,
-        "raw FP8 cuBLASLt must be deleted when a scaled equivalent covers the fused output-scale consumer"
+    assert!(
+        dataflow_reachable_cublaslt_raw_fp8_count(egraph) > 0,
+        "the raw FP8 matmul plus output scaling must remain reachable beside the scaled cuBLASLt implementation"
     );
 }
 
@@ -1502,10 +1704,9 @@ fn cublaslt_fp8_scaled_candidates_reach_fused_mlp_consumer() {
         dataflow_reachable_cublaslt_scaled_count(egraph) >= 2,
         "scaled cuBLASLt candidates must remain reachable through fused MLP gate/up consumers"
     );
-    assert_eq!(
-        dataflow_reachable_cublaslt_raw_fp8_count(egraph),
-        0,
-        "raw FP8 cuBLASLt must be deleted when a scaled equivalent covers the fused MLP consumer"
+    assert!(
+        dataflow_reachable_cublaslt_raw_fp8_count(egraph) >= 2,
+        "raw FP8 matmul plus output scaling must remain reachable for both MLP branches"
     );
 }
 
@@ -1527,10 +1728,7 @@ fn cublaslt_fp8_scaled_candidate_executes_batched_matmul_f32_output() {
     let b_input = cx.tensor((batch, n, k)).as_dtype(DType::F8E4M3);
     let b = b_input.transpose(1, 2);
     let scaled_a = (a / a_scale.expand_rhs((batch, m, k))).cast(DType::F8E4M3);
-    let lhs = scaled_a.expand_dim(2, n);
-    let rhs = b.permute((0, 2, 1)).expand_dim(1, m);
-    let mul = unchecked_mul_same_shape(lhs, rhs, DType::F8E4M3);
-    let matmul = mul.sum(3).cast(DType::F32);
+    let matmul = scaled_a.matmul(b);
     let out = (matmul * (a_scale * b_scale).expand_rhs((batch, m, n))).output();
     let expected_tuple = (
         DType::F8E4M3,
@@ -1679,10 +1877,7 @@ fn build_fp8_2d_cast_matmul_f32_graph(
     let b_input = cx.tensor((n, k)).as_dtype(b_dtype);
     let b = b_input.t();
 
-    let lhs = a.expand_dim(1, n);
-    let rhs = b.permute((1, 0)).expand_dim(0, m);
-    let mul = unchecked_mul_same_shape(lhs, rhs, a_dtype);
-    let out = mul.sum(2).cast(DType::F32).output();
+    let out = a.matmul(b).output();
     (a, b_input, out)
 }
 
@@ -1699,23 +1894,8 @@ fn build_fp8_batched_cast_matmul_f32_graph(
     let b_input = cx.tensor((batch, n, k)).as_dtype(b_dtype);
     let b = b_input.transpose(1, 2);
 
-    let lhs = a.expand_dim(2, n);
-    let rhs = b.permute((0, 2, 1)).expand_dim(1, m);
-    let mul = unchecked_mul_same_shape(lhs, rhs, a_dtype);
-    let out = mul.sum(3).cast(DType::F32).output();
+    let out = a.matmul(b).output();
     (a, b_input, out)
-}
-
-fn unchecked_mul_same_shape(lhs: GraphTensor, rhs: GraphTensor, dtype: DType) -> GraphTensor {
-    let shape = lhs.shape.contiguous();
-    let new_id = lhs.graph().add_op(
-        luminal::hlir::Mul {
-            input_shapes: vec![lhs.shape, rhs.shape],
-            ..Default::default()
-        },
-        &[lhs.id, rhs.id],
-    );
-    GraphTensor::from_id(new_id, shape, lhs.graph_ref, dtype)
 }
 
 #[test]
@@ -3399,6 +3579,93 @@ fn extract_forced_cublaslt_llir_where(
     );
 }
 
+/// Force exactly one cuBLASLt alternative in every distinct IR e-class.
+///
+/// Multi-matmul tests need this stronger form because each output e-class also
+/// intentionally retains a GenericMatmul fallback. Forcing every cuBLASLt
+/// enode directly would be contradictory when several of those enodes are
+/// mutually-exclusive alternatives in the same e-class, so choices are made
+/// per class and candidate combinations are validated before extraction.
+fn extract_forced_distinct_cublaslt_classes_llir_where(
+    cx: &mut Graph,
+    case_name: &str,
+    matches: impl Fn(&LLIRGraph) -> bool,
+) -> LLIRGraph {
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    let ops = cx
+        .egglog_ops()
+        .expect("search space should have registered egglog ops");
+    let mut nodes_by_class: BTreeMap<ClassId, Vec<&NodeId>> = BTreeMap::new();
+    for node in cublaslt_ir_nodes(egraph) {
+        nodes_by_class
+            .entry(egraph.node_to_class[node].clone())
+            .or_default()
+            .push(node);
+    }
+    assert!(
+        nodes_by_class.len() > 1,
+        "expected distinct cuBLASLt output e-classes for {case_name}"
+    );
+    for nodes in nodes_by_class.values_mut() {
+        nodes.sort_unstable();
+    }
+
+    let combination_count = nodes_by_class
+        .values()
+        .try_fold(1usize, |count, nodes| count.checked_mul(nodes.len()))
+        .expect("cuBLASLt test alternative combination count overflowed");
+    let mut last_error = None;
+
+    // Retry each per-class combination against several deterministic random
+    // backgrounds for the non-forced e-classes. This preserves all semantic
+    // fallbacks while ensuring both logical matmuls are represented by one
+    // compatible cuBLASLt choice in the selected LLIR.
+    for background in 0..16usize {
+        for combination in 0..combination_count {
+            let mut rng = StdRng::seed_from_u64(
+                0xD157_1C7C + (background * combination_count + combination) as u64,
+            );
+            let mut choices = random_initial_choice(egraph, &mut rng);
+            let mut selection = combination;
+            for (class, nodes) in &nodes_by_class {
+                let selected = nodes[selection % nodes.len()];
+                selection /= nodes.len();
+                choices.insert(class, selected);
+            }
+
+            if let Err(err) = validate_choice_set(egraph, &choices, ops) {
+                last_error = Some(err);
+                continue;
+            }
+
+            let mut list_cache = FxHashMap::default();
+            let mut expr_cache = FxHashMap::default();
+            let llir = egglog_to_llir(
+                egraph,
+                choices,
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+            if cublaslt_type_tuples(&llir).len() == nodes_by_class.len() && matches(&llir) {
+                return llir;
+            }
+
+            last_error =
+                Some("per-class cuBLASLt choices did not satisfy requested extracted shape".into());
+        }
+    }
+
+    panic!(
+        "expected one compatible CuBlasLt HostOp from each distinct e-class for {case_name}; last error: {}",
+        last_error.unwrap_or_else(|| "no per-class candidate could be forced".into())
+    );
+}
+
 fn assert_no_forced_cublaslt_llir_where(
     cx: &mut Graph,
     case_name: &str,
@@ -3519,6 +3786,26 @@ fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a No
             .then_some(node)
         })
         .collect()
+}
+
+fn ir_class_has_op_kinds(egraph: &SerializedEGraph, kind_labels: &[&str]) -> bool {
+    egraph.eclasses.values().any(|(sort, nodes)| {
+        sort == "IR"
+            && kind_labels.iter().all(|kind_label| {
+                nodes.iter().any(|node| {
+                    let Some((label, children)) = egraph.enodes.get(node) else {
+                        return false;
+                    };
+                    label == "Op"
+                        && children.first().is_some_and(|kind_class| {
+                            egraph.eclasses[kind_class]
+                                .1
+                                .iter()
+                                .any(|kind_node| egraph.enodes[kind_node].0.as_str() == *kind_label)
+                        })
+                })
+            })
+    })
 }
 
 fn dataflow_reachable_cublaslt_scaled_count(egraph: &SerializedEGraph) -> usize {

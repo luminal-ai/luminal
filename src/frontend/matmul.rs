@@ -2,6 +2,19 @@ use crate::prelude::*;
 
 impl GraphTensor {
     pub fn matmul(mut self, mut rhs: GraphTensor) -> Self {
+        // FP8 matrix multiplication has an F32 product/accumulator/output
+        // contract. Express that contract in HLIR with real casts so the
+        // fully decomposed Mul + Sum path remains a correct (if expensive)
+        // implementation. CUDA backends may absorb these casts and consume
+        // the underlying FP8 buffers directly, but they must remain optional
+        // alternatives to this semantic reference path.
+        let lhs_is_fp8 = matches!(self.dtype, DType::F8E4M3 | DType::F8E5M2);
+        let rhs_is_fp8 = matches!(rhs.dtype, DType::F8E4M3 | DType::F8E5M2);
+        if lhs_is_fp8 && rhs_is_fp8 {
+            self = self.cast(DType::F32);
+            rhs = rhs.cast(DType::F32);
+        }
+
         if (self.shape.len() == 1 || self.shape.len() == 2) && rhs.shape.len() == 2 {
             let vec = self.shape.len() == 1;
             if vec {
@@ -113,7 +126,31 @@ impl GraphTensor {
 #[cfg(test)]
 mod tests {
     use crate::frontend::binary::tests::test_binary;
+    use crate::prelude::{DType, Graph};
     use proptest::prelude::*;
+
+    #[test]
+    fn fp8_matmul_promotes_products_and_accumulation_to_f32() {
+        let mut cx = Graph::new();
+        let lhs = cx.tensor((2, 4)).as_dtype(DType::F8E4M3);
+        let rhs = cx.tensor((4, 3)).as_dtype(DType::F8E4M3);
+
+        let out = lhs.matmul(rhs);
+
+        assert_eq!(out.dtype, DType::F32);
+        let promoted_casts = cx
+            .graph
+            .node_indices()
+            .filter(|&node| {
+                cx.try_get_op::<crate::hlir::Cast>(node)
+                    .is_some_and(|cast| cast.1 == DType::F32)
+            })
+            .count();
+        assert_eq!(
+            promoted_casts, 2,
+            "both FP8 operands must have explicit F32 semantic fallbacks"
+        );
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]

@@ -74,417 +74,595 @@ impl EgglogOp for KernelConv2D {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // 1x1 convs in Flux2's VAE are represented without `unfold`:
-            //
-            //   input.permute([H,W,C]).merge(H,W)
-            //     -> matmul(weight.t())
-            //     -> split/permute back to [C_out,H,W]
-            //     -> + channel bias
-            //
-            // The lowered form is still the same Mul -> KernelSum -> Add
-            // matmul skeleton, but the lhs FusionStart reads directly from the
-            // original input instead of a KernelGather window tensor.
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride (F32)) (ICons ?sum_fs (ICons ?bias_fs (INil)))))
-                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
-                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+        vec![Rule::raw(
+            "; A semantic witness is produced only after the complete matmul
+            ; decomposition has been proven. The final bias rules consume the
+            ; witness in either Add operand order. Keeping the witness separate
+            ; also prevents a partially lowered CUDA spelling from weakening
+            ; the Gather/index/layout contract.
+            (relation conv2d_unfold_matmul
+                (IR IR IR EList EList
+                 Expression Expression Expression Expression Expression
+                 Expression Expression Expression Expression Expression))
+            (relation conv2d_1x1_matmul
+                (IR IR IR Expression Expression Expression
+                 Expression Expression Expression))
 
-                        (= ?sum (Op (KernelSum ?matmul_out_shape ?c_in ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
-                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
-                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?input_1x1_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?input_fs (ICons ?weight_fs (INil)))))
-                        (= ?input_fs (Op (FusionStart ?mul_shape ?input_1x1_stride (F32)) (ICons ?input (INil))))
-                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
+            (rule
+                (
+                    (= ?sum (Op (Sum ?matmul_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride)
+                        (ICons ?mul (INil))))
+                    (= ?mul (Op (Mul ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride)
+                        (ICons ?patches (ICons ?weight (INil)))))
+                    (= ?patches (Op (Gather ?idx_shape ?idx_stride ?input_shape ?input_stride)
+                        (ICons ?indices (ICons ?input (INil)))))
+                    (= ?indices (Op (Iota ?unfold_index ?index_range) (INil)))
+                    (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
+                    (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
+                    (= ?matmul_shape (ECons ?m (ECons ?c_out (ENil))))
+                    (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?k_dim (ENil)))))
 
-                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
-                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
-                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?c_in (ENil)))))
-                        (= ?input_1x1_stride (ECons ?flat_stride (ECons (MNum 0) (ECons ?input_c_stride (ENil)))))
-                        (= ?flat_stride (MIter))
+                    ; Constants are already folded (and their arithmetic rows
+                    ; subsumed) before kernel_specialize. Prove the same
+                    ; equalities directly in egglog's i64 domain instead of
+                    ; requiring those hidden MMul/MAdd rows to remain live.
+                    (= ?c_in (MNum ?c_in_n))
+                    (= ?h_in (MNum ?h_in_n))
+                    (= ?w_in (MNum ?w_in_n))
+                    (= ?c_out (MNum ?c_out_n))
+                    (= ?h_out (MNum ?h_out_n))
+                    (= ?w_out (MNum ?w_out_n))
+                    (= ?kernel_h (MNum ?kernel_h_n))
+                    (= ?kernel_w (MNum ?kernel_w_n))
+                    (= ?m (MNum ?m_n))
+                    (= ?k_dim (MNum ?k_dim_n))
+                    (= ?kernel_area (MNum ?kernel_area_n))
+                    (= ?row_kernel (MNum ?row_kernel_n))
+                    (= ?spatial_kernel (MNum ?spatial_kernel_n))
+                    (= ?input_hw (MNum ?input_hw_n))
+                    (= ?m_kernel (MNum ?m_kernel_n))
+                    (= ?index_range (MNum ?index_range_n))
+                    (= ?h_out_n (+ (- ?h_in_n ?kernel_h_n) 1))
+                    (= ?w_out_n (+ (- ?w_in_n ?kernel_w_n) 1))
+                    (= ?m_n (* ?h_out_n ?w_out_n))
+                    (= ?kernel_area_n (* ?kernel_w_n ?kernel_h_n))
+                    (= ?k_dim_n (* ?c_in_n ?kernel_area_n))
+                    (= ?row_kernel_n (* ?kernel_area_n ?w_out_n))
+                    (= ?spatial_kernel_n (* ?row_kernel_n ?h_out_n))
+                    (= ?input_hw_n (* ?w_in_n ?h_in_n))
+                    (= ?m_kernel_n (* ?m_n ?kernel_area_n))
+                    (= ?index_range_n (* ?c_in_n ?m_kernel_n))
 
-                        (= ?k_stride (MIter))
-                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
-                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
-                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
-                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
-                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
-                        (= (MNum 0) (nth_from_end ?weight_stride 2))
-                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
-                    )
-                    (
-                        (let ?conv (Op (KernelConv2D
-                            ?out_shape
-                            (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
-                            (ECons ?input_c_stride (ECons (MMul ?w_out ?flat_stride) (ECons ?flat_stride (ENil))))
-                            ?weight_co_stride
-                            ?weight_inner_stride
-                            ?bias_c_stride
-                            ?out_stride
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 0)
-                            (MNum 0)
-                            (F32))
-                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
-                        (union ?out ?conv)
-                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (set (dtype ?conv) (F32))
-                    )
-                    :ruleset kernel_lower
-                    :name \"kernel conv2d 1x1 from cuda lowered matmul bias\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride (F32)) (ICons ?bias_fs (ICons ?sum_fs (INil)))))
-                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
-                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+                    (= ?unfold_index
+                        (MAdd
+                         (MAdd
+                          (MAdd
+                           (MMod (MDiv (MIter) ?kernel_area) ?w_out)
+                           (MAdd
+                            (MMod (MIter) ?kernel_w)
+                            (MMul
+                             (MMod (MDiv (MIter) ?kernel_w) ?kernel_h)
+                             ?w_in)))
+                          (MMul
+                           (MMod (MDiv (MIter) ?row_kernel) ?h_out)
+                           ?w_in))
+                         (MMul (MDiv (MIter) ?spatial_kernel) ?input_hw)))
+                    (= ?idx_stride
+                        (ECons
+                         (MMul (MMul (MMul (MMul (MIter) ?kernel_w) ?kernel_h) ?w_out) ?h_out)
+                         (ECons
+                          (MMul (MMul (MMul (MIter) ?kernel_w) ?kernel_h) ?w_out)
+                          (ECons
+                           (MMul (MMul (MIter) ?kernel_w) ?kernel_h)
+                           (ECons
+                            (MMul (MMul (MIter) ?kernel_w) ?kernel_h)
+                            (ECons (MMul (MIter) ?kernel_w)
+                            (ECons (MIter) (ENil))))))))
+                    (= ?patch_stride
+                        (ECons (MMul (MMul (MIter) ?kernel_w) ?kernel_h)
+                         (ECons (MNum 0)
+                         (ECons
+                          (MAdd
+                           (MMul (MDiv (MIter) ?kernel_area) ?m_kernel)
+                           (MMod (MIter) ?kernel_area))
+                          (ENil)))))
+                    (= ?weight_stride
+                        (ECons (MNum 0)
+                         (ECons ?weight_co_stride
+                         (ECons ?weight_inner_stride (ENil)))))
+                    (= ?mul_out_stride
+                        (ECons
+                         (MMul (MMul (MIter) ?k_dim) ?c_out)
+                         (ECons (MMul (MIter) ?k_dim)
+                         (ECons (MIter) (ENil)))))
+                    (= ?sum_in_stride
+                        (ECons
+                         (MMul (MMul (MIter) ?k_dim) ?c_out)
+                         (ECons (MMul (MIter) ?k_dim) (ENil))))
+                    (= ?k_stride (MIter))
+                    (= ?sum_out_stride
+                        (ECons (MMul (MIter) ?c_out) (ECons (MIter) (ENil))))
+                    (= (F32) (dtype ?input))
+                    (= (F32) (dtype ?weight))
+                )
+                ((conv2d_unfold_matmul ?sum ?input ?weight ?input_shape ?input_stride
+                    ?c_in ?h_in ?w_in ?c_out ?h_out ?w_out ?weight_co_stride
+                    ?weight_inner_stride ?kernel_h ?kernel_w))
+                :ruleset kernel_specialize
+                :name \"prove static conv2d unfold matmul semantics\"
+            )
 
-                        (= ?sum (Op (KernelSum ?matmul_out_shape ?c_in ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
-                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
-                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?input_1x1_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?input_fs (ICons ?weight_fs (INil)))))
-                        (= ?input_fs (Op (FusionStart ?mul_shape ?input_1x1_stride (F32)) (ICons ?input (INil))))
-                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
+            ; Prove the exact stride-1, dilation-1 unfold represented by
+            ;
+            ;   [C,Hout,Wout,1,KH,KW] Gather -> [M,Cout,K] Mul -> Sum(K).
+            ;
+            ; Shape alone is not sufficient: the Iota expression proves which
+            ; input element each window position reads, while ?patch_stride
+            ; proves the squeeze/permute/merge view used by the matmul lhs.
+            (rule
+                (
+                    (= ?sum (Op (Sum ?matmul_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride)
+                        (ICons ?mul (INil))))
+                    (= ?mul (Op (Mul ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride)
+                        (ICons ?patches (ICons ?weight (INil)))))
+                    (= ?patches (Op (Gather ?idx_shape ?idx_stride ?input_shape ?input_stride)
+                        (ICons ?indices (ICons ?input (INil)))))
+                    (= ?indices (Op (Iota ?unfold_index ?index_range) (INil)))
 
-                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
-                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
-                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?c_in (ENil)))))
-                        (= ?input_1x1_stride (ECons ?flat_stride (ECons (MNum 0) (ECons ?input_c_stride (ENil)))))
-                        (= ?flat_stride (MIter))
+                    (= ?input_shape
+                        (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
+                    (= ?idx_shape
+                        (ECons ?c_in
+                         (ECons ?h_out
+                         (ECons ?w_out
+                         (ECons (MNum 1)
+                         (ECons ?kernel_h
+                         (ECons ?kernel_w (ENil))))))))
+                    (= ?matmul_shape (ECons ?m (ECons ?c_out (ENil))))
+                    (= ?mul_shape
+                        (ECons ?m (ECons ?c_out (ECons ?k_dim (ENil)))))
 
-                        (= ?k_stride (MIter))
-                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
-                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
-                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
-                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
-                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
-                        (= (MNum 0) (nth_from_end ?weight_stride 2))
-                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
-                    )
-                    (
-                        (let ?conv (Op (KernelConv2D
-                            ?out_shape
-                            (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
-                            (ECons ?input_c_stride (ECons (MMul ?w_out ?flat_stride) (ECons ?flat_stride (ENil))))
-                            ?weight_co_stride
-                            ?weight_inner_stride
-                            ?bias_c_stride
-                            ?out_stride
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 0)
-                            (MNum 0)
-                            (F32))
-                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
-                        (union ?out ?conv)
-                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (set (dtype ?conv) (F32))
-                    )
-                    :ruleset kernel_lower
-                    :name \"kernel conv2d 1x1 from cuda lowered bias matmul\"
-                )",
-            ),
-            // Match the same conv after generic CUDA lowering has normalized
-            // the elementwise pieces into fusion regions:
-            //
-            //   KernelGather(input windows)
-            //     -> CudaBinaryElementwise("Mul", weight)
-            //     -> KernelSum(reduce K)
-            //     -> CudaBinaryElementwise("Add", bias)
-            //
-            // This is the form that survives long enough for CUDA search in
-            // real models. The KernelConv2D op consumes the pre-gather input
-            // and avoids materializing both the im2col window tensor and the
-            // elementwise product tensor.
-            //
-            // TODO(egglog-shapes): the current e-graph does not reliably prove
-            // the derived arithmetic equalities for this chain after CUDA
-            // normalization:
-            //   * `M == H_out * W_out`
-            //   * `K == C_in * KH * KW`
-            //   * separately-derived but structurally identical stride
-            //     expressions, e.g. the Mul output stride and KernelSum input
-            //     stride, belong to the same e-class.
-            // Keep the rewrite anchored on the stable conv layout facts the
-            // graph does carry today: six-axis unfold window shape, flattened
-            // `[M, C_out, K]` product, reduction over `K`, the three-axis
-            // `[C_out, H_out, W_out]` output view, and channel-only bias
-            // broadcast. Once expression/list canonicalization can prove those
-            // equalities, tighten this rule and its regression tests.
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride (F32)) (ICons ?sum_fs (ICons ?bias_fs (INil)))))
-                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
-                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+                    ; The logical convolution dimensions must be the dimensions
+                    ; actually flattened into M and K.
+                    (= ?h_out (MAdd (MSub ?h_in ?kernel_h) (MNum 1)))
+                    (= ?w_out (MAdd (MSub ?w_in ?kernel_w) (MNum 1)))
+                    (= ?m (MMul ?h_out ?w_out))
+                    (= ?k_dim (MMul ?c_in (MMul ?kernel_h ?kernel_w)))
 
-                        (= ?sum (Op (KernelSum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
-                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
-                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?patch_fs (ICons ?weight_fs (INil)))))
-                        (= ?patch_fs (Op (FusionStart ?mul_shape ?patch_stride (F32)) (ICons ?patches (INil))))
-                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
-                        (= ?patches (Op (KernelGather ?idx_shape ?idx_stride ?input_shape ?input_stride ?gather_out_stride (F32)) (ICons ?indices (ICons ?input (INil)))))
+                    ; The index tensor itself must be the contiguous unfold
+                    ; Iota, not merely an arbitrary tensor with the same shape.
+                    (= ?idx_stride
+                        (ECons
+                         (MMul (MMul (MMul (MMul (MIter) ?kernel_w) ?kernel_h) ?w_out) ?h_out)
+                         (ECons
+                          (MMul (MMul (MMul (MIter) ?kernel_w) ?kernel_h) ?w_out)
+                          (ECons
+                           (MMul (MMul (MIter) ?kernel_w) ?kernel_h)
+                           (ECons
+                            (MMul (MMul (MIter) ?kernel_w) ?kernel_h)
+                            (ECons (MMul (MIter) ?kernel_w)
+                            (ECons (MIter) (ENil))))))))
+                    (= ?index_range (n_elements ?idx_shape))
+                    (= ?unfold_index
+                        (MAdd
+                         (MAdd
+                          (MAdd
+                           (MMod
+                            (MDiv (MIter) (MMul ?kernel_w ?kernel_h))
+                            ?w_out)
+                           (MAdd
+                            (MMod (MIter) ?kernel_w)
+                            (MMul
+                             (MMod (MDiv (MIter) ?kernel_w) ?kernel_h)
+                             ?w_in)))
+                          (MMul
+                           (MMod
+                            (MDiv
+                             (MIter)
+                             (MMul (MMul ?kernel_w ?kernel_h) ?w_out))
+                            ?h_out)
+                           ?w_in))
+                         (MMul
+                          (MDiv
+                           (MIter)
+                           (MMul
+                            (MMul (MMul ?kernel_w ?kernel_h) ?w_out)
+                            ?h_out))
+                          (MMul ?w_in ?h_in))))
 
-                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
-                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
-                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
-                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
-                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?k_dim (ENil)))))
+                    ; Patches are viewed as [M,Cout,K]. The M coordinate walks
+                    ; one spatial window, while K walks [Cin,KH,KW] across the
+                    ; channel-major Gather materialization.
+                    (= ?kernel_area (MMul ?kernel_w ?kernel_h))
+                    (= ?patch_stride
+                        (ECons (MMul (MMul (MIter) ?kernel_w) ?kernel_h)
+                         (ECons (MNum 0)
+                         (ECons
+                          (MAdd
+                           (MMul
+                            (MDiv (MIter) ?kernel_area)
+                            (MMul (MMul ?m ?kernel_w) ?kernel_h))
+                           (MMod (MIter) ?kernel_area))
+                          (ENil)))))
+                    (= ?weight_stride
+                        (ECons (MNum 0)
+                         (ECons ?weight_co_stride
+                         (ECons ?weight_inner_stride (ENil)))))
 
-                        (= ?k_stride (MIter))
-                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
-                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
-                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
-                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
-                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
-                        (= (MNum 0) (nth_from_end ?weight_stride 2))
-                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
-                    )
-                    (
-                        (let ?conv (Op (KernelConv2D
-                            ?out_shape
-                            ?input_shape
-                            ?input_stride
-                            ?weight_co_stride
-                            ?weight_inner_stride
-                            ?bias_c_stride
-                            ?out_stride
-                            ?kernel_h
-                            ?kernel_w
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 0)
-                            (MNum 0)
-                            (F32))
-                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
-                        (union ?out ?conv)
-                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (set (dtype ?conv) (F32))
-                    )
-                    :ruleset kernel_lower
-                    :name \"kernel conv2d from cuda lowered unfold matmul bias\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?out (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (= ?add_elem (Op (CudaBinaryElementwise \"Add\" ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride (F32)) (ICons ?bias_fs (ICons ?sum_fs (INil)))))
-                        (= ?sum_fs (Op (FusionStart ?out_shape ?sum_add_stride (F32)) (ICons ?sum (INil))))
-                        (= ?bias_fs (Op (FusionStart ?out_shape ?bias_add_stride (F32)) (ICons ?bias (INil))))
+                    ; Sum must reduce the contiguous K axis of this exact Mul,
+                    ; and its materialized output must be [M,Cout] row-major.
+                    (= ?mul_out_stride
+                        (ECons
+                         (MMul (MMul (MIter) ?k_dim) ?c_out)
+                         (ECons (MMul (MIter) ?k_dim)
+                         (ECons ?k_stride (ENil)))))
+                    (= ?sum_in_stride
+                        (ECons
+                         (MMul (MMul (MIter) ?k_dim) ?c_out)
+                         (ECons (MMul (MIter) ?k_dim) (ENil))))
+                    (= ?k_stride (MIter))
+                    (= ?sum_out_stride
+                        (ECons (MMul (MIter) ?c_out) (ECons (MIter) (ENil))))
 
-                        (= ?sum (Op (KernelSum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride (F32)) (ICons ?mul_fe (INil))))
-                        (= ?mul_fe (Op (FusionEnd ?mul_shape ?mul_out_stride (F32)) (ICons ?mul_elem (INil))))
-                        (= ?mul_elem (Op (CudaBinaryElementwise \"Mul\" ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride (F32)) (ICons ?patch_fs (ICons ?weight_fs (INil)))))
-                        (= ?patch_fs (Op (FusionStart ?mul_shape ?patch_stride (F32)) (ICons ?patches (INil))))
-                        (= ?weight_fs (Op (FusionStart ?mul_shape ?weight_stride (F32)) (ICons ?weight (INil))))
-                        (= ?patches (Op (KernelGather ?idx_shape ?idx_stride ?input_shape ?input_stride ?gather_out_stride (F32)) (ICons ?indices (ICons ?input (INil)))))
+                    (= (F32) (dtype ?input))
+                    (= (F32) (dtype ?weight))
+                )
+                ((conv2d_unfold_matmul
+                    ?sum ?input ?weight ?input_shape ?input_stride
+                    ?c_in ?h_in ?w_in ?c_out ?h_out ?w_out
+                    ?weight_co_stride ?weight_inner_stride
+                    ?kernel_h ?kernel_w))
+                :ruleset kernel_specialize
+                :name \"prove conv2d unfold matmul semantics\"
+            )
 
-                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
-                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
-                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
-                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
-                        (= ?mul_shape (ECons ?m (ECons ?c_out (ECons ?k_dim (ENil)))))
+            ; The 1x1 spelling has no Gather. Its flattened spatial coordinate
+            ; must be contiguous, and M is tied to Hout*Wout by the bias rule.
+            (rule
+                (
+                    (= ?sum (Op (Sum ?matmul_shape ?c_in ?sum_in_stride ?k_stride ?sum_out_stride)
+                        (ICons ?mul (INil))))
+                    (= ?mul (Op (Mul ?mul_shape ?input_stride ?weight_stride ?mul_out_stride)
+                        (ICons ?input (ICons ?weight (INil)))))
+                    (= ?matmul_shape (ECons ?m (ECons ?c_out (ENil))))
+                    (= ?mul_shape
+                        (ECons ?m (ECons ?c_out (ECons ?c_in (ENil)))))
+                    (= ?input_stride
+                        (ECons (MIter)
+                         (ECons (MNum 0) (ECons ?input_c_stride (ENil)))))
+                    (= ?weight_stride
+                        (ECons (MNum 0)
+                         (ECons ?weight_co_stride
+                         (ECons ?weight_inner_stride (ENil)))))
+                    (= ?mul_out_stride
+                        (ECons
+                         (MMul (MMul (MIter) ?c_in) ?c_out)
+                         (ECons (MMul (MIter) ?c_in)
+                         (ECons ?k_stride (ENil)))))
+                    (= ?sum_in_stride
+                        (ECons
+                         (MMul (MMul (MIter) ?c_in) ?c_out)
+                         (ECons (MMul (MIter) ?c_in) (ENil))))
+                    (= ?k_stride (MIter))
+                    (= ?sum_out_stride
+                        (ECons (MMul (MIter) ?c_out) (ECons (MIter) (ENil))))
+                    (= (F32) (dtype ?input))
+                    (= (F32) (dtype ?weight))
+                )
+                ((conv2d_1x1_matmul
+                    ?sum ?input ?weight ?c_in ?c_out ?m
+                    ?input_c_stride ?weight_co_stride ?weight_inner_stride))
+                :ruleset kernel_specialize
+                :name \"prove conv2d 1x1 matmul semantics\"
+            )
 
-                        (= ?k_stride (MIter))
-                        (= ?sum_in_stride (ECons ?sum_m_stride (ECons ?sum_c_stride (ENil))))
-                        (= ?sum_out_stride (ECons ?sum_out_m_stride (ECons ?sum_out_c_stride (ENil))))
-                        (= ?sum_add_stride (ECons ?sum_add_c_stride (ECons ?sum_add_h_stride (ECons ?sum_add_w_stride (ENil)))))
-                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
-                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
-                        (= (MNum 0) (nth_from_end ?weight_stride 2))
-                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
-                    )
-                    (
-                        (let ?conv (Op (KernelConv2D
-                            ?out_shape
-                            ?input_shape
-                            ?input_stride
-                            ?weight_co_stride
-                            ?weight_inner_stride
-                            ?bias_c_stride
-                            ?out_stride
-                            ?kernel_h
-                            ?kernel_w
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 0)
-                            (MNum 0)
-                            (F32))
-                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
-                        (union ?out ?conv)
-                        (subsume (Op (FusionEnd ?out_shape ?out_stride (F32)) (ICons ?add_elem (INil))))
-                        (set (dtype ?conv) (F32))
-                    )
-                    :ruleset kernel_lower
-                    :name \"kernel conv2d from cuda lowered bias unfold matmul\"
-                )",
-            ),
-            // Match the im2col-style HLIR conv used by Flux2:
-            //
-            //   input.unfold([1, kh, kw], [1, 1, 1], [1, 1, 1])
-            //     -> squeeze/permute/merge view
-            //     -> matmul(weight.t())
-            //     -> split/permute view
-            //     -> + bias.expand_dim(1, h_out).expand_dim(2, w_out)
-            //
-            // The kernel consumes the pre-unfold input directly. That input may
-            // already be a padded HLIR tensor, so the rewrite is still correct
-            // for Flux2's padded convs while removing the large patch matrix.
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?add_out_stride) (ICons ?sum (ICons ?bias (INil)))))
-                        (= ?sum (Op (Sum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
-                        (= ?mul (Op (Mul ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride) (ICons ?patches (ICons ?weight (INil)))))
-                        (= ?patches (Op (Gather ?idx_shape ?idx_stride ?input_shape ?input_stride) (ICons ?indices (ICons ?input (INil)))))
+            (rule
+                (
+                    (conv2d_unfold_matmul
+                        ?sum ?input ?weight ?input_shape ?input_stride
+                        ?c_in ?h_in ?w_in ?c_out ?h_out ?w_out
+                        ?weight_co_stride ?weight_inner_stride
+                        ?kernel_h ?kernel_w)
+                    (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride)
+                        (ICons ?sum (ICons ?bias (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?c_out (MNum ?c_out_n))
+                    (= ?w_out (MNum ?w_out_n))
+                    (= ?sum_row_width (MNum ?sum_row_width_n))
+                    (= ?sum_row_width_n (* ?w_out_n ?c_out_n))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MIter) ?sum_row_width)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape ?input_shape ?input_stride
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride ?kernel_h ?kernel_w
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel conv2d from proven unfold matmul bias\"
+            )
+            (rule
+                (
+                    (conv2d_unfold_matmul
+                        ?sum ?input ?weight ?input_shape ?input_stride
+                        ?c_in ?h_in ?w_in ?c_out ?h_out ?w_out
+                        ?weight_co_stride ?weight_inner_stride
+                        ?kernel_h ?kernel_w)
+                    (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride)
+                        (ICons ?bias (ICons ?sum (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?c_out (MNum ?c_out_n))
+                    (= ?w_out (MNum ?w_out_n))
+                    (= ?sum_row_width (MNum ?sum_row_width_n))
+                    (= ?sum_row_width_n (* ?w_out_n ?c_out_n))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MIter) ?sum_row_width)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape ?input_shape ?input_stride
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride ?kernel_h ?kernel_w
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel conv2d from proven bias unfold matmul\"
+            )
 
-                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
-                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
-                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
-                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
+            (rule
+                (
+                    (conv2d_1x1_matmul
+                        ?sum ?input ?weight ?c_in ?c_out ?m
+                        ?input_c_stride ?weight_co_stride ?weight_inner_stride)
+                    (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride)
+                        (ICons ?sum (ICons ?bias (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?m (MNum ?m_n))
+                    (= ?h_out (MNum ?h_out_n))
+                    (= ?w_out (MNum ?w_out_n))
+                    (= ?c_out (MNum ?c_out_n))
+                    (= ?sum_row_width (MNum ?sum_row_width_n))
+                    (= ?m_n (* ?h_out_n ?w_out_n))
+                    (= ?sum_row_width_n (* ?w_out_n ?c_out_n))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MIter) ?sum_row_width)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape
+                        (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
+                        (ECons ?input_c_stride
+                         (ECons (MMul (MIter) ?w_out) (ECons (MIter) (ENil))))
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride (MNum 1) (MNum 1)
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel conv2d 1x1 from proven matmul bias\"
+            )
+            (rule
+                (
+                    (conv2d_1x1_matmul
+                        ?sum ?input ?weight ?c_in ?c_out ?m
+                        ?input_c_stride ?weight_co_stride ?weight_inner_stride)
+                    (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride)
+                        (ICons ?bias (ICons ?sum (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?m (MNum ?m_n))
+                    (= ?h_out (MNum ?h_out_n))
+                    (= ?w_out (MNum ?w_out_n))
+                    (= ?c_out (MNum ?c_out_n))
+                    (= ?sum_row_width (MNum ?sum_row_width_n))
+                    (= ?m_n (* ?h_out_n ?w_out_n))
+                    (= ?sum_row_width_n (* ?w_out_n ?c_out_n))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MIter) ?sum_row_width)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape
+                        (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
+                        (ECons ?input_c_stride
+                         (ECons (MMul (MIter) ?w_out) (ECons (MIter) (ENil))))
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride (MNum 1) (MNum 1)
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel conv2d 1x1 from proven bias matmul\"
+            )
 
-                        ; This rewrite is for stride=1, dilation=1 over the
-                        ; tensor passed to unfold. Padded HLIR inputs are already
-                        ; represented as their own tensor, so padding is 0 here.
-                        (= ?h_out (MAdd (MSub ?h_in ?kernel_h) (MNum 1)))
-                        (= ?w_out (MAdd (MSub ?w_in ?kernel_w) (MNum 1)))
-                        (= ?m (MMul ?h_out ?w_out))
-                        (= ?k_dim (MMul ?c_in (MMul ?kernel_h ?kernel_w)))
-                        (= ?k_stride (MIter))
-
-                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
-                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
-                        (= (MNum 0) (nth_from_end ?weight_stride 2))
-
-                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
-
-                        (= (F32) (dtype ?input))
-                        (= (F32) (dtype ?weight))
-                        (= (F32) (dtype ?bias))
-                    )
-                    (
-                        (let ?conv (Op (KernelConv2D
-                            ?out_shape
-                            ?input_shape
-                            ?input_stride
-                            ?weight_co_stride
-                            ?weight_inner_stride
-                            ?bias_c_stride
-                            ?add_out_stride
-                            ?kernel_h
-                            ?kernel_w
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 0)
-                            (MNum 0)
-                            (F32))
-                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
-                        (union ?add ?conv)
-                        (subsume (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?add_out_stride) (ICons ?sum (ICons ?bias (INil)))))
-                        (set (dtype ?conv) (F32))
-                    )
-                    :ruleset kernel_specialize
-                    :name \"kernel conv2d from unfold matmul bias\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?add_out_stride) (ICons ?bias (ICons ?sum (INil)))))
-                        (= ?sum (Op (Sum ?matmul_out_shape ?k_dim ?sum_in_stride ?k_stride ?sum_out_stride) (ICons ?mul (INil))))
-                        (= ?mul (Op (Mul ?mul_shape ?patch_stride ?weight_stride ?mul_out_stride) (ICons ?patches (ICons ?weight (INil)))))
-                        (= ?patches (Op (Gather ?idx_shape ?idx_stride ?input_shape ?input_stride) (ICons ?indices (ICons ?input (INil)))))
-
-                        (= ?out_shape (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
-                        (= ?input_shape (ECons ?c_in (ECons ?h_in (ECons ?w_in (ENil)))))
-                        (= ?idx_shape (ECons ?c_in (ECons ?h_out (ECons ?w_out (ECons (MNum 1) (ECons ?kernel_h (ECons ?kernel_w (ENil))))))))
-                        (= ?matmul_out_shape (ECons ?m (ECons ?c_out (ENil))))
-
-                        (= ?h_out (MAdd (MSub ?h_in ?kernel_h) (MNum 1)))
-                        (= ?w_out (MAdd (MSub ?w_in ?kernel_w) (MNum 1)))
-                        (= ?m (MMul ?h_out ?w_out))
-                        (= ?k_dim (MMul ?c_in (MMul ?kernel_h ?kernel_w)))
-                        (= ?k_stride (MIter))
-
-                        (= ?weight_co_stride (nth_from_end ?weight_stride 1))
-                        (= ?weight_inner_stride (nth_from_end ?weight_stride 0))
-                        (= (MNum 0) (nth_from_end ?weight_stride 2))
-
-                        (= ?bias_add_stride (ECons ?bias_c_stride (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
-
-                        (= (F32) (dtype ?input))
-                        (= (F32) (dtype ?weight))
-                        (= (F32) (dtype ?bias))
-                    )
-                    (
-                        (let ?conv (Op (KernelConv2D
-                            ?out_shape
-                            ?input_shape
-                            ?input_stride
-                            ?weight_co_stride
-                            ?weight_inner_stride
-                            ?bias_c_stride
-                            ?add_out_stride
-                            ?kernel_h
-                            ?kernel_w
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 1)
-                            (MNum 0)
-                            (MNum 0)
-                            (F32))
-                            (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
-                        (union ?add ?conv)
-                        (subsume (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?add_out_stride) (ICons ?bias (ICons ?sum (INil)))))
-                        (set (dtype ?conv) (F32))
-                    )
-                    :ruleset kernel_specialize
-                    :name \"kernel conv2d from bias unfold matmul\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?add (Op (Add ?shape ?as ?bs ?os) ?inputs))
-                        (= ?add (Op (KernelConv2D ?out_shape ?input_shape ?input_stride ?wco ?wi ?bc ?out_stride ?kh ?kw ?sh ?sw ?dh ?dw ?ph ?pw ?dt) ?conv_inputs))
-                    )
-                    ((delete (Op (Add ?shape ?as ?bs ?os) ?inputs)))
-                    :ruleset cleanup
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?fe (Op (FusionEnd ?shape ?os ?dt) ?inputs))
-                        (= ?fe (Op (KernelConv2D ?out_shape ?input_shape ?input_stride ?wco ?wi ?bc ?out_stride ?kh ?kw ?sh ?sw ?dh ?dw ?ph ?pw ?conv_dt) ?conv_inputs))
-                    )
-                    ((delete (Op (FusionEnd ?shape ?os ?dt) ?inputs)))
-                    :ruleset cleanup
-                )",
-            ),
-        ]
+            ; Symbolic dimensions retain their arithmetic rows through expr
+            ; saturation, so these consumers prove the same output-layout
+            ; contract structurally. The static consumers above use i64 facts
+            ; because constant-folding deliberately subsumes those rows.
+            (rule
+                (
+                    (conv2d_unfold_matmul
+                        ?sum ?input ?weight ?input_shape ?input_stride
+                        ?c_in ?h_in ?w_in ?c_out ?h_out ?w_out
+                        ?weight_co_stride ?weight_inner_stride
+                        ?kernel_h ?kernel_w)
+                    (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride)
+                        (ICons ?sum (ICons ?bias (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MMul (MIter) ?w_out) ?c_out)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape ?input_shape ?input_stride
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride ?kernel_h ?kernel_w
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel symbolic conv2d from proven unfold matmul bias\"
+            )
+            (rule
+                (
+                    (conv2d_unfold_matmul
+                        ?sum ?input ?weight ?input_shape ?input_stride
+                        ?c_in ?h_in ?w_in ?c_out ?h_out ?w_out
+                        ?weight_co_stride ?weight_inner_stride
+                        ?kernel_h ?kernel_w)
+                    (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride)
+                        (ICons ?bias (ICons ?sum (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MMul (MIter) ?w_out) ?c_out)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape ?input_shape ?input_stride
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride ?kernel_h ?kernel_w
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel symbolic conv2d from proven bias unfold matmul\"
+            )
+            (rule
+                (
+                    (conv2d_1x1_matmul
+                        ?sum ?input ?weight ?c_in ?c_out ?m
+                        ?input_c_stride ?weight_co_stride ?weight_inner_stride)
+                    (= ?add (Op (Add ?out_shape ?sum_add_stride ?bias_add_stride ?out_stride)
+                        (ICons ?sum (ICons ?bias (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?m (MMul ?h_out ?w_out))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MMul (MIter) ?w_out) ?c_out)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape
+                        (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
+                        (ECons ?input_c_stride
+                         (ECons (MMul (MIter) ?w_out) (ECons (MIter) (ENil))))
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride (MNum 1) (MNum 1)
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel symbolic conv2d 1x1 from proven matmul bias\"
+            )
+            (rule
+                (
+                    (conv2d_1x1_matmul
+                        ?sum ?input ?weight ?c_in ?c_out ?m
+                        ?input_c_stride ?weight_co_stride ?weight_inner_stride)
+                    (= ?add (Op (Add ?out_shape ?bias_add_stride ?sum_add_stride ?out_stride)
+                        (ICons ?bias (ICons ?sum (INil)))))
+                    (= ?out_shape
+                        (ECons ?c_out (ECons ?h_out (ECons ?w_out (ENil)))))
+                    (= ?m (MMul ?h_out ?w_out))
+                    (= ?sum_add_stride
+                        (ECons (MIter)
+                         (ECons (MMul (MMul (MIter) ?w_out) ?c_out)
+                         (ECons (MMul (MIter) ?c_out) (ENil)))))
+                    (= ?bias_add_stride
+                        (ECons ?bias_c_stride
+                         (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+                    (= (F32) (dtype ?bias))
+                )
+                (
+                    (let ?conv (Op (KernelConv2D
+                        ?out_shape
+                        (ECons ?c_in (ECons ?h_out (ECons ?w_out (ENil))))
+                        (ECons ?input_c_stride
+                         (ECons (MMul (MIter) ?w_out) (ECons (MIter) (ENil))))
+                        ?weight_co_stride ?weight_inner_stride ?bias_c_stride
+                        ?out_stride (MNum 1) (MNum 1)
+                        (MNum 1) (MNum 1) (MNum 1) (MNum 1)
+                        (MNum 0) (MNum 0) (F32))
+                        (ICons ?input (ICons ?weight (ICons ?bias (INil))))))
+                    (union ?add ?conv)
+                    (set (dtype ?conv) (F32))
+                )
+                :ruleset kernel_specialize
+                :name \"kernel symbolic conv2d 1x1 from proven bias matmul\"
+            )",
+        )]
     }
 
     fn cleanup(&self) -> bool {

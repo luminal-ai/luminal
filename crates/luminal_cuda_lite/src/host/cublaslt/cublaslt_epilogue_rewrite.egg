@@ -66,6 +66,16 @@
             ?positive_strides
             ?relu_strides)
             (ICons ?zeroed (ICons ?positive (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d (F32)
+            ?shape ?matmul_strides ?pointwise_zero_strides ?size)
+        (= ?mask_strides ?matmul_strides)
+        (= ?zeroed_strides ?matmul_strides)
+        (= ?neg_mask_strides ?matmul_strides)
+        (= ?not_mask_f32_strides ?matmul_strides)
+        (= ?positive_strides ?matmul_strides)
+        (= ?relu_strides ?matmul_strides)
     )
     (
         (let ?fused (Op (cublaslt
@@ -146,6 +156,16 @@
             ?positive_strides
             ?relu_strides)
             (ICons ?zeroed (ICons ?positive (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d (F32)
+            ?shape ?matmul_strides ?pointwise_zero_strides ?size)
+        (= ?mask_strides ?matmul_strides)
+        (= ?zeroed_strides ?matmul_strides)
+        (= ?neg_mask_strides ?matmul_strides)
+        (= ?not_mask_f32_strides ?matmul_strides)
+        (= ?positive_strides ?matmul_strides)
+        (= ?relu_strides ?matmul_strides)
     )
     (
         (let ?fused (Op (cublaslt
@@ -226,6 +246,16 @@
             ?positive_strides
             ?relu_strides)
             (ICons ?zeroed (ICons ?positive (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d (F32)
+            ?shape ?matmul_strides ?pointwise_zero_strides ?size)
+        (= ?mask_strides ?matmul_strides)
+        (= ?zeroed_strides ?matmul_strides)
+        (= ?neg_mask_strides ?matmul_strides)
+        (= ?not_mask_f32_strides ?matmul_strides)
+        (= ?positive_strides ?matmul_strides)
+        (= ?relu_strides ?matmul_strides)
     )
     (
         (let ?fused (Op (cublaslt
@@ -306,6 +336,16 @@
             ?positive_strides
             ?relu_strides)
             (ICons ?zeroed (ICons ?positive (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d (F32)
+            ?shape ?matmul_strides ?pointwise_zero_strides ?size)
+        (= ?mask_strides ?matmul_strides)
+        (= ?zeroed_strides ?matmul_strides)
+        (= ?neg_mask_strides ?matmul_strides)
+        (= ?not_mask_f32_strides ?matmul_strides)
+        (= ?positive_strides ?matmul_strides)
+        (= ?relu_strides ?matmul_strides)
     )
     (
         (let ?fused (Op (cublaslt
@@ -362,6 +402,56 @@
         (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
         (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
         (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
+
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d (F32)
+            ?pointwise_shape ?pointwise_strides ?pointwise_zero_strides ?pointwise_size)
+
+        (= ?gelu_inner_scaled_shape ?pointwise_shape)
+        (= ?gelu_inner_quad_shape ?pointwise_shape)
+        (= ?gelu_poly_shape ?pointwise_shape)
+        (= ?gelu_outer_scaled_shape ?pointwise_shape)
+        (= ?gelu_scaled_shape ?pointwise_shape)
+        (= ?gelu_neg_shape ?pointwise_shape)
+        (= ?gelu_exp_scaled_shape ?pointwise_shape)
+        (= ?gelu_exp_shape ?pointwise_shape)
+        (= ?gelu_plus1_shape ?pointwise_shape)
+        (= ?gelu_sigmoid_shape ?pointwise_shape)
+        (= ?gelu_out_shape ?pointwise_shape)
+
+        (= ?gelu_inner_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_inner_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_inner_quad_a_stride ?pointwise_strides)
+        (= ?gelu_inner_quad_b_stride ?pointwise_strides)
+        (= ?gelu_inner_quad_out_stride ?pointwise_strides)
+        (= ?gelu_poly_a_stride ?pointwise_strides)
+        (= ?gelu_poly_out_stride ?pointwise_strides)
+        (= ?gelu_outer_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_outer_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_scaled_b_stride ?pointwise_strides)
+        (= ?gelu_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_neg_a_stride ?pointwise_strides)
+        (= ?gelu_neg_out_stride ?pointwise_strides)
+        (= ?gelu_exp_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_exp_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_exp_in_stride ?pointwise_strides)
+        (= ?gelu_exp_out_stride ?pointwise_strides)
+        (= ?gelu_plus1_a_stride ?pointwise_strides)
+        (= ?gelu_plus1_out_stride ?pointwise_strides)
+        (= ?gelu_sigmoid_in_stride ?pointwise_strides)
+        (= ?gelu_sigmoid_out_stride ?pointwise_strides)
+        (= ?gelu_out_a_stride ?pointwise_strides)
+        (= ?gelu_out_b_stride ?pointwise_strides)
+        (= ?gelu_out_out_stride ?pointwise_strides)
+
+        (= ?gelu_inner_scaled_b_stride ?pointwise_zero_strides)
+        (= ?gelu_poly_b_stride ?pointwise_zero_strides)
+        (= ?gelu_outer_scaled_b_stride ?pointwise_zero_strides)
+        (= ?gelu_neg_b_stride ?pointwise_zero_strides)
+        (= ?gelu_exp_scaled_b_stride ?pointwise_zero_strides)
+        (= ?gelu_plus1_b_stride ?pointwise_zero_strides)
     )
     (
         (let ?fused (Op (cublaslt
@@ -412,6 +502,56 @@
         (= ?gelu_plus1 (Op (Add ?gelu_plus1_shape ?gelu_plus1_a_stride ?gelu_plus1_b_stride ?gelu_plus1_out_stride) (ICons ?gelu_exp2_val (ICons ?gelu_one (INil)))))
         (= ?gelu_sigmoid (Op (Recip ?gelu_sigmoid_shape ?gelu_sigmoid_in_stride ?gelu_sigmoid_out_stride) (ICons ?gelu_plus1 (INil))))
         (= ?gelu_out (Op (Mul ?gelu_out_shape ?gelu_out_a_stride ?gelu_out_b_stride ?gelu_out_out_stride) (ICons ?matmul (ICons ?gelu_sigmoid (INil)))))
+
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d (F32)
+            ?pointwise_shape ?pointwise_strides ?pointwise_zero_strides ?pointwise_size)
+
+        (= ?gelu_inner_scaled_shape ?pointwise_shape)
+        (= ?gelu_inner_quad_shape ?pointwise_shape)
+        (= ?gelu_poly_shape ?pointwise_shape)
+        (= ?gelu_outer_scaled_shape ?pointwise_shape)
+        (= ?gelu_scaled_shape ?pointwise_shape)
+        (= ?gelu_neg_shape ?pointwise_shape)
+        (= ?gelu_exp_scaled_shape ?pointwise_shape)
+        (= ?gelu_exp_shape ?pointwise_shape)
+        (= ?gelu_plus1_shape ?pointwise_shape)
+        (= ?gelu_sigmoid_shape ?pointwise_shape)
+        (= ?gelu_out_shape ?pointwise_shape)
+
+        (= ?gelu_inner_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_inner_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_inner_quad_a_stride ?pointwise_strides)
+        (= ?gelu_inner_quad_b_stride ?pointwise_strides)
+        (= ?gelu_inner_quad_out_stride ?pointwise_strides)
+        (= ?gelu_poly_a_stride ?pointwise_strides)
+        (= ?gelu_poly_out_stride ?pointwise_strides)
+        (= ?gelu_outer_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_outer_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_scaled_b_stride ?pointwise_strides)
+        (= ?gelu_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_neg_a_stride ?pointwise_strides)
+        (= ?gelu_neg_out_stride ?pointwise_strides)
+        (= ?gelu_exp_scaled_a_stride ?pointwise_strides)
+        (= ?gelu_exp_scaled_out_stride ?pointwise_strides)
+        (= ?gelu_exp_in_stride ?pointwise_strides)
+        (= ?gelu_exp_out_stride ?pointwise_strides)
+        (= ?gelu_plus1_a_stride ?pointwise_strides)
+        (= ?gelu_plus1_out_stride ?pointwise_strides)
+        (= ?gelu_sigmoid_in_stride ?pointwise_strides)
+        (= ?gelu_sigmoid_out_stride ?pointwise_strides)
+        (= ?gelu_out_a_stride ?pointwise_strides)
+        (= ?gelu_out_b_stride ?pointwise_strides)
+        (= ?gelu_out_out_stride ?pointwise_strides)
+
+        (= ?gelu_inner_scaled_b_stride ?pointwise_zero_strides)
+        (= ?gelu_poly_b_stride ?pointwise_zero_strides)
+        (= ?gelu_outer_scaled_b_stride ?pointwise_zero_strides)
+        (= ?gelu_neg_b_stride ?pointwise_zero_strides)
+        (= ?gelu_exp_scaled_b_stride ?pointwise_zero_strides)
+        (= ?gelu_plus1_b_stride ?pointwise_zero_strides)
     )
     (
         (let ?fused (Op (cublaslt
@@ -459,6 +599,11 @@
             (ICons ?matmul (ICons ?bias (INil)))))
 
         (= ?bias_add_strides (ECons (MNum 0) (ECons (MIter) (ENil))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?n (ECons ?m (ENil)))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
         (= ?matmul_add_strides ?add_out_strides)
         (= ?d_dtype (dtype ?bias))
     )
@@ -503,6 +648,11 @@
             (ICons ?bias (ICons ?matmul (INil)))))
 
         (= ?bias_add_strides (ECons (MNum 0) (ECons (MIter) (ENil))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?n (ECons ?m (ENil)))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
         (= ?matmul_add_strides ?add_out_strides)
         (= ?d_dtype (dtype ?bias))
     )
@@ -547,6 +697,11 @@
             (ICons ?matmul (ICons ?bias (INil)))))
 
         (= ?bias_add_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MIter) (ENil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
         (= ?matmul_add_strides ?add_out_strides)
         (= ?d_dtype (dtype ?bias))
     )
@@ -591,6 +746,11 @@
             (ICons ?bias (ICons ?matmul (INil)))))
 
         (= ?bias_add_strides (ECons (MNum 0) (ECons (MNum 0) (ECons (MIter) (ENil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
         (= ?matmul_add_strides ?add_out_strides)
         (= ?d_dtype (dtype ?bias))
     )

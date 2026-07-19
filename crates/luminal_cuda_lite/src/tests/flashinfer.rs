@@ -1253,85 +1253,31 @@ fn flashinfer_rule_fires_on_mha() {
 
 // ─── Layer 5: extraction reachability (no GPU) ───────────────────────────
 //
-// After `build_search_space` saturates egglog, the GA picks an extraction by
-// cost. In a tiny test graph the cuBLAS+kernel path is often faster than the
-// FlashInfer host op (which pays a `plan()` setup cost per call), so asserting
-// "GA picked FlashInfer" is flaky. Instead, sample many random valid genomes
-// from the search space and assert that the FlashInfer extraction is reachable
-// — meaning the rule fired AND `find_indptrs` extraction succeeded for at
-// least one offspring. That is the end-to-end check we actually want.
+// After `build_search_space` saturates egglog, the measured search may prefer a
+// cuBLAS+kernel path over FlashInfer for this tiny graph. Force the FlashInfer
+// e-class alternative explicitly so the test proves extraction reachability
+// without depending on mutation probability or performance ranking.
 
 #[test]
 fn flashinfer_extraction_reachable_from_search_space() {
     if !crate::tests::utilities::gpu_supports_flashinfer() {
         return;
     }
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-
     let (mut cx, _h) = build_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM);
     cx.set_dim('s', 1usize);
     cx.set_dim('c', 16usize);
     cx.set_dim('r', 2usize);
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
-    let egraph = cx
-        .egraph()
-        .expect("egraph missing after build_search_space");
-    let ops = cx
-        .egglog_ops()
-        .expect("egglog_ops missing after build_search_space");
-
-    let mut rng = StdRng::seed_from_u64(0xf1a541);
-    let mut prev: FxHashSet<u64> = FxHashSet::default();
-    let initial = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
-    prev.insert(luminal::egglog_utils::hash_choice_set(&initial));
-    let mut base = initial;
-
-    let mut found = false;
-    'outer: for _ in 0..50 {
-        let offspring =
-            luminal::egglog_utils::extract_generation(egraph, &base, 10, 2, &mut prev, &mut rng);
-        if offspring.is_empty() {
-            break;
-        }
-        for genome in offspring {
-            if luminal::egglog_utils::validate_choice_set(egraph, &genome, ops).is_err() {
-                continue;
-            }
-            let mut list_cache = FxHashMap::default();
-            let mut expr_cache = FxHashMap::default();
-            // Catch a possible panic from find_indptrs walking the mask — we
-            // want the test to fail with a clean message, not abort.
-            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                luminal::egglog_utils::egglog_to_llir(
-                    egraph,
-                    genome.clone(),
-                    ops,
-                    &cx.custom_ops,
-                    &mut list_cache,
-                    &mut expr_cache,
-                    None,
-                )
-            }));
-            let Ok(llir_graph) = panicked else { continue };
-
-            let has_fi = llir_graph.node_indices().any(|n| {
-                llir_graph[n]
-                    .to_dialect::<dyn HostOp>()
-                    .and_then(|op| op.stats_name())
-                    == Some("FlashInferAttention")
-            });
-            if has_fi {
-                found = true;
-                break 'outer;
-            }
-            base = genome;
-        }
-    }
+    let llir = extract_forced_flashinfer_llir(&mut cx, "paged-attention reachability");
+    let found = llir.node_indices().any(|n| {
+        llir[n]
+            .to_dialect::<dyn HostOp>()
+            .and_then(|op| op.stats_name())
+            == Some("FlashInferAttention")
+    });
     assert!(
         found,
-        "FlashInferAttention extraction not reachable from search space after 50 generations"
+        "forced FlashInferAttention candidate did not extract to a HostOp"
     );
 }
 
@@ -1374,39 +1320,45 @@ fn extract_forced_flashinfer_llir(cx: &mut Graph, case_name: &str) -> LLIRGraph 
 
     let mut last_error = None;
     for (idx, flashinfer_node) in flashinfer_nodes.iter().enumerate() {
-        let mut rng = StdRng::seed_from_u64(0xF1A5_0000 + idx as u64);
-        let mut choices = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
-        let flashinfer_class = &egraph.node_to_class[*flashinfer_node];
-        choices.insert(flashinfer_class, flashinfer_node);
+        for background in 0..64u64 {
+            let mut rng = StdRng::seed_from_u64(
+                0xF1A5_0000u64
+                    .wrapping_add((idx as u64) << 16)
+                    .wrapping_add(background),
+            );
+            let mut choices = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
+            let flashinfer_class = &egraph.node_to_class[*flashinfer_node];
+            choices.insert(flashinfer_class, flashinfer_node);
 
-        if let Err(err) = luminal::egglog_utils::validate_choice_set(egraph, &choices, ops) {
-            last_error = Some(err);
-            continue;
+            if let Err(err) = luminal::egglog_utils::validate_choice_set(egraph, &choices, ops) {
+                last_error = Some(err);
+                continue;
+            }
+
+            let mut list_cache = FxHashMap::default();
+            let mut expr_cache = FxHashMap::default();
+            let llir = luminal::egglog_utils::egglog_to_llir(
+                egraph,
+                choices,
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+
+            let has_flashinfer = llir.node_indices().any(|n| {
+                llir[n]
+                    .to_dialect::<dyn HostOp>()
+                    .and_then(|op| op.stats_name())
+                    == Some("FlashInferAttention")
+            });
+            if has_flashinfer {
+                return llir;
+            }
+
+            last_error = Some("forced FlashInfer candidate did not extract to HostOp".into());
         }
-
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
-        let llir = luminal::egglog_utils::egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
-
-        let has_flashinfer = llir.node_indices().any(|n| {
-            llir[n]
-                .to_dialect::<dyn HostOp>()
-                .and_then(|op| op.stats_name())
-                == Some("FlashInferAttention")
-        });
-        if has_flashinfer {
-            return llir;
-        }
-
-        last_error = Some("forced FlashInfer candidate did not extract to HostOp".into());
     }
 
     panic!(

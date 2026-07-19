@@ -43,7 +43,10 @@ pub type Ops = (
     moe_gemv::KernelMoEGemv,
     rms_norm::KernelRMSNorm,
     rms_norm::KernelRMSNormQuant,
+    rope::RoPEHalfKernel,
+    rope::RoPEScatterKernel,
     rope::KernelRoPE,
+    rope::KernelRoPEScatterFused,
     swiglu::KernelSwiglu,
     swiglu::KernelSwigluQuant,
     topk::KernelStableSortIdx,
@@ -192,6 +195,10 @@ pub fn record_cuda_graph_timings(
 }
 
 pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
+    /// Compile the kernel and return its function/module, exact generated CUDA
+    /// source, launch expressions, dynamic shared memory, and constants. The
+    /// source string is part of the runtime contract: it is used to detect the
+    /// optional `dyn_dims` parameter and enforce compilation-resource budgets.
     #[allow(clippy::type_complexity)]
     fn compile(
         &self,
@@ -282,6 +289,20 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
         params
     }
 
+    /// Number of 64-bit launch parameters produced by `build_params` for a
+    /// kernel with `input_count` graph inputs. Resource preflight uses this to
+    /// enforce CUDA's kernel-parameter ABI limit without allocating buffers.
+    ///
+    /// The default matches the standard parameter contract: one output pointer
+    /// unless output aliases an input, one pointer per input, and an optional
+    /// dynamic-dimension pointer. An override of `build_params` that changes
+    /// that count must override this method as well.
+    fn kernel_parameter_count(&self, input_count: usize, has_dyn_dims_param: bool) -> usize {
+        input_count
+            + usize::from(self.output_aliases_input().is_none())
+            + usize::from(has_dyn_dims_param)
+    }
+
     /// Called before each kernel execution. Update internal state if needed.
     /// `all_buffer_ptrs` contains pointers for all buffers this kernel might use.
     /// `constants` are device constants returned by compile() that may need updating.
@@ -299,6 +320,14 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// return the input index. Used to propagate buffer pointers in CUDA graphs.
     fn output_aliases_input(&self) -> Option<usize> {
         None
+    }
+
+    /// Whether aliasing the output also mutates the aliased input buffer.
+    /// Aliases are conservatively treated as mutations by default so a new
+    /// in-place kernel cannot silently bypass candidate-local hazard checks.
+    /// Proven identity/view markers such as FusionStart override this to false.
+    fn mutates_aliased_input(&self) -> bool {
+        self.output_aliases_input().is_some()
     }
 
     /// If this kernel's output is derived from one of its inputs (copy-then-modify

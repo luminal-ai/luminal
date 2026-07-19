@@ -56,9 +56,58 @@ impl EgglogOp for GenericMatmul {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            Rule::raw(
-                "(rule
+        vec![Rule::raw(
+            "; cuBLASLt and GEMV implement only the canonical materialized
+             ; matmul reduction. Operand broadcast strides alone are not a
+             ; sufficient witness: a movement-only view between Mul and Sum
+             ; can permute the reduction's surviving axes while leaving both
+             ; operand strides unchanged. Stage the complete semantic layout
+             ; here so every optimized consumer shares the same proof.
+             (rule
+                (
+                    (= ?sum (Op (GenericMatmul
+                        (ECons ?m (ECons ?n (ENil)))
+                        (ECons ?m (ECons ?n (ECons ?k (ENil))))
+                        ?k
+                        ?lhs_strides ?rhs_strides
+                        (ECons
+                            (MMul (MMul (MIter) ?k) ?n)
+                            (ECons (MMul (MIter) ?k) (ENil)))
+                        (MIter)
+                        (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))
+                        ?dt)
+                        ?inputs))
+                )
+                ((generic_matmul_exact_2d ?sum ?m ?n ?k ?dt))
+                :ruleset matmul_backend
+                :name \"prove exact materialized 2d matmul reduction\"
+             )
+
+             (rule
+                (
+                    (= ?sum (Op (GenericMatmul
+                        (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+                        (ECons ?batch (ECons ?m (ECons ?n (ECons ?k (ENil)))))
+                        ?k
+                        ?lhs_strides ?rhs_strides
+                        (ECons
+                            (MMul (MMul (MMul (MIter) ?k) ?n) ?m)
+                            (ECons
+                                (MMul (MMul (MIter) ?k) ?n)
+                                (ECons (MMul (MIter) ?k) (ENil))))
+                        (MIter)
+                        (ECons
+                            (MMul (MMul (MIter) ?n) ?m)
+                            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+                        ?dt)
+                        ?inputs))
+                )
+                ((generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt))
+                :ruleset matmul_backend
+                :name \"prove exact materialized 3d matmul reduction\"
+             )
+
+             (rule
                     (
                         (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
                             (ICons ?lhs (ICons ?rhs (INil)))))
@@ -84,42 +133,7 @@ impl EgglogOp for GenericMatmul {
                     :ruleset matmul_backend
                     :name \"generic-matmul-cuda-mul-sum\"
                 )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
-                            (ICons ?lhs (ICons ?rhs (INil)))))
-                        (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
-                            (ICons ?mul (INil))))
-                        (= ?sum (Op (GenericMatmul
-                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt)
-                            ?generic_inputs))
-                    )
-                    (
-                        (delete (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
-                            (ICons ?mul (INil))))
-                    )
-                    :ruleset cleanup
-                    :name \"delete-sum-when-generic-matmul-exists\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    (
-                        (= ?kernel_sum (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
-                            ?sum_inputs))
-                        (= ?kernel_sum (Op (GenericMatmul
-                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt)
-                            ?generic_inputs))
-                    )
-                    ((delete (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
-                        ?sum_inputs)))
-                    :ruleset cleanup
-                    :name \"delete-kernel-sum-when-generic-matmul-exists\"
-                )",
-            ),
-        ]
+        )]
     }
 
     fn cleanup(&self) -> bool {

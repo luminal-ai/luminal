@@ -173,8 +173,6 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
                 .map_err(|_| std::env::VarError::NotPresent)
         })
         .ok();
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
@@ -201,7 +199,7 @@ fn run_text_encoder(prompt: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>
 
     println!("Compiling text encoder...");
     let t0 = Instant::now();
-    runtime = cx.search(runtime, search_options());
+    runtime = cx.compile(runtime, search_options());
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
     println!("Encoding prompt...");
@@ -308,15 +306,12 @@ fn run_full_pipeline(
         .forward(latent_in, text_in, cos_in, sin_in, timestep_in, guidance_in)
         .output();
 
-    println!("Building search space (this is the long step — many minutes for the full DiT)...");
     let max_memory_gib = std::env::var("TX_MEM_GIB")
         .and_then(|s| {
             s.parse::<usize>()
                 .map_err(|_| std::env::VarError::NotPresent)
         })
         .ok();
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
@@ -350,7 +345,7 @@ fn run_full_pipeline(
     // `timesteps_proj` argument saturate.
     runtime.set_data(guidance_in, vec![guidance]);
 
-    // First-step dummy values so search() has shapes/data to profile against.
+    // First-step dummy values so compile() has shapes/data to profile against.
     runtime.set_data(latent_in, latent.clone());
     runtime.set_data(timestep_in, vec![timesteps[0] / 1000.0]);
 
@@ -361,9 +356,9 @@ fn run_full_pipeline(
     {
         use rand::SeedableRng;
         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-        runtime = cx.search_with_rng(runtime, search_options(), &mut rng);
+        runtime = cx.compile_with_rng(runtime, search_options(), &mut rng);
     } else {
-        runtime = cx.search(runtime, search_options());
+        runtime = cx.compile(runtime, search_options());
     }
     println!("  compile done in {:.1}s", t0.elapsed().as_secs_f64());
 
@@ -422,8 +417,6 @@ fn run_full_pipeline(
                 .map_err(|_| std::env::VarError::NotPresent)
         })
         .ok();
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
     let mut runtime = CudaRuntime::initialize(stream);
@@ -432,7 +425,7 @@ fn run_full_pipeline(
     }
     runtime.load_safetensors(&cx, vae_path.to_str().unwrap());
     runtime.set_data(latent_in, vae_input);
-    runtime = cx.search(runtime, search_options());
+    runtime = cx.compile(runtime, search_options());
     runtime.execute(&cx.dyn_map);
     let img = runtime.get_f32(out);
     // VaeDecoder output is in roughly [-1, 1] range. Diffusers'

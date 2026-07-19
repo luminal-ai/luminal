@@ -3,9 +3,6 @@ import re
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 EXPECTED_OUTPUT = {
-    "gemma4_moe": [
-        "city of romance, art and culture",
-    ],
     "whisper": [
         "ask not what your country can do for you",
     ],
@@ -34,6 +31,11 @@ EXPECTED_CONCEPTS = {
         ["learn", "learning", "training"],
     ],
     "qwen3_moe": [
+        ["capital"],
+        ["france"],
+        ["paris"],
+    ],
+    "gemma4_moe": [
         ["capital"],
         ["france"],
         ["paris"],

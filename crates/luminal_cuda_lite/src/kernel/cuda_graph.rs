@@ -135,7 +135,13 @@ impl CudaGraphHandle {
         assert_eq!(from.len(), to.len());
         self.ctx.bind_to_thread()?;
         unsafe {
-            sys::cuGraphAddDependencies(self.cu_graph, from.as_ptr(), to.as_ptr(), from.len())
+            sys::cuGraphAddDependencies_v2(
+                self.cu_graph,
+                from.as_ptr(),
+                to.as_ptr(),
+                std::ptr::null(),
+                from.len(),
+            )
         }
         .result()
     }
@@ -149,7 +155,13 @@ impl CudaGraphHandle {
         assert_eq!(from.len(), to.len());
         self.ctx.bind_to_thread()?;
         unsafe {
-            sys::cuGraphRemoveDependencies(self.cu_graph, from.as_ptr(), to.as_ptr(), from.len())
+            sys::cuGraphRemoveDependencies_v2(
+                self.cu_graph,
+                from.as_ptr(),
+                to.as_ptr(),
+                std::ptr::null(),
+                from.len(),
+            )
         }
         .result()
     }
@@ -177,14 +189,27 @@ impl CudaGraphHandle {
         self.ctx.bind_to_thread()?;
         let mut count = 0usize;
         unsafe {
-            sys::cuGraphNodeGetDependencies(node, std::ptr::null_mut(), &mut count).result()?;
+            sys::cuGraphNodeGetDependencies_v2(
+                node,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
         }
         if count == 0 {
             return Ok(Vec::new());
         }
         let mut deps = vec![std::ptr::null_mut(); count];
+        let mut edge_data = vec![MaybeUninit::<sys::CUgraphEdgeData>::uninit(); count];
         unsafe {
-            sys::cuGraphNodeGetDependencies(node, deps.as_mut_ptr(), &mut count).result()?;
+            sys::cuGraphNodeGetDependencies_v2(
+                node,
+                deps.as_mut_ptr(),
+                edge_data.as_mut_ptr().cast(),
+                &mut count,
+            )
+            .result()?;
         }
         deps.truncate(count);
         Ok(deps)
@@ -195,14 +220,27 @@ impl CudaGraphHandle {
         self.ctx.bind_to_thread()?;
         let mut count = 0usize;
         unsafe {
-            sys::cuGraphNodeGetDependentNodes(node, std::ptr::null_mut(), &mut count).result()?;
+            sys::cuGraphNodeGetDependentNodes_v2(
+                node,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
         }
         if count == 0 {
             return Ok(Vec::new());
         }
         let mut deps = vec![std::ptr::null_mut(); count];
+        let mut edge_data = vec![MaybeUninit::<sys::CUgraphEdgeData>::uninit(); count];
         unsafe {
-            sys::cuGraphNodeGetDependentNodes(node, deps.as_mut_ptr(), &mut count).result()?;
+            sys::cuGraphNodeGetDependentNodes_v2(
+                node,
+                deps.as_mut_ptr(),
+                edge_data.as_mut_ptr().cast(),
+                &mut count,
+            )
+            .result()?;
         }
         deps.truncate(count);
         Ok(deps)

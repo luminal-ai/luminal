@@ -14,6 +14,7 @@ pub const ELIST: SortClass = SortClass::new("EList");
 pub const DTYPE: SortClass = SortClass::new("DType");
 pub const I64: SortClass = SortClass::new("i64");
 pub const F64: SortClass = SortClass::new("f64");
+pub const BOOL: SortClass = SortClass::new("bool");
 pub const STRING: SortClass = SortClass::new("String");
 
 pub static SORTS: LazyLock<BaseSorts> = LazyLock::new(BaseSorts::new);

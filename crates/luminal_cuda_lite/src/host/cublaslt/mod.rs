@@ -41,6 +41,7 @@ use crate::{
         driver::{CudaSlice, CudaStream, DevicePtr},
     },
     host::{DeviceBuffer, HostOp},
+    resource::{HostDeviceMemoryPlan, ResourceViolation},
     try_create_cublaslt,
 };
 
@@ -204,55 +205,11 @@ impl EgglogOp for CuBlasLt {
             Rule::raw(include_str!["cublaslt_CmRm_rewrite.egg"]), // col row
             Rule::raw(include_str!["cublaslt_CmCm_rewrite.egg"]), // col col
             Rule::raw(include_str!["cublaslt_fp8_rewrite.egg"]),
+            Rule::raw(include_str!["cublaslt_output_witness.egg"]),
             Rule::raw(include_str!["cublaslt_scale_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_beta_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_epilogue_rewrite.egg"]),
             Rule::raw(include_str!["cublaslt_row_order_rewrite.egg"]),
-            // cuBLASLt now specializes GenericMatmul, so cleanup should prune
-            // the matmul output alternatives directly. Do not delete the
-            // broadcast Mul here; it may still have non-matmul consumers.
-            Rule::raw("(rule
-                ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
-                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-sum-when-cublaslt-exists\"
-            )"),
-            Rule::raw("(rule
-                ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
-                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-kernel-sum-when-cublaslt-exists\"
-            )"),
-            Rule::raw("(rule
-                ((= ?sum (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs))
-                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (Sum ?shape ?k ?sis ?sks ?sos) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-sum-when-scaled-cublaslt-exists\"
-            )"),
-            Rule::raw("(rule
-                ((= ?sum (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs))
-                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?ci)))
-                ((delete (Op (KernelSum ?shape ?k ?sis ?sks ?sos ?dt) ?inputs)))
-                :ruleset cleanup
-                :name \"delete-kernel-sum-when-scaled-cublaslt-exists\"
-            )"),
-            Rule::raw("(rule
-                ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
-                 (= ?sum (Op (cublaslt ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
-                ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
-                :ruleset cleanup
-                :name \"prefer-cublaslt-over-generic-matmul\"
-            )"),
-            Rule::raw("(rule
-                ((= ?sum (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs))
-                 (= ?sum (Op (cublaslt_scaled ?cm ?cn ?ck ?cta ?ctb ?cao ?cbo ?cco ?cdo ?clda ?cldb ?cldc ?cldd ?cbc ?csa ?csb ?csc ?csd ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue) ?cublas_inputs)))
-                ((delete (Op (GenericMatmul ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt) ?generic_inputs)))
-                :ruleset cleanup
-                :name \"prefer-scaled-cublaslt-over-generic-matmul\"
-            )"),
         ]
     }
 
@@ -671,6 +628,17 @@ pub(crate) struct LtMatmulSpec {
     workspace_size: usize,
 }
 
+impl LtMatmulSpec {
+    pub(crate) fn persistent_device_bytes(self) -> usize {
+        let scale_bytes = [self.a.dtype, self.b.dtype, self.c.dtype, self.d.dtype]
+            .into_iter()
+            .filter(|dtype| cuda_dtype_needs_tensorwide_scale(*dtype))
+            .count()
+            * std::mem::size_of::<f32>();
+        self.workspace_size + scale_bytes
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LtMatmulPointers {
     a: u64,
@@ -886,6 +854,12 @@ impl CuBlasLtResolvedGraphCall {
 
     pub(crate) fn prepare_key(self) -> CuBlasLtPrepareKey {
         CuBlasLtPrepareKey { spec: self.spec }
+    }
+}
+
+impl CuBlasLtPrepareKey {
+    pub(crate) fn persistent_device_bytes(self) -> usize {
+        self.spec.persistent_device_bytes()
     }
 }
 
@@ -1491,6 +1465,98 @@ impl CuBlasLt {
         .collect()
     }
 
+    /// Resolve the prepare-cache key without requiring operand pointers. This
+    /// mirrors `resolve_for_graph`'s dimension/layout contract and is used by
+    /// allocation preflight before any arena exists.
+    pub(crate) fn prepare_key_for_resources(
+        &self,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> anyhow::Result<CuBlasLtPrepareKey> {
+        let resolve = |expression: &Expression, name: &str| -> anyhow::Result<usize> {
+            expression
+                .substitute('z', Expression::from(1))
+                .exec(dyn_map)
+                .ok_or_else(|| anyhow::anyhow!("unresolved cuBLASLt resource dimension {name}"))
+        };
+        let m = resolve(&self.m, "m")? as u64;
+        let n = resolve(&self.n, "n")? as u64;
+        let k = resolve(&self.k, "k")? as u64;
+        let lda = resolve(&self.lda, "lda")? as i64;
+        let ldb = resolve(&self.ldb, "ldb")? as i64;
+        let ldc = resolve(&self.ldc, "ldc")? as i64;
+        let ldd = resolve(&self.ldd, "ldd")? as i64;
+        let batch_count = resolve(&self.batch_count, "batch_count")? as i32;
+        let stride_a = resolve(&self.stride_a, "stride_a")? as i64;
+        let stride_b = resolve(&self.stride_b, "stride_b")? as i64;
+        let stride_c = resolve(&self.stride_c, "stride_c")? as i64;
+        let stride_d = resolve(&self.stride_d, "stride_d")? as i64;
+        let (a_rows, a_cols) = if self.a_layout == cublasOperation_t::CUBLAS_OP_N {
+            (m, k)
+        } else {
+            (k, m)
+        };
+        let (b_rows, b_cols) = if self.b_layout == cublasOperation_t::CUBLAS_OP_N {
+            (k, n)
+        } else {
+            (n, k)
+        };
+        let lda = clamp_ld_for_order(lda, a_rows, a_cols, self.a_order);
+        let ldb = clamp_ld_for_order(ldb, b_rows, b_cols, self.b_order);
+        let ldc = clamp_ld_for_order(ldc, m, n, self.c_order);
+        let ldd = clamp_ld_for_order(ldd, m, n, self.d_order);
+        let spec = LtMatmulSpec {
+            problem: LtMatmulProblem {
+                m,
+                n,
+                k,
+                batch_count,
+            },
+            trans_a: self.a_layout,
+            trans_b: self.b_layout,
+            a: LtMatrixSpec {
+                dtype: dtype_to_cuda_dtype(self.a_dtype),
+                rows: a_rows,
+                cols: a_cols,
+                ld: lda,
+                batch_stride: stride_a,
+                order: self.a_order,
+            },
+            b: LtMatrixSpec {
+                dtype: dtype_to_cuda_dtype(self.b_dtype),
+                rows: b_rows,
+                cols: b_cols,
+                ld: ldb,
+                batch_stride: stride_b,
+                order: self.b_order,
+            },
+            c: LtMatrixSpec {
+                dtype: dtype_to_cuda_dtype(self.c_dtype),
+                rows: m,
+                cols: n,
+                ld: ldc,
+                batch_stride: stride_c,
+                order: self.c_order,
+            },
+            d: LtMatrixSpec {
+                dtype: dtype_to_cuda_dtype(self.d_dtype),
+                rows: m,
+                cols: n,
+                ld: ldd,
+                batch_stride: stride_d,
+                order: self.d_order,
+            },
+            compute: LtComputeSpec {
+                compute_type: self.compute_type,
+                scale_dtype: dtype_to_cuda_dtype(self.scale_dtype),
+                alpha: LtScalar::from_f64(self.scale_dtype, self.alpha)?,
+                beta: LtScalar::from_f64(self.scale_dtype, self.beta)?,
+                epilogue: self.epilogue,
+            },
+            workspace_size: 32 * 1024 * 1024,
+        };
+        Ok(CuBlasLtPrepareKey { spec })
+    }
+
     pub(crate) fn resolve_for_graph(
         &self,
         self_node: NodeIndex,
@@ -1835,6 +1901,26 @@ impl HostOp for CuBlasLt {
 
     fn output_bytes(&self) -> Expression {
         (self.output_size() * self.d_dtype.bits()).ceil_div(8)
+    }
+
+    fn device_memory_plan(
+        &self,
+        _self_node: NodeIndex,
+        _inputs: &[NodeIndex],
+        _buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
+        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+        let scale_bytes = [self.a_dtype, self.b_dtype, self.c_dtype, self.d_dtype]
+            .into_iter()
+            .map(dtype_to_cuda_dtype)
+            .filter(|dtype| cuda_dtype_needs_tensorwide_scale(*dtype))
+            .count()
+            * std::mem::size_of::<f32>();
+        Ok(HostDeviceMemoryPlan {
+            transient_peak_bytes: WORKSPACE_SIZE + scale_bytes,
+            ..Default::default()
+        })
     }
 }
 

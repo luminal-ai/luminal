@@ -2,8 +2,9 @@
 //!
 //! Matches the same row-major × column-major `GenericMatmul` pattern as the
 //! cuBLASLt RmCm rewrite, restricted to m == 1 and 16-bit dtypes, and unions
-//! a lean kernel into the same eclass — the GA search then picks cuBLASLt or
-//! this per shape. Rationale (measured on Llama 3 8B decode): the nvjet GEMV
+//! a lean kernel into the same eclass — measured search then chooses among
+//! cuBLASLt, GenericMatmul, the lowered reduction, and this kernel per shape.
+//! Rationale (measured on Llama 3 8B decode): the nvjet GEMV
 //! kernels carry ~5µs of fixed launch/tail cost per call, which dominates the
 //! small projections (o-proj: 13.2µs vs an 8.3µs traffic floor). One warp per
 //! output row with vectorized 16-byte loads and F32 accumulation has ~1µs of
@@ -60,21 +61,35 @@ impl EgglogOp for KernelGemv {
         let m_variants: [(&str, &str); 2] = [
             (
                 "static",
-                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))",
+                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))
+                            (= ?semantic_m (MNum 1))",
             ),
             (
                 "dyn",
                 "(= ?out_shape (ECons ?m (ECons ?n (ENil))))
+                            (= ?semantic_m ?m)
                             (= ?m_lower (lower ?m))
                             (= ?m_upper (upper ?m))
                             (> ?m_lower 0)
                             (< ?m_upper 2)",
             ),
         ];
-        m_variants
-            .into_iter()
-            .flat_map(|(variant, m_cond)| ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt)))
-            .map(|(variant, m_cond, dt)| {
+        let mut rules = vec![Rule::raw(
+            "; Shared semantic witnesses produced by GenericMatmul and consumed
+             ; by GEMV/cuBLASLt rewrites. KernelGemv is registered before those
+             ; consumers, so these declarations are emitted exactly once.
+             (relation generic_matmul_exact_2d
+                (IR Expression Expression Expression DType))
+             (relation generic_matmul_exact_3d
+                (IR Expression Expression Expression Expression DType))",
+        )];
+        rules.extend(
+            m_variants
+                .into_iter()
+                .flat_map(|(variant, m_cond)| {
+                    ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt))
+                })
+                .map(|(variant, m_cond, dt)| {
                 Rule::raw(format!(
                     "(rule
                         (
@@ -86,6 +101,9 @@ impl EgglogOp for KernelGemv {
                                 (ICons ?a (ICons ?b (INil)))))
 
                             {m_cond}
+                            (generic_matmul_exact_2d
+                                ?sum ?semantic_m ?n ?k ({dt}))
+                            (= ?matmul_dtype ({dt}))
                             (!= ?n (MNum 0))
                             (!= ?k (MNum 1))
 
@@ -117,8 +135,9 @@ impl EgglogOp for KernelGemv {
                         :name \"kernel gemv m1 {dt} {variant}\"
                     )"
                 ))
-            })
-            .collect()
+            }),
+        );
+        rules
     }
 
     fn cleanup(&self) -> bool {
@@ -325,11 +344,15 @@ impl EgglogOp for KernelGemvF8 {
         let m_variants: [(&str, &str); 2] = [
             (
                 "static",
-                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))",
+                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))
+                        (= ?semantic_m (MNum 1))
+                        (= ?semantic_size ?n)",
             ),
             (
                 "dyn",
                 "(= ?out_shape (ECons ?m (ECons ?n (ENil))))
+                        (= ?semantic_m ?m)
+                        (= ?semantic_size (MMul ?m ?n))
                         (= ?m_lower (lower ?m))
                         (= ?m_upper (upper ?m))
                         (> ?m_lower 0)
@@ -343,15 +366,15 @@ impl EgglogOp for KernelGemvF8 {
         let a_variants: [(&str, &str); 3] = [
             (
                 "quant",
-                "(= ?a (Op (KernelQuantF8 ?q_size) (ICons ?x (ICons ?in_scale (INil)))))",
+                "(= ?a_fp8 (Op (KernelQuantF8 ?q_size) (ICons ?x (ICons ?in_scale (INil)))))",
             ),
             (
                 "custom3",
-                "(= ?a (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?cw (ICons ?in_scale (INil))))))",
+                "(= ?a_fp8 (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?cw (ICons ?in_scale (INil))))))",
             ),
             (
                 "custom2",
-                "(= ?a (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?in_scale (INil)))))",
+                "(= ?a_fp8 (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?in_scale (INil)))))",
             ),
         ];
         m_variants
@@ -364,6 +387,11 @@ impl EgglogOp for KernelGemvF8 {
                         ; A is a pre-quantized f8 activation with its input
                         ; scale recoverable from the producing op.
                         {a_cond}
+                        ; GraphTensor::matmul represents FP8 semantics with
+                        ; explicit F32 operand casts. Absorb those casts while
+                        ; keeping the materialized GenericMatmul fallback legal.
+                        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
+                        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
 
                         (= ?sum (Op (GenericMatmul
                             ?out_shape ?mul_shape ?k
@@ -371,8 +399,11 @@ impl EgglogOp for KernelGemvF8 {
                             ?sum_in_stride ?k_stride ?sum_out_stride
                             ?matmul_dtype)
                             (ICons ?a (ICons ?b (INil)))))
+                        (= ?matmul_dtype (F32))
 
                         {m_cond}
+                        (generic_matmul_exact_2d
+                            ?sum ?semantic_m ?n ?k (F32))
                         (!= ?n (MNum 0))
                         (!= ?k (MNum 1))
 
@@ -385,10 +416,9 @@ impl EgglogOp for KernelGemvF8 {
                         (= ?b_m_stride (MNum 0))
                         (= ?b_n_stride (MMul (MIter) ?k))
                         (= ?b_k_stride (MIter))
-                        (= (F8E4M3) (dtype ?b))
+                        (= (F8E4M3) (dtype ?b_fp8))
 
-                        ; dequant: Cast(F32) → × (in_scale · w_scale) → Cast(Bf16)
-                        (= ?cast (Op (Cast ?c_size (F32)) (ICons ?sum (INil))))
+                        ; dequant: F32 matmul → × (in_scale · w_scale) → Cast(Bf16)
                         (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
                             (ICons ?in_scale2 (ICons ?w_scale (INil)))))
                         (= ?in_scale ?in_scale2)
@@ -396,12 +426,19 @@ impl EgglogOp for KernelGemvF8 {
                             ?s_shape ?s_a_strides
                             (ECons (MNum 0) (ECons (MNum 0) (ENil)))
                             ?s_out_strides)
-                            (ICons ?cast (ICons ?scale_product (INil)))))
+                            (ICons ?sum (ICons ?scale_product (INil)))))
                         (= ?out_bf16 (Op (Cast ?o_size (Bf16)) (ICons ?scaled (INil))))
+                        (= ?s_shape
+                            (ECons ?semantic_m (ECons ?n (ENil))))
+                        (= ?s_a_strides
+                            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+                        (= ?s_out_strides
+                            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+                        (= ?o_size ?semantic_size)
                     )
                     (
                         (let ?gemv (Op (KernelGemvF8 ?n ?k)
-                            (ICons ?a (ICons ?b (ICons ?in_scale (ICons ?w_scale (INil)))))))
+                            (ICons ?a_fp8 (ICons ?b_fp8 (ICons ?in_scale (ICons ?w_scale (INil)))))))
                         (union ?out_bf16 ?gemv)
                         (set (dtype ?gemv) (Bf16))
                     )

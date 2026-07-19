@@ -36,7 +36,7 @@ use crate::{
         },
         flashinfer::{
             FlashInferAttention, FlashInferDecodeCaptureSignature, FlashInferDecodePointers,
-            FlashInferDecodeSpec, PreparedFlashInferDecode,
+            FlashInferPrepareKey, PreparedFlashInferDecode,
         },
     },
     kernel::{
@@ -44,6 +44,10 @@ use crate::{
         destroy_cuda_event,
         fusion::region_codegen::{self, CompileUnit},
         hlir::{clear_global_dyn_dims, get_global_dyn_dims, set_global_dyn_dims},
+    },
+    resource::{
+        HostDeviceMemoryPlan, KernelResourcePlan, ResourceViolation, eval_resource_expression,
+        kernel_parameter_bytes,
     },
     runtime::partition_marked_convex,
 };
@@ -92,6 +96,9 @@ struct CompiledKernel {
     graph_node: Option<CUgraphNode>,
     /// Kernel name for profiling
     kernel_name: &'static str,
+    /// Generated source size returned by the kernel compiler. Search-grown
+    /// fused regions additionally expose this before compilation.
+    source_bytes: Option<usize>,
 }
 
 struct CompiledCuBlasLt {
@@ -122,11 +129,6 @@ struct CompiledFlashInferDecode {
     ptrs: Option<FlashInferDecodePointers>,
     signature: Option<FlashInferDecodeCaptureSignature>,
     recapture_count: usize,
-    /// True if this island owns its shared prepared plan's metadata kernel.
-    /// Per-layer attention islands share one prepared plan (same spec), and
-    /// only the topologically-first user enqueues the kv-metadata preparation
-    /// kernel + per-step `current_c` upload; the rest read the shared buffers.
-    metadata_owner: bool,
 }
 
 impl CompiledFlashInferDecode {
@@ -142,7 +144,6 @@ impl CompiledFlashInferDecode {
             ptrs: None,
             signature: None,
             recapture_count: 0,
-            metadata_owner: true,
         }
     }
 
@@ -158,19 +159,16 @@ impl CompiledFlashInferDecode {
 
 struct PendingFlashInferDecodeRecapture {
     prepared: Option<Rc<PreparedFlashInferDecode>>,
-    /// Owner status for the new `prepared`; `None` keeps the island's
-    /// existing ownership (ptrs-only recapture).
-    metadata_owner: Option<bool>,
     signature: FlashInferDecodeCaptureSignature,
 }
 
-/// Prepared FlashInfer plans shared across attention islands with identical
-/// specs (the per-layer islands of one decode step). The owner island is the
-/// first (topological) user; it carries the metadata kernel in its capture.
+/// Prepared FlashInfer plan and the dependency-ordered steps that use it.
+/// `key` includes the metadata producer, not just the shape-level spec.
+#[derive(Clone)]
 struct CachedFlashInferPrepare {
-    spec: FlashInferDecodeSpec,
+    key: FlashInferPrepareKey,
     prepared: Rc<PreparedFlashInferDecode>,
-    owner: NodeIndex,
+    user_steps: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -354,6 +352,7 @@ impl CompiledKernel {
         has_dyn_dims_param: bool,
         constants: FxHashMap<char, CudaSlice<u8>>,
         kernel_name: &'static str,
+        source_bytes: Option<usize>,
     ) -> Self {
         let dyn_vars = kernel_op
             .all_dyn_vars()
@@ -381,6 +380,7 @@ impl CompiledKernel {
             constants,
             graph_node: None,
             kernel_name,
+            source_bytes,
         }
     }
 }
@@ -557,6 +557,160 @@ impl CudaGraphOp {
             .unwrap_or_default()
     }
 
+    /// Exact launch-resource facts for the compiled kernels in this CUDA graph.
+    /// This is queried before profiling so impossible launch configurations do
+    /// not consume search trials. It does not assign a cost to legal kernels.
+    pub(crate) fn resource_plans(
+        &self,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<Vec<KernelResourcePlan>, ResourceViolation> {
+        self.state
+            .borrow()
+            .kernels
+            .iter()
+            .map(|kernel| {
+                let function_attribute_error =
+                    |attribute| ResourceViolation::FunctionAttributeQuery {
+                        name: kernel.kernel_name,
+                        attribute,
+                    };
+                let parameter_bytes = kernel_parameter_bytes(
+                    kernel.kernel_op.as_ref().as_ref(),
+                    kernel.inputs.len(),
+                    kernel.has_dyn_dims_param,
+                )?;
+                let static_shared_memory_bytes = usize::try_from(
+                    kernel
+                        .function
+                        .shared_size_bytes()
+                        .map_err(|_| function_attribute_error("static shared memory"))?,
+                )
+                .map_err(|_| function_attribute_error("static shared memory"))?;
+                let function_max_threads_per_block = usize::try_from(
+                    kernel
+                        .function
+                        .max_threads_per_block()
+                        .map_err(|_| function_attribute_error("maximum threads per block"))?,
+                )
+                .map_err(|_| function_attribute_error("maximum threads per block"))?;
+                Ok(KernelResourcePlan {
+                    name: kernel.kernel_name,
+                    source_bytes: kernel.source_bytes,
+                    parameter_bytes,
+                    grid: [
+                        eval_resource_expression(kernel.grid.0, dyn_map, "kernel grid x")?,
+                        eval_resource_expression(kernel.grid.1, dyn_map, "kernel grid y")?,
+                        eval_resource_expression(kernel.grid.2, dyn_map, "kernel grid z")?,
+                    ],
+                    block: [
+                        eval_resource_expression(kernel.block.0, dyn_map, "kernel block x")?,
+                        eval_resource_expression(kernel.block.1, dyn_map, "kernel block y")?,
+                        eval_resource_expression(kernel.block.2, dyn_map, "kernel block z")?,
+                    ],
+                    dynamic_shared_memory_bytes: eval_resource_expression(
+                        kernel.shared_mem,
+                        dyn_map,
+                        "kernel dynamic shared memory",
+                    )?,
+                    static_shared_memory_bytes,
+                    function_max_threads_per_block: Some(function_max_threads_per_block),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn resource_dyn_dims(&self) -> &[char] {
+        &self.dyn_dims_order
+    }
+
+    fn host_device_memory_plan(
+        &self,
+        buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
+        let state = self.state.borrow();
+        let mut persistent_bytes = self
+            .dyn_dims_order
+            .len()
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(ResourceViolation::ArithmeticOverflow {
+                resource: "CUDA graph dynamic-dimension buffer",
+            })?;
+
+        // Mirror get_or_prepare_cublaslt: equal specs share a prepared
+        // workspace only when every user is dependency-ordered with the new
+        // step. Unordered islands need distinct workspaces because they may
+        // overlap in the captured graph.
+        let mut cublaslt_cache_plan: Vec<(CuBlasLtPrepareKey, Vec<usize>)> = Vec::new();
+        for (idx, op) in state.cublaslt_ops.iter().enumerate() {
+            let key = op
+                .cublaslt()
+                .prepare_key_for_resources(dyn_map)
+                .map_err(|_| ResourceViolation::HostResourcePlanning { name: "cuBLASLt" })?;
+            let step = state.cublaslt_step_indices[idx];
+            if let Some((_, users)) = cublaslt_cache_plan.iter_mut().find(|(candidate, users)| {
+                prepare_cache_group_accepts(candidate, users, &key, step, &state.step_reachability)
+            }) {
+                users.push(step);
+            } else {
+                persistent_bytes = persistent_bytes
+                    .checked_add(key.persistent_device_bytes())
+                    .ok_or(ResourceViolation::ArithmeticOverflow {
+                        resource: "cuBLASLt prepared device memory",
+                    })?;
+                cublaslt_cache_plan.push((key, vec![step]));
+            }
+        }
+
+        // Mirror the runtime FlashInfer cache proof. A prepared allocation may
+        // be shared only by derived-decode users with the same gather producer
+        // and capacity-adjusted spec, and only when every user is ordered by a
+        // real data dependency. Explicit indptr contents are unavailable in a
+        // pointer-free preflight, so those plans are always counted separately.
+        let mut flashinfer_cache_plan: Vec<(FlashInferPrepareKey, Vec<usize>)> = Vec::new();
+        for (idx, op) in state.flashinfer_ops.iter().enumerate() {
+            let resource_spec =
+                op.flashinfer()
+                    .device_resource_spec(&op.inputs, buffer_lengths, dyn_map, true)?;
+            let step = state.flashinfer_step_indices[idx];
+            let shares_existing = resource_spec.cache_key.as_ref().is_some_and(|key| {
+                flashinfer_cache_plan.iter_mut().any(|(candidate, users)| {
+                    if prepare_cache_group_accepts(
+                        candidate,
+                        users,
+                        key,
+                        step,
+                        &state.step_reachability,
+                    ) {
+                        users.push(step);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            });
+            if !shares_existing {
+                persistent_bytes = persistent_bytes
+                    .checked_add(resource_spec.prepared_device_bytes()?)
+                    .ok_or(ResourceViolation::ArithmeticOverflow {
+                        resource: "FlashInfer prepared device memory",
+                    })?;
+                if let Some(key) = resource_spec.cache_key {
+                    flashinfer_cache_plan.push((key, vec![step]));
+                }
+            }
+        }
+
+        Ok(HostDeviceMemoryPlan {
+            persistent_bytes,
+            shared_allocations: (!state.flashinfer_ops.is_empty())
+                .then(crate::host::flashinfer::shared_device_memory_allocation)
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+    }
+
     pub fn absorbed_host_nodes(&self) -> Vec<NodeIndex> {
         let state = self.state.borrow();
         state
@@ -676,6 +830,16 @@ impl HostOp for CudaGraphOp {
     fn output_bytes(&self) -> Expression {
         // CudaGraphOp doesn't have a single output - individual kernels have outputs
         0.into()
+    }
+
+    fn device_memory_plan(
+        &self,
+        _self_node: NodeIndex,
+        _inputs: &[NodeIndex],
+        buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
+        self.host_device_memory_plan(buffer_lengths, dyn_map)
     }
 
     fn extra_buffer_nodes(&self) -> Vec<NodeIndex> {
@@ -934,8 +1098,27 @@ fn build_step_reachability(
             }
         }
     }
+    // Every FlashInfer plan references the process-global float/int
+    // workspaces, even when its per-plan allocations are distinct. Model the
+    // same serialization edge that build_graph installs so resource sharing
+    // and runtime execution use one reachability relation.
+    add_flashinfer_workspace_serial_edges(steps, &mut successors);
 
     transitive_step_reachability(&successors)
+}
+
+fn add_flashinfer_workspace_serial_edges(steps: &[CompiledStep], successors: &mut [Vec<usize>]) {
+    let mut previous_flashinfer_step: Option<usize> = None;
+    for (step, graph_step) in steps.iter().enumerate() {
+        if matches!(graph_step, CompiledStep::FlashInferDecode(_)) {
+            if let Some(previous) = previous_flashinfer_step
+                && !successors[previous].contains(&step)
+            {
+                successors[previous].push(step);
+            }
+            previous_flashinfer_step = Some(step);
+        }
+    }
 }
 
 fn transitive_step_reachability(successors: &[Vec<usize>]) -> Vec<FixedBitSet> {
@@ -955,6 +1138,19 @@ fn steps_are_dependency_ordered(reachable: &[FixedBitSet], a: usize, b: usize) -
     a == b || reachable[a].contains(b) || reachable[b].contains(a)
 }
 
+fn prepare_cache_group_accepts<K: PartialEq>(
+    candidate: &K,
+    users: &[usize],
+    key: &K,
+    step: usize,
+    reachable: &[FixedBitSet],
+) -> bool {
+    candidate == key
+        && users
+            .iter()
+            .all(|&user| steps_are_dependency_ordered(reachable, user, step))
+}
+
 fn remove_prepared_cache_user(cache: &mut Vec<CachedCuBlasLtPrepare>, step: usize) {
     for entry in cache.iter_mut() {
         entry.user_steps.retain(|&user_step| user_step != step);
@@ -970,11 +1166,7 @@ fn get_or_prepare_cublaslt(
     prepare: impl FnOnce() -> anyhow::Result<PreparedCuBlasLtMatmul>,
 ) -> anyhow::Result<(Rc<PreparedCuBlasLtMatmul>, bool)> {
     if let Some(entry) = cache.iter_mut().find(|entry| {
-        entry.key == key
-            && entry
-                .user_steps
-                .iter()
-                .all(|&user_step| steps_are_dependency_ordered(reachable, user_step, step))
+        prepare_cache_group_accepts(&entry.key, &entry.user_steps, &key, step, reachable)
     }) {
         entry.user_steps.push(step);
         return Ok((entry.prepared.clone(), true));
@@ -993,6 +1185,42 @@ fn get_or_prepare_cublaslt(
     cache.push(CachedCuBlasLtPrepare {
         key,
         prepared: prepared.clone(),
+        user_steps: vec![step],
+    });
+    Ok((prepared, false))
+}
+
+fn remove_flashinfer_prepare_cache_user(cache: &mut Vec<CachedFlashInferPrepare>, step: usize) {
+    for entry in cache.iter_mut() {
+        entry.user_steps.retain(|&user_step| user_step != step);
+    }
+    cache.retain(|entry| !entry.user_steps.is_empty());
+}
+
+fn get_or_prepare_flashinfer(
+    cache: &mut Vec<CachedFlashInferPrepare>,
+    reachable: &[FixedBitSet],
+    key: Option<FlashInferPrepareKey>,
+    step: usize,
+    prepare: impl FnOnce() -> anyhow::Result<PreparedFlashInferDecode>,
+) -> anyhow::Result<(Rc<PreparedFlashInferDecode>, bool)> {
+    // Explicit indptr buffers can change contents without changing identity.
+    // They therefore never enter the persistent prepare cache.
+    let Some(key) = key else {
+        return Ok((Rc::new(prepare()?), false));
+    };
+
+    if let Some(entry) = cache.iter_mut().find(|entry| {
+        prepare_cache_group_accepts(&entry.key, &entry.user_steps, &key, step, reachable)
+    }) {
+        entry.user_steps.push(step);
+        return Ok((Rc::clone(&entry.prepared), true));
+    }
+
+    let prepared = Rc::new(prepare()?);
+    cache.push(CachedFlashInferPrepare {
+        key,
+        prepared: Rc::clone(&prepared),
         user_steps: vec![step],
     });
     Ok((prepared, false))
@@ -1234,6 +1462,14 @@ impl CudaGraphOp {
                     &kernel.internal_bufs,
                     kernel_dyn_dims_ptr,
                 );
+                debug_assert_eq!(
+                    param_values.len(),
+                    kernel
+                        .kernel_op
+                        .kernel_parameter_count(input_ptrs.len(), kernel.has_dyn_dims_param),
+                    "KernelOp::kernel_parameter_count must match build_params for {}",
+                    kernel.kernel_name,
+                );
                 state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
             }
             profile.kernel_param_build += timer.elapsed();
@@ -1426,6 +1662,7 @@ impl CudaGraphOp {
 
             if !state.flashinfer_ops.is_empty() {
                 let mut pending_recaptures = Vec::new();
+                let mut prepared_cache_plan = state.flashinfer_prepare_cache.clone();
                 for idx in 0..state.flashinfer_ops.len() {
                     let timer = Instant::now();
                     let resolved = {
@@ -1449,62 +1686,49 @@ impl CudaGraphOp {
                             .signature
                             .as_ref()
                             .is_none_or(|old| explicit_indptr || old.spec != signature.spec);
-                        let (prepared, metadata_owner) = if needs_prepare {
-                            let op_node = state.flashinfer_ops[idx].node;
-                            if let Some(cached) = state
-                                .flashinfer_prepare_cache
-                                .iter()
-                                .find(|entry| entry.spec == signature.spec)
-                            {
-                                (
-                                    Some(Rc::clone(&cached.prepared)),
-                                    Some(cached.owner == op_node),
-                                )
-                            } else {
-                                let timer = Instant::now();
-                                let prepared = Rc::new(
+                        let prepared = if needs_prepare {
+                            let step = state.flashinfer_step_indices[idx];
+                            remove_flashinfer_prepare_cache_user(&mut prepared_cache_plan, step);
+                            let key = FlashInferPrepareKey::for_inputs(
+                                signature.spec.clone(),
+                                &state.flashinfer_ops[idx].inputs,
+                            );
+                            let timer = Instant::now();
+                            let (prepared, cache_hit) = get_or_prepare_flashinfer(
+                                &mut prepared_cache_plan,
+                                &state.step_reachability,
+                                key,
+                                step,
+                                || {
                                     state.flashinfer_ops[idx]
                                         .flashinfer()
-                                        .prepare_resolved_for_graph(stream, resolved, true)?,
-                                );
-                                profile.cublaslt_prepare += timer.elapsed();
+                                        .prepare_resolved_for_graph(stream, resolved, true)
+                                },
+                            )?;
+                            profile.cublaslt_prepare += timer.elapsed();
+                            if cache_hit {
+                                profile.prepare_cache_hits += 1;
+                            } else {
                                 profile.prepared_count += 1;
-                                state
-                                    .flashinfer_prepare_cache
-                                    .push(CachedFlashInferPrepare {
-                                        spec: signature.spec.clone(),
-                                        prepared: Rc::clone(&prepared),
-                                        owner: op_node,
-                                    });
-                                (Some(prepared), Some(true))
                             }
+                            Some(prepared)
                         } else {
-                            if state.flashinfer_ops[idx].metadata_owner
-                                && let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref()
-                            {
+                            if let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref() {
                                 prepared.update_current_c(stream, current_c)?;
                             }
-                            (None, None)
+                            None
                         };
                         pending_recaptures.push((
                             idx,
                             PendingFlashInferDecodeRecapture {
                                 prepared,
-                                metadata_owner,
                                 signature,
                             },
                         ));
-                    } else if state.flashinfer_ops[idx].metadata_owner
-                        && let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref()
-                    {
+                    } else if let Some(prepared) = state.flashinfer_ops[idx].prepared.as_ref() {
                         prepared.update_current_c(stream, current_c)?;
                     }
                 }
-                // Drop shared-plan cache entries no longer referenced by any island.
-                state
-                    .flashinfer_prepare_cache
-                    .retain(|entry| Rc::strong_count(&entry.prepared) > 1);
-
                 profile.pending_count += pending_recaptures.len();
                 if !pending_recaptures.is_empty() {
                     let timer = Instant::now();
@@ -1528,6 +1752,7 @@ impl CudaGraphOp {
                         state.producer_to_graph_node.insert(op_node, exit_node);
                     }
                     state.cuda_graph = Some(graph);
+                    state.flashinfer_prepare_cache = prepared_cache_plan;
                     recaptured_cublaslt = true;
                 }
             }
@@ -1944,12 +2169,8 @@ impl CudaGraphOp {
         let recapture_timer = Instant::now();
         let PendingFlashInferDecodeRecapture {
             prepared,
-            metadata_owner,
             signature,
         } = recapture;
-        if let Some(owner) = metadata_owner {
-            op.metadata_owner = owner;
-        }
         let ptrs = signature.ptrs;
         let entry_node = op
             .entry_node
@@ -2006,7 +2227,7 @@ impl CudaGraphOp {
             entry_node,
             prepared_ref,
             ptrs,
-            op.metadata_owner,
+            true,
             profile.as_deref_mut(),
         )?;
 
@@ -2095,7 +2316,9 @@ impl CudaGraphOp {
         let serialize_internal_steps =
             state.cublaslt_ops.is_empty() && state.flashinfer_ops.is_empty();
         let mut previous_graph_node = None;
+        let mut previous_flashinfer_graph_node = None;
         let mut prepared_cache_plan = Vec::new();
+        let mut flashinfer_prepare_cache_plan = state.flashinfer_prepare_cache.clone();
 
         // Collect buffer pointers
         let mut buffer_ptrs: FxHashMap<NodeIndex, u64> = FxHashMap::default();
@@ -2190,6 +2413,14 @@ impl CudaGraphOp {
                         &input_ptrs,
                         &kernel.internal_bufs,
                         kernel_dyn_dims_ptr,
+                    );
+                    debug_assert_eq!(
+                        param_values.len(),
+                        kernel
+                            .kernel_op
+                            .kernel_parameter_count(input_ptrs.len(), kernel.has_dyn_dims_param),
+                        "KernelOp::kernel_parameter_count must match build_params for {}",
+                        kernel.kernel_name,
                     );
                     let mut params = UnifiedKernelParams::new(param_values);
 
@@ -2314,6 +2545,14 @@ impl CudaGraphOp {
                         &state.producer_to_graph_node,
                         &state.flashinfer_ops[idx].inputs,
                     );
+                    // All FlashInfer islands reference the same process-global
+                    // float/int workspaces. Chain just these islands so
+                    // different prepare keys cannot race those allocations.
+                    if let Some(previous) = previous_flashinfer_graph_node
+                        && !deps.contains(&previous)
+                    {
+                        deps.push(previous);
+                    }
                     if serialize_internal_steps
                         && let Some(prev) = previous_graph_node
                         && !deps.contains(&prev)
@@ -2331,30 +2570,23 @@ impl CudaGraphOp {
                     let signature = resolved.signature_for_graph_plan(plan_c);
                     let ptrs = signature.ptrs;
                     let op_node = state.flashinfer_ops[idx].node;
-                    let (prepared, metadata_owner) = if let Some(cached) = state
-                        .flashinfer_prepare_cache
-                        .iter()
-                        .find(|entry| entry.spec == signature.spec)
-                    {
-                        (Rc::clone(&cached.prepared), cached.owner == op_node)
-                    } else {
-                        let prepared = {
-                            let op = &state.flashinfer_ops[idx];
-                            Rc::new(
-                                op.flashinfer()
-                                    .prepare_resolved_for_graph(stream, resolved, true)?,
-                            )
-                        };
-                        state
-                            .flashinfer_prepare_cache
-                            .push(CachedFlashInferPrepare {
-                                spec: signature.spec.clone(),
-                                prepared: Rc::clone(&prepared),
-                                owner: op_node,
-                            });
-                        (prepared, true)
-                    };
-
+                    let step = state.flashinfer_step_indices[idx];
+                    remove_flashinfer_prepare_cache_user(&mut flashinfer_prepare_cache_plan, step);
+                    let key = FlashInferPrepareKey::for_inputs(
+                        signature.spec.clone(),
+                        &state.flashinfer_ops[idx].inputs,
+                    );
+                    let (prepared, _) = get_or_prepare_flashinfer(
+                        &mut flashinfer_prepare_cache_plan,
+                        &state.step_reachability,
+                        key,
+                        step,
+                        || {
+                            state.flashinfer_ops[idx]
+                                .flashinfer()
+                                .prepare_resolved_for_graph(stream, resolved, true)
+                        },
+                    )?;
                     let capture_stream = self.capture_stream()?;
                     let (captured_nodes, exit_node) = Self::capture_flashinfer_decode_island(
                         &mut graph,
@@ -2363,7 +2595,7 @@ impl CudaGraphOp {
                         entry_node,
                         &prepared,
                         ptrs,
-                        metadata_owner,
+                        true,
                         None,
                     )?;
 
@@ -2374,8 +2606,8 @@ impl CudaGraphOp {
                     op.prepared = Some(prepared);
                     op.ptrs = Some(ptrs);
                     op.signature = Some(signature);
-                    op.metadata_owner = metadata_owner;
                     state.producer_to_graph_node.insert(op_node, exit_node);
+                    previous_flashinfer_graph_node = Some(exit_node);
                     if serialize_internal_steps {
                         previous_graph_node = Some(exit_node);
                     }
@@ -2395,6 +2627,7 @@ impl CudaGraphOp {
         state.cuda_graph = Some(graph);
         state.cuda_graph_exec = Some(exec);
         state.cublaslt_prepare_cache = prepared_cache_plan;
+        state.flashinfer_prepare_cache = flashinfer_prepare_cache_plan;
         state.last_dyn_values = dyn_map.clone();
         state.last_buffer_ptrs = buffer_ptrs;
 
@@ -2572,6 +2805,7 @@ pub fn kernel_to_host(
                     let (kernel_function, _, kernel_str, grid, block, shared_mem, constants) =
                         kernel_op_ref.compile(cuda_stream, kernel_cache);
                     let has_dyn_dims_param = kernel_str.contains("dyn_dims");
+                    let source_bytes = kernel_str.len();
 
                     // Collect inputs from graph edges
                     let inputs: Vec<NodeIndex> = llir_graph
@@ -2630,6 +2864,7 @@ pub fn kernel_to_host(
                         has_dyn_dims_param,
                         constants,
                         kernel_op.kernel_name(),
+                        Some(source_bytes),
                     ));
                     kernel_step_by_node.insert(*kernel_node_idx, kernel_idx);
                 }
@@ -2642,6 +2877,7 @@ pub fn kernel_to_host(
                         kernel_cache,
                     );
                     let has_dyn_dims_param = compiled.kernel_str.contains("dyn_dims");
+                    let source_bytes = compiled.kernel_str.len();
 
                     // The region's CompiledKernel is keyed on the FE node
                     // (so FE provides trait methods like output_size /
@@ -2696,6 +2932,7 @@ pub fn kernel_to_host(
                         has_dyn_dims_param,
                         compiled.constants,
                         "FusedRegion",
+                        Some(source_bytes),
                     ));
                     kernel_step_by_node.insert(region.fe_node, kernel_idx);
                 }
@@ -2940,5 +3177,38 @@ mod tests {
 
         let deps = CudaGraphOp::graph_deps_for_inputs(&producers, &[a, external, b, a]);
         assert_eq!(deps, vec![dep_a, dep_b]);
+    }
+
+    #[test]
+    fn prepare_sharing_rejects_unordered_steps_and_distinct_keys() {
+        // 0 feeds both siblings, but neither sibling reaches the other.
+        let reachable = transitive_step_reachability(&[vec![1, 2], vec![], vec![]]);
+        assert!(steps_are_dependency_ordered(&reachable, 0, 1));
+        assert!(steps_are_dependency_ordered(&reachable, 0, 2));
+        assert!(!steps_are_dependency_ordered(&reachable, 1, 2));
+        assert!(prepare_cache_group_accepts(&7, &[0, 1], &7, 1, &reachable));
+        assert!(!prepare_cache_group_accepts(&7, &[1], &7, 2, &reachable));
+        assert!(!prepare_cache_group_accepts(&7, &[0], &8, 1, &reachable));
+    }
+
+    #[test]
+    fn flashinfer_global_workspaces_serialize_every_island() {
+        let steps = vec![
+            CompiledStep::FlashInferDecode(0),
+            CompiledStep::Kernel(0),
+            CompiledStep::FlashInferDecode(1),
+            CompiledStep::CuBlasLt(0),
+            CompiledStep::FlashInferDecode(2),
+        ];
+        let mut successors = vec![Vec::new(); steps.len()];
+        add_flashinfer_workspace_serial_edges(&steps, &mut successors);
+
+        assert_eq!(successors[0], vec![2]);
+        assert_eq!(successors[2], vec![4]);
+        assert!(successors[1].is_empty());
+        assert!(successors[3].is_empty());
+
+        let reachable = transitive_step_reachability(&successors);
+        assert!(steps_are_dependency_ordered(&reachable, 0, 4));
     }
 }

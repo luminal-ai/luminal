@@ -677,7 +677,9 @@ impl MetalRuntime {
         }
 
         for node in topo_order {
-            if let Some(Output { node: hlir_node }) = llir_graph[node].to_op::<Output>()
+            if let Some(Output {
+                node: hlir_node, ..
+            }) = llir_graph[node].to_op::<Output>()
                 && let Some(data_node) = llir_graph
                     .edges_directed(node, Direction::Incoming)
                     .sorted_by_key(|e| e.id())

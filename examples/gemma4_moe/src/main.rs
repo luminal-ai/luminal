@@ -75,18 +75,16 @@ fn main() {
         .next_power_of_two()
         .min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default().dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(search_s),
-        ],
-    );
-
-    println!("Building E-Graph...");
-    let phase = std::time::Instant::now();
-    cx.build_search_space::<CudaRuntime>(build_options);
-    println!("  e-graph build: {:.1}s", phase.elapsed().as_secs_f64());
+    let compile_options = CompileOptions::default()
+        .dim_buckets(
+            's',
+            &[
+                DimBucket::new(1, 1),
+                DimBucket::new(2, max_prefill).representative(search_s),
+            ],
+        )
+        .search_dim('c', search_s)
+        .search_graph_limit(search_graphs);
 
     println!("Loading weights...");
     // ~52 GB of weights leave room for the arena on an 80 GB A100 only after
@@ -106,7 +104,6 @@ fn main() {
 
     println!("Compiling...");
     cx.set_dim('s', search_s);
-    cx.set_dim('c', search_s);
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
@@ -115,8 +112,7 @@ fn main() {
     runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
     // Profiling timeouts use the CompileOptions defaults (5s candidate / 1s execution).
-    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
-    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
 
     // Search profiling leaves several GB cached in the async allocator pool;
     // reclaim it before the first real execute so the stitched-graph arena

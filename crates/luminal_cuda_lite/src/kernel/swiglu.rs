@@ -80,7 +80,7 @@ extern "C" __global__ void swiglu_k(
         (
             func,
             module,
-            "swiglu_k".to_string(),
+            kernel,
             (
                 self.rows,
                 Expression::from(col_tiles),
@@ -229,7 +229,7 @@ extern "C" __global__ void swiglu_quant_k(
         (
             func,
             module,
-            "swiglu_quant_k".to_string(),
+            kernel,
             (
                 self.rows,
                 Expression::from(col_tiles),

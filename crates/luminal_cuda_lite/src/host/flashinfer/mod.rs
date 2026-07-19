@@ -22,6 +22,7 @@ use jit::FlashInferDType;
 use crate::{
     cudarc::driver::{CudaSlice, CudaStream, DevicePtr, result},
     host::{DeviceBuffer, HostOp},
+    resource::{HostDeviceMemoryPlan, ResourceViolation, SharedDeviceMemoryAllocation},
 };
 
 /// FlashInfer attention op (batch decode for f32/f16/bf16, batch prefill for
@@ -97,6 +98,102 @@ pub(crate) struct FlashInferDecodePointers {
 pub(crate) struct FlashInferDecodeCaptureSignature {
     pub(crate) spec: FlashInferDecodeSpec,
     pub(crate) ptrs: FlashInferDecodePointers,
+}
+
+/// Pointer-free proof that two derived-decode islands may reuse one prepared
+/// allocation. Equal shapes are not enough: the mutable metadata buffers are
+/// populated from `gather_idx`, so the producer node is part of the key.
+/// Explicit-indptr plans deliberately have no key because their device
+/// contents can change without their node identities changing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FlashInferPrepareKey {
+    spec: FlashInferDecodeSpec,
+    gather_idx: NodeIndex,
+}
+
+impl FlashInferPrepareKey {
+    pub(crate) fn for_inputs(spec: FlashInferDecodeSpec, inputs: &[NodeIndex]) -> Option<Self> {
+        (inputs.len() == 4).then(|| Self {
+            spec,
+            gather_idx: inputs[3],
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FlashInferDeviceResourceSpec {
+    /// `None` means explicit indptr contents cannot be proven equal without a
+    /// forbidden preflight device read, so this plan must not be deduplicated.
+    pub(crate) cache_key: Option<FlashInferPrepareKey>,
+    spec: FlashInferDecodeSpec,
+    explicit_qo_indptr: bool,
+    explicit_kv_indptr: bool,
+    enable_cuda_graph: bool,
+}
+
+impl FlashInferDeviceResourceSpec {
+    pub(crate) fn prepared_device_bytes(&self) -> Result<usize, ResourceViolation> {
+        prepared_device_bytes(
+            &self.spec,
+            self.explicit_qo_indptr,
+            self.explicit_kv_indptr,
+            self.enable_cuda_graph,
+        )
+    }
+}
+
+fn prepared_device_bytes(
+    spec: &FlashInferDecodeSpec,
+    explicit_qo_indptr: bool,
+    explicit_kv_indptr: bool,
+    enable_cuda_graph: bool,
+) -> Result<usize, ResourceViolation> {
+    let is_prefill = spec.is_prefill();
+    let mut allocations = Vec::with_capacity(6);
+
+    if !explicit_kv_indptr {
+        // Derived prefill owns [0, c]. CUDA-graph decode owns [0, c]
+        // plus the one-element current-c update buffer.
+        allocations.push(2usize * std::mem::size_of::<i32>());
+        if enable_cuda_graph && !is_prefill && spec.total_q_tokens == 1 {
+            allocations.push(std::mem::size_of::<i32>());
+        }
+    }
+    if is_prefill && !explicit_qo_indptr {
+        allocations.push(2usize * std::mem::size_of::<i32>());
+    }
+    allocations.push(
+        spec.c
+            .max(1)
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(ResourceViolation::ArithmeticOverflow {
+                resource: "FlashInfer indices",
+            })?,
+    );
+    allocations.push(
+        spec.batch_size
+            .max(1)
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or(ResourceViolation::ArithmeticOverflow {
+                resource: "FlashInfer last-page lengths",
+            })?,
+    );
+    allocations.push(
+        spec.total_q_tokens
+            .checked_mul(spec.num_qo_heads)
+            .and_then(|elements| elements.checked_mul(spec.head_dim))
+            .and_then(|elements| elements.checked_mul(spec.dtype.size_of()))
+            .map(|bytes| bytes.max(1))
+            .ok_or(ResourceViolation::ArithmeticOverflow {
+                resource: "FlashInfer temporary output",
+            })?,
+    );
+    allocations
+        .into_iter()
+        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+        .ok_or(ResourceViolation::ArithmeticOverflow {
+            resource: "FlashInfer prepared device memory",
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +273,25 @@ unsafe impl Sync for FlashInferAttention {}
 
 const FLOAT_WORKSPACE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
 const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+static FLOAT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
+static INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
+
+pub(crate) fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
+    SharedDeviceMemoryAllocation {
+        key: "flashinfer-global-workspaces",
+        bytes: FLOAT_WORKSPACE_SIZE + INT_WORKSPACE_SIZE,
+    }
+}
+
+/// Process-global workspaces survive after the graph that first requested
+/// them is discarded. Resource planning must therefore keep charging them to
+/// later candidates, including candidates with no FlashInfer op of their own.
+pub(crate) fn resident_shared_device_memory_allocations() -> Vec<SharedDeviceMemoryAllocation> {
+    (FLOAT_WORKSPACE.get().is_some() || INT_WORKSPACE.get().is_some())
+        .then(shared_device_memory_allocation)
+        .into_iter()
+        .collect()
+}
 
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
 
@@ -330,6 +446,113 @@ impl EgglogOp for FlashInferAttention {
 impl FlashInferAttention {
     pub(crate) fn graph_inputs(&self) -> usize {
         4
+    }
+
+    /// Resolve only dimensions and allocation sizes. No pointer is fabricated
+    /// and no explicit-indptr contents are copied from the device during
+    /// preflight.
+    pub(crate) fn device_resource_spec(
+        &self,
+        inputs: &[NodeIndex],
+        buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        dyn_map: &FxHashMap<char, usize>,
+        enable_cuda_graph: bool,
+    ) -> Result<FlashInferDeviceResourceSpec, ResourceViolation> {
+        let total_q_tokens =
+            self.batch_dim
+                .exec(dyn_map)
+                .ok_or(ResourceViolation::UnresolvedExpression {
+                    resource: "FlashInfer total query tokens",
+                })?;
+        let c = dyn_map
+            .get(&'c')
+            .copied()
+            .ok_or(ResourceViolation::UnresolvedExpression {
+                resource: "FlashInfer context length",
+            })?;
+        if inputs.len() != 4 && inputs.len() != 6 {
+            return Err(ResourceViolation::HostResourcePlanning {
+                name: "FlashInferAttention input arity",
+            });
+        }
+        let dtype = FlashInferDType::from_dtype(self.dtype).ok_or(
+            ResourceViolation::HostResourcePlanning {
+                name: "FlashInferAttention dtype",
+            },
+        )?;
+        let kv_dim = self.num_kv_heads.checked_mul(self.head_dim).ok_or(
+            ResourceViolation::ArithmeticOverflow {
+                resource: "FlashInfer KV width",
+            },
+        )?;
+        let kv_bytes =
+            kv_dim
+                .checked_mul(dtype.size_of())
+                .ok_or(ResourceViolation::ArithmeticOverflow {
+                    resource: "FlashInfer KV row bytes",
+                })?;
+        let k_bytes = buffer_lengths.get(&inputs[1]).copied().ok_or(
+            ResourceViolation::HostResourcePlanning {
+                name: "FlashInfer K-cache length",
+            },
+        )?;
+        let v_bytes = buffer_lengths.get(&inputs[2]).copied().ok_or(
+            ResourceViolation::HostResourcePlanning {
+                name: "FlashInfer V-cache length",
+            },
+        )?;
+        let max_kv_pages = k_bytes
+            .checked_div(kv_bytes)
+            .zip(v_bytes.checked_div(kv_bytes))
+            .map(|(k_pages, v_pages)| k_pages.min(v_pages).max(c))
+            .unwrap_or(c);
+        let explicit_indptr = inputs.len() == 6;
+        let batch_size = if explicit_indptr {
+            dyn_map
+                .get(&'r')
+                .copied()
+                .ok_or(ResourceViolation::UnresolvedExpression {
+                    resource: "FlashInfer indptr rows",
+                })?
+                .saturating_sub(1)
+        } else if total_q_tokens > 1 && dtype.supports_prefill() {
+            1
+        } else {
+            total_q_tokens
+        };
+        let sm_scale = if self.sm_scale == 0.0 {
+            1.0 / (self.head_dim as f32).sqrt()
+        } else {
+            self.sm_scale as f32
+        };
+        let mut spec = FlashInferDecodeSpec {
+            total_q_tokens,
+            batch_size,
+            c,
+            num_qo_heads: self.num_qo_heads,
+            num_kv_heads: self.num_kv_heads,
+            page_size: self.page_size,
+            head_dim: self.head_dim,
+            kv_dim,
+            max_kv_pages,
+            dtype,
+            sm_scale_bits: sm_scale.to_bits(),
+            window_left: self.window_left as i32,
+            kv_indptr_host: Vec::new(),
+            qo_indptr_host: Vec::new(),
+        };
+        if enable_cuda_graph && !explicit_indptr && total_q_tokens == 1 {
+            let plan_c = flashinfer_graph_plan_capacity(c, max_kv_pages);
+            spec.c = plan_c;
+            spec.kv_indptr_host = vec![0, plan_c as i32];
+        }
+        Ok(FlashInferDeviceResourceSpec {
+            cache_key: FlashInferPrepareKey::for_inputs(spec.clone(), inputs),
+            spec,
+            explicit_qo_indptr: explicit_indptr,
+            explicit_kv_indptr: explicit_indptr,
+            enable_cuda_graph,
+        })
     }
 
     pub(crate) fn resolve_for_graph(
@@ -667,10 +890,9 @@ impl PreparedFlashInferDecode {
     ///
     /// `include_metadata` controls whether the kv-metadata preparation kernel
     /// (indices/indptr/valid-mask derived from `gather_idx` + `current_c`) is
-    /// launched first. When several islands share one prepared plan (same
-    /// spec, same gather index), only the topologically-first owner needs to
-    /// launch it — the metadata buffers live in the shared workspaces and the
-    /// kernel only reads `plan_info`, never mutates it.
+    /// launched first. CUDA-graph callers that share prepared allocations set
+    /// this for every user: sharing is allowed only between dependency-ordered
+    /// users, so each refresh completes before that user consumes the buffers.
     pub(crate) fn enqueue(
         &self,
         stream: &Arc<CudaStream>,
@@ -685,7 +907,7 @@ impl PreparedFlashInferDecode {
 
         let mut plan_info = self.plan_info.clone();
         if !include_metadata {
-            // Owner island already enqueued the metadata kernels this capture.
+            // A preceding dependency has already populated the metadata.
         } else if let Some(current_c_ptr) = self.current_c_ptr {
             unsafe {
                 (self.lib.prepare_decode_metadata)(
@@ -869,6 +1091,21 @@ impl HostOp for FlashInferAttention {
         (self.output_size() * self.dtype.bits()).ceil_div(8)
     }
 
+    fn device_memory_plan(
+        &self,
+        _self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
+        let resource_spec = self.device_resource_spec(inputs, buffer_lengths, dyn_map, false)?;
+        Ok(HostDeviceMemoryPlan {
+            transient_peak_bytes: resource_spec.prepared_device_bytes()?,
+            shared_allocations: vec![shared_device_memory_allocation()],
+            ..Default::default()
+        })
+    }
+
     fn stats_name(&self) -> Option<&'static str> {
         Some("FlashInferAttention")
     }
@@ -883,9 +1120,6 @@ impl HostOp for FlashInferAttention {
 fn flashinfer_workspaces(
     stream: &Arc<CudaStream>,
 ) -> (&'static CudaSlice<u8>, u64, &'static CudaSlice<u8>, u64) {
-    static FLOAT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
-    static INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
-
     let float_ws = FLOAT_WORKSPACE
         .get_or_init(|| unsafe { stream.alloc::<u8>(FLOAT_WORKSPACE_SIZE).unwrap() });
     let int_ws =
@@ -927,4 +1161,115 @@ unsafe fn cuda_pin_memory(ptr: *mut std::ffi::c_void, size: usize) -> i32 {
     let f: HostRegisterFn = unsafe { std::mem::transmute(raw) };
     // cudaHostRegisterDefault = 0
     unsafe { f(ptr, size, 0) }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use itertools::Itertools;
+
+    #[test]
+    fn device_resource_spec_is_pointer_free_and_capacity_adjusted() {
+        let attention = FlashInferAttention {
+            num_qo_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 64,
+            page_size: 1,
+            batch_dim: 1.into(),
+            dtype: DType::F16,
+            sm_scale: 0.0,
+            window_left: -1,
+            plan_info: Mutex::new(Vec::new()),
+        };
+        let inputs = (0..4).map(NodeIndex::new).collect_vec();
+        let kv_row_bytes = 2 * 64 * 2;
+        let lengths = FxHashMap::from_iter([
+            (inputs[1], 4096 * kv_row_bytes),
+            (inputs[2], 4096 * kv_row_bytes),
+        ]);
+        let dyn_map = FxHashMap::from_iter([('c', 100)]);
+        let resident_before = resident_shared_device_memory_allocations();
+
+        let spec = attention
+            .device_resource_spec(&inputs, &lengths, &dyn_map, true)
+            .unwrap();
+        let mut other_metadata_inputs = inputs.clone();
+        other_metadata_inputs[3] = NodeIndex::new(99);
+        let other_spec = attention
+            .device_resource_spec(&other_metadata_inputs, &lengths, &dyn_map, true)
+            .unwrap();
+
+        assert_eq!(resident_shared_device_memory_allocations(), resident_before);
+        assert!(spec.cache_key.is_some());
+        assert_ne!(spec.cache_key, other_spec.cache_key);
+        // Capacity tier 256: kv indptr (8), current-c (4), indices
+        // (1024), last-page length (4), and temporary output (512).
+        assert_eq!(spec.prepared_device_bytes().unwrap(), 1_552);
+        assert_eq!(shared_device_memory_allocation().bytes, 136 * 1024 * 1024);
+    }
+
+    #[test]
+    fn device_resource_spec_uses_context_for_uninstalled_cache_sentinels() {
+        let attention = FlashInferAttention {
+            num_qo_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 64,
+            page_size: 1,
+            batch_dim: 1.into(),
+            dtype: DType::F16,
+            sm_scale: 0.0,
+            window_left: -1,
+            plan_info: Mutex::new(Vec::new()),
+        };
+        let inputs = (0..4).map(NodeIndex::new).collect_vec();
+        let dyn_map = FxHashMap::from_iter([('c', 100)]);
+        let uninstalled_lengths = FxHashMap::from_iter([(inputs[1], 0), (inputs[2], 0)]);
+
+        let spec = attention
+            .device_resource_spec(&inputs, &uninstalled_lengths, &dyn_map, true)
+            .unwrap();
+
+        assert_eq!(spec.spec.max_kv_pages, 100);
+        assert_eq!(spec.spec.c, 100);
+        assert_eq!(spec.prepared_device_bytes().unwrap(), 928);
+        assert_eq!(
+            attention
+                .device_resource_spec(&inputs, &FxHashMap::default(), &dyn_map, true)
+                .unwrap_err(),
+            ResourceViolation::HostResourcePlanning {
+                name: "FlashInfer K-cache length"
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_indptr_resource_specs_do_not_assume_cache_sharing() {
+        let attention = FlashInferAttention {
+            num_qo_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 64,
+            page_size: 1,
+            batch_dim: 2.into(),
+            dtype: DType::F16,
+            sm_scale: 0.0,
+            window_left: -1,
+            plan_info: Mutex::new(Vec::new()),
+        };
+        let inputs = (0..6).map(NodeIndex::new).collect_vec();
+        let kv_row_bytes = 2 * 64 * 2;
+        let lengths = FxHashMap::from_iter([
+            (inputs[1], 4096 * kv_row_bytes),
+            (inputs[2], 4096 * kv_row_bytes),
+        ]);
+        let dyn_map = FxHashMap::from_iter([('c', 100), ('r', 3)]);
+
+        let spec = attention
+            .device_resource_spec(&inputs, &lengths, &dyn_map, true)
+            .unwrap();
+
+        assert!(spec.cache_key.is_none());
+        // No owned indptrs: indices (400), two last-page lengths (8),
+        // and temporary output (1024).
+        assert_eq!(spec.prepared_device_bytes().unwrap(), 1_432);
+    }
 }

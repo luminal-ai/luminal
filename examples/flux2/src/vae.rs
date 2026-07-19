@@ -750,8 +750,7 @@ mod tests {
             },
         );
 
-        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
-        let mut rt = cx.search(ReferenceRuntime::default(), one_search());
+        let mut rt = cx.compile(ReferenceRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
@@ -769,8 +768,7 @@ mod tests {
         let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 - 11.0).collect();
         let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
 
-        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
-        let mut rt = cx.search(ReferenceRuntime::default(), one_search());
+        let mut rt = cx.compile(ReferenceRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.execute(&cx.dyn_map);
 
@@ -791,10 +789,9 @@ mod tests {
         let input: Vec<f32> = (0..2 * 3 * 4).map(|i| i as f32 - 11.0).collect();
         let expected = reference_nearest_upsample_2x(&input, 2, 3, 4);
 
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut rt = CudaRuntime::initialize(ctx.default_stream());
         rt.set_data(input_t, input);
-        rt = cx.search(rt, one_search());
+        rt = cx.compile(rt, one_search());
         rt.execute(&cx.dyn_map);
 
         assert_close(&rt.get_f32(out.id), &expected);
@@ -824,8 +821,7 @@ mod tests {
             },
         );
 
-        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
-        let mut rt = cx.search(ReferenceRuntime::default(), one_search());
+        let mut rt = cx.compile(ReferenceRuntime::default(), one_search());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
@@ -863,12 +859,11 @@ mod tests {
             },
         );
 
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut rt = CudaRuntime::initialize(ctx.default_stream());
         rt.set_data(input_t, input);
         rt.set_data(weight_t, weight);
         rt.set_data(bias_t, bias);
-        rt = cx.search(rt, one_search());
+        rt = cx.compile(rt, one_search());
         rt.execute(&cx.dyn_map);
 
         assert_close(&rt.get_f32(out.id), &expected);

@@ -6,8 +6,10 @@ extern crate self as luminal_cuda_lite;
 pub mod dyn_backend;
 pub mod host;
 pub mod kernel;
+mod resource;
 pub mod runtime;
 use std::{
+    cell::Cell,
     ffi::{CStr, CString},
     path::Path,
     sync::Arc,
@@ -29,6 +31,50 @@ use cudarc::{
     },
 };
 use luminal::dtype::DType;
+
+thread_local! {
+    /// Compilation is synchronous, so a thread-local budget lets each runtime
+    /// control its own NVRTC safety limit without leaking policy across
+    /// concurrent searches. Direct kernel compilation keeps the safe default.
+    static KERNEL_SOURCE_LIMIT_BYTES: Cell<Option<usize>> =
+        const { Cell::new(Some(resource::DEFAULT_MAX_KERNEL_SOURCE_BYTES)) };
+}
+
+struct KernelSourceLimitGuard {
+    previous: Option<usize>,
+}
+
+impl Drop for KernelSourceLimitGuard {
+    fn drop(&mut self) {
+        KERNEL_SOURCE_LIMIT_BYTES.with(|limit| limit.set(self.previous));
+    }
+}
+
+pub(crate) fn with_kernel_source_limit<T>(limit: Option<usize>, compile: impl FnOnce() -> T) -> T {
+    let previous = KERNEL_SOURCE_LIMIT_BYTES.with(|current| current.replace(limit));
+    let _guard = KernelSourceLimitGuard { previous };
+    compile()
+}
+
+fn kernel_source_limit() -> Option<usize> {
+    KERNEL_SOURCE_LIMIT_BYTES.with(Cell::get)
+}
+
+#[cfg(test)]
+mod kernel_source_limit_tests {
+    use super::*;
+
+    #[test]
+    fn source_limit_is_scoped_and_nestable() {
+        let initial = kernel_source_limit();
+        with_kernel_source_limit(Some(64), || {
+            assert_eq!(kernel_source_limit(), Some(64));
+            with_kernel_source_limit(None, || assert_eq!(kernel_source_limit(), None));
+            assert_eq!(kernel_source_limit(), Some(64));
+        });
+        assert_eq!(kernel_source_limit(), initial);
+    }
+}
 
 fn cuda_dtype(dtype: DType) -> &'static str {
     match dtype {
@@ -131,7 +177,60 @@ fn cuda_nvrtc_include_paths() -> Vec<String> {
             include_paths.push(path);
         }
     }
+
+    // NVRTC parses the CUDA headers itself, so using headers from a newer
+    // toolkit than the dynamically loaded compiler can make otherwise-valid
+    // kernels fail before code generation (FP8 headers are particularly
+    // sensitive to this). Prefer the include tree whose CUDA_VERSION matches
+    // the loaded NVRTC, while preserving the configured order as a tie-break.
+    if let Some(nvrtc_version) = loaded_nvrtc_version() {
+        include_paths.sort_by_key(|path| {
+            cuda_header_version(path)
+                .map(|header_version| header_version.abs_diff(nvrtc_version))
+                .unwrap_or(u32::MAX)
+        });
+    }
     include_paths
+}
+
+fn loaded_nvrtc_version() -> Option<u32> {
+    let (mut major, mut minor) = (0, 0);
+    unsafe { nvrtc_sys::nvrtcVersion(&mut major, &mut minor) }
+        .result()
+        .ok()?;
+    Some((major as u32) * 1000 + (minor as u32) * 10)
+}
+
+fn cuda_header_version(include_path: &str) -> Option<u32> {
+    let header = std::fs::read_to_string(Path::new(include_path).join("cuda.h")).ok()?;
+    parse_cuda_header_version(&header)
+}
+
+fn parse_cuda_header_version(header: &str) -> Option<u32> {
+    header.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("#define"), Some("CUDA_VERSION"), Some(version)) => version.parse().ok(),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod nvrtc_header_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cuda_version_define() {
+        assert_eq!(
+            parse_cuda_header_version("#pragma once\n#define CUDA_VERSION 12080\n"),
+            Some(12080)
+        );
+        assert_eq!(
+            parse_cuda_header_version("#define SOMETHING_ELSE 1\n"),
+            None
+        );
+    }
 }
 
 fn cuda_driver_diagnostics() -> (Option<i32>, Option<i32>) {
@@ -283,14 +382,14 @@ pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
     let target_arch = format!("sm_{major}{minor}");
     let nvrtc_options = cuda_nvrtc_compile_options(&target_arch);
 
-    // nvrtc compile time grows super-linearly with source size; pathological
-    // fusion-region candidates have produced multi-megabyte kernels that sit
-    // in nvrtcCompileProgram for an hour. Reject them as candidates instead
-    // of compiling (the search treats the panic as an invalid genome).
-    const MAX_KERNEL_SOURCE_BYTES: usize = 512 * 1024;
+    // NVRTC compile time grows super-linearly with source size. The active
+    // runtime installs its configured budget around compilation; direct calls
+    // use the default safety budget.
     let src_len = src.as_ref().len();
-    if src_len > MAX_KERNEL_SOURCE_BYTES {
-        panic!("kernel source too large for nvrtc ({src_len} bytes > {MAX_KERNEL_SOURCE_BYTES})");
+    if let Some(limit) = kernel_source_limit()
+        && src_len > limit
+    {
+        panic!("kernel source too large for nvrtc ({src_len} bytes > {limit})");
     }
     if src_len > 128 * 1024 {
         eprintln!("nvrtc: compiling a large kernel ({src_len} bytes)");

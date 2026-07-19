@@ -12,12 +12,15 @@
 //!
 //! Layout: x `(S, H, D)`, cos/sin `(S, D)` (broadcast across H).
 
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
-    dtype::DType, op::CustomOp, op::LLIROp, prelude::FxHashMap, prelude::FxHashSet,
-    prelude::GraphTensor, shape::Expression,
+    dtype::DType,
+    egglog_utils::list_to_egglog,
+    op::{CustomOp, HLIROp, LLIROp},
+    prelude::{FxHashMap, FxHashSet, GraphTensor, NodeIndex, ShapeTracker},
+    shape::Expression,
 };
 
 use crate::compile_module_image_for_current_device;
@@ -99,7 +102,7 @@ extern "C" __global__ void rope_kernel(
         (
             func,
             module,
-            "rope_kernel".to_string(),
+            kernel,
             (
                 Expression::from(s * h),
                 Expression::from(1usize),
@@ -215,6 +218,117 @@ pub struct RoPEHalfKernel {
     pub dtype: DType,
 }
 
+impl Default for RoPEHalfKernel {
+    fn default() -> Self {
+        Self {
+            s: 1.into(),
+            h: 1,
+            d: 2,
+            pitch: 2,
+            offset: 0,
+            dtype: DType::F32,
+        }
+    }
+}
+
+impl Display for RoPEHalfKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RoPEHalf")
+    }
+}
+
+impl HLIROp for RoPEHalfKernel {
+    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
+        assert_eq!(inputs.len(), 3, "RoPEHalf has x, cos, and sin inputs");
+        format!(
+            "(Op (KernelRoPEHalf {} {} {} {} {} {} ({:?})) {})",
+            self.s.to_egglog(),
+            Expression::from(self.h).to_egglog(),
+            Expression::from(self.d).to_egglog(),
+            Expression::from(self.h * self.d).to_egglog(),
+            Expression::from(self.pitch).to_egglog(),
+            Expression::from(self.offset).to_egglog(),
+            self.dtype,
+            list_to_egglog(&[&inputs[0].1, &inputs[1].1, &inputs[2].1], "ICons", "INil"),
+        )
+    }
+}
+
+impl EgglogOp for RoPEHalfKernel {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelRoPEHalf",
+            &[
+                ("s", EXPRESSION),
+                ("h", EXPRESSION),
+                ("d", EXPRESSION),
+                ("out_width", EXPRESSION),
+                ("pitch", EXPRESSION),
+                ("offset", EXPRESSION),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        3
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![Rule::raw(
+            "(rule
+                ((= ?rope (Op (KernelRoPEHalf ?s ?h ?d ?out_width ?pitch ?offset ?dt) ?inputs)))
+                ((set (dtype ?rope) ?dt))
+                :ruleset dtype_prop
+                :name \"kernel-rope-half-dtype\"
+            )",
+        )]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let s = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
+        let h = extract_expr(egraph, kind_children[1], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf h must be static");
+        let d = extract_expr(egraph, kind_children[2], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf d must be static");
+        let pitch = extract_expr(egraph, kind_children[4], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf pitch must be static");
+        let offset = extract_expr(egraph, kind_children[5], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf offset must be static");
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                s,
+                h,
+                d,
+                pitch,
+                offset,
+                dtype: extract_dtype(egraph, kind_children[6]),
+            }) as Box<dyn KernelOp>),
+            input_enodes,
+        )
+    }
+}
+
 impl KernelOp for RoPEHalfKernel {
     fn compile(
         &self,
@@ -283,7 +397,7 @@ extern "C" __global__ void rope_half_kernel(
         (
             func,
             module,
-            "rope_half_kernel".to_string(),
+            kernel,
             (
                 self.s * self.h,
                 Expression::from(1usize),
@@ -367,19 +481,22 @@ pub fn apply_rope_half(
         dtype: x.dtype,
     };
     let cx = unsafe { &mut *x.graph_ref };
-
-    cx.custom_op(RoPEHalfCustom(kern), vec![x, cos, sin], (s, h * d), x.dtype)
+    let id = cx.add_op(kern, &[x.id, cos.id, sin.id]);
+    GraphTensor::from_id(
+        id,
+        ShapeTracker::new_with_element_bits((s, h * d), x.dtype.bits()),
+        cx,
+        x.dtype,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════
 // Fused RoPE + KV-cache scatter
 //
-// The K head group's rope output is consumed by exactly one op: the in-place
-// scatter into the cache pool. Fusing them writes the rotated values straight
-// to their cache slots, removing one kernel launch and one (s, kv_dim)
-// intermediate buffer per layer. Created by `fuse_rope_scatter`, an LLIR
-// peephole that runs on every loaded graph (search candidates included), so
-// it only fires when the search actually selected the in-place scatter.
+// The fused kernels below are selectable egglog alternatives to materialized
+// RoPE followed by in-place scatter. They write rotated values straight to the
+// cache slots, removing one launch and one `(s, kv_dim)` temporary when measured
+// search selects them. The materialized form remains in the same e-class.
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
@@ -390,6 +507,133 @@ pub struct RoPEScatterKernel {
     /// Flattened scatter-index expression over `z`, where `z` is the element
     /// position in the rope output's contiguous (s, h·d) layout.
     idx_flat: Expression,
+}
+
+impl Default for RoPEScatterKernel {
+    fn default() -> Self {
+        Self {
+            rope: RoPEHalfKernel::default(),
+            dest_size: 1.into(),
+            idx_flat: Expression::from('z'),
+        }
+    }
+}
+
+impl EgglogOp for RoPEScatterKernel {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelRoPEHalfScatter",
+            &[
+                ("s", EXPRESSION),
+                ("h", EXPRESSION),
+                ("d", EXPRESSION),
+                ("out_width", EXPRESSION),
+                ("pitch", EXPRESSION),
+                ("offset", EXPRESSION),
+                ("dest_shape", ELIST),
+                ("index_shape", ELIST),
+                ("index_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        5
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![Rule::raw(
+            "(rule
+                (
+                    ; The source grid is exactly RoPEHalf's contiguous
+                    ; `(s, out_width)` output. `out_width` is emitted by the
+                    ; RoPEHalf HLIROp as the derived `h*d` semantic field.
+                    (= ?index_shape (ECons ?s (ECons ?out_width (ENil))))
+                    (= ?src_strides
+                        (ECons (MMul (MIter) ?out_width)
+                            (ECons (MIter) (ENil))))
+                    (= ?dest_strides ?out_strides)
+                    (= ?rope (Op
+                        (KernelRoPEHalf ?s ?h ?d ?out_width ?pitch ?offset ?dt)
+                        (ICons ?x (ICons ?cos (ICons ?sin (INil))))))
+                    (= ?dt (dtype ?x))
+                    (= ?dt (dtype ?dest))
+                    (= (Int) (dtype ?indexes))
+                    (= (F32) (dtype ?cos))
+                    (= (F32) (dtype ?sin))
+                    (= ?scatter (Op
+                        (KernelScatterNoCopy ?dest_shape ?dest_strides
+                            ?index_shape ?index_strides ?src_strides ?out_strides ?dt)
+                        (ICons ?dest (ICons ?indexes (ICons ?rope (INil))))))
+                )
+                (
+                    (let ?fused (Op
+                        (KernelRoPEHalfScatter ?s ?h ?d ?out_width ?pitch ?offset
+                            ?dest_shape ?index_shape ?index_strides ?dt)
+                        (ICons ?dest (ICons ?indexes
+                            (ICons ?x (ICons ?cos (ICons ?sin (INil))))))))
+                    (union ?scatter ?fused)
+                    (set (dtype ?fused) ?dt)
+                )
+                :ruleset kernel_fuse_late2
+                :name \"kernel rope-half scatter exact-layout\"
+            )",
+        )]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let s = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
+        let h = extract_expr(egraph, kind_children[1], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf h must be static");
+        let d = extract_expr(egraph, kind_children[2], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf d must be static");
+        let pitch = extract_expr(egraph, kind_children[4], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf pitch must be static");
+        let offset = extract_expr(egraph, kind_children[5], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPEHalf offset must be static");
+        let dest_shape =
+            extract_expr_list(egraph, kind_children[6], list_cache, expr_cache).unwrap();
+        let index_shape =
+            extract_expr_list(egraph, kind_children[7], list_cache, expr_cache).unwrap();
+        let index_strides =
+            extract_expr_list(egraph, kind_children[8], list_cache, expr_cache).unwrap();
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                rope: RoPEHalfKernel {
+                    s,
+                    h,
+                    d,
+                    pitch,
+                    offset,
+                    dtype: extract_dtype(egraph, kind_children[9]),
+                },
+                dest_size: dest_shape.into_iter().product(),
+                idx_flat: luminal::shape::flatten_strides(&index_shape, &index_strides),
+            }) as Box<dyn KernelOp>),
+            input_enodes,
+        )
+    }
 }
 
 impl KernelOp for RoPEScatterKernel {
@@ -532,6 +776,10 @@ extern "C" __global__ void rope_scatter_kernel(
         Some(0)
     }
 
+    fn mutates_aliased_input(&self) -> bool {
+        true
+    }
+
     fn all_dyn_vars(&self) -> FxHashSet<char> {
         self.idx_flat
             .dyn_vars()
@@ -571,243 +819,6 @@ extern "C" __global__ void rope_scatter_kernel(
     }
 }
 
-/// LLIR peephole: fuse `RoPEHalfKernel → KernelScatterNoCopy` pairs into one
-/// [`RoPEScatterKernel`] that rotates and writes straight into the cache pool.
-///
-/// Fires only when (all checked structurally, otherwise the pair is left
-/// untouched):
-/// - the scatter is the rope output's only consumer,
-/// - the scatter reads its source contiguously (identity layout over the
-///   rope output),
-/// - the scatter index grid matches the rope output shape `(s, h·d)`,
-/// - dtypes agree.
-///
-/// Returns `None` when nothing fused (callers keep the original graph).
-/// Count of rope→scatter pairs fused so far (test/debug introspection).
-pub static ROPE_SCATTER_FUSIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-pub(crate) fn fuse_rope_scatter(
-    llir: &luminal::prelude::LLIRGraph,
-) -> Option<luminal::prelude::LLIRGraph> {
-    use crate::kernel::other_ops::KernelScatterNoCopy;
-    use luminal::prelude::petgraph::{Direction, visit::EdgeRef};
-    use luminal::shape::flatten_strides;
-
-    let sorted_inputs = |graph: &luminal::prelude::LLIRGraph,
-                         node: luminal::prelude::NodeIndex|
-     -> Vec<luminal::prelude::NodeIndex> {
-        let mut edges: Vec<_> = graph
-            .edges_directed(node, Direction::Incoming)
-            .map(|e| (e.id(), e.source()))
-            .collect();
-        edges.sort_by_key(|(id, _)| *id);
-        edges.into_iter().map(|(_, source)| source).collect()
-    };
-
-    let mut fusions: FxHashMap<luminal::prelude::NodeIndex, (luminal::prelude::NodeIndex, LLIROp)> =
-        FxHashMap::default();
-    let mut fused_ropes: FxHashSet<luminal::prelude::NodeIndex> = FxHashSet::default();
-
-    for node in llir.node_indices() {
-        let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() else {
-            continue;
-        };
-        let Some(scatter) = kernel
-            .as_ref()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<KernelScatterNoCopy>()
-        else {
-            continue;
-        };
-        let inputs = sorted_inputs(llir, node);
-        if inputs.len() != 3 {
-            continue;
-        }
-        let src = inputs[2];
-        if fused_ropes.contains(&src) {
-            continue;
-        }
-        let Some(src_kernel) = llir[src].to_dialect::<dyn KernelOp>() else {
-            continue;
-        };
-        let Some(rope) = src_kernel
-            .as_ref()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<RoPEHalfKernel>()
-        else {
-            continue;
-        };
-        // The scatter must be the rope's only consumer.
-        if llir.edges_directed(src, Direction::Outgoing).count() != 1 {
-            continue;
-        }
-        if scatter.dtype != rope.dtype {
-            continue;
-        }
-        // Scatter grid must be the rope output shape (s, h·d)…
-        if scatter.index_shape.len() != 2
-            || scatter.index_shape[1].to_usize() != Some(rope.h * rope.d)
-            || scatter.index_shape[0].simplify() != rope.s.simplify()
-        {
-            continue;
-        }
-        // …read contiguously (identity layout over the rope output).
-        let z = Expression::from('z');
-        let contig: Vec<Expression> = (0..scatter.index_shape.len())
-            .map(|i| {
-                scatter.index_shape[i + 1..]
-                    .iter()
-                    .copied()
-                    .product::<Expression>()
-                    * z
-            })
-            .collect();
-        let src_flat = flatten_strides(&scatter.index_shape, &scatter.src_strides).simplify();
-        let contig_flat = flatten_strides(&scatter.index_shape, &contig).simplify();
-        if src_flat != contig_flat {
-            continue;
-        }
-
-        let fused = RoPEScatterKernel {
-            rope: rope.clone(),
-            dest_size: scatter.dest_shape.iter().copied().product(),
-            idx_flat: flatten_strides(&scatter.index_shape, &scatter.index_strides),
-        };
-        fusions.insert(
-            node,
-            (
-                src,
-                LLIROp::new::<dyn KernelOp>(Box::new(fused) as Box<dyn KernelOp>),
-            ),
-        );
-        fused_ropes.insert(src);
-    }
-
-    // Second arm: KernelRoPE (egglog-fused rotary, (heads, seq, hd) buffer)
-    // whose sole consumer is the cache scatter reading it through the
-    // (s, heads*hd) deinterleave view.
-    for node in llir.node_indices() {
-        if fusions.contains_key(&node) {
-            continue;
-        }
-        let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() else {
-            continue;
-        };
-        let Some(scatter) = kernel
-            .as_ref()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<KernelScatterNoCopy>()
-        else {
-            continue;
-        };
-        let inputs = sorted_inputs(llir, node);
-        if inputs.len() != 3 {
-            continue;
-        }
-        let src = inputs[2];
-        if fused_ropes.contains(&src) {
-            continue;
-        }
-        let Some(src_kernel) = llir[src].to_dialect::<dyn KernelOp>() else {
-            continue;
-        };
-        let Some(rope) = src_kernel
-            .as_ref()
-            .as_ref()
-            .as_any()
-            .downcast_ref::<KernelRoPE>()
-        else {
-            continue;
-        };
-        if llir.edges_directed(src, Direction::Outgoing).count() != 1 {
-            continue;
-        }
-        if scatter.dtype != DType::Bf16 {
-            continue;
-        }
-        let heads = rope.out_shape[0];
-        let seq = rope.out_shape[1];
-        let hd = rope.out_shape[2];
-        let kvd = (heads * hd).simplify();
-        // Index grid must be the (s, heads*hd) deinterleaved layout…
-        if scatter.index_shape.len() != 2
-            || scatter.index_shape[1].simplify() != kvd
-            || scatter.index_shape[0].simplify() != seq.simplify()
-        {
-            continue;
-        }
-        // …and the source must be read through exactly the deinterleave view
-        // of the (heads, seq, hd) rope buffer: offset(s_i, c) =
-        // (c/hd)·hd·seq + s_i·hd + c%hd.
-        let z = Expression::from('z');
-        // NB: association order must match the emission exactly —
-        // `simplify()` does not canonicalize Mul associativity, so
-        // ((z/hd)*hd)*seq matches but (z/hd)*(hd*seq) does not.
-        let expected = vec![z * hd, ((z / hd) * hd) * seq + z % hd];
-        let src_flat = flatten_strides(&scatter.index_shape, &scatter.src_strides).simplify();
-        let expected_flat = flatten_strides(&scatter.index_shape, &expected).simplify();
-        if src_flat != expected_flat {
-            continue;
-        }
-
-        let fused = KernelRoPEScatterFused {
-            rope: rope.clone(),
-            dest_size: scatter.dest_shape.iter().copied().product(),
-            idx_flat: flatten_strides(&scatter.index_shape, &scatter.index_strides),
-        };
-        fusions.insert(
-            node,
-            (
-                src,
-                LLIROp::new::<dyn KernelOp>(Box::new(fused) as Box<dyn KernelOp>),
-            ),
-        );
-        fused_ropes.insert(src);
-    }
-
-    if fusions.is_empty() {
-        return None;
-    }
-    ROPE_SCATTER_FUSIONS.fetch_add(fusions.len(), std::sync::atomic::Ordering::Relaxed);
-
-    // Rebuild the graph so per-node input-edge id order stays deterministic
-    // (StableGraph reuses freed edge ids, so in-place edge surgery would
-    // scramble the sorted-by-edge-id input convention).
-    let mut new = luminal::prelude::LLIRGraph::default();
-    let mut map: FxHashMap<luminal::prelude::NodeIndex, luminal::prelude::NodeIndex> =
-        FxHashMap::default();
-    for node in llir.node_indices() {
-        if fused_ropes.contains(&node) {
-            continue;
-        }
-        let weight = fusions
-            .get(&node)
-            .map(|(_, op)| op.clone())
-            .unwrap_or_else(|| llir[node].clone());
-        map.insert(node, new.add_node(weight));
-    }
-    for node in llir.node_indices() {
-        if fused_ropes.contains(&node) {
-            continue;
-        }
-        let mut inputs = sorted_inputs(llir, node);
-        if let Some((rope_node, _)) = fusions.get(&node) {
-            let rope_inputs = sorted_inputs(llir, *rope_node);
-            // (dest, idx, rope) → (dest, idx, <rope inputs…>):
-            // RoPEHalfKernel contributes (x, cos, sin); KernelRoPE (x, pos).
-            inputs = [&inputs[..2], &rope_inputs[..]].concat();
-        }
-        for input in inputs {
-            new.add_edge(map[&input], map[&node], ());
-        }
-    }
-    Some(new)
-}
-
 // ═══════════════════════════════════════════════════════════
 // KernelRoPE — egglog-matched fused rotary (half convention, bf16).
 //
@@ -842,8 +853,8 @@ pub struct KernelRoPE {
 use luminal::{
     egglog_utils::{
         api::{Rule, SortDef, sort},
-        base::{ELIST, EXPRESSION, F64, OP_KIND},
-        extract_expr, extract_expr_list,
+        base::{DTYPE, ELIST, EXPRESSION, F64, OP_KIND},
+        extract_dtype, extract_expr, extract_expr_list,
     },
     op::EgglogOp,
     prelude::{ENodeId, SerializedEGraph},
@@ -856,6 +867,8 @@ impl EgglogOp for KernelRoPE {
             "KernelRoPE",
             &[
                 ("out_shape", ELIST),
+                ("out_width", EXPRESSION),
+                ("head_stride", EXPRESSION),
                 ("width", EXPRESSION),
                 ("ln_theta", F64),
                 ("inv_hd", F64),
@@ -1033,7 +1046,8 @@ impl EgglogOp for KernelRoPE {
                     {}
                 )
                 (
-                    (let ?kr (Op (KernelRoPE ?a3_sh ?e_w ?ln_theta ?inv_hd)
+                    (let ?kr (Op (KernelRoPE ?a3_sh (MMul ?heads ?e_hd)
+                        (MMul ?e_hd ?e_seq) ?e_w ?ln_theta ?inv_hd)
                         (ICons ?x (ICons ?pos (INil)))))
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
@@ -1062,16 +1076,16 @@ impl EgglogOp for KernelRoPE {
     ) -> (LLIROp, Vec<&'a ENodeId>) {
         let out_shape =
             extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-        let width = extract_expr(egraph, kind_children[1], expr_cache)
+        let width = extract_expr(egraph, kind_children[3], expr_cache)
             .unwrap()
             .to_usize()
             .expect("RoPE width must be static");
-        let ln_theta: f64 = egraph.enodes[kind_children[2]]
+        let ln_theta: f64 = egraph.enodes[kind_children[4]]
             .0
             .replace('"', "")
             .parse()
             .unwrap();
-        let inv_hd: f64 = egraph.enodes[kind_children[3]]
+        let inv_hd: f64 = egraph.enodes[kind_children[5]]
             .0
             .replace('"', "")
             .parse()
@@ -1224,10 +1238,9 @@ extern \"C\" {{
 }
 
 // ═══════════════════════════════════════════════════════════
-// KernelRoPEScatterFused — LLIR peephole product: KernelRoPE whose sole
-// consumer is the KV-cache KernelScatterNoCopy reading the rope buffer
-// through the (s, heads·hd) deinterleave view. Rotates and writes straight
-// into the cache pool rows; output aliases the dest (input 0).
+// KernelRoPEScatterFused — egglog-selected alternative to KernelRoPE followed
+// by KernelScatterNoCopy through the exact `(s, heads*hd)` deinterleave view.
+// It rotates and writes straight into the cache pool; output aliases dest.
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
@@ -1238,6 +1251,131 @@ pub struct KernelRoPEScatterFused {
     /// Flattened scatter-index expression over `z`, where `z` is the element
     /// position in the (s, heads·hd) deinterleaved index grid.
     idx_flat: Expression,
+}
+
+impl Default for KernelRoPEScatterFused {
+    fn default() -> Self {
+        Self {
+            rope: KernelRoPE::default(),
+            dest_size: 1.into(),
+            idx_flat: Expression::from('z'),
+        }
+    }
+}
+
+impl EgglogOp for KernelRoPEScatterFused {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelRoPEScatterFused",
+            &[
+                ("out_shape", ELIST),
+                ("out_width", EXPRESSION),
+                ("head_stride", EXPRESSION),
+                ("width", EXPRESSION),
+                ("ln_theta", F64),
+                ("inv_hd", F64),
+                ("dest_shape", ELIST),
+                ("index_shape", ELIST),
+                ("index_strides", ELIST),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        4
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![Rule::raw(
+            "(rule
+                (
+                    (= ?out_shape
+                        (ECons ?heads (ECons ?seq (ECons ?hd (ENil)))))
+                    (= ?index_shape (ECons ?seq (ECons ?out_width (ENil))))
+                    ; Exact deinterleave view of KernelRoPE's physical
+                    ; `(heads, seq, hd)` output:
+                    ; (z/hd)*(hd*seq) + z%hd.
+                    (= ?src_strides
+                        (ECons (MMul (MIter) ?hd)
+                            (ECons
+                                (MAdd
+                                    (MMul (MDiv (MIter) ?hd) ?head_stride)
+                                    (MMod (MIter) ?hd))
+                                (ENil))))
+                    (= ?rope (Op
+                        (KernelRoPE ?out_shape ?out_width ?head_stride
+                            ?width ?ln_theta ?inv_hd)
+                        (ICons ?x (ICons ?pos (INil)))))
+                    (= ?scatter (Op
+                        (KernelScatterNoCopy ?dest_shape ?dest_strides
+                            ?index_shape ?index_strides ?src_strides ?out_strides (Bf16))
+                        (ICons ?dest (ICons ?indexes (ICons ?rope (INil))))))
+                    (= ?dest_strides ?out_strides)
+                    (= (Bf16) (dtype ?x))
+                    (= (Bf16) (dtype ?dest))
+                    (= (Int) (dtype ?indexes))
+                    (= (Int) (dtype ?pos))
+                )
+                (
+                    (let ?fused (Op
+                        (KernelRoPEScatterFused ?out_shape ?out_width ?head_stride
+                            ?width ?ln_theta ?inv_hd ?dest_shape ?index_shape ?index_strides)
+                        (ICons ?dest (ICons ?indexes (ICons ?x (ICons ?pos (INil)))))))
+                    (union ?scatter ?fused)
+                    (set (dtype ?fused) (Bf16))
+                )
+                :ruleset post_cleanup
+                :name \"kernel rope scatter exact-deinterleave\"
+            )",
+        )]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let out_shape =
+            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
+        let width = extract_expr(egraph, kind_children[3], expr_cache)
+            .unwrap()
+            .to_usize()
+            .expect("RoPE width must be static");
+        let parse_f64 = |child: &'a ENodeId| {
+            egraph.enodes[child]
+                .0
+                .replace('"', "")
+                .parse::<f64>()
+                .unwrap()
+        };
+        let dest_shape =
+            extract_expr_list(egraph, kind_children[6], list_cache, expr_cache).unwrap();
+        let index_shape =
+            extract_expr_list(egraph, kind_children[7], list_cache, expr_cache).unwrap();
+        let index_strides =
+            extract_expr_list(egraph, kind_children[8], list_cache, expr_cache).unwrap();
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                rope: KernelRoPE {
+                    out_shape,
+                    width,
+                    ln_theta: parse_f64(kind_children[4]),
+                    inv_hd: parse_f64(kind_children[5]),
+                },
+                dest_size: dest_shape.into_iter().product(),
+                idx_flat: luminal::shape::flatten_strides(&index_shape, &index_strides),
+            }) as Box<dyn KernelOp>),
+            input_enodes,
+        )
+    }
 }
 
 impl KernelOp for KernelRoPEScatterFused {
@@ -1367,6 +1505,10 @@ extern \"C\" {{
 
     fn output_aliases_input(&self) -> Option<usize> {
         Some(0)
+    }
+
+    fn mutates_aliased_input(&self) -> bool {
+        true
     }
 
     fn all_dyn_vars(&self) -> FxHashSet<char> {

@@ -11,8 +11,14 @@
 
 use half::bf16;
 use luminal::dtype::DType;
+use luminal::egglog_utils::{
+    NodeId, SerializedEGraph, egglog_to_llir, random_initial_choice, validate_choice_set,
+};
 use luminal::prelude::*;
+use rand::SeedableRng;
 
+use crate::kernel::KernelOp;
+use crate::resource::plan_static_llir_resources;
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::{
     TOLERANCE_SAFETY_FACTOR, assert_close, dtype_epsilon, fuzz_genomes, get_cuda_stream,
@@ -38,6 +44,95 @@ fn egraph_has_enode(cx: &Graph, label: &str, child_label: Option<&str>) -> bool 
                 .any(|n| egraph.enodes[n].0.contains(child_label))
         })
     })
+}
+
+pub(super) fn egraph_has_op_alternatives(cx: &Graph, kind_labels: &[&str]) -> bool {
+    let egraph = cx.egraph().expect("search space should be built");
+    egraph.eclasses.values().any(|(sort, nodes)| {
+        sort == "IR"
+            && kind_labels.iter().all(|kind_label| {
+                nodes.iter().any(|node| {
+                    let Some((label, children)) = egraph.enodes.get(node) else {
+                        return false;
+                    };
+                    label == "Op"
+                        && children.first().is_some_and(|kind_class| {
+                            egraph.eclasses[kind_class]
+                                .1
+                                .iter()
+                                .any(|kind_node| egraph.enodes[kind_node].0.as_str() == *kind_label)
+                        })
+                })
+            })
+    })
+}
+
+fn op_ir_nodes<'a>(egraph: &'a SerializedEGraph, kind_label: &str) -> Vec<&'a NodeId> {
+    egraph
+        .eclasses
+        .values()
+        .filter(|(sort, _)| sort == "IR")
+        .flat_map(|(_, nodes)| nodes)
+        .filter(|node| {
+            let Some((label, children)) = egraph.enodes.get(*node) else {
+                return false;
+            };
+            label == "Op"
+                && children.first().is_some_and(|kind_class| {
+                    egraph.eclasses[kind_class]
+                        .1
+                        .iter()
+                        .any(|kind_node| egraph.enodes[kind_node].0 == kind_label)
+                })
+        })
+        .collect()
+}
+
+pub(super) fn extract_forced_kernel_llir(
+    cx: &Graph,
+    egglog_kind: &str,
+    runtime_kernel_name: &str,
+) -> LLIRGraph {
+    let egraph = cx.egraph().expect("search space should be built");
+    let ops = cx.egglog_ops().expect("egglog ops should be built");
+    let kernel_nodes = op_ir_nodes(egraph, egglog_kind);
+    assert!(
+        !kernel_nodes.is_empty(),
+        "expected a {egglog_kind} alternative"
+    );
+
+    for (node_index, kernel_node) in kernel_nodes.iter().enumerate() {
+        for background in 0..64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(
+                0xA11C_E000 + (node_index as u64) * 64 + background,
+            );
+            let mut choices = random_initial_choice(egraph, &mut rng);
+            choices.insert(&egraph.node_to_class[*kernel_node], kernel_node);
+            if validate_choice_set(egraph, &choices, ops).is_err() {
+                continue;
+            }
+            let mut list_cache = Default::default();
+            let mut expr_cache = Default::default();
+            let llir = egglog_to_llir(
+                egraph,
+                choices,
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+            if llir.node_weights().any(|op| {
+                op.to_dialect::<dyn KernelOp>()
+                    .is_some_and(|kernel| kernel.kernel_name() == runtime_kernel_name)
+            }) && plan_static_llir_resources(&llir, &FxHashMap::default()).is_ok()
+            {
+                return llir;
+            }
+        }
+    }
+
+    panic!("could not extract a valid {egglog_kind} candidate");
 }
 
 #[test]
@@ -305,16 +400,19 @@ fn test_bf16_reciprocal_region_compiles() {
     assert_close(&result, &expected, tol, tol);
 }
 
-/// Regression test for the FS/FE extraction cycle created by the
-/// grow-FE-Cast + grow-Cast-FS pair before cleanup-nested-FS-FE-cast
-/// existed: f32 norm-style sandwiches between bf16 residuals
-/// congruence-merged an FS eclass with the FE eclass it wraps, and random
-/// extraction selected the 2-node cycle ~75% of the time.
+/// Growth keeps both materialized and absorbed FS/FE boundary choices. Some
+/// correlated choices form an LLIR cycle; reject those selected candidates
+/// without deleting the legal acyclic choices from the egraph.
 #[test]
-fn bf16_cast_sandwich_extraction_is_acyclic() {
-    use luminal::egglog_utils::{egglog_to_llir, random_initial_choice};
-    use luminal::prelude::petgraph::algo::toposort;
+fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
+    use luminal::egglog_utils::{
+        egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
+        validate_choice_set,
+    };
     use rand::SeedableRng;
+
+    use crate::resource::{ResourceViolation, plan_static_llir_resources};
+
     let mut cx = Graph::default();
     let a = cx.tensor((4, 64)).as_dtype(DType::Bf16);
     // Two f32 norm-ish sandwiches with bf16 residuals, mimicking llama layers.
@@ -327,25 +425,64 @@ fn bf16_cast_sandwich_extraction_is_acyclic() {
     let egraph = cx.egraph().unwrap();
     let ops = cx.egglog_ops().unwrap();
     let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+    let mut base = random_initial_choice(egraph, &mut rng);
+    let mut seen = FxHashSet::default();
+    seen.insert(hash_choice_set(&base));
     let mut cycles = 0;
-    for _ in 0..300 {
-        let choices = random_initial_choice(egraph, &mut rng);
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
-        if toposort(&llir, None).is_err() {
-            cycles += 1;
+    let mut acyclic = 0;
+    for _ in 0..100 {
+        let generation = extract_generation(egraph, &base, 16, 4, &mut seen, &mut rng);
+        if generation.is_empty() {
+            break;
+        }
+        for choices in generation {
+            match validate_choice_set(egraph, &choices, ops) {
+                Err(error) if error.contains("dependency cycle") => {
+                    cycles += 1;
+                    continue;
+                }
+                Err(_) => continue,
+                Ok(()) => {}
+            }
+
+            let mut list_cache = Default::default();
+            let mut expr_cache = Default::default();
+            let llir = egglog_to_llir(
+                egraph,
+                choices.clone(),
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+            match plan_static_llir_resources(&llir, &cx.dyn_map) {
+                Err(ResourceViolation::CyclicLlir) => {
+                    panic!("choice validation allowed a cyclic LLIR")
+                }
+                Err(ResourceViolation::InvalidFusionRegion { .. }) => {}
+                Ok(_) => {
+                    acyclic += 1;
+                    base = choices;
+                }
+                Err(other) => panic!("unexpected static candidate rejection: {other}"),
+            }
+            if cycles > 0 && acyclic > 0 {
+                break;
+            }
+        }
+        if cycles > 0 && acyclic > 0 {
+            break;
         }
     }
-    assert_eq!(cycles, 0, "extraction produced cyclic LLIR");
+    assert!(
+        cycles > 0,
+        "expected to exercise at least one cyclic choice"
+    );
+    assert!(
+        acyclic > 0,
+        "cycle validation must retain legal acyclic materialized/absorbed choices"
+    );
 }
 
 // ─── bf16 mini-transformer vs f32 reference ──────────────────────────────
@@ -666,6 +803,7 @@ fn pure_matmul_chain_cuda_graph_materializes() {
     };
     use rand::SeedableRng;
     const N: usize = 4096;
+    const TARGET_GENOMES: usize = 8;
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -742,8 +880,14 @@ fn pure_matmul_chain_cuda_graph_materializes() {
             "genome produced non-finite output"
         );
         tested += 1;
+        if tested == TARGET_GENOMES {
+            break;
+        }
     }
-    assert!(tested > 0, "no genomes were testable");
+    assert_eq!(
+        tested, TARGET_GENOMES,
+        "could not materialize the requested distinct genomes"
+    );
 }
 
 #[test]
@@ -911,6 +1055,23 @@ fn gemv_m1_matches_reference() {
     gemv_m1_case(384, 512, 0xA1);
 }
 
+#[test]
+fn gemv_m1_bf16_preserves_all_legal_backends() {
+    let mut cx = Graph::default();
+    let x = cx.tensor((1, 64)).as_dtype(DType::Bf16);
+    let w = cx.tensor((96, 64)).as_dtype(DType::Bf16);
+    x.matmul(w.t()).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(
+            &cx,
+            &["KernelSum", "GenericMatmul", "KernelGemv", "cublaslt"],
+        ),
+        "m=1 bf16 matmul should retain the lowered reduction, generic matmul, warp GEMV, and cuBLASLt choices in one output e-class"
+    );
+}
+
 #[allow(non_snake_case)]
 fn gemv_m1_case(n: usize, k: usize, seed: u64) {
     let K: usize = k;
@@ -979,7 +1140,7 @@ fn gemv_m1_case(n: usize, k: usize, seed: u64) {
 fn quant_f8_linear_chain_matches_reference() {
     // Mirrors llama's fp8 linear spelling with bf16 activations:
     //   q = Cast(F8)(Cast(F32)(x) / in_scale)            -> KernelQuantF8
-    //   y = Cast(Bf16)(Cast(F32)(q @ w.t()) * (in_scale * w_scale))
+    //   y = Cast(Bf16)((Cast(F32)(q) @ Cast(F32)(w.t())) * (in_scale * w_scale))
     // Data is restricted to exactly-representable fp8 values so the CPU
     // reference needs no fp8 rounding emulation: x/in_scale lands on
     // {-2,-1,-0.5,0,0.5,1,2}, products are multiples of 0.25, and the f32
@@ -1025,6 +1186,14 @@ fn quant_f8_linear_chain_matches_reference() {
         egraph_has_enode(&cx, "KernelGemvF8", None),
         "m=1 fp8 matmul + dequant chain should offer the tensor-core GEMV candidate"
     );
+    assert!(
+        egraph_has_op_alternatives(&cx, &["GenericMatmul", "cublaslt"]),
+        "the materialized F32-cast GenericMatmul and raw FP8 cuBLASLt must coexist"
+    );
+    assert!(
+        egraph_has_enode(&cx, "cublaslt_scaled", None),
+        "the scaled FP8 cuBLASLt candidate must coexist with raw and decomposed paths"
+    );
 
     let mut rt = CudaRuntime::initialize(stream.clone());
     let xb: Vec<bf16> = x_data.iter().map(|v| bf16::from_f32(*v)).collect();
@@ -1051,8 +1220,8 @@ fn quant_f8_linear_chain_matches_reference() {
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
     assert_close(&result[..N], &expected, tol, tol);
 
-    // Every candidate (scaled-fp8 cuBLASLt, quant-chain fallback, tensor-core
-    // GEMV) agrees on exactly-representable data.
+    // Every candidate (materialized-cast GenericMatmul, raw/scaled FP8
+    // cuBLASLt, and tensor-core GEMV) agrees on exactly-representable inputs.
     fuzz_genomes::<f32>(
         &cx,
         &stream,
@@ -1144,14 +1313,60 @@ fn gemv_f8_unaligned_shape_matches_reference() {
 }
 
 #[test]
+fn rope_half_scatter_fusion_requires_exact_shape_and_layout() {
+    use crate::kernel::rope::apply_rope_half;
+
+    const S: usize = 3;
+    const H: usize = 2;
+    const D: usize = 8;
+    const KVD: usize = H * D;
+    const PITCH: usize = 32;
+    let mut cx = Graph::default();
+    let x = cx.tensor((S, PITCH)).as_dtype(DType::Bf16);
+    let cos = cx.tensor((S, D / 2));
+    let sin = cx.tensor((S, D / 2));
+    let rope = apply_rope_half(x, 8, H, D, cos, sin);
+    let dest = cx.tensor((10, KVD)).as_dtype(DType::Bf16).persist();
+
+    // Same logical dimensions but a non-contiguous source view.
+    let z = Expression::from('z');
+    let wrong_layout = GraphTensor::from_id(
+        rope.id,
+        ShapeTracker::new_strided((S, KVD), (z, z * S)).with_element_bits(DType::Bf16.bits()),
+        rope.graph_ref,
+        rope.dtype,
+    );
+    let layout_indexes = cx.tensor((S, KVD)).as_dtype(DType::Int);
+    wrong_layout.scatter(layout_indexes, dest).output();
+
+    // Contiguous, but not RoPEHalf's declared `(s, out_width)` grid.
+    let wrong_shape = GraphTensor::from_id(
+        rope.id,
+        ShapeTracker::new_with_element_bits((1, S * KVD), DType::Bf16.bits()),
+        rope.graph_ref,
+        rope.dtype,
+    );
+    let shape_indexes = cx.tensor((1, S * KVD)).as_dtype(DType::Int);
+    wrong_shape.scatter(shape_indexes, dest).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_enode(&cx, "KernelRoPEHalfScatter", None),
+        "wrong source shape/layout must not create the fused alternative"
+    );
+    assert!(
+        egraph_has_enode(&cx, "KernelScatterNoCopy", None),
+        "the materialized no-copy scatter remains available"
+    );
+}
+
+#[test]
 fn rope_scatter_fusion_matches_reference() {
     // apply_rope_half on a head group inside a fused (s, pitch) row, scattered
-    // in place into a cache pool — the LLIR peephole fuses the pair into one
-    // RoPEScatter kernel. Checks both values (vs a CPU reference) and that the
-    // fusion actually engaged.
-    use crate::kernel::rope::{ROPE_SCATTER_FUSIONS, apply_rope_half};
+    // in place into a cache pool. Egglog keeps both materialized and fused
+    // representations available for measured search.
+    use crate::kernel::rope::apply_rope_half;
     use luminal_nn::scatter_rows;
-    use std::sync::atomic::Ordering;
 
     const S: usize = 3;
     const H: usize = 2;
@@ -1189,6 +1404,23 @@ fn rope_scatter_fusion_matches_reference() {
         .output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(&cx, &["KernelScatterNoCopy", "KernelRoPEHalfScatter"]),
+        "materialized and fused RoPEHalf+scatter must coexist"
+    );
+    let fused = extract_forced_kernel_llir(&cx, "KernelRoPEHalfScatter", "RoPEScatter");
+    assert!(fused.node_weights().any(|op| {
+        op.to_dialect::<dyn KernelOp>()
+            .is_some_and(|kernel| kernel.kernel_name() == "RoPEScatter")
+    }));
+    let materialized = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
+    let materialized_names: Vec<_> = materialized
+        .node_weights()
+        .filter_map(|op| op.to_dialect::<dyn KernelOp>())
+        .map(|kernel| kernel.kernel_name())
+        .collect();
+    assert!(materialized_names.contains(&"RoPEHalf"));
+    assert!(materialized_names.contains(&"ScatterNoCopy"));
 
     // CPU reference: rope the head group of each row, write to its slot.
     let mut expected: Vec<f32> = cache_data.clone();
@@ -1206,7 +1438,6 @@ fn rope_scatter_fusion_matches_reference() {
         }
     }
 
-    let fusions_before = ROPE_SCATTER_FUSIONS.load(Ordering::Relaxed);
     let xb: Vec<bf16> = x_data.iter().map(|v| bf16::from_f32(*v)).collect();
     let cacheb: Vec<bf16> = cache_data.iter().map(|v| bf16::from_f32(*v)).collect();
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
@@ -1225,11 +1456,6 @@ fn rope_scatter_fusion_matches_reference() {
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out.id);
     assert_close(&result[..SLOTS * KVD], &expected, tol, tol);
-
-    assert!(
-        ROPE_SCATTER_FUSIONS.load(Ordering::Relaxed) > fusions_before,
-        "rope→scatter peephole should have fused the pair"
-    );
 }
 
 /// Nearest-e4m3 emulation for CPU references: decode all 256 codes once and

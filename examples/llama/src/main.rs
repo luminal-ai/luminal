@@ -322,7 +322,7 @@ fn main() {
     cx.set_dim('c', 1);
     let max_prefill = (prompt_len + 16).next_power_of_two().min(MAX_SEQ_LEN);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default()
+    let compile_options = CompileOptions::default()
         .dim_buckets(
             's',
             &[
@@ -333,15 +333,10 @@ fn main() {
         .dim_buckets(
             'c',
             &[DimBucket::new(1, MAX_SEQ_LEN).representative(search_s)],
-        );
-
-    println!("Building E-Graph...");
-    let egraph_start = std::time::Instant::now();
-    cx.build_search_space::<CudaRuntime>(build_options);
-    println!(
-        "  E-Graph build: {:.2} s",
-        egraph_start.elapsed().as_secs_f64()
-    );
+        )
+        .search_graph_limit(SEARCH_GRAPHS)
+        .trials(SEARCH_TRIALS)
+        .keep_best(SEARCH_KEEP_BEST);
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();
@@ -376,11 +371,7 @@ fn main() {
     println!("  Search trials: {SEARCH_TRIALS}");
     println!("  Search keep-best: {SEARCH_KEEP_BEST}");
     let mut rng = StdRng::seed_from_u64(search_seed);
-    let search_options = CompileOptions::default()
-        .search_graph_limit(SEARCH_GRAPHS)
-        .trials(SEARCH_TRIALS)
-        .keep_best(SEARCH_KEEP_BEST);
-    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
     println!(
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()

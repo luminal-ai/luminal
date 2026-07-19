@@ -290,33 +290,12 @@ impl EgglogOp for KernelScatterNoCopy {
         // the scatter output layout. If dest is a strided/broadcast view,
         // regular Scatter must first materialize a contiguous output copy.
         //
-        // Two-phase resolution:
-        // 1. During (run): cleanup rules delete ConsumedBuffer if dest is shared (another op uses it)
-        // 2. During (saturate base_cleanup): surviving ConsumedBuffers are valid — union with
-        //    source and delete. This merges the ConsumedBuffer eclass into the source eclass,
-        //    making KernelScatterNoCopy's input resolve directly to the source buffer.
-        //
-        // If ConsumedBuffer was deleted (shared case), cascade cleanup removes the dependent
-        // ICons and KernelScatterNoCopy Op, leaving only KernelScatter.
+        // ConsumedBuffer is an egraph marker only. It is resolved after
+        // saturation; selected LLIR candidates then prove alias safety from
+        // their actual dependency order. This preserves legal prior reads such
+        // as `src = f(dest); scatter(dest, src)` while rejecting unordered
+        // competing reads without globally pruning the no-copy alternative.
         let mut rules = vec![
-            Rule::raw("(relation consumed_buffer_ilist_contains (IList IR))"),
-            Rule::raw(
-                "(rule
-                    ((= ?list (ICons ?head ?tail)))
-                    ((consumed_buffer_ilist_contains ?list ?head))
-                    :ruleset cleanup
-                    :name \"consumed-buffer-ilist-contains-head\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
-                    ((= ?list (ICons ?head ?tail))
-                     (consumed_buffer_ilist_contains ?tail ?item))
-                    ((consumed_buffer_ilist_contains ?list ?item))
-                    :ruleset cleanup
-                    :name \"consumed-buffer-ilist-contains-tail\"
-                )",
-            ),
             // Rewrite: KernelScatter -> KernelScatterNoCopy with ConsumedBuffer
             Rule::raw(
                 "(rule
@@ -348,38 +327,8 @@ impl EgglogOp for KernelScatterNoCopy {
                 )",
             ),
         ];
-        // Cleanup: delete ConsumedBuffer when inner buffer is used by a DIFFERENT Op.
-        rules.push(Rule::raw(
-            "(rule
-                ((= ?cb (ConsumedBuffer ?a))
-                 (= ?op1 (Op ?k1 ?ilist1))
-                 (consumed_buffer_ilist_contains ?ilist1 ?cb)
-                 (= ?op2 (Op ?k2 ?ilist2))
-                 (!= ?op1 ?op2)
-                 (consumed_buffer_ilist_contains ?ilist2 ?a))
-                ((delete (ConsumedBuffer ?a)))
-                :ruleset cleanup
-                :name \"consumed-buffer-cleanup-shared-op-use\"
-            )",
-        ));
-        // If a valid no-copy scatter survives cleanup, it dominates the copying scatter.
-        // This must run before base_cleanup resolves ConsumedBuffer back to the destination.
-        rules.push(Rule::raw(
-            "(rule
-                ((= ?cb (ConsumedBuffer ?dest))
-                 (= ?scatter (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                     (ICons ?dest (ICons ?indexes (ICons ?src (INil))))))
-                 (= ?nocopy (Op (KernelScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                     (ICons ?cb (ICons ?indexes (ICons ?src (INil)))))))
-                ((delete (Op (KernelScatter ?ds ?dst ?is ?istr ?ss ?os ?dt)
-                     (ICons ?dest (ICons ?indexes (ICons ?src (INil)))))))
-                :ruleset post_cleanup
-                :name \"scatter-no-copy-dominates-valid-consumed-buffer\"
-            )",
-        ));
-        // Surviving ConsumedBuffers are valid — union with source and delete.
-        // Runs in base_cleanup (after all (run) iterations).
-        // TODO: figure out how to validate this is a valid ConsumedBuffer independantly so we can run it in the cleanup ruleset, rather than base_cleanup
+        // Resolve the marker after all alternatives have been generated. Alias
+        // validity is checked per extracted LLIR candidate, not per eclass.
         rules.push(Rule::raw(
             "(rule
                 ((= ?cb (ConsumedBuffer ?a)))
@@ -602,6 +551,10 @@ extern \"C\" {{
 
     fn output_aliases_input(&self) -> Option<usize> {
         Some(0) // output aliases dest (input 0)
+    }
+
+    fn mutates_aliased_input(&self) -> bool {
+        true
     }
 
     fn output_dtype(&self) -> DType {

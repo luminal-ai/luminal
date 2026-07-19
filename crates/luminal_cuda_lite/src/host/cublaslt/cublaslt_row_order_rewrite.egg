@@ -11,6 +11,8 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
         (!= ?m (MNum 0))
@@ -64,6 +66,8 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
         (!= ?m (MNum 0))
@@ -117,6 +121,8 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
         (!= ?m (MNum 0))
@@ -170,6 +176,8 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
         (!= ?m (MNum 0))
@@ -223,24 +231,17 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
         (!= ?batch (MNum 0))
 
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
 
         (= ?k_stride (MIter))
 
@@ -290,24 +291,17 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
         (!= ?batch (MNum 0))
 
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
 
         (= ?k_stride (MIter))
 
@@ -357,24 +351,17 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
         (!= ?batch (MNum 0))
 
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
 
         (= ?k_stride (MIter))
 
@@ -424,24 +411,17 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
 
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
         (!= ?batch (MNum 0))
 
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
 
         (= ?k_stride (MIter))
 

@@ -1,15 +1,13 @@
 //! Direct 2D matmul kernel — bypasses egglog rewrites, used as a custom op
 //! for matmul shapes where the cublaslt egg rules don't reliably fire.
 //!
-//! The cublaslt 2D rules in `host/cublaslt/cublaslt_*Cm_rewrite.egg` /
-//! `cublaslt_Rm*_rewrite.egg` are *supposed* to match any 2D matmul whose
-//! Mul + SumReduce broadcast lowering has the expected stride patterns,
-//! and the conditional matmul cleanup is *supposed* to delete the
-//! elementwise Mul + KernelSumReduce fallback whenever a cublaslt alternative
-//! exists. In practice both fail to fire reliably for the VAE's mid-block
-//! `AttnBlock` matmuls — at 1024² that lets the search occasionally pick
-//! the broadcast-Mul path for `q @ kᵀ`, generating a `(HW, HW, C) =
-//! (16384, 16384, 512)` ≈ 524 GiB single intermediate that OOMs the GPU.
+//! The ordinary CUDA matmul rules preserve the decomposed reduction, generic
+//! kernel, GEMV, and cuBLASLt implementations as measured-search alternatives.
+//! This API is an explicit caller-selected custom op for cases that should not
+//! enter that search space (historically the VAE mid-block `AttnBlock` at very
+//! large spatial sizes). Hard candidate resource checks now reject an
+//! impossible broadcast-Mul allocation instead of deleting every decomposed
+//! matmul merely because a specialized alternative exists.
 //!
 //! Same approach as `kernel::conv2d`: define a `KernelOp`, wrap it in a
 //! `CustomOp`, expose a tiny `pub fn` so callers don't see the

@@ -326,6 +326,11 @@ impl ReferenceOp for Input {
 #[derive(Default, Debug, Clone)]
 pub struct Output {
     pub node: usize,
+    /// `persist_only` keeps storage live across executions but does not
+    /// semantically observe a snapshot of the value. This distinction lets
+    /// backends use a proven-safe in-place update without conflating it with a
+    /// user-visible output of the pre-update logical version.
+    pub persist_only: bool,
 }
 
 impl Display for Output {
@@ -336,7 +341,11 @@ impl Display for Output {
 
 impl EgglogOp for Output {
     fn sort(&self) -> SortDef {
-        sort(IR, "Output", &[("inp", IR), ("node", I64)])
+        sort(
+            IR,
+            "Output",
+            &[("inp", IR), ("node", I64), ("persist_only", BOOL)],
+        )
     }
 
     fn cleanup(&self) -> bool {
@@ -362,6 +371,11 @@ impl EgglogOp for Output {
                     .replace("\"", "")
                     .parse::<usize>()
                     .unwrap(),
+                persist_only: match egraph.enodes[kind_children[2]].0.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    value => panic!("invalid Output persist_only value {value}"),
+                },
             })),
             vec![kind_children[0]],
         )
@@ -370,7 +384,7 @@ impl EgglogOp for Output {
 
 impl HLIROp for Output {
     fn to_egglog(&self, inp: &[(NodeIndex, String)]) -> String {
-        format!("(Output {} {})", inp[0].1, self.node)
+        format!("(Output {} {} {})", inp[0].1, self.node, self.persist_only)
     }
 }
 
@@ -3023,7 +3037,8 @@ impl ReferenceRuntime {
             .graph
             .node_indices()
             .find(|n| {
-                if let Some(Output { node }) = (**self.graph[*n]).as_any().downcast_ref::<Output>()
+                if let Some(Output { node, .. }) =
+                    (**self.graph[*n]).as_any().downcast_ref::<Output>()
                 {
                     *node == id.index()
                 } else {

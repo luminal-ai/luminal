@@ -116,6 +116,9 @@ impl KernelOp for FusionStart {
     fn output_aliases_input(&self) -> Option<usize> {
         Some(0)
     }
+    fn mutates_aliased_input(&self) -> bool {
+        false
+    }
 }
 
 // =========================================================================
@@ -209,49 +212,6 @@ impl EgglogOp for FusionEnd {
              ) :ruleset fusion_grow :name \"grow-Cast-FS\")",
         ));
 
-        // Cast variant of the nested-FS-FE cleanup. Without it, the
-        // grow-FE-Cast + grow-Cast-FS pair congruence-merges an FS eclass
-        // with the FE eclass it wraps (FS(dt_in)(FE-result) vs the fused
-        // cast elem reading the FE's interior), leaving a 2-node FS/FE
-        // cycle that extraction can select. Deleting the redundant
-        // FS-wrapping-FE enode breaks the cycle; the fused form remains.
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
-                (= ?bad_fs (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
-                (= ?bad_elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                                 (ICons ?bad_fs (INil))))
-                (= ?bad_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?bad_elem (INil))))
-                (= ?good_elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                                  (ICons ?inner (INil))))
-                (= ?good_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?good_elem (INil))))
-                (= ?bad_fe ?good_fe)
-             ) (
-                (delete (Op (FusionStart ?shape ?s ?dt_in) (ICons ?inner_fe (INil))))
-             ) :ruleset cleanup :name \"cleanup-nested-FS-FE-cast\")",
-        ));
-
-        // Genome freeze: grow-Cast-FS leaves each cast-bearing FS eclass
-        // with two extraction-equivalent variants — the bare FS reading the
-        // materialized cast output, and the absorbed CudaCast reading the
-        // original buffer and converting in-register. Both wirings move
-        // the same bytes for the bandwidth-bound regions they sit in, but
-        // each pair doubles the search genome and makes candidates emit
-        // textually fresh region kernels. Delete the bare-FS variant once
-        // growth is done (cleanup runs after the fusion_grow cycles, so
-        // the row is not re-derived); the premise proves the absorbed
-        // survivor exists in the same eclass, so the eclass never empties.
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
-                (= ?fs_c (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
-                (= ?fs_c (Op (CudaUnaryElementwise \"Cast\" ?shape ?is ?os ?dt_out)
-                             (ICons ?fs_x (INil))))
-             ) (
-                (delete (Op (FusionStart ?shape ?s ?dt_out) (ICons ?cast (INil))))
-             ) :ruleset cleanup :name \"cleanup-FS-with-absorbed-cast\")",
-        ));
-
         // Grow FE → binary consumer, left and right orientations.
         for (hlir, opcode) in binaries {
             rules.push(Rule::raw(format!(
@@ -299,21 +259,6 @@ impl EgglogOp for FusionEnd {
                     (union ?fs_u ?elem)
                  ) :ruleset fusion_grow :name \"grow-U-FS-{hlir}\")"
             )));
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?inner_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?inner (INil))))
-                    (= ?bad_fs (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
-                    (= ?bad_elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
-                                     (ICons ?bad_fs (INil))))
-                    (= ?bad_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?bad_elem (INil))))
-                    (= ?good_elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?s ?dt)
-                                      (ICons ?inner (INil))))
-                    (= ?good_fe (Op (FusionEnd ?shape ?s ?dt) (ICons ?good_elem (INil))))
-                    (= ?bad_fe ?good_fe)
-                 ) (
-                    (delete (Op (FusionStart ?shape ?s ?dt) (ICons ?inner_fe (INil))))
-                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-unary-{hlir}\")"
-            )));
         }
         for (hlir, opcode) in binaries {
             rules.push(Rule::raw(format!(
@@ -328,38 +273,6 @@ impl EgglogOp for FusionEnd {
                                    (ICons ?fs_a (ICons ?fs_b (INil)))))
                     (union ?fs_bin ?elem)
                  ) :ruleset fusion_grow :name \"grow-B-FS-{hlir}\")"
-            )));
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?inner_fe (Op (FusionEnd ?shape ?a_s ?dt) (ICons ?inner_a (INil))))
-                    (= ?bad_fs (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
-                    (= ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
-                    (= ?bad_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                     (ICons ?bad_fs (ICons ?fs_b (INil)))))
-                    (= ?bad_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?bad_elem (INil))))
-                    (= ?good_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                      (ICons ?inner_a (ICons ?fs_b (INil)))))
-                    (= ?good_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?good_elem (INil))))
-                    (= ?bad_fe ?good_fe)
-                 ) (
-                    (delete (Op (FusionStart ?shape ?a_s ?dt) (ICons ?inner_fe (INil))))
-                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-lhs-{hlir}\")"
-            )));
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?inner_fe (Op (FusionEnd ?shape ?b_s ?dt) (ICons ?inner_b (INil))))
-                    (= ?bad_fs (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
-                    (= ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (= ?bad_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                     (ICons ?fs_a (ICons ?bad_fs (INil)))))
-                    (= ?bad_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?bad_elem (INil))))
-                    (= ?good_elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt)
-                                      (ICons ?fs_a (ICons ?inner_b (INil)))))
-                    (= ?good_fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?good_elem (INil))))
-                    (= ?bad_fe ?good_fe)
-                 ) (
-                    (delete (Op (FusionStart ?shape ?b_s ?dt) (ICons ?inner_fe (INil))))
-                 ) :ruleset cleanup :name \"cleanup-nested-FS-FE-binary-rhs-{hlir}\")"
             )));
         }
 
@@ -383,64 +296,9 @@ impl EgglogOp for FusionEnd {
 
         // No dissolve rule (`FS(FE(x)) → x`): unioning FS's eclass with FE's
         // inner eclass creates self-referential eclasses after grow rules
-        // extend the downstream region, and extraction then panics with
-        // `Cycle(NodeIndex(_))`. Grow rules already compose adjacent regions
-        // correctly without dissolve.
-
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_shape ?inner_shape)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-unary-shape\")",
-        ));
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaUnaryElementwise ?op ?inner_shape ?inner_in_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_s ?inner_s)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-unary-strides\")",
-        ));
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_shape ?inner_shape)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-binary-shape\")",
-        ));
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (CudaBinaryElementwise ?op ?inner_shape ?a_s ?b_s ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_s ?inner_s)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-binary-strides\")",
-        ));
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_shape ?inner_shape)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-nested-shape\")",
-        ));
-        rules.push(Rule::raw(
-            "(rule (
-                (= ?fe (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-                (= ?inner (Op (FusionEnd ?inner_shape ?inner_s ?dt) ?inner_inputs))
-                (!= ?fe_s ?inner_s)
-             ) (
-                (delete (Op (FusionEnd ?fe_shape ?fe_s ?dt) (ICons ?inner (INil))))
-             ) :ruleset cleanup :name \"delete-malformed-FE-nested-strides\")",
-        ));
+        // extend the downstream region. Growth deliberately keeps both the
+        // materialized boundary and absorbed alternatives; static candidate
+        // validation rejects only selections that actually form an LLIR cycle.
 
         rules
     }

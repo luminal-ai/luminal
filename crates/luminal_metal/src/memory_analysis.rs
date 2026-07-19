@@ -49,7 +49,7 @@ pub(crate) fn metal_memory_analysis_pass(
       :ruleset metal_memory_analysis
       :name "metal-memory-input")
 
-(rule ((= ?node (Output ?inp ?id)))
+(rule ((= ?node (Output ?inp ?id ?persist_only)))
       ((metal_local_memory ?node (MNum 0)))
       :ruleset metal_memory_analysis
       :name "metal-memory-output")

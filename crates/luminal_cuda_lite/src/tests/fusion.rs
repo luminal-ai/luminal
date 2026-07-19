@@ -1,13 +1,244 @@
 use as_any::Downcast;
-use luminal::egglog_utils::{egglog_to_llir, random_initial_choice};
+use luminal::egglog_utils::run_egglog;
+use luminal::egglog_utils::{ClassId, SerializedEGraph, egglog_to_llir, random_initial_choice};
+use luminal::op::{IntoEgglogOp, LLIROp};
 use luminal::prelude::*;
+use rand::SeedableRng;
 
 use crate::kernel::KernelOp;
-use crate::kernel::fusion::{CudaBinaryElementwise, CudaUnaryElementwise};
+use crate::kernel::fusion::{CudaBinaryElementwise, CudaUnaryElementwise, FusionEnd, FusionStart};
+use crate::resource::{ResourceViolation, plan_static_llir_resources};
 use crate::runtime::CudaRuntime;
 use crate::tests::utilities::{
     TOLERANCE_SAFETY_FACTOR, dtype_epsilon, random_f32_vec, test_binary_cuda, test_unary_cuda,
 };
+
+fn eclass_has_op_kind(egraph: &SerializedEGraph, eclass: &ClassId, kind_label: &str) -> bool {
+    egraph.eclasses.get(eclass).is_some_and(|(sort, nodes)| {
+        sort == "IR"
+            && nodes.iter().any(|node| {
+                let Some((label, children)) = egraph.enodes.get(node) else {
+                    return false;
+                };
+                label == "Op"
+                    && children.first().is_some_and(|kind_class| {
+                        egraph.eclasses[kind_class]
+                            .1
+                            .iter()
+                            .any(|kind_node| egraph.enodes[kind_node].0 == kind_label)
+                    })
+            })
+    })
+}
+
+/// True when one boundary eclass retains both:
+/// - an FS that can read a materialized producer whose eclass contains an FE;
+/// - the CUDA elementwise form that absorbs that producer into its consumer.
+///
+/// Some correlated selections through this egraph structure are cyclic, but
+/// deleting the FS would also erase the legal materialized split selection.
+fn egraph_has_split_and_absorbed_boundary(cx: &Graph, absorbed_kind: &str) -> bool {
+    let egraph = cx.egraph().expect("search space should be built");
+    egraph
+        .eclasses
+        .iter()
+        .any(|(boundary_class, (sort, nodes))| {
+            sort == "IR"
+                && eclass_has_op_kind(egraph, boundary_class, absorbed_kind)
+                && nodes.iter().any(|node| {
+                    let Some((label, children)) = egraph.enodes.get(node) else {
+                        return false;
+                    };
+                    if label != "Op"
+                        || !children.first().is_some_and(|kind_class| {
+                            egraph.eclasses[kind_class].1.iter().any(|kind_node| {
+                                egraph.enodes[kind_node].0.as_str() == "FusionStart"
+                            })
+                        })
+                    {
+                        return false;
+                    }
+
+                    let Some(inputs_class) = children.get(1) else {
+                        return false;
+                    };
+                    egraph.eclasses[inputs_class].1.iter().any(|ilist_node| {
+                        let (ilist_label, ilist_children) = &egraph.enodes[ilist_node];
+                        ilist_label == "ICons"
+                            && ilist_children.first().is_some_and(|producer_class| {
+                                eclass_has_op_kind(egraph, producer_class, "FusionEnd")
+                            })
+                    })
+                })
+        })
+}
+
+#[test]
+fn semantically_equal_ununified_fusion_end_metadata_survives_cleanup() {
+    // General add associativity is intentionally not saturated by the base
+    // expression rules, so these one-dimensional lists denote the same value
+    // while remaining different egraph values. Cleanup must not interpret
+    // `value_a != value_b` as a proof of semantic inequality.
+    let program = r#"
+        (let input (Input 0 "" (F32)))
+        (let fixed (ECons (MNum 1) (ENil)))
+        (let assoc_l (ECons (MAdd (MAdd (MVar "a") (MVar "b")) (MVar "c")) (ENil)))
+        (let assoc_r (ECons (MAdd (MVar "a") (MAdd (MVar "b") (MVar "c"))) (ENil)))
+
+        (let fs_fixed (Op (FusionStart fixed fixed (F32)) (ICons input (INil))))
+        (let unary_shape_inner
+            (Op (CudaUnaryElementwise "Sin" assoc_l fixed fixed (F32))
+                (ICons fs_fixed (INil))))
+        (let unary_shape_fe
+            (Op (FusionEnd assoc_r fixed (F32)) (ICons unary_shape_inner (INil))))
+
+        (let unary_stride_inner
+            (Op (CudaUnaryElementwise "Sin" fixed fixed assoc_l (F32))
+                (ICons fs_fixed (INil))))
+        (let unary_stride_fe
+            (Op (FusionEnd fixed assoc_r (F32)) (ICons unary_stride_inner (INil))))
+
+        (let binary_shape_inner
+            (Op (CudaBinaryElementwise "Add" assoc_l fixed fixed fixed (F32))
+                (ICons fs_fixed (ICons fs_fixed (INil)))))
+        (let binary_shape_fe
+            (Op (FusionEnd assoc_r fixed (F32)) (ICons binary_shape_inner (INil))))
+
+        (let binary_stride_inner
+            (Op (CudaBinaryElementwise "Add" fixed fixed fixed assoc_l (F32))
+                (ICons fs_fixed (ICons fs_fixed (INil)))))
+        (let binary_stride_fe
+            (Op (FusionEnd fixed assoc_r (F32)) (ICons binary_stride_inner (INil))))
+
+        (let fs_nested_shape
+            (Op (FusionStart assoc_l fixed (F32)) (ICons input (INil))))
+        (let nested_shape_elem
+            (Op (CudaUnaryElementwise "Sin" assoc_l fixed fixed (F32))
+                (ICons fs_nested_shape (INil))))
+        (let nested_shape_inner
+            (Op (FusionEnd assoc_l fixed (F32)) (ICons nested_shape_elem (INil))))
+        (let nested_shape_outer
+            (Op (FusionEnd assoc_r fixed (F32)) (ICons nested_shape_inner (INil))))
+
+        (let fs_nested_stride
+            (Op (FusionStart fixed fixed (F32)) (ICons input (INil))))
+        (let nested_stride_elem
+            (Op (CudaUnaryElementwise "Sin" fixed fixed assoc_l (F32))
+                (ICons fs_nested_stride (INil))))
+        (let nested_stride_inner
+            (Op (FusionEnd fixed assoc_l (F32)) (ICons nested_stride_elem (INil))))
+        (let nested_stride_outer
+            (Op (FusionEnd fixed assoc_r (F32)) (ICons nested_stride_inner (INil))))
+
+        (let join0 (OutputJoin unary_shape_fe unary_stride_fe))
+        (let join1 (OutputJoin binary_shape_fe binary_stride_fe))
+        (let join2 (OutputJoin nested_shape_outer nested_stride_outer))
+        (let join3 (OutputJoin join0 join1))
+        (let root (OutputJoin join3 join2))
+    "#;
+
+    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
+    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
+    let egraph = run_egglog(program, "root", &ops, false)
+        .expect("semantically valid FusionEnd alternatives must survive cleanup");
+    assert!(
+        egraph.eclasses[&egraph.roots[0]]
+            .1
+            .iter()
+            .any(|node| egraph.enodes[node].0 == "OutputJoin"),
+        "all six FusionEnd metadata alternatives must remain reachable"
+    );
+}
+
+#[test]
+fn static_validation_accepts_split_and_fused_regions_but_rejects_cycle() {
+    let fusion_start = || {
+        LLIROp::new::<dyn KernelOp>(Box::new(FusionStart {
+            shape: vec![16.into()],
+            strides: vec![1.into()],
+            dtype: luminal::dtype::DType::F32,
+        }))
+    };
+    let unary = |op: &str| {
+        LLIROp::new::<dyn KernelOp>(Box::new(CudaUnaryElementwise {
+            op: op.to_string(),
+            shape: vec![16.into()],
+            in_strides: vec![1.into()],
+            out_strides: vec![1.into()],
+            dtype: luminal::dtype::DType::F32,
+        }))
+    };
+    let fusion_end = || {
+        LLIROp::new::<dyn KernelOp>(Box::new(FusionEnd {
+            shape: vec![16.into()],
+            strides: vec![1.into()],
+            dtype: luminal::dtype::DType::F32,
+        }))
+    };
+
+    let mut split = LLIRGraph::default();
+    let input = split.add_node(LLIROp::new::<luminal::hlir::Input>(Box::default()));
+    let fs0 = split.add_node(fusion_start());
+    let sin = split.add_node(unary("Sin"));
+    let fe0 = split.add_node(fusion_end());
+    let fs1 = split.add_node(fusion_start());
+    let sqrt = split.add_node(unary("Sqrt"));
+    let fe1 = split.add_node(fusion_end());
+    split.add_edge(input, fs0, ());
+    split.add_edge(fs0, sin, ());
+    split.add_edge(sin, fe0, ());
+    split.add_edge(fe0, fs1, ());
+    split.add_edge(fs1, sqrt, ());
+    split.add_edge(sqrt, fe1, ());
+    assert!(plan_static_llir_resources(&split, &FxHashMap::default()).is_ok());
+
+    let mut fused = LLIRGraph::default();
+    let input = fused.add_node(LLIROp::new::<luminal::hlir::Input>(Box::default()));
+    let fs = fused.add_node(fusion_start());
+    let sin = fused.add_node(unary("Sin"));
+    let sqrt = fused.add_node(unary("Sqrt"));
+    let fe = fused.add_node(fusion_end());
+    fused.add_edge(input, fs, ());
+    fused.add_edge(fs, sin, ());
+    fused.add_edge(sin, sqrt, ());
+    fused.add_edge(sqrt, fe, ());
+    assert!(plan_static_llir_resources(&fused, &FxHashMap::default()).is_ok());
+
+    // Candidate-local fusion validation must reject contradictory metadata
+    // before compile-unit construction or source generation.
+    let mut malformed = LLIRGraph::default();
+    let input = malformed.add_node(LLIROp::new::<luminal::hlir::Input>(Box::default()));
+    let fs = malformed.add_node(fusion_start());
+    let sin = malformed.add_node(LLIROp::new::<dyn KernelOp>(Box::new(
+        CudaUnaryElementwise {
+            op: "Sin".to_string(),
+            shape: vec![16.into()],
+            in_strides: vec![],
+            out_strides: vec![1.into()],
+            dtype: luminal::dtype::DType::F32,
+        },
+    )));
+    let fe = malformed.add_node(fusion_end());
+    malformed.add_edge(input, fs, ());
+    malformed.add_edge(fs, sin, ());
+    malformed.add_edge(sin, fe, ());
+    assert!(matches!(
+        plan_static_llir_resources(&malformed, &FxHashMap::default()),
+        Err(ResourceViolation::InvalidFusionRegion { .. })
+    ));
+
+    let mut cyclic = LLIRGraph::default();
+    let fs = cyclic.add_node(fusion_start());
+    let sin = cyclic.add_node(unary("Sin"));
+    let fe = cyclic.add_node(fusion_end());
+    cyclic.add_edge(fs, sin, ());
+    cyclic.add_edge(sin, fe, ());
+    cyclic.add_edge(fe, fs, ());
+    assert_eq!(
+        plan_static_llir_resources(&cyclic, &FxHashMap::default()),
+        Err(ResourceViolation::CyclicLlir)
+    );
+}
 
 #[test]
 fn test_two_unary_ops_fuse() {
@@ -299,12 +530,13 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
     let custom_ops = &cx.custom_ops;
 
     let mut seen: Vec<FusedRegion> = Vec::new();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0xF051_0A11);
     // 200 samples: the random extractor picks one e-node per e-class per
     // call, and the fully-fused diamond form lives in an e-class with
     // many equivalent forms. 50 was flaky; 200 is reliably stable and
     // each sample is cheap (~100 µs).
     for _ in 0..200 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
+        let choices = random_initial_choice(egraph, &mut rng);
         let mut list_cache = Default::default();
         let mut expr_cache = Default::default();
         let llir = egglog_to_llir(
@@ -316,6 +548,13 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
             &mut expr_cache,
             None,
         );
+        match plan_static_llir_resources(&llir, &cx.dyn_map) {
+            Ok(_) => {}
+            Err(ResourceViolation::CyclicLlir | ResourceViolation::InvalidFusionRegion { .. }) => {
+                continue;
+            }
+            Err(other) => panic!("unexpected static candidate rejection: {other}"),
+        }
 
         let name_of = |idx: NodeIndex| -> Option<String> {
             llir.node_weight(idx).and_then(|op| {
@@ -522,13 +761,6 @@ fn test_unary_then_binary_fuses() {
 }
 
 #[test]
-// Subsume in grow rules (introduced to bound the BB partial-FE explosion)
-// means a multi-consumer producer can no longer be fused into the same
-// region as all its consumers — only one branch wins. The diamond's `t`
-// has two consumers, so the structural "one 5-op region" outcome is no
-// longer guaranteed. Numerical correctness still holds (see
-// test_diamond_dag_preserves_output).
-#[ignore = "asserts pre-subsume ideal multi-consumer fusion shape"]
 fn test_diamond_dag_fuses() {
     // The canonical diamond-DAG example agreed with the user:
     //   t = a + b; u = exp2(t); v = sin(t); w = u * a; out = w + v
@@ -659,7 +891,6 @@ fn test_diamond_dag_preserves_output() {
 // ---- Marker invariant tests ----
 
 #[test]
-#[ignore = "asserts pre-subsume ideal multi-consumer fusion shape"]
 fn test_fused_region_has_exactly_one_end() {
     // Design invariant: a fused region always has exactly one FusionEnd.
     // Uses the diamond DAG so there's real fan-in/out inside the region.
@@ -687,7 +918,6 @@ fn test_fused_region_has_exactly_one_end() {
 }
 
 #[test]
-#[ignore = "asserts pre-subsume ideal multi-consumer fusion shape"]
 fn test_fused_region_starts_match_distinct_external_tensors() {
     // Design invariant: FusionStart count == number of distinct external input
     // tensors, NOT number of edges crossing the boundary. In the diamond DAG
@@ -820,15 +1050,10 @@ fn test_grow_fe_to_binary_rhs() {
 }
 
 #[test]
-#[ignore = "asserts pre-subsume two-FE merge shape; numerical correctness preserved"]
 fn test_merge_two_regions_at_outer_binary() {
-    // Merge: `(sin(a) + b) + (sqrt(c) + d)`. Each side independently pair-fuses
-    // U→B on its own (the unary gives the inner Add a fusion partner that
-    // doesn't pull in the outer Add), so both sides become FEs. The outer Add
-    // then fires merge-FE-FE-Add to collapse them into a single region.
-    // Without the unaries, `(a+b) + (c+d)` would only ever pair-fuse one
-    // inner Add at a time with the outer Add — merge wouldn't have two FEs to
-    // combine because the inner Adds never become singleton FEs on their own.
+    // Merge: `(sin(a) + b) + (sqrt(c) + d)`. Each side grows its unary region
+    // through the inner Add, so both sides become FEs. The outer Add can then
+    // fire merge-FE-FE-Add to produce a single region.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -1036,6 +1261,60 @@ fn test_cast_producer_absorbed_into_region() {
             .iter()
             .any(|r| r.internal_ops_sorted == expected && r.start_count == 1 && r.end_count == 1),
         "expected a marker region of {expected:?} with 1 FusionStart, got: {regions:#?}"
+    );
+}
+
+#[test]
+fn test_cast_split_boundary_and_absorbed_choice_coexist() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(16);
+    a.sin().cast(luminal::dtype::DType::Bf16).sqrt().output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_split_and_absorbed_boundary(&cx, "CudaUnaryElementwise"),
+        "cast growth must retain materialized-split and absorbed alternatives"
+    );
+}
+
+#[test]
+fn test_unary_split_boundary_and_absorbed_choice_coexist() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(16);
+    a.sin().sqrt().reciprocal().output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_split_and_absorbed_boundary(&cx, "CudaUnaryElementwise"),
+        "unary growth must retain materialized-split and absorbed alternatives"
+    );
+}
+
+#[test]
+fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(16);
+    let b = cx.tensor(16);
+    (a.sin() + b).sqrt().output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_split_and_absorbed_boundary(&cx, "CudaBinaryElementwise"),
+        "binary-LHS growth must retain materialized-split and absorbed alternatives"
+    );
+}
+
+#[test]
+fn test_binary_rhs_split_boundary_and_absorbed_choice_coexist() {
+    let mut cx = Graph::new();
+    let a = cx.tensor(16);
+    let b = cx.tensor(16);
+    (a + b.sin()).sqrt().output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_split_and_absorbed_boundary(&cx, "CudaBinaryElementwise"),
+        "binary-RHS growth must retain materialized-split and absorbed alternatives"
     );
 }
 
