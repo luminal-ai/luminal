@@ -258,6 +258,12 @@ struct ArenaReleasePlan {
     pools_to_trim: Vec<sys::CUmemoryPool>,
 }
 
+struct ValidatedBucketSet {
+    compiled_buckets: Vec<CompiledBucket>,
+    representative_dyn_maps: Vec<FxHashMap<char, usize>>,
+    input_lengths_complete: bool,
+}
+
 impl ArenaReleasePlan {
     fn record_arena(&mut self, pool: Option<sys::CUmemoryPool>) {
         self.arenas_released += 1;
@@ -2043,6 +2049,13 @@ impl CudaRuntime {
     }
 
     fn prepare_bucket_buffers(&mut self, bucket_idx: usize, dyn_map: &FxHashMap<char, usize>) {
+        debug_assert!(
+            self.compiled_buckets
+                .iter()
+                .enumerate()
+                .all(|(idx, bucket)| idx == bucket_idx || bucket.arena.is_none()),
+            "a CUDA bucket arena must be released before preparing another bucket"
+        );
         let profile_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let prepare_start = std::time::Instant::now();
         let changed_hlir_count = self.changed_hlir.len();
@@ -2691,21 +2704,19 @@ impl CudaRuntime {
         Ok((persistent_bytes, transient_peak_bytes, shared_allocations))
     }
 
-    fn aggregate_planned_arena_bytes(
-        buckets: &[CompiledBucket],
-    ) -> Result<usize, ResourceViolation> {
-        buckets.iter().try_fold(0usize, |total, bucket| {
-            total
-                .checked_add(Self::planned_allocation_bytes(bucket))
-                .ok_or(ResourceViolation::ArithmeticOverflow {
-                    resource: "retained bucket arena bytes",
-                })
-        })
+    fn peak_planned_arena_bytes(buckets: &[CompiledBucket]) -> usize {
+        buckets
+            .iter()
+            .map(Self::planned_allocation_bytes)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// Build one hard-resource plan for all buckets whose arenas remain live
-    /// together. This is deliberately independent of CUDA allocation so a
-    /// stitched graph can be rejected before replacing the working runtime.
+    /// Build one hard-resource plan for all retained buckets. Persistent HostOp
+    /// state coexists across buckets, but only the active bucket owns an arena:
+    /// dispatch releases it before allocating the next bucket's arena. This is
+    /// deliberately independent of CUDA allocation so a stitched graph can be
+    /// rejected before replacing the working runtime.
     fn retained_bucket_resource_plan(
         buckets: &mut [CompiledBucket],
         allocation_dyn_maps: &[FxHashMap<char, usize>],
@@ -2731,7 +2742,7 @@ impl CudaRuntime {
             )?;
         Ok(CandidateResourcePlan {
             intermediate_lower_bound_bytes: 0,
-            planned_intermediate_bytes: Some(Self::aggregate_planned_arena_bytes(buckets)?),
+            planned_intermediate_bytes: Some(Self::peak_planned_arena_bytes(buckets)),
             host_persistent_bytes,
             host_transient_peak_bytes,
             shared_device_allocations,
@@ -3111,30 +3122,86 @@ impl CudaRuntime {
         dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) -> anyhow::Result<()> {
+        let bucket_llir_refs = bucket_llirs.iter().map(BucketLLIRRef::from).collect_vec();
+        let ValidatedBucketSet {
+            compiled_buckets,
+            representative_dyn_maps,
+            input_lengths_complete,
+        } = self.compile_and_validate_bucket_set(dim_buckets, &bucket_llir_refs)?;
+
+        // Only now replace the old executable state.
+        let _ = self.cuda_stream.synchronize();
+        let _ = self.cuda_stream.context().bind_to_thread();
+        let mut releases = ArenaReleasePlan::default();
+        for old_bucket in &mut self.compiled_buckets {
+            Self::take_bucket_arena(old_bucket, &mut releases);
+        }
+        self.dim_buckets = dim_buckets.clone();
+        self.compiled_buckets = compiled_buckets;
+        // The first real execution for model workloads is usually prefill, which
+        // lands in the largest/range bucket rather than the singleton decode
+        // bucket. Select it before prebuilding so only that active bucket gets an
+        // arena; dispatch evicts it before lazily preparing another bucket.
+        self.active_bucket = self.compiled_buckets.len().saturating_sub(1);
+        Self::finish_arena_releases(&self.cuda_stream, releases)?;
+        self.last_resource_input_signature = if input_lengths_complete {
+            self.current_resource_input_signature()
+        } else {
+            FxHashMap::default()
+        };
+
+        // Reclaim what search profiling left resident in the async allocator
+        // pool before allocating the stitched-graph arenas. This load runs
+        // inside search() (the final stitch), before the example gets a chance
+        // to call release_pooled_memory() itself, so on a memory-tight GPU the
+        // arena allocation below would otherwise OOM against the pool residue.
+        self.release_pooled_memory();
+        if input_lengths_complete
+            && let Some(representative_dyn_map) = representative_dyn_maps.get(self.active_bucket)
+        {
+            self.prepare_bucket_buffers(self.active_bucket, representative_dyn_map);
+            self.materialize_bucket_cuda_graphs(self.active_bucket, representative_dyn_map, true)?;
+        }
+
+        // Mark all HLIR inputs as changed so their pointers get re-cached
+        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
+        Ok(())
+    }
+
+    /// Compile and validate a complete retained bucket set without replacing
+    /// the runtime's executable state or allocating an intermediate arena.
+    /// Aggregate search filtering and final loading share this path so a set
+    /// accepted during selection cannot encounter a different resource plan at
+    /// load time.
+    fn compile_and_validate_bucket_set(
+        &mut self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_llirs: &[BucketLLIRRef<'_>],
+    ) -> anyhow::Result<ValidatedBucketSet> {
         // Validate the entire stitched candidate before mutating the currently
         // loaded runtime. A bad later bucket must not discard a previously
         // usable graph after the earlier buckets have already compiled.
-        for (_, _, llir) in bucket_llirs {
-            validate_static_llir_semantics(llir)
+        for bucket in bucket_llirs {
+            validate_static_llir_semantics(bucket.llir)
                 .map_err(|violation| anyhow::anyhow!("invalid CUDA LLIR bucket: {violation}"))?;
         }
 
         // Compile and dry-plan the replacement while the current runtime is
-        // still intact. All bucket arenas remain resident after loading, so
-        // validate their aggregate bytes and every compiled kernel before the
-        // first arena allocation or replacement of the working graph.
+        // still intact. Validate the peak active-bucket arena, retained HostOp
+        // state, and every compiled kernel before the first arena allocation or
+        // replacement of the working graph.
         let mut compiled_buckets = Vec::with_capacity(bucket_llirs.len());
         let mut representative_dyn_maps = Vec::with_capacity(bucket_llirs.len());
         let mut allocation_dyn_maps = Vec::with_capacity(bucket_llirs.len());
-        for (bucket_indices, representative_dyn_map, llir) in bucket_llirs {
-            let mut bucket = self.compile_bucket(llir);
-            bucket.bucket_indices = bucket_indices.clone();
+        for candidate in bucket_llirs {
+            let mut bucket = self.compile_bucket(candidate.llir);
+            bucket.bucket_indices = candidate.bucket_indices.clone();
             allocation_dyn_maps.push(Self::bucket_capacity_dyn_map_from_context(
-                representative_dyn_map,
+                candidate.representative_dyn_map,
                 &bucket.bucket_indices,
                 dim_buckets,
             ));
-            representative_dyn_maps.push(representative_dyn_map.clone());
+            representative_dyn_maps.push(candidate.representative_dyn_map.clone());
             compiled_buckets.push(bucket);
         }
         let (hlir_buffer_lengths, input_lengths_complete) =
@@ -3162,44 +3229,11 @@ impl CudaRuntime {
             bucket.last_resource_validation_dyn_map = dyn_map.clone();
             bucket.resource_validation_complete = input_lengths_complete;
         }
-
-        // Only now replace the old executable state.
-        let _ = self.cuda_stream.synchronize();
-        let _ = self.cuda_stream.context().bind_to_thread();
-        let mut releases = ArenaReleasePlan::default();
-        for old_bucket in &mut self.compiled_buckets {
-            Self::take_bucket_arena(old_bucket, &mut releases);
-        }
-        self.dim_buckets = dim_buckets.clone();
-        self.compiled_buckets = compiled_buckets;
-        Self::finish_arena_releases(&self.cuda_stream, releases)?;
-        self.last_resource_input_signature = if input_lengths_complete {
-            self.current_resource_input_signature()
-        } else {
-            FxHashMap::default()
-        };
-
-        // Reclaim what search profiling left resident in the async allocator
-        // pool before allocating the stitched-graph arenas. This load runs
-        // inside search() (the final stitch), before the example gets a chance
-        // to call release_pooled_memory() itself, so on a memory-tight GPU the
-        // arena allocation below would otherwise OOM against the pool residue.
-        self.release_pooled_memory();
-        if input_lengths_complete {
-            for (idx, representative_dyn_map) in representative_dyn_maps.iter().enumerate() {
-                self.prepare_bucket_buffers(idx, representative_dyn_map);
-                self.materialize_bucket_cuda_graphs(idx, representative_dyn_map, true)?;
-            }
-        }
-        // The first real execution for model workloads is usually prefill, which
-        // lands in the largest/range bucket rather than the singleton decode
-        // bucket. Start there so pre-execute diagnostics and first-use setup do
-        // not touch the decode bucket's captured library graph state.
-        self.active_bucket = self.compiled_buckets.len().saturating_sub(1);
-
-        // Mark all HLIR inputs as changed so their pointers get re-cached
-        self.changed_hlir.extend(self.hlir_buffers.keys().copied());
-        Ok(())
+        Ok(ValidatedBucketSet {
+            compiled_buckets,
+            representative_dyn_maps,
+            input_lengths_complete,
+        })
     }
 }
 
@@ -3271,6 +3305,20 @@ impl Runtime for CudaRuntime {
             ))
         } else {
             luminal::op::CandidateFilterResult::accept_with_display(display)
+        }
+    }
+
+    fn filter_llir_bucket_set(
+        &mut self,
+        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        bucket_llirs: &[BucketLLIRRef<'_>],
+        _search_options: &CompileOptions,
+    ) -> luminal::op::CandidateFilterResult {
+        match self.compile_and_validate_bucket_set(dim_buckets, bucket_llirs) {
+            Ok(_) => luminal::op::CandidateFilterResult::accept(),
+            Err(error) => luminal::op::CandidateFilterResult::reject_with_display(format!(
+                "aggregate bucket resource reject: {error}"
+            )),
         }
     }
 
@@ -3711,6 +3759,15 @@ impl CudaRuntime {
         self.compiled_buckets
             .get(self.active_bucket)
             .is_some_and(|bucket| bucket.stabilize_intermediate_pointers)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_resident_bucket_arena_indices(&self) -> Vec<usize> {
+        self.compiled_buckets
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, bucket)| bucket.arena.is_some().then_some(idx))
+            .collect()
     }
 
     /// Compile a single LLIR graph into a CompiledBucket.
@@ -4608,9 +4665,12 @@ mod arena_plan_tests {
     }
 
     #[test]
-    fn retained_bucket_plan_sums_every_live_arena_before_allocation() {
+    fn retained_bucket_plan_uses_peak_live_arena_before_allocation() {
         let mut buckets = Vec::new();
-        for (node, bytes) in [(NodeIndex::new(1), 64usize), (NodeIndex::new(2), 96usize)] {
+        for (node, bytes) in [
+            (NodeIndex::new(1), 64usize),
+            (NodeIndex::new(2), ARENA_ALIGNMENT * 2),
+        ] {
             let mut bucket = CompiledBucket::new();
             bucket.buffer_specs.insert(
                 node,
@@ -4637,15 +4697,27 @@ mod arena_plan_tests {
 
         assert_eq!(
             aggregate.planned_intermediate_bytes,
-            Some(individual_bytes.iter().sum())
+            individual_bytes.iter().copied().max()
         );
         let limit = *individual_bytes.iter().max().unwrap();
+        assert!(individual_bytes.iter().sum::<usize>() > limit);
         assert!(individual_bytes.iter().all(|bytes| *bytes <= limit));
-        assert!(matches!(
+        assert!(
             validate_resource_plan(
                 &aggregate,
                 CandidateResourceCaps {
                     max_intermediate_bytes: Some(limit),
+                    max_kernel_source_bytes: None,
+                },
+                None,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_resource_plan(
+                &aggregate,
+                CandidateResourceCaps {
+                    max_intermediate_bytes: Some(limit - 1),
                     max_kernel_source_bytes: None,
                 },
                 None,

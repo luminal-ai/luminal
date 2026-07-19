@@ -111,7 +111,9 @@ pub trait Runtime {
         self.profile(llir_graph, dyn_map, trials, timeout)
     }
     /// Aggregate multiple profile metrics into one comparable metric.
-    /// Used for regionalized profiling where one candidate maps to multiple LLIR regions.
+    /// Used for regionalized profiling and best-first bucket-set selection.
+    /// Implementations must be coordinate-monotone: replacing any input with
+    /// a metric that compares greater must not make the aggregate compare less.
     fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
         metrics
             .first()
@@ -145,6 +147,19 @@ pub trait Runtime {
         &mut self,
         _llir_graph: &LLIRGraph,
         _context: CandidateFilterContext<'_>,
+    ) -> CandidateFilterResult {
+        CandidateFilterResult::accept()
+    }
+    /// Runtime-specific filter for a complete retained set of bucket LLIRs.
+    /// Individual buckets may each be viable while their persistent resources
+    /// conflict or exceed a limit when all buckets are retained together.
+    /// Backends with aggregate bucket resources should override this with the
+    /// same dry planning used by [`Runtime::load_llir_buckets`].
+    fn filter_llir_bucket_set(
+        &mut self,
+        _dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        _bucket_llirs: &[BucketLLIRRef<'_>],
+        _search_options: &crate::graph::CompileOptions,
     ) -> CandidateFilterResult {
         CandidateFilterResult::accept()
     }

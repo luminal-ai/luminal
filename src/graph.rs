@@ -1,6 +1,6 @@
 use crate::egglog_utils::{
-    count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation, hash_choice_set,
-    hlir_to_egglog, log_channel_enabled, random_initial_choice,
+    EGraphChoiceSet, count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation,
+    hash_choice_set, hlir_to_egglog, log_channel_enabled, random_initial_choice,
     run_egglog_with_late_passes_interval_analysis_and_log,
 };
 use crate::shape::{DimInterval, DynDimIntervals};
@@ -90,8 +90,61 @@ struct SearchProfileBucketContext {
     representative_dyn_map: FxHashMap<char, usize>,
 }
 
+struct Finalist<M> {
+    metric: M,
+    pre_unroll: Option<LLIRGraph>,
+    llir: LLIRGraph,
+}
+
+struct LazyFinalists<'a, M> {
+    ranked: Vec<(M, EGraphChoiceSet<'a>)>,
+    next_ranked: usize,
+    finalists: Vec<Finalist<M>>,
+    rejections: usize,
+    last_rejection: Option<String>,
+    stopped_reason: Option<String>,
+}
+
+impl<'a, M> LazyFinalists<'a, M> {
+    fn new(ranked: Vec<(M, EGraphChoiceSet<'a>)>) -> Self {
+        Self {
+            ranked,
+            next_ranked: 0,
+            finalists: Vec::new(),
+            rejections: 0,
+            last_rejection: None,
+            stopped_reason: None,
+        }
+    }
+}
+
+struct BucketFinalistSearch<'a, M> {
+    context: SearchProfileBucketContext,
+    egraph_index: usize,
+    candidates: LazyFinalists<'a, M>,
+}
+
 /// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
 pub type BucketLLIR = (FxHashMap<char, usize>, FxHashMap<char, usize>, LLIRGraph);
+
+/// Borrowed view of a compiled bucket used for non-committing aggregate
+/// candidate filtering.
+#[derive(Clone, Copy)]
+pub struct BucketLLIRRef<'a> {
+    pub bucket_indices: &'a FxHashMap<char, usize>,
+    pub representative_dyn_map: &'a FxHashMap<char, usize>,
+    pub llir: &'a LLIRGraph,
+}
+
+impl<'a> From<&'a BucketLLIR> for BucketLLIRRef<'a> {
+    fn from((bucket_indices, representative_dyn_map, llir): &'a BucketLLIR) -> Self {
+        Self {
+            bucket_indices,
+            representative_dyn_map,
+            llir,
+        }
+    }
+}
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
 /// For an exact value, use `min == max` (zero-length range).
@@ -1442,7 +1495,7 @@ impl Graph {
         let search_log = options.search_log_enabled();
         if self.search_space_dim_buckets.is_empty() {
             // No buckets: existing single-search path
-            let stitched = self.search_single(
+            let ranked = self.search_single(
                 &mut runtime,
                 &options,
                 rng,
@@ -1452,15 +1505,37 @@ impl Graph {
                 0,
                 search_started_at,
             );
+            let mut candidates = LazyFinalists::new(ranked);
+            if !self.ensure_finalist(
+                &mut runtime,
+                &mut candidates,
+                0,
+                &options,
+                &self.dyn_map,
+                None,
+                0,
+                search_started_at,
+            ) {
+                panic!(
+                    "Failed to find a viable final graph: {}",
+                    Self::no_finalist_message(&candidates)
+                );
+            }
+            let finalist = candidates
+                .finalists
+                .pop()
+                .expect("ensure_finalist returned without a finalist");
+            Self::dump_selected_finalist(&finalist, &self.dyn_map, None);
 
             runtime.clear_intermediate_buffers();
-            runtime.load_llir(&stitched);
+            runtime.load_llir(&finalist.llir);
             runtime
         } else {
-            // Bucketed search: compile one LLIR per bucket combination
+            // Bucketed search: retain ranked genomes for every bucket, then
+            // choose a collectively viable finalist set below.
             let bucket_contexts = self.search_space_contexts(&self.search_space_dim_buckets);
             let n_combos = bucket_contexts.len();
-            let mut bucket_llirs: Vec<BucketLLIR> = Vec::with_capacity(n_combos);
+            let mut bucket_searches = Vec::with_capacity(n_combos);
             assert!(
                 self.egraphs.len() == n_combos,
                 "dim buckets must be configured before build_search_space; search space has {} egraphs but current bucket configuration has {n_combos} combinations",
@@ -1480,24 +1555,210 @@ impl Graph {
                     );
                 }
 
-                let stitched = self.search_single(
+                let profile_context = SearchProfileBucketContext {
+                    dim_buckets: self.search_space_dim_buckets.clone(),
+                    bucket_indices: context.bucket_indices.clone(),
+                    representative_dyn_map: context.representative_dyn_map.clone(),
+                };
+                let ranked = self.search_single(
                     &mut runtime,
                     &options,
                     rng,
                     &context.representative_dyn_map,
                     Some((combo_idx, n_combos)),
-                    Some(SearchProfileBucketContext {
-                        dim_buckets: self.search_space_dim_buckets.clone(),
-                        bucket_indices: context.bucket_indices.clone(),
-                        representative_dyn_map: context.representative_dyn_map.clone(),
-                    }),
+                    Some(profile_context.clone()),
                     combo_idx,
                     search_started_at,
                 );
+                bucket_searches.push(BucketFinalistSearch {
+                    context: profile_context,
+                    egraph_index: combo_idx,
+                    candidates: LazyFinalists::new(ranked),
+                });
+            }
+
+            // Materialize only the fastest individually viable graph for each
+            // bucket to seed a best-first walk over the Cartesian finalist
+            // lattice. Slower full LLIRs are extracted only when an aggregate
+            // rejection makes their coordinate reachable.
+            for (bucket_idx, bucket) in bucket_searches.iter_mut().enumerate() {
+                if !self.ensure_finalist(
+                    &mut runtime,
+                    &mut bucket.candidates,
+                    0,
+                    &options,
+                    &bucket.context.representative_dyn_map,
+                    Some(&bucket.context),
+                    bucket.egraph_index,
+                    search_started_at,
+                ) {
+                    let label = self.format_bucket_label(
+                        &self.search_space_dim_buckets,
+                        &bucket.context.bucket_indices,
+                    );
+                    panic!(
+                        "Failed to find a viable final graph for bucket {bucket_idx} ({label}): {}",
+                        Self::no_finalist_message(&bucket.candidates)
+                    );
+                }
+            }
+
+            let initial_indices = vec![0usize; bucket_searches.len()];
+            let initial_metrics = bucket_searches
+                .iter()
+                .map(|bucket| bucket.candidates.finalists[0].metric.clone())
+                .collect_vec();
+            let mut frontier = vec![(
+                R::aggregate_profile_metrics(&initial_metrics),
+                initial_indices.clone(),
+            )];
+            let mut visited = FxHashSet::default();
+            visited.insert(initial_indices);
+            let mut selected_indices = None;
+            let mut aggregate_attempts = 0usize;
+            let mut aggregate_rejections = 0usize;
+            let mut last_aggregate_rejection = None;
+            let mut aggregate_stopped_reason = None;
+
+            while !frontier.is_empty() {
+                if aggregate_attempts > 0
+                    && search_started_at.elapsed() >= options.search_time_limit
+                {
+                    aggregate_stopped_reason = Some(
+                        "search time limit expired during aggregate bucket finalization"
+                            .to_string(),
+                    );
+                    break;
+                }
+                let best_pos = (1..frontier.len()).fold(0, |best, candidate| {
+                    if frontier[candidate]
+                        .0
+                        .partial_cmp(&frontier[best].0)
+                        .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+                    {
+                        candidate
+                    } else {
+                        best
+                    }
+                });
+                let (_, indices) = frontier.swap_remove(best_pos);
+                aggregate_attempts += 1;
+
+                let bucket_refs = bucket_searches
+                    .iter()
+                    .zip(&indices)
+                    .map(|(bucket, &candidate_idx)| BucketLLIRRef {
+                        bucket_indices: &bucket.context.bucket_indices,
+                        representative_dyn_map: &bucket.context.representative_dyn_map,
+                        llir: &bucket.candidates.finalists[candidate_idx].llir,
+                    })
+                    .collect_vec();
+                runtime.clear_intermediate_buffers();
+                let aggregate_started_at = std::time::Instant::now();
+                let aggregate_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.filter_llir_bucket_set(
+                            &self.search_space_dim_buckets,
+                            &bucket_refs,
+                            &options,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        CandidateFilterResult::reject_with_display(
+                            "aggregate bucket candidate filter panicked",
+                        )
+                    });
+                let aggregate_timed_out = options
+                    .candidate_timeout
+                    .is_some_and(|timeout| aggregate_started_at.elapsed() >= timeout);
+                if aggregate_result.accepted && !aggregate_timed_out {
+                    selected_indices = Some(indices);
+                    break;
+                }
+                aggregate_rejections += 1;
+                last_aggregate_rejection = if aggregate_timed_out {
+                    Some(format!(
+                        "candidate timeout expired while filtering aggregate bucket set {aggregate_attempts}"
+                    ))
+                } else {
+                    aggregate_result.display
+                };
+
+                // Any one-coordinate successor is the next possible slower
+                // combination. A visited set prevents duplicate lattice paths.
+                for bucket_idx in 0..bucket_searches.len() {
+                    let mut successor = indices.clone();
+                    successor[bucket_idx] += 1;
+                    if !visited.insert(successor.clone()) {
+                        continue;
+                    }
+                    let bucket = &mut bucket_searches[bucket_idx];
+                    if !self.ensure_finalist(
+                        &mut runtime,
+                        &mut bucket.candidates,
+                        successor[bucket_idx],
+                        &options,
+                        &bucket.context.representative_dyn_map,
+                        Some(&bucket.context),
+                        bucket.egraph_index,
+                        search_started_at,
+                    ) {
+                        if bucket.candidates.stopped_reason.is_some()
+                            || bucket
+                                .candidates
+                                .last_rejection
+                                .as_deref()
+                                .is_some_and(|reason| reason.contains("timeout"))
+                        {
+                            let label = self.format_bucket_label(
+                                &self.search_space_dim_buckets,
+                                &bucket.context.bucket_indices,
+                            );
+                            aggregate_stopped_reason.get_or_insert_with(|| {
+                                format!(
+                                    "bucket {bucket_idx} ({label}) fallback stopped: {}",
+                                    Self::no_finalist_message(&bucket.candidates)
+                                )
+                            });
+                        }
+                        continue;
+                    }
+                    let metrics = bucket_searches
+                        .iter()
+                        .zip(&successor)
+                        .map(|(bucket, &candidate_idx)| {
+                            bucket.candidates.finalists[candidate_idx].metric.clone()
+                        })
+                        .collect_vec();
+                    frontier.push((R::aggregate_profile_metrics(&metrics), successor));
+                }
+            }
+
+            let Some(selected_indices) = selected_indices else {
+                let reason = aggregate_stopped_reason
+                    .or(last_aggregate_rejection)
+                    .unwrap_or_else(|| "no aggregate candidate combinations remain".to_string());
+                panic!(
+                    "Failed to find a viable aggregate bucket set after {aggregate_rejections} rejections: {reason}"
+                );
+            };
+
+            let mut bucket_llirs = Vec::with_capacity(n_combos);
+            for (bucket_idx, (mut bucket, candidate_idx)) in bucket_searches
+                .into_iter()
+                .zip(selected_indices)
+                .enumerate()
+            {
+                let finalist = bucket.candidates.finalists.swap_remove(candidate_idx);
+                Self::dump_selected_finalist(
+                    &finalist,
+                    &bucket.context.representative_dyn_map,
+                    Some((bucket_idx, n_combos)),
+                );
                 bucket_llirs.push((
-                    context.bucket_indices,
-                    context.representative_dyn_map,
-                    stitched,
+                    bucket.context.bucket_indices,
+                    bucket.context.representative_dyn_map,
+                    finalist.llir,
                 ));
             }
 
@@ -1576,12 +1837,14 @@ impl Graph {
         parts.join(", ")
     }
 
-    /// Run the genetic search and return the unrolled LLIR for the winning
-    /// genome. `bucket_progress`: if `Some((current_bucket_idx, total_buckets))`
-    /// adds a second "Bucket" progress bar.
+    /// Run the genetic search and return every successfully profiled genome in
+    /// metric order. Final extraction and hard filtering are deliberately
+    /// deferred so bucketed compilation can choose a viable retained set.
+    /// `bucket_progress`: if `Some((current_bucket_idx, total_buckets))` adds a
+    /// second "Bucket" progress bar.
     #[allow(clippy::too_many_arguments)]
-    fn search_single<R: Runtime + 'static, G: rand::Rng>(
-        &mut self,
+    fn search_single<'a, R: Runtime + 'static, G: rand::Rng>(
+        &'a self,
         runtime: &mut R,
         options: &CompileOptions,
         rng: &mut G,
@@ -1590,7 +1853,7 @@ impl Graph {
         bucket_profile_context: Option<SearchProfileBucketContext>,
         egraph_index: usize,
         search_started_at: std::time::Instant,
-    ) -> LLIRGraph {
+    ) -> Vec<(R::ProfileMetric, EGraphChoiceSet<'a>)> {
         let mut profile_dyn_map = dyn_map.clone();
         for (&dim, &value) in &options.profile_dims {
             profile_dyn_map.insert(dim, value);
@@ -1656,7 +1919,7 @@ impl Graph {
         // Find a viable initial genome. Runtime-filtered candidates are dry
         // failures, not searched graphs: they are never profiled and do not
         // count toward the graph search limit.
-        let (mut best_genome, mut best_metric, display, mut n_graphs) = {
+        let (initial_genome, mut best_metric, display, mut n_graphs) = {
             let mut invalid_attempts = 0usize;
             let mut filter_fails = 0usize;
             let mut last_filter_rejection: Option<String> = None;
@@ -1812,9 +2075,15 @@ impl Graph {
             std::io::stdout().flush().unwrap();
         }
 
+        // Retain every successfully profiled genome in metric order. Profiling
+        // uses a collapsed loop body, so the fastest collapsed candidate is not
+        // necessarily viable after the final loop unroll. Final selection below
+        // re-extracts and hard-filters these candidates fastest-first.
+        let mut ranked_candidates = vec![(best_metric.clone(), initial_genome.clone())];
+
         // Track top-N parents for offspring generation
         let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
-            vec![(best_metric.clone(), best_genome.clone())];
+            vec![(best_metric.clone(), initial_genome)];
         let mut resample_generation = false;
 
         while n_graphs < search_limit {
@@ -1984,6 +2253,16 @@ impl Graph {
                     }
                 };
 
+                let rank = ranked_candidates
+                    .iter()
+                    .position(|(metric, _)| {
+                        new_metric
+                            .partial_cmp(metric)
+                            .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+                    })
+                    .unwrap_or(ranked_candidates.len());
+                ranked_candidates.insert(rank, (new_metric.clone(), genome.clone()));
+
                 // Update parents list (keep top-N for next generation)
                 let dominated_by_all = parents.len() >= options.keep_best
                     && !parents.last().unwrap().0.gt(&new_metric);
@@ -2005,7 +2284,6 @@ impl Graph {
                 let new_best = best_metric.gt(&new_metric);
                 if new_best {
                     best_metric = new_metric;
-                    best_genome = genome.clone();
                 }
 
                 if new_best {
@@ -2048,29 +2326,6 @@ impl Graph {
             std::io::stdout().flush().unwrap();
         }
 
-        // Re-extract the winning genome WITHOUT the per-candidate
-        // single-iteration collapse, then run the real loop unroll. The
-        // resulting LLIR is the full N-iteration graph the runtime executes;
-        // the per-candidate collapsed form was used only for ranking.
-        let mut stitched = egglog_to_llir(
-            egraph,
-            best_genome,
-            ops,
-            &self.custom_ops,
-            &mut FxHashMap::default(),
-            &mut FxHashMap::default(),
-            None,
-        );
-        if std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some() {
-            let dump_label = bucket_progress
-                .map(|(bucket_idx, n_buckets)| {
-                    format!("pre-unroll-bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
-                })
-                .unwrap_or_else(|| "pre-unroll-single".to_string());
-            maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
-        }
-        unroll_loops_in_llir(&mut stitched);
-
         if search_log {
             println!(
                 "   {:>6}  in {}",
@@ -2079,14 +2334,157 @@ impl Graph {
             );
         }
 
+        ranked_candidates
+    }
+
+    /// Lazily materialize individually viable final LLIRs until `target` is
+    /// available. Ranked genomes remain compact e-graph choices; full graphs
+    /// are only retained when aggregate bucket backtracking actually reaches
+    /// them.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_finalist<'a, R: Runtime + 'static>(
+        &'a self,
+        runtime: &mut R,
+        candidates: &mut LazyFinalists<'a, R::ProfileMetric>,
+        target: usize,
+        options: &CompileOptions,
+        dyn_map: &FxHashMap<char, usize>,
+        bucket_profile_context: Option<&SearchProfileBucketContext>,
+        egraph_index: usize,
+        search_started_at: std::time::Instant,
+    ) -> bool {
+        let egraph = &self.egraphs[egraph_index];
+        let ops = self.ops.as_ref().unwrap();
+        let dump_pre_unroll = std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some();
+        let final_filter_dyn_map = if bucket_profile_context.is_some() {
+            dyn_map.clone()
+        } else {
+            let mut profile_dyn_map = dyn_map.clone();
+            for (&dim, &value) in &options.profile_dims {
+                profile_dyn_map.insert(dim, value);
+            }
+            profile_dyn_map
+        };
+
+        while candidates.finalists.len() <= target {
+            if candidates.next_ranked >= candidates.ranked.len() {
+                return false;
+            }
+            // Always give the fastest profiled genome one finalization attempt.
+            // Later fallbacks respect the overall search budget.
+            if candidates.next_ranked > 0
+                && search_started_at.elapsed() >= options.search_time_limit
+            {
+                candidates.stopped_reason = Some(format!(
+                    "search time limit expired before finalizing ranked candidate {}",
+                    candidates.next_ranked + 1
+                ));
+                return false;
+            }
+
+            let finalist_started_at = std::time::Instant::now();
+            let (metric, genome) = &candidates.ranked[candidates.next_ranked];
+            let metric = metric.clone();
+            let genome = genome.clone();
+            candidates.next_ranked += 1;
+
+            let final_graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut stitched = egglog_to_llir(
+                    egraph,
+                    genome,
+                    ops,
+                    &self.custom_ops,
+                    &mut FxHashMap::default(),
+                    &mut FxHashMap::default(),
+                    None,
+                );
+                let pre_unroll = dump_pre_unroll.then(|| stitched.clone());
+                unroll_loops_in_llir(&mut stitched);
+                (pre_unroll, stitched)
+            }));
+            let Ok((pre_unroll, stitched)) = final_graph_result else {
+                candidates.rejections += 1;
+                candidates.last_rejection =
+                    Some("final extraction or loop unroll panicked".to_string());
+                continue;
+            };
+
+            runtime.clear_intermediate_buffers();
+            let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.candidate_filter_result(
+                    runtime,
+                    &stitched,
+                    &final_filter_dyn_map,
+                    options,
+                    bucket_profile_context,
+                )
+            }))
+            .unwrap_or_else(|_| {
+                CandidateFilterResult::reject_with_display("final candidate filter panicked")
+            });
+
+            if options
+                .candidate_timeout
+                .is_some_and(|timeout| finalist_started_at.elapsed() >= timeout)
+            {
+                candidates.rejections += 1;
+                candidates.last_rejection = Some(format!(
+                    "candidate timeout expired while finalizing ranked candidate {}",
+                    candidates.next_ranked
+                ));
+                continue;
+            }
+            if !filter_result.accepted {
+                candidates.rejections += 1;
+                candidates.last_rejection = filter_result.display;
+                continue;
+            }
+
+            candidates.finalists.push(Finalist {
+                metric,
+                pre_unroll,
+                llir: stitched,
+            });
+        }
+        true
+    }
+
+    fn no_finalist_message<M>(candidates: &LazyFinalists<'_, M>) -> String {
+        if let Some(stopped_reason) = &candidates.stopped_reason {
+            return format!(
+                "no viable final graph after {} hard-filter rejections: {stopped_reason}",
+                candidates.rejections
+            );
+        }
+        format!(
+            "no viable final graph after hard-filtering {} profiled candidates: {}",
+            candidates.rejections,
+            candidates
+                .last_rejection
+                .as_deref()
+                .unwrap_or("no rejection reason")
+        )
+    }
+
+    fn dump_selected_finalist<M>(
+        finalist: &Finalist<M>,
+        dyn_map: &FxHashMap<char, usize>,
+        bucket_progress: Option<(usize, usize)>,
+    ) {
+        if let Some(pre_unroll) = &finalist.pre_unroll {
+            let dump_label = bucket_progress
+                .map(|(bucket_idx, n_buckets)| {
+                    format!("pre-unroll-bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
+                })
+                .unwrap_or_else(|| "pre-unroll-single".to_string());
+            maybe_dump_selected_llir(&dump_label, dyn_map, pre_unroll);
+        }
         let dump_label = bucket_progress
             .map(|(bucket_idx, n_buckets)| {
                 format!("bucket-{:02}-of-{n_buckets:02}", bucket_idx + 1)
             })
             .unwrap_or_else(|| "single".to_string());
-        maybe_dump_selected_llir(&dump_label, dyn_map, &stitched);
-
-        stitched
+        maybe_dump_selected_llir(&dump_label, dyn_map, &finalist.llir);
     }
 
     fn candidate_filter_result<R: Runtime + 'static>(
@@ -3177,6 +3575,12 @@ fn compact_llir_preserving_input_order(old: &LLIRGraph) -> LLIRGraph {
 mod tests {
     use super::*;
     use crate::egglog_utils::hash_egglog_normalized;
+    use crate::egglog_utils::{
+        api::{Rule, SortDef, sort},
+        base::OP_KIND,
+    };
+    use crate::hlir::{ReferenceData, ReferenceOp};
+    use rand::SeedableRng;
 
     // A rolling candidate is only collapsible if every non-state boundary input
     // is fed from OUTSIDE the candidate's occurrences. A non-state input produced
@@ -3356,6 +3760,449 @@ mod tests {
         }
     }
 
+    macro_rules! final_filter_test_op {
+        ($name:ident, $sort_name:literal, $rule_name:literal) => {
+            #[derive(Debug, Default)]
+            struct $name;
+
+            impl EgglogOp for $name {
+                fn sort(&self) -> SortDef {
+                    sort(OP_KIND, $sort_name, &[])
+                }
+
+                fn rewrites(&self) -> Vec<Rule> {
+                    vec![Rule::raw(format!(
+                        "(rule
+                            (
+                                (= ?sin (Op (Sin ?shape ?strides ?out_strides) ?inputs))
+                                (= (F32) (dtype ?sin))
+                            )
+                            (
+                                (let ?candidate (Op ({}) ?inputs))
+                                (union ?sin ?candidate)
+                                (set (dtype ?candidate) (F32))
+                            )
+                            :ruleset kernel_lower
+                            :name \"{}\"
+                        )",
+                        $sort_name, $rule_name
+                    ))]
+                }
+
+                fn cleanup(&self) -> bool {
+                    false
+                }
+
+                fn n_inputs(&self) -> usize {
+                    1
+                }
+
+                fn extract<'a>(
+                    &'a self,
+                    _: &'a SerializedEGraph,
+                    _: &[&'a ENodeId],
+                    input_enodes: Vec<&'a ENodeId>,
+                    _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+                    _: &mut FxHashMap<&'a ENodeId, Expression>,
+                ) -> (LLIROp, Vec<&'a ENodeId>) {
+                    (
+                        LLIROp::new::<dyn ReferenceOp>(Box::new(Self) as Box<dyn ReferenceOp>),
+                        input_enodes,
+                    )
+                }
+            }
+
+            impl ReferenceOp for $name {
+                fn execute(
+                    &self,
+                    inputs: Vec<&ReferenceData>,
+                    _: &FxHashMap<char, usize>,
+                ) -> ReferenceData {
+                    let ReferenceData::F32(input) = inputs[0] else {
+                        panic!("final-filter test Sin candidates only support F32")
+                    };
+                    ReferenceData::F32(input.iter().map(|value| value.sin()).collect())
+                }
+            }
+        };
+    }
+
+    final_filter_test_op!(FastButInvalidAfterUnroll, "TestFastSin", "test fast sin");
+    final_filter_test_op!(SlowerValidAfterUnroll, "TestSafeSin", "test safe sin");
+
+    #[derive(Default)]
+    struct FinalFilterRuntime {
+        accepted_signatures: FxHashSet<(usize, usize, usize)>,
+        loaded_signatures: Vec<(usize, usize, usize)>,
+        profiled_fast: usize,
+        profiled_safe: usize,
+        rejected_unrolled_fast: usize,
+    }
+
+    impl FinalFilterRuntime {
+        fn signature(llir: &LLIRGraph) -> (usize, usize, usize) {
+            let mut fast = 0;
+            let mut safe = 0;
+            for op in llir.node_weights() {
+                let Some(reference_op) = op.to_dialect::<dyn ReferenceOp>() else {
+                    continue;
+                };
+                let reference_op = reference_op.as_ref().as_ref();
+                fast += usize::from(reference_op.as_any().is::<FastButInvalidAfterUnroll>());
+                safe += usize::from(reference_op.as_any().is::<SlowerValidAfterUnroll>());
+            }
+            (fast, safe, llir.node_count())
+        }
+    }
+
+    impl Runtime for FinalFilterRuntime {
+        type Ops = (FastButInvalidAfterUnroll, SlowerValidAfterUnroll);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, llir: &LLIRGraph) {
+            let signature = Self::signature(llir);
+            assert!(
+                self.accepted_signatures.contains(&signature),
+                "loaded final LLIR {signature:?} did not pass the hard candidate filter"
+            );
+            self.loaded_signatures.push(signature);
+        }
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            llir: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let (fast, safe, _) = Self::signature(llir);
+            assert_eq!(
+                fast + safe,
+                1,
+                "profiling should see exactly one collapsed loop-body candidate"
+            );
+            if fast == 1 {
+                self.profiled_fast += 1;
+                (0, "fast".to_string())
+            } else {
+                self.profiled_safe += 1;
+                (1, "safe".to_string())
+            }
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            llir: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            let signature = Self::signature(llir);
+            if signature.0 > 1 {
+                self.rejected_unrolled_fast += 1;
+                CandidateFilterResult::reject_with_display(
+                    "fast candidate exceeds final unrolled resource limit",
+                )
+            } else {
+                self.accepted_signatures.insert(signature);
+                CandidateFilterResult::accept()
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ProfileDimFinalFilterRuntime {
+        last_profile_dim: Option<usize>,
+        loaded_signatures: Vec<(usize, usize, usize)>,
+        rejected_unrolled_fast: usize,
+    }
+
+    impl Runtime for ProfileDimFinalFilterRuntime {
+        type Ops = (FastButInvalidAfterUnroll, SlowerValidAfterUnroll);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, llir: &LLIRGraph) {
+            let signature = FinalFilterRuntime::signature(llir);
+            let profile_dim = self
+                .last_profile_dim
+                .expect("a selected LLIR must be loaded after profiling");
+            assert!(
+                signature.0 == 0 || signature.0 + signature.1 == 1 || profile_dim <= 1,
+                "load rejected unrolled fast LLIR {signature:?} at profile dim {profile_dim}"
+            );
+            self.loaded_signatures.push(signature);
+        }
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            llir: &LLIRGraph,
+            dyn_map: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let (fast, safe, _) = FinalFilterRuntime::signature(llir);
+            assert_eq!(
+                fast + safe,
+                1,
+                "profiling should see exactly one collapsed loop-body candidate"
+            );
+            self.last_profile_dim = dyn_map.get(&'s').copied();
+            if fast == 1 {
+                (0, "fast".to_string())
+            } else {
+                (1, "safe".to_string())
+            }
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            llir: &LLIRGraph,
+            context: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            let (fast, safe, _) = FinalFilterRuntime::signature(llir);
+            let is_unrolled = fast + safe > 1;
+            let filter_dim = context.dyn_map.get(&'s').copied().unwrap_or(1);
+            if is_unrolled && fast > 0 && filter_dim > 1 {
+                self.rejected_unrolled_fast += 1;
+                CandidateFilterResult::reject_with_display(format!(
+                    "fast candidate exceeds final resource limit at s={filter_dim}"
+                ))
+            } else {
+                CandidateFilterResult::accept()
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct AggregateBucketFilterRuntime {
+        individually_accepted: FxHashSet<(usize, usize, usize)>,
+        aggregate_attempts: Vec<Vec<(usize, usize, usize)>>,
+        aggregate_accepted: FxHashSet<Vec<(usize, usize, usize)>>,
+        loaded_sets: Vec<Vec<(usize, usize, usize)>>,
+    }
+
+    impl Runtime for AggregateBucketFilterRuntime {
+        type Ops = (FastButInvalidAfterUnroll, SlowerValidAfterUnroll);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {
+            panic!("aggregate bucket regression must load a retained bucket set")
+        }
+
+        fn load_llir_buckets(
+            &mut self,
+            _: &FxHashMap<char, Vec<DimBucket>>,
+            bucket_llirs: &[BucketLLIR],
+        ) {
+            let signatures = bucket_llirs
+                .iter()
+                .map(|(_, _, llir)| FinalFilterRuntime::signature(llir))
+                .collect_vec();
+            assert!(
+                signatures
+                    .iter()
+                    .all(|signature| self.individually_accepted.contains(signature)),
+                "load received a bucket LLIR that did not pass individual final filtering"
+            );
+            assert!(
+                self.aggregate_accepted.contains(&signatures),
+                "load received bucket set {signatures:?} that did not pass aggregate filtering"
+            );
+            self.loaded_sets.push(signatures);
+        }
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            llir: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let (fast, safe, _) = FinalFilterRuntime::signature(llir);
+            if fast > 0 {
+                (0, "fast".to_string())
+            } else if safe > 0 {
+                (1, "safe".to_string())
+            } else {
+                (2, "original".to_string())
+            }
+        }
+
+        fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
+            metrics.iter().sum()
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            llir: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            self.individually_accepted
+                .insert(FinalFilterRuntime::signature(llir));
+            CandidateFilterResult::accept()
+        }
+
+        fn filter_llir_bucket_set(
+            &mut self,
+            _: &FxHashMap<char, Vec<DimBucket>>,
+            bucket_llirs: &[BucketLLIRRef<'_>],
+            _: &CompileOptions,
+        ) -> CandidateFilterResult {
+            let signatures = bucket_llirs
+                .iter()
+                .map(|bucket| FinalFilterRuntime::signature(bucket.llir))
+                .collect_vec();
+            assert!(
+                signatures
+                    .iter()
+                    .all(|signature| self.individually_accepted.contains(signature)),
+                "aggregate filter received a bucket that skipped individual filtering"
+            );
+            self.aggregate_attempts.push(signatures.clone());
+            let all_fast = signatures
+                .iter()
+                .all(|(fast, safe, _)| *fast > 0 && *safe == 0);
+            if all_fast {
+                CandidateFilterResult::reject_with_display(
+                    "fast bucket finalists conflict in retained resources",
+                )
+            } else {
+                self.aggregate_accepted.insert(signatures);
+                CandidateFilterResult::accept()
+            }
+        }
+    }
+
+    static SEARCH_BUDGET_PROFILE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SEARCH_BUDGET_FINAL_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, Default)]
+    struct SearchBudgetFinalFilterRuntime;
+
+    impl Runtime for SearchBudgetFinalFilterRuntime {
+        type Ops = (FastButInvalidAfterUnroll, SlowerValidAfterUnroll);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {
+            panic!("a runtime with no viable final candidate must not be loaded")
+        }
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            llir: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let profile_call = SEARCH_BUDGET_PROFILE_CALLS.fetch_add(1, Ordering::SeqCst);
+            if profile_call == 1 {
+                // Cross the global budget only after a second genome has
+                // entered profiling, so it is retained as a possible fallback.
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            let (fast, _, _) = FinalFilterRuntime::signature(llir);
+            if fast == 1 {
+                (0, "fast".to_string())
+            } else {
+                (1, "safe".to_string())
+            }
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            llir: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            let (fast, safe, _) = FinalFilterRuntime::signature(llir);
+            if fast + safe > 1 {
+                SEARCH_BUDGET_FINAL_FILTER_CALLS.fetch_add(1, Ordering::SeqCst);
+                CandidateFilterResult::reject_with_display("forced final rejection")
+            } else {
+                CandidateFilterResult::accept()
+            }
+        }
+    }
+
+    static CANDIDATE_BUDGET_FINAL_FILTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Debug, Default)]
+    struct CandidateBudgetFinalFilterRuntime;
+
+    impl Runtime for CandidateBudgetFinalFilterRuntime {
+        type Ops = (FastButInvalidAfterUnroll, SlowerValidAfterUnroll);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {
+            panic!("a timed-out final candidate must not be loaded")
+        }
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            llir: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+        ) -> (Self::ProfileMetric, String) {
+            let (fast, _, _) = FinalFilterRuntime::signature(llir);
+            if fast == 1 {
+                (0, "fast".to_string())
+            } else {
+                (1, "safe".to_string())
+            }
+        }
+
+        fn filter_llir_candidate(
+            &mut self,
+            llir: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            let (fast, safe, _) = FinalFilterRuntime::signature(llir);
+            if fast + safe > 1 {
+                CANDIDATE_BUDGET_FINAL_FILTER_CALLS.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            CandidateFilterResult::accept()
+        }
+    }
+
     #[test]
     fn compile_options_defaults_and_search_time_limit_builder() {
         let opts = CompileOptions::default();
@@ -3475,6 +4322,185 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn final_filter_skips_fast_invalid_unroll_and_loads_filtered_fallback() {
+        let mut cx = Graph::new();
+        let input = cx.tensor(8);
+        let _ = input.sin().sin().sin().output();
+
+        let options = CompileOptions::default()
+            .search_graph_limit(32)
+            .generation_size(8)
+            .mutations(2)
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF1A1_F11E);
+        let runtime = cx.compile_with_rng(FinalFilterRuntime::default(), options, &mut rng);
+
+        assert!(runtime.profiled_fast > 0, "fast candidate was not profiled");
+        assert!(runtime.profiled_safe > 0, "safe candidate was not profiled");
+        assert!(
+            runtime.rejected_unrolled_fast > 0,
+            "the fastest candidate should pass collapsed filtering and fail after unroll"
+        );
+        assert_eq!(
+            runtime.loaded_signatures.len(),
+            1,
+            "search should load exactly one final LLIR"
+        );
+        let (fast, safe, _) = runtime.loaded_signatures[0];
+        assert_eq!(fast, 0, "the rejected fast candidate was loaded");
+        assert!(
+            safe > 1,
+            "the loaded fallback should be the fully unrolled safe graph"
+        );
+    }
+
+    #[test]
+    fn unbucketed_final_filter_uses_profile_dims_seen_by_load() {
+        let mut cx = Graph::new();
+        cx.set_dim('s', 1);
+        let input = cx.tensor('s');
+        let _ = input.sin().sin().sin().output();
+
+        let options = CompileOptions::default()
+            .profile_dim('s', 8)
+            .search_graph_limit(32)
+            .generation_size(8)
+            .mutations(2)
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF1A1_F11E);
+        let runtime =
+            cx.compile_with_rng(ProfileDimFinalFilterRuntime::default(), options, &mut rng);
+
+        assert_eq!(runtime.last_profile_dim, Some(8));
+        assert!(
+            runtime.rejected_unrolled_fast > 0,
+            "the final hard filter did not receive the profiling dimension"
+        );
+        assert_eq!(runtime.loaded_signatures.len(), 1);
+        let (fast, safe, _) = runtime.loaded_signatures[0];
+        assert_eq!(fast, 0, "load received a candidate invalid at profile_dim");
+        assert!(safe > 1, "load should receive a fully unrolled fallback");
+    }
+
+    #[test]
+    fn final_fallback_validates_one_candidate_then_stops_at_search_time_limit() {
+        SEARCH_BUDGET_PROFILE_CALLS.store(0, Ordering::SeqCst);
+        SEARCH_BUDGET_FINAL_FILTER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut cx = Graph::new();
+        let input = cx.tensor(8);
+        let _ = input.sin().sin().sin().output();
+        let options = CompileOptions::default()
+            .search_graph_limit(2)
+            .generation_size(1)
+            .mutations(2)
+            .search_time_limit(std::time::Duration::from_millis(100))
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF1A1_F11E);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cx.compile_with_rng(SearchBudgetFinalFilterRuntime, options, &mut rng)
+        }));
+
+        let panic = result.expect_err("every finalized candidate should be rejected");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(
+            message.contains("search time limit expired before finalizing ranked candidate 2"),
+            "unexpected finalization failure: {message}"
+        );
+        assert_eq!(
+            SEARCH_BUDGET_PROFILE_CALLS.load(Ordering::SeqCst),
+            2,
+            "the fallback genome must be retained before the budget expires"
+        );
+        assert_eq!(
+            SEARCH_BUDGET_FINAL_FILTER_CALLS.load(Ordering::SeqCst),
+            1,
+            "the fastest finalist must be validated, but no fallback may start after expiry"
+        );
+    }
+
+    #[test]
+    fn final_fallback_rejects_candidates_that_exceed_candidate_timeout() {
+        CANDIDATE_BUDGET_FINAL_FILTER_CALLS.store(0, Ordering::SeqCst);
+
+        let mut cx = Graph::new();
+        let input = cx.tensor(8);
+        let _ = input.sin().sin().sin().output();
+        let options = CompileOptions::default()
+            .search_graph_limit(2)
+            .generation_size(1)
+            .mutations(2)
+            .candidate_timeout(std::time::Duration::from_millis(20))
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xF1A1_F11E);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cx.compile_with_rng(CandidateBudgetFinalFilterRuntime, options, &mut rng)
+        }));
+
+        let panic = result.expect_err("timed-out finalists must not be loaded");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(
+            message.contains("candidate timeout expired while finalizing ranked candidate 2"),
+            "unexpected finalization failure: {message}"
+        );
+        assert_eq!(
+            CANDIDATE_BUDGET_FINAL_FILTER_CALLS.load(Ordering::SeqCst),
+            2,
+            "both retained finalists should be timed and rejected"
+        );
+    }
+
+    #[test]
+    fn aggregate_bucket_filter_backtracks_to_fastest_viable_retained_set() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor('s').sin().output();
+
+        let options = CompileOptions::default()
+            .dim_buckets('s', &[DimBucket::new(1, 1), DimBucket::new(2, 2)])
+            .search_graph_limit(32)
+            .generation_size(8)
+            .mutations(2)
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xA66E_6A7E);
+        let runtime =
+            cx.compile_with_rng(AggregateBucketFilterRuntime::default(), options, &mut rng);
+
+        assert!(
+            runtime.aggregate_attempts.len() >= 2,
+            "aggregate rejection should trigger a slower finalist combination"
+        );
+        assert!(
+            runtime.aggregate_attempts[0]
+                .iter()
+                .all(|(fast, safe, _)| *fast > 0 && *safe == 0),
+            "the independently fastest all-fast set should be tried first"
+        );
+        assert_eq!(runtime.loaded_sets.len(), 1);
+        let loaded = &runtime.loaded_sets[0];
+        assert_eq!(
+            loaded
+                .iter()
+                .filter(|(fast, safe, _)| *fast > 0 && *safe == 0)
+                .count(),
+            1,
+            "best-first fallback should keep one fast bucket"
+        );
+        assert_eq!(
+            loaded.iter().filter(|(_, safe, _)| *safe > 0).count(),
+            1,
+            "best-first fallback should replace only one conflicting finalist"
+        );
     }
 
     #[test]
