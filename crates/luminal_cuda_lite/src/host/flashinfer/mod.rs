@@ -1,5 +1,6 @@
 pub mod find_indptrs;
 pub mod jit;
+pub mod sink_attention;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -295,7 +296,21 @@ pub(crate) fn resident_shared_device_memory_allocations() -> Vec<SharedDeviceMem
 
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
 
-struct PageLockedPtr(*mut u8);
+/// Process-wide page-locked (pinned) staging buffer for FlashInfer's
+/// host-side plan writes. Allocated once, never freed; shared by the FA2 and
+/// FA3 (SinkAttention) plan paths.
+pub(crate) fn page_locked_workspace() -> &'static PageLockedPtr {
+    PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
+        assert_eq!(status, 0, "Failed to allocate page-locked workspace");
+        let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
+        assert_eq!(cuda_status, 0, "Failed to pin memory");
+        PageLockedPtr(ptr as *mut u8)
+    })
+}
+
+pub(crate) struct PageLockedPtr(pub(crate) *mut u8);
 
 // SAFETY: The pointer is page-locked CUDA memory allocated once via
 // posix_memalign + cudaHostRegister and only mutated during OnceLock
@@ -779,14 +794,7 @@ impl FlashInferAttention {
 
         let (float_workspace, float_workspace_ptr, int_workspace, int_workspace_ptr) =
             flashinfer_workspaces(stream);
-        let page_locked_workspace = PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
-            assert_eq!(status, 0, "Failed to allocate page-locked workspace");
-            let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
-            assert_eq!(cuda_status, 0, "Failed to pin memory");
-            PageLockedPtr(ptr as *mut u8)
-        });
+        let page_locked_workspace = page_locked_workspace();
 
         let mut plan_info_buf = [0i64; 16];
         let mut plan_info_len: i32 = 0;
