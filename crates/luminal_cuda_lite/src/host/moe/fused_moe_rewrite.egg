@@ -13,11 +13,49 @@
 (function fused_moe_densify (IR) FusedMoeDensifyState :merge new)
 (function fused_moe_gate_up (IR) FusedMoeGateUpState :merge new)
 
+; Demand guard for the densify marker.
+;
+; The densify pattern is 25 generic Op atoms (Mul/Sum/Add/Gather/Max/Exp2/
+; Recip/LessThan/Cast) with no MXFP4-specific anchor, so on a graph that has
+; no MXFP4 MoE at all it still scans the whole e-graph every iteration —
+; measured as the single slowest rule of the whole build on Gemma-4 (~5s per
+; e-graph context at 30 layers, 0 matches).  Nothing consumes a densify state
+; without also matching `fused_moe_unpack` (the final fusion needs the down
+; unpack, and `fused_moe_gate_up` needs the gate/up unpack), so requiring an
+; unpack to exist first costs no matching power and makes the densify join
+; start from an empty relation on every non-MXFP4 graph.
+(relation fused_moe_unpack_present ())
+
+(rule
+    ((= ?state (fused_moe_unpack ?e)))
+    ((fused_moe_unpack_present))
+    :ruleset glumoe
+    :name "fused_moe unpack present"
+)
+
+; Staged head of the unpack pattern: one Cast-to-Int expert index feeding two
+; separate Gathers (the MXFP4 block and scale tables).  Splitting this prefix
+; off — the same marker staging `glumoe_rewrite.egg` uses — keeps the 12-atom
+; unpack join from being replanned as one flat scan over every Gather/Mul/Add
+; in the e-graph on every iteration.
+(relation fused_moe_unpack_head (IR IR IR))
+
 (rule
     (
         (= ?t297 (Op (Cast ?w737 (Int)) (ICons ?t40 (INil))))
         (= ?t298 (Op (Gather ?w738 ?w739 ?w740 ?w741) (ICons ?t297 (ICons ?t10 (INil)))))
         (= ?t299 (Op (Gather ?w742 ?w743 ?w744 ?w745) (ICons ?t297 (ICons ?t12 (INil)))))
+    )
+    (
+        (fused_moe_unpack_head ?t40 ?t298 ?t299)
+    )
+    :ruleset glumoe
+    :name "fused_moe unpack head"
+)
+
+(rule
+    (
+        (fused_moe_unpack_head ?t40 ?t298 ?t299)
         (= ?t301 (Op (Gather ?w748 ?w749 ?w750 ?w751) (ICons ?t300 (ICons ?t298 (INil)))))
         (= ?t303 (Op (Cast ?w754 (Bf16)) (ICons ?t302 (INil))))
         (= ?t304 (Op (Mul ?w755 ?w756 ?w757 ?w758) (ICons ?t301 (ICons ?t303 (INil)))))
@@ -37,6 +75,7 @@
 
 (rule
     (
+        (fused_moe_unpack_present)
         (= ?t247 (Op (Mul ?w593 ?w594 ?w595 ?w596) (ICons ?t245 (ICons ?t246 (INil)))))
         (= ?t248 (Op (Sum ?w597 ?w598 ?w599 ?w600 ?w601) (ICons ?t247 (INil))))
         (= ?t250 (Op (Add ?w603 ?w604 ?w605 ?w606) (ICons ?t248 (ICons ?t249 (INil)))))

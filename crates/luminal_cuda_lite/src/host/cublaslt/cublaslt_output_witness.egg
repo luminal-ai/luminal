@@ -48,6 +48,40 @@
     :name "cublaslt product stride coefficient"
 )
 
+; Descriptor dimensions of some cuBLASLt op in the e-graph.
+;
+; Every consumer of the two witness relations below binds their dimension
+; arguments to a descriptor m/n (`cublaslt_valid_leading_dimension`'s
+; `?minimum` and `cublaslt_exact_matrix_stride`'s `?rows`/`?cols` all come
+; from a `cublaslt_exact_pointwise_output` match).  Deriving those witnesses
+; for *every* `MNum` in the e-graph instead is a pure |MNum|^2 cross product
+; with no extra matching power: on a 30-layer Gemma-4 graph it materializes
+; ~1M witness tuples that nothing ever reads.  Gating on this relation keeps
+; the witnesses to |MNum| x |descriptor dims|.
+(relation cublaslt_descriptor_dim (Expression))
+
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order ?d_order
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+    )
+    (
+        (cublaslt_descriptor_dim ?descriptor_m)
+        (cublaslt_descriptor_dim ?descriptor_n)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt descriptor dimension"
+)
+
 ; Runtime clamps a descriptor's leading dimension up to the minimum accepted
 ; by cuBLASLt.  A fusion is semantic only when that clamp is a no-op.  Unknown
 ; symbolic inequalities deliberately remain unfused.
@@ -63,6 +97,7 @@
 (rule
     (
         (cublaslt_stride_coefficient ?ld ?ld_value)
+        (cublaslt_descriptor_dim ?minimum)
         (= ?minimum (MNum ?minimum_value))
         (>= ?ld_value ?minimum_value)
     )
@@ -96,6 +131,8 @@
 (rule
     (
         (cublaslt_stride_coefficient ?stride ?stride_value)
+        (cublaslt_descriptor_dim ?rows)
+        (cublaslt_descriptor_dim ?cols)
         (= ?rows (MNum ?rows_value))
         (= ?cols (MNum ?cols_value))
         (= ?stride_value (* ?rows_value ?cols_value))
