@@ -101,8 +101,12 @@ impl EgglogOp for KernelGemv {
                             (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
                             (= ?k_stride (MIter))
 
-                            ; A (the activation row) is row-major [1, k]
-                            (= ?a_m_stride (MMul (MIter) ?k))
+                            ; A (the activation row) reads as a contiguous
+                            ; [k] vector. Both m variants guarantee m <= 1,
+                            ; so the m stride is never advanced and carries
+                            ; no layout constraint: a reshaped view (e.g. an
+                            ; attention output merged from [heads, head_dim])
+                            ; may spell it as any value.
                             (= ?a_n_stride (MNum 0))
                             (= ?a_k_stride (MIter))
 

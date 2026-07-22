@@ -148,3 +148,217 @@
     :ruleset matmul_backend
     :name "cublaslt batched row-major × row-major"
 )
+
+; Batched Row-major × Row-major, single-row (m = 1) A operand.
+;
+; Decode-time attention reads A as one row per batch head, usually through a
+; permuted view (e.g. q reshaped from [1, heads, head_dim]), so its m stride
+; is arbitrary — and irrelevant, because a 1-row matrix never advances it.
+; cuBLASLt only needs each batch's row to be contiguous: batch stride = k.
+; ldb/stride_b are passed as k explicitly rather than the unconstrained view
+; strides.
+(rule
+    (
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
+
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        ; m = 1: static spelling. (Dyn bounds variant below.)
+        (= ?m (MNum 1))
+
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
+
+        (= ?k_stride (MIter))
+
+        ; A: one contiguous [k] row per batch; m stride unconstrained.
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_batch_stride (MMul (MIter) ?k))
+
+        ; B row-major: n=MIter, m=0, k_stride=n*MIter
+        (= ?b_n_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_k_stride (MMul (MIter) ?n))
+        (= ?b_batch_stride (MMul ?k ?b_k_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "N" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_k_stride       ; lda (cuBLAS A = our B, row stride)
+            (MMul (MIter) ?k) ; ldb (cuBLAS B = our A: one row of k)
+            ?n                ; ldc
+            ?n                ; ldd
+            ?batch            ; batch_count
+            ?b_batch_stride   ; stride_a
+            (MMul (MIter) ?k) ; stride_b (contiguous single-row batches)
+            (MMul ?m ?n)      ; stride_c
+            (MMul ?m ?n)      ; stride_d
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched row-major × row-major single-row"
+)
+
+; Same as above with a dynamic m proven to be 1 by interval bounds.
+(rule
+    (
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
+
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?m_lower (lower ?m))
+        (= ?m_upper (upper ?m))
+        (> ?m_lower 0)
+        (< ?m_upper 2)
+
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_batch_stride (MMul (MIter) ?k))
+
+        (= ?b_n_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_k_stride (MMul (MIter) ?n))
+        (= ?b_batch_stride (MMul ?k ?b_k_stride))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "N" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_k_stride
+            (MMul (MIter) ?k)
+            ?n
+            ?n
+            ?batch
+            ?b_batch_stride
+            (MMul (MIter) ?k)
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched row-major × row-major single-row dyn"
+)
+
+; Batched Row-major × Row-major with free row/batch strides.
+;
+; cuBLASLt's strided-batch addressing is A[b,m,k] = stride_b·b + ldb·m + k
+; (and likewise for B), so ANY operand layout of the form
+; (batch: z·β, m: z·α, n: 0, k: z) is natively supported — permuted views
+; (e.g. q read as [heads, s, head_dim] from a [s, heads, head_dim] tensor)
+; included. The only true constraints are the unit-stride innermost dim,
+; the broadcast zeros, and the descriptor requirement ld >= rows, guarded
+; here via interval bounds.
+(rule
+    (
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
+
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
+
+        (= ?k_stride (MIter))
+
+        ; A[b, m, k]: contiguous k, broadcast n. The row stride factor is
+        ; destructured for the ld guard below; the batch stride passes
+        ; through verbatim (any movement expression, including 0 for a
+        ; batch-broadcast operand, is native cuBLASLt strided batching).
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?a_row))
+
+        ; B[b, k, n]: contiguous n, broadcast m.
+        (= ?b_n_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_k_stride (MMul (MIter) ?b_row))
+
+        ; Descriptor validity: ld >= rows of the column-major view.
+        ; cuBLAS A = our B^T [n, k] with lda = b_row  => b_row >= n.
+        ; cuBLAS B = our A^T [k, m] with ldb = a_row  => a_row >= k.
+        (= ?a_row_lower (lower ?a_row))
+        (= ?k_upper (upper ?k))
+        (>= ?a_row_lower ?k_upper)
+        (= ?b_row_lower (lower ?b_row))
+        (= ?n_upper (upper ?n))
+        (>= ?b_row_lower ?n_upper)
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt
+            ?n ?m ?k
+            "N" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_k_stride       ; lda (cuBLAS A = our B, row stride)
+            ?a_m_stride       ; ldb (cuBLAS B = our A, row stride)
+            ?n                ; ldc
+            ?n                ; ldd
+            ?batch            ; batch_count
+            ?b_batch_stride   ; stride_a
+            ?a_batch_stride   ; stride_b
+            (MMul ?m ?n)      ; stride_c
+            (MMul ?m ?n)      ; stride_d
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT")
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched row-major × row-major free strides"
+)

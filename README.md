@@ -130,6 +130,47 @@ Some things on the roadmap:
 - Write compiler for quantum photonic retro encabulator
 - Build dyson swarm
 
+## Environment flags
+
+Runtime/compile-time flags recognized by luminal and the CUDA backend. All are
+off by default; set to `1` to enable unless noted.
+
+### Logging
+
+| Flag | Effect |
+|---|---|
+| `LUMINAL_LOG` | Master switch: enables every log channel below (`SEARCH_LOG`, `EGGLOG_LOG`, `ROLLING_LOG`). Channel flags accept `1`/`0` to force-enable/disable individually. |
+| `SEARCH_LOG` | Search progress: per-bucket progress bars, best-so-far metrics, finalist/aggregate rejection and fallback lines. On by default inside the examples; `SEARCH_LOG=0` silences it. |
+| `EGGLOG_LOG` | E-graph build/schedule diagnostics. |
+| `ROLLING_LOG` | Loop-rolling prepass diagnostics: candidate windows, per-stream per-iteration sources, rolled-region partition, and post-roll region validation (foreign-marker bridge report). |
+| `LUMINAL_LOG_LLIR` | Prints a canonical, diffable dump of the candidate LLIR each time the search finds a new fastest graph (`LLIR_BEST … / LLIR_BEST_END` blocks). Node ids are canonical (topological with deterministic tie-breaks), so identical graphs from different runs produce byte-identical text — compare best graphs across runs with plain `diff`. Note: logs the collapsed profiling body, i.e. the object the search ranks. |
+| `LUMINAL_MASK_LOG` | Per-event detail lines for post-extraction mask events (candidate rejections/repairs — see `LEGALITY_AUDIT.md`). Counters are always on and a nonzero summary prints at the end of every compile regardless of this flag; this adds the per-event `[mask:…]` lines. |
+| `LUMINAL_SEARCH_OP_NAMES` | Appends per-candidate kernel/host-op composition summaries (`[Kernels: …] [Hosts: …]`) to best-so-far search lines. |
+
+### Search & compile behavior
+
+| Flag | Effect |
+|---|---|
+| `LUMINAL_SEARCH_SEED` | Overrides the search RNG seed in the examples (integer). |
+| `SEARCH_MEMORY_MIB` | Overrides the search intermediate-memory cap in examples that support it (integer MiB). |
+| `LUMINAL_MAX_ROLL_BODY` | Caps the largest HLIR window probed by the loop-rolling prepass (default 8192 nodes). |
+| `LUMINAL_COMPUTE_MAJOR` | Overrides the detected CUDA compute capability major version. |
+| `LUMINAL_CUBLASLT_AUTOTUNE` | Enables cuBLASLt algorithm autotuning at prepare time. |
+| `FLASHINFER_CUDA_ARCH` / `LUMINAL_FLASHINFER_DIR` / `LUMINAL_FLASHINFER_DECODE_GRAPH_CAPACITY` | FlashInfer JIT: target arch, cache/library directory, and decode graph capacity override. |
+
+### Dumps & debugging
+
+| Flag | Effect |
+|---|---|
+| `LLIR_DUMP_DIR` | Directory to write selected-finalist LLIR dumps (`.txt` summary + `.dot` graph, per bucket) and failed-filter candidate dumps. |
+| `LLIR_DUMP_PRE_UNROLL` | Also dump each selected finalist before loop unrolling (requires `LLIR_DUMP_DIR`). |
+| `LUMINAL_SEARCH_DUMP_LAST_LLIR` / `LUMINAL_FUZZ_DUMP_LAST_LLIR` | Write the most recent candidate LLIR summary to a fixed path during search / equivalence fuzzing. |
+| `LUMINAL_CUDA_PROFILE_RECAPTURE` | Per-execute phase timing (`CUDA_PREPARE_PROFILE`, `CUDA_EXEC_PROFILE`, `CUDA_ALLOC_PROFILE`, `CUDA_RECAP_PROFILE` lines): prepare/allocate/materialize/launch/sync breakdown — the tool for decomposing TTFT/TPOT into kernel time vs. runtime overhead. |
+| `LUMINAL_CUDA_MEMORY_DEBUG` | CUDA arena/buffer accounting diagnostics. |
+| `LUMINAL_CUDA_DEBUG_GRAPH` / `LUMINAL_CUDA_DEBUG_CUBLASLT_RECAPTURE` / `LUMINAL_CUDA_DEBUG_CUBLASLT_PREPARE_CACHE` | CUDA graph capture and cuBLASLt recapture/prepare-cache debugging. |
+| `LUMINAL_CUDA_CHECK_NONFINITE_INTERNAL` | Checks intermediate buffers (not just outputs) for non-finite values after execution. |
+| `EGGLOG_DEBUG` | Dumps egglog programs/serialized e-graphs for debugging. |
+
 ## License
 
 Licensed under the Apache License, Version 2.0 http://www.apache.org/licenses/LICENSE-2.0 or the MIT license http://opensource.org/licenses/MIT, at your option. This file may not be copied, modified, or distributed except according to those terms.

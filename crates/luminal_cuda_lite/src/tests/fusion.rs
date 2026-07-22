@@ -244,6 +244,7 @@ fn static_validation_accepts_split_and_fused_regions_but_rejects_cycle() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_two_unary_ops_fuse() {
     // Marker form: `a.sin().sqrt()` should fuse into a region with FusedSin
     // and FusedSqrt under one FusionEnd (per pair-fuse U→U).
@@ -320,6 +321,7 @@ fn test_unary_fusion_preserves_output() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_three_unary_ops_fuse() {
     // A chain of 3 pure-elementwise unaries with matching strides should be
     // reachable as a single marker region containing all three elementwise ops.
@@ -338,6 +340,7 @@ fn test_three_unary_ops_fuse() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_four_unary_ops_fuse() {
     // 4-op chain should collapse into a single marker region containing all
     // four elementwise ops (one pair-fuse + repeated grow-FE→U firings).
@@ -707,6 +710,7 @@ fn test_single_binary_does_not_fuse_alone() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_chain_of_binaries_fuses() {
     // `(a + b) * c`: three external inputs collapse into one region with
     // internal [Add, Mul] and 3 FusionStarts. Exercises the B-B pair-fuse
@@ -728,6 +732,7 @@ fn test_chain_of_binaries_fuses() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_binary_then_unary_fuses() {
     // `sin(a + b)`: binary feeds a unary inside one fused region.
     let mut cx = Graph::new();
@@ -746,6 +751,7 @@ fn test_binary_then_unary_fuses() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_unary_then_binary_fuses() {
     // `sin(a) + b`: unary feeds a binary inside one fused region.
     let mut cx = Graph::new();
@@ -764,6 +770,7 @@ fn test_unary_then_binary_fuses() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_diamond_dag_fuses() {
     // The canonical diamond-DAG example agreed with the user:
     //   t = a + b; u = exp2(t); v = sin(t); w = u * a; out = w + v
@@ -894,6 +901,7 @@ fn test_diamond_dag_preserves_output() {
 // ---- Marker invariant tests ----
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_fused_region_has_exactly_one_end() {
     // Design invariant: a fused region always has exactly one FusionEnd.
     // Uses the diamond DAG so there's real fan-in/out inside the region.
@@ -921,6 +929,7 @@ fn test_fused_region_has_exactly_one_end() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_fused_region_starts_match_distinct_external_tensors() {
     // Design invariant: FusionStart count == number of distinct external input
     // tensors, NOT number of edges crossing the boundary. In the diamond DAG
@@ -970,6 +979,7 @@ fn test_fused_region_starts_match_distinct_external_tensors() {
 // confusing diamond mismatch.
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_pair_fuse_unary_unary_marker_form() {
     // Pair-fuse U→U: `a.sin().sqrt()` should be reachable as a marker-bracketed
     // region containing FusedSin and FusedSqrt (with one FusionStart for `a`).
@@ -988,6 +998,7 @@ fn test_pair_fuse_unary_unary_marker_form() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_pair_fuse_unary_to_binary_rhs() {
     // Pair-fuse U→B (RHS variant): `a + b.sin()`. The unary is on the
     // binary's B input, so the rule's RHS-orientation version is what fires.
@@ -1008,6 +1019,7 @@ fn test_pair_fuse_unary_to_binary_rhs() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_pair_fuse_binary_to_binary_rhs() {
     // Pair-fuse B→B (RHS variant): `c * (a + b)`. The inner binary feeds the
     // outer binary's B input, exercising the mirror direction of the rule
@@ -1030,6 +1042,7 @@ fn test_pair_fuse_binary_to_binary_rhs() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_grow_fe_to_binary_rhs() {
     // Grow FE→B (RHS variant): `c + (a.sin() + b)`. Once the inner
     // `a.sin() + b` is fused, the outer `+ c` consumes that FE on its B input
@@ -1053,6 +1066,7 @@ fn test_grow_fe_to_binary_rhs() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_merge_two_regions_at_outer_binary() {
     // Merge: `(sin(a) + b) + (sqrt(c) + d)`. Each side grows its unary region
     // through the inner Add, so both sides become FEs. The outer Add can then
@@ -1231,6 +1245,7 @@ extern "C" __global__ void fused_k(float* out, const float* a, const float* b, l
 // =========================================================================
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_cast_after_unary_fuses() {
     // grow-FE-Cast: `a.sin().cast(Bf16)` should be reachable as one region
     // with the cast as an interior elementwise node, instead of a separate
@@ -1250,6 +1265,7 @@ fn test_cast_after_unary_fuses() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_cast_producer_absorbed_into_region() {
     // grow-Cast-FS: a bf16 input cast to f32 then consumed by a unary chain
     // should pull the cast inside the region.
@@ -1268,6 +1284,7 @@ fn test_cast_producer_absorbed_into_region() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_cast_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
@@ -1281,6 +1298,7 @@ fn test_cast_split_boundary_and_absorbed_choice_coexist() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_unary_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
@@ -1294,6 +1312,7 @@ fn test_unary_split_boundary_and_absorbed_choice_coexist() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
@@ -1308,6 +1327,7 @@ fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
 }
 
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1)"]
 fn test_binary_rhs_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);

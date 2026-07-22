@@ -2020,6 +2020,7 @@ fn repair_choice_cycles<'a>(
 
         let mut repairs = Vec::new();
         for component in components {
+            crate::mask_events::CHOICE_CYCLE_REPAIR.record();
             let component_set: FxHashSet<&NodeId> = component.iter().copied().collect();
             for selected_node in component {
                 let Some(class) = egraph.node_to_class.get(selected_node) else {
@@ -2158,6 +2159,43 @@ pub fn count_choice_sets_up_to(egraph: &SerializedEGraph, limit: usize) -> usize
 /// Draw a complete random genome, then repair only cycles in its reachable
 /// selected term. Legal choices outside those cycles are left untouched so
 /// specialization remains a measured-search decision.
+/// Indices of enodes that are not loop-input markers. A `LoopInput` /
+/// `LoopInputStatic` spelling in a class that also holds the raw value is an
+/// identity wrapper (egglog unions invariant markers with their source), and
+/// choosing it re-wraps the value — the marker's source child is its own
+/// class, so extraction materializes self-referential marker chains. Restrict
+/// choices to non-marker spellings whenever any exist; classes holding only
+/// the marker (genuine varying streams) are unaffected.
+fn enode_is_loop_input_marker(egraph: &SerializedEGraph, n: &NodeId) -> bool {
+    // IR enodes are all headed `Op`; the marker kind lives in the first
+    // child (the OpKind class).
+    let (head, children) = &egraph.enodes[n];
+    if head != "Op" {
+        return false;
+    }
+    let Some(kind_class) = children.first() else {
+        return false;
+    };
+    egraph
+        .eclasses
+        .get(kind_class)
+        .is_some_and(|(_, kind_enodes)| {
+            kind_enodes.iter().any(|k| {
+                let op = egraph.enodes[k].0.as_str();
+                op == "LoopInput" || op == "LoopInputStatic"
+            })
+        })
+}
+
+fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec<usize> {
+    enodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| !enode_is_loop_input_marker(egraph, n))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
     rng: &mut impl Rng,
@@ -2190,10 +2228,32 @@ pub fn random_initial_choice<'a>(
         } else {
             Vec::new()
         };
+        let marker_free = non_marker_enode_indices(egraph, enodes);
+        if !consistent_opkind_indices.is_empty() && consistent_opkind_indices.len() < enodes.len() {
+            crate::mask_events::OPKIND_INCONSISTENT.record();
+        }
+        if !marker_free.is_empty() && marker_free.len() < enodes.len() {
+            crate::mask_events::MARKER_CHOICE_RESTRICTED.record();
+        }
+        let restrict = |pool: Vec<usize>| -> Vec<usize> {
+            if marker_free.is_empty() {
+                return pool;
+            }
+            let filtered: Vec<usize> = pool
+                .iter()
+                .copied()
+                .filter(|i| marker_free.contains(i))
+                .collect();
+            if filtered.is_empty() { pool } else { filtered }
+        };
+        let consistent_opkind_indices = restrict(consistent_opkind_indices);
+        let synth_indices = restrict(synth_indices);
         let pick_idx = if !consistent_opkind_indices.is_empty() {
             consistent_opkind_indices[rng.random_range(0..consistent_opkind_indices.len())]
         } else if !synth_indices.is_empty() {
             synth_indices[rng.random_range(0..synth_indices.len())]
+        } else if !marker_free.is_empty() {
+            marker_free[rng.random_range(0..marker_free.len())]
         } else {
             rng.random_range(0..enodes.len())
         };
@@ -2450,8 +2510,28 @@ fn extract_generation_from_classes<'a>(
             } else {
                 Vec::new()
             };
+            let marker_free = non_marker_enode_indices(egraph, enodes);
+            if !marker_free.is_empty() && marker_free.len() < enodes.len() {
+                crate::mask_events::MARKER_CHOICE_RESTRICTED.record();
+            }
             let new_node = if !consistent_opkind_nodes.is_empty() {
-                consistent_opkind_nodes[rng.random_range(0..consistent_opkind_nodes.len())]
+                let pool: Vec<&NodeId> = if marker_free.is_empty() {
+                    consistent_opkind_nodes
+                } else {
+                    let filtered: Vec<&NodeId> = consistent_opkind_nodes
+                        .iter()
+                        .copied()
+                        .filter(|n| !enode_is_loop_input_marker(egraph, n))
+                        .collect();
+                    if filtered.is_empty() {
+                        consistent_opkind_nodes
+                    } else {
+                        filtered
+                    }
+                };
+                pool[rng.random_range(0..pool.len())]
+            } else if !marker_free.is_empty() {
+                &enodes[marker_free[rng.random_range(0..marker_free.len())]]
             } else {
                 &enodes[rng.random_range(0..enodes.len())]
             };

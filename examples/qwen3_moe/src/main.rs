@@ -47,7 +47,11 @@ fn promote_persistent_state(
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
-    let search_graphs = 200;
+    // 200 stopped converging mid-improvement once the widened search kept
+    // every backend alternative alive (best decode candidates were still
+    // trading naive GenericMatmuls for KernelMoEGemv at the cutoff); 500
+    // matches the other example models.
+    let search_graphs = 500;
     let prompt = "What is the capital of France?";
 
     let ctx = CudaContext::new(0).unwrap();
@@ -94,6 +98,13 @@ fn main() {
         .next_power_of_two()
         .min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
+    // Profile the context dim at a representative size, not the bucket
+    // minimum: at c=16 attention is ~256 elements and the cost differences
+    // between attention backends (FlashInfer vs mask+softmax kernels) or
+    // fused vs unfused chains are below profiling noise, so the search
+    // cannot rank them. 512 makes size-dependent costs visible while
+    // keeping per-candidate profiling cheap.
+    let search_c = 512.min(max_seq_len);
     let compile_options = CompileOptions::default()
         .dim_buckets(
             's',
@@ -104,7 +115,7 @@ fn main() {
         )
         .dim_buckets(
             'c',
-            &[DimBucket::new(1, max_seq_len).representative(search_s)],
+            &[DimBucket::new(1, max_seq_len).representative(search_c)],
         )
         .search_graph_limit(search_graphs);
 
@@ -123,11 +134,11 @@ fn main() {
 
     println!("Compiling...");
     cx.set_dim('s', search_s);
-    cx.set_dim('c', search_s);
+    cx.set_dim('c', search_c);
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
-    runtime.set_data(gather_idx_t, (0..search_s as i32).collect::<Vec<_>>());
+    runtime.set_data(gather_idx_t, (0..search_c as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
     let search_seed = std::env::var("LUMINAL_SEARCH_SEED")

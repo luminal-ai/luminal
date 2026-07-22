@@ -219,6 +219,13 @@ pub struct CompileOptions {
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
+    /// Number of surviving finalists to re-profile in fully-unrolled form
+    /// before final selection (default: 3). Search ranks candidates on a
+    /// collapsed single-iteration body, which underweights costs that scale
+    /// with trip count — a host op inside a rolled layer profiles as one
+    /// call but unrolls to one call per layer. Re-ranking the top finalists
+    /// on the graph that actually ships closes that gap by measurement.
+    pub finalist_depth: usize,
     /// Per-candidate viability budget covering compile (`load_llir`) + run.
     /// Candidates exceeding it are discarded.
     pub candidate_timeout: Option<std::time::Duration>,
@@ -274,6 +281,13 @@ impl CompileOptions {
     /// Set the number of profiling trials per candidate.
     pub fn trials(mut self, trials: usize) -> Self {
         self.trials = trials;
+        self
+    }
+
+    /// Set how many surviving finalists are re-profiled unrolled before
+    /// final selection.
+    pub fn finalist_depth(mut self, depth: usize) -> Self {
+        self.finalist_depth = depth;
         self
     }
 
@@ -359,8 +373,12 @@ impl Default for CompileOptions {
             search_time_limit: std::time::Duration::MAX,
             generation_size: 10,
             mutations: 10,
-            trials: 3,
+            // 3 trials proved too noisy to discriminate fast-vs-slow backends
+            // now that search keeps equivalent alternatives alive; llama has
+            // long used 10 and shows the most stable selections.
+            trials: 5,
             keep_best: 1,
+            finalist_depth: 3,
             candidate_timeout: Some(std::time::Duration::from_secs(5)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
             search_dims: FxHashMap::default(),
@@ -527,13 +545,134 @@ impl Graph {
     fn run_auto_loop_rolling_prepass(&mut self, options: &CompileOptions) {
         let log = options.rolling_log_enabled();
         let before = self.graph.node_count();
-        let inserted = self.auto_roll_loops_prepass_with_log(log);
-        if inserted == 0 {
+        // Roll to a fixpoint. Each pass rolls the single best repeated
+        // region, and rolling one region can expose the next: a periodic
+        // layer pattern (e.g. 5 local + 1 global attention layer) first
+        // rolls into a multi-layer body, and only then do the identical
+        // layers inside that one surviving body form a rollable run of
+        // their own. Termination: every roll strictly deletes duplicate
+        // body nodes, and marker ops are unique so they never form new
+        // repeats.
+        let mut rolled = 0usize;
+        while self.auto_roll_loops_prepass_with_log(log) > 0 {
+            rolled += 1;
+        }
+        if rolled == 0 {
             println!(
                 "   {:>6}  no loop regions found (max body={})",
                 "Rolled".cyan().bold(),
                 before / 2,
             );
+        }
+        if log {
+            self.debug_validate_rolled_regions();
+        }
+    }
+
+    /// ROLLING_LOG diagnostic: walk each rolled region's body in the HLIR and
+    /// report any path that reaches another region's markers without passing
+    /// through this region's own exit markers. Inner regions reaching outer
+    /// markers directly means some cross-region edge was not rewired through
+    /// a marker at insert time.
+    fn debug_validate_rolled_regions(&self) {
+        use crate::hlir::{LoopEnd, LoopInput, LoopOutput, LoopOutputSelect, LoopStart, Output};
+        let mut markers: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        let mut entries: FxHashMap<usize, Vec<NodeIndex>> = FxHashMap::default();
+        for n in self.graph.node_indices() {
+            if let Some(op) = self.try_get_op::<LoopStart>(n) {
+                markers.insert(n, op.loop_id);
+                entries.entry(op.loop_id).or_default().push(n);
+            } else if let Some(op) = self.try_get_op::<LoopEnd>(n) {
+                markers.insert(n, op.loop_id);
+            } else if let Some(op) = self.try_get_op::<LoopInput>(n) {
+                markers.insert(n, op.loop_id);
+                entries.entry(op.loop_id).or_default().push(n);
+            } else if let Some(op) = self.try_get_op::<LoopOutput>(n) {
+                markers.insert(n, op.loop_id);
+            } else if let Some(op) = self.try_get_op::<LoopOutputSelect>(n) {
+                markers.insert(n, op.loop_id);
+            }
+        }
+        for (&id, seeds) in entries.iter().sorted_by_key(|(id, _)| **id) {
+            let mut seen: FxHashSet<NodeIndex> = FxHashSet::default();
+            let mut bridges = 0usize;
+            let mut worklist: Vec<(NodeIndex, NodeIndex)> = seeds
+                .iter()
+                .flat_map(|m| {
+                    self.graph
+                        .neighbors_directed(*m, Direction::Outgoing)
+                        .map(|s| (s, *m))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            while let Some((n, pred)) = worklist.pop() {
+                if seen.contains(&n) {
+                    continue;
+                }
+                if let Some(&owner) = markers.get(&n) {
+                    if owner != id {
+                        bridges += 1;
+                        if bridges <= 3 {
+                            println!(
+                                "   {:>6}  region {id} bridge: {} -> {} (owner {owner})",
+                                "Rolled".red().bold(),
+                                self.graph[pred],
+                                self.graph[n],
+                            );
+                        }
+                    }
+                    continue;
+                }
+                if self.try_get_op::<Output>(n).is_some() {
+                    continue;
+                }
+                seen.insert(n);
+                for succ in self
+                    .graph
+                    .neighbors_directed(n, Direction::Outgoing)
+                    .collect::<Vec<_>>()
+                {
+                    worklist.push((succ, n));
+                }
+            }
+            println!(
+                "   {:>6}  region {id}: body={} foreign-marker bridges={}",
+                "Rolled".cyan().bold(),
+                seen.len(),
+                bridges,
+            );
+        }
+    }
+
+    /// Add edges whose relative edge-id order carries meaning (LoopInput
+    /// per-iteration sources) with freshly allocated, ascending edge ids.
+    /// StableGraph recycles freed edge indices LIFO, so after any removals a
+    /// plain `add_edge` sequence lands on arbitrary ids — and `get_sources`
+    /// / serialization order edges by id. Drain the free list with dummy
+    /// edges first, add the real edges in fresh index territory, then drop
+    /// the dummies.
+    fn add_iteration_ordered_edges(&mut self, pending: Vec<(NodeIndex, Vec<NodeIndex>)>) {
+        use petgraph::visit::EdgeIndexable;
+        let Some(&(anchor, _)) = pending.first() else {
+            return;
+        };
+        let bound = EdgeIndexable::edge_bound(&self.graph);
+        let mut dummies = Vec::new();
+        loop {
+            let e = self.graph.add_edge(anchor, anchor, ());
+            let fresh = e.index() >= bound;
+            dummies.push(e);
+            if fresh {
+                break;
+            }
+        }
+        for (marker, sources) in pending {
+            for src in sources {
+                self.graph.add_edge(src, marker, ());
+            }
+        }
+        for e in dummies {
+            self.graph.remove_edge(e);
         }
     }
 
@@ -545,7 +684,18 @@ impl Graph {
 
         let nodes_before = self.graph.node_count();
         let n_iters = candidate.occurrences.len();
-        let loop_id = 0usize;
+        // Regions roll one at a time; each gets the next free id so nested
+        // and disjoint regions stay distinguishable through egglog and the
+        // LLIR unroll/collapse passes.
+        let loop_id = self
+            .graph
+            .node_indices()
+            .filter_map(|n| {
+                self.try_get_op::<LoopStart>(n)
+                    .map(|start| start.loop_id + 1)
+            })
+            .max()
+            .unwrap_or(0);
 
         // Build the body-node sets EXCLUDING `Output` HLIR nodes. An Output
         // inside a rolled occurrence is a graph-external sink for that
@@ -591,6 +741,13 @@ impl Graph {
         // function might target slots that happen to coincide with a new
         // loop-marker's NodeIndex, so we explicitly exclude those.
         let mut added_loop_ops: FxHashSet<NodeIndex> = FxHashSet::default();
+        // LoopInput per-iteration source edges, added together at the end:
+        // edge-id order IS logical input order across HLIR (`get_sources`
+        // sorts by id), and StableGraph recycles freed edge indices LIFO, so
+        // adding these amid the rewiring below — or after a previous pass's
+        // duplicate-body deletions — would hand them arbitrary recycled ids
+        // and silently permute iteration order at serialization.
+        let mut deferred_source_edges: Vec<(NodeIndex, Vec<NodeIndex>)> = Vec::new();
 
         for (slot_idx, (&p, &out_pos)) in candidate
             .state_param_indices
@@ -663,15 +820,25 @@ impl Graph {
 
             let body_input = candidate.occurrences[0].boundary_inputs[p];
             let dtype = self.infer_node_dtype_cached(body_input, &mut dtype_cache);
+            if log {
+                println!(
+                    "   {:>6}  loop {loop_id} stream {p}: per-iter sources {:?}",
+                    "Rolled".cyan().bold(),
+                    per_iter_sources
+                        .iter()
+                        .map(|n| n.index())
+                        .collect::<Vec<_>>(),
+                );
+            }
             let loop_input = self.graph.add_node(Box::new(LoopInput {
                 loop_id,
                 stream_id: p,
                 dtype,
             }));
             added_loop_ops.insert(loop_input);
-            for &src in &per_iter_sources {
-                self.graph.add_edge(src, loop_input, ());
-            }
+            // Deferred: added at the end with fresh ascending edge ids —
+            // see `add_iteration_ordered_edges`.
+            deferred_source_edges.push((loop_input, per_iter_sources.clone()));
 
             let body_edges: Vec<_> = self
                 .graph
@@ -791,6 +958,8 @@ impl Graph {
             }
             self.graph.remove_node(node);
         }
+
+        self.add_iteration_ordered_edges(deferred_source_edges);
 
         if log && created > 0 {
             let nodes_after = self.graph.node_count();
@@ -927,6 +1096,25 @@ impl Graph {
         if candidate.occurrences.len() < 2 {
             return 0;
         }
+        // Reject rolls that grow the graph: a roll that deletes fewer
+        // duplicate nodes than the markers it creates is pure overhead.
+        // (Termination of the rolling fixpoint doesn't depend on this —
+        // every roll irreversibly consumes a repetition run, since markers
+        // are unique and can never form new repeats — so break-even rolls
+        // are kept for their search-space compression.)
+        let net = rolling_net_savings(&candidate);
+        if net < 0 {
+            if log {
+                println!(
+                    "   {:>6}  best candidate rejected: net savings {} <= 0 (body={} trips={})",
+                    "Rolled".yellow().bold(),
+                    net,
+                    candidate.occurrences[0].nodes.len(),
+                    candidate.occurrences.len(),
+                );
+            }
+            return 0;
+        }
 
         // Mutate the HLIR in place — insert LoopStart/LoopEnd/LoopInput/
         // LoopOutput markers, delete N-1 duplicate bodies. The loop structure
@@ -964,6 +1152,65 @@ impl Graph {
         }
     }
 
+    /// Innermost enclosing rolled region per HLIR node. Walked outer-to-inner
+    /// (ascending loop_id = creation order), so later (inner) regions
+    /// overwrite nothing: an outer walk stops at the inner region's markers
+    /// and never sees the inner body. Nodes outside every region are absent.
+    fn region_scope_map(&self) -> FxHashMap<NodeIndex, usize> {
+        use crate::hlir::{LoopInput, LoopStart, Output};
+        let mut entries: std::collections::BTreeMap<usize, Vec<NodeIndex>> =
+            std::collections::BTreeMap::new();
+        for n in self.graph.node_indices() {
+            if let Some(op) = self.try_get_op::<LoopStart>(n) {
+                entries.entry(op.loop_id).or_default().push(n);
+            } else if let Some(op) = self.try_get_op::<LoopInput>(n) {
+                entries.entry(op.loop_id).or_default().push(n);
+            }
+        }
+        let mut scope: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        for (&id, seeds) in &entries {
+            let mut worklist: Vec<NodeIndex> = seeds
+                .iter()
+                .flat_map(|m| {
+                    self.graph
+                        .neighbors_directed(*m, Direction::Outgoing)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut seen: FxHashSet<NodeIndex> = FxHashSet::default();
+            while let Some(n) = worklist.pop() {
+                if seen.contains(&n)
+                    || self.is_rolled_loop_marker(n)
+                    || self.try_get_op::<Output>(n).is_some()
+                {
+                    continue;
+                }
+                seen.insert(n);
+                scope.insert(n, id);
+                for succ in self
+                    .graph
+                    .neighbors_directed(n, Direction::Outgoing)
+                    .collect::<Vec<_>>()
+                {
+                    worklist.push(succ);
+                }
+            }
+        }
+        scope
+    }
+
+    fn is_rolled_loop_marker(&self, n: NodeIndex) -> bool {
+        use crate::hlir::{
+            LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart,
+        };
+        self.try_get_op::<LoopStart>(n).is_some()
+            || self.try_get_op::<LoopEnd>(n).is_some()
+            || self.try_get_op::<LoopInput>(n).is_some()
+            || self.try_get_op::<LoopInputStatic>(n).is_some()
+            || self.try_get_op::<LoopOutput>(n).is_some()
+            || self.try_get_op::<LoopOutputSelect>(n).is_some()
+    }
+
     fn best_rolling_candidate(&self, max_region_size: usize) -> RollingSearchReport {
         // The signature memo is keyed by NodeIndex; clear it so entries from a
         // prior (now-mutated) graph state can't leak into this read-only search.
@@ -974,11 +1221,18 @@ impl Graph {
                 diagnostics: RollingSearchDiagnostics::default(),
             };
         };
+        // Inputs, Outputs, and loop markers are region boundary, not body:
+        // they feed or drain repeated windows without belonging to them.
+        // Markers especially must be excluded — after one roll, per-iteration
+        // values (e.g. layer weights) arrive through LoopInput markers whose
+        // stream ids differ, and letting them into windows breaks the hash
+        // match for otherwise-identical bodies nested inside the roll.
         let topo: Vec<NodeIndex> = full_topo
             .into_iter()
             .filter(|n| {
                 self.try_get_op::<crate::hlir::Input>(*n).is_none()
                     && self.try_get_op::<crate::hlir::Output>(*n).is_none()
+                    && !self.is_rolled_loop_marker(*n)
             })
             .collect();
         if topo.len() < 2 {
@@ -988,6 +1242,20 @@ impl Graph {
             };
         }
         let uses = build_uses(&self.graph);
+        // A roll must not straddle a rolled-region boundary: occurrences in
+        // different scopes would produce overlapping (not nested) regions.
+        // Markers are invisible to scan windows, so this scope check is the
+        // fence that keeps repetition discovery from crossing into or out of
+        // an existing rolled body.
+        let node_scope = self.region_scope_map();
+        let scope_uniform = |occs: &[RollingOccurrence]| {
+            let mut nodes = occs.iter().flat_map(|occ| occ.nodes.iter());
+            let first = nodes.next().map(|n| node_scope.get(n).copied());
+            match first {
+                None => true,
+                Some(s0) => nodes.all(|n| node_scope.get(n).copied() == s0),
+            }
+        };
         let topo_index: FxHashMap<NodeIndex, usize> =
             topo.iter().enumerate().map(|(i, &n)| (n, i)).collect();
         // Cap the largest probed window. A useful rolling candidate is one
@@ -1109,7 +1377,10 @@ impl Graph {
                 }
 
                 let state_params = collect_state_params(&occs, &uses, &self.graph);
-                if state_params.is_empty() || !candidate_is_rollable(&occs, &state_params) {
+                if state_params.is_empty()
+                    || !candidate_is_rollable(&occs, &state_params)
+                    || !scope_uniform(&occs)
+                {
                     let rejected = RollingRejectedCandidate {
                         window,
                         repetitions: occs.len(),
@@ -1137,13 +1408,59 @@ impl Graph {
                     savings,
                 };
                 let replace = best_overall.as_ref().is_none_or(|b| {
-                    (candidate.savings, candidate.occurrences.len())
-                        > (b.savings, b.occurrences.len())
+                    (rolling_net_savings(&candidate), candidate.occurrences.len())
+                        > (rolling_net_savings(b), b.occurrences.len())
                 });
                 if replace {
                     best_overall = Some(candidate);
                 }
                 start = pos.saturating_sub(window).max(start + 1);
+            }
+        }
+        if crate::egglog_utils::log_channel_enabled(false, "ROLLING_LOG")
+            && let Some(best) = &best_overall
+        {
+            // Probe the windows adjacent to the accepted run: if another
+            // repetition of the body exists but didn't match, the first
+            // divergent node names what broke the periodicity of the linear
+            // order (phase misalignment shows up as an immediate mismatch,
+            // interleaved shared nodes as a mismatch at their topo slot).
+            let window = best.occurrences[0].nodes.len();
+            let first_start = topo_index[&best.occurrences[0].nodes[0]];
+            let last_start = topo_index[&best.occurrences.last().unwrap().nodes[0]];
+            for (label, probe_start) in [
+                ("before", first_start.checked_sub(window)),
+                ("after", Some(last_start + window)),
+            ] {
+                let Some(probe_start) = probe_start else {
+                    continue;
+                };
+                if probe_start + window > topo.len() {
+                    continue;
+                }
+                let mismatches = (0..window)
+                    .filter(|i| node_hashes[probe_start + i] != node_hashes[first_start + i])
+                    .take(4)
+                    .map(|i| {
+                        format!(
+                            "+{i}: {:?} vs body {:?}",
+                            self.graph[topo[probe_start + i]],
+                            self.graph[topo[first_start + i]]
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let total = (0..window)
+                    .filter(|i| node_hashes[probe_start + i] != node_hashes[first_start + i])
+                    .count();
+                println!(
+                    "   Rolled  probe {label} run (start {probe_start}, window {window}): {total} hash mismatches{}{}",
+                    if mismatches.is_empty() {
+                        ""
+                    } else {
+                        "; first: "
+                    },
+                    mismatches.join(" | ")
+                );
             }
         }
         let mut grown_best = best_overall.take().map(|best| {
@@ -1159,7 +1476,9 @@ impl Graph {
                 &discovered_runs,
                 &self.custom_ops,
             );
-            if candidate_is_rollable(&grown.occurrences, &grown.state_param_indices) {
+            if candidate_is_rollable(&grown.occurrences, &grown.state_param_indices)
+                && scope_uniform(&grown.occurrences)
+            {
                 grown
             } else {
                 seed
@@ -1182,11 +1501,13 @@ impl Graph {
             );
             if grown.state_param_indices.is_empty()
                 || !candidate_is_rollable(&grown.occurrences, &grown.state_param_indices)
+                || !scope_uniform(&grown.occurrences)
             {
                 continue;
             }
             let replace = grown_best.as_ref().is_none_or(|best| {
-                (grown.savings, grown.occurrences.len()) > (best.savings, best.occurrences.len())
+                (rolling_net_savings(&grown), grown.occurrences.len())
+                    > (rolling_net_savings(best), best.occurrences.len())
             });
             if replace {
                 grown_best = Some(grown);
@@ -1466,7 +1787,14 @@ impl Graph {
         rng: &mut G,
     ) -> R {
         self.build_search_space::<R>(options.clone());
-        self.search_with_rng(runtime, options, rng)
+        let runtime = self.search_with_rng(runtime, options, rng);
+        // Legality-by-construction burn-down: any post-extraction mask that
+        // fired during this compile is a contract violation to fix, not a
+        // normal event — always report it.
+        if let Some(report) = crate::mask_events::report() {
+            println!("{report}");
+        }
+        runtime
     }
 
     #[tracing::instrument(skip_all)]
@@ -1521,10 +1849,17 @@ impl Graph {
                     Self::no_finalist_message(&candidates)
                 );
             }
-            let finalist = candidates
-                .finalists
-                .pop()
-                .expect("ensure_finalist returned without a finalist");
+            self.reprofile_finalists_unrolled(
+                &mut runtime,
+                &mut candidates,
+                &options,
+                &self.dyn_map,
+                None,
+                0,
+                search_started_at,
+                search_log,
+            );
+            let finalist = candidates.finalists.remove(0);
             Self::dump_selected_finalist(&finalist, &self.dyn_map, None);
 
             runtime.clear_intermediate_buffers();
@@ -1601,6 +1936,17 @@ impl Graph {
                         Self::no_finalist_message(&bucket.candidates)
                     );
                 }
+                let context = bucket.context.clone();
+                self.reprofile_finalists_unrolled(
+                    &mut runtime,
+                    &mut bucket.candidates,
+                    &options,
+                    &context.representative_dyn_map,
+                    Some(&context),
+                    bucket.egraph_index,
+                    search_started_at,
+                    search_log,
+                );
             }
 
             let initial_indices = vec![0usize; bucket_searches.len()];
@@ -1672,10 +2018,19 @@ impl Graph {
                     .candidate_timeout
                     .is_some_and(|timeout| aggregate_started_at.elapsed() >= timeout);
                 if aggregate_result.accepted && !aggregate_timed_out {
+                    if search_log && aggregate_rejections > 0 {
+                        println!(
+                            "   {:>6}  aggregate fallback: selected per-bucket finalist ranks {:?} after {} rejection(s)",
+                            "Search".yellow().bold(),
+                            indices,
+                            aggregate_rejections,
+                        );
+                    }
                     selected_indices = Some(indices);
                     break;
                 }
                 aggregate_rejections += 1;
+                crate::mask_events::AGGREGATE_REJECT.record();
                 last_aggregate_rejection = if aggregate_timed_out {
                     Some(format!(
                         "candidate timeout expired while filtering aggregate bucket set {aggregate_attempts}"
@@ -1683,6 +2038,14 @@ impl Graph {
                 } else {
                     aggregate_result.display
                 };
+                if search_log {
+                    println!(
+                        "   {:>6}  aggregate reject per-bucket finalist ranks {:?}: {}",
+                        "Search".yellow().bold(),
+                        indices,
+                        last_aggregate_rejection.as_deref().unwrap_or("(no reason)"),
+                    );
+                }
 
                 // Any one-coordinate successor is the next possible slower
                 // combination. A visited set prevents duplicate lattice paths.
@@ -2029,7 +2392,13 @@ impl Graph {
                         };
                     let timed_out = candidate_timed_out(profile_start.elapsed());
                     let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
+                    if has_nan {
+                        crate::mask_events::NAN_OUTPUT_REJECT.record();
+                    }
                     let invalid_profile = rep_display.starts_with("invalid ");
+                    if !has_nan && !timed_out && !invalid_profile {
+                        log_best_llir(&graph, &format!("candidate=0 {rep_display}"));
+                    }
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
@@ -2137,12 +2506,19 @@ impl Graph {
                         &mut expr_cache,
                         None,
                     );
+                    let pre_collapse = std::env::var_os("LLIR_DUMP_DIR")
+                        .is_some()
+                        .then(|| llir_graph.clone());
                     // Collapse the rolled body to a single iteration
                     // before profiling — see initial-genome path.
                     collapse_loops_to_first_iter(&mut llir_graph);
-                    llir_graph
+                    (pre_collapse, llir_graph)
                 }));
-                let Ok(llir_graph) = graph_result else {
+                if let Err(payload) = &graph_result {
+                    crate::mask_events::CANDIDATE_PANIC
+                        .record_with(|| crate::mask_events::panic_payload(payload.as_ref()));
+                }
+                let Ok((pre_collapse, llir_graph)) = graph_result else {
                     if search_log {
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
@@ -2163,7 +2539,13 @@ impl Graph {
                         bucket_profile_context.as_ref(),
                     )
                 }))
-                .unwrap_or_else(|_| {
+                .unwrap_or_else(|payload| {
+                    crate::mask_events::CANDIDATE_PANIC
+                        .record_with(|| crate::mask_events::panic_payload(payload.as_ref()));
+                    maybe_dump_selected_llir("failed-filter-candidate", dyn_map, &llir_graph);
+                    if let Some(pre) = &pre_collapse {
+                        maybe_dump_selected_llir("failed-filter-precollapse", dyn_map, pre);
+                    }
                     CandidateFilterResult::reject_with_display("candidate compile panicked")
                 });
                 if !filter_result.accepted {
@@ -2199,6 +2581,9 @@ impl Graph {
                     let timed_out = candidate_timed_out(profile_start.elapsed());
                     let has_nan =
                         !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
+                    if has_nan {
+                        crate::mask_events::NAN_OUTPUT_REJECT.record();
+                    }
                     let invalid_profile = rep_display.starts_with("invalid ");
                     (
                         rep_metric,
@@ -2284,6 +2669,10 @@ impl Graph {
                 let new_best = best_metric.gt(&new_metric);
                 if new_best {
                     best_metric = new_metric;
+                    log_best_llir(
+                        &llir_graph,
+                        &format!("candidate={n_graphs} {display_metric}"),
+                    );
                 }
 
                 if new_best {
@@ -2337,6 +2726,148 @@ impl Graph {
         ranked_candidates
     }
 
+    /// Materialize up to `options.finalist_depth` viable finalists and
+    /// re-rank them by profiling their fully-unrolled graphs. Search ranks
+    /// candidates on collapsed single-iteration bodies, which underweights
+    /// any cost that scales with trip count (host-op call overhead, CUDA
+    /// graph island boundaries) by the trip factor; the unrolled profile
+    /// measures the graph that actually ships.
+    #[allow(clippy::too_many_arguments)]
+    fn reprofile_finalists_unrolled<'a, R: Runtime + 'static>(
+        &'a self,
+        runtime: &mut R,
+        candidates: &mut LazyFinalists<'a, R::ProfileMetric>,
+        options: &CompileOptions,
+        dyn_map: &FxHashMap<char, usize>,
+        bucket_profile_context: Option<&SearchProfileBucketContext>,
+        egraph_index: usize,
+        search_started_at: std::time::Instant,
+        search_log: bool,
+    ) {
+        if options.finalist_depth <= 1 {
+            return;
+        }
+        // Materialize finalists until `finalist_depth` structurally distinct
+        // graphs are available (or the ranked list runs out). The top of the
+        // ranked list is often a cluster of near-identical genomes differing
+        // only in irrelevant genes; deduplicating by kernel composition
+        // makes each profiling slot buy a genuinely different alternative.
+        let composition = |llir: &LLIRGraph| -> String {
+            let mut names: Vec<String> = llir
+                .node_weights()
+                .map(|op| format!("{op:?}"))
+                .map(|d| d.split(['{', '(']).take(3).collect::<Vec<_>>().join(""))
+                .collect();
+            names.sort();
+            names.join(";")
+        };
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        seen.insert(composition(&candidates.finalists[0].llir));
+        // Scanning a clone-heavy ranked list materializes (extract + unroll
+        // + filter) each entry, which can dominate compile time on large
+        // graphs. Budget the scan with the knobs that already price a
+        // candidate: one candidate_timeout per requested distinct finalist.
+        let scan_started_at = std::time::Instant::now();
+        let scan_budget = options
+            .candidate_timeout
+            .map(|timeout| timeout * options.finalist_depth as u32);
+        loop {
+            if seen.len() >= options.finalist_depth {
+                break;
+            }
+            if scan_budget.is_some_and(|budget| scan_started_at.elapsed() >= budget) {
+                if search_log {
+                    println!(
+                        "   {:>6}  finalist scan budget exhausted with {} distinct structure(s)",
+                        "Search".yellow().bold(),
+                        seen.len(),
+                    );
+                }
+                break;
+            }
+            let target = candidates.finalists.len();
+            if !self.ensure_finalist(
+                runtime,
+                candidates,
+                target,
+                options,
+                dyn_map,
+                bucket_profile_context,
+                egraph_index,
+                search_started_at,
+            ) {
+                break;
+            }
+            let sig = composition(&candidates.finalists[target].llir);
+            if !seen.insert(sig) {
+                // Same structure as an already-profiled finalist — drop it
+                // and keep walking the ranked list.
+                candidates.finalists.remove(target);
+            }
+        }
+        if candidates.finalists.len() <= 1 {
+            return;
+        }
+        let profile_dyn_map = if bucket_profile_context.is_some() {
+            dyn_map.clone()
+        } else {
+            let mut profile_dyn_map = dyn_map.clone();
+            for (&dim, &value) in &options.profile_dims {
+                profile_dyn_map.insert(dim, value);
+            }
+            profile_dyn_map
+        };
+        for (rank, finalist) in candidates.finalists.iter_mut().enumerate() {
+            runtime.clear_intermediate_buffers();
+            let profiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(context) = bucket_profile_context {
+                    runtime.profile_with_bucket_context(
+                        &finalist.llir,
+                        &profile_dyn_map,
+                        options.trials,
+                        options.execution_timeout,
+                        ProfileBucketContext {
+                            dim_buckets: &context.dim_buckets,
+                            bucket_indices: &context.bucket_indices,
+                            representative_dyn_map: &context.representative_dyn_map,
+                        },
+                    )
+                } else {
+                    runtime.profile(
+                        &finalist.llir,
+                        &profile_dyn_map,
+                        options.trials,
+                        options.execution_timeout,
+                    )
+                }
+            }));
+            match profiled {
+                Ok((metric, display)) => {
+                    if search_log {
+                        println!(
+                            "   {:>6}  finalist #{rank} unrolled: {display}",
+                            "Search".cyan().bold(),
+                        );
+                    }
+                    finalist.metric = metric;
+                }
+                Err(_) => {
+                    if search_log {
+                        println!(
+                            "   {:>6}  finalist #{rank} unrolled profile panicked; keeping collapsed metric",
+                            "Search".yellow().bold(),
+                        );
+                    }
+                }
+            }
+        }
+        candidates.finalists.sort_by(|a, b| {
+            a.metric
+                .partial_cmp(&b.metric)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     /// Lazily materialize individually viable final LLIRs until `target` is
     /// available. Ranked genomes remain compact e-graph choices; full graphs
     /// are only retained when aggregate bucket backtracking actually reaches
@@ -2355,6 +2886,7 @@ impl Graph {
     ) -> bool {
         let egraph = &self.egraphs[egraph_index];
         let ops = self.ops.as_ref().unwrap();
+        let search_log = options.search_log_enabled();
         let dump_pre_unroll = std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some();
         let final_filter_dyn_map = if bucket_profile_context.is_some() {
             dyn_map.clone()
@@ -2402,10 +2934,21 @@ impl Graph {
                 unroll_loops_in_llir(&mut stitched);
                 (pre_unroll, stitched)
             }));
+            if let Err(payload) = &final_graph_result {
+                crate::mask_events::CANDIDATE_PANIC
+                    .record_with(|| crate::mask_events::panic_payload(payload.as_ref()));
+            }
             let Ok((pre_unroll, stitched)) = final_graph_result else {
                 candidates.rejections += 1;
                 candidates.last_rejection =
                     Some("final extraction or loop unroll panicked".to_string());
+                if search_log {
+                    println!(
+                        "   {:>6}  finalist reject ranked #{}: final extraction or loop unroll panicked",
+                        "Search".yellow().bold(),
+                        candidates.next_ranked,
+                    );
+                }
                 continue;
             };
 
@@ -2432,14 +2975,49 @@ impl Graph {
                     "candidate timeout expired while finalizing ranked candidate {}",
                     candidates.next_ranked
                 ));
+                if search_log {
+                    println!(
+                        "   {:>6}  finalist reject ranked #{}: finalization timeout after {:?}",
+                        "Search".yellow().bold(),
+                        candidates.next_ranked,
+                        finalist_started_at.elapsed(),
+                    );
+                }
                 continue;
             }
             if !filter_result.accepted {
                 candidates.rejections += 1;
                 candidates.last_rejection = filter_result.display;
+                crate::mask_events::FINALIST_REJECT.record_with(|| {
+                    candidates
+                        .last_rejection
+                        .clone()
+                        .unwrap_or_else(|| "(no reason)".to_string())
+                });
+                if search_log {
+                    println!(
+                        "   {:>6}  finalist reject ranked #{}: {}",
+                        "Search".yellow().bold(),
+                        candidates.next_ranked,
+                        candidates
+                            .last_rejection
+                            .as_deref()
+                            .unwrap_or("(no reason)"),
+                    );
+                }
                 continue;
             }
 
+            // Falling past rank #1 silently substitutes a slower-profiled
+            // graph; make the substitution visible.
+            if search_log && candidates.next_ranked > 1 {
+                println!(
+                    "   {:>6}  finalist fallback: loading ranked #{} after {} rejection(s)",
+                    "Search".yellow().bold(),
+                    candidates.next_ranked,
+                    candidates.rejections,
+                );
+            }
             candidates.finalists.push(Finalist {
                 metric,
                 pre_unroll,
@@ -2625,11 +3203,13 @@ fn cheap_rolling_node_hash(
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(1099511628211);
     }
+    // Only in-degree (op arity) may enter the hash. Out-degree counts external
+    // consumers, and boundary nodes legitimately differ in fan-out between
+    // occurrences (an interior repetition feeds the next one, the last feeds
+    // the epilogue) — the canonical signature models those consumers as loop
+    // outputs, so a gate stricter than the matcher would reject valid trips.
     let in_degree = graph.neighbors_directed(node, Direction::Incoming).count() as u64;
-    let out_degree = graph.neighbors_directed(node, Direction::Outgoing).count() as u64;
     hash ^= in_degree.wrapping_mul(0x9e3779b185ebca87);
-    hash = hash.rotate_left(13);
-    hash ^= out_degree.wrapping_mul(0xc2b2ae3d27d4eb4f);
     hash
 }
 
@@ -2874,6 +3454,30 @@ fn candidate_is_rollable(occurrences: &[RollingOccurrence], state_params: &[usiz
     true
 }
 
+/// Net node-count change of rolling a candidate: duplicate body nodes
+/// deleted minus marker ops created (mirroring `insert_loop_region_ops`:
+/// LoopStart + LoopEnd per state slot, one LoopInput per iteration-varying
+/// non-state boundary stream, and one LoopOutput plus a per-iteration Select
+/// for each non-state output stream). Rolling is only worth doing — and the
+/// rolling fixpoint only terminates — when this is positive.
+fn rolling_net_savings(candidate: &RollingCandidate) -> i64 {
+    let occs = &candidate.occurrences;
+    let n_iters = occs.len();
+    let states: FxHashSet<usize> = candidate.state_param_indices.iter().copied().collect();
+    let deleted = occs[0].nodes.len() * (n_iters - 1);
+    let varying_inputs = (0..occs[0].boundary_inputs.len())
+        .filter(|p| !states.contains(p))
+        .filter(|&p| {
+            !occs
+                .windows(2)
+                .all(|w| w[0].boundary_inputs[p] == w[1].boundary_inputs[p])
+        })
+        .count();
+    let output_streams = occs[0].output_nodes.len().saturating_sub(states.len());
+    let markers = 2 * states.len() + varying_inputs + output_streams * (n_iters + 1);
+    deleted as i64 - markers as i64
+}
+
 fn grow_rolling_candidate(
     graph: &HLIRGraph,
     uses: &FxHashMap<NodeIndex, Vec<(NodeIndex, usize)>>,
@@ -3008,79 +3612,175 @@ fn grow_rolling_candidate(
 ///
 /// Incoming-edge ORDER is preserved for every affected node — ops read their
 /// inputs by edge-id order, so edges are rebuilt in position.
-pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
-    use crate::hlir::{
-        LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart, Output,
-    };
+/// When `LUMINAL_LOG_LLIR=1`, print a canonical, diffable dump of a
+/// candidate LLIR each time the search finds a new fastest graph. Nodes are
+/// numbered canonically (Kahn topological order with a deterministic
+/// tie-break on op text and canonical input ids), so two runs of an
+/// identical graph produce byte-identical output regardless of NodeIndex
+/// assignment — best-so-far graphs from different runs can be compared with
+/// plain `diff`.
+pub fn log_best_llir(llir: &LLIRGraph, context: &str) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("LUMINAL_LOG_LLIR").is_some()) {
+        return;
+    }
     use petgraph::visit::EdgeRef;
     use std::collections::BTreeMap;
 
-    let mut starts: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    let mut ends: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    let mut inputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    // Iteration-independent inputs. Keyed on LLIR NodeIndex (stream_id is not
-    // unique when a single LoopInput splits into multiple LoopInputStatics via
-    // egglog rewrites of the same stream).
-    let mut static_inputs: FxHashSet<NodeIndex> = FxHashSet::default();
-    // LoopOutput stream → its NodeIndex. Each stream has one LoopOutput.
-    let mut outputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    // (stream_id, iter) → LoopOutputSelect NodeIndex.
-    let mut output_selects: FxHashMap<NodeIndex, (usize /*stream*/, usize /*iter*/)> =
-        FxHashMap::default();
-
-    let mut iters = 0usize;
-    for n in llir.node_indices() {
-        let op = &llir[n];
-        if let Some(ls) = op.to_op::<LoopStart>() {
-            iters = iters.max(ls.iters.to_usize().unwrap_or(1));
-            starts.insert(ls.slot_idx, n);
-        } else if let Some(le) = op.to_op::<LoopEnd>() {
-            ends.insert(le.slot_idx, n);
-        } else if op.to_op::<LoopInputStatic>().is_some() {
-            // Must be checked before LoopInput because LoopInputStatic is a
-            // distinct op with its own sort name, but we want it recognized as
-            // a separate category here.
-            static_inputs.insert(n);
-        } else if let Some(li) = op.to_op::<LoopInput>() {
-            inputs.insert(li.stream_id, n);
-        } else if let Some(los) = op.to_op::<LoopOutputSelect>() {
-            output_selects.insert(n, (los.stream_id, los.iter));
-        } else if let Some(lo) = op.to_op::<LoopOutput>() {
-            outputs.insert(lo.stream_id, n);
+    let mut indegree: FxHashMap<NodeIndex, usize> = llir
+        .node_indices()
+        .map(|n| (n, llir.edges_directed(n, Direction::Incoming).count()))
+        .collect();
+    // Ready nodes keyed by (op text, canonical input ids) for deterministic
+    // pops; true duplicates tie and are interchangeable.
+    let mut ready: BTreeMap<(String, Vec<usize>), Vec<NodeIndex>> = BTreeMap::new();
+    let mut canonical: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+    let inputs_of = |n: NodeIndex, canonical: &FxHashMap<NodeIndex, usize>| -> Vec<usize> {
+        llir.edges_directed(n, Direction::Incoming)
+            .sorted_by_key(|e| e.id())
+            .map(|e| canonical.get(&e.source()).copied().unwrap_or(usize::MAX))
+            .collect()
+    };
+    for (&n, &d) in &indegree {
+        if d == 0 {
+            ready
+                .entry((format!("{:?}", llir[n]), Vec::new()))
+                .or_default()
+                .push(n);
         }
     }
-    if iters <= 1 || starts.is_empty() {
-        return;
+    let mut lines: Vec<String> = Vec::with_capacity(indegree.len());
+    while let Some((key, nodes)) = ready.pop_first() {
+        for n in nodes {
+            let id = lines.len();
+            canonical.insert(n, id);
+            let inputs = key
+                .1
+                .iter()
+                .map(|i| format!("n{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!("n{id}: {} <- [{inputs}]", key.0));
+            for succ in llir
+                .neighbors_directed(n, Direction::Outgoing)
+                .collect::<Vec<_>>()
+            {
+                let d = indegree.get_mut(&succ).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    ready
+                        .entry((format!("{:?}", llir[succ]), inputs_of(succ, &canonical)))
+                        .or_default()
+                        .push(succ);
+                }
+            }
+        }
     }
+    println!("LLIR_BEST {context} nodes={}", lines.len());
+    for line in &lines {
+        println!("{line}");
+    }
+    println!("LLIR_BEST_END");
+}
 
-    let loop_markers: FxHashSet<NodeIndex> = starts
-        .values()
-        .copied()
-        .chain(ends.values().copied())
-        .chain(inputs.values().copied())
-        .chain(static_inputs.iter().copied())
-        .chain(outputs.values().copied())
-        .chain(output_selects.keys().copied())
-        .collect();
+/// Marker nodes and per-slot metadata of one rolled loop region, grouped
+/// from the LLIR graph by `loop_id`.
+#[derive(Default)]
+struct LoopRegion {
+    /// slot_idx → LoopStart.
+    starts: std::collections::BTreeMap<usize, NodeIndex>,
+    /// slot_idx → LoopEnd.
+    ends: std::collections::BTreeMap<usize, NodeIndex>,
+    /// stream_id → LoopInput.
+    inputs: std::collections::BTreeMap<usize, NodeIndex>,
+    /// stream_id → LoopOutput. Each stream has one LoopOutput.
+    outputs: std::collections::BTreeMap<usize, NodeIndex>,
+    /// LoopOutputSelect NodeIndex → (stream_id, iter).
+    output_selects: FxHashMap<NodeIndex, (usize, usize)>,
+    iters: usize,
+    /// Every marker node of this region.
+    markers: FxHashSet<NodeIndex>,
+}
+
+fn collect_loop_regions(llir: &LLIRGraph) -> std::collections::BTreeMap<usize, LoopRegion> {
+    use crate::hlir::{LoopEnd, LoopInput, LoopOutput, LoopOutputSelect, LoopStart};
+
+    let mut regions: std::collections::BTreeMap<usize, LoopRegion> =
+        std::collections::BTreeMap::new();
+    for n in llir.node_indices() {
+        let op = &llir[n];
+        let loop_id = if let Some(ls) = op.to_op::<LoopStart>() {
+            let region = regions.entry(ls.loop_id).or_default();
+            region.iters = region.iters.max(ls.iters.to_usize().unwrap_or(1));
+            region.starts.insert(ls.slot_idx, n);
+            ls.loop_id
+        } else if let Some(le) = op.to_op::<LoopEnd>() {
+            regions
+                .entry(le.loop_id)
+                .or_default()
+                .ends
+                .insert(le.slot_idx, n);
+            le.loop_id
+        } else if let Some(li) = op.to_op::<LoopInput>() {
+            regions
+                .entry(li.loop_id)
+                .or_default()
+                .inputs
+                .insert(li.stream_id, n);
+            li.loop_id
+        } else if let Some(los) = op.to_op::<LoopOutputSelect>() {
+            regions
+                .entry(los.loop_id)
+                .or_default()
+                .output_selects
+                .insert(n, (los.stream_id, los.iter));
+            los.loop_id
+        } else if let Some(lo) = op.to_op::<LoopOutput>() {
+            regions
+                .entry(lo.loop_id)
+                .or_default()
+                .outputs
+                .insert(lo.stream_id, n);
+            lo.loop_id
+        } else {
+            continue;
+        };
+        regions.entry(loop_id).or_default().markers.insert(n);
+    }
+    regions
+}
+
+/// Forward-reachable body of one region: successors of its entry markers,
+/// stopping at `Output` ops and at any loop marker of any region. Also
+/// reports whether a marker belonging to a *different* region was reached —
+/// i.e. that region is nested inside this one.
+fn loop_region_body(
+    llir: &LLIRGraph,
+    region: &LoopRegion,
+    marker_owner: &FxHashMap<NodeIndex, usize>,
+    self_id: usize,
+) -> (FxHashSet<NodeIndex>, std::collections::BTreeSet<usize>) {
+    use crate::hlir::Output;
 
     let mut body_nodes: FxHashSet<NodeIndex> = FxHashSet::default();
-    let mut worklist: Vec<NodeIndex> = starts
+    let mut foreign: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut worklist: Vec<NodeIndex> = region
+        .starts
         .values()
+        .chain(region.inputs.values())
         .flat_map(|n| {
             llir.neighbors_directed(*n, Direction::Outgoing)
                 .collect::<Vec<_>>()
         })
-        .chain(inputs.values().flat_map(|n| {
-            llir.neighbors_directed(*n, Direction::Outgoing)
-                .collect::<Vec<_>>()
-        }))
-        .chain(static_inputs.iter().flat_map(|n| {
-            llir.neighbors_directed(*n, Direction::Outgoing)
-                .collect::<Vec<_>>()
-        }))
         .collect();
     while let Some(n) = worklist.pop() {
-        if body_nodes.contains(&n) || loop_markers.contains(&n) {
+        if body_nodes.contains(&n) {
+            continue;
+        }
+        if let Some(&owner) = marker_owner.get(&n) {
+            if owner != self_id {
+                foreign.insert(owner);
+            }
             continue;
         }
         if llir[n].to_op::<Output>().is_some() {
@@ -3094,6 +3794,188 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
             worklist.push(succ);
         }
     }
+    (body_nodes, foreign)
+}
+
+/// Remove and return an innermost loop region — one whose body contains no
+/// other region's markers — together with that body. Marker ops are unique,
+/// so a repeated occurrence can never contain one and regions are always
+/// strictly nested or disjoint.
+fn take_innermost_region(llir: &LLIRGraph) -> Option<(LoopRegion, FxHashSet<NodeIndex>)> {
+    let mut regions = collect_loop_regions(llir);
+    if regions.is_empty() {
+        return None;
+    }
+    let marker_owner: FxHashMap<NodeIndex, usize> = regions
+        .iter()
+        .flat_map(|(&id, region)| region.markers.iter().map(move |&n| (n, id)))
+        .collect();
+    let (id, body_nodes) = regions
+        .iter()
+        .find_map(|(&id, region)| {
+            let (body_nodes, foreign) = loop_region_body(llir, region, &marker_owner, id);
+            foreign.is_empty().then_some((id, body_nodes))
+        })
+        .unwrap_or_else(|| {
+            let contains: Vec<String> = regions
+                .iter()
+                .map(|(&id, region)| {
+                    let (body_nodes, foreign) = loop_region_body(llir, region, &marker_owner, id);
+                    // Re-walk with parent tracking to show the exact bridge
+                    // edges into foreign markers.
+                    let mut bridges: Vec<String> = Vec::new();
+                    let mut seen: FxHashSet<NodeIndex> = FxHashSet::default();
+                    let mut worklist: Vec<(NodeIndex, Option<NodeIndex>)> = region
+                        .starts
+                        .values()
+                        .chain(region.inputs.values())
+                        .flat_map(|m| {
+                            llir.neighbors_directed(*m, Direction::Outgoing)
+                                .map(|s| (s, Some(*m)))
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    while let Some((n, pred)) = worklist.pop() {
+                        if seen.contains(&n) {
+                            continue;
+                        }
+                        if let Some(&owner) = marker_owner.get(&n) {
+                            if owner != id && bridges.len() < 4 {
+                                let pred_desc = pred
+                                    .map(|p| format!("{:?}", llir[p]))
+                                    .unwrap_or_else(|| "<entry>".to_string());
+                                bridges.push(format!(
+                                    "      {} -> {:?}",
+                                    &pred_desc[..pred_desc.len().min(160)],
+                                    llir[n]
+                                ));
+                            }
+                            continue;
+                        }
+                        seen.insert(n);
+                        for succ in llir
+                            .neighbors_directed(n, Direction::Outgoing)
+                            .collect::<Vec<_>>()
+                        {
+                            worklist.push((succ, Some(n)));
+                        }
+                    }
+                    format!(
+                        "loop {id}: body={} starts={} inputs={} reaches markers of {foreign:?}\n{}",
+                        body_nodes.len(),
+                        region.starts.len(),
+                        region.inputs.len(),
+                        bridges.join("\n"),
+                    )
+                })
+                .collect();
+            panic!(
+                "loop regions must be strictly nested or disjoint; none is innermost:\n  {}",
+                contains.join("\n  ")
+            )
+        });
+    Some((regions.remove(&id).unwrap(), body_nodes))
+}
+
+/// Inline every iteration-invariant input marker: rewire its consumers to
+/// its single shared source and delete it. `LoopInputStatic` is invariant by
+/// definition (one source), and a `LoopInput` whose per-iteration sources are
+/// all the same node is invariant in fact. Egglog unions invariant markers
+/// with their source value, which lets extraction elect a marker node as the
+/// representative of a value class consumed far outside its region (an inner
+/// region's invariant input is often exactly an enclosing region's value).
+/// Region walks and rewiring must never see that cross-region aliasing, so
+/// both `unroll_loops_in_llir` and `collapse_loops_to_first_iter` inline them
+/// before touching any region.
+fn inline_static_loop_inputs(llir: &mut LLIRGraph) {
+    use crate::hlir::{LoopInput, LoopInputStatic};
+    use petgraph::visit::EdgeRef;
+
+    // One marker at a time with live edge reads: invariant markers chain
+    // (an inner region's invariant input is often an enclosing region's
+    // marker), so a source captured up front can be deleted before its
+    // dependent marker is processed.
+    loop {
+        let Some((marker, source)) = llir.node_indices().find_map(|n| {
+            if llir[n].to_op::<LoopInputStatic>().is_none()
+                && llir[n].to_op::<LoopInput>().is_none()
+            {
+                return None;
+            }
+            let mut sources = llir.neighbors_directed(n, Direction::Incoming);
+            let first = sources.next()?;
+            sources.all(|s| s == first).then_some((n, first))
+        }) else {
+            break;
+        };
+        // Per-edge remove+add to keep each consumer's edge-id ordering via
+        // LIFO reuse — the runtime reads inputs sorted by edge id.
+        let consumers: Vec<(petgraph::graph::EdgeIndex, NodeIndex)> = llir
+            .edges_directed(marker, Direction::Outgoing)
+            .sorted_by_key(|e| e.id())
+            .map(|e| (e.id(), e.target()))
+            .collect();
+        for (eid, consumer) in consumers {
+            llir.remove_edge(eid);
+            llir.add_edge(source, consumer, ());
+        }
+        llir.remove_node(marker);
+        crate::mask_events::INVARIANT_MARKER_INLINED.record();
+    }
+}
+
+pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
+    inline_static_loop_inputs(llir);
+    // Innermost first: unrolling an inner region turns it back into plain
+    // body nodes, which is exactly what the enclosing region's clone step
+    // needs to replicate.
+    while let Some((region, body)) = take_innermost_region(llir) {
+        if region.iters <= 1 || region.starts.is_empty() {
+            eprintln!(
+                "[loop-debug] unroll abandoned on degenerate region: iters={} starts={} ends={} inputs={} outputs={} selects={}",
+                region.iters,
+                region.starts.len(),
+                region.ends.len(),
+                region.inputs.len(),
+                region.outputs.len(),
+                region.output_selects.len(),
+            );
+            return;
+        }
+        unroll_loop_region(llir, &region, &body);
+        // Compact into a freshly-allocated StableGraph so all edge IDs are
+        // re-assigned sequentially in our chosen insertion order. Without
+        // this, later add_edge calls (the next region's rewiring, or
+        // kernel_to_host scheduling edges) can reuse edge indices freed by
+        // remove_node on loop markers, producing sort-by-edge-id orderings
+        // where a later-added edge lands at a low index — which the runtime
+        // interprets as a primary input position.
+        let compacted = compact_llir_preserving_input_order(llir);
+        *llir = compacted;
+    }
+    debug_assert!(
+        collect_loop_regions(llir).is_empty(),
+        "unroll left stray loop marker ops in LLIR"
+    );
+}
+
+fn unroll_loop_region(
+    llir: &mut LLIRGraph,
+    region: &LoopRegion,
+    body_nodes: &FxHashSet<NodeIndex>,
+) {
+    use petgraph::visit::EdgeRef;
+
+    let LoopRegion {
+        starts,
+        ends,
+        inputs,
+        outputs,
+        output_selects,
+        iters,
+        markers: loop_markers,
+    } = region;
+    let iters = *iters;
 
     // start_meta[loop_start] = (initial, body_producer):
     //   - `initial` = LoopStart's incoming (state at iter 0).
@@ -3111,7 +3993,7 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
     // skipped — `resolve_src` and `marker_post_sub` use `body_producer`
     // directly, recognised by `clone_map.get(&body_producer).is_none()`.
     let mut start_meta: FxHashMap<NodeIndex, (NodeIndex, NodeIndex)> = FxHashMap::default();
-    for (slot_idx, &start_node) in &starts {
+    for (slot_idx, &start_node) in starts {
         let end_node = *ends
             .get(slot_idx)
             .unwrap_or_else(|| panic!("missing LoopEnd for slot {slot_idx}"));
@@ -3140,29 +4022,13 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
         );
         input_per_iter.insert(*input_node, srcs);
     }
-    // LoopInputStatic: single shared source reused across all iterations.
-    let mut static_source: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
-    for &static_node in &static_inputs {
-        let srcs: Vec<NodeIndex> = llir
-            .edges_directed(static_node, Direction::Incoming)
-            .sorted_by_key(|e| e.id())
-            .map(|e| e.source())
-            .collect();
-        assert_eq!(
-            srcs.len(),
-            1,
-            "LoopInputStatic must have exactly 1 source (got {})",
-            srcs.len()
-        );
-        static_source.insert(static_node, srcs[0]);
-    }
 
     let mut clone_map: Vec<FxHashMap<NodeIndex, NodeIndex>> = vec![FxHashMap::default(); iters];
-    for &b in &body_nodes {
+    for &b in body_nodes {
         clone_map[0].insert(b, b);
     }
     for clone in clone_map.iter_mut().skip(1) {
-        for &b in &body_nodes {
+        for &b in body_nodes {
             let cloned = llir.add_node(llir[b].clone());
             clone.insert(b, cloned);
         }
@@ -3182,9 +4048,6 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
             }
         } else if let Some(sources) = input_per_iter.get(&src) {
             sources[i]
-        } else if let Some(&shared) = static_source.get(&src) {
-            // LoopInputStatic: same source for every iteration's clone.
-            shared
         } else if body_nodes.contains(&src) {
             clone_map[i][&src]
         } else {
@@ -3210,7 +4073,7 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
     // LIFO, so interleaving remove+add for each edge causes the new edge
     // to reuse exactly the freed slot, preserving edge-id ordering (which
     // the runtime relies on for input positions).
-    for &b in &body_nodes {
+    for &b in body_nodes {
         let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
             .edges_directed(b, Direction::Incoming)
             .sorted_by_key(|e| e.id())
@@ -3225,7 +4088,7 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
     // For iter > 0 clones, there are no existing edges — add fresh ones in
     // body_incoming order so edge-id ordering matches.
     for i in 1..iters {
-        for &b in &body_nodes {
+        for &b in body_nodes {
             let target = clone_map[i][&b];
             let srcs = &body_incoming[&b];
             for &src in srcs {
@@ -3247,7 +4110,7 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
     // Resolve each LoopOutput stream's body producer (its single incoming
     // edge in the LLIR).
     let mut output_body_producer: FxHashMap<usize /*stream_id*/, NodeIndex> = FxHashMap::default();
-    for (&stream_id, &output_node) in &outputs {
+    for (&stream_id, &output_node) in outputs {
         let body_producer = llir
             .neighbors_directed(output_node, Direction::Incoming)
             .next()
@@ -3272,7 +4135,19 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
     // stream's body producer. Same iteration-invariant fallback as for
     // LoopEnd above: if the body producer isn't in `body_nodes`, it wasn't
     // cloned per iter and every iter shares the single `body_producer`.
-    for (&select_node, &(stream_id, iter)) in &output_selects {
+    // Entry markers can also have consumers outside the walked body:
+    // extraction may elect a marker as the representative of a value class
+    // read anywhere in the graph. Such aliasing only arises for
+    // iteration-invariant values (that is what egglog unions), so route
+    // stray consumers to the iter-0 value — never leave a consumer pointing
+    // at a marker about to be removed.
+    for (&input_node, sources) in &input_per_iter {
+        marker_post_sub.insert(input_node, sources[0]);
+    }
+    for (&start_node, &(initial, _)) in &start_meta {
+        marker_post_sub.insert(start_node, initial);
+    }
+    for (&select_node, &(stream_id, iter)) in output_selects {
         let body_producer = output_body_producer[&stream_id];
         let sub = clone_map[iter]
             .get(&body_producer)
@@ -3295,35 +4170,9 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
         }
     }
 
-    for &n in &loop_markers {
+    for &n in loop_markers {
         llir.remove_node(n);
     }
-
-    debug_assert_eq!(
-        llir.node_indices()
-            .filter(|n| {
-                let op = &llir[*n];
-                op.to_op::<LoopStart>().is_some()
-                    || op.to_op::<LoopEnd>().is_some()
-                    || op.to_op::<LoopInput>().is_some()
-                    || op.to_op::<LoopInputStatic>().is_some()
-                    || op.to_op::<LoopOutput>().is_some()
-                    || op.to_op::<LoopOutputSelect>().is_some()
-            })
-            .count(),
-        0,
-        "unroll left stray loop marker ops in LLIR"
-    );
-
-    // Compact the graph into a freshly-allocated StableGraph so all edge
-    // IDs are re-assigned sequentially in our chosen insertion order.
-    // Without this, later kernel_to_host add_edge calls can reuse edge
-    // indices that our unroll freed via remove_node on loop markers,
-    // producing sort-by-edge-id orderings where a later-added scheduling
-    // edge ends up at a low index — which the runtime interprets as a
-    // primary input position and crashes looking up a buffer.
-    let compacted = compact_llir_preserving_input_order(llir);
-    *llir = compacted;
 }
 
 /// Collapse all loop markers in an LLIR graph down to a SINGLE iteration's
@@ -3333,88 +4182,48 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
 /// cost of any extraction choice is preserved on the body shape.
 ///
 /// LoopStart consumers re-route to the initial value, LoopInput consumers
-/// re-route to `sources[0]`, LoopInputStatic consumers re-route to the single
-/// shared source, LoopEnd's post-loop consumers re-route to the body producer
+/// re-route to `sources[0]`, LoopEnd's post-loop consumers re-route to the body producer
 /// directly, and each `LoopOutput` is replaced with a single `Output { node:
 /// targets[0] }`. After collapse the LLIR has no marker ops left and contains
 /// exactly the iter-0 body plus the surrounding non-loop graph.
 pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
-    use crate::hlir::{
-        LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart, Output,
-    };
+    inline_static_loop_inputs(llir);
+    // Innermost first, same as `unroll_loops_in_llir`: collapsing an inner
+    // region leaves its iter-0 body as plain nodes inside the enclosing
+    // region, which then collapses over them in turn.
+    while let Some((region, body)) = take_innermost_region(llir) {
+        if region.starts.is_empty() {
+            eprintln!(
+                "[loop-debug] collapse abandoned on degenerate region: ends={} inputs={} outputs={} selects={}",
+                region.ends.len(),
+                region.inputs.len(),
+                region.outputs.len(),
+                region.output_selects.len(),
+            );
+            return;
+        }
+        collapse_loop_region(llir, &region, &body);
+        let compacted = compact_llir_preserving_input_order(llir);
+        *llir = compacted;
+    }
+}
+
+fn collapse_loop_region(
+    llir: &mut LLIRGraph,
+    region: &LoopRegion,
+    body_nodes: &FxHashSet<NodeIndex>,
+) {
     use petgraph::visit::EdgeRef;
-    use std::collections::BTreeMap;
 
-    let mut starts: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    let mut ends: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    let mut inputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    let mut static_inputs: FxHashSet<NodeIndex> = FxHashSet::default();
-    let mut outputs: BTreeMap<usize, NodeIndex> = BTreeMap::new();
-    let mut output_selects: FxHashSet<NodeIndex> = FxHashSet::default();
-
-    for n in llir.node_indices() {
-        let op = &llir[n];
-        if op.to_op::<LoopStart>().is_some() {
-            starts.insert(op.to_op::<LoopStart>().unwrap().slot_idx, n);
-        } else if let Some(le) = op.to_op::<LoopEnd>() {
-            ends.insert(le.slot_idx, n);
-        } else if op.to_op::<LoopInputStatic>().is_some() {
-            static_inputs.insert(n);
-        } else if let Some(li) = op.to_op::<LoopInput>() {
-            inputs.insert(li.stream_id, n);
-        } else if op.to_op::<LoopOutputSelect>().is_some() {
-            output_selects.insert(n);
-        } else if let Some(lo) = op.to_op::<LoopOutput>() {
-            outputs.insert(lo.stream_id, n);
-        }
-    }
-    if starts.is_empty() {
-        return;
-    }
-
-    let loop_markers: FxHashSet<NodeIndex> = starts
-        .values()
-        .copied()
-        .chain(ends.values().copied())
-        .chain(inputs.values().copied())
-        .chain(static_inputs.iter().copied())
-        .chain(outputs.values().copied())
-        .chain(output_selects.iter().copied())
-        .collect();
-
-    // body_nodes = forward-reachable from any marker outgoing, stopping at
-    // markers and Output ops. This matches `unroll_loops_in_llir`.
-    let mut body_nodes: FxHashSet<NodeIndex> = FxHashSet::default();
-    let mut worklist: Vec<NodeIndex> = starts
-        .values()
-        .flat_map(|n| {
-            llir.neighbors_directed(*n, Direction::Outgoing)
-                .collect::<Vec<_>>()
-        })
-        .chain(inputs.values().flat_map(|n| {
-            llir.neighbors_directed(*n, Direction::Outgoing)
-                .collect::<Vec<_>>()
-        }))
-        .chain(static_inputs.iter().flat_map(|n| {
-            llir.neighbors_directed(*n, Direction::Outgoing)
-                .collect::<Vec<_>>()
-        }))
-        .collect();
-    while let Some(n) = worklist.pop() {
-        if body_nodes.contains(&n) || loop_markers.contains(&n) {
-            continue;
-        }
-        if llir[n].to_op::<Output>().is_some() {
-            continue;
-        }
-        body_nodes.insert(n);
-        for succ in llir
-            .neighbors_directed(n, Direction::Outgoing)
-            .collect::<Vec<_>>()
-        {
-            worklist.push(succ);
-        }
-    }
+    let LoopRegion {
+        starts,
+        ends,
+        inputs,
+        outputs,
+        output_selects,
+        markers: loop_markers,
+        ..
+    } = region;
 
     // Initial value per LoopStart, body producer per LoopEnd / LoopOutput.
     let mut start_initial: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
@@ -3435,14 +4244,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             .expect("LoopInput must have at least one source");
         input_first_source.insert(*input_node, first);
     }
-    let mut static_source: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
-    for &static_node in &static_inputs {
-        let src = llir
-            .neighbors_directed(static_node, Direction::Incoming)
-            .next()
-            .expect("LoopInputStatic must have a source");
-        static_source.insert(static_node, src);
-    }
 
     // Resolve a source reference to its iter-0 equivalent.
     let resolve_src = |src: NodeIndex| -> NodeIndex {
@@ -3450,8 +4251,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             initial
         } else if let Some(&first) = input_first_source.get(&src) {
             first
-        } else if let Some(&shared) = static_source.get(&src) {
-            shared
         } else {
             src
         }
@@ -3460,7 +4259,7 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
     // Rewrite every body node's incoming edges. Per-edge remove+add to keep
     // edge-id ordering via LIFO reuse — runtime reads inputs sorted by edge
     // id so position must be preserved.
-    for &b in &body_nodes {
+    for &b in body_nodes {
         let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
             .edges_directed(b, Direction::Incoming)
             .sorted_by_key(|e| e.id())
@@ -3475,7 +4274,7 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
 
     // Per LoopOutput stream, find the body producer (its single incoming edge).
     let mut output_body_producer: FxHashMap<usize, NodeIndex> = FxHashMap::default();
-    for (&stream_id, &output_node) in &outputs {
+    for (&stream_id, &output_node) in outputs {
         let body_producer = llir
             .neighbors_directed(output_node, Direction::Incoming)
             .next()
@@ -3496,14 +4295,20 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
             .expect("LoopEnd missing body producer during rewire");
         marker_post_sub.insert(end_node, body_producer);
     }
-    for &select_node in &output_selects {
-        let stream_id = llir[select_node]
-            .to_op::<LoopOutputSelect>()
-            .map(|s| s.stream_id)
-            .expect("output_selects entries must be LoopOutputSelect");
+    for (&select_node, &(stream_id, _)) in output_selects {
         if let Some(&body_producer) = output_body_producer.get(&stream_id) {
             marker_post_sub.insert(select_node, body_producer);
         }
+    }
+    // Entry markers can also have consumers outside the walked body:
+    // extraction may elect a marker as the representative of a value class
+    // read anywhere in the graph. Resolve them to their iter-0 values —
+    // never leave a consumer pointing at a marker about to be removed.
+    for (&input_node, &first) in &input_first_source {
+        marker_post_sub.insert(input_node, first);
+    }
+    for (&start_node, &initial) in &start_initial {
+        marker_post_sub.insert(start_node, initial);
     }
     let post_loop_consumers: FxHashSet<NodeIndex> = loop_markers
         .iter()
@@ -3526,12 +4331,9 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         }
     }
 
-    for &n in &loop_markers {
+    for &n in loop_markers {
         llir.remove_node(n);
     }
-
-    let compacted = compact_llir_preserving_input_order(llir);
-    *llir = compacted;
 }
 
 /// Rebuild an LLIR graph into a fresh StableGraph, copying nodes and edges
@@ -4805,5 +5607,295 @@ mod tests {
                 .is_none(),
             "output should remain a graph root"
         );
+    }
+
+    #[test]
+    fn test_nested_loop_rolling_rolls_periodic_layer_pattern() {
+        // Periodic pattern like alternating-attention transformers: blocks
+        // of 3 identical "layers" (sin) closed by a distinct one (exp2),
+        // repeated 4 times. The first pass rolls the 4 blocks; the second
+        // rolls the 3 identical layers inside the surviving body.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let mut y = x;
+        for _ in 0..4 {
+            for _ in 0..3 {
+                y = y.sin();
+            }
+            y = y.exp2();
+        }
+        let out = y.output();
+
+        let first = cx.auto_roll_loops_prepass_with_log(true);
+        assert!(first > 0, "expected the block pattern to roll");
+        let second = cx.auto_roll_loops_prepass_with_log(true);
+        assert!(
+            second > 0,
+            "expected the repeated layers inside the rolled body to roll"
+        );
+
+        let loop_ids: FxHashSet<usize> = cx
+            .graph
+            .node_indices()
+            .filter_map(|n| {
+                cx.try_get_op::<crate::hlir::LoopStart>(n)
+                    .map(|ls| ls.loop_id)
+            })
+            .collect();
+        assert_eq!(loop_ids.len(), 2, "expected two distinct loop regions");
+
+        let vals = random_vec(8);
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, vals.clone());
+        rt.execute(&cx.dyn_map);
+
+        let expected = vals
+            .into_iter()
+            .map(|mut v| {
+                for _ in 0..4 {
+                    for _ in 0..3 {
+                        v = v.sin();
+                    }
+                    v = v.exp2();
+                }
+                v
+            })
+            .collect::<Vec<f32>>();
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn test_nested_loop_rolling_chained_sibling_inner_regions() {
+        // Mirror of gemma's rolled topology: an outer periodic block whose
+        // body contains multiple distinct repeated runs, chained through
+        // non-repeating ops. The runs roll into sibling regions nested
+        // inside the outer region; unroll must find each sibling innermost.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let mut y = x;
+        for _ in 0..4 {
+            for _ in 0..3 {
+                y = y.sin();
+            }
+            y = y.exp2();
+            for _ in 0..4 {
+                y = y.sin();
+            }
+            y = y.reciprocal();
+        }
+        let out = y.output();
+
+        let mut passes = 0;
+        while cx.auto_roll_loops_prepass_with_log(true) > 0 {
+            passes += 1;
+        }
+        assert!(
+            passes >= 3,
+            "expected outer + two sibling inner rolls, got {passes}"
+        );
+
+        let vals = random_vec(8);
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, vals.clone());
+        rt.execute(&cx.dyn_map);
+
+        let expected = vals
+            .into_iter()
+            .map(|mut v| {
+                for _ in 0..4 {
+                    for _ in 0..3 {
+                        v = v.sin();
+                    }
+                    v = v.exp2();
+                    for _ in 0..4 {
+                        v = v.sin();
+                    }
+                    v = v.recip();
+                }
+                v
+            })
+            .collect::<Vec<f32>>();
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn test_nested_loop_rolling_with_varying_weights() {
+        // Gemma-shaped: an outer periodic block of 3 identical weighted
+        // layers plus a distinct closer, repeated 4 times, with a DISTINCT
+        // weight tensor per layer. The inner region's per-iteration inputs
+        // are then varying streams fed by the outer region's own LoopInput
+        // markers — the exact structure of per-layer weights in a rolled
+        // transformer.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let weights: Vec<GraphTensor> = (0..12).map(|_| cx.tensor(8)).collect();
+        let mut y = x;
+        for block in 0..4 {
+            for layer in 0..3 {
+                y = (y * weights[block * 3 + layer]).sin();
+            }
+            y = y.exp2();
+        }
+        let out = y.output();
+
+        let mut passes = 0;
+        while cx.auto_roll_loops_prepass_with_log(true) > 0 {
+            passes += 1;
+        }
+        assert!(passes >= 2, "expected nested rolls, got {passes}");
+
+        let xv = random_vec(8);
+        let wvs: Vec<Vec<f32>> = (0..12).map(|_| random_vec(8)).collect();
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, xv.clone());
+        for (w, wv) in weights.iter().zip(&wvs) {
+            rt.set_data(w.id, wv.clone());
+        }
+        rt.execute(&cx.dyn_map);
+
+        let expected: Vec<f32> = (0..8)
+            .map(|j| {
+                let mut v = xv[j];
+                for block in 0..4 {
+                    for layer in 0..3 {
+                        v = (v * wvs[block * 3 + layer][j]).sin();
+                    }
+                    v = v.exp2();
+                }
+                v
+            })
+            .collect();
+        assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn test_nested_loop_rolling_per_layer_outputs_not_permuted() {
+        // Cache-analog regression test: every layer persists a side output
+        // (like per-layer KV caches). Nested rolling + unroll must route each
+        // side output to ITS OWN layer's value — a permutation across layers
+        // corrupts state promotion even when the final output is correct.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let weights: Vec<GraphTensor> = (0..24).map(|_| cx.tensor(8)).collect();
+        let mut y = x;
+        let mut side = Vec::new();
+        for block in 0..4 {
+            for layer in 0..5 {
+                y = (y * weights[block * 6 + layer]).sin();
+                side.push((y * 2.0_f32).output());
+            }
+            y = (y * weights[block * 6 + 5]).exp2();
+            side.push((y * 2.0_f32).output());
+        }
+        let out = y.output();
+
+        let mut passes = 0;
+        while cx.auto_roll_loops_prepass_with_log(true) > 0 {
+            passes += 1;
+        }
+        assert!(passes >= 2, "expected nested rolls, got {passes}");
+
+        let xv = random_vec(8);
+        let wvs: Vec<Vec<f32>> = (0..24).map(|_| random_vec(8)).collect();
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, xv.clone());
+        for (w, wv) in weights.iter().zip(&wvs) {
+            rt.set_data(w.id, wv.clone());
+        }
+        rt.execute(&cx.dyn_map);
+
+        let mut refs: Vec<Vec<f32>> = Vec::new();
+        let mut v: Vec<f32> = xv.clone();
+        for block in 0..4 {
+            for layer in 0..5 {
+                v = v
+                    .iter()
+                    .zip(&wvs[block * 6 + layer])
+                    .map(|(a, b)| (a * b).sin())
+                    .collect();
+                refs.push(v.iter().map(|a| a * 2.0).collect());
+            }
+            v = v
+                .iter()
+                .zip(&wvs[block * 6 + 5])
+                .map(|(a, b)| (a * b).exp2())
+                .collect();
+            refs.push(v.iter().map(|a| a * 2.0).collect());
+        }
+        let mut permutation = Vec::new();
+        for (idx, t) in side.iter().enumerate() {
+            let got = rt.get_f32(t.id);
+            let matches: Vec<usize> = refs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| got.iter().zip(*r).all(|(a, b)| (a - b).abs() < 1e-5))
+                .map(|(j, _)| j)
+                .collect();
+            permutation.push((idx, matches));
+        }
+        let bad: Vec<_> = permutation.iter().filter(|(i, m)| !m.contains(i)).collect();
+        assert!(
+            bad.is_empty(),
+            "side outputs carry other layers' values: {permutation:?}"
+        );
+        let final_expected: Vec<f32> = refs.last().unwrap().iter().map(|a| a / 2.0).collect();
+        assert!(
+            rt.get_f32(out.id)
+                .iter()
+                .zip(&final_expected)
+                .all(|(a, b)| (a - b).abs() < 1e-5),
+            "final output mismatch"
+        );
+    }
+
+    #[test]
+    fn test_nested_loop_rolling_handles_disjoint_regions() {
+        // Two independent recurrence chains roll into two disjoint regions
+        // across successive passes; unroll must handle both.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let y = cx.tensor(8);
+        let a = x.sin().sin().sin().sin();
+        let b = y.exp2().exp2().exp2().exp2();
+        let out = (a + b).output();
+
+        let mut passes = 0;
+        while cx.auto_roll_loops_prepass_with_log(true) > 0 {
+            passes += 1;
+        }
+        assert!(
+            passes >= 2,
+            "expected both chains to roll, got {passes} passes"
+        );
+
+        let xv = random_vec(8);
+        let yv = random_vec(8);
+        let mut rt = ReferenceRuntime::default();
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+        rt.set_data(x.id, xv.clone());
+        rt.set_data(y.id, yv.clone());
+        rt.execute(&cx.dyn_map);
+
+        let expected = xv
+            .into_iter()
+            .zip(yv)
+            .map(|(mut a, mut b)| {
+                for _ in 0..4 {
+                    a = a.sin();
+                    b = b.exp2();
+                }
+                a + b
+            })
+            .collect::<Vec<f32>>();
+        assert_close(rt.get_f32(out.id), &expected);
     }
 }

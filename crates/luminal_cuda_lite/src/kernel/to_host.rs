@@ -1279,6 +1279,31 @@ impl CudaGraphOp {
         Ok(())
     }
 
+    /// Forget every memory derived from a dynamic-dimension value, so the next
+    /// materialize walks the same staleness paths a real dim change triggers:
+    /// dyn-var kernels rebuild params, dyn-shaped cuBLASLt islands re-prepare
+    /// and recapture, and capacity-planned ops (FlashInfer) pay only their
+    /// per-step update. State keyed on static shapes or buffer pointers is
+    /// untouched — a dim change does not dirty it. (The process-global
+    /// cuBLASLt heuristic cache is deliberately kept: purging it would fight
+    /// autotune and its query is not the dominant transition cost.)
+    pub(crate) fn assume_dyn_dims_stale(&self) {
+        let mut state = self.state.borrow_mut();
+        state.last_dyn_values.clear();
+        for idx in 0..state.cublaslt_ops.len() {
+            if state.cublaslt_ops[idx]
+                .cublaslt()
+                .graph_spec_dyn_vars()
+                .is_empty()
+            {
+                continue;
+            }
+            state.cublaslt_ops[idx].signature = None;
+            let step = state.cublaslt_step_indices[idx];
+            remove_prepared_cache_user(&mut state.cublaslt_prepare_cache, step);
+        }
+    }
+
     /// Ensure the mutable and executable CUDA graphs reflect the given buffers
     /// and dynamic dimensions. This may build the graph once, patch kernel node
     /// params, and surgically recapture cuBLASLt islands, but it does not launch.
@@ -2820,9 +2845,14 @@ pub fn kernel_to_host(
                         assert_eq!(
                             inputs.len(),
                             expected_inputs,
-                            "invalid input arity for CUDA kernel {} at LLIR node {:?}",
+                            "invalid input arity for CUDA kernel {} at LLIR node {:?}; inputs: {}",
                             kernel_op_ref.kernel_name(),
                             kernel_node_idx,
+                            inputs
+                                .iter()
+                                .map(|&i| format!("{:?}", llir_graph[i]))
+                                .collect::<Vec<_>>()
+                                .join(" | "),
                         );
                     }
                     let input_labels = inputs

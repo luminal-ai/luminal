@@ -69,6 +69,58 @@ impl EgglogOp for GenericMatmul {
 
     fn rewrites(&self) -> Vec<Rule> {
         vec![
+            // The exact-layout witnesses below pattern-match the canonical
+            // nested stride spellings, but HLIR serialization and constant
+            // folding often leave only the folded product in the e-graph
+            // (e.g. z*8388608 instead of (z*4096)*2048), so a semantically
+            // canonical layout fails the syntactic match. Seed the canonical
+            // spellings for every GenericMatmul: the expr fold rules union a
+            // seeded spelling into the actual stride's e-class exactly when
+            // the two are numerically equal, which lets the witness match
+            // without ever equating unequal strides.
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?sum (Op (GenericMatmul
+                            (ECons ?m (ECons ?n (ENil)))
+                            (ECons ?m (ECons ?n (ECons ?k (ENil))))
+                            ?k
+                            ?lhs_strides ?rhs_strides
+                            ?sum_input_strides ?sum_iter_stride ?out_strides
+                            ?dt)
+                            ?inputs))
+                    )
+                    (
+                        (let ?canonical_sum_m (MMul (MMul (MIter) ?k) ?n))
+                        (let ?canonical_sum_n (MMul (MIter) ?k))
+                        (let ?canonical_out_m (MMul (MIter) ?n))
+                    )
+                    :ruleset matmul_backend
+                    :name \"seed canonical 2d matmul stride spellings\"
+                )
+
+                (rule
+                    (
+                        (= ?sum (Op (GenericMatmul
+                            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+                            (ECons ?batch (ECons ?m (ECons ?n (ECons ?k (ENil)))))
+                            ?k
+                            ?lhs_strides ?rhs_strides
+                            ?sum_input_strides ?sum_iter_stride ?out_strides
+                            ?dt)
+                            ?inputs))
+                    )
+                    (
+                        (let ?canonical_sum_batch (MMul (MMul (MMul (MIter) ?k) ?n) ?m))
+                        (let ?canonical_sum_m (MMul (MMul (MIter) ?k) ?n))
+                        (let ?canonical_sum_n (MMul (MIter) ?k))
+                        (let ?canonical_out_batch (MMul (MMul (MIter) ?n) ?m))
+                        (let ?canonical_out_m (MMul (MIter) ?n))
+                    )
+                    :ruleset matmul_backend
+                    :name \"seed canonical 3d matmul stride spellings\"
+                )",
+            ),
             Rule::raw(
                 "; cuBLASLt and GEMV implement only the canonical materialized
              ; matmul reduction. Operand broadcast strides alone are not a

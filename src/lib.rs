@@ -4,6 +4,7 @@ pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;
 pub mod hlir;
+pub mod mask_events;
 pub mod op;
 pub mod shape;
 pub mod visualization;

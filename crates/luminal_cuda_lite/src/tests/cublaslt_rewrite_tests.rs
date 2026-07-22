@@ -765,8 +765,21 @@ fn mixed_cuda_graph_cublaslt_kernel_chain_executes_correctly() {
 
     let (m, n, k) = (7, 11, 5);
     let (mut cx, a, pre, b, out) = build_mixed_chain_graph(m, n, k);
-    let llir = extract_forced_cublaslt_llir_where(&mut cx, "mixed graph chain", |llir| {
-        cublaslt_scale_value_tuples(llir).contains(&(1.0, 0.0))
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    // Fixed-seed forcing is background-sensitive; this graph needs a few
+    // attempts to land a background that keeps the plain-scale cuBLASLt
+    // reachable now that the fusion alternatives are gone.
+    let llir = try_extract_forced_op_llir_where(
+        &cx,
+        &["cublaslt", "cublaslt_scaled"],
+        ForcedExtractionConfig::new(0x00C0_B1A5).attempts_per_node(8),
+        |llir| {
+            !cublaslt_type_tuples(llir).is_empty()
+                && cublaslt_scale_value_tuples(llir).contains(&(1.0, 0.0))
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!("expected to extract a CuBlasLt HostOp for mixed graph chain: {error}")
     });
 
     let a_data = random_f32_vec(m * k, 0xCAFE_0001, -0.08, 0.08);

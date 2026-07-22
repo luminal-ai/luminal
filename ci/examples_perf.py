@@ -4,7 +4,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from example_output import validate_output
+from example_output import parse_perf_metrics, validate_output, validate_perf
 
 
 DEFAULT_EXAMPLES = ["llama", "gemma", "qwen", "qwen3_moe", "gemma4_moe", "whisper"]
@@ -112,6 +112,7 @@ def run_example(example: str) -> ExampleResult:
 
     try:
         validate_output(example, output)
+        validate_perf(example, output)
     except Exception as exc:
         return ExampleResult(example, False, metrics=metrics, wall_s=wall_s, error=str(exc))
 
@@ -123,41 +124,8 @@ def repo_root() -> str:
 
 
 def parse_metrics(output: str) -> Metrics:
-    metrics = Metrics()
-    for line in output.splitlines():
-        if "TTFT:" in line:
-            metrics.ttft_ms = parse_number_after(line, "TTFT:")
-        if "TPOT:" in line:
-            metrics.tpot_ms = parse_number_after(line, "TPOT:")
-        if "tok/s" in line:
-            metrics.tps = parse_tok_per_second(line)
-    if metrics.tps is None and metrics.tpot_ms:
-        metrics.tps = 1000.0 / metrics.tpot_ms
-    return metrics
-
-
-def parse_number_after(line: str, marker: str) -> float | None:
-    tail = line.split(marker, 1)[1].lstrip()
-    chars = []
-    for char in tail:
-        if char.isdigit() or char == ".":
-            chars.append(char)
-        else:
-            break
-    if not chars:
-        return None
-    return float("".join(chars))
-
-
-def parse_tok_per_second(line: str) -> float | None:
-    head = line.split("tok/s", 1)[0].rstrip(" (")
-    parts = head.split()
-    if not parts:
-        return None
-    try:
-        return float(parts[-1])
-    except ValueError:
-        return None
+    parsed = parse_perf_metrics(output)
+    return Metrics(ttft_ms=parsed["ttft_ms"], tpot_ms=parsed["tpot_ms"], tps=parsed["tps"])
 
 
 def print_table(results: list[ExampleResult]) -> None:

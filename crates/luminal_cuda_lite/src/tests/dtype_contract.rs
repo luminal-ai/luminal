@@ -315,6 +315,7 @@ fn test_bf16_reciprocal_region_compiles() {
 /// correlated choices form an LLIR cycle; reject those selected candidates
 /// without deleting the legal acyclic choices from the egraph.
 #[test]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1): the cycle-producing absorbed-boundary choices this exercises no longer exist"]
 fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
     use luminal::egglog_utils::{
         egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
@@ -964,6 +965,44 @@ fn gemv_m1_matches_reference_qwen_shapes() {
 #[test]
 fn gemv_m1_matches_reference() {
     gemv_m1_case(384, 512, 0xA1);
+}
+
+#[test]
+fn gemv_m1_bf16_survives_constant_folded_witness_strides() {
+    // qwen3-moe k/v projection: operand layouts are fully canonical, but at
+    // these sizes the witness's canonical m-row stride spelling
+    // ((z*2048)*512) only exists constant-folded (z*1048576) in the e-graph,
+    // which used to fail the exact-layout witness and drop GEMV/cuBLASLt.
+    let mut cx = Graph::default();
+    let x = cx.tensor((1, 2048)).as_dtype(DType::Bf16);
+    let w = cx.tensor((512, 2048)).as_dtype(DType::Bf16);
+    x.matmul(w.t()).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(&cx, &["GenericMatmul", "KernelGemv", "cublaslt"]),
+        "canonical m=1 bf16 matmul must keep its fast backends regardless of \
+         how constant folding spells the witness strides"
+    );
+}
+
+#[test]
+fn gemv_m1_bf16_accepts_merged_head_view_activation() {
+    // qwen3-moe o_proj: the activation is an attention output permuted from
+    // [heads, 1, head_dim] and merged to [1, heads*head_dim], leaving a
+    // non-canonical m-row stride (z*head_dim). With m = 1 that stride is
+    // never advanced, so GEMV must still apply.
+    let mut cx = Graph::default();
+    let attn = cx.tensor((32, 1, 128)).as_dtype(DType::Bf16);
+    let w_o = cx.tensor((2048, 4096)).as_dtype(DType::Bf16);
+    let x = attn.permute((1, 0, 2)).merge_dims(1, 2);
+    x.matmul(w_o.t()).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(&cx, &["GenericMatmul", "KernelGemv"]),
+        "m=1 bf16 matmul over a merged attention-head view must keep GEMV"
+    );
 }
 
 #[test]

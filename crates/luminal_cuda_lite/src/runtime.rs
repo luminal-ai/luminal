@@ -2977,6 +2977,23 @@ impl CudaRuntime {
         )
     }
 
+    /// Assume a worst-case dynamic-dimension change: drop every cached
+    /// decision derived from live dyn values (per-bucket length tables and
+    /// each captured graph's dyn state) so the next execute pays the same
+    /// staleness costs a real dim transition pays. State keyed on bucket
+    /// capacities or buffer pointers is untouched — real transitions within
+    /// a bucket don't dirty it.
+    fn assume_dyn_dims_stale(&mut self) {
+        for bucket in &mut self.compiled_buckets {
+            bucket.last_dyn_map.clear();
+            for exec_op in bucket.exec_graph.node_weights() {
+                if let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                    cuda_graph.assume_dyn_dims_stale();
+                }
+            }
+        }
+    }
+
     fn profile_loaded_llir(
         &mut self,
         llir_graph: &LLIRGraph,
@@ -2986,8 +3003,29 @@ impl CudaRuntime {
     ) -> (Duration, String) {
         self.profiling = true;
         let profile_start = std::time::Instant::now();
+        // Warmup absorbs one-time costs (CUDA graph materialization, lazy
+        // allocations, cache warming) so the timed trials measure steady-state
+        // execution instead of folding setup noise into the candidate ranking.
+        self.execute(dyn_map);
+        // A warmup that already blew the whole profiling budget has proven
+        // the candidate slow; return it as the measurement instead of paying
+        // for a timed trial of the same magnitude. Bad candidates are the
+        // most expensive ones to run, so this halves their cost.
+        if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+            self.profiling = false;
+            let duration = profile_start.elapsed();
+            return (duration, format_duration_precise(&duration));
+        }
         let mut durations = Vec::with_capacity(trials.max(1));
         for _ in 0..trials.max(1) {
+            // Deployment never executes the same dyn_map twice (decode's `c`
+            // is fresh every step), so replaying frozen dims would let
+            // dim-baked state carry over between trials and hide the
+            // per-transition costs (param rebuild, island re-prepare and
+            // recapture) that dim-agnostic graphs don't pay. Each trial
+            // measures execute-after-dim-change — the quantity deployment
+            // actually samples.
+            self.assume_dyn_dims_stale();
             let start = std::time::Instant::now();
             self.execute(dyn_map);
             durations.push(start.elapsed());
@@ -3261,6 +3299,7 @@ impl Runtime for CudaRuntime {
         let mut resource_plan = match plan_static_llir_resources(llir_graph, &allocation_dyn_map) {
             Ok(plan) => plan,
             Err(violation) => {
+                luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
                 return luminal::op::CandidateFilterResult::reject_with_display(format!(
                     "candidate reject: {violation}"
                 ));
@@ -3268,6 +3307,7 @@ impl Runtime for CudaRuntime {
         };
         if let Err(violation) = validate_resource_plan(&resource_plan, caps, device_resource_limits)
         {
+            luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
             return luminal::op::CandidateFilterResult::reject_with_display(format!(
                 "resource reject: {violation}"
             ));
