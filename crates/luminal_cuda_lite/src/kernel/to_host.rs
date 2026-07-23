@@ -1287,15 +1287,14 @@ impl CudaGraphOp {
     /// untouched — a dim change does not dirty it. (The process-global
     /// cuBLASLt heuristic cache is deliberately kept: purging it would fight
     /// autotune and its query is not the dominant transition cost.)
-    pub(crate) fn assume_dyn_dims_stale(&self) {
+    pub(crate) fn assume_dyn_dims_stale(&self, stale_dims: &[char]) {
         let mut state = self.state.borrow_mut();
-        state.last_dyn_values.clear();
+        for dim in stale_dims {
+            state.last_dyn_values.remove(dim);
+        }
         for idx in 0..state.cublaslt_ops.len() {
-            if state.cublaslt_ops[idx]
-                .cublaslt()
-                .graph_spec_dyn_vars()
-                .is_empty()
-            {
+            let spec_dyn_vars = state.cublaslt_ops[idx].cublaslt().graph_spec_dyn_vars();
+            if !stale_dims.iter().any(|dim| spec_dyn_vars.contains(dim)) {
                 continue;
             }
             state.cublaslt_ops[idx].signature = None;

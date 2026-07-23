@@ -47,7 +47,7 @@ fn promote_persistent_state(
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
-    let search_graphs = 500;
+    let search_graphs = 1000;
     let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
     let print_token_ids = env_bool("PRINT_TOKEN_IDS");
 
@@ -118,6 +118,16 @@ fn main() {
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+
+    // Declare the per-step promote pairs so profiling executes the same
+    // remove_buffer/set_buffer promote the decode loop pays every token —
+    // in-place cache updates profile their pointer no-op, copy-then-modify
+    // candidates profile their full per-step copy.
+    runtime.mark_persistent(seen_out, seen_mask_t);
+    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        runtime.mark_persistent(*k_out, kv_cache.k_caches[layer]);
+        runtime.mark_persistent(*v_out, kv_cache.v_caches[layer]);
+    }
     println!("  weight load: {:.1}s", phase.elapsed().as_secs_f64());
 
     for layer in 0..LAYERS {

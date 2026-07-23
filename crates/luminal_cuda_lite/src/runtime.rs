@@ -286,6 +286,11 @@ pub struct CudaRuntime {
     hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
     cuda_stream: Arc<CudaStream>,
     changed_hlir: FxHashSet<NodeIndex>,
+    /// (output, input) pairs the application promotes between steps via
+    /// `remove_buffer` + `set_buffer` (persistent state like KV caches).
+    /// Declared with `mark_persistent` so profiling trials execute the same
+    /// promote deployment pays every step.
+    persistent_pairs: Vec<(NodeIndex, NodeIndex)>,
     pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
     pub last_kernel_stats: Vec<KernelStats>,
     pub last_total_time_us: f64,
@@ -999,6 +1004,62 @@ impl CudaRuntime {
     /// remove and return it. For copy-then-modify ops (like Scatter), the output data
     /// lives in an intermediate buffer while the HLIR buffer has stale data — swap them
     /// so the caller gets the updated data and the intermediate slot stays allocated.
+    /// Declare that the application promotes `output` into `input` between
+    /// steps (the `remove_buffer` + `set_buffer` persistent-state idiom, e.g.
+    /// KV caches). Profiling trials then execute the same promote, so a
+    /// candidate whose output aliases its input in place profiles the pointer
+    /// no-op deployment pays, while a copy-then-modify candidate profiles its
+    /// full per-step copy-out and island repatch. Without this, the promote
+    /// cost is invisible to the search and copy families profile 5-10x
+    /// faster than they run.
+    pub fn mark_persistent(&mut self, output: impl ToId, input: impl ToId) {
+        self.persistent_pairs.push((output.to_id(), input.to_id()));
+    }
+
+    /// Execute every declared persistent promote whose output exists in the
+    /// currently loaded LLIR. Collapsed profile graphs keep only the
+    /// representative iteration's outputs, so absent pairs are skipped rather
+    /// than treated as candidate failures.
+    fn promote_persistent_pairs_for_profiling(&mut self) {
+        if self.compiled_buckets.is_empty() || self.persistent_pairs.is_empty() {
+            return;
+        }
+        for idx in 0..self.persistent_pairs.len() {
+            let (out, inp) = self.persistent_pairs[idx];
+            let bucket = self.active();
+            let Some(&producer) = bucket.output_producers.get(&out) else {
+                continue;
+            };
+            let alias_node = self.follow_aliases(producer);
+            let lineage_node = self.follow_data_lineage(producer);
+            let bucket = self.active();
+            // Mirror `remove_buffer`'s branch preconditions, and additionally
+            // require that the output's data lineage terminates at the
+            // DECLARED input. Collapsed profile graphs can map every rolled
+            // layer's output onto the one representative producer; promoting
+            // through a foreign lineage would steal that layer's input buffer
+            // (pair L takes the slot pair L-1 just refilled) and starve the
+            // next materialization. Skipped pairs under-tax the collapsed
+            // stage only — finalist reprofiling runs unrolled, where every
+            // pair resolves and the full per-step promote cost is priced.
+            let ready = if alias_node == lineage_node {
+                match bucket.llir_to_hlir.get(&lineage_node) {
+                    Some(&hlir) => hlir == inp && self.hlir_buffers.contains_key(&hlir),
+                    None => Self::bucket_buffer(bucket, &self.cuda_stream, &lineage_node).is_some(),
+                }
+            } else {
+                bucket.llir_to_hlir.get(&lineage_node) == Some(&inp)
+                    && self.hlir_buffers.contains_key(&inp)
+                    && Self::bucket_buffer(bucket, &self.cuda_stream, &alias_node).is_some()
+            };
+            if !ready {
+                continue;
+            }
+            let buf = self.remove_buffer(out);
+            self.set_buffer(inp, buf);
+        }
+    }
+
     pub fn remove_buffer(&mut self, id: impl ToId) -> CudaSlice<u8> {
         let producer = self.find_producer_node(id);
         let alias_node = self.follow_aliases(producer);
@@ -2984,11 +3045,41 @@ impl CudaRuntime {
     /// capacities or buffer pointers is untouched — real transitions within
     /// a bucket don't dirty it.
     fn assume_dyn_dims_stale(&mut self) {
-        for bucket in &mut self.compiled_buckets {
-            bucket.last_dyn_map.clear();
+        for bucket_idx in 0..self.compiled_buckets.len() {
+            // Only dims that vary within this bucket are stale on a real
+            // step. Pinned dims (bucket min == max) never change in
+            // deployment; poisoning them too charges every trial a
+            // full-graph rewalk real steps don't pay, which inflates
+            // trip-difference terms by a constant per body (~3x observed on
+            // gemma4_moe) regardless of the candidate's true dim
+            // sensitivity.
+            let stale_dims: Vec<char> = {
+                let bucket = &self.compiled_buckets[bucket_idx];
+                bucket
+                    .last_dyn_map
+                    .keys()
+                    .copied()
+                    .filter(|dim| {
+                        let idx = bucket.bucket_indices.get(dim).copied().unwrap_or(0);
+                        match self
+                            .dim_buckets
+                            .get(dim)
+                            .and_then(|buckets| buckets.get(idx))
+                        {
+                            Some(dim_bucket) => dim_bucket.min != dim_bucket.max,
+                            // Unbucketed search dims vary in deployment.
+                            None => true,
+                        }
+                    })
+                    .collect()
+            };
+            let bucket = &mut self.compiled_buckets[bucket_idx];
+            for dim in &stale_dims {
+                bucket.last_dyn_map.remove(dim);
+            }
             for exec_op in bucket.exec_graph.node_weights() {
                 if let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
-                    cuda_graph.assume_dyn_dims_stale();
+                    cuda_graph.assume_dyn_dims_stale(&stale_dims);
                 }
             }
         }
@@ -3007,6 +3098,11 @@ impl CudaRuntime {
         // allocations, cache warming) so the timed trials measure steady-state
         // execution instead of folding setup noise into the candidate ranking.
         self.execute(dyn_map);
+        // Deployment promotes persistent state after every step; the warmup
+        // promote is untimed but its pointer effects land in trial 1's
+        // execute, putting every timed trial in the same steady state a real
+        // decode step sees.
+        self.promote_persistent_pairs_for_profiling();
         // A warmup that already blew the whole profiling budget has proven
         // the candidate slow; return it as the measurement instead of paying
         // for a timed trial of the same magnitude. Bad candidates are the
@@ -3028,6 +3124,10 @@ impl CudaRuntime {
             self.assume_dyn_dims_stale();
             let start = std::time::Instant::now();
             self.execute(dyn_map);
+            // Part of the per-step cost: a no-op for in-place aliased
+            // outputs, a full copy-out (plus next-execute repatch) for
+            // copy-then-modify candidates.
+            self.promote_persistent_pairs_for_profiling();
             durations.push(start.elapsed());
             if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
                 break;
@@ -3372,6 +3472,7 @@ impl Runtime for CudaRuntime {
             cuda_stream: stream,
             changed_hlir: FxHashSet::default(),
             cuda_graph_timings: vec![],
+            persistent_pairs: vec![],
             last_kernel_stats: vec![],
             last_total_time_us: 0.0,
             kernel_cache: FxHashMap::default(),
@@ -3387,6 +3488,20 @@ impl Runtime for CudaRuntime {
             external_output_buffers: FxHashMap::default(),
             external_buffers: FxHashMap::default(),
         }
+    }
+
+    fn deployment_metric(
+        base: &Self::ProfileMetric,
+        terms: &[(f64, Self::ProfileMetric)],
+    ) -> Self::ProfileMetric {
+        let mut total = *base;
+        for (weight, variant) in terms {
+            // Noise can put a variant below base; a negative body reads as
+            // zero rather than crediting the candidate.
+            let body = variant.saturating_sub(*base);
+            total += body.mul_f64(*weight);
+        }
+        total
     }
 
     fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {

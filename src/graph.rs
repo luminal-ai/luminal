@@ -219,6 +219,11 @@ pub struct CompileOptions {
     pub trials: usize,
     /// Number of best genomes to keep as parents per generation (default: 1)
     pub keep_best: usize,
+    /// Generations without a new best before exploration escalates:
+    /// mutation counts grow per stagnant generation (escaping local minima
+    /// needs multi-gene jumps) and every other stagnant generation samples
+    /// fresh random genomes. 0 disables (default: 0).
+    pub restart_stagnation: usize,
     /// Number of surviving finalists to re-profile in fully-unrolled form
     /// before final selection (default: 3). Search ranks candidates on a
     /// collapsed single-iteration body, which underweights costs that scale
@@ -294,6 +299,11 @@ impl CompileOptions {
     /// Set the number of best genomes to keep as parents per generation.
     pub fn keep_best(mut self, keep_best: usize) -> Self {
         self.keep_best = keep_best;
+        self
+    }
+
+    pub fn restart_stagnation(mut self, generations: usize) -> Self {
+        self.restart_stagnation = generations;
         self
     }
 
@@ -378,6 +388,7 @@ impl Default for CompileOptions {
             // long used 10 and shows the most stable selections.
             trials: 5,
             keep_best: 1,
+            restart_stagnation: 0,
             finalist_depth: 3,
             candidate_timeout: Some(std::time::Duration::from_secs(5)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
@@ -2339,11 +2350,13 @@ impl Graph {
                     // Collapse the rolled body to a single iteration before
                     // profiling — one transformer block instead of N×block, so
                     // per-candidate profile time scales with body size, not the
-                    // unrolled graph size.
+                    // unrolled graph size. Trip-bumped variants restore
+                    // deployment's multiplicity weights via differencing.
+                    let variants = profiling_trip_variants(&graph);
                     collapse_loops_to_first_iter(&mut graph);
-                    graph
+                    (graph, variants)
                 }));
-                let Ok(graph) = graph_result else {
+                let Ok((graph, variants)) = graph_result else {
                     invalid_attempts += 1;
                     if invalid_attempts > max_invalid_attempts {
                         panic!(
@@ -2421,6 +2434,19 @@ impl Graph {
                     if !has_nan && !timed_out && !invalid_profile {
                         log_best_llir(&graph, &format!("candidate=0 {rep_display}"));
                     }
+                    let (rep_metric, rep_display) = if !has_nan && !timed_out && !invalid_profile {
+                        Self::profile_deployment_metric(
+                            runtime,
+                            &rep_metric,
+                            rep_display,
+                            &variants,
+                            &profile_dyn_map,
+                            options,
+                            bucket_profile_context.as_ref(),
+                        )
+                    } else {
+                        (rep_metric, rep_display)
+                    };
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
@@ -2476,6 +2502,7 @@ impl Graph {
         let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
             vec![(best_metric.clone(), initial_genome)];
         let mut resample_generation = false;
+        let mut stagnant_generations = 0usize;
 
         while n_graphs < search_limit {
             if search_time_limit_reached() {
@@ -2494,11 +2521,21 @@ impl Graph {
                     if remaining == 0 {
                         break;
                     }
+                    // Stagnation kick: escaping a family basin needs
+                    // multi-gene jumps, so mutation counts escalate with
+                    // consecutive stagnant generations (capped 16x).
+                    let kick = if options.restart_stagnation > 0
+                        && stagnant_generations >= options.restart_stagnation
+                    {
+                        (1 + stagnant_generations - options.restart_stagnation).min(16)
+                    } else {
+                        1
+                    };
                     offspring.extend(extract_reachable_generation(
                         egraph,
                         parent_genome,
                         per_parent.min(remaining),
-                        options.mutations,
+                        options.mutations * kick,
                         &mut prev_selected,
                         rng,
                     ));
@@ -2510,6 +2547,7 @@ impl Graph {
             }
 
             let mut generation_found_non_timeout = false;
+            let mut generation_found_new_best = false;
 
             for genome in all_offspring {
                 if search_time_limit_reached() {
@@ -2533,14 +2571,15 @@ impl Graph {
                         .then(|| llir_graph.clone());
                     // Collapse the rolled body to a single iteration
                     // before profiling — see initial-genome path.
+                    let variants = profiling_trip_variants(&llir_graph);
                     collapse_loops_to_first_iter(&mut llir_graph);
-                    (pre_collapse, llir_graph)
+                    (pre_collapse, llir_graph, variants)
                 }));
                 if let Err(payload) = &graph_result {
                     crate::mask_events::CANDIDATE_PANIC
                         .record_with(|| crate::mask_events::panic_payload(payload.as_ref()));
                 }
-                let Ok((pre_collapse, llir_graph)) = graph_result else {
+                let Ok((pre_collapse, llir_graph, variants)) = graph_result else {
                     if search_log {
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
@@ -2607,6 +2646,19 @@ impl Graph {
                         crate::mask_events::NAN_OUTPUT_REJECT.record();
                     }
                     let invalid_profile = rep_display.starts_with("invalid ");
+                    let (rep_metric, rep_display) = if !has_nan && !timed_out && !invalid_profile {
+                        Self::profile_deployment_metric(
+                            runtime,
+                            &rep_metric,
+                            rep_display,
+                            &variants,
+                            &profile_dyn_map,
+                            options,
+                            bucket_profile_context.as_ref(),
+                        )
+                    } else {
+                        (rep_metric, rep_display)
+                    };
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
@@ -2688,8 +2740,10 @@ impl Graph {
                     }
                 }
 
+                log_candidate_ops(&llir_graph, &format!("cand={n_graphs} {display_metric}"));
                 let new_best = best_metric.gt(&new_metric);
                 if new_best {
+                    generation_found_new_best = true;
                     best_metric = new_metric;
                     log_best_llir(
                         &llir_graph,
@@ -2718,7 +2772,17 @@ impl Graph {
                 }
             }
 
-            resample_generation = !generation_found_non_timeout;
+            if generation_found_new_best {
+                stagnant_generations = 0;
+            } else {
+                stagnant_generations += 1;
+            }
+            // Every other stagnant generation past the threshold explores
+            // from fresh random genomes instead of the converged parents.
+            let stagnation_resample = options.restart_stagnation > 0
+                && stagnant_generations >= options.restart_stagnation
+                && stagnant_generations.is_multiple_of(2);
+            resample_generation = !generation_found_non_timeout || stagnation_resample;
         }
 
         // Clear progress bars
@@ -2755,6 +2819,69 @@ impl Graph {
     /// graph island boundaries) by the trip factor; the unrolled profile
     /// measures the graph that actually ships.
     #[allow(clippy::too_many_arguments)]
+    /// Profile the trip-bumped variants of a candidate and fold them into
+    /// the deployment-order metric (`T1 + Σ w·(M_r − T1)`). Any variant
+    /// failure falls back to the collapsed metric — no candidate is
+    /// rejected on variant grounds.
+    #[allow(clippy::too_many_arguments)]
+    fn profile_deployment_metric<R: Runtime + 'static>(
+        runtime: &mut R,
+        base_metric: &R::ProfileMetric,
+        base_display: String,
+        variants: &[(f64, LLIRGraph)],
+        profile_dyn_map: &FxHashMap<char, usize>,
+        options: &CompileOptions,
+        bucket_profile_context: Option<&SearchProfileBucketContext>,
+    ) -> (R::ProfileMetric, String) {
+        if variants.is_empty() {
+            return (base_metric.clone(), base_display);
+        }
+        let mut terms = Vec::with_capacity(variants.len());
+        for (weight, variant_graph) in variants {
+            let profiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.clear_intermediate_buffers();
+                if let Some(bucket_context) = bucket_profile_context {
+                    runtime.profile_with_bucket_context(
+                        variant_graph,
+                        profile_dyn_map,
+                        options.trials,
+                        options.execution_timeout,
+                        ProfileBucketContext {
+                            dim_buckets: &bucket_context.dim_buckets,
+                            bucket_indices: &bucket_context.bucket_indices,
+                            representative_dyn_map: &bucket_context.representative_dyn_map,
+                        },
+                    )
+                } else {
+                    runtime.profile(
+                        variant_graph,
+                        profile_dyn_map,
+                        options.trials,
+                        options.execution_timeout,
+                    )
+                }
+            }));
+            match profiled {
+                Ok((metric, display)) if !display.starts_with("invalid ") => {
+                    terms.push((*weight, metric));
+                }
+                _ => {
+                    return (
+                        base_metric.clone(),
+                        format!("{base_display} | deploy-est unavailable"),
+                    );
+                }
+            }
+        }
+        let metric = R::deployment_metric(base_metric, &terms);
+        let display = if options.search_log_enabled() {
+            format!("{base_display} | deploy {metric:?} terms {terms:?}")
+        } else {
+            format!("{base_display} | deploy {metric:?}")
+        };
+        (metric, display)
+    }
+
     fn reprofile_finalists_unrolled<'a, R: Runtime + 'static>(
         &'a self,
         runtime: &mut R,
@@ -3641,6 +3768,43 @@ fn grow_rolling_candidate(
 /// identical graph produce byte-identical output regardless of NodeIndex
 /// assignment — best-so-far graphs from different runs can be compared with
 /// plain `diff`.
+
+/// Append one line per profiled candidate (op-type histogram + metric) to
+/// the file named by `LUMINAL_CANDIDATE_OPS` — search-trajectory forensics
+/// for "was family X ever generated, and what did it measure".
+fn log_candidate_ops(llir: &LLIRGraph, tag: &str) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var("LUMINAL_CANDIDATE_OPS").ok()) else {
+        return;
+    };
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for op in llir.node_weights() {
+        let debug = format!("{op:?}");
+        let name = debug
+            .split(['{', '(', ' ', ')'])
+            .find(|s| !s.is_empty() && *s != "LLIROp" && *s != "DialectOp")
+            .unwrap_or("?")
+            .to_string();
+        *counts.entry(name).or_default() += 1;
+    }
+    let line = format!(
+        "{tag} | {}\n",
+        counts
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 pub fn log_best_llir(llir: &LLIRGraph, context: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("LUMINAL_LOG_LLIR").is_some()) {
@@ -3964,7 +4128,7 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
             );
             return;
         }
-        unroll_loop_region(llir, &region, &body);
+        unroll_loop_region(llir, &region, &body, usize::MAX);
         // Compact into a freshly-allocated StableGraph so all edge IDs are
         // re-assigned sequentially in our chosen insertion order. Without
         // this, later add_edge calls (the next region's rewiring, or
@@ -3985,6 +4149,11 @@ fn unroll_loop_region(
     llir: &mut LLIRGraph,
     region: &LoopRegion,
     body_nodes: &FxHashSet<NodeIndex>,
+    // `usize::MAX` = full unroll. A smaller limit materializes only the
+    // first `trip_limit` iterations (per-iter sources [0..limit], output
+    // selects clamped to the last materialized copy) — values are wrong
+    // past the limit, but trip-differencing profiling only needs the time.
+    trip_limit: usize,
 ) {
     use petgraph::visit::EdgeRef;
 
@@ -3997,7 +4166,8 @@ fn unroll_loop_region(
         iters,
         markers: loop_markers,
     } = region;
-    let iters = *iters;
+    let full_iters = *iters;
+    let iters = full_iters.min(trip_limit).max(1);
 
     // start_meta[loop_start] = (initial, body_producer):
     //   - `initial` = LoopStart's incoming (state at iter 0).
@@ -4032,16 +4202,17 @@ fn unroll_loop_region(
 
     let mut input_per_iter: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
     for input_node in inputs.values() {
-        let srcs: Vec<NodeIndex> = llir
+        let mut srcs: Vec<NodeIndex> = llir
             .edges_directed(*input_node, Direction::Incoming)
             .sorted_by_key(|e| e.id())
             .map(|e| e.source())
             .collect();
         assert_eq!(
             srcs.len(),
-            iters,
+            full_iters,
             "LoopInput stream must have `iters` sources"
         );
+        srcs.truncate(iters);
         input_per_iter.insert(*input_node, srcs);
     }
 
@@ -4171,6 +4342,7 @@ fn unroll_loop_region(
     }
     for (&select_node, &(stream_id, iter)) in output_selects {
         let body_producer = output_body_producer[&stream_id];
+        let iter = iter.min(iters - 1);
         let sub = clone_map[iter]
             .get(&body_producer)
             .copied()
@@ -4228,6 +4400,90 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         let compacted = compact_llir_preserving_input_order(llir);
         *llir = compacted;
     }
+}
+
+/// Second measurement point for trip-count differencing: the region with
+/// `bumped_loop_id` is materialized at two iterations, every other region
+/// collapses to one. `M_r - T1` then isolates one extra iteration of region
+/// r, with boundary/overlap effects identical in both measurements.
+fn expand_loops_bump_region(llir: &mut LLIRGraph, bumped_loop_id: usize) {
+    inline_static_loop_inputs(llir);
+    while let Some((region, body)) = take_innermost_region(llir) {
+        if region.starts.is_empty() {
+            return;
+        }
+        let region_id = region
+            .starts
+            .values()
+            .next()
+            .and_then(|&s| llir[s].to_op::<crate::hlir::LoopStart>())
+            .map(|op| op.loop_id);
+        if region_id == Some(bumped_loop_id) && region.iters > 1 {
+            unroll_loop_region(llir, &region, &body, 2);
+        } else {
+            collapse_loop_region(llir, &region, &body);
+        }
+        let compacted = compact_llir_preserving_input_order(llir);
+        *llir = compacted;
+    }
+}
+
+/// Trip-differencing variants for deployment-order ranking. The collapsed
+/// profile measures `A + Σ body_r`; deployment costs `A + Σ mult_r·body_r`
+/// (mult = product of trips up the region tree) — different weightings of
+/// the same components, so candidates trading fixed vs body cost rank
+/// inverted. Each variant re-measures with one region at two iterations;
+/// the score `T1 + Σ (mult_r − mult_parent(r))·(M_r − T1)` restores
+/// deployment's weights. Regions with trivial bodies are skipped: their
+/// total mis-weighting is bounded by a few nodes and doesn't justify a
+/// profile load.
+pub(crate) fn profiling_trip_variants(marked: &LLIRGraph) -> Vec<(f64, LLIRGraph)> {
+    let regions = collect_loop_regions(marked);
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    let marker_owner: FxHashMap<NodeIndex, usize> = regions
+        .iter()
+        .flat_map(|(&id, region)| region.markers.iter().map(move |&n| (n, id)))
+        .collect();
+    let mut body_len: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut contains: FxHashMap<usize, std::collections::BTreeSet<usize>> = FxHashMap::default();
+    for (&id, region) in &regions {
+        let (body, foreign) = loop_region_body(marked, region, &marker_owner, id);
+        body_len.insert(id, body.len());
+        contains.insert(id, foreign);
+    }
+    // Immediate parent = containing region with the smallest body.
+    let parent_of = |id: usize| -> Option<usize> {
+        contains
+            .iter()
+            .filter(|(a, children)| **a != id && children.contains(&id))
+            .min_by_key(|(a, _)| body_len[a])
+            .map(|(a, _)| *a)
+    };
+    let mult_of = |mut id: usize| -> usize {
+        let mut mult = regions[&id].iters.max(1);
+        while let Some(parent) = parent_of(id) {
+            mult *= regions[&parent].iters.max(1);
+            id = parent;
+        }
+        mult
+    };
+    let mut variants = Vec::new();
+    for (&id, region) in &regions {
+        if region.iters <= 1 || body_len[&id] < 8 {
+            continue;
+        }
+        let mult = mult_of(id);
+        let weight = (mult - mult / region.iters.max(1)) as f64;
+        if weight <= 0.0 {
+            continue;
+        }
+        let mut bumped = marked.clone();
+        expand_loops_bump_region(&mut bumped, id);
+        variants.push((weight, bumped));
+    }
+    variants
 }
 
 fn collapse_loop_region(
