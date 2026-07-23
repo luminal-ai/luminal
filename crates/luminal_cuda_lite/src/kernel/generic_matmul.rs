@@ -19,6 +19,14 @@ use luminal::{
     shape::flatten_strides,
 };
 
+const MATMUL_BACKEND_RELATION_DECLARATIONS: &str = "(relation generic_matmul_exact_2d
+        (IR Expression Expression Expression DType))
+     (relation generic_matmul_exact_3d
+        (IR Expression Expression Expression Expression DType))
+     (relation low_precision_matmul_dtype (DType))
+     (low_precision_matmul_dtype (F16))
+     (low_precision_matmul_dtype (Bf16))";
+
 #[derive(Default, Debug, Clone)]
 pub struct GenericMatmul {
     out_shape: Vec<Expression>,
@@ -55,10 +63,64 @@ impl EgglogOp for GenericMatmul {
         2
     }
 
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec![MATMUL_BACKEND_RELATION_DECLARATIONS.to_string()]
+    }
+
     fn rewrites(&self) -> Vec<Rule> {
         vec![
             Rule::raw(
-                "(rule
+                "; cuBLASLt and GEMV implement only the canonical materialized
+             ; matmul reduction. Operand broadcast strides alone are not a
+             ; sufficient witness: a movement-only view between Mul and Sum
+             ; can permute the reduction's surviving axes while leaving both
+             ; operand strides unchanged. Stage the complete semantic layout
+             ; here so every optimized consumer shares the same proof.
+             (rule
+                (
+                    (= ?sum (Op (GenericMatmul
+                        (ECons ?m (ECons ?n (ENil)))
+                        (ECons ?m (ECons ?n (ECons ?k (ENil))))
+                        ?k
+                        ?lhs_strides ?rhs_strides
+                        (ECons
+                            (MMul (MMul (MIter) ?k) ?n)
+                            (ECons (MMul (MIter) ?k) (ENil)))
+                        (MIter)
+                        (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))
+                        ?dt)
+                        ?inputs))
+                )
+                ((generic_matmul_exact_2d ?sum ?m ?n ?k ?dt))
+                :ruleset matmul_backend
+                :name \"prove exact materialized 2d matmul reduction\"
+             )
+
+             (rule
+                (
+                    (= ?sum (Op (GenericMatmul
+                        (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+                        (ECons ?batch (ECons ?m (ECons ?n (ECons ?k (ENil)))))
+                        ?k
+                        ?lhs_strides ?rhs_strides
+                        (ECons
+                            (MMul (MMul (MMul (MIter) ?k) ?n) ?m)
+                            (ECons
+                                (MMul (MMul (MIter) ?k) ?n)
+                                (ECons (MMul (MIter) ?k) (ENil))))
+                        (MIter)
+                        (ECons
+                            (MMul (MMul (MIter) ?n) ?m)
+                            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
+                        ?dt)
+                        ?inputs))
+                )
+                ((generic_matmul_exact_3d ?sum ?batch ?m ?n ?k ?dt))
+                :ruleset matmul_backend
+                :name \"prove exact materialized 3d matmul reduction\"
+             )
+
+             (rule
                     (
                         (= ?mul (Op (Mul ?mul_shape ?lhs_strides ?rhs_strides ?mul_out_strides)
                             (ICons ?lhs (ICons ?rhs (INil)))))
@@ -85,6 +147,26 @@ impl EgglogOp for GenericMatmul {
                     :name \"generic-matmul-cuda-mul-sum\"
                 )",
             ),
+
+            // A low-precision materialized Mul followed by a separate reduction is
+            // not the floating-point matmul contract implemented by GenericMatmul,
+            // GEMV, or cuBLASLt: it rounds every product to F16/BF16 before the
+            // reduction instead of accumulating products in F32. Keep search wide
+            // across the F32-accumulating backends, not across a numerically
+            // different product-materialization algorithm. F32 keeps its
+            // decomposed alternative because there is no low-precision product
+            // rounding to eliminate.
+            //
+            // GraphTensor::matmul is already decomposed to Mul + Sum at this IR
+            // boundary, so there is no separate provenance marker to distinguish
+            // it from the same contraction authored directly. The shared
+            // GenericMatmul e-class is therefore the witness that this contraction
+            // has the backend matmul accumulator contract. A future first-class
+            // contraction marker could make that provenance explicit.
+            //
+            // Both forms must be covered because cleanup can observe either the
+            // original HLIR Sum or its CUDA KernelSum lowering depending on rule
+            // scheduling.
             Rule::raw(
                 "(rule
                     (
@@ -93,30 +175,38 @@ impl EgglogOp for GenericMatmul {
                         (= ?sum (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
                             (ICons ?mul (INil))))
                         (= ?sum (Op (GenericMatmul
-                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt)
+                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?dt)
                             ?generic_inputs))
+                        (= ?dt (dtype ?sum))
+                        (= ?dt (dtype ?mul))
+                        (low_precision_matmul_dtype ?dt)
                     )
                     (
                         (delete (Op (Sum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides)
                             (ICons ?mul (INil))))
                     )
                     :ruleset cleanup
-                    :name \"delete-sum-when-generic-matmul-exists\"
-                )",
-            ),
-            Rule::raw(
-                "(rule
+                    :name \"delete-low-precision-sum-when-wide-accum-matmul-exists\"
+                )
+
+                (rule
                     (
-                        (= ?kernel_sum (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
+                        (= ?kernel_sum (Op (KernelSum
+                            ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
                             ?sum_inputs))
                         (= ?kernel_sum (Op (GenericMatmul
-                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?gdt)
+                            ?go ?gm ?gk ?gls ?grs ?gsis ?gsit ?gos ?dt)
                             ?generic_inputs))
+                        (= ?dt (dtype ?kernel_sum))
+                        (low_precision_matmul_dtype ?dt)
                     )
-                    ((delete (Op (KernelSum ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
-                        ?sum_inputs)))
+                    (
+                        (delete (Op (KernelSum
+                            ?out_shape ?k ?sum_input_strides ?sum_iter_stride ?out_strides ?dt)
+                            ?sum_inputs))
+                    )
                     :ruleset cleanup
-                    :name \"delete-kernel-sum-when-generic-matmul-exists\"
+                    :name \"delete-low-precision-kernel-sum-when-wide-accum-matmul-exists\"
                 )",
             ),
         ]

@@ -323,23 +323,16 @@ impl EgglogOp for CudaBinaryElementwise {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let mut out_shape =
+        // Preserve every extracted metadata list verbatim. A selected
+        // candidate with inconsistent ranks is rejected by fusion-region
+        // validation; truncating here would erase the contradiction and could
+        // silently change the operation's iteration space.
+        let out_shape =
             extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap();
-        let mut a_stride =
-            extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
-        let mut b_stride =
-            extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap();
-        let mut out_stride =
+        let a_stride = extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();
+        let b_stride = extract_expr_list(egraph, kind_children[3], list_cache, expr_cache).unwrap();
+        let out_stride =
             extract_expr_list(egraph, kind_children[4], list_cache, expr_cache).unwrap();
-        let n = out_shape
-            .len()
-            .min(a_stride.len())
-            .min(b_stride.len())
-            .min(out_stride.len());
-        out_shape.truncate(n);
-        a_stride.truncate(n);
-        b_stride.truncate(n);
-        out_stride.truncate(n);
         (
             LLIROp::new::<dyn KernelOp>(Box::new(Self {
                 op: extract_string_label(egraph, kind_children[0]),

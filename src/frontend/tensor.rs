@@ -57,7 +57,8 @@ impl GraphTensor {
         self.graph().get_op_mut::<Input>(self.id).label = name.to_string();
     }
 
-    /// Mark this tensor as an output.
+    /// Mark this tensor as an observable output. Unlike [`GraphTensor::persist`],
+    /// this protects the tensor's logical value from a later in-place update.
     /// If the tensor has non-contiguous strides (e.g. from transpose + merge_dims),
     /// inserts a gather to materialize contiguous data before the output node.
     pub fn output(&self) -> GraphTensor {
@@ -72,15 +73,16 @@ impl GraphTensor {
             gathered.shape = ShapeTracker::new(dims);
             gathered
         };
-        self.output_raw(source)
+        self.output_raw(source, false)
     }
 
     /// Mark a tensor as an output without any contiguous materialization.
     /// Used internally by graph_break and persist.
-    fn output_raw(&self, source: GraphTensor) -> GraphTensor {
+    fn output_raw(&self, source: GraphTensor, persist_only: bool) -> GraphTensor {
         self.graph().add_op(
             Output {
                 node: source.id.index(),
+                persist_only,
             },
             &[source.id],
         );
@@ -92,11 +94,13 @@ impl GraphTensor {
         self.shape.required_total_bytes()
     }
 
-    /// Mark this tensor to persist across executions. Creates an Output node
-    /// so the buffer is not consumed after execute(), but returns the original
-    /// Input node's GraphTensor (not the Output node).
+    /// Mark this tensor's storage to persist across executions. Creates a
+    /// persist-only Output marker so the buffer is not consumed after
+    /// execute(), but does not request an immutable observable snapshot. Call
+    /// [`GraphTensor::output`] separately when the pre-update logical value is
+    /// user-visible. Returns the original tensor rather than the Output marker.
     pub fn persist(&self) -> GraphTensor {
-        self.output_raw(*self);
+        self.output_raw(*self, true);
         *self
     }
 

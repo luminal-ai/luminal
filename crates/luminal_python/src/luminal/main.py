@@ -26,9 +26,9 @@ def _detect_factory_capsule(example_inputs):
                 "the cuda feature. Rebuild with `maturin develop --features cuda` "
                 "or run through `run_tests_cuda.sh`/the Modal CUDA test runner."
             ) from exc
-    from .luminal import _native_factory_capsule
+    from .luminal import _reference_factory_capsule
 
-    return _native_factory_capsule()
+    return _reference_factory_capsule()
 
 
 def _collect_weight_pointers(weights):
@@ -97,7 +97,7 @@ def luminal_backend(gm, example_inputs, options=None):
     """Auto-detecting torch.compile backend.
 
     Picks cuda_lite if inputs are on CUDA (and cuda feature is compiled in),
-    native otherwise.
+    reference otherwise.
 
     For external backends, use register_backend with the backend's factory capsule.
     """

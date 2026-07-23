@@ -1,3 +1,11 @@
+// glibc malloc degrades into an allocating livelock inside
+// nvrtcCompileProgram after heavy search heap churn (hundreds of
+// thousands of compiles). jemalloc built with unprefixed symbols
+// interposes malloc for the whole process, including dlopened CUDA
+// libraries like libnvrtc — a Rust-only global allocator would not.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hf;
 mod model;
 
@@ -12,6 +20,9 @@ use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 const REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
+
+/// KV cache element size in bytes (bf16 = 2).
+const KV_ELEMENT_BYTES: usize = 2;
 
 fn llama3_chat_prompt(user_prompt: &str) -> String {
     format!(
@@ -151,7 +162,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn main() {
     let num_slots = env_usize("NUM_SLOTS", 8192);
     let search_graphs = 100;
-    let gen_tokens = 30;
+    let gen_tokens = 500;
     let prompt_a = "Explain what a neural network is in a paragraph.";
     let prompt_b = "What is the capital of France?";
 
@@ -208,23 +219,26 @@ fn main() {
     // optimized compilation — decode can select warp-parallel kernels while
     // prefill can select tiled matmul / cuBLAS.
     let max_prefill = (tokens_a.len().max(tokens_b.len()) + 16).next_power_of_two();
-    let build_options = CompileOptions::default().dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(16),
-        ],
-    );
-
-    println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>(build_options);
+    let search_s = 16;
+    let search_c = 16;
+    let compile_options = CompileOptions::default()
+        .dim_buckets(
+            's',
+            &[
+                DimBucket::new(1, 1),
+                DimBucket::new(2, max_prefill).representative(search_s),
+            ],
+        )
+        .search_dim('c', search_c)
+        .search_graph_limit(search_graphs);
 
     println!("Loading weights...");
     let mut runtime = CudaRuntime::initialize(stream);
-    let weights_path = model_dir.join("model_combined.safetensors");
+    let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    // KV cache is bf16: 2 bytes/element.
+    let cache_bytes = num_slots * KV_DIM * KV_ELEMENT_BYTES;
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
@@ -232,20 +246,16 @@ fn main() {
 
     println!("Compiling...");
     // Dummy data sized for the largest representative (s=16, c=16)
-    let search_s = 16;
-    let search_c = 16;
     cx.set_dim('s', search_s);
-    cx.set_dim('c', search_c);
     runtime.set_data(input, vec![1i32; search_s]);
     runtime.set_data(q_pos_t, vec![0i32; search_s]);
     runtime.set_data(scatter_idx_t, vec![0i32; search_s]);
     runtime.set_data(gather_idx_t, vec![0i32; search_c]);
     runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_c]);
-    let search_options = CompileOptions::default().search_graph_limit(search_graphs);
-    runtime = cx.search(runtime, search_options);
+    runtime = cx.compile(runtime, compile_options);
 
     // Re-initialize KV cache after search (search consumes buffers)
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    let cache_bytes = num_slots * KV_DIM * KV_ELEMENT_BYTES;
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);

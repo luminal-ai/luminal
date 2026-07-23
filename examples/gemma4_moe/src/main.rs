@@ -1,3 +1,11 @@
+// glibc malloc degrades into an allocating livelock inside
+// nvrtcCompileProgram after hours of search heap churn (hundreds of
+// thousands of compiles). jemalloc built with unprefixed symbols
+// interposes malloc for the whole process, including dlopened CUDA
+// libraries like libnvrtc — a Rust-only global allocator would not.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hf;
 mod model;
 
@@ -6,7 +14,6 @@ use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use model::*;
 use rand::{SeedableRng, rngs::SmallRng};
-use rustc_hash::FxHashSet;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
 
@@ -19,10 +26,28 @@ fn env_bool(name: &str) -> bool {
         .is_some_and(|s| matches!(s.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
+fn promote_persistent_state(
+    runtime: &mut CudaRuntime,
+    seen_out: GraphTensor,
+    seen_mask: GraphTensor,
+    cache_outputs: &[(GraphTensor, GraphTensor)],
+    kv_cache: &KVCache,
+) {
+    let seen_buf = runtime.remove_buffer(seen_out);
+    runtime.set_buffer(seen_mask, seen_buf);
+
+    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        let k_buf = runtime.remove_buffer(*k_out);
+        let v_buf = runtime.remove_buffer(*v_out);
+        runtime.set_buffer(kv_cache.k_caches[layer], k_buf);
+        runtime.set_buffer(kv_cache.v_caches[layer], v_buf);
+    }
+}
+
 fn main() {
     let max_seq_len = 4096;
-    let gen_tokens = 30;
-    let search_graphs = 50;
+    let gen_tokens = 500;
+    let search_graphs = 500;
     let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
     let print_token_ids = env_bool("PRINT_TOKEN_IDS");
 
@@ -42,9 +67,24 @@ fn main() {
     let mut cx = Graph::default();
     let input = cx.named_tensor("input", 's').as_dtype(DType::Int);
     let pos_ids = cx.named_tensor("pos_ids", 's').as_dtype(DType::Int);
+    let seen_mask_t = cx.named_tensor("seen_mask", VOCAB_SIZE);
+    let new_token_t = cx.named_tensor("new_token", 1).as_dtype(DType::Int);
+    let scatter_idx_t = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
+    let gather_idx_t = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
+    let repetition_penalty: f32 = 1.05;
     let kv_cache = KVCache::new(&mut cx, max_seq_len);
-    let (logits, cache_outputs) = Gemma4MoE::init(&mut cx).forward(input, pos_ids, &kv_cache);
-    let logits = logits.output();
+    let (token_ids, seen_out, cache_outputs) = Gemma4MoE::init(&mut cx).forward_with_sampling(
+        input,
+        pos_ids,
+        scatter_idx_t,
+        gather_idx_t,
+        &kv_cache,
+        seen_mask_t,
+        new_token_t,
+        repetition_penalty,
+    );
+    let token_ids = token_ids.output();
+    seen_out.output();
     for (k_out, v_out) in &cache_outputs {
         k_out.output();
         v_out.output();
@@ -53,21 +93,26 @@ fn main() {
         .next_power_of_two()
         .min(max_seq_len);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default().dim_buckets(
-        's',
-        &[
-            DimBucket::new(1, 1),
-            DimBucket::new(2, max_prefill).representative(search_s),
-        ],
-    );
-
-    println!("Building E-Graph...");
-    cx.build_search_space::<CudaRuntime>(build_options);
+    let compile_options = CompileOptions::default()
+        .dim_buckets(
+            's',
+            &[
+                DimBucket::new(1, 1),
+                DimBucket::new(2, max_prefill).representative(search_s),
+            ],
+        )
+        .search_dim('c', search_s)
+        .search_graph_limit(search_graphs);
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream);
-    let weights_path = model_dir.join("model_combined.safetensors");
+    // ~52 GB of weights leave room for the arena on an 80 GB A100 only after
+    // release_pooled_memory() (below) reclaims what search profiling leaves in
+    // the async allocator pool — without that trim even a 10 GiB arena OOMs.
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(12);
+    let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
+    let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
+    println!("  weight load: {:.1}s", phase.elapsed().as_secs_f64());
 
     for layer in 0..LAYERS {
         let cache_bytes = cache_bytes_for_layer(layer, max_seq_len);
@@ -77,100 +122,101 @@ fn main() {
 
     println!("Compiling...");
     cx.set_dim('s', search_s);
-    cx.set_dim('p', 0);
     runtime.set_data(input, vec![1; search_s]);
     runtime.set_data(pos_ids, (0..search_s as i32).collect::<Vec<_>>());
+    runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
+    runtime.set_data(gather_idx_t, (0..search_s as i32).collect::<Vec<_>>());
+    runtime.set_data(new_token_t, vec![-1i32]);
+    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    let search_options = CompileOptions::default()
-        .search_graph_limit(search_graphs)
-        .profile_timeout(Duration::from_secs(2));
-    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+    // Profiling timeouts use the CompileOptions defaults (5s candidate / 1s execution).
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
+
+    // Search profiling leaves several GB cached in the async allocator pool;
+    // reclaim it before the first real execute so the stitched-graph arena
+    // allocation has room alongside the 52 GB of weights on an 80 GB A100.
+    runtime.release_pooled_memory();
+
+    // Pre-size the gather index buffer to its maximum so per-step set_data
+    // reuses the same device pointer — growth reallocation would invalidate
+    // the FlashInfer capture signatures and force per-step recaptures.
+    runtime.set_data_with_capacity(
+        gather_idx_t,
+        Vec::<i32>::new(),
+        max_seq_len * std::mem::size_of::<i32>(),
+    );
 
     for layer in 0..LAYERS {
         let cache_bytes = cache_bytes_for_layer(layer, max_seq_len);
         runtime.set_zeros(kv_cache.k_caches[layer], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[layer], cache_bytes);
     }
+    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
 
     print!("{prompt}");
     std::io::stdout().flush().unwrap();
 
     let mut prev_seq: usize;
     let mut fwd_durations = vec![];
-    let mut seen_tokens = FxHashSet::default();
     let mut generated_token_ids = vec![];
-    let repetition_penalty: f32 = 1.05;
 
     const EOS_TOKEN: u32 = 1;
 
+    // Sampling runs on-device, and each execute's selected cache/seen outputs
+    // are promoted back into the persistent input slots before the next step.
+    // Per-step host I/O is one token id each way.
     let prefill_start = std::time::Instant::now();
-    cx.set_dim('s', prompt_tokens.len());
-    cx.set_dim('p', 0);
+    let plen = prompt_tokens.len();
+    cx.set_dim('s', plen);
+    cx.set_dim('c', plen);
     runtime.set_data(
         input,
         prompt_tokens.iter().map(|t| *t as i32).collect::<Vec<_>>(),
     );
-    runtime.set_data(pos_ids, (0..prompt_tokens.len() as i32).collect::<Vec<_>>());
+    runtime.set_data(pos_ids, (0..plen as i32).collect::<Vec<_>>());
+    runtime.set_data(scatter_idx_t, (0..plen as i32).collect::<Vec<_>>());
+    runtime.set_data(gather_idx_t, (0..plen as i32).collect::<Vec<_>>());
+    runtime.set_data(new_token_t, vec![-1i32]);
     runtime.execute(&cx.dyn_map);
-
-    for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-        let k_buf = runtime.remove_buffer(*k_out);
-        let v_buf = runtime.remove_buffer(*v_out);
-        runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
-        runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
-    }
+    promote_persistent_state(
+        &mut runtime,
+        seen_out,
+        seen_mask_t,
+        &cache_outputs,
+        &kv_cache,
+    );
     prev_seq = prompt_tokens.len();
-    let prefill_duration = prefill_start.elapsed();
 
-    let logits_data = runtime.get_f32(logits);
-    let row_start = (prompt_tokens.len() - 1) * VOCAB_SIZE;
-    let last_row = &logits_data[row_start..row_start + VOCAB_SIZE];
-    let mut next_token = last_row
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .unwrap()
-        .0 as u32;
+    let ids = runtime.get_i32(token_ids);
+    let mut next_token = ids[prompt_tokens.len() - 1] as u32;
+    let prefill_duration = prefill_start.elapsed();
     generated_token_ids.push(next_token);
     print!("{}", tokenizer.decode(&[next_token], true).unwrap());
     std::io::stdout().flush().unwrap();
-    seen_tokens.insert(next_token);
 
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 1..gen_tokens {
         let start = std::time::Instant::now();
         cx.set_dim('s', 1);
-        cx.set_dim('p', prev_seq);
+        cx.set_dim('c', prev_seq + 1);
         runtime.set_data(input, vec![next_token as i32]);
         runtime.set_data(pos_ids, vec![prev_seq as i32]);
+        runtime.set_data(scatter_idx_t, vec![prev_seq as i32]);
+        runtime.set_data(gather_idx_t, (0..=prev_seq as i32).collect::<Vec<_>>());
+        runtime.set_data(new_token_t, vec![next_token as i32]);
         runtime.execute(&cx.dyn_map);
-
-        for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-            let k_buf = runtime.remove_buffer(*k_out);
-            let v_buf = runtime.remove_buffer(*v_out);
-            runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
-            runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
-        }
+        promote_persistent_state(
+            &mut runtime,
+            seen_out,
+            seen_mask_t,
+            &cache_outputs,
+            &kv_cache,
+        );
 
         prev_seq += 1;
-
-        let logits_data = runtime.get_f32(logits);
-        let mut last_row = logits_data[..VOCAB_SIZE].to_vec();
-        for &tok in &seen_tokens {
-            let logit = &mut last_row[tok as usize];
-            if *logit > 0.0 {
-                *logit /= repetition_penalty;
-            } else {
-                *logit *= repetition_penalty;
-            }
-        }
-        next_token = last_row
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .unwrap()
-            .0 as u32;
+        let ids = runtime.get_i32(token_ids);
+        next_token = ids[0] as u32;
         generated_token_ids.push(next_token);
-        seen_tokens.insert(next_token);
 
         if next_token == EOS_TOKEN {
             break;

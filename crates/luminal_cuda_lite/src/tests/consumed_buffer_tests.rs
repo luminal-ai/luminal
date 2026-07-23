@@ -3,33 +3,27 @@ use luminal::prelude::*;
 use luminal_nn::{gather_rows, scatter_rows};
 use rand::SeedableRng;
 
-use luminal::egglog_utils::{egglog_to_llir, random_initial_choice, validate_choice_set};
+use luminal::egglog_utils::{random_initial_choice, validate_choice_set};
 
 use crate::kernel::KernelOp;
+use crate::resource::{ResourceViolation, plan_static_llir_resources};
 use crate::runtime::CudaRuntime;
+use crate::tests::utilities::{
+    ForcedExtractionConfig, egraph_has_op_alternatives,
+    extract_forced_kernel_llir as extract_forced_kernel_llir_with_config, extract_llir_for_choices,
+    op_ir_nodes,
+};
 
 /// Helper: build search space and extract all possible kernel names across many random choices.
 fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
-    let custom_ops = &cx.custom_ops;
-
     let mut all_names = Vec::new();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x5CA7_7E12);
     // Try many random extractions to cover both alternatives
     for _ in 0..20 {
-        let choices = random_initial_choice(egraph, &mut rand::rng());
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
+        let choices = random_initial_choice(egraph, &mut rng);
+        let llir = extract_llir_for_choices(cx, choices);
         for op in llir.node_weights() {
             if let Some(k) = op.to_dialect::<dyn KernelOp>() {
                 let name = k.kernel_name().to_string();
@@ -42,13 +36,74 @@ fn extract_all_kernel_names(cx: &mut Graph) -> Vec<String> {
     all_names
 }
 
-/// When dest is NOT shared with any other compute op, KernelScatterNoCopy should
-/// be the only scatter variant left after post-cleanup.
-#[test]
-fn test_scatter_nocopy_selected_when_dest_unshared() {
-    let ctx = CudaContext::new(0).unwrap();
-    ctx.bind_to_thread().unwrap();
+fn extract_forced_kernel_llir(
+    cx: &Graph,
+    egglog_kind: &str,
+    runtime_kernel_name: &str,
+) -> LLIRGraph {
+    extract_forced_kernel_llir_with_config(
+        cx,
+        egglog_kind,
+        runtime_kernel_name,
+        ForcedExtractionConfig::new(0x5CA7_0000),
+        false,
+    )
+}
 
+fn extract_forced_all_kernel_llir(
+    cx: &Graph,
+    egglog_kind: &str,
+    runtime_kernel_name: &str,
+    expected_count: usize,
+) -> LLIRGraph {
+    let egraph = cx.egraph().expect("egraph not built");
+    let ops = cx.egglog_ops().expect("ops not built");
+    let mut forced_nodes = Vec::new();
+    for node in op_ir_nodes(egraph, egglog_kind) {
+        let class = &egraph.node_to_class[node];
+        if !forced_nodes
+            .iter()
+            .any(|existing| egraph.node_to_class[*existing] == *class)
+        {
+            forced_nodes.push(node);
+        }
+    }
+    assert_eq!(
+        forced_nodes.len(),
+        expected_count,
+        "expected {expected_count} distinct {egglog_kind} output classes"
+    );
+
+    for attempt in 0..64_u64 {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5CA7_A110 + attempt);
+        let mut choices = random_initial_choice(egraph, &mut rng);
+        for node in &forced_nodes {
+            choices.insert(&egraph.node_to_class[*node], node);
+        }
+        if validate_choice_set(egraph, &choices, ops).is_err() {
+            continue;
+        }
+
+        let llir = extract_llir_for_choices(cx, choices);
+        let selected_count = llir
+            .node_weights()
+            .filter_map(|op| op.to_dialect::<dyn KernelOp>())
+            .filter(|kernel| kernel.kernel_name() == runtime_kernel_name)
+            .count();
+        if selected_count == expected_count
+            && plan_static_llir_resources(&llir, &FxHashMap::default()).is_ok()
+        {
+            return llir;
+        }
+    }
+
+    panic!("could not extract all {expected_count} {egglog_kind} candidates");
+}
+
+/// When dest is not shared, copying and in-place scatter are both semantically
+/// legal and must remain available for measured selection.
+#[test]
+fn test_scatter_copy_and_nocopy_coexist_when_dest_unshared() {
     let mut cx = Graph::default();
 
     // dest: a 10-element buffer, src: 3 values, indexes: 3 indices
@@ -59,27 +114,49 @@ fn test_scatter_nocopy_selected_when_dest_unshared() {
     // scatter src into dest at indexes
     let _result = src.scatter(indexes, dest).output();
 
-    let names = extract_all_kernel_names(&mut cx);
-    println!("All possible kernels: {:?}", names);
-
-    // KernelScatterNoCopy should be the only scatter variant (dest is not shared)
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        names.iter().any(|n| n == "ScatterNoCopy"),
-        "Expected ScatterNoCopy to be available but got: {:?}",
-        names
+        egraph_has_op_alternatives(&cx, &["KernelScatter", "KernelScatterNoCopy"]),
+        "copying and no-copy scatter should coexist in the scatter output e-class"
     );
+    let nocopy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
     assert!(
-        !names.iter().any(|n| n == "Scatter"),
-        "Regular Scatter should be pruned when ScatterNoCopy is valid, got: {:?}",
-        names
+        plan_static_llir_resources(&nocopy, &FxHashMap::default()).is_ok(),
+        "a persist-only destination does not observe the old logical version"
     );
 }
 
-/// When dest IS shared (used by another op besides the scatter), the ConsumedBuffer
-/// cleanup rule should fire, deleting the ConsumedBuffer. This makes KernelScatterNoCopy
-/// invalid, so it should NOT appear in any extraction.
+/// An ordinary Output observes a logical value; unlike `persist()`, it cannot
+/// silently become an alias of a later in-place update.
 #[test]
-fn test_scatter_nocopy_not_selected_when_dest_shared() {
+fn test_scatter_nocopy_rejected_when_old_dest_is_observed_output() {
+    let mut cx = Graph::default();
+    let dest = cx.tensor(10);
+    dest.output();
+    let src = cx.tensor(3).persist();
+    let indexes = cx.tensor(3).as_dtype(DType::Int).persist();
+    src.scatter(indexes, dest).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op_alternatives(&cx, &["KernelScatter", "KernelScatterNoCopy"]),
+        "observing the old value must not globally erase the no-copy implementation"
+    );
+
+    let nocopy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
+    assert!(matches!(
+        plan_static_llir_resources(&nocopy, &FxHashMap::default()),
+        Err(ResourceViolation::AliasingHazard { .. })
+    ));
+
+    let copying = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
+    assert!(plan_static_llir_resources(&copying, &FxHashMap::default()).is_ok());
+}
+
+/// An unordered read of the old destination makes a selected no-copy plan
+/// invalid, but must not globally erase that implementation from the egraph.
+#[test]
+fn test_scatter_nocopy_candidate_rejected_when_dest_has_unordered_read() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
 
@@ -97,28 +174,28 @@ fn test_scatter_nocopy_not_selected_when_dest_shared() {
     let _dest_also_used = (dest + dest).output();
     let _result = scatter_result.output();
 
-    let names = extract_all_kernel_names(&mut cx);
-    println!("All possible kernels: {:?}", names);
-
-    // KernelScatterNoCopy should NOT be available (dest is shared with the add op)
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        !names.iter().any(|n| n == "ScatterNoCopy"),
-        "ScatterNoCopy should NOT be available when dest is shared, got: {:?}",
-        names
+        egraph_has_op_alternatives(&cx, &["KernelScatter", "KernelScatterNoCopy"]),
+        "both scatter implementations should remain searchable"
     );
-    // Regular KernelScatter should be present
+    let no_copy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
     assert!(
-        names.iter().any(|n| n == "Scatter"),
-        "Expected Scatter but got: {:?}",
-        names
+        matches!(
+            plan_static_llir_resources(&no_copy, &FxHashMap::default()),
+            Err(ResourceViolation::AliasingHazard { .. })
+        ),
+        "the selected no-copy plan must reject the unordered old-value read"
     );
+    let copying = extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter");
+    plan_static_llir_resources(&copying, &FxHashMap::default())
+        .expect("the copying scatter remains a legal candidate");
 }
 
-/// Shared-use detection must catch the destination in non-first input
-/// positions too. Gather takes indexes first and data second, so this would
-/// miss the unsafe read if cleanup only inspected the head of the input list.
+/// Candidate-local validation follows every edge, including reads where the
+/// destination is not the first input (Gather takes indexes before data).
 #[test]
-fn test_scatter_nocopy_not_selected_when_dest_shared_as_later_input() {
+fn test_scatter_nocopy_candidate_rejected_for_unordered_later_input_read() {
     let ctx = CudaContext::new(0).unwrap();
     ctx.bind_to_thread().unwrap();
 
@@ -133,19 +210,32 @@ fn test_scatter_nocopy_not_selected_when_dest_shared_as_later_input() {
     let _dest_also_read = dest.gather(read_indexes).output();
     let _result = scatter_result.output();
 
-    let names = extract_all_kernel_names(&mut cx);
-    println!("All possible kernels: {:?}", names);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let no_copy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
+    assert!(
+        matches!(
+            plan_static_llir_resources(&no_copy, &FxHashMap::default()),
+            Err(ResourceViolation::AliasingHazard { .. })
+        ),
+        "the no-copy plan must reject an unordered gather of the old destination"
+    );
+}
 
-    assert!(
-        !names.iter().any(|n| n == "ScatterNoCopy"),
-        "ScatterNoCopy should NOT be available when dest is read by another op, got: {:?}",
-        names
-    );
-    assert!(
-        names.iter().any(|n| n == "Scatter"),
-        "Expected regular Scatter but got: {:?}",
-        names
-    );
+/// A read that produces the scatter source is dependency-ordered before the
+/// mutation, so sharing the destination in this form is safe for no-copy.
+#[test]
+fn test_scatter_nocopy_allows_ordered_prior_read() {
+    let mut cx = Graph::default();
+    let dest = cx.tensor(5).persist();
+    let delta = cx.tensor(5).persist();
+    let indexes = cx.tensor(5).as_dtype(DType::Int).persist();
+    let src = dest + delta;
+    src.scatter(indexes, dest).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let no_copy = extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy");
+    plan_static_llir_resources(&no_copy, &FxHashMap::default())
+        .expect("the data dependency proves the old destination read precedes mutation");
 }
 
 /// ScatterNoCopy aliases the destination buffer as the output, so it is only
@@ -180,8 +270,7 @@ fn test_scatter_nocopy_not_selected_for_expanded_dest_layout() {
     );
 }
 
-/// Actually execute the scatter and verify correctness.
-/// Post-cleanup should force the valid no-copy extraction.
+/// Actually execute the scatter and verify every selected implementation.
 #[test]
 fn test_scatter_execution_correctness() {
     let ctx = CudaContext::new(0).unwrap();
@@ -200,47 +289,23 @@ fn test_scatter_execution_correctness() {
     let result = src.scatter(indexes, dest).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    let egraph = cx.egraph().expect("egraph not built");
-    let ops = cx.egglog_ops().expect("ops not built");
+    let candidates = [
+        (
+            "KernelScatter",
+            "Scatter",
+            extract_forced_kernel_llir(&cx, "KernelScatter", "Scatter"),
+        ),
+        (
+            "KernelScatterNoCopy",
+            "ScatterNoCopy",
+            extract_forced_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy"),
+        ),
+    ];
 
     // Expected: [0.0, 10.0, 2.0, 20.0, 30.0]
     let expected = vec![0.0f32, 10.0, 2.0, 20.0, 30.0];
 
-    // Try many random extractions; each valid choice should now use ScatterNoCopy.
-    let mut rng = rand::rng();
-    let mut tested_nocopy = false;
-
-    for _ in 0..50 {
-        let choices = random_initial_choice(egraph, &mut rng);
-        if validate_choice_set(egraph, &choices, ops).is_err() {
-            continue;
-        }
-
-        let mut list_cache = Default::default();
-        let mut expr_cache = Default::default();
-        let llir = egglog_to_llir(
-            egraph,
-            choices,
-            ops,
-            &cx.custom_ops,
-            &mut list_cache,
-            &mut expr_cache,
-            None,
-        );
-
-        // Check which scatter variant was selected
-        let mut has_nocopy = false;
-        let mut has_scatter = false;
-        for op in llir.node_weights() {
-            if let Some(k) = op.to_dialect::<dyn KernelOp>() {
-                match k.kernel_name() {
-                    "ScatterNoCopy" => has_nocopy = true,
-                    "Scatter" => has_scatter = true,
-                    _ => {}
-                }
-            }
-        }
-
+    for (egglog_kind, runtime_kernel_name, llir) in candidates {
         let mut rt = CudaRuntime::initialize(stream.clone());
         rt.load_llir(&llir);
         rt.set_data(dest, vec![0.0f32, 1.0, 2.0, 3.0, 4.0]);
@@ -250,28 +315,12 @@ fn test_scatter_execution_correctness() {
 
         let actual = rt.get_f32(result);
 
-        assert!(
-            has_nocopy,
-            "Expected ScatterNoCopy after post-cleanup, got no no-copy scatter"
-        );
-        assert!(
-            !has_scatter,
-            "Regular Scatter should be pruned when ScatterNoCopy is valid"
-        );
-        tested_nocopy = true;
-
         assert_eq!(
             actual, expected,
-            "Scatter result mismatch with ScatterNoCopy: got {:?}, expected {:?}",
+            "{egglog_kind}/{runtime_kernel_name} result mismatch: got {:?}, expected {:?}",
             actual, expected
         );
     }
-
-    println!("Tested ScatterNoCopy: {}", tested_nocopy);
-    assert!(
-        tested_nocopy,
-        "ScatterNoCopy was never selected in 50 attempts — can't verify correctness"
-    );
 }
 
 /// Test the KV-cache round-trip pattern: scatter → remove_buffer → set_buffer → scatter again.
@@ -322,13 +371,8 @@ fn test_scatter_kv_cache_roundtrip() {
         }
     }
     assert!(
-        scatter_names.contains(&"ScatterNoCopy"),
-        "Expected ScatterNoCopy in KV-cache search result, got: {:?}",
-        scatter_names
-    );
-    assert!(
-        !scatter_names.contains(&"Scatter"),
-        "Regular Scatter should be pruned from KV-cache search result, got: {:?}",
+        scatter_names.contains(&"ScatterNoCopy") ^ scatter_names.contains(&"Scatter"),
+        "expected search to select exactly one legal scatter implementation, got: {:?}",
         scatter_names
     );
 
@@ -450,8 +494,11 @@ fn test_scatter_dual_cache() {
         "Expected scatter kernels in dual-cache search result"
     );
     assert!(
-        scatter_names.iter().all(|name| *name == "ScatterNoCopy"),
-        "Expected only ScatterNoCopy in dual-cache search result, got: {:?}",
+        scatter_names.len() == 2
+            && scatter_names
+                .iter()
+                .all(|name| matches!(*name, "Scatter" | "ScatterNoCopy")),
+        "Expected one legal implementation for each dual-cache scatter, got: {:?}",
         scatter_names
     );
 
@@ -509,6 +556,72 @@ fn test_scatter_dual_cache() {
         vec![6.0, 20.0, 42.0, 0.0, 0.0],
         "Step 3 attn mismatch"
     );
+}
+
+/// ScatterNoCopy should mutate the persistent cache inputs directly, so decode
+/// steps do not need remove/set/refresh feedback between executions.
+#[test]
+fn test_scatter_dual_cache_accumulates_without_roundtrip() {
+    let ctx = CudaContext::new(0).unwrap();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let mut cx = Graph::default();
+
+    let k_cache = cx.named_tensor("k_cache", 5).persist();
+    let v_cache = cx.named_tensor("v_cache", 5).persist();
+    let k_new = cx.tensor(1).persist();
+    let v_new = cx.tensor(1).persist();
+    let indexes = cx.tensor(1).as_dtype(DType::Int).persist();
+
+    let k_out = k_new.scatter(indexes, k_cache);
+    let v_out = v_new.scatter(indexes, v_cache);
+    let attn_out = ((k_out + 0.0) * (v_out + 0.0)).output();
+    let k_cache_out = k_out.output();
+    let v_cache_out = v_out.output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let llir = extract_forced_all_kernel_llir(&cx, "KernelScatterNoCopy", "ScatterNoCopy", 2);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data(k_cache, vec![0.0f32; 5]);
+    rt.set_data(v_cache, vec![0.0f32; 5]);
+    rt.set_data(k_new, vec![2.0f32]);
+    rt.set_data(v_new, vec![3.0f32]);
+    rt.set_data(indexes, vec![0i32]);
+
+    rt.load_llir(&llir);
+
+    let scatter_names: Vec<_> = rt
+        .kernel_names()
+        .iter()
+        .copied()
+        .filter(|name| name.contains("catter"))
+        .collect();
+    assert!(
+        scatter_names.iter().all(|name| *name == "ScatterNoCopy"),
+        "Expected the forced no-copy dual-cache plan, got: {:?}",
+        scatter_names
+    );
+
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(attn_out), vec![6.0, 0.0, 0.0, 0.0, 0.0]);
+
+    rt.set_data(k_new, vec![4.0f32]);
+    rt.set_data(v_new, vec![5.0f32]);
+    rt.set_data(indexes, vec![1i32]);
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(attn_out), vec![6.0, 20.0, 0.0, 0.0, 0.0]);
+
+    rt.set_data(k_new, vec![6.0f32]);
+    rt.set_data(v_new, vec![7.0f32]);
+    rt.set_data(indexes, vec![2i32]);
+    rt.execute(&cx.dyn_map);
+    assert_eq!(rt.get_f32(attn_out), vec![6.0, 20.0, 42.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(k_cache_out), vec![2.0, 4.0, 6.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(v_cache_out), vec![3.0, 5.0, 7.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(k_cache), vec![2.0, 4.0, 6.0, 0.0, 0.0]);
+    assert_eq!(rt.get_f32(v_cache), vec![3.0, 5.0, 7.0, 0.0, 0.0]);
 }
 
 /// Batched KV-cache updates scatter many rows at once during prefill. This is

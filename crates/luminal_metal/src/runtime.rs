@@ -3,9 +3,8 @@ use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
     dtype::DType,
-    egglog_utils::SerializedEGraph,
     graph::{BucketLLIR, DimBucket, Graph, LLIRGraph},
-    hlir::{Input, NativeData, Output},
+    hlir::{Input, Output, ReferenceData},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
         FxHashMap, NodeIndex, ToId,
@@ -43,7 +42,7 @@ pub struct MetalRuntime {
     device: Device,
     command_queue: CommandQueue,
     /// Host-side input tensors provided by the user.
-    input_data: FxHashMap<NodeIndex, NativeData>,
+    input_data: FxHashMap<NodeIndex, ReferenceData>,
     /// Buffers for HLIR input tensors (set by user)
     pub hlir_buffers: FxHashMap<NodeIndex, Buffer>,
     /// Buffers for LLIR intermediate/output tensors
@@ -209,7 +208,7 @@ impl MetalRuntime {
         }
     }
 
-    pub fn set_data(&mut self, id: impl ToId, data: impl Into<NativeData>) {
+    pub fn set_data(&mut self, id: impl ToId, data: impl Into<ReferenceData>) {
         let id = id.to_id();
         let data = data.into();
         if let Some(dtype) = self.input_dtype(id) {
@@ -326,22 +325,12 @@ impl Runtime for MetalRuntime {
 
     fn late_egglog_passes(
         ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
-        options: &luminal::graph::CompileOptions,
+        _options: &luminal::graph::CompileOptions,
         dyn_map: &FxHashMap<char, usize>,
     ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
         vec![crate::memory_analysis::metal_memory_analysis_pass(
-            ops,
-            options.max_memory_bytes,
-            dyn_map,
+            ops, None, dyn_map,
         )]
-    }
-
-    fn estimate_graph_memory<'a>(
-        egraph: &'a SerializedEGraph,
-        choices: &luminal::egglog_utils::EGraphChoiceSet<'a>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> Option<usize> {
-        crate::memory_analysis::estimate_graph_memory_bytes(egraph, choices, dyn_map)
     }
 
     fn initialize(_: Self::CompileArg) -> Self {
@@ -478,14 +467,6 @@ impl Runtime for MetalRuntime {
             .sum()
     }
 
-    fn planned_intermediate_buffer_bytes(&self) -> Option<usize> {
-        Some(self.intermediate_buffer_bytes())
-    }
-
-    fn allocated_intermediate_buffer_bytes(&self) -> Option<usize> {
-        Some(self.intermediate_buffer_bytes())
-    }
-
     fn load_llir_buckets(
         &mut self,
         dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
@@ -532,7 +513,7 @@ impl RuntimeStats for MetalRuntime {
 }
 
 impl MetalRuntime {
-    fn create_input_buffer(&self, data: &NativeData, dtype: DType) -> Buffer {
+    fn create_input_buffer(&self, data: &ReferenceData, dtype: DType) -> Buffer {
         match dtype {
             DType::F32 => {
                 let values = data.to_f32_vec();
@@ -696,7 +677,9 @@ impl MetalRuntime {
         }
 
         for node in topo_order {
-            if let Some(Output { node: hlir_node }) = llir_graph[node].to_op::<Output>()
+            if let Some(Output {
+                node: hlir_node, ..
+            }) = llir_graph[node].to_op::<Output>()
                 && let Some(data_node) = llir_graph
                     .edges_directed(node, Direction::Incoming)
                     .sorted_by_key(|e| e.id())

@@ -71,7 +71,7 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.relu.default" => self.translate_unary_op(node, |a| a.relu())?,
             "torch.ops.aten.tanh.default" => self.translate_unary_op(node, |a| a.tanh())?,
             "torch.ops.aten.silu.default" => self.translate_unary_op(node, |a| a.silu())?,
-            "torch.ops.aten.gelu.default" => self.translate_unary_op(node, |a| a.gelu())?,
+            "torch.ops.aten.gelu.default" => self.translate_gelu(node)?,
             "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
             "torch.ops.aten.log.default" => self.translate_unary_op(node, |a| a.log())?,
             "torch.ops.aten.log2.default" => self.translate_unary_op(node, |a| a.log2())?,
@@ -87,6 +87,7 @@ impl<'a> Translator<'a> {
 
             // Shape ops
             "torch.ops.aten.view.default" => self.translate_reshape(node)?,
+            "torch.ops.aten.upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
             "torch.ops.aten.unsqueeze.default" => {
                 let a = self.get_input_tensor(node, 0)?;
@@ -165,6 +166,12 @@ impl<'a> Translator<'a> {
 
             // LayerNorm
             "torch.ops.aten.native_layer_norm.default" => self.translate_layer_norm(node)?,
+
+            // GroupNorm
+            "torch.ops.aten.native_group_norm.default" => self.translate_group_norm(node)?,
+
+            // RMSNorm
+            "torch.ops.aten._fused_rms_norm.default" => self.translate_fused_rms_norm(node)?,
 
             // Where
             "torch.ops.aten.where.self" => self.translate_where(node)?,

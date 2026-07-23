@@ -170,14 +170,12 @@ where
     };
     compile_options = compile_options.dim_buckets('p', &p_buckets);
 
-    println!("Building E-Graph...");
-    cx.build_search_space::<R>(compile_options);
-
     println!("Loading weights...");
-    let weights_path = model_dir.join("model_combined.safetensors");
+    let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
-    let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * std::mem::size_of::<f32>();
+    // KV cache is bf16: 2 bytes per element.
+    let cache_bytes = N_KV_HEADS * config.max_seq_len * HEAD_DIM * 2;
     for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i].id, cache_bytes);
@@ -188,8 +186,8 @@ where
     cx.set_dim('p', 0);
     runtime.set_i32_data(input.id, vec![1; search_s]);
     runtime.set_i32_data(token_ids.id, (0..search_s as i32).collect::<Vec<_>>());
-    let search_options = CompileOptions::default().search_graph_limit(config.search_graphs);
-    runtime = cx.search(runtime, search_options);
+    compile_options = compile_options.search_graph_limit(config.search_graphs);
+    runtime = cx.compile(runtime, compile_options);
 
     for i in 0..config.layers {
         runtime.set_zeros(kv_cache.k_caches[i].id, cache_bytes);

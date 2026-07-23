@@ -80,19 +80,16 @@ fn llama_architecture_search_space_equivalence_fuzz() {
     let q_pos = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
     let scatter_idx = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
     let gather_idx = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
-    let attn_mask = cx.named_tensor("attn_mask", ('s', 'c'));
     let kv_cache = llama_model::KVCache::new_with_config(&mut cx, SLOTS, config);
     let llama = llama_model::Llama::init_with_config(&mut cx, config);
 
-    let (logits, cache_outputs) =
-        llama.forward(input, q_pos, scatter_idx, gather_idx, attn_mask, &kv_cache);
+    let (logits, cache_outputs) = llama.forward(input, q_pos, scatter_idx, gather_idx, &kv_cache);
     let logits = logits.output();
     let mut fuzzer = CudaSearchEquivalenceFuzzer::new(&mut cx, &stream)
         .seed(0x5EED_1234)
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .output_f32(logits.id, "logits", 5e-2, 5e-2);
     for (layer, (k_out, v_out)) in cache_outputs.into_iter().enumerate() {
         let k_out = k_out.output();
@@ -106,8 +103,7 @@ fn llama_architecture_search_space_equivalence_fuzz() {
         .input_i32(input.id, vec![3, 17])
         .input_i32(q_pos.id, vec![1, 2])
         .input_i32(scatter_idx.id, vec![1, 2])
-        .input_i32(gather_idx.id, vec![0, 1, 2])
-        .input_f32(attn_mask.id, vec![0.0, 0.0, -1e4, 0.0, 0.0, 0.0]);
+        .input_i32(gather_idx.id, vec![0, 1, 2]);
 
     let kv_dim = config.kv_dim();
     for tensor in kv_cache.tensors() {
@@ -168,7 +164,6 @@ fn gemma_architecture_search_space_equivalence_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .input_f32(input.id, random_f32_vec(SEQ * HIDDEN, 101, -0.15, 0.15))
         .input_f32(attn_norm_w.id, random_f32_vec(HIDDEN, 102, 0.7, 1.3))
         .input_f32(post_attn_norm_w.id, random_f32_vec(HIDDEN, 103, 0.7, 1.3))
@@ -263,7 +258,6 @@ fn moe_architecture_search_space_equivalence_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
         .input_f32(
             router_input.id,
             random_f32_vec(SEQ * HIDDEN, 201, -0.15, 0.15),
@@ -295,7 +289,7 @@ fn moe_architecture_search_space_equivalence_fuzz() {
 }
 
 #[test]
-fn moe_architecture_native_reference_fuzz() {
+fn moe_architecture_reference_runtime_fuzz() {
     let Some(stream) = get_cuda_stream() else {
         return;
     };
@@ -353,8 +347,7 @@ fn moe_architecture_native_reference_fuzz() {
         .samples(SEARCH_EQUIV_SAMPLES)
         .generation_size(8)
         .mutations(3)
-        .build_options(CompileOptions::default().max_memory_mib(512))
-        .native_reference()
+        .reference_runtime()
         .input_f32(input.id, random_f32_vec(SEQ * HIDDEN, 301, -0.15, 0.15))
         .input_f32(
             router.id,
@@ -368,7 +361,7 @@ fn moe_architecture_native_reference_fuzz() {
             down_weights.id,
             random_bf16_vec(NUM_EXPERTS * HIDDEN * MOE_INTERMEDIATE, 304, -0.1, 0.1),
         )
-        .output_f32(out.id, "qwen_swiglu_moe_native_reference", 6e-2, 6e-2)
+        .output_f32(out.id, "qwen_swiglu_moe_reference_runtime", 6e-2, 6e-2)
         .run();
-    eprintln!("moe native-reference fuzz report: {report:?}");
+    eprintln!("moe reference-runtime fuzz report: {report:?}");
 }

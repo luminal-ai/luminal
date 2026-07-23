@@ -1,6 +1,3 @@
-[alias]
-examples = "run --release --bin examples-perf --"
-
 [target.aarch64-unknown-linux-gnu]
 rustflags = [
     "-Ctarget-feature=+fp16,+fhm"

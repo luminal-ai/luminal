@@ -35,6 +35,12 @@
         (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
         (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
         (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?n (ECons ?m (ENil)))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?m)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -87,6 +93,12 @@
         (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
         (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
         (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?n (ECons ?m (ENil)))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?m)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -139,6 +151,12 @@
         (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
         (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
         (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?m)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -191,6 +209,12 @@
         (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
         (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
         (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?n (ECons ?m (ENil))))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?m)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -247,6 +271,12 @@
         (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
         (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
         (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "ROW"
+            ?m ?n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?m (ECons ?n (ENil)))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?n)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -299,6 +329,12 @@
         (= ?matmul_add_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
         (= ?c_add_strides (ECons ?c_row_stride (ECons ?c_col_stride (ENil))))
         (= ?add_out_strides (ECons ?d_row_stride (ECons ?d_col_stride (ENil))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "ROW"
+            ?m ?n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?m (ECons ?n (ENil)))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?n)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -351,6 +387,12 @@
         (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
         (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
         (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "ROW"
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?n)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)
@@ -403,6 +445,12 @@
         (= ?matmul_add_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
         (= ?c_add_strides (ECons ?c_batch_stride (ECons ?c_row_stride (ECons ?c_col_stride (ENil)))))
         (= ?add_out_strides (ECons ?d_batch_stride (ECons ?d_row_stride (ECons ?d_col_stride (ENil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul "ROW"
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?m (ECons ?n (ENil))))
+            ?matmul_add_strides ?pointwise_zero_strides ?pointwise_size)
+        (cublaslt_valid_leading_dimension ?c_row_stride ?n)
         (= ?c_col_stride (MIter))
         (!= ?c_row_stride (MNum 0))
         (= ?matmul_add_strides ?add_out_strides)

@@ -1,0 +1,236 @@
+; Exact logical-output witnesses for post-matmul cuBLASLt fusions.
+;
+; A cuBLASLt descriptor does not itself carry Luminal's logical shape.  The
+; base matmul rules use either a swapped COL descriptor or a natural ROW
+; descriptor for the same canonical row-major tensor.  Post-matmul alpha,
+; beta, bias, ReLU, and GELU rules must prove that every pointwise stage reads
+; and writes that exact mapping; equal-but-arbitrary movement strides are not
+; sufficient because they may encode a permutation.
+;
+; Arguments after the IR identify the *matched descriptor*, preventing a fact
+; for a different cuBLASLt alternative in the same e-class from certifying it:
+;   (D order, descriptor m/n, ldd, batch, stride_d, dtype,
+;    logical shape, logical canonical strides, logical zero strides,
+;    logical element count).
+(relation cublaslt_exact_pointwise_output
+    (IR String
+        Expression Expression Expression Expression Expression
+        DType EList EList EList Expression))
+
+; Extract the coefficient of the linear shape-tracker stride `z * c` (and of
+; fixed descriptor expressions).  This stays entirely in egglog and lets the
+; guards compare fixed layouts without trusting a single MMul association.
+(relation cublaslt_stride_coefficient (Expression i64))
+
+(rule
+    ((= ?stride (MIter)))
+    ((cublaslt_stride_coefficient ?stride 1))
+    :ruleset matmul_backend
+    :name "cublaslt unit stride coefficient"
+)
+
+(rule
+    ((= ?stride (MNum ?value)))
+    ((cublaslt_stride_coefficient ?stride ?value))
+    :ruleset matmul_backend
+    :name "cublaslt fixed stride coefficient"
+)
+
+(rule
+    (
+        (= ?stride (MMul ?lhs ?rhs))
+        (cublaslt_stride_coefficient ?lhs ?lhs_value)
+        (cublaslt_stride_coefficient ?rhs ?rhs_value)
+        (= ?value (* ?lhs_value ?rhs_value))
+    )
+    ((cublaslt_stride_coefficient ?stride ?value))
+    :ruleset matmul_backend
+    :name "cublaslt product stride coefficient"
+)
+
+; Runtime clamps a descriptor's leading dimension up to the minimum accepted
+; by cuBLASLt.  A fusion is semantic only when that clamp is a no-op.  Unknown
+; symbolic inequalities deliberately remain unfused.
+(relation cublaslt_valid_leading_dimension (Expression Expression))
+
+(rule
+    ((= ?ld (MMul (MIter) ?minimum)))
+    ((cublaslt_valid_leading_dimension ?ld ?minimum))
+    :ruleset matmul_backend
+    :name "prove exact symbolic cublaslt leading dimension"
+)
+
+(rule
+    (
+        (cublaslt_stride_coefficient ?ld ?ld_value)
+        (= ?minimum (MNum ?minimum_value))
+        (>= ?ld_value ?minimum_value)
+    )
+    ((cublaslt_valid_leading_dimension ?ld ?minimum))
+    :ruleset matmul_backend
+    :name "prove fixed cublaslt leading dimension"
+)
+
+; D is a newly materialized canonical tensor, so its batched descriptor stride
+; must be exactly one full matrix (not merely non-overlapping).
+(relation cublaslt_exact_matrix_stride (Expression Expression Expression))
+
+(rule
+    (
+        (= ?stride (MMul ?rows ?cols))
+    )
+    ((cublaslt_exact_matrix_stride ?stride ?rows ?cols))
+    :ruleset matmul_backend
+    :name "prove exact symbolic cublaslt matrix stride"
+)
+
+(rule
+    (
+        (= ?stride (MMul ?cols ?rows))
+    )
+    ((cublaslt_exact_matrix_stride ?stride ?rows ?cols))
+    :ruleset matmul_backend
+    :name "prove commuted exact symbolic cublaslt matrix stride"
+)
+
+(rule
+    (
+        (cublaslt_stride_coefficient ?stride ?stride_value)
+        (= ?rows (MNum ?rows_value))
+        (= ?cols (MNum ?cols_value))
+        (= ?stride_value (* ?rows_value ?cols_value))
+    )
+    ((cublaslt_exact_matrix_stride ?stride ?rows ?cols))
+    :ruleset matmul_backend
+    :name "prove fixed cublaslt matrix stride"
+)
+
+; Swapped COL output: descriptor D[n, m] is Luminal row-major [m, n].
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+        (= ?ldd ?descriptor_m)
+        (= ?stride_d (MNum 0))
+        (= ?d_dtype (dtype ?matmul))
+    )
+    (
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?descriptor_m ?descriptor_n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?descriptor_n (ECons ?descriptor_m (ENil)))
+            (ECons (MMul (MIter) ?descriptor_m) (ECons (MIter) (ENil)))
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            (MMul ?descriptor_n ?descriptor_m))
+    )
+    :ruleset matmul_backend
+    :name "prove exact 2d col-order cublaslt output"
+)
+
+; Natural ROW output: descriptor D[m, n] is Luminal row-major [m, n].
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "ROW"
+            ?lda ?ldb ?ldc ?ldd
+            (MNum 1)
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+        (= ?ldd ?descriptor_n)
+        (= ?stride_d (MNum 0))
+        (= ?d_dtype (dtype ?matmul))
+    )
+    (
+        (cublaslt_exact_pointwise_output
+            ?matmul "ROW"
+            ?descriptor_m ?descriptor_n ?ldd (MNum 1) ?stride_d ?d_dtype
+            (ECons ?descriptor_m (ECons ?descriptor_n (ENil)))
+            (ECons (MMul (MIter) ?descriptor_n) (ECons (MIter) (ENil)))
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            (MMul ?descriptor_m ?descriptor_n))
+    )
+    :ruleset matmul_backend
+    :name "prove exact 2d row-order cublaslt output"
+)
+
+; Batched swapped COL output: logical [batch, descriptor_n, descriptor_m].
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+        (= ?ldd ?descriptor_m)
+        (cublaslt_exact_matrix_stride
+            ?stride_d ?descriptor_n ?descriptor_m)
+        (= ?d_dtype (dtype ?matmul))
+    )
+    (
+        (cublaslt_exact_pointwise_output
+            ?matmul "COL"
+            ?descriptor_m ?descriptor_n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?descriptor_n (ECons ?descriptor_m (ENil))))
+            (ECons
+                (MMul (MMul (MIter) ?descriptor_m) ?descriptor_n)
+                (ECons (MMul (MIter) ?descriptor_m) (ECons (MIter) (ENil))))
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            (MMul (MMul ?batch ?descriptor_n) ?descriptor_m))
+    )
+    :ruleset matmul_backend
+    :name "prove exact batched col-order cublaslt output"
+)
+
+; Batched natural ROW output: logical [batch, descriptor_m, descriptor_n].
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "ROW"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+        (= ?ldd ?descriptor_n)
+        (cublaslt_exact_matrix_stride
+            ?stride_d ?descriptor_m ?descriptor_n)
+        (= ?d_dtype (dtype ?matmul))
+    )
+    (
+        (cublaslt_exact_pointwise_output
+            ?matmul "ROW"
+            ?descriptor_m ?descriptor_n ?ldd ?batch ?stride_d ?d_dtype
+            (ECons ?batch (ECons ?descriptor_m (ECons ?descriptor_n (ENil))))
+            (ECons
+                (MMul (MMul (MIter) ?descriptor_n) ?descriptor_m)
+                (ECons (MMul (MIter) ?descriptor_n) (ECons (MIter) (ENil))))
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            (MMul (MMul ?batch ?descriptor_m) ?descriptor_n))
+    )
+    :ruleset matmul_backend
+    :name "prove exact batched row-order cublaslt output"
+)

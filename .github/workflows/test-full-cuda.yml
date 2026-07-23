@@ -6,6 +6,9 @@ on:
         types: [labeled, synchronize]
     workflow_dispatch:
 
+env:
+    LUMINAL_LOG: "1"
+
 jobs:
     rust_cuda_ignored_tests:
         if: >-

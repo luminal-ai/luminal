@@ -9,14 +9,21 @@ use luminal_tracing::schema::{
 };
 use uuid::Uuid;
 
+pub mod argmax;
 pub mod conv2d;
 pub mod cuda_graph;
 pub mod fusion;
+pub mod gemv;
 pub mod generic_matmul;
 pub mod hlir;
 pub mod matmul2d;
+pub mod moe_gemv;
 pub mod other_ops;
+pub mod quant_f8;
+pub mod rms_norm;
 pub mod rope;
+pub mod swiglu;
+pub mod topk;
 
 pub use conv2d::KernelConv2D;
 pub use cuda_graph::*;
@@ -25,10 +32,25 @@ pub use matmul2d::{
     Matmul2DCustom, Matmul2DKernel, linear_bias, linear_no_bias_bf16_w, matmul_2d, matmul_2d_t,
     matmul_3d, matmul_3d_t,
 };
+pub use rms_norm::{RMSNormCustom, RMSNormKernel, fused_rms_norm};
 pub use rope::{RoPECustom, RoPEKernel, apply_rope};
 
 pub type Ops = (
     hlir::Ops,
+    argmax::KernelArgmax,
+    gemv::KernelGemv,
+    gemv::KernelGemvF8,
+    moe_gemv::KernelMoEGemv,
+    rms_norm::KernelRMSNorm,
+    rms_norm::KernelRMSNormQuant,
+    rope::RoPEHalfKernel,
+    rope::RoPEScatterKernel,
+    rope::KernelRoPE,
+    rope::KernelRoPEScatterFused,
+    swiglu::KernelSwiglu,
+    swiglu::KernelSwigluQuant,
+    topk::KernelStableSortIdx,
+    quant_f8::KernelQuantF8,
     other_ops::Ops,
     conv2d::KernelConv2D,
     GenericMatmul,
@@ -173,6 +195,10 @@ pub fn record_cuda_graph_timings(
 }
 
 pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
+    /// Compile the kernel and return its function/module, exact generated CUDA
+    /// source, launch expressions, dynamic shared memory, and constants. The
+    /// source string is part of the runtime contract: it is used to detect the
+    /// optional `dyn_dims` parameter and enforce compilation-resource budgets.
     #[allow(clippy::type_complexity)]
     fn compile(
         &self,
@@ -263,6 +289,20 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
         params
     }
 
+    /// Number of 64-bit launch parameters produced by `build_params` for a
+    /// kernel with `input_count` graph inputs. Resource preflight uses this to
+    /// enforce CUDA's kernel-parameter ABI limit without allocating buffers.
+    ///
+    /// The default matches the standard parameter contract: one output pointer
+    /// unless output aliases an input, one pointer per input, and an optional
+    /// dynamic-dimension pointer. An override of `build_params` that changes
+    /// that count must override this method as well.
+    fn kernel_parameter_count(&self, input_count: usize, has_dyn_dims_param: bool) -> usize {
+        input_count
+            + usize::from(self.output_aliases_input().is_none())
+            + usize::from(has_dyn_dims_param)
+    }
+
     /// Called before each kernel execution. Update internal state if needed.
     /// `all_buffer_ptrs` contains pointers for all buffers this kernel might use.
     /// `constants` are device constants returned by compile() that may need updating.
@@ -280,6 +320,14 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// return the input index. Used to propagate buffer pointers in CUDA graphs.
     fn output_aliases_input(&self) -> Option<usize> {
         None
+    }
+
+    /// Whether aliasing the output also mutates the aliased input buffer.
+    /// Aliases are conservatively treated as mutations by default so a new
+    /// in-place kernel cannot silently bypass candidate-local hazard checks.
+    /// Proven identity/view markers such as FusionStart override this to false.
+    fn mutates_aliased_input(&self) -> bool {
+        self.output_aliases_input().is_some()
     }
 
     /// If this kernel's output is derived from one of its inputs (copy-then-modify
@@ -304,4 +352,4 @@ luminal::impl_into_ops!(KernelOp);
 
 // Kernel to host op compilation
 mod to_host;
-pub use to_host::{CudaGraphOp, kernel_to_host};
+pub use to_host::{CudaGraphDebugSummary, CudaGraphOp, kernel_to_host};

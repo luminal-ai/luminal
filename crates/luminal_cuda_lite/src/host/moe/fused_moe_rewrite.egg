@@ -1,0 +1,120 @@
+; AUTO-GENERATED from an LLIR dump of the naive (unfused) MoE spelling — if
+; that spelling drifts, regenerate this pattern from a fresh dump rather
+; than editing the match by hand.
+; Fuses the DENSE reference MoE spelling (moe_naive) into the FusedMoE host op.
+; Dims fixed: hidden=2880, intermediate=2880, top_k=4.
+
+(datatype*
+    (FusedMoeUnpackState (MkFusedMoeUnpack IR IR))
+    (FusedMoeDensifyState (MkFusedMoeDensify IR IR IR))
+    (FusedMoeGateUpState (MkFusedMoeGateUp IR IR IR IR IR))
+)
+(function fused_moe_unpack (IR) FusedMoeUnpackState :merge new)
+(function fused_moe_densify (IR) FusedMoeDensifyState :merge new)
+(function fused_moe_gate_up (IR) FusedMoeGateUpState :merge new)
+
+(rule
+    (
+        (= ?t297 (Op (Cast ?w737 (Int)) (ICons ?t40 (INil))))
+        (= ?t298 (Op (Gather ?w738 ?w739 ?w740 ?w741) (ICons ?t297 (ICons ?t10 (INil)))))
+        (= ?t299 (Op (Gather ?w742 ?w743 ?w744 ?w745) (ICons ?t297 (ICons ?t12 (INil)))))
+        (= ?t301 (Op (Gather ?w748 ?w749 ?w750 ?w751) (ICons ?t300 (ICons ?t298 (INil)))))
+        (= ?t303 (Op (Cast ?w754 (Bf16)) (ICons ?t302 (INil))))
+        (= ?t304 (Op (Mul ?w755 ?w756 ?w757 ?w758) (ICons ?t301 (ICons ?t303 (INil)))))
+        (= ?t306 (Op (Gather ?w761 ?w762 ?w763 ?w764) (ICons ?t305 (ICons ?t299 (INil)))))
+        (= ?t308 (Op (Cast ?w767 (Bf16)) (ICons ?t307 (INil))))
+        (= ?t309 (Op (Mul ?w768 ?w769 ?w770 ?w771) (ICons ?t306 (ICons ?t308 (INil)))))
+        (= ?t310 (Op (Add ?w772 ?w773 ?w774 ?w775) (ICons ?t304 (ICons ?t309 (INil)))))
+        (= ?t311 (Op (Cast ?w776 (Bf16)) (ICons ?t42 (INil))))
+        (= ?t312 (Op (Mul ?w777 ?w778 ?w779 ?w780) (ICons ?t310 (ICons ?t311 (INil)))))
+    )
+    (
+        (set (fused_moe_unpack ?t312) (MkFusedMoeUnpack ?t40 ?t42))
+    )
+    :ruleset glumoe
+    :name "fused_moe unpack marker"
+)
+
+(rule
+    (
+        (= ?t247 (Op (Mul ?w593 ?w594 ?w595 ?w596) (ICons ?t245 (ICons ?t246 (INil)))))
+        (= ?t248 (Op (Sum ?w597 ?w598 ?w599 ?w600 ?w601) (ICons ?t247 (INil))))
+        (= ?t250 (Op (Add ?w603 ?w604 ?w605 ?w606) (ICons ?t248 (ICons ?t249 (INil)))))
+        (= ?t269 (Op (Add ?w656 ?w657 ?w658 ?w659) (ICons ?t268 (ICons ?t267 (INil)))))
+        (= ?t270 (Op (Gather ?w660 ?w661 ?w662 ?w663) (ICons ?t269 (ICons ?t250 (INil)))))
+        (= ?t271 (Op (Max ?w664 ?w665 ?w666 ?w667 ?w668) (ICons ?t270 (INil))))
+        (= ?t273 (Op (Mul ?w670 ?w671 ?w672 ?w673) (ICons ?t271 (ICons ?t272 (INil)))))
+        (= ?t274 (Op (Add ?w674 ?w675 ?w676 ?w677) (ICons ?t270 (ICons ?t273 (INil)))))
+        (= ?t276 (Op (Mul ?w679 ?w680 ?w681 ?w682) (ICons ?t274 (ICons ?t275 (INil)))))
+        (= ?t277 (Op (Exp2 ?w683 ?w684 ?w685) (ICons ?t276 (INil))))
+        (= ?t278 (Op (Sum ?w686 ?w687 ?w688 ?w689 ?w690) (ICons ?t277 (INil))))
+        (= ?t279 (Op (Recip ?w691 ?w692 ?w693) (ICons ?t278 (INil))))
+        (= ?t280 (Op (Mul ?w694 ?w695 ?w696 ?w697) (ICons ?t277 (ICons ?t279 (INil)))))
+        (= ?t283 (Op (Cast ?w701 (F32)) (ICons ?t267 (INil))))
+        (= ?t284 (Op (LessThan ?w702 ?w703 ?w704 ?w705) (ICons ?t283 (ICons ?t282 (INil)))))
+        (= ?t285 (Op (Cast ?w706 (F32)) (ICons ?t284 (INil))))
+        (= ?t286 (Op (LessThan ?w707 ?w708 ?w709 ?w710) (ICons ?t282 (ICons ?t283 (INil)))))
+        (= ?t287 (Op (Cast ?w711 (F32)) (ICons ?t286 (INil))))
+        (= ?t288 (Op (Add ?w712 ?w713 ?w714 ?w715) (ICons ?t285 (ICons ?t287 (INil)))))
+        (= ?t290 (Op (Mul ?w717 ?w718 ?w719 ?w720) (ICons ?t288 (ICons ?t289 (INil)))))
+        (= ?t292 (Op (Add ?w722 ?w723 ?w724 ?w725) (ICons ?t290 (ICons ?t291 (INil)))))
+        (= ?t293 (Op (Cast ?w726 (Bool)) (ICons ?t292 (INil))))
+        (= ?t294 (Op (Cast ?w727 (F32)) (ICons ?t293 (INil))))
+        (= ?t295 (Op (Mul ?w728 ?w729 ?w730 ?w731) (ICons ?t294 (ICons ?t280 (INil)))))
+        (= ?t296 (Op (Sum ?w732 ?w733 ?w734 ?w735 ?w736) (ICons ?t295 (INil))))
+    )
+    (
+        (set (fused_moe_densify ?t296) (MkFusedMoeDensify ?t267 ?t280 ?t245))
+    )
+    :ruleset glumoe
+    :name "fused_moe densify marker"
+)
+
+(rule
+    (
+        (= ?gu_unpack (fused_moe_unpack ?t312))
+        (= ?gu_unpack (MkFusedMoeUnpack ?gu_blocks ?gu_scales))
+        (= ?t313 (Op (Cast ?w781 (Bf16)) (ICons ?t245 (INil))))
+        (= ?t314 (Op (Mul ?w782 ?w783 ?w784 ?w785) (ICons ?t313 (ICons ?t312 (INil)))))
+        (= ?t315 (Op (Sum ?w786 ?w787 ?w788 ?w789 ?w790) (ICons ?t314 (INil))))
+        (= ?t316 (Op (Add ?w791 ?w792 ?w793 ?w794) (ICons ?t315 (ICons ?t44 (INil)))))
+    )
+    (
+        (set (fused_moe_gate_up ?t316)
+            (MkFusedMoeGateUp ?t245 ?gu_blocks ?gu_scales ?t44 ?t312))
+    )
+    :ruleset glumoe
+    :name "fused_moe gate_up marker"
+)
+
+(rule
+    (
+        (= ?dn_unpack (fused_moe_unpack ?t410))
+        (= ?dn_unpack (MkFusedMoeUnpack ?dn_blocks ?dn_scales))
+        (= ?gu_state (fused_moe_gate_up ?w1097))
+        (= ?gu_state (MkFusedMoeGateUp ?t245 ?gu_blocks ?gu_scales ?gu_bias ?w1098))
+        (= ?dense_state (fused_moe_densify ?t296))
+        (= ?dense_state (MkFusedMoeDensify ?t267 ?t280 ?t245))
+        (= ?t411 (Op (Mul ?w1021 ?w1022 ?w1023 ?w1024) (ICons ?t394 (ICons ?t410 (INil)))))
+        (= ?t412 (Op (Sum ?w1025 ?w1026 ?w1027 ?w1028 ?w1029) (ICons ?t411 (INil))))
+        (= ?t413 (Op (Add ?w1030 ?w1031 ?w1032 ?w1033) (ICons ?t412 (ICons ?t50 (INil)))))
+        (= ?t414 (Op (Cast ?w1034 (F32)) (ICons ?t413 (INil))))
+        (= ?t415 (Op (Mul ?w1035 ?w1036 ?w1037 ?w1038) (ICons ?t414 (ICons ?t296 (INil)))))
+        (= ?t378 (Op (Mul ?w1317 ?w1318 ?w1319 ?w1320) (ICons ?t337 (ICons ?t377 (INil)))))
+        (= ?t381 (Op (Mul ?w1321 ?w1322 ?w1323 ?w1324) (ICons ?t378 (ICons ?t380 (INil)))))
+        (= ?t384 (Op (Mul ?w1325 ?w1326 ?w1327 ?w1328) (ICons ?t381 (ICons ?t383 (INil)))))
+        (= ?t385 (Op (Exp2 ?w1329 ?w1330 ?w1331) (ICons ?t384 (INil))))
+        (= ?t388 (Op (Add ?w1332 ?w1333 ?w1334 ?w1335) (ICons ?t385 (ICons ?t387 (INil)))))
+        (= ?t389 (Op (Recip ?w1336 ?w1337 ?w1338) (ICons ?t388 (INil))))
+        (= ?t390 (Op (Mul ?w1339 ?w1340 ?w1341 ?w1342) (ICons ?t337 (ICons ?t389 (INil)))))
+        (= ?t393 (Op (Add ?w1343 ?w1344 ?w1345 ?w1346) (ICons ?t375 (ICons ?t392 (INil)))))
+        (= ?t394 (Op (Mul ?w1347 ?w1348 ?w1349 ?w1350) (ICons ?t393 (ICons ?t390 (INil)))))
+        (= ?t416 (Op (Sum ?w1039 ?w1040 ?w1041 ?w1042 ?w1043) (ICons ?t415 (INil))))
+    )
+    (
+        (let ?fused (Op (FusedMoE (MNum 2880) (MNum 2880) (MNum 4)) (ICons ?t245 (ICons ?t267 (ICons ?t280 (ICons ?gu_blocks (ICons ?gu_scales (ICons ?gu_bias (ICons ?dn_blocks (ICons ?dn_scales (ICons ?t50 (INil))))))))))))
+        (union ?t416 ?fused)
+    )
+    :ruleset glumoe
+    :name "fused_moe final fusion"
+)

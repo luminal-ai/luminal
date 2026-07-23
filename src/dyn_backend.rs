@@ -4,7 +4,7 @@
 //! - [`DynBackend`]: an object-safe trait for dynamic backend dispatch
 //! - [`compile_backend`]: generic helper that handles the full compilation pipeline
 //! - [`BackendFactory`]: function pointer type for backend factories
-//! - [`NativeDynBackend`]: the reference implementation for CPU
+//! - [`ReferenceDynBackend`]: the reference implementation for CPU
 
 use std::collections::HashMap;
 
@@ -14,7 +14,7 @@ use rustc_hash::FxHashMap;
 
 use crate::dtype::DType;
 use crate::graph::{CompileOptions, Graph};
-use crate::hlir::{NativeData, NativeRuntime, Output};
+use crate::hlir::{Output, ReferenceData, ReferenceRuntime};
 use crate::op::Runtime;
 
 // ---------------------------------------------------------------------------
@@ -237,8 +237,8 @@ pub fn make_ones_bytes(n_elements: usize, dtype: DType) -> Vec<u8> {
     }
 }
 
-/// Convert raw bytes + [`DType`] to [`NativeData`].
-pub fn bytes_to_native_data(bytes: Vec<u8>, dtype: DType) -> NativeData {
+/// Convert raw bytes + [`DType`] to [`ReferenceData`].
+pub fn bytes_to_reference_data(bytes: Vec<u8>, dtype: DType) -> ReferenceData {
     // Safety: source bytes are from a valid typed buffer; we reinterpret.
     unsafe fn from_bytes<T: Copy>(bytes: Vec<u8>) -> Vec<T> {
         let n = bytes.len() / std::mem::size_of::<T>();
@@ -247,44 +247,44 @@ pub fn bytes_to_native_data(bytes: Vec<u8>, dtype: DType) -> NativeData {
         unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut T, n, cap) }
     }
     match dtype {
-        DType::F32 | DType::TF32 => NativeData::F32(unsafe { from_bytes(bytes) }),
-        DType::F64 => NativeData::F64(unsafe { from_bytes(bytes) }),
-        DType::F16 => NativeData::F16(unsafe { from_bytes(bytes) }),
-        DType::Bf16 => NativeData::Bf16(unsafe { from_bytes(bytes) }),
-        DType::Int => NativeData::Int(unsafe { from_bytes(bytes) }),
-        DType::I64 => NativeData::I64(unsafe { from_bytes(bytes) }),
-        DType::Bool => NativeData::Bool(bytes.into_iter().map(|b| b != 0).collect()),
-        DType::I8 => NativeData::Int(bytes.iter().map(|&b| b as i8 as i32).collect()),
-        DType::U8 => NativeData::Int(bytes.iter().map(|&b| b as i32).collect()),
+        DType::F32 | DType::TF32 => ReferenceData::F32(unsafe { from_bytes(bytes) }),
+        DType::F64 => ReferenceData::F64(unsafe { from_bytes(bytes) }),
+        DType::F16 => ReferenceData::F16(unsafe { from_bytes(bytes) }),
+        DType::Bf16 => ReferenceData::Bf16(unsafe { from_bytes(bytes) }),
+        DType::Int => ReferenceData::Int(unsafe { from_bytes(bytes) }),
+        DType::I64 => ReferenceData::I64(unsafe { from_bytes(bytes) }),
+        DType::Bool => ReferenceData::Bool(bytes.into_iter().map(|b| b != 0).collect()),
+        DType::I8 => ReferenceData::Int(bytes.iter().map(|&b| b as i8 as i32).collect()),
+        DType::U8 => ReferenceData::Int(bytes.iter().map(|&b| b as i32).collect()),
         DType::I16 => {
             let i16s: Vec<i16> = unsafe { from_bytes(bytes) };
-            NativeData::Int(i16s.into_iter().map(|v| v as i32).collect())
+            ReferenceData::Int(i16s.into_iter().map(|v| v as i32).collect())
         }
         DType::U16 => {
             let u16s: Vec<u16> = unsafe { from_bytes(bytes) };
-            NativeData::Int(u16s.into_iter().map(|v| v as i32).collect())
+            ReferenceData::Int(u16s.into_iter().map(|v| v as i32).collect())
         }
-        _ => NativeData::F32(vec![]),
+        _ => ReferenceData::F32(vec![]),
     }
 }
 
 // ---------------------------------------------------------------------------
-// NativeDynBackend
+// ReferenceDynBackend
 // ---------------------------------------------------------------------------
 
-/// [`DynBackend`] wrapper for the native (CPU) runtime.
-pub struct NativeDynBackend {
-    pub runtime: NativeRuntime,
+/// [`DynBackend`] wrapper for the reference CPU runtime.
+pub struct ReferenceDynBackend {
+    pub runtime: ReferenceRuntime,
 }
 
-impl DynBackend for NativeDynBackend {
+impl DynBackend for ReferenceDynBackend {
     fn name(&self) -> &str {
-        "native"
+        "reference"
     }
 
     fn set_data_bytes(&mut self, node: NodeIndex, bytes: Vec<u8>, dtype: DType) {
         self.runtime
-            .set_data(node, bytes_to_native_data(bytes, dtype));
+            .set_data(node, bytes_to_reference_data(bytes, dtype));
     }
 
     fn set_data_f32(&mut self, node: NodeIndex, data: Vec<f32>) {
@@ -293,7 +293,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_f32(&self, node: NodeIndex) -> Vec<f32> {
         match self.output_buffer(node) {
-            NativeData::F32(v) => v.clone(),
+            ReferenceData::F32(v) => v.clone(),
             other => panic!(
                 "get_output_f32: buffer dtype is {:?}, expected F32. \
                  Add a `Cast(DType::F32)` before the Output.",
@@ -304,7 +304,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_f16(&self, node: NodeIndex) -> Vec<half::f16> {
         match self.output_buffer(node) {
-            NativeData::F16(v) => v.clone(),
+            ReferenceData::F16(v) => v.clone(),
             other => panic!(
                 "get_output_f16: buffer dtype is {:?}, expected F16. \
                  Add a `Cast(DType::F16)` before the Output.",
@@ -315,7 +315,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_bf16(&self, node: NodeIndex) -> Vec<half::bf16> {
         match self.output_buffer(node) {
-            NativeData::Bf16(v) => v.clone(),
+            ReferenceData::Bf16(v) => v.clone(),
             other => panic!(
                 "get_output_bf16: buffer dtype is {:?}, expected Bf16. \
                  Add a `Cast(DType::Bf16)` before the Output.",
@@ -326,7 +326,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_i32(&self, node: NodeIndex) -> Vec<i32> {
         match self.output_buffer(node) {
-            NativeData::Int(v) => v.clone(),
+            ReferenceData::Int(v) => v.clone(),
             other => panic!(
                 "get_output_i32: buffer dtype is {:?}, expected Int (i32). \
                  Add a `Cast(DType::Int)` before the Output.",
@@ -337,7 +337,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_i64(&self, node: NodeIndex) -> Vec<i64> {
         match self.output_buffer(node) {
-            NativeData::I64(v) => v.clone(),
+            ReferenceData::I64(v) => v.clone(),
             other => panic!(
                 "get_output_i64: buffer dtype is {:?}, expected I64. \
                  Add a `Cast(DType::I64)` before the Output.",
@@ -348,7 +348,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_f64(&self, node: NodeIndex) -> Vec<f64> {
         match self.output_buffer(node) {
-            NativeData::F64(v) => v.clone(),
+            ReferenceData::F64(v) => v.clone(),
             other => panic!(
                 "get_output_f64: buffer dtype is {:?}, expected F64. \
                  Add a `Cast(DType::F64)` before the Output.",
@@ -359,7 +359,7 @@ impl DynBackend for NativeDynBackend {
 
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {
         match self.output_buffer(node) {
-            NativeData::Bool(v) => v.clone(),
+            ReferenceData::Bool(v) => v.clone(),
             other => panic!(
                 "get_output_bool: buffer dtype is {:?}, expected Bool. \
                  Add a `Cast(DType::Bool)` before the Output.",
@@ -373,8 +373,8 @@ impl DynBackend for NativeDynBackend {
     }
 }
 
-impl NativeDynBackend {
-    fn output_buffer(&self, node: NodeIndex) -> &NativeData {
+impl ReferenceDynBackend {
+    fn output_buffer(&self, node: NodeIndex) -> &ReferenceData {
         let output_id = self
             .runtime
             .graph
@@ -393,24 +393,24 @@ impl NativeDynBackend {
     }
 }
 
-pub fn native_factory(
+pub fn reference_factory(
     graph: &mut Graph,
     args: BackendCompileArgs,
 ) -> Result<Box<dyn DynBackend>, String> {
-    compile_backend::<NativeRuntime>(
+    compile_backend::<ReferenceRuntime>(
         graph,
         args,
-        || Ok(NativeRuntime::default()),
-        // NativeRuntime::set_data requires the LLIR graph to be loaded (it searches
+        || Ok(ReferenceRuntime::default()),
+        // ReferenceRuntime::set_data requires the LLIR graph to be loaded (it searches
         // for Input nodes in the LLIR). Before search, the LLIR is empty. We guard
         // against that: if rt.graph is empty, skip (dummy data isn't needed for
-        // native since its profile is a no-op).
+        // reference since its profile is a no-op).
         |rt, node, bytes, dtype| {
             if rt.graph.node_count() > 0 {
-                rt.set_data(node, bytes_to_native_data(bytes, dtype));
+                rt.set_data(node, bytes_to_reference_data(bytes, dtype));
             }
         },
         None,
-        |rt| Box::new(NativeDynBackend { runtime: rt }),
+        |rt| Box::new(ReferenceDynBackend { runtime: rt }),
     )
 }

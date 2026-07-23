@@ -8,6 +8,9 @@ on:
         types: [labeled, synchronize]
     workflow_dispatch:
 
+env:
+    LUMINAL_LOG: "1"
+
 jobs:
     cuda_unit_test:
         if: >-

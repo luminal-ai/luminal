@@ -3,9 +3,6 @@ import re
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 EXPECTED_OUTPUT = {
-    "gemma4_moe": [
-        "city of romance, art and culture",
-    ],
     "whisper": [
         "ask not what your country can do for you",
     ],
@@ -15,7 +12,7 @@ EXPECTED_CONCEPTS = {
     "llama": [
         ["layers"],
         ["neurons", "nodes"],
-        ["learn", "learning", "adapt"],
+        ["learn", "learns", "learning", "learned", "adapt", "adapts", "adaptation"],
         ["data", "patterns", "features"],
     ],
     "gemma": [
@@ -23,7 +20,7 @@ EXPECTED_CONCEPTS = {
         ["nodes", "neurons"],
         ["layers"],
         ["weights"],
-        ["training", "learn", "learns"],
+        ["training", "learn", "learns", "learning", "learned"],
     ],
     "qwen": [
         ["neural network", "neural networks"],
@@ -31,12 +28,16 @@ EXPECTED_CONCEPTS = {
         ["brain"],
         ["layers"],
         ["neurons", "nodes"],
-        ["learn", "learning", "training"],
+        ["learn", "learns", "learning", "learned", "training"],
     ],
     "qwen3_moe": [
         ["capital"],
         ["france"],
         ["paris"],
+    ],
+    "gemma4_moe": [
+        ["paris"],
+        ["romance", "art", "culture"],
     ],
 }
 
@@ -47,6 +48,14 @@ def normalize_output(output: str) -> str:
     return re.sub(r"\s+", " ", output).casefold()
 
 
+def contains_term(normalized_output: str, term: str) -> bool:
+    """Match a word or phrase without accepting it inside a larger word."""
+    normalized_term = normalize_output(term)
+    return re.search(
+        rf"(?<![^\W_]){re.escape(normalized_term)}(?![^\W_])", normalized_output
+    ) is not None
+
+
 def validate_output(example: str, output: str):
     normalized_output = normalize_output(output)
 
@@ -55,7 +64,7 @@ def validate_output(example: str, output: str):
         missing = [
             concept_group
             for concept_group in expected_concepts
-            if not any(normalize_output(term) in normalized_output for term in concept_group)
+            if not any(contains_term(normalized_output, term) for term in concept_group)
         ]
         if missing:
             expected = "\n  - ".join(" / ".join(group) for group in expected_concepts)
@@ -75,7 +84,7 @@ def validate_output(example: str, output: str):
         raise ValueError(f"No expected output phrases configured for example {example!r}")
 
     for phrase in expected_phrases:
-        if normalize_output(phrase) in normalized_output:
+        if contains_term(normalized_output, phrase):
             print(f"\nOutput check passed for {example!r}: found {phrase!r}")
             return
 

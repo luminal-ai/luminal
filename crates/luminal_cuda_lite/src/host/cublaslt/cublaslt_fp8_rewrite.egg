@@ -23,7 +23,12 @@
             (ECons (MNum 0) (ECons (MNum 0) (ENil)))
             ?recip_out_strides)
             (ICons ?input_scale (INil))))
-        (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+        (= ?a_fp8 (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+        ; GraphTensor::matmul promotes FP8 operands to explicit F32 casts so
+        ; the decomposed GenericMatmul is a semantic reference implementation.
+        ; Optimized backends absorb only these casts and keep the FP8 buffers.
+        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
+        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
 
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
@@ -31,18 +36,21 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?matmul_dtype (F32))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k (F32))
         (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
             (ICons ?input_scale (ICons ?weight_scale (INil)))))
         (= ?scaled (Op (Mul
             ?out_shape
-            ?cast_strides
+            ?sum_strides
             (ECons (MNum 0) (ECons (MNum 0) (ENil)))
             ?scaled_out_strides)
-            (ICons ?cast (ICons ?scale_product (INil)))))
-        (= ?cast_strides ?scaled_out_strides)
+            (ICons ?sum (ICons ?scale_product (INil)))))
+        (= ?sum_strides ?scaled_out_strides)
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (= ?sum_strides
+            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
@@ -59,7 +67,7 @@
         (= ?b_n_stride (MMul (MIter) ?k))
         (= ?b_k_stride (MIter))
 
-        (= ?b_dtype (dtype ?b))
+        (= ?b_dtype (dtype ?b_fp8))
         (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
     )
     (
@@ -77,7 +85,7 @@
             (MNum 0)
             (MNum 0)
             ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+            (ICons ?b_fp8 (ICons ?a_fp8 (ICons ?weight_scale (ICons ?input_scale (INil)))))))
         (union ?scaled ?sgemm)
         (set (dtype ?sgemm) (F32))
     )
@@ -85,113 +93,32 @@
 :name "cublaslt scaled fp8 row-major x column-major f32 output"
 )
 
+
 (rule
     (
-        (= ?scaled_activation (Op (Mul
-            ?activation_shape
-            ?raw_activation_strides
-            ?recip_activation_strides
-            ?activation_out_strides)
-            (ICons ?raw_activation (ICons ?recip_input_scale (INil)))))
-        (= ?recip_input_scale (Op (Recip
-            ?activation_shape
-            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
-            ?recip_out_strides)
-            (ICons ?input_scale (INil))))
-        (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
-
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
-            (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
-        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
-            (ICons ?input_scale (ICons ?weight_scale (INil)))))
-        (= ?scaled (Op (Mul
-            ?out_shape
-            ?cast_strides
-            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
-            ?scaled_out_strides)
-            (ICons ?cast (ICons ?scale_product (INil)))))
-        (= ?cast_strides ?scaled_out_strides)
-
-        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
-        (!= ?m (MNum 0))
-        (!= ?n (MNum 0))
-        (!= ?k (MNum 1))
-
-        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
-        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
-        (= ?k_stride (MIter))
-
-        (= ?a_m_stride (MMul (MIter) ?k))
-        (= ?a_n_stride (MNum 0))
-        (= ?a_k_stride (MIter))
-
-        (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-        (= ?b_k_stride (MIter))
-
-        (= ?b_dtype (dtype ?b))
-        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
-        (= ?scaled (Op (cublaslt_scaled
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            (MNum 1)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
-        (= ?cast (Op (cublaslt
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            (MNum 1)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
+        ; Stage the tensor-wide fp8 scale product (a_scale · b_scale), keyed
+        ; by its FusionEnd. ANCHORED at the scalar Mul: its two scalar
+        ; FusionStart operands are read from the Mul's input list, never
+        ; enumerated. Without this fact, the fused-output-scale rule below
+        ; matched ?fs_a_scale / ?fs_b_scale as free scalar-FusionStart atoms
+        ; and egglog enumerated their K² cross-product on graphs with many
+        ; scalar fusion boundaries (adaLN modulation + softmax) — a
+        ; super-linear compile-time blowup that OOMs the real FLUX compile.
+        (= ?scale_product_inner (Op (CudaBinaryElementwise
+            "Mul" (ENil) (ENil) (ENil) (ENil) (F32))
+            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
+        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?a_scale (INil))))
+        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
+            (ICons ?b_scale (INil))))
+        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
+            (ICons ?scale_product_inner (INil))))
     )
     (
-        (delete (Op (Mul
-            ?out_shape
-            ?cast_strides
-            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
-            ?scaled_out_strides)
-            (ICons ?cast (ICons ?scale_product (INil)))))
-        (delete (Op (cublaslt
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            (MNum 1)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
+        (cublaslt_fp8_scale_product ?scale_product ?a_scale ?b_scale)
     )
-    :ruleset cleanup
-    :name "delete raw fp8 path when scaled cublaslt covers direct output scale"
+    :ruleset fusion_grow
+    :name "cublaslt fp8 scale-product fact"
 )
 
 (rule
@@ -224,25 +151,16 @@
         (= ?out_shape (ECons ?out_m (ECons ?out_n (ENil))))
         (= ?scale_strides (ECons (MNum 0) (ECons (MNum 0) (ENil))))
 
-        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?a_scale (INil))))
-        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?b_scale (INil))))
-        (= ?scale_product_inner (Op (CudaBinaryElementwise
-            "Mul"
-            (ENil)
-            (ENil)
-            (ENil)
-            (ENil)
-            (F32))
-            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
-        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
-            (ICons ?scale_product_inner (INil))))
+        ; ?fused_scale = Mul(fs_cast, fs_scale) is the rare anchor (one per
+        ; fp8 gemm). fs_scale wraps the scale-product FusionEnd; the staged
+        ; fact yields its two scalar operands without re-matching the scalar
+        ; FusionStart pair (see "cublaslt fp8 scale-product fact").
         (= ?fs_scale (Op (FusionStart
             ?out_shape
             ?scale_strides
             (F32))
             (ICons ?scale_product (INil))))
+        (cublaslt_fp8_scale_product ?scale_product ?a_scale ?b_scale)
         (= ?fused_scale (Op (CudaBinaryElementwise
             "Mul"
             ?out_shape
@@ -272,92 +190,6 @@
     :name "cublaslt scaled fp8 fused output-scale f32 output"
 )
 
-(rule
-    (
-        (= ?raw_gemm (Op (cublaslt
-            ?cm ?cn ?ck
-            ?cta ?ctb
-            ?cao ?cbo ?cco ?cdo
-            ?clda ?cldb ?cldc ?cldd
-            ?cbc ?csa ?csb ?csc ?csd
-            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
-            (ICons ?a (ICons ?b (INil)))))
-        (cublaslt_fp8_f32_output_pair ?cadt ?cbdt)
-        (= ?ccdt (F32))
-        (= ?cddt (F32))
-        (= ?cbeta 0.0)
-        (= ?cepilogue "DEFAULT")
-
-        (= ?fs_cast (Op (FusionStart
-            ?out_shape
-            ?cast_strides
-            (F32))
-            (ICons ?raw_gemm (INil))))
-
-        (= ?out_shape (ECons ?out_m (ECons ?out_n (ENil))))
-        (= ?scale_strides (ECons (MNum 0) (ECons (MNum 0) (ENil))))
-
-        (= ?fs_a_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?a_scale (INil))))
-        (= ?fs_b_scale (Op (FusionStart (ENil) (ENil) (F32))
-            (ICons ?b_scale (INil))))
-        (= ?scale_product_inner (Op (CudaBinaryElementwise
-            "Mul"
-            (ENil)
-            (ENil)
-            (ENil)
-            (ENil)
-            (F32))
-            (ICons ?fs_a_scale (ICons ?fs_b_scale (INil)))))
-        (= ?scale_product (Op (FusionEnd (ENil) (ENil) (F32))
-            (ICons ?scale_product_inner (INil))))
-        (= ?fs_scale (Op (FusionStart
-            ?out_shape
-            ?scale_strides
-            (F32))
-            (ICons ?scale_product (INil))))
-        (= ?fused_scale (Op (CudaBinaryElementwise
-            "Mul"
-            ?out_shape
-            ?cast_strides
-            ?scale_strides
-            ?scaled_out_strides
-            (F32))
-            (ICons ?fs_cast (ICons ?fs_scale (INil)))))
-        (= ?cast_strides ?scaled_out_strides)
-
-        (= ?sgemm (Op (cublaslt_scaled
-            ?cm ?cn ?ck
-            ?cta ?ctb
-            ?cao ?cbo ?cco ?cdo
-            ?clda ?cldb ?cldc ?cldd
-            ?cbc ?csa ?csb ?csc ?csd
-            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
-            (ICons ?a (ICons ?b (ICons ?a_scale (ICons ?b_scale (INil)))))))
-        (= ?fused_scale (Op (FusionStart ?out_shape ?scaled_out_strides (F32))
-            (ICons ?sgemm (INil))))
-    )
-    (
-        (delete (Op (cublaslt
-            ?cm ?cn ?ck
-            ?cta ?ctb
-            ?cao ?cbo ?cco ?cdo
-            ?clda ?cldb ?cldc ?cldd
-            ?cbc ?csa ?csb ?csc ?csd
-            ?cadt ?cbdt ?ccdt ?cddt ?ccompute ?cscale ?calpha ?cbeta ?cepilogue)
-            (ICons ?a (ICons ?b (INil)))))
-        (delete (Op (CudaBinaryElementwise
-            "Mul"
-            ?out_shape
-            ?cast_strides
-            ?scale_strides
-            ?scaled_out_strides
-            (F32))
-            (ICons ?fs_cast (ICons ?fs_scale (INil)))))
-    )
-    :ruleset cleanup
-    :name "delete raw fp8 path when scaled cublaslt covers fused output scale"
-)
 
 (rule
     (
@@ -374,7 +206,9 @@
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?recip_out_strides)
             (ICons ?input_scale (INil))))
-        (= ?a (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+        (= ?a_fp8 (Op (Cast ?a_size ?a_dtype) (ICons ?scaled_activation (INil))))
+        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
+        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
 
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
@@ -382,34 +216,32 @@
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?matmul_dtype (F32))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k (F32))
         (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
             (ICons ?input_scale (ICons ?weight_scale (INil)))))
         (= ?scaled (Op (Mul
             ?out_shape
-            ?cast_strides
+            ?sum_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?scaled_out_strides)
-            (ICons ?cast (ICons ?scale_product (INil)))))
-        (= ?cast_strides ?scaled_out_strides)
+            (ICons ?sum (ICons ?scale_product (INil)))))
+        (= ?sum_strides ?scaled_out_strides)
 
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
+        ; cuBLASLt exposes one strided-batch axis here. Match exactly rank 3;
+        ; suffix-only indexing would silently drop outer batch axes.
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
+        (= ?sum_strides
+            (ECons
+                (MMul (MMul (MIter) ?n) ?m)
+                (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
         (!= ?batch (MNum 0))
 
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
 
         (= ?k_stride (MIter))
 
@@ -424,7 +256,7 @@
         (= ?a_batch_stride (MMul ?m ?a_m_stride))
         (= ?b_batch_stride (MMul ?n ?b_n_stride))
 
-        (= ?b_dtype (dtype ?b))
+        (= ?b_dtype (dtype ?b_fp8))
         (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
     )
     (
@@ -442,7 +274,7 @@
             (MMul ?m ?n)
             (MMul ?m ?n)
             ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+            (ICons ?b_fp8 (ICons ?a_fp8 (ICons ?weight_scale (ICons ?input_scale (INil)))))))
         (union ?scaled ?sgemm)
         (set (dtype ?sgemm) (F32))
     )
@@ -452,13 +284,18 @@
 
 (rule
     (
+        ; The semantic GenericMatmul consumes materialized F32 casts. Match
+        ; through those casts and let cuBLASLt read the original FP8 buffers.
+        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
+        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?matmul_dtype (F32))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k (F32))
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
         (!= ?m (MNum 0))
@@ -477,11 +314,12 @@
         (= ?b_n_stride (MMul (MIter) ?k))
         (= ?b_k_stride (MIter))
 
-        (= (F8E4M3) (dtype ?a))
-        (= (F8E4M3) (dtype ?b))
+        (= ?a_dtype (dtype ?a_fp8))
+        (= ?b_dtype (dtype ?b_fp8))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
     )
     (
-        (let ?sgemm (Op (cublaslt
+        (let ?gemm (Op (cublaslt
             ?n ?m ?k
             "T" "N"
             "COL" "COL" "COL" "COL"
@@ -494,26 +332,168 @@
             (MNum 0)
             (MNum 0)
             (MNum 0)
-            (F8E4M3) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
-        (union ?cast ?sgemm)
-        (set (dtype ?sgemm) (F32))
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b_fp8 (ICons ?a_fp8 (INil)))))
+        (union ?sum ?gemm)
+        (set (dtype ?gemm) (F32))
     )
     :ruleset matmul_backend
-    :name "cublaslt fp8 e4m3/e4m3 row-major x column-major f32 output"
+    :name "cublaslt fp8 promoted row-major x column-major f32 output"
 )
 
 (rule
     (
+        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
+        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
         (= ?sum (Op (GenericMatmul
             ?out_shape ?mul_shape ?k
             ?a_stride ?b_stride
             ?sum_in_stride ?k_stride ?sum_out_stride
             ?matmul_dtype)
             (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
+        (= ?matmul_dtype (F32))
+        (generic_matmul_exact_3d ?sum ?batch ?m ?n ?k (F32))
+
+        ; This descriptor has one strided-batch axis, so rank must be exactly
+        ; three unless leading batches are explicitly flattened by a rewrite.
+        (= ?out_shape (ECons ?batch (ECons ?m (ECons ?n (ENil)))))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+        (!= ?batch (MNum 0))
+
+        (= ?a_stride (ECons ?a_batch_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil))))))
+        (= ?b_stride (ECons ?b_batch_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil))))))
+
+        (= ?k_stride (MIter))
+
+        (= ?a_k_stride (MIter))
+        (= ?a_n_stride (MNum 0))
+        (= ?a_m_stride (MMul (MIter) ?k))
+
+        (= ?b_k_stride (MIter))
+        (= ?b_m_stride (MNum 0))
+        (= ?b_n_stride (MMul (MIter) ?k))
+
+        (= ?a_batch_stride (MMul ?m ?a_m_stride))
+        (= ?b_batch_stride (MMul ?n ?b_n_stride))
+
+        (= ?a_dtype (dtype ?a_fp8))
+        (= ?b_dtype (dtype ?b_fp8))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
+    )
+    (
+        (let ?gemm (Op (cublaslt
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n_stride
+            ?a_m_stride
+            ?n
+            ?n
+            ?batch
+            ?b_batch_stride
+            ?a_batch_stride
+            (MMul ?m ?n)
+            (MMul ?m ?n)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b_fp8 (ICons ?a_fp8 (INil)))))
+        (union ?sum ?gemm)
+        (set (dtype ?gemm) (F32))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt fp8 promoted batched row-major x column-major f32 output"
+)
+
+; Fold a trailing Cast(Bf16) into a scaled FP8 matmul's output dtype.
+; cuBLASLt supports BF16 C/D with FP8 A/B; beta is pinned to 0.0 so no C
+; operand exists whose physical dtype could disagree (same hazard as the
+; mixed-dtype fold guard).
+(rule
+    (
+        (= ?matmul (Op (cublaslt_scaled
+            ?m ?n ?k ?ta ?tb ?ao ?bo ?co ?do
+            ?lda ?ldb ?ldc ?ldd ?batch
+            ?sa ?sb ?sc ?sd
+            ?adt ?bdt (F32) (F32)
+            ?compute ?scale ?alpha 0.0 ?epilogue)
+            ?inputs))
+        (= ?cast (Op (Cast ?size (Bf16)) (ICons ?matmul (INil))))
+    )
+    (
+        (let ?fused (Op (cublaslt_scaled
+            ?m ?n ?k ?ta ?tb ?ao ?bo ?co ?do
+            ?lda ?ldb ?ldc ?ldd ?batch
+            ?sa ?sb ?sc ?sd
+            ?adt ?bdt (Bf16) (Bf16)
+            ?compute ?scale ?alpha 0.0 ?epilogue)
+            ?inputs))
+        (union ?cast ?fused)
+        (set (dtype ?fused) (Bf16))
+    )
+    :ruleset matmul_backend
+    :name "cublaslt scaled fp8 bf16 output"
+)
+
+; Stage pre-quantized activations by producer shape. F8-producing custom ops
+; put their tensor-wide quantization scale in the final input slot. Keeping
+; the small arity-specific joins here lets the full matmul/layout join below
+; run once for every supported producer instead of duplicating its body.
+(rule
+    (
+        (= ?a_fp8 (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?cw (ICons ?input_scale (INil))))))
+        (= ?a_dtype (dtype ?a_fp8))
+    )
+    (
+        (cublaslt_fp8_scaled_activation ?a_fp8 ?input_scale ?a_dtype)
+    )
+:ruleset matmul_backend
+:name "stage cublaslt fp8 custom quantized activation arity 3"
+)
+
+(rule
+    (
+        (= ?a_fp8 (Op (CustomOpKind ?cid (F8E4M3)) (ICons ?cx (ICons ?input_scale (INil)))))
+        (= ?a_dtype (dtype ?a_fp8))
+    )
+    (
+        (cublaslt_fp8_scaled_activation ?a_fp8 ?input_scale ?a_dtype)
+    )
+:ruleset matmul_backend
+:name "stage cublaslt fp8 custom quantized activation arity 2"
+)
+
+; Consume every staged custom quantizer through one exact scaled-FP8 matmul
+; rewrite. The relation retains both the physical activation and its scale;
+; the explicit F32 casts and GenericMatmul remain as the semantic fallback.
+(rule
+    (
+        (cublaslt_fp8_scaled_activation ?a_fp8 ?input_scale ?a_dtype)
+        (= ?a (Op (Cast ?a_promoted_size (F32)) (ICons ?a_fp8 (INil))))
+        (= ?b (Op (Cast ?b_promoted_size (F32)) (ICons ?b_fp8 (INil))))
+
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (= ?matmul_dtype (F32))
+        (generic_matmul_exact_2d ?sum ?m ?n ?k (F32))
+        (= ?scale_product (Op (Mul (ENil) (ENil) (ENil) (ENil))
+            (ICons ?input_scale2 (ICons ?weight_scale (INil)))))
+        (= ?input_scale ?input_scale2)
+        (= ?scaled (Op (Mul
+            ?out_shape
+            ?sum_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ENil)))
+            ?scaled_out_strides)
+            (ICons ?sum (ICons ?scale_product (INil)))))
+        (= ?sum_strides ?scaled_out_strides)
 
         (= ?out_shape (ECons ?m (ECons ?n (ENil))))
+        (= ?sum_strides
+            (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil))))
         (!= ?m (MNum 0))
         (!= ?n (MNum 0))
         (!= ?k (MNum 1))
@@ -530,11 +510,11 @@
         (= ?b_n_stride (MMul (MIter) ?k))
         (= ?b_k_stride (MIter))
 
-        (= (F8E4M3) (dtype ?a))
-        (= (F8E5M2) (dtype ?b))
+        (= ?b_dtype (dtype ?b_fp8))
+        (cublaslt_fp8_f32_output_pair ?a_dtype ?b_dtype)
     )
     (
-        (let ?sgemm (Op (cublaslt
+        (let ?sgemm (Op (cublaslt_scaled
             ?n ?m ?k
             "T" "N"
             "COL" "COL" "COL" "COL"
@@ -547,265 +527,11 @@
             (MNum 0)
             (MNum 0)
             (MNum 0)
-            (F8E5M2) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
-        (union ?cast ?sgemm)
+            ?b_dtype ?a_dtype (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
+            (ICons ?b_fp8 (ICons ?a_fp8 (ICons ?weight_scale (ICons ?input_scale (INil)))))))
+        (union ?scaled ?sgemm)
         (set (dtype ?sgemm) (F32))
     )
-    :ruleset matmul_backend
-    :name "cublaslt fp8 e5m2/e4m3 row-major x column-major f32 output"
-)
-
-(rule
-    (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
-            (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
-
-        (= ?out_shape (ECons ?m (ECons ?n (ENil))))
-        (!= ?m (MNum 0))
-        (!= ?n (MNum 0))
-        (!= ?k (MNum 1))
-
-        (= ?a_stride (ECons ?a_m_stride (ECons ?a_n_stride (ECons ?a_k_stride (ENil)))))
-        (= ?b_stride (ECons ?b_m_stride (ECons ?b_n_stride (ECons ?b_k_stride (ENil)))))
-        (= ?k_stride (MIter))
-
-        (= ?a_m_stride (MMul (MIter) ?k))
-        (= ?a_n_stride (MNum 0))
-        (= ?a_k_stride (MIter))
-
-        (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-        (= ?b_k_stride (MIter))
-
-        (= (F8E5M2) (dtype ?a))
-        (= (F8E4M3) (dtype ?b))
-    )
-    (
-        (let ?sgemm (Op (cublaslt
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            (MNum 1)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            (MNum 0)
-            (F8E4M3) (F8E5M2) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
-        (union ?cast ?sgemm)
-        (set (dtype ?sgemm) (F32))
-    )
-    :ruleset matmul_backend
-    :name "cublaslt fp8 e4m3/e5m2 row-major x column-major f32 output"
-)
-
-(rule
-    (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
-            (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
-
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
-        (!= ?m (MNum 0))
-        (!= ?n (MNum 0))
-        (!= ?k (MNum 1))
-        (!= ?batch (MNum 0))
-
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
-
-        (= ?k_stride (MIter))
-
-        (= ?a_k_stride (MIter))
-        (= ?a_n_stride (MNum 0))
-        (= ?a_m_stride (MMul (MIter) ?k))
-
-        (= ?b_k_stride (MIter))
-        (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-
-        (= ?a_batch_stride (MMul ?m ?a_m_stride))
-        (= ?b_batch_stride (MMul ?n ?b_n_stride))
-
-        (= (F8E4M3) (dtype ?a))
-        (= (F8E4M3) (dtype ?b))
-    )
-    (
-        (let ?sgemm (Op (cublaslt
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            ?batch
-            ?b_batch_stride
-            ?a_batch_stride
-            (MMul ?m ?n)
-            (MMul ?m ?n)
-            (F8E4M3) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
-        (union ?cast ?sgemm)
-        (set (dtype ?sgemm) (F32))
-    )
-    :ruleset matmul_backend
-    :name "cublaslt fp8 e4m3/e4m3 batched row-major x column-major f32 output"
-)
-
-(rule
-    (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
-            (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
-
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
-        (!= ?m (MNum 0))
-        (!= ?n (MNum 0))
-        (!= ?k (MNum 1))
-        (!= ?batch (MNum 0))
-
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
-
-        (= ?k_stride (MIter))
-
-        (= ?a_k_stride (MIter))
-        (= ?a_n_stride (MNum 0))
-        (= ?a_m_stride (MMul (MIter) ?k))
-
-        (= ?b_k_stride (MIter))
-        (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-
-        (= ?a_batch_stride (MMul ?m ?a_m_stride))
-        (= ?b_batch_stride (MMul ?n ?b_n_stride))
-
-        (= (F8E4M3) (dtype ?a))
-        (= (F8E5M2) (dtype ?b))
-    )
-    (
-        (let ?sgemm (Op (cublaslt
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            ?batch
-            ?b_batch_stride
-            ?a_batch_stride
-            (MMul ?m ?n)
-            (MMul ?m ?n)
-            (F8E5M2) (F8E4M3) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
-        (union ?cast ?sgemm)
-        (set (dtype ?sgemm) (F32))
-    )
-    :ruleset matmul_backend
-    :name "cublaslt fp8 e5m2/e4m3 batched row-major x column-major f32 output"
-)
-
-(rule
-    (
-        (= ?sum (Op (GenericMatmul
-            ?out_shape ?mul_shape ?k
-            ?a_stride ?b_stride
-            ?sum_in_stride ?k_stride ?sum_out_stride
-            ?matmul_dtype)
-            (ICons ?a (ICons ?b (INil)))))
-        (= ?cast (Op (Cast ?size (F32)) (ICons ?sum (INil))))
-
-        (= ?batch (nth_from_end ?out_shape 2))
-        (= ?m (nth_from_end ?out_shape 1))
-        (= ?n (nth_from_end ?out_shape 0))
-        (!= ?m (MNum 0))
-        (!= ?n (MNum 0))
-        (!= ?k (MNum 1))
-        (!= ?batch (MNum 0))
-
-        (= ?a_batch_stride (nth_from_end ?a_stride 3))
-        (= ?a_m_stride (nth_from_end ?a_stride 2))
-        (= ?a_n_stride (nth_from_end ?a_stride 1))
-        (= ?a_k_stride (nth_from_end ?a_stride 0))
-
-        (= ?b_batch_stride (nth_from_end ?b_stride 3))
-        (= ?b_m_stride (nth_from_end ?b_stride 2))
-        (= ?b_n_stride (nth_from_end ?b_stride 1))
-        (= ?b_k_stride (nth_from_end ?b_stride 0))
-
-        (= ?k_stride (MIter))
-
-        (= ?a_k_stride (MIter))
-        (= ?a_n_stride (MNum 0))
-        (= ?a_m_stride (MMul (MIter) ?k))
-
-        (= ?b_k_stride (MIter))
-        (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-
-        (= ?a_batch_stride (MMul ?m ?a_m_stride))
-        (= ?b_batch_stride (MMul ?n ?b_n_stride))
-
-        (= (F8E5M2) (dtype ?a))
-        (= (F8E4M3) (dtype ?b))
-    )
-    (
-        (let ?sgemm (Op (cublaslt
-            ?n ?m ?k
-            "T" "N"
-            "COL" "COL" "COL" "COL"
-            ?b_n_stride
-            ?a_m_stride
-            ?n
-            ?n
-            ?batch
-            ?b_batch_stride
-            ?a_batch_stride
-            (MMul ?m ?n)
-            (MMul ?m ?n)
-            (F8E4M3) (F8E5M2) (F32) (F32) "32F" "F32" 1.0 0.0 "DEFAULT")
-            (ICons ?b (ICons ?a (INil)))))
-        (union ?cast ?sgemm)
-        (set (dtype ?sgemm) (F32))
-    )
-    :ruleset matmul_backend
-    :name "cublaslt fp8 e4m3/e5m2 batched row-major x column-major f32 output"
+:ruleset matmul_backend
+:name "cublaslt scaled fp8 RmCm f32 output, staged custom quantized activation"
 )

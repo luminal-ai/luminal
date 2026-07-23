@@ -65,6 +65,105 @@ impl<'a> Translator<'a> {
         })
     }
 
+    pub(crate) fn translate_upsample_nearest2d(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let input_dimensions = input.dims();
+
+        anyhow::ensure!(
+            input_dimensions.len() == 4,
+            "upsample_nearest2d expects a 4D (N, C, H, W) input, got {}D",
+            input_dimensions.len()
+        );
+
+        let input_height = input_dimensions[2]
+            .to_usize()
+            .context("upsample_nearest2d requires a static input height")?;
+
+        let input_width = input_dimensions[3]
+            .to_usize()
+            .context("upsample_nearest2d requires a static input width")?;
+
+        let output_dimensions = self.output_meta_shape(node)?;
+
+        anyhow::ensure!(
+            output_dimensions.len() == 4,
+            "upsample_nearest2d expects a 4D output, got {}D",
+            output_dimensions.len()
+        );
+
+        let output_height = output_dimensions[2]
+            .to_usize()
+            .context("upsample_nearest2d requires a static output height")?;
+
+        let output_width = output_dimensions[3]
+            .to_usize()
+            .context("upsample_nearest2d requires a static output width")?;
+
+        anyhow::ensure!(
+            input_height != 0 && input_width != 0 && output_height != 0 && output_width != 0,
+            "upsample_nearest2d requires non-zero spatial dims \
+               (in {input_height}x{input_width} -> out {output_height}x{output_width})"
+        );
+
+        // Optional explicit scale_factors (arg 2): ATen's general branch
+        // indexes by floor(j / s) when scales are provided, which differs
+        // from floor(j * in / out) when in * s is non-integral.
+        let scales: Option<(f64, f64)> = node.inputs.get(2).and_then(|i| match &i.arg {
+            Argument::Other(v) => {
+                let a = v.get("as_floats")?.as_array()?;
+                if a.len() == 2 {
+                    Some((a[0].as_f64()?, a[1].as_f64()?))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        });
+
+        let result =
+            self.upsample_nearest_axis(input, 2, input_height, output_height, scales.map(|s| s.0))?;
+        let result =
+            self.upsample_nearest_axis(result, 3, input_width, output_width, scales.map(|s| s.1))?;
+        Ok(result)
+    }
+
+    /// Nearest-neighbor resample of one axis. `out == in` and `out == 2*in`
+    /// are ATen kernel fast paths that ignore the scale, and integer scales
+    /// matching out/in are pure shape movement (`expand_dim` + `merge_dims`).
+    /// Everything else gathers with `src = min(floor(j * scale_inv), in-1)`
+    /// where scale_inv = 1/s when scales were provided else in/out — the
+    /// float chain deliberately mirrors ATen's float32 index math.
+    fn upsample_nearest_axis(
+        &mut self,
+        t: GraphTensor,
+        axis: usize,
+        in_dim: usize,
+        out_dim: usize,
+        scale: Option<f64>,
+    ) -> Result<GraphTensor> {
+        if out_dim.is_multiple_of(in_dim) {
+            let k = out_dim / in_dim;
+            let scale_matches = scale.is_none_or(|s| (s - k as f64).abs() < 1e-9);
+            if k <= 2 || scale_matches {
+                if k == 1 {
+                    return Ok(t);
+                }
+                return Ok(t.expand_dim(axis + 1, k).merge_dims(axis, axis + 1));
+            }
+        }
+
+        let scale_inv = scale.map_or(in_dim as f64 / out_dim as f64, |s| 1.0 / s) as f32;
+        let mut idx = (self.graph.arange(out_dim).cast(DType::F32) * scale_inv)
+            .minimum_f32((in_dim - 1) as f32)
+            .cast(DType::Int);
+        for (d, &dim) in t.dims().iter().enumerate() {
+            if d != axis {
+                idx = idx.expand_dim(d, dim);
+            }
+        }
+        Ok(super::movement_dynamic::pt2_gather_elements(t, idx, axis))
+    }
+
     pub(crate) fn translate_permute(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         let dims = self.get_ints_arg(node, 1)?;

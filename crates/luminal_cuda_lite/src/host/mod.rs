@@ -1,8 +1,10 @@
 use std::{fmt::Debug, sync::Arc};
 
 use crate::cudarc::driver::{CudaStream, DriverError, result};
+#[doc(hidden)]
+pub use crate::resource::{HostDeviceMemoryPlan, ResourceViolation, SharedDeviceMemoryAllocation};
 use luminal::{op::EgglogOp, prelude::*};
-mod cublaslt;
+pub(crate) mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
 
@@ -10,6 +12,7 @@ pub type Ops = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
+    moe::fused::FusedMoE,
     flashinfer::FlashInferAttention,
 );
 
@@ -167,12 +170,36 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         None
     }
 
+    /// Returns pairs of extra buffer nodes that must not share arena storage.
+    ///
+    /// This refines `extra_buffer_lifetimes` for host ops with internal DAGs:
+    /// two buffers may have disjoint positions in one topological order while
+    /// still being unordered by real dependencies, so CUDA could overlap them.
+    fn extra_buffer_conflicts(&self) -> Option<Vec<(NodeIndex, NodeIndex)>> {
+        None
+    }
+
     /// Returns buffer size requirements for extra nodes (node -> size in elements).
     ///
     /// Called during buffer allocation to ensure all required buffers exist.
     /// For CudaGraphOp, this returns sizes for all internal kernel output buffers.
     fn extra_buffer_sizes(&self) -> FxHashMap<NodeIndex, Expression> {
         FxHashMap::default()
+    }
+
+    /// Device allocations owned by, temporarily created by, or globally
+    /// shared by this host operation beyond its graph-visible output and the
+    /// runtime intermediate arena. Planning is pointer-free: `buffer_lengths`
+    /// contains logical byte lengths only, and implementations must not
+    /// allocate device memory or read device contents during this call.
+    fn device_memory_plan(
+        &self,
+        _self_node: NodeIndex,
+        _inputs: &[NodeIndex],
+        _buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        _dyn_map: &FxHashMap<char, usize>,
+    ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
+        Ok(HostDeviceMemoryPlan::default())
     }
 
     /// Returns the name of this host op for stats reporting, or None if not reportable.

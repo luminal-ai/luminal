@@ -286,12 +286,22 @@ fn test_bucket_switch_preserves_weights() {
         CompileOptions::default().search_graph_limit(5),
         &mut rng,
     );
+    assert_eq!(
+        rt.debug_resident_bucket_arena_indices(),
+        vec![1],
+        "stitched load should prepare only the selected prefill bucket"
+    );
 
     // Execute with bucket 1 (s=1)
     cx.set_dim('s', 1);
     rt.set_data(a, a_data.clone());
     rt.set_data(b_tensor, b_data.clone());
     rt.execute(&cx.dyn_map);
+    assert_eq!(
+        rt.debug_resident_bucket_arena_indices(),
+        vec![0],
+        "switching to decode must evict the prefill arena first"
+    );
     let result_1a = rt.get_f32(c);
 
     // Switch to bucket 2 (s=3)
@@ -300,6 +310,11 @@ fn test_bucket_switch_preserves_weights() {
     rt.set_data(a, a_data_3.clone());
     rt.set_data(b_tensor, b_data.clone());
     rt.execute(&cx.dyn_map);
+    assert_eq!(
+        rt.debug_resident_bucket_arena_indices(),
+        vec![1],
+        "switching to prefill must leave only its arena resident"
+    );
     let result_3 = rt.get_f32(c);
 
     // Switch back to bucket 1 (s=1) — weights should still work
@@ -307,6 +322,11 @@ fn test_bucket_switch_preserves_weights() {
     rt.set_data(a, a_data.clone());
     rt.set_data(b_tensor, b_data.clone());
     rt.execute(&cx.dyn_map);
+    assert_eq!(
+        rt.debug_resident_bucket_arena_indices(),
+        vec![0],
+        "switching back must still preserve one-live-arena ownership"
+    );
     let result_1b = rt.get_f32(c);
 
     // First and last s=1 results should match exactly

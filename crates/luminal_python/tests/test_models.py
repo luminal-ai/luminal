@@ -1567,6 +1567,124 @@ class LayerNormTestModel(torch.nn.Module):
         return self.norm(x)
 
 
+# ========== GELU Node Test Models ==========
+# nn.GELU() defaults to the exact erf form; nn.GELU(approximate="tanh") selects
+# the tanh approximation. The translator dispatches on the `approximate` kwarg, so
+# both should match PyTorch eager tightly.
+
+
+class GeluTestModel(torch.nn.Module):
+    """nn.GELU (default = exact erf)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.act = torch.nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x)
+
+
+class GeluTanhModel(torch.nn.Module):
+    """nn.GELU(approximate="tanh") — the tanh approximation."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.act = torch.nn.GELU(approximate="tanh")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x)
+
+
+class LinearGeluBatchedModel(torch.nn.Module):
+    """Linear -> GELU on 3D (B, S, H) — the transformer-MLP shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc = torch.nn.Linear(16, 32)
+        self.act = torch.nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.fc(x))
+
+
+# ========== GroupNorm Node Test Models ==========
+# These exercise torch.nn.GroupNorm / F.group_norm which export as PT2
+# aten.native_group_norm. GroupNorm splits channels into groups and normalizes
+# each (batch, group) slice jointly over group_size * spatial.
+
+
+class GroupNormTestModel(torch.nn.Module):
+    """Baseline GroupNorm: 2 groups over 4 channels, 4D input (N, C, H, W)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = torch.nn.GroupNorm(2, 4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class GroupNormGroups1Model(torch.nn.Module):
+    """GroupNorm with a single group (normalizes over all channels + spatial)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = torch.nn.GroupNorm(1, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class GroupNormGroupsEqChannelsModel(torch.nn.Module):
+    """GroupNorm with one group per channel (InstanceNorm-like)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = torch.nn.GroupNorm(8, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class GroupNormNoAffineModel(torch.nn.Module):
+    """GroupNorm with affine=False — exercises the weight/bias = None path."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = torch.nn.GroupNorm(2, 4, affine=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class GroupNorm3DModel(torch.nn.Module):
+    """GroupNorm on 3D input (N, C, L) — conv1d-style single spatial dim."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm = torch.nn.GroupNorm(2, 6)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x)
+
+
+class ConvGroupNormSiLUModel(torch.nn.Module):
+    """Conv2d -> GroupNorm -> SiLU, the canonical Stable-Diffusion ResNet block.
+
+    Guards against the failure mode where the single-axis group reduction is
+    dropped by the e-graph when composed into a conv chain.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(4, 8, kernel_size=3, padding=1)
+        self.norm = torch.nn.GroupNorm(4, 8)
+        self.act = torch.nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.norm(self.conv(x)))
+
+
 # ========== Gemm Node Test Models ==========
 
 
@@ -1642,7 +1760,7 @@ class ArgsortStableDuplicatesModel(torch.nn.Module):
 
 
 class TinyMoERoutingModel(torch.nn.Module):
-    """Minimal deterministic MoE-style routing proof for PT2/native and CUDA.
+    """Minimal deterministic MoE-style routing proof for PT2/reference and CUDA.
 
     ``idx_dtype`` casts the integer-valued outputs (routed_indices, dispatch,
     group_ids) to the requested dtype so the test can sweep int32 and int64
@@ -2360,3 +2478,44 @@ class SdpaWithBiasModel(torch.nn.Module):
         bias: torch.Tensor,
     ) -> torch.Tensor:
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+
+
+# ========== Nearest Upsample Test Models ==========
+
+
+class UpsampleNearestScaleModel(torch.nn.Module):
+    """`F.interpolate(scale_factor=..., mode="nearest")` — the
+    `scale_factors` overload (the SD UNet path)."""
+
+    def __init__(self, scale_factor: float = 2.0) -> None:
+        super().__init__()
+        self.scale_factor = scale_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(
+            x, scale_factor=self.scale_factor, mode="nearest"
+        )
+
+
+class UpsampleNearestScaleHWModel(torch.nn.Module):
+    """Non-square per-axis scale, `scale_factor=(sh, sw)`."""
+
+    def __init__(self, scale_h: float = 2.0, scale_w: float = 3.0) -> None:
+        super().__init__()
+        self.scale = (scale_h, scale_w)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(
+            x, scale_factor=self.scale, mode="nearest"
+        )
+
+
+class UpsampleNearestSizeModel(torch.nn.Module):
+    """`F.interpolate(size=...)` — the `output_size` overload."""
+
+    def __init__(self, size: tuple[int, int] = (16, 16)) -> None:
+        super().__init__()
+        self.size = size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.interpolate(x, size=self.size, mode="nearest")

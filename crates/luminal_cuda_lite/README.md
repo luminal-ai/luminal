@@ -27,3 +27,38 @@ Thread ops are not yet merged. Stay tuned!
 ### Architecture
 
 `luminal_cuda_lite` can model a joint search space that smoothly searches through various mixed configurations of these ops. At compile time, a waterfall process takes place to iteratively raise each op to the level above, resulting in all host-level ops in the final runtime graph. For instance, block ops get combined into megakernels, implemented as kernel ops. Kernel ops get combined into cuda graphs, implemented as host ops.
+
+### Semantic search contract
+
+Backend rewrites add legal implementations with `union`; they do not remove a
+legal implementation merely because another implementation is usually faster.
+The profiling search, rather than cleanup, chooses between alternatives such as
+generic kernels, specialized kernels, and host-library calls.
+
+That includes GenericMatmul/cuBLASLt/GEMV, direct/decomposed Conv2D,
+materialized/absorbed fusion and casts, copying/no-copy scatter, and
+materialized/fused RoPE-scatter paths. These alternatives are matched in
+egglog; selected LLIR is not rewritten into a different operator pattern after
+extraction.
+
+Cleanup may remove only representations that are not executable plans: cycles,
+malformed shape/stride metadata, unsupported type/layout combinations, and
+proven alias or ownership violations. Candidate resource checks may reject a
+plan that cannot fit or launch on the target device. The intermediate-memory
+cap applies to the peak planned bucket arena. Bucket dispatch drops the active
+arena before allocating another, so bucket arenas peak rather than coexist. The
+device-memory check separately includes that peak arena, persistent host-op state
+retained by all compiled buckets, the peak transient host-op allocation, and
+deduplicated shared workspaces. That check is a necessary planned-capacity bound,
+not an available-memory guarantee: external allocations, CUDA context and
+allocator overhead, and pool reservations are not observable in the plan. Arena
+growth likewise drops the synchronized old arena before allocating its
+replacement, so replacement itself does not introduce an old-plus-new peak. The
+intermediate-memory and synchronous-NVRTC source budgets are reported as resource
+rejections and can be adjusted independently of rewrite semantics. Otherwise, a
+plan that is legal but merely expensive remains available for measured search.
+
+Choice-set validation detects correlated e-class cycles before LLIR loading.
+Random initial genomes repair only those reachable cycles; later mutations may
+still produce them, in which case candidate filtering discards them without
+profiling and continues searching the remaining legal alternatives.

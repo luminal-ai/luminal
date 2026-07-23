@@ -22,7 +22,7 @@ use torch_dtype::TorchDType;
 fn luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process_pt2, m)?)?;
     m.add_class::<CompiledGraph>()?;
-    m.add_function(wrap_pyfunction!(_native_factory_capsule, m)?)?;
+    m.add_function(wrap_pyfunction!(_reference_factory_capsule, m)?)?;
     m.add_function(wrap_pyfunction!(_torch_dtype_codes, m)?)?;
     #[cfg(feature = "cuda")]
     m.add_function(wrap_pyfunction!(_cuda_lite_factory_capsule, m)?)?;
@@ -50,10 +50,10 @@ fn _torch_dtype_codes() -> HashMap<&'static str, u32> {
 struct FnPtrWrapper(pub *const std::ffi::c_void);
 unsafe impl Send for FnPtrWrapper {}
 
-/// PyCapsule wrapping the native (CPU) backend factory.
+/// PyCapsule wrapping the reference CPU backend factory.
 #[pyfunction]
-fn _native_factory_capsule<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
-    let fptr = ::luminal::dyn_backend::native_factory as *const std::ffi::c_void;
+fn _reference_factory_capsule<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+    let fptr = ::luminal::dyn_backend::reference_factory as *const std::ffi::c_void;
     let name = ::luminal::dyn_backend::BACKEND_FACTORY_CAPSULE_NAME.to_owned();
     PyCapsule::new(py, FnPtrWrapper(fptr), Some(name))
 }

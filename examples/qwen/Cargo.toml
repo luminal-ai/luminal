@@ -14,6 +14,7 @@ metal = ["dep:luminal_metal"]
 
 [dependencies]
 luminal = { path = "../.." }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 luminal_nn = { path = "../../crates/luminal_nn" }
 luminal_tracing = { path = "../../crates/luminal_tracing" }
 luminal_cuda_lite = { path = "../../crates/luminal_cuda_lite", optional = true }

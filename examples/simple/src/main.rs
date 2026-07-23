@@ -1,3 +1,11 @@
+// glibc malloc degrades into an allocating livelock inside
+// nvrtcCompileProgram after heavy search heap churn (hundreds of
+// thousands of compiles). jemalloc built with unprefixed symbols
+// interposes malloc for the whole process, including dlopened CUDA
+// libraries like libnvrtc — a Rust-only global allocator would not.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use luminal::prelude::*;
 
 fn main() {
@@ -11,8 +19,7 @@ fn main() {
     display_graph(&cx);
 
     // Compile
-    cx.build_search_space::<NativeRuntime>(CompileOptions::default());
-    let mut rt = cx.search(NativeRuntime::default(), CompileOptions::default());
+    let mut rt = cx.compile(ReferenceRuntime::default(), CompileOptions::default());
 
     // Set input tensors
     rt.set_data(a, vec![1.0, 2.0, 3.0]);

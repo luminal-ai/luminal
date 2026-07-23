@@ -90,9 +90,12 @@ impl GraphTensor {
         if self.dtype == dtype {
             return self;
         }
+        // Cast converts the addressed span of the underlying buffer and the
+        // view passes through unchanged; sliced views address beyond
+        // n_physical_elements, so size by span.
         let id = self
             .graph()
-            .add_op(Cast(self.shape.n_physical_elements(), dtype), &[self.id]);
+            .add_op(Cast(self.shape.physical_span(), dtype), &[self.id]);
         let mut shape = self.shape;
         shape.element_stride_bits = dtype.bits();
         GraphTensor::from_id(id, shape, self.graph_ref, dtype)
@@ -125,9 +128,9 @@ mod tests {
         let mut cx = Graph::new();
         let b = func(&mut cx).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 
@@ -213,9 +216,9 @@ mod tests {
         let c = cx.tensor((2, 3));
         let stacked = cx.stack(&[a, b, c], 0).output();
 
-        cx.build_search_space::<NativeRuntime>(CompileOptions::default());
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
         let mut rt = cx.search(
-            NativeRuntime::default(),
+            ReferenceRuntime::default(),
             CompileOptions::default().search_graph_limit(1),
         );
 

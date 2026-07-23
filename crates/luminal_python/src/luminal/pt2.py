@@ -136,19 +136,44 @@ def _decomp_table():
     return table
 
 
+def _collect_input_device_ptrs(ep, user_inputs):
+    """Map user-input placeholder names to (device_ptr, n_bytes) for live,
+    contiguous CUDA nn.Parameters. Parameters are read-only in inference
+    graphs, so the search can safely alias their memory; buffers and
+    activations are excluded because in-place kernel candidates
+    (output_aliases_input, e.g. KernelScatterNoCopy) may write into their
+    alias target's buffer during profiling. Excluded inputs fall back to the
+    search's ones-buffer seeding."""
+    from torch.export.graph_signature import InputKind
+
+    user_specs = [
+        s for s in ep.graph_signature.input_specs if s.kind == InputKind.USER_INPUT
+    ]
+    ptrs = {}
+    for spec, tensor in zip(user_specs, user_inputs):
+        if (
+            isinstance(tensor, torch.nn.Parameter)
+            and tensor.is_cuda
+            and tensor.is_contiguous()
+        ):
+            ptrs[spec.arg.name] = (
+                tensor.data_ptr(),
+                tensor.numel() * tensor.element_size(),
+            )
+    return ptrs
+
+
 def _save_and_compile(
-    ep_or_path, factory, search_iterations, original_weights=None, user_indices=None
+    ep_or_path, factory, search_iterations, user_indices=None, input_device_ptrs=None
 ):
     """Compile a PT2 model via Rust, return CompiledModel.
 
     Args:
         ep_or_path: Either an ExportedProgram (will be saved to a temp file) or
-            a path to an already-saved .pt2 file.
+            a path to an already-saved .pt2 file. Baked weights come from
+            ep.state_dict (the AOT compile() path); torch.compile graphs carry
+            weights as ordinary inputs and have an empty state_dict.
         factory: PyCapsule wrapping the BackendFactory to use.
-        original_weights: Optional dict mapping state_dict key -> original PyTorch tensor.
-            When provided, device pointers are taken from these tensors instead of
-            ep.state_dict (which torch.export may have cloned), enabling true zero-copy
-            sharing with the original model's GPU memory.
     """
     owns_tmpdir = not isinstance(ep_or_path, str)
     tmpdir = tempfile.mkdtemp(prefix="luminal_") if owns_tmpdir else None
@@ -156,17 +181,17 @@ def _save_and_compile(
         if owns_tmpdir:
             pt2_path = os.path.join(tmpdir, "model.pt2")
             torch.export.save(ep_or_path, pt2_path)
-            weight_source = (
-                original_weights if original_weights else ep_or_path.state_dict
-            )
+            weight_source = ep_or_path.state_dict
         else:
             pt2_path = ep_or_path
-            weight_source = original_weights or {}
+            weight_source = {}
 
         # Collect weight pointers for Rust (avoids duplicate GPU buffer allocation)
         keep_alive, weight_device_ptrs, cpu_weights = _collect_weight_pointers(
             weight_source
         )
+        if input_device_ptrs:
+            weight_device_ptrs.update(input_device_ptrs)
 
         # Compile with device pointers — search uses actual weight memory (zero-copy)
         compiled = process_pt2(
@@ -218,9 +243,8 @@ def _strip_symint_placeholders(gm, example_inputs):
 
     Returns `(post_strip_inputs, kept_indices, ok)` where:
       - `post_strip_inputs` is `example_inputs` filtered to tensor-only entries
-      - `kept_indices` is the indices into `example_inputs` we kept (used by
-        the caller to compose with any prior input filter, e.g. lifted-weight
-        re-internalization, when handing `user_indices` to CompiledModel)
+      - `kept_indices` is the indices into `example_inputs` we kept (handed
+        to CompiledModel as `user_indices` so __call__ drops stripped SymInts)
       - `ok` is False when at least one SymInt placeholder couldn't be
         rewritten (compound expression with users, or no matching tensor dim);
         the caller should fall back to no-dynamic export in that case.
@@ -339,58 +363,6 @@ def _build_dynamic_shapes_from_gm(gm):
     if not saw_dynamic:
         return None
     return {"args": tuple(per_input_spec)}
-
-
-def _reinternalize_lifted_params(gm, example_inputs):
-    """Re-internalize lifted params as buffers so torch.export sees them as model state.
-
-    torch.compile lifts model parameters out of the module and passes them as
-    extra elements in example_inputs.  The Rust PT2 compiler may expect weights in
-    the .pt2 state dict, not as runtime inputs.  This function reverses the
-    lifting by registering them as buffers and replacing the placeholder nodes
-    with get_attr nodes.
-
-    Returns (gm, user_inputs, original_weights) where:
-      - user_inputs contains only the real inputs
-      - original_weights maps buffer name -> original tensor (for zero-copy device pointers)
-    """
-    buffer_indices = []
-    user_indices = []
-    buffer_nodes = []
-    placeholder_idx = 0
-    for node in gm.graph.nodes:
-        if node.op == "placeholder":
-            name = node.name
-            if name.startswith("l_self_") or name.startswith("l_model_"):
-                buffer_indices.append(placeholder_idx)
-                buffer_nodes.append(node)
-            else:
-                user_indices.append(placeholder_idx)
-            placeholder_idx += 1
-
-    original_weights = {}
-    if buffer_nodes:
-        for i, node in enumerate(buffer_nodes):
-            attr_name = f"_luminal_param_{i}"
-            # Keep a reference to the original tensor for zero-copy device pointers.
-            # torch.export.export may clone the registered buffer, so we bypass
-            # the EP's state_dict and use the originals directly.
-            original_weights[attr_name] = example_inputs[buffer_indices[i]]
-            gm.register_buffer(attr_name, example_inputs[buffer_indices[i]].detach())
-            with gm.graph.inserting_before(node):
-                new_node = gm.graph.create_node("get_attr", attr_name)
-                new_node.meta = node.meta.copy()
-                node.replace_all_uses_with(new_node)
-            gm.graph.erase_node(node)
-        gm.graph.lint()
-        gm.recompile()
-
-    user_inputs = (
-        [example_inputs[i] for i in user_indices]
-        if user_indices
-        else list(example_inputs)
-    )
-    return gm, user_inputs, original_weights, user_indices
 
 
 # ---------------------------------------------------------------------------
@@ -602,9 +574,7 @@ def _build_dynamic_shapes_from_dim_arg(dynamic_dim, example_args):
     return (spec,) + rest
 
 
-def _eager_pt2_compile(
-    gm, user_inputs, original_weights, user_indices, dynamic_shapes, factory
-):
+def _eager_pt2_compile(gm, user_inputs, user_indices, dynamic_shapes, factory):
     """Run torch.export → save → Rust compile end-to-end. Returns CompiledModel.
 
     Factored out so both the eager (static-shapes) and lazy (dynamic-shapes)
@@ -633,23 +603,24 @@ def _eager_pt2_compile(
     _drop_dead_data_dependent_ops(ep.graph_module)
     ep = ep.run_decompositions(_decomp_table())
 
-    # When using shared memory (original_weights), strip large weight buffers
-    # from the EP before saving. The Rust side uses device pointers for these
-    # weights, not the .pt2 file data, so serializing them is pure IO waste
-    # (~32 GB for 8B models). Replace with tiny CPU scalars to shrink to <1 MB.
-    if original_weights:
-        for key in list(ep._state_dict.keys()):
-            if key in original_weights:
-                orig = ep._state_dict[key]
-                ep._state_dict[key] = torch.zeros(1, dtype=orig.dtype, device="cpu")
-                del orig
-
     # Save EP to disk, then free it and the traced graph module before Rust
     # compilation. torch.export clones the state_dict internally; holding ep
     # alive during compile would double weight memory on GPU.
     tmpdir = tempfile.mkdtemp(prefix="luminal_")
     pt2_path = os.path.join(tmpdir, "model.pt2")
+    # torch.export.save pickles ep.example_inputs (real tensor data) into the
+    # archive; with weights flowing as inputs that is the entire parameter
+    # set per compile. Nothing reads them back — drop before saving.
+    ep._example_inputs = None
     torch.export.save(ep, pt2_path)
+
+    # Search-time aliases: hand the kernel search the live CUDA tensors for
+    # every user input (weights included), keyed by placeholder name. Without
+    # this the search seeds each input with a freshly allocated ones-buffer -
+    # duplicating the full parameter set on device (OOM at ~2x weights for
+    # whole-model compiles) and profiling with synthetic data. Nothing is
+    # baked: the runtime still takes pointers per call.
+    input_device_ptrs = _collect_input_device_ptrs(ep, user_inputs)
 
     del ep, gm
     gc.collect()
@@ -661,8 +632,8 @@ def _eager_pt2_compile(
             pt2_path,
             factory,
             10,
-            original_weights=original_weights,
             user_indices=user_indices,
+            input_device_ptrs=input_device_ptrs,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -689,14 +660,12 @@ class _LazyDynamicCompiledModel:
         self,
         gm,
         user_inputs,
-        original_weights,
         user_indices,
         dynamic_shapes,
         factory,
     ):
         self._gm = gm
         self._user_inputs = user_inputs
-        self._original_weights = original_weights
         self._user_indices = user_indices
         self._dynamic_shapes = dynamic_shapes
         self._factory = factory
@@ -707,16 +676,13 @@ class _LazyDynamicCompiledModel:
             self._compiled = _eager_pt2_compile(
                 self._gm,
                 self._user_inputs,
-                self._original_weights,
                 self._user_indices,
                 self._dynamic_shapes,
                 self._factory,
             )
-            # Drop references to inputs we no longer need — the Rust side
-            # holds onto weights via device pointers / CPU buffers.
+            # Drop references we no longer need post-compile.
             self._gm = None
             self._user_inputs = None
-            self._original_weights = None
         return self._compiled
 
     def __call__(self, *inputs, **kwargs):
@@ -751,9 +717,10 @@ def pt2_backend(gm, example_inputs, factory=None):
     # same frame" assertions on the next call. The deepcopy is cheap relative
     # to the rest of the export pipeline.
     gm = _copy.deepcopy(gm).eval()
-    gm, user_inputs, original_weights, post_lift_indices = _reinternalize_lifted_params(
-        gm, example_inputs
-    )
+    # Dynamo-lifted weights stay in the args and flow through torch.export
+    # as ordinary inputs, so artifact reuse across same-shape module
+    # instances is correct by construction (LUM-631).
+    user_inputs = list(example_inputs)
 
     # Lift any SymInt placeholders Dynamo emitted alongside the tensor inputs
     # into `aten.sym_size.int` calls so the re-export sees a tensor-only
@@ -766,10 +733,13 @@ def pt2_backend(gm, example_inputs, factory=None):
     )
     dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
 
-    # Compose both filter steps into a single user_indices list relative to
-    # the *original* example_inputs Dynamo will pass at runtime — so
-    # CompiledModel.__call__ can drop both lifted weights and SymInt args.
-    user_indices = [post_lift_indices[i] for i in post_strip_subindices]
+    # Arg positions surviving the SymInt strip; None when nothing was
+    # stripped so CompiledModel.__call__ takes its no-filter fast path.
+    user_indices = (
+        list(post_strip_subindices)
+        if len(post_strip_subindices) != len(example_inputs)
+        else None
+    )
 
     if dynamic_shapes is not None:
         # See `_LazyDynamicCompiledModel` for why dynamic-shape compiles must
@@ -777,9 +747,7 @@ def pt2_backend(gm, example_inputs, factory=None):
         # Dynamo is still relying on, and running it inside the backend frame
         # corrupts the freshly-installed guards.
         return _LazyDynamicCompiledModel(
-            gm, user_inputs, original_weights, user_indices, dynamic_shapes, factory
+            gm, user_inputs, user_indices, dynamic_shapes, factory
         )
 
-    return _eager_pt2_compile(
-        gm, user_inputs, original_weights, user_indices, None, factory
-    )
+    return _eager_pt2_compile(gm, user_inputs, user_indices, None, factory)

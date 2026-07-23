@@ -1,18 +1,25 @@
+// glibc malloc degrades into an allocating livelock inside
+// nvrtcCompileProgram after hours of search heap churn (hundreds of
+// thousands of compiles). jemalloc built with unprefixed symbols
+// interposes malloc for the whole process, including dlopened CUDA
+// libraries like libnvrtc — a Rust-only global allocator would not.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod hf;
 mod model;
 
 use hf::{WeightFormat, prepare_hf_model};
-use luminal::prelude::*;
+use luminal::{dtype::DType, prelude::*};
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
 use rand::{SeedableRng, rngs::StdRng};
-use rustc_hash::FxHashSet;
 use std::{env, io::Write, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-const FP32_REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
+const BF16_REPO_ID: &str = "NousResearch/Meta-Llama-3-8B-Instruct";
 const FP8_REPO_ID: &str = "nvidia/Llama-3.1-8B-Instruct-FP8";
 const MAX_SEQ_LEN: usize = 4096;
 const GEN_TOKENS: usize = 500;
@@ -22,43 +29,54 @@ const SEARCH_KEEP_BEST: usize = 4;
 const SEARCH_MEMORY_MIB: usize = 2048;
 const SEARCH_SEED: u64 = 0;
 const PROMPT: &str = "Explain what a neural network is in a paragraph.";
+const REPETITION_PENALTY: f32 = 1.05;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlamaWeightMode {
-    Fp32,
+    Bf16,
     Fp8,
 }
 
 impl LlamaWeightMode {
     fn repo_id(self) -> &'static str {
         match self {
-            Self::Fp32 => FP32_REPO_ID,
+            Self::Bf16 => BF16_REPO_ID,
             Self::Fp8 => FP8_REPO_ID,
         }
     }
 
     fn weight_format(self) -> WeightFormat {
         match self {
-            Self::Fp32 => WeightFormat::Fp32,
+            Self::Bf16 => WeightFormat::Bf16,
             Self::Fp8 => WeightFormat::Fp8,
         }
+    }
+
+    fn kv_dtype(self) -> luminal::dtype::DType {
+        luminal::dtype::DType::Bf16
+    }
+
+    fn kv_element_bytes(self) -> usize {
+        2
     }
 }
 
 fn print_usage(program: &str) {
-    println!("Usage: {program} [--fp8]");
+    println!("Usage: {program} [--bf16|--fp8]");
     println!();
-    println!("  --fp8     Use {FP8_REPO_ID} with FP8 projection weights");
+    println!("  --bf16    Native bf16 weights, activations and KV cache (default)");
+    println!("  --fp8     FP8 linear weights with bf16 activations and KV cache");
     println!("  -h,--help Show this help");
 }
 
 fn parse_args() -> LlamaWeightMode {
-    let mut mode = LlamaWeightMode::Fp32;
+    let mut mode = LlamaWeightMode::Bf16;
     let mut args = env::args();
     let program = args.next().unwrap_or_else(|| "llama".to_string());
     for arg in args {
         match arg.as_str() {
             "--fp8" => mode = LlamaWeightMode::Fp8,
+            "--bf16" => mode = LlamaWeightMode::Bf16,
             "-h" | "--help" => {
                 print_usage(&program);
                 std::process::exit(0);
@@ -85,8 +103,30 @@ struct StepProfile {
     set_inputs: Duration,
     execute: Duration,
     get_logits: Duration,
-    cache_roundtrip: Duration,
     sample: Duration,
+}
+
+struct PersistentState<'a> {
+    seen_mask: GraphTensor,
+    seen_out: GraphTensor,
+    kv_cache: &'a KVCache,
+    cache_outputs: &'a [(GraphTensor, GraphTensor)],
+}
+
+impl PersistentState<'_> {
+    fn promote_outputs(&self, runtime: &mut CudaRuntime) {
+        // Search may select either aliasing or copy-producing state updates,
+        // so explicitly carry every persistent output into the next step.
+        let seen_buf = runtime.remove_buffer(self.seen_out);
+        runtime.set_buffer(self.seen_mask, seen_buf);
+
+        for (layer_idx, (k_out, v_out)) in self.cache_outputs.iter().enumerate() {
+            let k_buf = runtime.remove_buffer(*k_out);
+            let v_buf = runtime.remove_buffer(*v_out);
+            runtime.set_buffer(self.kv_cache.k_caches[layer_idx], k_buf);
+            runtime.set_buffer(self.kv_cache.v_caches[layer_idx], v_buf);
+        }
+    }
 }
 
 fn sum_profiles<'a>(profiles: impl Iterator<Item = &'a StepProfile>) -> StepProfile {
@@ -95,7 +135,6 @@ fn sum_profiles<'a>(profiles: impl Iterator<Item = &'a StepProfile>) -> StepProf
         acc.set_inputs += p.set_inputs;
         acc.execute += p.execute;
         acc.get_logits += p.get_logits;
-        acc.cache_roundtrip += p.cache_roundtrip;
         acc.sample += p.sample;
         acc
     })
@@ -111,12 +150,11 @@ fn avg_ms(duration: Duration, n: usize) -> f64 {
 
 fn print_profile(label: &str, profile: &StepProfile, n: usize) {
     println!(
-        "  {label}: n={n}, avg={:.2} ms [set={:.2}, exec={:.2}, logits_dtoh={:.2}, cache={:.2}, sample={:.2}]",
+        "  {label}: n={n}, avg={:.2} ms [set={:.2}, exec={:.2}, logits_dtoh={:.2}, sample={:.2}]",
         avg_ms(profile.total, n),
         avg_ms(profile.set_inputs, n),
         avg_ms(profile.execute, n),
         avg_ms(profile.get_logits, n),
-        avg_ms(profile.cache_roundtrip, n),
         avg_ms(profile.sample, n),
     );
 }
@@ -146,30 +184,60 @@ fn print_host_op_summary(runtime: &CudaRuntime, label: &str) {
                 && op.contains("b_scale_input: true")
         })
         .count();
+    let flashinfer = debug_ops
+        .iter()
+        .filter(|op| op.contains("FlashInferAttention"))
+        .count();
     println!(
-        "Host op summary ({label}): total={}, cublasLt={}, fp8_cublasLt={}, scaled_fp8_cublasLt={}",
+        "Host op summary ({label}): total={}, cublasLt={}, fp8_cublasLt={}, scaled_fp8_cublasLt={}, flashinfer={}",
         debug_ops.len(),
         cublaslt,
         fp8_cublaslt,
-        scaled_fp8_cublaslt
+        scaled_fp8_cublaslt,
+        flashinfer
     );
 }
 
-fn sample_greedy(logits_row: &[f32], seen: &FxHashSet<u32>, repetition_penalty: f32) -> u32 {
-    let mut row = logits_row.to_vec();
-    for &tok in seen {
-        let logit = &mut row[tok as usize];
-        if *logit > 0.0 {
-            *logit /= repetition_penalty;
-        } else {
-            *logit *= repetition_penalty;
-        }
+fn print_cuda_graph_summary(runtime: &CudaRuntime, label: &str) {
+    if std::env::var_os("LUMINAL_LLAMA_CUDA_GRAPH_SUMMARY").is_none() {
+        return;
     }
-    row.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .unwrap()
-        .0 as u32
+
+    let summaries = runtime.debug_cuda_graph_summaries();
+    let total_kernels: usize = summaries.iter().map(|s| s.n_kernels).sum();
+    let total_cublaslt: usize = summaries.iter().map(|s| s.n_cublaslt).sum();
+    let total_flashinfer: usize = summaries.iter().map(|s| s.n_flashinfer).sum();
+    let total_steps: usize = summaries.iter().map(|s| s.n_steps).sum();
+    println!(
+        "CUDA graph summary ({label}): graphs={}, kernels={}, cublasLt={}, flashinfer={}, steps={}",
+        summaries.len(),
+        total_kernels,
+        total_cublaslt,
+        total_flashinfer,
+        total_steps
+    );
+    for (idx, summary) in summaries.iter().enumerate() {
+        let dep_sum: usize = summary.step_dependency_counts.iter().sum();
+        let dep_max = summary
+            .step_dependency_counts
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        println!(
+            "  graph[{idx}]: kernels={}, cublasLt={}, flashinfer={}, prepared_cublasLt={}, steps={}, absorbed_host_nodes={}, dep_sum={}, dep_max={}, flashinfer_inputs={:?}, flashinfer_recaptures={:?}",
+            summary.n_kernels,
+            summary.n_cublaslt,
+            summary.n_flashinfer,
+            summary.n_cublaslt_prepared,
+            summary.n_steps,
+            summary.absorbed_host_nodes.len(),
+            dep_sum,
+            dep_max,
+            summary.flashinfer_input_counts,
+            summary.flashinfer_recapture_counts,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -180,16 +248,15 @@ fn run_model_step(
     q_pos_t: GraphTensor,
     scatter_idx_t: GraphTensor,
     gather_idx_t: GraphTensor,
-    attn_mask_t: GraphTensor,
-    logits: GraphTensor,
-    kv_cache: &KVCache,
-    cache_outputs: &[(GraphTensor, GraphTensor)],
+    new_token_t: GraphTensor,
+    token_ids: GraphTensor,
+    persistent_state: &PersistentState<'_>,
     tokens: &[u32],
     q_pos: &[i32],
     scatter_idx: &[i32],
     gather_idx: &[i32],
-    attn_mask: &[f32],
-) -> (Vec<f32>, StepProfile) {
+    prev_sampled: i32,
+) -> (i32, StepProfile) {
     let start = std::time::Instant::now();
     let seq_len = tokens.len();
     let mut profile = StepProfile::default();
@@ -202,40 +269,24 @@ fn run_model_step(
     runtime.set_data(q_pos_t, q_pos.to_vec());
     runtime.set_data(scatter_idx_t, scatter_idx.to_vec());
     runtime.set_data(gather_idx_t, gather_idx.to_vec());
-    runtime.set_data(attn_mask_t, attn_mask.to_vec());
+    runtime.set_data(new_token_t, vec![prev_sampled]);
     profile.set_inputs = set_start.elapsed();
 
     let execute_start = std::time::Instant::now();
     runtime.execute(&cx.dyn_map);
+    persistent_state.promote_outputs(runtime);
     profile.execute = execute_start.elapsed();
 
     let logits_start = std::time::Instant::now();
-    let logits_data = runtime.get_f32(logits);
+    // Sampling runs on-device (penalty + argmax); fetch one id per row and
+    // index from the START of the buffer (it may exceed the current s).
+    let ids = runtime.get_i32(token_ids);
+    let sampled = ids[seq_len - 1];
     profile.get_logits = logits_start.elapsed();
 
-    let cache_start = std::time::Instant::now();
-    for (layer_idx, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-        let k_buf = runtime.remove_buffer(*k_out);
-        let v_buf = runtime.remove_buffer(*v_out);
-        runtime.set_buffer(kv_cache.k_caches[layer_idx], k_buf);
-        runtime.set_buffer(kv_cache.v_caches[layer_idx], v_buf);
-    }
-    profile.cache_roundtrip = cache_start.elapsed();
     profile.total = start.elapsed();
 
-    (logits_data, profile)
-}
-
-fn causal_mask(q_pos: &[usize], context_len: usize) -> Vec<f32> {
-    let mut mask = vec![-1e10f32; q_pos.len() * context_len];
-    for (qi, &pos) in q_pos.iter().enumerate() {
-        for ci in 0..context_len {
-            if ci <= pos {
-                mask[qi * context_len + ci] = 0.0;
-            }
-        }
-    }
-    mask
+    (sampled, profile)
 }
 
 fn main() {
@@ -268,98 +319,112 @@ fn main() {
     let q_pos_t = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
     let scatter_idx_t = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
     let gather_idx_t = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
-    let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'));
-    let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
+    let seen_mask_t = cx.named_tensor("seen_mask", VOCAB_SIZE);
+    let new_token_t = cx.named_tensor("new_token", 1).as_dtype(DType::Int);
+    let kv_cache = KVCache::new_dtype(&mut cx, MAX_SEQ_LEN, weight_mode.kv_dtype());
     let llama = match weight_mode {
-        LlamaWeightMode::Fp32 => Llama::init(&mut cx),
+        LlamaWeightMode::Bf16 => Llama::init_bf16(&mut cx),
         LlamaWeightMode::Fp8 => Llama::init_fp8(&mut cx),
     };
-    let (logits, cache_outputs) = llama.forward(
+    let (token_ids, seen_out, cache_outputs) = llama.forward_with_sampling(
         input,
         q_pos_t,
         scatter_idx_t,
         gather_idx_t,
-        attn_mask_t,
         &kv_cache,
+        seen_mask_t,
+        new_token_t,
+        REPETITION_PENALTY,
     );
-    let logits = logits.output();
+    let token_ids = token_ids.output();
+    seen_out.output();
     for (k_out, v_out) in &cache_outputs {
         k_out.output();
         v_out.output();
     }
+    let persistent_state = PersistentState {
+        seen_mask: seen_mask_t,
+        seen_out,
+        kv_cache: &kv_cache,
+        cache_outputs: &cache_outputs,
+    };
 
     cx.set_dim('s', 1);
     cx.set_dim('c', 1);
     let max_prefill = (prompt_len + 16).next_power_of_two().min(MAX_SEQ_LEN);
     let search_s = 16.min(max_prefill).max(2);
-    let build_options = CompileOptions::default()
-        .max_memory_mib(SEARCH_MEMORY_MIB)
+    let compile_options = CompileOptions::default()
         .dim_buckets(
             's',
             &[
                 DimBucket::new(1, 1),
                 DimBucket::new(2, max_prefill).representative(search_s),
             ],
-        );
-
-    println!("Building E-Graph...");
-    let egraph_start = std::time::Instant::now();
-    cx.build_search_space::<CudaRuntime>(build_options);
-    println!(
-        "  E-Graph build: {:.2} s",
-        egraph_start.elapsed().as_secs_f64()
-    );
+        )
+        .dim_buckets(
+            'c',
+            &[DimBucket::new(1, MAX_SEQ_LEN).representative(search_s)],
+        )
+        .search_graph_limit(SEARCH_GRAPHS)
+        .trials(SEARCH_TRIALS)
+        .keep_best(SEARCH_KEEP_BEST);
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();
-    let mut runtime = CudaRuntime::initialize(stream);
+    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_mib(SEARCH_MEMORY_MIB);
     for weights_path in &prepared.weight_files {
         println!("  Loading {}", weights_path.display());
         runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
     }
     println!("  Weight load: {:.2} s", load_start.elapsed().as_secs_f64());
 
-    let cache_bytes = MAX_SEQ_LEN * KV_DIM * std::mem::size_of::<f32>();
+    let cache_bytes = MAX_SEQ_LEN * KV_DIM * weight_mode.kv_element_bytes();
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
     }
+    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
 
     println!("Compiling...");
     let compile_start = std::time::Instant::now();
     cx.set_dim('s', search_s);
     cx.set_dim('c', search_s);
     runtime.set_data(input, vec![1; search_s]);
+    runtime.set_data(new_token_t, vec![-1i32]);
     runtime.set_data(q_pos_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(gather_idx_t, (0..search_s as i32).collect::<Vec<_>>());
-    runtime.set_data(attn_mask_t, vec![0.0f32; search_s * search_s]);
-    println!("  Search seed: {SEARCH_SEED}");
+    let search_seed = std::env::var("LUMINAL_LLAMA_SEARCH_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(SEARCH_SEED);
+    println!("  Search seed: {search_seed}");
     println!("  Search trials: {SEARCH_TRIALS}");
     println!("  Search keep-best: {SEARCH_KEEP_BEST}");
-    let mut rng = StdRng::seed_from_u64(SEARCH_SEED);
-    let search_options = CompileOptions::default()
-        .search_graph_limit(SEARCH_GRAPHS)
-        .trials(SEARCH_TRIALS)
-        .keep_best(SEARCH_KEEP_BEST);
-    runtime = cx.search_with_rng(runtime, search_options, &mut rng);
+    let mut rng = StdRng::seed_from_u64(search_seed);
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
     println!(
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()
     );
     print_host_op_summary(&runtime, "post-compile active bucket");
+    print_cuda_graph_summary(&runtime, "post-compile active bucket");
+
+    runtime.set_data_with_capacity(
+        gather_idx_t,
+        Vec::<i32>::new(),
+        MAX_SEQ_LEN * std::mem::size_of::<i32>(),
+    );
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
         runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
     }
+    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
 
     let mut context_len = 0usize;
     let mut fwd_durations = vec![];
     let mut step_profiles = vec![];
-    let mut seen_tokens = FxHashSet::default();
-    let repetition_penalty: f32 = 1.05;
-
     const EOS_TOKEN: u32 = 128009;
     const STOP_TOKEN: u32 = 128001;
 
@@ -375,36 +440,30 @@ fn main() {
         let q_pos: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
         let scatter_idx = q_pos.clone();
         let gather_idx = q_pos.clone();
-        let mask = causal_mask(&positions, prompt_len);
-        let (logits_data, mut profile) = run_model_step(
+        let (sampled, mut profile) = run_model_step(
             &mut cx,
             &mut runtime,
             input,
             q_pos_t,
             scatter_idx_t,
             gather_idx_t,
-            attn_mask_t,
-            logits,
-            &kv_cache,
-            &cache_outputs,
+            new_token_t,
+            token_ids,
+            &persistent_state,
             &prompt_tokens,
             &q_pos,
             &scatter_idx,
             &gather_idx,
-            &mask,
+            -1, // nothing sampled yet — the seen-mask scatter skips -1
         );
         print_host_op_summary(&runtime, "after prefill");
+        print_cuda_graph_summary(&runtime, "after prefill");
         context_len = prompt_len;
 
         let sample_start = std::time::Instant::now();
-        let token = sample_greedy(
-            &logits_data[logits_data.len() - VOCAB_SIZE..],
-            &seen_tokens,
-            repetition_penalty,
-        );
+        let token = sampled as u32;
         profile.sample = sample_start.elapsed();
         profile.total += profile.sample;
-        seen_tokens.insert(token);
         next_token = Some(token);
         generated = 1;
 
@@ -424,37 +483,41 @@ fn main() {
             _ => break,
         };
 
-        let (logits_data, mut profile) = run_model_step(
+        // Optional nsys capture window over steady-state decode:
+        // `nsys profile -c cudaProfilerApi` + LUMINAL_NSYS_DECODE=1.
+        if std::env::var_os("LUMINAL_NSYS_DECODE").is_some() {
+            if generated == 5 {
+                luminal_cuda_lite::cudarc::driver::safe::profiler_start().unwrap();
+            } else if generated == 55 {
+                luminal_cuda_lite::cudarc::driver::safe::profiler_stop().unwrap();
+            }
+        }
+        let (sampled, mut profile) = run_model_step(
             &mut cx,
             &mut runtime,
             input,
             q_pos_t,
             scatter_idx_t,
             gather_idx_t,
-            attn_mask_t,
-            logits,
-            &kv_cache,
-            &cache_outputs,
+            new_token_t,
+            token_ids,
+            &persistent_state,
             &[current_token],
             &[context_len as i32],
             &[context_len as i32],
             &(0..=context_len as i32).collect::<Vec<_>>(),
-            &causal_mask(&[context_len], context_len + 1),
+            current_token as i32,
         );
         if generated == 1 {
             print_host_op_summary(&runtime, "after first decode");
+            print_cuda_graph_summary(&runtime, "after first decode");
         }
         context_len += 1;
 
         let sample_start = std::time::Instant::now();
-        let token = sample_greedy(
-            &logits_data[logits_data.len() - VOCAB_SIZE..],
-            &seen_tokens,
-            repetition_penalty,
-        );
+        let token = sampled as u32;
         profile.sample = sample_start.elapsed();
         profile.total += profile.sample;
-        seen_tokens.insert(token);
         next_token = Some(token);
         generated += 1;
 
