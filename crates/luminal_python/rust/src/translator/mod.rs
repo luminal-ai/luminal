@@ -409,87 +409,66 @@ impl<'a> Translator<'a> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::{
+        fs,
+        process::Command,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
 
     fn input_backed_index_put_program() -> ParsedPT2 {
-        let program = serde_json::from_value(json!({
-            "graph_module": {
-                "graph": {
-                    "inputs": [
-                        {"as_tensor": {"name": "cache"}},
-                        {"as_tensor": {"name": "positions"}},
-                        {"as_tensor": {"name": "values"}}
-                    ],
-                    "outputs": [{"as_tensor": {"name": "updated_cache"}}],
-                    "nodes": [{
-                        "target": "torch.ops.aten.index_put.default",
-                        "inputs": [
-                            {
-                                "name": "self",
-                                "arg": {"as_tensor": {"name": "cache"}},
-                                "kind": 1
-                            },
-                            {
-                                "name": "indices",
-                                "arg": {
-                                    "as_optional_tensors": [
-                                        {"as_none": null},
-                                        {"as_tensor": {"name": "positions"}}
-                                    ]
-                                },
-                                "kind": 1
-                            },
-                            {
-                                "name": "values",
-                                "arg": {"as_tensor": {"name": "values"}},
-                                "kind": 1
-                            },
-                            {
-                                "name": "accumulate",
-                                "arg": {"as_bool": false},
-                                "kind": 1
-                            }
-                        ],
-                        "outputs": [{"as_tensor": {"name": "updated_cache"}}]
-                    }],
-                    "tensor_values": {
-                        "cache": {
-                            "dtype": 7,
-                            "sizes": [{"as_int": 2}, {"as_int": 4}]
-                        },
-                        "positions": {
-                            "dtype": 4,
-                            "sizes": [{"as_int": 1}]
-                        },
-                        "values": {
-                            "dtype": 7,
-                            "sizes": [{"as_int": 2}, {"as_int": 1}]
-                        },
-                        "updated_cache": {
-                            "dtype": 7,
-                            "sizes": [{"as_int": 2}, {"as_int": 4}]
-                        }
-                    }
-                },
-                "signature": {
-                    "input_specs": [
-                        {"user_input": {"arg": {"as_tensor": {"name": "cache"}}}},
-                        {"user_input": {"arg": {"as_tensor": {"name": "positions"}}}},
-                        {"user_input": {"arg": {"as_tensor": {"name": "values"}}}}
-                    ]
-                }
-            }
-        }))
-        .expect("synthetic PT2 program should deserialize");
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after the Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "luminal_input_backed_index_put_{}_{}.pt2",
+            std::process::id(),
+            nonce
+        ));
+        let script = r#"
+import sys
+import torch
 
-        ParsedPT2 {
-            program,
-            constants_config: None,
-            archive_prefix: String::new(),
-            pt2_path: String::new(),
-        }
+
+class InputBackedIndexPut(torch.nn.Module):
+    def forward(self, cache, positions, values):
+        cache[:, positions] = values
+        return cache
+
+
+cache = torch.zeros(2, 4)
+positions = torch.tensor([1], dtype=torch.int64)
+values = torch.ones(2, 1)
+exported = torch.export.export(
+    InputBackedIndexPut(),
+    (cache, positions, values),
+    strict=False,
+)
+torch.export.save(exported, sys.argv[1])
+"#;
+
+        let python = std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
+        let output = Command::new(python)
+            .arg("-c")
+            .arg(script)
+            .arg(&path)
+            .output()
+            .expect("Python should be available to export the PT2 fixture");
+        assert!(
+            output.status.success(),
+            "PyTorch export failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let parsed = crate::pt2_parser::parse_pt2(
+            path.to_str()
+                .expect("temporary PT2 path should contain valid UTF-8"),
+        )
+        .expect("PyTorch-exported PT2 program should parse");
+        fs::remove_file(path).expect("temporary PT2 fixture should be removable");
+        parsed
     }
 
     #[test]
@@ -501,7 +480,7 @@ mod tests {
         let (output_name, output_id) = &translated.output_ids[0];
 
         assert_eq!(input_name, "cache");
-        assert_eq!(output_name, "updated_cache");
+        assert!(output_name.contains("index_put"));
         assert_eq!(
             output_id, input_id,
             "an index_put write-back into a user input must expose that input as its output"
