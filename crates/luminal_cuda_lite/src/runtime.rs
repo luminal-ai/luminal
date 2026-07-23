@@ -286,11 +286,6 @@ pub struct CudaRuntime {
     hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
     cuda_stream: Arc<CudaStream>,
     changed_hlir: FxHashSet<NodeIndex>,
-    /// (output, input) pairs the application promotes between steps via
-    /// `remove_buffer` + `set_buffer` (persistent state like KV caches).
-    /// Declared with `mark_persistent` so profiling trials execute the same
-    /// promote deployment pays every step.
-    persistent_pairs: Vec<(NodeIndex, NodeIndex)>,
     pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
     pub last_kernel_stats: Vec<KernelStats>,
     pub last_total_time_us: f64,
@@ -317,6 +312,10 @@ pub struct CudaRuntime {
     /// Pending output pointer registrations: HLIR output id -> (device_ptr, n_bytes)
     /// Set by python before execute(), consumed at start of execute()
     output_ptr_registrations: FxHashMap<NodeIndex, (u64, usize)>,
+    /// (src_ptr, dst_ptr, bytes) device copies enqueued at the end of each
+    /// execute: in-place-elected outputs whose registered buffer differs
+    /// from the aliased input's (user-managed double buffering).
+    pending_output_copies: Vec<(u64, u64, usize)>,
 
     /// Non-owning CudaSlice views of external output pointers, keyed by LLIR data node
     /// ManuallyDrop prevents cuMemFree -- Pytorch owns the memory
@@ -943,25 +942,54 @@ impl CudaRuntime {
             }
         }
 
+        self.pending_output_copies.clear();
         if self.output_ptr_registrations.is_empty() {
             return;
         }
 
-        // Collect registrations to avoid borrow conflict (drain borrows self mutably,
-        // but find_producer_node/follow_aliases need &self).
-
-        let registrations: Vec<_> = self.output_ptr_registrations.drain().collect();
+        // Registrations are durable: outputs are re-resolved against the
+        // active bucket every execute (producers and alias structure differ
+        // per bucket and per loaded candidate).
+        let registrations: Vec<_> = self
+            .output_ptr_registrations
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect();
 
         for (hlir_id, (device_ptr, n_bytes)) in registrations {
-            // Resolve HLIR output id -> LLIR producer -> follow aliases -> data node
-            let producer = self.find_producer_node(hlir_id);
+            // Resolve HLIR output id -> LLIR producer -> follow aliases -> data node.
+            // Registrations are durable and may reference outputs absent from
+            // the active bucket (stale profiling-scratch ids, other-bucket
+            // outputs) — skip those.
+            let Some(&producer) = self.active().output_producers.get(&hlir_id) else {
+                continue;
+            };
             let data_node = self.follow_aliases(producer);
 
-            // If data_node is an HLIR input (aliased output), skip — can't substitute
-            if self.compiled_buckets[self.active_bucket]
+            // In-place elected output: the data lands in the aliased HLIR
+            // input's buffer. If the user registered that same buffer, the
+            // write is already in place; otherwise honor the registration
+            // with an epilogue copy (manual double-buffering support).
+            if let Some(&hlir_input) = self.compiled_buckets[self.active_bucket]
                 .llir_to_hlir
-                .contains_key(&data_node)
+                .get(&data_node)
             {
+                let input_buf = match self.hlir_buffers.get(&hlir_input) {
+                    Some(CudaInput::Buffer { buf, len }) => {
+                        Some((buf.device_ptr(&self.cuda_stream).0, *len))
+                    }
+                    Some(CudaInput::Ptr(p)) => Some((*p, n_bytes)),
+                    None => None,
+                };
+                if let Some((input_ptr, input_len)) = input_buf
+                    && input_ptr != device_ptr
+                {
+                    self.pending_output_copies.push((
+                        input_ptr,
+                        device_ptr,
+                        n_bytes.min(input_len),
+                    ));
+                }
                 continue;
             }
 
@@ -1004,62 +1032,6 @@ impl CudaRuntime {
     /// remove and return it. For copy-then-modify ops (like Scatter), the output data
     /// lives in an intermediate buffer while the HLIR buffer has stale data — swap them
     /// so the caller gets the updated data and the intermediate slot stays allocated.
-    /// Declare that the application promotes `output` into `input` between
-    /// steps (the `remove_buffer` + `set_buffer` persistent-state idiom, e.g.
-    /// KV caches). Profiling trials then execute the same promote, so a
-    /// candidate whose output aliases its input in place profiles the pointer
-    /// no-op deployment pays, while a copy-then-modify candidate profiles its
-    /// full per-step copy-out and island repatch. Without this, the promote
-    /// cost is invisible to the search and copy families profile 5-10x
-    /// faster than they run.
-    pub fn mark_persistent(&mut self, output: impl ToId, input: impl ToId) {
-        self.persistent_pairs.push((output.to_id(), input.to_id()));
-    }
-
-    /// Execute every declared persistent promote whose output exists in the
-    /// currently loaded LLIR. Collapsed profile graphs keep only the
-    /// representative iteration's outputs, so absent pairs are skipped rather
-    /// than treated as candidate failures.
-    fn promote_persistent_pairs_for_profiling(&mut self) {
-        if self.compiled_buckets.is_empty() || self.persistent_pairs.is_empty() {
-            return;
-        }
-        for idx in 0..self.persistent_pairs.len() {
-            let (out, inp) = self.persistent_pairs[idx];
-            let bucket = self.active();
-            let Some(&producer) = bucket.output_producers.get(&out) else {
-                continue;
-            };
-            let alias_node = self.follow_aliases(producer);
-            let lineage_node = self.follow_data_lineage(producer);
-            let bucket = self.active();
-            // Mirror `remove_buffer`'s branch preconditions, and additionally
-            // require that the output's data lineage terminates at the
-            // DECLARED input. Collapsed profile graphs can map every rolled
-            // layer's output onto the one representative producer; promoting
-            // through a foreign lineage would steal that layer's input buffer
-            // (pair L takes the slot pair L-1 just refilled) and starve the
-            // next materialization. Skipped pairs under-tax the collapsed
-            // stage only — finalist reprofiling runs unrolled, where every
-            // pair resolves and the full per-step promote cost is priced.
-            let ready = if alias_node == lineage_node {
-                match bucket.llir_to_hlir.get(&lineage_node) {
-                    Some(&hlir) => hlir == inp && self.hlir_buffers.contains_key(&hlir),
-                    None => Self::bucket_buffer(bucket, &self.cuda_stream, &lineage_node).is_some(),
-                }
-            } else {
-                bucket.llir_to_hlir.get(&lineage_node) == Some(&inp)
-                    && self.hlir_buffers.contains_key(&inp)
-                    && Self::bucket_buffer(bucket, &self.cuda_stream, &alias_node).is_some()
-            };
-            if !ready {
-                continue;
-            }
-            let buf = self.remove_buffer(out);
-            self.set_buffer(inp, buf);
-        }
-    }
-
     pub fn remove_buffer(&mut self, id: impl ToId) -> CudaSlice<u8> {
         let producer = self.find_producer_node(id);
         let alias_node = self.follow_aliases(producer);
@@ -3085,6 +3057,12 @@ impl CudaRuntime {
         }
     }
 
+    /// Every graph output gets a dedicated, statically-sized buffer before
+    /// profiling: candidate execution then includes its real output writes
+    /// (in-place families write through the alias, materializing families
+    /// write into the buffer via substitution), so the step cost the search
+    /// measures is the step cost deployment pays. User registrations take
+    /// precedence; scratch fills the rest and is reused across candidates.
     fn profile_loaded_llir(
         &mut self,
         llir_graph: &LLIRGraph,
@@ -3098,11 +3076,6 @@ impl CudaRuntime {
         // allocations, cache warming) so the timed trials measure steady-state
         // execution instead of folding setup noise into the candidate ranking.
         self.execute(dyn_map);
-        // Deployment promotes persistent state after every step; the warmup
-        // promote is untimed but its pointer effects land in trial 1's
-        // execute, putting every timed trial in the same steady state a real
-        // decode step sees.
-        self.promote_persistent_pairs_for_profiling();
         // A warmup that already blew the whole profiling budget has proven
         // the candidate slow; return it as the measurement instead of paying
         // for a timed trial of the same magnitude. Bad candidates are the
@@ -3124,10 +3097,6 @@ impl CudaRuntime {
             self.assume_dyn_dims_stale();
             let start = std::time::Instant::now();
             self.execute(dyn_map);
-            // Part of the per-step cost: a no-op for in-place aliased
-            // outputs, a full copy-out (plus next-execute repatch) for
-            // copy-then-modify candidates.
-            self.promote_persistent_pairs_for_profiling();
             durations.push(start.elapsed());
             if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
                 break;
@@ -3472,7 +3441,6 @@ impl Runtime for CudaRuntime {
             cuda_stream: stream,
             changed_hlir: FxHashSet::default(),
             cuda_graph_timings: vec![],
-            persistent_pairs: vec![],
             last_kernel_stats: vec![],
             last_total_time_us: 0.0,
             kernel_cache: FxHashMap::default(),
@@ -3485,6 +3453,7 @@ impl Runtime for CudaRuntime {
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
             output_ptr_registrations: FxHashMap::default(),
+            pending_output_copies: Vec::new(),
             external_output_buffers: FxHashMap::default(),
             external_buffers: FxHashMap::default(),
         }
@@ -3774,6 +3743,23 @@ impl Runtime for CudaRuntime {
                 }
             }
         }
+
+        // User-registered output buffers that differ from an in-place
+        // output's aliased input: honor them with device copies (part of
+        // the step; no allocation).
+        if !self.pending_output_copies.is_empty() {
+            for &(src, dst, bytes) in &self.pending_output_copies {
+                let src_slice = unsafe { self.cuda_stream.upgrade_device_ptr::<u8>(src, bytes) };
+                let mut dst_slice =
+                    unsafe { self.cuda_stream.upgrade_device_ptr::<u8>(dst, bytes) };
+                self.cuda_stream
+                    .memcpy_dtod(&src_slice, &mut dst_slice)
+                    .expect("output epilogue copy failed");
+                std::mem::forget(src_slice);
+                std::mem::forget(dst_slice);
+            }
+        }
+
         // Single sync at end - CUDA stream ordering guarantees sequential execution
         let timer = std::time::Instant::now();
         self.cuda_stream.synchronize().unwrap();

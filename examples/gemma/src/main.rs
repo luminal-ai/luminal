@@ -143,15 +143,6 @@ fn main() {
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
-    // Declare the per-step promote pairs so profiling executes the same
-    // remove_buffer/set_buffer promote the decode loop pays every token —
-    // in-place cache updates profile their pointer no-op, copy-then-modify
-    // candidates profile their full per-step copy.
-    runtime.mark_persistent(seen_out, seen_mask_t);
-    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-        runtime.mark_persistent(*k_out, kv_cache.k_caches[layer]);
-        runtime.mark_persistent(*v_out, kv_cache.v_caches[layer]);
-    }
     println!("  weight load: {:.1}s", phase.elapsed().as_secs_f64());
 
     let cache_bytes = cache_bytes(max_seq_len);

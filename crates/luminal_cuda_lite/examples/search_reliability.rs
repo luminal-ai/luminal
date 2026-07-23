@@ -12,7 +12,7 @@
 
 use half::bf16;
 use luminal::{dtype::DType, prelude::*, shape::Expression};
-use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
+use luminal_cuda_lite::{cudarc, cudarc::driver::CudaContext, runtime::CudaRuntime};
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 const HEAD_DIM: usize = 64;
@@ -218,8 +218,8 @@ fn set_all_inputs(runtime: &mut CudaRuntime, model: &Model, seed: u64) {
                 .map(bf16::from_f32)
                 .collect::<Vec<_>>(),
         );
-        runtime.set_data(l.k_cache, rand_vec(&mut rng, MAX_SEQ * KV_DIM, 0.1));
-        runtime.set_data(l.v_cache, rand_vec(&mut rng, MAX_SEQ * KV_DIM, 0.1));
+        // Cache inputs are user-provided device buffers (set via
+        // set_device_ptr in main), not host data.
     }
 }
 
@@ -260,9 +260,24 @@ fn main() {
         model.cx.set_dim('s', 1);
         model.cx.set_dim('c', CTX);
         set_all_inputs(&mut runtime, &model, seed);
+        // User-provided cache buffers, aliased input<->output: in-place
+        // candidates write through the alias for free, materializing
+        // candidates pay a graph-visible self-copy — priced by profiling.
+        let cache_bytes = MAX_SEQ * KV_DIM * 4;
+        let mut cache_bufs = Vec::new();
         for (layer, (k_out, v_out)) in model.cache_outs.iter().enumerate() {
-            runtime.mark_persistent(*k_out, model.layers[layer].k_cache);
-            runtime.mark_persistent(*v_out, model.layers[layer].v_cache);
+            for (t_in, t_out) in [
+                (model.layers[layer].k_cache, *k_out),
+                (model.layers[layer].v_cache, *v_out),
+            ] {
+                let buf = unsafe { stream.alloc::<u8>(cache_bytes).unwrap() };
+                let ptr = cudarc::driver::DevicePtr::device_ptr(&buf, &stream).0;
+                unsafe {
+                    runtime.set_device_ptr(t_in, ptr, cache_bytes);
+                    runtime.set_output_device_ptr(t_out, ptr, cache_bytes);
+                }
+                cache_bufs.push(buf);
+            }
         }
 
         let mut rng = SmallRng::seed_from_u64(seed);
@@ -274,15 +289,10 @@ fn main() {
         // before executing, as the real examples do.
         set_all_inputs(&mut runtime, &model, seed);
 
-        // Steady-state decode-step proxy including the real promote.
+        // Steady-state decode step: caches are user-aliased, so a step is
+        // exactly one execute.
         let mut step_once = |runtime: &mut CudaRuntime| {
             runtime.execute(&model.cx.dyn_map);
-            for (layer, (k_out, v_out)) in model.cache_outs.iter().enumerate() {
-                let k_buf = runtime.remove_buffer(*k_out);
-                runtime.set_buffer(model.layers[layer].k_cache, k_buf);
-                let v_buf = runtime.remove_buffer(*v_out);
-                runtime.set_buffer(model.layers[layer].v_cache, v_buf);
-            }
         };
         for _ in 0..3 {
             step_once(&mut runtime);
