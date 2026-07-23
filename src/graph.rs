@@ -1012,16 +1012,38 @@ impl Graph {
             cache.insert(node, op.1);
             return op.1;
         }
-        for pred in self
-            .graph
-            .neighbors_directed(node, Direction::Incoming)
-            .collect::<Vec<_>>()
-        {
-            let dt = self.infer_node_dtype_cached(pred, cache);
-            if dt != DType::F32 || self.input_meta.contains_key(&pred) {
-                cache.insert(node, dt);
-                return dt;
-            }
+        // Mirror the egglog `dtype_prop` rules exactly. Loop markers created
+        // from this inference are later unioned with their sources by the
+        // "LoopInputStatic inline" rule, and `dtype` merges with `:merge new`
+        // — a marker stamped with the wrong dtype silently corrupts the
+        // source class's dtype fact (an Int iota class flipping to F32 was
+        // the gemma4_moe fusion-region reject lottery).
+        if self.try_get_op::<crate::hlir::Iota>(node).is_some() {
+            cache.insert(node, DType::Int);
+            return DType::Int;
+        }
+        if self.try_get_op::<crate::hlir::Constant>(node).is_some() {
+            cache.insert(node, DType::F32);
+            return DType::F32;
+        }
+        if self.try_get_op::<crate::hlir::LessThan>(node).is_some() {
+            cache.insert(node, DType::Bool);
+            return DType::Bool;
+        }
+        // Gather inherits dtype from its second input (data), not first
+        // (indexes); everything else propagates from its first input.
+        let sources = self.get_sources(node);
+        let propagation_source = if self.try_get_op::<crate::hlir::Gather>(node).is_some() {
+            sources.get(1)
+        } else {
+            sources.first()
+        };
+        if let Some(&src) = propagation_source {
+            // Break potential cycles (marker chains) before recursing.
+            cache.insert(node, DType::F32);
+            let dt = self.infer_node_dtype_cached(src, cache);
+            cache.insert(node, dt);
+            return dt;
         }
         cache.insert(node, DType::F32);
         DType::F32

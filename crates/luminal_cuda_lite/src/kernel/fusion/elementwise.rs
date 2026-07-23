@@ -74,12 +74,19 @@ impl EgglogOp for CudaUnaryElementwise {
             ("Log2", "Log2"),
             ("Recip", "Recip"),
         ] {
+            // Each FusionStart is stamped with ITS input's dtype — it
+            // describes how the external producer's buffer is loaded, and the
+            // codegen reads every local at its producer's dtype. Stamping the
+            // consumer's dtype instead is illegal by construction whenever
+            // input and output dtypes differ (the post-extraction fusion
+            // region check rejects the mismatch nondeterministically).
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?u (Op ({hlir} ?shape ?s ?out_s) (ICons ?x (INil))))
                     (= ?dt (dtype ?u))
+                    (= ?dt_x (dtype ?x))
                  ) (
-                    (let ?fs (Op (FusionStart ?shape ?s ?dt) (ICons ?x (INil))))
+                    (let ?fs (Op (FusionStart ?shape ?s ?dt_x) (ICons ?x (INil))))
                     (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?s ?out_s ?dt)
                                    (ICons ?fs (INil))))
                     (let ?fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
@@ -196,12 +203,16 @@ impl EgglogOp for CudaBinaryElementwise {
     fn rewrites(&self) -> Vec<Rule> {
         vec![
             Rule::raw(
+                // FusionStart dtypes follow each input's producer; see the
+                // unary rules for why anything else is construction-illegal.
                 "(rule (
                     (= ?bin (Op (Add ?shape ?a_s ?b_s ?out_s) (ICons ?a (ICons ?b (INil)))))
                     (= ?dt (dtype ?bin))
+                    (= ?dt_a (dtype ?a))
+                    (= ?dt_b (dtype ?b))
                  ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
+                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt_a) (ICons ?a (INil))))
+                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt_b) (ICons ?b (INil))))
                     (let ?elem (Op (CudaBinaryElementwise \"Add\" ?shape ?a_s ?b_s ?out_s ?dt)
                                    (ICons ?fs_a (ICons ?fs_b (INil)))))
                     (let ?fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))
@@ -210,12 +221,17 @@ impl EgglogOp for CudaBinaryElementwise {
                  ) :ruleset kernel_lower :name \"cuda-elem-singleton-Add\")",
             ),
             Rule::raw(
+                // The op and FusionEnd carry the RESULT dtype (?bin, not ?a —
+                // Mul(bf16, f32) stamped bf16 would round the product); the
+                // FusionStarts carry their producers' dtypes as above.
                 "(rule (
                     (= ?bin (Op (Mul ?shape ?a_s ?b_s ?out_s) (ICons ?a (ICons ?b (INil)))))
-                    (= ?dt (dtype ?a))
+                    (= ?dt (dtype ?bin))
+                    (= ?dt_a (dtype ?a))
+                    (= ?dt_b (dtype ?b))
                  ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt) (ICons ?a (INil))))
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt) (ICons ?b (INil))))
+                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt_a) (ICons ?a (INil))))
+                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt_b) (ICons ?b (INil))))
                     (let ?elem (Op (CudaBinaryElementwise \"Mul\" ?shape ?a_s ?b_s ?out_s ?dt)
                                    (ICons ?fs_a (ICons ?fs_b (INil)))))
                     (let ?fe (Op (FusionEnd ?shape ?out_s ?dt) (ICons ?elem (INil))))

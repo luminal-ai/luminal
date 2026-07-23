@@ -153,6 +153,25 @@ PR #373 deleted 11 cleanup rules from `markers.rs` and added ~1,200 lines of
   extractable.
 
 ### 2.6 Metadata coherence (core + to_host) — T2
+- **FIXED (2026-07-23): `dtype` fact corruption via loop-marker unions.** The
+  rolling prepass inferred marker dtypes with a heuristic that had no case
+  for `Iota`/`Constant`/`LessThan` (F32 fallback), so Int index expressions
+  got F32-typed `LoopInput` markers; the "LoopInputStatic inline" rule then
+  unioned the marker class into the Int source class, and `dtype`'s
+  `:merge new` silently let the last write win. Singleton fusion lowering
+  read the flip-flopping fact when stamping `FusionStart`, producing the
+  nondeterministic `fusion-region-reject` storms (26/292/659 across
+  identical gemma4_moe runs) that randomly culled decode families (TPOT 12
+  vs 107 ms). Fixed by (a) stamping each `FusionStart` with its own input's
+  dtype in the singleton rules and (b) making `infer_node_dtype_cached`
+  mirror `dtype_prop` exactly (fixed dtypes, first-input propagation,
+  Gather data-input case). Acceptance: two consecutive runs with zero
+  fusion-region rejects.
+- **`dtype` with `:merge new`** (egglog_utils/mod.rs:155): the above is one
+  instance of a systemic hole — any future cross-dtype union silently
+  corrupts the fact instead of failing saturation. **Remedy:** conflict-
+  detecting merge (assert-equal) so illegal unions crash loudly in tests;
+  this is the construction-enforcement backstop for the whole dtype system.
 - **`len`/`nth_from_end`/`n_elements` with `merge: new`** (base.rs:1234-1304):
   last-write-wins silently swallows contradictory facts when length-changing
   backend rewrites leave an ELIST class with different-length spellings — the

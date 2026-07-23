@@ -624,11 +624,19 @@ pub(crate) fn validate_fusion_regions(
             if let Some(producer_dtype) = known_buffer_dtype(llir, inputs[0])
                 && producer_dtype != start.dtype
             {
+                let consumer = llir
+                    .neighbors_directed(node, Direction::Outgoing)
+                    .next()
+                    .map(|n| format!("{:?}", llir[n]))
+                    .unwrap_or_default();
                 return Err(invalid(
                     node,
                     format!(
-                        "FusionStart dtype {} disagrees with external producer dtype {}",
-                        start.dtype, producer_dtype
+                        "FusionStart dtype {} disagrees with external producer dtype {} \
+                         (producer: {:.120}; consumer: {consumer:.120})",
+                        start.dtype,
+                        producer_dtype,
+                        format!("{:?}", llir[inputs[0]])
                     ),
                 ));
             }
