@@ -1,3 +1,4 @@
+import re
 from typing import Callable
 
 import pytest
@@ -2309,6 +2310,37 @@ def test_scatter_nd(device: torch.device):
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+
+
+def test_input_backed_index_put_output_aliases_destination_input(tmp_path):
+    from luminal import process_pt2
+    from luminal.luminal import _reference_factory_capsule
+
+    class InputBackedIndexPut(torch.nn.Module):
+        def forward(self, cache, positions, values):
+            cache[:, positions] = values
+            return cache
+
+    exported = torch.export.export(
+        InputBackedIndexPut(),
+        (
+            torch.zeros(2, 4),
+            torch.tensor([1], dtype=torch.int64),
+            torch.ones(2, 1),
+        ),
+        strict=False,
+    )
+    pt2_path = tmp_path / "input_backed_index_put.pt2"
+    torch.export.save(exported, pt2_path)
+    compiled = process_pt2(str(pt2_path), "", 0, _reference_factory_capsule())
+
+    dot = compiled.to_dot()
+    cache_node = re.search(r'Input \{ node: (\d+), label: \\"cache\\"', dot)
+    output_nodes = re.findall(r"Output \{ node: (\d+), persist_only: false \}", dot)
+
+    assert cache_node is not None
+    assert output_nodes
+    assert set(output_nodes) == {cache_node.group(1)}
 
 
 # ========== Bool-mask index_put correctness tests ==========
