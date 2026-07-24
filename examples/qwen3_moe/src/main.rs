@@ -118,17 +118,9 @@ fn main() {
         seen_out,
         VOCAB_SIZE * std::mem::size_of::<f32>(),
     )];
-    for i in 0..LAYERS {
-        persistent_buffers.push(runtime.alias_state(
-            kv_cache.k_caches[i],
-            cache_outputs[i].0,
-            cache_bytes,
-        ));
-        persistent_buffers.push(runtime.alias_state(
-            kv_cache.v_caches[i],
-            cache_outputs[i].1,
-            cache_bytes,
-        ));
+    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
+        persistent_buffers.push(runtime.alias_state(kv_cache.k_caches[layer], *k_out, cache_bytes));
+        persistent_buffers.push(runtime.alias_state(kv_cache.v_caches[layer], *v_out, cache_bytes));
     }
 
     println!("Compiling...");
