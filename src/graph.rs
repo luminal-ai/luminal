@@ -224,13 +224,6 @@ pub struct CompileOptions {
     /// needs multi-gene jumps) and every other stagnant generation samples
     /// fresh random genomes. 0 disables (default: 0).
     pub restart_stagnation: usize,
-    /// Number of surviving finalists to re-profile in fully-unrolled form
-    /// before final selection (default: 3). Search ranks candidates on a
-    /// collapsed single-iteration body, which underweights costs that scale
-    /// with trip count — a host op inside a rolled layer profiles as one
-    /// call but unrolls to one call per layer. Re-ranking the top finalists
-    /// on the graph that actually ships closes that gap by measurement.
-    pub finalist_depth: usize,
     /// Per-candidate viability budget covering compile (`load_llir`) + run.
     /// Candidates exceeding it are discarded.
     pub candidate_timeout: Option<std::time::Duration>,
@@ -291,10 +284,6 @@ impl CompileOptions {
 
     /// Set how many surviving finalists are re-profiled unrolled before
     /// final selection.
-    pub fn finalist_depth(mut self, depth: usize) -> Self {
-        self.finalist_depth = depth;
-        self
-    }
 
     /// Set the number of best genomes to keep as parents per generation.
     pub fn keep_best(mut self, keep_best: usize) -> Self {
@@ -389,11 +378,6 @@ impl Default for CompileOptions {
             trials: 5,
             keep_best: 1,
             restart_stagnation: 0,
-            // Collapsed/differenced estimates carry family-dependent bias
-            // (per-layer island maintenance leaks from the trip deltas); the
-            // unrolled finalist measurement is the faithful one, so give it a
-            // wide funnel: 8 structurally-distinct finalists per bucket.
-            finalist_depth: 8,
             candidate_timeout: Some(std::time::Duration::from_secs(5)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
             search_dims: FxHashMap::default(),
@@ -2766,213 +2750,6 @@ impl Graph {
         ranked_candidates
     }
 
-    /// Materialize up to `options.finalist_depth` viable finalists and
-    /// re-rank them by profiling their fully-unrolled graphs. Search ranks
-    /// candidates on collapsed single-iteration bodies, which underweights
-    /// any cost that scales with trip count (host-op call overhead, CUDA
-    /// graph island boundaries) by the trip factor; the unrolled profile
-    /// measures the graph that actually ships.
-    #[allow(clippy::too_many_arguments)]
-    /// Profile the trip-bumped variants of a candidate and fold them into
-    /// the deployment-order metric (`T1 + Σ w·(M_r − T1)`). Any variant
-    /// failure falls back to the collapsed metric — no candidate is
-    /// rejected on variant grounds.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)] // superseded by fully-unrolled candidate profiling
-    fn profile_deployment_metric<R: Runtime + 'static>(
-        runtime: &mut R,
-        base_metric: &R::ProfileMetric,
-        base_display: String,
-        variants: &[(f64, LLIRGraph)],
-        profile_dyn_map: &FxHashMap<char, usize>,
-        options: &CompileOptions,
-        bucket_profile_context: Option<&SearchProfileBucketContext>,
-    ) -> (R::ProfileMetric, String) {
-        if variants.is_empty() {
-            return (base_metric.clone(), base_display);
-        }
-        let mut terms = Vec::with_capacity(variants.len());
-        for (weight, variant_graph) in variants {
-            let profiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.clear_intermediate_buffers();
-                if let Some(bucket_context) = bucket_profile_context {
-                    runtime.profile_with_bucket_context(
-                        variant_graph,
-                        profile_dyn_map,
-                        options.trials,
-                        options.execution_timeout,
-                        ProfileBucketContext {
-                            dim_buckets: &bucket_context.dim_buckets,
-                            bucket_indices: &bucket_context.bucket_indices,
-                            representative_dyn_map: &bucket_context.representative_dyn_map,
-                        },
-                    )
-                } else {
-                    runtime.profile(
-                        variant_graph,
-                        profile_dyn_map,
-                        options.trials,
-                        options.execution_timeout,
-                    )
-                }
-            }));
-            match profiled {
-                Ok((metric, display)) if !display.starts_with("invalid ") => {
-                    terms.push((*weight, metric));
-                }
-                _ => {
-                    return (
-                        base_metric.clone(),
-                        format!("{base_display} | deploy-est unavailable"),
-                    );
-                }
-            }
-        }
-        let metric = R::deployment_metric(base_metric, &terms);
-        let display = if options.search_log_enabled() {
-            format!("{base_display} | deploy {metric:?} terms {terms:?}")
-        } else {
-            format!("{base_display} | deploy {metric:?}")
-        };
-        (metric, display)
-    }
-
-    #[allow(dead_code)] // superseded by fully-unrolled candidate profiling
-    fn reprofile_finalists_unrolled<'a, R: Runtime + 'static>(
-        &'a self,
-        runtime: &mut R,
-        candidates: &mut LazyFinalists<'a, R::ProfileMetric>,
-        options: &CompileOptions,
-        dyn_map: &FxHashMap<char, usize>,
-        bucket_profile_context: Option<&SearchProfileBucketContext>,
-        egraph_index: usize,
-        search_started_at: std::time::Instant,
-        search_log: bool,
-    ) {
-        if options.finalist_depth <= 1 {
-            return;
-        }
-        // Materialize finalists until `finalist_depth` structurally distinct
-        // graphs are available (or the ranked list runs out). The top of the
-        // ranked list is often a cluster of near-identical genomes differing
-        // only in irrelevant genes; deduplicating by kernel composition
-        // makes each profiling slot buy a genuinely different alternative.
-        let composition = |llir: &LLIRGraph| -> String {
-            let mut names: Vec<String> = llir
-                .node_weights()
-                .map(|op| format!("{op:?}"))
-                .map(|d| d.split(['{', '(']).take(3).collect::<Vec<_>>().join(""))
-                .collect();
-            names.sort();
-            names.join(";")
-        };
-        let mut seen: FxHashSet<String> = FxHashSet::default();
-        seen.insert(composition(&candidates.finalists[0].llir));
-        // Scanning a clone-heavy ranked list materializes (extract + unroll
-        // + filter) each entry, which can dominate compile time on large
-        // graphs. Budget the scan with the knobs that already price a
-        // candidate: one candidate_timeout per requested distinct finalist.
-        let scan_started_at = std::time::Instant::now();
-        let scan_budget = options
-            .candidate_timeout
-            .map(|timeout| timeout * options.finalist_depth as u32);
-        loop {
-            if seen.len() >= options.finalist_depth {
-                break;
-            }
-            if scan_budget.is_some_and(|budget| scan_started_at.elapsed() >= budget) {
-                if search_log {
-                    println!(
-                        "   {:>6}  finalist scan budget exhausted with {} distinct structure(s)",
-                        "Search".yellow().bold(),
-                        seen.len(),
-                    );
-                }
-                break;
-            }
-            let target = candidates.finalists.len();
-            if !self.ensure_finalist(
-                runtime,
-                candidates,
-                target,
-                options,
-                dyn_map,
-                bucket_profile_context,
-                egraph_index,
-                search_started_at,
-            ) {
-                break;
-            }
-            let sig = composition(&candidates.finalists[target].llir);
-            if !seen.insert(sig) {
-                // Same structure as an already-profiled finalist — drop it
-                // and keep walking the ranked list.
-                candidates.finalists.remove(target);
-            }
-        }
-        if candidates.finalists.len() <= 1 {
-            return;
-        }
-        let profile_dyn_map = if bucket_profile_context.is_some() {
-            dyn_map.clone()
-        } else {
-            let mut profile_dyn_map = dyn_map.clone();
-            for (&dim, &value) in &options.profile_dims {
-                profile_dyn_map.insert(dim, value);
-            }
-            profile_dyn_map
-        };
-        for (rank, finalist) in candidates.finalists.iter_mut().enumerate() {
-            runtime.clear_intermediate_buffers();
-            let profiled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if let Some(context) = bucket_profile_context {
-                    runtime.profile_with_bucket_context(
-                        &finalist.llir,
-                        &profile_dyn_map,
-                        options.trials,
-                        options.execution_timeout,
-                        ProfileBucketContext {
-                            dim_buckets: &context.dim_buckets,
-                            bucket_indices: &context.bucket_indices,
-                            representative_dyn_map: &context.representative_dyn_map,
-                        },
-                    )
-                } else {
-                    runtime.profile(
-                        &finalist.llir,
-                        &profile_dyn_map,
-                        options.trials,
-                        options.execution_timeout,
-                    )
-                }
-            }));
-            match profiled {
-                Ok((metric, display)) => {
-                    if search_log {
-                        println!(
-                            "   {:>6}  finalist #{rank} unrolled: {display}",
-                            "Search".cyan().bold(),
-                        );
-                    }
-                    finalist.metric = metric;
-                }
-                Err(_) => {
-                    if search_log {
-                        println!(
-                            "   {:>6}  finalist #{rank} unrolled profile panicked; keeping collapsed metric",
-                            "Search".yellow().bold(),
-                        );
-                    }
-                }
-            }
-        }
-        candidates.finalists.sort_by(|a, b| {
-            a.metric
-                .partial_cmp(&b.metric)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    }
-
     /// Lazily materialize individually viable final LLIRs until `target` is
     /// available. Ranked genomes remain compact e-graph choices; full graphs
     /// are only retained when aggregate bucket backtracking actually reaches
@@ -4084,7 +3861,7 @@ pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
             );
             return;
         }
-        unroll_loop_region(llir, &region, &body, usize::MAX);
+        unroll_loop_region(llir, &region, &body);
         // Compact into a freshly-allocated StableGraph so all edge IDs are
         // re-assigned sequentially in our chosen insertion order. Without
         // this, later add_edge calls (the next region's rewiring, or
@@ -4105,11 +3882,6 @@ fn unroll_loop_region(
     llir: &mut LLIRGraph,
     region: &LoopRegion,
     body_nodes: &FxHashSet<NodeIndex>,
-    // `usize::MAX` = full unroll. A smaller limit materializes only the
-    // first `trip_limit` iterations (per-iter sources [0..limit], output
-    // selects clamped to the last materialized copy) — values are wrong
-    // past the limit, but trip-differencing profiling only needs the time.
-    trip_limit: usize,
 ) {
     use petgraph::visit::EdgeRef;
 
@@ -4122,8 +3894,7 @@ fn unroll_loop_region(
         iters,
         markers: loop_markers,
     } = region;
-    let full_iters = *iters;
-    let iters = full_iters.min(trip_limit).max(1);
+    let iters = *iters;
 
     // start_meta[loop_start] = (initial, body_producer):
     //   - `initial` = LoopStart's incoming (state at iter 0).
@@ -4158,17 +3929,16 @@ fn unroll_loop_region(
 
     let mut input_per_iter: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
     for input_node in inputs.values() {
-        let mut srcs: Vec<NodeIndex> = llir
+        let srcs: Vec<NodeIndex> = llir
             .edges_directed(*input_node, Direction::Incoming)
             .sorted_by_key(|e| e.id())
             .map(|e| e.source())
             .collect();
         assert_eq!(
             srcs.len(),
-            full_iters,
+            iters,
             "LoopInput stream must have `iters` sources"
         );
-        srcs.truncate(iters);
         input_per_iter.insert(*input_node, srcs);
     }
 
@@ -4298,7 +4068,6 @@ fn unroll_loop_region(
     }
     for (&select_node, &(stream_id, iter)) in output_selects {
         let body_producer = output_body_producer[&stream_id];
-        let iter = iter.min(iters - 1);
         let sub = clone_map[iter]
             .get(&body_producer)
             .copied()
@@ -4356,92 +4125,6 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
         let compacted = compact_llir_preserving_input_order(llir);
         *llir = compacted;
     }
-}
-
-/// Second measurement point for trip-count differencing: the region with
-/// `bumped_loop_id` is materialized at two iterations, every other region
-/// collapses to one. `M_r - T1` then isolates one extra iteration of region
-/// r, with boundary/overlap effects identical in both measurements.
-#[allow(dead_code)] // superseded by fully-unrolled candidate profiling
-fn expand_loops_bump_region(llir: &mut LLIRGraph, bumped_loop_id: usize) {
-    inline_static_loop_inputs(llir);
-    while let Some((region, body)) = take_innermost_region(llir) {
-        if region.starts.is_empty() {
-            return;
-        }
-        let region_id = region
-            .starts
-            .values()
-            .next()
-            .and_then(|&s| llir[s].to_op::<crate::hlir::LoopStart>())
-            .map(|op| op.loop_id);
-        if region_id == Some(bumped_loop_id) && region.iters > 1 {
-            unroll_loop_region(llir, &region, &body, 2);
-        } else {
-            collapse_loop_region(llir, &region, &body);
-        }
-        let compacted = compact_llir_preserving_input_order(llir);
-        *llir = compacted;
-    }
-}
-
-/// Trip-differencing variants for deployment-order ranking. The collapsed
-/// profile measures `A + Σ body_r`; deployment costs `A + Σ mult_r·body_r`
-/// (mult = product of trips up the region tree) — different weightings of
-/// the same components, so candidates trading fixed vs body cost rank
-/// inverted. Each variant re-measures with one region at two iterations;
-/// the score `T1 + Σ (mult_r − mult_parent(r))·(M_r − T1)` restores
-/// deployment's weights. Regions with trivial bodies are skipped: their
-/// total mis-weighting is bounded by a few nodes and doesn't justify a
-/// profile load.
-#[allow(dead_code)] // superseded by fully-unrolled candidate profiling
-pub(crate) fn profiling_trip_variants(marked: &LLIRGraph) -> Vec<(f64, LLIRGraph)> {
-    let regions = collect_loop_regions(marked);
-    if regions.is_empty() {
-        return Vec::new();
-    }
-    let marker_owner: FxHashMap<NodeIndex, usize> = regions
-        .iter()
-        .flat_map(|(&id, region)| region.markers.iter().map(move |&n| (n, id)))
-        .collect();
-    let mut body_len: FxHashMap<usize, usize> = FxHashMap::default();
-    let mut contains: FxHashMap<usize, std::collections::BTreeSet<usize>> = FxHashMap::default();
-    for (&id, region) in &regions {
-        let (body, foreign) = loop_region_body(marked, region, &marker_owner, id);
-        body_len.insert(id, body.len());
-        contains.insert(id, foreign);
-    }
-    // Immediate parent = containing region with the smallest body.
-    let parent_of = |id: usize| -> Option<usize> {
-        contains
-            .iter()
-            .filter(|(a, children)| **a != id && children.contains(&id))
-            .min_by_key(|(a, _)| body_len[a])
-            .map(|(a, _)| *a)
-    };
-    let mult_of = |mut id: usize| -> usize {
-        let mut mult = regions[&id].iters.max(1);
-        while let Some(parent) = parent_of(id) {
-            mult *= regions[&parent].iters.max(1);
-            id = parent;
-        }
-        mult
-    };
-    let mut variants = Vec::new();
-    for (&id, region) in &regions {
-        if region.iters <= 1 || body_len[&id] < 8 {
-            continue;
-        }
-        let mult = mult_of(id);
-        let weight = (mult - mult / region.iters.max(1)) as f64;
-        if weight <= 0.0 {
-            continue;
-        }
-        let mut bumped = marked.clone();
-        expand_loops_bump_region(&mut bumped, id);
-        variants.push((weight, bumped));
-    }
-    variants
 }
 
 fn collapse_loop_region(

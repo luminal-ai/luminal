@@ -3485,20 +3485,6 @@ impl Runtime for CudaRuntime {
         }
     }
 
-    fn deployment_metric(
-        base: &Self::ProfileMetric,
-        terms: &[(f64, Self::ProfileMetric)],
-    ) -> Self::ProfileMetric {
-        let mut total = *base;
-        for (weight, variant) in terms {
-            // Noise can put a variant below base; a negative body reads as
-            // zero rather than crediting the candidate.
-            let body = variant.saturating_sub(*base);
-            total += body.mul_f64(*weight);
-        }
-        total
-    }
-
     fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
         metrics.iter().copied().sum()
     }

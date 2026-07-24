@@ -120,18 +120,6 @@ pub trait Runtime {
             .unwrap_or_else(|| panic!("aggregate_profile_metrics called with empty metrics"))
             .clone()
     }
-    /// Compose the deployment-order metric from the collapsed measurement
-    /// and trip-bumped variant measurements: base + Σ weight·max(variant −
-    /// base, 0). Restores deployment's region-multiplicity weighting so the
-    /// candidate order matches full-execution order (see
-    /// `profiling_trip_variants`). Default keeps the base for runtimes
-    /// without duration arithmetic.
-    fn deployment_metric(
-        base: &Self::ProfileMetric,
-        _terms: &[(f64, Self::ProfileMetric)],
-    ) -> Self::ProfileMetric {
-        base.clone()
-    }
     /// Allocate a dummy input buffer for a boundary node during per-chunk profiling.
     /// `node_index` is the HLIR node index used in the Input op's `node` field.
     /// `num_bytes` is the number of bytes to allocate.
