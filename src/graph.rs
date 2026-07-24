@@ -389,7 +389,11 @@ impl Default for CompileOptions {
             trials: 5,
             keep_best: 1,
             restart_stagnation: 0,
-            finalist_depth: 3,
+            // Collapsed/differenced estimates carry family-dependent bias
+            // (per-layer island maintenance leaks from the trip deltas); the
+            // unrolled finalist measurement is the faithful one, so give it a
+            // wide funnel: 8 structurally-distinct finalists per bucket.
+            finalist_depth: 8,
             candidate_timeout: Some(std::time::Duration::from_secs(5)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
             search_dims: FxHashMap::default(),
@@ -1882,16 +1886,6 @@ impl Graph {
                     Self::no_finalist_message(&candidates)
                 );
             }
-            self.reprofile_finalists_unrolled(
-                &mut runtime,
-                &mut candidates,
-                &options,
-                &self.dyn_map,
-                None,
-                0,
-                search_started_at,
-                search_log,
-            );
             let finalist = candidates.finalists.remove(0);
             Self::dump_selected_finalist(&finalist, &self.dyn_map, None);
 
@@ -1969,17 +1963,6 @@ impl Graph {
                         Self::no_finalist_message(&bucket.candidates)
                     );
                 }
-                let context = bucket.context.clone();
-                self.reprofile_finalists_unrolled(
-                    &mut runtime,
-                    &mut bucket.candidates,
-                    &options,
-                    &context.representative_dyn_map,
-                    Some(&context),
-                    bucket.egraph_index,
-                    search_started_at,
-                    search_log,
-                );
             }
 
             let initial_indices = vec![0usize; bucket_searches.len()];
@@ -2347,16 +2330,15 @@ impl Graph {
                         &mut expr_cache,
                         None,
                     );
-                    // Collapse the rolled body to a single iteration before
-                    // profiling — one transformer block instead of N×block, so
-                    // per-candidate profile time scales with body size, not the
-                    // unrolled graph size. Trip-bumped variants restore
-                    // deployment's multiplicity weights via differencing.
-                    let variants = profiling_trip_variants(&graph);
-                    collapse_loops_to_first_iter(&mut graph);
-                    (graph, variants)
+                    // Profile the deployment graph itself: fully unrolled.
+                    // Every scaled-down proxy (collapsed bodies, trip-count
+                    // differencing) leaked family-dependent costs and
+                    // inverted rankings; measuring the real graph is slower
+                    // per candidate but cannot misorder families.
+                    unroll_loops_in_llir(&mut graph);
+                    graph
                 }));
-                let Ok((graph, variants)) = graph_result else {
+                let Ok(graph) = graph_result else {
                     invalid_attempts += 1;
                     if invalid_attempts > max_invalid_attempts {
                         panic!(
@@ -2434,19 +2416,6 @@ impl Graph {
                     if !has_nan && !timed_out && !invalid_profile {
                         log_best_llir(&graph, &format!("candidate=0 {rep_display}"));
                     }
-                    let (rep_metric, rep_display) = if !has_nan && !timed_out && !invalid_profile {
-                        Self::profile_deployment_metric(
-                            runtime,
-                            &rep_metric,
-                            rep_display,
-                            &variants,
-                            &profile_dyn_map,
-                            options,
-                            bucket_profile_context.as_ref(),
-                        )
-                    } else {
-                        (rep_metric, rep_display)
-                    };
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
@@ -2569,17 +2538,15 @@ impl Graph {
                     let pre_collapse = std::env::var_os("LLIR_DUMP_DIR")
                         .is_some()
                         .then(|| llir_graph.clone());
-                    // Collapse the rolled body to a single iteration
-                    // before profiling — see initial-genome path.
-                    let variants = profiling_trip_variants(&llir_graph);
-                    collapse_loops_to_first_iter(&mut llir_graph);
-                    (pre_collapse, llir_graph, variants)
+                    // Profile fully unrolled — see initial-genome path.
+                    unroll_loops_in_llir(&mut llir_graph);
+                    (pre_collapse, llir_graph)
                 }));
                 if let Err(payload) = &graph_result {
                     crate::mask_events::CANDIDATE_PANIC
                         .record_with(|| crate::mask_events::panic_payload(payload.as_ref()));
                 }
-                let Ok((pre_collapse, llir_graph, variants)) = graph_result else {
+                let Ok((pre_collapse, llir_graph)) = graph_result else {
                     if search_log {
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
@@ -2646,19 +2613,6 @@ impl Graph {
                         crate::mask_events::NAN_OUTPUT_REJECT.record();
                     }
                     let invalid_profile = rep_display.starts_with("invalid ");
-                    let (rep_metric, rep_display) = if !has_nan && !timed_out && !invalid_profile {
-                        Self::profile_deployment_metric(
-                            runtime,
-                            &rep_metric,
-                            rep_display,
-                            &variants,
-                            &profile_dyn_map,
-                            options,
-                            bucket_profile_context.as_ref(),
-                        )
-                    } else {
-                        (rep_metric, rep_display)
-                    };
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
@@ -2824,6 +2778,7 @@ impl Graph {
     /// failure falls back to the collapsed metric — no candidate is
     /// rejected on variant grounds.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // superseded by fully-unrolled candidate profiling
     fn profile_deployment_metric<R: Runtime + 'static>(
         runtime: &mut R,
         base_metric: &R::ProfileMetric,
@@ -2882,6 +2837,7 @@ impl Graph {
         (metric, display)
     }
 
+    #[allow(dead_code)] // superseded by fully-unrolled candidate profiling
     fn reprofile_finalists_unrolled<'a, R: Runtime + 'static>(
         &'a self,
         runtime: &mut R,
@@ -4406,6 +4362,7 @@ pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
 /// `bumped_loop_id` is materialized at two iterations, every other region
 /// collapses to one. `M_r - T1` then isolates one extra iteration of region
 /// r, with boundary/overlap effects identical in both measurements.
+#[allow(dead_code)] // superseded by fully-unrolled candidate profiling
 fn expand_loops_bump_region(llir: &mut LLIRGraph, bumped_loop_id: usize) {
     inline_static_loop_inputs(llir);
     while let Some((region, body)) = take_innermost_region(llir) {
@@ -4437,6 +4394,7 @@ fn expand_loops_bump_region(llir: &mut LLIRGraph, bumped_loop_id: usize) {
 /// deployment's weights. Regions with trivial bodies are skipped: their
 /// total mis-weighting is bounded by a few nodes and doesn't justify a
 /// profile load.
+#[allow(dead_code)] // superseded by fully-unrolled candidate profiling
 pub(crate) fn profiling_trip_variants(marked: &LLIRGraph) -> Vec<(f64, LLIRGraph)> {
     let regions = collect_loop_regions(marked);
     if regions.is_empty() {
@@ -4966,8 +4924,8 @@ mod tests {
             let (fast, safe, _) = Self::signature(llir);
             assert_eq!(
                 fast + safe,
-                1,
-                "profiling should see exactly one collapsed loop-body candidate"
+                3,
+                "profiling should see the fully unrolled candidate"
             );
             if fast == 1 {
                 self.profiled_fast += 1;
@@ -5037,8 +4995,8 @@ mod tests {
             let (fast, safe, _) = FinalFilterRuntime::signature(llir);
             assert_eq!(
                 fast + safe,
-                1,
-                "profiling should see exactly one collapsed loop-body candidate"
+                3,
+                "profiling should see the fully unrolled candidate"
             );
             self.last_profile_dim = dyn_map.get(&'s').copied();
             if fast == 1 {
@@ -5225,7 +5183,15 @@ mod tests {
         ) -> CandidateFilterResult {
             let (fast, safe, _) = FinalFilterRuntime::signature(llir);
             if fast + safe > 1 {
-                SEARCH_BUDGET_FINAL_FILTER_CALLS.fetch_add(1, Ordering::SeqCst);
+                // Candidates are filtered unrolled at search time AND at
+                // finalization now. Accept the first two calls (the two
+                // search candidates), then reject the finalization
+                // re-checks, burning the search time limit on the first.
+                let call = SEARCH_BUDGET_FINAL_FILTER_CALLS.fetch_add(1, Ordering::SeqCst);
+                if call < 2 {
+                    return CandidateFilterResult::accept();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(120));
                 CandidateFilterResult::reject_with_display("forced final rejection")
             } else {
                 CandidateFilterResult::accept()
@@ -5418,11 +5384,14 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xF1A1_F11E);
         let runtime = cx.compile_with_rng(FinalFilterRuntime::default(), options, &mut rng);
 
-        assert!(runtime.profiled_fast > 0, "fast candidate was not profiled");
+        assert_eq!(
+            runtime.profiled_fast, 0,
+            "invalid-unrolled fast candidates must be filtered before profiling"
+        );
         assert!(runtime.profiled_safe > 0, "safe candidate was not profiled");
         assert!(
             runtime.rejected_unrolled_fast > 0,
-            "the fastest candidate should pass collapsed filtering and fail after unroll"
+            "the fast candidate should be rejected by the unrolled candidate filter"
         );
         assert_eq!(
             runtime.loaded_signatures.len(),
@@ -5501,8 +5470,8 @@ mod tests {
         );
         assert_eq!(
             SEARCH_BUDGET_FINAL_FILTER_CALLS.load(Ordering::SeqCst),
-            1,
-            "the fastest finalist must be validated, but no fallback may start after expiry"
+            3,
+            "two search-time filter calls plus one finalization attempt; no fallback after expiry"
         );
     }
 
@@ -5536,8 +5505,8 @@ mod tests {
         );
         assert_eq!(
             CANDIDATE_BUDGET_FINAL_FILTER_CALLS.load(Ordering::SeqCst),
-            2,
-            "both retained finalists should be timed and rejected"
+            4,
+            "both candidates are filtered unrolled at search time and again at finalization"
         );
     }
 

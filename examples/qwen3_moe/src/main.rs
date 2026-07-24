@@ -26,24 +26,6 @@ fn qwen3_chat_prompt(user_prompt: &str) -> String {
     )
 }
 
-fn promote_persistent_state(
-    runtime: &mut CudaRuntime,
-    seen_out: GraphTensor,
-    seen_mask: GraphTensor,
-    cache_outputs: &[(GraphTensor, GraphTensor)],
-    kv_cache: &KVCache,
-) {
-    let seen_buf = runtime.remove_buffer(seen_out);
-    runtime.set_buffer(seen_mask, seen_buf);
-
-    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-        let k_buf = runtime.remove_buffer(*k_out);
-        let v_buf = runtime.remove_buffer(*v_out);
-        runtime.set_buffer(kv_cache.k_caches[layer], k_buf);
-        runtime.set_buffer(kv_cache.v_caches[layer], v_buf);
-    }
-}
-
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
@@ -120,17 +102,33 @@ fn main() {
         .search_graph_limit(search_graphs);
 
     println!("Loading weights...");
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(20);
+    let mut runtime = CudaRuntime::initialize(stream.clone()).with_max_memory_gib(20);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
 
     println!("  weight load: {:.1}s", phase.elapsed().as_secs_f64());
 
+    // Persistent state is user-owned, aliased input<->output, and
+    // registered before compile so search profiling prices state updates
+    // the way deployment pays them (in-place free, materializing = copy).
     let cache_bytes = max_seq_len * KV_DIM * 2; // bf16
+    let mut persistent_buffers = vec![runtime.alias_state(
+        seen_mask_t,
+        seen_out,
+        VOCAB_SIZE * std::mem::size_of::<f32>(),
+    )];
     for i in 0..LAYERS {
-        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
+        persistent_buffers.push(runtime.alias_state(
+            kv_cache.k_caches[i],
+            cache_outputs[i].0,
+            cache_bytes,
+        ));
+        persistent_buffers.push(runtime.alias_state(
+            kv_cache.v_caches[i],
+            cache_outputs[i].1,
+            cache_bytes,
+        ));
     }
 
     println!("Compiling...");
@@ -141,7 +139,6 @@ fn main() {
     runtime.set_data(scatter_idx_t, (0..search_s as i32).collect::<Vec<_>>());
     runtime.set_data(gather_idx_t, (0..search_c as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
-    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
     let search_seed = std::env::var("LUMINAL_SEARCH_SEED")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -164,11 +161,9 @@ fn main() {
         max_seq_len * std::mem::size_of::<i32>(),
     );
 
-    for i in 0..LAYERS {
-        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
+    for buf in &mut persistent_buffers {
+        stream.memset_zeros(buf).unwrap();
     }
-    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
 
     println!("Prompt: {prompt}");
     print!("Response: ");
@@ -196,13 +191,6 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..plen as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.execute(&cx.dyn_map);
-    promote_persistent_state(
-        &mut runtime,
-        seen_out,
-        seen_mask_t,
-        &cache_outputs,
-        &kv_cache,
-    );
     prev_seq = plen;
 
     // One sampled id per row; index from the START of the (possibly larger)
@@ -230,13 +218,6 @@ fn main() {
         t_set += start.elapsed();
         let e = std::time::Instant::now();
         runtime.execute(&cx.dyn_map);
-        promote_persistent_state(
-            &mut runtime,
-            seen_out,
-            seen_mask_t,
-            &cache_outputs,
-            &kv_cache,
-        );
         t_exec += e.elapsed();
 
         prev_seq += 1;

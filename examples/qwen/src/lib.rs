@@ -50,6 +50,11 @@ pub trait QwenRuntime: Runtime<ExecReturn = ()> {
     fn load_safetensors(&mut self, cx: &Graph, file_path: &str);
     fn set_i32_data(&mut self, id: NodeIndex, data: Vec<i32>);
     fn set_zeros(&mut self, id: NodeIndex, num_bytes: usize);
+    // TODO(aliasing): the CUDA backend now supports user-owned aliased
+    // state buffers (CudaRuntime::alias_state), which replaces the per-step
+    // remove_buffer/set_buffer promote below. This example keeps the legacy
+    // promote because it also targets the Metal backend, which has no
+    // aliasing API yet.
     fn remove_buffer(&mut self, id: NodeIndex) -> Self::Buffer;
     fn set_buffer(&mut self, id: NodeIndex, buffer: Self::Buffer);
     fn get_f32(&self, id: NodeIndex) -> Vec<f32>;

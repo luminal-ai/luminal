@@ -26,26 +26,6 @@ fn gemma3_chat_prompt(user_prompt: &str) -> String {
     format!("<bos><start_of_turn>user\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n")
 }
 
-fn rebind_persistent_state(
-    runtime: &mut CudaRuntime,
-    seen_out: GraphTensor,
-    seen_mask: GraphTensor,
-    cache_outputs: &[(GraphTensor, GraphTensor)],
-    kv_cache: &KVCache,
-) {
-    let seen = runtime.remove_buffer(seen_out);
-    runtime.set_buffer(seen_mask, seen);
-
-    debug_assert_eq!(cache_outputs.len(), kv_cache.k_caches.len());
-    debug_assert_eq!(cache_outputs.len(), kv_cache.v_caches.len());
-    for (layer, (k_out, v_out)) in cache_outputs.iter().enumerate() {
-        let k = runtime.remove_buffer(*k_out);
-        let v = runtime.remove_buffer(*v_out);
-        runtime.set_buffer(kv_cache.k_caches[layer], k);
-        runtime.set_buffer(kv_cache.v_caches[layer], v);
-    }
-}
-
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
@@ -138,7 +118,8 @@ fn main() {
     // larger pathological unfused plans. Allow constrained machines and
     // resource-regression checks to override the measured default explicitly.
     println!("Search memory cap: {search_memory_mib} MiB");
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_mib(search_memory_mib);
+    let mut runtime =
+        CudaRuntime::initialize(stream.clone()).with_max_memory_mib(search_memory_mib);
     let weights_path = model_dir.join("model_combined_bf16_v1.safetensors");
     let phase = std::time::Instant::now();
     runtime.load_safetensors(&cx, weights_path.to_str().unwrap());
@@ -146,11 +127,25 @@ fn main() {
     println!("  weight load: {:.1}s", phase.elapsed().as_secs_f64());
 
     let cache_bytes = cache_bytes(max_seq_len);
+    // Persistent state is user-owned, aliased input<->output, registered
+    // before compile so the search prices state updates as deployed.
+    let mut persistent_buffers = vec![runtime.alias_state(
+        seen_mask_t,
+        seen_out,
+        VOCAB_SIZE * std::mem::size_of::<f32>(),
+    )];
     for i in 0..LAYERS {
-        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
+        persistent_buffers.push(runtime.alias_state(
+            kv_cache.k_caches[i],
+            cache_outputs[i].0,
+            cache_bytes,
+        ));
+        persistent_buffers.push(runtime.alias_state(
+            kv_cache.v_caches[i],
+            cache_outputs[i].1,
+            cache_bytes,
+        ));
     }
-    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
 
     println!("Compiling...");
     cx.set_dim('s', search_s);
@@ -176,11 +171,9 @@ fn main() {
         max_seq_len * std::mem::size_of::<i32>(),
     );
 
-    for i in 0..LAYERS {
-        runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
-        runtime.set_zeros(kv_cache.v_caches[i], cache_bytes);
+    for buf in &mut persistent_buffers {
+        stream.memset_zeros(buf).unwrap();
     }
-    runtime.set_zeros(seen_mask_t, VOCAB_SIZE * std::mem::size_of::<f32>());
 
     const EOS_TOKEN: u32 = 1; // <eos>
     const STOP_TOKEN: u32 = 106; // <end_of_turn>
@@ -206,13 +199,6 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..prompt_len as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     runtime.execute(&cx.dyn_map);
-    rebind_persistent_state(
-        &mut runtime,
-        seen_out,
-        seen_mask_t,
-        &cache_outputs,
-        &kv_cache,
-    );
     prev_seq = prompt_len;
 
     let ids = runtime.get_i32(token_ids);
@@ -238,13 +224,6 @@ fn main() {
         runtime.set_data(gather_idx_t, (0..=prev_seq as i32).collect::<Vec<_>>());
         runtime.set_data(new_token_t, vec![next_token as i32]);
         runtime.execute(&cx.dyn_map);
-        rebind_persistent_state(
-            &mut runtime,
-            seen_out,
-            seen_mask_t,
-            &cache_outputs,
-            &kv_cache,
-        );
 
         prev_seq += 1;
         let ids = runtime.get_i32(token_ids);

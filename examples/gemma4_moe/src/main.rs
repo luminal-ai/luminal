@@ -67,6 +67,10 @@ fn alias_persistent_state(
 fn main() {
     let max_seq_len = 4096;
     let gen_tokens = 500;
+    // 500 candidates leaves the decode search short of full fused-op
+    // adoption on some runs (the full-adoption genome first appears past
+    // candidate ~120 on average); 1000 closes the TPOT gap at ~2x compile
+    // time, still well inside the CI window.
     let search_graphs = 500;
     let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
     let print_token_ids = env_bool("PRINT_TOKEN_IDS");
