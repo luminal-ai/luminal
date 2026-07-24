@@ -282,9 +282,6 @@ impl CompileOptions {
         self
     }
 
-    /// Set how many surviving finalists are re-profiled unrolled before
-    /// final selection.
-
     /// Set the number of best genomes to keep as parents per generation.
     pub fn keep_best(mut self, keep_best: usize) -> Self {
         self.keep_best = keep_best;
@@ -2719,7 +2716,7 @@ impl Graph {
             // from fresh random genomes instead of the converged parents.
             let stagnation_resample = options.restart_stagnation > 0
                 && stagnant_generations >= options.restart_stagnation
-                && stagnant_generations.is_multiple_of(2);
+                && stagnant_generations % 2 == 0;
             resample_generation = !generation_found_non_timeout || stagnation_resample;
         }
 
@@ -3485,23 +3482,6 @@ fn grow_rolling_candidate(
     }
 }
 
-/// Expand all loop-region markers in an LLIR graph into fully unrolled bodies.
-///
-/// Reads `LoopStart` / `LoopEnd` / `LoopInput` / `LoopOutput` metadata placed
-/// by the auto-roll prepass, clones the loop body `iters-1` additional times,
-/// threads loop-carried state between clones, routes per-iteration inputs and
-/// per-iteration outputs, and removes the four marker op types.
-///
-/// Incoming-edge ORDER is preserved for every affected node — ops read their
-/// inputs by edge-id order, so edges are rebuilt in position.
-/// When `LUMINAL_LOG_LLIR=1`, print a canonical, diffable dump of a
-/// candidate LLIR each time the search finds a new fastest graph. Nodes are
-/// numbered canonically (Kahn topological order with a deterministic
-/// tie-break on op text and canonical input ids), so two runs of an
-/// identical graph produce byte-identical output regardless of NodeIndex
-/// assignment — best-so-far graphs from different runs can be compared with
-/// plain `diff`.
-
 /// Append one line per profiled candidate (op-type histogram + metric) to
 /// the file named by `LUMINAL_CANDIDATE_OPS` — search-trajectory forensics
 /// for "was family X ever generated, and what did it measure".
@@ -3538,6 +3518,22 @@ fn log_candidate_ops(llir: &LLIRGraph, tag: &str) {
     }
 }
 
+/// Expand all loop-region markers in an LLIR graph into fully unrolled bodies.
+///
+/// Reads `LoopStart` / `LoopEnd` / `LoopInput` / `LoopOutput` metadata placed
+/// by the auto-roll prepass, clones the loop body `iters-1` additional times,
+/// threads loop-carried state between clones, routes per-iteration inputs and
+/// per-iteration outputs, and removes the four marker op types.
+///
+/// Incoming-edge ORDER is preserved for every affected node — ops read their
+/// inputs by edge-id order, so edges are rebuilt in position.
+/// When `LUMINAL_LOG_LLIR=1`, print a canonical, diffable dump of a
+/// candidate LLIR each time the search finds a new fastest graph. Nodes are
+/// numbered canonically (Kahn topological order with a deterministic
+/// tie-break on op text and canonical input ids), so two runs of an
+/// identical graph produce byte-identical output regardless of NodeIndex
+/// assignment — best-so-far graphs from different runs can be compared with
+/// plain `diff`.
 pub fn log_best_llir(llir: &LLIRGraph, context: &str) {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("LUMINAL_LOG_LLIR").is_some()) {
@@ -3814,19 +3810,14 @@ fn inline_static_loop_inputs(llir: &mut LLIRGraph) {
     // (an inner region's invariant input is often an enclosing region's
     // marker), so a source captured up front can be deleted before its
     // dependent marker is processed.
-    loop {
-        let Some((marker, source)) = llir.node_indices().find_map(|n| {
-            if llir[n].to_op::<LoopInputStatic>().is_none()
-                && llir[n].to_op::<LoopInput>().is_none()
-            {
-                return None;
-            }
-            let mut sources = llir.neighbors_directed(n, Direction::Incoming);
-            let first = sources.next()?;
-            sources.all(|s| s == first).then_some((n, first))
-        }) else {
-            break;
-        };
+    while let Some((marker, source)) = llir.node_indices().find_map(|n| {
+        if llir[n].to_op::<LoopInputStatic>().is_none() && llir[n].to_op::<LoopInput>().is_none() {
+            return None;
+        }
+        let mut sources = llir.neighbors_directed(n, Direction::Incoming);
+        let first = sources.next()?;
+        sources.all(|s| s == first).then_some((n, first))
+    }) {
         // Per-edge remove+add to keep each consumer's edge-id ordering via
         // LIFO reuse — the runtime reads inputs sorted by edge id.
         let consumers: Vec<(petgraph::graph::EdgeIndex, NodeIndex)> = llir

@@ -171,9 +171,9 @@ fn build_model() -> Model {
         let k_ctx = gather_rows(k_cache_out, gather_idx, KV_DIM);
         let v_ctx = gather_rows(v_cache_out, gather_idx, KV_DIM);
         let attn = attn_block(q, k_ctx, v_ctx);
-        x = x + attn.matmul(inputs.wo.t());
+        x += attn.matmul(inputs.wo.t());
         let m = moe_block(x.std_norm(1, 1e-6), &inputs);
-        x = x + m;
+        x += m;
         layers.push(inputs);
         cache_outs.push((k_cache_out, v_cache_out));
     }
@@ -291,7 +291,7 @@ fn main() {
 
         // Steady-state decode step: caches are user-aliased, so a step is
         // exactly one execute.
-        let mut step_once = |runtime: &mut CudaRuntime| {
+        let step_once = |runtime: &mut CudaRuntime| {
             runtime.execute(&model.cx.dyn_map);
         };
         for _ in 0..3 {

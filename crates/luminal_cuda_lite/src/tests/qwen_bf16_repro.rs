@@ -783,7 +783,7 @@ fn rms_norm_rule_fires_on_mini_layer() {
             .unwrap_or_default()
     };
     let mut found = 0;
-    for (_id, (head, children)) in egraph.enodes.iter() {
+    for (head, children) in egraph.enodes.values() {
         if head == "Op"
             && !children.is_empty()
             && kinds_of(&children[0])
@@ -1017,7 +1017,7 @@ fn dump_rotary_post_egglog() {
                 if t2l != "ICons" {
                     continue;
                 }
-                println!("=== cat eclass {:?} enodes:", &t2c[0]);
+                println!("=== cat eclass {:?} enodes:", t2c[0]);
                 for cn in &egraph.eclasses[&t2c[0]].1 {
                     let (cl, cc) = &egraph.enodes[cn];
                     if cl == "Op" && cc.len() == 2 {
