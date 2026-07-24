@@ -18,14 +18,12 @@ ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 #   gemma4_moe  TTFT 122-137 ms  TPOT 27.4-34.2 ms
 #   whisper     7.1 tok/s
 PERF_GATES = {
-    # llama/qwen TTFT gates are calibrated to post-elementwise-fusion-removal
-    # prefill (LEGALITY_AUDIT.md §2.1): the multi-op fusion family was removed
-    # pending its legality-by-construction rework, which costs unfused prefill
-    # elementwise chains on these two models. Restore to 105/180 when the
-    # construction-legal fusion rebuild lands.
-    "llama": {"max_ttft_ms": 220.0, "max_tpot_ms": 15.0},
+    # Calibrated to fully-unrolled candidate profiling (search ranks
+    # deployment graphs directly). GH200 references: llama 71/6.4,
+    # gemma 74/10.0, qwen 99/6.7, qwen3_moe 74/7.4, gemma4_moe 149/10.8.
+    "llama": {"max_ttft_ms": 150.0, "max_tpot_ms": 15.0},
     "gemma": {"max_ttft_ms": 300.0, "max_tpot_ms": 22.0},
-    "qwen": {"max_ttft_ms": 450.0, "max_tpot_ms": 22.0},
+    "qwen": {"max_ttft_ms": 180.0, "max_tpot_ms": 22.0},
     "qwen3_moe": {"max_ttft_ms": 260.0, "max_tpot_ms": 24.0},
     "gemma4_moe": {"max_ttft_ms": 235.0, "max_tpot_ms": 45.0},
     "whisper": {"min_tps": 5.0},

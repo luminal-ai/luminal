@@ -153,6 +153,12 @@ PR #373 deleted 11 cleanup rules from `markers.rs` and added ~1,200 lines of
   extractable.
 
 ### 2.6 Metadata coherence (core + to_host) — T2
+- **KNOWN BUG (found by the search-reliability harness, 2026-07-24): the
+  single-bucket-combo stitched load path never uploads KernelConstant
+  buffers** ("missing cached buffer" at first execute). No shipped model
+  exercises one combo (all have >= 2 's' buckets); the harness works
+  around it with two 's' buckets. Fix when the load path is next open.
+
 - **FIXED (2026-07-23): `dtype` fact corruption via loop-marker unions.** The
   rolling prepass inferred marker dtypes with a heuristic that had no case
   for `Iota`/`Constant`/`LessThan` (F32 fallback), so Int index expressions
