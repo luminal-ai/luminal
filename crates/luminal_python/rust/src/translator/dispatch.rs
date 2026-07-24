@@ -88,6 +88,7 @@ impl<'a> Translator<'a> {
             // Shape ops
             "torch.ops.aten.view.default" => self.translate_reshape(node)?,
             "torch.ops.aten.upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
+            "torch.ops.aten.repeat.default" => self.translate_repeat(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
             "torch.ops.aten.unsqueeze.default" => {
                 let a = self.get_input_tensor(node, 0)?;
@@ -169,6 +170,9 @@ impl<'a> Translator<'a> {
 
             // GroupNorm
             "torch.ops.aten.native_group_norm.default" => self.translate_group_norm(node)?,
+
+            // RMSNorm
+            "torch.ops.aten._fused_rms_norm.default" => self.translate_fused_rms_norm(node)?,
 
             // Where
             "torch.ops.aten.where.self" => self.translate_where(node)?,

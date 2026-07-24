@@ -65,6 +65,28 @@ impl<'a> Translator<'a> {
         })
     }
 
+    /// `aten.repeat`: tile the tensor `repeats[d]` times along each dim.
+    /// Leading entries beyond the input rank prepend new dims (torch
+    /// semantics); the tiling itself delegates to the core `repeat` view.
+    pub(crate) fn translate_repeat(&mut self, node: &Node) -> Result<GraphTensor> {
+        let mut t = self.get_input_tensor(node, 0)?;
+        let repeats = self.get_ints_arg(node, 1)?;
+        anyhow::ensure!(
+            repeats.len() >= t.shape.len(),
+            "repeat expects at least as many repeats ({}) as dims ({})",
+            repeats.len(),
+            t.shape.len()
+        );
+        anyhow::ensure!(
+            repeats.iter().all(|&r| r >= 1),
+            "repeat counts must be >= 1, got {repeats:?}"
+        );
+        for _ in 0..(repeats.len() - t.shape.len()) {
+            t = t.unsqueeze(0);
+        }
+        Ok(t.repeat(repeats.iter().map(|&r| r as usize).collect::<Vec<_>>()))
+    }
+
     pub(crate) fn translate_upsample_nearest2d(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
         let input_dimensions = input.dims();
@@ -211,6 +233,7 @@ impl<'a> Translator<'a> {
         } else {
             Expression::from(0usize)
         };
+        let start = normalize_slice_bound(start, a.shape.dims[dim]);
 
         if node.inputs.len() <= 3 {
             return Ok(a);
@@ -230,6 +253,7 @@ impl<'a> Translator<'a> {
         }
 
         let end: Expression = self.get_expr_arg(node, 3)?;
+        let end = normalize_slice_bound(end, a.shape.dims[dim]);
 
         if let Some(s) = start.to_usize()
             && let Some(e) = end.to_usize()
@@ -581,14 +605,83 @@ impl<'a> Translator<'a> {
 
     pub(crate) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
-        let index_names = node.inputs[1]
-            .arg
-            .as_tensors()
-            .context("index_put: indices not as_tensors")?;
+        if let Some(entries) = node.inputs[1].arg.as_optional_tensors() {
+            let mut axis_and_name = None;
+            for (dim, entry) in entries.iter().enumerate() {
+                if let OptionalTensorEntry::Tensor(t) = entry {
+                    if axis_and_name.is_some() {
+                        bail!(
+                            "index_put: multiple tensor indices not supported: {:?}",
+                            node.inputs[1].arg
+                        );
+                    }
+                    axis_and_name = Some((dim, t.as_tensor.name.clone()));
+                }
+            }
+            let Some((axis, idx_name)) = axis_and_name else {
+                bail!(
+                    "index_put: optional_tensors indices contain no tensor: {:?}",
+                    node.inputs[1].arg
+                );
+            };
+            let values = self.get_input_tensor(node, 2)?;
+            let idx = self.get_tensor(&idx_name)?.cast(DType::Int);
+            if idx.shape.len() != 1 {
+                bail!(
+                    "index_put: only a 1-D tensor index is supported, got rank {}",
+                    idx.shape.len()
+                );
+            }
+            let val_dims = values.dims();
+            if val_dims.len() != a.dims().len() {
+                bail!(
+                    "index_put: values rank {} != data rank {} (broadcasting not supported)",
+                    val_dims.len(),
+                    a.dims().len()
+                );
+            }
+            if axis >= val_dims.len() {
+                bail!(
+                    "index_put: index dim {axis} out of range for values rank {}",
+                    val_dims.len()
+                );
+            }
+            let mut idx_full = idx;
+            for (dim, &size) in val_dims.iter().enumerate().take(axis) {
+                idx_full = idx_full.expand_dim(dim, size);
+            }
+            for (dim, &size) in val_dims.iter().enumerate().skip(axis + 1) {
+                idx_full = idx_full.expand_dim(dim, size);
+            }
+            let values = if values.dtype == a.dtype {
+                values
+            } else {
+                values.cast(a.dtype)
+            };
+            let result = super::movement_dynamic::pt2_scatter_elements(a, idx_full, values, axis);
+            if self
+                .user_input_ids
+                .iter()
+                .any(|(_, input_id)| *input_id == a.id)
+            {
+                self.input_backed_write_backs.insert(result.id, a);
+            }
+            return Ok(result);
+        }
+        let index_names = if let Some(names) = node.inputs[1].arg.as_tensors() {
+            names
+                .iter()
+                .map(|name| name.name.clone())
+                .collect::<Vec<_>>()
+        } else if let Some(name) = node.inputs[1].arg.as_tensor_name() {
+            vec![name.to_string()]
+        } else {
+            bail!("index_put: indices not tensor(s): {:?}", node.inputs[1].arg);
+        };
         let values = self.get_input_tensor(node, 2)?;
 
         if index_names.len() == 1 {
-            let idx_tensor = self.get_tensor(&index_names[0].name)?;
+            let idx_tensor = self.get_tensor(&index_names[0])?;
 
             // Boolean-mask index_put: when the only index is a Bool tensor whose
             // shape matches the data tensor, PyTorch semantics are

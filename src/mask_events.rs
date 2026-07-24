@@ -4,7 +4,7 @@
 //! e-nodes that are unconditionally legal and equivalent, so the checks that
 //! reject or repair candidates *after* extraction must never fire. Each such
 //! check records an event here. Under the contract every counter reads zero;
-//! nonzero counts are the legality burn-down list (see LEGALITY_AUDIT.md).
+//! nonzero counts are the legality burn-down list.
 //!
 //! Counters are always on (relaxed atomics — nanoseconds on cold rejection
 //! paths). Per-event details are printed when `LUMINAL_MASK_LOG=1`. A summary

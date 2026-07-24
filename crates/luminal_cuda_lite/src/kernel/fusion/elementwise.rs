@@ -100,7 +100,7 @@ impl EgglogOp for CudaUnaryElementwise {
         // they replaced exact HLIR chains with approximate single
         // instructions (`rsqrtf`, `expf`, fused sigmoid) matched through
         // constant tolerance windows — V2 violations under the exact-HLIR
-        // reproduction ruling. See LEGALITY_AUDIT.md §2.7.
+        // reproduction ruling. See the exact-HLIR reproduction ruling.
 
         rules
     }

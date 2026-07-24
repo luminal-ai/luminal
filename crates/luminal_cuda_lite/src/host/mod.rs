@@ -12,7 +12,9 @@ pub type Ops = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
+    moe::fused::FusedMoE,
     flashinfer::FlashInferAttention,
+    flashinfer::sink_attention::SinkAttention,
 );
 
 #[cfg(test)]

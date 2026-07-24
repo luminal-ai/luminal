@@ -32,6 +32,13 @@ pub fn normalize_dim(dim: i64, ndim: usize) -> usize {
     }
 }
 
+pub fn normalize_slice_bound(bound: Expression, dim_size: Expression) -> Expression {
+    match bound.as_num() {
+        Some(n) if n < 0 => (dim_size + Expression::from(n as i32)).simplify(),
+        _ => bound,
+    }
+}
+
 /// Broadcast two tensors following NumPy broadcasting rules.
 /// Right-aligns dims, unsqueezes shorter, expands size-1 dims.
 pub fn broadcast_binary(mut a: GraphTensor, mut b: GraphTensor) -> (GraphTensor, GraphTensor) {

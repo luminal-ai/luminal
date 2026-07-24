@@ -144,7 +144,7 @@ off by default; set to `1` to enable unless noted.
 | `EGGLOG_LOG` | E-graph build/schedule diagnostics. |
 | `ROLLING_LOG` | Loop-rolling prepass diagnostics: candidate windows, per-stream per-iteration sources, rolled-region partition, and post-roll region validation (foreign-marker bridge report). |
 | `LUMINAL_LOG_LLIR` | Prints a canonical, diffable dump of the candidate LLIR each time the search finds a new fastest graph (`LLIR_BEST … / LLIR_BEST_END` blocks). Node ids are canonical (topological with deterministic tie-breaks), so identical graphs from different runs produce byte-identical text — compare best graphs across runs with plain `diff`. Note: logs the collapsed profiling body, i.e. the object the search ranks. |
-| `LUMINAL_MASK_LOG` | Per-event detail lines for post-extraction mask events (candidate rejections/repairs — see `LEGALITY_AUDIT.md`). Counters are always on and a nonzero summary prints at the end of every compile regardless of this flag; this adds the per-event `[mask:…]` lines. |
+| `LUMINAL_MASK_LOG` | Per-event detail lines for post-extraction mask events (candidate rejections/repairs — see `the legality-by-construction contract`). Counters are always on and a nonzero summary prints at the end of every compile regardless of this flag; this adds the per-event `[mask:…]` lines. |
 | `LUMINAL_SEARCH_OP_NAMES` | Appends per-candidate kernel/host-op composition summaries (`[Kernels: …] [Hosts: …]`) to best-so-far search lines. |
 
 ### Search & compile behavior

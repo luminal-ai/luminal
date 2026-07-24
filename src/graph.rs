@@ -4043,11 +4043,7 @@ fn unroll_loop_region(
             .neighbors_directed(end_node, Direction::Incoming)
             .next()
             .expect("LoopEnd missing body producer during rewire");
-        // Same iteration-invariant fallback as `resolve_src`.
-        let sub = clone_map[iters - 1]
-            .get(&body_producer)
-            .copied()
-            .unwrap_or(body_producer);
+        let sub = resolve_src(body_producer, iters - 1, &clone_map);
         marker_post_sub.insert(end_node, sub);
     }
     // Each LoopOutputSelect(stream, iter) routes to iter's clone of that
@@ -4068,10 +4064,7 @@ fn unroll_loop_region(
     }
     for (&select_node, &(stream_id, iter)) in output_selects {
         let body_producer = output_body_producer[&stream_id];
-        let sub = clone_map[iter]
-            .get(&body_producer)
-            .copied()
-            .unwrap_or(body_producer);
+        let sub = resolve_src(body_producer, iter, &clone_map);
         marker_post_sub.insert(select_node, sub);
     }
 

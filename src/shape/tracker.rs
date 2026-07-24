@@ -136,7 +136,15 @@ impl ShapeTracker {
                 *dim = size;
                 *stride = 0.into();
             } else {
-                panic!("Cannot expand dim {axis} from {dim} to {size}",);
+                let (dim_simplified, size_simplified) = (dim.simplify(), size.simplify());
+                if dim_simplified == size_simplified {
+                    *dim = size;
+                } else {
+                    panic!(
+                        "Cannot expand dim {axis} from {dim} to {size} \
+                         (simplified: {dim_simplified} vs {size_simplified})",
+                    );
+                }
             }
         }
     }
@@ -158,6 +166,11 @@ impl ShapeTracker {
             .zip(self.strides.iter_mut())
             .zip(repeats)
         {
+            // r == 1 leaves the axis untouched; skip the mod-wrap so untiled
+            // axes keep clean stride expressions.
+            if repeat == Expression::from(1) {
+                continue;
+            }
             let original_dim = *dim;
             *dim = (*dim * repeat).simplify();
             *stride = stride.substitute('z', expr('z') % original_dim).simplify();

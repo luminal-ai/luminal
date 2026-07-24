@@ -150,8 +150,7 @@ impl EgglogOp for FusionEnd {
         // could create self-referential e-classes whose cyclic extractions
         // were rejected only by post-extraction candidate validation, and the
         // grown regions' dtype/metadata legality was likewise established by
-        // `validate_fusion_regions` instead of by the rules themselves. See
-        // LEGALITY_AUDIT.md §2.1. Elementwise ops still lower through
+        // `validate_fusion_regions` instead of by the rules themselves. Elementwise ops still lower through
         // single-op regions (`cuda-elem-singleton-*` in elementwise.rs).
         Vec::new()
     }

@@ -315,7 +315,7 @@ fn test_bf16_reciprocal_region_compiles() {
 /// correlated choices form an LLIR cycle; reject those selected candidates
 /// without deleting the legal acyclic choices from the egraph.
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (LEGALITY_AUDIT.md §2.1): the cycle-producing absorbed-boundary choices this exercises no longer exist"]
+#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework): the cycle-producing absorbed-boundary choices this exercises no longer exist"]
 fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
     use luminal::egglog_utils::{
         egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,

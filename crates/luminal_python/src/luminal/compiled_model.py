@@ -45,6 +45,7 @@ class CompiledModel:
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
         self._user_indices = user_indices
+        self.skip_input_names = frozenset()
         self._is_gpu = getattr(graph_result, "device_type", "cpu") != "cpu"
         self._supports_device_ptrs = getattr(
             graph_result, "supports_device_ptrs", False
@@ -117,6 +118,8 @@ class CompiledModel:
         for name, tensor, expected_dtype in zip(
             self._input_names, user_inputs, self._input_dtypes
         ):
+            if name in self.skip_input_names:
+                continue
             if tensor.dtype != expected_dtype:
                 raise DTypeBoundaryError(
                     f"Luminal compiled input '{name}' expects "
@@ -211,16 +214,17 @@ class CompiledModel:
                 )
             getter_name, read_dtype = entry
             data = getattr(self._graph, getter_name)(name)
+            if len(data) == 0 and all(d != 0 for d in shape):
+                return None
             if out_dtype in (torch.float16, torch.bfloat16):
                 # Getter returned an immutable `bytes` from Rust; wrap in
                 # `bytearray` to make the storage writable (suppresses
                 # the "non-writable buffer" warning), then bit-cast via
                 # `frombuffer` — no numeric conversion.
-                tensor = torch.frombuffer(bytearray(data), dtype=out_dtype).reshape(
-                    tuple(shape)
-                )
+                tensor = torch.frombuffer(bytearray(data), dtype=out_dtype)
             else:
-                tensor = torch.tensor(data, dtype=read_dtype).reshape(tuple(shape))
+                tensor = torch.tensor(data, dtype=read_dtype)
+            tensor = tensor.reshape(tuple(shape))
             return tensor.to(input_device)
 
         # Pre-allocation is GPU-only: the CUDA kernel needs the
