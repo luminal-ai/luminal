@@ -494,7 +494,12 @@ impl EgglogOp for LoopStart {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+        vec![
+            // Derived from the `inp` field's class inside the e-graph
+            // (initial value / body producer); the serialized dtype field is
+            // a placeholder. See LoopInput.
+            dtype_propagation_rule(&self.sort(), "inp"),
+        ]
     }
 
     fn extract<'a>(
@@ -584,7 +589,12 @@ impl EgglogOp for LoopEnd {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_field_rule(&self.sort(), "dtype")]
+        vec![
+            // Derived from the `inp` field's class inside the e-graph
+            // (initial value / body producer); the serialized dtype field is
+            // a placeholder. See LoopInput.
+            dtype_propagation_rule(&self.sort(), "inp"),
+        ]
     }
 
     fn extract<'a>(
@@ -669,7 +679,12 @@ impl EgglogOp for LoopInput {
         // that expect raw op kinds at boundary positions can match via the
         // unioned eclass.
         vec![
-            dtype_from_kind_field(&self.sort(), "dtype"),
+            // The marker's class dtype is DERIVED from its input inside the
+            // e-graph (generic first-input propagation) — the serialized
+            // field is not a source of truth. Declaring the field here let a
+            // wrongly-stamped marker corrupt its source class's dtype fact
+            // through the inline union (`:merge new` is last-write-wins).
+            dtype_propagation_op(&self.sort()),
             Rule::raw(
                 r#"
             (relation identical_inputs (IList))
@@ -798,7 +813,10 @@ impl EgglogOp for LoopInputStatic {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+        vec![
+            // Derived from the input inside the e-graph; see LoopInput.
+            dtype_propagation_op(&self.sort()),
+        ]
     }
 
     fn extract<'a>(
@@ -885,7 +903,10 @@ impl EgglogOp for LoopOutput {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+        vec![
+            // Derived from the input inside the e-graph; see LoopInput.
+            dtype_propagation_op(&self.sort()),
+        ]
     }
 
     fn extract<'a>(
@@ -979,7 +1000,10 @@ impl EgglogOp for LoopOutputSelect {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![dtype_from_kind_field(&self.sort(), "dtype")]
+        vec![
+            // Derived from the input inside the e-graph; see LoopInput.
+            dtype_propagation_op(&self.sort()),
+        ]
     }
 
     fn extract<'a>(

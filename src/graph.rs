@@ -731,7 +731,6 @@ impl Graph {
         }
 
         let mut created = 0usize;
-        let mut dtype_cache: FxHashMap<NodeIndex, DType> = FxHashMap::default();
         // Track all NodeIndex slots we newly assign for loop-marker ops.
         // StableGraph reuses freed node indices; removals later in this
         // function might target slots that happen to coincide with a new
@@ -754,13 +753,19 @@ impl Graph {
             let initial = candidate.occurrences[0].boundary_inputs[p];
             let body_state_out = candidate.occurrences[0].output_nodes[out_pos];
             let last_state_out = candidate.occurrences[n_iters - 1].output_nodes[out_pos];
-            let dtype = self.infer_node_dtype_cached(initial, &mut dtype_cache);
 
+            // Marker dtype fields are placeholders: the e-graph derives each
+            // marker's dtype fact from its input via dtype_prop (see hlir.rs).
+            // Marker dtype fields are placeholders, not sources of truth:
+            // each marker's dtype fact is derived inside the e-graph from
+            // its input by the generic dtype_prop propagation rule (see the
+            // marker EgglogOp impls in hlir.rs). Nothing downstream reads
+            // the field semantically.
             let loop_start = self.graph.add_node(Box::new(LoopStart {
                 loop_id,
                 slot_idx,
                 iters: Expression::from(n_iters as i32),
-                dtype,
+                dtype: DType::F32,
             }));
             added_loop_ops.insert(loop_start);
             self.graph.add_edge(initial, loop_start, ());
@@ -779,7 +784,7 @@ impl Graph {
             let loop_end = self.graph.add_node(Box::new(LoopEnd {
                 loop_id,
                 slot_idx,
-                dtype,
+                dtype: DType::F32,
             }));
             added_loop_ops.insert(loop_end);
             self.graph.add_edge(body_state_out, loop_end, ());
@@ -815,7 +820,6 @@ impl Graph {
             }
 
             let body_input = candidate.occurrences[0].boundary_inputs[p];
-            let dtype = self.infer_node_dtype_cached(body_input, &mut dtype_cache);
             if log {
                 println!(
                     "   {:>6}  loop {loop_id} stream {p}: per-iter sources {:?}",
@@ -829,7 +833,7 @@ impl Graph {
             let loop_input = self.graph.add_node(Box::new(LoopInput {
                 loop_id,
                 stream_id: p,
-                dtype,
+                dtype: DType::F32,
             }));
             added_loop_ops.insert(loop_input);
             // Deferred: added at the end with fresh ascending edge ids —
@@ -914,12 +918,11 @@ impl Graph {
 
             // Iter-0 body producer feeds the LoopOutput marker.
             let body_output = per_iter_plan[0].0;
-            let dtype = self.infer_node_dtype_cached(body_output, &mut dtype_cache);
 
             let loop_output = self.graph.add_node(Box::new(LoopOutput {
                 loop_id,
                 stream_id: q,
-                dtype,
+                dtype: DType::F32,
             }));
             self.graph.add_edge(body_output, loop_output, ());
             added_loop_ops.insert(loop_output);
@@ -931,7 +934,7 @@ impl Graph {
                     loop_id,
                     stream_id: q,
                     iter: i,
-                    dtype,
+                    dtype: DType::F32,
                 }));
                 self.graph.add_edge(loop_output, select, ());
                 added_loop_ops.insert(select);
@@ -984,65 +987,6 @@ impl Graph {
             );
         }
         created
-    }
-
-    /// Best-effort dtype lookup for a NodeIndex in the HLIR graph.
-    fn infer_node_dtype_cached(
-        &self,
-        node: NodeIndex,
-        cache: &mut FxHashMap<NodeIndex, DType>,
-    ) -> DType {
-        if let Some(&dt) = cache.get(&node) {
-            return dt;
-        }
-
-        if let Some((_, dt)) = self.input_meta.get(&node) {
-            cache.insert(node, *dt);
-            return *dt;
-        }
-        if let Some(op) = self.try_get_op::<crate::hlir::Input>(node) {
-            cache.insert(node, op.dtype);
-            return op.dtype;
-        }
-        if let Some(op) = self.try_get_op::<crate::hlir::Cast>(node) {
-            cache.insert(node, op.1);
-            return op.1;
-        }
-        // Mirror the egglog `dtype_prop` rules exactly. Loop markers created
-        // from this inference are later unioned with their sources by the
-        // "LoopInputStatic inline" rule, and `dtype` merges with `:merge new`
-        // — a marker stamped with the wrong dtype silently corrupts the
-        // source class's dtype fact (an Int iota class flipping to F32 was
-        // the gemma4_moe fusion-region reject lottery).
-        if self.try_get_op::<crate::hlir::Iota>(node).is_some() {
-            cache.insert(node, DType::Int);
-            return DType::Int;
-        }
-        if self.try_get_op::<crate::hlir::Constant>(node).is_some() {
-            cache.insert(node, DType::F32);
-            return DType::F32;
-        }
-        if self.try_get_op::<crate::hlir::LessThan>(node).is_some() {
-            cache.insert(node, DType::Bool);
-            return DType::Bool;
-        }
-        // Gather inherits dtype from its second input (data), not first
-        // (indexes); everything else propagates from its first input.
-        let sources = self.get_sources(node);
-        let propagation_source = if self.try_get_op::<crate::hlir::Gather>(node).is_some() {
-            sources.get(1)
-        } else {
-            sources.first()
-        };
-        if let Some(&src) = propagation_source {
-            // Break potential cycles (marker chains) before recursing.
-            cache.insert(node, DType::F32);
-            let dt = self.infer_node_dtype_cached(src, cache);
-            cache.insert(node, dt);
-            return dt;
-        }
-        cache.insert(node, DType::F32);
-        DType::F32
     }
 
     /// Set a runtime dimension
