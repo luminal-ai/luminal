@@ -1979,6 +1979,189 @@ def test_sdpa_with_attn_bias(device: torch.device):
     assert torch.allclose(actual, expected, atol=1e-5)
 
 
+# ---- SDPA low-precision softmax parity -------------------------------------
+#
+# torch's fused kernels run QK^T accumulation and softmax in fp32 even for
+# bf16/f16; translate_sdpa mirrors this. Parity bound: luminal's error vs an
+# fp64 reference stays within a small factor of torch's own kernel error —
+# an all-bf16 chain fails by ~7-10x on wide scores (the Qwen2.5-style
+# outlier-activation divergence).
+
+
+def _sdpa_wide_qkv(device: torch.device, dtype: torch.dtype):
+    """Q/K with a wide score distribution — the softmax-precision stress case."""
+    torch.manual_seed(0)
+    b, h, s, d = 1, 4, 64, 64
+    q = (torch.randn(b, h, s, d) * 4.0).to(dtype).to(device)
+    k = (torch.randn(b, h, s, d) * 4.0).to(dtype).to(device)
+    v = torch.randn(b, h, s, d).to(dtype).to(device)
+    return q, k, v
+
+
+def _assert_sdpa_parity(model, inputs, factor: float = 3.0, select=None):
+    """luminal error vs fp64 reference <= `factor` x torch's own kernel error.
+
+    `select` restricts the compared region (e.g. to rows where the reference
+    is well-defined). Returns the compiled output for further assertions."""
+    with torch.no_grad():
+        ref64 = model(
+            *(t.double() if t.is_floating_point() else t for t in inputs)
+        ).double()
+        eager = model(*inputs)
+        compiled = torch.compile(model, backend=luminal_backend)
+        actual = compiled(*inputs)
+    ref_c, eager_c, actual_c = ref64, eager, actual
+    if select is not None:
+        ref_c, eager_c, actual_c = select(ref64), select(eager), select(actual)
+    err_eager = (eager_c.double() - ref_c).abs().max().item()
+    err_luminal = (actual_c.double() - ref_c).abs().max().item()
+    assert err_luminal <= factor * err_eager + 1e-6, (
+        f"luminal SDPA error {err_luminal:.5f} vs fp64 reference exceeds "
+        f"{factor}x torch's fused-kernel error {err_eager:.5f} — "
+        "score chain is likely not running in fp32"
+    )
+    return actual
+
+
+def test_sdpa_bf16_softmax_parity(device: torch.device):
+    """bf16 SDPA, no mask: fp32 score-chain parity with torch's fused kernel."""
+    from test_models import SdpaBasicModel
+
+    model: torch.nn.Module = SdpaBasicModel().to(device)
+    _assert_sdpa_parity(model, _sdpa_wide_qkv(device, torch.bfloat16))
+
+
+def test_sdpa_f16_softmax_parity(device: torch.device):
+    """f16 SDPA, no mask: fp32 score-chain parity with torch's fused kernel."""
+    from test_models import SdpaBasicModel
+
+    model: torch.nn.Module = SdpaBasicModel().to(device)
+    _assert_sdpa_parity(model, _sdpa_wide_qkv(device, torch.float16))
+
+
+def test_sdpa_bf16_causal_softmax_parity(device: torch.device):
+    """bf16 SDPA with is_causal=True: the causal mask rides the fp32 chain."""
+    from test_models import SdpaCausalModel
+
+    model: torch.nn.Module = SdpaCausalModel().to(device)
+    _assert_sdpa_parity(model, _sdpa_wide_qkv(device, torch.bfloat16))
+
+
+def test_sdpa_bf16_bool_mask_softmax_parity(device: torch.device):
+    """bf16 SDPA with a boolean keep-mask: mask conversion joins the fp32 chain."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    q, k, v = _sdpa_wide_qkv(device, torch.bfloat16)
+    keep = ~torch.triu(
+        torch.ones(q.shape[-2], k.shape[-2], dtype=torch.bool, device=q.device),
+        diagonal=1,
+    )
+    _assert_sdpa_parity(model, (q, k, v, keep))
+
+
+def test_sdpa_bf16_float_bias_softmax_parity(device: torch.device):
+    """bf16 SDPA with a bf16 additive bias: bias is promoted into the fp32 chain."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    q, k, v = _sdpa_wide_qkv(device, torch.bfloat16)
+    torch.manual_seed(1)
+    bias = (torch.randn(1, 1, q.shape[-2], k.shape[-2]) * 2.0).to(q.dtype).to(q.device)
+    _assert_sdpa_parity(model, (q, k, v, bias))
+
+
+def test_sdpa_bool_mask_fully_masked_row(device: torch.device):
+    """Fully-masked query rows must be exactly zero (torch CPU-kernel
+    semantics); a plain -1e9 conversion averages V instead — silently wrong
+    for left-padded batches."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    q, k, v = _sdpa_qkv(device)
+    s_q, s_k = q.shape[-2], k.shape[-2]
+    keep = torch.ones(s_q, s_k, dtype=torch.bool, device=device)
+    keep[0, :] = False  # query row 0 attends to nothing
+    expected: torch.Tensor = model(q, k, v, keep)
+    actual: torch.Tensor = compiled(q, k, v, keep)
+    assert torch.all(actual[..., 0, :] == 0.0), (
+        f"fully-masked row must be zeros, got absmax "
+        f"{actual[..., 0, :].abs().max().item():.4f}"
+    )
+    # torch is backend-inconsistent here (CPU zeros, CUDA efficient-attn
+    # unspecified) — compare eager on defined rows only; zeros asserted above.
+    assert torch.allclose(actual[..., 1:, :], expected[..., 1:, :], atol=1e-5)
+
+
+def test_sdpa_bool_mask_fully_masked_row_bf16_4d(device: torch.device):
+    """Same contract on the bf16 fp32-upcast chain with a 4D broadcast mask."""
+    from test_models import SdpaWithBiasModel
+
+    model: torch.nn.Module = SdpaWithBiasModel().to(device)
+    q, k, v = _sdpa_wide_qkv(device, torch.bfloat16)
+    s_q, s_k = q.shape[-2], k.shape[-2]
+    keep = torch.ones(1, 1, s_q, s_k, dtype=torch.bool, device=device)
+    keep[..., -1, :] = False  # last query row attends to nothing
+    # Parity-bounded on defined rows only: the fp64 reference (and CUDA
+    # eager) is undefined for the fully-masked row — see the 2D test note.
+    actual = _assert_sdpa_parity(
+        model, (q, k, v, keep), select=lambda t: t[..., :-1, :]
+    )
+    assert torch.all(actual[..., -1, :] == 0.0), (
+        f"fully-masked row must be zeros, got absmax "
+        f"{actual[..., -1, :].abs().max().item():.4f}"
+    )
+
+
+def _gqa_qkv(device: torch.device, dtype: torch.dtype = torch.float32):
+    """Q with 4 heads, K/V with 2 — the grouped-query head layout."""
+    torch.manual_seed(0)
+    b, s, d = 1, 8, 16
+    q = torch.randn(b, 4, s, d, dtype=dtype, device=device)
+    k = torch.randn(b, 2, s, d, dtype=dtype, device=device)
+    v = torch.randn(b, 2, s, d, dtype=dtype, device=device)
+    return q, k, v
+
+
+def test_sdpa_gqa_fp32(device: torch.device):
+    """`enable_gqa=True` with H_q=4, H_kv=2: K/V head-broadcast, exact match."""
+    from test_models import SdpaGqaModel
+
+    model: torch.nn.Module = SdpaGqaModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    q, k, v = _gqa_qkv(device)
+    expected: torch.Tensor = model(q, k, v)
+    actual: torch.Tensor = compiled(q, k, v)
+    assert torch.allclose(actual, expected, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(actual - expected)).item():.2e}"
+    )
+
+
+def test_sdpa_gqa_causal_bf16_parity(device: torch.device):
+    """GQA + is_causal on the bf16 fp32-upcast chain, parity-bounded."""
+    from test_models import SdpaGqaModel
+
+    model: torch.nn.Module = SdpaGqaModel(is_causal=True).to(device)
+    _assert_sdpa_parity(model, _gqa_qkv(device, torch.bfloat16))
+
+
+def test_sdpa_f32_unaffected_by_upcast(device: torch.device):
+    """fp32 SDPA still matches eager tightly — the upcast is low-precision-only."""
+    from test_models import SdpaBasicModel
+
+    model: torch.nn.Module = SdpaBasicModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    q, k, v = _sdpa_wide_qkv(device, torch.float32)
+    expected: torch.Tensor = model(q, k, v)
+    actual: torch.Tensor = compiled(q, k, v)
+    # 1e-4, not 1e-5: wide scores expose fp32 accumulation order — measured
+    # ~1.4-1.7e-5 vs eager (cpu/cuda); reduction ordering, not a bug.
+    assert torch.allclose(actual, expected, atol=1e-4), (
+        f"max_diff={torch.max(torch.abs(actual - expected)).item():.2e}"
+    )
+
+
 def test_mlp_block(device: torch.device):
     """Test two-layer MLP: Linear(8,16) -> ReLU -> Linear(16,4) on input (2,8)."""
     model: torch.nn.Module = MLPBlockModel().to(device)

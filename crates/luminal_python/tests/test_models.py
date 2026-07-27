@@ -2480,6 +2480,23 @@ class SdpaWithBiasModel(torch.nn.Module):
         return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
 
 
+class SdpaGqaModel(torch.nn.Module):
+    """`enable_gqa=True`: K/V carry fewer heads and the kernel
+    head-broadcasts. Newer transformers pass this instead of materializing
+    `repeat_kv`."""
+
+    def __init__(self, is_causal: bool = False) -> None:
+        super().__init__()
+        self.is_causal = is_causal
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=self.is_causal, enable_gqa=True
+        )
+
+
 class RepeatModel(torch.nn.Module):
     """`Tensor.repeat(*repeats)` — tiles `repeats[d]` copies along each dim;
     when `len(repeats) > ndim`, size-1 leading dims are prepended first."""
