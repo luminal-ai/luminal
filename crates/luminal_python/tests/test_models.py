@@ -2497,6 +2497,76 @@ class SdpaGqaModel(torch.nn.Module):
         )
 
 
+class ReductionParityModel(torch.nn.Module):
+    """One reduction-class op, for the fp16 opmath parity battery: torch
+    accumulates reductions in fp32 for half inputs; these pin luminal to the
+    same contract at outlier magnitudes."""
+
+    OPS = {
+        "sum": lambda x: x.sum(-1),
+        "mean": lambda x: x.mean(-1),
+        "softmax": lambda x: torch.softmax(x, -1),
+        "cumsum": lambda x: x.cumsum(-1),
+        "amax": lambda x: x.amax(-1),
+    }
+
+    def __init__(self, op: str) -> None:
+        super().__init__()
+        self.op = op
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.OPS[self.op](x)
+
+
+class LayerNormOutlierModel(torch.nn.Module):
+    """LayerNorm over fp16 activations with outlier magnitudes (~350, the
+    OPT-family residual-stream profile). torch computes LN statistics in
+    fp32 (opmath); fp16 statistics overflow at |x| > ~256 since x^2
+    exceeds fp16 max (65504)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ln = torch.nn.LayerNorm(64)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ln(x)
+
+
+class ExpandRankExtendModel(torch.nn.Module):
+    """Rank-extending `expand` with `-1`: a 1-D parameter grown to 3-D
+    (`class_embedding.expand(B, 1, -1)` — the CLIP vision-tower pattern).
+    torch prepends the new dims, so `-1`/existing sizes resolve
+    RIGHT-aligned against the source shape."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emb = torch.nn.Parameter(torch.randn(16))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cls = self.emb.expand(x.shape[0], 1, -1)
+        return torch.cat([cls, x], dim=1)
+
+
+class MixedIntMinimumModel(torch.nn.Module):
+    """`torch.minimum` between int64 and int32 tensors — torch promotes to
+    int64 inside the kernel, so the exported graph carries mixed operand
+    dtypes with no explicit cast."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        cap = torch.full_like(x, 4, dtype=torch.int32)
+        return torch.minimum(x, cap).to(torch.float32)
+
+
+class WideIntCompareModel(torch.nn.Module):
+    """int64-vs-int32 comparison where the int64 side exceeds i32 range —
+    detects wrong-direction promotion (truncating i64 to i32 flips the
+    comparison for values beyond 2^31)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        small = torch.full_like(x, 5, dtype=torch.int32)
+        return (x > small).to(torch.float32)
+
+
 class RepeatModel(torch.nn.Module):
     """`Tensor.repeat(*repeats)` — tiles `repeats[d]` copies along each dim;
     when `len(repeats) > ndim`, size-1 leading dims are prepended first."""

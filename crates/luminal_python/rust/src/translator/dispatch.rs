@@ -134,7 +134,9 @@ impl<'a> Translator<'a> {
                 let mat2 = self.get_input_tensor(node, 2)?;
                 let beta = self.get_float_arg(node, 3).unwrap_or(1.0) as f32;
                 let alpha = self.get_float_arg(node, 4).unwrap_or(1.0) as f32;
+                let (mat1, mat2) = ensure_same_dtype(mat1, mat2);
                 let mm = mat1.matmul(mat2);
+                let (input, mm) = ensure_same_dtype(input, mm);
                 let (input, mm) = broadcast_binary(input, mm);
                 input * beta + mm * alpha
             }
@@ -381,12 +383,14 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.maximum.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
+                let (a, b) = ensure_same_dtype(a, b);
                 let (a, b) = broadcast_binary(a, b);
                 a.maximum(b)
             }
             "torch.ops.aten.minimum.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
+                let (a, b) = ensure_same_dtype(a, b);
                 let (a, b) = broadcast_binary(a, b);
                 a.minimum(b)
             }

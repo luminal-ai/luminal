@@ -114,23 +114,32 @@ impl<'a> Translator<'a> {
         // eps is arg 4 (after input, normalized_shape, weight, bias), default 1e-5
         let eps = self.get_float_arg(node, 4).unwrap_or(1e-5) as f32;
 
-        let mut result = input.layer_norm(axes, eps);
+        // torch computes LN statistics in fp32 (opmath) even for fp16/bf16
+        // inputs — "For FP16 or BFloat16 inputs, ops should perform internal
+        // math in FP32" (aten/src/ATen/OpMathType.h; used by
+        // layer_norm_kernel.cpp as `opmath_t`). fp16 statistics overflow on
+        // outlier activations (x^2 > 65504 at |x| > ~256 — the OPT-family
+        // residual-stream profile).
+        // Mirror translate_fused_rms_norm: normalize + affine in F32, cast
+        // the result back to the input dtype.
+        let out_dtype = input.dtype;
+        let mut result = input.cast(DType::F32).layer_norm(axes, eps);
 
         // Apply weight (arg 2) if present and not None
         if let Some(weight_name) = node.inputs.get(2).and_then(|i| i.arg.as_tensor_name()) {
-            let w = self.get_tensor(weight_name)?;
+            let w = self.get_tensor(weight_name)?.cast(DType::F32);
             let (r, w) = broadcast_binary(result, w);
             result = r * w;
         }
 
         // Apply bias (arg 3) if present and not None
         if let Some(bias_name) = node.inputs.get(3).and_then(|i| i.arg.as_tensor_name()) {
-            let b = self.get_tensor(bias_name)?;
+            let b = self.get_tensor(bias_name)?.cast(DType::F32);
             let (r, b) = broadcast_binary(result, b);
             result = r + b;
         }
 
-        Ok(result)
+        Ok(result.cast(out_dtype))
     }
 
     /// `aten._fused_rms_norm` (F.rms_norm on CUDA): frontend `std_norm` +
@@ -213,9 +222,13 @@ impl<'a> Translator<'a> {
         let spatial: Expression = orig_dims[2..].iter().cloned().product();
         let group_volume = spatial * Expression::from(group_size);
 
+        // torch computes group-norm statistics in fp32 (opmath); fp16 stats
+        // overflow on outlier activations. Normalize + affine in F32 and
+        // cast back at the end (mirrors translate_fused_rms_norm).
+        let out_dtype = input.dtype;
         // Flatten everything after the batch dim into one axis: (N, C, ...) -> (N, M),
         // where M = C * spatial. Group volumes are contiguous in this layout.
-        let mut t = input;
+        let mut t = input.cast(DType::F32);
         while t.shape.len() > 2 {
             t = t.merge_dims(1, 2);
         }
@@ -239,19 +252,19 @@ impl<'a> Translator<'a> {
         // broadcast them onto every axis except the channel axis.
         let non_channel_axes: Vec<usize> = (0..ndim).filter(|&a| a != 1).collect();
         if let Some(weight_name) = node.inputs.get(1).and_then(|i| i.arg.as_tensor_name()) {
-            let w = self.get_tensor(weight_name)?;
+            let w = self.get_tensor(weight_name)?.cast(DType::F32);
             let w = w.expand_to_shape_on_axes(t.shape, non_channel_axes.clone());
             let (r, w) = broadcast_binary(t, w);
             t = r * w;
         }
         if let Some(bias_name) = node.inputs.get(2).and_then(|i| i.arg.as_tensor_name()) {
-            let b = self.get_tensor(bias_name)?;
+            let b = self.get_tensor(bias_name)?.cast(DType::F32);
             let b = b.expand_to_shape_on_axes(t.shape, non_channel_axes);
             let (r, b) = broadcast_binary(t, b);
             t = r + b;
         }
 
-        Ok(t)
+        Ok(t.cast(out_dtype))
     }
 
     pub(crate) fn translate_sign(&mut self, node: &Node) -> Result<GraphTensor> {

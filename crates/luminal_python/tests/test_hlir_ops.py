@@ -2161,6 +2161,95 @@ def test_sdpa_f32_unaffected_by_upcast(device: torch.device):
     )
 
 
+# ---- mixed-dtype operand unification ---------------------------------------
+
+
+@pytest.mark.parametrize("op", ["sum", "mean", "softmax", "cumsum", "amax"])
+def test_reduction_fp16_opmath_parity(op: str, device: torch.device):
+    """Reduction-class ops at fp16 outlier scale must match eager (which
+    accumulates in fp32 opmath). Guards against input-dtype statistic
+    chains — the layer_norm/sdpa overflow class."""
+    from test_models import ReductionParityModel
+
+    torch.manual_seed(0)
+    model = ReductionParityModel(op).to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    if op in ("sum", "mean", "cumsum"):
+        x = (torch.rand(2, 8, 2048) * 30 + 1).half().to(device)  # big positive sums
+    else:
+        x = (torch.randn(2, 8, 2048) * 40).half().to(device)  # ~300-magnitude tails
+    expected = model(x)
+    actual = compiled(x)
+    assert torch.isfinite(actual).all(), f"{op}: non-finite output"
+    rel = (
+        (actual.double() - expected.double()).abs().max()
+        / expected.double().abs().max().clamp(min=1e-9)
+    ).item()
+    assert rel < 0.01, f"{op}: rel_err={rel:.4f} vs eager"
+
+
+def test_layer_norm_fp16_outliers(device: torch.device):
+    """LN statistics must be computed in fp32 for low-precision inputs —
+    fp16 stats overflow on outlier activations (x^2 > fp16 max)."""
+    from test_models import LayerNormOutlierModel
+
+    torch.manual_seed(0)
+    model = LayerNormOutlierModel().to(device).half()
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = (torch.randn(1, 8, 64) * 40.0).half().to(device)
+    x[..., 0] = 350.0  # outlier channel: 350^2 overflows fp16
+    expected: torch.Tensor = model(x)
+    actual: torch.Tensor = compiled(x)
+    assert torch.isfinite(actual).all(), "LN produced non-finite output"
+    assert torch.allclose(actual.float(), expected.float(), atol=2e-2), (
+        f"max_diff={torch.max(torch.abs(actual.float() - expected.float())).item():.4f}"
+    )
+
+
+def test_expand_rank_extending(device: torch.device):
+    """1-D -> 3-D expand with -1 must resolve source dims right-aligned
+    (torch prepends new dims); left-aligned indexing walks off the end."""
+    from test_models import ExpandRankExtendModel
+
+    model: torch.nn.Module = ExpandRankExtendModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.randn(2, 3, 16, device=device)
+    expected: torch.Tensor = model(x)
+    actual: torch.Tensor = compiled(x)
+    assert torch.allclose(actual, expected, atol=1e-5), (
+        f"max_diff={torch.max(torch.abs(actual - expected)).item():.2e}"
+    )
+
+
+def test_minimum_mixed_int_widths(device: torch.device):
+    """`torch.minimum(int64, int32)`: operands must be dtype-unified before
+    the core compare (panics with "Dtypes must match" otherwise). The
+    T5-family relative-position bucketing hits exactly this."""
+    from test_models import MixedIntMinimumModel
+
+    model: torch.nn.Module = MixedIntMinimumModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor([[1, 3, 7, 9]], dtype=torch.int64, device=device)
+    expected: torch.Tensor = model(x)
+    actual: torch.Tensor = compiled(x)
+    assert torch.equal(actual, expected)
+
+
+def test_compare_promotes_to_int64(device: torch.device):
+    """Mixed int widths must promote UP to int64 (torch semantics) — an
+    int64 operand beyond i32 range flips the comparison if truncated."""
+    from test_models import WideIntCompareModel
+
+    model: torch.nn.Module = WideIntCompareModel().to(device)
+    compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor(
+        [[3_000_000_000, 2, 6_000_000_000]], dtype=torch.int64, device=device
+    )
+    expected: torch.Tensor = model(x)  # [1, 0, 1]
+    actual: torch.Tensor = compiled(x)
+    assert torch.equal(actual, expected), f"{actual=} {expected=}"
+
+
 def test_mlp_block(device: torch.device):
     """Test two-layer MLP: Linear(8,16) -> ReLU -> Linear(16,4) on input (2,8)."""
     model: torch.nn.Module = MLPBlockModel().to(device)
