@@ -163,6 +163,55 @@ def _collect_input_device_ptrs(ep, user_inputs):
     return ptrs
 
 
+
+def _lower_sym_sum(ep) -> None:
+    """Rewrite `torch.sym_sum` nodes into chains of `operator.add` so the
+    ExportedProgram survives `torch.export.save`.
+
+    WORKAROUND for a torch.export inconsistency: the export VERIFIER allows
+    sym_sum in graphs (pytorch#159111, landed 2025-07), but the PT2 serde's
+    `_SYM_OPS` table never got the matching entry, so `torch.export.save`
+    raises `AssertionError: op sym_sum is not in _SYM_OPS` on any graph the
+    verifier just blessed. sym_sum appears whenever shape arithmetic sums
+    three or more SymInts (sympy's Add is n-ary) — e.g. HF llama under
+    attn_implementation="sdpa" with a growing KV cache.
+
+    The upstream one-line fix exists inside the (larger, still-open)
+    duck-sizing PR: https://github.com/pytorch/pytorch/pull/186373
+    This pass checks torch's own table first, so it becomes a no-op — and
+    can be DELETED — once we run a torch that includes that fix.
+    """
+    import operator
+
+    if not hasattr(torch, "sym_sum"):
+        return  # torch too old to ever emit it
+    try:
+        from torch._export.serde.serialize import _SYM_OPS
+
+        if torch.sym_sum in _SYM_OPS:
+            return  # torch can serialize it natively (pytorch#186373 landed)
+    except ImportError:
+        pass  # private module moved — fall through and lower defensively
+
+    gm = ep.graph_module
+    changed = False
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not torch.sym_sum:
+            continue
+        (terms,) = node.args
+        terms = list(terms)
+        with gm.graph.inserting_before(node):
+            acc = terms[0]
+            for term in terms[1:]:
+                acc = gm.graph.call_function(operator.add, (acc, term))
+        node.replace_all_uses_with(acc)
+        gm.graph.erase_node(node)
+        changed = True
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+
+
 def _save_and_compile(
     ep_or_path, factory, search_iterations, user_indices=None, input_device_ptrs=None
 ):
@@ -180,6 +229,7 @@ def _save_and_compile(
     try:
         if owns_tmpdir:
             pt2_path = os.path.join(tmpdir, "model.pt2")
+            _lower_sym_sum(ep_or_path)  # serde gap workaround; see docstring
             torch.export.save(ep_or_path, pt2_path)
             weight_source = ep_or_path.state_dict
         else:
