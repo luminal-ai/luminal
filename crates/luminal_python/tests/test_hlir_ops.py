@@ -1,4 +1,3 @@
-import re
 from typing import Callable
 
 import pytest
@@ -2549,14 +2548,26 @@ def test_scatter_nd(device: torch.device):
     assert torch.allclose(output, original)
 
 
-def test_input_backed_index_put_output_aliases_destination_input(tmp_path):
-    from luminal import process_pt2
+def test_input_backed_index_put_mutates_caller_tensor(tmp_path):
+    """In-place mutation of a graph input is applied back to the caller's
+    tensor and reported in `writeback_inputs`, and only the real user outputs
+    are returned.
+
+    `cache[:, positions] = values; return cache, None` is the sharpest case:
+    the functionalized graph has TWO outputs with the same tensor name — the
+    mutation write-back and the returned user output — so the write-back
+    bookkeeping must key on output position, not name; and the `None` user
+    output (serialized as `as_none`, filtered out of the translator's output
+    list) checks that write-back positions index the tensor-only output
+    space, not raw signature-spec order.
+    """
+    from luminal import CompiledModel, process_pt2
     from luminal.luminal import _reference_factory_capsule
 
     class InputBackedIndexPut(torch.nn.Module):
         def forward(self, cache, positions, values):
             cache[:, positions] = values
-            return cache
+            return cache, None
 
     exported = torch.export.export(
         InputBackedIndexPut(),
@@ -2567,17 +2578,28 @@ def test_input_backed_index_put_output_aliases_destination_input(tmp_path):
         ),
         strict=False,
     )
+    # Both real compile paths (pt2.compile and pt2_backend) decompose before
+    # saving; decomposition is also what functionalizes the in-place
+    # `index_put_` into a write-back output declared by the graph signature.
+    exported = exported.run_decompositions()
     pt2_path = tmp_path / "input_backed_index_put.pt2"
     torch.export.save(exported, pt2_path)
-    compiled = process_pt2(str(pt2_path), "", 0, _reference_factory_capsule())
+    graph_result = process_pt2(str(pt2_path), "", 0, _reference_factory_capsule())
+    model = CompiledModel(graph_result)
 
-    dot = compiled.to_dot()
-    cache_node = re.search(r'Input \{ node: (\d+), label: \\"cache\\"', dot)
-    output_nodes = re.findall(r"Output \{ node: (\d+), persist_only: false \}", dot)
+    assert model.writeback_inputs == {"index_put": "cache"}
 
-    assert cache_node is not None
-    assert output_nodes
-    assert set(output_nodes) == {cache_node.group(1)}
+    cache = torch.zeros(2, 4)
+    outs = model(cache, torch.tensor([1], dtype=torch.int64), torch.ones(2, 1))
+
+    expected = torch.zeros(2, 4)
+    expected[:, 1] = 1.0
+    # The caller's tensor was mutated in place, eager-style.
+    assert torch.equal(cache, expected)
+    # Only the user output (the returned cache) comes back — the write-back
+    # output is consumed by the mutation, not returned.
+    assert len(outs) == 1
+    assert torch.equal(outs[0], expected)
 
 
 # ========== Bool-mask index_put correctness tests ==========

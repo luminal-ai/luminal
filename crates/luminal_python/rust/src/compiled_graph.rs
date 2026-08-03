@@ -98,6 +98,9 @@ pub struct GraphTranslation {
     pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<IntExpr>>,
     pub dim_param_map: DimParamMap,
+    /// (output position, user-input name) for outputs that write back into a
+    /// user input's buffer (in-place state updates like HF StaticCache k/v).
+    pub writeback_outputs: Vec<(usize, String)>,
 }
 
 /// Pre-loaded weight data from any model format (dtype-aware).
@@ -126,6 +129,8 @@ pub struct CompiledGraph {
     pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<IntExpr>>,
     pub dim_param_map: DimParamMap,
+    /// See [`GraphTranslation::writeback_outputs`].
+    pub writeback_outputs: Vec<(usize, String)>,
 }
 
 impl CompiledGraph {
@@ -149,6 +154,7 @@ impl CompiledGraph {
             output_dtypes,
             input_shape_exprs,
             dim_param_map,
+            writeback_outputs,
         } = translation;
         let WeightData {
             weights,
@@ -191,6 +197,7 @@ impl CompiledGraph {
             output_dtypes,
             input_shape_exprs,
             dim_param_map,
+            writeback_outputs,
         })
     }
 }
@@ -237,6 +244,13 @@ impl CompiledGraph {
     #[getter]
     fn tensor_names(&self) -> Vec<String> {
         self.tensor_ids.keys().cloned().collect()
+    }
+
+    /// (output position, input name) pairs for outputs that write back into a
+    /// user input's buffer (in-place state updates like HF StaticCache k/v).
+    #[getter]
+    fn writeback_outputs(&self) -> Vec<(usize, String)> {
+        self.writeback_outputs.clone()
     }
 
     /// Get the name of the active backend.

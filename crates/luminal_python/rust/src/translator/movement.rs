@@ -658,13 +658,6 @@ impl<'a> Translator<'a> {
                 values.cast(a.dtype)
             };
             let result = super::movement_dynamic::pt2_scatter_elements(a, idx_full, values, axis);
-            if self
-                .user_input_ids
-                .iter()
-                .any(|(_, input_id)| *input_id == a.id)
-            {
-                self.input_backed_write_backs.insert(result.id, a);
-            }
             return Ok(result);
         }
         let index_names = if let Some(names) = node.inputs[1].arg.as_tensors() {

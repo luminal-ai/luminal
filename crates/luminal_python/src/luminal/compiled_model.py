@@ -41,6 +41,11 @@ class CompiledModel:
         self._graph = graph_result
         self._input_names = input_names or graph_result.input_names
         self._output_names = graph_result.output_names
+        # {output position: mutated input name} for the write-back outputs
+        # torch.export's functionalization appends for in-place input
+        # mutations. Keyed by position, not name: a model that mutates an
+        # input and also returns it yields two same-named outputs.
+        self._writeback_by_pos = dict(graph_result.writeback_outputs)
         self._output_shapes = graph_result.output_shapes
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
@@ -66,6 +71,15 @@ class CompiledModel:
     def set_dim(self, param_name: str, value: int) -> None:
         """Set a dynamic dimension value by its param name."""
         self._graph.set_dim(param_name, value)
+
+    @property
+    def writeback_inputs(self) -> dict:
+        """{output name: input name it writes back to} for the in-place input
+        mutations `__call__` applies to the caller's tensors."""
+        return {
+            self._output_names[pos]: input_name
+            for pos, input_name in self._writeback_by_pos.items()
+        }
 
     @property
     def has_dynamic_dims(self) -> bool:
@@ -241,6 +255,11 @@ class CompiledModel:
         if _use_zero_copy:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
+                if i in self._writeback_by_pos:
+                    # Write-backs land in the caller's input tensor below, not
+                    # in a fresh output buffer.
+                    output_tensors.append(None)
+                    continue
                 out = torch.empty(shape, dtype=out_dtype, device=input_device)
                 if out_dtype in _zero_copy_native_floats:
                     self._graph.set_output_device_ptr(
@@ -253,6 +272,14 @@ class CompiledModel:
         outputs = []
         for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
             out_dtype = output_torch_dtypes[i]
+            if i in self._writeback_by_pos:
+                # In-place input mutation: copy the computed state back into
+                # the caller's tensor (the same object the model would have
+                # mutated eagerly); it is not part of the returned tuple.
+                input_name = self._writeback_by_pos[i]
+                target = user_inputs[self._input_names.index(input_name)]
+                target.copy_(_read_typed_output(name, shape, out_dtype))
+                continue
             if _use_zero_copy and out_dtype in _zero_copy_native_floats:
                 out = output_tensors[i]
                 if not self._graph.output_is_zero_copy(name):

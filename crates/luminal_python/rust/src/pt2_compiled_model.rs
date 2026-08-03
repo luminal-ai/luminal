@@ -261,6 +261,7 @@ pub fn translate_pt2(
         output_shape_exprs,
         input_shape_exprs,
         dim_param_map,
+        writeback_outputs: parsed.writeback_outputs(),
     };
 
     let weight_data = WeightData {

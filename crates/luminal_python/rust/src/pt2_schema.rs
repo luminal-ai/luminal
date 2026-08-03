@@ -324,6 +324,29 @@ impl DimSize {
 #[derive(Debug, Deserialize)]
 pub struct Signature {
     pub input_specs: Vec<InputSpec>,
+    /// Output specs — distinguish real user outputs from the extra outputs
+    /// torch.export's functionalization appends for in-place input mutations
+    /// (e.g. HF StaticCache k/v updates, cumulative_length counters).
+    #[serde(default)]
+    pub output_specs: Vec<OutputSpec>,
+}
+
+/// An output spec — tagged enum via JSON key. Only mutations are modeled;
+/// user outputs (and anything else) fall through to `Other`.
+/// `{"user_input_mutation": {"arg": {...}, "user_input_name": "cache"}}`
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OutputSpec {
+    UserInputMutation {
+        user_input_mutation: UserInputMutation,
+    },
+    #[allow(dead_code)] // Serde catch-all for untagged enum
+    Other(serde_json::Value),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UserInputMutation {
+    pub user_input_name: String,
 }
 
 /// An input spec — tagged enum via JSON key.

@@ -96,6 +96,37 @@ impl ParsedPT2 {
             .collect()
     }
 
+    /// (output position, mutated user-input name) for every output the export
+    /// signature declares as an in-place input mutation — the extra outputs
+    /// functionalization appends for `index_put_`/`copy_`/`add_` on graph
+    /// inputs (e.g. HF StaticCache updates). Keyed by position, not name: a
+    /// model that mutates an input *and* returns it yields two outputs with
+    /// the same tensor name.
+    ///
+    /// Positions index the same tensor-only output list `output_names()`
+    /// returns: output_specs is parallel to graph.outputs, but non-tensor
+    /// user outputs (e.g. a returned `None` serializes as `as_none`) are
+    /// filtered out of `output_names()`, so counting raw spec positions
+    /// would skew everything after one.
+    pub fn writeback_outputs(&self) -> Vec<(usize, String)> {
+        let outputs = &self.program.graph_module.graph.outputs;
+        self.program
+            .graph_module
+            .signature
+            .output_specs
+            .iter()
+            .zip(outputs)
+            .filter(|(_, output)| output.as_tensor.is_some())
+            .enumerate()
+            .filter_map(|(position, (spec, _))| match spec {
+                OutputSpec::UserInputMutation {
+                    user_input_mutation,
+                } => Some((position, user_input_mutation.user_input_name.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Get tensor metadata by name.
     pub fn tensor_meta(&self, name: &str) -> Option<&TensorMeta> {
         self.program.graph_module.graph.tensor_values.get(name)

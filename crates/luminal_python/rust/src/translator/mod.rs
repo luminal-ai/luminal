@@ -52,7 +52,6 @@ pub(crate) struct Translator<'a> {
     pub(crate) output_ids: Vec<(String, NodeIndex)>,
     /// Extra tensor metadata from inlined subgraphs.
     pub(crate) extra_tensor_values: HashMap<String, TensorMeta>,
-    pub(crate) input_backed_write_backs: HashMap<NodeIndex, GraphTensor>,
 }
 
 impl<'a> Translator<'a> {
@@ -66,7 +65,6 @@ impl<'a> Translator<'a> {
             user_input_ids: Vec::new(),
             output_ids: Vec::new(),
             extra_tensor_values: HashMap::new(),
-            input_backed_write_backs: HashMap::new(),
         })
     }
 
@@ -82,11 +80,6 @@ impl<'a> Translator<'a> {
         let output_names = self.parsed.output_names();
         for name in &output_names {
             let tensor = self.get_tensor(name)?;
-            if let Some(dest) = self.input_backed_write_backs.get(&tensor.id) {
-                dest.output();
-                self.output_ids.push((name.clone(), dest.id));
-                continue;
-            }
             let tensor = if tensor.dtype == DType::Bool {
                 tensor.cast(DType::Int).cast(DType::Bool)
             } else if tensor.dtype == DType::Int {
