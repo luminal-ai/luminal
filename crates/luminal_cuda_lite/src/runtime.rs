@@ -3095,6 +3095,7 @@ impl CudaRuntime {
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
         timeout: Option<std::time::Duration>,
+        early_stop: Option<(Duration, f64)>,
     ) -> (Duration, String) {
         self.profiling = true;
         let profile_start = std::time::Instant::now();
@@ -3125,6 +3126,18 @@ impl CudaRuntime {
             self.execute(dyn_map);
             durations.push(start.elapsed());
             if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
+            // Early stop against the search's best-so-far: once this
+            // candidate's running mean has lost by the configured margin,
+            // remaining trials can't change the outcome — return the partial
+            // mean and let ranking handle it. Deliberately checked only on
+            // timed trials: the warmup above absorbs one-time costs, and a
+            // slow warmup must not disqualify a fast steady-state candidate.
+            if early_stop.is_some_and(|(best, factor)| {
+                let mean = durations.iter().sum::<Duration>() / durations.len() as u32;
+                luminal::op::early_stop_exceeded(mean, best, factor)
+            }) {
                 break;
             }
         }
@@ -3586,6 +3599,7 @@ impl Runtime for CudaRuntime {
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
         timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
     ) -> (Self::ProfileMetric, String) {
         Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         // Clear active bucket's arena before loading new LLIR for profiling.
@@ -3598,7 +3612,7 @@ impl Runtime for CudaRuntime {
         if let Err(e) = self.try_load_llir(llir_graph) {
             return Self::invalid_profile_metric(e);
         }
-        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
+        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout, early_stop)
     }
 
     fn profile_with_bucket_context(
@@ -3607,12 +3621,13 @@ impl Runtime for CudaRuntime {
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
         timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
         bucket_context: luminal::op::ProfileBucketContext<'_>,
     ) -> (Self::ProfileMetric, String) {
         // Profile with the same bucket metadata that final bucket compilation
         // uses, so bucket-sensitive graph packaging decisions match search.
         if bucket_context.dim_buckets.is_empty() {
-            return self.profile(llir_graph, dyn_map, trials, timeout);
+            return self.profile(llir_graph, dyn_map, trials, timeout, early_stop);
         }
         Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         if !self.compiled_buckets.is_empty() {
@@ -3629,7 +3644,7 @@ impl Runtime for CudaRuntime {
         if let Err(e) = self.try_load_llir_buckets(bucket_context.dim_buckets, &bucket_llirs) {
             return Self::invalid_profile_metric(e);
         }
-        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
+        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout, early_stop)
     }
 
     #[tracing::instrument(skip_all)]

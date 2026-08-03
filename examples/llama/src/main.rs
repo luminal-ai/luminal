@@ -342,7 +342,11 @@ fn main() {
         )
         .search_graph_limit(SEARCH_GRAPHS)
         .trials(SEARCH_TRIALS)
-        .keep_best(SEARCH_KEEP_BEST);
+        .keep_best(SEARCH_KEEP_BEST)
+        // Candidates whose running mean has already lost by 2x stop trialing
+        // early; their partial mean is still ranked. Cuts profiling time spent
+        // on losers without changing which candidate wins.
+        .early_stop_factor(2.0);
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();

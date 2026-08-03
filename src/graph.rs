@@ -229,6 +229,12 @@ pub struct CompileOptions {
     pub candidate_timeout: Option<std::time::Duration>,
     /// Caps how long profiling runs a single trial; not a rejection criterion.
     pub execution_timeout: Option<std::time::Duration>,
+    /// Stop profiling a candidate early once its running mean exceeds
+    /// `factor ×` the best candidate's metric. The partial mean is still
+    /// returned and ranked normally, so this never changes which candidates
+    /// are eligible — it only stops spending trials on candidates that have
+    /// already lost by at least this margin. `None` disables (default).
+    pub early_stop_factor: Option<f64>,
     /// Dynamic dimension values applied after search-space construction and
     /// before search. These values persist in [`Graph::dyn_map`] and provide
     /// the base representative values for unbucketed dimensions. Per-bucket
@@ -305,6 +311,17 @@ impl CompileOptions {
         self
     }
 
+    /// Stop profiling a candidate once its running mean exceeds `factor ×`
+    /// the current best. See [`CompileOptions::early_stop_factor`].
+    pub fn early_stop_factor(mut self, factor: f64) -> Self {
+        assert!(
+            factor >= 1.0,
+            "early_stop_factor below 1.0 would truncate candidates still in contention"
+        );
+        self.early_stop_factor = Some(factor);
+        self
+    }
+
     /// Set a dynamic dimension after search-space construction and before
     /// search. This is equivalent to calling [`Graph::set_dim`] between
     /// [`Graph::build_search_space`] and [`Graph::search`], while still using
@@ -377,6 +394,7 @@ impl Default for CompileOptions {
             restart_stagnation: 0,
             candidate_timeout: Some(std::time::Duration::from_secs(5)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
+            early_stop_factor: None,
             search_dims: FxHashMap::default(),
             profile_dims: FxHashMap::default(),
             dim_buckets: FxHashMap::default(),
@@ -2318,6 +2336,9 @@ impl Graph {
                                 &profile_dyn_map,
                                 options.trials,
                                 options.execution_timeout,
+                                // No best exists yet — the initial genome
+                                // establishes the early-stop baseline.
+                                None,
                                 ProfileBucketContext {
                                     dim_buckets: &bucket_context.dim_buckets,
                                     bucket_indices: &bucket_context.bucket_indices,
@@ -2330,6 +2351,7 @@ impl Graph {
                                 &profile_dyn_map,
                                 options.trials,
                                 options.execution_timeout,
+                                None,
                             )
                         };
                     let timed_out = candidate_timed_out(profile_start.elapsed());
@@ -2507,6 +2529,13 @@ impl Graph {
                 let filter_display = filter_result.display;
 
                 n_graphs += 1;
+                // Losers are the most expensive candidates to profile: a
+                // candidate whose running mean is already `factor ×` worse
+                // than the best can stop trialing — its partial mean is
+                // ranked normally and cannot win.
+                let early_stop = options
+                    .early_stop_factor
+                    .map(|factor| (best_metric.clone(), factor));
                 let profile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     runtime.clear_intermediate_buffers();
                     let profile_start = std::time::Instant::now();
@@ -2517,6 +2546,7 @@ impl Graph {
                                 &profile_dyn_map,
                                 options.trials,
                                 options.execution_timeout,
+                                early_stop,
                                 ProfileBucketContext {
                                     dim_buckets: &bucket_context.dim_buckets,
                                     bucket_indices: &bucket_context.bucket_indices,
@@ -2529,6 +2559,7 @@ impl Graph {
                                 &profile_dyn_map,
                                 options.trials,
                                 options.execution_timeout,
+                                early_stop,
                             )
                         };
                     let timed_out = candidate_timed_out(profile_start.elapsed());
@@ -4316,6 +4347,7 @@ mod tests {
             dyn_map: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             self.profile_dyn_maps.push(dyn_map.clone());
             (0, "0 ms".to_string())
@@ -4347,6 +4379,7 @@ mod tests {
             _: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             (0, "0 ms".to_string())
         }
@@ -4391,6 +4424,7 @@ mod tests {
             _: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             let count = PROFILE_CALLS.fetch_add(1, Ordering::SeqCst);
             (count, format!("{count} ms"))
@@ -4531,6 +4565,7 @@ mod tests {
             _: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             let (fast, safe, _) = Self::signature(llir);
             assert_eq!(
@@ -4602,6 +4637,7 @@ mod tests {
             dyn_map: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             let (fast, safe, _) = FinalFilterRuntime::signature(llir);
             assert_eq!(
@@ -4688,6 +4724,7 @@ mod tests {
             _: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             let (fast, safe, _) = FinalFilterRuntime::signature(llir);
             if fast > 0 {
@@ -4772,6 +4809,7 @@ mod tests {
             _: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             let profile_call = SEARCH_BUDGET_PROFILE_CALLS.fetch_add(1, Ordering::SeqCst);
             if profile_call == 1 {
@@ -4837,6 +4875,7 @@ mod tests {
             _: &FxHashMap<char, usize>,
             _: usize,
             _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
         ) -> (Self::ProfileMetric, String) {
             let (fast, _, _) = FinalFilterRuntime::signature(llir);
             if fast == 1 {
@@ -5015,6 +5054,76 @@ mod tests {
             safe > 1,
             "the loaded fallback should be the fully unrolled safe graph"
         );
+    }
+
+    #[derive(Default)]
+    struct EarlyStopRecordingRuntime {
+        early_stop_args: Vec<Option<(usize, f64)>>,
+        profile_calls: usize,
+    }
+
+    impl Runtime for EarlyStopRecordingRuntime {
+        // Two competing ops so the e-graph has real choices and the search
+        // actually produces offspring after the initial genome.
+        type Ops = (FastButInvalidAfterUnroll, SlowerValidAfterUnroll);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &FxHashMap<char, usize>,
+            _: usize,
+            _: Option<std::time::Duration>,
+            early_stop: Option<(Self::ProfileMetric, f64)>,
+        ) -> (Self::ProfileMetric, String) {
+            self.early_stop_args.push(early_stop);
+            // Strictly increasing metrics: the initial genome (metric 0)
+            // stays the running best for the whole search.
+            let metric = self.profile_calls;
+            self.profile_calls += 1;
+            (metric, format!("{metric} ms"))
+        }
+    }
+
+    #[test]
+    fn search_passes_best_so_far_to_profile_early_stop() {
+        let mut cx = Graph::new();
+        let input = cx.tensor(8);
+        let _ = input.sin().sin().sin().output();
+
+        let options = CompileOptions::default()
+            .search_graph_limit(16)
+            .generation_size(4)
+            .mutations(2)
+            .early_stop_factor(2.0)
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xEA51_5709);
+        let runtime = cx.compile_with_rng(EarlyStopRecordingRuntime::default(), options, &mut rng);
+
+        assert!(
+            runtime.early_stop_args.len() > 1,
+            "search should profile more candidates than the initial genome"
+        );
+        assert_eq!(
+            runtime.early_stop_args[0], None,
+            "no best exists before the initial genome is profiled"
+        );
+        for arg in &runtime.early_stop_args[1..] {
+            let (best, factor) =
+                arg.expect("offspring profiling should receive the best-so-far cutoff");
+            assert_eq!(best, 0, "the initial genome's metric is the running best");
+            assert_eq!(factor, 2.0);
+        }
     }
 
     #[test]

@@ -383,6 +383,7 @@ impl Runtime for MetalRuntime {
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
         timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
     ) -> (Self::ProfileMetric, String) {
         self.load_llir(llir_graph);
         self.allocate_intermediate_buffers(dyn_map);
@@ -397,6 +398,14 @@ impl Runtime for MetalRuntime {
             duration += start.elapsed();
             completed_trials += 1;
             if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
+            // A candidate whose running mean has already lost by the
+            // early-stop margin keeps its partial mean; further trials
+            // can only refine a metric that is out of contention.
+            if early_stop.is_some_and(|(best, factor)| {
+                luminal::op::early_stop_exceeded(duration / completed_trials as u32, best, factor)
+            }) {
                 break;
             }
         }

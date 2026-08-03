@@ -89,12 +89,20 @@ pub trait Runtime {
     fn initialize(arg: Self::CompileArg) -> Self;
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn;
+    /// `early_stop` is `Some((best_metric, factor))` when the search already
+    /// holds a best candidate: once this candidate's running mean exceeds
+    /// `best * factor`, the runtime may stop remaining trials and return the
+    /// partial mean. The truncated metric is still returned and ranked
+    /// normally — early stop never changes which candidates are eligible,
+    /// only how much profiling time is spent on ones that have already lost.
+    /// Runtimes are free to ignore it.
     fn profile(
         &mut self,
         llir_graph: &LLIRGraph,
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
         timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
     ) -> (Self::ProfileMetric, String);
     /// Profile one candidate in the context of a specific dynamic-dimension
     /// bucket. Runtimes with bucket-sensitive lowering can override this so
@@ -106,9 +114,10 @@ pub trait Runtime {
         dyn_map: &FxHashMap<char, usize>,
         trials: usize,
         timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
         _bucket_context: ProfileBucketContext<'_>,
     ) -> (Self::ProfileMetric, String) {
-        self.profile(llir_graph, dyn_map, trials, timeout)
+        self.profile(llir_graph, dyn_map, trials, timeout, early_stop)
     }
     /// Aggregate multiple profile metrics into one comparable metric.
     /// Used for regionalized profiling and best-first bucket-set selection.
@@ -182,6 +191,18 @@ pub trait Runtime {
 /// Optional runtime instrumentation for collecting execution statistics.
 pub trait RuntimeStats: Runtime {
     fn execute_with_stats(&mut self, dyn_map: &FxHashMap<char, usize>) -> Option<ExecutionStats>;
+}
+
+/// Shared early-stop predicate for duration-metric runtimes: true once a
+/// candidate's running mean trial time exceeds `best * factor`, i.e. the
+/// candidate has already lost by at least the configured margin and further
+/// trials can only refine a metric that is out of contention.
+pub fn early_stop_exceeded(
+    mean: std::time::Duration,
+    best: std::time::Duration,
+    factor: f64,
+) -> bool {
+    mean.as_secs_f64() > best.as_secs_f64() * factor
 }
 
 /// Timing method used for execution statistics.
@@ -497,4 +518,22 @@ macro_rules! impl_into_ops {
         $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y);
         $crate::__impl_tuple_into_dyn_arcbox_concat_arity!($tr; A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
     };
+}
+
+#[cfg(test)]
+mod early_stop_tests {
+    use super::early_stop_exceeded;
+    use std::time::Duration;
+
+    #[test]
+    fn test_early_stop_exceeded() {
+        let best = Duration::from_millis(5);
+        // 2x cutoff: 10ms mean is at the boundary, not over it.
+        assert!(!early_stop_exceeded(Duration::from_millis(10), best, 2.0));
+        assert!(early_stop_exceeded(Duration::from_millis(11), best, 2.0));
+        // A candidate faster than best never stops early.
+        assert!(!early_stop_exceeded(Duration::from_millis(4), best, 2.0));
+        // Factor 1.0 stops anything slower than best.
+        assert!(early_stop_exceeded(Duration::from_millis(6), best, 1.0));
+    }
 }

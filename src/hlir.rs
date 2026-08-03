@@ -2983,6 +2983,7 @@ impl Runtime for ReferenceRuntime {
         _: &FxHashMap<char, usize>,
         _: usize,
         _: Option<std::time::Duration>,
+        _: Option<(Self::ProfileMetric, f64)>,
     ) -> (Self::ProfileMetric, String) {
         (0, "0 ms".to_string())
     }
