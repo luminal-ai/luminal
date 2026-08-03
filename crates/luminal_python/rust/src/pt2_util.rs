@@ -83,8 +83,22 @@ pub fn ensure_same_dtype(a: GraphTensor, b: GraphTensor) -> (GraphTensor, GraphT
     if a.dtype == b.dtype {
         return (a, b);
     }
+    // Promotion lattice mirroring torch's type-promotion rules, as
+    // implemented by `torch.promote_types` (documented under "Type
+    // promotion",
+    // https://docs.pytorch.org/docs/stable/tensor_attributes.html#type-promotion-doc):
+    // wider wins, floats
+    // beat ints, and a mixed f16/bf16 pair promotes to f32 — verifiable
+    // directly: promote_types(int32, int64) == int64,
+    // promote_types(float16, bfloat16) == float32. The old table promoted
+    // (Int, I64) to Int, silently truncating the 64-bit side.
     let target = match (a.dtype, b.dtype) {
+        (DType::F64, _) | (_, DType::F64) => DType::F64,
         (DType::F32, _) | (_, DType::F32) => DType::F32,
+        (DType::F16, DType::Bf16) | (DType::Bf16, DType::F16) => DType::F32,
+        (DType::F16, _) | (_, DType::F16) => DType::F16,
+        (DType::Bf16, _) | (_, DType::Bf16) => DType::Bf16,
+        (DType::I64, _) | (_, DType::I64) => DType::I64,
         (DType::Int, _) | (_, DType::Int) => DType::Int,
         _ => DType::F32,
     };

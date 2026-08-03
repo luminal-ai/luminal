@@ -198,13 +198,17 @@ impl<'a> Translator<'a> {
     pub(crate) fn translate_expand(&mut self, node: &Node) -> Result<GraphTensor> {
         let mut a = self.get_input_tensor(node, 0)?;
         let neg1_expr = IntExpr::from(-1i32);
-        let target_shape: Vec<IntExpr> = if let Ok(sizes) = self.get_ints_arg(node, 1) {
+        // torch's expand PREPENDS new dims when the target rank exceeds the
+        // source rank, so `-1`/existing sizes resolve RIGHT-aligned against
+        // the source shape (`class_embedding.expand(B, 1, -1)`: 1-D -> 3-D).
+        // Unsqueeze leading dims first so the tracker expand sees matching
+        // ranks; left-aligned indexing walks off the source shape.
+        let raw: Vec<IntExpr> = if let Ok(sizes) = self.get_ints_arg(node, 1) {
             sizes
                 .iter()
-                .enumerate()
-                .map(|(i, &s)| {
+                .map(|&s| {
                     if s == -1 {
-                        a.legacy_tracker_ref().dims[i]
+                        neg1_expr
                     } else {
                         IntExpr::from(s as usize)
                     }
@@ -212,11 +216,32 @@ impl<'a> Translator<'a> {
                 .collect()
         } else {
             self.get_exprs_arg(node, 1)?
-                .into_iter()
-                .enumerate()
-                .map(|(i, e)| if e == neg1_expr { a.legacy_tracker_ref().dims[i] } else { e })
-                .collect()
         };
+        anyhow::ensure!(
+            raw.len() >= a.legacy_tracker_ref().len(),
+            "expand: target rank {} below source rank {}",
+            raw.len(),
+            a.legacy_tracker_ref().len()
+        );
+        let offset = raw.len() - a.legacy_tracker_ref().len();
+        for _ in 0..offset {
+            a = a.unsqueeze(0);
+        }
+        let target_shape: Vec<IntExpr> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if e == neg1_expr {
+                    anyhow::ensure!(
+                        i >= offset,
+                        "expand: -1 is only valid for existing (right-aligned) dims"
+                    );
+                    Ok(a.legacy_tracker_ref().dims[i])
+                } else {
+                    Ok(e)
+                }
+            })
+            .collect::<Result<_>>()?;
         crate::pt2_util::tracker_expand(a.legacy_tracker_mut(), target_shape);
         Ok(a)
     }
