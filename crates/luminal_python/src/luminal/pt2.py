@@ -163,6 +163,69 @@ def _collect_input_device_ptrs(ep, user_inputs):
     return ptrs
 
 
+
+def _lower_sym_sum(ep) -> None:
+    """Rewrite `torch.sym_sum` nodes into chains of `operator.add` so the
+    ExportedProgram survives `torch.export.save`.
+
+    WORKAROUND for a torch.export inconsistency: the export VERIFIER allows
+    sym_sum in graphs (pytorch#159111, landed 2025-07), but the PT2 serde's
+    `_SYM_OPS` table never got the matching entry, so `torch.export.save`
+    raises `AssertionError: op sym_sum is not in _SYM_OPS` on any graph the
+    verifier just blessed. sym_sum appears whenever shape arithmetic sums
+    three or more SymInts (sympy's Add is n-ary) — e.g. HF llama under
+    attn_implementation="sdpa" with a growing KV cache.
+
+    The upstream one-line fix exists inside the (larger, still-open)
+    duck-sizing PR: https://github.com/pytorch/pytorch/pull/186373
+    This pass checks torch's own table first, so it becomes a no-op — and
+    can be DELETED — once we run a torch that includes that fix.
+    """
+    import operator
+
+    if not hasattr(torch, "sym_sum"):
+        return  # torch too old to ever emit it
+    try:
+        from torch._export.serde.serialize import _SYM_OPS
+
+        if torch.sym_sum in _SYM_OPS:
+            return  # torch can serialize it natively (pytorch#186373 landed)
+    except ImportError:
+        pass  # private module moved — fall through and lower defensively
+
+    def _val(x):
+        # SymInt/int value of a term: fx Nodes carry it in meta["val"];
+        # bare ints are their own value.
+        return x.meta["val"] if hasattr(x, "meta") else x
+
+    gm = ep.graph_module
+    changed = False
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target is not torch.sym_sum:
+            continue
+        (terms,) = node.args
+        terms = list(terms)
+        with gm.graph.inserting_before(node):
+            acc = terms[0]
+            acc_val = _val(acc)
+            for term in terms[1:]:
+                acc = gm.graph.call_function(operator.add, (acc, term))
+                # Every ExportedProgram node must carry meta["val"] (the
+                # verifier's _check_val rejects the graph otherwise). The
+                # partial sums are real SymInt arithmetic over the terms'
+                # vals; the FINAL node inherits the original node's meta
+                # wholesale so downstream consumers see an exact swap.
+                acc_val = acc_val + _val(term)
+                acc.meta["val"] = acc_val
+        acc.meta = {**node.meta, **acc.meta}
+        node.replace_all_uses_with(acc)
+        gm.graph.erase_node(node)
+        changed = True
+    if changed:
+        gm.graph.lint()
+        gm.recompile()
+
+
 def _save_and_compile(
     ep_or_path, factory, search_iterations, user_indices=None, input_device_ptrs=None
 ):
@@ -180,6 +243,7 @@ def _save_and_compile(
     try:
         if owns_tmpdir:
             pt2_path = os.path.join(tmpdir, "model.pt2")
+            _lower_sym_sum(ep_or_path)  # serde gap workaround; see docstring
             torch.export.save(ep_or_path, pt2_path)
             weight_source = ep_or_path.state_dict
         else:
@@ -612,6 +676,7 @@ def _eager_pt2_compile(gm, user_inputs, user_indices, dynamic_shapes, factory):
     # archive; with weights flowing as inputs that is the entire parameter
     # set per compile. Nothing reads them back — drop before saving.
     ep._example_inputs = None
+    _lower_sym_sum(ep)  # serde gap workaround; see docstring
     torch.export.save(ep, pt2_path)
 
     # Search-time aliases: hand the kernel search the live CUDA tensors for
