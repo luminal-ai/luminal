@@ -19,7 +19,6 @@ TINY_LLAMA_KWARGS = dict(
     vocab_size=256,
     max_position_embeddings=64,
     use_cache=True,
-    attn_implementation="eager",
 )
 
 

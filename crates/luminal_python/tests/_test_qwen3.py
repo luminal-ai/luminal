@@ -33,7 +33,6 @@ def _make_qwen3_config(
         vocab_size=vocab_size,
         max_position_embeddings=128,
         use_cache=False,
-        attn_implementation="eager",
     )
 
 
@@ -115,7 +114,6 @@ def test_hf_qwen3_real_config_1layer(device: torch.device):
     config = AutoConfig.from_pretrained("Qwen/Qwen3-8B")
     config.num_hidden_layers = 1
     config.use_cache = False
-    config._attn_implementation = "eager"
 
     model = Qwen3ForCausalLM(config).eval().to(device)
     compiled = torch.compile(model, backend=luminal_backend)
@@ -141,7 +139,6 @@ def test_hf_qwen3_decode_loop_static(device: torch.device):
         vocab_size=256,
         max_position_embeddings=128,
         use_cache=False,
-        attn_implementation="eager",
     )
     model = Qwen3ForCausalLM(config).eval().to(device)
     tokens = [1, 2, 3, 4]
@@ -170,7 +167,6 @@ def test_hf_qwen3_8b_full(device: torch.device):
 
     config = AutoConfig.from_pretrained("Qwen/Qwen3-8B")
     config.use_cache = False
-    config._attn_implementation = "eager"
 
     model = (
         Qwen3ForCausalLM.from_pretrained(

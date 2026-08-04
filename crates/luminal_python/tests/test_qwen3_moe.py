@@ -66,7 +66,6 @@ def _make_qwen3_moe_config(
         vocab_size=vocab_size,
         max_position_embeddings=128,
         use_cache=False,
-        attn_implementation="eager",
     )
 
 
@@ -230,7 +229,6 @@ def test_hf_qwen3_moe_real_config_1layer(device: torch.device):
     config = AutoConfig.from_pretrained("Qwen/Qwen3-30B-A3B")
     config.num_hidden_layers = 1
     config.use_cache = False
-    config._attn_implementation = "eager"
 
     model = Qwen3MoeForCausalLM(config).eval().to(device)
     compiled = torch.compile(model, backend=luminal_backend)
@@ -288,7 +286,6 @@ def test_hf_qwen3_moe_real_config_full(device: torch.device):
 
     config = AutoConfig.from_pretrained("Qwen/Qwen3-30B-A3B")
     config.use_cache = False
-    config._attn_implementation = "eager"
 
     model = (
         Qwen3MoeForCausalLM.from_pretrained(

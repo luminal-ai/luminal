@@ -31,7 +31,6 @@ def _model(device):
         vocab_size=2048,
         max_position_embeddings=64,
         use_cache=False,
-        attn_implementation="eager",
         head_dim=128,
     )
     torch.manual_seed(0)

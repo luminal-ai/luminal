@@ -40,7 +40,6 @@ def test_kv_cache_growing():
         vocab_size=256,
         max_position_embeddings=128,
         use_cache=True,
-        attn_implementation="eager",
     )
     model = LlamaForCausalLM(config).eval()
     compiled = torch.compile(model, backend=luminal_backend)

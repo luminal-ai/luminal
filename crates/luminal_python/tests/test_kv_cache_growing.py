@@ -41,7 +41,6 @@ def test_kv_cache_growing():
         vocab_size=256,
         max_position_embeddings=128,
         use_cache=True,
-        attn_implementation="eager",
     )
     model = LlamaForCausalLM(config).eval()
     compiled = torch.compile(model, backend=luminal_backend)
@@ -131,7 +130,6 @@ def test_dynamic_kv_cache_torch_compile_matches_reference_and_reuses_decode_grap
                     vocab_size=256,
                     max_position_embeddings=128,
                     use_cache=True,
-                    attn_implementation="eager",
                 )
             )
             .eval()
@@ -210,7 +208,6 @@ def test_kv_cache_growing_r1_mla(device: torch.device):
     config.num_hidden_layers = 1
     # first_k_dense_replace=3 (default) makes the 1 layer dense, so we avoid
     # the 256-expert MoE path and the associated memory pressure.
-    config._attn_implementation = "eager"
     config.torch_dtype = torch.float32
     # Aggressively shrink the embedding / LM head / FFN dimensions while
     # preserving the MLA-specific knobs that the test is actually exercising

@@ -41,7 +41,6 @@ def test_kv_cache_decode_loop():
         vocab_size=256,
         max_position_embeddings=128,
         use_cache=True,
-        attn_implementation="eager",
     )
     model = LlamaForCausalLM(config).eval()
     input_ids = torch.tensor([[1, 2, 3, 4]])
