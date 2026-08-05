@@ -163,7 +163,6 @@ def _collect_input_device_ptrs(ep, user_inputs):
     return ptrs
 
 
-
 def _lower_sym_sum(ep) -> None:
     """Rewrite `torch.sym_sum` nodes into chains of `operator.add` so the
     ExportedProgram survives `torch.export.save`.

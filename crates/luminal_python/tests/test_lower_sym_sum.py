@@ -6,6 +6,7 @@ affected versions. Whether or not this torch build emits sym_sum, the
 contract is the same: after the pass, no sym_sum nodes remain and save()
 succeeds. CPU-only.
 """
+
 import os
 import tempfile
 
