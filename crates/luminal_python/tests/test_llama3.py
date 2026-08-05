@@ -452,6 +452,7 @@ def test_hf_llama38b_mark_dynamic_seq_dim_before_compile(device: torch.device):
     try:
         config = AutoConfig.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct")
         config.use_cache = False
+        config._attn_implementation = "eager"
 
         model = (
             LlamaForCausalLM.from_pretrained(
@@ -554,6 +555,7 @@ def test_hf_llama3_1b_bf16_error_within_fp32_floor(device: torch.device):
 
     config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
     config.use_cache = False
+    config._attn_implementation = "eager"
     model = (
         LlamaForCausalLM.from_pretrained("NousResearch/Llama-3.2-1B", config=config)
         .eval()
