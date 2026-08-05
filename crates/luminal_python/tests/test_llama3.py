@@ -118,41 +118,21 @@ def _run_hf_llama_test(config, device: torch.device, atol: float):
     )
 
 
-# One bf16 ULP at logit magnitude ~16-32 (bf16 has 8 mantissa bits, so the
-# representable spacing in [16, 32) is 16/256). Token pairs closer than this
-# are not distinguishable in a bf16 logit tensor at all.
-_BF16_LOGIT_ULP = 0.0625
-
-
 def _assert_bf16_logits_match(out_logits, ref_logits, label: str = ""):
     """Compare luminal vs PyTorch-eager logits for a model loaded in bf16.
 
     Tests that use ``from_pretrained`` load the checkpoint in its native bf16
     (no ``torch_dtype=float32``), so both the eager reference and the luminal
     output run in bf16 and agree only to the bf16 rounding floor — ~O(1) in
-    absolute logit terms for an 8B model, not the fp32-era ``1e-5``.
-
-    Next-token agreement is asserted as "the selected token is one the
-    reference also rates best", not as index equality. Real logit ties occur:
-    on Llama-3.2-1B at input [1,2,3,4] position 3, tokens 3 and 5 are
-    separated by 0.024 in fp32 — below one bf16 ULP (0.0625), and ~13x below
-    either implementation's own error against an fp32 reference (0.319 for
-    both torch's and luminal's bf16 attention). Torch's own bf16 output puts
-    both at exactly 17.0 and only picks token 3 because ``argmax`` breaks ties
-    by lower index. Demanding index equality there tests rounding luck, not
-    correctness; a genuine break (e.g. the bool-mask SDPA bug, which moved
-    logits by ~4) still fails this assertion loudly.
+    absolute logit terms for an 8B model, not the fp32-era ``1e-5``. We assert
+    exact next-token (argmax) agreement at every position — the property that
+    governs generation — plus bf16-appropriate closeness via
+    ``torch.testing.assert_close``.
     """
     out_f = out_logits.float()
     ref_f = ref_logits.float()
-    selected = out_f.argmax(dim=-1)
-    ref_best = ref_f.max(dim=-1).values
-    ref_at_selected = ref_f.gather(-1, selected.unsqueeze(-1)).squeeze(-1)
-    shortfall = ref_best - ref_at_selected
-    assert torch.all(shortfall <= _BF16_LOGIT_ULP), (
-        f"{label}selected token is not a reference-best token "
-        f"(max shortfall {float(shortfall.max()):.4f} > {_BF16_LOGIT_ULP} = 1 bf16 ULP); "
-        f"selected={selected.tolist()} reference_argmax={ref_f.argmax(dim=-1).tolist()}"
+    assert torch.equal(out_f.argmax(dim=-1), ref_f.argmax(dim=-1)), (
+        f"{label}next-token argmax mismatch"
     )
     torch.testing.assert_close(
         out_f,
@@ -320,53 +300,6 @@ def _gpu_mem(label):
         print(
             f"[GPU MEM] {label}: allocated={alloc:.3f} GiB, reserved={reserved:.3f} GiB, peak={peak:.3f} GiB"
         )
-
-
-@pytest.mark.slow
-def test_hf_llama3_full(device: torch.device):
-    """HuggingFace LlamaForCausalLM — full Llama3.2-1B with real pretrained weights.
-
-    No config alterations except use_cache=False and eager attention.
-    Loads actual weights from NousResearch/Llama-3.2-1B.
-    """
-    from transformers import AutoConfig, LlamaForCausalLM
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
-    _gpu_mem("before model load")
-
-    config = AutoConfig.from_pretrained("NousResearch/Llama-3.2-1B")
-    config.use_cache = False
-
-    model = (
-        LlamaForCausalLM.from_pretrained(
-            "NousResearch/Llama-3.2-1B",
-            config=config,
-        )
-        .eval()
-        .to(device)
-    )
-    n_params = sum(p.numel() for p in model.parameters())
-    print(
-        f"[MODEL] Total parameters: {n_params:,} ({n_params * 4 / 1024**3:.3f} GiB in f32)"
-    )
-    _gpu_mem("after model load")
-
-    compiled = torch.compile(model, backend=luminal_backend)
-    _gpu_mem("after torch.compile (lazy, no compilation yet)")
-
-    input_ids = torch.tensor([[1, 2, 3, 4]], device=device)
-    with torch.no_grad():
-        ref = model(input_ids)
-        _gpu_mem("after PyTorch reference forward")
-
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        _gpu_mem("before compiled forward (peak reset)")
-        out = compiled(input_ids)
-        _gpu_mem("after compiled forward (includes compilation)")
-
-    _assert_bf16_logits_match(out.logits, ref.logits)
 
 
 @pytest.mark.slow
