@@ -132,6 +132,7 @@ fn print_topk_predictions(logits_data: &[f32], mask_positions: &[usize], tokeniz
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_model_step(
     cx: &mut Graph,
     runtime: &mut CudaRuntime,
@@ -183,8 +184,6 @@ fn main() {
     println!("Using model: {REPO_ID}");
     println!("Using model directory: {}", prepared.model_dir.display());
 
-    let tokenizer = Tokenizer::from_file(prepared.model_dir.join("tokenizer.json")).unwrap();
-
     // Build graph
     let mut cx = Graph::default();
     let input_ids = cx.named_tensor("input_ids", 's').as_dtype(DType::Int);
@@ -196,6 +195,8 @@ fn main() {
         BertWeightMode::Bf16 => BertForMaskedLM::init_bf16(&mut cx),
     };
     let logits = bert.forward_with_topk(input_ids, token_type_ids, pos_ids);
+
+    let tokenizer = Tokenizer::from_file(prepared.model_dir.join("tokenizer.json")).unwrap();
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();
@@ -212,8 +213,16 @@ fn main() {
     runtime.set_data(input_ids, vec![0i32; MAX_SEQ_LEN]);
     runtime.set_data(token_type_ids, vec![0i32; MAX_SEQ_LEN]);
     runtime.set_data(pos_ids, (0..MAX_SEQ_LEN as i32).collect::<Vec<_>>());
+    let compile_options = CompileOptions::default()
+        .dim_buckets(
+            's',
+            &[DimBucket::new(1, MAX_SEQ_LEN).representative(MAX_SEQ_LEN)],
+        )
+        .search_graph_limit(500)
+        .generation_size(1)
+        .mutations(1);
     let mut rng = StdRng::seed_from_u64(0);
-    runtime = cx.compile_with_rng(runtime, CompileOptions::default(), &mut rng);
+    runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
     println!("  Compile: {:.2} s", compile_start.elapsed().as_secs_f64());
     print_host_op_summary(&runtime, "post-compile");
 

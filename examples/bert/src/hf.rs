@@ -150,7 +150,9 @@ pub fn combine_safetensors(
     convert_bf16: bool,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let suffix = if convert_bf16 { "bf16" } else { "f32" };
-    let output_path = model_dir.join(format!("model_combined_{suffix}.safetensors"));
+    // Bump the filename so existing cached combined files are regenerated
+    // after key-mapping changes (e.g. LayerNorm.gamma -> LayerNorm.weight).
+    let output_path = model_dir.join(format!("model_combined_v2_{suffix}.safetensors"));
 
     if output_path.exists() {
         return Ok(output_path);
@@ -160,7 +162,11 @@ pub fn combine_safetensors(
     info!(
         "Loading {} shard files (converting to {})...",
         shard_files.len(),
-        if convert_bf16 { "BF16, norms F32" } else { "F32" }
+        if convert_bf16 {
+            "BF16, norms F32"
+        } else {
+            "F32"
+        }
     );
 
     let mut all_tensors: HashMap<String, StoredTensor> = HashMap::new();
@@ -175,9 +181,18 @@ pub fn combine_safetensors(
         let st = SafeTensors::deserialize(&mmap)?;
 
         for name in st.names() {
+            // HF BERT checkpoints use LayerNorm.gamma / LayerNorm.beta, but the
+            // Luminal model declares them as LayerNorm.weight / LayerNorm.bias.
+            let mapped_name = if name.ends_with("LayerNorm.gamma") {
+                name.replace("LayerNorm.gamma", "LayerNorm.weight")
+            } else if name.ends_with("LayerNorm.beta") {
+                name.replace("LayerNorm.beta", "LayerNorm.bias")
+            } else {
+                name.to_string()
+            };
             let tensor = st.tensor(name)?;
             all_tensors.insert(
-                name.to_string(),
+                mapped_name,
                 if convert_bf16 {
                     stored_tensor_bf16(name, &tensor)
                 } else {
