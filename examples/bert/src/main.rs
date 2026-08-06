@@ -82,12 +82,10 @@ fn main() {
 
     // Build graph
     let mut cx = Graph::default();
-    let input_ids = cx.named_tensor("input_ids", (1, 's')).as_dtype(DType::Int);
-    let token_type_ids = cx
-        .named_tensor("token_type_ids", (1, 's'))
-        .as_dtype(DType::Int);
-    let pos_ids = cx.named_tensor("pos_ids", (1, 's')).as_dtype(DType::Int);
-    let mask = cx.named_tensor("mask", (1, 1, 's', 's'));
+    let input_ids = cx.named_tensor("input_ids", 's').as_dtype(DType::Int);
+    let token_type_ids = cx.named_tensor("token_type_ids", 's').as_dtype(DType::Int);
+    let pos_ids = cx.named_tensor("pos_ids", 's').as_dtype(DType::Int);
+    let mask = cx.named_tensor("mask", (1, 's', 's'));
 
     let bert = match weight_mode {
         BertWeightMode::F32 => BertForMaskedLM::init_f32(&mut cx),
