@@ -210,6 +210,7 @@ pub struct BertSelfAttention {
     o_weight: GraphTensor,
     o_bias: GraphTensor,
     head_dim: usize,
+    n_heads: usize,
 }
 
 impl BertSelfAttention {
@@ -225,6 +226,7 @@ impl BertSelfAttention {
             o_weight: layer_linear_weight(cx, layer, "attention.output.dense", (hidden, hidden), precision),
             o_bias: layer_linear_bias(cx, layer, "attention.output.dense", hidden),
             head_dim: config.hidden / config.n_heads,
+            n_heads: config.n_heads,
         }
     }
 
@@ -240,7 +242,7 @@ impl BertSelfAttention {
         let v = v.split_dims(1, self.head_dim).transpose(0, 1);
 
         let scores = q.matmul(k.permute((0, 2, 1))) * scale;
-        let masked = scores + mask;
+        let masked = scores + mask.expand_dim(0, self.n_heads);
         let weights = masked.softmax(2);
 
         let out = weights.matmul(v).transpose(0, 1).merge_dims(1, 2);
