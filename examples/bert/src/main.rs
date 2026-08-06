@@ -9,7 +9,7 @@ use luminal::{dtype::DType, prelude::*};
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
-use std::env;
+use std::{env, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -17,6 +17,49 @@ const REPO_ID: &str = "google-bert/bert-base-uncased";
 const MAX_SEQ_LEN: usize = 128;
 const MASK_TOKEN: u32 = 103;
 const TOP_K: usize = 5;
+
+#[derive(Default, Clone)]
+struct StepProfile {
+    total: Duration,
+    set_inputs: Duration,
+    execute: Duration,
+    get_logits: Duration,
+}
+
+fn avg_ms(duration: Duration, n: usize) -> f64 {
+    if n == 0 {
+        0.0
+    } else {
+        duration.as_secs_f64() * 1e3 / n as f64
+    }
+}
+
+fn print_profile(label: &str, profile: &StepProfile, n: usize) {
+    println!(
+        "  {label}: n={n}, avg={:.2} ms [set={:.2}, exec={:.2}, logits_dtoh={:.2}]",
+        avg_ms(profile.total, n),
+        avg_ms(profile.set_inputs, n),
+        avg_ms(profile.execute, n),
+        avg_ms(profile.get_logits, n),
+    );
+}
+
+fn print_host_op_summary(runtime: &CudaRuntime, label: &str) {
+    let host_ops = runtime.host_ops();
+    let debug_ops = host_ops
+        .iter()
+        .map(|op| format!("{op:?}"))
+        .collect::<Vec<_>>();
+    let cublaslt = debug_ops
+        .iter()
+        .filter(|op| op.contains("CuBlasLt"))
+        .count();
+    println!(
+        "Host op summary ({label}): total={}, cublasLt={}",
+        debug_ops.len(),
+        cublaslt,
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BertWeightMode {
@@ -85,7 +128,7 @@ fn main() {
     let input_ids = cx.named_tensor("input_ids", 's').as_dtype(DType::Int);
     let token_type_ids = cx.named_tensor("token_type_ids", 's').as_dtype(DType::Int);
     let pos_ids = cx.named_tensor("pos_ids", 's').as_dtype(DType::Int);
-    let mask = cx.named_tensor("mask", (1, 's', 's'));
+    let mask = cx.named_tensor("mask", ('s', 's'));
 
     let bert = match weight_mode {
         BertWeightMode::F32 => BertForMaskedLM::init_f32(&mut cx),
@@ -110,7 +153,11 @@ fn main() {
     let compile_start = std::time::Instant::now();
     cx.set_dim('s', MAX_SEQ_LEN);
     runtime = cx.compile(runtime, CompileOptions::default());
-    println!("  Compile: {:.2} s", compile_start.elapsed().as_secs_f64());
+    println!(
+        "  Compile: {:.2} s",
+        compile_start.elapsed().as_secs_f64()
+    );
+    print_host_op_summary(&runtime, "post-compile");
 
     // Example: "The capital of France is [MASK]."
     let sentence = "The capital of France is [MASK].";
@@ -141,15 +188,15 @@ fn main() {
     let pos_ids_data: Vec<i32> = (0..seq_len as i32).collect();
     let token_type_ids_data: Vec<i32> = vec![0; seq_len];
 
-    // Build attention mask (causal not needed for BERT, just 1s for valid tokens)
-    let mut mask_data = vec![0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in 0..seq_len {
-            mask_data[i * seq_len + j] = 0.0; // 0 = not masked (BERT uses 0/1, not -inf/0)
-        }
-    }
+    // Build attention mask (all zeros = no masking for BERT)
+    let mask_data = vec![0f32; seq_len * seq_len];
 
     cx.set_dim('s', seq_len);
+
+    let mut profile = StepProfile::default();
+    let start = std::time::Instant::now();
+
+    let set_start = std::time::Instant::now();
     runtime.set_data(
         input_ids,
         tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
@@ -157,10 +204,21 @@ fn main() {
     runtime.set_data(token_type_ids, token_type_ids_data);
     runtime.set_data(pos_ids, pos_ids_data);
     runtime.set_data(mask, mask_data);
+    profile.set_inputs = set_start.elapsed();
 
+    let execute_start = std::time::Instant::now();
     runtime.execute(&cx.dyn_map);
+    profile.execute = execute_start.elapsed();
 
+    let logits_start = std::time::Instant::now();
     let logits_data = runtime.get_f32(logits);
+    profile.get_logits = logits_start.elapsed();
+
+    profile.total = start.elapsed();
+
+    print_host_op_summary(&runtime, "after forward");
+    println!("\nProfile:");
+    print_profile("forward", &profile, 1);
 
     // For each mask position, find top-k predictions
     for &mask_pos in &mask_positions {

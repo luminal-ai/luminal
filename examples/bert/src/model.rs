@@ -1,8 +1,4 @@
-use luminal::{
-    dtype::DType,
-    graph::Graph,
-    prelude::GraphTensor,
-};
+use luminal::{dtype::DType, graph::Graph, prelude::GraphTensor};
 use luminal_nn::LayerNorm;
 
 // BERT-base hyperparams
@@ -83,11 +79,7 @@ fn linear_weight(
         .persist()
 }
 
-fn linear_bias(
-    cx: &mut Graph,
-    prefix: impl ToString,
-    out: usize,
-) -> GraphTensor {
+fn linear_bias(cx: &mut Graph, prefix: impl ToString, out: usize) -> GraphTensor {
     cx.named_tensor(format!("{}.bias", prefix.to_string()), out)
         .persist()
 }
@@ -107,17 +99,8 @@ fn layer_linear_weight(
     )
 }
 
-fn layer_linear_bias(
-    cx: &mut Graph,
-    layer: usize,
-    suffix: &str,
-    out: usize,
-) -> GraphTensor {
-    linear_bias(
-        cx,
-        format!("bert.encoder.layer.{layer}.{suffix}"),
-        out,
-    )
+fn layer_linear_bias(cx: &mut Graph, layer: usize, suffix: &str, out: usize) -> GraphTensor {
+    linear_bias(cx, format!("bert.encoder.layer.{layer}.{suffix}"), out)
 }
 
 fn norm_in_f32(norm: &LayerNorm, x: GraphTensor, act: DType) -> GraphTensor {
@@ -214,16 +197,45 @@ pub struct BertSelfAttention {
 }
 
 impl BertSelfAttention {
-    pub fn init(cx: &mut Graph, layer: usize, config: &BertConfig, precision: BertPrecision) -> Self {
+    pub fn init(
+        cx: &mut Graph,
+        layer: usize,
+        config: &BertConfig,
+        precision: BertPrecision,
+    ) -> Self {
         let hidden = config.hidden;
         Self {
-            q_weight: layer_linear_weight(cx, layer, "attention.self.query", (hidden, hidden), precision),
+            q_weight: layer_linear_weight(
+                cx,
+                layer,
+                "attention.self.query",
+                (hidden, hidden),
+                precision,
+            ),
             q_bias: layer_linear_bias(cx, layer, "attention.self.query", hidden),
-            k_weight: layer_linear_weight(cx, layer, "attention.self.key", (hidden, hidden), precision),
+            k_weight: layer_linear_weight(
+                cx,
+                layer,
+                "attention.self.key",
+                (hidden, hidden),
+                precision,
+            ),
             k_bias: layer_linear_bias(cx, layer, "attention.self.key", hidden),
-            v_weight: layer_linear_weight(cx, layer, "attention.self.value", (hidden, hidden), precision),
+            v_weight: layer_linear_weight(
+                cx,
+                layer,
+                "attention.self.value",
+                (hidden, hidden),
+                precision,
+            ),
             v_bias: layer_linear_bias(cx, layer, "attention.self.value", hidden),
-            o_weight: layer_linear_weight(cx, layer, "attention.output.dense", (hidden, hidden), precision),
+            o_weight: layer_linear_weight(
+                cx,
+                layer,
+                "attention.output.dense",
+                (hidden, hidden),
+                precision,
+            ),
             o_bias: layer_linear_bias(cx, layer, "attention.output.dense", hidden),
             head_dim: config.hidden / config.n_heads,
             n_heads: config.n_heads,
@@ -261,7 +273,12 @@ pub struct BertLayer {
 }
 
 impl BertLayer {
-    pub fn init(cx: &mut Graph, layer: usize, config: &BertConfig, precision: BertPrecision) -> Self {
+    pub fn init(
+        cx: &mut Graph,
+        layer: usize,
+        config: &BertConfig,
+        precision: BertPrecision,
+    ) -> Self {
         let hidden = config.hidden;
         let intermediate = config.intermediate;
         Self {
@@ -269,34 +286,28 @@ impl BertLayer {
             attn_norm: {
                 let w = format!("bert.encoder.layer.{layer}.attention.output.LayerNorm.weight");
                 let b = format!("bert.encoder.layer.{layer}.attention.output.LayerNorm.bias");
-                LayerNorm::new(
-                    hidden,
-                    Some(w.as_str()),
-                    Some(b.as_str()),
-                    true,
-                    1e-12,
-                    cx,
-                )
+                LayerNorm::new(hidden, Some(w.as_str()), Some(b.as_str()), true, 1e-12, cx)
             },
             intermediate_weight: layer_linear_weight(
-                cx, layer, "intermediate.dense", (intermediate, hidden), precision,
+                cx,
+                layer,
+                "intermediate.dense",
+                (intermediate, hidden),
+                precision,
             ),
             intermediate_bias: layer_linear_bias(cx, layer, "intermediate.dense", intermediate),
             output_weight: layer_linear_weight(
-                cx, layer, "output.dense", (hidden, intermediate), precision,
+                cx,
+                layer,
+                "output.dense",
+                (hidden, intermediate),
+                precision,
             ),
             output_bias: layer_linear_bias(cx, layer, "output.dense", hidden),
             output_norm: {
                 let w = format!("bert.encoder.layer.{layer}.output.LayerNorm.weight");
                 let b = format!("bert.encoder.layer.{layer}.output.LayerNorm.bias");
-                LayerNorm::new(
-                    hidden,
-                    Some(w.as_str()),
-                    Some(b.as_str()),
-                    true,
-                    1e-12,
-                    cx,
-                )
+                LayerNorm::new(hidden, Some(w.as_str()), Some(b.as_str()), true, 1e-12, cx)
             },
         }
     }
@@ -343,7 +354,12 @@ impl BertLMPredictionHead {
     pub fn init(cx: &mut Graph, config: &BertConfig, precision: BertPrecision) -> Self {
         let hidden = config.hidden;
         Self {
-            dense_weight: linear_weight(cx, "cls.predictions.transform.dense", (hidden, hidden), precision),
+            dense_weight: linear_weight(
+                cx,
+                "cls.predictions.transform.dense",
+                (hidden, hidden),
+                precision,
+            ),
             dense_bias: linear_bias(cx, "cls.predictions.transform.dense", hidden),
             norm: LayerNorm::new(
                 hidden,
@@ -357,12 +373,20 @@ impl BertLMPredictionHead {
         }
     }
 
-    pub fn forward(&self, x: GraphTensor, embedding_weight: GraphTensor, act: DType) -> GraphTensor {
+    pub fn forward(
+        &self,
+        x: GraphTensor,
+        embedding_weight: GraphTensor,
+        act: DType,
+    ) -> GraphTensor {
         let h = linear(x, self.dense_weight, Some(self.dense_bias)).gelu();
         let h = norm_in_f32(&self.norm, h, act);
         // Weight tying: decoder weight = embedding weight
         let logits = h.matmul(embedding_weight.t());
-        logits + self.decoder_bias.expand_lhs(&logits.dims()[..logits.dims().len() - 1])
+        logits
+            + self
+                .decoder_bias
+                .expand_lhs(&logits.dims()[..logits.dims().len() - 1])
     }
 }
 
@@ -405,8 +429,121 @@ impl BertForMaskedLM {
         mask: GraphTensor,
     ) -> GraphTensor {
         let act = self.precision.act_dtype();
-        let emb = self.embeddings.forward(input_ids, token_type_ids, pos_ids, act, self.config.hidden);
+        let emb =
+            self.embeddings
+                .forward(input_ids, token_type_ids, pos_ids, act, self.config.hidden);
         let encoded = self.encoder.forward(emb, mask, act);
         self.head.forward(encoded, self.embeddings.token_embed, act)
     }
+
+    // pub fn parameter_tensors(&self) -> Vec<GraphTensor> {
+    //     let mut tensors = vec![
+    //         self.embeddings.token_embed,
+    //         self.embeddings.type_embed,
+    //         self.embeddings.position_embed,
+    //     ];
+    //     if let Some(w) = self.embeddings.norm.weight {
+    //         tensors.push(w);
+    //     }
+    //     if let Some(b) = self.embeddings.norm.bias {
+    //         tensors.push(b);
+    //     }
+    //     for layer in &self.encoder.layers {
+    //         tensors.push(layer.attention.q_weight);
+    //         tensors.push(layer.attention.q_bias);
+    //         tensors.push(layer.attention.k_weight);
+    //         tensors.push(layer.attention.k_bias);
+    //         tensors.push(layer.attention.v_weight);
+    //         tensors.push(layer.attention.v_bias);
+    //         tensors.push(layer.attention.o_weight);
+    //         tensors.push(layer.attention.o_bias);
+    //         if let Some(w) = layer.attn_norm.weight {
+    //             tensors.push(w);
+    //         }
+    //         if let Some(b) = layer.attn_norm.bias {
+    //             tensors.push(b);
+    //         }
+    //         tensors.push(layer.intermediate_weight);
+    //         tensors.push(layer.intermediate_bias);
+    //         tensors.push(layer.output_weight);
+    //         tensors.push(layer.output_bias);
+    //         if let Some(w) = layer.output_norm.weight {
+    //             tensors.push(w);
+    //         }
+    //         if let Some(b) = layer.output_norm.bias {
+    //             tensors.push(b);
+    //         }
+    //     }
+    //     tensors.push(self.head.dense_weight);
+    //     tensors.push(self.head.dense_bias);
+    //     if let Some(w) = self.head.norm.weight {
+    //         tensors.push(w);
+    //     }
+    //     if let Some(b) = self.head.norm.bias {
+    //         tensors.push(b);
+    //     }
+    //     tensors.push(self.head.decoder_bias);
+    //     tensors
+    // }
 }
+
+// #[cfg(test)]
+// mod tests {
+//     use luminal::prelude::*;
+
+//     use super::*;
+
+//     fn run_forward(seq_len: usize) {
+//         let mut cx = Graph::default();
+//         let input_ids = cx.named_tensor("input_ids", 's').as_dtype(DType::Int);
+//         let token_type_ids = cx.named_tensor("token_type_ids", 's').as_dtype(DType::Int);
+//         let pos_ids = cx.named_tensor("pos_ids", 's').as_dtype(DType::Int);
+//         let mask = cx.named_tensor("mask", ('s', 's'));
+
+//         let bert = BertForMaskedLM::init_f32(&mut cx);
+//         let logits = bert
+//             .forward(input_ids, token_type_ids, pos_ids, mask)
+//             .output();
+
+//         cx.set_dim('s', seq_len);
+//         let mut rt: ReferenceRuntime = cx.compile(
+//             ReferenceRuntime::default(),
+//             CompileOptions::default().search_graph_limit(1),
+//         );
+
+//         // Set input data
+//         rt.set_data(input_ids, vec![0i32; seq_len]);
+//         rt.set_data(token_type_ids, vec![0i32; seq_len]);
+//         rt.set_data(pos_ids, (0..seq_len as i32).collect::<Vec<_>>());
+//         rt.set_data(mask, vec![0f32; seq_len * seq_len]);
+
+//         // Set zero data for all weight tensors
+//         for t in bert.parameter_tensors() {
+//             let n: usize = t.shape.dims.iter().map(|e| e.to_usize().unwrap()).product();
+//             match t.dtype {
+//                 DType::F32 => rt.set_data(t, vec![0f32; n]),
+//                 DType::Bf16 => rt.set_data(t, vec![half::bf16::ZERO; n]),
+//                 _ => {}
+//             }
+//         }
+
+//         rt.execute(&cx.dyn_map);
+//         let out = rt.get_f32(logits);
+//         assert_eq!(out.len(), seq_len * VOCAB_SIZE);
+//     }
+
+//     // #[test]
+//     // fn forward_seq_1() {
+//     //     run_forward(1);
+//     // }
+
+//     #[test]
+//     fn forward_seq_4() {
+//         run_forward(4);
+//     }
+
+//     // #[test]
+//     // fn forward_seq_8() {
+//     //     run_forward(8);
+//     // }
+// }
