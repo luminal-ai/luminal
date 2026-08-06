@@ -2380,7 +2380,7 @@ impl Graph {
 
         // Print initial result and progress
         if search_log {
-            let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
+            let msg = format!("   {:>6} {}", "Start".cyan().bold(), display);
             println!("{msg}");
             render_bars(n_graphs, search_limit, bucket_progress);
             std::io::stdout().flush().unwrap();
