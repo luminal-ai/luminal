@@ -239,9 +239,9 @@ impl BertSelfAttention {
         let k = k.split_dims(1, self.head_dim).transpose(0, 1);
         let v = v.split_dims(1, self.head_dim).transpose(0, 1);
 
-        let scores = q.matmul(k.permute((0, 1, 3, 2))) * scale;
+        let scores = q.matmul(k.permute((0, 2, 1))) * scale;
         let masked = scores + mask;
-        let weights = masked.softmax(3);
+        let weights = masked.softmax(2);
 
         let out = weights.matmul(v).transpose(0, 1).merge_dims(1, 2);
         linear(out, self.o_weight, Some(self.o_bias))
