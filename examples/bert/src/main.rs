@@ -9,6 +9,7 @@ use luminal::{dtype::DType, prelude::*};
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
 use luminal_tracing::*;
 use model::*;
+use rand::{SeedableRng, rngs::StdRng};
 use std::{env, time::Duration};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -106,6 +107,67 @@ fn parse_args() -> BertWeightMode {
     mode
 }
 
+fn print_topk_predictions(logits_data: &[f32], mask_positions: &[usize], tokenizer: &Tokenizer) {
+    for &mask_pos in mask_positions {
+        println!("\nTop {TOP_K} predictions at position {mask_pos}:");
+        let start = mask_pos * VOCAB_SIZE;
+        let end = start + VOCAB_SIZE;
+        let scores = &logits_data[start..end];
+
+        let mut indices: Vec<usize> = (0..VOCAB_SIZE).collect();
+        indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
+
+        for (rank, &idx) in indices.iter().take(TOP_K).enumerate() {
+            let token_str = tokenizer
+                .decode(&[idx as u32], true)
+                .unwrap_or_else(|_| format!("<id {idx}>"));
+            println!(
+                "  {}. {} (id={}, score={:.4})",
+                rank + 1,
+                token_str.trim(),
+                idx,
+                scores[idx]
+            );
+        }
+    }
+}
+
+fn run_model_step(
+    cx: &mut Graph,
+    runtime: &mut CudaRuntime,
+    input_ids: GraphTensor,
+    token_type_ids: GraphTensor,
+    pos_ids: GraphTensor,
+    logits: GraphTensor,
+    tokens: &[i32],
+    token_type_ids_data: &[i32],
+    pos_ids_data: &[i32],
+    seq_len: usize,
+) -> (Vec<f32>, StepProfile) {
+    let start = std::time::Instant::now();
+    let mut profile = StepProfile::default();
+
+    cx.set_dim('s', seq_len);
+
+    let set_start = std::time::Instant::now();
+    runtime.set_data(input_ids, tokens.to_vec());
+    runtime.set_data(token_type_ids, token_type_ids_data.to_vec());
+    runtime.set_data(pos_ids, pos_ids_data.to_vec());
+    profile.set_inputs = set_start.elapsed();
+
+    let execute_start = std::time::Instant::now();
+    runtime.execute(&cx.dyn_map);
+    profile.execute = execute_start.elapsed();
+
+    let logits_start = std::time::Instant::now();
+    let logits_data = runtime.get_f32(logits);
+    profile.get_logits = logits_start.elapsed();
+
+    profile.total = start.elapsed();
+
+    (logits_data, profile)
+}
+
 fn main() {
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -128,17 +190,12 @@ fn main() {
     let input_ids = cx.named_tensor("input_ids", 's').as_dtype(DType::Int);
     let token_type_ids = cx.named_tensor("token_type_ids", 's').as_dtype(DType::Int);
     let pos_ids = cx.named_tensor("pos_ids", 's').as_dtype(DType::Int);
-    let mask = cx.named_tensor("mask", ('s', 's'));
 
     let bert = match weight_mode {
         BertWeightMode::F32 => BertForMaskedLM::init_f32(&mut cx),
         BertWeightMode::Bf16 => BertForMaskedLM::init_bf16(&mut cx),
     };
-    let logits = bert
-        .forward(input_ids, token_type_ids, pos_ids, mask)
-        .output();
-
-    cx.set_dim('s', 1);
+    let logits = bert.forward_with_topk(input_ids, token_type_ids, pos_ids);
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();
@@ -152,14 +209,14 @@ fn main() {
     println!("Compiling...");
     let compile_start = std::time::Instant::now();
     cx.set_dim('s', MAX_SEQ_LEN);
-    runtime = cx.compile(runtime, CompileOptions::default().search_graph_limit(1));
-    println!(
-        "  Compile: {:.2} s",
-        compile_start.elapsed().as_secs_f64()
-    );
+    runtime.set_data(input_ids, vec![0i32; MAX_SEQ_LEN]);
+    runtime.set_data(token_type_ids, vec![0i32; MAX_SEQ_LEN]);
+    runtime.set_data(pos_ids, (0..MAX_SEQ_LEN as i32).collect::<Vec<_>>());
+    let mut rng = StdRng::seed_from_u64(0);
+    runtime = cx.compile_with_rng(runtime, CompileOptions::default(), &mut rng);
+    println!("  Compile: {:.2} s", compile_start.elapsed().as_secs_f64());
     print_host_op_summary(&runtime, "post-compile");
 
-    // Example: "The capital of France is [MASK]."
     let sentence = "The capital of France is [MASK].";
     let encoding = tokenizer.encode(sentence, true).unwrap();
     let tokens = encoding.get_ids();
@@ -188,59 +245,22 @@ fn main() {
     let pos_ids_data: Vec<i32> = (0..seq_len as i32).collect();
     let token_type_ids_data: Vec<i32> = vec![0; seq_len];
 
-    // Build attention mask (all zeros = no masking for BERT)
-    let mask_data = vec![0f32; seq_len * seq_len];
-
-    cx.set_dim('s', seq_len);
-
-    let mut profile = StepProfile::default();
-    let start = std::time::Instant::now();
-
-    let set_start = std::time::Instant::now();
-    runtime.set_data(
+    let (logits_data, profile) = run_model_step(
+        &mut cx,
+        &mut runtime,
         input_ids,
-        tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+        token_type_ids,
+        pos_ids,
+        logits,
+        &tokens.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+        &token_type_ids_data,
+        &pos_ids_data,
+        seq_len,
     );
-    runtime.set_data(token_type_ids, token_type_ids_data);
-    runtime.set_data(pos_ids, pos_ids_data);
-    runtime.set_data(mask, mask_data);
-    profile.set_inputs = set_start.elapsed();
-
-    let execute_start = std::time::Instant::now();
-    runtime.execute(&cx.dyn_map);
-    profile.execute = execute_start.elapsed();
-
-    let logits_start = std::time::Instant::now();
-    let logits_data = runtime.get_f32(logits);
-    profile.get_logits = logits_start.elapsed();
-
-    profile.total = start.elapsed();
 
     print_host_op_summary(&runtime, "after forward");
     println!("\nProfile:");
     print_profile("forward", &profile, 1);
 
-    // For each mask position, find top-k predictions
-    for &mask_pos in &mask_positions {
-        println!("\nTop {TOP_K} predictions at position {mask_pos}:");
-        let start = mask_pos * VOCAB_SIZE;
-        let end = start + VOCAB_SIZE;
-        let scores = &logits_data[start..end];
-
-        let mut indices: Vec<usize> = (0..VOCAB_SIZE).collect();
-        indices.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap());
-
-        for (rank, &idx) in indices.iter().take(TOP_K).enumerate() {
-            let token_str = tokenizer
-                .decode(&[idx as u32], true)
-                .unwrap_or_else(|_| format!("<id {idx}>"));
-            println!(
-                "  {}. {} (id={}, score={:.4})",
-                rank + 1,
-                token_str.trim(),
-                idx,
-                scores[idx]
-            );
-        }
-    }
+    print_topk_predictions(&logits_data, &mask_positions, &tokenizer);
 }

@@ -3683,7 +3683,7 @@ impl Runtime for CudaRuntime {
         // Materialize CUDA graphs before timed execution. The first real launch
         // should only patch an already-instantiated graph, not build it from scratch.
         let timer = std::time::Instant::now();
-        self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
+        self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, self.profiling)
             .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
         materialize_time += timer.elapsed();
 
