@@ -104,10 +104,35 @@ fn layer_linear_bias(cx: &mut Graph, layer: usize, suffix: &str, out: usize) -> 
 }
 
 fn norm_in_f32(norm: &LayerNorm, x: GraphTensor, act: DType) -> GraphTensor {
-    if act == DType::F32 {
-        norm.forward(x)
+    let x = if act == DType::F32 {
+        x
     } else {
-        norm.forward(x.cast(DType::F32)).cast(act)
+        x.cast(DType::F32)
+    };
+    // Manual LayerNorm: mean_norm + std_norm + weight + bias.
+    // mean_norm is decomposed as x - x.mean() rather than calling
+    // LayerNorm::forward with mean_norm=true, because the CUDA backend's
+    // KernelRMSNorm egglog rule only matches the RMS norm pattern (no mean
+    // subtraction). Writing the mean subtraction explicitly lets the std_norm
+    // chain still fuse into a single kernel.
+    let axis = x.shape.last_axis();
+    let mean = x.mean(axis).expand_to_shape_on_axes(x.shape, axis);
+    let h = x - mean;
+    let h = h.std_norm(axis, 1e-12);
+    let h = if let Some(w) = norm.weight {
+        h * w.expand_lhs(&h.dims()[..h.dims().len() - 1])
+    } else {
+        h
+    };
+    let h = if let Some(b) = norm.bias {
+        h + b.expand_lhs(&h.dims()[..h.dims().len() - 1])
+    } else {
+        h
+    };
+    if act == DType::F32 {
+        h
+    } else {
+        h.cast(act)
     }
 }
 

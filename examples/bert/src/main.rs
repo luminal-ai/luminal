@@ -152,7 +152,7 @@ fn main() {
     println!("Compiling...");
     let compile_start = std::time::Instant::now();
     cx.set_dim('s', MAX_SEQ_LEN);
-    runtime = cx.compile(runtime, CompileOptions::default());
+    runtime = cx.compile(runtime, CompileOptions::default().search_graph_limit(1));
     println!(
         "  Compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()
