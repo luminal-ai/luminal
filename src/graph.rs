@@ -2380,7 +2380,7 @@ impl Graph {
 
         // Print initial result and progress
         if search_log {
-            let msg = format!("   {:>6} {}", "Search".cyan().bold(), display);
+            let msg = format!("   {:>6} {}", "Start".cyan().bold(), display);
             println!("{msg}");
             render_bars(n_graphs, search_limit, bucket_progress);
             std::io::stdout().flush().unwrap();
@@ -2397,6 +2397,8 @@ impl Graph {
             vec![(best_metric.clone(), initial_genome)];
         let mut resample_generation = false;
         let mut stagnant_generations = 0usize;
+        let mut slower_since_faster = 0usize;
+        let mut slower_line_visible = false;
 
         while n_graphs < search_limit {
             if search_time_limit_reached() {
@@ -2630,20 +2632,27 @@ impl Graph {
                     );
                 }
 
-                if new_best {
-                    if search_log {
-                        let msg = format!("   {:>6} {display_metric}", "Searched".green().bold());
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
-                        }
-                        print!("\r\x1b[2K");
-                        println!("{msg}");
-                    }
-                } else if search_log {
+                let msg = if new_best {
+                    slower_since_faster = 0;
+                    format!("   {:>6} {display_metric}", "Faster".green().bold())
+                } else {
+                    slower_since_faster += 1;
+                    format!("   {:>6} x{slower_since_faster}", "Slower".yellow().bold())
+                };
+                if search_log {
+                    // Move from the last progress bar to the first one. A
+                    // slower result has one additional transient line above
+                    // the bars; another slower result replaces it in place,
+                    // while a faster result is appended beneath it.
                     for _ in 1..n_bar_lines {
                         print!("\x1b[1A");
                     }
+                    if slower_line_visible && !new_best {
+                        print!("\x1b[1A");
+                    }
                     print!("\r\x1b[2K");
+                    println!("{msg}");
+                    slower_line_visible = !new_best;
                 }
                 if search_log {
                     render_bars(n_graphs, search_limit, bucket_progress);
