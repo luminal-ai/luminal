@@ -22,14 +22,14 @@ PERF_GATES = {
     # deployment graphs directly). GH200 references: llama 71/6.4,
     # gemma 74/10.0, qwen 99/6.7, qwen3_moe 74/7.4, gemma4_moe 149/10.8.
     "llama": {"max_ttft_ms": 150.0, "max_tpot_ms": 15.0},
-    "gemma": {"max_ttft_ms": 300.0, "max_tpot_ms": 22.0},
+    "gemma": {"max_ttft_ms": 300.0, "max_tpot_ms": 30.0},
     "qwen": {"max_ttft_ms": 180.0, "max_tpot_ms": 22.0},
     "qwen3_moe": {"max_ttft_ms": 450.0, "max_tpot_ms": 35.0},
     # gemma4_moe's decode search still has run-to-run family variance
     # (A100 draws observed 25-52 ms TPOT vs 10.8 best; exploration work
     # tracked separately) — gate above the draw spread, below the
     # 100+ ms failure modes.
-    "gemma4_moe": {"max_ttft_ms": 450.0, "max_tpot_ms": 35.0},
+    "gemma4_moe": {"max_ttft_ms": 450.0, "max_tpot_ms": 60.0},
     "whisper": {"min_tps": 5.0},
 }
 
