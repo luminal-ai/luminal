@@ -574,7 +574,9 @@ def _build_dynamic_shapes_from_dim_arg(dynamic_dim, example_args):
     return (spec,) + rest
 
 
-def _eager_pt2_compile(gm, user_inputs, user_indices, dynamic_shapes, factory):
+def _eager_pt2_compile(
+    gm, user_inputs, user_indices, dynamic_shapes, factory, search_iterations
+):
     """Run torch.export → save → Rust compile end-to-end. Returns CompiledModel.
 
     Factored out so both the eager (static-shapes) and lazy (dynamic-shapes)
@@ -631,12 +633,20 @@ def _eager_pt2_compile(gm, user_inputs, user_indices, dynamic_shapes, factory):
         return _save_and_compile(
             pt2_path,
             factory,
-            10,
+            search_iterations,
             user_indices=user_indices,
             input_device_ptrs=input_device_ptrs,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# Schedule-search budget for the torch.compile backend path when the caller
+# passes no options. Was an anonymous literal 10 buried in _eager_pt2_compile;
+# raised to 25 to match the direct compile() API's default — the two entry
+# points now agree. (10 was the budget the bench's config notes call
+# maximally lottery-prone.)
+_BACKEND_DEFAULT_SEARCH_ITERATIONS = 25
 
 
 class _LazyDynamicCompiledModel:
@@ -663,11 +673,13 @@ class _LazyDynamicCompiledModel:
         user_indices,
         dynamic_shapes,
         factory,
+        search_iterations,
     ):
         self._gm = gm
         self._user_inputs = user_inputs
         self._user_indices = user_indices
         self._dynamic_shapes = dynamic_shapes
+        self._search_iterations = search_iterations
         self._factory = factory
         self._compiled = None
 
@@ -679,6 +691,7 @@ class _LazyDynamicCompiledModel:
                 self._user_indices,
                 self._dynamic_shapes,
                 self._factory,
+                self._search_iterations,
             )
             # Drop references we no longer need post-compile.
             self._gm = None
@@ -700,11 +713,17 @@ class _LazyDynamicCompiledModel:
         return self._ensure_compiled().set_dim(name, value)
 
 
-def pt2_backend(gm, example_inputs, factory=None):
+def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
     """torch.compile backend using PT2 pipeline.
 
     Usage: torch.compile(model, backend=luminal.register_backend(capsule))
+
+    `search_iterations`: schedule-search budget; None means
+    _BACKEND_DEFAULT_SEARCH_ITERATIONS. (The direct `compile()` API keeps its
+    own default — unifying the two is a deliberate follow-up, not implied.)
     """
+    if search_iterations is None:
+        search_iterations = _BACKEND_DEFAULT_SEARCH_ITERATIONS
     import copy as _copy
 
     if factory is None:
@@ -747,7 +766,10 @@ def pt2_backend(gm, example_inputs, factory=None):
         # Dynamo is still relying on, and running it inside the backend frame
         # corrupts the freshly-installed guards.
         return _LazyDynamicCompiledModel(
-            gm, user_inputs, user_indices, dynamic_shapes, factory
+            gm, user_inputs, user_indices, dynamic_shapes, factory,
+            search_iterations,
         )
 
-    return _eager_pt2_compile(gm, user_inputs, user_indices, None, factory)
+    return _eager_pt2_compile(
+        gm, user_inputs, user_indices, None, factory, search_iterations
+    )

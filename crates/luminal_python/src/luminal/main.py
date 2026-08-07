@@ -83,7 +83,10 @@ def register_backend(factory_capsule):
     """
 
     def backend(gm, example_inputs, options=None):
-        return _compile_pt2(gm, example_inputs, factory_capsule)
+        return _compile_pt2(
+            gm, example_inputs, factory_capsule,
+            search_iterations=(options or {}).get("search_iterations"),
+        )
 
     return backend
 
@@ -97,12 +100,17 @@ def luminal_backend(gm, example_inputs, options=None):
     """Auto-detecting torch.compile backend.
 
     Picks cuda_lite if inputs are on CUDA (and cuda feature is compiled in),
-    reference otherwise.
+    reference otherwise. `options={"search_iterations": N}` (torch.compile's
+    backend-options dict) sets the schedule-search budget; default lives in
+    pt2._BACKEND_DEFAULT_SEARCH_ITERATIONS.
 
     For external backends, use register_backend with the backend's factory capsule.
     """
     capsule = _detect_factory_capsule(example_inputs)
-    return _compile_pt2(gm, example_inputs, capsule)
+    return _compile_pt2(
+        gm, example_inputs, capsule,
+        search_iterations=(options or {}).get("search_iterations"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +118,11 @@ def luminal_backend(gm, example_inputs, options=None):
 # ---------------------------------------------------------------------------
 
 
-def _compile_pt2(gm, example_inputs, factory_capsule):
+def _compile_pt2(gm, example_inputs, factory_capsule, search_iterations=None):
     """PT2/torch.export path — delegates to pt2.pt2_backend."""
     from .pt2 import pt2_backend
 
-    return pt2_backend(gm, example_inputs, factory=factory_capsule)
+    return pt2_backend(
+        gm, example_inputs, factory=factory_capsule,
+        search_iterations=search_iterations,
+    )
