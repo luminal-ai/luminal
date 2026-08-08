@@ -25,7 +25,9 @@ const MAX_SEQ_LEN: usize = 4096;
 const GEN_TOKENS: usize = 500;
 const SEARCH_GRAPHS: usize = 500;
 const SEARCH_TRIALS: usize = 10;
-const SEARCH_KEEP_BEST: usize = 4;
+// 3 parents x 5 offspring each per generation.
+const SEARCH_KEEP_BEST: usize = 3;
+const SEARCH_GENERATION_SIZE: usize = 15;
 const SEARCH_MEMORY_MIB: usize = 2048;
 const SEARCH_SEED: u64 = 0;
 const PROMPT: &str = "Explain what a neural network is in a paragraph.";
@@ -342,7 +344,8 @@ fn main() {
         )
         .search_graph_limit(SEARCH_GRAPHS)
         .trials(SEARCH_TRIALS)
-        .keep_best(SEARCH_KEEP_BEST);
+        .keep_best(SEARCH_KEEP_BEST)
+        .generation_size(SEARCH_GENERATION_SIZE);
 
     println!("Loading weights...");
     let load_start = std::time::Instant::now();

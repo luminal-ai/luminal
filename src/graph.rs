@@ -2427,14 +2427,29 @@ impl Graph {
                     } else {
                         1
                     };
-                    offspring.extend(extract_reachable_generation(
-                        egraph,
-                        parent_genome,
-                        per_parent.min(remaining),
-                        options.mutations * kick,
-                        &mut prev_selected,
-                        rng,
-                    ));
+                    // Scale-mixed mutation counts: each offspring draws
+                    // uniformly from 1..=mutations (x kick when stagnant).
+                    // Small counts exploit around the parent every
+                    // generation; large counts keep the multi-gene basin
+                    // jumps available for the whole run — trajectory data
+                    // shows the winning jumps often land late, so a
+                    // time-decayed anneal would remove exactly those moves.
+                    // No new knob: `mutations` becomes the maximum.
+                    for _ in 0..per_parent.min(remaining) {
+                        let max_mutations = (options.mutations * kick).max(1);
+                        let n_mutations = rng.random_range(1..=max_mutations);
+                        offspring.extend(extract_reachable_generation(
+                            egraph,
+                            parent_genome,
+                            1,
+                            n_mutations,
+                            &mut prev_selected,
+                            rng,
+                        ));
+                        if offspring.len() >= budget {
+                            break;
+                        }
+                    }
                 }
                 offspring
             };
