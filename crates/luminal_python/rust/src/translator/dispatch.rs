@@ -53,6 +53,10 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.div.Tensor" => self.translate_binary_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Scalar" => self.translate_binary_scalar_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Tensor_mode" => self.translate_div_tensor_mode(node)?,
+            "torch.ops.aten.bitwise_right_shift.Tensor" => {
+                self.translate_bitwise_right_shift(node)?
+            }
+            "torch.ops.aten.bitwise_and.Scalar" => self.translate_bitwise_and_scalar(node)?,
 
             // Unary ops
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
@@ -275,7 +279,8 @@ impl<'a> Translator<'a> {
                 let (a, b) = broadcast_binary(a, b);
                 a.le(b)
             }
-            "torch.ops.aten.bitwise_and.Tensor" | "torch.ops.aten.logical_and.default" => {
+            "torch.ops.aten.bitwise_and.Tensor" => self.translate_bitwise_and_tensor(node)?,
+            "torch.ops.aten.logical_and.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);

@@ -290,6 +290,38 @@ impl<S: Into<Expression>> Rem<S> for GraphTensor {
     }
 }
 
+impl GraphTensor {
+    /// Elementwise arithmetic right shift for identically-shaped signed integer tensors.
+    pub fn bitwise_right_shift(self, rhs: GraphTensor) -> GraphTensor {
+        assert_eq!(
+            self.dims(),
+            rhs.dims(),
+            "Dims must match to right-shift tensors."
+        );
+        assert_eq!(
+            self.dtype, rhs.dtype,
+            "Dtypes must match to right-shift tensors. Got {:?} and {:?}",
+            self.dtype, rhs.dtype
+        );
+        assert!(
+            matches!(
+                self.dtype,
+                DType::Int | DType::I64 | DType::I8 | DType::I16 | DType::I4
+            ),
+            "Bitwise right shift requires signed integer tensors, got {:?}",
+            self.dtype
+        );
+        let new_id = self.graph().add_op(
+            BitwiseRightShift {
+                input_shapes: vec![self.shape, rhs.shape],
+                ..Default::default()
+            },
+            &[self.id, rhs.id],
+        );
+        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+    }
+}
+
 // Comparisons, all redurn bools (based on https://github.com/tinygrad/tinygrad/blob/3e0c2d256fe9f4f5f85cd3e4d8733a51d7b4a984/tinygrad/tensor.py#L653)
 impl GraphTensor {
     /// Less than comparison

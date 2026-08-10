@@ -234,3 +234,26 @@ pub fn torch_dtype_int_to_luminal(dtype: u32) -> DType {
         }),
     }
 }
+
+/// Map a PT2 dtype code used by an operation inside the graph to a Luminal
+/// dtype. Unlike the public tensor boundary, graph-local casts may use narrow
+/// integer widths (GPTQ unpacking, for example, casts shifted int32 words to
+/// int8 before masking). Those widths are preserved in HLIR so backend
+/// rewrites can observe the original computation without widening it.
+pub fn torch_internal_dtype_int_to_luminal(dtype: u32) -> DType {
+    let t = crate::torch_dtype::TorchDType::from_code(dtype).unwrap_or_else(|c| {
+        panic!("torch_internal_dtype_int_to_luminal: unknown PT2 dtype code {c}")
+    });
+    match t {
+        crate::torch_dtype::TorchDType::Byte => DType::U8,
+        crate::torch_dtype::TorchDType::Char => DType::I8,
+        crate::torch_dtype::TorchDType::Short => DType::I16,
+        crate::torch_dtype::TorchDType::Uint16 => DType::U16,
+        other => DType::try_from(other).unwrap_or_else(|t| {
+            panic!(
+                "torch_internal_dtype_int_to_luminal: {} isn't a first-class luminal IR type",
+                t.name()
+            )
+        }),
+    }
+}

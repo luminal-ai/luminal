@@ -1,4 +1,6 @@
 from typing import Callable
+
+import pytest
 import torch
 import torch._dynamo
 from test_models import (
@@ -20,6 +22,31 @@ from test_models import (
     ClipMaxOnlyTestModel,
 )
 from luminal import luminal_backend
+
+
+class Exp2Model(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.exp2(x)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_exp2_integer_input_promotes_to_float32(device, dtype):
+    if device.type != "cpu":
+        pytest.skip("integer-input Exp2 is currently reference-backend only")
+    model = Exp2Model().to(device)
+    model_compiled: Callable = torch.compile(model, backend=luminal_backend)
+    x = torch.tensor(
+        [-150, -149, -126, -2, -1, 0, 1, 30, 127, 128],
+        dtype=dtype,
+        device=device,
+    )
+
+    expected = model(x)
+    actual = model_compiled(x)
+
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, expected)
 
 # ── Sigmoid ──────────────────────────────────────────────────────────────────
 

@@ -2,7 +2,7 @@ use anyhow::Result;
 use luminal::prelude::*;
 
 use crate::pt2_schema::*;
-use crate::pt2_util::{broadcast_binary, torch_dtype_int_to_luminal};
+use crate::pt2_util::{broadcast_binary, torch_internal_dtype_int_to_luminal};
 
 use super::Translator;
 
@@ -89,7 +89,7 @@ impl<'a> Translator<'a> {
                     .map(|i| i as u32)
                     .or_else(|| input.arg.as_scalar_type());
                 if let Some(d) = dtype_int {
-                    let dtype = torch_dtype_int_to_luminal(d);
+                    let dtype = torch_internal_dtype_int_to_luminal(d);
                     // Skip emitting a Cast op when the dtype already matches —
                     // PT2 graphs frequently emit `_to_copy` purely as a clone hint
                     // (e.g. dtype=float32 on a tensor that is already F32), and

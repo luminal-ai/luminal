@@ -84,8 +84,20 @@ impl GraphTensor {
         GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
-    /// Base 2 exp
+    /// Base 2 exp. Integer and Bool inputs promote to F32 before evaluation.
     pub fn exp2(self) -> GraphTensor {
+        let output_dtype = match self.dtype {
+            DType::Int
+            | DType::I64
+            | DType::I4
+            | DType::U4
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::Bool => DType::F32,
+            dtype => dtype,
+        };
         let new_id = self.graph().add_op(
             crate::hlir::Exp2 {
                 input_shape: self.shape,
@@ -93,7 +105,12 @@ impl GraphTensor {
             },
             &[self.id],
         );
-        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
+        GraphTensor::from_id(
+            new_id,
+            self.shape.contiguous(),
+            self.graph_ref,
+            output_dtype,
+        )
     }
 
     /// Natural exp
@@ -489,6 +506,56 @@ pub(super) mod tests {
     use itertools::Itertools;
     use ordered_float::NotNan;
     use proptest::prelude::*;
+
+    #[test]
+    fn test_exp2_integer_promotes_to_f32() {
+        let mut cx = Graph::new();
+        let input = cx.tensor(10).as_dtype(DType::Int);
+        let output = input.exp2().output();
+        assert_eq!(output.dtype, DType::F32);
+
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut rt = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
+        let values = vec![-150, -149, -126, -2, -1, 0, 1, 30, 127, 128];
+        let expected = vec![
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            1_073_741_824.0,
+            f32::from_bits(0x7f00_0000),
+            f32::INFINITY,
+        ];
+        rt.set_data(input.id, values);
+        rt.execute(&cx.dyn_map);
+
+        assert_eq!(rt.get_f32(output.id), &expected);
+    }
+
+    #[test]
+    fn test_exp2_all_integer_dtypes_promote_to_f32() {
+        for dtype in [
+            DType::Int,
+            DType::I64,
+            DType::I4,
+            DType::U4,
+            DType::I8,
+            DType::U8,
+            DType::I16,
+            DType::U16,
+            DType::Bool,
+        ] {
+            let mut cx = Graph::new();
+            let input = cx.tensor(1).as_dtype(dtype);
+            assert_eq!(input.exp2().dtype, DType::F32, "input dtype {dtype:?}");
+        }
+    }
 
     fn cummax_ref_2d(a: Tensor) -> Tensor {
         let v = a.to_vec2::<f32>().unwrap();
