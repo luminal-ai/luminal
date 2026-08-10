@@ -1,5 +1,7 @@
+mod block;
 mod matmul;
 mod ops;
+pub use block::*;
 pub use matmul::*;
 pub use ops::*;
 
@@ -201,6 +203,10 @@ pub trait MetalKernelOp: EgglogOp {
         0
     }
 
+    fn kernel_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn mul_info(&self) -> Option<MetalMulInfo> {
         None
     }
@@ -209,12 +215,27 @@ pub trait MetalKernelOp: EgglogOp {
         None
     }
 
+    fn is_matmul(&self) -> bool {
+        false
+    }
+
+    /// If this kernel's output aliases one of its inputs (i.e., writes in-place),
+    /// return the input index.
     fn output_aliases_input(&self) -> Option<usize> {
         None
     }
 
-    fn is_matmul(&self) -> bool {
-        false
+    /// If this kernel's output data is derived from one of its inputs
+    /// (copy-then-modify or in-place write), return that input index.
+    ///
+    /// Defaults to `output_aliases_input()`. Override for copy-then-modify ops
+    /// such as Scatter that copy dest -> output and then modify output.
+    fn output_data_input(&self) -> Option<usize> {
+        self.output_aliases_input()
+    }
+
+    fn constant_value(&self) -> Option<f32> {
+        None
     }
 }
 

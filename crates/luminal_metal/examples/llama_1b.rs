@@ -66,6 +66,10 @@ fn avg_ms(duration: Duration, n: usize) -> f64 {
     }
 }
 
+fn mib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
 fn sample_greedy(logits_row: &[f32], seen: &FxHashSet<u32>, repetition_penalty: f32) -> u32 {
     let mut row = logits_row.to_vec();
     for &tok in seen {
@@ -500,6 +504,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         "  Search/compile: {:.2} s",
         compile_start.elapsed().as_secs_f64()
     );
+    let stats = runtime.debug_stats();
+    println!(
+        "  Runtime stats after search: buckets={}, active_bucket={}, steps={}, pipelines={}, input_buffers={}, intermediate_buffers={}, intermediate_allocated={:.2} MiB, intermediate_logical={:.2} MiB, pipeline_cache_hits={}, pipeline_cache_misses={}, pipeline_cache_entries={}",
+        stats.compiled_buckets,
+        stats.active_bucket,
+        stats.execution_steps,
+        stats.pipelines,
+        stats.input_buffers,
+        stats.intermediate_buffers,
+        mib(stats.intermediate_allocated_bytes),
+        mib(stats.intermediate_logical_bytes),
+        stats.pipeline_cache_hits,
+        stats.pipeline_cache_misses,
+        stats.pipeline_cache_entries,
+    );
 
     for i in 0..LAYERS {
         runtime.set_zeros(kv_cache.k_caches[i], cache_bytes);
@@ -627,6 +646,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         avg_ms(execute_total, profiles.len()),
         avg_ms(logits_total, profiles.len()),
         avg_ms(cache_total, profiles.len()),
+    );
+    let stats = runtime.debug_stats();
+    println!(
+        "  Runtime stats after generation: buckets={}, active_bucket={}, steps={}, pipelines={}, input_buffers={}, intermediate_buffers={}, intermediate_allocated={:.2} MiB, intermediate_logical={:.2} MiB, pipeline_cache_hits={}, pipeline_cache_misses={}, pipeline_cache_entries={}",
+        stats.compiled_buckets,
+        stats.active_bucket,
+        stats.execution_steps,
+        stats.pipelines,
+        stats.input_buffers,
+        stats.intermediate_buffers,
+        mib(stats.intermediate_allocated_bytes),
+        mib(stats.intermediate_logical_bytes),
+        stats.pipeline_cache_hits,
+        stats.pipeline_cache_misses,
+        stats.pipeline_cache_entries,
     );
 
     Ok(())

@@ -451,6 +451,34 @@ fn metal_simple_add() {
     assert_eq!(out, vec![6.0, 8.0, 10.0, 12.0]);
 }
 
+#[test]
+fn metal_bufferization_reuses_dead_intermediates() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(4);
+    let output = (((input + input) * input) + input).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(input, &[1.0, 2.0, 3.0, 4.0]);
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+    rt.allocate_intermediate_buffers(&cx.dyn_map);
+
+    let stats = rt.debug_stats();
+    assert!(
+        stats.intermediate_allocated_bytes < stats.intermediate_logical_bytes,
+        "expected bufferization to reduce physical bytes below logical bytes, stats: {stats:?}"
+    );
+    assert!(
+        stats.intermediate_buffers < rt.buffers.len(),
+        "expected fewer physical buffers than logical buffer mappings, stats: {stats:?}, logical={}",
+        rt.buffers.len()
+    );
+
+    rt.execute(&cx.dyn_map);
+    let out = rt.get_f32(output);
+    assert_eq!(out, vec![3.0, 10.0, 21.0, 36.0]);
+}
+
 /// Simple deterministic test for mul
 #[test]
 fn metal_simple_mul() {
@@ -1530,6 +1558,57 @@ fn test_scatter_no_copy_remove_buffer_aliases_dest() {
     };
     assert_close(&moved_values, &[10.0, 7.0, 30.0, 8.0, 50.0], 0.001);
     rt.set_buffer(dest.id, moved);
+}
+
+#[test]
+fn test_scatter_copy_remove_buffer_roundtrip_preserves_cache() {
+    let mut cx = Graph::default();
+    let src = cx.tensor(1);
+    let indexes = cx.tensor(1).as_dtype(DType::Int);
+    let cache = cx.tensor(4).persist();
+    let cache_out = src.scatter(indexes, cache);
+    let read_cache_out = cache_out.output();
+    let read_original_cache = (cache + 1.0).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut rt = MetalRuntime::initialize(());
+    rt.set_data(src, &[0.0]);
+    rt.set_data(indexes, &[0.0]);
+    rt.set_zeros(cache, 4 * std::mem::size_of::<f32>());
+    rt = cx.search(rt, CompileOptions::default().search_graph_limit(1));
+    let kernels = rt.debug_kernel_ops();
+    assert!(
+        !kernels.iter().any(|k| k.contains("MetalScatterNoCopy")),
+        "copy scatter should be selected when cache has another consumer, kernels: {:?}",
+        kernels
+    );
+
+    let mut previous_cache = [0.0, 0.0, 0.0, 0.0];
+    for (pos, value, expected) in [
+        (0, 10.0, [10.0, 0.0, 0.0, 0.0]),
+        (2, 30.0, [10.0, 0.0, 30.0, 0.0]),
+    ] {
+        rt.set_data(src, &[value]);
+        rt.set_data(indexes, &[pos as f32]);
+        rt.allocate_intermediate_buffers(&cx.dyn_map);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(&rt.get_f32(read_cache_out), &expected, 0.001);
+        assert_close(
+            &rt.get_f32(read_original_cache),
+            &[
+                previous_cache[0] + 1.0,
+                previous_cache[1] + 1.0,
+                previous_cache[2] + 1.0,
+                previous_cache[3] + 1.0,
+            ],
+            0.001,
+        );
+
+        let updated_cache = rt.remove_buffer(cache_out);
+        rt.set_buffer(cache, updated_cache);
+        previous_cache = expected;
+    }
 }
 
 #[test]
