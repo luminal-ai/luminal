@@ -49,14 +49,24 @@ pub enum CudaInput {
 /// Input facts that can change hard-resource accounting. Payload bytes and
 /// pointer identity are deliberately excluded: replacing data or a pointer at
 /// the same logical length/capacity only requires refreshing launch bindings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ResourceInputFootprint {
-    logical_bytes: usize,
+    logical_bytes: Option<usize>,
     owned_capacity_bytes: Option<usize>,
 }
 
+/// Complete hard-resource state covered by one successful validation. Keeping
+/// more than the most recent signature matters for decode workloads: context
+/// lengths repeat across requests, and revisiting an already validated shape
+/// must not rebuild the same aggregate resource plan.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ResourceValidationSignature {
+    allocation_dyn_maps: Vec<Vec<(char, usize)>>,
+    input_footprints: Vec<(usize, ResourceInputFootprint)>,
+}
+
 impl ResourceInputFootprint {
-    fn owned(logical_bytes: usize, capacity_bytes: usize) -> Self {
+    fn owned(capacity_bytes: usize, logical_bytes: Option<usize>) -> Self {
         Self {
             logical_bytes,
             owned_capacity_bytes: Some(capacity_bytes),
@@ -65,7 +75,7 @@ impl ResourceInputFootprint {
 
     fn external(logical_bytes: usize) -> Self {
         Self {
-            logical_bytes,
+            logical_bytes: Some(logical_bytes),
             owned_capacity_bytes: None,
         }
     }
@@ -73,12 +83,8 @@ impl ResourceInputFootprint {
 
 fn resource_input_signature_changed(
     previous: &FxHashMap<NodeIndex, ResourceInputFootprint>,
-    current_input_count: usize,
     mut changed_inputs: impl Iterator<Item = (NodeIndex, Option<ResourceInputFootprint>)>,
 ) -> bool {
-    if previous.len() != current_input_count {
-        return true;
-    }
     changed_inputs.any(|(node, current)| previous.get(&node).copied() != current)
 }
 
@@ -291,6 +297,10 @@ struct PrepareBucketProfile {
     changed_hlir: usize,
     processed_llir_bindings: usize,
     resource_validations: usize,
+    resource_validation_incomplete: usize,
+    resource_validation_dyn_map_changed: usize,
+    resource_validation_inputs_changed: usize,
+    resource_validation_cache_miss: usize,
 }
 
 impl ArenaReleasePlan {
@@ -327,6 +337,14 @@ pub struct CudaRuntime {
     /// Resource-relevant input state covered by the most recent aggregate
     /// retained-bucket validation.
     last_resource_input_signature: FxHashMap<NodeIndex, ResourceInputFootprint>,
+    /// Boundary inputs whose logical byte length is read by a HostOp resource
+    /// plan. External inputs not in this set cannot change hard-resource
+    /// accounting, regardless of pointer or logical-size churn.
+    resource_length_sensitive_hlir: FxHashSet<NodeIndex>,
+    /// Successful validations for the currently loaded retained-bucket set.
+    /// Cleared whenever the executable graph or a configured hard limit
+    /// changes.
+    validated_resource_signatures: FxHashSet<ResourceValidationSignature>,
     /// Optional correlation and structured result for opt-in invocation
     /// profiling. They are inert unless the Python boundary requests a trace.
     profile_invocation_id: Option<u64>,
@@ -407,6 +425,7 @@ impl CudaRuntime {
     /// remains subject to the CUDA device limit when this is `None`.
     pub fn set_max_memory_bytes(&mut self, max_memory_bytes: Option<usize>) {
         self.max_intermediate_memory_bytes = max_memory_bytes;
+        self.validated_resource_signatures.clear();
         for bucket in &mut self.compiled_buckets {
             bucket.resource_validation_complete = false;
         }
@@ -431,6 +450,7 @@ impl CudaRuntime {
 
     pub fn set_max_kernel_source_bytes(&mut self, max_kernel_source_bytes: Option<usize>) {
         self.max_kernel_source_bytes = max_kernel_source_bytes;
+        self.validated_resource_signatures.clear();
         for bucket in &mut self.compiled_buckets {
             bucket.resource_validation_complete = false;
         }
@@ -2174,12 +2194,25 @@ impl CudaRuntime {
         let allocation_dyn_map_time = timer.elapsed();
         let timer = std::time::Instant::now();
         let resource_inputs_changed = self.resource_inputs_changed_since_validation();
+        let resource_validation_signature =
+            self.resource_validation_signature(bucket_idx, &allocation_dyn_map);
+        let resource_validation_cache_miss = !self
+            .validated_resource_signatures
+            .contains(&resource_validation_signature);
         let resource_signature_time = timer.elapsed();
-        let needs_resource_validation = {
+        let (
+            resource_validation_incomplete,
+            resource_validation_dyn_map_changed,
+            needs_resource_validation,
+        ) = {
             let bucket = &self.compiled_buckets[bucket_idx];
-            !bucket.resource_validation_complete
-                || bucket.last_resource_validation_dyn_map != allocation_dyn_map
-                || resource_inputs_changed
+            let incomplete = !bucket.resource_validation_complete;
+            let dyn_map_changed = bucket.last_resource_validation_dyn_map != allocation_dyn_map;
+            (
+                incomplete,
+                resource_validation_cache_miss && dyn_map_changed,
+                incomplete || resource_validation_cache_miss,
+            )
         };
         let timer = std::time::Instant::now();
         if needs_resource_validation
@@ -2187,6 +2220,19 @@ impl CudaRuntime {
                 self.validate_compiled_bucket_resources(bucket_idx, &allocation_dyn_map)
         {
             panic!("compiled CUDA plan violates a hard resource limit: {violation}");
+        }
+        if needs_resource_validation {
+            self.validated_resource_signatures
+                .insert(resource_validation_signature);
+        } else {
+            // A non-consecutive cache hit is now the active proof. Advance the
+            // "last" state as if validation had just run so later bucket
+            // switches build aggregate signatures from the state actually in
+            // use, not from whichever shape happened to validate most recently.
+            let bucket = &mut self.compiled_buckets[bucket_idx];
+            bucket.last_resource_validation_dyn_map = allocation_dyn_map.clone();
+            bucket.resource_validation_complete = true;
+            self.last_resource_input_signature = self.current_resource_input_signature();
         }
         let resource_validation_time = timer.elapsed();
         let (
@@ -2262,6 +2308,14 @@ impl CudaRuntime {
                     refresh_lengths_us: refresh_lengths_time.as_secs_f64() * 1e6,
                     changed_hlir: changed_hlir_count,
                     resource_validations: usize::from(needs_resource_validation),
+                    resource_validation_incomplete: usize::from(resource_validation_incomplete),
+                    resource_validation_dyn_map_changed: usize::from(
+                        resource_validation_dyn_map_changed,
+                    ),
+                    resource_validation_inputs_changed: usize::from(
+                        resource_validation_cache_miss && resource_inputs_changed,
+                    ),
+                    resource_validation_cache_miss: usize::from(resource_validation_cache_miss),
                     ..PrepareBucketProfile::default()
                 };
             }
@@ -2356,6 +2410,14 @@ impl CudaRuntime {
                 changed_hlir: changed_hlir_count,
                 processed_llir_bindings: to_process_count,
                 resource_validations: usize::from(needs_resource_validation),
+                resource_validation_incomplete: usize::from(resource_validation_incomplete),
+                resource_validation_dyn_map_changed: usize::from(
+                    resource_validation_dyn_map_changed,
+                ),
+                resource_validation_inputs_changed: usize::from(
+                    resource_validation_cache_miss && resource_inputs_changed,
+                ),
+                resource_validation_cache_miss: usize::from(resource_validation_cache_miss),
             };
         }
         if log_prepare {
@@ -2677,42 +2739,121 @@ impl CudaRuntime {
         &self,
         node: NodeIndex,
         input: &CudaInput,
-    ) -> ResourceInputFootprint {
+    ) -> Option<ResourceInputFootprint> {
+        let length_sensitive = self.resource_length_sensitive_hlir.contains(&node);
         match input {
-            CudaInput::Buffer { buf, len } => ResourceInputFootprint::owned(*len, buf.num_bytes()),
-            CudaInput::Ptr(_) => ResourceInputFootprint::external(
+            // Runtime-owned allocation capacity always contributes to the
+            // device-memory limit. Its logical length matters only when an
+            // attached HostOp explicitly consumes it during planning.
+            CudaInput::Buffer { buf, len } => Some(ResourceInputFootprint::owned(
+                buf.num_bytes(),
+                length_sensitive.then_some(*len),
+            )),
+            // External allocations are intentionally excluded from aggregate
+            // device-memory accounting: aliases/views could otherwise be
+            // counted repeatedly. Retain only logical lengths that a HostOp
+            // resource plan actually reads.
+            CudaInput::Ptr(_) if length_sensitive => Some(ResourceInputFootprint::external(
                 self.external_buffers
                     .get(&node)
                     .map(|buffer| buffer.len())
                     .unwrap_or(0),
-            ),
+            )),
+            CudaInput::Ptr(_) => None,
         }
     }
 
     fn current_resource_input_signature(&self) -> FxHashMap<NodeIndex, ResourceInputFootprint> {
         self.hlir_buffers
             .iter()
-            .map(|(&node, input)| (node, self.resource_input_footprint(node, input)))
+            .filter_map(|(&node, input)| {
+                self.resource_input_footprint(node, input)
+                    .map(|footprint| (node, footprint))
+            })
             .collect()
+    }
+
+    fn retained_bucket_allocation_dyn_maps(
+        &self,
+        bucket_idx: usize,
+        allocation_dyn_map: &FxHashMap<char, usize>,
+    ) -> Vec<FxHashMap<char, usize>> {
+        self.compiled_buckets
+            .iter()
+            .enumerate()
+            .map(|(idx, bucket)| {
+                if idx == bucket_idx {
+                    allocation_dyn_map.clone()
+                } else if !bucket.last_resource_validation_dyn_map.is_empty() {
+                    bucket.last_resource_validation_dyn_map.clone()
+                } else {
+                    Self::complete_resource_dyn_map(bucket, bucket.last_dyn_map.clone())
+                }
+            })
+            .collect()
+    }
+
+    fn resource_validation_signature(
+        &self,
+        bucket_idx: usize,
+        allocation_dyn_map: &FxHashMap<char, usize>,
+    ) -> ResourceValidationSignature {
+        let allocation_dyn_maps = self
+            .retained_bucket_allocation_dyn_maps(bucket_idx, allocation_dyn_map)
+            .into_iter()
+            .map(|map| {
+                let mut entries = map.into_iter().collect_vec();
+                entries.sort_unstable_by_key(|(name, _)| *name);
+                entries
+            })
+            .collect();
+        let mut input_footprints = self
+            .current_resource_input_signature()
+            .into_iter()
+            .map(|(node, footprint)| (node.index(), footprint))
+            .collect_vec();
+        input_footprints.sort_unstable_by_key(|(node, _)| *node);
+        ResourceValidationSignature {
+            allocation_dyn_maps,
+            input_footprints,
+        }
     }
 
     fn resource_inputs_changed_since_validation(&self) -> bool {
         // All supported input mutation paths add the affected node to
         // changed_hlir. Restrict the potentially large signature comparison to
         // that set so a token update does not rescan every model weight. A
-        // removal without a replacement is caught by the map-length check; a
-        // replacement/addition is itself in changed_hlir.
+        // relevant removal compares its prior footprint with `None`; a
+        // replacement/addition is itself in changed_hlir. Irrelevant external
+        // inputs are absent from both signatures by construction.
         resource_input_signature_changed(
             &self.last_resource_input_signature,
-            self.hlir_buffers.len(),
             self.changed_hlir.iter().map(|&node| {
                 let current = self
                     .hlir_buffers
                     .get(&node)
-                    .map(|input| self.resource_input_footprint(node, input));
+                    .and_then(|input| self.resource_input_footprint(node, input));
                 (node, current)
             }),
         )
+    }
+
+    fn resource_length_sensitive_hlir_inputs(buckets: &[CompiledBucket]) -> FxHashSet<NodeIndex> {
+        buckets
+            .iter()
+            .flat_map(|bucket| {
+                bucket
+                    .exec_graph
+                    .node_weights()
+                    .flat_map(move |executable| {
+                        executable
+                            .internal
+                            .resource_buffer_nodes(&executable.inputs)
+                            .into_iter()
+                            .filter_map(|llir_node| bucket.llir_to_hlir.get(&llir_node).copied())
+                    })
+            })
+            .collect()
     }
 
     /// Loading can preflight an LLIR before its graph inputs are installed.
@@ -2904,20 +3045,8 @@ impl CudaRuntime {
         };
         let device = self.candidate_device_resource_limits();
         let hlir_buffer_lengths = self.hlir_resource_buffer_lengths();
-        let allocation_dyn_maps = self
-            .compiled_buckets
-            .iter()
-            .enumerate()
-            .map(|(idx, bucket)| {
-                if idx == bucket_idx {
-                    allocation_dyn_map.clone()
-                } else if !bucket.last_resource_validation_dyn_map.is_empty() {
-                    bucket.last_resource_validation_dyn_map.clone()
-                } else {
-                    Self::complete_resource_dyn_map(bucket, bucket.last_dyn_map.clone())
-                }
-            })
-            .collect_vec();
+        let allocation_dyn_maps =
+            self.retained_bucket_allocation_dyn_maps(bucket_idx, allocation_dyn_map);
         let plan = Self::retained_bucket_resource_plan(
             &mut self.compiled_buckets,
             &allocation_dyn_maps,
@@ -3325,6 +3454,9 @@ impl CudaRuntime {
         self.compiled_buckets = vec![bucket];
         self.active_bucket = 0;
         self.dim_buckets.clear();
+        self.validated_resource_signatures.clear();
+        self.resource_length_sensitive_hlir =
+            Self::resource_length_sensitive_hlir_inputs(&self.compiled_buckets);
         Self::finish_arena_releases(&self.cuda_stream, releases)?;
         // Reclaim search-profiling residue from the async allocator pool before
         // the stitched-graph arena allocates (see try_load_llir_buckets).
@@ -3334,6 +3466,13 @@ impl CudaRuntime {
         } else {
             FxHashMap::default()
         };
+        if input_lengths_complete {
+            let validated_dyn_map = self.compiled_buckets[0]
+                .last_resource_validation_dyn_map
+                .clone();
+            let signature = self.resource_validation_signature(0, &validated_dyn_map);
+            self.validated_resource_signatures.insert(signature);
+        }
 
         // Mark all HLIR inputs as changed so their pointers get re-cached in execute
         self.changed_hlir.extend(self.hlir_buffers.keys().copied());
@@ -3368,6 +3507,9 @@ impl CudaRuntime {
         }
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets = compiled_buckets;
+        self.validated_resource_signatures.clear();
+        self.resource_length_sensitive_hlir =
+            Self::resource_length_sensitive_hlir_inputs(&self.compiled_buckets);
         // The first real execution for model workloads is usually prefill, which
         // lands in the largest/range bucket rather than the singleton decode
         // bucket. Select it before prebuilding so only that active bucket gets an
@@ -3379,6 +3521,14 @@ impl CudaRuntime {
         } else {
             FxHashMap::default()
         };
+        if input_lengths_complete {
+            let validated_dyn_map = self.compiled_buckets[self.active_bucket]
+                .last_resource_validation_dyn_map
+                .clone();
+            let signature =
+                self.resource_validation_signature(self.active_bucket, &validated_dyn_map);
+            self.validated_resource_signatures.insert(signature);
+        }
 
         // Reclaim what search profiling left resident in the async allocator
         // pool before allocating the stitched-graph arenas. This load runs
@@ -3572,6 +3722,8 @@ impl Runtime for CudaRuntime {
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             device_resource_limits,
             last_resource_input_signature: FxHashMap::default(),
+            resource_length_sensitive_hlir: FxHashSet::default(),
+            validated_resource_signatures: FxHashSet::default(),
             profile_invocation_id: None,
             last_execution_profile_json: None,
             last_prepare_profile: PrepareBucketProfile::default(),
@@ -4020,6 +4172,10 @@ impl Runtime for CudaRuntime {
                             "dirty_hlir": prepare.changed_hlir,
                             "processed_llir_bindings": prepare.processed_llir_bindings,
                             "resource_validations": prepare.resource_validations,
+                            "resource_validation_incomplete": prepare.resource_validation_incomplete,
+                            "resource_validation_dyn_map_changed": prepare.resource_validation_dyn_map_changed,
+                            "resource_validation_inputs_changed": prepare.resource_validation_inputs_changed,
+                            "resource_validation_cache_miss": prepare.resource_validation_cache_miss,
                             "graph_launches": graph_launches,
                             "host_ops": host_op_launches,
                             "graphs_visited": graphs_visited,
@@ -4835,10 +4991,11 @@ mod arena_plan_tests {
 
     #[test]
     fn resource_input_footprint_tracks_lengths_and_owned_capacity_only() {
-        let owned = ResourceInputFootprint::owned(8, 64);
-        assert_eq!(owned, ResourceInputFootprint::owned(8, 64));
-        assert_ne!(owned, ResourceInputFootprint::owned(16, 64));
-        assert_ne!(owned, ResourceInputFootprint::owned(8, 128));
+        let owned = ResourceInputFootprint::owned(64, Some(8));
+        assert_eq!(owned, ResourceInputFootprint::owned(64, Some(8)));
+        assert_ne!(owned, ResourceInputFootprint::owned(64, Some(16)));
+        assert_ne!(owned, ResourceInputFootprint::owned(128, Some(8)));
+        assert_ne!(owned, ResourceInputFootprint::owned(64, None));
         assert_ne!(owned, ResourceInputFootprint::external(8));
 
         // External pointer identity and payload contents are intentionally not
@@ -4904,40 +5061,78 @@ mod arena_plan_tests {
     }
 
     #[test]
-    fn resource_signature_checks_only_changed_inputs_after_count_guard() {
+    fn resource_signature_checks_only_changed_resource_inputs() {
         let a = NodeIndex::new(1);
         let b = NodeIndex::new(2);
         let c = NodeIndex::new(3);
         let previous = FxHashMap::from_iter([
-            (a, ResourceInputFootprint::owned(8, 64)),
+            (a, ResourceInputFootprint::owned(64, Some(8))),
             (b, ResourceInputFootprint::external(32)),
         ]);
 
         assert!(!resource_input_signature_changed(
             &previous,
-            2,
-            [(a, Some(ResourceInputFootprint::owned(8, 64)))].into_iter(),
+            [(a, Some(ResourceInputFootprint::owned(64, Some(8))))].into_iter(),
         ));
         assert!(resource_input_signature_changed(
             &previous,
-            2,
-            [(a, Some(ResourceInputFootprint::owned(16, 64)))].into_iter(),
+            [(a, Some(ResourceInputFootprint::owned(64, Some(16))))].into_iter(),
         ));
         assert!(resource_input_signature_changed(
             &previous,
-            1,
-            std::iter::empty(),
-        ));
-        assert!(resource_input_signature_changed(
-            &previous,
-            2,
             [(c, Some(ResourceInputFootprint::external(32)))].into_iter(),
         ));
         assert!(resource_input_signature_changed(
             &previous,
-            2,
             [(b, None)].into_iter(),
         ));
+    }
+
+    #[test]
+    fn resource_validation_cache_reuses_nonconsecutive_exact_signatures() {
+        let signature = |a, bytes| ResourceValidationSignature {
+            allocation_dyn_maps: vec![vec![('a', a)]],
+            input_footprints: vec![(7, ResourceInputFootprint::external(bytes))],
+        };
+        let a17 = signature(17, 64);
+        let a18 = signature(18, 64);
+        let a17_larger_input = signature(17, 128);
+        let mut validated = FxHashSet::default();
+
+        assert!(validated.insert(a17.clone()));
+        assert!(validated.insert(a18));
+        assert!(validated.contains(&a17));
+        assert!(!validated.contains(&a17_larger_input));
+    }
+
+    #[test]
+    fn external_lengths_only_enter_signature_for_resource_sensitive_inputs() {
+        let mut rt = CudaRuntime::new().unwrap();
+        let ordinary = NodeIndex::new(126);
+        let resource_sensitive = NodeIndex::new(127);
+        let allocation = rt.cuda_stream.alloc_zeros::<u8>(128).unwrap();
+        let ptr = allocation.device_ptr(&rt.cuda_stream).0;
+
+        unsafe {
+            rt.set_device_ptr(ordinary, ptr, 32);
+            rt.set_device_ptr(resource_sensitive, ptr, 64);
+        }
+        rt.resource_length_sensitive_hlir.insert(resource_sensitive);
+
+        let signature = rt.current_resource_input_signature();
+        assert!(!signature.contains_key(&ordinary));
+        assert_eq!(
+            signature.get(&resource_sensitive),
+            Some(&ResourceInputFootprint::external(64))
+        );
+
+        rt.last_resource_input_signature = signature;
+        rt.changed_hlir.clear();
+        unsafe { rt.set_device_ptr(ordinary, ptr, 16) };
+        assert!(!rt.resource_inputs_changed_since_validation());
+
+        unsafe { rt.set_device_ptr(resource_sensitive, ptr, 32) };
+        assert!(rt.resource_inputs_changed_since_validation());
     }
 
     #[test]

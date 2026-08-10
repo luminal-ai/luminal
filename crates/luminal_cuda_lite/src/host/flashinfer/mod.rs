@@ -1114,6 +1114,13 @@ impl HostOp for FlashInferAttention {
         })
     }
 
+    fn resource_buffer_nodes(&self, inputs: &[NodeIndex]) -> Vec<NodeIndex> {
+        // device_resource_spec derives max_kv_pages from the logical lengths
+        // of K and V. Q, gather indices, and explicit indptr contents do not
+        // alter the allocation plan.
+        inputs.get(1..3).unwrap_or_default().to_vec()
+    }
+
     fn stats_name(&self) -> Option<&'static str> {
         Some("FlashInferAttention")
     }
@@ -1175,6 +1182,18 @@ unsafe fn cuda_pin_memory(ptr: *mut std::ffi::c_void, size: usize) -> i32 {
 mod resource_tests {
     use super::*;
     use itertools::Itertools;
+
+    #[test]
+    fn resource_signature_depends_only_on_kv_lengths() {
+        let attention = FlashInferAttention::default();
+        let inputs = (0..6).map(NodeIndex::new).collect_vec();
+
+        assert_eq!(
+            attention.resource_buffer_nodes(&inputs),
+            vec![inputs[1], inputs[2]]
+        );
+        assert!(attention.resource_buffer_nodes(&inputs[..2]).is_empty());
+    }
 
     #[test]
     fn device_resource_spec_is_pointer_free_and_capacity_adjusted() {

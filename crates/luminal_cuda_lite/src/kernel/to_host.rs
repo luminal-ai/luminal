@@ -856,6 +856,19 @@ impl HostOp for CudaGraphOp {
         self.host_device_memory_plan(buffer_lengths, dyn_map)
     }
 
+    fn resource_buffer_nodes(&self, _inputs: &[NodeIndex]) -> Vec<NodeIndex> {
+        // CudaGraphOp absorbs HostOps, so its graph-visible `inputs` argument
+        // does not describe the internal FlashInfer inputs. Preserve the
+        // dependency explicitly from the compiled island metadata.
+        let state = self.state.borrow();
+        state
+            .flashinfer_ops
+            .iter()
+            .flat_map(|op| op.inputs.get(1..3).unwrap_or_default().iter().copied())
+            .unique()
+            .collect()
+    }
+
     fn extra_buffer_nodes(&self) -> Vec<NodeIndex> {
         // Only return nodes that actually have buffers
         // Filter out nodes in buffer_sizes with size 0 (like MegakernelOps)

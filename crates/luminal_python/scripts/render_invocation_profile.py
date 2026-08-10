@@ -47,6 +47,34 @@ TAIL_FIELDS = [
     ("output_finalize", "Output finalization", "host"),
     ("unattributed", "CompiledModel unattributed", "unknown"),
 ]
+COUNT_FIELDS = [
+    ("compiled_model", "changed_input_bindings", "Changed input bindings"),
+    ("runtime", "dirty_hlir", "Dirty HLIR inputs"),
+    ("runtime", "processed_llir_bindings", "Processed LLIR bindings"),
+    ("runtime", "resource_validations", "Resource validations"),
+    (
+        "runtime",
+        "resource_validation_incomplete",
+        "Validation reason: incomplete cache",
+    ),
+    (
+        "runtime",
+        "resource_validation_dyn_map_changed",
+        "Validation reason: allocation dimensions changed",
+    ),
+    (
+        "runtime",
+        "resource_validation_inputs_changed",
+        "Validation reason: resource input changed",
+    ),
+    (
+        "runtime",
+        "resource_validation_cache_miss",
+        "Validation reason: unseen resource signature",
+    ),
+    ("runtime", "graph_nodes_inspected", "Graph nodes inspected"),
+    ("runtime", "graph_nodes_updated", "Graph nodes updated"),
+]
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -92,6 +120,10 @@ def value(record: dict, scope: str, field: str) -> float:
         runtime = record.get("runtime") or {}
         return float(runtime.get("timings_us", {}).get(field, 0.0))
     return float(record.get("compiled_model", {}).get("timings_us", {}).get(field, 0.0))
+
+
+def count_value(record: dict, scope: str, field: str) -> int:
+    return int(record.get(scope, {}).get("counts", {}).get(field, 0))
 
 
 def representative(records: list[dict], phase: str) -> dict | None:
@@ -158,6 +190,15 @@ def render(records: list[dict], source: Path) -> str:
             for r in records
         )
         heat_rows.append(f"<tr><th>{html.escape(label)}</th>{cells}</tr>")
+
+    count_rows = []
+    for scope, field, label in COUNT_FIELDS:
+        cells = "".join(
+            f"<td title='{html.escape(label)}: {count_value(r, scope, field):,}'>"
+            f"{count_value(r, scope, field):,}</td>"
+            for r in records
+        )
+        count_rows.append(f"<tr><th>{html.escape(label)}</th>{cells}</tr>")
 
     summary_rows = "".join(
         "<tr>"
@@ -238,6 +279,7 @@ th:first-child{{text-align:left;position:sticky;left:0;background:white;z-index:
 <p><strong>Important:</strong> runtime <em>prepare</em> is inclusive of its detailed rows; CompiledModel <em>graph_run</em> is inclusive of the entire runtime and is omitted from the heatmap to avoid visual double counting. Stream wait includes GPU execution and dependency waiting; it is not removable CPU bookkeeping.</p>
 <h2>Representative invocation waterfall</h2>{"".join(waterfall_parts) or "<p>No confidently classified prefill/decode records.</p>"}
 <h2>Invocation heatmap</h2><div class="scroll"><table><thead><tr><th>Region</th>{heat_header}</tr></thead><tbody>{"".join(heat_rows)}</tbody></table></div>
+<h2>Invocation counts and invalidation reasons</h2><div class="scroll"><table><thead><tr><th>Counter</th>{heat_header}</tr></thead><tbody>{"".join(count_rows)}</tbody></table></div>
 <h2>Summary</h2><table><thead><tr><th>Region</th><th>class</th><th>n</th><th>mean</th><th>p50</th><th>p90</th><th>p99</th><th>stddev</th></tr></thead><tbody>{summary_rows}</tbody></table>
 </body></html>"""
 

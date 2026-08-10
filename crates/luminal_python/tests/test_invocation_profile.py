@@ -174,7 +174,10 @@ def test_invocation_profile_renderer_generates_heatmap(tmp_path):
         },
         "runtime": {
             "timings_us": {"total": 8.0, "prepare": 2.0, "sync": 5.0},
-            "counts": {},
+            "counts": {
+                "resource_validations": 1,
+                "resource_validation_inputs_changed": 1,
+            },
         },
     }
     trace.write_text(json.dumps(record) + "\n")
@@ -188,3 +191,5 @@ def test_invocation_profile_renderer_generates_heatmap(tmp_path):
     assert "Invocation heatmap" in rendered
     assert "Representative invocation waterfall" in rendered
     assert "Stream execution/wait" in rendered
+    assert "Invocation counts and invalidation reasons" in rendered
+    assert "Validation reason: resource input changed" in rendered
