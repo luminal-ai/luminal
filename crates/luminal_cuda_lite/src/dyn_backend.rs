@@ -50,6 +50,12 @@ impl DynBackend for CudaLiteDynBackend {
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
         self.runtime.execute(dyn_map);
     }
+    fn set_profile_invocation_id(&mut self, invocation_id: u64) {
+        self.runtime.set_profile_invocation_id(invocation_id);
+    }
+    fn take_last_execution_profile_json(&mut self) -> Option<String> {
+        self.runtime.take_last_execution_profile_json()
+    }
 
     fn supports_device_ptrs(&self) -> bool {
         true

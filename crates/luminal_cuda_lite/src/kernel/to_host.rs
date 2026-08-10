@@ -446,6 +446,10 @@ struct CudaGraphOpState {
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     /// Timing events for profiling
     timing_events: Vec<cudarc::driver::sys::CUevent>,
+    /// Counts from the most recent materialization pass. These are diagnostic
+    /// only and do not participate in graph state or update decisions.
+    last_materialize_nodes_inspected: usize,
+    last_materialize_nodes_updated: usize,
 }
 
 impl CudaGraphOpState {
@@ -478,6 +482,8 @@ impl CudaGraphOpState {
             last_dyn_values: FxHashMap::default(),
             last_buffer_ptrs: FxHashMap::default(),
             timing_events: Vec::new(),
+            last_materialize_nodes_inspected: 0,
+            last_materialize_nodes_updated: 0,
         }
     }
 }
@@ -770,6 +776,14 @@ impl CudaGraphOp {
                 .collect(),
             step_dependency_counts,
         }
+    }
+
+    pub(crate) fn last_materialize_counts(&self) -> (usize, usize) {
+        let state = self.state.borrow();
+        (
+            state.last_materialize_nodes_inspected,
+            state.last_materialize_nodes_updated,
+        )
     }
 }
 
@@ -1315,6 +1329,8 @@ impl CudaGraphOp {
         let materialize_start = Instant::now();
         let mut profile = RecaptureProfile::new();
         let mut state = self.state.borrow_mut();
+        let nodes_inspected = state.steps.len();
+        let mut nodes_updated = 0usize;
         let _span = span!(Level::TRACE, "cuda_graph", kernels = state.kernels.len()).entered();
 
         // Check if dyn_map changed
@@ -1443,6 +1459,7 @@ impl CudaGraphOp {
                     output_ptr_changed || input_ptr_changed || dyn_changed
                 })
                 .collect_vec();
+            nodes_updated += kernel_dirty.iter().filter(|dirty| **dirty).count();
 
             // Update kernel params
             let dyn_dims_ptr = state
@@ -1873,6 +1890,9 @@ impl CudaGraphOp {
             state.last_buffer_ptrs = current_buffer_ptrs;
         }
 
+        nodes_updated += profile.pending_count;
+        state.last_materialize_nodes_inspected = nodes_inspected;
+        state.last_materialize_nodes_updated = nodes_updated;
         profile.materialize_total = materialize_start.elapsed();
         profile.print(dyn_map, state.kernels.len(), state.cublaslt_ops.len());
 

@@ -82,6 +82,19 @@ fn resource_input_signature_changed(
     changed_inputs.any(|(node, current)| previous.get(&node).copied() != current)
 }
 
+fn device_pointer_binding_matches(
+    current_ptr: Option<u64>,
+    current_bytes: Option<usize>,
+    device_ptr: u64,
+    n_bytes: usize,
+) -> bool {
+    current_ptr == Some(device_ptr) && current_bytes == Some(n_bytes)
+}
+
+fn should_consume_hlir_input(is_external_pointer: bool, preserved_for_output: bool) -> bool {
+    !preserved_for_output && !is_external_pointer
+}
+
 impl CudaInput {
     fn from_bytes(stream: &Arc<CudaStream>, bytes: &[u8]) -> Self {
         Self::from_bytes_with_capacity(stream, bytes, bytes.len())
@@ -264,6 +277,22 @@ struct ValidatedBucketSet {
     input_lengths_complete: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct PrepareBucketProfile {
+    total_us: f64,
+    allocation_dyn_map_us: f64,
+    resource_signature_us: f64,
+    resource_validation_us: f64,
+    allocate_us: f64,
+    refresh_lengths_us: f64,
+    collect_hlir_us: f64,
+    resolve_ptrs_us: f64,
+    insert_ptrs_us: f64,
+    changed_hlir: usize,
+    processed_llir_bindings: usize,
+    resource_validations: usize,
+}
+
 impl ArenaReleasePlan {
     fn record_arena(&mut self, pool: Option<sys::CUmemoryPool>) {
         self.arenas_released += 1;
@@ -298,6 +327,11 @@ pub struct CudaRuntime {
     /// Resource-relevant input state covered by the most recent aggregate
     /// retained-bucket validation.
     last_resource_input_signature: FxHashMap<NodeIndex, ResourceInputFootprint>,
+    /// Optional correlation and structured result for opt-in invocation
+    /// profiling. They are inert unless the Python boundary requests a trace.
+    profile_invocation_id: Option<u64>,
+    last_execution_profile_json: Option<String>,
+    last_prepare_profile: PrepareBucketProfile,
 
     // Per-bucket compiled state
     compiled_buckets: Vec<CompiledBucket>,
@@ -343,6 +377,14 @@ impl CudaRuntime {
     /// invalidated together.
     pub fn hlir_buffers(&self) -> &FxHashMap<NodeIndex, CudaInput> {
         &self.hlir_buffers
+    }
+
+    pub fn set_profile_invocation_id(&mut self, invocation_id: u64) {
+        self.profile_invocation_id = Some(invocation_id);
+    }
+
+    pub fn take_last_execution_profile_json(&mut self) -> Option<String> {
+        self.last_execution_profile_json.take()
     }
 
     /// Configure the search/runtime intermediate-arena cap. This intentionally
@@ -741,6 +783,14 @@ impl CudaRuntime {
     pub unsafe fn set_device_ptr(&mut self, id: impl ToId, device_ptr: u64, n_bytes: usize) {
         debug_assert!(device_ptr != 0, "set_device_ptr called with null pointer");
         let id = id.to_id();
+        let current_ptr = match self.hlir_buffers.get(&id) {
+            Some(CudaInput::Ptr(ptr)) => Some(*ptr),
+            _ => None,
+        };
+        let current_bytes = self.external_buffers.get(&id).map(|buffer| buffer.len());
+        if device_pointer_binding_matches(current_ptr, current_bytes, device_ptr, n_bytes) {
+            return;
+        }
         // Create CudaSlice view via cudarc's upgrade_device_ptr.
         // ManuallyDrop prevents cuMemFree on drop (external allocator owns this memory).
         let slice = unsafe {
@@ -2115,25 +2165,30 @@ impl CudaRuntime {
                 .all(|(idx, bucket)| idx == bucket_idx || bucket.arena.is_none()),
             "a CUDA bucket arena must be released before preparing another bucket"
         );
-        let profile_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let log_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let profile_prepare = log_prepare || std::env::var_os("LUMINAL_PROFILE_JSONL").is_some();
         let prepare_start = std::time::Instant::now();
         let changed_hlir_count = self.changed_hlir.len();
         let timer = std::time::Instant::now();
         let allocation_dyn_map = self.bucket_capacity_dyn_map(bucket_idx, dyn_map);
         let allocation_dyn_map_time = timer.elapsed();
+        let timer = std::time::Instant::now();
         let resource_inputs_changed = self.resource_inputs_changed_since_validation();
+        let resource_signature_time = timer.elapsed();
         let needs_resource_validation = {
             let bucket = &self.compiled_buckets[bucket_idx];
             !bucket.resource_validation_complete
                 || bucket.last_resource_validation_dyn_map != allocation_dyn_map
                 || resource_inputs_changed
         };
+        let timer = std::time::Instant::now();
         if needs_resource_validation
             && let Err(violation) =
                 self.validate_compiled_bucket_resources(bucket_idx, &allocation_dyn_map)
         {
             panic!("compiled CUDA plan violates a hard resource limit: {violation}");
         }
+        let resource_validation_time = timer.elapsed();
         let (
             stabilize_intermediate_pointers,
             was_hlir_synced,
@@ -2198,6 +2253,19 @@ impl CudaRuntime {
 
         if self.changed_hlir.is_empty() && self.compiled_buckets[bucket_idx].hlir_synced {
             if profile_prepare {
+                self.last_prepare_profile = PrepareBucketProfile {
+                    total_us: prepare_start.elapsed().as_secs_f64() * 1e6,
+                    allocation_dyn_map_us: allocation_dyn_map_time.as_secs_f64() * 1e6,
+                    resource_signature_us: resource_signature_time.as_secs_f64() * 1e6,
+                    resource_validation_us: resource_validation_time.as_secs_f64() * 1e6,
+                    allocate_us: allocate_time.as_secs_f64() * 1e6,
+                    refresh_lengths_us: refresh_lengths_time.as_secs_f64() * 1e6,
+                    changed_hlir: changed_hlir_count,
+                    resource_validations: usize::from(needs_resource_validation),
+                    ..PrepareBucketProfile::default()
+                };
+            }
+            if log_prepare {
                 eprintln!(
                     "CUDA_PREPARE_PROFILE dyn={dyn_map:?} bucket={bucket_idx} total_ms={:.3} allocation_dyn_map_ms={:.3} allocate_ms={:.3} refresh_lengths_ms={:.3} collect_hlir_ms=0.000 resolve_ptrs_ms=0.000 insert_ptrs_ms=0.000 changed_hlir={} was_hlir_synced={} stabilize={} old_arena_len={} new_arena_len={} old_arena_bytes={} new_arena_bytes={} hlir_nodes=0 to_process=0 cached_ptrs_after_alloc={} cached_ptrs_final={}",
                     prepare_start.elapsed().as_secs_f64() * 1e3,
@@ -2275,6 +2343,22 @@ impl CudaRuntime {
         // global dirty set.
         self.changed_hlir.clear();
         if profile_prepare {
+            self.last_prepare_profile = PrepareBucketProfile {
+                total_us: prepare_start.elapsed().as_secs_f64() * 1e6,
+                allocation_dyn_map_us: allocation_dyn_map_time.as_secs_f64() * 1e6,
+                resource_signature_us: resource_signature_time.as_secs_f64() * 1e6,
+                resource_validation_us: resource_validation_time.as_secs_f64() * 1e6,
+                allocate_us: allocate_time.as_secs_f64() * 1e6,
+                refresh_lengths_us: refresh_lengths_time.as_secs_f64() * 1e6,
+                collect_hlir_us: collect_hlir_time.as_secs_f64() * 1e6,
+                resolve_ptrs_us: resolve_ptrs_time.as_secs_f64() * 1e6,
+                insert_ptrs_us: insert_ptrs_time.as_secs_f64() * 1e6,
+                changed_hlir: changed_hlir_count,
+                processed_llir_bindings: to_process_count,
+                resource_validations: usize::from(needs_resource_validation),
+            };
+        }
+        if log_prepare {
             eprintln!(
                 "CUDA_PREPARE_PROFILE dyn={dyn_map:?} bucket={bucket_idx} total_ms={:.3} allocation_dyn_map_ms={:.3} allocate_ms={:.3} refresh_lengths_ms={:.3} collect_hlir_ms={:.3} resolve_ptrs_ms={:.3} insert_ptrs_ms={:.3} changed_hlir={} was_hlir_synced={} stabilize={} old_arena_len={} new_arena_len={} old_arena_bytes={} new_arena_bytes={} hlir_nodes={} to_process={} cached_ptrs_after_alloc={} cached_ptrs_final={}",
                 prepare_start.elapsed().as_secs_f64() * 1e3,
@@ -3488,6 +3572,9 @@ impl Runtime for CudaRuntime {
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             device_resource_limits,
             last_resource_input_signature: FxHashMap::default(),
+            profile_invocation_id: None,
+            last_execution_profile_json: None,
+            last_prepare_profile: PrepareBucketProfile::default(),
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
@@ -3649,7 +3736,10 @@ impl Runtime for CudaRuntime {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
-        let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let log_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        let structured_profile = std::env::var_os("LUMINAL_PROFILE_JSONL").is_some();
+        let profile_runtime = log_runtime || structured_profile;
+        self.last_execution_profile_json = None;
         let runtime_profile_start = std::time::Instant::now();
         let mut bucket_dispatch_time = Duration::ZERO;
         let mut prepare_buffers_time = Duration::ZERO;
@@ -3658,6 +3748,7 @@ impl Runtime for CudaRuntime {
         let mut buffer_map_time = Duration::ZERO;
         let mut graph_launch_time = Duration::ZERO;
         let mut host_op_time = Duration::ZERO;
+        let mut output_copy_time = Duration::ZERO;
         let mut sync_time = Duration::ZERO;
         let mut stats_time = Duration::ZERO;
         let mut consume_time = Duration::ZERO;
@@ -3701,6 +3792,23 @@ impl Runtime for CudaRuntime {
         self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
             .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
         materialize_time += timer.elapsed();
+        let (graphs_visited, graph_nodes_inspected, graph_nodes_updated) = if structured_profile {
+            self.compiled_buckets[self.active_bucket]
+                .exec_graph
+                .node_weights()
+                .filter_map(|exec_op| {
+                    exec_op
+                        .internal
+                        .as_any()
+                        .downcast_ref::<CudaGraphOp>()
+                        .map(CudaGraphOp::last_materialize_counts)
+                })
+                .fold((0usize, 0usize, 0usize), |acc, (inspected, updated)| {
+                    (acc.0 + 1, acc.1 + inspected, acc.2 + updated)
+                })
+        } else {
+            (0, 0, 0)
+        };
 
         let total_start = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
@@ -3775,6 +3883,7 @@ impl Runtime for CudaRuntime {
         // output's aliased input: honor them with device copies (part of
         // the step; no allocation).
         if !self.pending_output_copies.is_empty() {
+            let timer = std::time::Instant::now();
             for &(src, dst, bytes) in &self.pending_output_copies {
                 let src_slice = unsafe { self.cuda_stream.upgrade_device_ptr::<u8>(src, bytes) };
                 let mut dst_slice =
@@ -3785,6 +3894,7 @@ impl Runtime for CudaRuntime {
                 std::mem::forget(src_slice);
                 std::mem::forget(dst_slice);
             }
+            output_copy_time += timer.elapsed();
         }
 
         // Single sync at end - CUDA stream ordering guarantees sequential execution
@@ -3813,7 +3923,12 @@ impl Runtime for CudaRuntime {
         }
         stats_time += timer.elapsed();
 
-        // Consume input buffers
+        // Consume runtime-owned one-shot input buffers. External pointers are
+        // caller-owned persistent bindings: set_device_ptr's safety contract
+        // requires them to remain valid for the runtime lifetime, and dropping
+        // their metadata here would force every repeated invocation to
+        // reinstall lifted weights. A later changed set_device_ptr call safely
+        // replaces the retained non-owning view.
         if self.profiling {
             return;
         }
@@ -3834,9 +3949,14 @@ impl Runtime for CudaRuntime {
 
         let to_consume: Vec<NodeIndex> = self
             .hlir_buffers
-            .keys()
-            .filter(|hlir_node| !inputs_with_outputs.contains(hlir_node))
-            .copied()
+            .iter()
+            .filter_map(|(&hlir_node, input)| {
+                should_consume_hlir_input(
+                    matches!(input, CudaInput::Ptr(_)),
+                    inputs_with_outputs.contains(&hlir_node),
+                )
+                .then_some(hlir_node)
+            })
             .collect();
 
         for hlir_node in to_consume {
@@ -3853,30 +3973,90 @@ impl Runtime for CudaRuntime {
         if profile_runtime {
             let runtime_total = runtime_profile_start.elapsed();
             let launch_total = graph_launch_time + host_op_time + sync_time;
-            eprintln!(
-                "CUDA_EXEC_PROFILE dyn={dyn_map:?} bucket={} graph_launches={} host_ops={} total_ms={:.3} prelaunch_ms={:.3} dispatch_ms={:.3} prepare_buffers_ms={:.3} output_registration_ms={:.3} materialize_ms={:.3} buffer_map_ms={:.3} launch_total_ms={:.3} graph_launch_call_ms={:.3} host_op_call_ms={:.3} sync_ms={:.3} stats_ms={:.3} consume_ms={:.3}",
-                self.active_bucket,
-                graph_launches,
-                host_op_launches,
-                runtime_total.as_secs_f64() * 1e3,
-                (bucket_dispatch_time
-                    + prepare_buffers_time
-                    + output_registration_time
-                    + materialize_time)
-                    .as_secs_f64()
-                    * 1e3,
-                bucket_dispatch_time.as_secs_f64() * 1e3,
-                prepare_buffers_time.as_secs_f64() * 1e3,
-                output_registration_time.as_secs_f64() * 1e3,
-                materialize_time.as_secs_f64() * 1e3,
-                buffer_map_time.as_secs_f64() * 1e3,
-                launch_total.as_secs_f64() * 1e3,
-                graph_launch_time.as_secs_f64() * 1e3,
-                host_op_time.as_secs_f64() * 1e3,
-                sync_time.as_secs_f64() * 1e3,
-                stats_time.as_secs_f64() * 1e3,
-                consume_time.as_secs_f64() * 1e3,
-            );
+            if structured_profile {
+                let dyn_dims = dyn_map
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), serde_json::json!(value)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>();
+                let selected_host_ops = self.last_kernel_stats.iter().fold(
+                    std::collections::BTreeMap::<&str, usize>::new(),
+                    |mut counts, stats| {
+                        *counts.entry(stats.name).or_default() += 1;
+                        counts
+                    },
+                );
+                let prepare = self.last_prepare_profile;
+                self.last_execution_profile_json = Some(
+                    serde_json::json!({
+                        "invocation": self.profile_invocation_id,
+                        "backend": "cuda_lite",
+                        "selected_host_ops": selected_host_ops,
+                        "dynamic_dims": dyn_dims,
+                        "bucket": self.active_bucket,
+                        "timings_us": {
+                            "total": runtime_total.as_secs_f64() * 1e6,
+                            "dispatch": bucket_dispatch_time.as_secs_f64() * 1e6,
+                            "prepare": prepare_buffers_time.as_secs_f64() * 1e6,
+                            "prepare_internal": prepare.total_us,
+                            "resource_signature": prepare.resource_signature_us,
+                            "resource_validation": prepare.resource_validation_us,
+                            "allocation_dyn_map": prepare.allocation_dyn_map_us,
+                            "arena_allocate": prepare.allocate_us,
+                            "refresh_lengths": prepare.refresh_lengths_us,
+                            "collect_hlir": prepare.collect_hlir_us,
+                            "resolve_input_ptrs": prepare.resolve_ptrs_us,
+                            "install_input_ptrs": prepare.insert_ptrs_us,
+                            "output_registration": output_registration_time.as_secs_f64() * 1e6,
+                            "materialize": materialize_time.as_secs_f64() * 1e6,
+                            "buffer_map": buffer_map_time.as_secs_f64() * 1e6,
+                            "graph_launch": graph_launch_time.as_secs_f64() * 1e6,
+                            "hostop_launch": host_op_time.as_secs_f64() * 1e6,
+                            "output_copy": output_copy_time.as_secs_f64() * 1e6,
+                            "sync": sync_time.as_secs_f64() * 1e6,
+                            "stats": stats_time.as_secs_f64() * 1e6,
+                            "cleanup": consume_time.as_secs_f64() * 1e6,
+                        },
+                        "counts": {
+                            "dirty_hlir": prepare.changed_hlir,
+                            "processed_llir_bindings": prepare.processed_llir_bindings,
+                            "resource_validations": prepare.resource_validations,
+                            "graph_launches": graph_launches,
+                            "host_ops": host_op_launches,
+                            "graphs_visited": graphs_visited,
+                            "graph_nodes_inspected": graph_nodes_inspected,
+                            "graph_nodes_updated": graph_nodes_updated,
+                            "pending_output_copies": self.pending_output_copies.len(),
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            if log_runtime {
+                eprintln!(
+                    "CUDA_EXEC_PROFILE dyn={dyn_map:?} bucket={} graph_launches={} host_ops={} total_ms={:.3} prelaunch_ms={:.3} dispatch_ms={:.3} prepare_buffers_ms={:.3} output_registration_ms={:.3} materialize_ms={:.3} buffer_map_ms={:.3} launch_total_ms={:.3} graph_launch_call_ms={:.3} host_op_call_ms={:.3} sync_ms={:.3} stats_ms={:.3} consume_ms={:.3}",
+                    self.active_bucket,
+                    graph_launches,
+                    host_op_launches,
+                    runtime_total.as_secs_f64() * 1e3,
+                    (bucket_dispatch_time
+                        + prepare_buffers_time
+                        + output_registration_time
+                        + materialize_time)
+                        .as_secs_f64()
+                        * 1e3,
+                    bucket_dispatch_time.as_secs_f64() * 1e3,
+                    prepare_buffers_time.as_secs_f64() * 1e3,
+                    output_registration_time.as_secs_f64() * 1e3,
+                    materialize_time.as_secs_f64() * 1e3,
+                    buffer_map_time.as_secs_f64() * 1e3,
+                    launch_total.as_secs_f64() * 1e3,
+                    graph_launch_time.as_secs_f64() * 1e3,
+                    host_op_time.as_secs_f64() * 1e3,
+                    sync_time.as_secs_f64() * 1e3,
+                    stats_time.as_secs_f64() * 1e3,
+                    consume_time.as_secs_f64() * 1e3,
+                );
+            }
         }
     }
 
@@ -4672,6 +4852,55 @@ mod arena_plan_tests {
             ResourceInputFootprint::external(32),
             ResourceInputFootprint::external(64)
         );
+    }
+
+    #[test]
+    fn identical_external_pointer_binding_is_a_noop() {
+        assert!(device_pointer_binding_matches(
+            Some(0x1000),
+            Some(64),
+            0x1000,
+            64
+        ));
+        assert!(!device_pointer_binding_matches(
+            Some(0x2000),
+            Some(64),
+            0x1000,
+            64
+        ));
+        assert!(!device_pointer_binding_matches(
+            Some(0x1000),
+            Some(32),
+            0x1000,
+            64
+        ));
+        assert!(!device_pointer_binding_matches(None, None, 0x1000, 64));
+    }
+
+    #[test]
+    fn set_device_ptr_dirties_only_changed_external_bindings() {
+        let mut rt = CudaRuntime::new().unwrap();
+        let input = NodeIndex::new(125);
+        let allocation = rt.cuda_stream.alloc_zeros::<u8>(64).unwrap();
+        let ptr = allocation.device_ptr(&rt.cuda_stream).0;
+
+        unsafe { rt.set_device_ptr(input, ptr, 64) };
+        assert_eq!(rt.changed_hlir, FxHashSet::from_iter([input]));
+
+        rt.changed_hlir.clear();
+        unsafe { rt.set_device_ptr(input, ptr, 64) };
+        assert!(rt.changed_hlir.is_empty());
+
+        unsafe { rt.set_device_ptr(input, ptr, 32) };
+        assert_eq!(rt.changed_hlir, FxHashSet::from_iter([input]));
+    }
+
+    #[test]
+    fn external_pointer_inputs_are_persistent_but_owned_inputs_remain_consumable() {
+        assert!(!should_consume_hlir_input(true, false));
+        assert!(!should_consume_hlir_input(true, true));
+        assert!(should_consume_hlir_input(false, false));
+        assert!(!should_consume_hlir_input(false, true));
     }
 
     #[test]

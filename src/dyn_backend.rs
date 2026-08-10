@@ -58,6 +58,17 @@ pub trait DynBackend {
     }
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>);
 
+    /// Attach a caller-generated identifier to the next execution profile.
+    /// CPU and third-party backends may ignore this optional diagnostic hook.
+    fn set_profile_invocation_id(&mut self, _invocation_id: u64) {}
+
+    /// Return and clear the structured profile produced by the most recent
+    /// execution. The payload is JSON so this optional hook stays object-safe
+    /// without coupling the core crate to a backend-specific profile type.
+    fn take_last_execution_profile_json(&mut self) -> Option<String> {
+        None
+    }
+
     // --- Optional device pointer support (GPU backends) --------------------
 
     fn supports_device_ptrs(&self) -> bool {

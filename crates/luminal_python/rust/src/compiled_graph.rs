@@ -506,6 +506,16 @@ impl CompiledGraph {
         self.runtime.execute(&self.graph.dyn_map);
     }
 
+    /// Correlate the next backend execution profile with its Python caller.
+    fn set_profile_invocation_id(&mut self, invocation_id: u64) {
+        self.runtime.set_profile_invocation_id(invocation_id);
+    }
+
+    /// Return and clear the backend profile for the most recent execution.
+    fn take_last_execution_profile_json(&mut self) -> Option<String> {
+        self.runtime.take_last_execution_profile_json()
+    }
+
     /// Return the HLIR graph as a DOT string for visualization.
     fn to_dot(&self) -> PyResult<String> {
         self.graph.graph.to_dot().map_err(|e| {
