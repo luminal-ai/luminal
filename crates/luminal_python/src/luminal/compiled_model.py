@@ -130,6 +130,11 @@ class CompiledModel:
         # mutations. Keyed by position, not name: a model that mutates an
         # input and also returns it yields two same-named outputs.
         self._writeback_by_pos = dict(graph_result.writeback_outputs)
+        input_positions = {name: pos for pos, name in enumerate(self._input_names)}
+        self._writeback_input_pos = {
+            output_pos: input_positions[input_name]
+            for output_pos, input_name in self._writeback_by_pos.items()
+        }
         self._output_shapes = graph_result.output_shapes
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
@@ -406,8 +411,7 @@ class CompiledModel:
                     # state tensor up front. The CUDA runtime either writes
                     # there directly or schedules its required epilogue D2D
                     # copy on the graph stream before the one terminal wait.
-                    input_name = self._writeback_by_pos[i]
-                    target = user_inputs[self._input_names.index(input_name)]
+                    target = user_inputs[self._writeback_input_pos[i]]
                     expected_numel = math.prod(shape)
                     if (
                         target.is_cuda
@@ -460,8 +464,7 @@ class CompiledModel:
                 # In-place input mutation: copy the computed state back into
                 # the caller's tensor (the same object the model would have
                 # mutated eagerly); it is not part of the returned tuple.
-                input_name = self._writeback_by_pos[i]
-                target = user_inputs[self._input_names.index(input_name)]
+                target = user_inputs[self._writeback_input_pos[i]]
                 if i in direct_writebacks:
                     continue
                 expected_numel = math.prod(shape)

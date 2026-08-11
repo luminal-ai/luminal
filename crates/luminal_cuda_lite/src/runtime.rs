@@ -181,6 +181,23 @@ pub(crate) struct NonFiniteBufferReport {
     pub(crate) value: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedOutputRegistration {
+    /// The compiled producer writes directly into an external allocation.
+    External { data_node: NodeIndex },
+    /// The selected graph aliases the output to an HLIR input. A differing
+    /// destination requires the recorded copy on every execution.
+    Alias {
+        hlir_input: NodeIndex,
+        input_ptr: u64,
+        input_bytes: usize,
+        destination_ptr: u64,
+        copy_bytes: usize,
+    },
+    /// This retained bucket does not contain the registered HLIR output.
+    Missing,
+}
+
 /// Per-bucket compiled state. Each bucket holds its own executable graph,
 /// explicit runtime metadata, intermediate buffers, and node mappings.
 /// Weights (hlir_buffers) are shared.
@@ -206,6 +223,7 @@ pub(crate) struct CompiledBucket {
     buffer_spec_nodes_by_dyn_var: FxHashMap<char, Vec<NodeIndex>>,
     pub(crate) llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
+    pub(crate) hlir_to_all_llir: FxHashMap<NodeIndex, Vec<NodeIndex>>,
     pub(crate) output_producers: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) output_alias_map: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) output_data_map: FxHashMap<NodeIndex, NodeIndex>,
@@ -230,6 +248,12 @@ pub(crate) struct CompiledBucket {
     /// Keep intermediate offsets and base allocation stable across shape growth
     /// when captured library graph nodes embed intermediate pointers.
     stabilize_intermediate_pointers: bool,
+    /// Exact bindings whose effective pointer or logical length changed since
+    /// the previous successful CUDA-graph materialization.
+    materialization_dirty_nodes: FxHashSet<NodeIndex>,
+    /// Arena relocation, candidate replacement, and first use invalidate the
+    /// complete buffer map instead of attempting incremental repair.
+    materialization_fully_dirty: bool,
 }
 
 impl CompiledBucket {
@@ -252,6 +276,7 @@ impl CompiledBucket {
             buffer_spec_nodes_by_dyn_var: FxHashMap::default(),
             llir_to_hlir: FxHashMap::default(),
             hlir_to_llir: FxHashMap::default(),
+            hlir_to_all_llir: FxHashMap::default(),
             output_producers: FxHashMap::default(),
             output_alias_map: FxHashMap::default(),
             output_data_map: FxHashMap::default(),
@@ -267,6 +292,8 @@ impl CompiledBucket {
             hlir_synced: false,
             preserve_intermediate_buffers_for_debug: false,
             stabilize_intermediate_pointers: false,
+            materialization_dirty_nodes: FxHashSet::default(),
+            materialization_fully_dirty: true,
         }
     }
 }
@@ -364,6 +391,11 @@ pub struct CudaRuntime {
     /// Pending output pointer registrations: HLIR output id -> (device_ptr, n_bytes)
     /// Set by python before execute(), consumed at start of execute()
     output_ptr_registrations: FxHashMap<NodeIndex, (u64, usize)>,
+    /// Registrations whose pointer/size changed or whose LLIR resolution was
+    /// invalidated by loading/switching executable buckets.
+    dirty_output_ptr_registrations: FxHashSet<NodeIndex>,
+    resolved_output_registrations: FxHashMap<NodeIndex, ResolvedOutputRegistration>,
+    resolved_output_bucket: Option<usize>,
     /// (src_ptr, dst_ptr, bytes) device copies enqueued at the end of each
     /// execute: in-place-elected outputs whose registered buffer differs
     /// from the aliased input's (user-managed double buffering).
@@ -549,6 +581,31 @@ impl CudaRuntime {
         Some(DeviceBuffer::new(ptr, len))
     }
 
+    fn cache_bucket_device_buffer(
+        bucket: &mut CompiledBucket,
+        node: NodeIndex,
+        buffer: DeviceBuffer,
+    ) {
+        let changed = bucket.cached_buffer_ptrs.get(&node) != Some(&buffer.ptr())
+            || bucket
+                .cached_device_buffers
+                .get(&node)
+                .is_none_or(|old| old.len() != buffer.len());
+        if changed {
+            bucket.materialization_dirty_nodes.insert(node);
+        }
+        bucket.cached_buffer_ptrs.insert(node, buffer.ptr());
+        bucket.cached_device_buffers.insert(node, buffer);
+    }
+
+    fn remove_cached_bucket_device_buffer(bucket: &mut CompiledBucket, node: NodeIndex) {
+        if bucket.cached_buffer_ptrs.remove(&node).is_some()
+            || bucket.cached_device_buffers.remove(&node).is_some()
+        {
+            bucket.materialization_dirty_nodes.insert(node);
+        }
+    }
+
     fn copy_device_buffer_to_new_slice(
         stream: &Arc<CudaStream>,
         src: DeviceBuffer,
@@ -646,6 +703,8 @@ impl CudaRuntime {
             bucket.logical_buffer_capacity_bytes.clear();
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
             bucket.hlir_synced = false;
             Self::take_bucket_arena(bucket, &mut releases);
             bucket.arena_bytes = 0;
@@ -836,8 +895,13 @@ impl CudaRuntime {
             device_ptr != 0,
             "set_output_device_ptr called with null pointer"
         );
+        let id = id.to_id();
+        if self.output_ptr_registrations.get(&id) == Some(&(device_ptr, n_bytes)) {
+            return;
+        }
         self.output_ptr_registrations
-            .insert(id.to_id(), (device_ptr, n_bytes));
+            .insert(id, (device_ptr, n_bytes));
+        self.dirty_output_ptr_registrations.insert(id);
     }
 
     /// Allocate a user-owned, statically sized, zeroed device buffer and
@@ -1047,92 +1111,156 @@ impl CudaRuntime {
         self.cuda_stream.synchronize().unwrap();
     }
 
-    /// Resolve pending output pointer registrations into external_output_buffers.
-    /// Called at the start of execute(), after buffer allocation and HLIR sync.
-    fn apply_output_ptr_registrations(&mut self) {
-        // clear stale external output buffers from previous execution
-        let stale_output_nodes = self.external_output_buffers.keys().copied().collect_vec();
-        self.external_output_buffers.clear();
-        for data_node in stale_output_nodes {
-            if let Some(buf) = Self::bucket_buffer(self.active(), &self.cuda_stream, &data_node) {
-                let bucket = self.active_mut();
-                bucket.cached_buffer_ptrs.insert(data_node, buf.ptr());
-                bucket.cached_device_buffers.insert(data_node, buf);
-            } else {
-                let bucket = self.active_mut();
-                bucket.cached_buffer_ptrs.remove(&data_node);
-                bucket.cached_device_buffers.remove(&data_node);
-            }
+    fn restore_external_output_node(&mut self, data_node: NodeIndex) {
+        self.external_output_buffers.remove(&data_node);
+        if let Some(buf) = Self::bucket_buffer(self.active(), &self.cuda_stream, &data_node) {
+            Self::cache_bucket_device_buffer(self.active_mut(), data_node, buf);
+        } else {
+            Self::remove_cached_bucket_device_buffer(self.active_mut(), data_node);
         }
+    }
 
-        self.pending_output_copies.clear();
-        if self.output_ptr_registrations.is_empty() {
+    fn remove_resolved_output_registration(&mut self, hlir_id: NodeIndex) {
+        let Some(old) = self.resolved_output_registrations.remove(&hlir_id) else {
             return;
+        };
+        let ResolvedOutputRegistration::External { data_node } = old else {
+            return;
+        };
+        let still_used = self.resolved_output_registrations.values().any(|resolved| {
+            matches!(
+                resolved,
+                ResolvedOutputRegistration::External { data_node: other } if *other == data_node
+            )
+        });
+        if !still_used {
+            self.restore_external_output_node(data_node);
+        }
+    }
+
+    fn invalidate_output_registration_resolution(&mut self) {
+        self.external_output_buffers.clear();
+        self.resolved_output_registrations.clear();
+        self.dirty_output_ptr_registrations
+            .extend(self.output_ptr_registrations.keys().copied());
+        self.resolved_output_bucket = None;
+        self.pending_output_copies.clear();
+    }
+
+    fn current_hlir_device_binding(&self, hlir_input: NodeIndex) -> Option<(u64, usize)> {
+        match self.hlir_buffers.get(&hlir_input) {
+            Some(CudaInput::Buffer { buf, len }) => {
+                Some((buf.device_ptr(&self.cuda_stream).0, *len))
+            }
+            Some(CudaInput::Ptr(ptr)) => self
+                .external_buffers
+                .get(&hlir_input)
+                .map(|buffer| (*ptr, buffer.len())),
+            None => None,
+        }
+    }
+
+    /// Incrementally resolve durable output registrations. Stable cache
+    /// destinations keep their LLIR resolution and external CudaSlice views;
+    /// only changed registrations (normally the fresh logits output) cross
+    /// this path on steady decode.
+    fn apply_output_ptr_registrations(&mut self) {
+        if self.resolved_output_bucket != Some(self.active_bucket) {
+            self.invalidate_output_registration_resolution();
+            self.resolved_output_bucket = Some(self.active_bucket);
         }
 
-        // Registrations are durable: outputs are re-resolved against the
-        // active bucket every execute (producers and alias structure differ
-        // per bucket and per loaded candidate).
-        let registrations: Vec<_> = self
-            .output_ptr_registrations
+        // Aliased registrations depend on an input pointer as well as their
+        // own destination. Re-resolve only aliases whose source binding moved.
+        let changed_aliases = self
+            .resolved_output_registrations
             .iter()
-            .map(|(k, v)| (*k, *v))
-            .collect();
+            .filter_map(|(hlir_output, resolved)| {
+                let ResolvedOutputRegistration::Alias {
+                    hlir_input,
+                    input_ptr,
+                    input_bytes,
+                    ..
+                } = resolved
+                else {
+                    return None;
+                };
+                (self.current_hlir_device_binding(*hlir_input) != Some((*input_ptr, *input_bytes)))
+                    .then_some(*hlir_output)
+            })
+            .collect_vec();
+        self.dirty_output_ptr_registrations.extend(changed_aliases);
 
-        for (hlir_id, (device_ptr, n_bytes)) in registrations {
-            // Resolve HLIR output id -> LLIR producer -> follow aliases -> data node.
-            // Registrations are durable and may reference outputs absent from
-            // the active bucket (stale profiling-scratch ids, other-bucket
-            // outputs) — skip those.
+        let dirty = std::mem::take(&mut self.dirty_output_ptr_registrations);
+        for hlir_id in dirty {
+            self.remove_resolved_output_registration(hlir_id);
+            let Some(&(device_ptr, n_bytes)) = self.output_ptr_registrations.get(&hlir_id) else {
+                continue;
+            };
             let Some(&producer) = self.active().output_producers.get(&hlir_id) else {
+                self.resolved_output_registrations
+                    .insert(hlir_id, ResolvedOutputRegistration::Missing);
                 continue;
             };
             let data_node = self.follow_aliases(producer);
 
-            // In-place elected output: the data lands in the aliased HLIR
-            // input's buffer. If the user registered that same buffer, the
-            // write is already in place; otherwise honor the registration
-            // with an epilogue copy (manual double-buffering support).
-            if let Some(&hlir_input) = self.compiled_buckets[self.active_bucket]
-                .llir_to_hlir
-                .get(&data_node)
-            {
-                let input_buf = match self.hlir_buffers.get(&hlir_input) {
-                    Some(CudaInput::Buffer { buf, len }) => {
-                        Some((buf.device_ptr(&self.cuda_stream).0, *len))
-                    }
-                    Some(CudaInput::Ptr(p)) => Some((*p, n_bytes)),
-                    None => None,
+            if let Some(&hlir_input) = self.active().llir_to_hlir.get(&data_node) {
+                let Some((input_ptr, input_len)) = self.current_hlir_device_binding(hlir_input)
+                else {
+                    self.resolved_output_registrations
+                        .insert(hlir_id, ResolvedOutputRegistration::Missing);
+                    continue;
                 };
-                if let Some((input_ptr, input_len)) = input_buf
-                    && input_ptr != device_ptr
-                {
-                    self.pending_output_copies.push((
+                self.resolved_output_registrations.insert(
+                    hlir_id,
+                    ResolvedOutputRegistration::Alias {
+                        hlir_input,
                         input_ptr,
-                        device_ptr,
-                        n_bytes.min(input_len),
-                    ));
-                }
+                        input_bytes: input_len,
+                        destination_ptr: device_ptr,
+                        copy_bytes: n_bytes.min(input_len),
+                    },
+                );
                 continue;
             }
 
-            // Create non-owning CudaSlice view of PyTorch's buffer
             let slice = unsafe {
                 self.cuda_stream
                     .upgrade_device_ptr::<u8>(device_ptr, n_bytes)
             };
-
             self.external_output_buffers
                 .insert(data_node, std::mem::ManuallyDrop::new(slice));
-
-            // Update cached_buffer_ptrs so CudaGraphOp picks up the new pointer
-            self.compiled_buckets[self.active_bucket]
-                .cached_buffer_ptrs
-                .insert(data_node, device_ptr);
-            self.compiled_buckets[self.active_bucket]
-                .cached_device_buffers
-                .insert(data_node, DeviceBuffer::new(device_ptr, n_bytes));
+            Self::cache_bucket_device_buffer(
+                self.active_mut(),
+                data_node,
+                DeviceBuffer::new(device_ptr, n_bytes),
+            );
+            self.resolved_output_registrations
+                .insert(hlir_id, ResolvedOutputRegistration::External { data_node });
         }
+
+        self.pending_output_copies.clear();
+        self.pending_output_copies
+            .extend(
+                self.resolved_output_registrations
+                    .values()
+                    .filter_map(|resolved| {
+                        let ResolvedOutputRegistration::Alias {
+                            input_ptr,
+                            destination_ptr,
+                            copy_bytes,
+                            ..
+                        } = *resolved
+                        else {
+                            return None;
+                        };
+                        (input_ptr != destination_ptr).then_some((
+                            input_ptr,
+                            destination_ptr,
+                            copy_bytes,
+                        ))
+                    }),
+            );
     }
 
     pub fn get_f32(&self, id: impl ToId) -> Vec<f32> {
@@ -1376,6 +1504,8 @@ impl CudaRuntime {
             Self::take_bucket_arena(bucket, &mut releases);
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
             bucket.hlir_synced = false;
         }
         Self::finish_arena_releases(&self.cuda_stream, releases)
@@ -1441,6 +1571,8 @@ impl CudaRuntime {
             }
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
             if profile_alloc {
                 eprintln!(
                     "CUDA_ALLOC_PROFILE total_ms={:.3} needs_new_plan={} sync_ms={:.3} plan_ms={:.3} refresh_ms={:.3} cuda_alloc_ms={:.3} cache_ptrs_ms={:.3} allocated_new_arena=false old_arena_len={} new_arena_len=0 old_arena_bytes={} new_arena_bytes=0 allocation_bytes=0 cached_ptrs=0 logical_offsets=0",
@@ -1507,17 +1639,21 @@ impl CudaRuntime {
         }
 
         let timer = std::time::Instant::now();
+        if allocated_new_arena {
+            bucket.materialization_fully_dirty = true;
+        }
         let arena_ptr = bucket.arena.as_ref().unwrap().device_ptr(stream).0;
-        for (logical_node, &offset) in &bucket.logical_buffer_offsets {
-            let Some(&len) = bucket.logical_buffer_bytes.get(logical_node) else {
-                continue;
-            };
-            if let Some(ptr) = arena_ptr.checked_add(offset as u64) {
-                bucket.cached_buffer_ptrs.insert(*logical_node, ptr);
-                bucket
-                    .cached_device_buffers
-                    .insert(*logical_node, DeviceBuffer::new(ptr, len));
-            }
+        let buffer_updates = bucket
+            .logical_buffer_offsets
+            .iter()
+            .filter_map(|(logical_node, offset)| {
+                let len = bucket.logical_buffer_bytes.get(logical_node).copied()?;
+                let ptr = arena_ptr.checked_add(*offset as u64)?;
+                Some((*logical_node, DeviceBuffer::new(ptr, len)))
+            })
+            .collect_vec();
+        for (logical_node, buffer) in buffer_updates {
+            Self::cache_bucket_device_buffer(bucket, logical_node, buffer);
         }
         cache_ptrs_time += timer.elapsed();
         if profile_alloc {
@@ -1569,17 +1705,28 @@ impl CudaRuntime {
         dyn_dims: &FxHashMap<char, usize>,
     ) {
         bucket.logical_buffer_bytes.clear();
-        for (node, spec) in &bucket.buffer_specs {
-            let bytes = spec.bytes.exec(dyn_dims).unwrap();
+        let buffer_lengths = bucket
+            .buffer_specs
+            .iter()
+            .map(|(node, spec)| (*node, spec.bytes.exec(dyn_dims).unwrap()))
+            .collect_vec();
+        for (node, bytes) in buffer_lengths {
             if bytes > 0 {
-                bucket.logical_buffer_bytes.insert(*node, bytes);
-                if let Some(ptr) = bucket.cached_buffer_ptrs.get(node).copied() {
+                bucket.logical_buffer_bytes.insert(node, bytes);
+                if let Some(ptr) = bucket.cached_buffer_ptrs.get(&node).copied() {
+                    if bucket
+                        .cached_device_buffers
+                        .get(&node)
+                        .is_none_or(|old| old.len() != bytes)
+                    {
+                        bucket.materialization_dirty_nodes.insert(node);
+                    }
                     bucket
                         .cached_device_buffers
-                        .insert(*node, DeviceBuffer::new(ptr, bytes));
+                        .insert(node, DeviceBuffer::new(ptr, bytes));
                 }
             } else {
-                bucket.cached_device_buffers.remove(node);
+                Self::remove_cached_bucket_device_buffer(bucket, node);
             }
         }
         bucket.last_dyn_map = dyn_dims.clone();
@@ -1640,13 +1787,20 @@ impl CudaRuntime {
             if bytes > 0 {
                 bucket.logical_buffer_bytes.insert(node, bytes);
                 if let Some(ptr) = bucket.cached_buffer_ptrs.get(&node).copied() {
+                    if bucket
+                        .cached_device_buffers
+                        .get(&node)
+                        .is_none_or(|old| old.len() != bytes)
+                    {
+                        bucket.materialization_dirty_nodes.insert(node);
+                    }
                     bucket
                         .cached_device_buffers
                         .insert(node, DeviceBuffer::new(ptr, bytes));
                 }
             } else {
                 bucket.logical_buffer_bytes.remove(&node);
-                bucket.cached_device_buffers.remove(&node);
+                Self::remove_cached_bucket_device_buffer(bucket, node);
             }
         }
         bucket.last_dyn_map = dyn_dims.clone();
@@ -1935,6 +2089,8 @@ impl CudaRuntime {
         bucket.intermediate_buffer_dims.clear();
         bucket.cached_buffer_ptrs.clear();
         bucket.cached_device_buffers.clear();
+        bucket.materialization_dirty_nodes.clear();
+        bucket.materialization_fully_dirty = true;
         bucket.last_dyn_map = dyn_dims.clone();
 
         let mut logical_bytes = FxHashMap::default();
@@ -2380,7 +2536,7 @@ impl CudaRuntime {
             let to_process: Vec<(NodeIndex, u64, usize)> = hlir_nodes
                 .iter()
                 .filter_map(|hlir_node| {
-                    let llir_node = bucket.hlir_to_llir.get(hlir_node)?;
+                    bucket.hlir_to_all_llir.get(hlir_node)?;
                     let input = self.hlir_buffers.get(hlir_node)?;
                     let (ptr, len) = match input {
                         CudaInput::Buffer { buf, len } => {
@@ -2395,7 +2551,7 @@ impl CudaRuntime {
                             (*p, len)
                         }
                     };
-                    Some((*llir_node, ptr, len))
+                    Some((*hlir_node, ptr, len))
                 })
                 .collect();
             (
@@ -2409,11 +2565,15 @@ impl CudaRuntime {
         let timer = std::time::Instant::now();
         let bucket = &mut self.compiled_buckets[bucket_idx];
         let to_process_count = to_process.len();
-        for (llir_node, ptr, len) in to_process {
-            bucket.cached_buffer_ptrs.insert(llir_node, ptr);
-            bucket
-                .cached_device_buffers
-                .insert(llir_node, DeviceBuffer::new(ptr, len));
+        for (hlir_node, ptr, len) in to_process {
+            let llir_nodes = bucket
+                .hlir_to_all_llir
+                .get(&hlir_node)
+                .cloned()
+                .unwrap_or_default();
+            for llir_node in llir_nodes {
+                Self::cache_bucket_device_buffer(bucket, llir_node, DeviceBuffer::new(ptr, len));
+            }
         }
         bucket.hlir_synced = true;
         let cached_ptrs_final = bucket.cached_buffer_ptrs.len();
@@ -2618,23 +2778,68 @@ impl CudaRuntime {
     }
 
     fn materialize_bucket_cuda_graphs(
-        &self,
+        &mut self,
         bucket_idx: usize,
         dyn_map: &FxHashMap<char, usize>,
         allow_missing_inputs: bool,
     ) -> anyhow::Result<()> {
+        let fully_dirty = self.compiled_buckets[bucket_idx].materialization_fully_dirty;
+        let dirty_nodes = self.compiled_buckets[bucket_idx]
+            .materialization_dirty_nodes
+            .clone();
         let bucket = &self.compiled_buckets[bucket_idx];
         for exec_node in toposort(&bucket.exec_graph, None).unwrap() {
             let exec_op = &bucket.exec_graph[exec_node];
             let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() else {
                 continue;
             };
+            if !fully_dirty {
+                let mut changed_buffers = FxHashMap::default();
+                for node in dirty_nodes
+                    .iter()
+                    .copied()
+                    .filter(|node| cuda_graph.uses_buffer(*node))
+                {
+                    let buffer = Self::cached_device_buffer_for_node(bucket, node).or_else(|| {
+                        Self::resolve_runtime_buffer(
+                            bucket,
+                            &self.cuda_stream,
+                            &self.hlir_buffers,
+                            &self.external_buffers,
+                            &self.external_output_buffers,
+                            node,
+                        )
+                    });
+                    let Some(buffer) = buffer else {
+                        if allow_missing_inputs {
+                            continue;
+                        }
+                        anyhow::bail!(
+                            "missing dirty buffer for CUDA graph materialization: LLIR node {:?}",
+                            node
+                        );
+                    };
+                    changed_buffers.insert(node, buffer);
+                }
+                if cuda_graph.materialize_changed_bindings(
+                    &exec_op.stream,
+                    &changed_buffers,
+                    dyn_map,
+                )? {
+                    continue;
+                }
+            }
             let Some(buffer_map) =
                 self.buffer_map_for_cuda_graph(bucket, cuda_graph, allow_missing_inputs)?
             else {
                 continue;
             };
             cuda_graph.materialize(&exec_op.stream, &buffer_map, dyn_map)?;
+        }
+        if !allow_missing_inputs {
+            let bucket = &mut self.compiled_buckets[bucket_idx];
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = false;
         }
         Ok(())
     }
@@ -3480,6 +3685,7 @@ impl CudaRuntime {
         }
         self.compiled_buckets = vec![bucket];
         self.active_bucket = 0;
+        self.invalidate_output_registration_resolution();
         self.dim_buckets.clear();
         self.validated_resource_signatures.clear();
         self.resource_length_sensitive_hlir =
@@ -3534,6 +3740,7 @@ impl CudaRuntime {
         }
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets = compiled_buckets;
+        self.invalidate_output_registration_resolution();
         self.validated_resource_signatures.clear();
         self.resource_length_sensitive_hlir =
             Self::resource_length_sensitive_hlir_inputs(&self.compiled_buckets);
@@ -3758,6 +3965,9 @@ impl Runtime for CudaRuntime {
             active_bucket: 0,
             dim_buckets: FxHashMap::default(),
             output_ptr_registrations: FxHashMap::default(),
+            dirty_output_ptr_registrations: FxHashSet::default(),
+            resolved_output_registrations: FxHashMap::default(),
+            resolved_output_bucket: None,
             pending_output_copies: Vec::new(),
             external_output_buffers: FxHashMap::default(),
             external_buffers: FxHashMap::default(),
@@ -3801,6 +4011,8 @@ impl Runtime for CudaRuntime {
             Self::take_bucket_arena(bucket, &mut releases);
             bucket.cached_buffer_ptrs.clear();
             bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
             bucket.hlir_synced = false;
         }
         Self::finish_arena_releases(&self.cuda_stream, releases)
@@ -3945,6 +4157,10 @@ impl Runtime for CudaRuntime {
                 Self::take_bucket_arena(&mut self.compiled_buckets[old], &mut releases);
                 self.compiled_buckets[old].cached_buffer_ptrs.clear();
                 self.compiled_buckets[old].cached_device_buffers.clear();
+                self.compiled_buckets[old]
+                    .materialization_dirty_nodes
+                    .clear();
+                self.compiled_buckets[old].materialization_fully_dirty = true;
                 Self::finish_arena_releases(&self.cuda_stream, releases)
                     .expect("failed to release the previous CUDA bucket arena");
                 self.active_bucket = idx;
@@ -4142,9 +4358,13 @@ impl Runtime for CudaRuntime {
             self.hlir_buffers.remove(&hlir_node);
             self.external_buffers.remove(&hlir_node);
             let bucket = &mut self.compiled_buckets[self.active_bucket];
-            if let Some(llir_node) = bucket.hlir_to_llir.get(&hlir_node) {
-                bucket.cached_buffer_ptrs.remove(llir_node);
-                bucket.cached_device_buffers.remove(llir_node);
+            let llir_nodes = bucket
+                .hlir_to_all_llir
+                .get(&hlir_node)
+                .cloned()
+                .unwrap_or_default();
+            for llir_node in llir_nodes {
+                Self::remove_cached_bucket_device_buffer(bucket, llir_node);
             }
         }
         consume_time += timer.elapsed();
@@ -4332,8 +4552,14 @@ impl CudaRuntime {
                 node: hlir_node, ..
             }) = llir_graph[node].to_op::<Input>()
             {
-                bucket.llir_to_hlir.insert(node, NodeIndex::new(*hlir_node));
-                bucket.hlir_to_llir.insert(NodeIndex::new(*hlir_node), node);
+                let hlir_node = NodeIndex::new(*hlir_node);
+                bucket.llir_to_hlir.insert(node, hlir_node);
+                bucket.hlir_to_llir.insert(hlir_node, node);
+                bucket
+                    .hlir_to_all_llir
+                    .entry(hlir_node)
+                    .or_default()
+                    .push(node);
                 continue;
             }
 
@@ -5077,6 +5303,53 @@ mod arena_plan_tests {
 
         unsafe { rt.set_device_ptr(input, ptr, 32) };
         assert_eq!(rt.changed_hlir, FxHashSet::from_iter([input]));
+    }
+
+    #[test]
+    fn set_output_device_ptr_dirties_only_changed_registrations() {
+        let mut rt = CudaRuntime::new().unwrap();
+        let output = NodeIndex::new(126);
+        let allocation = rt.cuda_stream.alloc_zeros::<u8>(64).unwrap();
+        let ptr = allocation.device_ptr(&rt.cuda_stream).0;
+
+        unsafe { rt.set_output_device_ptr(output, ptr, 64) };
+        assert_eq!(
+            rt.dirty_output_ptr_registrations,
+            FxHashSet::from_iter([output])
+        );
+
+        rt.dirty_output_ptr_registrations.clear();
+        unsafe { rt.set_output_device_ptr(output, ptr, 64) };
+        assert!(rt.dirty_output_ptr_registrations.is_empty());
+
+        unsafe { rt.set_output_device_ptr(output, ptr, 32) };
+        assert_eq!(
+            rt.dirty_output_ptr_registrations,
+            FxHashSet::from_iter([output])
+        );
+    }
+
+    #[test]
+    fn cached_device_buffer_tracks_exact_materialization_changes() {
+        let mut bucket = CompiledBucket::new();
+        let node = NodeIndex::new(7);
+
+        bucket.materialization_fully_dirty = false;
+        CudaRuntime::cache_bucket_device_buffer(&mut bucket, node, DeviceBuffer::new(0x1000, 64));
+        assert_eq!(
+            bucket.materialization_dirty_nodes,
+            FxHashSet::from_iter([node])
+        );
+
+        bucket.materialization_dirty_nodes.clear();
+        CudaRuntime::cache_bucket_device_buffer(&mut bucket, node, DeviceBuffer::new(0x1000, 64));
+        assert!(bucket.materialization_dirty_nodes.is_empty());
+
+        CudaRuntime::cache_bucket_device_buffer(&mut bucket, node, DeviceBuffer::new(0x1000, 32));
+        assert_eq!(
+            bucket.materialization_dirty_nodes,
+            FxHashSet::from_iter([node])
+        );
     }
 
     #[test]
