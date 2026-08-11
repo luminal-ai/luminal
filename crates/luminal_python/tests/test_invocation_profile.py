@@ -247,7 +247,9 @@ def test_invocation_profile_renderer_generates_heatmap(tmp_path):
 def test_profile_stage_balances_nvtx_when_body_raises(monkeypatch):
     calls = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda label: calls.append(label))
+    monkeypatch.setattr(
+        torch.cuda.nvtx, "range_push", lambda label: calls.append(label)
+    )
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: calls.append("pop"))
     timings = {}
 

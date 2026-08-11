@@ -394,7 +394,9 @@ class CompiledModel:
             torch.bool: ("get_output_bool", torch.bool),
         }
 
-        def _read_typed_output(position: int, name: str, shape, out_dtype) -> torch.Tensor:
+        def _read_typed_output(
+            position: int, name: str, shape, out_dtype
+        ) -> torch.Tensor:
             """Pull one output back from the runtime at the right dtype.
 
             Strict: any `out_dtype` not in `_output_readers` raises
