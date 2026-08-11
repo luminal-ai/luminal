@@ -28,20 +28,45 @@ def _cuda_input_binding_signature(tensor, n_bytes: int) -> tuple:
     return (tensor.device, tensor.data_ptr(), n_bytes, tensor.dtype)
 
 
-def _start_profile_stage(enabled: bool, label: str):
-    if not enabled:
+class _DisabledProfileStage:
+    __slots__ = ()
+
+    def __enter__(self):
         return None
-    if torch.cuda.is_available():
-        torch.cuda.nvtx.range_push(label)
-    return time.perf_counter_ns()
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
 
 
-def _finish_profile_stage(start, timings: dict, name: str) -> None:
-    if start is None:
-        return
-    timings[name] = (time.perf_counter_ns() - start) / 1_000.0
-    if torch.cuda.is_available():
-        torch.cuda.nvtx.range_pop()
+class _EnabledProfileStage:
+    __slots__ = ("label", "timings", "name", "use_nvtx", "start")
+
+    def __init__(self, label: str, timings: dict, name: str):
+        self.label = label
+        self.timings = timings
+        self.name = name
+
+    def __enter__(self):
+        self.use_nvtx = torch.cuda.is_available()
+        if self.use_nvtx:
+            torch.cuda.nvtx.range_push(self.label)
+        self.start = time.perf_counter_ns()
+        return None
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        self.timings[self.name] = (time.perf_counter_ns() - self.start) / 1_000.0
+        if self.use_nvtx:
+            torch.cuda.nvtx.range_pop()
+        return False
+
+
+_DISABLED_PROFILE_STAGE = _DisabledProfileStage()
+
+
+def _profile_stage(enabled: bool, label: str, timings: dict, name: str):
+    if not enabled:
+        return _DISABLED_PROFILE_STAGE
+    return _EnabledProfileStage(label, timings, name)
 
 
 def _append_profile_record(path: str, record: dict) -> None:
@@ -149,7 +174,7 @@ class CompiledModel:
         # CUDA bindings are persistent in the runtime; only changed metadata
         # needs to cross PyO3 on subsequent calls.
         self._cuda_input_bindings = {}
-        # output name -> (device, pointer, required bytes, dtype, strong tensor ref).
+        # output position -> (device, pointer, required bytes, dtype, strong tensor ref).
         # Functionalized mutation outputs normally target long-lived state
         # tensors, so their durable registrations cross PyO3 only when the
         # actual storage changes.
@@ -161,6 +186,8 @@ class CompiledModel:
         # invocation of the model's hot path.
         self._profile_path = os.getenv("LUMINAL_PROFILE_JSONL")
         self._profile_enabled = bool(self._profile_path)
+        if hasattr(self._graph, "set_structured_profiling"):
+            self._graph.set_structured_profiling(self._profile_enabled)
         # Expected input dtypes from graph. Every declared input MUST
         # have a dtype code — refuse to silently default to float32 if
         # the Rust side returned a shorter list than `input_names`.
@@ -215,38 +242,44 @@ class CompiledModel:
         if profile_enabled:
             self._profile_call_index += 1
 
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.setup.{invocation_id}"
-        )
-        # Drop stripped SymInt args, if any.
-        if self._user_indices is not None:
-            user_inputs = [inputs[i] for i in self._user_indices]
-        else:
-            user_inputs = inputs
-        # Positional binding against input_names: never zip-truncate silently.
-        if len(user_inputs) != len(self._input_names):
-            raise ValueError(
-                f"Expected {len(self._input_names)} inputs, got {len(user_inputs)}"
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.setup.{invocation_id}",
+            profile_timings,
+            "setup",
+        ):
+            # Drop stripped SymInt args, if any.
+            if self._user_indices is not None:
+                user_inputs = [inputs[i] for i in self._user_indices]
+            else:
+                user_inputs = inputs
+            # Positional binding against input_names: never zip-truncate silently.
+            if len(user_inputs) != len(self._input_names):
+                raise ValueError(
+                    f"Expected {len(self._input_names)} inputs, got {len(user_inputs)}"
+                )
+
+            # Device for outputs: prefer any CUDA input — inputs include lifted
+            # weights, and user_inputs[0] may be a CPU-resident weight (offloaded
+            # models) while activations live on the GPU.
+            input_device = next(
+                (t.device for t in user_inputs if t.is_cuda),
+                user_inputs[0].device if user_inputs else torch.device("cpu"),
+            )
+            logical_tokens = (
+                _infer_logical_tokens(user_inputs) if profile_enabled else None
             )
 
-        # Device for outputs: prefer any CUDA input — inputs include lifted
-        # weights, and user_inputs[0] may be a CPU-resident weight (offloaded
-        # models) while activations live on the GPU.
-        input_device = next(
-            (t.device for t in user_inputs if t.is_cuda),
-            user_inputs[0].device if user_inputs else torch.device("cpu"),
-        )
-        logical_tokens = _infer_logical_tokens(user_inputs) if profile_enabled else None
-        _finish_profile_stage(stage, profile_timings, "setup")
-
         # Auto-detect dynamic dims from input shapes
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.dynamic_dims.{invocation_id}"
-        )
-        if self._has_dynamic_dims:
-            input_shapes = [list(t.shape) for t in user_inputs]
-            self._graph.auto_set_dims_from_input_shapes(input_shapes)
-        _finish_profile_stage(stage, profile_timings, "dynamic_dims")
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.dynamic_dims.{invocation_id}",
+            profile_timings,
+            "dynamic_dims",
+        ):
+            if self._has_dynamic_dims:
+                input_shapes = [list(t.shape) for t in user_inputs]
+                self._graph.auto_set_dims_from_input_shapes(input_shapes)
 
         # Set user input data via pointer.
         # Convert to the graph's expected dtype so bytes match the Input node's dtype tag.
@@ -255,71 +288,81 @@ class CompiledModel:
         _input_refs = []
         input_bindings = 0
         changed_input_bindings = 0
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.input_bind.{invocation_id}"
-        )
-        for name, tensor, expected_dtype in zip(
-            self._input_names, user_inputs, self._input_dtypes
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.input_bind.{invocation_id}",
+            profile_timings,
+            "input_bind",
         ):
-            if name in self.skip_input_names:
-                continue
-            input_bindings += 1
-            if tensor.dtype != expected_dtype:
-                raise DTypeBoundaryError(
-                    f"Luminal compiled input '{name}' expects "
-                    f"{expected_dtype} but got {tensor.dtype}. "
-                    "Convert at the call site with "
-                    f"`x.to({expected_dtype})` — the boundary used to silently "
-                    "cast (and warn) on every call, which masked precision "
-                    "bugs and burnt cycles on per-call allocation+copy."
-                )
-            if self._supports_device_ptrs and tensor.is_cuda:
-                # A contiguous caller tensor is already a valid read-only
-                # boundary input; making a detached view for every lifted
-                # weight adds hundreds of Python objects per invocation.
-                t = tensor if tensor.is_contiguous() else tensor.detach().contiguous()
-                n_bytes = t.numel() * t.element_size()
-                signature = _cuda_input_binding_signature(t, n_bytes)
-                previous = self._cuda_input_bindings.get(name)
-                if previous is None or previous[:4] != signature:
-                    self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
+            for name, tensor, expected_dtype in zip(
+                self._input_names, user_inputs, self._input_dtypes
+            ):
+                if name in self.skip_input_names:
+                    continue
+                input_bindings += 1
+                if tensor.dtype != expected_dtype:
+                    raise DTypeBoundaryError(
+                        f"Luminal compiled input '{name}' expects "
+                        f"{expected_dtype} but got {tensor.dtype}. "
+                        "Convert at the call site with "
+                        f"`x.to({expected_dtype})` — the boundary used to silently "
+                        "cast (and warn) on every call, which masked precision "
+                        "bugs and burnt cycles on per-call allocation+copy."
+                    )
+                if self._supports_device_ptrs and tensor.is_cuda:
+                    # A contiguous caller tensor is already a valid read-only
+                    # boundary input; making a detached view for every lifted
+                    # weight adds hundreds of Python objects per invocation.
+                    t = (
+                        tensor
+                        if tensor.is_contiguous()
+                        else tensor.detach().contiguous()
+                    )
+                    n_bytes = t.numel() * t.element_size()
+                    signature = _cuda_input_binding_signature(t, n_bytes)
+                    previous = self._cuda_input_bindings.get(name)
+                    if previous is None or previous[:4] != signature:
+                        self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
+                        changed_input_bindings += 1
+                    # Commit only after a changed registration succeeds. Retaining
+                    # the tensor prevents allocator reuse while Rust holds its
+                    # non-owning pointer; `previous` keeps the old allocation alive
+                    # until the replacement has crossed the boundary.
+                    self._cuda_input_bindings[name] = (*signature, t)
+                    _input_refs.append(t)
+                else:
+                    t = tensor.detach().cpu().contiguous()
+                    n_bytes = t.numel() * t.element_size()
+                    dtype_code = _torch_dtype_code(t.dtype)
+                    self._graph.set_input_from_ptr(
+                        name, t.data_ptr(), n_bytes, dtype_code
+                    )
                     changed_input_bindings += 1
-                # Commit only after a changed registration succeeds. Retaining
-                # the tensor prevents allocator reuse while Rust holds its
-                # non-owning pointer; `previous` keeps the old allocation alive
-                # until the replacement has crossed the boundary.
-                self._cuda_input_bindings[name] = (*signature, t)
-                _input_refs.append(t)
-            else:
-                t = tensor.detach().cpu().contiguous()
-                n_bytes = t.numel() * t.element_size()
-                dtype_code = _torch_dtype_code(t.dtype)
-                self._graph.set_input_from_ptr(name, t.data_ptr(), n_bytes, dtype_code)
-                changed_input_bindings += 1
-        _finish_profile_stage(stage, profile_timings, "input_bind")
 
         # Resolve output shapes before run() (needed for pre-allocation).
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.output_metadata.{invocation_id}"
-        )
-        if self._has_dynamic_dims:
-            output_shapes = self._graph.resolve_output_shapes()
-        else:
-            output_shapes = self._output_shapes
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.output_metadata.{invocation_id}",
+            profile_timings,
+            "output_metadata",
+        ):
+            if self._has_dynamic_dims:
+                output_shapes = self._graph.resolve_output_shapes()
+            else:
+                output_shapes = self._output_shapes
 
-        # Every declared output MUST have a dtype code; refuse to default
-        # to float32 the way we used to if the Rust side returned fewer
-        # codes than declared outputs.
-        output_dtype_codes = self._graph.output_dtypes
-        if len(output_dtype_codes) != len(self._output_names):
-            raise RuntimeError(
-                f"CompiledGraph returned {len(output_dtype_codes)} output "
-                f"dtype codes for {len(self._output_names)} declared outputs "
-                f"({self._output_names!r}) — every declared output needs a "
-                f"matching dtype."
-            )
-        output_torch_dtypes = [code_to_torch_dtype(c) for c in output_dtype_codes]
-        _finish_profile_stage(stage, profile_timings, "output_metadata")
+            # Every declared output MUST have a dtype code; refuse to default
+            # to float32 the way we used to if the Rust side returned fewer
+            # codes than declared outputs.
+            output_dtype_codes = self._graph.output_dtypes
+            if len(output_dtype_codes) != len(self._output_names):
+                raise RuntimeError(
+                    f"CompiledGraph returned {len(output_dtype_codes)} output "
+                    f"dtype codes for {len(self._output_names)} declared outputs "
+                    f"({self._output_names!r}) — every declared output needs a "
+                    f"matching dtype."
+                )
+            output_torch_dtypes = [code_to_torch_dtype(c) for c in output_dtype_codes]
 
         # Per-dtype dispatch table mapping `torch_dtype` → the typed
         # `_graph` getter for that dtype. Every supported dtype has an
@@ -351,7 +394,7 @@ class CompiledModel:
             torch.bool: ("get_output_bool", torch.bool),
         }
 
-        def _read_typed_output(name: str, shape, out_dtype) -> torch.Tensor:
+        def _read_typed_output(position: int, name: str, shape, out_dtype) -> torch.Tensor:
             """Pull one output back from the runtime at the right dtype.
 
             Strict: any `out_dtype` not in `_output_readers` raises
@@ -375,7 +418,7 @@ class CompiledModel:
                     f"the output to a supported dtype upstream."
                 )
             getter_name, read_dtype = entry
-            data = getattr(self._graph, getter_name)(name)
+            data = getattr(self._graph, f"{getter_name}_at")(position)
             if len(data) == 0:
                 if all(d != 0 for d in shape):
                     return None
@@ -405,104 +448,119 @@ class CompiledModel:
         output_allocations = 0
         output_registrations = 0
         direct_writebacks = set()
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.output_plan.{invocation_id}"
-        )
-        if _use_zero_copy:
-            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
-                out_dtype = output_torch_dtypes[i]
-                if i in self._writeback_by_pos:
-                    # Point functionalized mutation outputs at the caller's
-                    # state tensor up front. The CUDA runtime either writes
-                    # there directly or schedules its required epilogue D2D
-                    # copy on the graph stream before the one terminal wait.
-                    target = user_inputs[self._writeback_input_pos[i]]
-                    expected_numel = math.prod(shape)
-                    if (
-                        target.is_cuda
-                        and target.is_contiguous()
-                        and target.dtype == out_dtype
-                        and target.numel() == expected_numel
-                    ):
-                        n_bytes = target.numel() * target.element_size()
-                        signature = _cuda_input_binding_signature(target, n_bytes)
-                        previous = self._cuda_writeback_bindings.get(name)
-                        if previous is None or previous[:4] != signature:
-                            self._graph.set_output_device_ptr(
-                                name, target.data_ptr(), n_bytes
-                            )
-                            output_registrations += 1
-                        self._cuda_writeback_bindings[name] = (*signature, target)
-                        direct_writebacks.add(i)
-                    output_tensors.append(None)
-                    continue
-                out = torch.empty(shape, dtype=out_dtype, device=input_device)
-                output_allocations += 1
-                if out_dtype in _zero_copy_native_floats:
-                    self._graph.set_output_device_ptr(
-                        name, out.data_ptr(), out.numel() * out.element_size()
-                    )
-                    output_registrations += 1
-                output_tensors.append(out)
-        _finish_profile_stage(stage, profile_timings, "output_plan")
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.output_plan.{invocation_id}",
+            profile_timings,
+            "output_plan",
+        ):
+            if _use_zero_copy:
+                for i, (name, shape) in enumerate(
+                    zip(self._output_names, output_shapes)
+                ):
+                    out_dtype = output_torch_dtypes[i]
+                    if i in self._writeback_by_pos:
+                        # Point functionalized mutation outputs at the caller's
+                        # state tensor up front. The CUDA runtime either writes
+                        # there directly or schedules its required epilogue D2D
+                        # copy on the graph stream before the one terminal wait.
+                        target = user_inputs[self._writeback_input_pos[i]]
+                        expected_numel = math.prod(shape)
+                        if (
+                            target.is_cuda
+                            and target.is_contiguous()
+                            and target.dtype == out_dtype
+                            and target.numel() == expected_numel
+                        ):
+                            n_bytes = target.numel() * target.element_size()
+                            signature = _cuda_input_binding_signature(target, n_bytes)
+                            previous = self._cuda_writeback_bindings.get(i)
+                            if previous is None or previous[:4] != signature:
+                                self._graph.set_output_device_ptr_at(
+                                    i, target.data_ptr(), n_bytes
+                                )
+                                output_registrations += 1
+                            self._cuda_writeback_bindings[i] = (*signature, target)
+                            direct_writebacks.add(i)
+                        elif i in self._cuda_writeback_bindings:
+                            self._graph.clear_output_device_ptr_at(i)
+                            del self._cuda_writeback_bindings[i]
+                        output_tensors.append(None)
+                        continue
+                    out = torch.empty(shape, dtype=out_dtype, device=input_device)
+                    output_allocations += 1
+                    if out_dtype in _zero_copy_native_floats:
+                        self._graph.set_output_device_ptr_at(
+                            i, out.data_ptr(), out.numel() * out.element_size()
+                        )
+                        output_registrations += 1
+                    output_tensors.append(out)
 
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.graph_run.{invocation_id}"
-        )
-        if profile_enabled:
-            self._graph.set_profile_invocation_id(invocation_id)
-        self._graph.run()
-        _finish_profile_stage(stage, profile_timings, "graph_run")
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.graph_run.{invocation_id}",
+            profile_timings,
+            "graph_run",
+        ):
+            if profile_enabled:
+                self._graph.set_profile_invocation_id(invocation_id)
+            self._graph.run()
         runtime_profile_json = (
             self._graph.take_last_execution_profile_json() if profile_enabled else None
         )
 
-        stage = _start_profile_stage(
-            profile_enabled, f"luminal.compiled_model.output_finalize.{invocation_id}"
-        )
         outputs = []
         gpu_writebacks = []
         cpu_writebacks = 0
-        for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
-            out_dtype = output_torch_dtypes[i]
-            if i in self._writeback_by_pos:
-                # In-place input mutation: copy the computed state back into
-                # the caller's tensor (the same object the model would have
-                # mutated eagerly); it is not part of the returned tuple.
-                target = user_inputs[self._writeback_input_pos[i]]
-                if i in direct_writebacks:
+        with _profile_stage(
+            profile_enabled,
+            f"luminal.compiled_model.output_finalize.{invocation_id}",
+            profile_timings,
+            "output_finalize",
+        ):
+            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
+                out_dtype = output_torch_dtypes[i]
+                if i in self._writeback_by_pos:
+                    # In-place input mutation: copy the computed state back into
+                    # the caller's tensor (the same object the model would have
+                    # mutated eagerly); it is not part of the returned tuple.
+                    target = user_inputs[self._writeback_input_pos[i]]
+                    if i in direct_writebacks:
+                        continue
+                    expected_numel = math.prod(shape)
+                    can_copy_on_device = (
+                        self._supports_device_ptrs
+                        and hasattr(self._graph, "copy_outputs_to_device_ptrs_at")
+                        and target.is_cuda
+                        and target.is_contiguous()
+                        and target.dtype == out_dtype
+                        and target.numel() == expected_numel
+                    )
+                    if can_copy_on_device:
+                        gpu_writebacks.append(
+                            (
+                                i,
+                                target.data_ptr(),
+                                target.numel() * target.element_size(),
+                            )
+                        )
+                    else:
+                        target.copy_(_read_typed_output(i, name, shape, out_dtype))
+                        cpu_writebacks += 1
                     continue
-                expected_numel = math.prod(shape)
-                can_copy_on_device = (
-                    self._supports_device_ptrs
-                    and hasattr(self._graph, "copy_outputs_to_device_ptrs")
-                    and target.is_cuda
-                    and target.is_contiguous()
-                    and target.dtype == out_dtype
-                    and target.numel() == expected_numel
-                )
-                if can_copy_on_device:
-                    gpu_writebacks.append(
-                        (name, target.data_ptr(), target.numel() * target.element_size())
-                    )
+                if _use_zero_copy and out_dtype in _zero_copy_native_floats:
+                    out = output_tensors[i]
+                    if not self._graph.output_is_zero_copy_at(i):
+                        self._graph.copy_output_to_device_ptr_at(
+                            i, out.data_ptr(), out.numel() * out.element_size()
+                        )
                 else:
-                    target.copy_(_read_typed_output(name, shape, out_dtype))
-                    cpu_writebacks += 1
-                continue
-            if _use_zero_copy and out_dtype in _zero_copy_native_floats:
-                out = output_tensors[i]
-                if not self._graph.output_is_zero_copy(name):
-                    self._graph.copy_output_to_device_ptr(
-                        name, out.data_ptr(), out.numel() * out.element_size()
-                    )
-            else:
-                out = _read_typed_output(name, shape, out_dtype)
-            outputs.append(out)
+                    out = _read_typed_output(i, name, shape, out_dtype)
+                outputs.append(out)
 
-        if gpu_writebacks:
-            self._graph.copy_outputs_to_device_ptrs(gpu_writebacks)
+            if gpu_writebacks:
+                self._graph.copy_outputs_to_device_ptrs_at(gpu_writebacks)
 
-        _finish_profile_stage(stage, profile_timings, "output_finalize")
         if profile_enabled:
             total_us = (time.perf_counter_ns() - profile_total_start) / 1_000.0
             named_us = sum(profile_timings.values())

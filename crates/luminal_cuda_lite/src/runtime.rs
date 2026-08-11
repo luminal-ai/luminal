@@ -375,6 +375,7 @@ pub struct CudaRuntime {
     /// Optional correlation and structured result for opt-in invocation
     /// profiling. They are inert unless the Python boundary requests a trace.
     profile_invocation_id: Option<u64>,
+    structured_profiling: bool,
     last_execution_profile_json: Option<String>,
     last_prepare_profile: PrepareBucketProfile,
 
@@ -431,6 +432,14 @@ impl CudaRuntime {
 
     pub fn set_profile_invocation_id(&mut self, invocation_id: u64) {
         self.profile_invocation_id = Some(invocation_id);
+    }
+
+    pub fn set_structured_profiling(&mut self, enabled: bool) {
+        self.structured_profiling = enabled;
+        if !enabled {
+            self.profile_invocation_id = None;
+            self.last_execution_profile_json = None;
+        }
     }
 
     pub fn take_last_execution_profile_json(&mut self) -> Option<String> {
@@ -902,6 +911,15 @@ impl CudaRuntime {
         self.output_ptr_registrations
             .insert(id, (device_ptr, n_bytes));
         self.dirty_output_ptr_registrations.insert(id);
+    }
+
+    /// Remove a durable external output registration. The next execution
+    /// restores the runtime-managed output buffer for this node.
+    pub fn clear_output_device_ptr(&mut self, id: impl ToId) {
+        let id = id.to_id();
+        if self.output_ptr_registrations.remove(&id).is_some() {
+            self.dirty_output_ptr_registrations.insert(id);
+        }
     }
 
     /// Allocate a user-owned, statically sized, zeroed device buffer and
@@ -1459,12 +1477,10 @@ impl CudaRuntime {
             .output_producers
             .get(&output_id)
             .expect("Cannot find output node for swap!");
-
-        // Get the LLIR node for the input
-        let input_llir_node = *bucket
-            .hlir_to_llir
-            .get(&input_id)
-            .expect("Cannot find input in LLIR mapping!");
+        assert!(
+            bucket.hlir_to_all_llir.contains_key(&input_id),
+            "Cannot find input in LLIR mapping!"
+        );
 
         let src = Self::bucket_buffer(
             &self.compiled_buckets[bi],
@@ -1483,17 +1499,9 @@ impl CudaRuntime {
         );
         self.changed_hlir.insert(input_id);
 
-        // Update cached pointer for the input
-        let ptr = match &self.hlir_buffers[&input_id] {
-            CudaInput::Buffer { buf, .. } => buf.device_ptr(&self.cuda_stream).0,
-            CudaInput::Ptr(p) => *p,
-        };
-        self.compiled_buckets[bi]
-            .cached_buffer_ptrs
-            .insert(input_llir_node, ptr);
-        self.compiled_buckets[bi]
-            .cached_device_buffers
-            .insert(input_llir_node, DeviceBuffer::new(ptr, len));
+        // `changed_hlir` is the single source of truth for binding changes.
+        // The next prepare pass updates every LLIR copy and marks CUDA graph
+        // nodes dirty before the old input pointer can be launched again.
     }
 
     /// Free all intermediate buffers to reclaim GPU memory.
@@ -2369,7 +2377,7 @@ impl CudaRuntime {
             "a CUDA bucket arena must be released before preparing another bucket"
         );
         let log_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
-        let profile_prepare = log_prepare || std::env::var_os("LUMINAL_PROFILE_JSONL").is_some();
+        let profile_prepare = log_prepare || self.structured_profiling;
         let prepare_start = std::time::Instant::now();
         let changed_hlir_count = self.changed_hlir.len();
         let timer = std::time::Instant::now();
@@ -3959,6 +3967,7 @@ impl Runtime for CudaRuntime {
             resource_length_sensitive_hlir: FxHashSet::default(),
             validated_resource_signatures: FxHashSet::default(),
             profile_invocation_id: None,
+            structured_profiling: false,
             last_execution_profile_json: None,
             last_prepare_profile: PrepareBucketProfile::default(),
             compiled_buckets: vec![CompiledBucket::new()],
@@ -4128,7 +4137,7 @@ impl Runtime for CudaRuntime {
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
         let log_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
-        let structured_profile = std::env::var_os("LUMINAL_PROFILE_JSONL").is_some();
+        let structured_profile = self.structured_profiling;
         let profile_runtime = log_runtime || structured_profile;
         self.last_execution_profile_json = None;
         let runtime_profile_start = std::time::Instant::now();
@@ -5323,6 +5332,14 @@ mod arena_plan_tests {
         assert!(rt.dirty_output_ptr_registrations.is_empty());
 
         unsafe { rt.set_output_device_ptr(output, ptr, 32) };
+        assert_eq!(
+            rt.dirty_output_ptr_registrations,
+            FxHashSet::from_iter([output])
+        );
+
+        rt.dirty_output_ptr_registrations.clear();
+        rt.clear_output_device_ptr(output);
+        assert!(!rt.output_ptr_registrations.contains_key(&output));
         assert_eq!(
             rt.dirty_output_ptr_registrations,
             FxHashSet::from_iter([output])

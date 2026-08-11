@@ -53,6 +53,9 @@ impl DynBackend for CudaLiteDynBackend {
     fn set_profile_invocation_id(&mut self, invocation_id: u64) {
         self.runtime.set_profile_invocation_id(invocation_id);
     }
+    fn set_structured_profiling(&mut self, enabled: bool) {
+        self.runtime.set_structured_profiling(enabled);
+    }
     fn take_last_execution_profile_json(&mut self) -> Option<String> {
         self.runtime.take_last_execution_profile_json()
     }
@@ -65,6 +68,9 @@ impl DynBackend for CudaLiteDynBackend {
     }
     unsafe fn set_output_device_ptr(&mut self, node: NodeIndex, ptr: u64, n: usize) {
         unsafe { self.runtime.set_output_device_ptr(node, ptr, n) }
+    }
+    fn clear_output_device_ptr(&mut self, node: NodeIndex) {
+        self.runtime.clear_output_device_ptr(node)
     }
     fn output_is_zero_copy(&self, node: NodeIndex) -> bool {
         self.runtime.output_is_zero_copy(node)

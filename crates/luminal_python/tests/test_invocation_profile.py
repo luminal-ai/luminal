@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 import torch
-from luminal.compiled_model import CompiledModel, _cuda_input_binding_signature
+from luminal.compiled_model import (
+    CompiledModel,
+    _cuda_input_binding_signature,
+    _profile_stage,
+)
 from luminal.dtype_util import torch_dtype_code
 
 
@@ -22,12 +26,16 @@ class _ProfileTestGraph:
         self.output_dtypes = [7]
         self.invocation = None
         self.profile = None
+        self.structured_profiling = None
 
     def set_input_from_ptr(self, *_args):
         pass
 
     def set_profile_invocation_id(self, invocation):
         self.invocation = invocation
+
+    def set_structured_profiling(self, enabled):
+        self.structured_profiling = enabled
 
     def run(self):
         self.profile = json.dumps(
@@ -45,7 +53,7 @@ class _ProfileTestGraph:
         profile, self.profile = self.profile, None
         return profile
 
-    def get_output(self, _name):
+    def get_output_at(self, _position):
         return [3.0]
 
 
@@ -84,8 +92,34 @@ class _CudaBindingTestGraph:
     def run(self):
         pass
 
-    def get_output_i32(self, _name):
+    def get_output_i32_at(self, _position):
         return [3]
+
+
+class _DuplicateOutputNameGraph:
+    has_dynamic_dims = False
+    device_type = "cpu"
+    supports_device_ptrs = False
+
+    def __init__(self):
+        self.input_names = ["x"]
+        self.output_names = ["same", "same"]
+        self.writeback_outputs = [(0, "x")]
+        self.output_shapes = [[1], [1]]
+        self.input_dtypes = [torch_dtype_code(torch.float32)]
+        self.output_dtypes = [
+            torch_dtype_code(torch.float32),
+            torch_dtype_code(torch.float32),
+        ]
+
+    def set_input_from_ptr(self, *_args):
+        pass
+
+    def run(self):
+        pass
+
+    def get_output_at(self, position):
+        return [5.0] if position == 0 else [7.0]
 
 
 def test_cuda_input_binding_cache_tracks_resource_relevant_metadata():
@@ -111,6 +145,16 @@ def test_cuda_input_binding_cache_tracks_resource_relevant_metadata():
         )
         != signature
     )
+
+
+def test_duplicate_output_names_are_resolved_by_position():
+    model = CompiledModel(_DuplicateOutputNameGraph())
+    mutated = torch.tensor([1.0])
+
+    (returned,) = model(mutated)
+
+    assert torch.equal(mutated, torch.tensor([5.0]))
+    assert torch.equal(returned, torch.tensor([7.0]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -152,6 +196,8 @@ def test_invocation_profile_is_captured_when_compiled_model_is_created(
     # remains unprofiled after the environment changes, while a model created
     # after the opt-in emits records without consulting getenv in __call__.
     assert len(records) == 1
+    assert first._graph.structured_profiling is False
+    assert second._graph.structured_profiling is True
     assert records[0]["call_index"] == 0
     assert records[0]["graph"] == second._profile_graph_id
     for record in records:
@@ -196,3 +242,18 @@ def test_invocation_profile_renderer_generates_heatmap(tmp_path):
     assert "Stream execution/wait" in rendered
     assert "Invocation counts and invalidation reasons" in rendered
     assert "Validation reason: resource input changed" in rendered
+
+
+def test_profile_stage_balances_nvtx_when_body_raises(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda label: calls.append(label))
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: calls.append("pop"))
+    timings = {}
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with _profile_stage(True, "stage", timings, "work"):
+            raise RuntimeError("boom")
+
+    assert calls == ["stage", "pop"]
+    assert timings["work"] >= 0

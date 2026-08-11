@@ -62,6 +62,10 @@ pub trait DynBackend {
     /// CPU and third-party backends may ignore this optional diagnostic hook.
     fn set_profile_invocation_id(&mut self, _invocation_id: u64) {}
 
+    /// Enable or disable structured per-invocation profiling for this backend
+    /// instance. Backends which do not expose structured profiles may ignore it.
+    fn set_structured_profiling(&mut self, _enabled: bool) {}
+
     /// Return and clear the structured profile produced by the most recent
     /// execution. The payload is JSON so this optional hook stays object-safe
     /// without coupling the core crate to a backend-specific profile type.
@@ -83,6 +87,9 @@ pub trait DynBackend {
     /// Device pointer must remain valid through the next `execute()` call.
     unsafe fn set_output_device_ptr(&mut self, _node: NodeIndex, _ptr: u64, _n_bytes: usize) {
         panic!("set_output_device_ptr not supported by '{}'", self.name());
+    }
+    fn clear_output_device_ptr(&mut self, _node: NodeIndex) {
+        panic!("clear_output_device_ptr not supported by '{}'", self.name());
     }
     fn output_is_zero_copy(&self, _node: NodeIndex) -> bool {
         false

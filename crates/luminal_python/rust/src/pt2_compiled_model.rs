@@ -173,6 +173,7 @@ pub fn translate_pt2(
         .iter()
         .map(|(name, _)| name.clone())
         .collect();
+    let output_ids: Vec<NodeIndex> = translated.output_ids.iter().map(|(_, id)| *id).collect();
 
     let input_shape_exprs: Vec<Vec<Expression>> = translated
         .user_input_ids
@@ -257,6 +258,7 @@ pub fn translate_pt2(
         tensor_ids,
         input_names,
         output_names,
+        output_ids,
         output_dtypes,
         output_shape_exprs,
         input_shape_exprs,
