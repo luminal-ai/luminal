@@ -446,10 +446,6 @@ struct CudaGraphOpState {
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     /// Timing events for profiling
     timing_events: Vec<cudarc::driver::sys::CUevent>,
-    /// Counts from the most recent materialization pass. These are diagnostic
-    /// only and do not participate in graph state or update decisions.
-    last_materialize_nodes_inspected: usize,
-    last_materialize_nodes_updated: usize,
 }
 
 impl CudaGraphOpState {
@@ -482,8 +478,6 @@ impl CudaGraphOpState {
             last_dyn_values: FxHashMap::default(),
             last_buffer_ptrs: FxHashMap::default(),
             timing_events: Vec::new(),
-            last_materialize_nodes_inspected: 0,
-            last_materialize_nodes_updated: 0,
         }
     }
 }
@@ -818,14 +812,6 @@ impl CudaGraphOp {
                 .collect(),
             step_dependency_counts,
         }
-    }
-
-    pub(crate) fn last_materialize_counts(&self) -> (usize, usize) {
-        let state = self.state.borrow();
-        (
-            state.last_materialize_nodes_inspected,
-            state.last_materialize_nodes_updated,
-        )
     }
 }
 
@@ -1386,7 +1372,6 @@ impl CudaGraphOp {
         changed_buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<bool> {
-        let materialize_start = Instant::now();
         let mut state = self.state.borrow_mut();
         if state.cuda_graph.is_none() || state.cuda_graph_exec.is_none() {
             return Ok(false);
@@ -1553,11 +1538,6 @@ impl CudaGraphOp {
         for (node, buffer) in changed {
             state.last_buffer_ptrs.insert(node, buffer.ptr());
         }
-        state.last_materialize_nodes_inspected = changed_buffers.len();
-        state.last_materialize_nodes_updated = dirty_kernels.len();
-        let mut profile = RecaptureProfile::new();
-        profile.materialize_total = materialize_start.elapsed();
-        profile.print(dyn_map, state.kernels.len(), state.cublaslt_ops.len());
         Ok(true)
     }
 
@@ -1573,8 +1553,6 @@ impl CudaGraphOp {
         let materialize_start = Instant::now();
         let mut profile = RecaptureProfile::new();
         let mut state = self.state.borrow_mut();
-        let nodes_inspected = state.steps.len();
-        let mut nodes_updated = 0usize;
         let _span = span!(Level::TRACE, "cuda_graph", kernels = state.kernels.len()).entered();
 
         // Check if dyn_map changed
@@ -1707,7 +1685,6 @@ impl CudaGraphOp {
             }
             let mut dirty_kernels = dirty_kernel_set.into_iter().collect_vec();
             dirty_kernels.sort_unstable();
-            nodes_updated += dirty_kernels.len();
 
             // Update kernel params
             let dyn_dims_ptr = state
@@ -2128,9 +2105,6 @@ impl CudaGraphOp {
             state.last_buffer_ptrs = current_buffer_ptrs;
         }
 
-        nodes_updated += profile.pending_count;
-        state.last_materialize_nodes_inspected = nodes_inspected;
-        state.last_materialize_nodes_updated = nodes_updated;
         profile.materialize_total = materialize_start.elapsed();
         profile.print(dyn_map, state.kernels.len(), state.cublaslt_ops.len());
 
