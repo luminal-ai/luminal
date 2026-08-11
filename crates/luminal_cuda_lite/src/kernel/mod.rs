@@ -316,14 +316,6 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     ) {
     }
 
-    /// Whether `pre_execute` has observable per-invocation work. CUDA graph
-    /// materialization uses this to avoid virtual calls across every kernel in
-    /// a large graph when the default hook is a no-op. Implementations which
-    /// override `pre_execute` must also return true here.
-    fn needs_pre_execute(&self) -> bool {
-        false
-    }
-
     /// If this kernel's output aliases one of its inputs (i.e., writes in-place),
     /// return the input index. Used to propagate buffer pointers in CUDA graphs.
     fn output_aliases_input(&self) -> Option<usize> {

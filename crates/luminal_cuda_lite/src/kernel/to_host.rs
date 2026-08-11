@@ -501,7 +501,6 @@ pub struct CudaGraphOp {
     kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>>,
     kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>>,
     output_aliases: Vec<(NodeIndex, NodeIndex)>,
-    pre_execute_kernels: Vec<usize>,
     library_buffer_nodes: FxHashSet<NodeIndex>,
     /// Buffer size requirements for extra nodes (node -> size in elements)
     buffer_sizes: FxHashMap<NodeIndex, Expression>,
@@ -527,8 +526,9 @@ impl CudaGraphOp {
         let mut kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>> = FxHashMap::default();
         let mut kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>> = FxHashMap::default();
         let mut output_aliases = Vec::new();
-        let mut pre_execute_kernels = Vec::new();
         let mut library_buffer_nodes = FxHashSet::default();
+        // Build reverse dependency indexes once so materialization can update only the kernels
+        // affected by changed buffer bindings or dynamic dimensions.
         for (idx, kernel) in state.kernels.iter().enumerate() {
             kernel_users_by_buffer
                 .entry(kernel.node)
@@ -542,9 +542,6 @@ impl CudaGraphOp {
             }
             if let Some(input_idx) = kernel.kernel_op.output_aliases_input() {
                 output_aliases.push((kernel.inputs[input_idx], kernel.node));
-            }
-            if kernel.kernel_op.needs_pre_execute() {
-                pre_execute_kernels.push(idx);
             }
         }
         for op in &state.cublaslt_ops {
@@ -562,7 +559,6 @@ impl CudaGraphOp {
             kernel_users_by_buffer,
             kernel_users_by_dyn_dim,
             output_aliases,
-            pre_execute_kernels,
             library_buffer_nodes,
             buffer_sizes,
             dyn_dims_order,
@@ -1383,7 +1379,7 @@ impl CudaGraphOp {
     /// Patch a CUDA graph from an exact set of changed bindings without
     /// rebuilding or comparing its complete pointer table. Returns `false`
     /// when a full materialization is required (first use, dynamic-dimension
-    /// changes, per-execution hooks, or an affected captured library island).
+    /// changes or an affected captured library island).
     pub(crate) fn materialize_changed_bindings(
         &self,
         stream: &Arc<CudaStream>,
@@ -1399,7 +1395,7 @@ impl CudaGraphOp {
             || dyn_map
                 .iter()
                 .any(|(dim, value)| state.last_dyn_values.get(dim) != Some(value));
-        if dyn_map_changed || !self.pre_execute_kernels.is_empty() {
+        if dyn_map_changed {
             return Ok(false);
         }
 
@@ -1425,6 +1421,18 @@ impl CudaGraphOp {
             .any(|node| self.library_buffer_nodes.contains(node))
         {
             return Ok(false);
+        }
+
+        let mut current_buffer_ptrs = state.last_buffer_ptrs.clone();
+        current_buffer_ptrs.extend(changed.iter().map(|(&node, buffer)| (node, buffer.ptr())));
+        for kernel in &mut state.kernels {
+            kernel.kernel_op.pre_execute(
+                stream,
+                &mut kernel.internal_bufs,
+                &mut kernel.constants,
+                &current_buffer_ptrs,
+                dyn_map,
+            );
         }
 
         let mut dirty_kernel_set = FxHashSet::default();
@@ -1668,12 +1676,9 @@ impl CudaGraphOp {
         }
         profile.collect_buffer_ptrs += timer.elapsed();
 
-        // Call only hooks which explicitly declare per-invocation work. The
-        // default KernelOp hook is a no-op; walking thousands of those virtual
-        // calls was pure materialization overhead.
+        // Reset any per-invocation kernel state before updating the graph.
         let timer = Instant::now();
-        for &idx in &self.pre_execute_kernels {
-            let kernel = &mut state.kernels[idx];
+        for kernel in &mut state.kernels {
             kernel.kernel_op.pre_execute(
                 stream,
                 &mut kernel.internal_bufs,
