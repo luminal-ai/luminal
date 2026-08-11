@@ -76,6 +76,7 @@ def test_static_cache_prefill_smoke(device):
         assert torch.allclose(lum_layer.keys, ref_layer.keys, atol=1e-4)
         assert torch.allclose(lum_layer.values, ref_layer.values, atol=1e-4)
 
+
 def test_writeback_metadata_exposed(device):
     """The compiled artifact names its write-back outputs and their inputs."""
     config, model = tiny_llama()

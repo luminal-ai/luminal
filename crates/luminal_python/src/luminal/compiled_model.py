@@ -7,6 +7,7 @@ import torch
 from .dtype_util import code_to_torch_dtype
 from .dtype_util import torch_dtype_code as _torch_dtype_code
 
+
 def _cuda_input_binding_signature(tensor, n_bytes: int) -> tuple:
     """Return the metadata that determines an external CUDA binding.
 
@@ -298,9 +299,7 @@ class CompiledModel:
         output_tensors = []
         direct_writebacks = set()
         if _use_zero_copy:
-            for i, (name, shape) in enumerate(
-                zip(self._output_names, output_shapes)
-            ):
+            for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
                 if i in self._writeback_by_pos:
                     # Point functionalized mutation outputs at the caller's
