@@ -3140,6 +3140,15 @@ impl EgglogOp for MetalScatterNoCopy {
             ),
             Rule::raw(
                 "(rule
+                    ((= ?cb (ConsumedBuffer ?a))
+                     (= ?observed (Output ?a ?id false)))
+                    ((delete (ConsumedBuffer ?a)))
+                    :ruleset cleanup
+                    :name \"metal-consumed-buffer-cleanup-observed-output\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
                     ((= ?cb (ConsumedBuffer ?dest))
                      (= ?scatter (MetalScatter ?ds ?dst ?dest ?indexes ?is ?istr ?src ?ss ?os))
                      (= ?nocopy (Op (MetalScatterNoCopy ?ds ?dst ?is ?istr ?ss ?os)

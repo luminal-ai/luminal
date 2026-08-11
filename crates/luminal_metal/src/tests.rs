@@ -56,6 +56,39 @@ fn egraph_has_op(cx: &Graph, op_name: &str) -> bool {
         .any(|(label, _)| label == op_name)
 }
 
+fn egraph_ir_op_names(cx: &Graph) -> Vec<String> {
+    let egraph = cx.egraph().expect("search space should be built");
+    let mut names = Vec::new();
+    for (node, (label, children)) in &egraph.enodes {
+        let class = &egraph.node_to_class[node];
+        if egraph.eclasses[class].0 != "IR" {
+            continue;
+        }
+
+        if label == "Op" {
+            let Some(kind_class) = children.first() else {
+                continue;
+            };
+            names.extend(
+                egraph.eclasses[kind_class]
+                    .1
+                    .iter()
+                    .filter_map(|kind_node| egraph.enodes.get(kind_node))
+                    .map(|(kind_label, _)| kind_label.clone()),
+            );
+        } else {
+            names.push(label.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn egraph_has_ir_op(cx: &Graph, op_name: &str) -> bool {
+    egraph_ir_op_names(cx).iter().any(|name| name == op_name)
+}
+
 fn assert_matmul_options(cx: &Graph, mps_op_name: &str) {
     assert!(
         egraph_has_op(cx, mps_op_name),
@@ -1584,6 +1617,27 @@ fn test_scatter_no_copy_not_selected_when_dest_has_another_consumer() {
 
     assert_close(&rt.get_f32(scatter), &[10.0, 99.0, 30.0, 40.0], 0.001);
     assert_close(&rt.get_f32(dest_plus_one), &[11.0, 21.0, 31.0, 41.0], 0.001);
+}
+
+#[test]
+fn metal_scatter_nocopy_rewrite_rejects_observed_dest_output() {
+    let mut cx = Graph::default();
+    let dest = cx.tensor(5);
+    dest.output();
+    let src = cx.tensor(2);
+    let indexes = cx.tensor(2).as_dtype(DType::Int);
+    src.scatter(indexes, dest).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_ir_op(&cx, "MetalScatterNoCopy"),
+        "an observed old destination must invalidate the in-place rewrite"
+    );
+    assert!(
+        egraph_has_ir_op(&cx, "MetalScatter"),
+        "the copying scatter must remain available, IR ops: {:?}",
+        egraph_ir_op_names(&cx)
+    );
 }
 
 #[test]
