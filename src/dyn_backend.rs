@@ -95,6 +95,17 @@ pub trait DynBackend {
             self.name()
         );
     }
+    /// Copy multiple outputs to device pointers. Backends may override this to
+    /// enqueue the full batch and synchronize once.
+    ///
+    /// # Safety
+    /// Every destination pointer must be a valid device allocation with at
+    /// least the corresponding byte count available.
+    unsafe fn copy_outputs_to_device_ptrs(&self, copies: &[(NodeIndex, u64, usize)]) {
+        for &(node, dest_ptr, n_bytes) in copies {
+            unsafe { self.copy_output_to_device_ptr(node, dest_ptr, n_bytes) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

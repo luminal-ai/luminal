@@ -1002,20 +1002,47 @@ impl CudaRuntime {
     /// # Safety
     /// The dest_ptr must be a valid CUDA device allocation with at least n_bytes available.
     pub unsafe fn copy_output_to_device_ptr(&self, id: impl ToId, dest_ptr: u64, n_bytes: usize) {
-        debug_assert!(
-            dest_ptr != 0,
-            "copy_output_to_device_ptr called with null pointer"
-        );
-        let src = self.resolve_output_buffer(id);
-        let copy_bytes = n_bytes.min(src.len());
-        unsafe {
-            result::memcpy_dtod_async(
-                dest_ptr,
-                src.ptr(),
-                copy_bytes,
-                self.cuda_stream.cu_stream(),
-            )
-            .expect("cuMemcpyDtoDAsync failed");
+        unsafe { self.copy_outputs_to_device_ptrs(&[(id.to_id(), dest_ptr, n_bytes)]) };
+    }
+
+    /// Copy several output tensors to external CUDA device pointers and wait once.
+    ///
+    /// Resolving every source before submitting any work makes the operation
+    /// all-or-nothing with respect to runtime lookup failures. More importantly,
+    /// callers which need to commit many functionalized mutations (for example
+    /// every K/V tensor in a StaticCache) do not pay one stream synchronization
+    /// per tensor.
+    ///
+    /// # Safety
+    /// Every destination pointer must name a live CUDA allocation with at least
+    /// the corresponding byte count available for the duration of this call.
+    pub unsafe fn copy_outputs_to_device_ptrs(&self, copies: &[(NodeIndex, u64, usize)]) {
+        let resolved = copies
+            .iter()
+            .map(|(id, dest_ptr, n_bytes)| {
+                assert!(
+                    *dest_ptr != 0,
+                    "copy_outputs_to_device_ptrs called with null pointer"
+                );
+                let src = self.resolve_output_buffer(*id);
+                (src, *dest_ptr, *n_bytes)
+            })
+            .collect_vec();
+
+        for (src, dest_ptr, n_bytes) in resolved {
+            let copy_bytes = n_bytes.min(src.len());
+            if copy_bytes == 0 || src.ptr() == dest_ptr {
+                continue;
+            }
+            unsafe {
+                result::memcpy_dtod_async(
+                    dest_ptr,
+                    src.ptr(),
+                    copy_bytes,
+                    self.cuda_stream.cu_stream(),
+                )
+                .expect("cuMemcpyDtoDAsync failed");
+            }
         }
         self.cuda_stream.synchronize().unwrap();
     }

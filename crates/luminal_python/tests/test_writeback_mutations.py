@@ -7,6 +7,8 @@ applies them back to the caller's tensors and returns only the user outputs,
 matching eager semantics and torch.compile's calling contract.
 """
 
+import json
+
 import torch
 from luminal import luminal_backend
 
@@ -57,7 +59,7 @@ def static_cache_forward(model, cache, input_ids):
     )
 
 
-def test_static_cache_prefill_smoke(device):
+def test_static_cache_prefill_smoke(device, monkeypatch, tmp_path):
     """One StaticCache forward through the compiled path matches eager —
     logits, cache contents, and the in-place mutation semantics."""
     config, model = tiny_llama()
@@ -66,6 +68,8 @@ def test_static_cache_prefill_smoke(device):
 
     ref_cache = make_static_cache(config, 16, device)
     lum_cache = make_static_cache(config, 16, device)
+    profile_path = tmp_path / "writeback-profile.jsonl"
+    monkeypatch.setenv("LUMINAL_PROFILE_JSONL", str(profile_path))
     compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
 
     with torch.inference_mode():
@@ -75,6 +79,15 @@ def test_static_cache_prefill_smoke(device):
     for ref_layer, lum_layer in zip(ref_cache.layers, lum_cache.layers):
         assert torch.allclose(lum_layer.keys, ref_layer.keys, atol=1e-4)
         assert torch.allclose(lum_layer.values, ref_layer.values, atol=1e-4)
+
+    if torch.device(device).type == "cuda":
+        records = [json.loads(line) for line in profile_path.read_text().splitlines()]
+        counts = records[-1]["compiled_model"]["counts"]
+        expected_writebacks = 3 * config.num_hidden_layers
+        assert counts["writebacks"] == expected_writebacks
+        assert counts["direct_writebacks"] == expected_writebacks
+        assert counts["gpu_writebacks"] == 0
+        assert counts["cpu_writebacks"] == 0
 
 
 def test_writeback_metadata_exposed(device):

@@ -642,4 +642,30 @@ impl CompiledGraph {
         };
         Ok(())
     }
+
+    /// Copy several outputs directly to CUDA device pointers, synchronizing
+    /// only after the entire batch has been enqueued.
+    fn copy_outputs_to_device_ptrs(&self, copies: Vec<(String, u64, usize)>) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "copy_outputs_to_device_ptrs requires a GPU backend",
+            ));
+        }
+        let resolved = copies
+            .into_iter()
+            .map(|(name, dest_ptr, n_bytes)| {
+                self.tensor_ids
+                    .get(&name)
+                    .copied()
+                    .map(|node_id| (node_id, dest_ptr, n_bytes))
+                    .ok_or_else(|| {
+                        PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                            "Unknown output tensor: {name}"
+                        ))
+                    })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        unsafe { self.runtime.copy_outputs_to_device_ptrs(&resolved) };
+        Ok(())
+    }
 }

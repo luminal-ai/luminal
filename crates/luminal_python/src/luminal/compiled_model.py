@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import math
 import os
 import threading
 import time
@@ -143,6 +144,11 @@ class CompiledModel:
         # CUDA bindings are persistent in the runtime; only changed metadata
         # needs to cross PyO3 on subsequent calls.
         self._cuda_input_bindings = {}
+        # output name -> (device, pointer, required bytes, dtype, strong tensor ref).
+        # Functionalized mutation outputs normally target long-lived state
+        # tensors, so their durable registrations cross PyO3 only when the
+        # actual storage changes.
+        self._cuda_writeback_bindings = {}
         self._profile_graph_id = next(_PROFILE_GRAPH_IDS)
         self._profile_call_index = 0
         # Expected input dtypes from graph. Every declared input MUST
@@ -388,6 +394,7 @@ class CompiledModel:
         output_tensors = []
         output_allocations = 0
         output_registrations = 0
+        direct_writebacks = set()
         stage = _start_profile_stage(
             profile_enabled, f"luminal.compiled_model.output_plan.{invocation_id}"
         )
@@ -395,8 +402,29 @@ class CompiledModel:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
                 if i in self._writeback_by_pos:
-                    # Write-backs land in the caller's input tensor below, not
-                    # in a fresh output buffer.
+                    # Point functionalized mutation outputs at the caller's
+                    # state tensor up front. The CUDA runtime either writes
+                    # there directly or schedules its required epilogue D2D
+                    # copy on the graph stream before the one terminal wait.
+                    input_name = self._writeback_by_pos[i]
+                    target = user_inputs[self._input_names.index(input_name)]
+                    expected_numel = math.prod(shape)
+                    if (
+                        target.is_cuda
+                        and target.is_contiguous()
+                        and target.dtype == out_dtype
+                        and target.numel() == expected_numel
+                    ):
+                        n_bytes = target.numel() * target.element_size()
+                        signature = _cuda_input_binding_signature(target, n_bytes)
+                        previous = self._cuda_writeback_bindings.get(name)
+                        if previous is None or previous[:4] != signature:
+                            self._graph.set_output_device_ptr(
+                                name, target.data_ptr(), n_bytes
+                            )
+                            output_registrations += 1
+                        self._cuda_writeback_bindings[name] = (*signature, target)
+                        direct_writebacks.add(i)
                     output_tensors.append(None)
                     continue
                 out = torch.empty(shape, dtype=out_dtype, device=input_device)
@@ -424,6 +452,8 @@ class CompiledModel:
             profile_enabled, f"luminal.compiled_model.output_finalize.{invocation_id}"
         )
         outputs = []
+        gpu_writebacks = []
+        cpu_writebacks = 0
         for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
             out_dtype = output_torch_dtypes[i]
             if i in self._writeback_by_pos:
@@ -432,7 +462,24 @@ class CompiledModel:
                 # mutated eagerly); it is not part of the returned tuple.
                 input_name = self._writeback_by_pos[i]
                 target = user_inputs[self._input_names.index(input_name)]
-                target.copy_(_read_typed_output(name, shape, out_dtype))
+                if i in direct_writebacks:
+                    continue
+                expected_numel = math.prod(shape)
+                can_copy_on_device = (
+                    self._supports_device_ptrs
+                    and hasattr(self._graph, "copy_outputs_to_device_ptrs")
+                    and target.is_cuda
+                    and target.is_contiguous()
+                    and target.dtype == out_dtype
+                    and target.numel() == expected_numel
+                )
+                if can_copy_on_device:
+                    gpu_writebacks.append(
+                        (name, target.data_ptr(), target.numel() * target.element_size())
+                    )
+                else:
+                    target.copy_(_read_typed_output(name, shape, out_dtype))
+                    cpu_writebacks += 1
                 continue
             if _use_zero_copy and out_dtype in _zero_copy_native_floats:
                 out = output_tensors[i]
@@ -443,6 +490,9 @@ class CompiledModel:
             else:
                 out = _read_typed_output(name, shape, out_dtype)
             outputs.append(out)
+
+        if gpu_writebacks:
+            self._graph.copy_outputs_to_device_ptrs(gpu_writebacks)
 
         _finish_profile_stage(stage, profile_timings, "output_finalize")
         if profile_enabled:
@@ -492,6 +542,10 @@ class CompiledModel:
                         "output_allocations": output_allocations,
                         "output_registrations": output_registrations,
                         "writebacks": len(self._writeback_by_pos),
+                        "gpu_writebacks": len(gpu_writebacks),
+                        "cpu_writebacks": cpu_writebacks,
+                        "writeback_batches": int(bool(gpu_writebacks)),
+                        "direct_writebacks": len(direct_writebacks),
                     },
                 },
                 "runtime": runtime_profile,

@@ -72,6 +72,10 @@ impl DynBackend for CudaLiteDynBackend {
     unsafe fn copy_output_to_device_ptr(&self, node: NodeIndex, ptr: u64, n: usize) {
         unsafe { self.runtime.copy_output_to_device_ptr(node, ptr, n) }
     }
+
+    unsafe fn copy_outputs_to_device_ptrs(&self, copies: &[(NodeIndex, u64, usize)]) {
+        unsafe { self.runtime.copy_outputs_to_device_ptrs(copies) }
+    }
 }
 
 pub fn cuda_lite_factory(

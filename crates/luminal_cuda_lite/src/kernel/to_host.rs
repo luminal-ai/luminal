@@ -495,6 +495,12 @@ impl CudaGraphOpState {
 pub struct CudaGraphOp {
     /// All nodes that this graph needs buffers for (kernels + their inputs)
     buffer_nodes: Vec<NodeIndex>,
+    /// Reverse dependency indices built once at graph construction. These let
+    /// pointer/dimension changes identify affected kernel nodes directly.
+    kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>>,
+    kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>>,
+    output_aliases: Vec<(NodeIndex, NodeIndex)>,
+    pre_execute_kernels: Vec<usize>,
     /// Buffer size requirements for extra nodes (node -> size in elements)
     buffer_sizes: FxHashMap<NodeIndex, Expression>,
     /// Dynamic dimensions used by this graph (sorted alphabetically)
@@ -516,8 +522,34 @@ impl CudaGraphOp {
         capture_stream: Option<Arc<CudaStream>>,
         state: CudaGraphOpState,
     ) -> Self {
+        let mut kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>> = FxHashMap::default();
+        let mut kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>> = FxHashMap::default();
+        let mut output_aliases = Vec::new();
+        let mut pre_execute_kernels = Vec::new();
+        for (idx, kernel) in state.kernels.iter().enumerate() {
+            kernel_users_by_buffer
+                .entry(kernel.node)
+                .or_default()
+                .push(idx);
+            for input in &kernel.inputs {
+                kernel_users_by_buffer.entry(*input).or_default().push(idx);
+            }
+            for dim in &kernel.dyn_vars {
+                kernel_users_by_dyn_dim.entry(*dim).or_default().push(idx);
+            }
+            if let Some(input_idx) = kernel.kernel_op.output_aliases_input() {
+                output_aliases.push((kernel.inputs[input_idx], kernel.node));
+            }
+            if kernel.kernel_op.needs_pre_execute() {
+                pre_execute_kernels.push(idx);
+            }
+        }
         Self {
             buffer_nodes,
+            kernel_users_by_buffer,
+            kernel_users_by_dyn_dim,
+            output_aliases,
+            pre_execute_kernels,
             buffer_sizes,
             dyn_dims_order,
             stream,
@@ -1424,26 +1456,32 @@ impl CudaGraphOp {
         // Collect current buffer pointers
         let timer = Instant::now();
         let mut current_buffer_ptrs: FxHashMap<NodeIndex, u64> = FxHashMap::default();
+        let mut changed_buffer_nodes = FxHashSet::default();
         for &node in &self.buffer_nodes {
             if let Some(buf) = buffers.get(&node) {
                 current_buffer_ptrs.insert(node, buf.ptr());
+                if state.last_buffer_ptrs.get(&node) != Some(&buf.ptr()) {
+                    changed_buffer_nodes.insert(node);
+                }
             }
         }
 
         // Apply output-aliases-input
-        for kernel in state.kernels.iter() {
-            if let Some(input_idx) = kernel.kernel_op.output_aliases_input()
-                && let Some(&input_ptr) = current_buffer_ptrs.get(&kernel.inputs[input_idx])
-            {
-                current_buffer_ptrs.insert(kernel.node, input_ptr);
+        for &(input, output) in &self.output_aliases {
+            if let Some(&input_ptr) = current_buffer_ptrs.get(&input) {
+                current_buffer_ptrs.insert(output, input_ptr);
+                if state.last_buffer_ptrs.get(&output) != Some(&input_ptr) {
+                    changed_buffer_nodes.insert(output);
+                }
             }
         }
         profile.collect_buffer_ptrs += timer.elapsed();
 
-        // Always call pre_execute for each kernel to reset internal state
-        // (e.g., MegakernelOps need work queue, head, barriers, lock reset every execution)
+        // Call only hooks which explicitly declare per-invocation work. The
+        // default KernelOp hook is a no-op; walking thousands of those virtual
+        // calls was pure materialization overhead.
         let timer = Instant::now();
-        for idx in 0..state.kernels.len() {
+        for &idx in &self.pre_execute_kernels {
             let kernel = &mut state.kernels[idx];
             kernel.kernel_op.pre_execute(
                 stream,
@@ -1460,19 +1498,20 @@ impl CudaGraphOp {
         let needs_update = dyn_map_changed || buffer_ptrs_changed;
 
         if needs_update {
-            let kernel_dirty = (0..state.kernels.len())
-                .map(|idx| {
-                    let kernel = &state.kernels[idx];
-                    let output_ptr_changed = current_buffer_ptrs.get(&kernel.node)
-                        != state.last_buffer_ptrs.get(&kernel.node);
-                    let input_ptr_changed = kernel.inputs.iter().any(|input| {
-                        current_buffer_ptrs.get(input) != state.last_buffer_ptrs.get(input)
-                    });
-                    let dyn_changed = !changed_dyn_vars.is_disjoint(&kernel.dyn_vars);
-                    output_ptr_changed || input_ptr_changed || dyn_changed
-                })
-                .collect_vec();
-            nodes_updated += kernel_dirty.iter().filter(|dirty| **dirty).count();
+            let mut dirty_kernel_set = FxHashSet::default();
+            for node in &changed_buffer_nodes {
+                if let Some(users) = self.kernel_users_by_buffer.get(node) {
+                    dirty_kernel_set.extend(users.iter().copied());
+                }
+            }
+            for dim in &changed_dyn_vars {
+                if let Some(users) = self.kernel_users_by_dyn_dim.get(dim) {
+                    dirty_kernel_set.extend(users.iter().copied());
+                }
+            }
+            let mut dirty_kernels = dirty_kernel_set.into_iter().collect_vec();
+            dirty_kernels.sort_unstable();
+            nodes_updated += dirty_kernels.len();
 
             // Update kernel params
             let dyn_dims_ptr = state
@@ -1482,12 +1521,8 @@ impl CudaGraphOp {
                 .unwrap_or(0);
 
             // Build params for each kernel first
-            let num_kernels = state.kernels.len();
             let timer = Instant::now();
-            for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
-                if !dirty {
-                    continue;
-                }
+            for &idx in &dirty_kernels {
                 let kernel = &state.kernels[idx];
                 let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
                 let input_ptrs: Vec<u64> = kernel
@@ -1532,10 +1567,7 @@ impl CudaGraphOp {
             // is recaptured below, cuGraphExecUpdate will refresh the executable
             // from these source-node params.
             let timer = Instant::now();
-            for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
-                if !dirty {
-                    continue;
-                }
+            for &idx in &dirty_kernels {
                 let kernel = &state.kernels[idx];
                 let graph_node = state.node_to_graph_node[&kernel.node];
 
@@ -1856,10 +1888,7 @@ impl CudaGraphOp {
                     .bind_to_thread()?;
 
                 let timer = Instant::now();
-                for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
-                    if !dirty {
-                        continue;
-                    }
+                for &idx in &dirty_kernels {
                     let kernel = &state.kernels[idx];
                     let graph_node = state.node_to_graph_node[&kernel.node];
 
