@@ -90,6 +90,15 @@ fn device_pointer_binding_matches(
     current_ptr == Some(device_ptr) && current_bytes == Some(n_bytes)
 }
 
+fn device_ranges_overlap(a_ptr: u64, a_bytes: usize, b_ptr: u64, b_bytes: usize) -> bool {
+    if a_bytes == 0 || b_bytes == 0 {
+        return false;
+    }
+    let a_end = a_ptr.saturating_add(a_bytes as u64);
+    let b_end = b_ptr.saturating_add(b_bytes as u64);
+    a_ptr < b_end && b_ptr < a_end
+}
+
 fn should_consume_hlir_input(is_external_pointer: bool, preserved_for_output: bool) -> bool {
     !preserved_for_output && !is_external_pointer
 }
@@ -184,6 +193,17 @@ enum ResolvedOutputRegistration {
         hlir_input: NodeIndex,
         input_ptr: u64,
         input_bytes: usize,
+        destination_ptr: u64,
+        copy_bytes: usize,
+    },
+    /// The requested destination overlaps a graph input, but the selected
+    /// producer does not explicitly alias that input. Binding it directly
+    /// would introduce a hidden dependency, so compute into the planned
+    /// output buffer and copy after graph execution.
+    Copy {
+        data_node: NodeIndex,
+        source_ptr: u64,
+        source_bytes: usize,
         destination_ptr: u64,
         copy_bytes: usize,
     },
@@ -1138,26 +1158,36 @@ impl CudaRuntime {
             self.resolved_output_bucket = Some(self.active_bucket);
         }
 
-        // Aliased registrations depend on an input pointer as well as their
-        // own destination. Re-resolve only aliases whose source binding moved.
-        let changed_aliases = self
+        // Copy registrations depend on their source buffer, and aliases depend
+        // on their input binding. Re-resolve only registrations whose source moved.
+        let changed_sources = self
             .resolved_output_registrations
             .iter()
             .filter_map(|(hlir_output, resolved)| {
-                let ResolvedOutputRegistration::Alias {
-                    hlir_input,
-                    input_ptr,
-                    input_bytes,
-                    ..
-                } = resolved
-                else {
-                    return None;
+                let changed = match resolved {
+                    ResolvedOutputRegistration::Alias {
+                        hlir_input,
+                        input_ptr,
+                        input_bytes,
+                        ..
+                    } => {
+                        self.current_hlir_device_binding(*hlir_input)
+                            != Some((*input_ptr, *input_bytes))
+                    }
+                    ResolvedOutputRegistration::Copy {
+                        data_node,
+                        source_ptr,
+                        source_bytes,
+                        ..
+                    } => Self::cached_device_buffer_for_node(self.active(), *data_node).is_none_or(
+                        |source| source.ptr() != *source_ptr || source.len() != *source_bytes,
+                    ),
+                    _ => false,
                 };
-                (self.current_hlir_device_binding(*hlir_input) != Some((*input_ptr, *input_bytes)))
-                    .then_some(*hlir_output)
+                changed.then_some(*hlir_output)
             })
             .collect_vec();
-        self.dirty_output_ptr_registrations.extend(changed_aliases);
+        self.dirty_output_ptr_registrations.extend(changed_sources);
 
         let dirty = std::mem::take(&mut self.dirty_output_ptr_registrations);
         for hlir_id in dirty {
@@ -1192,6 +1222,33 @@ impl CudaRuntime {
                 continue;
             }
 
+            let destination_overlaps_input = self.hlir_buffers.keys().copied().any(|hlir_input| {
+                self.current_hlir_device_binding(hlir_input).is_some_and(
+                    |(input_ptr, input_bytes)| {
+                        device_ranges_overlap(device_ptr, n_bytes, input_ptr, input_bytes)
+                    },
+                )
+            });
+            if destination_overlaps_input {
+                let Some(source) = Self::cached_device_buffer_for_node(self.active(), data_node)
+                else {
+                    self.resolved_output_registrations
+                        .insert(hlir_id, ResolvedOutputRegistration::Missing);
+                    continue;
+                };
+                self.resolved_output_registrations.insert(
+                    hlir_id,
+                    ResolvedOutputRegistration::Copy {
+                        data_node,
+                        source_ptr: source.ptr(),
+                        source_bytes: source.len(),
+                        destination_ptr: device_ptr,
+                        copy_bytes: n_bytes.min(source.len()),
+                    },
+                );
+                continue;
+            }
+
             let slice = unsafe {
                 self.cuda_stream
                     .upgrade_device_ptr::<u8>(device_ptr, n_bytes)
@@ -1210,24 +1267,27 @@ impl CudaRuntime {
         self.pending_output_copies.clear();
         self.pending_output_copies
             .extend(
-                self.resolved_output_registrations
-                    .values()
-                    .filter_map(|resolved| {
-                        let ResolvedOutputRegistration::Alias {
+                self.resolved_output_registrations.values().filter_map(
+                    |resolved| match *resolved {
+                        ResolvedOutputRegistration::Alias {
                             input_ptr,
                             destination_ptr,
                             copy_bytes,
                             ..
-                        } = *resolved
-                        else {
-                            return None;
-                        };
-                        (input_ptr != destination_ptr).then_some((
+                        } => (input_ptr != destination_ptr).then_some((
                             input_ptr,
                             destination_ptr,
                             copy_bytes,
-                        ))
-                    }),
+                        )),
+                        ResolvedOutputRegistration::Copy {
+                            source_ptr,
+                            destination_ptr,
+                            copy_bytes,
+                            ..
+                        } => Some((source_ptr, destination_ptr, copy_bytes)),
+                        _ => None,
+                    },
+                ),
             );
     }
 
@@ -5153,6 +5213,14 @@ mod arena_plan_tests {
         assert!(!should_consume_hlir_input(true, true));
         assert!(should_consume_hlir_input(false, false));
         assert!(!should_consume_hlir_input(false, true));
+    }
+
+    #[test]
+    fn device_range_overlap_detects_hidden_output_input_aliases() {
+        assert!(device_ranges_overlap(0x1000, 64, 0x1000, 64));
+        assert!(device_ranges_overlap(0x1000, 64, 0x1020, 64));
+        assert!(!device_ranges_overlap(0x1000, 64, 0x1040, 64));
+        assert!(!device_ranges_overlap(0x1000, 0, 0x1000, 64));
     }
 
     #[test]
