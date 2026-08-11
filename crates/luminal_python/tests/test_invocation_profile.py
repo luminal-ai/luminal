@@ -133,7 +133,7 @@ def test_compiled_model_skips_unchanged_cuda_input_pointer_registration():
     assert len(graph.input_pointer_calls) == 2
 
 
-def test_invocation_profile_is_opt_in_correlated_and_multi_graph_safe(
+def test_invocation_profile_is_captured_when_compiled_model_is_created(
     tmp_path, monkeypatch
 ):
     trace = tmp_path / "parallel" / "invocations.jsonl"
@@ -148,9 +148,12 @@ def test_invocation_profile_is_opt_in_correlated_and_multi_graph_safe(
     assert torch.equal(second(torch.tensor([1.0]))[0], torch.tensor([3.0]))
     records = _read_jsonl(trace)
 
-    assert len(records) == 2
-    assert records[0]["invocation"] < records[1]["invocation"]
-    assert records[0]["graph"] != records[1]["graph"]
+    # Profiling configuration belongs to a compiled instance. The first model
+    # remains unprofiled after the environment changes, while a model created
+    # after the opt-in emits records without consulting getenv in __call__.
+    assert len(records) == 1
+    assert records[0]["call_index"] == 0
+    assert records[0]["graph"] == second._profile_graph_id
     for record in records:
         assert record["kind"] == "luminal_invocation"
         assert record["runtime"]["invocation"] == record["invocation"]

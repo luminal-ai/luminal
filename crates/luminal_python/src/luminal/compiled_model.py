@@ -156,6 +156,11 @@ class CompiledModel:
         self._cuda_writeback_bindings = {}
         self._profile_graph_id = next(_PROFILE_GRAPH_IDS)
         self._profile_call_index = 0
+        # Profiling is a property of this compiled instance. Resolve the
+        # opt-in once instead of consulting the process environment on every
+        # invocation of the model's hot path.
+        self._profile_path = os.getenv("LUMINAL_PROFILE_JSONL")
+        self._profile_enabled = bool(self._profile_path)
         # Expected input dtypes from graph. Every declared input MUST
         # have a dtype code — refuse to silently default to float32 if
         # the Rust side returned a shorter list than `input_names`.
@@ -201,8 +206,8 @@ class CompiledModel:
         Returns:
             Tuple of PyTorch tensors containing the model outputs
         """
-        profile_path = os.getenv("LUMINAL_PROFILE_JSONL")
-        profile_enabled = bool(profile_path)
+        profile_path = self._profile_path
+        profile_enabled = self._profile_enabled
         profile_total_start = time.perf_counter_ns() if profile_enabled else None
         profile_timings = {}
         invocation_id = next(_PROFILE_INVOCATION_IDS) if profile_enabled else None
