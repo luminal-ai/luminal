@@ -59,6 +59,8 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.exp.default" => self.translate_unary_op(node, |a| a.exp())?,
             "torch.ops.aten.sin.default" => self.translate_unary_op(node, |a| a.sin())?,
             "torch.ops.aten.cos.default" => self.translate_unary_op(node, |a| a.cos())?,
+            "torch.ops.aten.acos.default" => self.translate_acos(node)?,
+            "torch.ops.aten.acosh.default" => self.translate_acosh(node)?,
             "torch.ops.aten.sqrt.default" => self.translate_unary_op(node, |a| a.sqrt())?,
             "torch.ops.aten.rsqrt.default" => {
                 self.translate_unary_op(node, |a| a.sqrt().reciprocal())?

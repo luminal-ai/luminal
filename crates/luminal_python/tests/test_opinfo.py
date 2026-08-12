@@ -99,6 +99,18 @@ def _call(op: Callable[..., Any], sample: SampleInput) -> Any:
 
 
 def _assert_close(actual: Any, expected: Any, dtype: torch.dtype) -> None:
+    # Unary operations such as acos/acosh promote integral inputs to F32. Base
+    # tolerances on the reference output when it has one unambiguous tensor
+    # dtype; using the parametrized input dtype would incorrectly demand exact
+    # integer equality from a floating-point result.
+    expected_dtypes = {
+        value.dtype
+        for value in pytree.tree_leaves(expected)
+        if isinstance(value, torch.Tensor)
+    }
+    if len(expected_dtypes) == 1:
+        dtype = expected_dtypes.pop()
+
     kwargs = {
         "equal_nan": True,
         "check_device": True,

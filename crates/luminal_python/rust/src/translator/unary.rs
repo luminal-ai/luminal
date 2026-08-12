@@ -52,6 +52,67 @@ impl<'a> Translator<'a> {
         Ok(f(a))
     }
 
+    /// Translate `aten.acos.default` into existing elementwise HLIR primitives.
+    ///
+    /// For `x >= 0`, approximate `acos(x)` as `sqrt(1 - x) * P(x)`, where
+    /// `P` is a degree-8 Chebyshev approximation of
+    /// `acos(x) / sqrt(1 - x)` on `[0, 1]`. Extend it to negative inputs with
+    /// `acos(-x) = pi - acos(x)`. Factoring out the square-root endpoint
+    /// behavior keeps the polynomial smooth and also makes out-of-domain real
+    /// inputs produce NaN through `sqrt(1 - abs(x))`, matching PyTorch.
+    ///
+    /// PyTorch promotes integral and bool inputs to F32 for inverse trig ops.
+    #[allow(clippy::excessive_precision)]
+    pub(crate) fn translate_acos(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let input = match input.dtype {
+            DType::Bool | DType::Int | DType::I64 => input.cast(DType::F32),
+            _ => input,
+        };
+        let x = input.abs();
+
+        // Horner form, highest-order coefficient first. The maximum absolute
+        // approximation error in F32 is below 3e-7 over the real acos domain.
+        let polynomial = 0.000_684_531_8 * x - 0.003_974_577_8;
+        let polynomial = polynomial * x + 0.011_028_381;
+        let polynomial = polynomial * x - 0.020_727_666;
+        let polynomial = polynomial * x + 0.032_571_17;
+        let polynomial = polynomial * x - 0.050_593_574;
+        let polynomial = polynomial * x + 0.089_030_14;
+        let polynomial = polynomial * x - 0.214_601_16;
+        let polynomial = polynomial * x + std::f32::consts::FRAC_PI_2;
+        let positive = polynomial * (1.0 - x).sqrt();
+
+        let zero = self
+            .graph
+            .constant_float(0.0)
+            .cast(input.dtype)
+            .expand_rhs(input.shape);
+        let negative = input.lt(zero).cast(input.dtype);
+        Ok(positive + negative * (std::f32::consts::PI - 2.0 * positive))
+    }
+
+    /// Translate `aten.acosh.default` into existing elementwise HLIR primitives.
+    ///
+    /// The textbook `log(x + sqrt(x * x - 1))` form overflows before the log
+    /// for large finite inputs, especially in F16. Use the equivalent form
+    ///
+    /// `log(x) + log(1 + sqrt(1 - 1 / x^2))`
+    ///
+    /// instead. For real inputs below one, either the square root or `log(x)`
+    /// naturally produces NaN, matching PyTorch's real-domain behavior.
+    /// PyTorch promotes integral and bool inputs to F32 for inverse hyperbolic
+    /// operations, while floating inputs retain their dtype.
+    pub(crate) fn translate_acosh(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let input = match input.dtype {
+            DType::Bool | DType::Int | DType::I64 => input.cast(DType::F32),
+            _ => input,
+        };
+        let reciprocal_squared = input.reciprocal().square();
+        Ok(input.log() + (1.0 + (1.0 - reciprocal_squared).sqrt()).log())
+    }
+
     /// Translate `aten.gelu`, honoring the `approximate` kwarg. PyTorch's default
     /// (`approximate="none"`) is the exact erf form; `"tanh"` selects the tanh
     /// approximation. Mapping both to a single `gelu()` (as before) silently used the
