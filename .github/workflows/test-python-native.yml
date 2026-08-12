@@ -28,4 +28,4 @@ jobs:
             - name: Build maturin extension
               run: uv run maturin develop --manifest-path rust/Cargo.toml --profile release
             - name: Run pytest
-              run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py -v -m "not slow"
+              run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py tests/test_opinfo.py -v -m "not slow"

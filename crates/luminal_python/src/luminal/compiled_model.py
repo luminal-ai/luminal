@@ -228,8 +228,10 @@ class CompiledModel:
                 )
             getter_name, read_dtype = entry
             data = getattr(self._graph, getter_name)(name)
-            if len(data) == 0 and all(d != 0 for d in shape):
-                return None
+            if len(data) == 0:
+                if all(d != 0 for d in shape):
+                    return None
+                return torch.empty(tuple(shape), dtype=out_dtype, device=input_device)
             if out_dtype in (torch.float16, torch.bfloat16):
                 # Getter returned an immutable `bytes` from Rust; wrap in
                 # `bytearray` to make the storage writable (suppresses

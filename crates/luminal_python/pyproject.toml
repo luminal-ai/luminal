@@ -37,9 +37,12 @@ markers = [
 
 [dependency-groups]
 dev = [
+    "expecttest>=0.3.0",
+    "hypothesis",
     "maturin>=1.0,<2.0",
     "pytest>=9.0.2",
     "pytest-profiling",
+    "pytest-subtests",
     "snakeviz",
     "maturin-import-hook>=0.3.0",
     "pytest-randomly>=4.0.1",
