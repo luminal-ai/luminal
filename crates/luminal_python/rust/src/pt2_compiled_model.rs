@@ -54,6 +54,75 @@ fn resolve_dim_sizes(
         .collect()
 }
 
+/// A translated module: the HLIR graph and its weights, before any backend
+/// compilation.
+///
+/// Handed to Python only so it can be returned from a `torch.compile` backend;
+/// the embedding host then calls [`TranslatedModule::take`] and owns the
+/// translation outright. Nothing here is `Send`, but nothing needs to be — once
+/// taken, the value never goes back through the interpreter.
+#[pyclass(unsendable)]
+pub struct TranslatedModule {
+    inner: Option<(GraphTranslation, WeightData)>,
+}
+
+impl TranslatedModule {
+    /// Move the translation out. `None` on a second call.
+    pub fn take(&mut self) -> Option<(GraphTranslation, WeightData)> {
+        self.inner.take()
+    }
+}
+
+#[pymethods]
+impl TranslatedModule {
+    /// Whether the translation is still held (false once a host has taken it).
+    fn is_available(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    fn input_names(&self) -> Vec<String> {
+        self.inner
+            .as_ref()
+            .map(|(t, _)| t.input_names.clone())
+            .unwrap_or_default()
+    }
+
+    fn output_names(&self) -> Vec<String> {
+        self.inner
+            .as_ref()
+            .map(|(t, _)| t.output_names.clone())
+            .unwrap_or_default()
+    }
+
+    fn writeback_outputs(&self) -> Vec<(usize, String)> {
+        self.inner
+            .as_ref()
+            .map(|(t, _)| t.writeback_outputs.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Translate an exported `.pt2` WITHOUT compiling a backend for it.
+///
+/// `process_pt2` translates and then immediately compiles, which fixes the
+/// search budget, the dim buckets and the graph itself at that moment. A host
+/// that wants to make those choices — or to extend the graph before lowering —
+/// needs the translation on its own.
+#[pyfunction]
+#[pyo3(signature = (pt2_path, weights_path, weight_device_ptrs=None))]
+pub fn translate_module(
+    pt2_path: &str,
+    weights_path: &str,
+    weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
+) -> PyResult<TranslatedModule> {
+    let (translation, mut weights) = translate_pt2(pt2_path, weights_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    weights.device_ptrs = weight_device_ptrs.unwrap_or_default();
+    Ok(TranslatedModule {
+        inner: Some((translation, weights)),
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (pt2_path, weights_path, search_iters, factory_capsule, weight_device_ptrs=None))]
 pub fn process_pt2(
