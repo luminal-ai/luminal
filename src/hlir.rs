@@ -227,6 +227,7 @@ pub type HLIROps = (
     LoopOutput,
     LoopOutputSelect,
     Constant,
+    ConstantF64,
     Cast,
     Iota,
     Exp2,
@@ -1120,6 +1121,68 @@ impl ReferenceOp for Constant {
     }
 }
 
+/// Produces a single F64 constant without narrowing through F32.
+#[derive(Clone, PartialEq, Default)]
+pub struct ConstantF64(pub f64);
+
+impl Debug for ConstantF64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConstantF64({:?})", self.0)
+    }
+}
+
+impl Display for ConstantF64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl HLIROp for ConstantF64 {
+    fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
+        format!("(Op (ConstantF64 {:?}) (INil))", self.0)
+    }
+}
+
+impl EgglogOp for ConstantF64 {
+    fn sort(&self) -> SortDef {
+        sort(OP_KIND, "ConstantF64", &[("value", F64)])
+    }
+
+    fn cleanup(&self) -> bool {
+        true
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_fixed_op(&self.sort(), &SORTS.f64_dt)]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        _input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
+                egraph.enodes[kind_children[0]]
+                    .0
+                    .replace('"', "")
+                    .parse::<f64>()
+                    .unwrap(),
+            ))),
+            vec![],
+        )
+    }
+}
+
+impl ReferenceOp for ConstantF64 {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+        ReferenceData::F64(vec![self.0])
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Iota(pub Expression, pub Expression);
 impl Display for Iota {
@@ -1317,35 +1380,30 @@ impl ReferenceOp for Cast {
 
 // Unary Op (A -> A)
 
+struct UnaryKernels {
+    f32_fn: fn(f32) -> f32,
+    f16_fn: fn(f16) -> f16,
+    bf16_fn: fn(bf16) -> bf16,
+    f64_fn: fn(f64) -> f64,
+}
+
 fn unary_impl(
     inp: &ReferenceData,
     shape: &[Expression],
     strides: &[Expression],
     dyn_map: &FxHashMap<char, usize>,
-    f32_fn: fn(f32) -> f32,
-    f16_fn: fn(f16) -> f16,
-    bf16_fn: fn(bf16) -> bf16,
+    kernels: UnaryKernels,
 ) -> ReferenceData {
     let ind = StridedIterator::new(shape, strides, dyn_map);
     match &inp {
-        ReferenceData::F32(f) => ReferenceData::F32(ind.map(|i| f32_fn(f[i])).collect()),
-        ReferenceData::F16(f) => ReferenceData::F16(ind.map(|i| f16_fn(f[i])).collect()),
-        ReferenceData::Bf16(f) => ReferenceData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
+        ReferenceData::F32(f) => ReferenceData::F32(ind.map(|i| (kernels.f32_fn)(f[i])).collect()),
+        ReferenceData::F16(f) => ReferenceData::F16(ind.map(|i| (kernels.f16_fn)(f[i])).collect()),
+        ReferenceData::Bf16(f) => {
+            ReferenceData::Bf16(ind.map(|i| (kernels.bf16_fn)(f[i])).collect())
+        }
+        ReferenceData::F64(f) => ReferenceData::F64(ind.map(|i| (kernels.f64_fn)(f[i])).collect()),
         ReferenceData::Int(_) => panic!("unary_impl: no Int kernel — cast to F32 at the call site"),
         ReferenceData::I64(_) => panic!("unary_impl: no I64 kernel — cast to F32 at the call site"),
-        // No F64 transcendental kernel. Refuse loudly rather than
-        // silently bridging through F32 — the caller asked for double
-        // precision and that's not what an F32 bridge delivers. Fix at
-        // the call site: cast inputs to F32 (`x.to(torch.float32)`) and
-        // accept the precision, or wait for a native F64 transcendental
-        // kernel.
-        ReferenceData::F64(_) => panic!(
-            "unary_impl: no F64 transcendental kernel — cast inputs to F32 \
-             at the call site (`x.to(torch.float32)`), or wait for the F64 \
-             transcendental kernel follow-up. Silent F32 bridging is \
-             intentionally rejected: it would hide a precision downgrade \
-             behind an `F64` dtype tag."
-        ),
         ReferenceData::Bool(_) => {
             panic!("unary_impl: no Bool kernel — cast to F32 at the call site")
         }
@@ -1417,9 +1475,12 @@ impl ReferenceOp for Log2 {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.log2(),
-            |f| f.log2(),
-            |f| f.log2(),
+            UnaryKernels {
+                f32_fn: |f| f.log2(),
+                f16_fn: |f| f.log2(),
+                bf16_fn: |f| f.log2(),
+                f64_fn: |f| f.log2(),
+            },
         )
     }
 }
@@ -1489,9 +1550,12 @@ impl ReferenceOp for Exp2 {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.exp2(),
-            |f| f.exp2(),
-            |f| f.exp2(),
+            UnaryKernels {
+                f32_fn: |f| f.exp2(),
+                f16_fn: |f| f.exp2(),
+                bf16_fn: |f| f.exp2(),
+                f64_fn: |f| f.exp2(),
+            },
         )
     }
 }
@@ -1562,9 +1626,12 @@ impl ReferenceOp for Sin {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.sin(),
-            |f| f.sin(),
-            |f| f.sin(),
+            UnaryKernels {
+                f32_fn: |f| f.sin(),
+                f16_fn: |f| f.sin(),
+                bf16_fn: |f| f.sin(),
+                f64_fn: |f| f.sin(),
+            },
         )
     }
 }
@@ -1635,9 +1702,12 @@ impl ReferenceOp for Recip {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.recip(),
-            |f| f.recip(),
-            |f| f.recip(),
+            UnaryKernels {
+                f32_fn: |f| f.recip(),
+                f16_fn: |f| f.recip(),
+                bf16_fn: |f| f.recip(),
+                f64_fn: |f| f.recip(),
+            },
         )
     }
 }
@@ -1708,9 +1778,12 @@ impl ReferenceOp for Sqrt {
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.sqrt(),
-            |f| f.sqrt(),
-            |f| f.sqrt(),
+            UnaryKernels {
+                f32_fn: |f| f.sqrt(),
+                f16_fn: |f| f.sqrt(),
+                bf16_fn: |f| f.sqrt(),
+                f64_fn: |f| f.sqrt(),
+            },
         )
     }
 }
@@ -3135,6 +3208,73 @@ impl Iterator for StridedIterator {
 mod tests {
     use super::*;
 
+    fn assert_f64_unary(op: &dyn ReferenceOp, input: &[f64], expected_fn: fn(f64) -> f64) {
+        let input_data = ReferenceData::F64(input.to_vec());
+        let actual = op.execute(vec![&input_data], &FxHashMap::default());
+        let ReferenceData::F64(actual) = actual else {
+            panic!("F64 unary input must produce an F64 reference buffer")
+        };
+        let expected: Vec<f64> = input.iter().copied().map(expected_fn).collect();
+
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn reference_unary_ops_execute_f64_natively() {
+        let input = [0.25, 0.5, 1.0, 2.0, 4.0];
+        let shape = vec![input.len().into()];
+        let strides = vec!['z'.into()];
+
+        assert_f64_unary(
+            &Log2 {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::log2,
+        );
+        assert_f64_unary(
+            &Exp2 {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::exp2,
+        );
+        assert_f64_unary(
+            &Sin {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::sin,
+        );
+        assert_f64_unary(
+            &Recip {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::recip,
+        );
+        assert_f64_unary(
+            &Sqrt {
+                shape,
+                strides,
+                ..Default::default()
+            },
+            &input,
+            f64::sqrt,
+        );
+    }
+
     fn round_tripped(v: f32) -> f32 {
         let s = Constant(v).to_egglog(&[]);
         let inner = &s["(Op (Constant ".len()..s.len() - ") (INil))".len()];
@@ -3170,6 +3310,36 @@ mod tests {
         ];
         for &v in &adversarial {
             assert_eq!(round_tripped(v).to_bits(), v.to_bits(), "constant {v:?}");
+        }
+    }
+
+    #[test]
+    fn f64_constant_to_egglog_round_trips_exactly() {
+        let adversarial = [
+            0.0f64,
+            -0.0,
+            1.000_000_000_000_000_2,
+            f64::EPSILON,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            std::f64::consts::PI,
+            1e300,
+            -1e-300,
+        ];
+
+        for value in adversarial {
+            let serialized = ConstantF64(value).to_egglog(&[]);
+            let prefix = "(Op (ConstantF64 ";
+            let suffix = ") (INil))";
+            let inner = &serialized[prefix.len()..serialized.len() - suffix.len()];
+            let round_tripped = inner
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("unparseable F64 constant text {inner:?}"));
+            assert_eq!(
+                round_tripped.to_bits(),
+                value.to_bits(),
+                "F64 constant changed across egglog serialization: {value:?}"
+            );
         }
     }
 }

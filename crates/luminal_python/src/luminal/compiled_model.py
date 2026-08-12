@@ -26,7 +26,12 @@ class CompiledModel:
     """Wrapper around CompiledGraph that handles PyTorch tensor conversion."""
 
     def __init__(
-        self, graph_result, weight_refs=None, input_names=None, user_indices=None
+        self,
+        graph_result,
+        weight_refs=None,
+        input_names=None,
+        user_indices=None,
+        scalar_output_positions=(),
     ):
         """Initialize with a compiled CompiledGraph from Rust.
 
@@ -50,6 +55,7 @@ class CompiledModel:
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
         self._user_indices = user_indices
+        self._scalar_output_positions = frozenset(scalar_output_positions)
         self.skip_input_names = frozenset()
         self._is_gpu = getattr(graph_result, "device_type", "cpu") != "cpu"
         self._supports_device_ptrs = getattr(
@@ -292,4 +298,7 @@ class CompiledModel:
                 out = _read_typed_output(name, shape, out_dtype)
             outputs.append(out)
 
-        return tuple(outputs)
+        return tuple(
+            output.item() if i in self._scalar_output_positions else output
+            for i, output in enumerate(outputs)
+        )

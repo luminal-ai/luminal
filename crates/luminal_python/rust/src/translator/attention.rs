@@ -76,13 +76,13 @@ impl<'a> Translator<'a> {
         // Default scale 1/sqrt(head_dim) needs a concrete head_dim;
         // symbolic-shape HF graphs always pass `scale` explicitly.
         let scale = match float_arg("scale") {
-            Some(v) => v as f32,
+            Some(v) => v,
             None => {
                 let head_dim = query.shape.dims.last().and_then(|d| d.to_usize()).context(
                     "SDPA: query head_dim must be concrete to derive the default \
                          scale (pass `scale` explicitly for symbolic head dims)",
                 )?;
-                1.0_f32 / (head_dim as f32).sqrt()
+                1.0_f64 / (head_dim as f64).sqrt()
             }
         };
 

@@ -10,6 +10,28 @@ use std::collections::HashMap;
 
 use crate::typed_data::TypedData;
 
+/// Copy a CPU buffer into Rust-owned storage.
+///
+/// PyTorch legitimately reports `data_ptr() == 0` for an empty tensor, so a
+/// null pointer is valid exactly when there are no bytes to read.  Keeping
+/// this check in one helper gives inputs and weights the same boundary
+/// contract and prevents `from_raw_parts` from ever receiving a null pointer.
+fn copy_host_bytes(ptr: u64, n_bytes: usize, buffer_kind: &str) -> PyResult<Vec<u8>> {
+    if n_bytes == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr == 0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{buffer_kind} pointer is null for a non-empty buffer of {n_bytes} bytes"
+        )));
+    }
+
+    // SAFETY: the caller guarantees that a non-null pointer addresses at
+    // least `n_bytes` readable bytes for the duration of this call.  We copy
+    // immediately, so the resulting Vec does not borrow the source buffer.
+    Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() })
+}
+
 /// Maps symbolic dimension parameter names (e.g. "seq_len") to luminal Expression variable chars.
 pub type DimParamMap = HashMap<String, char>;
 
@@ -355,9 +377,10 @@ impl CompiledGraph {
     }
 
     /// Set input tensor data from a CPU host memory pointer (dtype-aware).
-    /// The pointer must point to contiguous data. `n_bytes` is the total byte count.
+    /// The pointer must point to contiguous data. It may be null only when
+    /// `n_bytes == 0`; otherwise it must address at least `n_bytes` readable bytes.
     /// `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
-    /// Converts source format to luminal's native format (e.g., i64→i32, f64→f32).
+    /// Preserves the source dtype and width in luminal's typed input buffer.
     fn set_input_from_ptr(
         &mut self,
         name: &str,
@@ -365,11 +388,10 @@ impl CompiledGraph {
         n_bytes: usize,
         dtype_code: u32,
     ) -> PyResult<()> {
-        debug_assert!(ptr != 0, "set_input_from_ptr called with null pointer");
         let node_id = self.tensor_ids.get(name).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("Unknown input tensor: {}", name))
         })?;
-        let raw_bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
+        let raw_bytes = copy_host_bytes(ptr, n_bytes, "input")?;
         let typed = TypedData::from_pytorch_bytes(raw_bytes, dtype_code);
         self.runtime
             .set_data_bytes(*node_id, typed.bytes, typed.dtype);
@@ -459,7 +481,9 @@ impl CompiledGraph {
     }
 
     /// Register a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
-    /// `n_bytes` is the total byte count. `dtype_code` uses PT2 numbering (7=f32, 6=f16, 13=bf16, etc.).
+    /// `ptr` may be null only when `n_bytes == 0`; otherwise it must address at
+    /// least `n_bytes` readable bytes. `dtype_code` uses PT2 numbering
+    /// (7=f32, 6=f16, 13=bf16, etc.).
     fn set_weight_from_ptr(
         &mut self,
         label: &str,
@@ -467,11 +491,10 @@ impl CompiledGraph {
         n_bytes: usize,
         dtype_code: u32,
     ) -> PyResult<()> {
-        debug_assert!(ptr != 0, "set_weight_from_ptr called with null pointer");
         let &node_id = self.label_map.get(label).ok_or_else(|| {
             pyo3::exceptions::PyKeyError::new_err(format!("No Input node with label: {}", label))
         })?;
-        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() };
+        let bytes = copy_host_bytes(ptr, n_bytes, "weight")?;
         let typed = TypedData::from_pytorch_bytes(bytes, dtype_code);
         self.runtime
             .set_data_bytes(node_id, typed.bytes, typed.dtype);

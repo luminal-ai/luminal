@@ -239,6 +239,25 @@ pub fn make_ones_bytes(n_elements: usize, dtype: DType) -> Vec<u8> {
 
 /// Convert raw bytes + [`DType`] to [`ReferenceData`].
 pub fn bytes_to_reference_data(bytes: Vec<u8>, dtype: DType) -> ReferenceData {
+    // An empty `Vec<u8>` has no typed allocation to reinterpret. Construct the
+    // correctly typed empty buffer directly so zero-element inputs preserve
+    // their dtype without passing a dangling empty-Vec pointer to
+    // `Vec::from_raw_parts`.
+    if bytes.is_empty() {
+        return match dtype {
+            DType::F32 | DType::TF32 => ReferenceData::F32(Vec::new()),
+            DType::F64 => ReferenceData::F64(Vec::new()),
+            DType::F16 => ReferenceData::F16(Vec::new()),
+            DType::Bf16 => ReferenceData::Bf16(Vec::new()),
+            DType::Int | DType::I8 | DType::U8 | DType::I16 | DType::U16 => {
+                ReferenceData::Int(Vec::new())
+            }
+            DType::I64 => ReferenceData::I64(Vec::new()),
+            DType::Bool => ReferenceData::Bool(Vec::new()),
+            _ => ReferenceData::F32(Vec::new()),
+        };
+    }
+
     // Safety: source bytes are from a valid typed buffer; we reinterpret.
     unsafe fn from_bytes<T: Copy>(bytes: Vec<u8>) -> Vec<T> {
         let n = bytes.len() / std::mem::size_of::<T>();
@@ -413,4 +432,41 @@ pub fn reference_factory(
         None,
         |rt| Box::new(ReferenceDynBackend { runtime: rt }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_bytes_preserve_reference_dtype() {
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::F32),
+            ReferenceData::F32(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::F64),
+            ReferenceData::F64(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::F16),
+            ReferenceData::F16(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::Bf16),
+            ReferenceData::Bf16(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::Int),
+            ReferenceData::Int(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::I64),
+            ReferenceData::I64(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::Bool),
+            ReferenceData::Bool(values) if values.is_empty()
+        ));
+    }
 }

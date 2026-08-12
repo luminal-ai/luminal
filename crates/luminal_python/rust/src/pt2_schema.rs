@@ -50,11 +50,43 @@ pub struct TensorRef {
     pub as_tensor: Option<TensorName>,
     #[serde(default)]
     pub as_tensors: Option<Vec<TensorName>>,
+    #[serde(default)]
+    pub as_sym_int: Option<ScalarName>,
+    #[serde(default)]
+    pub as_sym_float: Option<ScalarName>,
+    #[serde(default)]
+    pub as_sym_bool: Option<ScalarName>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TensorName {
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ScalarName {
+    pub as_name: String,
+}
+
+impl TensorRef {
+    /// Name of either a tensor value or a PT2 scalar value. Luminal represents
+    /// both as GraphTensors; scalar references have an empty shape.
+    pub fn value_name(&self) -> Option<&str> {
+        self.as_tensor
+            .as_ref()
+            .map(|value| value.name.as_str())
+            .or_else(|| self.as_sym_int.as_ref().map(|value| value.as_name.as_str()))
+            .or_else(|| {
+                self.as_sym_float
+                    .as_ref()
+                    .map(|value| value.as_name.as_str())
+            })
+            .or_else(|| {
+                self.as_sym_bool
+                    .as_ref()
+                    .map(|value| value.as_name.as_str())
+            })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +117,8 @@ pub enum Argument {
     Ints(IntsArg),
     SymInts(SymIntsArg),
     SymInt(SymIntArg),
+    SymFloat(SymFloatArg),
+    SymBool(SymBoolArg),
     Expr(ExprArg),
     #[allow(dead_code)]
     ScalarType(ScalarTypeArg),
@@ -160,6 +194,16 @@ pub struct SymIntValue {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct SymFloatArg {
+    pub as_sym_float: ScalarName,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SymBoolArg {
+    pub as_sym_bool: ScalarName,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExprArg {
     pub as_expr: ExprValue,
 }
@@ -205,6 +249,17 @@ impl Argument {
             Argument::Tensor(t) => Some(&t.as_tensor.name),
             _ => None,
         }
+    }
+
+    /// Resolve a PT2 tensor or scalar dataflow reference. Scalar references
+    /// are backed by typed zero-dimensional GraphTensors in the translator.
+    pub fn as_value_name(&self) -> Option<&str> {
+        self.as_tensor_name().or_else(|| match self {
+            Argument::SymInt(value) => Some(value.as_sym_int.as_name.as_str()),
+            Argument::SymFloat(value) => Some(value.as_sym_float.as_name.as_str()),
+            Argument::SymBool(value) => Some(value.as_sym_bool.as_name.as_str()),
+            _ => None,
+        })
     }
 
     pub fn as_int(&self) -> Option<i64> {

@@ -12,6 +12,8 @@ paths remain visible as ordinary test failures.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
+from types import FunctionType
 from typing import Any
 
 import pytest
@@ -19,6 +21,7 @@ import torch
 from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.inductor_utils import clone_preserve_strides_offset
 from torch.testing._internal.opinfo.core import OpInfo, SampleInput
+from torch.testing._utils import freeze_rng_state, wrapper_set_seed
 from torch.utils import _pytree as pytree
 
 from luminal import luminal_backend
@@ -98,6 +101,66 @@ def _call(op: Callable[..., Any], sample: SampleInput) -> Any:
     return op(sample.input, *sample.args, **sample.kwargs)
 
 
+def _call_without_seed_wrapper(op: Callable[..., Any], *args, **kwargs) -> Any:
+    """The traceable body of PyTorch's ``wrapper_set_seed``."""
+
+    return op(*args, **kwargs)
+
+
+def _traceable_opinfo_callable(
+    op: Callable[..., Any],
+) -> tuple[Callable[..., Any], bool]:
+    """Remove only PyTorch's RNG test wrapper from an OpInfo callable.
+
+    Several OpInfos define their public callable as a lambda that invokes
+    ``wrapper_set_seed``. That wrapper enters internal C++ context managers to
+    save RNG state; Dynamo cannot trace their pybind constructors in a full
+    graph. Clone the callable with only that global replaced by its operation
+    body, then reproduce the wrapper's seed and state isolation outside the
+    compiled graph.
+    """
+
+    if not isinstance(op, FunctionType):
+        return op, False
+    if "wrapper_set_seed" not in op.__code__.co_names:
+        return op, False
+    if op.__globals__.get("wrapper_set_seed") is not wrapper_set_seed:
+        return op, False
+
+    traceable_globals = op.__globals__.copy()
+    traceable_globals["wrapper_set_seed"] = _call_without_seed_wrapper
+    traceable = FunctionType(
+        op.__code__,
+        traceable_globals,
+        name=op.__name__,
+        argdefs=op.__defaults__,
+        closure=op.__closure__,
+    )
+    traceable.__kwdefaults__ = op.__kwdefaults__
+    traceable.__annotations__ = op.__annotations__
+    return traceable, True
+
+
+def test_seed_wrapped_opinfos_are_made_traceable() -> None:
+    """Every PyTorch RNG wrapper is removed without changing other OpInfos."""
+
+    wrapper_backed = 0
+    for op in _OPINFOS:
+        op_callable = op.get_op()
+        traceable, changed = _traceable_opinfo_callable(op_callable)
+        is_wrapper_backed = (
+            isinstance(op_callable, FunctionType)
+            and "wrapper_set_seed" in op_callable.__code__.co_names
+            and op_callable.__globals__.get("wrapper_set_seed") is wrapper_set_seed
+        )
+        assert changed is is_wrapper_backed
+        if changed:
+            wrapper_backed += 1
+            assert traceable is not op_callable
+
+    assert wrapper_backed > 0
+
+
 def _assert_close(actual: Any, expected: Any, dtype: torch.dtype) -> None:
     # Unary operations such as acos/acosh promote integral inputs to F32. Base
     # tolerances on the reference output when it has one unambiguous tensor
@@ -153,8 +216,11 @@ def _test_opinfo_sample(
     compiled_sample = _clone_sample(compiled_source)
     if input_layout == "noncontiguous":
         assert _has_noncontiguous_tensor(compiled_sample)
-    torch.manual_seed(0)
-    expected = _call(op.get_op(), eager_sample)
+    op_callable, uses_seed_wrapper = _traceable_opinfo_callable(op.get_op())
+    rng_context = freeze_rng_state if uses_seed_wrapper else nullcontext
+    with rng_context():
+        torch.manual_seed(42 if uses_seed_wrapper else 0)
+        expected = _call(op_callable, eager_sample)
 
     compile_count = 0
 
@@ -168,7 +234,7 @@ def _test_opinfo_sample(
         )
 
     def fn(*args, **kwargs):
-        return op.get_op()(*args, **kwargs)
+        return op_callable(*args, **kwargs)
 
     compiled = torch.compile(
         fn,
@@ -176,8 +242,9 @@ def _test_opinfo_sample(
         fullgraph=True,
         dynamic=False,
     )
-    torch.manual_seed(0)
-    actual = _call(compiled, compiled_sample)
+    with rng_context():
+        torch.manual_seed(42 if uses_seed_wrapper else 0)
+        actual = _call(compiled, compiled_sample)
 
     case_name = f"{op.full_name} {dtype} sample {sample_index} {input_layout}"
     assert compile_count > 0, f"Luminal backend was not invoked for {case_name}"

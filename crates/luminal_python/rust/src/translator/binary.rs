@@ -36,12 +36,35 @@ fn same_dims(
 }
 
 impl<'a> Translator<'a> {
+    fn scalar_constant(&mut self, val: f64, dtype: DType) -> GraphTensor {
+        if dtype == DType::F64 {
+            self.graph.constant_float64(val)
+        } else {
+            self.graph.constant_float(val as f32).cast(dtype)
+        }
+    }
+
+    fn get_explicit_alpha(&self, node: &Node, op: BinaryOp) -> Result<Option<f64>> {
+        if !matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            return Ok(None);
+        }
+        node.inputs
+            .iter()
+            .position(|input| input.name == "alpha")
+            .map(|idx| self.get_float_arg(node, idx))
+            .transpose()
+    }
+
     pub(crate) fn translate_binary_op(&mut self, node: &Node, op: BinaryOp) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
+        let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;
         if let Some(name) = arg1.as_tensor_name() {
             let b = self.get_tensor(name)?;
-            let (a, b) = ensure_same_dtype(a, b);
+            let (a, mut b) = ensure_same_dtype(a, b);
+            if let Some(alpha) = alpha {
+                b = self.apply_scalar_op(b, alpha, BinaryOp::Mul);
+            }
             let (mut a, mut b) = broadcast_binary(a, b);
             let sym_ranges = sym_char_ranges(&self.sym_map);
             normalize_equal_dims(&mut a, &mut b, &sym_ranges);
@@ -62,13 +85,18 @@ impl<'a> Translator<'a> {
             })
         } else {
             if let Some(f) = arg1.as_float() {
-                return Ok(self.apply_scalar_op(a, f as f32, op));
+                return Ok(self.apply_scalar_op_with_alpha(a, f, alpha, op));
             }
             if let Some(expr) = self.resolve_arg_as_expression(arg1) {
+                anyhow::ensure!(
+                    alpha.is_none(),
+                    "{} with an explicit alpha and symbolic scalar operand is not supported",
+                    node.target
+                );
                 return Ok(self.apply_symbolic_scalar_op(a, expr, op));
             }
-            let val = self.get_float_arg(node, 1)? as f32;
-            Ok(self.apply_scalar_op(a, val, op))
+            let val = self.get_float_arg(node, 1)?;
+            Ok(self.apply_scalar_op_with_alpha(a, val, alpha, op))
         }
     }
 
@@ -78,33 +106,56 @@ impl<'a> Translator<'a> {
         op: BinaryOp,
     ) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
+        let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;
         if let Some(f) = arg1.as_float() {
-            return Ok(self.apply_scalar_op(a, f as f32, op));
+            return Ok(self.apply_scalar_op_with_alpha(a, f, alpha, op));
         }
         if let Some(expr) = self.resolve_arg_as_expression(arg1) {
+            anyhow::ensure!(
+                alpha.is_none(),
+                "{} with an explicit alpha and symbolic scalar operand is not supported",
+                node.target
+            );
             return Ok(self.apply_symbolic_scalar_op(a, expr, op));
         }
-        let val = self.get_float_arg(node, 1)? as f32;
-        Ok(self.apply_scalar_op(a, val, op))
+        let val = self.get_float_arg(node, 1)?;
+        Ok(self.apply_scalar_op_with_alpha(a, val, alpha, op))
     }
 
     pub(crate) fn apply_scalar_op(
         &mut self,
         a: GraphTensor,
-        val: f32,
+        val: f64,
         op: BinaryOp,
     ) -> GraphTensor {
-        let scalar = self
-            .graph
-            .constant_float(val)
-            .cast(a.dtype)
-            .expand_rhs(a.shape);
+        let scalar = self.scalar_constant(val, a.dtype).expand_rhs(a.shape);
         match op {
             BinaryOp::Add => a + scalar,
             BinaryOp::Mul => a * scalar,
             BinaryOp::Sub => a - scalar,
             BinaryOp::Div => a / scalar,
+        }
+    }
+
+    fn apply_scalar_op_with_alpha(
+        &mut self,
+        a: GraphTensor,
+        val: f64,
+        alpha: Option<f64>,
+        op: BinaryOp,
+    ) -> GraphTensor {
+        if let Some(alpha) = alpha {
+            let scalar = self.scalar_constant(val, a.dtype).expand_rhs(a.shape);
+            let scaled = self.apply_scalar_op(scalar, alpha, BinaryOp::Mul);
+            match op {
+                BinaryOp::Add => a + scaled,
+                BinaryOp::Mul => a * scaled,
+                BinaryOp::Sub => a - scaled,
+                BinaryOp::Div => a / scaled,
+            }
+        } else {
+            self.apply_scalar_op(a, val, op)
         }
     }
 
