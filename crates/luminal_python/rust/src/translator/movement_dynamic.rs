@@ -191,31 +191,28 @@ pub fn pt2_scatter_nd(
     let mut full_flat_dest = if trailing_is_unit {
         flat_base
     } else {
-        let mut base_expanded = flat_base.expand_dim(1, trailing_numel);
-
-        let trailing_rank = trailing_shape.len();
-        for (ti, d) in (k..data_rank).enumerate() {
-            let ar = data.graph().arange(data_dims[d]);
-            let mut ar_shaped = ar;
-            for _ in ti + 1..trailing_rank {
-                let n = ar_shaped.dims().len();
-                ar_shaped = ar_shaped.expand_dim(n, 1);
-            }
-            for _ in 0..ti {
-                ar_shaped = ar_shaped.expand_dim(0, 1);
-            }
-            ar_shaped.shape.expand(trailing_shape.clone());
-            let mut ar_flat = ar_shaped;
-            ar_flat.shape = ShapeTracker::new(vec![trailing_numel]);
-            ar_flat = ar_flat.expand_dim(0, batch_numel);
-
-            let stride_tensor = data
-                .graph()
-                .constant(data_strides[d])
-                .expand_rhs(ar_flat.shape);
-            base_expanded += ar_flat * stride_tensor;
-        }
-        base_expanded
+        // The trailing offset of flat position `t` is just `t`.
+        //
+        // `data_strides` is row-major over `data_dims`, so `data_strides[k..]`
+        // are exactly the row-major strides of `trailing_shape` — walking the
+        // trailing block in flat order walks memory in step. There is nothing
+        // to weight.
+        //
+        // This replaced a per-dim loop that built an `arange` for each trailing
+        // dim, gave it EXPANDED (0-stride) dims to broadcast, and then
+        // overwrote its ShapeTracker with a contiguous `[trailing_numel]` view.
+        // Overwriting a tracker is a view-only reshape, which is valid only if
+        // the buffer really is laid out that way — an expanded dim is virtual,
+        // so it is not. It went unnoticed because a rank-2 target has
+        // trailing_rank 1 and never introduces an expanded dim; from rank 3 up
+        // it does, and the scatter then wrote one element per row instead of
+        // the whole block.
+        let base_expanded = flat_base.expand_dim(1, trailing_numel);
+        let offsets = data
+            .graph()
+            .arange(trailing_numel)
+            .expand_dim(0, batch_numel);
+        base_expanded + offsets
     };
 
     full_flat_dest = full_flat_dest.flatten();
