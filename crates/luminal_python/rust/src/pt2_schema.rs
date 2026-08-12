@@ -102,6 +102,7 @@ pub struct NodeInput {
     pub arg: Argument,
     /// 1 = positional, 2 = keyword (not formally documented, but observed)
     #[serde(default)]
+    #[allow(dead_code)]
     pub kind: u32,
 }
 
@@ -254,7 +255,7 @@ impl Argument {
     /// Resolve a PT2 tensor or scalar dataflow reference. Scalar references
     /// are backed by typed zero-dimensional GraphTensors in the translator.
     pub fn as_value_name(&self) -> Option<&str> {
-        self.as_tensor_name().or_else(|| match self {
+        self.as_tensor_name().or(match self {
             Argument::SymInt(value) => Some(value.as_sym_int.as_name.as_str()),
             Argument::SymFloat(value) => Some(value.as_sym_float.as_name.as_str()),
             Argument::SymBool(value) => Some(value.as_sym_bool.as_name.as_str()),

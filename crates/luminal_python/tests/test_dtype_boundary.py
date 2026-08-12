@@ -1,10 +1,9 @@
-from dataclasses import dataclass
 import warnings
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 import torch
-
 from luminal import luminal_backend
 from luminal.dtype_util import torch_dtype_code
 
@@ -19,9 +18,7 @@ class BoundaryNoopModel(torch.nn.Module):
 class EmptyWeightModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.register_buffer(
-            "weight", torch.empty((0, 3), dtype=torch.float32)
-        )
+        self.register_buffer("weight", torch.empty((0, 3), dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.weight
@@ -53,6 +50,39 @@ class AddScalarWithAlphaModel(torch.nn.Module):
 class ItemModel(torch.nn.Module):
     def forward(self, x: torch.Tensor):
         return x.item()
+
+
+class ArangeModel(torch.nn.Module):
+    def __init__(
+        self,
+        start,
+        end,
+        step,
+        dtype: torch.dtype,
+        *,
+        keyword_end: bool = False,
+    ) -> None:
+        super().__init__()
+        self.start = start
+        self.end = end
+        self.step = step
+        self.dtype = dtype
+        self.keyword_end = keyword_end
+
+    def forward(self) -> torch.Tensor:
+        if self.keyword_end:
+            return torch.arange(
+                self.start,
+                end=self.end,
+                step=self.step,
+                dtype=self.dtype,
+            )
+        return torch.arange(
+            self.start,
+            self.end,
+            self.step,
+            dtype=self.dtype,
+        )
 
 
 @dataclass(frozen=True)
@@ -328,6 +358,44 @@ def test_item_returns_exact_python_scalar(
     assert type(actual) is python_type
     assert type(actual) is type(expected)
     assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "step", "dtype", "keyword_end"),
+    [
+        pytest.param(-1, 2, 2, torch.float32, False, id="ceil-length"),
+        pytest.param(0.0, -8.000001, -4.0, torch.float64, False, id="negative-step"),
+        pytest.param(-0.9, 2.1, 2.0, torch.int32, False, id="fractional-to-int"),
+        pytest.param(False, True, True, torch.bfloat16, False, id="bool-scalars"),
+        pytest.param(0, 3.1, 1, torch.float16, True, id="keyword-end"),
+        pytest.param(1, 5, 2, torch.int64, False, id="int64-output"),
+        pytest.param(1.1, 1.1, -1.0, torch.float32, False, id="empty"),
+    ],
+)
+def test_arange_uses_exported_shape_and_declared_dtype(
+    start,
+    end,
+    step,
+    dtype: torch.dtype,
+    keyword_end: bool,
+) -> None:
+    """PT2 metadata owns arange's ceiling/endpoint shape semantics, while
+    the lowering preserves every scalar slot and materializes the declared
+    output dtype instead of leaking Iota's internal I32 dtype."""
+    model = ArangeModel(
+        start,
+        end,
+        step,
+        dtype,
+        keyword_end=keyword_end,
+    )
+    compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
+
+    expected = model()
+    actual = compiled()
+
+    assert actual.dtype == dtype
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
 
 
 def test_nonempty_cpu_input_rejects_null_pointer() -> None:
