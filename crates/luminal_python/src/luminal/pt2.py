@@ -139,7 +139,11 @@ def _box_scalar_graph_outputs(gm):
 
     boxed_outputs = []
     for value in flat_outputs:
-        example = value.meta.get("example_value") if isinstance(value, torch.fx.Node) else value
+        example = (
+            value.meta.get("example_value")
+            if isinstance(value, torch.fx.Node)
+            else value
+        )
         if isinstance(example, torch.Tensor):
             boxed_outputs.append(value)
             compiled_position += 1
@@ -153,7 +157,9 @@ def _box_scalar_graph_outputs(gm):
             continue
 
         with gm.graph.inserting_before(output):
-            boxed = gm.graph.call_function(torch.scalar_tensor, (value,), {"dtype": dtype})
+            boxed = gm.graph.call_function(
+                torch.scalar_tensor, (value,), {"dtype": dtype}
+            )
         boxed_outputs.append(boxed)
         scalar_output_positions.append(compiled_position)
         compiled_position += 1
@@ -905,8 +911,13 @@ def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
         # Dynamo is still relying on, and running it inside the backend frame
         # corrupts the freshly-installed guards.
         return _LazyDynamicCompiledModel(
-            gm, user_inputs, user_indices, dynamic_shapes, factory,
-            search_iterations, scalar_output_positions,
+            gm,
+            user_inputs,
+            user_indices,
+            dynamic_shapes,
+            factory,
+            search_iterations,
+            scalar_output_positions,
         )
 
     return _eager_pt2_compile(

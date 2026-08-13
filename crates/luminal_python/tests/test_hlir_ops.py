@@ -421,9 +421,7 @@ def test_acosh(device: torch.device):
     x = torch.cat(
         (
             torch.linspace(1.0, 10.0, 257, device=device),
-            torch.tensor(
-                [0.0, 0.5, torch.inf, -torch.inf, torch.nan], device=device
-            ),
+            torch.tensor([0.0, 0.5, torch.inf, -torch.inf, torch.nan], device=device),
         )
     )
     torch.testing.assert_close(
@@ -439,9 +437,7 @@ def test_acosh_promotes_integral_input(device: torch.device, dtype: torch.dtype)
     x = torch.tensor(values, device=device, dtype=dtype)
     output = compiled(x)
     assert output.dtype == torch.float32
-    torch.testing.assert_close(
-        output, model(x), rtol=1e-5, atol=1e-5, equal_nan=True
-    )
+    torch.testing.assert_close(output, model(x), rtol=1e-5, atol=1e-5, equal_nan=True)
 
 
 def test_transpose_2d(device: torch.device):
