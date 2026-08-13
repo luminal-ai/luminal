@@ -11,20 +11,21 @@ paths remain visible as ordinary test failures.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
+from itertools import pairwise
 from types import FunctionType
 from typing import Any
 
 import pytest
 import torch
+from luminal import luminal_backend
 from torch.testing._internal.common_methods_invocations import op_db
 from torch.testing._internal.inductor_utils import clone_preserve_strides_offset
 from torch.testing._internal.opinfo.core import OpInfo, SampleInput
 from torch.testing._utils import freeze_rng_state, wrapper_set_seed
 from torch.utils import _pytree as pytree
-
-from luminal import luminal_backend
 
 # PyTorch owns the complete operation inventory, metadata, and generated inputs
 # through ``op_db``. Every OpInfo is collected; unsupported Luminal paths should
@@ -80,7 +81,57 @@ def _opinfo_dtype_cases() -> tuple:
     return tuple(cases)
 
 
-_OPINFO_DTYPE_CASES = _opinfo_dtype_cases()
+def _opinfo_shard_bounds(total: int, index: int, count: int) -> tuple[int, int]:
+    """Return one gap-free, near-even interval of the OpInfo parent cases."""
+
+    if count <= 0:
+        raise ValueError(f"LUMINAL_OPINFO_SHARD_COUNT must be positive, got {count}")
+    if not 0 <= index < count:
+        raise ValueError(
+            "LUMINAL_OPINFO_SHARD_INDEX must satisfy "
+            f"0 <= index < count, got index={index}, count={count}"
+        )
+    if count > total:
+        raise ValueError(
+            "LUMINAL_OPINFO_SHARD_COUNT cannot exceed the number of OpInfo "
+            f"parent cases, got count={count}, total={total}"
+        )
+    return total * index // count, total * (index + 1) // count
+
+
+def _shard_opinfo_dtype_cases(cases: tuple) -> tuple:
+    """Select this process's deterministic interval of the complete suite.
+
+    Sharding changes only how the parent cases are distributed across workers.
+    Each selected parent still exercises every PyTorch-generated sample and its
+    noncontiguous variant. With indices ``0..count-1``, the intervals are
+    disjoint and their union is the complete OpInfo x CPU-dtype inventory.
+    """
+
+    try:
+        count = int(os.environ.get("LUMINAL_OPINFO_SHARD_COUNT", "1"))
+        index = int(os.environ.get("LUMINAL_OPINFO_SHARD_INDEX", "0"))
+    except ValueError as error:
+        raise ValueError(
+            "LUMINAL_OPINFO_SHARD_INDEX and LUMINAL_OPINFO_SHARD_COUNT must be integers"
+        ) from error
+    start, end = _opinfo_shard_bounds(len(cases), index, count)
+    return cases[start:end]
+
+
+_ALL_OPINFO_DTYPE_CASES = _opinfo_dtype_cases()
+_OPINFO_DTYPE_CASES = _shard_opinfo_dtype_cases(_ALL_OPINFO_DTYPE_CASES)
+
+
+@pytest.mark.parametrize(("total", "count"), ((1, 1), (7, 3), (6121, 32)))
+def test_opinfo_shard_bounds_cover_inventory(total: int, count: int) -> None:
+    """Every shard count partitions its inventory without gaps or overlap."""
+
+    bounds = [_opinfo_shard_bounds(total, index, count) for index in range(count)]
+    assert bounds[0][0] == 0
+    assert bounds[-1][1] == total
+    assert all(left[1] == right[0] for left, right in pairwise(bounds))
+    assert sum(end - start for start, end in bounds) == total
 
 
 def _clone_sample(sample: SampleInput) -> SampleInput:
