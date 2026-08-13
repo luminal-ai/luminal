@@ -1122,6 +1122,8 @@ impl ReferenceOp for Constant {
 }
 
 /// Produces a single F64 constant without narrowing through F32.
+///
+/// Temporary: delete this op once `Constant` is converted to a typed constant.
 #[derive(Clone, PartialEq, Default)]
 pub struct ConstantF64(pub f64);
 
