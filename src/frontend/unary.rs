@@ -264,7 +264,19 @@ impl GraphTensor {
 
     /// Take the absolute value
     pub fn abs(self) -> GraphTensor {
-        self.relu() + (-self).relu()
+        match self.dtype {
+            DType::U4 | DType::U8 | DType::U16 => self,
+            DType::I4 | DType::I8 | DType::I16 | DType::Int | DType::I64 => {
+                let zero = self
+                    .graph()
+                    .constant_float(0.0)
+                    .cast(self.dtype)
+                    .expand_rhs(self.shape);
+                let negative = self.lt(zero).cast(self.dtype);
+                self * (1.0 - negative * 2.0)
+            }
+            _ => self.relu() + (-self).relu(),
+        }
     }
 
     /// Get the sign of each element, '1' for positive and '-1' for negative

@@ -588,6 +588,39 @@ impl CompiledGraph {
         Ok(self.runtime.get_output_i64(*node_id))
     }
 
+    /// Read an output as i8 without widening.
+    fn get_output_i8(&self, name: &str) -> PyResult<Vec<i8>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_i8(*node_id))
+    }
+
+    /// Read an output as u8 without widening.
+    fn get_output_u8(&self, name: &str) -> PyResult<Vec<u8>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_u8(*node_id))
+    }
+
+    /// Read an output as i16 without widening.
+    fn get_output_i16(&self, name: &str) -> PyResult<Vec<i16>> {
+        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
+                "Unknown output tensor: {}",
+                name
+            ))
+        })?;
+        Ok(self.runtime.get_output_i16(*node_id))
+    }
+
     /// Read an output as f64. Strict: the producer node must already
     /// be `DType::F64`; no widening at the read boundary.
     fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {

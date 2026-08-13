@@ -150,12 +150,8 @@ impl TypedData {
 
     /// Convert raw bytes from a PyTorch tensor (identified by PT2 dtype
     /// code) to `TypedData`. Supported dtypes preserve their raw bytes —
-    /// no width changes at the FFI boundary. Narrow integer widths
-    /// (`Byte` / `Char` / `Short`) panic: luminal's `ReferenceData` has no
-    /// narrower-integer variants yet, so the only way they could pass
-    /// through is via implicit widening to `i32`, which the no-implicit-
-    /// cast directive forbids. Cast at the call site
-    /// (`x.to(torch.int32)`) or wait for the narrower-int IR follow-up.
+    /// no width changes at the FFI boundary, including Byte/U8, Char/I8,
+    /// and Short/I16.
     pub fn from_pytorch_bytes(bytes: Vec<u8>, dtype_code: u32) -> Self {
         let t = crate::torch_dtype::TorchDType::from_code(dtype_code)
             .unwrap_or_else(|c| panic!("from_pytorch_bytes: unknown PT2 dtype code {c}"));
@@ -167,15 +163,9 @@ impl TypedData {
             crate::torch_dtype::TorchDType::Bool => Self::from_raw(bytes, DType::Bool),
             crate::torch_dtype::TorchDType::Long => Self::from_raw(bytes, DType::I64),
             crate::torch_dtype::TorchDType::Double => Self::from_raw(bytes, DType::F64),
-            crate::torch_dtype::TorchDType::Byte
-            | crate::torch_dtype::TorchDType::Char
-            | crate::torch_dtype::TorchDType::Short => panic!(
-                "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
-                 IR type yet — cast to torch.int32 at the call site, or wait \
-                 for the narrower-int IR follow-up.",
-                t.name(),
-                t.code(),
-            ),
+            crate::torch_dtype::TorchDType::Byte => Self::from_raw(bytes, DType::U8),
+            crate::torch_dtype::TorchDType::Char => Self::from_raw(bytes, DType::I8),
+            crate::torch_dtype::TorchDType::Short => Self::from_raw(bytes, DType::I16),
             other => panic!(
                 "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
                  IR type — no luminal mapping.",
@@ -282,22 +272,18 @@ impl From<TypedData> for ReferenceData {
                 let data: Vec<bool> = td.bytes.iter().map(|&b| b != 0).collect();
                 ReferenceData::Bool(data)
             }
-            // Integer types that map to ReferenceData::Int
             DType::I8 => {
-                let data: Vec<i32> = td.bytes.iter().map(|&b| b as i8 as i32).collect();
-                ReferenceData::Int(data)
+                let data: Vec<i8> = td.bytes.into_iter().map(|b| b as i8).collect();
+                ReferenceData::I8(data)
             }
-            DType::U8 => {
-                let data: Vec<i32> = td.bytes.iter().map(|&b| b as i32).collect();
-                ReferenceData::Int(data)
-            }
+            DType::U8 => ReferenceData::U8(td.bytes),
             DType::I16 => {
-                let data: Vec<i32> = td
+                let data: Vec<i16> = td
                     .bytes
                     .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]) as i32)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]]))
                     .collect();
-                ReferenceData::Int(data)
+                ReferenceData::I16(data)
             }
             DType::U16 => {
                 let data: Vec<i32> = td

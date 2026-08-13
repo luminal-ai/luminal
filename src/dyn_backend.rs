@@ -50,6 +50,15 @@ pub trait DynBackend {
     fn get_output_i64(&self, _node: NodeIndex) -> Vec<i64> {
         panic!("get_output_i64 not supported by '{}'", self.name());
     }
+    fn get_output_i8(&self, _node: NodeIndex) -> Vec<i8> {
+        panic!("get_output_i8 not supported by '{}'", self.name());
+    }
+    fn get_output_u8(&self, _node: NodeIndex) -> Vec<u8> {
+        panic!("get_output_u8 not supported by '{}'", self.name());
+    }
+    fn get_output_i16(&self, _node: NodeIndex) -> Vec<i16> {
+        panic!("get_output_i16 not supported by '{}'", self.name());
+    }
     fn get_output_f64(&self, _node: NodeIndex) -> Vec<f64> {
         panic!("get_output_f64 not supported by '{}'", self.name());
     }
@@ -249,10 +258,12 @@ pub fn bytes_to_reference_data(bytes: Vec<u8>, dtype: DType) -> ReferenceData {
             DType::F64 => ReferenceData::F64(Vec::new()),
             DType::F16 => ReferenceData::F16(Vec::new()),
             DType::Bf16 => ReferenceData::Bf16(Vec::new()),
-            DType::Int | DType::I8 | DType::U8 | DType::I16 | DType::U16 => {
-                ReferenceData::Int(Vec::new())
-            }
+            DType::Int => ReferenceData::Int(Vec::new()),
             DType::I64 => ReferenceData::I64(Vec::new()),
+            DType::I8 => ReferenceData::I8(Vec::new()),
+            DType::U8 => ReferenceData::U8(Vec::new()),
+            DType::I16 => ReferenceData::I16(Vec::new()),
+            DType::U16 => ReferenceData::Int(Vec::new()),
             DType::Bool => ReferenceData::Bool(Vec::new()),
             _ => ReferenceData::F32(Vec::new()),
         };
@@ -273,12 +284,9 @@ pub fn bytes_to_reference_data(bytes: Vec<u8>, dtype: DType) -> ReferenceData {
         DType::Int => ReferenceData::Int(unsafe { from_bytes(bytes) }),
         DType::I64 => ReferenceData::I64(unsafe { from_bytes(bytes) }),
         DType::Bool => ReferenceData::Bool(bytes.into_iter().map(|b| b != 0).collect()),
-        DType::I8 => ReferenceData::Int(bytes.iter().map(|&b| b as i8 as i32).collect()),
-        DType::U8 => ReferenceData::Int(bytes.iter().map(|&b| b as i32).collect()),
-        DType::I16 => {
-            let i16s: Vec<i16> = unsafe { from_bytes(bytes) };
-            ReferenceData::Int(i16s.into_iter().map(|v| v as i32).collect())
-        }
+        DType::I8 => ReferenceData::I8(bytes.into_iter().map(|b| b as i8).collect()),
+        DType::U8 => ReferenceData::U8(bytes),
+        DType::I16 => ReferenceData::I16(unsafe { from_bytes(bytes) }),
         DType::U16 => {
             let u16s: Vec<u16> = unsafe { from_bytes(bytes) };
             ReferenceData::Int(u16s.into_iter().map(|v| v as i32).collect())
@@ -360,6 +368,39 @@ impl DynBackend for ReferenceDynBackend {
             other => panic!(
                 "get_output_i64: buffer dtype is {:?}, expected I64. \
                  Add a `Cast(DType::I64)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_i8(&self, node: NodeIndex) -> Vec<i8> {
+        match self.output_buffer(node) {
+            ReferenceData::I8(v) => v.clone(),
+            other => panic!(
+                "get_output_i8: buffer dtype is {:?}, expected I8. \
+                 Add a `Cast(DType::I8)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_u8(&self, node: NodeIndex) -> Vec<u8> {
+        match self.output_buffer(node) {
+            ReferenceData::U8(v) => v.clone(),
+            other => panic!(
+                "get_output_u8: buffer dtype is {:?}, expected U8. \
+                 Add a `Cast(DType::U8)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_i16(&self, node: NodeIndex) -> Vec<i16> {
+        match self.output_buffer(node) {
+            ReferenceData::I16(v) => v.clone(),
+            other => panic!(
+                "get_output_i16: buffer dtype is {:?}, expected I16. \
+                 Add a `Cast(DType::I16)` before the Output.",
                 std::mem::discriminant(other)
             ),
         }
@@ -465,8 +506,36 @@ mod tests {
             ReferenceData::I64(values) if values.is_empty()
         ));
         assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::I8),
+            ReferenceData::I8(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::U8),
+            ReferenceData::U8(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::I16),
+            ReferenceData::I16(values) if values.is_empty()
+        ));
+        assert!(matches!(
             bytes_to_reference_data(Vec::new(), DType::Bool),
             ReferenceData::Bool(values) if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn narrow_integer_bytes_preserve_width_and_signedness() {
+        assert!(matches!(
+            bytes_to_reference_data(vec![0x80, 0xff, 0x7f], DType::I8),
+            ReferenceData::I8(values) if values == [-128, -1, 127]
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(vec![0, 128, 255], DType::U8),
+            ReferenceData::U8(values) if values == [0, 128, 255]
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(vec![0x00, 0x80, 0xff, 0x7f], DType::I16),
+            ReferenceData::I16(values) if values == [-32_768, 32_767]
         ));
     }
 }

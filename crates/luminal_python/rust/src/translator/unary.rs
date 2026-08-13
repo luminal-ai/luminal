@@ -66,7 +66,9 @@ impl<'a> Translator<'a> {
     pub(crate) fn translate_acos(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
         let input = match input.dtype {
-            DType::Bool | DType::Int | DType::I64 => input.cast(DType::F32),
+            DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+                input.cast(DType::F32)
+            }
             _ => input,
         };
         let x = input.abs();
@@ -106,7 +108,9 @@ impl<'a> Translator<'a> {
     pub(crate) fn translate_acosh(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
         let input = match input.dtype {
-            DType::Bool | DType::Int | DType::I64 => input.cast(DType::F32),
+            DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
+                input.cast(DType::F32)
+            }
             _ => input,
         };
         let reciprocal_squared = input.reciprocal().square();
