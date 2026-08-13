@@ -65,6 +65,13 @@ impl<'a> Translator<'a> {
     #[allow(clippy::excessive_precision)]
     pub(crate) fn translate_acos(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
+        Ok(self.real_acos(input))
+    }
+
+    /// Elementwise real acos used by both real ATen dispatch and compound
+    /// complex inverse functions.
+    #[allow(clippy::excessive_precision)]
+    pub(crate) fn real_acos(&mut self, input: GraphTensor) -> GraphTensor {
         let input = match input.dtype {
             DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
                 input.cast(DType::F32)
@@ -75,23 +82,24 @@ impl<'a> Translator<'a> {
 
         // Horner form, highest-order coefficient first. The maximum absolute
         // approximation error in F32 is below 3e-7 over the real acos domain.
-        let polynomial = 0.000_684_531_8 * x - 0.003_974_577_8;
-        let polynomial = polynomial * x + 0.011_028_381;
-        let polynomial = polynomial * x - 0.020_727_666;
-        let polynomial = polynomial * x + 0.032_571_17;
-        let polynomial = polynomial * x - 0.050_593_574;
-        let polynomial = polynomial * x + 0.089_030_14;
-        let polynomial = polynomial * x - 0.214_601_16;
-        let polynomial = polynomial * x + std::f32::consts::FRAC_PI_2;
-        let positive = polynomial * (1.0 - x).sqrt();
+        let polynomial =
+            self.constant_like(x, 0.000_684_531_8) * x - self.constant_like(x, 0.003_974_577_8);
+        let polynomial = polynomial * x + self.constant_like(x, 0.011_028_381);
+        let polynomial = polynomial * x - self.constant_like(x, 0.020_727_666);
+        let polynomial = polynomial * x + self.constant_like(x, 0.032_571_17);
+        let polynomial = polynomial * x - self.constant_like(x, 0.050_593_574);
+        let polynomial = polynomial * x + self.constant_like(x, 0.089_030_14);
+        let polynomial = polynomial * x - self.constant_like(x, 0.214_601_16);
+        let half_pi = self.constant_like(x, std::f64::consts::FRAC_PI_2);
+        let polynomial = polynomial * x + half_pi;
+        let one = self.constant_like(x, 1.0);
+        let positive = polynomial * (one - x).sqrt();
 
-        let zero = self
-            .graph
-            .constant_float(0.0)
-            .cast(input.dtype)
-            .expand_rhs(input.shape);
+        let zero = self.constant_like(input, 0.0);
         let negative = input.lt(zero).cast(input.dtype);
-        Ok(positive + negative * (std::f32::consts::PI - 2.0 * positive))
+        let pi = self.constant_like(input, std::f64::consts::PI);
+        let two = self.constant_like(input, 2.0);
+        positive + negative * (pi - two * positive)
     }
 
     /// Translate `aten.acosh.default` into existing elementwise HLIR primitives.
@@ -107,6 +115,12 @@ impl<'a> Translator<'a> {
     /// operations, while floating inputs retain their dtype.
     pub(crate) fn translate_acosh(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.get_input_tensor(node, 0)?;
+        Ok(self.real_acosh(input))
+    }
+
+    /// Elementwise real acosh used by both real ATen dispatch and compound
+    /// complex inverse functions.
+    pub(crate) fn real_acosh(&mut self, input: GraphTensor) -> GraphTensor {
         let input = match input.dtype {
             DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
                 input.cast(DType::F32)
@@ -114,7 +128,8 @@ impl<'a> Translator<'a> {
             _ => input,
         };
         let reciprocal_squared = input.reciprocal().square();
-        Ok(input.log() + (1.0 + (1.0 - reciprocal_squared).sqrt()).log())
+        let one = self.constant_like(input, 1.0);
+        input.log() + (one + (one - reciprocal_squared).sqrt()).log()
     }
 
     /// Translate `aten.gelu`, honoring the `approximate` kwarg. PyTorch's default

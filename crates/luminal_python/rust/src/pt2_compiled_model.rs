@@ -9,6 +9,7 @@ use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, Weight
 use crate::pt2_expr::parse_sympy_expr;
 use crate::pt2_parser;
 use crate::pt2_schema;
+use crate::torch_dtype::TorchDType;
 use crate::translator;
 use crate::typed_data::TypedData;
 
@@ -168,6 +169,11 @@ pub fn translate_pt2(
         .iter()
         .map(|(name, _)| name.clone())
         .collect();
+    let input_dtypes: Vec<u32> = translated
+        .user_input_ids
+        .iter()
+        .map(|(name, _)| parsed.tensor_meta(name).map(|meta| meta.dtype).unwrap_or(7))
+        .collect();
     let output_names: Vec<String> = translated
         .output_ids
         .iter()
@@ -231,7 +237,10 @@ pub fn translate_pt2(
                 .sizes
                 .iter()
                 .map(|s| s.hint().unwrap_or(1) as usize)
-                .product();
+                .product::<usize>()
+                * TorchDType::from_code(meta.dtype)
+                    .map(TorchDType::storage_factor)
+                    .unwrap_or(1);
             tensor_sizes.insert(original_name.to_string(), n);
         }
     }
@@ -245,7 +254,10 @@ pub fn translate_pt2(
                 .sizes
                 .iter()
                 .map(|s| s.hint().unwrap_or(1) as usize)
-                .product();
+                .product::<usize>()
+                * TorchDType::from_code(meta.dtype)
+                    .map(TorchDType::storage_factor)
+                    .unwrap_or(1);
             tensor_sizes.insert(name.clone(), n);
         }
     }
@@ -256,6 +268,7 @@ pub fn translate_pt2(
         graph,
         tensor_ids,
         input_names,
+        input_dtypes,
         output_names,
         output_dtypes,
         output_shape_exprs,
@@ -333,7 +346,10 @@ fn preload_constants(
             .sizes
             .iter()
             .map(|s| s.hint().unwrap_or(1) as usize)
-            .product();
+            .product::<usize>()
+            * TorchDType::from_code(entry.tensor_meta.dtype)
+                .map(TorchDType::storage_factor)
+                .unwrap_or(1);
         sizes.insert(name.clone(), n);
 
         let raw_bytes = match pt2_parser::read_constant_bytes(

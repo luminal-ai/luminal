@@ -51,8 +51,22 @@ impl<'a> Translator<'a> {
         node.inputs
             .iter()
             .position(|input| input.name == "alpha")
-            .map(|idx| self.get_float_arg(node, idx))
+            .map(|idx| {
+                node.inputs[idx]
+                    .arg
+                    .as_bool()
+                    .map(|value| if value { 1.0 } else { 0.0 })
+                    .map(Ok)
+                    .unwrap_or_else(|| self.get_float_arg(node, idx))
+            })
             .transpose()
+    }
+
+    /// Lower boolean OR through numeric HLIR ops until HLIR has native logical ops.
+    pub(crate) fn apply_bool_or(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        let a = a.cast(DType::F32);
+        let b = b.cast(DType::F32);
+        (a + b - a * b).cast(DType::Bool)
     }
 
     pub(crate) fn translate_binary_op(&mut self, node: &Node, op: BinaryOp) -> Result<GraphTensor> {
@@ -62,7 +76,8 @@ impl<'a> Translator<'a> {
         if let Some(name) = arg1.as_tensor_name() {
             let b = self.get_tensor(name)?;
             let (a, mut b) = ensure_same_dtype(a, b);
-            if let Some(alpha) = alpha {
+            let is_bool_add = matches!(op, BinaryOp::Add) && a.dtype == DType::Bool;
+            if !is_bool_add && let Some(alpha) = alpha {
                 b = self.apply_scalar_op(b, alpha, BinaryOp::Mul);
             }
             let (mut a, mut b) = broadcast_binary(a, b);
@@ -76,6 +91,16 @@ impl<'a> Translator<'a> {
                     node.target,
                     node.inputs
                 );
+            }
+            if is_bool_add {
+                // PyTorch defines bool + bool as logical OR. Its alpha scales
+                // the RHS in boolean space, so zero drops it and any nonzero
+                // integral value leaves its truth value unchanged.
+                return Ok(if alpha == Some(0.0) {
+                    a
+                } else {
+                    self.apply_bool_or(a, b)
+                });
             }
             Ok(match op {
                 BinaryOp::Add => a + b,

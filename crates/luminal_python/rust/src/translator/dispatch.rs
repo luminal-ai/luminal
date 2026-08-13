@@ -45,8 +45,23 @@ impl<'a> Translator<'a> {
                 .first()
                 .and_then(TensorRef::value_name)
                 .context("item/local_scalar_dense is missing its scalar output name")?;
-            let scalar = reshape_tensor(self.get_input_tensor(node, 0)?, vec![]);
-            self.tensors.insert(name.to_string(), scalar);
+            let input_name = node.inputs[0]
+                .arg
+                .as_value_name()
+                .context("item/local_scalar_dense input is not tensor-backed")?;
+            if let Some(value) = self.complex_tensors.get(input_name).copied() {
+                self.complex_tensors.insert(
+                    name.to_string(),
+                    super::complex::ComplexTensor::new(
+                        reshape_tensor(value.real, vec![]),
+                        reshape_tensor(value.imag, vec![]),
+                        value.torch_dtype,
+                    ),
+                );
+            } else {
+                let scalar = reshape_tensor(self.get_tensor(input_name)?, vec![]);
+                self.tensors.insert(name.to_string(), scalar);
+            }
             return Ok(());
         }
 
@@ -55,6 +70,14 @@ impl<'a> Translator<'a> {
             .iter()
             .any(|o| o.as_tensor.is_some() || o.as_tensors.is_some());
         if !has_tensor_output {
+            return Ok(());
+        }
+
+        // Complex is a frontend virtual type. Route every node that consumes
+        // or produces one through algebraic real-component lowerings before
+        // the ordinary GraphTensor-only dispatch below.
+        if self.node_uses_complex(node, &output_name) {
+            self.translate_complex_node(node, &output_name)?;
             return Ok(());
         }
 
@@ -310,9 +333,7 @@ impl<'a> Translator<'a> {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
-                let a = a.cast(DType::F32);
-                let b = b.cast(DType::F32);
-                (a + b - a * b).cast(DType::Bool)
+                self.apply_bool_or(a, b)
             }
             "torch.ops.aten.logical_xor.default" => {
                 let a = self.get_input_tensor(node, 0)?;

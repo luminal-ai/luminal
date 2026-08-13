@@ -149,6 +149,11 @@ class CompiledModel:
                     "cast (and warn) on every call, which masked precision "
                     "bugs and burnt cycles on per-call allocation+copy."
                 )
+            # A conjugated complex tensor may be a metadata-only view whose
+            # physical bytes have not been conjugated. The real-component
+            # HLIR input consumes physical interleaved values, so resolve the
+            # view bit before exposing its pointer.
+            tensor = tensor.resolve_conj() if tensor.is_complex() else tensor
             if self._supports_device_ptrs and tensor.is_cuda:
                 t = tensor.detach().contiguous()
                 n_bytes = t.numel() * t.element_size()
@@ -193,7 +198,20 @@ class CompiledModel:
         # `torch.frombuffer`. That's a reinterpret, not a numeric
         # cast — no precision change.
         #
-        _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
+        _complex_components = {
+            torch.complex32: torch.float16,
+            torch.complex64: torch.float32,
+            torch.complex128: torch.float64,
+        }
+        _zero_copy_native_floats = (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+            # These use f32/f16 HLIR output storage respectively; a complex
+            # PyTorch allocation has the same interleaved byte layout.
+            torch.complex64,
+            torch.complex32,
+        )
         _output_readers = {
             torch.float32: ("get_output", torch.float32),
             torch.float64: ("get_output_f64", torch.float64),
@@ -222,7 +240,9 @@ class CompiledModel:
             and `.view(half)` so the conversion is a reinterpret of the
             bytes, not a numeric cast.
             """
-            entry = _output_readers.get(out_dtype)
+            component_dtype = _complex_components.get(out_dtype)
+            read_dtype = component_dtype or out_dtype
+            entry = _output_readers.get(read_dtype)
             if entry is None:
                 raise NotImplementedError(
                     f"Output '{name}' declared dtype {out_dtype} isn't "
@@ -230,21 +250,25 @@ class CompiledModel:
                     f"getter for this dtype (see `_output_readers`) or cast "
                     f"the output to a supported dtype upstream."
                 )
-            getter_name, read_dtype = entry
+            getter_name, reader_dtype = entry
             data = getattr(self._graph, getter_name)(name)
             if len(data) == 0:
                 if all(d != 0 for d in shape):
                     return None
                 return torch.empty(tuple(shape), dtype=out_dtype, device=input_device)
-            if out_dtype in (torch.float16, torch.bfloat16, torch.uint8):
+            if read_dtype in (torch.float16, torch.bfloat16, torch.uint8):
                 # Getter returned an immutable `bytes` from Rust; wrap in
                 # `bytearray` to make the storage writable (suppresses
                 # the "non-writable buffer" warning), then bit-cast via
                 # `frombuffer` — no numeric conversion.
-                tensor = torch.frombuffer(bytearray(data), dtype=out_dtype)
+                tensor = torch.frombuffer(bytearray(data), dtype=read_dtype)
             else:
-                tensor = torch.tensor(data, dtype=read_dtype)
-            tensor = tensor.reshape(tuple(shape))
+                tensor = torch.tensor(data, dtype=reader_dtype)
+            if component_dtype is not None:
+                tensor = tensor.reshape((*tuple(shape), 2))
+                tensor = torch.view_as_complex(tensor)
+            else:
+                tensor = tensor.reshape(tuple(shape))
             return tensor.to(input_device)
 
         # Pre-allocation is GPU-only: the CUDA kernel needs the

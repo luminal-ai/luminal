@@ -665,7 +665,7 @@ def _legacy_auto_dim(example_args):
     first = example_args[0]
     if not torch.is_tensor(first):
         return None
-    if first.is_floating_point():
+    if first.is_floating_point() or first.is_complex():
         return None
     if first.dim() < 2:
         return None

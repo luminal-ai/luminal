@@ -96,20 +96,15 @@ fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(char, usiz
     Some((var, candidate))
 }
 
-/// Convert luminal `DType` to a PT2 dtype code via `TorchDType`. Panics
-/// for luminal-specific dtypes that have no PyTorch counterpart (`I4`,
-/// `U4`, the F6 / F4 families, ...).
-fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
-    crate::torch_dtype::TorchDType::try_from(dtype)
-        .map(|t| t.code())
-        .unwrap_or_else(|d| panic!("luminal_dtype_to_pt2_code: unsupported dtype {d:?}"))
-}
-
 /// Common intermediate result from translating a model graph.
 pub struct GraphTranslation {
     pub graph: Graph,
     pub tensor_ids: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
+    /// Public PT2 input dtypes. These cannot be inferred from the HLIR Input
+    /// node because frontend compound types (complex) use a real component
+    /// dtype internally.
+    pub input_dtypes: Vec<u32>,
     pub output_names: Vec<String>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
     /// Output dtypes as PT2 dtype codes (e.g. 5 = int64, 7 = float32).
@@ -143,6 +138,7 @@ pub struct CompiledGraph {
     /// Cached label → NodeIndex map for O(1) lookups in set_weight_* methods.
     label_map: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
+    pub input_dtypes: Vec<u32>,
     pub output_names: Vec<String>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<Expression>>,
@@ -171,6 +167,7 @@ impl CompiledGraph {
             mut graph,
             tensor_ids,
             input_names,
+            input_dtypes,
             output_names,
             output_shape_exprs,
             output_dtypes,
@@ -213,6 +210,7 @@ impl CompiledGraph {
             tensor_ids,
             label_map,
             input_names,
+            input_dtypes,
             output_names,
             output_shapes,
             output_shape_exprs,
@@ -235,19 +233,7 @@ impl CompiledGraph {
     /// Get the PT2 dtype codes for all inputs (in order of input_names).
     #[getter]
     fn input_dtypes(&self) -> Vec<u32> {
-        self.input_names
-            .iter()
-            .map(|name| {
-                if let Some(&node_id) = self.tensor_ids.get(name)
-                    && let Some(input) = (*self.graph.graph[node_id])
-                        .as_any()
-                        .downcast_ref::<luminal::hlir::Input>()
-                {
-                    return luminal_dtype_to_pt2_code(input.dtype);
-                }
-                7 // default to f32
-            })
-            .collect()
+        self.input_dtypes.clone()
     }
 
     /// Get the list of output tensor names.

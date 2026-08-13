@@ -294,10 +294,8 @@ impl<'a> Translator<'a> {
     /// produces a rank-0 scalar. Both `dim` and `index` may be negative and
     /// are normalized against the input shape.
     ///
-    /// Lowered as `slice_along(index..index+1, dim).squeeze(dim)`. We use the
-    /// slice + squeeze decomposition (rather than `gather`) because the
-    /// composition is a pure shape manipulation with a single iota, which the
-    /// luminal compiler can fold into surrounding ops.
+    /// Slice and squeeze establish the view; gather materializes it without
+    /// arithmetic, preserving signed zero, infinity, and NaN exactly.
     pub(crate) fn translate_select(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         let dim = self.get_int_arg(node, 1)?;
@@ -327,7 +325,11 @@ impl<'a> Translator<'a> {
             index_raw as usize
         };
 
-        Ok(a.slice_along(index..index + 1, dim).squeeze(dim))
+        let selected = a.slice_along(index..index + 1, dim).squeeze(dim);
+        let indexes = selected
+            .graph()
+            .iota(Expression::from('z'), selected.dims());
+        Ok(selected.gather(indexes))
     }
 
     pub(crate) fn translate_cat(&mut self, node: &Node) -> Result<GraphTensor> {

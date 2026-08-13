@@ -275,6 +275,26 @@ def test_add(device: torch.device):
     assert torch.allclose(output, original)
 
 
+@pytest.mark.parametrize("alpha", [None, True, False, 2, -1])
+def test_bool_add_matches_pytorch(device: torch.device, alpha: int | bool | None):
+    class BoolAdd(torch.nn.Module):
+        def forward(self, lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+            if alpha is None:
+                return torch.add(lhs, rhs)
+            return torch.add(lhs, rhs, alpha=alpha)
+
+    model = BoolAdd().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    # Transposed inputs cover noncontiguous bool tensors while the unequal
+    # leading dimensions exercise broadcasting.
+    lhs = torch.tensor([[False, True], [True, False], [False, False]], device=device).T
+    rhs = torch.tensor([[True, False, True]], device=device)
+    expected = model(lhs, rhs)
+    actual = compiled(lhs, rhs)
+    assert actual.dtype == torch.bool
+    assert torch.equal(actual, expected)
+
+
 def test_linear_layer(device: torch.device):
     add_test_model: torch.nn.Module = LinearLayerModel().to(device)
     add_test_mode_compiled: Callable = torch.compile(
