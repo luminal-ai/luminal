@@ -1,11 +1,21 @@
 """CompiledModel wrapper for the Rust CompiledGraph."""
 
-from typing import List
+import math
 
 import torch
 
 from .dtype_util import code_to_torch_dtype
 from .dtype_util import torch_dtype_code as _torch_dtype_code
+
+
+def _cuda_input_binding_signature(tensor, n_bytes: int) -> tuple:
+    """Return the metadata that determines an external CUDA binding.
+
+    Tensor contents are deliberately absent from the signature. A producer may
+    update the same allocation between invocations without changing anything
+    about the compiled graph's pointer binding.
+    """
+    return (tensor.device, tensor.data_ptr(), n_bytes, tensor.dtype)
 
 
 class DTypeBoundaryError(TypeError):
@@ -26,7 +36,12 @@ class CompiledModel:
     """Wrapper around CompiledGraph that handles PyTorch tensor conversion."""
 
     def __init__(
-        self, graph_result, weight_refs=None, input_names=None, user_indices=None
+        self,
+        graph_result,
+        weight_refs=None,
+        input_names=None,
+        user_indices=None,
+        scalar_output_positions=(),
     ):
         """Initialize with a compiled CompiledGraph from Rust.
 
@@ -46,15 +61,30 @@ class CompiledModel:
         # mutations. Keyed by position, not name: a model that mutates an
         # input and also returns it yields two same-named outputs.
         self._writeback_by_pos = dict(graph_result.writeback_outputs)
+        input_positions = {name: pos for pos, name in enumerate(self._input_names)}
+        self._writeback_input_pos = {
+            output_pos: input_positions[input_name]
+            for output_pos, input_name in self._writeback_by_pos.items()
+        }
         self._output_shapes = graph_result.output_shapes
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
         self._user_indices = user_indices
+        self._scalar_output_positions = frozenset(scalar_output_positions)
         self.skip_input_names = frozenset()
         self._is_gpu = getattr(graph_result, "device_type", "cpu") != "cpu"
         self._supports_device_ptrs = getattr(
             graph_result, "supports_device_ptrs", False
         )
+        # name -> (device, pointer, required bytes, dtype, strong tensor ref).
+        # CUDA bindings are persistent in the runtime; only changed metadata
+        # needs to cross PyO3 on subsequent calls.
+        self._cuda_input_bindings = {}
+        # output position -> (device, pointer, required bytes, dtype, strong tensor ref).
+        # Functionalized mutation outputs normally target long-lived state
+        # tensors, so their durable registrations cross PyO3 only when the
+        # actual storage changes.
+        self._cuda_writeback_bindings = {}
         # Expected input dtypes from graph. Every declared input MUST
         # have a dtype code — refuse to silently default to float32 if
         # the Rust side returned a shorter list than `input_names`.
@@ -86,10 +116,10 @@ class CompiledModel:
         return self._has_dynamic_dims
 
     @property
-    def dim_params(self) -> List[str]:
+    def dim_params(self) -> list[str]:
         return self._graph.dim_params
 
-    def __call__(self, *inputs: torch.Tensor) -> List[torch.Tensor]:
+    def __call__(self, *inputs: torch.Tensor) -> list[torch.Tensor]:
         """Execute the compiled model with PyTorch tensor inputs.
 
         Args:
@@ -144,9 +174,20 @@ class CompiledModel:
                     "bugs and burnt cycles on per-call allocation+copy."
                 )
             if self._supports_device_ptrs and tensor.is_cuda:
-                t = tensor.detach().contiguous()
+                # A contiguous caller tensor is already a valid read-only
+                # boundary input; making a detached view for every lifted
+                # weight adds hundreds of Python objects per invocation.
+                t = tensor if tensor.is_contiguous() else tensor.detach().contiguous()
                 n_bytes = t.numel() * t.element_size()
-                self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
+                signature = _cuda_input_binding_signature(t, n_bytes)
+                previous = self._cuda_input_bindings.get(name)
+                if previous is None or previous[:4] != signature:
+                    self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
+                # Commit only after a changed registration succeeds. Retaining
+                # the tensor prevents allocator reuse while Rust holds its
+                # non-owning pointer; `previous` keeps the old allocation alive
+                # until the replacement has crossed the boundary.
+                self._cuda_input_bindings[name] = (*signature, t)
                 _input_refs.append(t)
             else:
                 t = tensor.detach().cpu().contiguous()
@@ -187,11 +228,6 @@ class CompiledModel:
         # `torch.frombuffer`. That's a reinterpret, not a numeric
         # cast — no precision change.
         #
-        # Narrow ints (`int8` / `int16` / `uint8`) are intentionally
-        # absent — luminal's IR refuses them at the FFI boundary (cf.
-        # `pt2_util::torch_dtype_int_to_luminal`,
-        # `typed_data::from_pytorch_bytes`), so a graph can never
-        # declare a narrow-int output that reaches this dispatch.
         _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
         _output_readers = {
             torch.float32: ("get_output", torch.float32),
@@ -200,10 +236,15 @@ class CompiledModel:
             torch.bfloat16: ("get_output_bf16", torch.bfloat16),
             torch.int64: ("get_output_i64", torch.int64),
             torch.int32: ("get_output_i32", torch.int32),
+            torch.int16: ("get_output_i16", torch.int16),
+            torch.int8: ("get_output_i8", torch.int8),
+            torch.uint8: ("get_output_u8", torch.uint8),
             torch.bool: ("get_output_bool", torch.bool),
         }
 
-        def _read_typed_output(name: str, shape, out_dtype) -> torch.Tensor:
+        def _read_typed_output(
+            position: int, name: str, shape, out_dtype
+        ) -> torch.Tensor:
             """Pull one output back from the runtime at the right dtype.
 
             Strict: any `out_dtype` not in `_output_readers` raises
@@ -227,10 +268,12 @@ class CompiledModel:
                     f"the output to a supported dtype upstream."
                 )
             getter_name, read_dtype = entry
-            data = getattr(self._graph, getter_name)(name)
-            if len(data) == 0 and all(d != 0 for d in shape):
-                return None
-            if out_dtype in (torch.float16, torch.bfloat16):
+            data = getattr(self._graph, f"{getter_name}_at")(position)
+            if len(data) == 0:
+                if all(d != 0 for d in shape):
+                    return None
+                return torch.empty(tuple(shape), dtype=out_dtype, device=input_device)
+            if out_dtype in (torch.float16, torch.bfloat16, torch.uint8):
                 # Getter returned an immutable `bytes` from Rust; wrap in
                 # `bytearray` to make the storage writable (suppresses
                 # the "non-writable buffer" warning), then bit-cast via
@@ -252,42 +295,91 @@ class CompiledModel:
         # device buffer to register against.
         _use_zero_copy = self._supports_device_ptrs
         output_tensors = []
+        direct_writebacks = set()
         if _use_zero_copy:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
                 if i in self._writeback_by_pos:
-                    # Write-backs land in the caller's input tensor below, not
-                    # in a fresh output buffer.
+                    # Point functionalized mutation outputs at the caller's
+                    # state tensor up front. The CUDA runtime either writes
+                    # there directly or schedules its required epilogue D2D
+                    # copy on the graph stream before the one terminal wait.
+                    target = user_inputs[self._writeback_input_pos[i]]
+                    expected_numel = math.prod(shape)
+                    if (
+                        target.is_cuda
+                        and target.is_contiguous()
+                        and target.dtype == out_dtype
+                        and target.numel() == expected_numel
+                    ):
+                        n_bytes = target.numel() * target.element_size()
+                        signature = _cuda_input_binding_signature(target, n_bytes)
+                        previous = self._cuda_writeback_bindings.get(i)
+                        if previous is None or previous[:4] != signature:
+                            self._graph.set_output_device_ptr_at(
+                                i, target.data_ptr(), n_bytes
+                            )
+                        self._cuda_writeback_bindings[i] = (*signature, target)
+                        direct_writebacks.add(i)
+                    elif i in self._cuda_writeback_bindings:
+                        self._graph.clear_output_device_ptr_at(i)
+                        del self._cuda_writeback_bindings[i]
                     output_tensors.append(None)
                     continue
                 out = torch.empty(shape, dtype=out_dtype, device=input_device)
                 if out_dtype in _zero_copy_native_floats:
-                    self._graph.set_output_device_ptr(
-                        name, out.data_ptr(), out.numel() * out.element_size()
+                    self._graph.set_output_device_ptr_at(
+                        i, out.data_ptr(), out.numel() * out.element_size()
                     )
                 output_tensors.append(out)
 
         self._graph.run()
 
         outputs = []
+        gpu_writebacks = []
         for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
             out_dtype = output_torch_dtypes[i]
             if i in self._writeback_by_pos:
                 # In-place input mutation: copy the computed state back into
                 # the caller's tensor (the same object the model would have
                 # mutated eagerly); it is not part of the returned tuple.
-                input_name = self._writeback_by_pos[i]
-                target = user_inputs[self._input_names.index(input_name)]
-                target.copy_(_read_typed_output(name, shape, out_dtype))
+                target = user_inputs[self._writeback_input_pos[i]]
+                if i in direct_writebacks:
+                    continue
+                expected_numel = math.prod(shape)
+                can_copy_on_device = (
+                    self._supports_device_ptrs
+                    and hasattr(self._graph, "copy_outputs_to_device_ptrs_at")
+                    and target.is_cuda
+                    and target.is_contiguous()
+                    and target.dtype == out_dtype
+                    and target.numel() == expected_numel
+                )
+                if can_copy_on_device:
+                    gpu_writebacks.append(
+                        (
+                            i,
+                            target.data_ptr(),
+                            target.numel() * target.element_size(),
+                        )
+                    )
+                else:
+                    target.copy_(_read_typed_output(i, name, shape, out_dtype))
                 continue
             if _use_zero_copy and out_dtype in _zero_copy_native_floats:
                 out = output_tensors[i]
-                if not self._graph.output_is_zero_copy(name):
-                    self._graph.copy_output_to_device_ptr(
-                        name, out.data_ptr(), out.numel() * out.element_size()
+                if not self._graph.output_is_zero_copy_at(i):
+                    self._graph.copy_output_to_device_ptr_at(
+                        i, out.data_ptr(), out.numel() * out.element_size()
                     )
             else:
-                out = _read_typed_output(name, shape, out_dtype)
+                out = _read_typed_output(i, name, shape, out_dtype)
             outputs.append(out)
 
-        return tuple(outputs)
+        if gpu_writebacks:
+            self._graph.copy_outputs_to_device_ptrs_at(gpu_writebacks)
+
+        return tuple(
+            output.item() if i in self._scalar_output_positions else output
+            for i, output in enumerate(outputs)
+        )

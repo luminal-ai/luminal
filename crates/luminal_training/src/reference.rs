@@ -111,7 +111,7 @@ impl OptimizerStep {
 /// calling `new`.
 pub struct Trainer<O> {
     pub rt: ReferenceRuntime,
-    dyn_map: FxHashMap<char, usize>,
+    dyn_map: DynMap,
     step: OptimizerStep,
     params: Vec<GraphTensor>,
     resident: Vec<GraphTensor>,

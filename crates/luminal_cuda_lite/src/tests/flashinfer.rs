@@ -152,6 +152,7 @@ fn run_flashinfer(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        context_dim: Expression::from('c'),
         dtype: luminal::dtype::DType::F32,
         sm_scale: 0.0,
         window_left: -1,
@@ -183,9 +184,9 @@ fn run_flashinfer(
     let inputs = [q_n, k_n, v_n, idx_n, qo_n, kv_n];
 
     let mut dyn_map = FxHashMap::default();
-    dyn_map.insert('s', batch_size);
-    dyn_map.insert('c', kv_indices.len());
-    dyn_map.insert('r', kv_indptr.len());
+    dyn_map.insert(Symbol::from('s'), batch_size);
+    dyn_map.insert(Symbol::from('c'), kv_indices.len());
+    dyn_map.insert(Symbol::from('r'), kv_indptr.len());
 
     fi.execute(stream, out_n, &inputs, &buffers, &dyn_map)
         .expect("FlashInferAttention execute failed");
@@ -226,6 +227,7 @@ fn run_flashinfer_with_compact_decode_indices(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        context_dim: Expression::from('c'),
         dtype: luminal::dtype::DType::F32,
         sm_scale: 0.0,
         window_left: -1,
@@ -250,8 +252,8 @@ fn run_flashinfer_with_compact_decode_indices(
     let inputs = [q_n, k_n, v_n, idx_n];
 
     let mut dyn_map = FxHashMap::default();
-    dyn_map.insert('s', batch_size);
-    dyn_map.insert('c', kv_indices.len());
+    dyn_map.insert(Symbol::from('s'), batch_size);
+    dyn_map.insert(Symbol::from('c'), kv_indices.len());
 
     fi.execute(stream, out_n, &inputs, &buffers, &dyn_map)
         .expect("FlashInferAttention compact-index execute failed");
@@ -281,6 +283,7 @@ fn resolve_flashinfer_decode_for_signature_test(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        context_dim: Expression::from('c'),
         dtype: luminal::dtype::DType::F32,
         sm_scale: 0.0,
         window_left: -1,
@@ -296,8 +299,8 @@ fn resolve_flashinfer_decode_for_signature_test(
     buffers.insert(out_n, DeviceBuffer::new(0x6000, HIDDEN * 4));
 
     let mut dyn_map = FxHashMap::default();
-    dyn_map.insert('s', 1);
-    dyn_map.insert('c', context_len);
+    dyn_map.insert(Symbol::from('s'), 1);
+    dyn_map.insert(Symbol::from('c'), context_len);
     fi.resolve_for_graph(out_n, &[q_n, k_n, v_n, idx_n], &buffers, &dyn_map)
         .unwrap()
 }
@@ -721,25 +724,52 @@ fn build_paged_attention_graph_with_mask_and_cache_provenance(
     k_provenance: TestCacheProvenance,
     v_provenance: TestCacheProvenance,
 ) -> (Graph, PagedAttnHandles) {
+    build_paged_attention_graph_with_token_dim(
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        mask_kind,
+        k_provenance,
+        v_provenance,
+        's',
+        'c',
+    )
+}
+
+/// `token_dim` and `context_dim` name the per-forward-pass token dimension and
+/// the total attended context. The rules bind both as pattern variables, so any
+/// names work; the parameters exist so a test can prove that rather than assert
+/// it.
+#[allow(clippy::too_many_arguments)] // test builder; the two dims are the point
+fn build_paged_attention_graph_with_token_dim(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    mask_kind: TestMaskKind,
+    k_provenance: TestCacheProvenance,
+    v_provenance: TestCacheProvenance,
+    token_dim: char,
+    context_dim: char,
+) -> (Graph, PagedAttnHandles) {
     let kv_groups = n_heads / n_kv_heads;
     let kv_dim = n_kv_heads * head_dim;
     let hidden = n_heads * head_dim;
 
     let mut cx = Graph::default();
 
-    let q_rope = cx.named_tensor("q_rope", ('s', hidden));
-    let k_rope = cx.named_tensor("k_rope", ('s', kv_dim));
-    let v_new = cx.named_tensor("v_new", ('s', kv_dim));
+    let q_rope = cx.named_tensor("q_rope", (token_dim, hidden));
+    let k_rope = cx.named_tensor("k_rope", (token_dim, kv_dim));
+    let v_new = cx.named_tensor("v_new", (token_dim, kv_dim));
     let k_cache = cx.named_tensor("k_cache", (2048, kv_dim)).persist();
     let v_cache = cx.named_tensor("v_cache", (2048, kv_dim)).persist();
     let scatter_idx = cx
-        .named_tensor("scatter_idx", 's')
+        .named_tensor("scatter_idx", token_dim)
         .as_dtype(luminal::dtype::DType::Int);
     let gather_idx = cx
-        .named_tensor("gather_idx", 'c')
+        .named_tensor("gather_idx", context_dim)
         .as_dtype(luminal::dtype::DType::Int);
     let q_pos = cx
-        .named_tensor("q_pos", 's')
+        .named_tensor("q_pos", token_dim)
         .as_dtype(luminal::dtype::DType::Int);
     let qo_indptr = cx
         .named_tensor("qo_indptr", 'r')
@@ -757,7 +787,7 @@ fn build_paged_attention_graph_with_mask_and_cache_provenance(
     let k = gather_rows(k_cache_out, gather_idx, kv_dim);
     let v_ctx = gather_rows(v_cache_out, gather_idx, kv_dim);
 
-    let c: Expression = 'c'.into();
+    let c: Expression = context_dim.into();
     let attn_mask = match mask_kind {
         TestMaskKind::Indptr => test_compute_attn_mask(&mut cx, q_pos, qo_indptr, kv_indptr, c),
         TestMaskKind::TriuGather => test_compute_triu_gather_mask(&mut cx, q_pos, c),
@@ -829,7 +859,10 @@ fn saturate_and_has_flashinfer_inner(
     // whether downstream extraction would have pruned it.
     let egraph = if let Some((s_min, s_max)) = s_interval {
         let mut intervals = luminal::prelude::FxHashMap::default();
-        intervals.insert('s', luminal::shape::DimInterval::new(s_min, s_max));
+        intervals.insert(
+            Symbol::from('s'),
+            luminal::shape::DimInterval::new(s_min, s_max),
+        );
         let interval_facts = luminal::egglog_utils::base::interval_facts_egglog(&intervals, []);
         let program = format!("{interval_facts}\n{program}");
         run_egglog_with_late_passes_and_interval_analysis(&program, &root, &ops, false, &[], true)
@@ -1260,6 +1293,35 @@ fn flashinfer_rule_fires_on_non_llama_dims() {
 }
 
 #[test]
+fn flashinfer_rule_fires_regardless_of_dim_names() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    // The rules bind both dynamic dims as pattern variables rather than matching
+    // literal names, so an identical graph must be recognised under any names.
+    // Before that change this graph produced no FlashInferAttention at all -- it
+    // silently fell back to the HLIR chain, which is why PT2-imported models
+    // (dims named s77/u0) never hit this path.
+    let (cx, _) = build_paged_attention_graph_with_token_dim(
+        8,
+        8,
+        64,
+        TestMaskKind::Indptr,
+        TestCacheProvenance::Raw,
+        TestCacheProvenance::Raw,
+        'w',
+        'x',
+    );
+    let (has_flashinfer, op_kinds) = saturate_and_has_flashinfer(&cx);
+    assert!(
+        has_flashinfer,
+        "FlashInferAttention was NOT found for a graph whose dims are named \
+         'w'/'x' instead of 's'/'c'. The rules are still name-coupled. \
+         OpKinds: {op_kinds:?}"
+    );
+}
+
+#[test]
 fn flashinfer_rule_fires_on_mha() {
     if !crate::tests::utilities::gpu_supports_flashinfer() {
         return;
@@ -1438,6 +1500,7 @@ fn run_flashinfer_bf16(
         head_dim: HEAD_DIM,
         page_size: 1,
         batch_dim: Expression::from('s'),
+        context_dim: Expression::from('c'),
         dtype: luminal::dtype::DType::Bf16,
         sm_scale: 0.0,
         window_left: -1,
@@ -1473,8 +1536,8 @@ fn run_flashinfer_bf16(
     );
 
     let mut dyn_map = FxHashMap::default();
-    dyn_map.insert('s', total_q_tokens);
-    dyn_map.insert('c', kv_indices.len());
+    dyn_map.insert(Symbol::from('s'), total_q_tokens);
+    dyn_map.insert(Symbol::from('c'), kv_indices.len());
 
     let _qo_buf;
     let _kv_buf;
@@ -1491,7 +1554,7 @@ fn run_flashinfer_bf16(
             kv_n,
             DeviceBuffer::new(_kv_buf.device_ptr(stream).0, kv_indptr.len() * 4),
         );
-        dyn_map.insert('r', kv_indptr.len());
+        dyn_map.insert(Symbol::from('r'), kv_indptr.len());
         vec![q_n, k_n, v_n, idx_n, qo_n, kv_n]
     } else {
         vec![q_n, k_n, v_n, idx_n]

@@ -146,7 +146,7 @@ impl KernelOp for KernelArgmax {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape

@@ -19,7 +19,7 @@ use luminal::{
     dtype::DType,
     egglog_utils::list_to_egglog,
     op::{CustomOp, HLIROp, LLIROp},
-    prelude::{FxHashMap, FxHashSet, GraphTensor, NodeIndex, ShapeTracker},
+    prelude::{DynMap, FxHashMap, FxHashSet, GraphTensor, NodeIndex, ShapeTracker, Symbol},
     shape::Expression,
 };
 
@@ -47,7 +47,7 @@ impl KernelOp for RoPEKernel {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let s = self.s;
         let h = self.h;
@@ -341,7 +341,7 @@ impl KernelOp for RoPEHalfKernel {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let h = self.h;
         let d = self.d;
@@ -648,7 +648,7 @@ impl KernelOp for RoPEScatterKernel {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let h = self.rope.h;
         let d = self.rope.d;
@@ -658,7 +658,7 @@ impl KernelOp for RoPEScatterKernel {
         let ty = crate::cuda_dtype(self.rope.dtype);
         let includes = crate::kernel::hlir::dtype_includes(&[self.rope.dtype]);
 
-        let vars: FxHashSet<char> = self
+        let vars: FxHashSet<Symbol> = self
             .idx_flat
             .dyn_vars()
             .into_iter()
@@ -780,7 +780,7 @@ extern "C" __global__ void rope_scatter_kernel(
         true
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.idx_flat
             .dyn_vars()
             .into_iter()
@@ -1117,7 +1117,7 @@ impl KernelOp for KernelRoPE {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let heads = self.out_shape[0].to_usize().expect("RoPE heads is static");
         let seq = self.out_shape[1];
@@ -1129,7 +1129,7 @@ impl KernelOp for KernelRoPE {
         let lnt = self.ln_theta as f32;
         let inv_hd = self.inv_hd as f32;
 
-        let vars: FxHashSet<char> = seq.dyn_vars().into_iter().collect();
+        let vars: FxHashSet<Symbol> = seq.dyn_vars().into_iter().collect();
         let (dyn_defines, _sorted) = crate::kernel::hlir::generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -1219,7 +1219,7 @@ extern \"C\" {{
         DType::Bf16
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.out_shape[1].dyn_vars().into_iter().collect()
     }
 
@@ -1393,7 +1393,7 @@ impl KernelOp for KernelRoPEScatterFused {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let heads = self.rope.out_shape[0]
             .to_usize()
@@ -1408,7 +1408,7 @@ impl KernelOp for KernelRoPEScatterFused {
         let inv_hd = self.rope.inv_hd as f32;
         let kvd = heads * hd;
 
-        let vars: FxHashSet<char> = self.all_dyn_vars();
+        let vars: FxHashSet<Symbol> = self.all_dyn_vars();
         let (dyn_defines, _sorted) = crate::kernel::hlir::generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -1514,7 +1514,7 @@ extern \"C\" {{
         true
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.idx_flat
             .dyn_vars()
             .into_iter()

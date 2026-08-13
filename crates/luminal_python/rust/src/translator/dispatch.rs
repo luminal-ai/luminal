@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
 
 use crate::pt2_schema::*;
@@ -32,6 +32,24 @@ impl<'a> Translator<'a> {
             _ => {}
         }
 
+        // PT2 scalar values remain tensor-backed in Luminal. `item` and
+        // `_local_scalar_dense` therefore bind their scalar output name to a
+        // zero-dimensional view of the one-element input instead of creating
+        // a separate host-scalar IR value.
+        if matches!(
+            target.as_str(),
+            "torch.ops.aten.item.default" | "torch.ops.aten._local_scalar_dense.default"
+        ) {
+            let name = node
+                .outputs
+                .first()
+                .and_then(TensorRef::value_name)
+                .context("item/local_scalar_dense is missing its scalar output name")?;
+            let scalar = reshape_tensor(self.get_input_tensor(node, 0)?, vec![]);
+            self.tensors.insert(name.to_string(), scalar);
+            return Ok(());
+        }
+
         let has_tensor_output = node
             .outputs
             .iter()
@@ -59,6 +77,8 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.exp.default" => self.translate_unary_op(node, |a| a.exp())?,
             "torch.ops.aten.sin.default" => self.translate_unary_op(node, |a| a.sin())?,
             "torch.ops.aten.cos.default" => self.translate_unary_op(node, |a| a.cos())?,
+            "torch.ops.aten.acos.default" => self.translate_acos(node)?,
+            "torch.ops.aten.acosh.default" => self.translate_acosh(node)?,
             "torch.ops.aten.sqrt.default" => self.translate_unary_op(node, |a| a.sqrt())?,
             "torch.ops.aten.rsqrt.default" => {
                 self.translate_unary_op(node, |a| a.sqrt().reciprocal())?
@@ -224,8 +244,7 @@ impl<'a> Translator<'a> {
                 self.translate_grouped_mm(node)?
             }
             "torch.ops.aten.scalar_tensor.default" => {
-                let val = self.get_float_arg(node, 0)? as f32;
-                self.graph.constant_float(val)
+                self.translate_scalar_tensor(node, &output_name)?
             }
             // Scalar comparisons
             "torch.ops.aten.gt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.gt(s))?,
@@ -524,6 +543,43 @@ impl<'a> Translator<'a> {
 }
 
 impl<'a> Translator<'a> {
+    fn translate_scalar_tensor(&mut self, node: &Node, output_name: &str) -> Result<GraphTensor> {
+        let meta = self
+            .tensor_meta(output_name)
+            .context("scalar_tensor is missing output tensor metadata")?;
+        let dtype = torch_dtype_int_to_luminal(meta.dtype);
+        let arg = &node
+            .inputs
+            .first()
+            .context("scalar_tensor is missing its scalar input")?
+            .arg;
+
+        if let Some(name) = arg.as_value_name() {
+            let value = reshape_tensor(self.get_tensor(name)?, vec![]);
+            return Ok(if value.dtype == dtype {
+                value
+            } else {
+                value.cast(dtype)
+            });
+        }
+
+        if let Some(value) = arg.as_float() {
+            return Ok(if dtype == DType::F64 {
+                self.graph.constant_float64(value)
+            } else {
+                self.graph.constant_float(value as f32).cast(dtype)
+            });
+        }
+        if let Some(value) = arg.as_int() {
+            return Ok(self.graph.constant(value).cast(dtype));
+        }
+        if let Some(value) = arg.as_bool() {
+            return Ok(self.graph.constant(i64::from(value)).cast(dtype));
+        }
+
+        bail!("scalar_tensor input is not tensor-backed or a literal: {arg:?}")
+    }
+
     fn translate_scalar_comparison(
         &mut self,
         node: &Node,

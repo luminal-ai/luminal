@@ -84,7 +84,9 @@ def register_backend(factory_capsule):
 
     def backend(gm, example_inputs, options=None):
         return _compile_pt2(
-            gm, example_inputs, factory_capsule,
+            gm,
+            example_inputs,
+            factory_capsule,
             search_iterations=(options or {}).get("search_iterations"),
         )
 
@@ -108,7 +110,9 @@ def luminal_backend(gm, example_inputs, options=None):
     """
     capsule = _detect_factory_capsule(example_inputs)
     return _compile_pt2(
-        gm, example_inputs, capsule,
+        gm,
+        example_inputs,
+        capsule,
         search_iterations=(options or {}).get("search_iterations"),
     )
 
@@ -123,6 +127,8 @@ def _compile_pt2(gm, example_inputs, factory_capsule, search_iterations=None):
     from .pt2 import pt2_backend
 
     return pt2_backend(
-        gm, example_inputs, factory=factory_capsule,
+        gm,
+        example_inputs,
+        factory=factory_capsule,
         search_iterations=search_iterations,
     )

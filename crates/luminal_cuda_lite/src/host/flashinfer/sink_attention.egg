@@ -75,7 +75,7 @@
 
 ; (out, q_bf16, k_pool, v_pool, flat_gather_idx, sinks_f32,
 ;  nheads, kvdim, hdim, scale, window_left)
-(relation sa_island (IR IR IR IR IR IR Expression Expression Expression f64 f64))
+(relation sa_island (IR IR IR IR IR IR Expression Expression Expression Expression f64 f64))
 
 (rule
     (
@@ -87,14 +87,14 @@
 
         ; ── Context gathers from both pools via ONE flat gather index ──
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?kg_a
             (ECons ?nslots (ECons ?kvdim2 (ENil)))
             ?kg_b)
             (ICons ?flat_gidx (ICons ?k_pool (INil)))))
         (= ?k_ctx (Op (Cast ?kc_sz (F32)) (ICons ?k_gathered (INil))))
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?vg_a
             (ECons ?nslots2 (ECons ?kvdim4 (ENil)))
             ?vg_b)
@@ -107,7 +107,7 @@
 
         ; ── Q·K^T: (nheads, s, c, hd) mul + reduce over hd ──
         (= ?qk (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim (ENil)))))
             ?qk_a ?qk_b ?qk_o)
             (ICons ?q_f (ICons ?k_ctx (INil)))))
         (= ?scores (Op (Sum ?ss_shape ?hdim ?ss_in ?ss_iter ?ss_out)
@@ -118,7 +118,7 @@
         (sa_masked ?masked ?scores ?scale_val ?window_val)
 
         ; ── Row max, then max(row_max, sink) in the lt-select spelling ──
-        (= ?rmax (Op (Max ?rm_shape (MVar "c") ?rm_in ?rm_iter ?rm_out)
+        (= ?rmax (Op (Max ?rm_shape ?context_tokens ?rm_in ?rm_iter ?rm_out)
             (ICons ?masked (INil))))
         (= ?sinks_f (Op (Cast ?sk_sz (F32)) (ICons ?sinks_w (INil))))
         (= ?lt (Op (LessThan ?lt_s ?lt_a ?lt_b ?lt_o)
@@ -149,7 +149,7 @@
             (ICons ?shifted (ICons ?log2e_a (INil)))))
         (const_like ?log2e_a 1.442695)
         (= ?num (Op (Exp2 ?ex_s ?ex_in ?ex_out) (ICons ?sc2 (INil))))
-        (= ?numsum (Op (Sum ?ns_shape (MVar "c") ?ns_in ?ns_iter ?ns_out)
+        (= ?numsum (Op (Sum ?ns_shape ?context_tokens ?ns_in ?ns_iter ?ns_out)
             (ICons ?num (INil))))
 
         ; ── The sink joins the DENOMINATOR only ──
@@ -170,15 +170,15 @@
 
         ; ── P·V: (nheads, s, hd, c) mul + reduce over c → output point ──
         (= ?pv (Op (Mul
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ECons ?context_tokens (ENil)))))
             ?pv_a ?pv_b ?pv_o)
             (ICons ?probs (ICons ?v_ctx (INil)))))
-        (= ?out (Op (Sum ?o_shape (MVar "c") ?o_in ?o_iter ?o_out)
+        (= ?out (Op (Sum ?o_shape ?context_tokens ?o_in ?o_iter ?o_out)
             (ICons ?pv (INil))))
     )
     (
         (sa_island ?out ?q_bf ?k_pool ?v_pool ?flat_gidx ?sinks_f
-            ?nheads ?kvdim ?hdim ?scale_val ?window_val)
+            ?nheads ?kvdim ?hdim ?input_tokens ?scale_val ?window_val)
     )
     :ruleset kernel_fuse_late
     :name "SinkAttention island fact"
@@ -188,13 +188,13 @@
 
 (rule
     (
-        (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?scale_val ?window_val)
+        (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?input_tokens ?scale_val ?window_val)
         (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
         (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
     )
     (
         (let ?fi (Op (SinkAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MVar "s") ?scale_val ?window_val)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?input_tokens ?scale_val ?window_val)
             (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
                 (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
         (union ?out ?fi)

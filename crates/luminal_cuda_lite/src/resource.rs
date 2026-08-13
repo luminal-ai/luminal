@@ -23,7 +23,7 @@ use luminal::{
     graph::LLIRGraph,
     hlir::Output,
     prelude::{
-        Expression, FxHashMap, FxHashSet, NodeIndex,
+        DynMap, Expression, FxHashMap, FxHashSet, NodeIndex,
         petgraph::{
             Direction,
             algo::toposort,
@@ -521,7 +521,7 @@ where
 
 pub(crate) fn eval_resource_expression(
     expr: Expression,
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
     resource: &'static str,
 ) -> Result<usize, ResourceViolation> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expr.exec(dyn_map))) {
@@ -760,7 +760,7 @@ pub(crate) fn validate_static_llir_semantics(llir: &LLIRGraph) -> Result<(), Res
 /// because non-overlapping buffers are individually large.
 pub(crate) fn plan_static_llir_resources(
     llir: &LLIRGraph,
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
 ) -> Result<CandidateResourcePlan, ResourceViolation> {
     let (topo, aliases) = validated_topology_and_aliases(llir)?;
     region_codegen::validate_fusion_regions(llir, Some(dyn_map)).map_err(|violation| {
@@ -882,6 +882,8 @@ pub(crate) fn plan_static_llir_resources(
 
 #[cfg(test)]
 mod tests {
+    use luminal::prelude::Symbol;
+
     use super::*;
 
     fn test_device(total_memory_bytes: usize) -> CudaDeviceResourceLimits {
@@ -1166,7 +1168,7 @@ mod tests {
             (Expression, Expression, Expression),
             (Expression, Expression, Expression),
             Expression,
-            FxHashMap<char, cudarc::driver::CudaSlice<u8>>,
+            FxHashMap<Symbol, cudarc::driver::CudaSlice<u8>>,
         ) {
             unreachable!("static resource planning must not compile test kernels")
         }
@@ -1211,7 +1213,7 @@ mod tests {
         llir.add_edge(input, first, ());
         llir.add_edge(first, second, ());
 
-        let dyn_map = FxHashMap::from_iter([('s', 16)]);
+        let dyn_map = FxHashMap::from_iter([(Symbol::from('s'), 16)]);
         let plan = plan_static_llir_resources(&llir, &dyn_map).unwrap();
 
         // The first output is 64 B and must coexist with the second's 128 B

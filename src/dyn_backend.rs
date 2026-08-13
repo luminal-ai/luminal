@@ -10,12 +10,12 @@ use std::collections::HashMap;
 
 use half::{bf16, f16};
 use petgraph::stable_graph::NodeIndex;
-use rustc_hash::FxHashMap;
 
 use crate::dtype::DType;
 use crate::graph::{CompileOptions, Graph};
 use crate::hlir::{Output, ReferenceData, ReferenceRuntime};
 use crate::op::Runtime;
+use crate::shape::DynMap;
 
 // ---------------------------------------------------------------------------
 // DynBackend trait
@@ -50,13 +50,22 @@ pub trait DynBackend {
     fn get_output_i64(&self, _node: NodeIndex) -> Vec<i64> {
         panic!("get_output_i64 not supported by '{}'", self.name());
     }
+    fn get_output_i8(&self, _node: NodeIndex) -> Vec<i8> {
+        panic!("get_output_i8 not supported by '{}'", self.name());
+    }
+    fn get_output_u8(&self, _node: NodeIndex) -> Vec<u8> {
+        panic!("get_output_u8 not supported by '{}'", self.name());
+    }
+    fn get_output_i16(&self, _node: NodeIndex) -> Vec<i16> {
+        panic!("get_output_i16 not supported by '{}'", self.name());
+    }
     fn get_output_f64(&self, _node: NodeIndex) -> Vec<f64> {
         panic!("get_output_f64 not supported by '{}'", self.name());
     }
     fn get_output_bool(&self, _node: NodeIndex) -> Vec<bool> {
         panic!("get_output_bool not supported by '{}'", self.name());
     }
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>);
+    fn execute(&mut self, dyn_map: &DynMap);
 
     // --- Optional device pointer support (GPU backends) --------------------
 
@@ -73,6 +82,9 @@ pub trait DynBackend {
     unsafe fn set_output_device_ptr(&mut self, _node: NodeIndex, _ptr: u64, _n_bytes: usize) {
         panic!("set_output_device_ptr not supported by '{}'", self.name());
     }
+    fn clear_output_device_ptr(&mut self, _node: NodeIndex) {
+        panic!("clear_output_device_ptr not supported by '{}'", self.name());
+    }
     fn output_is_zero_copy(&self, _node: NodeIndex) -> bool {
         false
     }
@@ -83,6 +95,17 @@ pub trait DynBackend {
             "copy_output_to_device_ptr not supported by '{}'",
             self.name()
         );
+    }
+    /// Copy multiple outputs to device pointers. Backends may override this to
+    /// enqueue the full batch and synchronize once.
+    ///
+    /// # Safety
+    /// Every destination pointer must be a valid device allocation with at
+    /// least the corresponding byte count available.
+    unsafe fn copy_outputs_to_device_ptrs(&self, copies: &[(NodeIndex, u64, usize)]) {
+        for &(node, dest_ptr, n_bytes) in copies {
+            unsafe { self.copy_output_to_device_ptr(node, dest_ptr, n_bytes) };
+        }
     }
 }
 
@@ -239,6 +262,27 @@ pub fn make_ones_bytes(n_elements: usize, dtype: DType) -> Vec<u8> {
 
 /// Convert raw bytes + [`DType`] to [`ReferenceData`].
 pub fn bytes_to_reference_data(bytes: Vec<u8>, dtype: DType) -> ReferenceData {
+    // An empty `Vec<u8>` has no typed allocation to reinterpret. Construct the
+    // correctly typed empty buffer directly so zero-element inputs preserve
+    // their dtype without passing a dangling empty-Vec pointer to
+    // `Vec::from_raw_parts`.
+    if bytes.is_empty() {
+        return match dtype {
+            DType::F32 | DType::TF32 => ReferenceData::F32(Vec::new()),
+            DType::F64 => ReferenceData::F64(Vec::new()),
+            DType::F16 => ReferenceData::F16(Vec::new()),
+            DType::Bf16 => ReferenceData::Bf16(Vec::new()),
+            DType::Int => ReferenceData::Int(Vec::new()),
+            DType::I64 => ReferenceData::I64(Vec::new()),
+            DType::I8 => ReferenceData::I8(Vec::new()),
+            DType::U8 => ReferenceData::U8(Vec::new()),
+            DType::I16 => ReferenceData::I16(Vec::new()),
+            DType::U16 => ReferenceData::Int(Vec::new()),
+            DType::Bool => ReferenceData::Bool(Vec::new()),
+            _ => ReferenceData::F32(Vec::new()),
+        };
+    }
+
     // Safety: source bytes are from a valid typed buffer; we reinterpret.
     unsafe fn from_bytes<T: Copy>(bytes: Vec<u8>) -> Vec<T> {
         let n = bytes.len() / std::mem::size_of::<T>();
@@ -254,12 +298,9 @@ pub fn bytes_to_reference_data(bytes: Vec<u8>, dtype: DType) -> ReferenceData {
         DType::Int => ReferenceData::Int(unsafe { from_bytes(bytes) }),
         DType::I64 => ReferenceData::I64(unsafe { from_bytes(bytes) }),
         DType::Bool => ReferenceData::Bool(bytes.into_iter().map(|b| b != 0).collect()),
-        DType::I8 => ReferenceData::Int(bytes.iter().map(|&b| b as i8 as i32).collect()),
-        DType::U8 => ReferenceData::Int(bytes.iter().map(|&b| b as i32).collect()),
-        DType::I16 => {
-            let i16s: Vec<i16> = unsafe { from_bytes(bytes) };
-            ReferenceData::Int(i16s.into_iter().map(|v| v as i32).collect())
-        }
+        DType::I8 => ReferenceData::I8(bytes.into_iter().map(|b| b as i8).collect()),
+        DType::U8 => ReferenceData::U8(bytes),
+        DType::I16 => ReferenceData::I16(unsafe { from_bytes(bytes) }),
         DType::U16 => {
             let u16s: Vec<u16> = unsafe { from_bytes(bytes) };
             ReferenceData::Int(u16s.into_iter().map(|v| v as i32).collect())
@@ -346,6 +387,39 @@ impl DynBackend for ReferenceDynBackend {
         }
     }
 
+    fn get_output_i8(&self, node: NodeIndex) -> Vec<i8> {
+        match self.output_buffer(node) {
+            ReferenceData::I8(v) => v.clone(),
+            other => panic!(
+                "get_output_i8: buffer dtype is {:?}, expected I8. \
+                 Add a `Cast(DType::I8)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_u8(&self, node: NodeIndex) -> Vec<u8> {
+        match self.output_buffer(node) {
+            ReferenceData::U8(v) => v.clone(),
+            other => panic!(
+                "get_output_u8: buffer dtype is {:?}, expected U8. \
+                 Add a `Cast(DType::U8)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    fn get_output_i16(&self, node: NodeIndex) -> Vec<i16> {
+        match self.output_buffer(node) {
+            ReferenceData::I16(v) => v.clone(),
+            other => panic!(
+                "get_output_i16: buffer dtype is {:?}, expected I16. \
+                 Add a `Cast(DType::I16)` before the Output.",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
     fn get_output_f64(&self, node: NodeIndex) -> Vec<f64> {
         match self.output_buffer(node) {
             ReferenceData::F64(v) => v.clone(),
@@ -368,7 +442,7 @@ impl DynBackend for ReferenceDynBackend {
         }
     }
 
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn execute(&mut self, dyn_map: &DynMap) {
         self.runtime.execute(dyn_map);
     }
 }
@@ -413,4 +487,69 @@ pub fn reference_factory(
         None,
         |rt| Box::new(ReferenceDynBackend { runtime: rt }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_bytes_preserve_reference_dtype() {
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::F32),
+            ReferenceData::F32(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::F64),
+            ReferenceData::F64(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::F16),
+            ReferenceData::F16(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::Bf16),
+            ReferenceData::Bf16(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::Int),
+            ReferenceData::Int(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::I64),
+            ReferenceData::I64(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::I8),
+            ReferenceData::I8(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::U8),
+            ReferenceData::U8(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::I16),
+            ReferenceData::I16(values) if values.is_empty()
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(Vec::new(), DType::Bool),
+            ReferenceData::Bool(values) if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn narrow_integer_bytes_preserve_width_and_signedness() {
+        assert!(matches!(
+            bytes_to_reference_data(vec![0x80, 0xff, 0x7f], DType::I8),
+            ReferenceData::I8(values) if values == [-128, -1, 127]
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(vec![0, 128, 255], DType::U8),
+            ReferenceData::U8(values) if values == [0, 128, 255]
+        ));
+        assert!(matches!(
+            bytes_to_reference_data(vec![0x00, 0x80, 0xff, 0x7f], DType::I16),
+            ReferenceData::I16(values) if values == [-32_768, 32_767]
+        ));
+    }
 }

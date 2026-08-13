@@ -45,7 +45,8 @@ pub fn translate(parsed: &ParsedPT2) -> Result<TranslatedGraph> {
 pub(crate) struct Translator<'a> {
     pub(crate) parsed: &'a ParsedPT2,
     pub(crate) graph: Graph,
-    /// Maps tensor name -> GraphTensor
+    /// Maps PT2 tensor and scalar value names to GraphTensors. Scalars are
+    /// represented as typed zero-dimensional tensors.
     pub(crate) tensors: HashMap<String, GraphTensor>,
     pub(crate) sym_map: SymDimMap,
     pub(crate) user_input_ids: Vec<(String, NodeIndex)>,
@@ -177,8 +178,11 @@ impl<'a> Translator<'a> {
             .get(idx)
             .with_context(|| format!("Node {} missing input {idx}", node.target))?
             .arg;
-        let name = arg.as_tensor_name().with_context(|| {
-            format!("Input {idx} of {} is not a tensor: {:?}", node.target, arg)
+        let name = arg.as_value_name().with_context(|| {
+            format!(
+                "Input {idx} of {} is not a tensor-backed value: {:?}",
+                node.target, arg
+            )
         })?;
         self.get_tensor(name)
     }
@@ -382,10 +386,10 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn resolve_expr_str(&self, expr_str: &str) -> Option<Expression> {
-        parse_sympy_expr_with_ranges(expr_str, &self.sym_map.sym_to_char, &self.sym_map.ranges)
+        parse_sympy_expr_with_ranges(expr_str, &self.sym_map.sym_to_symbol, &self.sym_map.ranges)
             .or_else(|| {
                 crate::pt2_parser::extract_symbol_name_pub(expr_str)
-                    .and_then(|sym| self.sym_map.sym_to_char.get(&sym).copied())
+                    .and_then(|sym| self.sym_map.sym_to_symbol.get(&sym).copied())
                     .map(Expression::from)
             })
     }

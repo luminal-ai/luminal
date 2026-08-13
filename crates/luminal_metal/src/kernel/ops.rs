@@ -72,19 +72,10 @@ fn compile_shader(device: &Device, source: &str, function_name: &str) -> Compute
         })
 }
 
-fn lower_dynamic_consts(mut code: String) -> String {
-    for c in b'a'..=b'y' {
-        let symbol = c as char;
-        code = code.replace(
-            &format!("const_{symbol}"),
-            &format!("dyn[{}]", (c - b'a') as usize),
-        );
-    }
-    code
-}
-
 pub(crate) fn lower_expression_for_metal(expr: &Expression, index_var: &str) -> String {
-    lower_dynamic_consts(expr.to_kernel().replace("const_z", index_var))
+    expr.to_kernel_with(index_var, &|symbol| {
+        format!("dyn[{}]", super::dyn_slot(symbol))
+    })
 }
 
 fn metal_buffer_type(dtype: DType) -> &'static str {
@@ -179,17 +170,17 @@ fn binary_dtype_rewrite(hlir_sort: &SortDef, metal_sort: &SortDef) -> Rule {
 /// Generate metrics methods for unary ops: 1 input read, 1 output write, 1 flop per element
 macro_rules! impl_unary_metrics {
     ($self:ident, $dyn_map:ident) => {
-        fn bytes_loaded(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn bytes_loaded(&$self, $dyn_map: &DynMap) -> usize {
             let n = $self.output_size().exec($dyn_map).unwrap_or(0);
             n * std::mem::size_of::<f32>()
         }
 
-        fn bytes_stored(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn bytes_stored(&$self, $dyn_map: &DynMap) -> usize {
             let n = $self.output_size().exec($dyn_map).unwrap_or(0);
             n * std::mem::size_of::<f32>()
         }
 
-        fn flops(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn flops(&$self, $dyn_map: &DynMap) -> usize {
             $self.output_size().exec($dyn_map).unwrap_or(0)
         }
     };
@@ -198,17 +189,17 @@ macro_rules! impl_unary_metrics {
 /// Generate metrics methods for binary ops: 2 inputs read, 1 output write, flops_per_elem per element
 macro_rules! impl_binary_metrics {
     ($self:ident, $dyn_map:ident, $flops_per_elem:expr) => {
-        fn bytes_loaded(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn bytes_loaded(&$self, $dyn_map: &DynMap) -> usize {
             let n = $self.output_size().exec($dyn_map).unwrap_or(0);
             n * 2 * std::mem::size_of::<f32>()
         }
 
-        fn bytes_stored(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn bytes_stored(&$self, $dyn_map: &DynMap) -> usize {
             let n = $self.output_size().exec($dyn_map).unwrap_or(0);
             n * std::mem::size_of::<f32>()
         }
 
-        fn flops(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn flops(&$self, $dyn_map: &DynMap) -> usize {
             $self.output_size().exec($dyn_map).unwrap_or(0) * $flops_per_elem
         }
     };
@@ -217,18 +208,18 @@ macro_rules! impl_binary_metrics {
 /// Generate metrics methods for reduce ops
 macro_rules! impl_reduce_metrics {
     ($self:ident, $dyn_map:ident) => {
-        fn bytes_loaded(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn bytes_loaded(&$self, $dyn_map: &DynMap) -> usize {
             let n_outputs = $self.output_size().exec($dyn_map).unwrap_or(0);
             let iters = $self.iters.exec($dyn_map).unwrap_or(0);
             n_outputs * iters * std::mem::size_of::<f32>()
         }
 
-        fn bytes_stored(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn bytes_stored(&$self, $dyn_map: &DynMap) -> usize {
             let n = $self.output_size().exec($dyn_map).unwrap_or(0);
             n * std::mem::size_of::<f32>()
         }
 
-        fn flops(&$self, $dyn_map: &FxHashMap<char, usize>) -> usize {
+        fn flops(&$self, $dyn_map: &DynMap) -> usize {
             let n_outputs = $self.output_size().exec($dyn_map).unwrap_or(0);
             let iters = $self.iters.exec($dyn_map).unwrap_or(0);
             n_outputs * iters
@@ -355,7 +346,7 @@ macro_rules! metal_unary_op {
                 pipeline: &ComputePipelineState,
                 inputs: &[&Buffer],
                 output: &Buffer,
-                dyn_map: &FxHashMap<char, usize>,
+                dyn_map: &DynMap,
             ) {
                 let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -508,7 +499,7 @@ impl MetalKernelOp for MetalAdd {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -640,7 +631,7 @@ impl MetalKernelOp for MetalMul {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -787,7 +778,7 @@ impl MetalKernelOp for MetalMod {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -932,7 +923,7 @@ impl MetalKernelOp for MetalLessThan {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -1098,7 +1089,7 @@ impl MetalKernelOp for MetalSumReduce {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_outputs = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -1270,7 +1261,7 @@ impl MetalKernelOp for MetalMaxReduce {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_outputs = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -1501,7 +1492,7 @@ impl EgglogOp for MPSMatmul {
 }
 
 impl MPSMatmul {
-    fn row_bytes(row_stride: Expression, dtype: DType, dyn_map: &FxHashMap<char, usize>) -> u64 {
+    fn row_bytes(row_stride: Expression, dtype: DType, dyn_map: &DynMap) -> u64 {
         let elems = row_stride
             .substitute('z', Expression::from(1))
             .exec(dyn_map)
@@ -1557,7 +1548,7 @@ impl MetalKernelOp for MPSMatmul {
         _pipeline: &ComputePipelineState,
         _inputs: &[&Buffer],
         _output: &Buffer,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) {
         panic!("MPSMatmul encodes directly onto the command buffer")
     }
@@ -1568,7 +1559,7 @@ impl MetalKernelOp for MPSMatmul {
         _pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         input_dtypes: &[DType],
         output_dtype: DType,
     ) {
@@ -1636,20 +1627,20 @@ impl MetalKernelOp for MPSMatmul {
         }
     }
 
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let m = self.m.exec(dyn_map).unwrap_or(0);
         let n = self.n.exec(dyn_map).unwrap_or(0);
         let k = self.k.exec(dyn_map).unwrap_or(0);
         2 * m * n * k * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         let m = self.m.exec(dyn_map).unwrap_or(0);
         let n = self.n.exec(dyn_map).unwrap_or(0);
         m * n * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, dyn_map: &DynMap) -> usize {
         let m = self.m.exec(dyn_map).unwrap_or(0);
         let n = self.n.exec(dyn_map).unwrap_or(0);
         let k = self.k.exec(dyn_map).unwrap_or(0);
@@ -1940,7 +1931,7 @@ impl MetalKernelOp for MPSBatchedMatmul {
         _pipeline: &ComputePipelineState,
         _inputs: &[&Buffer],
         _output: &Buffer,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) {
         panic!("MPSBatchedMatmul encodes directly onto the command buffer")
     }
@@ -1951,7 +1942,7 @@ impl MetalKernelOp for MPSBatchedMatmul {
         _pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         input_dtypes: &[DType],
         output_dtype: DType,
     ) {
@@ -2033,7 +2024,7 @@ impl MetalKernelOp for MPSBatchedMatmul {
         }
     }
 
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let batch = self.batch.exec(dyn_map).unwrap_or(0);
         let m = self.m.exec(dyn_map).unwrap_or(0);
         let n = self.n.exec(dyn_map).unwrap_or(0);
@@ -2041,14 +2032,14 @@ impl MetalKernelOp for MPSBatchedMatmul {
         2 * batch * m * n * k * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         let batch = self.batch.exec(dyn_map).unwrap_or(0);
         let m = self.m.exec(dyn_map).unwrap_or(0);
         let n = self.n.exec(dyn_map).unwrap_or(0);
         batch * m * n * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, dyn_map: &DynMap) -> usize {
         let batch = self.batch.exec(dyn_map).unwrap_or(0);
         let m = self.m.exec(dyn_map).unwrap_or(0);
         let n = self.n.exec(dyn_map).unwrap_or(0);
@@ -2304,7 +2295,7 @@ impl MetalKernelOp for GenericMatmul {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_outputs = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -2323,17 +2314,17 @@ impl MetalKernelOp for GenericMatmul {
         encoder.dispatch_thread_groups(thread_groups, thread_group_size);
     }
 
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let n_outputs = self.output_size().exec(dyn_map).unwrap_or(0);
         let k = self.k.exec(dyn_map).unwrap_or(0);
         2 * n_outputs * k * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         self.output_size().exec(dyn_map).unwrap_or(0) * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, dyn_map: &DynMap) -> usize {
         let n_outputs = self.output_size().exec(dyn_map).unwrap_or(0);
         let k = self.k.exec(dyn_map).unwrap_or(0);
         2 * n_outputs * k
@@ -2444,7 +2435,7 @@ impl MetalKernelOp for MetalConstant {
         pipeline: &ComputePipelineState,
         _inputs: &[&Buffer],
         output: &Buffer,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) {
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(output), 0);
@@ -2552,7 +2543,7 @@ impl MetalKernelOp for MetalIota {
         pipeline: &ComputePipelineState,
         _inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.range.exec(dyn_map).unwrap() as u32;
 
@@ -2725,7 +2716,7 @@ impl MetalKernelOp for MetalGather {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.output_size().exec(dyn_map).unwrap() as u32;
 
@@ -2745,19 +2736,19 @@ impl MetalKernelOp for MetalGather {
     }
 
     // Gather metrics: read indices + read gathered data + write output
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let n = self.output_size().exec(dyn_map).unwrap_or(0);
         // Read n indices (i32 = 4 bytes) + n data elements (f32 = 4 bytes)
         n * std::mem::size_of::<i32>() + n * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         let n = self.output_size().exec(dyn_map).unwrap_or(0);
         // Write n output elements (f32)
         n * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, _dyn_map: &DynMap) -> usize {
         // Gather is memory-bound, no significant FLOPs
         0
     }
@@ -2975,7 +2966,7 @@ impl MetalKernelOp for MetalScatter {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_dest = self
             .dest_shape
@@ -3027,7 +3018,7 @@ impl MetalKernelOp for MetalScatter {
         );
     }
 
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let n_dest = self.output_size().exec(dyn_map).unwrap_or(0);
         let n_src = self
             .index_shape
@@ -3041,12 +3032,12 @@ impl MetalKernelOp for MetalScatter {
             + n_src * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         let n = self.output_size().exec(dyn_map).unwrap_or(0);
         n * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, _dyn_map: &DynMap) -> usize {
         0
     }
 }
@@ -3255,7 +3246,7 @@ impl MetalKernelOp for MetalScatterNoCopy {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_src = self
             .index_shape
@@ -3281,7 +3272,7 @@ impl MetalKernelOp for MetalScatterNoCopy {
         );
     }
 
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let n_src = self
             .index_shape
             .iter()
@@ -3292,7 +3283,7 @@ impl MetalKernelOp for MetalScatterNoCopy {
         n_src * std::mem::size_of::<i32>() + n_src * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         let n_src = self
             .index_shape
             .iter()
@@ -3303,7 +3294,7 @@ impl MetalKernelOp for MetalScatterNoCopy {
         n_src * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, _dyn_map: &DynMap) -> usize {
         0
     }
 
@@ -3431,7 +3422,7 @@ impl MetalKernelOp for MetalCast {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) {
         let n_elements = self.size.exec(dyn_map).unwrap_or(0) as u32;
 
@@ -3450,19 +3441,19 @@ impl MetalKernelOp for MetalCast {
     }
 
     // Cast is memory-bound: 1 read, 1 write, minimal compute
-    fn bytes_loaded(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
         let n = self.size.exec(dyn_map).unwrap_or(0);
         // TODO: input dtype is not encoded; treat as 4B for now (matches current MetalRuntime IO path).
         n * std::mem::size_of::<f32>()
     }
 
-    fn bytes_stored(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
         let n = self.size.exec(dyn_map).unwrap_or(0);
         // TODO: output dtype sizing should be wired through MetalRuntime allocation.
         n * std::mem::size_of::<f32>()
     }
 
-    fn flops(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, _dyn_map: &DynMap) -> usize {
         0 // Type conversion has negligible compute cost
     }
 }

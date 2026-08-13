@@ -4,6 +4,8 @@ import pytest
 import torch
 import torch._dynamo
 from test_models import (
+    AcosTestModel,
+    AcoshTestModel,
     AddAddTestModel,
     AddConstantTestModel,
     AddTestModel,
@@ -386,6 +388,56 @@ def test_cos(device: torch.device):
     output = cos_test_model_compiled(x)
     original = cos_test_model(x)
     assert torch.allclose(output, original)
+
+
+def test_acos(device: torch.device):
+    model = AcosTestModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    x = torch.cat(
+        (
+            torch.linspace(-1.0, 1.0, 257, device=device),
+            torch.tensor([-1.5, 1.5, torch.nan], device=device),
+        )
+    )
+    torch.testing.assert_close(
+        compiled(x), model(x), rtol=1e-5, atol=1e-6, equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("dtype", (torch.bool, torch.int32, torch.int64))
+def test_acos_promotes_integral_input(device: torch.device, dtype: torch.dtype):
+    model = AcosTestModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    values = [False, True] if dtype == torch.bool else [-1, 0, 1]
+    x = torch.tensor(values, device=device, dtype=dtype)
+    output = compiled(x)
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, model(x), rtol=0, atol=0)
+
+
+def test_acosh(device: torch.device):
+    model = AcoshTestModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    x = torch.cat(
+        (
+            torch.linspace(1.0, 10.0, 257, device=device),
+            torch.tensor([0.0, 0.5, torch.inf, -torch.inf, torch.nan], device=device),
+        )
+    )
+    torch.testing.assert_close(
+        compiled(x), model(x), rtol=1e-5, atol=1e-5, equal_nan=True
+    )
+
+
+@pytest.mark.parametrize("dtype", (torch.bool, torch.int32, torch.int64))
+def test_acosh_promotes_integral_input(device: torch.device, dtype: torch.dtype):
+    model = AcoshTestModel().to(device)
+    compiled = torch.compile(model, backend=luminal_backend)
+    values = [False, True] if dtype == torch.bool else [1, 2, 4, 8]
+    x = torch.tensor(values, device=device, dtype=dtype)
+    output = compiled(x)
+    assert output.dtype == torch.float32
+    torch.testing.assert_close(output, model(x), rtol=1e-5, atol=1e-5, equal_nan=True)
 
 
 def test_transpose_2d(device: torch.device):

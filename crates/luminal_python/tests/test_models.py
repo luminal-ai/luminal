@@ -89,6 +89,16 @@ class CosTestModel(torch.nn.Module):
         return torch.cos(x)
 
 
+class AcosTestModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.acos(x)
+
+
+class AcoshTestModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.acosh(x)
+
+
 class SubTestModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()

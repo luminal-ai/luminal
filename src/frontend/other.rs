@@ -22,6 +22,17 @@ impl Graph {
         )
     }
 
+    /// A scalar F64 constant. The value remains F64 through HLIR instead of
+    /// being narrowed to F32 and widened again by a cast.
+    pub fn constant_float64(&mut self, i: f64) -> GraphTensor {
+        GraphTensor::from_id(
+            self.add_op(ConstantF64(i), &[]),
+            ShapeTracker::new(()),
+            self,
+            DType::F64,
+        )
+    }
+
     /// Iota expression
     pub fn iota(&mut self, i: impl Into<Expression>, shape: impl ToShape) -> GraphTensor {
         let sh = shape.to_shape();

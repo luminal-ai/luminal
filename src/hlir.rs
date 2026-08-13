@@ -227,6 +227,7 @@ pub type HLIROps = (
     LoopOutput,
     LoopOutputSelect,
     Constant,
+    ConstantF64,
     Cast,
     Iota,
     Exp2,
@@ -318,7 +319,7 @@ impl HLIROp for Input {
 }
 
 impl ReferenceOp for Input {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -389,7 +390,7 @@ impl HLIROp for Output {
 }
 
 impl ReferenceOp for Output {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -432,7 +433,7 @@ impl HLIROp for CustomOpKind {
 }
 
 impl ReferenceOp for CustomOpKind {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -548,7 +549,7 @@ impl HLIROp for LoopStart {
 }
 
 impl ReferenceOp for LoopStart {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopStart is driven by the runtime loop compiler")
     }
 }
@@ -637,7 +638,7 @@ impl HLIROp for LoopEnd {
 }
 
 impl ReferenceOp for LoopEnd {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopEnd is driven by the runtime loop compiler")
     }
 }
@@ -769,7 +770,7 @@ impl HLIROp for LoopInput {
 }
 
 impl ReferenceOp for LoopInput {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopInput is driven by the runtime loop compiler")
     }
 }
@@ -862,7 +863,7 @@ impl HLIROp for LoopInputStatic {
 }
 
 impl ReferenceOp for LoopInputStatic {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopInputStatic is driven by the runtime loop compiler")
     }
 }
@@ -952,7 +953,7 @@ impl HLIROp for LoopOutput {
 }
 
 impl ReferenceOp for LoopOutput {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopOutput is driven by the runtime loop compiler")
     }
 }
@@ -1056,7 +1057,7 @@ impl HLIROp for LoopOutputSelect {
 }
 
 impl ReferenceOp for LoopOutputSelect {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopOutputSelect is driven by the runtime loop compiler")
     }
 }
@@ -1115,8 +1116,72 @@ impl EgglogOp for Constant {
 }
 
 impl ReferenceOp for Constant {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         ReferenceData::F32(vec![self.0])
+    }
+}
+
+/// Produces a single F64 constant without narrowing through F32.
+///
+/// Temporary: delete this op once `Constant` is converted to a typed constant.
+#[derive(Clone, PartialEq, Default)]
+pub struct ConstantF64(pub f64);
+
+impl Debug for ConstantF64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ConstantF64({:?})", self.0)
+    }
+}
+
+impl Display for ConstantF64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl HLIROp for ConstantF64 {
+    fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
+        format!("(Op (ConstantF64 {:?}) (INil))", self.0)
+    }
+}
+
+impl EgglogOp for ConstantF64 {
+    fn sort(&self) -> SortDef {
+        sort(OP_KIND, "ConstantF64", &[("value", F64)])
+    }
+
+    fn cleanup(&self) -> bool {
+        true
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![dtype_fixed_op(&self.sort(), &SORTS.f64_dt)]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        _input_enodes: Vec<&'a ENodeId>,
+        _: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        _: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self(
+                egraph.enodes[kind_children[0]]
+                    .0
+                    .replace('"', "")
+                    .parse::<f64>()
+                    .unwrap(),
+            ))),
+            vec![],
+        )
+    }
+}
+
+impl ReferenceOp for ConstantF64 {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
+        ReferenceData::F64(vec![self.0])
     }
 }
 
@@ -1170,7 +1235,7 @@ impl EgglogOp for Iota {
     }
 }
 impl ReferenceOp for Iota {
-    fn execute(&self, _: Vec<&ReferenceData>, dyn_map: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let length = self.1.exec(dyn_map).unwrap();
         let expr = self.0.resolve_vars(dyn_map);
         ReferenceData::Int(
@@ -1232,82 +1297,18 @@ impl EgglogOp for Cast {
     }
 }
 impl ReferenceOp for Cast {
-    fn execute(&self, input: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, input: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         match self.1 {
-            DType::F32 => ReferenceData::F32(match &input[0] {
-                ReferenceData::F32(f) => f.clone(),
-                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32()).collect(),
-                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32()).collect(),
-                ReferenceData::Int(i) => i.iter().map(|i| *i as f32).collect(),
-                ReferenceData::I64(i) => i.iter().map(|i| *i as f32).collect(),
-                ReferenceData::F64(f) => f.iter().map(|f| *f as f32).collect(),
-                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
-            }),
-            DType::F64 => ReferenceData::F64(match &input[0] {
-                ReferenceData::F64(f) => f.clone(),
-                ReferenceData::F32(f) => f.iter().map(|f| *f as f64).collect(),
-                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
-                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() as f64).collect(),
-                ReferenceData::Int(i) => i.iter().map(|i| *i as f64).collect(),
-                ReferenceData::I64(i) => i.iter().map(|i| *i as f64).collect(),
-                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1.0 } else { 0.0 }).collect(),
-            }),
-            DType::Int => ReferenceData::Int(match &input[0] {
-                ReferenceData::F32(f) => f.iter().map(|f| *f as i32).collect(),
-                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
-                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() as i32).collect(),
-                ReferenceData::Int(i) => i.clone(),
-                // Saturating `Cast(I64 -> Int)`. This is the explicit
-                // graph node — `Cast` IS the user/translator-emitted
-                // operation, not an implicit bridge. Values outside the
-                // i32 range wrap via Rust's `as i32`, matching
-                // `tensor.to(torch.int32)` semantics on overflow.
-                ReferenceData::I64(i) => i.iter().map(|i| *i as i32).collect(),
-                ReferenceData::F64(f) => f.iter().map(|f| *f as i32).collect(),
-                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
-            }),
-            DType::I64 => ReferenceData::I64(match &input[0] {
-                ReferenceData::I64(i) => i.clone(),
-                ReferenceData::Int(i) => i.iter().map(|i| *i as i64).collect(),
-                ReferenceData::F32(f) => f.iter().map(|f| *f as i64).collect(),
-                ReferenceData::F64(f) => f.iter().map(|f| *f as i64).collect(),
-                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
-                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() as i64).collect(),
-                ReferenceData::Bool(b) => b.iter().map(|b| if *b { 1 } else { 0 }).collect(),
-            }),
-            DType::F16 => ReferenceData::F16(match &input[0] {
-                ReferenceData::F32(f) => f.iter().copied().map(f16::from_f32).collect(),
-                ReferenceData::F16(f) => f.clone(),
-                ReferenceData::Bf16(f) => f.iter().map(|f| f16::from_f32(f.to_f32())).collect(),
-                ReferenceData::Int(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
-                ReferenceData::I64(i) => i.iter().map(|i| f16::from_f32(*i as f32)).collect(),
-                ReferenceData::F64(f) => f.iter().map(|f| f16::from_f64(*f)).collect(),
-                ReferenceData::Bool(b) => b
-                    .iter()
-                    .map(|b| f16::from_f32(if *b { 1.0 } else { 0.0 }))
-                    .collect(),
-            }),
-            DType::Bf16 => ReferenceData::Bf16(match &input[0] {
-                ReferenceData::F32(f) => f.iter().copied().map(bf16::from_f32).collect(),
-                ReferenceData::F16(f) => f.iter().map(|f| bf16::from_f32(f.to_f32())).collect(),
-                ReferenceData::Bf16(f) => f.clone(),
-                ReferenceData::Int(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
-                ReferenceData::I64(i) => i.iter().map(|i| bf16::from_f32(*i as f32)).collect(),
-                ReferenceData::F64(f) => f.iter().map(|f| bf16::from_f64(*f)).collect(),
-                ReferenceData::Bool(b) => b
-                    .iter()
-                    .map(|b| bf16::from_f32(if *b { 1.0 } else { 0.0 }))
-                    .collect(),
-            }),
-            DType::Bool => ReferenceData::Bool(match &input[0] {
-                ReferenceData::F32(f) => f.iter().map(|f| *f != 0.0).collect(),
-                ReferenceData::F16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
-                ReferenceData::Bf16(f) => f.iter().map(|f| f.to_f32() != 0.0).collect(),
-                ReferenceData::Int(i) => i.iter().map(|i| *i != 0).collect(),
-                ReferenceData::I64(i) => i.iter().map(|i| *i != 0).collect(),
-                ReferenceData::F64(f) => f.iter().map(|f| *f != 0.0).collect(),
-                ReferenceData::Bool(b) => b.clone(),
-            }),
+            DType::F32 => ReferenceData::F32(input[0].to_f32_vec()),
+            DType::F64 => ReferenceData::F64(input[0].to_f64_vec()),
+            DType::F16 => ReferenceData::F16(input[0].to_f16_vec()),
+            DType::Bf16 => ReferenceData::Bf16(input[0].to_bf16_vec()),
+            DType::Int => ReferenceData::Int(input[0].to_i32_vec()),
+            DType::I64 => ReferenceData::I64(input[0].to_i64_vec()),
+            DType::I8 => ReferenceData::I8(input[0].to_i8_vec()),
+            DType::U8 => ReferenceData::U8(input[0].to_u8_vec()),
+            DType::I16 => ReferenceData::I16(input[0].to_i16_vec()),
+            DType::Bool => ReferenceData::Bool(input[0].to_bool_vec()),
             other => {
                 unimplemented!("Cast to {other} is not yet supported in reference interpreter")
             }
@@ -1317,35 +1318,33 @@ impl ReferenceOp for Cast {
 
 // Unary Op (A -> A)
 
+struct UnaryKernels {
+    f32_fn: fn(f32) -> f32,
+    f16_fn: fn(f16) -> f16,
+    bf16_fn: fn(bf16) -> bf16,
+    f64_fn: fn(f64) -> f64,
+}
+
 fn unary_impl(
     inp: &ReferenceData,
     shape: &[Expression],
     strides: &[Expression],
-    dyn_map: &FxHashMap<char, usize>,
-    f32_fn: fn(f32) -> f32,
-    f16_fn: fn(f16) -> f16,
-    bf16_fn: fn(bf16) -> bf16,
+    dyn_map: &DynMap,
+    kernels: UnaryKernels,
 ) -> ReferenceData {
     let ind = StridedIterator::new(shape, strides, dyn_map);
     match &inp {
-        ReferenceData::F32(f) => ReferenceData::F32(ind.map(|i| f32_fn(f[i])).collect()),
-        ReferenceData::F16(f) => ReferenceData::F16(ind.map(|i| f16_fn(f[i])).collect()),
-        ReferenceData::Bf16(f) => ReferenceData::Bf16(ind.map(|i| bf16_fn(f[i])).collect()),
+        ReferenceData::F32(f) => ReferenceData::F32(ind.map(|i| (kernels.f32_fn)(f[i])).collect()),
+        ReferenceData::F16(f) => ReferenceData::F16(ind.map(|i| (kernels.f16_fn)(f[i])).collect()),
+        ReferenceData::Bf16(f) => {
+            ReferenceData::Bf16(ind.map(|i| (kernels.bf16_fn)(f[i])).collect())
+        }
+        ReferenceData::F64(f) => ReferenceData::F64(ind.map(|i| (kernels.f64_fn)(f[i])).collect()),
         ReferenceData::Int(_) => panic!("unary_impl: no Int kernel — cast to F32 at the call site"),
         ReferenceData::I64(_) => panic!("unary_impl: no I64 kernel — cast to F32 at the call site"),
-        // No F64 transcendental kernel. Refuse loudly rather than
-        // silently bridging through F32 — the caller asked for double
-        // precision and that's not what an F32 bridge delivers. Fix at
-        // the call site: cast inputs to F32 (`x.to(torch.float32)`) and
-        // accept the precision, or wait for a native F64 transcendental
-        // kernel.
-        ReferenceData::F64(_) => panic!(
-            "unary_impl: no F64 transcendental kernel — cast inputs to F32 \
-             at the call site (`x.to(torch.float32)`), or wait for the F64 \
-             transcendental kernel follow-up. Silent F32 bridging is \
-             intentionally rejected: it would hide a precision downgrade \
-             behind an `F64` dtype tag."
-        ),
+        ReferenceData::I8(_) => panic!("unary_impl: no I8 kernel — cast to F32 at the call site"),
+        ReferenceData::U8(_) => panic!("unary_impl: no U8 kernel — cast to F32 at the call site"),
+        ReferenceData::I16(_) => panic!("unary_impl: no I16 kernel — cast to F32 at the call site"),
         ReferenceData::Bool(_) => {
             panic!("unary_impl: no Bool kernel — cast to F32 at the call site")
         }
@@ -1407,19 +1406,18 @@ impl EgglogOp for Log2 {
     }
 }
 impl ReferenceOp for Log2 {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.log2(),
-            |f| f.log2(),
-            |f| f.log2(),
+            UnaryKernels {
+                f32_fn: |f| f.log2(),
+                f16_fn: |f| f.log2(),
+                bf16_fn: |f| f.log2(),
+                f64_fn: |f| f.log2(),
+            },
         )
     }
 }
@@ -1479,19 +1477,18 @@ impl EgglogOp for Exp2 {
     }
 }
 impl ReferenceOp for Exp2 {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.exp2(),
-            |f| f.exp2(),
-            |f| f.exp2(),
+            UnaryKernels {
+                f32_fn: |f| f.exp2(),
+                f16_fn: |f| f.exp2(),
+                bf16_fn: |f| f.exp2(),
+                f64_fn: |f| f.exp2(),
+            },
         )
     }
 }
@@ -1552,19 +1549,18 @@ impl EgglogOp for Sin {
     }
 }
 impl ReferenceOp for Sin {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.sin(),
-            |f| f.sin(),
-            |f| f.sin(),
+            UnaryKernels {
+                f32_fn: |f| f.sin(),
+                f16_fn: |f| f.sin(),
+                bf16_fn: |f| f.sin(),
+                f64_fn: |f| f.sin(),
+            },
         )
     }
 }
@@ -1625,19 +1621,18 @@ impl EgglogOp for Recip {
     }
 }
 impl ReferenceOp for Recip {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.recip(),
-            |f| f.recip(),
-            |f| f.recip(),
+            UnaryKernels {
+                f32_fn: |f| f.recip(),
+                f16_fn: |f| f.recip(),
+                bf16_fn: |f| f.recip(),
+                f64_fn: |f| f.recip(),
+            },
         )
     }
 }
@@ -1698,19 +1693,18 @@ impl EgglogOp for Sqrt {
     }
 }
 impl ReferenceOp for Sqrt {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
             &self.strides,
             dyn_map,
-            |f| f.sqrt(),
-            |f| f.sqrt(),
-            |f| f.sqrt(),
+            UnaryKernels {
+                f32_fn: |f| f.sqrt(),
+                f16_fn: |f| f.sqrt(),
+                bf16_fn: |f| f.sqrt(),
+                f64_fn: |f| f.sqrt(),
+            },
         )
     }
 }
@@ -1838,11 +1832,7 @@ impl EgglogOp for Add {
 }
 
 impl ReferenceOp for Add {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -1863,6 +1853,15 @@ impl ReferenceOp for Add {
             }
             (ReferenceData::I64(a), ReferenceData::I64(b)) => {
                 ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
+            }
+            (ReferenceData::I8(a), ReferenceData::I8(b)) => {
+                ReferenceData::I8(bin_fn(a_ind, a, b_ind, b, i8::wrapping_add))
+            }
+            (ReferenceData::U8(a), ReferenceData::U8(b)) => {
+                ReferenceData::U8(bin_fn(a_ind, a, b_ind, b, u8::wrapping_add))
+            }
+            (ReferenceData::I16(a), ReferenceData::I16(b)) => {
+                ReferenceData::I16(bin_fn(a_ind, a, b_ind, b, i16::wrapping_add))
             }
             (ReferenceData::F64(a), ReferenceData::F64(b)) => {
                 ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x + y))
@@ -1938,11 +1937,7 @@ impl EgglogOp for Mul {
 }
 
 impl ReferenceOp for Mul {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -1963,6 +1958,15 @@ impl ReferenceOp for Mul {
             }
             (ReferenceData::I64(a), ReferenceData::I64(b)) => {
                 ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
+            }
+            (ReferenceData::I8(a), ReferenceData::I8(b)) => {
+                ReferenceData::I8(bin_fn(a_ind, a, b_ind, b, i8::wrapping_mul))
+            }
+            (ReferenceData::U8(a), ReferenceData::U8(b)) => {
+                ReferenceData::U8(bin_fn(a_ind, a, b_ind, b, u8::wrapping_mul))
+            }
+            (ReferenceData::I16(a), ReferenceData::I16(b)) => {
+                ReferenceData::I16(bin_fn(a_ind, a, b_ind, b, i16::wrapping_mul))
             }
             (ReferenceData::F64(a), ReferenceData::F64(b)) => {
                 ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x * y))
@@ -2038,11 +2042,7 @@ impl EgglogOp for Mod {
 }
 
 impl ReferenceOp for Mod {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -2063,6 +2063,15 @@ impl ReferenceOp for Mod {
             }
             (ReferenceData::I64(a), ReferenceData::I64(b)) => {
                 ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            }
+            (ReferenceData::I8(a), ReferenceData::I8(b)) => {
+                ReferenceData::I8(bin_fn(a_ind, a, b_ind, b, i8::wrapping_rem))
+            }
+            (ReferenceData::U8(a), ReferenceData::U8(b)) => {
+                ReferenceData::U8(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
+            }
+            (ReferenceData::I16(a), ReferenceData::I16(b)) => {
+                ReferenceData::I16(bin_fn(a_ind, a, b_ind, b, i16::wrapping_rem))
             }
             (ReferenceData::F64(a), ReferenceData::F64(b)) => {
                 ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| x % y))
@@ -2137,11 +2146,7 @@ impl EgglogOp for LessThan {
 }
 
 impl ReferenceOp for LessThan {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -2161,6 +2166,15 @@ impl ReferenceOp for LessThan {
                 ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
             (ReferenceData::I64(a), ReferenceData::I64(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            }
+            (ReferenceData::I8(a), ReferenceData::I8(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            }
+            (ReferenceData::U8(a), ReferenceData::U8(b)) => {
+                ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
+            }
+            (ReferenceData::I16(a), ReferenceData::I16(b)) => {
                 ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| x < y))
             }
             (ReferenceData::F64(a), ReferenceData::F64(b)) => {
@@ -2282,11 +2296,7 @@ impl EgglogOp for Gather {
     }
 }
 impl ReferenceOp for Gather {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (indexes, data) = (inputs[0], inputs[1]);
         let indexes_ind = StridedIterator::new(&self.index_shape, &self.index_strides, dyn_map);
         let data_ind =
@@ -2316,6 +2326,21 @@ impl ReferenceOp for Gather {
                     .collect(),
             ),
             ReferenceData::I64(a) => ReferenceData::I64(
+                indexes_ind
+                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .collect(),
+            ),
+            ReferenceData::I8(a) => ReferenceData::I8(
+                indexes_ind
+                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .collect(),
+            ),
+            ReferenceData::U8(a) => ReferenceData::U8(
+                indexes_ind
+                    .map(|i| a[data_ind[indexes[i] as usize]])
+                    .collect(),
+            ),
+            ReferenceData::I16(a) => ReferenceData::I16(
                 indexes_ind
                     .map(|i| a[data_ind[indexes[i] as usize]])
                     .collect(),
@@ -2447,11 +2472,7 @@ impl EgglogOp for Scatter {
     }
 }
 impl ReferenceOp for Scatter {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (dest, indexes, src) = (inputs[0], inputs[1], inputs[2]);
         let dest_ind =
             StridedIterator::new(&self.dest_shape, &self.dest_strides, dyn_map).collect_vec();
@@ -2480,6 +2501,9 @@ impl ReferenceOp for Scatter {
             (ReferenceData::Bf16(d), ReferenceData::Bf16(s)) => scatter_impl!(Bf16, d, s),
             (ReferenceData::Int(d), ReferenceData::Int(s)) => scatter_impl!(Int, d, s),
             (ReferenceData::I64(d), ReferenceData::I64(s)) => scatter_impl!(I64, d, s),
+            (ReferenceData::I8(d), ReferenceData::I8(s)) => scatter_impl!(I8, d, s),
+            (ReferenceData::U8(d), ReferenceData::U8(s)) => scatter_impl!(U8, d, s),
+            (ReferenceData::I16(d), ReferenceData::I16(s)) => scatter_impl!(I16, d, s),
             (ReferenceData::Bool(d), ReferenceData::Bool(s)) => scatter_impl!(Bool, d, s),
             _ => panic!("dest and src must have the same dtype!"),
         }
@@ -2571,11 +2595,7 @@ impl EgglogOp for SumReduce {
 }
 
 impl ReferenceOp for SumReduce {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         // Resolve dyn vars in iter_stride, then evaluate z-stride at each iteration
         let mut resolved_stride = self.iter_stride;
@@ -2621,6 +2641,30 @@ impl ReferenceOp for SumReduce {
                     (0..iters)
                         .map(|i| a[start + resolved_stride.exec_single_var(i)])
                         .sum::<i64>()
+                })
+                .collect(),
+            ),
+            ReferenceData::I8(a) => ReferenceData::I8(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .fold(0i8, i8::wrapping_add)
+                })
+                .collect(),
+            ),
+            ReferenceData::U8(a) => ReferenceData::U8(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .fold(0u8, u8::wrapping_add)
+                })
+                .collect(),
+            ),
+            ReferenceData::I16(a) => ReferenceData::I16(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .fold(0i16, i16::wrapping_add)
                 })
                 .collect(),
             ),
@@ -2708,11 +2752,7 @@ impl EgglogOp for MaxReduce {
 }
 
 impl ReferenceOp for MaxReduce {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         // Resolve dyn vars in iter_stride, then evaluate z-stride at each iteration
         let mut resolved_stride = self.iter_stride;
@@ -2766,6 +2806,33 @@ impl ReferenceOp for MaxReduce {
                 })
                 .collect(),
             ),
+            ReferenceData::I8(a) => ReferenceData::I8(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .max()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            ),
+            ReferenceData::U8(a) => ReferenceData::U8(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .max()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            ),
+            ReferenceData::I16(a) => ReferenceData::I16(
+                ind.map(|start| {
+                    (0..iters)
+                        .map(|i| a[start + resolved_stride.exec_single_var(i)])
+                        .max()
+                        .unwrap_or_default()
+                })
+                .collect(),
+            ),
             ReferenceData::F64(a) => ReferenceData::F64(
                 ind.map(|start| {
                     (0..iters)
@@ -2781,11 +2848,7 @@ impl ReferenceOp for MaxReduce {
 }
 
 pub trait ReferenceOp: Debug + AsAny + Send + Sync {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData;
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData;
 }
 
 #[derive(Debug, Clone)]
@@ -2795,6 +2858,9 @@ pub enum ReferenceData {
     Bf16(Vec<bf16>),
     Int(Vec<i32>),
     I64(Vec<i64>),
+    I8(Vec<i8>),
+    U8(Vec<u8>),
+    I16(Vec<i16>),
     F64(Vec<f64>),
     Bool(Vec<bool>),
 }
@@ -2810,6 +2876,9 @@ impl ReferenceData {
             ReferenceData::Bf16(v) => v.len(),
             ReferenceData::Int(v) => v.len(),
             ReferenceData::I64(v) => v.len(),
+            ReferenceData::I8(v) => v.len(),
+            ReferenceData::U8(v) => v.len(),
+            ReferenceData::I16(v) => v.len(),
             ReferenceData::F64(v) => v.len(),
             ReferenceData::Bool(v) => v.len(),
         }
@@ -2821,7 +2890,25 @@ impl ReferenceData {
             ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32()).collect(),
             ReferenceData::Int(v) => v.iter().map(|v| *v as f32).collect(),
             ReferenceData::I64(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::I8(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| *v as f32).collect(),
             ReferenceData::F64(v) => v.iter().map(|v| *v as f32).collect(),
+            ReferenceData::Bool(v) => v.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect(),
+        }
+    }
+
+    pub fn to_f64_vec(&self) -> Vec<f64> {
+        match self {
+            ReferenceData::F32(v) => v.iter().map(|v| *v as f64).collect(),
+            ReferenceData::F16(v) => v.iter().map(|v| v.to_f32() as f64).collect(),
+            ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32() as f64).collect(),
+            ReferenceData::Int(v) => v.iter().map(|v| *v as f64).collect(),
+            ReferenceData::I64(v) => v.iter().map(|v| *v as f64).collect(),
+            ReferenceData::I8(v) => v.iter().map(|v| *v as f64).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| *v as f64).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| *v as f64).collect(),
+            ReferenceData::F64(v) => v.clone(),
             ReferenceData::Bool(v) => v.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect(),
         }
     }
@@ -2833,10 +2920,31 @@ impl ReferenceData {
             ReferenceData::Bf16(v) => v.iter().map(|v| f16::from_f32(v.to_f32())).collect(),
             ReferenceData::Int(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
             ReferenceData::I64(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
+            ReferenceData::I8(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| f16::from_f32(*v as f32)).collect(),
             ReferenceData::F64(v) => v.iter().map(|v| f16::from_f64(*v)).collect(),
             ReferenceData::Bool(v) => v
                 .iter()
                 .map(|v| f16::from_f32(if *v { 1.0 } else { 0.0 }))
+                .collect(),
+        }
+    }
+
+    pub fn to_bf16_vec(&self) -> Vec<bf16> {
+        match self {
+            ReferenceData::F32(v) => v.iter().copied().map(bf16::from_f32).collect(),
+            ReferenceData::F16(v) => v.iter().map(|v| bf16::from_f32(v.to_f32())).collect(),
+            ReferenceData::Bf16(v) => v.clone(),
+            ReferenceData::Int(v) => v.iter().map(|v| bf16::from_f32(*v as f32)).collect(),
+            ReferenceData::I64(v) => v.iter().map(|v| bf16::from_f32(*v as f32)).collect(),
+            ReferenceData::I8(v) => v.iter().map(|v| bf16::from_f32(*v as f32)).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| bf16::from_f32(*v as f32)).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| bf16::from_f32(*v as f32)).collect(),
+            ReferenceData::F64(v) => v.iter().map(|v| bf16::from_f64(*v)).collect(),
+            ReferenceData::Bool(v) => v
+                .iter()
+                .map(|v| bf16::from_f32(if *v { 1.0 } else { 0.0 }))
                 .collect(),
         }
     }
@@ -2848,9 +2956,39 @@ impl ReferenceData {
             ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32() as i32).collect(),
             ReferenceData::Int(v) => v.clone(),
             ReferenceData::I64(v) => v.iter().map(|v| *v as i32).collect(),
+            ReferenceData::I8(v) => v.iter().map(|v| *v as i32).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| *v as i32).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| *v as i32).collect(),
             ReferenceData::F64(v) => v.iter().map(|v| *v as i32).collect(),
             ReferenceData::Bool(v) => v.iter().map(|v| if *v { 1 } else { 0 }).collect(),
         }
+    }
+
+    pub fn to_i64_vec(&self) -> Vec<i64> {
+        match self {
+            ReferenceData::F32(v) => v.iter().map(|v| *v as i64).collect(),
+            ReferenceData::F16(v) => v.iter().map(|v| v.to_f32() as i64).collect(),
+            ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32() as i64).collect(),
+            ReferenceData::Int(v) => v.iter().map(|v| *v as i64).collect(),
+            ReferenceData::I64(v) => v.clone(),
+            ReferenceData::I8(v) => v.iter().map(|v| *v as i64).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| *v as i64).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| *v as i64).collect(),
+            ReferenceData::F64(v) => v.iter().map(|v| *v as i64).collect(),
+            ReferenceData::Bool(v) => v.iter().map(|v| if *v { 1 } else { 0 }).collect(),
+        }
+    }
+
+    pub fn to_i8_vec(&self) -> Vec<i8> {
+        self.to_i64_vec().into_iter().map(|v| v as i8).collect()
+    }
+
+    pub fn to_u8_vec(&self) -> Vec<u8> {
+        self.to_i64_vec().into_iter().map(|v| v as u8).collect()
+    }
+
+    pub fn to_i16_vec(&self) -> Vec<i16> {
+        self.to_i64_vec().into_iter().map(|v| v as i16).collect()
     }
 
     pub fn to_bool_vec(&self) -> Vec<bool> {
@@ -2860,6 +2998,9 @@ impl ReferenceData {
             ReferenceData::Bf16(v) => v.iter().map(|v| v.to_f32() != 0.0).collect(),
             ReferenceData::Int(v) => v.iter().map(|v| *v != 0).collect(),
             ReferenceData::I64(v) => v.iter().map(|v| *v != 0).collect(),
+            ReferenceData::I8(v) => v.iter().map(|v| *v != 0).collect(),
+            ReferenceData::U8(v) => v.iter().map(|v| *v != 0).collect(),
+            ReferenceData::I16(v) => v.iter().map(|v| *v != 0).collect(),
             ReferenceData::F64(v) => v.iter().map(|v| *v != 0.0).collect(),
             ReferenceData::Bool(v) => v.clone(),
         }
@@ -2889,6 +3030,21 @@ impl From<Vec<i32>> for ReferenceData {
 impl From<Vec<i64>> for ReferenceData {
     fn from(value: Vec<i64>) -> Self {
         ReferenceData::I64(value)
+    }
+}
+impl From<Vec<i8>> for ReferenceData {
+    fn from(value: Vec<i8>) -> Self {
+        ReferenceData::I8(value)
+    }
+}
+impl From<Vec<u8>> for ReferenceData {
+    fn from(value: Vec<u8>) -> Self {
+        ReferenceData::U8(value)
+    }
+}
+impl From<Vec<i16>> for ReferenceData {
+    fn from(value: Vec<i16>) -> Self {
+        ReferenceData::I16(value)
     }
 }
 // No `From<Vec<f64>> for ReferenceData` impl. Adding it makes plain
@@ -2932,12 +3088,18 @@ impl_reference_data_from_ref!(f32, F32);
 impl_reference_data_from_ref!(f16, F16);
 impl_reference_data_from_ref!(bf16, Bf16);
 impl_reference_data_from_ref!(i32, Int);
+impl_reference_data_from_ref!(i8, I8);
+impl_reference_data_from_ref!(u8, U8);
+impl_reference_data_from_ref!(i16, I16);
 impl_reference_data_from_ref!(bool, Bool);
 
 impl_reference_data_from_array_ref!(f32, F32);
 impl_reference_data_from_array_ref!(f16, F16);
 impl_reference_data_from_array_ref!(bf16, Bf16);
 impl_reference_data_from_array_ref!(i32, Int);
+impl_reference_data_from_array_ref!(i8, I8);
+impl_reference_data_from_array_ref!(u8, U8);
+impl_reference_data_from_array_ref!(i16, I16);
 impl_reference_data_from_array_ref!(bool, Bool);
 
 #[derive(Default)]
@@ -2980,7 +3142,7 @@ impl Runtime for ReferenceRuntime {
     fn profile(
         &mut self,
         _: &LLIRGraph,
-        _: &FxHashMap<char, usize>,
+        _: &DynMap,
         _: usize,
         _: Option<std::time::Duration>,
         _: Option<(Self::ProfileMetric, f64)>,
@@ -3013,7 +3175,7 @@ impl Runtime for ReferenceRuntime {
         self.graph = graph;
     }
 
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
         for node in toposort(&self.graph, None).unwrap() {
             if (**self.graph[node]).as_any().is::<Input>() {
                 continue;
@@ -3086,7 +3248,7 @@ struct StridedIterator {
 }
 
 impl StridedIterator {
-    fn new(shape: &[Expression], strides: &[Expression], dyn_map: &FxHashMap<char, usize>) -> Self {
+    fn new(shape: &[Expression], strides: &[Expression], dyn_map: &DynMap) -> Self {
         let shape: Vec<usize> = shape.iter().map(|e| e.exec(dyn_map).unwrap()).collect();
         // Resolve dynamic vars in strides but keep 'z' as a variable
         let strides: Vec<Expression> = strides
@@ -3135,6 +3297,132 @@ impl Iterator for StridedIterator {
 mod tests {
     use super::*;
 
+    fn assert_f64_unary(op: &dyn ReferenceOp, input: &[f64], expected_fn: fn(f64) -> f64) {
+        let input_data = ReferenceData::F64(input.to_vec());
+        let actual = op.execute(vec![&input_data], &FxHashMap::default());
+        let ReferenceData::F64(actual) = actual else {
+            panic!("F64 unary input must produce an F64 reference buffer")
+        };
+        let expected: Vec<f64> = input.iter().copied().map(expected_fn).collect();
+
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert_eq!(actual.to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn reference_unary_ops_execute_f64_natively() {
+        let input = [0.25, 0.5, 1.0, 2.0, 4.0];
+        let shape = vec![input.len().into()];
+        let strides = vec!['z'.into()];
+
+        assert_f64_unary(
+            &Log2 {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::log2,
+        );
+        assert_f64_unary(
+            &Exp2 {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::exp2,
+        );
+        assert_f64_unary(
+            &Sin {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::sin,
+        );
+        assert_f64_unary(
+            &Recip {
+                shape: shape.clone(),
+                strides: strides.clone(),
+                ..Default::default()
+            },
+            &input,
+            f64::recip,
+        );
+        assert_f64_unary(
+            &Sqrt {
+                shape,
+                strides,
+                ..Default::default()
+            },
+            &input,
+            f64::sqrt,
+        );
+    }
+
+    #[test]
+    fn reference_narrow_integer_casts_preserve_native_widths() {
+        let source = ReferenceData::Int(vec![-32_769, -129, -128, -1, 0, 127, 128, 255, 256]);
+        let dyn_map = FxHashMap::default();
+
+        let i8_data = Cast(9.into(), DType::I8).execute(vec![&source], &dyn_map);
+        assert!(matches!(
+            i8_data,
+            ReferenceData::I8(ref values)
+                if values == &[-1, 127, -128, -1, 0, 127, -128, -1, 0]
+        ));
+
+        let u8_data = Cast(9.into(), DType::U8).execute(vec![&source], &dyn_map);
+        assert!(matches!(
+            u8_data,
+            ReferenceData::U8(ref values)
+                if values == &[255, 127, 128, 255, 0, 127, 128, 255, 0]
+        ));
+
+        let i16_data = Cast(9.into(), DType::I16).execute(vec![&source], &dyn_map);
+        assert!(matches!(
+            i16_data,
+            ReferenceData::I16(ref values)
+                if values == &[32767, -129, -128, -1, 0, 127, 128, 255, 256]
+        ));
+    }
+
+    #[test]
+    fn reference_narrow_integer_add_wraps_in_declared_dtype() {
+        let op = Add {
+            shape: vec![2.into()],
+            a_strides: vec!['z'.into()],
+            b_strides: vec!['z'.into()],
+            ..Default::default()
+        };
+        let dyn_map = FxHashMap::default();
+
+        let i8_lhs = ReferenceData::I8(vec![127, -128]);
+        let i8_rhs = ReferenceData::I8(vec![1, -1]);
+        assert!(matches!(
+            op.execute(vec![&i8_lhs, &i8_rhs], &dyn_map),
+            ReferenceData::I8(values) if values == [-128, 127]
+        ));
+
+        let u8_lhs = ReferenceData::U8(vec![255, 0]);
+        let u8_rhs = ReferenceData::U8(vec![1, 255]);
+        assert!(matches!(
+            op.execute(vec![&u8_lhs, &u8_rhs], &dyn_map),
+            ReferenceData::U8(values) if values == [0, 255]
+        ));
+
+        let i16_lhs = ReferenceData::I16(vec![32_767, -32_768]);
+        let i16_rhs = ReferenceData::I16(vec![1, -1]);
+        assert!(matches!(
+            op.execute(vec![&i16_lhs, &i16_rhs], &dyn_map),
+            ReferenceData::I16(values) if values == [-32_768, 32_767]
+        ));
+    }
+
     fn round_tripped(v: f32) -> f32 {
         let s = Constant(v).to_egglog(&[]);
         let inner = &s["(Op (Constant ".len()..s.len() - ") (INil))".len()];
@@ -3170,6 +3458,36 @@ mod tests {
         ];
         for &v in &adversarial {
             assert_eq!(round_tripped(v).to_bits(), v.to_bits(), "constant {v:?}");
+        }
+    }
+
+    #[test]
+    fn f64_constant_to_egglog_round_trips_exactly() {
+        let adversarial = [
+            0.0f64,
+            -0.0,
+            1.000_000_000_000_000_2,
+            f64::EPSILON,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            std::f64::consts::PI,
+            1e300,
+            -1e-300,
+        ];
+
+        for value in adversarial {
+            let serialized = ConstantF64(value).to_egglog(&[]);
+            let prefix = "(Op (ConstantF64 ";
+            let suffix = ") (INil))";
+            let inner = &serialized[prefix.len()..serialized.len() - suffix.len()];
+            let round_tripped = inner
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("unparseable F64 constant text {inner:?}"));
+            assert_eq!(
+                round_tripped.to_bits(),
+                value.to_bits(),
+                "F64 constant changed across egglog serialization: {value:?}"
+            );
         }
     }
 }

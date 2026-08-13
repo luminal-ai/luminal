@@ -78,16 +78,16 @@ struct RollingSearchReport {
 
 #[derive(Debug, Clone, Default)]
 struct SearchSpaceContext {
-    bucket_indices: FxHashMap<char, usize>,
-    representative_dyn_map: FxHashMap<char, usize>,
+    bucket_indices: DynMap,
+    representative_dyn_map: DynMap,
     intervals: DynDimIntervals,
 }
 
 #[derive(Debug, Clone)]
 struct SearchProfileBucketContext {
-    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
-    bucket_indices: FxHashMap<char, usize>,
-    representative_dyn_map: FxHashMap<char, usize>,
+    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
+    bucket_indices: DynMap,
+    representative_dyn_map: DynMap,
 }
 
 struct Finalist<M> {
@@ -125,14 +125,14 @@ struct BucketFinalistSearch<'a, M> {
 }
 
 /// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
-pub type BucketLLIR = (FxHashMap<char, usize>, FxHashMap<char, usize>, LLIRGraph);
+pub type BucketLLIR = (DynMap, DynMap, LLIRGraph);
 
 /// Borrowed view of a compiled bucket used for non-committing aggregate
 /// candidate filtering.
 #[derive(Clone, Copy)]
 pub struct BucketLLIRRef<'a> {
-    pub bucket_indices: &'a FxHashMap<char, usize>,
-    pub representative_dyn_map: &'a FxHashMap<char, usize>,
+    pub bucket_indices: &'a DynMap,
+    pub representative_dyn_map: &'a DynMap,
     pub llir: &'a LLIRGraph,
 }
 
@@ -240,12 +240,12 @@ pub struct CompileOptions {
     /// the base representative values for unbucketed dimensions. Per-bucket
     /// representatives override them during bucketed search, and
     /// [`CompileOptions::profile_dims`] override them only while profiling.
-    pub search_dims: FxHashMap<char, usize>,
+    pub search_dims: DynMap,
     /// Optional profiling dimension overrides.
-    pub profile_dims: FxHashMap<char, usize>,
+    pub profile_dims: DynMap,
     /// Bucket definitions per dynamic dimension. Dimensions without buckets use
     /// a single implicit bucket.
-    pub dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    pub dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
     /// Enable egglog progress logging. Quiet by default; overridden by
     /// `EGGLOG_LOG=1` or `LUMINAL_LOG=1`.
     pub egglog_log: bool,
@@ -255,6 +255,22 @@ pub struct CompileOptions {
     /// Enable search progress logging. Enabled by default; overridden by
     /// `SEARCH_LOG=0`/`1` or `LUMINAL_LOG=1`.
     pub search_log: bool,
+}
+
+/// Resolve a caller-supplied dimension name, rejecting the reserved loop index.
+///
+/// Covers the methods that give a dimension a value, not every way in:
+/// `Graph::dyn_map` and `CompileOptions::{search_dims, profile_dims,
+/// dim_buckets}` are public fields, and a serialized `ShapeTracker`
+/// deserializes without passing through here.
+fn checked_dim(dimension: impl Into<Symbol>) -> Symbol {
+    let dimension = dimension.into();
+    assert!(
+        !dimension.is_reserved(),
+        "{}",
+        crate::shape::InvalidSymbolName::Reserved
+    );
+    dimension
 }
 
 impl CompileOptions {
@@ -326,13 +342,15 @@ impl CompileOptions {
     /// search. This is equivalent to calling [`Graph::set_dim`] between
     /// [`Graph::build_search_space`] and [`Graph::search`], while still using
     /// the unified [`Graph::compile`] API.
-    pub fn search_dim(mut self, dim: char, value: usize) -> Self {
+    pub fn search_dim(mut self, dim: impl Into<Symbol>, value: usize) -> Self {
+        let dim = checked_dim(dim);
         self.search_dims.insert(dim, value);
         self
     }
 
     /// Override a dynamic dimension value used during search profiling.
-    pub fn profile_dim(mut self, dim: char, value: usize) -> Self {
+    pub fn profile_dim(mut self, dim: impl Into<Symbol>, value: usize) -> Self {
+        let dim = checked_dim(dim);
         self.profile_dims.insert(dim, value);
         self
     }
@@ -342,7 +360,8 @@ impl CompileOptions {
     /// Bucketed compilation builds a separate search space and selected LLIR for
     /// each bucket combination. Buckets must not overlap and must cover all
     /// values that will be used at runtime.
-    pub fn dim_buckets(mut self, dimension: char, buckets: &[DimBucket]) -> Self {
+    pub fn dim_buckets(mut self, dimension: impl Into<Symbol>, buckets: &[DimBucket]) -> Self {
+        let dimension = checked_dim(dimension);
         validate_dim_buckets(dimension, buckets);
         self.dim_buckets.insert(dimension, buckets.to_vec());
         self
@@ -405,7 +424,7 @@ impl Default for CompileOptions {
     }
 }
 
-fn validate_dim_buckets(dimension: char, buckets: &[DimBucket]) {
+fn validate_dim_buckets(dimension: Symbol, buckets: &[DimBucket]) {
     assert!(
         !buckets.is_empty(),
         "Buckets for dim '{dimension}' must not be empty"
@@ -425,7 +444,7 @@ fn validate_dim_buckets(dimension: char, buckets: &[DimBucket]) {
     }
 }
 
-fn maybe_dump_selected_llir(label: &str, dyn_map: &FxHashMap<char, usize>, llir: &LLIRGraph) {
+fn maybe_dump_selected_llir(label: &str, dyn_map: &DynMap, llir: &LLIRGraph) {
     let Ok(dir) = std::env::var("LLIR_DUMP_DIR") else {
         return;
     };
@@ -529,7 +548,7 @@ fn panic_initial_filter_limit(filter_fails: usize, last_rejection: Option<&str>)
 #[derive(Debug, Default)]
 pub struct Graph {
     /// A map of dynamic dimensions to concrete dimension sizes
-    pub dyn_map: FxHashMap<char, usize>,
+    pub dyn_map: DynMap,
     /// Edge weights: (Input index, Output index, Input shape)
     pub graph: HLIRGraph,
     /// E-Graph search spaces. Bucketed compilation stores one egraph per
@@ -541,7 +560,7 @@ pub struct Graph {
     /// Custom ops
     pub custom_ops: Vec<Box<dyn CustomOp>>,
     /// Bucket definitions used by the currently built search space.
-    search_space_dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    search_space_dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
     /// Optional graph-wide interval assumptions for dynamic dimensions.
     pub dim_intervals: DynDimIntervals,
     /// Metadata for Input nodes: NodeIndex -> (label, dtype).
@@ -1008,11 +1027,13 @@ impl Graph {
     }
 
     /// Set a runtime dimension
-    pub fn set_dim(&mut self, dimension: char, val: usize) {
+    pub fn set_dim(&mut self, dimension: impl Into<Symbol>, val: usize) {
+        let dimension = checked_dim(dimension);
         self.dyn_map.insert(dimension, val);
     }
 
-    pub fn set_dim_interval(&mut self, dimension: char, min: i64, max: i64) {
+    pub fn set_dim_interval(&mut self, dimension: impl Into<Symbol>, min: i64, max: i64) {
+        let dimension = checked_dim(dimension);
         self.dim_intervals
             .insert(dimension, DimInterval::new(min, max));
     }
@@ -1639,7 +1660,7 @@ impl Graph {
 
     fn search_space_contexts(
         &self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
     ) -> Vec<SearchSpaceContext> {
         if dim_buckets.is_empty() {
             return vec![SearchSpaceContext {
@@ -2094,14 +2115,13 @@ impl Graph {
     /// Returns Vec of (bucket_indices, representative_dyn_map).
     fn bucket_combinations(
         &self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
-    ) -> Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> {
-        let mut dims: Vec<(char, &Vec<DimBucket>)> =
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
+    ) -> Vec<(DynMap, DynMap)> {
+        let mut dims: Vec<(Symbol, &Vec<DimBucket>)> =
             dim_buckets.iter().map(|(c, b)| (*c, b)).collect();
         dims.sort_by_key(|(c, _)| *c);
 
-        let mut combos: Vec<(FxHashMap<char, usize>, FxHashMap<char, usize>)> =
-            vec![(FxHashMap::default(), self.dyn_map.clone())];
+        let mut combos: Vec<(DynMap, DynMap)> = vec![(FxHashMap::default(), self.dyn_map.clone())];
 
         for (dim, buckets) in &dims {
             let mut new_combos = Vec::new();
@@ -2120,10 +2140,7 @@ impl Graph {
         combos
     }
 
-    fn late_pass_dyn_map(
-        &self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
-    ) -> FxHashMap<char, usize> {
+    fn late_pass_dyn_map(&self, dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>) -> DynMap {
         let mut dyn_map = self.dyn_map.clone();
         for (&dim, buckets) in dim_buckets {
             if let Some(max) = buckets.iter().map(|bucket| bucket.max).max() {
@@ -2136,8 +2153,8 @@ impl Graph {
     /// Format a human-readable label for a bucket combination.
     fn format_bucket_label(
         &self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
-        bucket_indices: &FxHashMap<char, usize>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
+        bucket_indices: &DynMap,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
         let mut dims: Vec<_> = bucket_indices.iter().collect();
@@ -2170,7 +2187,7 @@ impl Graph {
         runtime: &mut R,
         options: &CompileOptions,
         rng: &mut G,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         bucket_progress: Option<(usize, usize)>,
         bucket_profile_context: Option<SearchProfileBucketContext>,
         egraph_index: usize,
@@ -2742,7 +2759,7 @@ impl Graph {
         candidates: &mut LazyFinalists<'a, R::ProfileMetric>,
         target: usize,
         options: &CompileOptions,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         bucket_profile_context: Option<&SearchProfileBucketContext>,
         egraph_index: usize,
         search_started_at: std::time::Instant,
@@ -2909,7 +2926,7 @@ impl Graph {
 
     fn dump_selected_finalist<M>(
         finalist: &Finalist<M>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         bucket_progress: Option<(usize, usize)>,
     ) {
         if let Some(pre_unroll) = &finalist.pre_unroll {
@@ -2932,7 +2949,7 @@ impl Graph {
         &self,
         runtime: &mut R,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         search_options: &CompileOptions,
         bucket_profile_context: Option<&SearchProfileBucketContext>,
     ) -> CandidateFilterResult {
@@ -4311,8 +4328,8 @@ mod tests {
 
     #[derive(Default)]
     struct SearchDimRecordingRuntime {
-        profile_dyn_maps: Vec<FxHashMap<char, usize>>,
-        bucket_representative_dyn_maps: Vec<FxHashMap<char, usize>>,
+        profile_dyn_maps: Vec<DynMap>,
+        bucket_representative_dyn_maps: Vec<DynMap>,
     }
 
     impl Runtime for SearchDimRecordingRuntime {
@@ -4324,10 +4341,10 @@ mod tests {
         fn late_egglog_passes(
             _: &[Arc<Box<dyn EgglogOp>>],
             _: &CompileOptions,
-            dyn_map: &FxHashMap<char, usize>,
+            dyn_map: &DynMap,
         ) -> Vec<crate::egglog_utils::LateEgglogPass> {
             SEARCH_DIM_LATE_PASS_CALLED.store(true, Ordering::SeqCst);
-            SEARCH_DIM_LATE_PASS_SAW_C.store(dyn_map.contains_key(&'c'), Ordering::SeqCst);
+            SEARCH_DIM_LATE_PASS_SAW_C.store(dyn_map.contains_key(&sym("c")), Ordering::SeqCst);
             vec![]
         }
 
@@ -4339,7 +4356,7 @@ mod tests {
 
         fn load_llir_buckets(
             &mut self,
-            _: &FxHashMap<char, Vec<DimBucket>>,
+            _: &FxHashMap<Symbol, Vec<DimBucket>>,
             bucket_llirs: &[BucketLLIR],
         ) {
             self.bucket_representative_dyn_maps = bucket_llirs
@@ -4348,12 +4365,12 @@ mod tests {
                 .collect();
         }
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             _: &LLIRGraph,
-            dyn_map: &FxHashMap<char, usize>,
+            dyn_map: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4380,12 +4397,12 @@ mod tests {
 
         fn load_llir(&mut self, _: &LLIRGraph) {}
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             _: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4425,12 +4442,12 @@ mod tests {
 
         fn load_llir(&mut self, _: &LLIRGraph) {}
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             _: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4505,11 +4522,7 @@ mod tests {
             }
 
             impl ReferenceOp for $name {
-                fn execute(
-                    &self,
-                    inputs: Vec<&ReferenceData>,
-                    _: &FxHashMap<char, usize>,
-                ) -> ReferenceData {
+                fn execute(&self, inputs: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
                     let ReferenceData::F32(input) = inputs[0] else {
                         panic!("final-filter test Sin candidates only support F32")
                     };
@@ -4566,12 +4579,12 @@ mod tests {
             self.loaded_signatures.push(signature);
         }
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             llir: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4638,12 +4651,12 @@ mod tests {
             self.loaded_signatures.push(signature);
         }
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             llir: &LLIRGraph,
-            dyn_map: &FxHashMap<char, usize>,
+            dyn_map: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4654,7 +4667,7 @@ mod tests {
                 3,
                 "profiling should see the fully unrolled candidate"
             );
-            self.last_profile_dim = dyn_map.get(&'s').copied();
+            self.last_profile_dim = dyn_map.get(&Symbol::from('s')).copied();
             if fast == 1 {
                 (0, "fast".to_string())
             } else {
@@ -4669,7 +4682,11 @@ mod tests {
         ) -> CandidateFilterResult {
             let (fast, safe, _) = FinalFilterRuntime::signature(llir);
             let is_unrolled = fast + safe > 1;
-            let filter_dim = context.dyn_map.get(&'s').copied().unwrap_or(1);
+            let filter_dim = context
+                .dyn_map
+                .get(&Symbol::from('s'))
+                .copied()
+                .unwrap_or(1);
             if is_unrolled && fast > 0 && filter_dim > 1 {
                 self.rejected_unrolled_fast += 1;
                 CandidateFilterResult::reject_with_display(format!(
@@ -4705,7 +4722,7 @@ mod tests {
 
         fn load_llir_buckets(
             &mut self,
-            _: &FxHashMap<char, Vec<DimBucket>>,
+            _: &FxHashMap<Symbol, Vec<DimBucket>>,
             bucket_llirs: &[BucketLLIR],
         ) {
             let signatures = bucket_llirs
@@ -4725,12 +4742,12 @@ mod tests {
             self.loaded_sets.push(signatures);
         }
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             llir: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4761,7 +4778,7 @@ mod tests {
 
         fn filter_llir_bucket_set(
             &mut self,
-            _: &FxHashMap<char, Vec<DimBucket>>,
+            _: &FxHashMap<Symbol, Vec<DimBucket>>,
             bucket_llirs: &[BucketLLIRRef<'_>],
             _: &CompileOptions,
         ) -> CandidateFilterResult {
@@ -4810,12 +4827,12 @@ mod tests {
             panic!("a runtime with no viable final candidate must not be loaded")
         }
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             llir: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4876,12 +4893,12 @@ mod tests {
             panic!("a timed-out final candidate must not be loaded")
         }
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             llir: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             _: Option<(Self::ProfileMetric, f64)>,
@@ -4928,7 +4945,7 @@ mod tests {
             .search_log(false);
         assert_eq!(opts.limit, 7);
         assert_eq!(opts.search_time_limit, time_limit);
-        assert_eq!(opts.search_dims[&'c'], 16);
+        assert_eq!(opts.search_dims[&sym("c")], 16);
         assert!(opts.egglog_log);
         assert!(opts.rolling_log);
         assert!(!opts.search_log);
@@ -4958,13 +4975,13 @@ mod tests {
             "search-only dimensions must not leak into build-time late passes"
         );
         assert_eq!(runtime.profile_dyn_maps.len(), 1);
-        assert_eq!(runtime.profile_dyn_maps[0][&'s'], 2);
-        assert_eq!(runtime.profile_dyn_maps[0][&'c'], 7);
+        assert_eq!(runtime.profile_dyn_maps[0][&sym("s")], 2);
+        assert_eq!(runtime.profile_dyn_maps[0][&sym("c")], 7);
         assert_eq!(runtime.bucket_representative_dyn_maps.len(), 1);
-        assert_eq!(runtime.bucket_representative_dyn_maps[0][&'s'], 3);
-        assert_eq!(runtime.bucket_representative_dyn_maps[0][&'c'], 16);
-        assert_eq!(cx.dyn_map[&'s'], 4);
-        assert_eq!(cx.dyn_map[&'c'], 16);
+        assert_eq!(runtime.bucket_representative_dyn_maps[0][&sym("s")], 3);
+        assert_eq!(runtime.bucket_representative_dyn_maps[0][&sym("c")], 16);
+        assert_eq!(cx.dyn_map[&sym("s")], 4);
+        assert_eq!(cx.dyn_map[&sym("c")], 16);
     }
 
     #[test]
@@ -5085,12 +5102,12 @@ mod tests {
 
         fn load_llir(&mut self, _: &LLIRGraph) {}
 
-        fn execute(&mut self, _: &FxHashMap<char, usize>) -> Self::ExecReturn {}
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
 
         fn profile(
             &mut self,
             _: &LLIRGraph,
-            _: &FxHashMap<char, usize>,
+            _: &DynMap,
             _: usize,
             _: Option<std::time::Duration>,
             early_stop: Option<(Self::ProfileMetric, f64)>,
@@ -5307,11 +5324,11 @@ mod tests {
         assert_eq!(cx.egraphs.len(), 2);
         assert_eq!(cx.egraph_contexts.len(), 2);
         assert_eq!(
-            cx.egraph_contexts[0].intervals[&'s'],
+            cx.egraph_contexts[0].intervals[&sym("s")],
             DimInterval::new(1, 1)
         );
         assert_eq!(
-            cx.egraph_contexts[1].intervals[&'s'],
+            cx.egraph_contexts[1].intervals[&sym("s")],
             DimInterval::new(2, 4)
         );
     }

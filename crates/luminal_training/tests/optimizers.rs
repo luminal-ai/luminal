@@ -19,7 +19,7 @@ fn seq(n: usize, lo: f32, hi: f32) -> Vec<f32> {
 /// step scalars; reads updated params and state back after each execute.
 struct OptTrainer {
     rt: ReferenceRuntime,
-    dyn_map: FxHashMap<char, usize>,
+    dyn_map: DynMap,
     loss_out: GraphTensor,
     step: OptimizerStep,
     param_ids: Vec<NodeIndex>,

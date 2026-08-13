@@ -209,28 +209,16 @@ pub fn resolve_neg1_dim_exprs(
 }
 
 /// Map a PT2 dtype code to luminal `DType`. Panics for variants the IR
-/// doesn't model as first-class types (narrow ints `Byte` / `Char` /
-/// `Short`, the complex family, the float8 family) and for unknown
-/// codes — better to fail loudly at the translator boundary than to
-/// silently widen and lie about the user's dtype.
+/// doesn't model as first-class types (the complex family, unsupported
+/// float8 variants, and uint16) and for unknown codes. The common narrow
+/// integers map to native-width HLIR dtypes without widening.
 pub fn torch_dtype_int_to_luminal(dtype: u32) -> DType {
     let t = crate::torch_dtype::TorchDType::from_code(dtype)
         .unwrap_or_else(|c| panic!("torch_dtype_int_to_luminal: unknown PT2 dtype code {c}"));
-    match t {
-        crate::torch_dtype::TorchDType::Byte
-        | crate::torch_dtype::TorchDType::Char
-        | crate::torch_dtype::TorchDType::Short => panic!(
-            "torch_dtype_int_to_luminal: PT2 dtype {} (code {}) isn't a first-class \
-             IR type yet — cast to torch.int32 at the call site, or wait for the \
-             narrower-int IR follow-up.",
-            t.name(),
-            t.code(),
-        ),
-        other => DType::try_from(other).unwrap_or_else(|t| {
-            panic!(
-                "torch_dtype_int_to_luminal: {} isn't a first-class luminal IR type",
-                t.name()
-            )
-        }),
-    }
+    DType::try_from(t).unwrap_or_else(|t| {
+        panic!(
+            "torch_dtype_int_to_luminal: {} isn't a first-class luminal IR type",
+            t.name()
+        )
+    })
 }

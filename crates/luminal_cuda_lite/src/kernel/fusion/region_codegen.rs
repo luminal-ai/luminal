@@ -170,7 +170,7 @@ struct FusionValidationCache {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum CanonicalSemanticExpression {
     Number(i64),
-    Variable(char),
+    Variable(Symbol),
     Binary(u8, Box<Self>, Box<Self>),
     AssociativeCommutative(u8, Vec<Self>),
 }
@@ -345,7 +345,7 @@ fn fusion_unary_dtype_supported(op: &str, dtype: DType) -> bool {
 fn expression_relation(
     lhs: Expression,
     rhs: Expression,
-    dyn_map: Option<&FxHashMap<char, usize>>,
+    dyn_map: Option<&DynMap>,
     z_witnesses: &[usize],
     exhaustive: bool,
     cache: &mut FusionValidationCache,
@@ -423,7 +423,7 @@ fn expression_relation(
         let mut different = false;
         for &z in z_witnesses {
             let mut values = concrete_map.clone();
-            values.insert('z', z);
+            values.insert(Symbol::reserved_index(), z);
             match (
                 eval_expression(lhs_simplified, &values),
                 eval_expression(rhs_simplified, &values),
@@ -462,7 +462,7 @@ fn expression_relation(
     relation
 }
 
-fn eval_expression(expression: Expression, values: &FxHashMap<char, usize>) -> Option<usize> {
+fn eval_expression(expression: Expression, values: &DynMap) -> Option<usize> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expression.exec(values)))
         .ok()
         .flatten()
@@ -471,7 +471,7 @@ fn eval_expression(expression: Expression, values: &FxHashMap<char, usize>) -> O
 fn layout_relation(
     lhs: FusionLayout<'_>,
     rhs: FusionLayout<'_>,
-    dyn_map: Option<&FxHashMap<char, usize>>,
+    dyn_map: Option<&DynMap>,
     cache: &mut FusionValidationCache,
 ) -> SemanticRelation {
     debug_assert_eq!(lhs.shape.len(), lhs.strides.len());
@@ -544,7 +544,7 @@ fn require_layout_compatible(
     input_slot: usize,
     produced: FusionLayout<'_>,
     expected: FusionLayout<'_>,
-    dyn_map: Option<&FxHashMap<char, usize>>,
+    dyn_map: Option<&DynMap>,
     cache: &mut FusionValidationCache,
 ) -> Result<(), FusionValidationError> {
     match layout_relation(produced, expected, dyn_map, cache) {
@@ -586,7 +586,7 @@ fn incoming_nodes(llir: &LLIRGraph, node: NodeIndex) -> Vec<NodeIndex> {
 /// rejected as an unsupported layout because codegen erases that metadata.
 pub(crate) fn validate_fusion_regions(
     llir: &LLIRGraph,
-    dyn_map: Option<&FxHashMap<char, usize>>,
+    dyn_map: Option<&DynMap>,
 ) -> Result<(), FusionValidationError> {
     let mut validation_cache = FusionValidationCache::default();
     for node in llir.node_indices() {
@@ -1429,7 +1429,7 @@ pub(crate) struct CompiledRegion {
     pub grid: (Expression, Expression, Expression),
     pub block: (Expression, Expression, Expression),
     pub shared_mem: Expression,
-    pub constants: FxHashMap<char, CudaSlice<u8>>,
+    pub constants: FxHashMap<Symbol, CudaSlice<u8>>,
 }
 
 /// Generate the fused kernel source plus launch geometry for a region.
@@ -1454,7 +1454,7 @@ pub(crate) fn region_kernel_source(
     // Aggregate all dynamic vars used anywhere in the region (FS strides,
     // FE strides and elementwise shapes.
     // own strides are likewise relevant for any future stride-affine ops).
-    let mut all_vars: FxHashSet<char> = FxHashSet::default();
+    let mut all_vars: FxHashSet<Symbol> = FxHashSet::default();
     all_vars.extend(out_shape.iter().flat_map(|e| e.dyn_vars()));
     all_vars.extend(out_strides.iter().flat_map(|e| e.dyn_vars()));
     for &fs_idx in &region.fs_nodes {
@@ -1815,7 +1815,13 @@ mod tests {
         llir.add_edge(fs, sin, ());
         llir.add_edge(sin, fe, ());
 
-        let dims = [('a', 2), ('b', 3), ('c', 4)].into_iter().collect();
+        let dims = [
+            (Symbol::from('a'), 2),
+            (Symbol::from('b'), 3),
+            (Symbol::from('c'), 4),
+        ]
+        .into_iter()
+        .collect();
         validate_fusion_regions(&llir, Some(&dims)).unwrap();
     }
 
@@ -1852,7 +1858,9 @@ mod tests {
         llir.add_edge(fs, sin, ());
         llir.add_edge(sin, fe, ());
 
-        let representative = [('a', 16), ('b', 16)].into_iter().collect();
+        let representative = [(Symbol::from('a'), 16), (Symbol::from('b'), 16)]
+            .into_iter()
+            .collect();
         let error = validate_fusion_regions(&llir, Some(&representative)).unwrap_err();
         assert!(error.reason.contains("could not be proved"));
     }

@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::egglog_utils::{self, SerializedEGraph, extract_expr};
+use crate::shape::symbol::{DynMap, Symbol, egglog_var_name, kernel_const_name};
 use egglog::{ast::Span, prelude::RustSpan, var};
 
 type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
@@ -50,15 +51,15 @@ impl DimInterval {
     }
 }
 
-pub type DynDimIntervals = FxHashMap<char, DimInterval>;
+pub type DynDimIntervals = FxHashMap<Symbol, DimInterval>;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct IntervalSimplifyKey {
     expr: Expression,
-    intervals: Vec<(char, DimInterval)>,
+    intervals: Vec<(Symbol, DimInterval)>,
 }
 
-fn canonical_intervals(intervals: &DynDimIntervals) -> Vec<(char, DimInterval)> {
+fn canonical_intervals(intervals: &DynDimIntervals) -> Vec<(Symbol, DimInterval)> {
     let mut intervals = intervals.iter().map(|(&c, &i)| (c, i)).collect::<Vec<_>>();
     intervals.sort_by_key(|(c, _)| *c);
     intervals
@@ -146,20 +147,36 @@ impl Expression {
     pub fn is_dynamic(&self) -> bool {
         self.terms.read().iter().any(|i| {
             if let Term::Var(v) = i {
-                *v != 'z'
+                !v.is_reserved()
             } else {
                 false
             }
         })
     }
 
-    pub fn dyn_vars(&self) -> Vec<char> {
+    /// Whether this expression mentions the reserved loop index.
+    ///
+    /// Distinct from [`dyn_vars`](Self::dyn_vars), which *excludes* the
+    /// reserved index — this is how a caller asks "is the index in here at
+    /// all", which strides legitimately are and dimension sizes must not be.
+    pub fn uses_reserved_index(&self) -> bool {
+        self.terms
+            .read()
+            .iter()
+            .any(|t| matches!(t, Term::Var(v) if v.is_reserved()))
+    }
+
+    /// The dimension variables this expression depends on.
+    ///
+    /// Excludes the reserved loop index — it is an index, not a dimension, so
+    /// nothing downstream should plan buffers or emit `dyn_dims` slots for it.
+    pub fn dyn_vars(&self) -> Vec<Symbol> {
         self.terms
             .read()
             .iter()
             .filter_map(|i| {
                 if let Term::Var(v) = i {
-                    if *v != 'z' { Some(*v) } else { None }
+                    (!v.is_reserved()).then_some(*v)
                 } else {
                     None
                 }
@@ -184,7 +201,7 @@ impl Default for Expression {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Term {
     Num(i64),
-    Var(char),
+    Var(Symbol),
     Add,
     Sub,
     Mul,
@@ -338,7 +355,7 @@ impl Expression {
         for term in self.terms.read().iter() {
             let new_symbol = match term {
                 Term::Num(n) => format!("(MNum {n})"),
-                Term::Var(c) => format!("(MVar \"{c}\")"),
+                Term::Var(c) => format!("(MVar \"{}\")", egglog_var_name(c)),
                 Term::Max => format!(
                     "(MMax {} {})",
                     symbols.pop().unwrap(),
@@ -361,12 +378,25 @@ impl Expression {
         symbols.pop().unwrap_or_default()
     }
 
-    pub fn to_kernel(&self) -> String {
+    /// Emit C for this expression, spelling the reserved loop index as
+    /// `index_var` instead of its default `const_z`.
+    ///
+    /// Substitutes on the term, so no dim name can be a prefix of another and
+    /// get rewritten mid-name.
+    pub fn to_kernel_with_index(&self, index_var: &str) -> String {
+        self.to_kernel_with(index_var, &kernel_const_name)
+    }
+
+    /// As [`to_kernel_with_index`](Self::to_kernel_with_index), but also chooses
+    /// how each dynamic dim is spelled — Metal names them by buffer slot rather
+    /// than by `const_<name>`.
+    pub fn to_kernel_with(&self, index_var: &str, dim: &dyn Fn(&Symbol) -> String) -> String {
         let mut symbols = vec![];
         for term in self.terms.read().iter() {
             let new_symbol = match term {
                 Term::Num(n) => n.to_string(),
-                Term::Var(c) => format!("const_{c}"),
+                Term::Var(c) if c.is_reserved() => index_var.to_string(),
+                Term::Var(c) => dim(c),
                 Term::Max => format!(
                     "max((int){}, (int){})",
                     symbols.pop().unwrap(),
@@ -403,6 +433,13 @@ impl Expression {
         }
         symbols.pop().unwrap_or_default()
     }
+
+    /// Emit C for this expression, with the reserved loop index spelled
+    /// `const_z` — the name generated kernels give their thread index.
+    pub fn to_kernel(&self) -> String {
+        self.to_kernel_with_index(&kernel_const_name(&Symbol::reserved_index()))
+    }
+
     /// Simplify the expression to its minimal terms
     #[tracing::instrument(skip_all)]
     pub fn simplify(self) -> Self {
@@ -557,7 +594,8 @@ impl Expression {
         Expression::new(terms)
     }
     /// Substitute an expression for a variable
-    pub fn substitute(self, var: char, expr: impl Into<Expression>) -> Self {
+    pub fn substitute(self, var: impl Into<Symbol>, expr: impl Into<Expression>) -> Self {
+        let var = var.into();
         let mut new_terms = vec![];
         let t = expr.into().terms.read();
         for term in self.terms.read().iter() {
@@ -615,15 +653,11 @@ impl Expression {
         stack.pop().unwrap() as usize
     }
     /// Evaluate the expression given variables.
-    pub fn exec(&self, variables: &FxHashMap<char, usize>) -> Option<usize> {
+    pub fn exec(&self, variables: &DynMap) -> Option<usize> {
         self.exec_stack(variables, &mut Vec::new())
     }
     /// Evaluate the expression given variables. This function requires a stack to be given for use as storage
-    pub fn exec_stack(
-        &self,
-        variables: &FxHashMap<char, usize>,
-        stack: &mut Vec<i64>,
-    ) -> Option<usize> {
+    pub fn exec_stack(&self, variables: &DynMap, stack: &mut Vec<i64>) -> Option<usize> {
         for term in self.terms.read().iter() {
             match term {
                 Term::Num(n) => stack.push(*n),
@@ -638,7 +672,7 @@ impl Expression {
         stack.pop().map(|i| i as usize)
     }
     /// Retrieve all symbols in the expression.
-    pub fn to_symbols(&self) -> Vec<char> {
+    pub fn to_symbols(&self) -> Vec<Symbol> {
         self.terms
             .read()
             .iter()
@@ -649,7 +683,7 @@ impl Expression {
             .collect()
     }
     /// Resolve all known variables from dyn map into real values
-    pub fn resolve_vars(&self, dyn_map: &FxHashMap<char, usize>) -> Expression {
+    pub fn resolve_vars(&self, dyn_map: &DynMap) -> Expression {
         let new_terms: Vec<Term> = self
             .terms
             .read()
@@ -739,15 +773,23 @@ impl From<Term> for Expression {
     }
 }
 
+impl From<Symbol> for Expression {
+    fn from(value: Symbol) -> Self {
+        Expression::new(vec![Term::Var(value)])
+    }
+}
+
+/// Names the same dim as `sym("s")`; a literal just reads better in
+/// hand-written models.
 impl From<char> for Expression {
     fn from(value: char) -> Self {
-        Expression::new(vec![Term::Var(value)])
+        Expression::from(Symbol::from(value))
     }
 }
 
 impl From<&char> for Expression {
     fn from(value: &char) -> Self {
-        Expression::new(vec![Term::Var(*value)])
+        Expression::from(Symbol::from(*value))
     }
 }
 
@@ -1271,6 +1313,7 @@ fn egglog_simplify_with_intervals(e: Expression, intervals: &DynDimIntervals) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shape::sym;
     use proptest::prelude::*;
 
     #[test]
@@ -1302,7 +1345,10 @@ mod tests {
         assert_eq!(((a * 1) + 0) / 1 + (1 - 1), a);
         // Evaluation after simplification
         let n = (x + (256 - (x % 256))).simplify();
-        assert_eq!(n.exec(&[('x', 767)].into_iter().collect()).unwrap(), 768);
+        assert_eq!(
+            n.exec(&[(sym("x"), 767)].into_iter().collect()).unwrap(),
+            768
+        );
     }
 
     #[test]
@@ -1327,7 +1373,7 @@ mod tests {
     #[test]
     fn test_interval_simplifications() {
         let s = expr('s');
-        let intervals = [('s', DimInterval::new(0, 127))].into_iter().collect();
+        let intervals = [(sym("s"), DimInterval::new(0, 127))].into_iter().collect();
 
         assert_eq!((s % 128).simplify_with_intervals(&intervals), s);
         assert_eq!((s / 128).simplify_with_intervals(&intervals), expr(0));
@@ -1354,7 +1400,7 @@ mod tests {
     #[test]
     fn test_singleton_interval_substitutes_dynamic_var() {
         let s = expr('s');
-        let intervals = [('s', DimInterval::new(1, 1))].into_iter().collect();
+        let intervals = [(sym("s"), DimInterval::new(1, 1))].into_iter().collect();
 
         assert_eq!((s + 127).simplify_with_intervals(&intervals), expr(128));
         assert_eq!((s.lt(2)).simplify_with_intervals(&intervals), expr(1));
@@ -1363,7 +1409,7 @@ mod tests {
     #[test]
     fn test_interval_simplification_requires_proof() {
         let s = expr('s');
-        let intervals = [('s', DimInterval::new(0, 256))].into_iter().collect();
+        let intervals = [(sym("s"), DimInterval::new(0, 256))].into_iter().collect();
 
         assert_ne!((s % 128).simplify_with_intervals(&intervals), s);
         assert_ne!(s.lt(128).simplify_with_intervals(&intervals), expr(1));
@@ -1445,12 +1491,12 @@ mod tests {
             let (x, y, z) = (expr('x'), expr('y'), expr('z'));
             // Simplification preserves evaluation
             let expr = ((x + 3) * 2) - (x * 2) + (y % 5);
-            let env = [('x', x_val), ('y', y_val)].into_iter().collect();
+            let env = [(sym("x"), x_val), (sym("y"), y_val)].into_iter().collect();
             assert_eq!(expr.exec(&env).unwrap(), expr.simplify().exec(&env).unwrap());
             // Substitution + simplification preserves evaluation
             let expr = (x + y) * (y - x);
             let substituted = expr.substitute('x', z + 1).substitute('y', z - 1);
-            let env = [('z', z_val)].into_iter().collect();
+            let env = [(sym("z"), z_val)].into_iter().collect();
             assert_eq!(substituted.exec(&env).unwrap(), substituted.simplify().exec(&env).unwrap());
         }
     }
@@ -1458,8 +1504,10 @@ mod tests {
     #[test]
     fn test_hash_consing() {
         // Creating identical expressions should return the same underlying storage
-        // Use unique variable names to avoid interference from other tests
-        let unique_var = '\u{E000}'; // Private use area character unlikely to conflict
+        // Use a unique variable name to avoid interference from other tests.
+        // This used to need a private-use-area char, because a dim was a char
+        // and every readable one was potentially in use by another test.
+        let unique_var = sym("hashConsingProbe");
 
         // Create expression with unique var + 42
         let x1 = expr(unique_var) + 42;
@@ -1479,7 +1527,7 @@ mod tests {
         );
 
         // Different expression should create new entry
-        let unique_var2 = '\u{E001}';
+        let unique_var2 = sym("hashConsingProbe2");
         let y = expr(unique_var2) + 43;
         assert_ne!(
             x1.terms.id(),

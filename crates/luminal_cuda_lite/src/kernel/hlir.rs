@@ -153,7 +153,7 @@ impl KernelOp for KernelMaxReduce {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -188,7 +188,7 @@ impl KernelOp for KernelMaxReduce {
             ", const int* dyn_dims"
         };
 
-        let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+        let iter_stride_of_i = self.iter_stride.to_kernel_with_index("i");
         let load_value = if low_precision_storage {
             format!("static_cast<float>(in[in_start + {iter_stride_of_i}])")
         } else {
@@ -385,7 +385,7 @@ impl KernelOp for KernelSumReduce {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -416,7 +416,7 @@ impl KernelOp for KernelSumReduce {
             ", const int* dyn_dims"
         };
 
-        let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+        let iter_stride_of_i = self.iter_stride.to_kernel_with_index("i");
         let load_value = if uses_fp8_storage {
             format!("static_cast<float>(in_data[in_start + {iter_stride_of_i}])")
         } else {
@@ -643,7 +643,7 @@ impl KernelOp for KernelCastSumReduce {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -666,7 +666,7 @@ impl KernelOp for KernelCastSumReduce {
             ", const int* dyn_dims"
         };
 
-        let iter_stride_of_i = self.iter_stride.to_kernel().replace("const_z", "i");
+        let iter_stride_of_i = self.iter_stride.to_kernel_with_index("i");
 
         let kernel = format!(
             "{includes}
@@ -903,7 +903,7 @@ impl KernelOp for KernelGather {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -969,7 +969,7 @@ extern \"C\" {{
         self.out_shape.iter().copied().product()
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.out_shape
             .iter()
             .flat_map(|e| e.dyn_vars())
@@ -1144,9 +1144,9 @@ impl KernelOp for KernelScatter {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
-        let all_vars: FxHashSet<char> = self
+        let all_vars: FxHashSet<Symbol> = self
             .dest_shape
             .iter()
             .flat_map(|e| e.dyn_vars())
@@ -1235,7 +1235,7 @@ extern \"C\" {{
         self.dest_shape.iter().copied().product()
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.dest_shape
             .iter()
             .flat_map(|e| e.dyn_vars())
@@ -1387,7 +1387,7 @@ impl KernelOp for KernelIota {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let mut vars = self.expr.dyn_vars().into_iter().collect::<FxHashSet<_>>();
         vars.extend(self.range.dyn_vars());
@@ -1533,7 +1533,7 @@ impl KernelOp for KernelMod {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -1711,7 +1711,7 @@ impl KernelOp for KernelLessThan {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -1894,7 +1894,7 @@ impl KernelOp for KernelConstant {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let value_str = if self.value.is_nan() {
             "__int_as_float(0x7fc00000)".to_string()
@@ -2042,7 +2042,7 @@ impl KernelOp for KernelCast {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let out_dtype = cuda_dtype(self.out_dtype);
         let includes = dtype_includes(&[self.in_dtype, self.out_dtype]);
@@ -2147,11 +2147,11 @@ extern \"C\" {{
 /// This ensures all kernels in a CudaGraphOp use consistent indices into the shared
 /// dyn_dims buffer.
 thread_local! {
-    static GLOBAL_DYN_DIMS: std::cell::RefCell<Option<Vec<char>>> = const { std::cell::RefCell::new(None) };
+    static GLOBAL_DYN_DIMS: std::cell::RefCell<Option<Vec<Symbol>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Set the global dyn dims ordering for subsequent kernel compilations.
-pub fn set_global_dyn_dims(dims: Vec<char>) {
+pub fn set_global_dyn_dims(dims: Vec<Symbol>) {
     GLOBAL_DYN_DIMS.with(|g| *g.borrow_mut() = Some(dims));
 }
 
@@ -2161,7 +2161,7 @@ pub fn clear_global_dyn_dims() {
 }
 
 /// Get the current global dyn dims ordering.
-pub fn get_global_dyn_dims() -> Option<Vec<char>> {
+pub fn get_global_dyn_dims() -> Option<Vec<Symbol>> {
     GLOBAL_DYN_DIMS.with(|g| g.borrow().clone())
 }
 
@@ -2171,7 +2171,7 @@ pub fn get_global_dyn_dims() -> Option<Vec<char>> {
 ///
 /// When a global dyn dims ordering is set (via `set_global_dyn_dims`), indices are based
 /// on the global ordering to ensure consistency across kernels sharing a dyn_dims buffer.
-pub fn generate_dyn_dims_defines(vars: &FxHashSet<char>) -> (String, Vec<char>) {
+pub fn generate_dyn_dims_defines(vars: &FxHashSet<Symbol>) -> (String, Vec<Symbol>) {
     if vars.is_empty() {
         return (String::new(), Vec::new());
     }
@@ -2200,28 +2200,22 @@ pub fn generate_dyn_dims_defines(vars: &FxHashSet<char>) -> (String, Vec<char>) 
                     .iter()
                     .position(|d| d == dim)
                     .expect("Dim must be in global ordering after extension");
-                format!("#define const_{dim} dyn_dims[{idx}]")
+                format!("#define {} dyn_dims[{idx}]", kernel_const_name(dim))
             })
             .collect::<Vec<_>>()
             .join("\n");
         return (defines, global_order);
     }
     // Default: local ordering
-    let mut sorted_dims: Vec<char> = vars.iter().copied().collect();
+    let mut sorted_dims: Vec<Symbol> = vars.iter().copied().collect();
     sorted_dims.sort();
     let defines = sorted_dims
         .iter()
         .enumerate()
-        .map(|(idx, dim)| format!("#define const_{dim} dyn_dims[{idx}]"))
+        .map(|(idx, dim)| format!("#define {} dyn_dims[{idx}]", kernel_const_name(dim)))
         .collect::<Vec<_>>()
         .join("\n");
     (defines, sorted_dims)
-}
-
-/// Get the offset for a dynamic dimension in the shared dyn_dims buffer.
-/// Returns None if the dim is not in the set.
-pub fn get_dyn_dim_offset(dim: char, sorted_dims: &[char]) -> Option<usize> {
-    sorted_dims.iter().position(|&d| d == dim)
 }
 
 #[derive(Default, Debug, Clone)]
@@ -2486,7 +2480,7 @@ impl KernelOp for KernelEmbed {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let batch_size = self
             .batch_shape

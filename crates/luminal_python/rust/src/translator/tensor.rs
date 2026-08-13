@@ -27,26 +27,91 @@ const WHERE_OTHER_ARG: usize = 2;
 const TRIANGULAR_INPUT_ARG: usize = 0;
 const TRIANGULAR_DIAGONAL_ARG: usize = 1;
 
+#[derive(Clone, Copy, Debug)]
+enum ArangeScalar {
+    Int(i64),
+    Float(f64),
+    Expr(Expression),
+}
+
 impl<'a> Translator<'a> {
     pub(crate) fn translate_arange(&mut self, node: &Node) -> Result<GraphTensor> {
-        let positional_args: Vec<Expression> = node
+        // PT2's start_step overload names these arguments even when the
+        // original call used a keyword (`torch.arange(0, end=3)`). Resolve by
+        // schema name rather than collecting every decodable positional arg:
+        // the old filter_map silently discarded float/bool values and shifted
+        // the remaining operands into the wrong start/end/step slots.
+        let start = self.arange_scalar_arg(node, "start")?;
+        let step = node
             .inputs
             .iter()
-            .filter(|i| i.kind <= 1)
-            .filter_map(|i| self.resolve_arg_as_expression(&i.arg))
-            .collect();
+            .find(|input| input.name == "step")
+            .map(|input| self.decode_arange_scalar(&input.arg))
+            .transpose()?
+            .unwrap_or(ArangeScalar::Int(1));
 
-        match positional_args.len() {
-            0 => anyhow::bail!("arange: no positional args found"),
-            1 => Ok(self.graph.arange(positional_args[0])),
-            2 => Ok(self
-                .graph
-                .arange_options(positional_args[0], positional_args[1], 1)),
-            _ => Ok(self.graph.arange_options(
-                positional_args[0],
-                positional_args[1],
-                positional_args[2],
-            )),
+        // Export has already applied PyTorch's dtype-sensitive ceiling and
+        // endpoint rules. Its tensor metadata is therefore authoritative for
+        // the number of values, including fractional/negative steps and empty
+        // ranges. Recomputing `(end-start)/step` in Expression arithmetic used
+        // truncating division and disagreed with shapes such as arange(-1,2,2).
+        let output_shape = self.output_meta_shape(node)?;
+        anyhow::ensure!(
+            output_shape.len() == 1,
+            "arange: expected rank-1 output metadata, got {output_shape:?}"
+        );
+        let output_dtype = self.output_meta_dtype(node)?;
+        let indices = self.graph.arange(output_shape[0]).cast(output_dtype);
+        let shape = indices.shape;
+        let step = self
+            .arange_scalar_constant(step, output_dtype)
+            .expand_rhs(shape);
+        let start = self
+            .arange_scalar_constant(start, output_dtype)
+            .expand_rhs(shape);
+        Ok(indices * step + start)
+    }
+
+    fn arange_scalar_arg(&self, node: &Node, name: &str) -> Result<ArangeScalar> {
+        let input = node
+            .inputs
+            .iter()
+            .find(|input| input.name == name)
+            .with_context(|| format!("arange: missing `{name}` argument"))?;
+        self.decode_arange_scalar(&input.arg)
+    }
+
+    fn decode_arange_scalar(&self, arg: &Argument) -> Result<ArangeScalar> {
+        if let Some(value) = arg.as_int() {
+            return Ok(ArangeScalar::Int(value));
+        }
+        if let Some(value) = arg.as_float() {
+            return Ok(ArangeScalar::Float(value));
+        }
+        if let Some(value) = arg.as_bool() {
+            return Ok(ArangeScalar::Int(i64::from(value)));
+        }
+        if let Some(value) = self.resolve_arg_as_expression(arg) {
+            return Ok(ArangeScalar::Expr(value));
+        }
+        anyhow::bail!("arange: unsupported scalar argument {arg:?}")
+    }
+
+    fn arange_scalar_constant(&mut self, value: ArangeScalar, dtype: DType) -> GraphTensor {
+        match value {
+            ArangeScalar::Int(value) => match dtype {
+                DType::F64 => self.graph.constant_float64(value as f64),
+                DType::F32 | DType::F16 | DType::Bf16 => {
+                    self.graph.constant_float(value as f32).cast(dtype)
+                }
+                _ => self.graph.constant(value).cast(dtype),
+            },
+            ArangeScalar::Float(value) => match dtype {
+                DType::F64 => self.graph.constant_float64(value),
+                DType::Int | DType::I64 => self.graph.constant_float64(value).cast(dtype),
+                _ => self.graph.constant_float(value as f32).cast(dtype),
+            },
+            ArangeScalar::Expr(value) => self.graph.constant(value).cast(dtype),
         }
     }
 

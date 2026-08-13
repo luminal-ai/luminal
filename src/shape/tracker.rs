@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use itertools::Itertools;
-use rustc_hash::FxHashMap;
 use tinyvec::ArrayVec;
 
 use crate::prelude::*;
@@ -38,6 +37,13 @@ impl ShapeTracker {
         };
         let mut stride = expr('z');
         for d in dims.to_shape().into_iter().rev() {
+            // A size may not depend on the runtime loop index, though a
+            // stride must.
+            assert!(
+                !d.uses_reserved_index(),
+                "dimension size {d:?} uses the reserved runtime loop index; \
+                 it is an index, not a dimension"
+            );
             s.dims.insert(0, d);
             s.strides.insert(0, stride);
             stride *= d;
@@ -325,7 +331,7 @@ impl ShapeTracker {
     }
 
     /// Given a dyn dim map, resolve global dyn dims into known dims
-    pub fn resolve_dyn_dims(&mut self, dyn_dim_map: &FxHashMap<char, usize>) {
+    pub fn resolve_dyn_dims(&mut self, dyn_dim_map: &DynMap) {
         for d in self.dims.iter_mut().chain(&mut self.strides) {
             *d = d.resolve_vars(dyn_dim_map);
         }
@@ -502,7 +508,7 @@ fn eval_stride_at(stride: Expression, z: usize) -> Option<i64> {
     for term in stride.terms.read().iter() {
         match *term {
             Term::Num(n) => stack.push(n),
-            Term::Var('z') => stack.push(z as i64),
+            Term::Var(v) if v.is_reserved() => stack.push(z as i64),
             Term::Var(_) => return None,
             _ => {
                 let a = stack.pop()?;
@@ -514,16 +520,18 @@ fn eval_stride_at(stride: Expression, z: usize) -> Option<i64> {
     stack.pop()
 }
 
-fn fresh_split_var(expressions: &[Expression], excluded: &[char]) -> char {
-    let candidates = ('a'..='y').chain('A'..='Y');
-    candidates
-        .filter(|&candidate| candidate != 'z' && !excluded.contains(&candidate))
-        .find(|&candidate| {
-            expressions
-                .iter()
-                .all(|expr| !expr.to_symbols().contains(&candidate))
+/// A scratch dimension for the split_dims proof, distinct from `excluded` and
+/// from anything `expressions` already mentions.
+fn fresh_split_var(expressions: &[Expression], excluded: &[Symbol]) -> Symbol {
+    (0..)
+        .map(|n| Symbol::new(&format!("split{n}")))
+        .find(|candidate| {
+            !excluded.contains(candidate)
+                && expressions
+                    .iter()
+                    .all(|expr| !expr.to_symbols().contains(candidate))
         })
-        .expect("ran out of temporary symbols for split_dims proof")
+        .expect("usize is not exhaustible")
 }
 
 #[cfg(test)]
@@ -543,7 +551,7 @@ mod tests {
         // few concrete sizes: span and n_elements must agree (regression for the
         // Add fold bug that over-counted the constant as 533 instead of 383).
         for s in 1usize..=4 {
-            let map: crate::prelude::FxHashMap<char, usize> = [('s', s)].into_iter().collect();
+            let map: crate::prelude::DynMap = [(sym("s"), s)].into_iter().collect();
             assert_eq!(
                 span.exec(&map),
                 n_elem.exec(&map),

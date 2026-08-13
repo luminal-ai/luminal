@@ -110,6 +110,68 @@ def _export_kwargs():
     return kwargs
 
 
+def _box_scalar_graph_outputs(gm):
+    """Represent backend scalar outputs as typed zero-dimensional tensors.
+
+    Dynamo's backend graph may return SymInt/SymFloat/SymBool values even
+    though Luminal's HLIR is tensor-only. Box those output leaves before the
+    second torch.export capture and remember their flattened output positions;
+    CompiledModel calls ``.item()`` at those positions after execution to
+    restore the backend contract.
+
+    This is an output-boundary canonicalization, not a symbolic-scalar IR:
+    inside Luminal the values remain ordinary typed rank-zero tensors.
+    """
+
+    output = next(node for node in gm.graph.nodes if node.op == "output")
+    flat_outputs, output_spec = torch.utils._pytree.tree_flatten(output.args[0])
+    scalar_output_positions = []
+    compiled_position = 0
+
+    def scalar_dtype(value):
+        if isinstance(value, (torch.SymBool, bool)):
+            return torch.bool
+        if isinstance(value, (torch.SymInt, int)):
+            return torch.int64
+        if isinstance(value, (torch.SymFloat, float)):
+            return torch.float64
+        return None
+
+    boxed_outputs = []
+    for value in flat_outputs:
+        example = (
+            value.meta.get("example_value")
+            if isinstance(value, torch.fx.Node)
+            else value
+        )
+        if isinstance(example, torch.Tensor):
+            boxed_outputs.append(value)
+            compiled_position += 1
+            continue
+
+        dtype = scalar_dtype(example)
+        if dtype is None:
+            # Non-value outputs such as None remain outside the compiled tensor
+            # output list, matching the existing PT2 parser behavior.
+            boxed_outputs.append(value)
+            continue
+
+        with gm.graph.inserting_before(output):
+            boxed = gm.graph.call_function(
+                torch.scalar_tensor, (value,), {"dtype": dtype}
+            )
+        boxed_outputs.append(boxed)
+        scalar_output_positions.append(compiled_position)
+        compiled_position += 1
+
+    if scalar_output_positions:
+        output.args = (torch.utils._pytree.tree_unflatten(boxed_outputs, output_spec),)
+        gm.graph.lint()
+        gm.recompile()
+
+    return tuple(scalar_output_positions)
+
+
 def _decomp_table():
     """Decomposition table for `ep.run_decompositions()` that preserves SDPA.
 
@@ -226,7 +288,12 @@ def _lower_sym_sum(ep) -> None:
 
 
 def _save_and_compile(
-    ep_or_path, factory, search_iterations, user_indices=None, input_device_ptrs=None
+    ep_or_path,
+    factory,
+    search_iterations,
+    user_indices=None,
+    input_device_ptrs=None,
+    scalar_output_positions=(),
 ):
     """Compile a PT2 model via Rust, return CompiledModel.
 
@@ -265,7 +332,10 @@ def _save_and_compile(
         _load_cpu_weights(compiled, cpu_weights)
 
         return CompiledModel(
-            compiled, weight_refs=keep_alive, user_indices=user_indices
+            compiled,
+            weight_refs=keep_alive,
+            user_indices=user_indices,
+            scalar_output_positions=scalar_output_positions,
         )
     finally:
         if owns_tmpdir and tmpdir:
@@ -638,7 +708,13 @@ def _build_dynamic_shapes_from_dim_arg(dynamic_dim, example_args):
 
 
 def _eager_pt2_compile(
-    gm, user_inputs, user_indices, dynamic_shapes, factory, search_iterations
+    gm,
+    user_inputs,
+    user_indices,
+    dynamic_shapes,
+    factory,
+    search_iterations,
+    scalar_output_positions=(),
 ):
     """Run torch.export → save → Rust compile end-to-end. Returns CompiledModel.
 
@@ -700,6 +776,7 @@ def _eager_pt2_compile(
             search_iterations,
             user_indices=user_indices,
             input_device_ptrs=input_device_ptrs,
+            scalar_output_positions=scalar_output_positions,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -738,12 +815,14 @@ class _LazyDynamicCompiledModel:
         dynamic_shapes,
         factory,
         search_iterations,
+        scalar_output_positions=(),
     ):
         self._gm = gm
         self._user_inputs = user_inputs
         self._user_indices = user_indices
         self._dynamic_shapes = dynamic_shapes
         self._search_iterations = search_iterations
+        self._scalar_output_positions = scalar_output_positions
         self._factory = factory
         self._compiled = None
 
@@ -756,6 +835,7 @@ class _LazyDynamicCompiledModel:
                 self._dynamic_shapes,
                 self._factory,
                 self._search_iterations,
+                self._scalar_output_positions,
             )
             # Drop references we no longer need post-compile.
             self._gm = None
@@ -800,6 +880,7 @@ def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
     # same frame" assertions on the next call. The deepcopy is cheap relative
     # to the rest of the export pipeline.
     gm = _copy.deepcopy(gm).eval()
+    scalar_output_positions = _box_scalar_graph_outputs(gm)
     # Dynamo-lifted weights stay in the args and flow through torch.export
     # as ordinary inputs, so artifact reuse across same-shape module
     # instances is correct by construction (LUM-631).
@@ -830,10 +911,21 @@ def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
         # Dynamo is still relying on, and running it inside the backend frame
         # corrupts the freshly-installed guards.
         return _LazyDynamicCompiledModel(
-            gm, user_inputs, user_indices, dynamic_shapes, factory,
+            gm,
+            user_inputs,
+            user_indices,
+            dynamic_shapes,
+            factory,
             search_iterations,
+            scalar_output_positions,
         )
 
     return _eager_pt2_compile(
-        gm, user_inputs, user_indices, None, factory, search_iterations
+        gm,
+        user_inputs,
+        user_indices,
+        None,
+        factory,
+        search_iterations,
+        scalar_output_positions,
     )

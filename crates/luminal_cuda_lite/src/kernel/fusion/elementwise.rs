@@ -30,7 +30,7 @@ type CompileOut = (
     (Expression, Expression, Expression),
     (Expression, Expression, Expression),
     Expression,
-    FxHashMap<char, CudaSlice<u8>>,
+    FxHashMap<Symbol, CudaSlice<u8>>,
 );
 
 fn extract_string_label(egraph: &SerializedEGraph, node: &ENodeId) -> String {
