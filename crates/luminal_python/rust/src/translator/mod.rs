@@ -386,10 +386,10 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn resolve_expr_str(&self, expr_str: &str) -> Option<Expression> {
-        parse_sympy_expr_with_ranges(expr_str, &self.sym_map.sym_to_char, &self.sym_map.ranges)
+        parse_sympy_expr_with_ranges(expr_str, &self.sym_map.sym_to_symbol, &self.sym_map.ranges)
             .or_else(|| {
                 crate::pt2_parser::extract_symbol_name_pub(expr_str)
-                    .and_then(|sym| self.sym_map.sym_to_char.get(&sym).copied())
+                    .and_then(|sym| self.sym_map.sym_to_symbol.get(&sym).copied())
                     .map(Expression::from)
             })
     }

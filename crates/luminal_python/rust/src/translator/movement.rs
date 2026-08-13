@@ -17,7 +17,7 @@ fn normalize_concat_dims(
     lhs: &mut GraphTensor,
     rhs: &mut GraphTensor,
     skip_dim: Option<usize>,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) {
     for i in 0..lhs.shape.len() {
         if Some(i) == skip_dim {

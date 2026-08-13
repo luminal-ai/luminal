@@ -168,7 +168,7 @@ pub fn expr_to_term(expr: &shape::Expression) -> Term {
     for term in expr.terms.read().iter() {
         let t = match term {
             shape::Term::Num(n) => num(i64(*n)),
-            shape::Term::Var(c) => mvar(str(&c.to_string())),
+            shape::Term::Var(c) => mvar(str(&shape::egglog_var_name(c))),
             op => {
                 let a = stack.pop().unwrap();
                 let b = stack.pop().unwrap();
@@ -430,7 +430,7 @@ pub fn dtype(e: Term) -> Term {
 
 pub fn interval_facts_egglog(
     intervals: &shape::DynDimIntervals,
-    vars: impl IntoIterator<Item = char>,
+    vars: impl IntoIterator<Item = shape::Symbol>,
 ) -> String {
     let mut all_vars = FxHashSet::default();
     all_vars.extend(intervals.keys().copied());
@@ -445,7 +445,7 @@ pub fn interval_facts_egglog(
             .get(&var)
             .copied()
             .unwrap_or_else(shape::DimInterval::unbounded);
-        let var_expr = mvar(str(&var.to_string()));
+        let var_expr = mvar(str(&shape::egglog_var_name(&var)));
         out.push_str(&format!(
             "(set {} {})\n",
             term_to_egglog(&interval_lower(var_expr.clone())),
@@ -459,7 +459,7 @@ pub fn interval_facts_egglog(
         if interval.min == interval.max {
             out.push_str(&format!(
                 "(union {} {})\n",
-                term_to_egglog(&mvar(str(&var.to_string()))),
+                term_to_egglog(&mvar(str(&shape::egglog_var_name(&var)))),
                 term_to_egglog(&num(i64(interval.min)))
             ));
         }

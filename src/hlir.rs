@@ -319,7 +319,7 @@ impl HLIROp for Input {
 }
 
 impl ReferenceOp for Input {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -390,7 +390,7 @@ impl HLIROp for Output {
 }
 
 impl ReferenceOp for Output {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -433,7 +433,7 @@ impl HLIROp for CustomOpKind {
 }
 
 impl ReferenceOp for CustomOpKind {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!()
     }
 }
@@ -549,7 +549,7 @@ impl HLIROp for LoopStart {
 }
 
 impl ReferenceOp for LoopStart {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopStart is driven by the runtime loop compiler")
     }
 }
@@ -638,7 +638,7 @@ impl HLIROp for LoopEnd {
 }
 
 impl ReferenceOp for LoopEnd {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopEnd is driven by the runtime loop compiler")
     }
 }
@@ -770,7 +770,7 @@ impl HLIROp for LoopInput {
 }
 
 impl ReferenceOp for LoopInput {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopInput is driven by the runtime loop compiler")
     }
 }
@@ -863,7 +863,7 @@ impl HLIROp for LoopInputStatic {
 }
 
 impl ReferenceOp for LoopInputStatic {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopInputStatic is driven by the runtime loop compiler")
     }
 }
@@ -953,7 +953,7 @@ impl HLIROp for LoopOutput {
 }
 
 impl ReferenceOp for LoopOutput {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopOutput is driven by the runtime loop compiler")
     }
 }
@@ -1057,7 +1057,7 @@ impl HLIROp for LoopOutputSelect {
 }
 
 impl ReferenceOp for LoopOutputSelect {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         unimplemented!("LoopOutputSelect is driven by the runtime loop compiler")
     }
 }
@@ -1116,7 +1116,7 @@ impl EgglogOp for Constant {
 }
 
 impl ReferenceOp for Constant {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         ReferenceData::F32(vec![self.0])
     }
 }
@@ -1180,7 +1180,7 @@ impl EgglogOp for ConstantF64 {
 }
 
 impl ReferenceOp for ConstantF64 {
-    fn execute(&self, _: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         ReferenceData::F64(vec![self.0])
     }
 }
@@ -1235,7 +1235,7 @@ impl EgglogOp for Iota {
     }
 }
 impl ReferenceOp for Iota {
-    fn execute(&self, _: Vec<&ReferenceData>, dyn_map: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, _: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let length = self.1.exec(dyn_map).unwrap();
         let expr = self.0.resolve_vars(dyn_map);
         ReferenceData::Int(
@@ -1297,7 +1297,7 @@ impl EgglogOp for Cast {
     }
 }
 impl ReferenceOp for Cast {
-    fn execute(&self, input: Vec<&ReferenceData>, _: &FxHashMap<char, usize>) -> ReferenceData {
+    fn execute(&self, input: Vec<&ReferenceData>, _: &DynMap) -> ReferenceData {
         match self.1 {
             DType::F32 => ReferenceData::F32(match &input[0] {
                 ReferenceData::F32(f) => f.clone(),
@@ -1393,7 +1393,7 @@ fn unary_impl(
     inp: &ReferenceData,
     shape: &[Expression],
     strides: &[Expression],
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
     kernels: UnaryKernels,
 ) -> ReferenceData {
     let ind = StridedIterator::new(shape, strides, dyn_map);
@@ -1467,11 +1467,7 @@ impl EgglogOp for Log2 {
     }
 }
 impl ReferenceOp for Log2 {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1542,11 +1538,7 @@ impl EgglogOp for Exp2 {
     }
 }
 impl ReferenceOp for Exp2 {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1618,11 +1610,7 @@ impl EgglogOp for Sin {
     }
 }
 impl ReferenceOp for Sin {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1694,11 +1682,7 @@ impl EgglogOp for Recip {
     }
 }
 impl ReferenceOp for Recip {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1770,11 +1754,7 @@ impl EgglogOp for Sqrt {
     }
 }
 impl ReferenceOp for Sqrt {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         unary_impl(
             inputs[0],
             &self.shape,
@@ -1913,11 +1893,7 @@ impl EgglogOp for Add {
 }
 
 impl ReferenceOp for Add {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -2013,11 +1989,7 @@ impl EgglogOp for Mul {
 }
 
 impl ReferenceOp for Mul {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -2113,11 +2085,7 @@ impl EgglogOp for Mod {
 }
 
 impl ReferenceOp for Mod {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -2212,11 +2180,7 @@ impl EgglogOp for LessThan {
 }
 
 impl ReferenceOp for LessThan {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (a, b) = (inputs[0], inputs[1]);
         let (a_ind, b_ind) = (
             StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
@@ -2357,11 +2321,7 @@ impl EgglogOp for Gather {
     }
 }
 impl ReferenceOp for Gather {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (indexes, data) = (inputs[0], inputs[1]);
         let indexes_ind = StridedIterator::new(&self.index_shape, &self.index_strides, dyn_map);
         let data_ind =
@@ -2522,11 +2482,7 @@ impl EgglogOp for Scatter {
     }
 }
 impl ReferenceOp for Scatter {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let (dest, indexes, src) = (inputs[0], inputs[1], inputs[2]);
         let dest_ind =
             StridedIterator::new(&self.dest_shape, &self.dest_strides, dyn_map).collect_vec();
@@ -2646,11 +2602,7 @@ impl EgglogOp for SumReduce {
 }
 
 impl ReferenceOp for SumReduce {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         // Resolve dyn vars in iter_stride, then evaluate z-stride at each iteration
         let mut resolved_stride = self.iter_stride;
@@ -2783,11 +2735,7 @@ impl EgglogOp for MaxReduce {
 }
 
 impl ReferenceOp for MaxReduce {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData {
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData {
         let ind = StridedIterator::new(&self.shape, &self.strides, dyn_map);
         // Resolve dyn vars in iter_stride, then evaluate z-stride at each iteration
         let mut resolved_stride = self.iter_stride;
@@ -2856,11 +2804,7 @@ impl ReferenceOp for MaxReduce {
 }
 
 pub trait ReferenceOp: Debug + AsAny + Send + Sync {
-    fn execute(
-        &self,
-        inputs: Vec<&ReferenceData>,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> ReferenceData;
+    fn execute(&self, inputs: Vec<&ReferenceData>, dyn_map: &DynMap) -> ReferenceData;
 }
 
 #[derive(Debug, Clone)]
@@ -3055,7 +2999,7 @@ impl Runtime for ReferenceRuntime {
     fn profile(
         &mut self,
         _: &LLIRGraph,
-        _: &FxHashMap<char, usize>,
+        _: &DynMap,
         _: usize,
         _: Option<std::time::Duration>,
         _: Option<(Self::ProfileMetric, f64)>,
@@ -3088,7 +3032,7 @@ impl Runtime for ReferenceRuntime {
         self.graph = graph;
     }
 
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
         for node in toposort(&self.graph, None).unwrap() {
             if (**self.graph[node]).as_any().is::<Input>() {
                 continue;
@@ -3161,7 +3105,7 @@ struct StridedIterator {
 }
 
 impl StridedIterator {
-    fn new(shape: &[Expression], strides: &[Expression], dyn_map: &FxHashMap<char, usize>) -> Self {
+    fn new(shape: &[Expression], strides: &[Expression], dyn_map: &DynMap) -> Self {
         let shape: Vec<usize> = shape.iter().map(|e| e.exec(dyn_map).unwrap()).collect();
         // Resolve dynamic vars in strides but keep 'z' as a variable
         let strides: Vec<Expression> = strides

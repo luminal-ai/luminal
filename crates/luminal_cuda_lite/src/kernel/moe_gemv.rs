@@ -215,12 +215,12 @@ impl KernelOp for KernelMoEGemv {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let (s, k, o, d, e, xs_s, xs_k, ts_s, ts_k) = self.dims();
         let includes = dtype_includes(&[DType::Bf16]);
 
-        let vars: FxHashSet<char> = s.dyn_vars().into_iter().collect();
+        let vars: FxHashSet<Symbol> = s.dyn_vars().into_iter().collect();
         let (dyn_defines, _sorted) = generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -332,7 +332,7 @@ extern \"C\" {{
         DType::F32
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.out_shape[0].dyn_vars().into_iter().collect()
     }
 

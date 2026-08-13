@@ -21,7 +21,7 @@ fn seq(n: usize, lo: f32, hi: f32) -> Vec<f32> {
 /// a real training loop would rebind weight buffers.
 struct Trainer {
     rt: ReferenceRuntime,
-    dyn_map: FxHashMap<char, usize>,
+    dyn_map: DynMap,
     loss_out: GraphTensor,
     grad_outs: Vec<GraphTensor>,
     param_ids: Vec<NodeIndex>,

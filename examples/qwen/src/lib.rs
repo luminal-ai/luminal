@@ -59,7 +59,7 @@ pub trait QwenRuntime: Runtime<ExecReturn = ()> {
     fn set_buffer(&mut self, id: NodeIndex, buffer: Self::Buffer);
     fn get_f32(&self, id: NodeIndex) -> Vec<f32>;
 
-    fn prepare_execute(&mut self, _dyn_map: &FxHashMap<char, usize>) {}
+    fn prepare_execute(&mut self, _dyn_map: &DynMap) {}
 }
 
 #[cfg(feature = "cuda")]

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
-use luminal::prelude::FxHashMap;
+use luminal::prelude::{FxHashMap, Symbol};
 use luminal::{
     dtype::DType,
     egglog_utils::{
@@ -717,11 +717,11 @@ impl KernelOp for KernelConv2D {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         assert_eq!(self.dtype, DType::F32, "KernelConv2D currently emits F32");
 
-        let vars: FxHashSet<char> = self
+        let vars: FxHashSet<Symbol> = self
             .out_shape
             .iter()
             .chain(&self.input_shape)
@@ -779,8 +779,7 @@ impl KernelOp for KernelConv2D {
         let pad_w = self.pad_w.to_kernel();
         let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
         let input_idx = flatten_strides(&self.input_shape, &self.input_stride)
-            .to_kernel()
-            .replace("const_z", "input_linear");
+            .to_kernel_with_index("input_linear");
         let n_outputs: Expression = self.out_shape.iter().copied().product();
 
         let kernel = format!(
@@ -867,7 +866,7 @@ extern \"C\" {{
         self.out_shape.iter().copied().product()
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.out_shape
             .iter()
             .chain(&self.input_shape)

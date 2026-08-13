@@ -10,12 +10,12 @@ use std::collections::HashMap;
 
 use half::{bf16, f16};
 use petgraph::stable_graph::NodeIndex;
-use rustc_hash::FxHashMap;
 
 use crate::dtype::DType;
 use crate::graph::{CompileOptions, Graph};
 use crate::hlir::{Output, ReferenceData, ReferenceRuntime};
 use crate::op::Runtime;
+use crate::shape::DynMap;
 
 // ---------------------------------------------------------------------------
 // DynBackend trait
@@ -56,7 +56,7 @@ pub trait DynBackend {
     fn get_output_bool(&self, _node: NodeIndex) -> Vec<bool> {
         panic!("get_output_bool not supported by '{}'", self.name());
     }
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>);
+    fn execute(&mut self, dyn_map: &DynMap);
 
     // --- Optional device pointer support (GPU backends) --------------------
 
@@ -387,7 +387,7 @@ impl DynBackend for ReferenceDynBackend {
         }
     }
 
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn execute(&mut self, dyn_map: &DynMap) {
         self.runtime.execute(dyn_map);
     }
 }

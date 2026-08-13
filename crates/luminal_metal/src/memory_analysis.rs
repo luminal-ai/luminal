@@ -29,7 +29,7 @@ const DTYPE_BITS: &[(&str, usize)] = &[
 pub(crate) fn metal_memory_analysis_pass(
     ops: &[Arc<Box<dyn EgglogOp>>],
     max_memory_bytes: Option<usize>,
-    _dyn_map: &FxHashMap<char, usize>,
+    _dyn_map: &DynMap,
 ) -> LateEgglogPass {
     let mut sorts = ops
         .iter()
@@ -86,7 +86,7 @@ pub(crate) fn metal_memory_analysis_pass(
 pub(crate) fn estimate_graph_memory_bytes<'a>(
     egraph: &'a SerializedEGraph,
     choices: &EGraphChoiceSet<'a>,
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
 ) -> Option<usize> {
     ChoiceMemoryEstimator::new(egraph, choices, dyn_map)
         .root_state()
@@ -213,7 +213,7 @@ pub(crate) struct MemorySplitStats {
 pub(crate) fn split_egraph_by_memory_limit(
     egraph: &mut SerializedEGraph,
     limit: usize,
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
 ) -> MemorySplitStats {
     let original_enodes = egraph.enodes.len();
     let original_eclasses = egraph.eclasses.len();
@@ -236,7 +236,7 @@ struct StateSplitter<'a> {
     original: &'a SerializedEGraph,
     split: SerializedEGraph,
     limit: usize,
-    dyn_map: &'a FxHashMap<char, usize>,
+    dyn_map: &'a DynMap,
     sort_by_name: FxHashMap<String, SortDef>,
     ir_memo: FxHashMap<ClassId, Vec<(MemoryState, ClassId)>>,
     list_memo: FxHashMap<ClassId, Vec<(ListMemoryState, ClassId)>>,
@@ -253,11 +253,7 @@ struct StateSplitter<'a> {
 }
 
 impl<'a> StateSplitter<'a> {
-    fn new(
-        original: &'a SerializedEGraph,
-        limit: usize,
-        dyn_map: &'a FxHashMap<char, usize>,
-    ) -> Self {
+    fn new(original: &'a SerializedEGraph, limit: usize, dyn_map: &'a DynMap) -> Self {
         let mut split = SerializedEGraph {
             enodes: FxHashMap::default(),
             eclasses: FxHashMap::default(),
@@ -761,7 +757,7 @@ impl<'a> StateSplitter<'a> {
 struct ChoiceMemoryEstimator<'a> {
     egraph: &'a SerializedEGraph,
     choices: &'a EGraphChoiceSet<'a>,
-    dyn_map: &'a FxHashMap<char, usize>,
+    dyn_map: &'a DynMap,
     sort_by_name: FxHashMap<String, SortDef>,
     ir_cache: FxHashMap<ClassId, MemoryState>,
     list_cache: FxHashMap<ClassId, ListMemoryState>,
@@ -773,7 +769,7 @@ impl<'a> ChoiceMemoryEstimator<'a> {
     fn new(
         egraph: &'a SerializedEGraph,
         choices: &'a EGraphChoiceSet<'a>,
-        dyn_map: &'a FxHashMap<char, usize>,
+        dyn_map: &'a DynMap,
     ) -> Self {
         Self {
             egraph,
@@ -936,7 +932,7 @@ fn kind_memory_for_node(
     egraph: &SerializedEGraph,
     sort_by_name: &FxHashMap<String, SortDef>,
     node: &NodeId,
-    dyn_map: &FxHashMap<char, usize>,
+    dyn_map: &DynMap,
 ) -> Option<KindMemory> {
     let (kind_label, kind_child_classes) = egraph.enodes.get(node)?;
     if zero_local_op_kind(kind_label) {
@@ -970,9 +966,9 @@ fn first_data_node<'a>(egraph: &'a SerializedEGraph, class: &'a ClassId) -> Opti
     nodes.iter().find(|node| egraph.enodes.contains_key(*node))
 }
 
-fn eval_bytes(expr: Expression, dyn_map: &FxHashMap<char, usize>) -> Option<usize> {
+fn eval_bytes(expr: Expression, dyn_map: &DynMap) -> Option<usize> {
     let mut dyn_map = dyn_map.clone();
-    dyn_map.entry('z').or_insert(1);
+    dyn_map.entry(Symbol::reserved_index()).or_insert(1);
     expr.simplify().exec(&dyn_map)
 }
 

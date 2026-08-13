@@ -211,7 +211,7 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     );
 
     /// Returns the output buffer size in elements.
@@ -220,7 +220,7 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// Returns all dynamic variables used by this kernel (for grid dims, strides, etc).
     /// Default: returns dyn vars from output_size(). Override if the kernel has dyn vars
     /// in expressions not captured by output_size (e.g., KernelScatter's index_shape).
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.output_size().dyn_vars().into_iter().collect()
     }
 
@@ -259,7 +259,7 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     fn allocate_internal_buffers(
         &self,
         _stream: &Arc<CudaStream>,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) -> Vec<CudaSlice<u8>> {
         vec![]
     }
@@ -267,7 +267,7 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// Returns the set of dynamic dimensions that affect internal buffer sizes.
     /// When any of these dimensions change, internal buffers should be reallocated.
     /// Default: empty set (no dimensions affect internal buffers).
-    fn internal_buffer_dyn_dims(&self) -> FxHashSet<char> {
+    fn internal_buffer_dyn_dims(&self) -> FxHashSet<Symbol> {
         FxHashSet::default()
     }
 
@@ -310,9 +310,9 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
         &self,
         _stream: &Arc<CudaStream>,
         _internal_bufs: &mut [CudaSlice<u8>],
-        _constants: &mut FxHashMap<char, CudaSlice<u8>>,
+        _constants: &mut FxHashMap<Symbol, CudaSlice<u8>>,
         _all_buffer_ptrs: &FxHashMap<NodeIndex, u64>,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) {
     }
 

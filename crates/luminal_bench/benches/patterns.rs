@@ -35,7 +35,7 @@ use rand::Rng;
 #[cfg(feature = "metal")]
 struct PreparedBench {
     rt: MetalRuntime,
-    dyn_map: luminal::prelude::FxHashMap<char, usize>,
+    dyn_map: luminal::prelude::DynMap,
     metrics: Option<BenchMetrics>,
 }
 

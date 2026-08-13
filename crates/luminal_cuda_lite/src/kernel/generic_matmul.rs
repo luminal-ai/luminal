@@ -316,7 +316,7 @@ impl KernelOp for GenericMatmul {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self.all_dyn_vars();
         let dtype = cuda_dtype(self.dtype);
@@ -330,13 +330,11 @@ impl KernelOp for GenericMatmul {
 
         let n_outputs = self.output_size();
         let sum_base_idx = flatten_strides(&self.out_shape, &self.sum_input_strides).to_kernel();
-        let iter_offset = self.sum_iter_stride.to_kernel().replace("const_z", "i");
-        let lhs_idx = flatten_strides(&self.mul_shape, &self.lhs_strides)
-            .to_kernel()
-            .replace("const_z", "mul_idx");
-        let rhs_idx = flatten_strides(&self.mul_shape, &self.rhs_strides)
-            .to_kernel()
-            .replace("const_z", "mul_idx");
+        let iter_offset = self.sum_iter_stride.to_kernel_with_index("i");
+        let lhs_idx =
+            flatten_strides(&self.mul_shape, &self.lhs_strides).to_kernel_with_index("mul_idx");
+        let rhs_idx =
+            flatten_strides(&self.mul_shape, &self.rhs_strides).to_kernel_with_index("mul_idx");
         let out_idx = flatten_strides(&self.out_shape, &self.out_strides).to_kernel();
         let k = self.k.to_kernel();
 
@@ -421,7 +419,7 @@ extern \"C\" {{
             .max(Expression::from(1))
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.out_shape
             .iter()
             .flat_map(|e| e.dyn_vars())

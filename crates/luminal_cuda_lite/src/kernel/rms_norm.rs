@@ -16,7 +16,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     dtype::DType, op::CustomOp, op::LLIROp, prelude::FxHashMap, prelude::GraphTensor,
-    shape::Expression,
+    prelude::Symbol, shape::Expression,
 };
 
 use crate::compile_module_image_for_current_device;
@@ -44,7 +44,7 @@ impl KernelOp for RMSNormKernel {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let cols = self.cols;
         let eps = self.eps;
@@ -248,7 +248,7 @@ impl KernelOp for RMSNormQuantKernel {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let cols = self.cols;
         let eps = self.eps;

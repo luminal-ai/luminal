@@ -10,6 +10,9 @@ use std::io::Read;
 use anyhow::{Context, Result};
 use zip::ZipArchive;
 
+use luminal::prelude::Symbol;
+use luminal::prelude::tracing::warn;
+
 use crate::pt2_schema::*;
 
 /// Parsed PT2 file contents — everything needed for graph translation.
@@ -42,11 +45,14 @@ pub enum InputKind {
     UserInput { graph_name: String },
 }
 
-/// Symbolic dimension mapping: PT2 symbol name -> luminal char variable.
+/// Symbolic dimension mapping: PT2 symbol name -> luminal dim symbol.
+///
+/// Usually the same string — torch's `s77` stays `s77` — but a name luminal
+/// cannot use is mapped to a minted one.
 #[derive(Debug, Clone)]
 pub struct SymDimMap {
-    /// Maps PT2 symbol names (e.g., "s77") to luminal char variables ('a', 'b', ...)
-    pub sym_to_char: HashMap<String, char>,
+    /// Maps PT2 symbol names (e.g. "s77") to the dim symbol of the same name.
+    pub sym_to_symbol: HashMap<String, Symbol>,
     /// Range constraints for each symbol
     pub ranges: HashMap<String, RangeConstraint>,
 }
@@ -134,8 +140,7 @@ impl ParsedPT2 {
 
     /// Build the symbolic dimension mapping.
     pub fn build_sym_dim_map(&self) -> SymDimMap {
-        let mut sym_to_char = HashMap::new();
-        let mut next_char = b'a';
+        let mut sym_to_symbol = HashMap::new();
 
         // Collect all symbolic dimension names from tensor_values
         let mut sym_set = std::collections::HashSet::new();
@@ -152,15 +157,36 @@ impl ParsedPT2 {
         let mut sym_names: Vec<String> = sym_set.into_iter().collect();
         sym_names.sort();
 
+        // A name we cannot use is remapped, not dropped: a symbol absent from
+        // this map never gets a value, so its dim would freeze at the export
+        // hint while torch, told it was dynamic, declines to recompile.
+        //
+        // Counted rather than derived, because deriving is not injective —
+        // `a.b` and `a-b` both sanitize to `a_b`, putting two dims on one
+        // symbol. Loops because `Dim("pt2_dim_0")` is legal input.
+        let mut minted = 0usize;
         for name in &sym_names {
-            if next_char <= b'z' {
-                sym_to_char.insert(name.clone(), next_char as char);
-                next_char += 1;
-            }
+            let symbol = Symbol::try_new_dim(name).unwrap_or_else(|e| {
+                let replacement = loop {
+                    let candidate = format!("pt2_dim_{minted}");
+                    minted += 1;
+                    if !sym_names.contains(&candidate) {
+                        break candidate;
+                    }
+                };
+                warn!(
+                    "PT2 symbol {name:?} is not a usable luminal dimension name \
+                     ({e}); using {replacement:?} internally. The dim stays \
+                     dynamic and is still addressed as {name:?}."
+                );
+                Symbol::try_new_dim(&replacement)
+                    .expect("minted names are well-formed by construction")
+            });
+            sym_to_symbol.insert(name.clone(), symbol);
         }
 
         SymDimMap {
-            sym_to_char,
+            sym_to_symbol,
             ranges: self.program.range_constraints.clone(),
         }
     }
@@ -318,9 +344,92 @@ mod tests {
         }
         let parsed = parse_pt2(path).unwrap();
         let sym_map = parsed.build_sym_dim_map();
-        // Should have one symbolic dim (s77)
-        assert_eq!(sym_map.sym_to_char.len(), 1);
-        assert!(sym_map.sym_to_char.contains_key("s77"));
-        assert_eq!(sym_map.sym_to_char["s77"], 'a');
+        // Should have one symbolic dim (s77), keeping the name torch gave it.
+        // This used to assert 'a' — the first char out of the 51-name pool.
+        assert_eq!(sym_map.sym_to_symbol.len(), 1);
+        assert!(sym_map.sym_to_symbol.contains_key("s77"));
+        assert_eq!(sym_map.sym_to_symbol["s77"].to_string(), "s77");
+    }
+
+    /// Builds a program whose only tensor has one dim per given symbol name.
+    fn program_with_dim_symbols(names: &[&str]) -> ParsedPT2 {
+        let sizes = names
+            .iter()
+            .map(|n| {
+                format!(
+                    r#"{{"as_expr":{{"expr_str":"Symbol('{n}', positive=True, integer=True)"}}}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{"graph_module":{{"graph":{{"inputs":[],"outputs":[],"nodes":[],
+               "tensor_values":{{"x":{{"dtype":6,"sizes":[{sizes}]}}}}}},
+               "signature":{{"input_specs":[]}}}}}}"#
+        );
+        ParsedPT2 {
+            program: serde_json::from_str(&json).expect("fixture must parse"),
+            constants_config: None,
+            archive_prefix: String::new(),
+            pt2_path: String::new(),
+        }
+    }
+
+    /// torch lets a user write `Dim("_batch")` or `Dim("a__b")` — ordinary
+    /// Python names that are not usable C++ identifiers — and `z` is luminal's
+    /// reserved loop index, which is our constraint leaking into their
+    /// namespace. Every one of them still has to produce a *dynamic* dim:
+    /// dropping the symbol freezes it at the export-time hint (or 1) with
+    /// nothing to correct it later, and torch will not recompile.
+    #[test]
+    fn build_sym_dim_map_remaps_unusable_names_and_keeps_them_dynamic() {
+        let names = ["s77", "u0", "batch", "_batch", "a__b", "z"];
+        let map = program_with_dim_symbols(&names).build_sym_dim_map();
+
+        assert_eq!(map.sym_to_symbol.len(), 6, "no dim may be dropped");
+        for name in names {
+            assert!(map.sym_to_symbol.contains_key(name), "{name} addressable");
+        }
+        // Usable names keep their spelling; only the rejects are renamed.
+        for ok in ["s77", "u0", "batch"] {
+            assert_eq!(map.sym_to_symbol[ok].to_string(), ok);
+        }
+        for rejected in ["_batch", "a__b", "z"] {
+            assert_ne!(map.sym_to_symbol[rejected].to_string(), rejected);
+        }
+
+        let distinct: std::collections::HashSet<_> =
+            map.sym_to_symbol.values().map(|s| s.to_string()).collect();
+        assert_eq!(distinct.len(), 6, "two dims must never share a symbol");
+    }
+
+    /// Minting must not collide with a name the user actually wrote. Deriving
+    /// the replacement from the rejected name would also collapse `a.b` and
+    /// `a-b` onto one symbol, which is why it is counted instead.
+    #[test]
+    fn build_sym_dim_map_mints_around_a_name_the_user_already_used() {
+        let map = program_with_dim_symbols(&["pt2_dim_0", "z"]).build_sym_dim_map();
+
+        assert_eq!(map.sym_to_symbol["pt2_dim_0"].to_string(), "pt2_dim_0");
+        assert_ne!(
+            map.sym_to_symbol["z"].to_string(),
+            "pt2_dim_0",
+            "minted name must not steal the one the user declared"
+        );
+    }
+
+    /// The ceiling this branch removed. `build_sym_dim_map` used to hand each
+    /// symbol a char from an `a..y` + `A..Z` pool and panic at 52 — and symbol
+    /// #26 landed on `z`, the reserved index, so it vanished from the buffer
+    /// planner. A 32-layer llama under sdpa + DynamicCache mints more than 26.
+    #[test]
+    fn build_sym_dim_map_has_no_symbol_ceiling() {
+        let names: Vec<String> = (0..200).map(|n| format!("s{n}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let map = program_with_dim_symbols(&refs).build_sym_dim_map();
+        assert_eq!(map.sym_to_symbol.len(), 200);
+        let distinct: std::collections::HashSet<_> =
+            map.sym_to_symbol.values().map(|s| s.to_string()).collect();
+        assert_eq!(distinct.len(), 200, "every dim must stay distinct");
     }
 }

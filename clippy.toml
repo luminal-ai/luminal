@@ -1,0 +1,10 @@
+# `Symbol` is a `GenerationalBox` handle, so clippy sees the arena's interior
+# mutability and flags every `DynMap` as a mutable key type. The name behind the
+# handle is written once when it is interned and never mutated, so a `Symbol`'s
+# hash and ordering are stable for as long as it is a key.
+#
+# Whitelisted here rather than allowed per-crate so the lint keeps working for
+# keys that really can mutate. Must be the definition path, not the
+# `shape::Symbol` re-export. `bytes::Bytes` is clippy's default and is repeated
+# because naming a type here replaces the default list rather than adding to it.
+ignore-interior-mutability = ["bytes::Bytes", "luminal::shape::symbol::Symbol"]

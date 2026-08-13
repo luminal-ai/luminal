@@ -102,7 +102,7 @@ impl KernelOp for KernelQuantF8 {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self.size.dyn_vars().into_iter().collect::<FxHashSet<_>>();
         let includes = dtype_includes(&[DType::Bf16, DType::F8E4M3]);

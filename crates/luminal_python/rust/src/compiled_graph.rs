@@ -32,8 +32,8 @@ fn copy_host_bytes(ptr: u64, n_bytes: usize, buffer_kind: &str) -> PyResult<Vec<
     Ok(unsafe { std::slice::from_raw_parts(ptr as *const u8, n_bytes).to_vec() })
 }
 
-/// Maps symbolic dimension parameter names (e.g. "seq_len") to luminal Expression variable chars.
-pub type DimParamMap = HashMap<String, char>;
+/// Maps symbolic dimension parameter names (e.g. "seq_len") to their dim symbol.
+pub type DimParamMap = HashMap<String, Symbol>;
 
 /// Recover a single-variable dim's variable value from an observed runtime size.
 ///
@@ -43,12 +43,12 @@ pub type DimParamMap = HashMap<String, char>;
 /// — multi-variable expressions, non-affine forms, slope==0, and inversions
 /// that don't divide cleanly are all rejected so we never write a wrong
 /// guess into `dyn_map`.
-fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(char, usize)> {
+fn solve_single_var_dim(expr: &Expression, dim_val: usize) -> Option<(Symbol, usize)> {
     use luminal::shape::Term;
     let terms = expr.terms.read();
 
     // Identify the unique variable, if any.
-    let mut var: Option<char> = None;
+    let mut var: Option<Symbol> = None;
     for t in terms.iter() {
         if let Term::Var(c) = t {
             match var {
