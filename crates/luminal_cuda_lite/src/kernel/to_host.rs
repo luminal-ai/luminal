@@ -493,7 +493,7 @@ pub struct CudaGraphOp {
     /// Reverse dependency indices built once at graph construction. These let
     /// pointer/dimension changes identify affected kernel nodes directly.
     kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>>,
-    kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>>,
+    kernel_users_by_dyn_dim: FxHashMap<Symbol, Vec<usize>>,
     output_aliases: Vec<(NodeIndex, NodeIndex)>,
     library_buffer_nodes: FxHashSet<NodeIndex>,
     /// Buffer size requirements for extra nodes (node -> size in elements)
@@ -518,7 +518,7 @@ impl CudaGraphOp {
         state: CudaGraphOpState,
     ) -> Self {
         let mut kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>> = FxHashMap::default();
-        let mut kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>> = FxHashMap::default();
+        let mut kernel_users_by_dyn_dim: FxHashMap<Symbol, Vec<usize>> = FxHashMap::default();
         let mut output_aliases = Vec::new();
         let mut library_buffer_nodes = FxHashSet::default();
         // Build reverse dependency indexes once so materialization can update only the kernels
@@ -1367,7 +1367,7 @@ impl CudaGraphOp {
         &self,
         stream: &Arc<CudaStream>,
         changed_buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<bool> {
         let mut state = self.state.borrow_mut();
         if state.cuda_graph.is_none() || state.cuda_graph_exec.is_none() {

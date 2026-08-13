@@ -61,7 +61,7 @@ struct ResourceInputFootprint {
 /// must not rebuild the same aggregate resource plan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResourceValidationSignature {
-    allocation_dyn_maps: Vec<Vec<(char, usize)>>,
+    allocation_dyn_maps: Vec<Vec<(Symbol, usize)>>,
     input_footprints: Vec<(usize, ResourceInputFootprint)>,
 }
 
@@ -2941,8 +2941,8 @@ impl CudaRuntime {
     fn retained_bucket_allocation_dyn_maps(
         &self,
         bucket_idx: usize,
-        allocation_dyn_map: &FxHashMap<char, usize>,
-    ) -> Vec<FxHashMap<char, usize>> {
+        allocation_dyn_map: &DynMap,
+    ) -> Vec<DynMap> {
         self.compiled_buckets
             .iter()
             .enumerate()
@@ -2961,7 +2961,7 @@ impl CudaRuntime {
     fn resource_validation_signature(
         &self,
         bucket_idx: usize,
-        allocation_dyn_map: &FxHashMap<char, usize>,
+        allocation_dyn_map: &DynMap,
     ) -> ResourceValidationSignature {
         let allocation_dyn_maps = self
             .retained_bucket_allocation_dyn_maps(bucket_idx, allocation_dyn_map)
@@ -5202,7 +5202,7 @@ mod arena_plan_tests {
     #[test]
     fn resource_validation_cache_reuses_nonconsecutive_exact_signatures() {
         let signature = |a, bytes| ResourceValidationSignature {
-            allocation_dyn_maps: vec![vec![('a', a)]],
+            allocation_dyn_maps: vec![vec![(Symbol::from('a'), a)]],
             input_footprints: vec![(7, ResourceInputFootprint::external(bytes))],
         };
         let a17 = signature(17, 64);
