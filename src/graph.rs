@@ -225,7 +225,7 @@ pub struct CompileOptions {
     /// fresh random genomes. 0 disables (default: 0).
     pub restart_stagnation: usize,
     /// Per-candidate viability budget covering compile (`load_llir`) + run.
-    /// Candidates exceeding it are discarded.
+    /// Candidates exceeding it are discarded (default: 60 seconds).
     pub candidate_timeout: Option<std::time::Duration>,
     /// Caps how long profiling runs a single trial; not a rejection criterion.
     pub execution_timeout: Option<std::time::Duration>,
@@ -411,7 +411,7 @@ impl Default for CompileOptions {
             trials: 5,
             keep_best: 1,
             restart_stagnation: 0,
-            candidate_timeout: Some(std::time::Duration::from_secs(5)),
+            candidate_timeout: Some(std::time::Duration::from_secs(60)),
             execution_timeout: Some(std::time::Duration::from_secs(1)),
             early_stop_factor: None,
             search_dims: FxHashMap::default(),

@@ -20,6 +20,45 @@ impl ArgExtremum {
     }
 }
 
+/// Whether a cumulative extremum tracks the running maximum or minimum.
+#[derive(Clone, Copy)]
+pub(crate) enum CumExtremum {
+    Max,
+    Min,
+}
+
+fn cumulative_axis(dim: i64, rank: usize) -> Result<Option<usize>> {
+    if rank == 0 {
+        anyhow::ensure!(
+            matches!(dim, -1 | 0),
+            "Dimension out of range for scalar cumulative op: {dim}"
+        );
+        return Ok(None);
+    }
+
+    let normalized = if dim < 0 { rank as i64 + dim } else { dim };
+    anyhow::ensure!(
+        (0..rank as i64).contains(&normalized),
+        "Dimension out of range for rank-{rank} cumulative op: {dim}"
+    );
+    Ok(Some(normalized as usize))
+}
+
+fn dtype_can_contain_nan(dtype: DType) -> bool {
+    !matches!(
+        dtype,
+        DType::Int
+            | DType::I64
+            | DType::I4
+            | DType::U4
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::Bool
+    )
+}
+
 /// Compute total element count, returning an error if any dimension is symbolic.
 fn concrete_numel(a: &GraphTensor) -> Result<usize> {
     a.dims().iter().try_fold(1usize, |acc, d| {
@@ -30,6 +69,141 @@ fn concrete_numel(a: &GraphTensor) -> Result<usize> {
 }
 
 impl<'a> Translator<'a> {
+    /// Build the per-element source indices and validity mask for one
+    /// Hillis-Steele inclusive-scan step. A lane at `i` reads `i - offset`;
+    /// prefix lanes read zero but are subsequently kept unchanged by `valid`.
+    /// This gather-based shift avoids arithmetic padding, which would turn
+    /// otherwise inactive `0 * NaN` lanes into NaNs.
+    pub(crate) fn scan_shift_indices(
+        &mut self,
+        shape: &[Expression],
+        axis: usize,
+        offset: usize,
+    ) -> (GraphTensor, GraphTensor) {
+        let mut positions = self.graph.arange(shape[axis]);
+        for (dim, size) in shape.iter().copied().enumerate() {
+            if dim != axis {
+                positions = positions.expand_dim(dim, size);
+            }
+        }
+
+        let offset = self
+            .graph
+            .constant(offset as i64)
+            .expand_rhs(positions.shape);
+        let valid = positions.ge(offset);
+        let zero = self.graph.constant(0).expand_rhs(positions.shape);
+        let shifted = self.select(valid, positions - offset, zero);
+        (shifted, valid)
+    }
+
+    /// Lower `aten.cumprod.default` as an inclusive multiplication scan.
+    /// Unlike Luminal's legacy `GraphTensor::cumprod`, this never rewrites
+    /// products through log/exp, so zeros, negatives, integers, and overflow
+    /// retain ordinary multiplication semantics.
+    pub(crate) fn translate_cumprod(&mut self, node: &Node) -> Result<GraphTensor> {
+        let mut values = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
+        let Some(axis) = cumulative_axis(self.get_int_arg(node, 1)?, values.shape.len())? else {
+            return Ok(values);
+        };
+        let length = values.dims()[axis].to_usize().ok_or_else(|| {
+            anyhow::anyhow!("cumprod currently requires a concrete scan dimension")
+        })?;
+
+        let mut offset = 1;
+        while offset < length {
+            let (shifted_indices, valid) = self.scan_shift_indices(&values.dims(), axis, offset);
+            let shifted =
+                super::movement_dynamic::pt2_gather_elements(values, shifted_indices, axis);
+            values = self.select(valid, shifted * values, values);
+            offset *= 2;
+        }
+        Ok(values)
+    }
+
+    /// Lower `aten.cummax.default` / `aten.cummin.default`, carrying both the
+    /// running value and its source index through the same inclusive scan.
+    /// PyTorch selects the later element on equal values and on repeated NaNs;
+    /// a prior NaN beats a later ordered value, so NaN propagation is explicit.
+    pub(crate) fn translate_cumextremum(&mut self, node: &Node, which: CumExtremum) -> Result<()> {
+        let mut values = self.get_input_tensor(node, 0)?;
+        let axis = cumulative_axis(self.get_int_arg(node, 1)?, values.shape.len())?;
+
+        let mut indices = match axis {
+            None => self.graph.constant(0i64).cast(DType::I64),
+            Some(axis) if values.dims()[axis].to_usize() == Some(0) => values.cast(DType::I64),
+            Some(axis) => {
+                let mut positions = self.graph.arange(values.dims()[axis]).cast(DType::I64);
+                for (dim, size) in values.dims().into_iter().enumerate() {
+                    if dim != axis {
+                        positions = positions.expand_dim(dim, size);
+                    }
+                }
+                positions
+            }
+        };
+
+        if let Some(axis) = axis {
+            let length = values.dims()[axis].to_usize().ok_or_else(|| {
+                anyhow::anyhow!("cummax/cummin currently require a concrete scan dimension")
+            })?;
+            let mut offset = 1;
+            while offset < length {
+                let (shifted_indices, valid) =
+                    self.scan_shift_indices(&values.dims(), axis, offset);
+                let left_values =
+                    super::movement_dynamic::pt2_gather_elements(values, shifted_indices, axis);
+                let left_indices =
+                    super::movement_dynamic::pt2_gather_elements(indices, shifted_indices, axis);
+
+                let ordered_left_wins = match which {
+                    CumExtremum::Max => values.lt(left_values),
+                    CumExtremum::Min => left_values.lt(values),
+                };
+                let left_wins = if dtype_can_contain_nan(values.dtype) {
+                    let left_nan = self.is_nan(left_values);
+                    let right_nan = self.is_nan(values);
+                    let left_nan_only = self.bool_and(left_nan, self.bool_not(right_nan));
+                    self.bool_or(ordered_left_wins, left_nan_only)
+                } else {
+                    ordered_left_wins
+                };
+                let selected_values = self.select(left_wins, left_values, values);
+                let selected_indices = self.select(left_wins, left_indices, indices);
+                values = self.select(valid, selected_values, values);
+                indices = self.select(valid, selected_indices, indices);
+                offset *= 2;
+            }
+        }
+
+        let tuple_outputs = node.outputs.first().and_then(|o| o.as_tensors.as_ref());
+        let values_name = if let Some(outputs) = tuple_outputs {
+            outputs.first().map(|tensor| tensor.name.clone())
+        } else {
+            node.outputs
+                .first()
+                .and_then(|output| output.as_tensor.as_ref())
+                .map(|tensor| tensor.name.clone())
+        };
+        let indices_name = if let Some(outputs) = tuple_outputs {
+            outputs.get(1).map(|tensor| tensor.name.clone())
+        } else {
+            node.outputs
+                .get(1)
+                .and_then(|output| output.as_tensor.as_ref())
+                .map(|tensor| tensor.name.clone())
+        };
+        if let Some(name) = values_name.filter(|name| !name.is_empty()) {
+            self.tensors.insert(name, values);
+        }
+        if let Some(name) = indices_name.filter(|name| !name.is_empty()) {
+            self.tensors.insert(name, indices.cast(DType::I64));
+        }
+        Ok(())
+    }
+
     pub(crate) fn translate_reduction(
         &mut self,
         node: &Node,

@@ -114,6 +114,7 @@ fn squeeze_dims(mut tensor: GraphTensor, dims: &[usize]) -> GraphTensor {
 fn float_max(dtype: DType) -> f64 {
     match dtype {
         DType::F16 => 65_504.0,
+        DType::Bf16 => 3.389_531_389_251_535_5e38,
         DType::F32 => f32::MAX as f64,
         DType::F64 => f64::MAX,
         _ => unreachable!("complex component has non-float dtype {dtype:?}"),
@@ -204,7 +205,7 @@ impl<'a> Translator<'a> {
             }
             "torch.ops.aten.acos.default" | "torch.ops.aten.acosh.default" => {
                 let value = self.get_complex_input(node, 0)?;
-                let (acos, acosh) = self.complex_acos_acosh(value);
+                let (acos, acosh, _) = self.complex_acos_acosh(value);
                 self.store_complex(
                     output_name,
                     if target == "torch.ops.aten.acos.default" {
@@ -213,6 +214,41 @@ impl<'a> Translator<'a> {
                         acosh
                     },
                 );
+            }
+            "torch.ops.aten.asin.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_asin(value);
+                self.store_complex(output_name, result);
+            }
+            "torch.ops.aten.asinh.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_asinh(value);
+                self.store_complex(output_name, result);
+            }
+            "torch.ops.aten.atan.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_atan(value);
+                self.store_complex(output_name, result);
+            }
+            "torch.ops.aten.atanh.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_atanh(value);
+                self.store_complex(output_name, result);
+            }
+            "torch.ops.aten.exp.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_exp(value);
+                self.store_complex(output_name, result);
+            }
+            "torch.ops.aten.cos.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_cos(value);
+                self.store_complex(output_name, result);
+            }
+            "torch.ops.aten.cosh.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let result = self.complex_cosh(value);
+                self.store_complex(output_name, result);
             }
             "torch.ops.aten.real.default" => {
                 let value = self.get_complex_input(node, 0)?;
@@ -390,6 +426,52 @@ impl<'a> Translator<'a> {
                     self.store_complex(output_name, value.map(|component| component.cumsum(dim)));
                 }
             }
+            "torch.ops.aten.cumprod.default" => {
+                let dtype = self.output_complex_dtype(output_name)?;
+                let mut value = self.get_complex_input(node, 0)?.cast(dtype);
+                let dim = self.get_int_arg(node, 1)?;
+                if value.real.shape.is_empty() {
+                    anyhow::ensure!(
+                        matches!(dim, -1 | 0),
+                        "Dimension out of range for scalar cumprod: {dim}"
+                    );
+                } else {
+                    let dim = normalize_dim(dim, value.real.shape.len());
+                    anyhow::ensure!(
+                        dim < value.real.shape.len(),
+                        "Dimension out of range for complex cumprod: {dim}"
+                    );
+                    let length = value.real.dims()[dim]
+                        .to_usize()
+                        .context("complex cumprod currently requires a concrete scan dimension")?;
+                    let mut offset = 1;
+                    while offset < length {
+                        let (shifted_indices, valid) =
+                            self.scan_shift_indices(&value.real.dims(), dim, offset);
+                        let left = ComplexTensor::new(
+                            super::movement_dynamic::pt2_gather_elements(
+                                value.real,
+                                shifted_indices,
+                                dim,
+                            ),
+                            super::movement_dynamic::pt2_gather_elements(
+                                value.imag,
+                                shifted_indices,
+                                dim,
+                            ),
+                            dtype,
+                        );
+                        let product = self.complex_mul(left, value);
+                        value = ComplexTensor::new(
+                            self.select(valid, product.real, value.real),
+                            self.select(valid, product.imag, value.imag),
+                            dtype,
+                        );
+                        offset *= 2;
+                    }
+                }
+                self.store_complex(output_name, value);
+            }
             "torch.ops.aten.mm.default" | "torch.ops.aten.bmm.default" => {
                 let value = self.translate_complex_matmul(node, output_name)?;
                 self.store_complex(output_name, value);
@@ -527,7 +609,7 @@ impl<'a> Translator<'a> {
 
     /// Elementwise selection through gather, not arithmetic masking. This is
     /// essential for IEEE values because `0 * inf` and `0 * NaN` are NaN.
-    fn select(
+    pub(crate) fn select(
         &mut self,
         condition: GraphTensor,
         if_true: GraphTensor,
@@ -539,7 +621,7 @@ impl<'a> Translator<'a> {
         packed.gather(base + condition.cast(DType::Int))
     }
 
-    fn real_abs(&mut self, value: GraphTensor) -> GraphTensor {
+    pub(crate) fn real_abs(&mut self, value: GraphTensor) -> GraphTensor {
         let zero = self.constant_like(value, 0.0);
         let magnitude = self.select(value.lt(zero), value * -1.0, value);
         // `abs(-0)` is +0; the comparison above deliberately treats both
@@ -548,28 +630,28 @@ impl<'a> Translator<'a> {
         self.select(is_zero, zero, magnitude)
     }
 
-    fn bool_or(&self, lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
+    pub(crate) fn bool_or(&self, lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
         let lhs = lhs.cast(DType::F32);
         let rhs = rhs.cast(DType::F32);
         (lhs + rhs - lhs * rhs).cast(DType::Bool)
     }
 
-    fn bool_and(&self, lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
+    pub(crate) fn bool_and(&self, lhs: GraphTensor, rhs: GraphTensor) -> GraphTensor {
         (lhs.cast(DType::F32) * rhs.cast(DType::F32)).cast(DType::Bool)
     }
 
-    fn bool_not(&self, value: GraphTensor) -> GraphTensor {
+    pub(crate) fn bool_not(&self, value: GraphTensor) -> GraphTensor {
         (1.0 - value.cast(DType::F32)).cast(DType::Bool)
     }
 
-    fn is_inf(&mut self, value: GraphTensor) -> GraphTensor {
+    pub(crate) fn is_inf(&mut self, value: GraphTensor) -> GraphTensor {
         let largest = float_max(value.dtype);
         let positive = value.gt(self.constant_like(value, largest));
         let negative = value.lt(self.constant_like(value, -largest));
         self.bool_or(positive, negative)
     }
 
-    fn is_zero(&mut self, value: GraphTensor) -> GraphTensor {
+    pub(crate) fn is_zero(&mut self, value: GraphTensor) -> GraphTensor {
         let zero = self.constant_like(value, 0.0);
         let nonzero = self.bool_or(value.lt(zero), value.gt(zero));
         let nan = self.is_nan(value);
@@ -577,13 +659,13 @@ impl<'a> Translator<'a> {
         self.bool_not(nonzero_or_nan)
     }
 
-    fn is_nan(&mut self, value: GraphTensor) -> GraphTensor {
+    pub(crate) fn is_nan(&mut self, value: GraphTensor) -> GraphTensor {
         let largest = self.constant_like(value, f32::MAX as f64);
         let ordered = self.bool_or(value.lt(largest), value.gt(largest * -1.0));
         self.bool_not(ordered)
     }
 
-    fn signbit(&mut self, value: GraphTensor) -> GraphTensor {
+    pub(crate) fn signbit(&mut self, value: GraphTensor) -> GraphTensor {
         let zero = self.constant_like(value, 0.0);
         let negative = value.lt(zero);
         let negative_zero = value.reciprocal().lt(zero);
@@ -597,7 +679,7 @@ impl<'a> Translator<'a> {
         self.select(signbit, negative, positive)
     }
 
-    fn copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
+    pub(crate) fn copy_sign(&mut self, magnitude: GraphTensor, sign: GraphTensor) -> GraphTensor {
         let negative = magnitude * -1.0;
         let signbit = self.signbit(sign);
         self.select(signbit, negative, magnitude)
@@ -829,7 +911,10 @@ impl<'a> Translator<'a> {
     /// This form uses only real HLIR primitives, preserves PyTorch's branch
     /// choice through the sign bit of `y`, and avoids the cancellation and
     /// overflow of the textbook complex log/sqrt identities.
-    fn complex_acos_acosh(&mut self, value: ComplexTensor) -> (ComplexTensor, ComplexTensor) {
+    fn complex_acos_acosh(
+        &mut self,
+        value: ComplexTensor,
+    ) -> (ComplexTensor, ComplexTensor, ComplexTensor) {
         let one = self.constant_like(value.real, 1.0);
         let plus_one = ComplexTensor::new(value.real + one, value.imag, value.torch_dtype);
         let minus_one = ComplexTensor::new(value.real - one, value.imag, value.torch_dtype);
@@ -871,6 +956,18 @@ impl<'a> Translator<'a> {
         let acos_beta = self.real_acos(beta);
         let acosh_alpha = self.real_acosh(alpha);
         let signed_acosh = self.copy_sign(acosh_alpha, value.imag);
+        // When y is tiny, alpha rounds to exactly one before acosh and loses
+        // the imaginary component. Since beta = sin(real(result)), recover
+        // sinh(imag(result)) = y / sqrt(1 - beta^2). Keep the alpha/acosh form
+        // at beta=+/-1, where it carries the real-axis branch cut.
+        let cosine = (one - beta.square()).sqrt();
+        let stable_signed_acosh = self.real_asinh(value.imag / cosine);
+        let well_conditioned = self.constant_like(cosine, 0.25);
+        let signed_acosh = self.select(
+            cosine.gt(well_conditioned),
+            stable_signed_acosh,
+            signed_acosh,
+        );
         let signed_acos = self.copy_sign(acos_beta, value.imag);
 
         let mut acos_real = acos_beta;
@@ -888,9 +985,118 @@ impl<'a> Translator<'a> {
         let signed_infinity = self.signed_constant_like(value.real, f64::INFINITY);
         acos_imag = self.select(real_inf_with_nan_imag, signed_infinity, acos_imag);
 
+        // Use the direct real asin approximation rather than pi/2 - acos.
+        // The subtraction amplifies the existing acos approximation error for
+        // small real components. Derive the imaginary lane from the finalized
+        // acos lane so its C99 infinity/NaN special cases remain identical.
+        let mut asin_real = self.real_asin(beta);
+        asin_real = self.select(zero_with_nan_imag, value.real, asin_real);
+        let asin_imag = acos_imag * -1.0;
+
         (
             ComplexTensor::new(acos_real, acos_imag, value.torch_dtype),
             ComplexTensor::new(acosh_alpha, signed_acos, value.torch_dtype),
+            ComplexTensor::new(asin_real, asin_imag, value.torch_dtype),
+        )
+    }
+
+    fn complex_asin(&mut self, value: ComplexTensor) -> ComplexTensor {
+        self.complex_acos_acosh(value).2
+    }
+
+    fn complex_asinh(&mut self, value: ComplexTensor) -> ComplexTensor {
+        // asinh(z) = -i asin(i z)
+        let rotated = ComplexTensor::new(value.imag * -1.0, value.real, value.torch_dtype);
+        let asin = self.complex_asin(rotated);
+        ComplexTensor::new(asin.imag, asin.real * -1.0, value.torch_dtype)
+    }
+
+    fn complex_exp(&mut self, value: ComplexTensor) -> ComplexTensor {
+        let scale = self.real_exp(value.real);
+        ComplexTensor::new(
+            scale * self.real_cos(value.imag),
+            scale * value.imag.sin(),
+            value.torch_dtype,
+        )
+    }
+
+    fn complex_cos(&mut self, value: ComplexTensor) -> ComplexTensor {
+        let cosh = self.real_cosh(value.imag);
+        let sinh = self.real_sinh(value.imag);
+        ComplexTensor::new(
+            self.real_cos(value.real) * cosh,
+            value.real.sin() * sinh * -1.0,
+            value.torch_dtype,
+        )
+    }
+
+    fn complex_cosh(&mut self, value: ComplexTensor) -> ComplexTensor {
+        let cosh = self.real_cosh(value.real);
+        let sinh = self.real_sinh(value.real);
+        ComplexTensor::new(
+            cosh * self.real_cos(value.imag),
+            sinh * value.imag.sin(),
+            value.torch_dtype,
+        )
+    }
+
+    fn complex_log(&mut self, value: ComplexTensor) -> ComplexTensor {
+        let magnitude = self.complex_abs(value);
+        let angle = self.real_atan2(value.imag, value.real);
+        ComplexTensor::new(magnitude.log(), angle, value.torch_dtype)
+    }
+
+    pub(crate) fn real_atan2(&mut self, y: GraphTensor, x: GraphTensor) -> GraphTensor {
+        let ratio = y / x;
+        let mut angle = self.real_atan(ratio);
+        let x_negative = self.signbit(x);
+        let pi = self.constant_like(y, std::f64::consts::PI);
+        let signed_pi = self.copy_sign(pi, y);
+        angle = self.select(x_negative, angle + signed_pi, angle);
+
+        let x_inf = self.is_inf(x);
+        let y_inf = self.is_inf(y);
+        let both_inf = self.bool_and(x_inf, y_inf);
+        let quarter = self.constant_like(y, std::f64::consts::FRAC_PI_4);
+        let three_quarters = self.constant_like(y, 3.0 * std::f64::consts::FRAC_PI_4);
+        let infinite_angle = self.select(x_negative, three_quarters, quarter);
+        let infinite_angle = self.copy_sign(infinite_angle, y);
+        angle = self.select(both_inf, infinite_angle, angle);
+
+        let x_zero = self.is_zero(x);
+        let y_zero = self.is_zero(y);
+        let both_zero = self.bool_and(x_zero, y_zero);
+        let zero = self.constant_like(y, 0.0);
+        let signed_zero = self.copy_sign(zero, y);
+        let zero_angle = self.select(x_negative, signed_pi, signed_zero);
+        self.select(both_zero, zero_angle, angle)
+    }
+
+    fn complex_atan(&mut self, value: ComplexTensor) -> ComplexTensor {
+        // atan(z) = i/2 * (log(1 - i z) - log(1 + i z))
+        let one = self.constant_like(value.real, 1.0);
+        let minus_iz = ComplexTensor::new(one + value.imag, value.real * -1.0, value.torch_dtype);
+        let plus_iz = ComplexTensor::new(one - value.imag, value.real, value.torch_dtype);
+        let a = self.complex_log(minus_iz);
+        let b = self.complex_log(plus_iz);
+        ComplexTensor::new(
+            (a.imag - b.imag) * -0.5,
+            (a.real - b.real) * 0.5,
+            value.torch_dtype,
+        )
+    }
+
+    fn complex_atanh(&mut self, value: ComplexTensor) -> ComplexTensor {
+        // atanh(z) = 1/2 * (log(1 + z) - log(1 - z))
+        let one = self.constant_like(value.real, 1.0);
+        let plus = ComplexTensor::new(one + value.real, value.imag, value.torch_dtype);
+        let minus = ComplexTensor::new(one - value.real, value.imag * -1.0, value.torch_dtype);
+        let plus = self.complex_log(plus);
+        let minus = self.complex_log(minus);
+        ComplexTensor::new(
+            (plus.real - minus.real) * 0.5,
+            (plus.imag - minus.imag) * 0.5,
+            value.torch_dtype,
         )
     }
 

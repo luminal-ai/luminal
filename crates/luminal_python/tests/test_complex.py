@@ -183,6 +183,21 @@ class ComplexInverseFunctions(torch.nn.Module):
         return torch.acos(value), torch.acosh(value)
 
 
+class ComplexAsinAsinh(torch.nn.Module):
+    def forward(self, value):
+        return torch.asin(value), torch.asinh(value)
+
+
+def test_complex_asin_asinh_avoid_cancellation():
+    value = torch.tensor(
+        [-0.2327 - 0.0001j, 0.0378 + 3.5795j], dtype=torch.complex64
+    )
+    expected = ComplexAsinAsinh()(value)
+    actual = _compile_and_run(ComplexAsinAsinh(), value)
+    for result, reference in zip(actual, expected):
+        _assert_close(result, reference, rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize(
     ("dtype", "component_dtype", "rtol", "atol"),
     (

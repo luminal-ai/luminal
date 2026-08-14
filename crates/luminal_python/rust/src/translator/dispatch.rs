@@ -5,7 +5,7 @@ use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
 use super::Translator;
-use super::reduction::ArgExtremum;
+use super::reduction::{ArgExtremum, CumExtremum};
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_node(&mut self, node: &Node) -> Result<()> {
@@ -94,14 +94,25 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.div.Tensor" => self.translate_binary_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Scalar" => self.translate_binary_scalar_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Tensor_mode" => self.translate_div_tensor_mode(node)?,
+            "torch.ops.aten.atan2.default" => self.translate_atan2(node)?,
+            "torch.ops.aten.copysign.Tensor" => self.translate_copysign(node)?,
+            "torch.ops.aten.copysign.Scalar" => self.translate_copysign_scalar(node)?,
+            "torch.ops.aten.fmax.default" => self.translate_fmax_fmin(node, true)?,
+            "torch.ops.aten.fmin.default" => self.translate_fmax_fmin(node, false)?,
 
             // Unary ops
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
-            "torch.ops.aten.exp.default" => self.translate_unary_op(node, |a| a.exp())?,
+            "torch.ops.aten.exp.default" => self.translate_exp(node)?,
             "torch.ops.aten.sin.default" => self.translate_unary_op(node, |a| a.sin())?,
-            "torch.ops.aten.cos.default" => self.translate_unary_op(node, |a| a.cos())?,
+            "torch.ops.aten.cos.default" => self.translate_cos(node)?,
             "torch.ops.aten.acos.default" => self.translate_acos(node)?,
             "torch.ops.aten.acosh.default" => self.translate_acosh(node)?,
+            "torch.ops.aten.asin.default" => self.translate_asin(node)?,
+            "torch.ops.aten.asinh.default" => self.translate_asinh(node)?,
+            "torch.ops.aten.atan.default" => self.translate_atan(node)?,
+            "torch.ops.aten.atanh.default" => self.translate_atanh(node)?,
+            "torch.ops.aten.cosh.default" => self.translate_cosh(node)?,
+            "torch.ops.aten.trunc.default" => self.translate_trunc(node)?,
             "torch.ops.aten.sqrt.default" => self.translate_unary_op(node, |a| a.sqrt())?,
             "torch.ops.aten.rsqrt.default" => {
                 self.translate_unary_op(node, |a| a.sqrt().reciprocal())?
@@ -369,6 +380,15 @@ impl<'a> Translator<'a> {
                     let dim = normalize_dim(dim, a.shape.len());
                     a.cumsum(dim)
                 }
+            }
+            "torch.ops.aten.cumprod.default" => self.translate_cumprod(node)?,
+            "torch.ops.aten.cummax.default" => {
+                self.translate_cumextremum(node, CumExtremum::Max)?;
+                return Ok(());
+            }
+            "torch.ops.aten.cummin.default" => {
+                self.translate_cumextremum(node, CumExtremum::Min)?;
+                return Ok(());
             }
 
             // Floor / Ceil / Erf (approximations)

@@ -166,7 +166,7 @@ fn main() {
     runtime.set_data(gather_idx_t, (0..search_c as i32).collect::<Vec<_>>());
     runtime.set_data(new_token_t, vec![-1i32]);
     let mut rng = SmallRng::seed_from_u64(SEARCH_SEED);
-    // Profiling timeouts use the CompileOptions defaults (5s candidate / 1s execution).
+    // Profiling timeouts use the CompileOptions defaults (60s candidate / 1s execution).
     runtime = cx.compile_with_rng(runtime, compile_options, &mut rng);
 
     // Search profiling leaves several GB cached in the async allocator pool;
