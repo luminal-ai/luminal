@@ -132,6 +132,8 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
             "torch.ops.aten.repeat.default" => self.translate_repeat(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
+            "torch.ops.aten.flip.default" => self.translate_flip(node)?,
+            "torch.ops.aten.diagonal.default" => self.translate_diagonal(node)?,
             "torch.ops.aten.unsqueeze.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let dim = self.get_int_arg(node, 1)?;

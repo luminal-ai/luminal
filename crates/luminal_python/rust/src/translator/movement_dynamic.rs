@@ -24,11 +24,25 @@ use luminal::prelude::*;
 use crate::dim_arith::product_of_dims;
 
 /// Row-major strides as `Expression`s. `stride[i] = prod(dims[i+1..])`.
-fn row_major_strides(dims: &[Expression]) -> Vec<Expression> {
+pub(super) fn row_major_strides(dims: &[Expression]) -> Vec<Expression> {
     let rank = dims.len();
     (0..rank)
         .map(|i| product_of_dims(dims[i + 1..].iter().copied()))
         .collect()
+}
+
+/// Build a tensor of logical flat indices from one contribution expression
+/// per output axis. `Gather` applies the data tensor's ShapeTracker after this
+/// mapping, so callers deliberately use logical row-major strides here rather
+/// than the data tensor's physical strides.
+pub(super) fn logical_flat_indices(
+    graph: &mut Graph,
+    output_shape: &[Expression],
+    axis_contributions: &[Expression],
+    base: Expression,
+) -> GraphTensor {
+    let index = base + flatten_strides(output_shape, axis_contributions);
+    graph.iota(index, output_shape.to_vec())
 }
 
 /// Build the additive non-axis contribution to a flat index over a

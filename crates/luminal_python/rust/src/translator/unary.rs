@@ -48,7 +48,9 @@ impl<'a> Translator<'a> {
         node: &Node,
         f: impl Fn(GraphTensor) -> GraphTensor,
     ) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
+        let a = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
         Ok(f(a))
     }
 
@@ -61,10 +63,12 @@ impl<'a> Translator<'a> {
     /// behavior keeps the polynomial smooth and also makes out-of-domain real
     /// inputs produce NaN through `sqrt(1 - abs(x))`, matching PyTorch.
     ///
-    /// PyTorch promotes integral and bool inputs to F32 for inverse trig ops.
+    /// PyTorch promotes integral and bool inputs to its default floating dtype.
     #[allow(clippy::excessive_precision)]
     pub(crate) fn translate_acos(&mut self, node: &Node) -> Result<GraphTensor> {
-        let input = self.get_input_tensor(node, 0)?;
+        let input = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
         Ok(self.real_acos(input))
     }
 
@@ -72,12 +76,6 @@ impl<'a> Translator<'a> {
     /// complex inverse functions.
     #[allow(clippy::excessive_precision)]
     pub(crate) fn real_acos(&mut self, input: GraphTensor) -> GraphTensor {
-        let input = match input.dtype {
-            DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
-                input.cast(DType::F32)
-            }
-            _ => input,
-        };
         let x = input.abs();
 
         // Horner form, highest-order coefficient first. The maximum absolute
@@ -111,22 +109,18 @@ impl<'a> Translator<'a> {
     ///
     /// instead. For real inputs below one, either the square root or `log(x)`
     /// naturally produces NaN, matching PyTorch's real-domain behavior.
-    /// PyTorch promotes integral and bool inputs to F32 for inverse hyperbolic
-    /// operations, while floating inputs retain their dtype.
+    /// PyTorch promotes integral and bool inputs to its default floating dtype,
+    /// while floating inputs retain their dtype.
     pub(crate) fn translate_acosh(&mut self, node: &Node) -> Result<GraphTensor> {
-        let input = self.get_input_tensor(node, 0)?;
+        let input = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
         Ok(self.real_acosh(input))
     }
 
     /// Elementwise real acosh used by both real ATen dispatch and compound
     /// complex inverse functions.
     pub(crate) fn real_acosh(&mut self, input: GraphTensor) -> GraphTensor {
-        let input = match input.dtype {
-            DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
-                input.cast(DType::F32)
-            }
-            _ => input,
-        };
         let reciprocal_squared = input.reciprocal().square();
         let one = self.constant_like(input, 1.0);
         input.log() + (one + (one - reciprocal_squared).sqrt()).log()

@@ -8,10 +8,100 @@ use crate::pt2_util::*;
 
 use super::Translator;
 
+use super::movement_dynamic::{logical_flat_indices, row_major_strides};
+
 const SCATTER_INPUT_ARG: usize = 0;
 const SCATTER_DIM_ARG: usize = 1;
 const SCATTER_INDEX_ARG: usize = 2;
 const SCATTER_VALUE_ARG: usize = 3;
+
+pub(crate) fn normalize_flip_dims(dims: &[i64], rank: usize) -> Result<Vec<usize>> {
+    let mut normalized = Vec::with_capacity(dims.len());
+    for &dim in dims {
+        anyhow::ensure!(
+            dim >= -(rank as i64) && dim < rank as i64,
+            "flip dimension {dim} out of range for rank {rank}"
+        );
+        let dim = normalize_dim(dim, rank);
+        anyhow::ensure!(
+            !normalized.contains(&dim),
+            "flip dimensions must be unique, got {dims:?}"
+        );
+        normalized.push(dim);
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn normalize_diagonal_dims(dim1: i64, dim2: i64, rank: usize) -> Result<(usize, usize)> {
+    anyhow::ensure!(
+        rank >= 2,
+        "diagonal expects an input with at least two dimensions"
+    );
+    for dim in [dim1, dim2] {
+        anyhow::ensure!(
+            dim >= -(rank as i64) && dim < rank as i64,
+            "diagonal dimension {dim} out of range for rank {rank}"
+        );
+    }
+    let dims = (normalize_dim(dim1, rank), normalize_dim(dim2, rank));
+    anyhow::ensure!(dims.0 != dims.1, "diagonal dimensions must be different");
+    Ok(dims)
+}
+
+pub(crate) fn flip_indices(input: GraphTensor, dims: &[usize]) -> GraphTensor {
+    let shape = input.dims();
+    let strides = row_major_strides(&shape);
+    let contributions: Vec<Expression> = strides
+        .iter()
+        .enumerate()
+        .map(|(axis, &stride)| {
+            let coordinate = if dims.contains(&axis) {
+                shape[axis] - 1 - Expression::from('z')
+            } else {
+                Expression::from('z')
+            };
+            coordinate * stride
+        })
+        .collect();
+    logical_flat_indices(input.graph(), &shape, &contributions, 0.into())
+}
+
+pub(crate) fn diagonal_indices(
+    input: GraphTensor,
+    output_shape: &[Expression],
+    offset: i64,
+    dim1: usize,
+    dim2: usize,
+) -> Result<GraphTensor> {
+    let input_shape = input.dims();
+    anyhow::ensure!(
+        output_shape.len() + 1 == input_shape.len(),
+        "diagonal output rank {} does not match input rank {}",
+        output_shape.len(),
+        input_shape.len()
+    );
+    let strides = row_major_strides(&input_shape);
+    let mut contributions: Vec<Expression> = (0..input_shape.len())
+        .filter(|&axis| axis != dim1 && axis != dim2)
+        .map(|axis| Expression::from('z') * strides[axis])
+        .collect();
+    contributions.push(Expression::from('z') * (strides[dim1] + strides[dim2]));
+
+    // Positive offsets start along dim2; negative offsets start along dim1.
+    // Express negation symbolically so the full signed ATen offset range does
+    // not overflow Rust while translating an empty, out-of-bounds diagonal.
+    let base = if offset >= 0 {
+        Expression::from(offset) * strides[dim2]
+    } else {
+        Expression::from(offset) * Expression::from(-1) * strides[dim1]
+    };
+    Ok(logical_flat_indices(
+        input.graph(),
+        output_shape,
+        &contributions,
+        base,
+    ))
+}
 
 fn normalize_concat_dims(
     lhs: &mut GraphTensor,
@@ -194,6 +284,24 @@ impl<'a> Translator<'a> {
             .map(|&d| normalize_dim(d, a.shape.len()))
             .collect();
         Ok(a.permute(axes))
+    }
+
+    pub(crate) fn translate_flip(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let dims = normalize_flip_dims(&self.get_ints_arg(node, 1)?, input.shape.len())?;
+        Ok(input.gather(flip_indices(input, &dims)))
+    }
+
+    pub(crate) fn translate_diagonal(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let offset = self.get_int_arg(node, 1).unwrap_or(0);
+        let (dim1, dim2) = normalize_diagonal_dims(
+            self.get_int_arg(node, 2).unwrap_or(0),
+            self.get_int_arg(node, 3).unwrap_or(1),
+            input.shape.len(),
+        )?;
+        let output_shape = self.output_meta_shape(node)?;
+        Ok(input.gather(diagonal_indices(input, &output_shape, offset, dim1, dim2)?))
     }
 
     pub(crate) fn translate_expand(&mut self, node: &Node) -> Result<GraphTensor> {

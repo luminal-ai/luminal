@@ -382,6 +382,24 @@ impl<'a> Translator<'a> {
         self.tensor_meta_to_shape(meta)
     }
 
+    /// Dtype of the node's first tensor output. PT2 metadata is authoritative
+    /// for PyTorch promotion semantics, including integral inputs promoted to
+    /// the current default floating dtype by transcendental and true-divide
+    /// operations.
+    pub(crate) fn output_meta_dtype(&self, node: &Node) -> Result<DType> {
+        let name = node
+            .outputs
+            .first()
+            .and_then(|output| output.as_tensor.as_ref())
+            .map(|tensor| tensor.name.clone())
+            .unwrap_or_default();
+
+        let meta = self
+            .tensor_meta(&name)
+            .context("Missing tensor meta for output dtype")?;
+        Ok(pt2_util::torch_dtype_int_to_luminal(meta.dtype))
+    }
+
     pub(crate) fn dim_size_to_expr(&self, dim: &DimSize) -> Result<Expression> {
         match dim {
             DimSize::Int(i) => Ok(Expression::from(i.as_int)),

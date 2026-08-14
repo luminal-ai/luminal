@@ -245,19 +245,6 @@ impl<'a> Translator<'a> {
         Ok(value.expand_rhs(reference.shape))
     }
 
-    fn output_meta_dtype(&self, node: &Node) -> Result<DType> {
-        let output_name = node
-            .outputs
-            .first()
-            .and_then(|o| o.as_tensor.as_ref())
-            .map(|t| t.name.clone())
-            .unwrap_or_default();
-        let meta = self
-            .tensor_meta(&output_name)
-            .context("Missing tensor meta for output dtype")?;
-        Ok(torch_dtype_int_to_luminal(meta.dtype))
-    }
-
     /// Translate `aten._grouped_mm.default(input, weight, offs)` → `Tensor[S, N]`.
     ///
     /// Grouped matmul: `input` is `[S, K]` (tokens sorted by expert), `weight` is

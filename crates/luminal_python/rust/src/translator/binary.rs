@@ -70,11 +70,17 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_binary_op(&mut self, node: &Node, op: BinaryOp) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
+        let mut a = self.get_input_tensor(node, 0)?;
+        if matches!(op, BinaryOp::Div) {
+            a = a.cast(self.output_meta_dtype(node)?);
+        }
         let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;
         if let Some(name) = arg1.as_tensor_name() {
-            let b = self.get_tensor(name)?;
+            let mut b = self.get_tensor(name)?;
+            if matches!(op, BinaryOp::Div) {
+                b = b.cast(a.dtype);
+            }
             let (a, mut b) = ensure_same_dtype(a, b);
             let is_bool_add = matches!(op, BinaryOp::Add) && a.dtype == DType::Bool;
             if !is_bool_add && let Some(alpha) = alpha {
@@ -130,7 +136,10 @@ impl<'a> Translator<'a> {
         node: &Node,
         op: BinaryOp,
     ) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
+        let mut a = self.get_input_tensor(node, 0)?;
+        if matches!(op, BinaryOp::Div) {
+            a = a.cast(self.output_meta_dtype(node)?);
+        }
         let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;
         if let Some(f) = arg1.as_float() {

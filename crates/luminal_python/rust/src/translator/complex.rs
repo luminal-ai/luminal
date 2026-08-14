@@ -15,6 +15,9 @@ use crate::pt2_util::{
 use crate::torch_dtype::TorchDType;
 
 use super::Translator;
+use super::movement::{
+    diagonal_indices, flip_indices, normalize_diagonal_dims, normalize_flip_dims,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ComplexTensor {
@@ -280,6 +283,31 @@ impl<'a> Translator<'a> {
                 self.store_complex(
                     output_name,
                     value.map(|component| component.permute(axes.clone())),
+                );
+            }
+            "torch.ops.aten.flip.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let dims =
+                    normalize_flip_dims(&self.get_ints_arg(node, 1)?, value.real.shape.len())?;
+                let indices = flip_indices(value.real, &dims);
+                self.store_complex(
+                    output_name,
+                    value.map(|component| component.gather(indices)),
+                );
+            }
+            "torch.ops.aten.diagonal.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let offset = self.get_int_arg(node, 1).unwrap_or(0);
+                let (dim1, dim2) = normalize_diagonal_dims(
+                    self.get_int_arg(node, 2).unwrap_or(0),
+                    self.get_int_arg(node, 3).unwrap_or(1),
+                    value.real.shape.len(),
+                )?;
+                let output_shape = self.output_meta_shape(node)?;
+                let indices = diagonal_indices(value.real, &output_shape, offset, dim1, dim2)?;
+                self.store_complex(
+                    output_name,
+                    value.map(|component| component.gather(indices)),
                 );
             }
             "torch.ops.aten.unsqueeze.default" => {
