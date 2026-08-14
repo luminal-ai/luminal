@@ -1,7 +1,9 @@
 mod expression;
+mod symbol;
 mod tracker;
 
 pub use expression::*;
+pub use symbol::*;
 pub use tracker::*;
 
 use std::ops::{Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeTo, RangeToInclusive};

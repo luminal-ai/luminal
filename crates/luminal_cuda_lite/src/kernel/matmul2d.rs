@@ -29,7 +29,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     dtype::DType, op::CustomOp, op::LLIROp, prelude::FxHashMap, prelude::GraphTensor,
-    shape::Expression,
+    prelude::Symbol, shape::Expression,
 };
 
 use crate::compile_module_image_for_current_device;
@@ -79,7 +79,7 @@ impl KernelOp for Matmul2DKernel {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let bias_param = if self.has_bias {
             ", const float* __restrict__ bias"

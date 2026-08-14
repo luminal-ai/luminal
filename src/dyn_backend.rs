@@ -10,12 +10,12 @@ use std::collections::HashMap;
 
 use half::{bf16, f16};
 use petgraph::stable_graph::NodeIndex;
-use rustc_hash::FxHashMap;
 
 use crate::dtype::DType;
 use crate::graph::{CompileOptions, Graph};
 use crate::hlir::{Output, ReferenceData, ReferenceRuntime};
 use crate::op::Runtime;
+use crate::shape::DynMap;
 
 // ---------------------------------------------------------------------------
 // DynBackend trait
@@ -65,7 +65,7 @@ pub trait DynBackend {
     fn get_output_bool(&self, _node: NodeIndex) -> Vec<bool> {
         panic!("get_output_bool not supported by '{}'", self.name());
     }
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>);
+    fn execute(&mut self, dyn_map: &DynMap);
 
     // --- Optional device pointer support (GPU backends) --------------------
 
@@ -82,6 +82,9 @@ pub trait DynBackend {
     unsafe fn set_output_device_ptr(&mut self, _node: NodeIndex, _ptr: u64, _n_bytes: usize) {
         panic!("set_output_device_ptr not supported by '{}'", self.name());
     }
+    fn clear_output_device_ptr(&mut self, _node: NodeIndex) {
+        panic!("clear_output_device_ptr not supported by '{}'", self.name());
+    }
     fn output_is_zero_copy(&self, _node: NodeIndex) -> bool {
         false
     }
@@ -92,6 +95,17 @@ pub trait DynBackend {
             "copy_output_to_device_ptr not supported by '{}'",
             self.name()
         );
+    }
+    /// Copy multiple outputs to device pointers. Backends may override this to
+    /// enqueue the full batch and synchronize once.
+    ///
+    /// # Safety
+    /// Every destination pointer must be a valid device allocation with at
+    /// least the corresponding byte count available.
+    unsafe fn copy_outputs_to_device_ptrs(&self, copies: &[(NodeIndex, u64, usize)]) {
+        for &(node, dest_ptr, n_bytes) in copies {
+            unsafe { self.copy_output_to_device_ptr(node, dest_ptr, n_bytes) };
+        }
     }
 }
 
@@ -428,7 +442,7 @@ impl DynBackend for ReferenceDynBackend {
         }
     }
 
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn execute(&mut self, dyn_map: &DynMap) {
         self.runtime.execute(dyn_map);
     }
 }

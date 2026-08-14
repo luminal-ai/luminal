@@ -1441,10 +1441,7 @@ impl CuBlasLt {
     /// CUDA-graph preparation, and ordinary host execution. Keeping dimension,
     /// layout, dtype, and scalar resolution here prevents those paths from
     /// silently preparing different descriptors for the same extracted op.
-    fn resolve_matmul_spec(
-        &self,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> anyhow::Result<LtMatmulSpec> {
+    fn resolve_matmul_spec(&self, dyn_map: &DynMap) -> anyhow::Result<LtMatmulSpec> {
         let resolve = |expression: &Expression, name: &str| -> anyhow::Result<usize> {
             expression
                 .substitute('z', Expression::from(1))
@@ -1560,7 +1557,7 @@ impl CuBlasLt {
         self.n_inputs()
     }
 
-    pub(crate) fn graph_spec_dyn_vars(&self) -> FxHashSet<char> {
+    pub(crate) fn graph_spec_dyn_vars(&self) -> FxHashSet<Symbol> {
         [
             &self.m,
             &self.n,
@@ -1585,7 +1582,7 @@ impl CuBlasLt {
     /// allocation preflight before any arena exists.
     pub(crate) fn prepare_key_for_resources(
         &self,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<CuBlasLtPrepareKey> {
         Ok(CuBlasLtPrepareKey {
             spec: self.resolve_matmul_spec(dyn_map)?,
@@ -1597,7 +1594,7 @@ impl CuBlasLt {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<CuBlasLtResolvedGraphCall> {
         let spec = self.resolve_matmul_spec(dyn_map)?;
         let ptrs = resolve_cublaslt_pointers(
@@ -1704,7 +1701,7 @@ impl HostOp for CuBlasLt {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         let spec = self.resolve_matmul_spec(dyn_map)?;
         let ptrs = resolve_cublaslt_pointers(
@@ -1760,7 +1757,7 @@ impl HostOp for CuBlasLt {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         _buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         let scale_bytes = [self.a_dtype, self.b_dtype, self.c_dtype, self.d_dtype]
             .into_iter()
@@ -1792,7 +1789,7 @@ mod tests {
             ldd: Expression::from(1),
             ..Default::default()
         };
-        let dyn_map = FxHashMap::from_iter([('m', 3)]);
+        let dyn_map = FxHashMap::from_iter([(Symbol::from('m'), 3)]);
 
         let spec = op.resolve_matmul_spec(&dyn_map).unwrap();
         let prepare_key = op.prepare_key_for_resources(&dyn_map).unwrap();

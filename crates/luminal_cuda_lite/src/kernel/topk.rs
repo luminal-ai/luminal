@@ -200,13 +200,13 @@ impl KernelOp for KernelStableSortIdx {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let rows = self.out_shape[0];
         let e = self.out_shape[1].to_usize().expect("ranks E is static");
         assert!(e <= 1024, "stable ranks kernel supports E <= 1024");
 
-        let vars: FxHashSet<char> = rows.dyn_vars().into_iter().collect();
+        let vars: FxHashSet<Symbol> = rows.dyn_vars().into_iter().collect();
         let (dyn_defines, _sorted) = generate_dyn_dims_defines(&vars);
         let dyn_dims_param = if vars.is_empty() {
             ""
@@ -285,7 +285,7 @@ extern \"C\" {{
         DType::Int
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.out_shape[0].dyn_vars().into_iter().collect()
     }
 

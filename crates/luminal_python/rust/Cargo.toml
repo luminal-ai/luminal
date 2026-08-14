@@ -4,8 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 
 [lib]
-name = "luminal"
-crate-type = ["cdylib"]
+name = "luminal_python"
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [features]

@@ -1,26 +1,28 @@
-mod compiled_graph;
+pub mod compiled_graph;
 mod dim_arith;
 pub mod torch_dtype;
 pub mod typed_data;
 
 // PT2 modules
-mod pt2_compiled_model;
+pub mod pt2_compiled_model;
 mod pt2_expr;
-mod pt2_parser;
-mod pt2_schema;
+pub mod pt2_parser;
+pub mod pt2_schema;
 mod pt2_util;
-mod translator;
+pub mod translator;
 
 use compiled_graph::CompiledGraph;
-use pt2_compiled_model::process_pt2;
+use pt2_compiled_model::{TranslatedModule, process_pt2, translate_module};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use std::collections::HashMap;
 use torch_dtype::TorchDType;
 
 #[pymodule]
-fn luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn luminal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process_pt2, m)?)?;
+    m.add_function(wrap_pyfunction!(translate_module, m)?)?;
+    m.add_class::<TranslatedModule>()?;
     m.add_class::<CompiledGraph>()?;
     m.add_function(wrap_pyfunction!(_reference_factory_capsule, m)?)?;
     m.add_function(wrap_pyfunction!(_torch_dtype_codes, m)?)?;

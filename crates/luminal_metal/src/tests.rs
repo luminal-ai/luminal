@@ -277,19 +277,61 @@ fn generate_layer_weights(layer: &MiniTransformerLayer) -> Vec<(GraphTensor, Vec
         .collect()
 }
 
-/// dynamic symbols in kernel expressions should route through dyn buffer.
-#[test]
-fn dynamic_const_codegen_uses_dyn_buffer() {
-    let expr = (Expression::from('a') * 2 + Expression::from('z')).simplify();
-    let code = lower_expression_for_metal(&expr, "idx");
+/// Which slot a dim gets, by lowering it and reading the emitted subscript.
+fn slot_of(name: &str) -> usize {
+    lower_expression_for_metal(&Expression::from(Symbol::new(name)), "idx")
+        .trim_start_matches("dyn[")
+        .trim_end_matches(']')
+        .parse::<usize>()
+        .unwrap()
+}
 
-    assert!(
-        !code.contains("*const_"),
-        "dynamic symbols should be lowered via dyn buffer, got: {code}"
+/// Slots come from the layout, not from the name. The old ABI computed one as
+/// `name_byte - b'a'`, so it could only carry a single `a`..`y` and had no
+/// representation at all for a multi-char or upper-case name.
+#[test]
+fn dyn_slots_are_assigned_by_position_not_by_letter() {
+    crate::kernel::clear_dyn_dims_order();
+
+    // None of these is a single letter, and the last would have collided with
+    // the first under the old byte arithmetic.
+    assert_eq!(slot_of("context_tokens"), 0);
+    assert_eq!(slot_of("input_tokens"), 1);
+    assert_eq!(slot_of("Cached"), 2);
+}
+
+/// A slot is assigned once and never moves. Codegen bakes it into emitted
+/// source as it goes, so a dim discovered later must append rather than
+/// displace one already written.
+#[test]
+fn a_slot_is_stable_once_assigned() {
+    crate::kernel::clear_dyn_dims_order();
+
+    assert_eq!(slot_of("input_tokens"), 0);
+    // Sorts before input_tokens, so it would displace it if the layout re-sorted.
+    assert_eq!(slot_of("cached_tokens"), 1);
+    assert_eq!(slot_of("input_tokens"), 0, "existing slot must be stable");
+    assert_eq!(
+        crate::kernel::dyn_dims_order().len(),
+        2,
+        "the runtime sizes the buffer from this, so every slot must be visible"
     );
-    assert!(
-        code.contains("dyn["),
-        "expected generated kernel expression to reference dyn buffer, got: {code}"
+}
+
+/// Each graph load starts from an empty layout, or slots carry over and the
+/// buffer is sized for dims the new graph never reads.
+#[test]
+fn clearing_the_layout_resets_slot_assignment() {
+    crate::kernel::clear_dyn_dims_order();
+    assert_eq!(slot_of("input_tokens"), 0);
+    assert_eq!(slot_of("cached_tokens"), 1);
+
+    crate::kernel::clear_dyn_dims_order();
+    assert!(crate::kernel::dyn_dims_order().is_empty());
+    assert_eq!(
+        slot_of("cached_tokens"),
+        0,
+        "a fresh graph starts at slot 0"
     );
 }
 

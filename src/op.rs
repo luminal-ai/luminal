@@ -9,15 +9,15 @@ use rustc_hash::FxHashMap;
 
 #[derive(Clone, Copy)]
 pub struct ProfileBucketContext<'a> {
-    pub dim_buckets: &'a FxHashMap<char, Vec<DimBucket>>,
-    pub bucket_indices: &'a FxHashMap<char, usize>,
-    pub representative_dyn_map: &'a FxHashMap<char, usize>,
+    pub dim_buckets: &'a FxHashMap<Symbol, Vec<DimBucket>>,
+    pub bucket_indices: &'a DynMap,
+    pub representative_dyn_map: &'a DynMap,
 }
 
 #[derive(Clone, Copy)]
 pub struct CandidateFilterContext<'a> {
     pub search_options: &'a crate::graph::CompileOptions,
-    pub dyn_map: &'a FxHashMap<char, usize>,
+    pub dyn_map: &'a DynMap,
     pub bucket_context: Option<ProfileBucketContext<'a>>,
 }
 
@@ -69,7 +69,7 @@ pub trait Runtime {
     fn late_egglog_passes(
         _ops: &[Arc<Box<dyn EgglogOp>>],
         _options: &crate::graph::CompileOptions,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) -> Vec<crate::egglog_utils::LateEgglogPass>
     where
         Self: Sized,
@@ -88,7 +88,7 @@ pub trait Runtime {
     }
     fn initialize(arg: Self::CompileArg) -> Self;
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn;
+    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn;
     /// `early_stop` is `Some((best_metric, factor))` when the search already
     /// holds a best candidate: once this candidate's running mean exceeds
     /// `best * factor`, the runtime may stop remaining trials and return the
@@ -99,7 +99,7 @@ pub trait Runtime {
     fn profile(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         trials: usize,
         timeout: Option<std::time::Duration>,
         early_stop: Option<(Self::ProfileMetric, f64)>,
@@ -111,7 +111,7 @@ pub trait Runtime {
     fn profile_with_bucket_context(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         trials: usize,
         timeout: Option<std::time::Duration>,
         early_stop: Option<(Self::ProfileMetric, f64)>,
@@ -145,7 +145,7 @@ pub trait Runtime {
     }
     /// Check if the most recent execution produced NaN in any output buffer.
     /// Used by the search to reject NaN-producing graph variants.
-    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
+    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &DynMap) -> bool {
         false
     }
     /// Runtime-specific pre-profile candidate filter. Backends can reject an
@@ -166,7 +166,7 @@ pub trait Runtime {
     /// same dry planning used by [`Runtime::load_llir_buckets`].
     fn filter_llir_bucket_set(
         &mut self,
-        _dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        _dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         _bucket_llirs: &[BucketLLIRRef<'_>],
         _search_options: &crate::graph::CompileOptions,
     ) -> CandidateFilterResult {
@@ -177,7 +177,7 @@ pub trait Runtime {
     /// The runtime dispatches between them in execute() based on dyn_map values.
     fn load_llir_buckets(
         &mut self,
-        _dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        _dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) {
         if bucket_llirs.len() == 1 {
@@ -190,7 +190,7 @@ pub trait Runtime {
 
 /// Optional runtime instrumentation for collecting execution statistics.
 pub trait RuntimeStats: Runtime {
-    fn execute_with_stats(&mut self, dyn_map: &FxHashMap<char, usize>) -> Option<ExecutionStats>;
+    fn execute_with_stats(&mut self, dyn_map: &DynMap) -> Option<ExecutionStats>;
 }
 
 /// Shared early-stop predicate for duration-metric runtimes: true once a

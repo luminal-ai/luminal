@@ -144,7 +144,7 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()>;
 
     /// Returns the output buffer size in elements.
@@ -198,9 +198,22 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         _buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         Ok(HostDeviceMemoryPlan::default())
+    }
+
+    /// Graph-visible buffers whose logical byte lengths can change the result
+    /// of `device_memory_plan`.
+    ///
+    /// Pointer identity and payload contents are never resource facts. Most
+    /// HostOps derive their resource requirements entirely from `dyn_map` and
+    /// therefore return no nodes here. An op that consults `buffer_lengths`
+    /// must return exactly those inputs so the runtime can invalidate its
+    /// hard-resource validation cache when (and only when) their lengths
+    /// change.
+    fn resource_buffer_nodes(&self, _inputs: &[NodeIndex]) -> Vec<NodeIndex> {
+        vec![]
     }
 
     /// Returns the name of this host op for stats reporting, or None if not reportable.

@@ -41,22 +41,22 @@ struct BoundedExpr {
 /// Supports the subset of sympy heads PT2 emits for symbolic shape metadata.
 pub(crate) fn parse_sympy_expr(
     expr: &str,
-    sym_to_char: &HashMap<String, char>,
+    sym_to_symbol: &HashMap<String, Symbol>,
 ) -> Option<Expression> {
-    parse_sympy_expr_with_ranges(expr, sym_to_char, &HashMap::new())
+    parse_sympy_expr_with_ranges(expr, sym_to_symbol, &HashMap::new())
 }
 
 pub(crate) fn parse_sympy_expr_with_ranges(
     expr: &str,
-    sym_to_char: &HashMap<String, char>,
+    sym_to_symbol: &HashMap<String, Symbol>,
     ranges: &HashMap<String, RangeConstraint>,
 ) -> Option<Expression> {
-    parse_sympy_expr_inner(expr, sym_to_char, ranges).map(|parsed| parsed.expr)
+    parse_sympy_expr_inner(expr, sym_to_symbol, ranges).map(|parsed| parsed.expr)
 }
 
-pub(crate) fn sym_char_ranges(sym_map: &SymDimMap) -> FxHashMap<char, ExprBounds> {
+pub(crate) fn sym_char_ranges(sym_map: &SymDimMap) -> FxHashMap<Symbol, ExprBounds> {
     sym_map
-        .sym_to_char
+        .sym_to_symbol
         .iter()
         .map(|(sym_name, sym_char)| {
             let range = sym_map.ranges.get(sym_name);
@@ -74,7 +74,7 @@ pub(crate) fn sym_char_ranges(sym_map: &SymDimMap) -> FxHashMap<char, ExprBounds
 
 pub(crate) fn simplify_expr_with_ranges(
     expr: Expression,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> Expression {
     simplify_bound_expr(expr, sym_ranges).expr
 }
@@ -82,7 +82,7 @@ pub(crate) fn simplify_expr_with_ranges(
 pub(crate) fn same_expr_with_ranges(
     lhs: Expression,
     rhs: Expression,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> bool {
     let lhs = simplify_bound_expr(lhs, sym_ranges);
     let rhs = simplify_bound_expr(rhs, sym_ranges);
@@ -94,7 +94,7 @@ pub(crate) fn same_expr_with_ranges(
 pub(crate) fn canonical_equal_expr(
     lhs: Expression,
     rhs: Expression,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> Option<Expression> {
     if !same_expr_with_ranges(lhs, rhs, sym_ranges) {
         return None;
@@ -110,7 +110,7 @@ pub(crate) fn canonical_equal_expr(
 
 fn parse_sympy_expr_inner(
     expr: &str,
-    sym_to_char: &HashMap<String, char>,
+    sym_to_symbol: &HashMap<String, Symbol>,
     ranges: &HashMap<String, RangeConstraint>,
 ) -> Option<ParsedExpr> {
     let expr = expr.trim();
@@ -127,7 +127,7 @@ fn parse_sympy_expr_inner(
         "Symbol" => {
             let name = extract_first_quoted(body)?;
             let bounds = infer_symbol_bounds(body, ranges.get(&name));
-            sym_to_char.get(&name).map(|c| ParsedExpr {
+            sym_to_symbol.get(&name).map(|c| ParsedExpr {
                 expr: Expression::from(*c),
                 bounds,
             })
@@ -145,9 +145,9 @@ fn parse_sympy_expr_inner(
                 return None;
             }
             let mut iter = parts.into_iter();
-            let mut acc = parse_sympy_expr_inner(iter.next()?, sym_to_char, ranges)?;
+            let mut acc = parse_sympy_expr_inner(iter.next()?, sym_to_symbol, ranges)?;
             for part in iter {
-                let rhs = parse_sympy_expr_inner(part, sym_to_char, ranges)?;
+                let rhs = parse_sympy_expr_inner(part, sym_to_symbol, ranges)?;
                 acc = match head {
                     "Mul" => ParsedExpr {
                         expr: normalize_mul_expr(acc.expr, rhs.expr),
@@ -166,8 +166,8 @@ fn parse_sympy_expr_inner(
         }
         "FloorDiv" => {
             let mut parts = split_top_level_args(body).into_iter();
-            let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_char, ranges)?;
-            let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_char, ranges)?;
+            let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
+            let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
             if parts.next().is_some() {
                 return None;
             }
@@ -178,8 +178,8 @@ fn parse_sympy_expr_inner(
         }
         "Mod" => {
             let mut parts = split_top_level_args(body).into_iter();
-            let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_char, ranges)?;
-            let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_char, ranges)?;
+            let lhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
+            let rhs = parse_sympy_expr_inner(parts.next()?, sym_to_symbol, ranges)?;
             if parts.next().is_some() {
                 return None;
             }
@@ -437,7 +437,7 @@ fn simplify_add(lhs: BoundedExpr, rhs: BoundedExpr) -> BoundedExpr {
 fn simplify_sub(
     lhs: BoundedExpr,
     rhs: BoundedExpr,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> BoundedExpr {
     if same_expr_with_ranges(lhs.expr, rhs.expr, sym_ranges) {
         return exact_expr(0);
@@ -459,7 +459,7 @@ fn simplify_sub(
 fn simplify_min(
     lhs: BoundedExpr,
     rhs: BoundedExpr,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> BoundedExpr {
     let bounds = min_bounds(lhs.bounds, rhs.bounds);
     if same_expr_with_ranges(lhs.expr, rhs.expr, sym_ranges) {
@@ -493,7 +493,7 @@ fn simplify_min(
 fn simplify_max(
     lhs: BoundedExpr,
     rhs: BoundedExpr,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> BoundedExpr {
     let bounds = max_bounds(lhs.bounds, rhs.bounds);
     if same_expr_with_ranges(lhs.expr, rhs.expr, sym_ranges) {
@@ -524,7 +524,10 @@ fn simplify_max(
     with_bounds(normalize_expr(lhs.expr.max(rhs.expr)), bounds)
 }
 
-fn simplify_bound_expr(expr: Expression, sym_ranges: &FxHashMap<char, ExprBounds>) -> BoundedExpr {
+fn simplify_bound_expr(
+    expr: Expression,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
+) -> BoundedExpr {
     let mut stack: Vec<BoundedExpr> = Vec::new();
     let terms = expr.terms.read().clone();
     for term in terms {

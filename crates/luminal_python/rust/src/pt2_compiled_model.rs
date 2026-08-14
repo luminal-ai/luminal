@@ -18,7 +18,7 @@ type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);
 
 fn resolve_dim_sizes(
     sizes: &[pt2_schema::DimSize],
-    sym_to_char: &HashMap<String, char>,
+    sym_to_symbol: &HashMap<String, Symbol>,
 ) -> Vec<Expression> {
     sizes
         .iter()
@@ -33,10 +33,10 @@ fn resolve_dim_sizes(
                 // the bare-Symbol fast path when that fails — the parser
                 // bails on unrecognised heads (Pow, Min, etc.) and we'd
                 // rather lose the symbolic info than misinterpret it.
-                parse_sympy_expr(s, sym_to_char)
+                parse_sympy_expr(s, sym_to_symbol)
                     .or_else(|| {
                         pt2_parser::extract_symbol_name_pub(s)
-                            .and_then(|sym| sym_to_char.get(&sym).map(|c| Expression::from(*c)))
+                            .and_then(|sym| sym_to_symbol.get(&sym).map(|c| Expression::from(*c)))
                     })
                     .or_else(|| {
                         // As a last resort, if the EP gave us a concrete `hint`
@@ -53,6 +53,75 @@ fn resolve_dim_sizes(
             }
         })
         .collect()
+}
+
+/// A translated module: the HLIR graph and its weights, before any backend
+/// compilation.
+///
+/// Handed to Python only so it can be returned from a `torch.compile` backend;
+/// the embedding host then calls [`TranslatedModule::take`] and owns the
+/// translation outright. Nothing here is `Send`, but nothing needs to be — once
+/// taken, the value never goes back through the interpreter.
+#[pyclass(unsendable)]
+pub struct TranslatedModule {
+    inner: Option<(GraphTranslation, WeightData)>,
+}
+
+impl TranslatedModule {
+    /// Move the translation out. `None` on a second call.
+    pub fn take(&mut self) -> Option<(GraphTranslation, WeightData)> {
+        self.inner.take()
+    }
+}
+
+#[pymethods]
+impl TranslatedModule {
+    /// Whether the translation is still held (false once a host has taken it).
+    fn is_available(&self) -> bool {
+        self.inner.is_some()
+    }
+
+    fn input_names(&self) -> Vec<String> {
+        self.inner
+            .as_ref()
+            .map(|(t, _)| t.input_names.clone())
+            .unwrap_or_default()
+    }
+
+    fn output_names(&self) -> Vec<String> {
+        self.inner
+            .as_ref()
+            .map(|(t, _)| t.output_names.clone())
+            .unwrap_or_default()
+    }
+
+    fn writeback_outputs(&self) -> Vec<(usize, String)> {
+        self.inner
+            .as_ref()
+            .map(|(t, _)| t.writeback_outputs.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// Translate an exported `.pt2` WITHOUT compiling a backend for it.
+///
+/// `process_pt2` translates and then immediately compiles, which fixes the
+/// search budget, the dim buckets and the graph itself at that moment. A host
+/// that wants to make those choices — or to extend the graph before lowering —
+/// needs the translation on its own.
+#[pyfunction]
+#[pyo3(signature = (pt2_path, weights_path, weight_device_ptrs=None))]
+pub fn translate_module(
+    pt2_path: &str,
+    weights_path: &str,
+    weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
+) -> PyResult<TranslatedModule> {
+    let (translation, mut weights) = translate_pt2(pt2_path, weights_path)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    weights.device_ptrs = weight_device_ptrs.unwrap_or_default();
+    Ok(TranslatedModule {
+        inner: Some((translation, weights)),
+    })
 }
 
 #[pyfunction]
@@ -134,7 +203,7 @@ pub fn translate_pt2(
     // Set initial dynamic dim values from symbol ranges. PT2 emits
     // `min_val: null` when the constraint is unbounded; fall back to 1 in
     // that case (the smallest valid dim — used only as an initial value).
-    for (sym_name, c) in &translated.sym_map.sym_to_char {
+    for (sym_name, c) in &translated.sym_map.sym_to_symbol {
         if let Some(rc) = translated.sym_map.ranges.get(sym_name) {
             let initial = rc.min_val.unwrap_or(1).max(0) as usize;
             graph.set_dim(*c, initial);
@@ -148,7 +217,7 @@ pub fn translate_pt2(
         .map(|(name, _id)| {
             parsed
                 .tensor_meta(name)
-                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_char))
+                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_symbol))
                 .unwrap_or_default()
         })
         .collect();
@@ -179,6 +248,7 @@ pub fn translate_pt2(
         .iter()
         .map(|(name, _)| name.clone())
         .collect();
+    let output_ids: Vec<NodeIndex> = translated.output_ids.iter().map(|(_, id)| *id).collect();
 
     let input_shape_exprs: Vec<Vec<Expression>> = translated
         .user_input_ids
@@ -186,7 +256,7 @@ pub fn translate_pt2(
         .map(|(name, _id)| {
             parsed
                 .tensor_meta(name)
-                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_char))
+                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_symbol))
                 .unwrap_or_default()
         })
         .collect();
@@ -262,7 +332,7 @@ pub fn translate_pt2(
         }
     }
 
-    let dim_param_map: DimParamMap = translated.sym_map.sym_to_char;
+    let dim_param_map: DimParamMap = translated.sym_map.sym_to_symbol;
 
     let translation = GraphTranslation {
         graph,
@@ -270,6 +340,7 @@ pub fn translate_pt2(
         input_names,
         input_dtypes,
         output_names,
+        output_ids,
         output_dtypes,
         output_shape_exprs,
         input_shape_exprs,

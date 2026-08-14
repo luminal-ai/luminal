@@ -168,7 +168,7 @@ impl KernelOp for KernelGemv {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .n
@@ -479,7 +479,7 @@ impl KernelOp for KernelGemvF8 {
         (Expression, Expression, Expression),
         (Expression, Expression, Expression),
         Expression,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .n

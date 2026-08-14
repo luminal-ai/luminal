@@ -87,11 +87,11 @@ struct CompiledKernel {
     /// Whether this compiled CUDA function has a trailing dyn_dims parameter.
     has_dyn_dims_param: bool,
     /// Dynamic dimensions that can affect launch dimensions, params, or code.
-    dyn_vars: FxHashSet<char>,
+    dyn_vars: FxHashSet<Symbol>,
     /// Internal buffers allocated for this kernel
     internal_bufs: Vec<CudaSlice<u8>>,
     /// Device constants from compile()
-    constants: FxHashMap<char, CudaSlice<u8>>,
+    constants: FxHashMap<Symbol, CudaSlice<u8>>,
     /// Graph node handle (set after graph is built)
     graph_node: Option<CUgraphNode>,
     /// Kernel name for profiling
@@ -231,7 +231,7 @@ impl RecaptureProfile {
         duration.as_secs_f64() * 1e3
     }
 
-    fn print(&self, dyn_map: &FxHashMap<char, usize>, kernels: usize, cublaslt: usize) {
+    fn print(&self, dyn_map: &DynMap, kernels: usize, cublaslt: usize) {
         if !self.enabled || (self.pending_count == 0 && self.materialize_total.is_zero()) {
             return;
         }
@@ -350,7 +350,7 @@ impl CompiledKernel {
         input_labels: Vec<String>,
         kernel_op: Arc<Box<dyn KernelOp>>,
         has_dyn_dims_param: bool,
-        constants: FxHashMap<char, CudaSlice<u8>>,
+        constants: FxHashMap<Symbol, CudaSlice<u8>>,
         kernel_name: &'static str,
         source_bytes: Option<usize>,
     ) -> Self {
@@ -441,7 +441,7 @@ struct CudaGraphOpState {
     /// Kernel params for each kernel
     kernel_params: Vec<UnifiedKernelParams>,
     /// Last dynamic dimension values (for change detection)
-    last_dyn_values: FxHashMap<char, usize>,
+    last_dyn_values: DynMap,
     /// Last buffer pointers (for change detection)
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     /// Timing events for profiling
@@ -489,10 +489,17 @@ impl CudaGraphOpState {
 pub struct CudaGraphOp {
     /// All nodes that this graph needs buffers for (kernels + their inputs)
     buffer_nodes: Vec<NodeIndex>,
+    buffer_node_set: FxHashSet<NodeIndex>,
+    /// Reverse dependency indices built once at graph construction. These let
+    /// pointer/dimension changes identify affected kernel nodes directly.
+    kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>>,
+    kernel_users_by_dyn_dim: FxHashMap<Symbol, Vec<usize>>,
+    output_aliases: Vec<(NodeIndex, NodeIndex)>,
+    library_buffer_nodes: FxHashSet<NodeIndex>,
     /// Buffer size requirements for extra nodes (node -> size in elements)
     buffer_sizes: FxHashMap<NodeIndex, Expression>,
     /// Dynamic dimensions used by this graph (sorted alphabetically)
-    dyn_dims_order: Vec<char>,
+    dyn_dims_order: Vec<Symbol>,
     /// The CUDA stream (needed for operations)
     stream: Arc<CudaStream>,
     /// Nonblocking stream used only for narrow cuBLASLt graph captures.
@@ -505,13 +512,48 @@ impl CudaGraphOp {
     fn new(
         buffer_nodes: Vec<NodeIndex>,
         buffer_sizes: FxHashMap<NodeIndex, Expression>,
-        dyn_dims_order: Vec<char>,
+        dyn_dims_order: Vec<Symbol>,
         stream: Arc<CudaStream>,
         capture_stream: Option<Arc<CudaStream>>,
         state: CudaGraphOpState,
     ) -> Self {
+        let mut kernel_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>> = FxHashMap::default();
+        let mut kernel_users_by_dyn_dim: FxHashMap<Symbol, Vec<usize>> = FxHashMap::default();
+        let mut output_aliases = Vec::new();
+        let mut library_buffer_nodes = FxHashSet::default();
+        // Build reverse dependency indexes once so materialization can update only the kernels
+        // affected by changed buffer bindings or dynamic dimensions.
+        for (idx, kernel) in state.kernels.iter().enumerate() {
+            kernel_users_by_buffer
+                .entry(kernel.node)
+                .or_default()
+                .push(idx);
+            for input in &kernel.inputs {
+                kernel_users_by_buffer.entry(*input).or_default().push(idx);
+            }
+            for dim in &kernel.dyn_vars {
+                kernel_users_by_dyn_dim.entry(*dim).or_default().push(idx);
+            }
+            if let Some(input_idx) = kernel.kernel_op.output_aliases_input() {
+                output_aliases.push((kernel.inputs[input_idx], kernel.node));
+            }
+        }
+        for op in &state.cublaslt_ops {
+            library_buffer_nodes.insert(op.node);
+            library_buffer_nodes.extend(op.inputs.iter().copied());
+        }
+        for op in &state.flashinfer_ops {
+            library_buffer_nodes.insert(op.node);
+            library_buffer_nodes.extend(op.inputs.iter().copied());
+        }
+        let buffer_node_set = buffer_nodes.iter().copied().collect();
         Self {
             buffer_nodes,
+            buffer_node_set,
+            kernel_users_by_buffer,
+            kernel_users_by_dyn_dim,
+            output_aliases,
+            library_buffer_nodes,
             buffer_sizes,
             dyn_dims_order,
             stream,
@@ -562,7 +604,7 @@ impl CudaGraphOp {
     /// not consume search trials. It does not assign a cost to legal kernels.
     pub(crate) fn resource_plans(
         &self,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<Vec<KernelResourcePlan>, ResourceViolation> {
         self.state
             .borrow()
@@ -619,14 +661,14 @@ impl CudaGraphOp {
             .collect()
     }
 
-    pub(crate) fn resource_dyn_dims(&self) -> &[char] {
+    pub(crate) fn resource_dyn_dims(&self) -> &[Symbol] {
         &self.dyn_dims_order
     }
 
     fn host_device_memory_plan(
         &self,
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         let state = self.state.borrow();
         let mut persistent_bytes = self
@@ -817,7 +859,7 @@ impl HostOp for CudaGraphOp {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         self.execute_internal(stream, buffers, dyn_map)
     }
@@ -837,9 +879,22 @@ impl HostOp for CudaGraphOp {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         self.host_device_memory_plan(buffer_lengths, dyn_map)
+    }
+
+    fn resource_buffer_nodes(&self, _inputs: &[NodeIndex]) -> Vec<NodeIndex> {
+        // CudaGraphOp absorbs HostOps, so its graph-visible `inputs` argument
+        // does not describe the internal FlashInfer inputs. Preserve the
+        // dependency explicitly from the compiled island metadata.
+        let state = self.state.borrow();
+        state
+            .flashinfer_ops
+            .iter()
+            .flat_map(|op| op.inputs.get(1..3).unwrap_or_default().iter().copied())
+            .unique()
+            .collect()
     }
 
     fn extra_buffer_nodes(&self) -> Vec<NodeIndex> {
@@ -1238,10 +1293,7 @@ impl CudaGraphOp {
         }
     }
 
-    fn kernel_requires_output_buffer(
-        kernel: &CompiledKernel,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> bool {
+    fn kernel_requires_output_buffer(kernel: &CompiledKernel, dyn_map: &DynMap) -> bool {
         kernel.kernel_op.output_size().exec(dyn_map).unwrap_or(1) != 0
             && kernel.kernel_op.output_aliases_input().is_none()
     }
@@ -1250,7 +1302,7 @@ impl CudaGraphOp {
         kernel: &CompiledKernel,
         output_ptr: u64,
         input_ptrs: &[u64],
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         if Self::kernel_requires_output_buffer(kernel, dyn_map) && output_ptr == 0 {
             anyhow::bail!(
@@ -1287,7 +1339,7 @@ impl CudaGraphOp {
     /// untouched — a dim change does not dirty it. (The process-global
     /// cuBLASLt heuristic cache is deliberately kept: purging it would fight
     /// autotune and its query is not the dominant transition cost.)
-    pub(crate) fn assume_dyn_dims_stale(&self, stale_dims: &[char]) {
+    pub(crate) fn assume_dyn_dims_stale(&self, stale_dims: &[Symbol]) {
         let mut state = self.state.borrow_mut();
         for dim in stale_dims {
             state.last_dyn_values.remove(dim);
@@ -1303,6 +1355,189 @@ impl CudaGraphOp {
         }
     }
 
+    pub(crate) fn uses_buffer(&self, node: NodeIndex) -> bool {
+        self.buffer_node_set.contains(&node)
+    }
+
+    /// Patch a CUDA graph from an exact set of changed bindings without
+    /// rebuilding or comparing its complete pointer table. Returns `false`
+    /// when a full materialization is required (first use, dynamic-dimension
+    /// changes or an affected captured library island).
+    pub(crate) fn materialize_changed_bindings(
+        &self,
+        stream: &Arc<CudaStream>,
+        changed_buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<bool> {
+        let mut state = self.state.borrow_mut();
+        if state.cuda_graph.is_none() || state.cuda_graph_exec.is_none() {
+            return Ok(false);
+        }
+        let dyn_map_changed = dyn_map.len() != state.last_dyn_values.len()
+            || dyn_map
+                .iter()
+                .any(|(dim, value)| state.last_dyn_values.get(dim) != Some(value));
+        if dyn_map_changed {
+            return Ok(false);
+        }
+
+        let mut changed = changed_buffers.clone();
+        // Output aliases always inherit their input pointer, even when the
+        // caller attempted to register a distinct output allocation.
+        for &(input, output) in &self.output_aliases {
+            if !changed.contains_key(&input) && !changed.contains_key(&output) {
+                continue;
+            }
+            let input_buffer = changed.get(&input).copied().or_else(|| {
+                let ptr = state.last_buffer_ptrs.get(&input).copied()?;
+                let len = changed.get(&output).map(|buffer| buffer.len()).unwrap_or(0);
+                Some(DeviceBuffer::new(ptr, len))
+            });
+            if let Some(input_buffer) = input_buffer {
+                changed.insert(output, input_buffer);
+            }
+        }
+
+        if changed
+            .keys()
+            .any(|node| self.library_buffer_nodes.contains(node))
+        {
+            return Ok(false);
+        }
+
+        let mut current_buffer_ptrs = state.last_buffer_ptrs.clone();
+        current_buffer_ptrs.extend(changed.iter().map(|(&node, buffer)| (node, buffer.ptr())));
+        for kernel in &mut state.kernels {
+            kernel.kernel_op.pre_execute(
+                stream,
+                &mut kernel.internal_bufs,
+                &mut kernel.constants,
+                &current_buffer_ptrs,
+                dyn_map,
+            );
+        }
+
+        let mut dirty_kernel_set = FxHashSet::default();
+        for node in changed.keys() {
+            if let Some(users) = self.kernel_users_by_buffer.get(node) {
+                dirty_kernel_set.extend(users.iter().copied());
+            }
+        }
+        let mut dirty_kernels = dirty_kernel_set.into_iter().collect_vec();
+        dirty_kernels.sort_unstable();
+
+        let dyn_dims_ptr = state
+            .dyn_dims_buffer
+            .as_ref()
+            .map(|buf| buf.device_ptr(stream).0)
+            .unwrap_or(0);
+        for &idx in &dirty_kernels {
+            let kernel = &state.kernels[idx];
+            let output_ptr = changed
+                .get(&kernel.node)
+                .map(|buffer| buffer.ptr())
+                .or_else(|| state.last_buffer_ptrs.get(&kernel.node).copied())
+                .unwrap_or(0);
+            let input_ptrs = kernel
+                .inputs
+                .iter()
+                .map(|input| {
+                    changed
+                        .get(input)
+                        .map(|buffer| buffer.ptr())
+                        .or_else(|| state.last_buffer_ptrs.get(input).copied())
+                        .unwrap_or(0)
+                })
+                .collect_vec();
+            Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
+            let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
+                dyn_dims_ptr
+            } else {
+                0
+            };
+            let param_values = kernel.kernel_op.build_params(
+                stream,
+                output_ptr,
+                &input_ptrs,
+                &kernel.internal_bufs,
+                kernel_dyn_dims_ptr,
+            );
+            state.kernel_params[idx] = UnifiedKernelParams::new(param_values);
+        }
+
+        for &idx in &dirty_kernels {
+            let kernel = &state.kernels[idx];
+            let graph_node = state.node_to_graph_node[&kernel.node];
+            let grid_dim = (
+                kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                kernel.grid.2.exec(dyn_map).unwrap() as u32,
+            );
+            let block_dim = (
+                kernel.block.0.exec(dyn_map).unwrap() as u32,
+                kernel.block.1.exec(dyn_map).unwrap() as u32,
+                kernel.block.2.exec(dyn_map).unwrap() as u32,
+            );
+            if grid_dim.0 == 0
+                || grid_dim.1 == 0
+                || grid_dim.2 == 0
+                || block_dim.0 == 0
+                || block_dim.1 == 0
+                || block_dim.2 == 0
+            {
+                anyhow::bail!(
+                    "invalid CUDA launch dimensions for kernel {} at LLIR node {:?}: grid={grid_dim:?} block={block_dim:?}",
+                    kernel.kernel_name,
+                    kernel.node,
+                );
+            }
+            let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
+            let cu_func = unsafe { kernel.function.raw_function() };
+            let params_ptr = state.kernel_params[idx].as_cuda_params();
+            let graph = state.cuda_graph.as_mut().unwrap();
+            unsafe {
+                graph.set_kernel_node_params(
+                    graph_node, cu_func, grid_dim, block_dim, shared_mem, params_ptr,
+                )?;
+            }
+        }
+
+        state
+            .cuda_graph_exec
+            .as_ref()
+            .unwrap()
+            .ctx
+            .bind_to_thread()?;
+        for &idx in &dirty_kernels {
+            let kernel = &state.kernels[idx];
+            let graph_node = state.node_to_graph_node[&kernel.node];
+            let grid_dim = (
+                kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                kernel.grid.2.exec(dyn_map).unwrap() as u32,
+            );
+            let block_dim = (
+                kernel.block.0.exec(dyn_map).unwrap() as u32,
+                kernel.block.1.exec(dyn_map).unwrap() as u32,
+                kernel.block.2.exec(dyn_map).unwrap() as u32,
+            );
+            let shared_mem = kernel.shared_mem.exec(dyn_map).unwrap() as u32;
+            let cu_func = unsafe { kernel.function.raw_function() };
+            let params_ptr = state.kernel_params[idx].as_cuda_params();
+            let exec = state.cuda_graph_exec.as_mut().unwrap();
+            unsafe {
+                exec.update_kernel_node(
+                    graph_node, cu_func, grid_dim, block_dim, shared_mem, params_ptr,
+                )?;
+            }
+        }
+
+        for (node, buffer) in changed {
+            state.last_buffer_ptrs.insert(node, buffer.ptr());
+        }
+        Ok(true)
+    }
+
     /// Ensure the mutable and executable CUDA graphs reflect the given buffers
     /// and dynamic dimensions. This may build the graph once, patch kernel node
     /// params, and surgically recapture cuBLASLt islands, but it does not launch.
@@ -1310,7 +1545,7 @@ impl CudaGraphOp {
         &self,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         let materialize_start = Instant::now();
         let mut profile = RecaptureProfile::new();
@@ -1395,27 +1630,30 @@ impl CudaGraphOp {
         // Collect current buffer pointers
         let timer = Instant::now();
         let mut current_buffer_ptrs: FxHashMap<NodeIndex, u64> = FxHashMap::default();
+        let mut changed_buffer_nodes = FxHashSet::default();
         for &node in &self.buffer_nodes {
             if let Some(buf) = buffers.get(&node) {
                 current_buffer_ptrs.insert(node, buf.ptr());
+                if state.last_buffer_ptrs.get(&node) != Some(&buf.ptr()) {
+                    changed_buffer_nodes.insert(node);
+                }
             }
         }
 
         // Apply output-aliases-input
-        for kernel in state.kernels.iter() {
-            if let Some(input_idx) = kernel.kernel_op.output_aliases_input()
-                && let Some(&input_ptr) = current_buffer_ptrs.get(&kernel.inputs[input_idx])
-            {
-                current_buffer_ptrs.insert(kernel.node, input_ptr);
+        for &(input, output) in &self.output_aliases {
+            if let Some(&input_ptr) = current_buffer_ptrs.get(&input) {
+                current_buffer_ptrs.insert(output, input_ptr);
+                if state.last_buffer_ptrs.get(&output) != Some(&input_ptr) {
+                    changed_buffer_nodes.insert(output);
+                }
             }
         }
         profile.collect_buffer_ptrs += timer.elapsed();
 
-        // Always call pre_execute for each kernel to reset internal state
-        // (e.g., MegakernelOps need work queue, head, barriers, lock reset every execution)
+        // Reset any per-invocation kernel state before updating the graph.
         let timer = Instant::now();
-        for idx in 0..state.kernels.len() {
-            let kernel = &mut state.kernels[idx];
+        for kernel in &mut state.kernels {
             kernel.kernel_op.pre_execute(
                 stream,
                 &mut kernel.internal_bufs,
@@ -1431,18 +1669,19 @@ impl CudaGraphOp {
         let needs_update = dyn_map_changed || buffer_ptrs_changed;
 
         if needs_update {
-            let kernel_dirty = (0..state.kernels.len())
-                .map(|idx| {
-                    let kernel = &state.kernels[idx];
-                    let output_ptr_changed = current_buffer_ptrs.get(&kernel.node)
-                        != state.last_buffer_ptrs.get(&kernel.node);
-                    let input_ptr_changed = kernel.inputs.iter().any(|input| {
-                        current_buffer_ptrs.get(input) != state.last_buffer_ptrs.get(input)
-                    });
-                    let dyn_changed = !changed_dyn_vars.is_disjoint(&kernel.dyn_vars);
-                    output_ptr_changed || input_ptr_changed || dyn_changed
-                })
-                .collect_vec();
+            let mut dirty_kernel_set = FxHashSet::default();
+            for node in &changed_buffer_nodes {
+                if let Some(users) = self.kernel_users_by_buffer.get(node) {
+                    dirty_kernel_set.extend(users.iter().copied());
+                }
+            }
+            for dim in &changed_dyn_vars {
+                if let Some(users) = self.kernel_users_by_dyn_dim.get(dim) {
+                    dirty_kernel_set.extend(users.iter().copied());
+                }
+            }
+            let mut dirty_kernels = dirty_kernel_set.into_iter().collect_vec();
+            dirty_kernels.sort_unstable();
 
             // Update kernel params
             let dyn_dims_ptr = state
@@ -1452,12 +1691,8 @@ impl CudaGraphOp {
                 .unwrap_or(0);
 
             // Build params for each kernel first
-            let num_kernels = state.kernels.len();
             let timer = Instant::now();
-            for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
-                if !dirty {
-                    continue;
-                }
+            for &idx in &dirty_kernels {
                 let kernel = &state.kernels[idx];
                 let output_ptr = current_buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
                 let input_ptrs: Vec<u64> = kernel
@@ -1502,10 +1737,7 @@ impl CudaGraphOp {
             // is recaptured below, cuGraphExecUpdate will refresh the executable
             // from these source-node params.
             let timer = Instant::now();
-            for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
-                if !dirty {
-                    continue;
-                }
+            for &idx in &dirty_kernels {
                 let kernel = &state.kernels[idx];
                 let graph_node = state.node_to_graph_node[&kernel.node];
 
@@ -1826,10 +2058,7 @@ impl CudaGraphOp {
                     .bind_to_thread()?;
 
                 let timer = Instant::now();
-                for (idx, dirty) in kernel_dirty.iter().enumerate().take(num_kernels) {
-                    if !dirty {
-                        continue;
-                    }
+                for &idx in &dirty_kernels {
                     let kernel = &state.kernels[idx];
                     let graph_node = state.node_to_graph_node[&kernel.node];
 
@@ -1884,7 +2113,7 @@ impl CudaGraphOp {
         &self,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         self.materialize(stream, buffers, dyn_map)?;
 
@@ -2316,7 +2545,7 @@ impl CudaGraphOp {
         state: &mut std::cell::RefMut<'_, CudaGraphOpState>,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         let ctx = stream.context().clone();
         let mut graph = CudaGraphHandle::new(ctx.clone())?;
@@ -2800,7 +3029,7 @@ pub fn kernel_to_host(
         }
 
         // Set global dyn dims ordering so compiles use consistent indices
-        let mut global_dyn_dims: Vec<char> = all_dyn_dims.iter().copied().collect();
+        let mut global_dyn_dims: Vec<Symbol> = all_dyn_dims.iter().copied().collect();
         global_dyn_dims.sort();
         set_global_dyn_dims(global_dyn_dims.clone());
 
@@ -3064,10 +3293,10 @@ pub fn kernel_to_host(
         clear_global_dyn_dims();
 
         // Use the final global ordering if it was extended during compilation
-        let mut dyn_dims_order: Vec<char> = if let Some(final_order) = final_global {
+        let mut dyn_dims_order: Vec<Symbol> = if let Some(final_order) = final_global {
             final_order
         } else {
-            let mut dims: Vec<char> = all_dyn_dims.into_iter().collect();
+            let mut dims: Vec<Symbol> = all_dyn_dims.into_iter().collect();
             dims.sort();
             dims
         };

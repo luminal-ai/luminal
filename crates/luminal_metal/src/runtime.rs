@@ -1,4 +1,4 @@
-use crate::kernel::{DYN_SLOT_COUNT, MetalEncodeContext, MetalKernelOp, MpsKernelCache};
+use crate::kernel::{MetalEncodeContext, MetalKernelOp, MpsKernelCache, clear_dyn_dims_order};
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::{
@@ -7,7 +7,7 @@ use luminal::{
     hlir::{Input, Output, ReferenceData},
     op::{ExecutionStats, Runtime, RuntimeStats, TimingMethod},
     prelude::{
-        FxHashMap, NodeIndex, ToId,
+        DynMap, FxHashMap, NodeIndex, Symbol, ToId,
         petgraph::{Direction, algo::toposort, prelude::StableGraph, visit::EdgeRef},
     },
 };
@@ -28,7 +28,7 @@ struct MetalExecutionStep {
 
 #[derive(Clone)]
 struct MetalCompiledBucket {
-    bucket_indices: FxHashMap<char, usize>,
+    bucket_indices: DynMap,
     llir_graph: LLIRGraph,
     llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     node_dtypes: FxHashMap<NodeIndex, DType>,
@@ -49,8 +49,12 @@ pub struct MetalRuntime {
     pub buffers: FxHashMap<NodeIndex, Buffer>,
     /// Logical byte length for each active LLIR buffer.
     buffer_lengths: FxHashMap<NodeIndex, u64>,
-    /// Dynamic dimensions table (a-z), shared across all kernels.
+    /// Dynamic dimension sizes, shared across all kernels. Slot `i` holds
+    /// `dyn_dims_order[i]`.
     dyn_buffer: Buffer,
+    /// Layout of `dyn_buffer`. Duplicated from the codegen thread-local so an
+    /// upload on another thread still sees this runtime's layout.
+    dyn_dims_order: Vec<Symbol>,
     /// Retained MPS descriptors/kernels reused across command encodes.
     mps_cache: RefCell<MpsKernelCache>,
     /// The current LLIR graph
@@ -68,7 +72,7 @@ pub struct MetalRuntime {
     /// Precomputed executable nodes and input metadata for the active LLIR graph.
     execution_plan: Vec<MetalExecutionStep>,
     /// Bucket definitions for dynamic dimensions.
-    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
     /// Compiled LLIR variants, one per bucket combination.
     compiled_buckets: Vec<MetalCompiledBucket>,
     /// Currently active compiled bucket.
@@ -326,7 +330,7 @@ impl Runtime for MetalRuntime {
     fn late_egglog_passes(
         ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
         _options: &luminal::graph::CompileOptions,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Vec<luminal::egglog_utils::LateEgglogPass> {
         vec![crate::memory_analysis::metal_memory_analysis_pass(
             ops, None, dyn_map,
@@ -336,8 +340,9 @@ impl Runtime for MetalRuntime {
     fn initialize(_: Self::CompileArg) -> Self {
         let device = Device::system_default().expect("No Metal device found!");
         let command_queue = device.new_command_queue();
+        // Resized in finish_dyn_dims_layout once the dim set is known.
         let dyn_buffer = device.new_buffer(
-            (DYN_SLOT_COUNT * std::mem::size_of::<i32>()) as u64,
+            std::mem::size_of::<i32>() as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
@@ -349,6 +354,7 @@ impl Runtime for MetalRuntime {
             buffers: FxHashMap::default(),
             buffer_lengths: FxHashMap::default(),
             dyn_buffer,
+            dyn_dims_order: Vec::new(),
             mps_cache: RefCell::new(MpsKernelCache::default()),
             llir_graph: StableGraph::default(),
             llir_to_hlir: FxHashMap::default(),
@@ -372,7 +378,9 @@ impl Runtime for MetalRuntime {
         self.buffers.clear();
         self.buffer_lengths.clear();
         self.dim_buckets.clear();
+        clear_dyn_dims_order();
         self.compiled_buckets = vec![self.compile_bucket(FxHashMap::default(), llir_graph)];
+        self.finish_dyn_dims_layout();
         self.activate_bucket(0);
     }
 
@@ -380,7 +388,7 @@ impl Runtime for MetalRuntime {
     fn profile(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         trials: usize,
         timeout: Option<std::time::Duration>,
         early_stop: Option<(Self::ProfileMetric, f64)>,
@@ -415,7 +423,7 @@ impl Runtime for MetalRuntime {
     }
 
     #[tracing::instrument(skip_all)]
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
         autoreleasepool(|| {
             self.select_bucket(dyn_map);
             self.allocate_active_intermediate_buffers(dyn_map);
@@ -478,12 +486,15 @@ impl Runtime for MetalRuntime {
 
     fn load_llir_buckets(
         &mut self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) {
         self.buffers.clear();
         self.buffer_lengths.clear();
         self.dim_buckets = dim_buckets.clone();
+        // Every bucket encodes against the same dyn_buffer, so one layout covers
+        // all of them; compiling in sequence accumulates into it.
+        clear_dyn_dims_order();
         self.compiled_buckets = bucket_llirs
             .iter()
             .map(|(bucket_indices, _, llir)| self.compile_bucket(bucket_indices.clone(), llir))
@@ -492,12 +503,13 @@ impl Runtime for MetalRuntime {
             !self.compiled_buckets.is_empty(),
             "Metal runtime received no bucketed LLIRs"
         );
+        self.finish_dyn_dims_layout();
         self.activate_bucket(0);
     }
 }
 
 impl RuntimeStats for MetalRuntime {
-    fn execute_with_stats(&mut self, dyn_map: &FxHashMap<char, usize>) -> Option<ExecutionStats> {
+    fn execute_with_stats(&mut self, dyn_map: &DynMap) -> Option<ExecutionStats> {
         let mut total_bytes_loaded = 0usize;
         let mut total_bytes_stored = 0usize;
         let mut total_flops = 0usize;
@@ -552,12 +564,12 @@ impl MetalRuntime {
         }
     }
 
-    pub fn allocate_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    pub fn allocate_intermediate_buffers(&mut self, dyn_map: &DynMap) {
         self.select_bucket(dyn_map);
         self.allocate_active_intermediate_buffers(dyn_map);
     }
 
-    fn allocate_active_intermediate_buffers(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn allocate_active_intermediate_buffers(&mut self, dyn_map: &DynMap) {
         let mut planned = Vec::new();
         let capacity_dyn_map = self.active_capacity_dyn_map(dyn_map);
 
@@ -596,16 +608,12 @@ impl MetalRuntime {
         }
     }
 
-    fn output_bytes(
-        kernel_op: &dyn MetalKernelOp,
-        dtype: DType,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> u64 {
+    fn output_bytes(kernel_op: &dyn MetalKernelOp, dtype: DType, dyn_map: &DynMap) -> u64 {
         let size = kernel_op.output_size().exec(dyn_map).unwrap();
         (size * dtype.bits().div_ceil(8)) as u64
     }
 
-    fn active_capacity_dyn_map(&self, dyn_map: &FxHashMap<char, usize>) -> FxHashMap<char, usize> {
+    fn active_capacity_dyn_map(&self, dyn_map: &DynMap) -> DynMap {
         let mut capacity_dyn_map = dyn_map.clone();
         let Some(active_bucket) = self.compiled_buckets.get(self.active_bucket) else {
             return capacity_dyn_map;
@@ -624,7 +632,7 @@ impl MetalRuntime {
 
     fn compile_bucket(
         &self,
-        bucket_indices: FxHashMap<char, usize>,
+        bucket_indices: DynMap,
         llir_graph: &LLIRGraph,
     ) -> MetalCompiledBucket {
         let mut node_dtypes = FxHashMap::default();
@@ -742,7 +750,7 @@ impl MetalRuntime {
         }
     }
 
-    fn select_bucket(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn select_bucket(&mut self, dyn_map: &DynMap) {
         if self.compiled_buckets.len() <= 1 {
             return;
         }
@@ -753,7 +761,7 @@ impl MetalRuntime {
         }
     }
 
-    fn resolve_bucket(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn resolve_bucket(&self, dyn_map: &DynMap) -> usize {
         self.compiled_buckets
             .iter()
             .position(|bucket| {
@@ -774,25 +782,36 @@ impl MetalRuntime {
             })
     }
 
-    fn update_dyn_buffer(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    /// Adopt the layout codegen built and size the buffer to it. Runs *after*
+    /// compiling, since that is when the dims are discovered.
+    fn finish_dyn_dims_layout(&mut self) {
+        self.dyn_dims_order = crate::kernel::dyn_dims_order();
+        // Metal rejects a zero-length buffer; a graph with no dynamic dims
+        // still binds this argument but never reads it.
+        self.dyn_buffer = self.device.new_buffer(
+            (self.dyn_dims_order.len().max(1) * std::mem::size_of::<i32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+    }
+
+    fn update_dyn_buffer(&mut self, dyn_map: &DynMap) {
         let ptr = self.dyn_buffer.contents() as *mut i32;
-        unsafe {
-            for idx in 0..DYN_SLOT_COUNT {
-                *ptr.add(idx) = 0;
-            }
-            for (&symbol, &value) in dyn_map {
-                if symbol.is_ascii_lowercase() {
-                    let slot = (symbol as u8 - b'a') as usize;
-                    if slot < DYN_SLOT_COUNT {
-                        *ptr.add(slot) = value as i32;
-                    }
-                }
-            }
+        // By layout position, not by iterating dyn_map: every slot the kernels
+        // can read gets a value, and unreferenced dims are ignored.
+        for (slot, symbol) in self.dyn_dims_order.iter().enumerate() {
+            let value = dyn_map.get(symbol).copied().unwrap_or_else(|| {
+                panic!(
+                    "Metal has no value for dim {symbol}, which its kernels read \
+                     from dyn[{slot}]. Bound dims: {:?}",
+                    dyn_map.keys().collect::<Vec<_>>(),
+                )
+            });
+            unsafe { *ptr.add(slot) = value as i32 };
         }
     }
 
     /// Execute and return GPU-side execution time in microseconds.
-    fn execute_timed(&mut self, dyn_map: &FxHashMap<char, usize>) -> (f64, TimingMethod) {
+    fn execute_timed(&mut self, dyn_map: &DynMap) -> (f64, TimingMethod) {
         autoreleasepool(|| {
             self.select_bucket(dyn_map);
             self.allocate_active_intermediate_buffers(dyn_map);

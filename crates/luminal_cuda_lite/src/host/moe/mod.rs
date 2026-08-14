@@ -301,7 +301,7 @@ impl HostOp for GLUMoE {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         if inputs.len() < 6 {
             anyhow::bail!("GLUMoE expected at least 6 inputs, got {}", inputs.len());
@@ -681,7 +681,7 @@ impl HostOp for GLUMoE {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         _buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         let x_bf16 = eval_resource_expression(
             Expression::from('s') * self.gu_matmul_k * 2,
