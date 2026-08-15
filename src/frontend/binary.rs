@@ -340,7 +340,12 @@ impl GraphTensor {
 
     /// Equal
     pub fn eq(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.ne(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
+        // Keep the inequality indicator numeric until the final cast. Calling
+        // `ne` here would create a Bool -> F32 round trip, forcing backends
+        // without Bool storage (currently Metal) to materialize an otherwise
+        // internal boolean buffer.
+        let not_equal = self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32);
+        (-not_equal + 1.0).cast(DType::Bool)
     }
 
     /// Raise the tensor to a power

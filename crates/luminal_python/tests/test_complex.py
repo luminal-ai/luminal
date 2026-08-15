@@ -189,9 +189,7 @@ class ComplexAsinAsinh(torch.nn.Module):
 
 
 def test_complex_asin_asinh_avoid_cancellation():
-    value = torch.tensor(
-        [-0.2327 - 0.0001j, 0.0378 + 3.5795j], dtype=torch.complex64
-    )
+    value = torch.tensor([-0.2327 - 0.0001j, 0.0378 + 3.5795j], dtype=torch.complex64)
     expected = ComplexAsinAsinh()(value)
     actual = _compile_and_run(ComplexAsinAsinh(), value)
     for result, reference in zip(actual, expected):

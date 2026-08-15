@@ -5,9 +5,7 @@ from luminal.pt2 import compile as luminal_compile
 
 
 def _compile_and_run(module: torch.nn.Module, *inputs: torch.Tensor):
-    compiled = luminal_compile(
-        module, inputs, search_iterations=1, dynamic_shapes={}
-    )
+    compiled = luminal_compile(module, inputs, search_iterations=1, dynamic_shapes={})
     return compiled(*inputs)
 
 

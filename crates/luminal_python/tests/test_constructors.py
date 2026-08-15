@@ -62,9 +62,7 @@ class ConstantPad(torch.nn.Module):
         self.value = value
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        return torch.ops.aten.constant_pad_nd.default(
-            tensor, self.padding, self.value
-        )
+        return torch.ops.aten.constant_pad_nd.default(tensor, self.padding, self.value)
 
 
 class DefaultConstantPad(torch.nn.Module):
@@ -105,6 +103,7 @@ def test_full_preserves_dtype_and_literal_value() -> None:
         expected = module(anchor)
         (actual,) = _compile(module, anchor)(anchor)
         _assert_exact(actual, expected)
+
 
 def test_full_supports_symbolic_shapes() -> None:
     module = Full(3.25 - 1.5j, torch.complex64)
@@ -153,7 +152,9 @@ def test_constructors_accept_tensor_backed_runtime_scalars() -> None:
 def test_constant_pad_nd_preserves_typed_fill_and_ieee_values() -> None:
     cases = (
         (
-            torch.tensor([float("nan"), float("inf"), -float("inf")], dtype=torch.float64),
+            torch.tensor(
+                [float("nan"), float("inf"), -float("inf")], dtype=torch.float64
+            ),
             [2, 1],
             1.2345678901234567,
         ),

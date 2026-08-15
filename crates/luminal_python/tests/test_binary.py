@@ -53,7 +53,9 @@ def test_copysign_scalar_typed_constants_and_zero_signs():
         expected = CopySignScalars()(value)
         actual = _compile_and_run(CopySignScalars(), value)
         for result, reference in zip(actual, expected):
-            torch.testing.assert_close(result, reference, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(
+                result, reference, rtol=0, atol=0, equal_nan=True
+            )
             classified = ~torch.isnan(reference)
             assert torch.equal(
                 torch.signbit(result)[classified], torch.signbit(reference)[classified]

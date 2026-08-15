@@ -8,15 +8,16 @@ use crate::{
 /// Select elementwise without arithmetic masking. Multiplying an inactive
 /// branch by zero would let NaNs and infinities leak through (`0 * NaN` is
 /// NaN), which is especially visible when padding tensors containing them.
-fn select_by_bool(
+fn select_by_index(
     graph: &mut Graph,
-    condition: GraphTensor,
+    index: GraphTensor,
     if_true: GraphTensor,
     if_false: GraphTensor,
 ) -> GraphTensor {
     assert_eq!(if_true.dims(), if_false.dims());
     assert_eq!(if_true.dtype, if_false.dtype);
-    assert_eq!(condition.dims(), if_true.dims());
+    assert_eq!(index.dims(), if_true.dims());
+    assert_eq!(index.dtype, DType::Int);
 
     let shape = if_true.dims();
     let mut packed_shape = shape.clone();
@@ -26,7 +27,7 @@ fn select_by_bool(
     let zero = graph.iota(0, packed_shape).cast(if_true.dtype);
     let packed = if_true.scatter(odd, if_false.scatter(even, zero));
     let base = graph.iota(Expression::from('z') * 2, shape);
-    packed.gather(base + condition.cast(DType::Int))
+    packed.gather(base + index)
 }
 
 impl GraphTensor {
@@ -652,12 +653,9 @@ impl GraphTensor {
             current_elem_size *= range;
         }
         let mask_expression = flat_stride.simplify();
-        let mask = self
-            .graph()
-            .iota(mask_expression, new_dims)
-            .cast(DType::Bool);
+        let mask = self.graph().iota(mask_expression, new_dims);
         let fill = elem.expand_rhs(mask.shape);
-        select_by_bool(self.graph(), mask, new_tensor, fill)
+        select_by_index(self.graph(), mask, new_tensor, fill)
     }
 
     /// Pad out dimensions of a tensor with an `f32` convenience value.

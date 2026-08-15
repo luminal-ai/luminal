@@ -66,9 +66,7 @@ class LinearComposites(torch.nn.Module):
 class ZeroCoefficientLinearComposites(torch.nn.Module):
     def forward(self, vector_input, matrix, vector, matrix_input, batch1, batch2):
         return (
-            torch.ops.aten.addmv.default(
-                vector_input, matrix, vector, beta=0, alpha=0
-            ),
+            torch.ops.aten.addmv.default(vector_input, matrix, vector, beta=0, alpha=0),
             torch.ops.aten.addbmm.default(
                 matrix_input, batch1, batch2, beta=0, alpha=0
             ),
