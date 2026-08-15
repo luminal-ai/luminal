@@ -16,8 +16,10 @@ use crate::torch_dtype::TorchDType;
 
 use super::Translator;
 use super::movement::{
-    diagonal_indices, flip_indices, normalize_diagonal_dims, normalize_flip_dims,
+    diagonal_indices, diagonal_scatter_tensor, flip_indices, index_select_tensor,
+    normalize_diagonal_dims, normalize_flip_dims, unfold_tensor,
 };
+use super::tensor::{ConstructorScalar, copy_tensor};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ComplexTensor {
@@ -263,6 +265,41 @@ impl<'a> Translator<'a> {
                 let packed = value.pack(&mut self.graph);
                 self.tensors.insert(output_name.to_string(), packed);
             }
+            "torch.ops.aten.full.default" | "torch.ops.aten.full_like.default" => {
+                let dtype = self.output_complex_dtype(output_name)?;
+                let shape = self.output_meta_shape(node)?;
+                let value = self.complex_constructor_scalar_arg(node, 1, dtype)?;
+                let value = if shape.is_empty() {
+                    value
+                } else {
+                    value.map(|component| component.expand_rhs(shape.clone()))
+                };
+                self.store_complex(output_name, value);
+            }
+            "torch.ops.aten.scalar_tensor.default" => {
+                let dtype = self.output_complex_dtype(output_name)?;
+                let value = self.complex_constructor_scalar_arg(node, 0, dtype)?;
+                self.store_complex(output_name, value);
+            }
+            "torch.ops.aten.constant_pad_nd.default" => {
+                let value = self.get_complex_input(node, 0)?;
+                let padding = self.constant_pad_spec(node, value.real.shape.len())?;
+                let fill = match node.inputs.iter().position(|input| input.name == "value") {
+                    Some(index) => {
+                        self.complex_constructor_scalar_arg(node, index, value.torch_dtype)?
+                    }
+                    None => self
+                        .complex_constructor_scalar(ConstructorScalar::Int(0), value.torch_dtype)?,
+                };
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(
+                        value.real.pad_with(padding.clone(), fill.real),
+                        value.imag.pad_with(padding, fill.imag),
+                        value.torch_dtype,
+                    ),
+                );
+            }
             "torch.ops.aten.view_as_complex.default" => {
                 let backing = self.get_input_tensor(node, 0)?;
                 let dtype = self.output_complex_dtype(output_name)?;
@@ -298,6 +335,44 @@ impl<'a> Translator<'a> {
                         self.bool_not(both_zero)
                     } else {
                         value.real.cast(dtype)
+                    };
+                    self.tensors.insert(output_name.to_string(), out);
+                }
+            }
+            "torch.ops.aten.copy.default" => {
+                let output_dtype = self
+                    .tensor_meta(output_name)
+                    .and_then(|meta| TorchDType::from_code(meta.dtype).ok())
+                    .context("complex copy output is missing dtype metadata")?;
+                let destination_name = self.input_value_name(node, 0)?;
+                let source_name = self.input_value_name(node, 1)?;
+                if output_dtype.is_complex() {
+                    let destination = self.value_as_complex(destination_name, output_dtype)?;
+                    let source = self.value_as_complex(source_name, output_dtype)?;
+                    let component_dtype = output_dtype.complex_component_dtype().unwrap();
+                    self.store_complex(
+                        output_name,
+                        ComplexTensor::new(
+                            copy_tensor(destination.real, source.real, component_dtype)?,
+                            copy_tensor(destination.imag, source.imag, component_dtype)?,
+                            output_dtype,
+                        ),
+                    );
+                } else {
+                    let destination = self.get_tensor(destination_name)?;
+                    let source = self.get_complex(source_name)?;
+                    let dtype = DType::try_from(output_dtype).map_err(|dtype| {
+                        anyhow::anyhow!("unsupported real copy target {}", dtype.name())
+                    })?;
+                    let out = if dtype == DType::Bool {
+                        let real = copy_tensor(destination, source.real, source.real.dtype)?;
+                        let imag = copy_tensor(destination, source.imag, source.imag.dtype)?;
+                        let real_zero = self.is_zero(real);
+                        let imag_zero = self.is_zero(imag);
+                        let both_zero = self.bool_and(real_zero, imag_zero);
+                        self.bool_not(both_zero)
+                    } else {
+                        copy_tensor(destination, source.real, dtype)?
                     };
                     self.tensors.insert(output_name.to_string(), out);
                 }
@@ -344,6 +419,82 @@ impl<'a> Translator<'a> {
                 self.store_complex(
                     output_name,
                     value.map(|component| component.gather(indices)),
+                );
+            }
+            "torch.ops.aten.diagonal_scatter.default" => {
+                let dtype = self.output_complex_dtype(output_name)?;
+                let destination = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
+                let source = self.value_as_complex(self.input_value_name(node, 1)?, dtype)?;
+                let offset = self.get_int_arg(node, 2).unwrap_or(0);
+                let (dim1, dim2) = normalize_diagonal_dims(
+                    self.get_int_arg(node, 3).unwrap_or(0),
+                    self.get_int_arg(node, 4).unwrap_or(1),
+                    destination.real.shape.len(),
+                )?;
+                self.store_complex(
+                    output_name,
+                    ComplexTensor::new(
+                        diagonal_scatter_tensor(destination.real, source.real, offset, dim1, dim2)?,
+                        diagonal_scatter_tensor(destination.imag, source.imag, offset, dim1, dim2)?,
+                        dtype,
+                    ),
+                );
+            }
+            "torch.ops.aten.index_select.default" => {
+                let dtype = self.output_complex_dtype(output_name)?;
+                let value = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
+                let raw_dim = self.get_int_arg(node, 1)?;
+                let dim = if value.real.shape.is_empty() {
+                    anyhow::ensure!(
+                        raw_dim == 0 || raw_dim == -1,
+                        "index_select dimension {raw_dim} out of range for a scalar"
+                    );
+                    0
+                } else {
+                    anyhow::ensure!(
+                        raw_dim >= -(value.real.shape.len() as i64)
+                            && raw_dim < value.real.shape.len() as i64,
+                        "index_select dimension {raw_dim} out of range for rank {}",
+                        value.real.shape.len()
+                    );
+                    normalize_dim(raw_dim, value.real.shape.len())
+                };
+                let index = self.get_input_tensor(node, 2)?;
+                let output_shape = self.output_meta_shape(node)?;
+                self.store_complex(
+                    output_name,
+                    value.try_map(|component| {
+                        index_select_tensor(component, index, dim, &output_shape)
+                    })?,
+                );
+            }
+            "torch.ops.aten.unfold.default" => {
+                let dtype = self.output_complex_dtype(output_name)?;
+                let value = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
+                let raw_dim = self.get_int_arg(node, 1)?;
+                let dim = if value.real.shape.is_empty() {
+                    anyhow::ensure!(
+                        raw_dim == 0 || raw_dim == -1,
+                        "unfold dimension {raw_dim} out of range for a scalar"
+                    );
+                    0
+                } else {
+                    anyhow::ensure!(
+                        raw_dim >= -(value.real.shape.len() as i64)
+                            && raw_dim < value.real.shape.len() as i64,
+                        "unfold dimension {raw_dim} out of range for rank {}",
+                        value.real.shape.len()
+                    );
+                    normalize_dim(raw_dim, value.real.shape.len())
+                };
+                let size = self.get_int_arg(node, 2)?;
+                let step = self.get_int_arg(node, 3)?;
+                let output_shape = self.output_meta_shape(node)?;
+                self.store_complex(
+                    output_name,
+                    value.try_map(|component| {
+                        unfold_tensor(component, dim, size, step, &output_shape)
+                    })?,
                 );
             }
             "torch.ops.aten.unsqueeze.default" => {
@@ -476,6 +627,14 @@ impl<'a> Translator<'a> {
                 let value = self.translate_complex_matmul(node, output_name)?;
                 self.store_complex(output_name, value);
             }
+            "torch.ops.aten.addmv.default" => {
+                let value = self.translate_complex_addmv(node, output_name)?;
+                self.store_complex(output_name, value);
+            }
+            "torch.ops.aten.addbmm.default" => {
+                let value = self.translate_complex_addbmm(node, output_name)?;
+                self.store_complex(output_name, value);
+            }
             "torch.ops.aten.addmm.default" => {
                 let value = self.translate_complex_addmm(node, output_name)?;
                 self.store_complex(output_name, value);
@@ -534,6 +693,44 @@ impl<'a> Translator<'a> {
         })
     }
 
+    fn complex_constructor_scalar_arg(
+        &mut self,
+        node: &Node,
+        index: usize,
+        dtype: TorchDType,
+    ) -> Result<ComplexTensor> {
+        let value = self.constructor_scalar_arg(node, index)?;
+        self.complex_constructor_scalar(value, dtype)
+    }
+
+    fn complex_constructor_scalar(
+        &mut self,
+        value: ConstructorScalar,
+        dtype: TorchDType,
+    ) -> Result<ComplexTensor> {
+        let (real, imag) = match value {
+            ConstructorScalar::Value(name) => {
+                let value = self.value_as_complex(&name, dtype)?;
+                return Ok(ComplexTensor::new(
+                    reshape_tensor(value.real, vec![]),
+                    reshape_tensor(value.imag, vec![]),
+                    dtype,
+                ));
+            }
+            ConstructorScalar::Complex(real, imag) => (
+                ConstructorScalar::Float(real),
+                ConstructorScalar::Float(imag),
+            ),
+            real => (real, ConstructorScalar::Int(0)),
+        };
+        let component_dtype = dtype.complex_component_dtype().unwrap();
+        Ok(ComplexTensor::new(
+            self.typed_scalar_constant(&real, component_dtype)?,
+            self.typed_scalar_constant(&imag, component_dtype)?,
+            dtype,
+        ))
+    }
+
     fn value_as_complex(&mut self, name: &str, dtype: TorchDType) -> Result<ComplexTensor> {
         if let Some(value) = self.complex_tensors.get(name).copied() {
             return Ok(value.cast(dtype));
@@ -581,6 +778,41 @@ impl<'a> Translator<'a> {
             a.real.matmul(b.imag) + a.imag.matmul(b.real),
             a.torch_dtype,
         )
+    }
+
+    fn scale_complex_by_named_scalar(
+        &mut self,
+        node: &Node,
+        name: &str,
+        value: ComplexTensor,
+    ) -> Result<ComplexTensor> {
+        let Some(index) = node.inputs.iter().position(|input| input.name == name) else {
+            return Ok(value);
+        };
+        let scalar_arg = self.constructor_scalar_arg(node, index)?;
+        if scalar_arg.is_literal_one() {
+            return Ok(value);
+        }
+        if scalar_arg.is_literal_zero() {
+            return Ok(ComplexTensor::new(
+                self.constant_like(value.real, 0.0),
+                self.constant_like(value.imag, 0.0),
+                value.torch_dtype,
+            ));
+        }
+        let scalar = self.complex_constructor_scalar(scalar_arg, value.torch_dtype)?;
+        let scalar = ComplexTensor::new(
+            scalar.real.expand_rhs(value.real.shape),
+            scalar.imag.expand_rhs(value.imag.shape),
+            value.torch_dtype,
+        );
+        Ok(self.complex_mul(value, scalar))
+    }
+
+    fn add_complex(&self, lhs: ComplexTensor, rhs: ComplexTensor) -> ComplexTensor {
+        let (lhs_real, rhs_real) = broadcast_binary(lhs.real, rhs.real);
+        let (lhs_imag, rhs_imag) = broadcast_binary(lhs.imag, rhs.imag);
+        ComplexTensor::new(lhs_real + rhs_real, lhs_imag + rhs_imag, lhs.torch_dtype)
     }
 
     fn scale_addend(&mut self, node: &Node, value: ComplexTensor) -> Result<ComplexTensor> {
@@ -1340,6 +1572,53 @@ impl<'a> Translator<'a> {
         let a = self.value_as_complex(self.input_value_name(node, 0)?, dtype)?;
         let b = self.value_as_complex(self.input_value_name(node, 1)?, dtype)?;
         Ok(self.complex_matmul(a, b))
+    }
+
+    fn translate_complex_addmv(&mut self, node: &Node, output_name: &str) -> Result<ComplexTensor> {
+        let output_dtype = self.output_complex_dtype(output_name)?;
+        let compute_dtype = if output_dtype == TorchDType::ComplexHalf {
+            TorchDType::ComplexFloat
+        } else {
+            output_dtype
+        };
+        let input = self.value_as_complex(self.input_value_name(node, 0)?, compute_dtype)?;
+        let matrix = self.value_as_complex(self.input_value_name(node, 1)?, compute_dtype)?;
+        let vector = self.value_as_complex(self.input_value_name(node, 2)?, compute_dtype)?;
+        anyhow::ensure!(matrix.real.shape.len() == 2, "addmv matrix must be rank 2");
+        anyhow::ensure!(vector.real.shape.len() == 1, "addmv vector must be rank 1");
+
+        let vector = vector.map(|component| component.unsqueeze(1));
+        let product = self
+            .complex_matmul(matrix, vector)
+            .map(|component| component.squeeze(1));
+        let input = self.scale_complex_by_named_scalar(node, "beta", input)?;
+        let product = self.scale_complex_by_named_scalar(node, "alpha", product)?;
+        Ok(self.add_complex(input, product).cast(output_dtype))
+    }
+
+    fn translate_complex_addbmm(
+        &mut self,
+        node: &Node,
+        output_name: &str,
+    ) -> Result<ComplexTensor> {
+        let output_dtype = self.output_complex_dtype(output_name)?;
+        let compute_dtype = if output_dtype == TorchDType::ComplexHalf {
+            TorchDType::ComplexFloat
+        } else {
+            output_dtype
+        };
+        let input = self.value_as_complex(self.input_value_name(node, 0)?, compute_dtype)?;
+        let batch1 = self.value_as_complex(self.input_value_name(node, 1)?, compute_dtype)?;
+        let batch2 = self.value_as_complex(self.input_value_name(node, 2)?, compute_dtype)?;
+        anyhow::ensure!(batch1.real.shape.len() == 3, "addbmm batch1 must be rank 3");
+        anyhow::ensure!(batch2.real.shape.len() == 3, "addbmm batch2 must be rank 3");
+
+        let product = self
+            .complex_matmul(batch1, batch2)
+            .map(|component| component.sum(0));
+        let input = self.scale_complex_by_named_scalar(node, "beta", input)?;
+        let product = self.scale_complex_by_named_scalar(node, "alpha", product)?;
+        Ok(self.add_complex(input, product).cast(output_dtype))
     }
 
     fn translate_complex_addmm(&mut self, node: &Node, output_name: &str) -> Result<ComplexTensor> {

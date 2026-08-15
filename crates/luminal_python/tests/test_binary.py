@@ -58,3 +58,19 @@ def test_copysign_scalar_typed_constants_and_zero_signs():
             assert torch.equal(
                 torch.signbit(result)[classified], torch.signbit(reference)[classified]
             )
+
+
+class BoolNotEqualAndDiff(torch.nn.Module):
+    def forward(self, left, right):
+        return left.ne(right), torch.diff(left)
+
+
+def test_not_equal_and_diff_preserve_boolean_output_dtype():
+    left = torch.tensor([True, True, False, True, False])
+    right = torch.tensor([False, True, False, False, True])
+    expected = BoolNotEqualAndDiff()(left, right)
+    actual = _compile_and_run(BoolNotEqualAndDiff(), left, right)
+
+    for result, reference in zip(actual, expected):
+        assert result.dtype == torch.bool
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)

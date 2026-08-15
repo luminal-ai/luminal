@@ -145,6 +145,9 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
             "torch.ops.aten.flip.default" => self.translate_flip(node)?,
             "torch.ops.aten.diagonal.default" => self.translate_diagonal(node)?,
+            "torch.ops.aten.diagonal_scatter.default" => self.translate_diagonal_scatter(node)?,
+            "torch.ops.aten.index_select.default" => self.translate_index_select(node)?,
+            "torch.ops.aten.unfold.default" => self.translate_unfold(node)?,
             "torch.ops.aten.unsqueeze.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let dim = self.get_int_arg(node, 1)?;
@@ -182,6 +185,8 @@ impl<'a> Translator<'a> {
                 let (a, b) = ensure_same_dtype(a, b);
                 a.matmul(b)
             }
+            "torch.ops.aten.addmv.default" => self.translate_addmv(node)?,
+            "torch.ops.aten.addbmm.default" => self.translate_addbmm(node)?,
 
             // addmm: beta*input + alpha*(mat1 @ mat2)
             "torch.ops.aten.addmm.default" => {
@@ -196,6 +201,8 @@ impl<'a> Translator<'a> {
                 let (input, mm) = broadcast_binary(input, mm);
                 input * beta + mm * alpha
             }
+
+            "torch.ops.aten.copy.default" => self.translate_copy(node)?,
 
             // Convolution
             "torch.ops.aten.convolution.default" => self.translate_conv(node)?,
@@ -257,6 +264,7 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.arange.start_step" => self.translate_arange(node)?,
             "torch.ops.aten.full.default" => self.translate_full(node)?,
             "torch.ops.aten.full_like.default" => self.translate_full_like(node)?,
+            "torch.ops.aten.constant_pad_nd.default" => self.translate_constant_pad_nd(node)?,
             // `empty` and `empty_permuted` allocate uninitialised tensors of
             // a given shape; the caller fills them. We lower to zeros with
             // the same shape+dtype — downstream reads are officially UB on
@@ -279,9 +287,7 @@ impl<'a> Translator<'a> {
             | "torch.ops.transformers.grouped_mm_fallback.default" => {
                 self.translate_grouped_mm(node)?
             }
-            "torch.ops.aten.scalar_tensor.default" => {
-                self.translate_scalar_tensor(node, &output_name)?
-            }
+            "torch.ops.aten.scalar_tensor.default" => self.translate_scalar_tensor(node)?,
             // Scalar comparisons
             "torch.ops.aten.gt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.gt(s))?,
             "torch.ops.aten.lt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.lt(s))?,
@@ -586,41 +592,9 @@ impl<'a> Translator<'a> {
 }
 
 impl<'a> Translator<'a> {
-    fn translate_scalar_tensor(&mut self, node: &Node, output_name: &str) -> Result<GraphTensor> {
-        let meta = self
-            .tensor_meta(output_name)
-            .context("scalar_tensor is missing output tensor metadata")?;
-        let dtype = torch_dtype_int_to_luminal(meta.dtype);
-        let arg = &node
-            .inputs
-            .first()
-            .context("scalar_tensor is missing its scalar input")?
-            .arg;
-
-        if let Some(name) = arg.as_value_name() {
-            let value = reshape_tensor(self.get_tensor(name)?, vec![]);
-            return Ok(if value.dtype == dtype {
-                value
-            } else {
-                value.cast(dtype)
-            });
-        }
-
-        if let Some(value) = arg.as_float() {
-            return Ok(if dtype == DType::F64 {
-                self.graph.constant_float64(value)
-            } else {
-                self.graph.constant_float(value as f32).cast(dtype)
-            });
-        }
-        if let Some(value) = arg.as_int() {
-            return Ok(self.graph.constant(value).cast(dtype));
-        }
-        if let Some(value) = arg.as_bool() {
-            return Ok(self.graph.constant(i64::from(value)).cast(dtype));
-        }
-
-        bail!("scalar_tensor input is not tensor-backed or a literal: {arg:?}")
+    fn translate_scalar_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
+        let dtype = self.output_meta_dtype(node)?;
+        self.real_constructor_scalar(node, 0, dtype)
     }
 
     fn translate_scalar_comparison(

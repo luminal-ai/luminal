@@ -98,8 +98,10 @@ impl<'a> Translator<'a> {
             } else {
                 tensor + 0.0
             };
-            tensor.output();
-            self.output_ids.push((name.clone(), tensor.id));
+            // `output()` may materialize a non-contiguous view with a Gather.
+            // Record that returned node, not the pre-materialization producer.
+            let output = tensor.output();
+            self.output_ids.push((name.clone(), output.id));
         }
         Ok(())
     }

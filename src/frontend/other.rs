@@ -12,6 +12,22 @@ impl Graph {
         )
     }
 
+    /// An exact scalar I64 constant built from 16-bit limbs.
+    ///
+    /// `Iota` stores values as the default 32-bit integer dtype, so emitting a
+    /// large literal there and casting afterward has already truncated it.
+    /// Horner assembly performs every multiply and add after promotion to I64
+    /// and covers the complete signed 64-bit range without a new HLIR op.
+    pub fn constant_i64(&mut self, value: i64) -> GraphTensor {
+        let base = self.constant(1i64 << 16).cast(DType::I64);
+        let mut result = self.constant(value >> 48).cast(DType::I64);
+        for shift in [32, 16, 0] {
+            let limb = self.constant((value >> shift) & 0xffff).cast(DType::I64);
+            result = result * base + limb;
+        }
+        result
+    }
+
     /// A scalar float constant
     pub fn constant_float(&mut self, i: f32) -> GraphTensor {
         GraphTensor::from_id(
@@ -128,7 +144,7 @@ impl GraphTensor {
 
 #[cfg(test)]
 mod tests {
-    use crate::{prelude::*, tests::assert_close};
+    use crate::{hlir::ReferenceData, prelude::*, tests::assert_close};
     use candle_core::{Device, Tensor};
     use proptest::prelude::*;
 
@@ -153,6 +169,35 @@ mod tests {
 
         // need to assert close because some unaries (exp and log) are (good) approximations
         assert_close(rt.get_f32(b.id), &ref_b.to_vec1::<f32>().unwrap())
+    }
+
+    #[test]
+    fn constant_i64_preserves_full_width_values() {
+        let values = [i64::MIN, -(1i64 << 40) + 7, -1, 0, 1i64 << 40, i64::MAX];
+        let mut cx = Graph::new();
+        for &value in &values {
+            cx.constant_i64(value).output();
+        }
+
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+        let mut runtime = cx.search(
+            ReferenceRuntime::default(),
+            CompileOptions::default().search_graph_limit(1),
+        );
+        runtime.execute(&cx.dyn_map);
+
+        let mut actual = runtime
+            .buffers
+            .values()
+            .map(|data| match data {
+                ReferenceData::I64(values) => values[0],
+                other => panic!("expected I64 output, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = values.to_vec();
+        expected.sort();
+        assert_eq!(actual, expected);
     }
 
     proptest! {

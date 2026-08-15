@@ -5,6 +5,30 @@ use crate::{
     prelude::*,
 };
 
+/// Select elementwise without arithmetic masking. Multiplying an inactive
+/// branch by zero would let NaNs and infinities leak through (`0 * NaN` is
+/// NaN), which is especially visible when padding tensors containing them.
+fn select_by_bool(
+    graph: &mut Graph,
+    condition: GraphTensor,
+    if_true: GraphTensor,
+    if_false: GraphTensor,
+) -> GraphTensor {
+    assert_eq!(if_true.dims(), if_false.dims());
+    assert_eq!(if_true.dtype, if_false.dtype);
+    assert_eq!(condition.dims(), if_true.dims());
+
+    let shape = if_true.dims();
+    let mut packed_shape = shape.clone();
+    packed_shape.push(2usize.into());
+    let even = graph.iota(Expression::from('z') * 2, shape.clone());
+    let odd = graph.iota(Expression::from('z') * 2 + 1, shape.clone());
+    let zero = graph.iota(0, packed_shape).cast(if_true.dtype);
+    let packed = if_true.scatter(odd, if_false.scatter(even, zero));
+    let base = graph.iota(Expression::from('z') * 2, shape);
+    packed.gather(base + condition.cast(DType::Int))
+}
+
 impl GraphTensor {
     /// Swap dimensions of the tensor
     pub fn permute(mut self, axes: impl ToAxes) -> GraphTensor {
@@ -575,8 +599,16 @@ impl GraphTensor {
     //     self
     // }
 
-    /// Pad out dimensions of a tensor with an element
-    pub fn pad(self, padding: impl ToPad, elem: f32) -> GraphTensor {
+    /// Pad out dimensions of a tensor with a typed scalar tensor.
+    ///
+    /// Keeping the fill as a tensor preserves F64 and integer constants that
+    /// cannot be represented exactly by the historical `f32` convenience API.
+    pub fn pad_with(self, padding: impl ToPad, elem: GraphTensor) -> GraphTensor {
+        assert_eq!(elem.shape.len(), 0, "padding value must be a scalar tensor");
+        assert_eq!(
+            elem.dtype, self.dtype,
+            "padding value dtype must match input"
+        );
         let mut padding = padding.to_pad_vec();
         padding.extend(vec![(0.into(), 0.into()); self.shape.len() - padding.len()]); // Make sure we have a padding per dim
         let mut index_expressions = vec![];
@@ -623,13 +655,15 @@ impl GraphTensor {
         let mask = self
             .graph()
             .iota(mask_expression, new_dims)
-            .cast(self.dtype);
-        let masked = new_tensor * mask;
-        if elem == 0.0 {
-            masked
-        } else {
-            masked + ((1.0 - mask) * elem)
-        }
+            .cast(DType::Bool);
+        let fill = elem.expand_rhs(mask.shape);
+        select_by_bool(self.graph(), mask, new_tensor, fill)
+    }
+
+    /// Pad out dimensions of a tensor with an `f32` convenience value.
+    pub fn pad(self, padding: impl ToPad, elem: f32) -> GraphTensor {
+        let fill = self.graph().constant_float(elem).cast(self.dtype);
+        self.pad_with(padding, fill)
     }
 
     /// Pad along an existing dimension

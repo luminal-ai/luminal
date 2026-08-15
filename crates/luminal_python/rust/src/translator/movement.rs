@@ -103,6 +103,101 @@ pub(crate) fn diagonal_indices(
     ))
 }
 
+pub(crate) fn diagonal_scatter_tensor(
+    destination: GraphTensor,
+    source: GraphTensor,
+    offset: i64,
+    dim1: usize,
+    dim2: usize,
+) -> Result<GraphTensor> {
+    anyhow::ensure!(
+        destination.dtype == source.dtype,
+        "diagonal_scatter requires matching dtypes, got {:?} and {:?}",
+        destination.dtype,
+        source.dtype
+    );
+    let indices = diagonal_indices(destination, &source.dims(), offset, dim1, dim2)?;
+    Ok(source.scatter(indices, destination))
+}
+
+pub(crate) fn index_select_tensor(
+    input: GraphTensor,
+    index: GraphTensor,
+    dim: usize,
+    output_shape: &[Expression],
+) -> Result<GraphTensor> {
+    if input.shape.is_empty() {
+        anyhow::ensure!(
+            output_shape.is_empty(),
+            "scalar index_select must produce a scalar output"
+        );
+        return Ok(input);
+    }
+    anyhow::ensure!(
+        index.shape.len() <= 1,
+        "index_select index must be rank 0 or 1, got rank {}",
+        index.shape.len()
+    );
+    Ok(super::movement_dynamic::pt2_index_select(
+        input,
+        index,
+        dim,
+        output_shape,
+    ))
+}
+
+pub(crate) fn unfold_tensor(
+    input: GraphTensor,
+    dim: usize,
+    size: i64,
+    step: i64,
+    output_shape: &[Expression],
+) -> Result<GraphTensor> {
+    anyhow::ensure!(size >= 0, "unfold size must be nonnegative, got {size}");
+    anyhow::ensure!(step > 0, "unfold step must be positive, got {step}");
+    if input.shape.is_empty() {
+        anyhow::ensure!(
+            output_shape.len() == 1,
+            "scalar unfold must produce one output dimension"
+        );
+        anyhow::ensure!(size <= 1, "scalar unfold size cannot exceed 1");
+        return Ok(input.expand_rhs(output_shape.to_vec()));
+    }
+    if let Some(dim_size) = input.shape.dims[dim].to_usize() {
+        anyhow::ensure!(
+            size as usize <= dim_size,
+            "unfold size {size} exceeds dimension {dim} of length {dim_size}"
+        );
+    }
+
+    let rank = input.shape.len();
+    let mut kernel = vec![1usize; rank];
+    let mut strides = vec![1usize; rank];
+    kernel[dim] = size as usize;
+    strides[dim] = step as usize;
+    let mut result = input.unfold(kernel, strides, vec![1usize; rank]);
+
+    // Core unfold returns [window_dims..., kernel_dims...]. Every kernel
+    // dimension except the selected one is size 1, so remove those in reverse
+    // order; the selected kernel dimension naturally becomes PyTorch's final
+    // output dimension.
+    for kernel_dim in (0..rank).rev() {
+        if kernel_dim != dim {
+            result = result.squeeze(rank + kernel_dim);
+        }
+    }
+    anyhow::ensure!(
+        result.shape.len() == output_shape.len(),
+        "unfold produced rank {}, expected {}",
+        result.shape.len(),
+        output_shape.len()
+    );
+    for (actual, expected) in result.shape.dims.iter_mut().zip(output_shape) {
+        *actual = *expected;
+    }
+    Ok(result)
+}
+
 fn normalize_concat_dims(
     lhs: &mut GraphTensor,
     rhs: &mut GraphTensor,
@@ -302,6 +397,65 @@ impl<'a> Translator<'a> {
         )?;
         let output_shape = self.output_meta_shape(node)?;
         Ok(input.gather(diagonal_indices(input, &output_shape, offset, dim1, dim2)?))
+    }
+
+    pub(crate) fn translate_diagonal_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
+        let destination = self.get_input_tensor(node, 0)?;
+        let source = self.get_input_tensor(node, 1)?;
+        let offset = self.get_int_arg(node, 2).unwrap_or(0);
+        let (dim1, dim2) = normalize_diagonal_dims(
+            self.get_int_arg(node, 3).unwrap_or(0),
+            self.get_int_arg(node, 4).unwrap_or(1),
+            destination.shape.len(),
+        )?;
+        diagonal_scatter_tensor(destination, source, offset, dim1, dim2)
+    }
+
+    pub(crate) fn translate_index_select(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let dim = if input.shape.is_empty() {
+            anyhow::ensure!(
+                raw_dim == 0 || raw_dim == -1,
+                "index_select dimension {raw_dim} out of range for a scalar"
+            );
+            0
+        } else {
+            anyhow::ensure!(
+                raw_dim >= -(input.shape.len() as i64) && raw_dim < input.shape.len() as i64,
+                "index_select dimension {raw_dim} out of range for rank {}",
+                input.shape.len()
+            );
+            normalize_dim(raw_dim, input.shape.len())
+        };
+        let index = self.get_input_tensor(node, 2)?;
+        index_select_tensor(input, index, dim, &self.output_meta_shape(node)?)
+    }
+
+    pub(crate) fn translate_unfold(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let dim = if input.shape.is_empty() {
+            anyhow::ensure!(
+                raw_dim == 0 || raw_dim == -1,
+                "unfold dimension {raw_dim} out of range for a scalar"
+            );
+            0
+        } else {
+            anyhow::ensure!(
+                raw_dim >= -(input.shape.len() as i64) && raw_dim < input.shape.len() as i64,
+                "unfold dimension {raw_dim} out of range for rank {}",
+                input.shape.len()
+            );
+            normalize_dim(raw_dim, input.shape.len())
+        };
+        unfold_tensor(
+            input,
+            dim,
+            self.get_int_arg(node, 2)?,
+            self.get_int_arg(node, 3)?,
+            &self.output_meta_shape(node)?,
+        )
     }
 
     pub(crate) fn translate_expand(&mut self, node: &Node) -> Result<GraphTensor> {

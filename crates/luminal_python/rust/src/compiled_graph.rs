@@ -643,35 +643,29 @@ impl CompiledGraph {
 
     /// Read an output as i8 without widening.
     fn get_output_i8(&self, name: &str) -> PyResult<Vec<i8>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_i8(*node_id))
+        Ok(self.runtime.get_output_i8(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_i8_at(&self, position: usize) -> PyResult<Vec<i8>> {
+        Ok(self.runtime.get_output_i8(self.output_node_at(position)?))
     }
 
     /// Read an output as u8 without widening.
     fn get_output_u8(&self, name: &str) -> PyResult<Vec<u8>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_u8(*node_id))
+        Ok(self.runtime.get_output_u8(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_u8_at(&self, position: usize) -> PyResult<Vec<u8>> {
+        Ok(self.runtime.get_output_u8(self.output_node_at(position)?))
     }
 
     /// Read an output as i16 without widening.
     fn get_output_i16(&self, name: &str) -> PyResult<Vec<i16>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_i16(*node_id))
+        Ok(self.runtime.get_output_i16(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_i16_at(&self, position: usize) -> PyResult<Vec<i16>> {
+        Ok(self.runtime.get_output_i16(self.output_node_at(position)?))
     }
 
     /// Read an output as f64. Strict: the producer node must already

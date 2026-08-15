@@ -109,6 +109,41 @@ pub fn pt2_gather_elements(data: GraphTensor, indexes: GraphTensor, axis: usize)
     data.gather(flat_idx)
 }
 
+/// `index_select` with a rank-0 or rank-1 index tensor. Unlike
+/// `gather_elements`, ATen does not wrap negative indices here; invalid index
+/// values therefore flow to Gather and fail instead of being normalized.
+pub fn pt2_index_select(
+    data: GraphTensor,
+    indices: GraphTensor,
+    axis: usize,
+    output_shape: &[Expression],
+) -> GraphTensor {
+    let rank = data.shape.len();
+    let indices = if indices.shape.is_empty() {
+        indices.unsqueeze(0)
+    } else {
+        indices
+    };
+    assert_eq!(
+        indices.shape.len(),
+        1,
+        "index_select index must be rank 0 or 1"
+    );
+    assert_eq!(output_shape.len(), rank);
+
+    let inserted_axes = (0..rank).filter(|&dim| dim != axis).collect::<Vec<_>>();
+    let indices = indices
+        .expand_to_shape_on_axes(output_shape.to_vec(), inserted_axes)
+        .cast(DType::Int);
+    let strides = row_major_strides(&data.dims());
+    let non_axis_flat = non_axis_flat(data.graph(), output_shape, &strides, axis);
+    let axis_stride = data
+        .graph()
+        .constant(strides[axis])
+        .expand_rhs(indices.shape);
+    data.gather(non_axis_flat + indices * axis_stride)
+}
+
 /// Translator-local `scatter_elements` that accepts symbolic shape dims.
 /// Same semantics as `GraphTensor::scatter_elements`.
 pub fn pt2_scatter_elements(
