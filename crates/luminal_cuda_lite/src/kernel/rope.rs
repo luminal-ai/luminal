@@ -892,6 +892,80 @@ impl EgglogOp for KernelRoPE {
             (relation rope_invf (IR f64 f64))
             (relation rope_angles (IR IR IR f64 f64))
             (relation rope_rotated (IR IR IR IR Expression Expression Expression Expression f64 f64))
+            (relation rope_safe_pad_left (IR IR EList Expression Expression Expression))
+            (relation rope_safe_pad_right (IR IR EList Expression Expression Expression))
+            (relation rope_row_dims (Expression Expression Expression Expression Expression))
+            (relation rope_tensor_range (Expression Expression Expression))
+            ; Static dimensions are folded before specialization, so prove
+            ; their products in egglog's i64 domain.
+            (rule
+                (
+                    (= ?hd (MNum ?hd_n))
+                    (= ?hd2 (MNum ?hd2_n))
+                    (= ?seq (MNum ?seq_n))
+                    (= ?hs (MNum ?hs_n))
+                    (= ?ch (MNum ?ch_n))
+                    (= ?hd_n (* ?hd2_n 2))
+                    (= ?hs_n (* ?hd_n ?seq_n))
+                    (= ?ch_n (* ?hd2_n ?seq_n))
+                )
+                ((rope_row_dims ?hd ?hd2 ?seq ?hs ?ch))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope static row dimensions\"
+            )
+            ; With a symbolic sequence length the product expressions remain
+            ; live. Accept either canonical operand order.
+            (rule
+                (
+                    (= ?hd (MNum ?hd_n))
+                    (= ?hd2 (MNum ?hd2_n))
+                    (= ?hd_n (* ?hd2_n 2))
+                    (= ?hs (MMul ?hd ?seq))
+                    (= ?ch (MMul ?hd2 ?seq))
+                )
+                ((rope_row_dims ?hd ?hd2 ?seq ?hs ?ch))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope symbolic row dimensions\"
+            )
+            (rule
+                (
+                    (= ?hd (MNum ?hd_n))
+                    (= ?hd2 (MNum ?hd2_n))
+                    (= ?hd_n (* ?hd2_n 2))
+                    (= ?hs (MMul ?seq ?hd))
+                    (= ?ch (MMul ?seq ?hd2))
+                )
+                ((rope_row_dims ?hd ?hd2 ?seq ?hs ?ch))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope symbolic row dimensions commuted\"
+            )
+            (rule
+                (
+                    (= ?heads (MNum ?heads_n))
+                    (= ?hs (MNum ?hs_n))
+                    (= ?range (MNum ?range_n))
+                    (= ?range_n (* ?heads_n ?hs_n))
+                )
+                ((rope_tensor_range ?heads ?hs ?range))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope static tensor range\"
+            )
+            (rule
+                (
+                    (= ?range (MMul ?heads ?hs))
+                )
+                ((rope_tensor_range ?heads ?hs ?range))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope symbolic tensor range\"
+            )
+            (rule
+                (
+                    (= ?range (MMul ?hs ?heads))
+                )
+                ((rope_tensor_range ?heads ?hs ?range))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope symbolic tensor range commuted\"
+            )
             (rule
                 (
                     ; inv_freq = recip(exp2(((2i x 1/hd) x ln theta) x log2 e))
@@ -993,6 +1067,10 @@ impl EgglogOp for KernelRoPE {
                               (MMul (MDiv (MIter) ?e_ch) ?e_hs2))
                         ?x1_range) (INil)))
 
+                    ; Exact half split and row pitches.  This relation proves
+                    ; the contract for both folded and symbolic dimensions.
+                    (rope_row_dims ?e_hd ?e_hd2 ?e_seq ?e_hs2 ?e_ch)
+
                     (= (Bf16) (dtype ?x))
                 )
                 (
@@ -1021,9 +1099,9 @@ impl EgglogOp for KernelRoPE {
                         (MAdd (MAdd (MMin (MMod (MIter) ?e_hd) ?e_hdm1)
                                     (MMul (MMod (MDiv (MIter) ?e_hd) ?e_seq) ?e_hd2))
                               (MMul (MDiv (MIter) ?e_hs) ?e_ch))
-                        ?c0_range) (INil)))
+                        ?cat_range) (INil)))
                     (= ?mk0b (Op (Cast ?k0_size (Bf16)) (ICons ?mk0 (INil))))
-                    (= ?mk0 (Op (Iota (MLt (MMod (MIter) ?e_hd) ?e_hd2) ?mk0_range) (INil)))",
+                    (= ?mk0 (Op (Iota (MLt (MMod (MIter) ?e_hd) ?e_hd2) ?cat_range) (INil)))",
             "
                     ; concat half 1
                     (= ?x1g (Op (Gather ?g3_osh ?g3_ostr ?g3_dsh ?g3_dstr)
@@ -1034,13 +1112,18 @@ impl EgglogOp for KernelRoPE {
                         (MAdd (MAdd (MMax (MSub (MMod (MIter) ?e_hd) ?e_hd2) (MNum 0))
                                     (MMul (MMod (MDiv (MIter) ?e_hd) ?e_seq) ?e_hd2))
                               (MMul (MDiv (MIter) ?e_hs) ?e_ch))
-                        ?c1_range) (INil)))
+                        ?cat_range) (INil)))
                     (= ?mk1b (Op (Cast ?k1_size (Bf16)) (ICons ?mk1 (INil))))
-                    (= ?mk1 (Op (Iota (MGte (MMod (MIter) ?e_hd) ?e_hd2) ?mk1_range) (INil)))",
+                    (= ?mk1 (Op (Iota (MGte (MMod (MIter) ?e_hd) ?e_hd2) ?cat_range) (INil)))",
             "
                     ; layout consistency
                     (= ?hdd ?e_hd)
-                    (= ?seqd ?e_seq)",
+                    (= ?seqd ?e_seq)
+                    (= ?e_hd2 (MNum ?e_hd2_n))
+                    (= ?e_hdm1 (MNum ?e_hdm1_n))
+                    (= ?e_hdm1_n (- ?e_hd2_n 1))
+                    (rope_row_dims ?e_hd ?e_hd2 ?e_seq ?e_hs ?e_ch)
+                    (rope_tensor_range ?heads ?e_hs ?cat_range)",
         ];
 
         let concat_rule = format!(
@@ -1060,8 +1143,142 @@ impl EgglogOp for KernelRoPE {
             )",
             segments.join("\n")
         );
+
+        // `GraphTensor::pad_with` selects between the gathered value and an
+        // exact typed zero through an interleaved scatter/gather.  This avoids
+        // the IEEE-invalid `0 * NaN` arithmetic mask used by the historical
+        // padding spelling.  Match both safe padded halves independently so
+        // the final RoPE join stays selective on large model graphs.
+        //
+        // The scatter/gather constraints below are the semantic proof for the
+        // normalization: even slots are overwritten with zero, odd slots with
+        // the gathered half, and the final gather chooses `2*z + mask(z)`.
+        // Consequently the left relation contributes x0 only for i < hd/2,
+        // the right relation contributes x1 only for i >= hd/2, and their Add
+        // is exactly concat(x0, x1), including NaN and infinity behavior.
+        let safe_concat_stage: &str = "
+            (rule
+                (
+                    ; Contiguous logical and packed layouts for a 3-D rope row.
+                    (= ?cat_sh (ECons ?heads (ECons ?e_seq (ECons ?e_hd (ENil)))))
+                    (= ?cat_st (ECons (MMul (MMul (MIter) ?e_hd) ?e_seq)
+                        (ECons (MMul (MIter) ?e_hd) (ECons (MIter) (ENil)))))
+                    (= ?packed_sh (ECons ?heads (ECons ?e_seq
+                        (ECons ?e_hd (ECons (MNum 2) (ENil))))))
+                    (= ?packed_st (ECons (MMul (MMul (MMul (MIter) (MNum 2)) ?e_hd) ?e_seq)
+                        (ECons (MMul (MMul (MIter) (MNum 2)) ?e_hd)
+                            (ECons (MMul (MIter) (MNum 2)) (ECons (MIter) (ENil))))))
+                    (= ?zero_st (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+
+                    ; The actual left half, clamped only in the inactive half.
+                    (= ?x0g (Op (Gather ?cat_sh ?cat_st ?x0_dsh ?x0_dstr)
+                        (ICons ?c0idx (ICons ?x0out (INil)))))
+                    (= ?c0idx (Op (Iota
+                        (MAdd (MAdd (MMin (MMod (MIter) ?e_hd) ?e_hdm1)
+                                    (MMul (MMod (MDiv (MIter) ?e_hd) ?e_seq) ?e_hd2))
+                              (MMul (MDiv (MIter) ?e_hs) ?e_ch))
+                        ?cat_range) (INil)))
+                    (= ?e_hd2 (MNum ?e_hd2_n))
+                    (= ?e_hdm1 (MNum ?e_hdm1_n))
+                    (= ?e_hdm1_n (- ?e_hd2_n 1))
+                    (rope_row_dims ?e_hd ?e_hd2 ?e_seq ?e_hs ?e_ch)
+                    (rope_tensor_range ?heads ?e_hs ?cat_range)
+
+                    ; select(mask, x0g, 0) encoded as two scatters and a gather.
+                    (= ?mk0 (Op (Iota (MLt (MMod (MIter) ?e_hd) ?e_hd2) ?cat_range) (INil)))
+                    (= ?even0 (Op (Iota (MMul (MIter) (MNum 2)) ?cat_range) (INil)))
+                    (= ?odd0 (Op (Iota (MAdd (MMul (MIter) (MNum 2)) (MNum 1)) ?cat_range) (INil)))
+                    (= ?base0 (Op (Iota (MMul (MIter) (MNum 2)) ?cat_range) (INil)))
+                    (= ?pick0 (Op (Add ?cat_sh ?cat_st ?cat_st ?cat_st)
+                        (ICons ?base0 (ICons ?mk0 (INil)))))
+                    (= ?zero0 (Op (Cast ?zero0_size (Bf16)) (ICons ?zero0c (INil))))
+                    (= ?zero0c (Op (Constant 0.000000) (INil)))
+                    (= ?zeros0 (Op (Scatter ?packed_sh ?packed_st ?cat_sh ?cat_st ?zero_st)
+                        (ICons ?dest0 (ICons ?even0 (ICons ?zero0 (INil))))))
+                    (= ?packed0 (Op (Scatter ?packed_sh ?packed_st ?cat_sh ?cat_st ?cat_st)
+                        (ICons ?zeros0 (ICons ?odd0 (ICons ?x0g (INil))))))
+                    (= ?selected0 (Op (Gather ?cat_sh ?cat_st ?packed_sh ?packed_st)
+                        (ICons ?pick0 (ICons ?packed0 (INil)))))
+                )
+                (
+                    (rope_safe_pad_left ?selected0 ?x0out ?cat_sh
+                        ?e_hd ?e_hd2 ?e_seq)
+                )
+                :ruleset kernel_fuse_late
+                :name \"kernel rope IEEE-safe left pad\"
+            )
+            (rule
+                (
+                    (= ?cat_sh (ECons ?heads (ECons ?e_seq (ECons ?e_hd (ENil)))))
+                    (= ?cat_st (ECons (MMul (MMul (MIter) ?e_hd) ?e_seq)
+                        (ECons (MMul (MIter) ?e_hd) (ECons (MIter) (ENil)))))
+                    (= ?packed_sh (ECons ?heads (ECons ?e_seq
+                        (ECons ?e_hd (ECons (MNum 2) (ENil))))))
+                    (= ?packed_st (ECons (MMul (MMul (MMul (MIter) (MNum 2)) ?e_hd) ?e_seq)
+                        (ECons (MMul (MMul (MIter) (MNum 2)) ?e_hd)
+                            (ECons (MMul (MIter) (MNum 2)) (ECons (MIter) (ENil))))))
+                    (= ?zero_st (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil)))))
+
+                    ; The actual right half, clamped only in the inactive half.
+                    (= ?x1g (Op (Gather ?cat_sh ?cat_st ?x1_dsh ?x1_dstr)
+                        (ICons ?c1idx (ICons ?x1out (INil)))))
+                    (= ?c1idx (Op (Iota
+                        (MAdd (MAdd (MMax (MSub (MMod (MIter) ?e_hd) ?e_hd2) (MNum 0))
+                                    (MMul (MMod (MDiv (MIter) ?e_hd) ?e_seq) ?e_hd2))
+                              (MMul (MDiv (MIter) ?e_hs) ?e_ch))
+                        ?cat_range) (INil)))
+                    (rope_row_dims ?e_hd ?e_hd2 ?e_seq ?e_hs ?e_ch)
+                    (rope_tensor_range ?heads ?e_hs ?cat_range)
+
+                    ; select(mask, x1g, 0) with the complementary half mask.
+                    (= ?mk1 (Op (Iota (MGte (MMod (MIter) ?e_hd) ?e_hd2) ?cat_range) (INil)))
+                    (= ?even1 (Op (Iota (MMul (MIter) (MNum 2)) ?cat_range) (INil)))
+                    (= ?odd1 (Op (Iota (MAdd (MMul (MIter) (MNum 2)) (MNum 1)) ?cat_range) (INil)))
+                    (= ?base1 (Op (Iota (MMul (MIter) (MNum 2)) ?cat_range) (INil)))
+                    (= ?pick1 (Op (Add ?cat_sh ?cat_st ?cat_st ?cat_st)
+                        (ICons ?base1 (ICons ?mk1 (INil)))))
+                    (= ?zero1 (Op (Cast ?zero1_size (Bf16)) (ICons ?zero1c (INil))))
+                    (= ?zero1c (Op (Constant 0.000000) (INil)))
+                    (= ?zeros1 (Op (Scatter ?packed_sh ?packed_st ?cat_sh ?cat_st ?zero_st)
+                        (ICons ?dest1 (ICons ?even1 (ICons ?zero1 (INil))))))
+                    (= ?packed1 (Op (Scatter ?packed_sh ?packed_st ?cat_sh ?cat_st ?cat_st)
+                        (ICons ?zeros1 (ICons ?odd1 (ICons ?x1g (INil))))))
+                    (= ?selected1 (Op (Gather ?cat_sh ?cat_st ?packed_sh ?packed_st)
+                        (ICons ?pick1 (ICons ?packed1 (INil)))))
+                )
+                (
+                    (rope_safe_pad_right ?selected1 ?x1out ?cat_sh
+                        ?e_hd ?e_hd2 ?e_seq)
+                )
+                :ruleset kernel_fuse_late
+                :name \"kernel rope IEEE-safe right pad\"
+            )
+            (rule
+                (
+                    (rope_rotated ?x0out ?x1out ?x ?pos
+                        ?e_hd ?e_hd2 ?e_w ?e_seq ?ln_theta ?inv_hd)
+                    (rope_safe_pad_left ?selected0 ?x0out ?cat_sh
+                        ?e_hd ?e_hd2 ?e_seq)
+                    (rope_safe_pad_right ?selected1 ?x1out ?cat_sh
+                        ?e_hd ?e_hd2 ?e_seq)
+                    (= ?cat (Op (Add ?cat_sh ?cat_st0 ?cat_st1 ?cat_out_st)
+                        (ICons ?selected0 (ICons ?selected1 (INil)))))
+                    (= ?cat_sh (ECons ?heads (ECons ?seqd (ECons ?hdd (ENil)))))
+                    (= ?hdd ?e_hd)
+                    (= ?seqd ?e_seq)
+                )
+                (
+                    (let ?kr (Op (KernelRoPE ?cat_sh (MMul ?heads ?e_hd)
+                        (MMul ?e_hd ?e_seq) ?e_w ?ln_theta ?inv_hd)
+                        (ICons ?x (ICons ?pos (INil)))))
+                    (union ?cat ?kr)
+                    (set (dtype ?kr) (Bf16))
+                )
+                :ruleset kernel_fuse_late
+                :name \"kernel rope IEEE-safe concat\"
+            )";
         vec![Rule::raw(format!(
-            "{angle_stage}\n{rotation_stage}\n{concat_rule}"
+            "{angle_stage}\n{rotation_stage}\n{concat_rule}\n{safe_concat_stage}"
         ))]
     }
 
