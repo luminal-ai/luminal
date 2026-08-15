@@ -72,6 +72,22 @@ fn compile_shader(device: &Device, source: &str, function_name: &str) -> Compute
         })
 }
 
+fn reduction_thread_count(pipeline: &ComputePipelineState, reduction_len: usize) -> usize {
+    let simd_width = usize::try_from(pipeline.thread_execution_width())
+        .expect("Metal SIMD width does not fit usize")
+        .max(1);
+    let pipeline_limit = usize::try_from(pipeline.max_total_threads_per_threadgroup())
+        .expect("Metal threadgroup limit does not fit usize");
+    let preferred_limit = 256usize.max(simd_width).min(pipeline_limit);
+    let aligned_limit = (preferred_limit / simd_width) * simd_width;
+    assert!(
+        aligned_limit > 0,
+        "Metal reduction pipeline cannot launch one SIMD group"
+    );
+
+    reduction_len.max(1).min(aligned_limit).div_ceil(simd_width) * simd_width
+}
+
 pub(crate) fn lower_expression_for_metal(expr: &Expression, index_var: &str) -> String {
     expr.to_kernel_with(index_var, &|symbol| {
         format!("dyn[{}]", super::dyn_slot(symbol))
@@ -1027,41 +1043,44 @@ impl MetalKernelOp for MetalSumReduce {
             #include <metal_stdlib>
             using namespace metal;
 
-            #define THREADS_PER_GROUP 256
-
             kernel void mkernel(
                 const device {input_ty} *in [[buffer(0)]],
                 device {output_ty} *out [[buffer(1)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
+                constant uint &thread_count [[buffer({thread_count_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simd_group [[simdgroup_index_in_threadgroup]],
+                uint simd_width [[threads_per_simdgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float partials[THREADS_PER_GROUP];
+                threadgroup float partials[256];
 
                 int in_start = {in_idx};
                 int iters = {iters};
                 (void)dyn;
 
                 float sum = 0.0f;
-                for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
+                for (int i = tid; i < iters; i += thread_count) {{
                     sum += {in_val};
                 }}
 
-                partials[tid] = sum;
+                const float simd_total = simd_sum(sum);
+                if (lane == 0) partials[simd_group] = simd_total;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
-                    if (tid < stride) {{
-                        partials[tid] += partials[tid + stride];
-                    }}
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                }}
 
-                if (tid == 0) {{
-                    float block_sum = partials[0];
-                    out[{out_idx}] = {out_val};
+                if (simd_group == 0) {{
+                    const uint simd_groups =
+                        (thread_count + simd_width - 1) / simd_width;
+                    float block_sum = 0.0f;
+                    for (uint group = lane; group < simd_groups; group += simd_width) {{
+                        block_sum += partials[group];
+                    }}
+                    block_sum = simd_sum(block_sum);
+                    if (lane == 0) out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
@@ -1071,6 +1090,7 @@ impl MetalKernelOp for MetalSumReduce {
             out_val = out_val,
             dyn_buffer_index = 2u64,
             n_outputs_index = 3u64,
+            thread_count_index = 4u64,
         );
         Some(compile_shader(device, &source, "mkernel"))
     }
@@ -1102,8 +1122,14 @@ impl MetalKernelOp for MetalSumReduce {
             &n_outputs as *const u32 as *const _,
         );
 
-        // One threadgroup per output element
-        let thread_group_size = MTLSize::new(256, 1, 1);
+        let reduction_len = self.iters.exec(dyn_map).unwrap_or(256);
+        let threads = reduction_thread_count(pipeline, reduction_len) as u32;
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &threads as *const u32 as *const _,
+        );
+        let thread_group_size = MTLSize::new(threads as u64, 1, 1);
         let thread_groups = MTLSize::new(n_outputs as u64, 1, 1);
         encoder.dispatch_thread_groups(thread_groups, thread_group_size);
     }
@@ -1198,7 +1224,6 @@ impl MetalKernelOp for MetalMaxReduce {
             #include <metal_stdlib>
             using namespace metal;
 
-            #define THREADS_PER_GROUP 256
             #define NEG_INF_F (-INFINITY)
 
             kernel void mkernel(
@@ -1206,34 +1231,39 @@ impl MetalKernelOp for MetalMaxReduce {
                 device {output_ty} *out [[buffer(1)]],
                 constant int *dyn [[buffer({dyn_buffer_index})]],
                 constant uint &n_outputs [[buffer({n_outputs_index})]],
+                constant uint &thread_count [[buffer({thread_count_index})]],
                 uint gid [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]]
+                uint tid [[thread_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simd_group [[simdgroup_index_in_threadgroup]],
+                uint simd_width [[threads_per_simdgroup]]
             ) {{
                 if (gid >= n_outputs) return;
 
-                threadgroup float partials[THREADS_PER_GROUP];
+                threadgroup float partials[256];
 
                 int in_start = {in_idx};
                 int iters = {iters};
                 (void)dyn;
 
                 float max_val = NEG_INF_F;
-                for (int i = tid; i < iters; i += THREADS_PER_GROUP) {{
+                for (int i = tid; i < iters; i += thread_count) {{
                     max_val = fmax(max_val, {in_val});
                 }}
 
-                partials[tid] = max_val;
+                const float simd_maximum = simd_max(max_val);
+                if (lane == 0) partials[simd_group] = simd_maximum;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {{
-                    if (tid < stride) {{
-                        partials[tid] = fmax(partials[tid], partials[tid + stride]);
-                    }}
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                }}
 
-                if (tid == 0) {{
-                    float block_max = partials[0];
-                    out[{out_idx}] = {out_val};
+                if (simd_group == 0) {{
+                    const uint simd_groups =
+                        (thread_count + simd_width - 1) / simd_width;
+                    float block_max = NEG_INF_F;
+                    for (uint group = lane; group < simd_groups; group += simd_width) {{
+                        block_max = fmax(block_max, partials[group]);
+                    }}
+                    block_max = simd_max(block_max);
+                    if (lane == 0) out[{out_idx}] = {out_val};
                 }}
             }}
             "#,
@@ -1243,6 +1273,7 @@ impl MetalKernelOp for MetalMaxReduce {
             out_val = out_val,
             dyn_buffer_index = 2u64,
             n_outputs_index = 3u64,
+            thread_count_index = 4u64,
         );
         Some(compile_shader(device, &source, "mkernel"))
     }
@@ -1274,7 +1305,14 @@ impl MetalKernelOp for MetalMaxReduce {
             &n_outputs as *const u32 as *const _,
         );
 
-        let thread_group_size = MTLSize::new(256, 1, 1);
+        let reduction_len = self.iters.exec(dyn_map).unwrap_or(256);
+        let threads = reduction_thread_count(pipeline, reduction_len) as u32;
+        encoder.set_bytes(
+            4,
+            std::mem::size_of::<u32>() as u64,
+            &threads as *const u32 as *const _,
+        );
+        let thread_group_size = MTLSize::new(threads as u64, 1, 1);
         let thread_groups = MTLSize::new(n_outputs as u64, 1, 1);
         encoder.dispatch_thread_groups(thread_groups, thread_group_size);
     }

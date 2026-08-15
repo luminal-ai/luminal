@@ -685,6 +685,37 @@ fn metal_simple_max_reduce() {
 }
 
 #[test]
+fn metal_reductions_cover_simd_boundaries() {
+    const ROWS: usize = 2;
+
+    for cols in [17, 33, 65, 257, 1025] {
+        let mut cx = Graph::default();
+        let input = cx.tensor((ROWS, cols));
+        let sum_output = input.sum(1).output();
+        let max_output = input.max(1).output();
+        let input_data = seeded_data(ROWS * cols, 2.0, -1.0);
+        let expected_sum = input_data
+            .chunks_exact(cols)
+            .map(|row| row.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let expected_max = input_data
+            .chunks_exact(cols)
+            .map(|row| row.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+            .collect::<Vec<_>>();
+
+        cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+        let mut rt = MetalRuntime::initialize(());
+        rt.set_data(input, &input_data);
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+        rt.allocate_intermediate_buffers(&cx.dyn_map);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(&rt.get_f32(sum_output), &expected_sum, 0.001);
+        assert_close(&rt.get_f32(max_output), &expected_max, 0.001);
+    }
+}
+
+#[test]
 fn metal_f16_cast_roundtrip() {
     let mut cx = Graph::default();
     let input = cx.tensor(4);
