@@ -40,6 +40,7 @@ pub type MetalOps = (
     // Reduce ops
     MetalSumReduce,
     MetalMaxReduce,
+    MetalRMSNorm,
     // Matrix ops
     MPSMatmul,
     MPSBatchedMatmul,
@@ -391,6 +392,359 @@ metal_unary_op!(MetalLog2, "MetalLog2", |x: &str| format!("log2({x})"));
 metal_unary_op!(MetalSin, "MetalSin", |x: &str| format!("sin({x})"));
 metal_unary_op!(MetalSqrt, "MetalSqrt", |x: &str| format!("sqrt({x})"));
 metal_unary_op!(MetalRecip, "MetalRecip", |x: &str| format!("1.0f / ({x})"));
+
+#[derive(Debug, Clone)]
+pub struct MetalRMSNorm {
+    rows: Expression,
+    cols: usize,
+    eps: f32,
+}
+
+impl Default for MetalRMSNorm {
+    fn default() -> Self {
+        Self {
+            rows: Expression::from(0),
+            cols: 0,
+            eps: 0.0,
+        }
+    }
+}
+
+impl EgglogOp for MetalRMSNorm {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "MetalRMSNorm",
+            &[("out_shape", ELIST), ("eps", F64)],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        2
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![Rule::raw(
+            "(relation metal_rms_rinv (IR IR f64 Expression Expression))
+            (rule
+                (
+                    (= (F32) (dtype ?x))
+                    (= ?sq (Op (MetalMul ?sq_shape ?sq_a ?sq_b ?sq_o)
+                        (ICons ?x (ICons ?x2 (INil)))))
+                    (= ?x ?x2)
+                    (= ?sq_shape (ECons ?rows (ECons ?cols (ENil))))
+                    (= ?cols (MNum ?cols_n))
+                    (= ?sq_a
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+                    (= ?sq_b
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+                    (= ?sq_o
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+                    (= ?sum (Op (MetalSum ?sum_shape ?cols ?sum_in (MIter) ?sum_out)
+                        (ICons ?sq (INil))))
+                    (= ?sum_shape (ECons ?rows (ENil)))
+                    (= ?sum_in (ECons (MMul (MIter) ?cols) (ENil)))
+                    (= ?sum_out (ECons (MIter) (ENil)))
+
+                    (= ?mean (Op (MetalMul ?mn_shape ?mn_a ?mn_b ?mn_o)
+                        (ICons ?sum (ICons ?rcpn (INil)))))
+                    (= ?mn_shape (ECons ?rows (ENil)))
+                    (= ?mn_a (ECons (MIter) (ENil)))
+                    (= ?mn_b (ECons (MIter) (ENil)))
+                    (= ?mn_o (ECons (MIter) (ENil)))
+                    (= ?rcpn (Op (MetalRecip ?rn_shape ?rn_in ?rn_out)
+                        (ICons ?ncast (INil))))
+                    (= ?rn_shape (ECons ?rows (ENil)))
+                    (= ?rn_in (ECons (MNum 0) (ENil)))
+                    (= ?rn_out (ECons (MIter) (ENil)))
+                    (= ?ncast (MetalCast ?ncst ?nc_size (F32)))
+                    (= ?ncst (MetalIota ?cols2 ?nc_range))
+                    (= ?nc_size (MNum 1))
+                    (= ?nc_range (MNum 1))
+                    (= ?cols ?cols2)
+
+                    (= ?plus_eps (Op (MetalAdd ?pe_shape ?pe_a ?pe_b ?pe_o)
+                        (ICons ?mean (ICons ?eps_const (INil)))))
+                    (= ?pe_shape (ECons ?rows (ENil)))
+                    (= ?pe_a (ECons (MIter) (ENil)))
+                    (= ?pe_b (ECons (MNum 0) (ENil)))
+                    (= ?pe_o (ECons (MIter) (ENil)))
+                    (= ?eps_const (MetalConstant ?eps))
+                    (= ?sqrt (Op (MetalSqrt ?sqrt_shape ?sqrt_in ?sqrt_out)
+                        (ICons ?plus_eps (INil))))
+                    (= ?sqrt_shape (ECons ?rows (ENil)))
+                    (= ?sqrt_in (ECons (MIter) (ENil)))
+                    (= ?sqrt_out (ECons (MIter) (ENil)))
+                    (= ?rinv (Op (MetalRecip ?ri_shape ?ri_in ?ri_out)
+                        (ICons ?sqrt (INil))))
+                    (= ?ri_shape (ECons ?rows (ENil)))
+                    (= ?ri_in (ECons (MIter) (ENil)))
+                    (= ?ri_out (ECons (MIter) (ENil)))
+                )
+                ((metal_rms_rinv ?rinv ?x ?eps ?rows ?cols))
+                :ruleset kernel_fuse_late_pre
+                :name \"metal rms inverse root mean square\"
+            )
+            (rule
+                (
+                    (metal_rms_rinv ?rinv ?x ?eps ?rows ?cols)
+
+                    (= ?norm (Op (MetalMul ?norm_shape ?norm_a ?norm_b ?norm_o)
+                        (ICons ?rinv (ICons ?x3 (INil)))))
+                    (= ?x ?x3)
+                    (= ?norm_shape (ECons ?rows (ECons ?cols (ENil))))
+                    (= ?norm_a (ECons (MIter) (ECons (MNum 0) (ENil))))
+                    (= ?norm_b
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+                    (= ?norm_o
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+
+                    (= ?weighted (Op (MetalMul ?out_shape ?weighted_a ?weighted_b ?weighted_o)
+                        (ICons ?norm (ICons ?weight (INil)))))
+                    (= (F32) (dtype ?weight))
+                    (= ?out_shape (ECons ?rows (ECons ?cols (ENil))))
+                    (= ?weighted_a
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+                    (= ?weighted_b (ECons (MNum 0) (ECons (MIter) (ENil))))
+                    (= ?weighted_o
+                        (ECons (MMul (MIter) ?cols) (ECons (MIter) (ENil))))
+                )
+                (
+                    (let ?rms (Op (MetalRMSNorm ?out_shape ?eps)
+                        (ICons ?x (ICons ?weight (INil)))))
+                    (union ?weighted ?rms)
+                    (set (dtype ?rms) (F32))
+                )
+                :ruleset kernel_fuse_late
+                :name \"metal fused rms norm f32 2d\"
+            )",
+        )]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let out_shape = luminal::egglog_utils::extract_expr_list(
+            egraph,
+            kind_children[0],
+            list_cache,
+            expr_cache,
+        )
+        .unwrap();
+        assert_eq!(out_shape.len(), 2, "Metal RMSNorm output must be 2-D");
+        let eps: f64 = egraph.enodes[kind_children[1]]
+            .0
+            .replace('"', "")
+            .parse()
+            .unwrap();
+        let rows = out_shape[0];
+        let cols = out_shape[1]
+            .to_usize()
+            .expect("Metal RMSNorm's last dimension must be static");
+        (
+            LLIROp::new::<dyn MetalKernelOp>(Box::new(Self {
+                rows,
+                cols,
+                eps: eps as f32,
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl MetalKernelOp for MetalRMSNorm {
+    fn compile(
+        &self,
+        device: &Device,
+        input_dtypes: &[DType],
+        output_dtype: DType,
+    ) -> Option<ComputePipelineState> {
+        let input_dtype = input_dtypes.first().copied().unwrap_or(DType::F32);
+        let weight_dtype = input_dtypes.get(1).copied().unwrap_or(DType::F32);
+        let input_ty = metal_buffer_type(input_dtype);
+        let weight_ty = metal_buffer_type(weight_dtype);
+        let output_ty = metal_buffer_type(output_dtype);
+        let x_val = metal_numeric_read(input_dtype, "x", "base + col");
+        let weight_val = metal_numeric_read(weight_dtype, "weight", "col");
+        let output_val = metal_numeric_write(
+            output_dtype,
+            &format!("({x_val}) * inv_rms * ({weight_val})"),
+        );
+        let cols = self.cols;
+        let eps_bits = self.eps.to_bits();
+        let eps_literal = format!("as_type<float>(0x{eps_bits:08x}u)");
+
+        let vectors_per_thread = cols / (256 * 4);
+        let source = if input_dtype == DType::F32
+            && weight_dtype == DType::F32
+            && output_dtype == DType::F32
+            && cols.is_multiple_of(256 * 4)
+            && vectors_per_thread > 0
+            && vectors_per_thread <= 4
+        {
+            format!(
+                r#"
+                #include <metal_stdlib>
+                using namespace metal;
+
+                #define THREADS_PER_GROUP 256
+                #define VECTORS_PER_THREAD {vectors_per_thread}
+
+                kernel void rms_norm(
+                    const device float4 *x [[buffer(0)]],
+                    const device float4 *weight [[buffer(1)]],
+                    device float4 *out [[buffer(2)]],
+                    uint row [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint simd_group [[simdgroup_index_in_threadgroup]],
+                    uint simd_width [[threads_per_simdgroup]]
+                ) {{
+                    threadgroup float partials[256];
+                    const uint base = row * ({cols} / 4);
+                    float4 values[VECTORS_PER_THREAD];
+                    float sum = 0.0f;
+
+                    for (uint item = 0; item < VECTORS_PER_THREAD; ++item) {{
+                        const uint col = tid + item * THREADS_PER_GROUP;
+                        const float4 value = x[base + col];
+                        values[item] = value;
+                        sum += dot(value, value);
+                    }}
+
+                    const float simd_total = simd_sum(sum);
+                    if (lane == 0) partials[simd_group] = simd_total;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    if (simd_group == 0) {{
+                        const uint simd_groups =
+                            (THREADS_PER_GROUP + simd_width - 1) / simd_width;
+                        float total = 0.0f;
+                        for (uint group = lane; group < simd_groups; group += simd_width) {{
+                            total += partials[group];
+                        }}
+                        total = simd_sum(total);
+                        if (lane == 0) {{
+                            partials[0] = rsqrt(total / float({cols}) + {eps_literal});
+                        }}
+                    }}
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    const float inv_rms = partials[0];
+                    for (uint item = 0; item < VECTORS_PER_THREAD; ++item) {{
+                        const uint col = tid + item * THREADS_PER_GROUP;
+                        out[base + col] = values[item] * inv_rms * weight[col];
+                    }}
+                }}
+                "#,
+            )
+        } else {
+            format!(
+                r#"
+            #include <metal_stdlib>
+            using namespace metal;
+
+            #define THREADS_PER_GROUP 256
+
+            kernel void rms_norm(
+                const device {input_ty} *x [[buffer(0)]],
+                const device {weight_ty} *weight [[buffer(1)]],
+                device {output_ty} *out [[buffer(2)]],
+                uint row [[threadgroup_position_in_grid]],
+                uint tid [[thread_index_in_threadgroup]],
+                uint lane [[thread_index_in_simdgroup]],
+                uint simd_group [[simdgroup_index_in_threadgroup]],
+                uint simd_width [[threads_per_simdgroup]]
+            ) {{
+                threadgroup float partials[256];
+                const uint base = row * {cols};
+                float sum = 0.0f;
+                for (uint col = tid; col < {cols}; col += THREADS_PER_GROUP) {{
+                    float value = {x_val};
+                    sum += value * value;
+                }}
+
+                const float simd_total = simd_sum(sum);
+                if (lane == 0) partials[simd_group] = simd_total;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (simd_group == 0) {{
+                    const uint simd_groups =
+                        (THREADS_PER_GROUP + simd_width - 1) / simd_width;
+                    float total = 0.0f;
+                    for (uint group = lane; group < simd_groups; group += simd_width) {{
+                        total += partials[group];
+                    }}
+                    total = simd_sum(total);
+                    if (lane == 0) {{
+                        partials[0] = rsqrt(total / float({cols}) + {eps_literal});
+                    }}
+                }}
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float inv_rms = partials[0];
+
+                for (uint col = tid; col < {cols}; col += THREADS_PER_GROUP) {{
+                    out[base + col] = {output_val};
+                }}
+            }}
+            "#,
+            )
+        };
+        Some(compile_shader(device, &source, "rms_norm"))
+    }
+
+    fn output_size(&self) -> Expression {
+        self.rows * self.cols
+    }
+
+    fn encode_compute(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipeline: &ComputePipelineState,
+        inputs: &[&Buffer],
+        output: &Buffer,
+        dyn_map: &DynMap,
+    ) {
+        assert_eq!(inputs.len(), 2, "MetalRMSNorm expects x and weight");
+        let rows = self.rows.exec(dyn_map).unwrap() as u64;
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(inputs[0]), 0);
+        encoder.set_buffer(1, Some(inputs[1]), 0);
+        encoder.set_buffer(2, Some(output), 0);
+        encoder.dispatch_thread_groups(MTLSize::new(rows, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    fn bytes_loaded(&self, dyn_map: &DynMap) -> usize {
+        let elements = self.output_size().exec(dyn_map).unwrap_or(0);
+        let vectors_per_thread = self.cols / (256 * 4);
+        let inputs_per_element = if self.cols.is_multiple_of(256 * 4)
+            && vectors_per_thread > 0
+            && vectors_per_thread <= 4
+        {
+            2
+        } else {
+            3
+        };
+        elements * inputs_per_element * std::mem::size_of::<f32>()
+    }
+
+    fn bytes_stored(&self, dyn_map: &DynMap) -> usize {
+        self.output_size().exec(dyn_map).unwrap_or(0) * std::mem::size_of::<f32>()
+    }
+
+    fn flops(&self, dyn_map: &DynMap) -> usize {
+        self.output_size().exec(dyn_map).unwrap_or(0) * 4
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct MetalAdd {
