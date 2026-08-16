@@ -894,12 +894,30 @@ impl EgglogOp for KernelRoPE {
             (relation rope_rotated (IR IR IR IR Expression Expression Expression Expression f64 f64))
             (relation rope_safe_pad_left (IR IR EList Expression Expression Expression))
             (relation rope_safe_pad_right (IR IR EList Expression Expression Expression))
+            (relation rope_row_dims_candidate (Expression Expression Expression Expression Expression))
             (relation rope_row_dims (Expression Expression Expression Expression Expression))
+            (relation rope_tensor_range_candidate (Expression Expression Expression))
             (relation rope_tensor_range (Expression Expression Expression))
+            ; Seed dimension proofs only from the distinctive offset-half
+            ; gather used by RoPE.  Unanchored numeric-product rules form a
+            ; combinatorial join over every dimension in large models.
+            (rule
+                (
+                    (= ?x1idx (Op (Iota
+                        (MAdd (MAdd (MAdd (MMod (MIter) ?hd2) ?hd2)
+                                    (MMul (MMod (MDiv (MIter) ?hd2) ?seq) ?hd))
+                              (MMul (MDiv (MIter) ?ch) ?hs))
+                        ?range) (INil)))
+                )
+                ((rope_row_dims_candidate ?hd ?hd2 ?seq ?hs ?ch))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope row dimension candidate\"
+            )
             ; Static dimensions are folded before specialization, so prove
             ; their products in egglog's i64 domain.
             (rule
                 (
+                    (rope_row_dims_candidate ?hd ?hd2 ?seq ?hs ?ch)
                     (= ?hd (MNum ?hd_n))
                     (= ?hd2 (MNum ?hd2_n))
                     (= ?seq (MNum ?seq_n))
@@ -917,6 +935,7 @@ impl EgglogOp for KernelRoPE {
             ; live. Accept either canonical operand order.
             (rule
                 (
+                    (rope_row_dims_candidate ?hd ?hd2 ?seq ?hs ?ch)
                     (= ?hd (MNum ?hd_n))
                     (= ?hd2 (MNum ?hd2_n))
                     (= ?hd_n (* ?hd2_n 2))
@@ -929,6 +948,7 @@ impl EgglogOp for KernelRoPE {
             )
             (rule
                 (
+                    (rope_row_dims_candidate ?hd ?hd2 ?seq ?hs ?ch)
                     (= ?hd (MNum ?hd_n))
                     (= ?hd2 (MNum ?hd2_n))
                     (= ?hd_n (* ?hd2_n 2))
@@ -939,8 +959,25 @@ impl EgglogOp for KernelRoPE {
                 :ruleset kernel_fuse_late
                 :name \"kernel rope symbolic row dimensions commuted\"
             )
+            ; The concat gather binds the tensor shape to the same flat range.
             (rule
                 (
+                    (= ?cat_sh (ECons ?heads (ECons ?seq (ECons ?hd (ENil)))))
+                    (= ?x0g (Op (Gather ?cat_sh ?cat_st ?x0_dsh ?x0_dstr)
+                        (ICons ?c0idx (ICons ?x0out (INil)))))
+                    (= ?c0idx (Op (Iota
+                        (MAdd (MAdd (MMin (MMod (MIter) ?hd) ?hdm1)
+                                    (MMul (MMod (MDiv (MIter) ?hd) ?seq) ?hd2))
+                              (MMul (MDiv (MIter) ?hs) ?ch))
+                        ?range) (INil)))
+                )
+                ((rope_tensor_range_candidate ?heads ?hs ?range))
+                :ruleset kernel_fuse_late
+                :name \"kernel rope tensor range candidate\"
+            )
+            (rule
+                (
+                    (rope_tensor_range_candidate ?heads ?hs ?range)
                     (= ?heads (MNum ?heads_n))
                     (= ?hs (MNum ?hs_n))
                     (= ?range (MNum ?range_n))
@@ -952,6 +989,7 @@ impl EgglogOp for KernelRoPE {
             )
             (rule
                 (
+                    (rope_tensor_range_candidate ?heads ?hs ?range)
                     (= ?range (MMul ?heads ?hs))
                 )
                 ((rope_tensor_range ?heads ?hs ?range))
@@ -960,6 +998,7 @@ impl EgglogOp for KernelRoPE {
             )
             (rule
                 (
+                    (rope_tensor_range_candidate ?heads ?hs ?range)
                     (= ?range (MMul ?hs ?heads))
                 )
                 ((rope_tensor_range ?heads ?hs ?range))
@@ -1067,14 +1106,13 @@ impl EgglogOp for KernelRoPE {
                               (MMul (MDiv (MIter) ?e_ch) ?e_hs2))
                         ?x1_range) (INil)))
 
-                    ; Exact half split and row pitches.  This relation proves
-                    ; the contract for both folded and symbolic dimensions.
                     (rope_row_dims ?e_hd ?e_hd2 ?e_seq ?e_hs2 ?e_ch)
 
                     (= (Bf16) (dtype ?x))
                 )
                 (
-                    (rope_rotated ?x0out ?x1out ?x ?pos ?e_hd ?e_hd2 ?e_w ?e_seq ?ln_theta ?inv_hd)
+                    (rope_rotated ?x0out ?x1out ?x ?pos
+                        ?e_hd ?e_hd2 ?e_w ?e_seq ?ln_theta ?inv_hd)
                 )
                 :ruleset kernel_fuse_late
                 :name \"kernel rope rotation stage\"
@@ -1138,7 +1176,7 @@ impl EgglogOp for KernelRoPE {
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
                 )
-                :ruleset kernel_fuse_late
+                :ruleset kernel_fuse_late2
                 :name \"kernel rope half bf16\"
             )",
             segments.join("\n")
@@ -1274,7 +1312,7 @@ impl EgglogOp for KernelRoPE {
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
                 )
-                :ruleset kernel_fuse_late
+                :ruleset kernel_fuse_late2
                 :name \"kernel rope IEEE-safe concat\"
             )";
         vec![Rule::raw(format!(

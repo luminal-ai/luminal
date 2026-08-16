@@ -709,6 +709,40 @@ fn flattened_dynamic_row_gather_embed_candidates_are_equivalent() {
 }
 
 #[test]
+fn scalar_gather_has_a_kernel_lowering() {
+    let mut cx = Graph::default();
+    let data = cx.tensor(4);
+    let scalar_index = cx.iota(2, ());
+    let _output = data.gather(scalar_index).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        !op_ir_nodes(egraph, "KernelGather").is_empty(),
+        "rank-zero gather outputs must lower with an empty row-major stride list"
+    );
+}
+
+#[test]
+fn f64_add_zero_has_a_complete_kernel_lowering() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(4).as_dtype(DType::F64);
+    let zero = cx.constant_float64(0.0).expand_rhs(input.shape);
+    let _output = (input + zero).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+    assert!(
+        !op_ir_nodes(egraph, "KernelConstant").is_empty(),
+        "native F64 constants must lower without narrowing through F32"
+    );
+    assert!(
+        !op_ir_nodes(egraph, "CudaBinaryElementwise").is_empty(),
+        "F64 add must retain a selectable CUDA elementwise lowering"
+    );
+}
+
+#[test]
 fn kernel_embed_rejects_noncontiguous_index_view() {
     // Keep the dimensions square so permuting the complete index grid preserves
     // its [batch, width] shape. The producer Add is contiguous, but Gather reads

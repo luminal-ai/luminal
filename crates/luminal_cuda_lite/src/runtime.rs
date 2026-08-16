@@ -611,6 +611,14 @@ impl CudaRuntime {
         bucket.arena_pool = arena.pool;
     }
 
+    fn release_bucket_cuda_graphs(&self, bucket_idx: usize) {
+        for exec_op in self.compiled_buckets[bucket_idx].exec_graph.node_weights() {
+            if let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                cuda_graph.release_materialization();
+            }
+        }
+    }
+
     fn release_all_arenas(&mut self) {
         let mut releases = ArenaReleasePlan::default();
         if let Some(arena) = self.persistent_arena.take() {
@@ -1510,6 +1518,51 @@ impl CudaRuntime {
             .into_iter()
             .map(|b| b != 0)
             .collect()
+    }
+
+    /// Read an output buffer as i8 without widening at the read boundary.
+    pub fn get_i8(&self, id: impl ToId) -> Vec<i8> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        assert_eq!(
+            buf_dtype,
+            Some(DType::I8),
+            "get_i8: buffer dtype is {buf_dtype:?}, expected I8"
+        );
+        self.get_output_data(id)
+            .into_iter()
+            .map(|byte| byte as i8)
+            .collect()
+    }
+
+    /// Read an output buffer as u8 without widening at the read boundary.
+    pub fn get_u8(&self, id: impl ToId) -> Vec<u8> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        assert_eq!(
+            buf_dtype,
+            Some(DType::U8),
+            "get_u8: buffer dtype is {buf_dtype:?}, expected U8"
+        );
+        self.get_output_data(id)
+    }
+
+    /// Read an output buffer as i16 without widening at the read boundary.
+    pub fn get_i16(&self, id: impl ToId) -> Vec<i16> {
+        let id = id.to_id();
+        let data_id = self.resolve_data_node(id);
+        let buf_dtype = self.active().buffer_specs.get(&data_id).map(|s| s.dtype);
+        assert_eq!(
+            buf_dtype,
+            Some(DType::I16),
+            "get_i16: buffer dtype is {buf_dtype:?}, expected I16"
+        );
+        self.get_output_data(id)
+            .chunks_exact(2)
+            .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]]))
+            .collect_vec()
     }
 
     pub fn get_i32(&self, id: impl ToId) -> Vec<i32> {
@@ -4161,6 +4214,11 @@ impl Runtime for CudaRuntime {
                 // graph-specific bindings are discarded.
                 let old = self.active_bucket;
                 self.park_bucket_arena(old);
+                // Keeping both buckets' instantiated CUDA graphs resident can
+                // exhaust driver memory on large MoE models even though their
+                // tensor arenas are shared. The inactive bucket is rebuilt if
+                // it is selected again.
+                self.release_bucket_cuda_graphs(old);
                 self.active_bucket = idx;
                 self.attach_persistent_arena(idx);
                 // Mark bucket as needing HLIR sync since it may have missed changes

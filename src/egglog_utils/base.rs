@@ -1304,6 +1304,7 @@ fn base_expression_egglog_impl(use_interval_analysis: bool) -> String {
     );
 
     // RowMajor rules (z-strides: base stride is MIter/'z', not 1)
+    p.add_rule(rewrite("rowmajor-empty", rowmajor(nil()), nil()).ruleset("expr"));
     p.add_rule(
         Rule::new()
             .facts(vec![

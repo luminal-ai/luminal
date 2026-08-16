@@ -35,6 +35,15 @@ impl DynBackend for CudaLiteDynBackend {
     fn get_output_bf16(&self, node: NodeIndex) -> Vec<half::bf16> {
         self.runtime.get_bf16(node)
     }
+    fn get_output_i8(&self, node: NodeIndex) -> Vec<i8> {
+        self.runtime.get_i8(node)
+    }
+    fn get_output_u8(&self, node: NodeIndex) -> Vec<u8> {
+        self.runtime.get_u8(node)
+    }
+    fn get_output_i16(&self, node: NodeIndex) -> Vec<i16> {
+        self.runtime.get_i16(node)
+    }
     fn get_output_i32(&self, node: NodeIndex) -> Vec<i32> {
         self.runtime.get_i32(node)
     }

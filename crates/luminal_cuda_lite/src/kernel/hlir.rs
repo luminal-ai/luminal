@@ -1804,7 +1804,7 @@ extern \"C\" {{
 
 #[derive(Default, Debug, Clone)]
 pub struct KernelConstant {
-    value: f32,
+    value: f64,
     dtype: DType,
 }
 
@@ -1832,6 +1832,15 @@ impl EgglogOp for KernelConstant {
             rule(union(hlir_op, kernel_op.clone()))
                 .set(dtype(kernel_op), app(&SORTS.f32_dt, vec![]))
                 .ruleset("kernel_lower"),
+            Rule::raw(
+                "(rule (
+                    (= ?c (Op (ConstantF64 ?val) (INil)))
+                 ) (
+                    (let ?kc (Op (KernelConstant ?val (F64)) (INil)))
+                    (union ?c ?kc)
+                    (set (dtype ?kc) (F64))
+                 ) :ruleset kernel_lower :name \"kernel-constant-f64\")",
+            ),
         ];
         // Fold an explicit Cast around a Constant into a dtype-typed
         // KernelConstant. HLIR constants are always F32 (the frontend emits
@@ -1841,7 +1850,7 @@ impl EgglogOp for KernelConstant {
         // F32 included: the frontend emits `constant(v).cast(F32)` identity
         // casts for scalars on f32 tensors; folding gives downstream rules a
         // constant-valued enode (see const_like) in the cast's eclass.
-        for dt in ["F16", "Bf16", "F32"] {
+        for dt in ["F16", "Bf16", "F32", "F64"] {
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?c (Op (Constant ?val) (INil)))
@@ -1873,7 +1882,7 @@ impl EgglogOp for KernelConstant {
                 value: egraph.enodes[kind_children[0]]
                     .0
                     .replace("\"", "")
-                    .parse::<f32>()
+                    .parse::<f64>()
                     .unwrap(),
                 dtype: extract_dtype(egraph, kind_children[1]),
             })),
@@ -1896,16 +1905,31 @@ impl KernelOp for KernelConstant {
         Expression,
         FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
-        let value_str = if self.value.is_nan() {
-            "__int_as_float(0x7fc00000)".to_string()
-        } else if self.value.is_infinite() {
-            if self.value > 0.0 {
-                "__int_as_float(0x7f800000)".to_string()
+        let value_str = if self.dtype == DType::F64 {
+            if self.value.is_nan() {
+                "__longlong_as_double(0x7ff8000000000000ULL)".to_string()
+            } else if self.value.is_infinite() {
+                if self.value > 0.0 {
+                    "__longlong_as_double(0x7ff0000000000000ULL)".to_string()
+                } else {
+                    "__longlong_as_double(0xfff0000000000000ULL)".to_string()
+                }
             } else {
-                "__int_as_float(0xff800000)".to_string()
+                format!("{:.17}", self.value)
             }
         } else {
-            format!("{:.10}f", self.value)
+            let value = self.value as f32;
+            if value.is_nan() {
+                "__int_as_float(0x7fc00000)".to_string()
+            } else if value.is_infinite() {
+                if value > 0.0 {
+                    "__int_as_float(0x7f800000)".to_string()
+                } else {
+                    "__int_as_float(0xff800000)".to_string()
+                }
+            } else {
+                format!("{value:.10}f")
+            }
         };
         let cuda_ty = cuda_dtype(self.dtype);
         let includes = dtype_includes(&[self.dtype]);
