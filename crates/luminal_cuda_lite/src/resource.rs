@@ -27,7 +27,7 @@ use luminal::{
         petgraph::{
             Direction,
             algo::toposort,
-            visit::{EdgeRef, IntoEdgeReferences},
+            visit::{EdgeRef, NodeIndexable},
         },
     },
 };
@@ -548,45 +548,73 @@ pub(crate) fn kernel_parameter_bytes(
 }
 
 fn resolve_alias(mut node: NodeIndex, aliases: &FxHashMap<NodeIndex, NodeIndex>) -> NodeIndex {
-    let mut visited = FxHashSet::default();
-    while visited.insert(node) {
-        let Some(next) = aliases.get(&node).copied() else {
-            break;
-        };
+    while let Some(next) = aliases.get(&node).copied() {
         node = next;
     }
     node
 }
 
-fn alias_version_includes(
-    mut version: NodeIndex,
-    ancestor: NodeIndex,
-    aliases: &FxHashMap<NodeIndex, NodeIndex>,
-) -> bool {
-    let mut visited = FxHashSet::default();
-    while visited.insert(version) {
-        if version == ancestor {
-            return true;
-        }
-        let Some(parent) = aliases.get(&version).copied() else {
-            break;
-        };
-        version = parent;
-    }
-    false
+struct AliasValidationAdjacency {
+    incoming_offsets: Vec<usize>,
+    incoming_sources: Vec<usize>,
+    outgoing_offsets: Vec<usize>,
+    outgoing_targets: Vec<usize>,
 }
 
-fn graph_ancestors(llir: &LLIRGraph, node: NodeIndex) -> FxHashSet<NodeIndex> {
-    let mut ancestors = FxHashSet::default();
-    let mut pending = llir
-        .neighbors_directed(node, Direction::Incoming)
-        .collect_vec();
-    while let Some(current) = pending.pop() {
-        if ancestors.insert(current) {
-            pending.extend(llir.neighbors_directed(current, Direction::Incoming));
+impl AliasValidationAdjacency {
+    fn new(llir: &LLIRGraph, node_bound: usize) -> Self {
+        let mut incoming_offsets = vec![0usize; node_bound + 1];
+        let mut outgoing_offsets = vec![0usize; node_bound + 1];
+        for edge in llir.edge_indices() {
+            let (source, target) = llir
+                .edge_endpoints(edge)
+                .expect("a live LLIR edge must have endpoints");
+            incoming_offsets[target.index() + 1] += 1;
+            outgoing_offsets[source.index() + 1] += 1;
+        }
+        for index in 1..=node_bound {
+            incoming_offsets[index] += incoming_offsets[index - 1];
+            outgoing_offsets[index] += outgoing_offsets[index - 1];
+        }
+
+        let mut incoming_cursor = incoming_offsets[..node_bound].to_vec();
+        let mut outgoing_cursor = outgoing_offsets[..node_bound].to_vec();
+        let mut incoming_sources = vec![usize::MAX; llir.edge_count()];
+        let mut outgoing_targets = vec![usize::MAX; llir.edge_count()];
+        // StableGraph yields live edge indices in ascending order. Filling the
+        // incoming table in that order preserves the LLIR input-position
+        // contract without sorting every alias node independently.
+        for edge in llir.edge_indices() {
+            let (source, target) = llir
+                .edge_endpoints(edge)
+                .expect("a live LLIR edge must have endpoints");
+            incoming_sources[incoming_cursor[target.index()]] = source.index();
+            incoming_cursor[target.index()] += 1;
+            outgoing_targets[outgoing_cursor[source.index()]] = target.index();
+            outgoing_cursor[source.index()] += 1;
+        }
+
+        Self {
+            incoming_offsets,
+            incoming_sources,
+            outgoing_offsets,
+            outgoing_targets,
         }
     }
-    ancestors
+
+    fn incoming(&self, node: usize) -> &[usize] {
+        &self.incoming_sources[self.incoming_offsets[node]..self.incoming_offsets[node + 1]]
+    }
+
+    fn outgoing(&self, node: usize) -> &[usize] {
+        &self.outgoing_targets[self.outgoing_offsets[node]..self.outgoing_offsets[node + 1]]
+    }
+}
+
+struct MutatingAlias {
+    node: usize,
+    base: usize,
+    name: &'static str,
 }
 
 /// Prove that each selected mutating alias sees an exclusive logical buffer
@@ -599,103 +627,171 @@ fn graph_ancestors(llir: &LLIRGraph, node: NodeIndex) -> FxHashSet<NodeIndex> {
 fn validate_mutating_aliases(
     llir: &LLIRGraph,
     topo: &[NodeIndex],
-) -> Result<FxHashMap<NodeIndex, NodeIndex>, ResourceViolation> {
+) -> Result<(FxHashMap<NodeIndex, NodeIndex>, usize), ResourceViolation> {
+    const NO_NODE: usize = usize::MAX;
+    const MUTATIONS_PER_BATCH: usize = u64::BITS as usize;
+
+    let node_bound = llir.node_bound();
+    let adjacency = AliasValidationAdjacency::new(llir, node_bound);
     let mut aliases = FxHashMap::default();
+    let mut alias_parent = vec![NO_NODE; node_bound];
+    let mut alias_root: Vec<usize> = (0..node_bound).collect();
+    let mut pure_alias = vec![false; node_bound];
+    let mut persist_only_output = vec![false; node_bound];
+    let mut mutations = Vec::new();
+
     for &node in topo {
+        let node_index = node.index();
+        persist_only_output[node_index] = llir[node]
+            .to_op::<Output>()
+            .is_some_and(|output| output.persist_only);
         let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() else {
             continue;
         };
         let Some(input_index) = kernel.output_aliases_input() else {
             continue;
         };
-        let inputs = llir
-            .edges_directed(node, Direction::Incoming)
-            .sorted_by_key(|edge| edge.id())
-            .map(|edge| edge.source())
-            .collect_vec();
-        let Some(input) = inputs.get(input_index).copied() else {
+        let Some(&input) = adjacency.incoming(node_index).get(input_index) else {
             luminal::mask_events::ALIAS_HAZARD_REJECT.record();
             return Err(ResourceViolation::AliasingHazard {
                 name: kernel.kernel_name(),
                 reason: "the declared aliased input is missing",
             });
         };
-        aliases.insert(node, input);
+        aliases.insert(node, NodeIndex::new(input));
+        alias_parent[node_index] = input;
+        alias_root[node_index] = alias_root[input];
+        if kernel.mutates_aliased_input() {
+            mutations.push(MutatingAlias {
+                node: node_index,
+                base: alias_root[input],
+                name: kernel.kernel_name(),
+            });
+        } else {
+            pure_alias[node_index] = true;
+        }
     }
 
-    for &node in topo {
-        let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() else {
-            continue;
-        };
-        if !kernel.mutates_aliased_input() {
-            continue;
-        }
-        let input_index = kernel
-            .output_aliases_input()
-            .expect("a mutating alias must declare its aliased input");
-        let inputs = llir
-            .edges_directed(node, Direction::Incoming)
-            .sorted_by_key(|edge| edge.id())
-            .map(|edge| edge.source())
-            .collect_vec();
-        let input = inputs[input_index];
-        let base = resolve_alias(input, &aliases);
-        if inputs
+    for mutation in &mutations {
+        if adjacency
+            .incoming(mutation.node)
             .iter()
-            .filter(|candidate| resolve_alias(**candidate, &aliases) == base)
+            .filter(|input| alias_root[**input] == mutation.base)
             .count()
             != 1
         {
             luminal::mask_events::ALIAS_HAZARD_REJECT.record();
             return Err(ResourceViolation::AliasingHazard {
-                name: kernel.kernel_name(),
+                name: mutation.name,
                 reason: "another kernel input aliases the mutated buffer",
-            });
-        }
-
-        let ancestors = graph_ancestors(llir, node);
-        for edge in llir.edge_references() {
-            let source = edge.source();
-            let consumer = edge.target();
-            let persist_only_output = llir[consumer]
-                .to_op::<Output>()
-                .is_some_and(|output| output.persist_only);
-            if resolve_alias(source, &aliases) != base
-                || alias_version_includes(source, node, &aliases)
-                || consumer == node
-                || persist_only_output
-            {
-                continue;
-            }
-            let pure_alias =
-                llir[consumer]
-                    .to_dialect::<dyn KernelOp>()
-                    .is_some_and(|consumer_kernel| {
-                        consumer_kernel.output_aliases_input().is_some()
-                            && !consumer_kernel.mutates_aliased_input()
-                    });
-            if pure_alias || ancestors.contains(&consumer) {
-                continue;
-            }
-            luminal::mask_events::ALIAS_HAZARD_REJECT.record();
-            return Err(ResourceViolation::AliasingHazard {
-                name: kernel.kernel_name(),
-                reason: "a competing read is not ordered before the mutation",
             });
         }
     }
 
-    Ok(aliases)
+    // `reaches_mutation[node]` is a 64-mutation reachability set. Propagating
+    // it once in reverse topological order answers every ancestor query in a
+    // batch; `includes_mutation` similarly propagates version ancestry along
+    // the alias-parent forest. The previous implementation rebuilt an
+    // ancestor hash set and rescanned every graph edge for every mutation.
+    let mut reaches_mutation = vec![0u64; node_bound];
+    let mut includes_mutation = vec![0u64; node_bound];
+    let mut mutation_index_by_node = vec![NO_NODE; node_bound];
+    for (index, mutation) in mutations.iter().enumerate() {
+        mutation_index_by_node[mutation.node] = index;
+    }
+
+    for batch_start in (0..mutations.len()).step_by(MUTATIONS_PER_BATCH) {
+        let batch_end = (batch_start + MUTATIONS_PER_BATCH).min(mutations.len());
+        reaches_mutation.fill(0);
+        includes_mutation.fill(0);
+        let mut mutations_by_base: FxHashMap<usize, u64> = FxHashMap::default();
+        for (local_index, mutation) in mutations[batch_start..batch_end].iter().enumerate() {
+            let bit = 1u64 << local_index;
+            reaches_mutation[mutation.node] = bit;
+            *mutations_by_base.entry(mutation.base).or_default() |= bit;
+        }
+
+        for &node in topo.iter().rev() {
+            let node = node.index();
+            let mut reachable = reaches_mutation[node];
+            for &consumer in adjacency.outgoing(node) {
+                reachable |= reaches_mutation[consumer];
+            }
+            reaches_mutation[node] = reachable;
+        }
+
+        for &node in topo {
+            let node = node.index();
+            let mutation_index = mutation_index_by_node[node];
+            let own_mutation = if mutation_index >= batch_start && mutation_index < batch_end {
+                1u64 << (mutation_index - batch_start)
+            } else {
+                0
+            };
+            let parent_mutations = if alias_parent[node] != NO_NODE {
+                includes_mutation[alias_parent[node]]
+            } else {
+                0
+            };
+            includes_mutation[node] = own_mutation | parent_mutations;
+        }
+
+        for &source in topo {
+            let source = source.index();
+            let Some(&same_buffer_mutations) = mutations_by_base.get(&alias_root[source]) else {
+                continue;
+            };
+            let preceding_mutations = same_buffer_mutations & !includes_mutation[source];
+            if preceding_mutations == 0 {
+                continue;
+            }
+            for &consumer in adjacency.outgoing(source) {
+                if persist_only_output[consumer] || pure_alias[consumer] {
+                    continue;
+                }
+                let unordered = preceding_mutations & !reaches_mutation[consumer];
+                if unordered != 0 {
+                    let mutation = &mutations[batch_start + unordered.trailing_zeros() as usize];
+                    luminal::mask_events::ALIAS_HAZARD_REJECT.record();
+                    return Err(ResourceViolation::AliasingHazard {
+                        name: mutation.name,
+                        reason: "a competing read is not ordered before the mutation",
+                    });
+                }
+            }
+        }
+    }
+
+    Ok((aliases, mutations.len()))
 }
 
 fn validated_topology_and_aliases(
     llir: &LLIRGraph,
 ) -> Result<(Vec<NodeIndex>, FxHashMap<NodeIndex, NodeIndex>), ResourceViolation> {
+    let profile = std::env::var_os("LUMINAL_CUDA_PROFILE_STATIC_VALIDATION").is_some();
+    let total_start = std::time::Instant::now();
+    let topology_start = std::time::Instant::now();
     let topo = toposort(llir, None).map_err(|_| {
         luminal::mask_events::CYCLIC_LLIR_REJECT.record();
         ResourceViolation::CyclicLlir
     })?;
-    let aliases = validate_mutating_aliases(llir, &topo)?;
+    let topology_elapsed = topology_start.elapsed();
+    let alias_start = std::time::Instant::now();
+    let (aliases, mutations) = validate_mutating_aliases(llir, &topo)?;
+    let alias_elapsed = alias_start.elapsed();
+    if profile {
+        eprintln!(
+            "CUDA_STATIC_VALIDATION_PROFILE total_ms={:.3} topology_ms={:.3} aliases_ms={:.3} nodes={} edges={} aliases={} mutations={} batches={}",
+            total_start.elapsed().as_secs_f64() * 1e3,
+            topology_elapsed.as_secs_f64() * 1e3,
+            alias_elapsed.as_secs_f64() * 1e3,
+            llir.node_count(),
+            llir.edge_count(),
+            aliases.len(),
+            mutations,
+            mutations.div_ceil(u64::BITS as usize),
+        );
+    }
     Ok((topo, aliases))
 }
 
@@ -1229,6 +1325,39 @@ mod tests {
         llir.add_edge(dest, competing_read, ());
         llir.add_edge(dest, mutation, ());
 
+        assert!(matches!(
+            plan_static_llir_resources(&llir, &FxHashMap::default()),
+            Err(ResourceViolation::AliasingHazard { .. })
+        ));
+    }
+
+    #[test]
+    fn mutating_alias_batches_check_mutations_after_the_first_word() {
+        use luminal::{hlir::Input, op::LLIROp};
+
+        let mut llir = LLIRGraph::default();
+        let mut version = llir.add_node(LLIROp::new::<Input>(Box::new(Input::default())));
+        let mut before_last = version;
+        for _ in 0..65 {
+            before_last = version;
+            let mutation = llir.add_node(LLIROp::new::<dyn KernelOp>(Box::new(TestKernel {
+                bytes: 16.into(),
+                aliases_input: true,
+                mutates_aliased_input: true,
+            })));
+            llir.add_edge(version, mutation, ());
+            version = mutation;
+        }
+
+        plan_static_llir_resources(&llir, &FxHashMap::default())
+            .expect("a dependency-ordered mutation chain is valid");
+
+        let competing_read = llir.add_node(LLIROp::new::<dyn KernelOp>(Box::new(TestKernel {
+            bytes: 16.into(),
+            aliases_input: false,
+            mutates_aliased_input: false,
+        })));
+        llir.add_edge(before_last, competing_read, ());
         assert!(matches!(
             plan_static_llir_resources(&llir, &FxHashMap::default()),
             Err(ResourceViolation::AliasingHazard { .. })
