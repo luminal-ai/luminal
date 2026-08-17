@@ -6,13 +6,24 @@ use rand::Rng;
 use rustc_hash::FxHashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::{str, sync::Arc, time::Duration};
+use std::{
+    str,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tracing::trace;
+
+use crate::graph::PackedLLIRGraph;
 
 pub use egraph_serialize::{ClassId, NodeId};
 
 pub mod api;
 pub mod base;
+
+pub(crate) fn llir_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LUMINAL_LLIR_PROFILE").is_some())
+}
 
 const MAIN_SCHEDULE_MAX_CYCLES: usize = 256;
 const MAIN_SCHEDULE_MAX_TUPLES: usize = 10_000_000;
@@ -1839,7 +1850,709 @@ pub fn extract_expr<'a>(
     Some(e)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct InternedIdKey {
+    data: usize,
+    len: usize,
+}
+
+impl InternedIdKey {
+    fn new(id: &impl AsRef<str>) -> Self {
+        let text = id.as_ref();
+        Self {
+            data: text.as_ptr() as usize,
+            len: text.len(),
+        }
+    }
+}
+
 pub type EGraphChoiceSet<'a> = FxHashMap<&'a ClassId, &'a NodeId>;
+
+type DenseIndex = u32;
+const NO_DENSE_INDEX: DenseIndex = DenseIndex::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DenseNode {
+    class: DenseIndex,
+    slot: DenseIndex,
+}
+
+/// Compact search genome used internally by [`LlirExtractor`]. Public
+/// extraction continues to accept [`EGraphChoiceSet`], but the compiler's
+/// hot search loop never has to hash e-graph strings after the initial genome
+/// is converted.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexedChoiceSet {
+    choices: Vec<DenseIndex>,
+    hash: u64,
+}
+
+struct IndexedEClass<'a> {
+    id: &'a ClassId,
+    label: &'a str,
+    nodes: &'a [NodeId],
+    searchable: bool,
+}
+
+struct IndexedENode<'a> {
+    id: &'a NodeId,
+    label: &'a str,
+    children: Vec<DenseIndex>,
+}
+
+struct CachedIndexedExtraction {
+    /// Exact selected bindings that can affect this extraction. This lets the
+    /// hot path validate a cached immutable op with direct integer loads,
+    /// without re-walking its OpKind and IList term.
+    dependencies: Box<[(DenseIndex, DenseIndex)]>,
+    custom_op_ids: Option<(usize, usize)>,
+    op: crate::op::LLIROp,
+    sources: Box<[DenseNode]>,
+}
+
+/// Reusable state for turning many choice sets from the same serialized
+/// e-graph into LLIR graphs.
+///
+/// Search extracts hundreds of candidates from an immutable e-graph.  The
+/// op-name dispatch table and decoded expression metadata are consequently
+/// candidate-independent and should be built once, not rediscovered for
+/// every LLIR node in every candidate.
+pub(crate) struct LlirExtractor<'a> {
+    egraph: &'a SerializedEGraph,
+    ops: &'a [Arc<Box<dyn EgglogOp>>],
+    op_by_name: FxHashMap<String, usize>,
+    list_cache: FxHashMap<&'a NodeId, Vec<Expression>>,
+    expr_cache: FxHashMap<&'a NodeId, Expression>,
+    indexed_classes: Vec<IndexedEClass<'a>>,
+    indexed_nodes: Vec<Vec<(DenseIndex, IndexedENode<'a>)>>,
+    indexed_opkind_consistent: Vec<Vec<(DenseIndex, bool)>>,
+    class_to_index: FxHashMap<&'a ClassId, DenseIndex>,
+    root_index: DenseIndex,
+    indexed_extractions: Vec<Vec<(DenseIndex, Vec<CachedIndexedExtraction>)>>,
+    mutation_nodes: Vec<Option<Vec<DenseIndex>>>,
+    visit_epoch: u32,
+    visited: Vec<u32>,
+    reachable: Vec<DenseNode>,
+    reachability_stack: Vec<DenseNode>,
+    graph_nodes: Vec<(u32, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedENode<'a> {
+    label: &'a str,
+    children: &'a [ClassId],
+    class: &'a ClassId,
+}
+
+#[derive(Clone, Copy)]
+struct CachedEClass<'a> {
+    label: &'a str,
+    nodes: &'a [NodeId],
+}
+
+impl<'a> LlirExtractor<'a> {
+    pub(crate) fn new(egraph: &'a SerializedEGraph, ops: &'a [Arc<Box<dyn EgglogOp>>]) -> Self {
+        let started_at = std::time::Instant::now();
+        let op_by_name = ops
+            .iter()
+            .enumerate()
+            .map(|(index, op)| (op.sort().name, index))
+            .collect();
+
+        let mut class_to_index = FxHashMap::default();
+        for (index, class) in egraph.eclasses.keys().enumerate() {
+            let index = DenseIndex::try_from(index).expect("too many e-classes to index");
+            class_to_index.insert(class, index);
+        }
+        let mut indexed_classes: Vec<Option<IndexedEClass<'a>>> = std::iter::repeat_with(|| None)
+            .take(class_to_index.len())
+            .collect();
+        for (class, (label, nodes)) in &egraph.eclasses {
+            let index = class_to_index[class] as usize;
+            indexed_classes[index] = Some(IndexedEClass {
+                id: class,
+                label,
+                nodes,
+                searchable: is_search_choice_eclass(label),
+            });
+        }
+        let indexed_classes: Vec<IndexedEClass<'a>> = indexed_classes
+            .into_iter()
+            .map(|class| class.expect("indexed e-class slot was not initialized"))
+            .collect();
+        let root_index = class_to_index[&egraph.roots[0]];
+        let serialized_node_count: usize =
+            egraph.eclasses.values().map(|(_, nodes)| nodes.len()).sum();
+        let mutation_nodes = std::iter::repeat_with(|| None)
+            .take(indexed_classes.len())
+            .collect();
+        let indexed_nodes = std::iter::repeat_with(Vec::new)
+            .take(indexed_classes.len())
+            .collect();
+        let indexed_opkind_consistent = std::iter::repeat_with(Vec::new)
+            .take(indexed_classes.len())
+            .collect();
+        let indexed_extractions = std::iter::repeat_with(Vec::new)
+            .take(indexed_classes.len())
+            .collect();
+        let indexed_class_count = indexed_classes.len();
+        let extractor = Self {
+            egraph,
+            ops,
+            op_by_name,
+            list_cache: FxHashMap::default(),
+            expr_cache: FxHashMap::default(),
+            indexed_classes,
+            indexed_nodes,
+            indexed_opkind_consistent,
+            class_to_index,
+            root_index,
+            indexed_extractions,
+            mutation_nodes,
+            visit_epoch: 0,
+            visited: vec![0; indexed_class_count],
+            reachable: Vec::new(),
+            reachability_stack: Vec::new(),
+            graph_nodes: vec![(0, usize::MAX); indexed_class_count],
+        };
+        if llir_profile_enabled() {
+            eprintln!(
+                "LLIR_INDEX_PROFILE total_ms={:.3} classes={} nodes={}",
+                started_at.elapsed().as_secs_f64() * 1e3,
+                extractor.indexed_classes.len(),
+                serialized_node_count,
+            );
+        }
+        extractor
+    }
+
+    fn indexed_selected(&self, choices: &IndexedChoiceSet, class: DenseIndex) -> DenseNode {
+        let class_info = &self.indexed_classes[class as usize];
+        let slot = if class_info.searchable {
+            let selected = choices.choices[class as usize];
+            assert_ne!(
+                selected, NO_DENSE_INDEX,
+                "indexed genome is missing searchable e-class {}",
+                class_info.id
+            );
+            selected
+        } else {
+            0
+        };
+        DenseNode { class, slot }
+    }
+
+    fn indexed_node_id(&self, node: DenseNode) -> &'a NodeId {
+        &self.indexed_classes[node.class as usize].nodes[node.slot as usize]
+    }
+
+    fn dense_node_for_id(&self, id: &NodeId) -> DenseNode {
+        let class_id = &self.egraph.node_to_class[id];
+        let class = self.class_to_index[class_id];
+        let slot = self.indexed_classes[class as usize]
+            .nodes
+            .iter()
+            .position(|candidate| candidate == id)
+            .expect("e-node is missing from its owning e-class");
+        DenseNode {
+            class,
+            slot: DenseIndex::try_from(slot).expect("too many e-nodes in e-class"),
+        }
+    }
+
+    fn indexed_node_parts(&mut self, node: DenseNode) -> (&'a NodeId, &'a str, Vec<DenseIndex>) {
+        let mut position = self.indexed_nodes[node.class as usize]
+            .iter()
+            .position(|(slot, _)| *slot == node.slot);
+        if position.is_none() {
+            let id = self.indexed_node_id(node);
+            let (label, children) = &self.egraph.enodes[id];
+            let indexed = IndexedENode {
+                id,
+                label,
+                children: children
+                    .iter()
+                    .map(|child| self.class_to_index[child])
+                    .collect(),
+            };
+            let class_cache = &mut self.indexed_nodes[node.class as usize];
+            position = Some(class_cache.len());
+            class_cache.push((node.slot, indexed));
+        }
+        let indexed = &self.indexed_nodes[node.class as usize][position.unwrap()].1;
+        (indexed.id, indexed.label, indexed.children.clone())
+    }
+
+    fn indexed_opkind_is_consistent(&mut self, node: DenseNode) -> bool {
+        if let Some((_, consistent)) = self.indexed_opkind_consistent[node.class as usize]
+            .iter()
+            .find(|(slot, _)| *slot == node.slot)
+        {
+            return *consistent;
+        }
+        let consistent = opkind_metadata_consistent(self.egraph, self.indexed_node_id(node));
+        self.indexed_opkind_consistent[node.class as usize].push((node.slot, consistent));
+        consistent
+    }
+
+    fn mutation_pool(&mut self, class: DenseIndex) -> &[DenseIndex] {
+        if self.mutation_nodes[class as usize].is_none() {
+            let class_info = &self.indexed_classes[class as usize];
+            let marker_free: Vec<DenseIndex> = class_info
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| !enode_is_loop_input_marker(self.egraph, node))
+                .map(|(slot, _)| DenseIndex::try_from(slot).expect("too many e-nodes in e-class"))
+                .collect();
+            let consistent: Vec<DenseIndex> = if class_info.label == "OpKind" {
+                class_info
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, node)| opkind_metadata_consistent(self.egraph, node))
+                    .map(|(slot, _)| {
+                        DenseIndex::try_from(slot).expect("too many e-nodes in e-class")
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let all = || {
+                (0..class_info.nodes.len())
+                    .map(|slot| DenseIndex::try_from(slot).expect("too many e-nodes in e-class"))
+                    .collect()
+            };
+            let pool = if !consistent.is_empty() {
+                let filtered: Vec<DenseIndex> = consistent
+                    .iter()
+                    .copied()
+                    .filter(|node| marker_free.contains(node))
+                    .collect();
+                if filtered.is_empty() {
+                    consistent
+                } else {
+                    filtered
+                }
+            } else if !marker_free.is_empty() {
+                marker_free
+            } else {
+                all()
+            };
+            self.mutation_nodes[class as usize] = Some(pool);
+        }
+        self.mutation_nodes[class as usize].as_deref().unwrap()
+    }
+
+    pub(crate) fn index_choice_set(&self, choices: &EGraphChoiceSet<'a>) -> IndexedChoiceSet {
+        let mut indexed = vec![NO_DENSE_INDEX; self.indexed_classes.len()];
+        let mut hash = 0u64;
+        for (&class, &node) in choices {
+            let class_index = self.class_to_index[class];
+            let slot = self.indexed_classes[class_index as usize]
+                .nodes
+                .iter()
+                .position(|candidate| candidate == node)
+                .expect("chosen e-node is not in its e-class");
+            let slot = DenseIndex::try_from(slot).expect("too many e-nodes in e-class");
+            indexed[class_index as usize] = slot;
+            hash ^= hash_choice_entry(class, node);
+        }
+        IndexedChoiceSet {
+            choices: indexed,
+            hash,
+        }
+    }
+
+    pub(crate) fn random_indexed_choice(&self, rng: &mut impl Rng) -> IndexedChoiceSet {
+        let choices = random_initial_choice(self.egraph, rng);
+        self.index_choice_set(&choices)
+    }
+
+    pub(crate) fn random_indexed_generation(
+        &self,
+        generation_size: usize,
+        prev_selected: &mut FxHashSet<u64>,
+        rng: &mut impl Rng,
+    ) -> Vec<IndexedChoiceSet> {
+        let mut generation = Vec::with_capacity(generation_size);
+        let max_attempts = generation_size.saturating_mul(100);
+        let mut attempts = 0;
+        while generation.len() < generation_size && attempts < max_attempts {
+            attempts += 1;
+            let genome = self.random_indexed_choice(rng);
+            if prev_selected.insert(genome.hash) {
+                generation.push(genome);
+            }
+        }
+        generation
+    }
+
+    pub(crate) fn extract_reachable_indexed_generation(
+        &mut self,
+        base: &IndexedChoiceSet,
+        generation_size: usize,
+        mutations_per_generation: usize,
+        prev_selected: &mut FxHashSet<u64>,
+        rng: &mut impl Rng,
+    ) -> Vec<IndexedChoiceSet> {
+        let mut seen_nodes = FxHashSet::default();
+        let mut seen_classes = FxHashSet::default();
+        let mut mutable_classes = Vec::new();
+        let root = self.root_index;
+        let root_class = &self.indexed_classes[root as usize];
+        if root_class.searchable && root_class.nodes.len() > 1 {
+            seen_classes.insert(root);
+            mutable_classes.push(root);
+        }
+        let mut stack = vec![self.indexed_selected(base, root)];
+        while let Some(node) = stack.pop() {
+            if !seen_nodes.insert(node) {
+                continue;
+            }
+            let (_, _, children) = self.indexed_node_parts(node);
+            for child_class in children {
+                let class = &self.indexed_classes[child_class as usize];
+                if !class.searchable {
+                    continue;
+                }
+                if class.nodes.len() > 1 && seen_classes.insert(child_class) {
+                    mutable_classes.push(child_class);
+                }
+                stack.push(self.indexed_selected(base, child_class));
+            }
+        }
+
+        if mutable_classes.is_empty() {
+            if prev_selected.insert(base.hash) {
+                return vec![base.clone()];
+            }
+            return Vec::new();
+        }
+
+        let mut offspring = Vec::with_capacity(generation_size);
+        let max_attempts = generation_size.saturating_mul(100);
+        let mut attempts = 0;
+        while offspring.len() < generation_size && attempts < max_attempts {
+            attempts += 1;
+            let mut child = base.clone();
+            let mutation_count = rng.random_range(1..=mutations_per_generation.max(1));
+            for _ in 0..mutation_count {
+                let class = mutable_classes[rng.random_range(0..mutable_classes.len())];
+                let new_node = {
+                    let pool = self.mutation_pool(class);
+                    pool[rng.random_range(0..pool.len())]
+                };
+                let old_node = std::mem::replace(&mut child.choices[class as usize], new_node);
+                let class_info = &self.indexed_classes[class as usize];
+                child.hash ^=
+                    hash_choice_entry(class_info.id, &class_info.nodes[old_node as usize]);
+                child.hash ^=
+                    hash_choice_entry(class_info.id, &class_info.nodes[new_node as usize]);
+            }
+            if prev_selected.insert(child.hash) {
+                offspring.push(child);
+            }
+        }
+        offspring
+    }
+
+    /// Extract through integer-indexed e-classes and e-nodes into a dense
+    /// rolled representation. The caller materializes the fully-unrolled
+    /// public `StableGraph` directly from this representation.
+    pub(crate) fn extract_indexed_packed(
+        &mut self,
+        choices: &IndexedChoiceSet,
+        custom_ops: &[Box<dyn CustomOp>],
+        custom_op_id_remap: Option<&FxHashMap<usize, usize>>,
+    ) -> PackedLLIRGraph {
+        let started_at = std::time::Instant::now();
+        let profile = llir_profile_enabled();
+        let mut cache_hits = 0usize;
+        let mut cache_misses = 0usize;
+        self.visit_epoch = self.visit_epoch.wrapping_add(1);
+        if self.visit_epoch == 0 {
+            self.visited.fill(0);
+            self.visit_epoch = 1;
+        }
+        self.reachable.clear();
+        self.reachability_stack.clear();
+
+        let root = self.indexed_selected(choices, self.root_index);
+        self.visited[root.class as usize] = self.visit_epoch;
+        self.reachable.push(root);
+        self.reachability_stack.push(root);
+        let estimated_nodes = (self.indexed_classes.len() / 4).max(64);
+        let mut ops = Vec::with_capacity(estimated_nodes);
+        let mut incoming_offsets = Vec::with_capacity(estimated_nodes + 1);
+        let mut dense_sources = Vec::with_capacity(estimated_nodes * 6 / 5);
+        let mut input_nodes = Vec::with_capacity(8);
+        let mut kind_children = Vec::with_capacity(8);
+        let mut dependencies = Vec::with_capacity(16);
+        while let Some(node_index) = self.reachability_stack.pop() {
+            self.graph_nodes[node_index.class as usize] = (self.visit_epoch, usize::MAX);
+
+            if self.indexed_classes[node_index.class as usize].label != "IR" {
+                let (_, _, node_children) = self.indexed_node_parts(node_index);
+                for child_class in node_children {
+                    if !self.indexed_classes[child_class as usize].searchable {
+                        continue;
+                    }
+                    let child = self.indexed_selected(choices, child_class);
+                    if self.visited[child.class as usize] != self.visit_epoch {
+                        self.visited[child.class as usize] = self.visit_epoch;
+                        self.reachable.push(child);
+                        self.reachability_stack.push(child);
+                    }
+                }
+                continue;
+            }
+
+            let cached_location = self.indexed_extractions[node_index.class as usize]
+                .iter()
+                .enumerate()
+                .find(|(_, (slot, _))| *slot == node_index.slot)
+                .and_then(|(entry_index, (_, variants))| {
+                    variants
+                        .iter()
+                        .position(|cached| {
+                            cached.dependencies.iter().all(|&(class, selected)| {
+                                self.indexed_selected(choices, class).slot == selected
+                            }) && cached.custom_op_ids.is_none_or(|(original, resolved)| {
+                                custom_op_id_remap
+                                    .and_then(|remap| remap.get(&original).copied())
+                                    .unwrap_or(original)
+                                    == resolved
+                            })
+                        })
+                        .map(|cached_index| (entry_index, cached_index))
+                });
+            if let Some((entry_index, cached_index)) = cached_location {
+                cache_hits += 1;
+                let cached = &self.indexed_extractions[node_index.class as usize][entry_index].1
+                    [cached_index];
+                let graph_node = ops.len();
+                ops.push(cached.op.clone());
+                incoming_offsets.push(dense_sources.len());
+                self.graph_nodes[node_index.class as usize] = (self.visit_epoch, graph_node);
+                dense_sources.extend(cached.sources.iter().copied());
+                for &source in cached.sources.iter() {
+                    if self.visited[source.class as usize] != self.visit_epoch {
+                        self.visited[source.class as usize] = self.visit_epoch;
+                        self.reachable.push(source);
+                        self.reachability_stack.push(source);
+                    }
+                }
+                continue;
+            }
+
+            let (_, node_label, node_children) = self.indexed_node_parts(node_index);
+            if node_label == "OutputJoin" {
+                for child_class in node_children {
+                    if !self.indexed_classes[child_class as usize].searchable {
+                        continue;
+                    }
+                    let child = self.indexed_selected(choices, child_class);
+                    if self.visited[child.class as usize] != self.visit_epoch {
+                        self.visited[child.class as usize] = self.visit_epoch;
+                        self.reachable.push(child);
+                        self.reachability_stack.push(child);
+                    }
+                }
+                continue;
+            }
+
+            input_nodes.clear();
+            kind_children.clear();
+            dependencies.clear();
+            let mut op_index = None;
+            let mut custom_id = None;
+            let mut original_custom_id = None;
+
+            if node_label == "Op" {
+                let kind_class = node_children[0];
+                let ilist_class = node_children[1];
+                let selected_kind_node = self.indexed_selected(choices, kind_class);
+                dependencies.push((kind_class, selected_kind_node.slot));
+                let mut kind_node = selected_kind_node;
+                if !self.indexed_opkind_is_consistent(kind_node) {
+                    let fallback_slot = self.mutation_pool(kind_class).first().copied();
+                    if let Some(slot) = fallback_slot {
+                        kind_node = DenseNode {
+                            class: kind_class,
+                            slot,
+                        };
+                    }
+                }
+                let (_, kind_label, kind_node_children) = self.indexed_node_parts(kind_node);
+                for child_class in kind_node_children {
+                    let selected = self.indexed_selected(choices, child_class);
+                    kind_children.push(selected);
+                    if self.indexed_classes[child_class as usize].searchable {
+                        dependencies.push((child_class, selected.slot));
+                    }
+                }
+
+                let mut current = self.indexed_selected(choices, ilist_class);
+                dependencies.push((ilist_class, current.slot));
+                loop {
+                    let (_, list_label, list_children) = self.indexed_node_parts(current);
+                    if list_label == "INil" {
+                        break;
+                    }
+                    let input_class = list_children[0];
+                    let tail_class = list_children[1];
+                    let input = self.indexed_selected(choices, input_class);
+                    input_nodes.push(input);
+                    dependencies.push((input_class, input.slot));
+                    current = self.indexed_selected(choices, tail_class);
+                    dependencies.push((tail_class, current.slot));
+                }
+
+                if kind_label == "CustomOpKind" {
+                    let id_node = self.indexed_node_id(kind_children[0]);
+                    let id: usize = self.egraph.enodes[id_node].0.parse().unwrap();
+                    let remapped = custom_op_id_remap
+                        .and_then(|remap| remap.get(&id).copied())
+                        .unwrap_or(id);
+                    custom_id = Some(remapped);
+                    original_custom_id = Some(id);
+                } else {
+                    op_index = Some(
+                        *self
+                            .op_by_name
+                            .get(kind_label)
+                            .unwrap_or_else(|| panic!("{kind_label} extraction not implemented!")),
+                    );
+                }
+            } else {
+                let Some(&index) = self.op_by_name.get(node_label) else {
+                    for child_class in node_children {
+                        if !self.indexed_classes[child_class as usize].searchable {
+                            continue;
+                        }
+                        let child = self.indexed_selected(choices, child_class);
+                        if self.visited[child.class as usize] != self.visit_epoch {
+                            self.visited[child.class as usize] = self.visit_epoch;
+                            self.reachable.push(child);
+                            self.reachability_stack.push(child);
+                        }
+                    }
+                    continue;
+                };
+                op_index = Some(index);
+                for child_class in node_children {
+                    let selected = self.indexed_selected(choices, child_class);
+                    kind_children.push(selected);
+                    if self.indexed_classes[child_class as usize].searchable {
+                        dependencies.push((child_class, selected.slot));
+                    }
+                }
+            }
+
+            cache_misses += 1;
+            let child_refs: Vec<&NodeId> = kind_children
+                .iter()
+                .map(|child| self.indexed_node_id(*child))
+                .collect();
+            let input_refs: Vec<&NodeId> = input_nodes
+                .iter()
+                .map(|input| self.indexed_node_id(*input))
+                .collect();
+            let (op, source_refs) = if let Some(custom_id) = custom_id {
+                (custom_ops[custom_id].to_llir_op(), input_refs)
+            } else {
+                self.ops[op_index.unwrap()].extract(
+                    self.egraph,
+                    &child_refs,
+                    input_refs,
+                    &mut self.list_cache,
+                    &mut self.expr_cache,
+                )
+            };
+            let sources: Vec<DenseNode> = source_refs
+                .iter()
+                .map(|source| {
+                    input_nodes
+                        .iter()
+                        .chain(kind_children.iter())
+                        .copied()
+                        .find(|node| self.indexed_node_id(*node) == *source)
+                        .unwrap_or_else(|| self.dense_node_for_id(source))
+                })
+                .collect();
+            let graph_node = ops.len();
+            ops.push(op.clone());
+            incoming_offsets.push(dense_sources.len());
+            self.graph_nodes[node_index.class as usize] = (self.visit_epoch, graph_node);
+            dense_sources.extend(sources.iter().copied());
+            for &source in &sources {
+                if self.visited[source.class as usize] != self.visit_epoch {
+                    self.visited[source.class as usize] = self.visit_epoch;
+                    self.reachable.push(source);
+                    self.reachability_stack.push(source);
+                }
+            }
+            let cached = CachedIndexedExtraction {
+                dependencies: dependencies.clone().into_boxed_slice(),
+                custom_op_ids: original_custom_id.zip(custom_id),
+                op,
+                sources: sources.into_boxed_slice(),
+            };
+            let class_cache = &mut self.indexed_extractions[node_index.class as usize];
+            if let Some((_, variants)) = class_cache
+                .iter_mut()
+                .find(|(slot, _)| *slot == node_index.slot)
+            {
+                variants.push(cached);
+            } else {
+                class_cache.push((node_index.slot, vec![cached]));
+            }
+        }
+
+        incoming_offsets.push(dense_sources.len());
+        let mut incoming_sources = Vec::with_capacity(dense_sources.len());
+        let mut outgoing_offsets = vec![0usize; ops.len() + 1];
+        for source in dense_sources {
+            let (source_epoch, source) = self.graph_nodes[source.class as usize];
+            assert_eq!(source_epoch, self.visit_epoch, "source e-node is stale");
+            assert_ne!(source, usize::MAX, "source e-node was not materialized");
+            incoming_sources.push(source);
+            outgoing_offsets[source + 1] += 1;
+        }
+        for index in 1..outgoing_offsets.len() {
+            outgoing_offsets[index] += outgoing_offsets[index - 1];
+        }
+        let mut outgoing_cursor = outgoing_offsets[..ops.len()].to_vec();
+        let mut outgoing_targets = vec![usize::MAX; incoming_sources.len()];
+        for destination in 0..ops.len() {
+            for &source in
+                &incoming_sources[incoming_offsets[destination]..incoming_offsets[destination + 1]]
+            {
+                outgoing_targets[outgoing_cursor[source]] = destination;
+                outgoing_cursor[source] += 1;
+            }
+        }
+        if profile {
+            eprintln!(
+                "LLIR_EXTRACT_PROFILE total_ms={:.3} indexed=true cache_hits={} cache_misses={} reachable={} rolled_nodes={} rolled_edges={}",
+                started_at.elapsed().as_secs_f64() * 1e3,
+                cache_hits,
+                cache_misses,
+                self.reachable.len(),
+                ops.len(),
+                incoming_sources.len(),
+            );
+        }
+        PackedLLIRGraph {
+            ops,
+            incoming_offsets,
+            incoming_sources,
+            outgoing_offsets,
+            outgoing_targets,
+        }
+    }
+}
 
 fn is_search_choice_eclass(label: &str) -> bool {
     label.contains("IR") || label.contains("IList") || label.contains("OpKind")
@@ -2217,7 +2930,7 @@ pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
     rng: &mut impl Rng,
 ) -> EGraphChoiceSet<'a> {
-    let mut choices = FxHashMap::default();
+    let mut choices = EGraphChoiceSet::default();
     for (eclass, (label, enodes)) in &egraph.eclasses {
         if !is_search_choice_eclass(label) {
             continue;
@@ -2376,7 +3089,7 @@ fn hash_choice_entry(class_id: &ClassId, node_id: &NodeId) -> u64 {
 /// per generation.
 pub fn hash_choice_set(choices: &EGraphChoiceSet) -> u64 {
     let mut h = 0u64;
-    for (k, v) in choices {
+    for (k, v) in choices.iter() {
         h ^= hash_choice_entry(k, v);
     }
     h
@@ -2572,28 +3285,6 @@ fn extract_generation_from_classes<'a>(
     offspring
 }
 
-/// Walk an IList in the egraph, returning the chosen IR enodes in order.
-fn walk_ilist<'a>(
-    egraph: &'a SerializedEGraph,
-    ilist_eclass: &'a ClassId,
-    choices: &EGraphChoiceSet<'a>,
-) -> Vec<&'a NodeId> {
-    let mut inputs = Vec::new();
-    let mut current = choices[ilist_eclass];
-    loop {
-        if egraph.enodes[current].0 == "INil" {
-            break;
-        }
-        // ICons: child[0] = IR eclass, child[1] = IList tail eclass
-        let input_eclass = &egraph.enodes[current].1[0];
-        let input_node = choices[input_eclass];
-        inputs.push(input_node);
-        let tail_eclass = &egraph.enodes[current].1[1];
-        current = choices[tail_eclass];
-    }
-    inputs
-}
-
 #[tracing::instrument(skip_all)]
 pub fn egglog_to_llir<'a>(
     egraph: &'a SerializedEGraph,
@@ -2627,23 +3318,133 @@ pub fn egglog_to_llir_from_root<'a>(
     custom_op_id_remap: Option<&FxHashMap<usize, usize>>,
     root_class: &ClassId,
 ) -> LLIRGraph {
+    let op_by_name: FxHashMap<String, usize> = ops
+        .iter()
+        .enumerate()
+        .map(|(index, op)| (op.sort().name, index))
+        .collect();
+    let mut node_cache = FxHashMap::default();
+    let mut class_cache = FxHashMap::default();
+    let mut opkind_consistency_cache = FxHashMap::default();
+    egglog_to_llir_from_root_cached(
+        egraph,
+        &choices,
+        ops,
+        &op_by_name,
+        custom_ops,
+        list_cache,
+        expr_cache,
+        &mut node_cache,
+        &mut class_cache,
+        &mut opkind_consistency_cache,
+        custom_op_id_remap,
+        root_class,
+    )
+}
+
+fn cached_enode<'a>(
+    egraph: &'a SerializedEGraph,
+    cache: &mut FxHashMap<InternedIdKey, CachedENode<'a>>,
+    node: &NodeId,
+) -> CachedENode<'a> {
+    let key = InternedIdKey::new(node);
+    if let Some(cached) = cache.get(&key) {
+        return *cached;
+    }
+    let (label, children) = &egraph.enodes[node];
+    let cached = CachedENode {
+        label,
+        children,
+        class: &egraph.node_to_class[node],
+    };
+    cache.insert(key, cached);
+    cached
+}
+
+fn cached_eclass<'a>(
+    egraph: &'a SerializedEGraph,
+    cache: &mut FxHashMap<InternedIdKey, CachedEClass<'a>>,
+    class: &ClassId,
+) -> CachedEClass<'a> {
+    let key = InternedIdKey::new(class);
+    if let Some(cached) = cache.get(&key) {
+        return *cached;
+    }
+    let (label, nodes) = &egraph.eclasses[class];
+    let cached = CachedEClass { label, nodes };
+    cache.insert(key, cached);
+    cached
+}
+
+fn cached_opkind_consistency(
+    egraph: &SerializedEGraph,
+    cache: &mut FxHashMap<InternedIdKey, bool>,
+    node: &NodeId,
+) -> bool {
+    let key = InternedIdKey::new(node);
+    if let Some(&consistent) = cache.get(&key) {
+        return consistent;
+    }
+    let consistent = opkind_metadata_consistent(egraph, node);
+    cache.insert(key, consistent);
+    consistent
+}
+
+fn walk_ilist_cached<'a>(
+    egraph: &'a SerializedEGraph,
+    ilist_eclass: &'a ClassId,
+    choices: &EGraphChoiceSet<'a>,
+    node_cache: &mut FxHashMap<InternedIdKey, CachedENode<'a>>,
+) -> Vec<&'a NodeId> {
+    let mut inputs = Vec::with_capacity(4);
+    let mut current = choices[ilist_eclass];
+    loop {
+        let node = cached_enode(egraph, node_cache, current);
+        if node.label == "INil" {
+            break;
+        }
+        let input_eclass = &node.children[0];
+        inputs.push(choices[input_eclass]);
+        current = choices[&node.children[1]];
+    }
+    inputs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn egglog_to_llir_from_root_cached<'a>(
+    egraph: &'a SerializedEGraph,
+    choices: &EGraphChoiceSet<'a>,
+    ops: &'a [Arc<Box<dyn EgglogOp>>],
+    op_by_name: &FxHashMap<String, usize>,
+    custom_ops: &[Box<dyn CustomOp>],
+    list_cache: &mut FxHashMap<&'a NodeId, Vec<Expression>>,
+    expr_cache: &mut FxHashMap<&'a NodeId, Expression>,
+    node_cache: &mut FxHashMap<InternedIdKey, CachedENode<'a>>,
+    class_cache: &mut FxHashMap<InternedIdKey, CachedEClass<'a>>,
+    opkind_consistency_cache: &mut FxHashMap<InternedIdKey, bool>,
+    custom_op_id_remap: Option<&FxHashMap<usize, usize>>,
+    root_class: &ClassId,
+) -> LLIRGraph {
     // Make reachability set from root
-    let mut reachable = FxHashSet::default();
-    reachable.insert(choices[root_class]);
-    let mut reachability_stack = vec![choices[root_class]];
+    let root = choices[root_class];
+    let mut reachable_keys = FxHashSet::default();
+    reachable_keys.insert(root);
+    let mut reachable = vec![root];
+    let mut reachability_stack = vec![root];
     while let Some(r) = reachability_stack.pop() {
-        for ch in &egraph.enodes[r].1 {
-            if is_search_choice_eclass(&egraph.eclasses[ch].0) {
+        let node = cached_enode(egraph, node_cache, r);
+        for ch in node.children {
+            if is_search_choice_eclass(cached_eclass(egraph, class_cache, ch).label) {
                 let n = choices[ch];
-                if !reachable.contains(n) {
+                if reachable_keys.insert(n) {
                     reachability_stack.push(n);
-                    reachable.insert(n);
+                    reachable.push(n);
                 }
             }
         }
     }
-    let mut graph = LLIRGraph::default();
-    let mut edges_to_place = vec![];
+    let mut graph = LLIRGraph::with_capacity(reachable.len() / 2, reachable.len());
+    let mut edges_to_place = Vec::with_capacity(reachable.len());
     let mut enode_to_node = FxHashMap::default();
     // Iterate the small reachable set rather than the full choice set.
     // On large e-graphs (e.g., Gemma's ~3.48M-entry choice set produced
@@ -2651,19 +3452,21 @@ pub fn egglog_to_llir_from_root<'a>(
     // chains), `reachable` is ~3K nodes and the choice set is ~1000×
     // larger. Filtering the choice set against `reachable` was
     // dominating per-candidate `egglog_to_llir` time.
-    for &node in &reachable {
-        if egraph.eclasses[&egraph.node_to_class[node]].0 != "IR" {
+    for &node_id in &reachable {
+        let node = cached_enode(egraph, node_cache, node_id);
+        if cached_eclass(egraph, class_cache, node.class).label != "IR" {
             // Skip IList enodes — `reachable` includes them because the
             // reachability walk follows IList children, but only IR
             // enodes become LLIR nodes.
             continue;
         }
-        let enode_label = egraph.enodes[node].0.as_str();
+        let node_key = node_id;
+        let enode_label = node.label;
         if enode_label == "Op" {
             // Normalized op: (Op OpKind IList)
             // child[0] = OpKind eclass, child[1] = IList eclass
-            let kind_eclass = &egraph.enodes[node].1[0];
-            let ilist_eclass = &egraph.enodes[node].1[1];
+            let kind_eclass = &node.children[0];
+            let ilist_eclass = &node.children[1];
 
             // Resolve OpKind enode. The kind eclass may contain multiple
             // structurally-equivalent kind enodes whose ELIST children
@@ -2672,34 +3475,37 @@ pub fn egglog_to_llir_from_root<'a>(
             // a downstream `flatten_strides` length mismatch. Candidate
             // generation filters these out where possible; this fallback is
             // structural only and does not rank backend implementations.
-            let kind_enodes = &egraph.eclasses[kind_eclass].1;
+            let kind_class = cached_eclass(egraph, class_cache, kind_eclass);
+            let kind_enodes = kind_class.nodes;
             let kind_enode = choices
                 .get(kind_eclass)
                 .copied()
-                .filter(|n| opkind_metadata_consistent(egraph, n))
+                .filter(|n| cached_opkind_consistency(egraph, opkind_consistency_cache, n))
                 .or_else(|| {
                     kind_enodes
                         .iter()
-                        .find(|n| opkind_metadata_consistent(egraph, n))
+                        .find(|n| cached_opkind_consistency(egraph, opkind_consistency_cache, n))
                 })
                 .unwrap_or(&kind_enodes[0]);
-            let kind_label = &egraph.enodes[kind_enode].0;
+            let kind_node = cached_enode(egraph, node_cache, kind_enode);
+            let kind_label = kind_node.label;
 
             // Resolve kind's metadata children (shapes, strides, etc.)
-            let kind_children: Vec<&NodeId> = egraph.enodes[kind_enode]
-                .1
+            let kind_children: Vec<&NodeId> = kind_node
+                .children
                 .iter()
                 .map(|c| {
-                    if is_search_choice_eclass(&egraph.eclasses[c].0) {
+                    let class = cached_eclass(egraph, class_cache, c);
+                    if is_search_choice_eclass(class.label) {
                         choices[c]
                     } else {
-                        &egraph.eclasses[c].1[0]
+                        &class.nodes[0]
                     }
                 })
                 .collect_vec();
 
             // Walk IList to get IR inputs
-            let input_enodes = walk_ilist(egraph, ilist_eclass, &choices);
+            let input_enodes = walk_ilist_cached(egraph, ilist_eclass, choices, node_cache);
 
             // Check for CustomOpKind first
             if kind_label == "CustomOpKind" {
@@ -2709,46 +3515,45 @@ pub fn egglog_to_llir_from_root<'a>(
                     .and_then(|m| m.get(&id).copied())
                     .unwrap_or(id);
                 let r = graph.add_node(custom_ops[remapped_id].to_llir_op());
-                enode_to_node.insert(node, r);
+                enode_to_node.insert(node_key, r);
                 for source in input_enodes {
-                    edges_to_place.push((source, node));
+                    edges_to_place.push((source, node_key));
                 }
             } else {
                 // Find matching op by OpKind name
-                let Some(op) = ops.iter().find(|op| kind_label.as_str() == op.sort().name) else {
+                let Some(&op_index) = op_by_name.get(kind_label) else {
                     todo!("{kind_label} extraction not implemented!");
                 };
+                let op = &ops[op_index];
                 let (op_instance, sources) =
                     op.extract(egraph, &kind_children, input_enodes, list_cache, expr_cache);
                 let r = graph.add_node(op_instance);
-                enode_to_node.insert(node, r);
-                for source in sources {
-                    edges_to_place.push((source, node));
-                }
+                enode_to_node.insert(node_key, r);
+                edges_to_place.extend(sources.iter().map(|source| (*source, node_key)));
             }
         } else if enode_label != "OutputJoin" {
             // Direct IR variant (Input, Output) — skip unknown labels (backend IR wrappers)
-            let Some(op) = ops.iter().find(|op| enode_label == op.sort().name) else {
+            let Some(&op_index) = op_by_name.get(enode_label) else {
                 continue;
             };
-            let ch = egraph.enodes[node]
-                .1
+            let op = &ops[op_index];
+            let ch = node
+                .children
                 .iter()
                 .map(|c| {
-                    if is_search_choice_eclass(&egraph.eclasses[c].0) {
+                    let class = cached_eclass(egraph, class_cache, c);
+                    if is_search_choice_eclass(class.label) {
                         choices[c]
                     } else {
-                        &egraph.eclasses[c].1[0]
+                        &class.nodes[0]
                     }
                 })
                 .collect_vec();
             // Direct IR ops pass children as kind_children, empty input_enodes
             let (op_instance, sources) = op.extract(egraph, &ch, vec![], list_cache, expr_cache);
             let r = graph.add_node(op_instance);
-            enode_to_node.insert(node, r);
-            for source in sources {
-                edges_to_place.push((source, node));
-            }
+            enode_to_node.insert(node_key, r);
+            edges_to_place.extend(sources.iter().map(|source| (*source, node_key)));
         }
     }
     for (src, dest) in edges_to_place {

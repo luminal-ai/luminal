@@ -1,6 +1,5 @@
 use crate::egglog_utils::{
-    EGraphChoiceSet, count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation,
-    hash_choice_set, hlir_to_egglog, log_channel_enabled, random_initial_choice,
+    IndexedChoiceSet, LlirExtractor, count_choice_sets_up_to, hlir_to_egglog, log_channel_enabled,
     run_egglog_with_late_passes_interval_analysis_and_log,
 };
 use crate::shape::{DimInterval, DynDimIntervals};
@@ -29,6 +28,35 @@ use tracing;
 
 pub type LLIRGraph = StableGraph<LLIROp, ()>;
 pub type HLIRGraph = StableGraph<Box<dyn HLIROp>, ()>;
+
+/// Dense, internal form used between indexed e-graph extraction and loop
+/// materialization. Runtimes continue to receive [`LLIRGraph`]; this only
+/// avoids constructing a throwaway rolled `StableGraph` for every search
+/// candidate.
+pub(crate) struct PackedLLIRGraph {
+    pub(crate) ops: Vec<LLIROp>,
+    pub(crate) incoming_offsets: Vec<usize>,
+    pub(crate) incoming_sources: Vec<usize>,
+    pub(crate) outgoing_offsets: Vec<usize>,
+    pub(crate) outgoing_targets: Vec<usize>,
+}
+
+impl PackedLLIRGraph {
+    pub(crate) fn to_stable(&self) -> LLIRGraph {
+        let mut graph = LLIRGraph::with_capacity(self.ops.len(), self.incoming_sources.len());
+        for op in &self.ops {
+            graph.add_node(op.clone());
+        }
+        for destination in 0..graph.node_count() {
+            for &source in &self.incoming_sources
+                [self.incoming_offsets[destination]..self.incoming_offsets[destination + 1]]
+            {
+                graph.add_edge(NodeIndex::new(source), NodeIndex::new(destination), ());
+            }
+        }
+        graph
+    }
+}
 
 #[derive(Debug, Clone)]
 struct RollingOccurrence {
@@ -96,8 +124,8 @@ struct Finalist<M> {
     llir: LLIRGraph,
 }
 
-struct LazyFinalists<'a, M> {
-    ranked: Vec<(M, EGraphChoiceSet<'a>)>,
+struct LazyFinalists<M> {
+    ranked: Vec<(M, IndexedChoiceSet)>,
     next_ranked: usize,
     finalists: Vec<Finalist<M>>,
     rejections: usize,
@@ -105,8 +133,8 @@ struct LazyFinalists<'a, M> {
     stopped_reason: Option<String>,
 }
 
-impl<'a, M> LazyFinalists<'a, M> {
-    fn new(ranked: Vec<(M, EGraphChoiceSet<'a>)>) -> Self {
+impl<M> LazyFinalists<M> {
+    fn new(ranked: Vec<(M, IndexedChoiceSet)>) -> Self {
         Self {
             ranked,
             next_ranked: 0,
@@ -118,10 +146,10 @@ impl<'a, M> LazyFinalists<'a, M> {
     }
 }
 
-struct BucketFinalistSearch<'a, M> {
+struct BucketFinalistSearch<M> {
     context: SearchProfileBucketContext,
     egraph_index: usize,
-    candidates: LazyFinalists<'a, M>,
+    candidates: LazyFinalists<M>,
 }
 
 /// A compiled bucket: (bucket_indices, representative_dyn_map, stitched_llir).
@@ -507,27 +535,6 @@ fn maybe_dump_selected_llir(label: &str, dyn_map: &DynMap, llir: &LLIRGraph) {
     } else {
         println!("   LLIR dump {summary_path}");
     }
-}
-
-fn random_choice_generation<'a, G: rand::Rng>(
-    egraph: &'a SerializedEGraph,
-    generation_size: usize,
-    prev_selected: &mut FxHashSet<u64>,
-    rng: &mut G,
-) -> Vec<crate::egglog_utils::EGraphChoiceSet<'a>> {
-    let mut generation = Vec::with_capacity(generation_size);
-    let max_attempts = generation_size.saturating_mul(100);
-    let mut attempts = 0;
-
-    while generation.len() < generation_size && attempts < max_attempts {
-        attempts += 1;
-        let genome = random_initial_choice(egraph, rng);
-        if prev_selected.insert(hash_choice_set(&genome)) {
-            generation.push(genome);
-        }
-    }
-
-    generation
 }
 
 fn panic_initial_filter_limit(filter_fails: usize, last_rejection: Option<&str>) -> ! {
@@ -2179,8 +2186,8 @@ impl Graph {
     /// `bucket_progress`: if `Some((current_bucket_idx, total_buckets))` adds a
     /// second "Bucket" progress bar.
     #[allow(clippy::too_many_arguments)]
-    fn search_single<'a, R: Runtime + 'static, G: rand::Rng>(
-        &'a self,
+    fn search_single<R: Runtime + 'static, G: rand::Rng>(
+        &self,
         runtime: &mut R,
         options: &CompileOptions,
         rng: &mut G,
@@ -2189,7 +2196,7 @@ impl Graph {
         bucket_profile_context: Option<SearchProfileBucketContext>,
         egraph_index: usize,
         search_started_at: std::time::Instant,
-    ) -> Vec<(R::ProfileMetric, EGraphChoiceSet<'a>)> {
+    ) -> Vec<(R::ProfileMetric, IndexedChoiceSet)> {
         let mut profile_dyn_map = dyn_map.clone();
         for (&dim, &value) in &options.profile_dims {
             profile_dyn_map.insert(dim, value);
@@ -2240,8 +2247,7 @@ impl Graph {
             };
 
         let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
-        let mut list_cache = FxHashMap::default();
-        let mut expr_cache = FxHashMap::default();
+        let mut llir_extractor = LlirExtractor::new(egraph, ops);
         runtime.clear_intermediate_buffers();
         let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
         // `profile_start.elapsed()` wraps the backend's post-acceptance profile
@@ -2271,30 +2277,21 @@ impl Graph {
                 .max(10_000);
 
             loop {
-                let mut generation = random_choice_generation(egraph, 1, &mut prev_selected, rng);
+                let mut generation =
+                    llir_extractor.random_indexed_generation(1, &mut prev_selected, rng);
                 let Some(genome) = generation.pop() else {
                     panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
                 };
 
-                list_cache.clear();
-                expr_cache.clear();
                 let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut graph = egglog_to_llir(
-                        egraph,
-                        genome.clone(),
-                        ops,
-                        &self.custom_ops,
-                        &mut list_cache,
-                        &mut expr_cache,
-                        None,
-                    );
+                    let graph =
+                        llir_extractor.extract_indexed_packed(&genome, &self.custom_ops, None);
                     // Profile the deployment graph itself: fully unrolled.
                     // Every scaled-down proxy (collapsed bodies, trip-count
                     // differencing) leaked family-dependent costs and
                     // inverted rankings; measuring the real graph is slower
                     // per candidate but cannot misorder families.
-                    unroll_loops_in_llir(&mut graph);
-                    graph
+                    unroll_packed_llir(graph)
                 }));
                 let Ok(graph) = graph_result else {
                     invalid_attempts += 1;
@@ -2413,7 +2410,7 @@ impl Graph {
         let mut ranked_candidates = vec![(best_metric.clone(), initial_genome.clone())];
 
         // Track top-N parents for offspring generation
-        let mut parents: Vec<(R::ProfileMetric, crate::egglog_utils::EGraphChoiceSet<'_>)> =
+        let mut parents: Vec<(R::ProfileMetric, IndexedChoiceSet)> =
             vec![(best_metric.clone(), initial_genome)];
         let mut resample_generation = false;
         let mut stagnant_generations = 0usize;
@@ -2428,7 +2425,7 @@ impl Graph {
             // Generate offspring from all parents, dividing budget evenly
             let budget = (search_limit - n_graphs).min(options.generation_size);
             let all_offspring = if resample_generation {
-                random_choice_generation(egraph, budget, &mut prev_selected, rng)
+                llir_extractor.random_indexed_generation(budget, &mut prev_selected, rng)
             } else {
                 let per_parent = budget.div_ceil(parents.len());
                 let mut offspring = Vec::new();
@@ -2447,8 +2444,7 @@ impl Graph {
                     } else {
                         1
                     };
-                    offspring.extend(extract_reachable_generation(
-                        egraph,
+                    offspring.extend(llir_extractor.extract_reachable_indexed_generation(
                         parent_genome,
                         per_parent.min(remaining),
                         options.mutations * kick,
@@ -2469,24 +2465,14 @@ impl Graph {
                 if search_time_limit_reached() {
                     break;
                 }
-                list_cache.clear();
-                expr_cache.clear();
-
                 let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let mut llir_graph = egglog_to_llir(
-                        egraph,
-                        genome.clone(),
-                        ops,
-                        &self.custom_ops,
-                        &mut list_cache,
-                        &mut expr_cache,
-                        None,
-                    );
+                    let packed =
+                        llir_extractor.extract_indexed_packed(&genome, &self.custom_ops, None);
                     let pre_collapse = std::env::var_os("LLIR_DUMP_DIR")
                         .is_some()
-                        .then(|| llir_graph.clone());
+                        .then(|| packed.to_stable());
                     // Profile fully unrolled — see initial-genome path.
-                    unroll_loops_in_llir(&mut llir_graph);
+                    let llir_graph = unroll_packed_llir(packed);
                     (pre_collapse, llir_graph)
                 }));
                 if let Err(payload) = &graph_result {
@@ -2704,10 +2690,10 @@ impl Graph {
     /// are only retained when aggregate bucket backtracking actually reaches
     /// them.
     #[allow(clippy::too_many_arguments)]
-    fn ensure_finalist<'a, R: Runtime + 'static>(
-        &'a self,
+    fn ensure_finalist<R: Runtime + 'static>(
+        &self,
         runtime: &mut R,
-        candidates: &mut LazyFinalists<'a, R::ProfileMetric>,
+        candidates: &mut LazyFinalists<R::ProfileMetric>,
         target: usize,
         options: &CompileOptions,
         dyn_map: &DynMap,
@@ -2717,6 +2703,7 @@ impl Graph {
     ) -> bool {
         let egraph = &self.egraphs[egraph_index];
         let ops = self.ops.as_ref().unwrap();
+        let mut llir_extractor = LlirExtractor::new(egraph, ops);
         let search_log = options.search_log_enabled();
         let dump_pre_unroll = std::env::var_os("LLIR_DUMP_PRE_UNROLL").is_some();
         let final_filter_dyn_map = if bucket_profile_context.is_some() {
@@ -2752,17 +2739,9 @@ impl Graph {
             candidates.next_ranked += 1;
 
             let final_graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut stitched = egglog_to_llir(
-                    egraph,
-                    genome,
-                    ops,
-                    &self.custom_ops,
-                    &mut FxHashMap::default(),
-                    &mut FxHashMap::default(),
-                    None,
-                );
-                let pre_unroll = dump_pre_unroll.then(|| stitched.clone());
-                unroll_loops_in_llir(&mut stitched);
+                let packed = llir_extractor.extract_indexed_packed(&genome, &self.custom_ops, None);
+                let pre_unroll = dump_pre_unroll.then(|| packed.to_stable());
+                let stitched = unroll_packed_llir(packed);
                 (pre_unroll, stitched)
             }));
             if let Err(payload) = &final_graph_result {
@@ -2858,7 +2837,7 @@ impl Graph {
         true
     }
 
-    fn no_finalist_message<M>(candidates: &LazyFinalists<'_, M>) -> String {
+    fn no_finalist_message<M>(candidates: &LazyFinalists<M>) -> String {
         if let Some(stopped_reason) = &candidates.stopped_reason {
             return format!(
                 "no viable final graph after {} hard-filter rejections: {stopped_reason}",
@@ -3808,247 +3787,582 @@ fn inline_static_loop_inputs(llir: &mut LLIRGraph) {
     }
 }
 
-pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
-    inline_static_loop_inputs(llir);
-    // Innermost first: unrolling an inner region turns it back into plain
-    // body nodes, which is exactly what the enclosing region's clone step
-    // needs to replicate.
-    while let Some((region, body)) = take_innermost_region(llir) {
-        if region.iters <= 1 || region.starts.is_empty() {
-            eprintln!(
-                "[loop-debug] unroll abandoned on degenerate region: iters={} starts={} ends={} inputs={} outputs={} selects={}",
-                region.iters,
-                region.starts.len(),
-                region.ends.len(),
-                region.inputs.len(),
-                region.outputs.len(),
-                region.output_selects.len(),
-            );
-            return;
-        }
-        unroll_loop_region(llir, &region, &body);
-        // Compact into a freshly-allocated StableGraph so all edge IDs are
-        // re-assigned sequentially in our chosen insertion order. Without
-        // this, later add_edge calls (the next region's rewiring, or
-        // kernel_to_host scheduling edges) can reuse edge indices freed by
-        // remove_node on loop markers, producing sort-by-edge-id orderings
-        // where a later-added edge lands at a low index — which the runtime
-        // interprets as a primary input position.
-        let compacted = compact_llir_preserving_input_order(llir);
-        *llir = compacted;
-    }
-    debug_assert!(
-        collect_loop_regions(llir).is_empty(),
-        "unroll left stray loop marker ops in LLIR"
-    );
+#[derive(Clone)]
+struct MaterializeLoopRegion {
+    iters: usize,
+    multiplier: usize,
 }
 
-fn unroll_loop_region(
-    llir: &mut LLIRGraph,
-    region: &LoopRegion,
-    body_nodes: &FxHashSet<NodeIndex>,
-) {
-    use petgraph::visit::EdgeRef;
+#[derive(Clone)]
+enum MaterializeLoopMarker {
+    Start {
+        region: usize,
+        initial: usize,
+        body_producer: usize,
+    },
+    End {
+        region: usize,
+        body_producer: usize,
+    },
+    Input {
+        region: usize,
+        sources: Vec<usize>,
+    },
+    StaticInput {
+        source: usize,
+    },
+    Output {
+        region: usize,
+        body_producer: usize,
+    },
+    OutputSelect {
+        region: usize,
+        iter: usize,
+        body_producer: usize,
+    },
+}
 
-    let LoopRegion {
-        starts,
-        ends,
-        inputs,
-        outputs,
-        output_selects,
-        iters,
-        markers: loop_markers,
-    } = region;
-    let iters = *iters;
+fn context_with_iteration(
+    context: usize,
+    region: usize,
+    iter: usize,
+    regions: &[MaterializeLoopRegion],
+) -> usize {
+    let descriptor = &regions[region];
+    let old_iter = (context / descriptor.multiplier) % descriptor.iters;
+    context - old_iter * descriptor.multiplier + iter * descriptor.multiplier
+}
 
-    // start_meta[loop_start] = (initial, body_producer):
-    //   - `initial` = LoopStart's incoming (state at iter 0).
-    //   - `body_producer` = LoopEnd's incoming (state value the body
-    //     produces each iter).
-    //
-    // A state slot is **iteration-invariant** iff `body_producer` is not
-    // in `body_nodes` (the forward-walk set from input markers). Such a
-    // producer has no input-marker ancestor, so its value can't depend on
-    // per-iter state — egglog rewrites prove the body chain reduces to a
-    // constant or external value, and extraction picks that directly. A
-    // real example is gemma's RoPE frequency factors (`Log2(10000)`,
-    // `log2(e)`), which the kernel-rewrite chain folds onto the body slot.
-    // For these, every iter sees the same state, so per-iter cloning is
-    // skipped — `resolve_src` and `marker_post_sub` use `body_producer`
-    // directly, recognised by `clone_map.get(&body_producer).is_none()`.
-    let mut start_meta: FxHashMap<NodeIndex, (NodeIndex, NodeIndex)> = FxHashMap::default();
-    for (slot_idx, &start_node) in starts {
-        let end_node = *ends
-            .get(slot_idx)
-            .unwrap_or_else(|| panic!("missing LoopEnd for slot {slot_idx}"));
-        let initial = llir
-            .neighbors_directed(start_node, Direction::Incoming)
-            .next()
-            .expect("LoopStart must have an initial-value producer");
-        let body_producer = llir
-            .neighbors_directed(end_node, Direction::Incoming)
-            .next()
-            .expect("LoopEnd must have a body producer");
-        start_meta.insert(start_node, (initial, body_producer));
+fn canonical_materialize_context(
+    context: usize,
+    mut membership: u128,
+    regions: &[MaterializeLoopRegion],
+) -> usize {
+    let mut canonical = 0;
+    while membership != 0 {
+        let region = membership.trailing_zeros() as usize;
+        let descriptor = &regions[region];
+        canonical += ((context / descriptor.multiplier) % descriptor.iters) * descriptor.multiplier;
+        membership &= membership - 1;
     }
+    canonical
+}
 
-    let mut input_per_iter: FxHashMap<NodeIndex, Vec<NodeIndex>> = FxHashMap::default();
-    for input_node in inputs.values() {
-        let srcs: Vec<NodeIndex> = llir
-            .edges_directed(*input_node, Direction::Incoming)
-            .sorted_by_key(|e| e.id())
-            .map(|e| e.source())
-            .collect();
-        assert_eq!(
-            srcs.len(),
-            iters,
-            "LoopInput stream must have `iters` sources"
-        );
-        input_per_iter.insert(*input_node, srcs);
-    }
-
-    let mut clone_map: Vec<FxHashMap<NodeIndex, NodeIndex>> = vec![FxHashMap::default(); iters];
-    for &b in body_nodes {
-        clone_map[0].insert(b, b);
-    }
-    for clone in clone_map.iter_mut().skip(1) {
-        for &b in body_nodes {
-            let cloned = llir.add_node(llir[b].clone());
-            clone.insert(b, cloned);
+fn materialize_contexts(membership: u128, regions: &[MaterializeLoopRegion]) -> Vec<usize> {
+    let mut contexts = vec![0usize];
+    for (region, descriptor) in regions.iter().enumerate() {
+        if membership & (1u128 << region) == 0 {
+            continue;
+        }
+        let existing = contexts.clone();
+        contexts.clear();
+        contexts.reserve(existing.len() * descriptor.iters);
+        for iter in 0..descriptor.iters {
+            contexts.extend(
+                existing
+                    .iter()
+                    .map(|context| context + iter * descriptor.multiplier),
+            );
         }
     }
+    contexts
+}
 
-    let resolve_src = |src: NodeIndex, i: usize, clone_map: &[FxHashMap<NodeIndex, NodeIndex>]| {
-        if let Some(&(initial, body_producer)) = start_meta.get(&src) {
-            if i == 0 {
-                initial
-            } else {
-                // Iteration-invariant slot fallback: `body_producer` not in
-                // `body_nodes` ⇒ not cloned per iter ⇒ all iters share it.
-                clone_map[i - 1]
-                    .get(&body_producer)
-                    .copied()
-                    .unwrap_or(body_producer)
-            }
-        } else if let Some(sources) = input_per_iter.get(&src) {
-            sources[i]
-        } else if body_nodes.contains(&src) {
-            clone_map[i][&src]
+struct MaterializeAdjacency {
+    offsets: Vec<usize>,
+    neighbors: Vec<usize>,
+}
+
+impl MaterializeAdjacency {
+    fn incoming(llir: &LLIRGraph, node_bound: usize) -> Self {
+        let mut offsets = vec![0usize; node_bound + 1];
+        for edge in llir.edge_indices() {
+            let (_, destination) = llir.edge_endpoints(edge).unwrap();
+            offsets[destination.index() + 1] += 1;
+        }
+        for index in 1..offsets.len() {
+            offsets[index] += offsets[index - 1];
+        }
+        let mut cursor = offsets[..node_bound].to_vec();
+        let mut neighbors = vec![usize::MAX; llir.edge_count()];
+        // StableGraph edge indices iterate in ascending slot order. Filling
+        // each destination's range in that order preserves positional inputs
+        // without sorting or allocating one Vec per node.
+        for edge in llir.edge_indices() {
+            let (source, destination) = llir.edge_endpoints(edge).unwrap();
+            neighbors[cursor[destination.index()]] = source.index();
+            cursor[destination.index()] += 1;
+        }
+        Self { offsets, neighbors }
+    }
+
+    fn outgoing(llir: &LLIRGraph, node_bound: usize) -> Self {
+        let mut offsets = vec![0usize; node_bound + 1];
+        for edge in llir.edge_indices() {
+            let (source, _) = llir.edge_endpoints(edge).unwrap();
+            offsets[source.index() + 1] += 1;
+        }
+        for index in 1..offsets.len() {
+            offsets[index] += offsets[index - 1];
+        }
+        let mut cursor = offsets[..node_bound].to_vec();
+        let mut neighbors = vec![usize::MAX; llir.edge_count()];
+        for edge in llir.edge_indices() {
+            let (source, destination) = llir.edge_endpoints(edge).unwrap();
+            neighbors[cursor[source.index()]] = destination.index();
+            cursor[source.index()] += 1;
+        }
+        Self { offsets, neighbors }
+    }
+
+    fn get(&self, node: usize) -> &[usize] {
+        &self.neighbors[self.offsets[node]..self.offsets[node + 1]]
+    }
+}
+
+trait MaterializeLLIRView {
+    fn node_bound(&self) -> usize;
+    fn op(&self, node: usize) -> Option<&LLIROp>;
+    fn incoming(&self, node: usize) -> &[usize];
+    fn outgoing(&self, node: usize) -> &[usize];
+}
+
+struct StableMaterializeView<'a> {
+    graph: &'a LLIRGraph,
+    incoming: MaterializeAdjacency,
+    outgoing: MaterializeAdjacency,
+    node_bound: usize,
+}
+
+impl<'a> StableMaterializeView<'a> {
+    fn new(graph: &'a LLIRGraph) -> Self {
+        let node_bound = petgraph::visit::NodeIndexable::node_bound(graph);
+        Self {
+            graph,
+            incoming: MaterializeAdjacency::incoming(graph, node_bound),
+            outgoing: MaterializeAdjacency::outgoing(graph, node_bound),
+            node_bound,
+        }
+    }
+}
+
+impl MaterializeLLIRView for StableMaterializeView<'_> {
+    fn node_bound(&self) -> usize {
+        self.node_bound
+    }
+
+    fn op(&self, node: usize) -> Option<&LLIROp> {
+        self.graph.node_weight(NodeIndex::new(node))
+    }
+
+    fn incoming(&self, node: usize) -> &[usize] {
+        self.incoming.get(node)
+    }
+
+    fn outgoing(&self, node: usize) -> &[usize] {
+        self.outgoing.get(node)
+    }
+}
+
+impl MaterializeLLIRView for PackedLLIRGraph {
+    fn node_bound(&self) -> usize {
+        self.ops.len()
+    }
+
+    fn op(&self, node: usize) -> Option<&LLIROp> {
+        self.ops.get(node)
+    }
+
+    fn incoming(&self, node: usize) -> &[usize] {
+        &self.incoming_sources[self.incoming_offsets[node]..self.incoming_offsets[node + 1]]
+    }
+
+    fn outgoing(&self, node: usize) -> &[usize] {
+        &self.outgoing_targets[self.outgoing_offsets[node]..self.outgoing_offsets[node + 1]]
+    }
+}
+
+#[derive(Default)]
+struct MaterializeCollectedRegion {
+    starts: std::collections::BTreeMap<usize, usize>,
+    ends: std::collections::BTreeMap<usize, usize>,
+    inputs: std::collections::BTreeMap<usize, usize>,
+    outputs: std::collections::BTreeMap<usize, usize>,
+    output_selects: FxHashMap<usize, (usize, usize)>,
+    iters: usize,
+    markers: FxHashSet<usize>,
+}
+
+fn collect_materialize_loop_regions(
+    llir: &impl MaterializeLLIRView,
+) -> std::collections::BTreeMap<usize, MaterializeCollectedRegion> {
+    use crate::hlir::{LoopEnd, LoopInput, LoopOutput, LoopOutputSelect, LoopStart};
+
+    let mut regions: std::collections::BTreeMap<usize, MaterializeCollectedRegion> =
+        std::collections::BTreeMap::new();
+    for node in 0..llir.node_bound() {
+        let Some(op) = llir.op(node) else {
+            continue;
+        };
+        let loop_id = if let Some(marker) = op.to_op::<LoopStart>() {
+            let region = regions.entry(marker.loop_id).or_default();
+            region.iters = region.iters.max(marker.iters.to_usize().unwrap_or(1));
+            region.starts.insert(marker.slot_idx, node);
+            marker.loop_id
+        } else if let Some(marker) = op.to_op::<LoopEnd>() {
+            regions
+                .entry(marker.loop_id)
+                .or_default()
+                .ends
+                .insert(marker.slot_idx, node);
+            marker.loop_id
+        } else if let Some(marker) = op.to_op::<LoopInput>() {
+            regions
+                .entry(marker.loop_id)
+                .or_default()
+                .inputs
+                .insert(marker.stream_id, node);
+            marker.loop_id
+        } else if let Some(marker) = op.to_op::<LoopOutputSelect>() {
+            regions
+                .entry(marker.loop_id)
+                .or_default()
+                .output_selects
+                .insert(node, (marker.stream_id, marker.iter));
+            marker.loop_id
+        } else if let Some(marker) = op.to_op::<LoopOutput>() {
+            regions
+                .entry(marker.loop_id)
+                .or_default()
+                .outputs
+                .insert(marker.stream_id, node);
+            marker.loop_id
         } else {
-            src
-        }
-    };
-
-    let body_incoming: FxHashMap<NodeIndex, Vec<NodeIndex>> = body_nodes
-        .iter()
-        .map(|&b| {
-            let srcs: Vec<NodeIndex> = llir
-                .edges_directed(b, Direction::Incoming)
-                .sorted_by_key(|e| e.id())
-                .map(|e| e.source())
-                .collect();
-            (b, srcs)
-        })
-        .collect();
-
-    // For iter 0, we rebuild each body node's incoming edges in place: we
-    // remove each old edge and immediately re-add a new edge with the
-    // resolved source. petgraph::stable_graph reuses freed edge indices
-    // LIFO, so interleaving remove+add for each edge causes the new edge
-    // to reuse exactly the freed slot, preserving edge-id ordering (which
-    // the runtime relies on for input positions).
-    for &b in body_nodes {
-        let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
-            .edges_directed(b, Direction::Incoming)
-            .sorted_by_key(|e| e.id())
-            .map(|e| (e.source(), e.id()))
-            .collect();
-        for (src, eid) in pairs {
-            let new_src = resolve_src(src, 0, &clone_map);
-            llir.remove_edge(eid);
-            llir.add_edge(new_src, b, ());
-        }
+            continue;
+        };
+        regions.entry(loop_id).or_default().markers.insert(node);
     }
-    // For iter > 0 clones, there are no existing edges — add fresh ones in
-    // body_incoming order so edge-id ordering matches.
-    for i in 1..iters {
-        for &b in body_nodes {
-            let target = clone_map[i][&b];
-            let srcs = &body_incoming[&b];
-            for &src in srcs {
-                let new_src = resolve_src(src, i, &clone_map);
-                llir.add_edge(new_src, target, ());
+    regions
+}
+
+/// Materialize a rolled LLIR into one fully-unrolled StableGraph without ever
+/// mutating a graph containing loop markers.  Each surviving `(node, loop
+/// context)` pair is allocated exactly once and its ordered incoming edges are
+/// emitted directly into the final graph.  This avoids StableGraph free-list
+/// edge reuse and therefore needs no repair/compaction pass.
+fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGraph> {
+    use crate::hlir::{
+        LoopEnd, LoopInput, LoopInputStatic, LoopOutput, LoopOutputSelect, LoopStart, Output,
+    };
+    let node_bound = llir.node_bound();
+
+    let mut loop_regions = collect_materialize_loop_regions(llir);
+    let mut markers: Vec<Option<MaterializeLoopMarker>> = vec![None; node_bound];
+
+    // Invariant LoopInput variants are transparent and must not seed a loop
+    // body. This mirrors `inline_static_loop_inputs` before region discovery.
+    for (node, marker_slot) in markers.iter_mut().enumerate() {
+        let Some(op) = llir.op(node) else {
+            continue;
+        };
+        if op.to_op::<LoopInputStatic>().is_some() {
+            let &source = llir.incoming(node).first()?;
+            *marker_slot = Some(MaterializeLoopMarker::StaticInput { source });
+        } else if let Some(input) = op.to_op::<LoopInput>() {
+            let sources = llir.incoming(node);
+            if let Some(&first) = sources.first()
+                && sources.iter().all(|source| *source == first)
+            {
+                *marker_slot = Some(MaterializeLoopMarker::StaticInput { source: first });
+                if let Some(region) = loop_regions.get_mut(&input.loop_id) {
+                    region.inputs.remove(&input.stream_id);
+                    region.markers.remove(&node);
+                }
             }
         }
     }
 
-    let post_loop_consumers: FxHashSet<NodeIndex> = loop_markers
-        .iter()
-        .flat_map(|n| {
-            llir.neighbors_directed(*n, Direction::Outgoing)
-                .collect::<Vec<_>>()
-        })
-        .filter(|n| !loop_markers.contains(n) && !body_nodes.contains(n))
-        .collect();
-
-    // Resolve each LoopOutput stream's body producer (its single incoming
-    // edge in the LLIR).
-    let mut output_body_producer: FxHashMap<usize /*stream_id*/, NodeIndex> = FxHashMap::default();
-    for (&stream_id, &output_node) in outputs {
-        let body_producer = llir
-            .neighbors_directed(output_node, Direction::Incoming)
-            .next()
-            .expect("LoopOutput missing body producer during rewire");
-        output_body_producer.insert(stream_id, body_producer);
+    if loop_regions.len() > 128 {
+        return None;
     }
 
-    let mut marker_post_sub: FxHashMap<NodeIndex, NodeIndex> = FxHashMap::default();
-    for &end_node in ends.values() {
-        let body_producer = llir
-            .neighbors_directed(end_node, Direction::Incoming)
-            .next()
-            .expect("LoopEnd missing body producer during rewire");
-        let sub = resolve_src(body_producer, iters - 1, &clone_map);
-        marker_post_sub.insert(end_node, sub);
-    }
-    // Each LoopOutputSelect(stream, iter) routes to iter's clone of that
-    // stream's body producer. Same iteration-invariant fallback as for
-    // LoopEnd above: if the body producer isn't in `body_nodes`, it wasn't
-    // cloned per iter and every iter shares the single `body_producer`.
-    // Entry markers can also have consumers outside the walked body:
-    // extraction may elect a marker as the representative of a value class
-    // read anywhere in the graph. Such aliasing only arises for
-    // iteration-invariant values (that is what egglog unions), so route
-    // stray consumers to the iter-0 value — never leave a consumer pointing
-    // at a marker about to be removed.
-    for (&input_node, sources) in &input_per_iter {
-        marker_post_sub.insert(input_node, sources[0]);
-    }
-    for (&start_node, &(initial, _)) in &start_meta {
-        marker_post_sub.insert(start_node, initial);
-    }
-    for (&select_node, &(stream_id, iter)) in output_selects {
-        let body_producer = output_body_producer[&stream_id];
-        let sub = resolve_src(body_producer, iter, &clone_map);
-        marker_post_sub.insert(select_node, sub);
+    let mut region_by_id: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut regions = Vec::with_capacity(loop_regions.len());
+    let mut context_count = 1usize;
+    for (&loop_id, region) in &loop_regions {
+        if region.iters <= 1 || region.starts.is_empty() {
+            return None;
+        }
+        region_by_id.insert(loop_id, regions.len());
+        regions.push(MaterializeLoopRegion {
+            iters: region.iters,
+            multiplier: context_count,
+        });
+        context_count = context_count.checked_mul(region.iters)?;
     }
 
-    for &consumer in &post_loop_consumers {
-        // Per-edge replace to preserve edge-id ordering via LIFO reuse.
-        let pairs: Vec<(NodeIndex, petgraph::graph::EdgeIndex)> = llir
-            .edges_directed(consumer, Direction::Incoming)
-            .sorted_by_key(|e| e.id())
-            .map(|e| (e.source(), e.id()))
-            .collect();
-        for (src, eid) in pairs {
-            let new_src = marker_post_sub.get(&src).copied().unwrap_or(src);
-            llir.remove_edge(eid);
-            llir.add_edge(new_src, consumer, ());
+    let mut marker_owner = vec![None; node_bound];
+    for (&loop_id, region) in &loop_regions {
+        let region_index = region_by_id[&loop_id];
+        for &marker in &region.markers {
+            marker_owner[marker] = Some(region_index);
+        }
+
+        for (&slot, &start) in &region.starts {
+            let &end = region.ends.get(&slot)?;
+            let &initial = llir.incoming(start).first()?;
+            let &body_producer = llir.incoming(end).first()?;
+            markers[start] = Some(MaterializeLoopMarker::Start {
+                region: region_index,
+                initial,
+                body_producer,
+            });
+            markers[end] = Some(MaterializeLoopMarker::End {
+                region: region_index,
+                body_producer,
+            });
+        }
+
+        for &input in region.inputs.values() {
+            let sources = llir.incoming(input).to_vec();
+            if sources.len() != region.iters {
+                return None;
+            }
+            markers[input] = Some(MaterializeLoopMarker::Input {
+                region: region_index,
+                sources,
+            });
+        }
+
+        let mut output_producers = FxHashMap::default();
+        for (&stream, &output) in &region.outputs {
+            let &body_producer = llir.incoming(output).first()?;
+            output_producers.insert(stream, body_producer);
+            markers[output] = Some(MaterializeLoopMarker::Output {
+                region: region_index,
+                body_producer,
+            });
+        }
+        for (&select, &(stream, iter)) in &region.output_selects {
+            if iter >= region.iters {
+                return None;
+            }
+            markers[select] = Some(MaterializeLoopMarker::OutputSelect {
+                region: region_index,
+                iter,
+                body_producer: *output_producers.get(&stream)?,
+            });
         }
     }
 
-    for &n in loop_markers {
-        llir.remove_node(n);
+    // Reject malformed marker graphs rather than silently materializing a
+    // marker as an executable op. Callers treat this as an invariant failure.
+    for (node, marker) in markers.iter().enumerate() {
+        let Some(op) = llir.op(node) else {
+            continue;
+        };
+        let is_marker = op.to_op::<LoopStart>().is_some()
+            || op.to_op::<LoopEnd>().is_some()
+            || op.to_op::<LoopInput>().is_some()
+            || op.to_op::<LoopInputStatic>().is_some()
+            || op.to_op::<LoopOutput>().is_some()
+            || op.to_op::<LoopOutputSelect>().is_some();
+        if is_marker && marker.is_none() {
+            return None;
+        }
+    }
+
+    // Region membership is a transitive scope: foreign (nested) markers are
+    // transparent, while this region's own exit markers are boundaries. This
+    // directly describes the nodes that must be cloned for each enclosing
+    // iteration.
+    let mut membership = vec![0u128; node_bound];
+    for (&loop_id, region) in &loop_regions {
+        let region_index = region_by_id[&loop_id];
+        let mut seen = vec![false; node_bound];
+        let mut worklist: Vec<usize> = region
+            .starts
+            .values()
+            .chain(region.inputs.values())
+            .flat_map(|marker| llir.outgoing(*marker).iter().copied())
+            .collect();
+        while let Some(node) = worklist.pop() {
+            if seen[node] {
+                continue;
+            }
+            seen[node] = true;
+            if markers[node].is_some() {
+                if marker_owner[node] != Some(region_index) {
+                    worklist.extend(llir.outgoing(node));
+                }
+                continue;
+            }
+            if llir.op(node)?.to_op::<Output>().is_some() {
+                continue;
+            }
+            membership[node] |= 1u128 << region_index;
+            worklist.extend(llir.outgoing(node));
+        }
+    }
+
+    let mut contexts_by_membership: FxHashMap<u128, Vec<usize>> = FxHashMap::default();
+    contexts_by_membership.insert(0, vec![0]);
+    let mut final_node_count = 0usize;
+    let mut final_edge_count = 0usize;
+    for node in 0..node_bound {
+        if llir.op(node).is_none() || markers[node].is_some() {
+            continue;
+        }
+        let contexts = contexts_by_membership
+            .entry(membership[node])
+            .or_insert_with(|| materialize_contexts(membership[node], &regions));
+        final_node_count += contexts.len();
+        final_edge_count += contexts.len() * llir.incoming(node).len();
+    }
+
+    let mut materialized = LLIRGraph::with_capacity(final_node_count, final_edge_count);
+    let map_len = node_bound.checked_mul(context_count)?;
+    let mut instance_map: Vec<Option<NodeIndex>> = vec![None; map_len];
+
+    for node in 0..node_bound {
+        let Some(op) = llir.op(node) else {
+            continue;
+        };
+        if markers[node].is_some() {
+            continue;
+        }
+        for &context in &contexts_by_membership[&membership[node]] {
+            let materialized_node = materialized.add_node(op.clone());
+            instance_map[node * context_count + context] = Some(materialized_node);
+        }
+    }
+
+    for node in 0..node_bound {
+        if llir.op(node).is_none() || markers[node].is_some() {
+            continue;
+        }
+        let node_membership = membership[node];
+        for &context in &contexts_by_membership[&node_membership] {
+            let target = instance_map[node * context_count + context]?;
+            for &original_source in llir.incoming(node) {
+                let mut source = original_source;
+                let mut source_context = context;
+                let mut marker_hops = 0usize;
+                while let Some(marker) = markers[source].as_ref() {
+                    marker_hops += 1;
+                    if marker_hops > node_bound {
+                        return None;
+                    }
+                    match marker {
+                        MaterializeLoopMarker::Start {
+                            region,
+                            initial,
+                            body_producer,
+                        } => {
+                            let descriptor = &regions[*region];
+                            let iter = (source_context / descriptor.multiplier) % descriptor.iters;
+                            if iter == 0 {
+                                source = *initial;
+                            } else {
+                                source = *body_producer;
+                                source_context = context_with_iteration(
+                                    source_context,
+                                    *region,
+                                    iter - 1,
+                                    &regions,
+                                );
+                            }
+                        }
+                        MaterializeLoopMarker::End {
+                            region,
+                            body_producer,
+                        } => {
+                            source = *body_producer;
+                            source_context = context_with_iteration(
+                                source_context,
+                                *region,
+                                regions[*region].iters - 1,
+                                &regions,
+                            );
+                        }
+                        MaterializeLoopMarker::Input { region, sources } => {
+                            let descriptor = &regions[*region];
+                            let iter = (source_context / descriptor.multiplier) % descriptor.iters;
+                            source = sources[iter];
+                        }
+                        MaterializeLoopMarker::StaticInput {
+                            source: static_source,
+                        } => {
+                            source = *static_source;
+                        }
+                        MaterializeLoopMarker::Output {
+                            region,
+                            body_producer,
+                        } => {
+                            source = *body_producer;
+                            let descriptor = &regions[*region];
+                            let iter = (source_context / descriptor.multiplier) % descriptor.iters;
+                            source_context =
+                                context_with_iteration(source_context, *region, iter, &regions);
+                        }
+                        MaterializeLoopMarker::OutputSelect {
+                            region,
+                            iter,
+                            body_producer,
+                        } => {
+                            source = *body_producer;
+                            source_context =
+                                context_with_iteration(source_context, *region, *iter, &regions);
+                        }
+                    }
+                }
+                let source_context =
+                    canonical_materialize_context(source_context, membership[source], &regions);
+                let materialized_source = instance_map[source * context_count + source_context]?;
+                materialized.add_edge(materialized_source, target, ());
+            }
+        }
+    }
+
+    Some(materialized)
+}
+
+fn materialize_unrolled_llir(llir: &LLIRGraph) -> Option<LLIRGraph> {
+    materialize_unrolled_view(&StableMaterializeView::new(llir))
+}
+
+/// Complete the indexed hot path by materializing its dense rolled graph
+/// directly into the public StableGraph representation expected by runtimes.
+pub(crate) fn unroll_packed_llir(llir: PackedLLIRGraph) -> LLIRGraph {
+    let started_at = std::time::Instant::now();
+    let rolled_nodes = llir.ops.len();
+    let graph = materialize_unrolled_view(&llir)
+        .expect("rolled LLIR must satisfy the loop materialization invariants");
+    if crate::egglog_utils::llir_profile_enabled() {
+        eprintln!(
+            "LLIR_UNROLL_PROFILE total_ms={:.3} rolled_nodes={} unrolled_nodes={} unrolled_edges={}",
+            started_at.elapsed().as_secs_f64() * 1e3,
+            rolled_nodes,
+            graph.node_count(),
+            graph.edge_count(),
+        );
+    }
+    graph
+}
+
+pub fn unroll_loops_in_llir(llir: &mut LLIRGraph) {
+    let started_at = std::time::Instant::now();
+    let rolled_nodes = llir.node_count();
+    *llir = materialize_unrolled_llir(llir)
+        .expect("rolled LLIR must satisfy the loop materialization invariants");
+    if crate::egglog_utils::llir_profile_enabled() {
+        eprintln!(
+            "LLIR_UNROLL_PROFILE total_ms={:.3} rolled_nodes={} unrolled_nodes={} unrolled_edges={}",
+            started_at.elapsed().as_secs_f64() * 1e3,
+            rolled_nodes,
+            llir.node_count(),
+            llir.edge_count(),
+        );
     }
 }
 
@@ -4065,9 +4379,9 @@ fn unroll_loop_region(
 /// exactly the iter-0 body plus the surrounding non-loop graph.
 pub fn collapse_loops_to_first_iter(llir: &mut LLIRGraph) {
     inline_static_loop_inputs(llir);
-    // Innermost first, same as `unroll_loops_in_llir`: collapsing an inner
-    // region leaves its iter-0 body as plain nodes inside the enclosing
-    // region, which then collapses over them in turn.
+    // Innermost first: collapsing an inner region leaves its iter-0 body as
+    // plain nodes inside the enclosing region, which then collapses over them
+    // in turn.
     while let Some((region, body)) = take_innermost_region(llir) {
         if region.starts.is_empty() {
             eprintln!(
