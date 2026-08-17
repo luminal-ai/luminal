@@ -1,10 +1,10 @@
 use generational_box::{AnyStorage, GenerationalBox, Owner, SyncStorage};
 use lru::LruCache;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     fmt::Debug,
-    hash::Hash,
+    hash::{Hash, Hasher},
     num::NonZeroUsize,
     ops::{
         Add, AddAssign, BitAnd, BitAndAssign, BitOr, BitOrAssign, Div, DivAssign, Mul, MulAssign,
@@ -182,6 +182,30 @@ impl Expression {
                 }
             })
             .collect()
+    }
+
+    /// Insert the dimension variables this expression depends on into an
+    /// existing set. This is the allocation-free counterpart to `dyn_vars`
+    /// for callers aggregating variables across many expressions.
+    pub fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        vars.extend(self.terms.read().iter().filter_map(|term| {
+            if let Term::Var(var) = term {
+                (!var.is_reserved()).then_some(*var)
+            } else {
+                None
+            }
+        }));
+    }
+
+    /// Hash this expression's process-local intern identity without walking
+    /// its terms. Equal term vectors are hash-consed to the same identity.
+    pub fn hash_intern_id<H: Hasher>(&self, state: &mut H) {
+        self.terms.id().hash(state);
+    }
+
+    /// Whether two expressions are the exact same hash-consed expression.
+    pub fn has_same_intern_id(&self, other: &Self) -> bool {
+        self.terms.id() == other.terms.id()
     }
 }
 

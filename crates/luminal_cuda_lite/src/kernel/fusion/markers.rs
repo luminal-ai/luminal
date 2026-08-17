@@ -145,13 +145,10 @@ impl EgglogOp for FusionEnd {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        // Multi-op fusion (the grow/merge absorption family) is removed
-        // pending its legality-by-construction rework: the absorption unions
-        // could create self-referential e-classes whose cyclic extractions
-        // were rejected only by post-extraction candidate validation, and the
-        // grown regions' dtype/metadata legality was likewise established by
-        // `validate_fusion_regions` instead of by the rules themselves. Elementwise ops still lower through
-        // single-op regions (`cuda-elem-singleton-*` in elementwise.rs).
+        // Multi-op fusion (the grow/merge absorption family) remains disabled
+        // until those rules encode output-layout, dtype, and metadata legality
+        // themselves. Elementwise ops still lower through singleton regions,
+        // whose metadata is copied directly from the matched HLIR operation.
         Vec::new()
     }
 

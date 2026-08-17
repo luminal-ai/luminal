@@ -1,23 +1,28 @@
 use crate::{
     host::{DeviceBuffer, HostOp},
-    kernel::{CudaGraphOp, CudaGraphTiming, KernelOp, record_cuda_graph_timings},
+    kernel::{
+        CompiledFunctionResourceCache, CudaGraphOp, CudaGraphTiming, KernelOp,
+        PreparedKernelToHostPlan, fusion::region_codegen::RegionSourceCache,
+        record_cuda_graph_timings,
+    },
     resource::{
         CandidateResourceCaps, CandidateResourcePlan, CudaDeviceResourceLimits,
-        DEFAULT_MAX_KERNEL_SOURCE_BYTES, HostDeviceMemoryPlan, KernelResourcePlan,
-        ResourceViolation, SharedDeviceMemoryAllocation, plan_static_llir_resources,
-        validate_resource_plan, validate_static_llir_semantics,
+        DEFAULT_MAX_KERNEL_SOURCE_BYTES, HostDeviceMemoryPlan, ResourceViolation,
+        SharedDeviceMemoryAllocation, prepare_static_llir_resources, validate_resource_plan,
+        validate_static_llir_semantics,
     },
 };
-use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result, sys};
+use cudarc::driver::{
+    CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, result, sys,
+};
 
-use fixedbitset::FixedBitSet;
 use half::{bf16, f16};
 use itertools::Itertools;
 use luminal::hlir::*;
 use luminal::prelude::{
     petgraph::{
         Directed, Direction,
-        algo::{Cycle, toposort},
+        algo::toposort,
         prelude::StableGraph,
         visit::{EdgeRef, NodeIndexable},
     },
@@ -176,6 +181,19 @@ struct ArenaSlot {
     capacity_bytes: usize,
 }
 
+#[derive(Default)]
+struct ArenaOrderingPlan {
+    groups: Vec<crate::kernel::CudaGraphArenaOrdering>,
+}
+
+impl ArenaOrderingPlan {
+    fn buffers_are_ordered(&self, before: NodeIndex, after: NodeIndex) -> bool {
+        self.groups.iter().all(|group| {
+            !group.contains(before) || !group.contains(after) || group.precedes(before, after)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NonFiniteBufferReport {
     pub(crate) node: NodeIndex,
@@ -216,6 +234,10 @@ enum ResolvedOutputRegistration {
 /// Weights (hlir_buffers) are shared.
 pub(crate) struct CompiledBucket {
     pub(crate) exec_graph: StableGraph<ExecutableHostOp, (), Directed>,
+    /// Dependency order is immutable after compilation. Cache it once instead
+    /// of running petgraph's full topological traversal before every profile
+    /// materialization and launch.
+    exec_order: Vec<NodeIndex>,
     pub(crate) node_to_exec: FxHashMap<NodeIndex, NodeIndex>,
     /// Single reusable arena for all intermediate buffers in this bucket.
     pub(crate) arena: Option<CudaSlice<u8>>,
@@ -229,7 +251,6 @@ pub(crate) struct CompiledBucket {
     pub(crate) logical_buffer_capacity_bytes: FxHashMap<NodeIndex, usize>,
     arena_slots: Vec<ArenaSlot>,
     logical_buffer_slots: FxHashMap<NodeIndex, usize>,
-    arena_conflicts: FxHashSet<(NodeIndex, NodeIndex)>,
     pub(crate) cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     pub(crate) buffer_specs: FxHashMap<NodeIndex, BufferSpec>,
     buffer_spec_dyn_vars: FxHashMap<NodeIndex, Vec<Symbol>>,
@@ -273,6 +294,7 @@ impl CompiledBucket {
     fn new() -> Self {
         CompiledBucket {
             exec_graph: StableGraph::default(),
+            exec_order: Vec::new(),
             node_to_exec: FxHashMap::default(),
             arena: None,
             arena_pool: None,
@@ -282,7 +304,6 @@ impl CompiledBucket {
             logical_buffer_capacity_bytes: FxHashMap::default(),
             arena_slots: Vec::new(),
             logical_buffer_slots: FxHashMap::default(),
-            arena_conflicts: FxHashSet::default(),
             cached_buffer_ptrs: FxHashMap::default(),
             buffer_specs: FxHashMap::default(),
             buffer_spec_dyn_vars: FxHashMap::default(),
@@ -333,6 +354,12 @@ struct ValidatedBucketSet {
     input_lengths_complete: bool,
 }
 
+struct ValidatedProfileCandidate {
+    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
+    buckets: ValidatedBucketSet,
+    display: String,
+}
+
 impl ArenaReleasePlan {
     fn record_arena(&mut self, pool: Option<sys::CUmemoryPool>) {
         self.arenas_released += 1;
@@ -359,8 +386,17 @@ pub struct CudaRuntime {
     pub last_kernel_stats: Vec<KernelStats>,
     pub last_total_time_us: f64,
     kernel_cache: FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    compiled_function_resource_cache: CompiledFunctionResourceCache,
+    region_source_cache: RegionSourceCache,
     /// When true, execute() skips input buffer consumption (used during search/profile)
     profiling: bool,
+    /// Reused timing-enabled events bounding only the stream work launched by
+    /// `execute`. Search profiling reads this interval instead of host wall
+    /// time, excluding graph materialization and CPU synchronization wall time
+    /// from candidate ranking.
+    profile_start_event: CudaEvent,
+    profile_end_event: CudaEvent,
+    last_profile_device_duration: Option<Duration>,
     max_intermediate_memory_bytes: Option<usize>,
     max_kernel_source_bytes: Option<usize>,
     device_resource_limits: Option<CudaDeviceResourceLimits>,
@@ -1990,13 +2026,18 @@ impl CudaRuntime {
     }
 
     fn initialize_fixed_intermediate_buffer_plan(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
+        let profile = std::env::var_os("LUMINAL_CUDA_ARENA_PROFILE").is_some();
+        let profile_start = std::time::Instant::now();
         bucket.arena_slots.clear();
         bucket.logical_buffer_slots.clear();
 
-        let mut planned = Self::planned_intermediate_buffers(bucket, dyn_dims, true);
+        let planned_start = std::time::Instant::now();
+        let (mut planned, ordering) = Self::planned_intermediate_buffers(bucket, dyn_dims, true);
+        let planned_ms = planned_start.elapsed().as_secs_f64() * 1000.0;
         if planned.is_empty() {
             return;
         }
+        let planned_len = planned.len();
 
         if bucket.preserve_intermediate_buffers_for_debug {
             planned.sort_by_key(|buf| buf.node.index());
@@ -2009,13 +2050,38 @@ impl CudaRuntime {
                     capacity_bytes: 0,
                 });
             }
+            Self::refresh_fixed_intermediate_buffer_plan_impl(bucket, dyn_dims, true);
             return;
         }
 
-        Self::assign_fixed_arena_slots(bucket, planned);
+        let assign_start = std::time::Instant::now();
+        Self::assign_fixed_arena_slots_with_ordering(bucket, planned, &ordering);
+        Self::refresh_fixed_intermediate_buffer_plan_impl(bucket, dyn_dims, true);
+        if profile {
+            eprintln!(
+                "CUDA_ARENA_INIT_PROFILE total_ms={:.3} planned_ms={planned_ms:.3} assign_ms={:.3} buffers={planned_len} groups={} slots={}",
+                profile_start.elapsed().as_secs_f64() * 1000.0,
+                assign_start.elapsed().as_secs_f64() * 1000.0,
+                ordering.groups.len(),
+                bucket.arena_slots.len(),
+            );
+        }
     }
 
+    #[cfg(test)]
     fn assign_fixed_arena_slots(bucket: &mut CompiledBucket, mut planned: Vec<PlannedBuffer>) {
+        Self::assign_fixed_arena_slots_with_ordering(
+            bucket,
+            std::mem::take(&mut planned),
+            &ArenaOrderingPlan::default(),
+        );
+    }
+
+    fn assign_fixed_arena_slots_with_ordering(
+        bucket: &mut CompiledBucket,
+        mut planned: Vec<PlannedBuffer>,
+        ordering: &ArenaOrderingPlan,
+    ) {
         // Size-major assignment order: place the largest buffers first so they
         // pack among themselves (per-layer giants have pairwise-disjoint
         // lifetimes and collapse into a few slots), then let small buffers fill
@@ -2033,18 +2099,35 @@ impl CudaRuntime {
             )
         });
         for buf in planned {
-            if let Some((slot_idx, slot)) =
-                bucket.arena_slots.iter_mut().enumerate().find(|(_, slot)| {
-                    slot.members.iter().all(|member| {
-                        !intervals_overlap(buf.start, buf.end, member.start, member.end)
-                            && !bucket
-                                .arena_conflicts
-                                .contains(&ordered_node_pair(buf.node, member.node))
-                    })
-                })
-            {
+            let compatible_slot =
+                bucket
+                    .arena_slots
+                    .iter()
+                    .enumerate()
+                    .find_map(|(slot_idx, slot)| {
+                        let insert_at = slot.members.partition_point(|member| {
+                            (member.start, member.end, member.node.index())
+                                < (buf.start, buf.end, buf.node.index())
+                        });
+                        let neighbors_are_compatible = insert_at
+                            .checked_sub(1)
+                            .and_then(|index| slot.members.get(index))
+                            .is_none_or(|before| {
+                                Self::arena_buffers_can_share(ordering, before, &buf)
+                            })
+                            && slot.members.get(insert_at).is_none_or(|after| {
+                                Self::arena_buffers_can_share(ordering, &buf, after)
+                            });
+                        if !neighbors_are_compatible {
+                            return None;
+                        }
+
+                        Some((slot_idx, insert_at))
+                    });
+
+            if let Some((slot_idx, insert_at)) = compatible_slot {
                 bucket.logical_buffer_slots.insert(buf.node, slot_idx);
-                slot.members.push(buf);
+                bucket.arena_slots[slot_idx].members.insert(insert_at, buf);
             } else {
                 let slot_idx = bucket.arena_slots.len();
                 bucket.logical_buffer_slots.insert(buf.node, slot_idx);
@@ -2057,7 +2140,24 @@ impl CudaRuntime {
         }
     }
 
+    fn arena_buffers_can_share(
+        ordering: &ArenaOrderingPlan,
+        before: &PlannedBuffer,
+        after: &PlannedBuffer,
+    ) -> bool {
+        !intervals_overlap(before.start, before.end, after.start, after.end)
+            && ordering.buffers_are_ordered(before.node, after.node)
+    }
+
     fn refresh_fixed_intermediate_buffer_plan(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
+        Self::refresh_fixed_intermediate_buffer_plan_impl(bucket, dyn_dims, false);
+    }
+
+    fn refresh_fixed_intermediate_buffer_plan_impl(
+        bucket: &mut CompiledBucket,
+        dyn_dims: &DynMap,
+        use_planned_bytes: bool,
+    ) {
         bucket.logical_buffer_offsets.clear();
         bucket.logical_buffer_bytes.clear();
         bucket.logical_buffer_capacity_bytes.clear();
@@ -2067,10 +2167,14 @@ impl CudaRuntime {
         for slot in &mut bucket.arena_slots {
             let mut slot_capacity = slot.capacity_bytes;
             for member in &slot.members {
-                let Some(spec) = bucket.buffer_specs.get(&member.node) else {
-                    continue;
+                let bytes = if use_planned_bytes {
+                    member.bytes
+                } else {
+                    let Some(spec) = bucket.buffer_specs.get(&member.node) else {
+                        continue;
+                    };
+                    spec.bytes.exec(dyn_dims).unwrap()
                 };
-                let bytes = spec.bytes.exec(dyn_dims).unwrap();
                 if bytes == 0 {
                     continue;
                 }
@@ -2113,17 +2217,15 @@ impl CudaRuntime {
         bucket: &mut CompiledBucket,
         dyn_dims: &DynMap,
         include_zero_sized: bool,
-    ) -> Vec<PlannedBuffer> {
+    ) -> (Vec<PlannedBuffer>, ArenaOrderingPlan) {
         bucket.intermediate_buffer_dims.clear();
-        bucket.arena_conflicts.clear();
         let mut logical_bytes = FxHashMap::default();
         for (node, spec) in &bucket.buffer_specs {
-            bucket
-                .intermediate_buffer_dims
-                .extend(spec.bytes.dyn_vars());
+            spec.bytes
+                .collect_dyn_vars_into(&mut bucket.intermediate_buffer_dims);
             let bytes = spec.bytes.exec(dyn_dims).unwrap();
             if bytes > 0 || include_zero_sized {
-                logical_bytes.insert(*node, bytes.max(1));
+                logical_bytes.insert(*node, bytes);
             }
         }
 
@@ -2133,49 +2235,61 @@ impl CudaRuntime {
     fn planned_intermediate_buffers_from_logical_bytes(
         bucket: &mut CompiledBucket,
         logical_bytes: FxHashMap<NodeIndex, usize>,
-    ) -> Vec<PlannedBuffer> {
+    ) -> (Vec<PlannedBuffer>, ArenaOrderingPlan) {
         if logical_bytes.is_empty() {
-            return Vec::new();
+            return (Vec::new(), ArenaOrderingPlan::default());
         }
 
-        let mut first_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-        let mut last_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-        let exec_order = toposort(&bucket.exec_graph, None).unwrap_or_default();
+        let logical_buffer_capacity = logical_bytes
+            .keys()
+            .map(|node| node.index() + 1)
+            .max()
+            .unwrap_or(0);
+        let mut first_use = vec![usize::MAX; logical_buffer_capacity];
+        let mut last_use = vec![0usize; logical_buffer_capacity];
+        let exec_order = bucket.exec_order.clone();
         let output_alias_map = bucket.output_alias_map.clone();
-
-        let mut touch = |node: NodeIndex, step: usize| {
-            let Some(node) = resolve_logical_buffer_node(node, &logical_bytes, &output_alias_map)
-            else {
-                return;
-            };
-            first_use
-                .entry(node)
-                .and_modify(|first| *first = (*first).min(step))
-                .or_insert(step);
-            last_use
-                .entry(node)
-                .and_modify(|last| *last = (*last).max(step))
-                .or_insert(step);
-        };
+        let mut ordering = ArenaOrderingPlan::default();
 
         let mut time = 0usize;
         for exec_node in exec_order.iter().copied() {
             let exec_op = &bucket.exec_graph[exec_node];
-            if let Some(conflicts) = exec_op.internal.extra_buffer_conflicts() {
-                for (a, b) in conflicts {
-                    let Some(a) = resolve_logical_buffer_node(a, &logical_bytes, &output_alias_map)
-                    else {
-                        continue;
+            if let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
+                let cuda_ordering = cuda_graph.arena_ordering(logical_buffer_capacity, |node| {
+                    resolve_logical_buffer_node(node, &logical_bytes, &output_alias_map)
+                });
+                let start_time = time;
+                let end_time = time + cuda_ordering.span() - 1;
+                time += cuda_ordering.span();
+
+                let touch_if_not_precise =
+                    |node: NodeIndex,
+                     step: usize,
+                     first_use: &mut [usize],
+                     last_use: &mut [usize]| {
+                        let Some(resolved) =
+                            resolve_logical_buffer_node(node, &logical_bytes, &output_alias_map)
+                        else {
+                            return;
+                        };
+                        if !cuda_ordering.contains(resolved) {
+                            touch_buffer_lifetime(first_use, last_use, resolved, step);
+                        }
                     };
-                    let Some(b) = resolve_logical_buffer_node(b, &logical_bytes, &output_alias_map)
-                    else {
-                        continue;
-                    };
-                    if a != b {
-                        bucket.arena_conflicts.insert(ordered_node_pair(a, b));
-                    }
+                touch_if_not_precise(exec_op.output, start_time, &mut first_use, &mut last_use);
+                touch_if_not_precise(exec_op.output, end_time, &mut first_use, &mut last_use);
+                for &input in &exec_op.inputs {
+                    touch_if_not_precise(input, start_time, &mut first_use, &mut last_use);
+                    touch_if_not_precise(input, end_time, &mut first_use, &mut last_use);
                 }
+                for (node, start, end) in cuda_ordering.lifetimes() {
+                    touch_buffer_lifetime(&mut first_use, &mut last_use, node, start_time + start);
+                    touch_buffer_lifetime(&mut first_use, &mut last_use, node, start_time + end);
+                }
+                ordering.groups.push(cuda_ordering);
+                continue;
             }
+
             let precise_extra_lifetimes = exec_op.internal.extra_buffer_lifetimes();
             let span = precise_extra_lifetimes
                 .as_ref()
@@ -2205,7 +2319,14 @@ impl CudaRuntime {
                 {
                     return;
                 }
-                touch(node, step);
+                touch_resolved_buffer_lifetime(
+                    &mut first_use,
+                    &mut last_use,
+                    node,
+                    step,
+                    &logical_bytes,
+                    &output_alias_map,
+                );
             };
 
             touch_if_not_precise(exec_op.output, start_time);
@@ -2217,13 +2338,41 @@ impl CudaRuntime {
 
             if let Some(lifetimes) = precise_extra_lifetimes {
                 for (node, start, end) in lifetimes {
-                    touch(node, start_time + start);
-                    touch(node, start_time + end);
+                    touch_resolved_buffer_lifetime(
+                        &mut first_use,
+                        &mut last_use,
+                        node,
+                        start_time + start,
+                        &logical_bytes,
+                        &output_alias_map,
+                    );
+                    touch_resolved_buffer_lifetime(
+                        &mut first_use,
+                        &mut last_use,
+                        node,
+                        start_time + end,
+                        &logical_bytes,
+                        &output_alias_map,
+                    );
                 }
             } else {
                 for extra_node in exec_op.internal.extra_buffer_nodes() {
-                    touch(extra_node, start_time);
-                    touch(extra_node, end_time);
+                    touch_resolved_buffer_lifetime(
+                        &mut first_use,
+                        &mut last_use,
+                        extra_node,
+                        start_time,
+                        &logical_bytes,
+                        &output_alias_map,
+                    );
+                    touch_resolved_buffer_lifetime(
+                        &mut first_use,
+                        &mut last_use,
+                        extra_node,
+                        end_time,
+                        &logical_bytes,
+                        &output_alias_map,
+                    );
                 }
             }
         }
@@ -2233,26 +2382,48 @@ impl CudaRuntime {
             while let Some(target) = bucket.output_alias_map.get(&alias_node) {
                 alias_node = *target;
             }
-            touch(alias_node, time);
+            touch_resolved_buffer_lifetime(
+                &mut first_use,
+                &mut last_use,
+                alias_node,
+                time,
+                &logical_bytes,
+                &output_alias_map,
+            );
 
             let mut data_node = producer;
             while let Some(target) = bucket.output_data_map.get(&data_node) {
                 data_node = *target;
             }
-            touch(data_node, time);
-            touch(producer, time);
+            touch_resolved_buffer_lifetime(
+                &mut first_use,
+                &mut last_use,
+                data_node,
+                time,
+                &logical_bytes,
+                &output_alias_map,
+            );
+            touch_resolved_buffer_lifetime(
+                &mut first_use,
+                &mut last_use,
+                producer,
+                time,
+                &logical_bytes,
+                &output_alias_map,
+            );
         }
 
-        logical_bytes
+        let planned = logical_bytes
             .into_iter()
-            .filter(|(node, _)| first_use.contains_key(node) || last_use.contains_key(node))
+            .filter(|(node, _)| first_use[node.index()] != usize::MAX)
             .map(|(node, bytes)| PlannedBuffer {
                 node,
                 bytes,
-                start: first_use.get(&node).copied().unwrap_or(0),
-                end: last_use.get(&node).copied().unwrap_or(0),
+                start: first_use[node.index()],
+                end: last_use[node.index()],
             })
-            .collect_vec()
+            .collect_vec();
+        (planned, ordering)
     }
 
     fn plan_intermediate_buffers(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
@@ -2289,7 +2460,7 @@ impl CudaRuntime {
 
         let mut first_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
         let mut last_use: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-        let exec_order = toposort(&bucket.exec_graph, None).unwrap_or_default();
+        let exec_order = bucket.exec_order.clone();
         let output_alias_map = bucket.output_alias_map.clone();
 
         let mut touch = |node: NodeIndex, step: usize| {
@@ -2901,7 +3072,7 @@ impl CudaRuntime {
             .materialization_dirty_nodes
             .clone();
         let bucket = &self.compiled_buckets[bucket_idx];
-        for exec_node in toposort(&bucket.exec_graph, None).unwrap() {
+        for &exec_node in &bucket.exec_order {
             let exec_op = &bucket.exec_graph[exec_node];
             let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() else {
                 continue;
@@ -2939,6 +3110,10 @@ impl CudaRuntime {
                     &changed_buffers,
                     dyn_map,
                 )? {
+                    continue;
+                }
+                if changed_buffers.is_empty() {
+                    cuda_graph.materialize_cached_bindings(&exec_op.stream, dyn_map)?;
                     continue;
                 }
             }
@@ -2991,6 +3166,7 @@ impl CudaRuntime {
             bucket.logical_buffer_slots.is_empty() && !bucket.buffer_specs.is_empty();
         if needs_new_plan {
             Self::initialize_fixed_intermediate_buffer_plan(bucket, dyn_dims);
+            return;
         }
 
         if !bucket.logical_buffer_slots.is_empty() {
@@ -3024,17 +3200,21 @@ impl CudaRuntime {
         }
     }
 
-    fn compiled_kernel_resource_plans(
+    fn validate_compiled_kernel_resources(
         bucket: &CompiledBucket,
         dyn_map: &DynMap,
-    ) -> Result<Vec<KernelResourcePlan>, ResourceViolation> {
-        let mut plans = Vec::new();
+        function_cache: &mut CompiledFunctionResourceCache,
+        caps: CandidateResourceCaps,
+        device: Option<CudaDeviceResourceLimits>,
+    ) -> Result<usize, ResourceViolation> {
+        let mut kernel_count = 0;
         for executable in bucket.exec_graph.node_weights() {
             if let Some(cuda_graph) = executable.internal.as_any().downcast_ref::<CudaGraphOp>() {
-                plans.extend(cuda_graph.resource_plans(dyn_map)?);
+                kernel_count +=
+                    cuda_graph.validate_kernel_resources(dyn_map, function_cache, caps, device)?;
             }
         }
-        Ok(plans)
+        Ok(kernel_count)
     }
 
     fn complete_resource_dyn_map(bucket: &CompiledBucket, mut dyn_map: DynMap) -> DynMap {
@@ -3319,32 +3499,65 @@ impl CudaRuntime {
         buckets: &mut [CompiledBucket],
         allocation_dyn_maps: &[DynMap],
         hlir_buffer_lengths: &FxHashMap<NodeIndex, usize>,
+        function_cache: &mut CompiledFunctionResourceCache,
+        caps: CandidateResourceCaps,
+        device: Option<CudaDeviceResourceLimits>,
     ) -> Result<CandidateResourcePlan, ResourceViolation> {
+        let profile = std::env::var_os("LUMINAL_CUDA_ARENA_PROFILE").is_some();
+        let profile_start = std::time::Instant::now();
         assert_eq!(buckets.len(), allocation_dyn_maps.len());
-        let mut kernels = Vec::new();
+        let mut kernel_count = 0usize;
         let mut host_plans = Vec::with_capacity(buckets.len());
+        let mut dry_ms = 0.0;
+        let mut kernels_ms = 0.0;
+        let mut lengths_ms = 0.0;
+        let mut host_ms = 0.0;
         for (bucket, dyn_map) in buckets.iter_mut().zip(allocation_dyn_maps) {
+            let phase_start = std::time::Instant::now();
             Self::dry_plan_intermediate_buffers(bucket, dyn_map);
-            kernels.extend(Self::compiled_kernel_resource_plans(bucket, dyn_map)?);
+            dry_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
+            let phase_start = std::time::Instant::now();
+            kernel_count += Self::validate_compiled_kernel_resources(
+                bucket,
+                dyn_map,
+                function_cache,
+                caps,
+                device,
+            )?;
+            kernels_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
+            let phase_start = std::time::Instant::now();
             let buffer_lengths = Self::planned_resource_buffer_lengths(bucket, hlir_buffer_lengths);
+            lengths_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
+            let phase_start = std::time::Instant::now();
             host_plans.push(Self::compiled_host_device_memory_plans(
                 bucket,
                 dyn_map,
                 &buffer_lengths,
             )?);
+            host_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
         }
+        let aggregate_start = std::time::Instant::now();
         let (host_persistent_bytes, host_transient_peak_bytes, shared_device_allocations) =
             Self::aggregate_host_device_memory(
                 &host_plans,
                 &crate::host::flashinfer::resident_shared_device_memory_allocations(),
             )?;
+        let aggregate_ms = aggregate_start.elapsed().as_secs_f64() * 1000.0;
+        if profile {
+            eprintln!(
+                "CUDA_ARENA_RESOURCE_PROFILE total_ms={:.3} dry_ms={dry_ms:.3} kernels_ms={kernels_ms:.3} lengths_ms={lengths_ms:.3} host_ms={host_ms:.3} aggregate_ms={aggregate_ms:.3} buckets={} kernels={}",
+                profile_start.elapsed().as_secs_f64() * 1000.0,
+                buckets.len(),
+                kernel_count,
+            );
+        }
         Ok(CandidateResourcePlan {
             intermediate_lower_bound_bytes: 0,
             planned_intermediate_bytes: Some(Self::peak_planned_arena_bytes(buckets)),
             host_persistent_bytes,
             host_transient_peak_bytes,
             shared_device_allocations,
-            kernels,
+            kernels: Vec::new(),
         })
     }
 
@@ -3365,6 +3578,9 @@ impl CudaRuntime {
             &mut self.compiled_buckets,
             &allocation_dyn_maps,
             &hlir_buffer_lengths,
+            &mut self.compiled_function_resource_cache,
+            caps,
+            device,
         )?;
         validate_resource_plan(&plan, caps, device)?;
         let bucket = &mut self.compiled_buckets[bucket_idx];
@@ -3479,16 +3695,39 @@ fn resolve_logical_buffer_node(
     logical_bytes: &FxHashMap<NodeIndex, usize>,
     output_alias_map: &FxHashMap<NodeIndex, NodeIndex>,
 ) -> Option<NodeIndex> {
-    let mut visited = FxHashSet::default();
-    while !logical_bytes.contains_key(&node) {
-        if !visited.insert(node) {
-            return None;
+    // Static LLIR validation has already proven that output aliases are
+    // acyclic. Bound the walk defensively without allocating a visited set in
+    // this extremely hot resolver.
+    for _ in 0..=output_alias_map.len() {
+        if logical_bytes.contains_key(&node) {
+            return Some(node);
         }
-        let target = output_alias_map.get(&node)?;
-        node = *target;
+        node = *output_alias_map.get(&node)?;
     }
+    None
+}
 
-    Some(node)
+fn touch_buffer_lifetime(
+    first_use: &mut [usize],
+    last_use: &mut [usize],
+    node: NodeIndex,
+    step: usize,
+) {
+    first_use[node.index()] = first_use[node.index()].min(step);
+    last_use[node.index()] = last_use[node.index()].max(step);
+}
+
+fn touch_resolved_buffer_lifetime(
+    first_use: &mut [usize],
+    last_use: &mut [usize],
+    node: NodeIndex,
+    step: usize,
+    logical_bytes: &FxHashMap<NodeIndex, usize>,
+    output_alias_map: &FxHashMap<NodeIndex, NodeIndex>,
+) {
+    if let Some(node) = resolve_logical_buffer_node(node, logical_bytes, output_alias_map) {
+        touch_buffer_lifetime(first_use, last_use, node, step);
+    }
 }
 
 fn align_up(value: usize, alignment: usize) -> usize {
@@ -3501,14 +3740,6 @@ fn align_up(value: usize, alignment: usize) -> usize {
 
 fn intervals_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
     a_start <= b_end && b_start <= a_end
-}
-
-fn ordered_node_pair(a: NodeIndex, b: NodeIndex) -> (NodeIndex, NodeIndex) {
-    if a.index() <= b.index() {
-        (a, b)
-    } else {
-        (b, a)
-    }
 }
 
 fn byte_ranges_overlap(a_offset: usize, a_bytes: usize, b_offset: usize, b_bytes: usize) -> bool {
@@ -3630,28 +3861,30 @@ impl CudaRuntime {
         // allocations, cache warming) so the timed trials measure steady-state
         // execution instead of folding setup noise into the candidate ranking.
         self.execute(dyn_map);
+        let warmup_duration = self
+            .last_profile_device_duration
+            .expect("profiled CUDA warmup did not record a device duration");
         // A warmup that already blew the whole profiling budget has proven
         // the candidate slow; return it as the measurement instead of paying
         // for a timed trial of the same magnitude. Bad candidates are the
         // most expensive ones to run, so this halves their cost.
         if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
             self.profiling = false;
-            let duration = profile_start.elapsed();
-            return (duration, format_duration_precise(&duration));
+            return (warmup_duration, format_duration_precise(&warmup_duration));
         }
         let mut durations = Vec::with_capacity(trials.max(1));
         for _ in 0..trials.max(1) {
             // Deployment never executes the same dyn_map twice (decode's `c`
-            // is fresh every step), so replaying frozen dims would let
-            // dim-baked state carry over between trials and hide the
-            // per-transition costs (param rebuild, island re-prepare and
-            // recapture) that dim-agnostic graphs don't pay. Each trial
-            // measures execute-after-dim-change — the quantity deployment
-            // actually samples.
+            // is fresh every step), so mark dimensions stale before every
+            // trial. This refreshes any dimension-baked launch state before
+            // the start event; the metric itself remains strictly the
+            // resulting device execution interval.
             self.assume_dyn_dims_stale();
-            let start = std::time::Instant::now();
             self.execute(dyn_map);
-            durations.push(start.elapsed());
+            durations.push(
+                self.last_profile_device_duration
+                    .expect("profiled CUDA trial did not record a device duration"),
+            );
             if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
                 break;
             }
@@ -3723,23 +3956,23 @@ impl CudaRuntime {
         let resource_dyn_map = Self::complete_resource_dyn_map(&bucket, previous_dyn_map);
         let (hlir_buffer_lengths, input_lengths_complete) =
             self.hlir_resource_buffer_lengths_for_load(std::slice::from_ref(&bucket));
+        let caps = CandidateResourceCaps {
+            max_intermediate_bytes: self.max_intermediate_memory_bytes,
+            max_kernel_source_bytes: self.max_kernel_source_bytes,
+        };
+        let device = self.candidate_device_resource_limits();
         let plan = Self::retained_bucket_resource_plan(
             std::slice::from_mut(&mut bucket),
             std::slice::from_ref(&resource_dyn_map),
             &hlir_buffer_lengths,
+            &mut self.compiled_function_resource_cache,
+            caps,
+            device,
         )
         .map_err(|violation| {
             anyhow::anyhow!("could not plan replacement CUDA resources: {violation}")
         })?;
-        validate_resource_plan(
-            &plan,
-            CandidateResourceCaps {
-                max_intermediate_bytes: self.max_intermediate_memory_bytes,
-                max_kernel_source_bytes: self.max_kernel_source_bytes,
-            },
-            self.candidate_device_resource_limits(),
-        )
-        .map_err(|violation| {
+        validate_resource_plan(&plan, caps, device).map_err(|violation| {
             anyhow::anyhow!("replacement CUDA graph violates a hard resource limit: {violation}")
         })?;
         bucket.last_resource_validation_dyn_map = resource_dyn_map;
@@ -3804,11 +4037,24 @@ impl CudaRuntime {
         bucket_llirs: &[BucketLLIR],
     ) -> anyhow::Result<()> {
         let bucket_llir_refs = bucket_llirs.iter().map(BucketLLIRRef::from).collect_vec();
+        let validated = self.compile_and_validate_bucket_set(dim_buckets, &bucket_llir_refs)?;
+        self.install_validated_bucket_set(dim_buckets, validated)
+    }
+
+    /// Install an already compiled and hard-resource-validated bucket set.
+    /// Keeping this separate from compilation lets search filtering hand the
+    /// exact accepted CUDA executable to profiling without invoking NVRTC or
+    /// retained-resource planning a second time.
+    fn install_validated_bucket_set(
+        &mut self,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
+        validated: ValidatedBucketSet,
+    ) -> anyhow::Result<()> {
         let ValidatedBucketSet {
             compiled_buckets,
             representative_dyn_maps,
             input_lengths_complete,
-        } = self.compile_and_validate_bucket_set(dim_buckets, &bucket_llir_refs)?;
+        } = validated;
 
         // Only now replace the old executable state.
         let _ = self.cuda_stream.synchronize();
@@ -3868,6 +4114,31 @@ impl CudaRuntime {
         dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIRRef<'_>],
     ) -> anyhow::Result<ValidatedBucketSet> {
+        let allocation_dyn_maps = bucket_llirs
+            .iter()
+            .map(|candidate| {
+                Self::bucket_capacity_dyn_map_from_context(
+                    candidate.representative_dyn_map,
+                    candidate.bucket_indices,
+                    dim_buckets,
+                )
+            })
+            .collect_vec();
+        self.compile_and_validate_bucket_set_with_allocation_maps(
+            bucket_llirs,
+            &allocation_dyn_maps,
+        )
+    }
+
+    fn compile_and_validate_bucket_set_with_allocation_maps(
+        &mut self,
+        bucket_llirs: &[BucketLLIRRef<'_>],
+        allocation_dyn_maps: &[DynMap],
+    ) -> anyhow::Result<ValidatedBucketSet> {
+        anyhow::ensure!(
+            bucket_llirs.len() == allocation_dyn_maps.len(),
+            "every CUDA LLIR bucket must have an allocation dimension map"
+        );
         // Validate the entire stitched candidate before mutating the currently
         // loaded runtime. A bad later bucket must not discard a previously
         // usable graph after the earlier buckets have already compiled.
@@ -3875,47 +4146,70 @@ impl CudaRuntime {
             validate_static_llir_semantics(bucket.llir)
                 .map_err(|violation| anyhow::anyhow!("invalid CUDA LLIR bucket: {violation}"))?;
         }
+        self.compile_and_validate_prevalidated_bucket_set_with_allocation_maps(
+            bucket_llirs,
+            allocation_dyn_maps,
+            None,
+        )
+    }
 
+    /// Compile and resource-plan LLIRs whose topology and aliasing contracts
+    /// have already been validated. Fusion contracts are guaranteed by the
+    /// rewrites that construct the LLIR. Callers must have successfully run
+    /// either `validate_static_llir_semantics` or `plan_static_llir_resources`
+    /// for every supplied graph.
+    fn compile_and_validate_prevalidated_bucket_set_with_allocation_maps(
+        &mut self,
+        bucket_llirs: &[BucketLLIRRef<'_>],
+        allocation_dyn_maps: &[DynMap],
+        prepared_kernel_plans: Option<&[PreparedKernelToHostPlan]>,
+    ) -> anyhow::Result<ValidatedBucketSet> {
+        anyhow::ensure!(
+            bucket_llirs.len() == allocation_dyn_maps.len(),
+            "every CUDA LLIR bucket must have an allocation dimension map"
+        );
+        if let Some(prepared_kernel_plans) = prepared_kernel_plans {
+            anyhow::ensure!(
+                bucket_llirs.len() == prepared_kernel_plans.len(),
+                "every prepared CUDA LLIR bucket must have a kernel-to-host plan"
+            );
+        }
         // Compile and dry-plan the replacement while the current runtime is
         // still intact. Validate the peak active-bucket arena, retained HostOp
         // state, and every compiled kernel before the first arena allocation or
         // replacement of the working graph.
         let mut compiled_buckets = Vec::with_capacity(bucket_llirs.len());
         let mut representative_dyn_maps = Vec::with_capacity(bucket_llirs.len());
-        let mut allocation_dyn_maps = Vec::with_capacity(bucket_llirs.len());
-        for candidate in bucket_llirs {
-            let mut bucket = self.compile_bucket(candidate.llir);
+        for (index, candidate) in bucket_llirs.iter().enumerate() {
+            let prepared_kernel =
+                prepared_kernel_plans.map(|prepared_kernel_plans| &prepared_kernel_plans[index]);
+            let mut bucket = self.compile_bucket_with_prepared(candidate.llir, prepared_kernel);
             bucket.bucket_indices = candidate.bucket_indices.clone();
-            allocation_dyn_maps.push(Self::bucket_capacity_dyn_map_from_context(
-                candidate.representative_dyn_map,
-                &bucket.bucket_indices,
-                dim_buckets,
-            ));
             representative_dyn_maps.push(candidate.representative_dyn_map.clone());
             compiled_buckets.push(bucket);
         }
         let (hlir_buffer_lengths, input_lengths_complete) =
             self.hlir_resource_buffer_lengths_for_load(&compiled_buckets);
+        let caps = CandidateResourceCaps {
+            max_intermediate_bytes: self.max_intermediate_memory_bytes,
+            max_kernel_source_bytes: self.max_kernel_source_bytes,
+        };
+        let device = self.candidate_device_resource_limits();
         let aggregate_plan = Self::retained_bucket_resource_plan(
             &mut compiled_buckets,
-            &allocation_dyn_maps,
+            allocation_dyn_maps,
             &hlir_buffer_lengths,
+            &mut self.compiled_function_resource_cache,
+            caps,
+            device,
         )
         .map_err(|violation| {
             anyhow::anyhow!("could not plan retained CUDA bucket resources: {violation}")
         })?;
-        validate_resource_plan(
-            &aggregate_plan,
-            CandidateResourceCaps {
-                max_intermediate_bytes: self.max_intermediate_memory_bytes,
-                max_kernel_source_bytes: self.max_kernel_source_bytes,
-            },
-            self.candidate_device_resource_limits(),
-        )
-        .map_err(|violation| {
+        validate_resource_plan(&aggregate_plan, caps, device).map_err(|violation| {
             anyhow::anyhow!("stitched CUDA buckets violate a hard resource limit: {violation}")
         })?;
-        for (bucket, dyn_map) in compiled_buckets.iter_mut().zip(&allocation_dyn_maps) {
+        for (bucket, dyn_map) in compiled_buckets.iter_mut().zip(allocation_dyn_maps) {
             bucket.last_resource_validation_dyn_map = dyn_map.clone();
             bucket.resource_validation_complete = input_lengths_complete;
         }
@@ -3923,6 +4217,83 @@ impl CudaRuntime {
             compiled_buckets,
             representative_dyn_maps,
             input_lengths_complete,
+        })
+    }
+
+    /// Compile the one-bucket set used to profile a search candidate. The
+    /// cheap static plan rejects impossible candidates before NVRTC; the
+    /// returned set has then passed the same exact retained-resource planning
+    /// used by final loading and is safe to install without recompilation.
+    fn compile_and_validate_profile_candidate(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        context: luminal::op::CandidateFilterContext<'_>,
+    ) -> Result<ValidatedProfileCandidate, luminal::op::CandidateFilterResult> {
+        let allocation_dyn_map = Self::candidate_allocation_dyn_map(context);
+        let static_plan = match prepare_static_llir_resources(
+            llir_graph,
+            &allocation_dyn_map,
+            &mut self.region_source_cache,
+        ) {
+            Ok(plan) => plan,
+            Err(violation) => {
+                luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
+                return Err(luminal::op::CandidateFilterResult::reject_with_display(
+                    format!("candidate reject: {violation}"),
+                ));
+            }
+        };
+        if let Err(violation) = validate_resource_plan(
+            &static_plan.resources,
+            CandidateResourceCaps {
+                max_intermediate_bytes: self.max_intermediate_memory_bytes,
+                max_kernel_source_bytes: self.max_kernel_source_bytes,
+            },
+            self.candidate_device_resource_limits(),
+        ) {
+            luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
+            return Err(luminal::op::CandidateFilterResult::reject_with_display(
+                format!("resource reject: {violation}"),
+            ));
+        }
+
+        let dim_buckets = context
+            .bucket_context
+            .map(|bucket_context| bucket_context.dim_buckets.clone())
+            .unwrap_or_default();
+        let bucket_indices = context
+            .bucket_context
+            .map(|bucket_context| bucket_context.bucket_indices.clone())
+            .unwrap_or_default();
+        let representative_dyn_map = context
+            .bucket_context
+            .map(|bucket_context| bucket_context.representative_dyn_map)
+            .unwrap_or(context.dyn_map);
+        let candidate = BucketLLIRRef {
+            bucket_indices: &bucket_indices,
+            representative_dyn_map,
+            llir: llir_graph,
+        };
+        // Static preparation above already validated topology, mutating
+        // aliases, and fusion-region contracts for this exact LLIR. Reuse its
+        // regions and CUDA sources during compilation.
+        let validated = self
+            .compile_and_validate_prevalidated_bucket_set_with_allocation_maps(
+                std::slice::from_ref(&candidate),
+                std::slice::from_ref(&allocation_dyn_map),
+                Some(std::slice::from_ref(&static_plan.kernel_to_host)),
+            )
+            .map_err(|error| {
+                luminal::op::CandidateFilterResult::reject_with_display(format!(
+                    "resource reject: {error}"
+                ))
+            })?;
+        let display =
+            format_memory_bytes(Self::peak_planned_arena_bytes(&validated.compiled_buckets));
+        Ok(ValidatedProfileCandidate {
+            dim_buckets,
+            buckets: validated,
+            display,
         })
     }
 }
@@ -3938,65 +4309,29 @@ impl Runtime for CudaRuntime {
         llir_graph: &LLIRGraph,
         context: luminal::op::CandidateFilterContext<'_>,
     ) -> luminal::op::CandidateFilterResult {
-        let allocation_dyn_map = Self::candidate_allocation_dyn_map(context);
-        let caps = CandidateResourceCaps {
-            max_intermediate_bytes: self.max_intermediate_memory_bytes,
-            max_kernel_source_bytes: self.max_kernel_source_bytes,
-        };
-        let device_resource_limits = self.candidate_device_resource_limits();
+        match self.compile_and_validate_profile_candidate(llir_graph, context) {
+            Ok(candidate) => {
+                luminal::op::CandidateFilterResult::accept_with_display(candidate.display)
+            }
+            Err(rejection) => rejection,
+        }
+    }
 
-        // The first pass is pure LLIR accounting. In particular, it catches a
-        // single/search-created buffer larger than the device and oversized
-        // search-grown fused kernels before invoking NVRTC.
-        let mut resource_plan = match plan_static_llir_resources(llir_graph, &allocation_dyn_map) {
-            Ok(plan) => plan,
-            Err(violation) => {
-                luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
-                return luminal::op::CandidateFilterResult::reject_with_display(format!(
-                    "candidate reject: {violation}"
-                ));
-            }
+    fn prepare_profile_candidate(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        context: luminal::op::CandidateFilterContext<'_>,
+    ) -> luminal::op::CandidateFilterResult {
+        let candidate = match self.compile_and_validate_profile_candidate(llir_graph, context) {
+            Ok(candidate) => candidate,
+            Err(rejection) => return rejection,
         };
-        if let Err(violation) = validate_resource_plan(&resource_plan, caps, device_resource_limits)
-        {
-            luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
-            return luminal::op::CandidateFilterResult::reject_with_display(format!(
-                "resource reject: {violation}"
-            ));
-        }
-
-        let mut bucket = self.compile_bucket(llir_graph);
-        if let Some(bucket_context) = context.bucket_context {
-            bucket.bucket_indices = bucket_context.bucket_indices.clone();
-        }
-        let hlir_buffer_lengths = self.hlir_resource_buffer_lengths();
-        match Self::retained_bucket_resource_plan(
-            std::slice::from_mut(&mut bucket),
-            std::slice::from_ref(&allocation_dyn_map),
-            &hlir_buffer_lengths,
-        ) {
-            Ok(exact) => {
-                resource_plan.planned_intermediate_bytes = exact.planned_intermediate_bytes;
-                resource_plan.host_persistent_bytes = exact.host_persistent_bytes;
-                resource_plan.host_transient_peak_bytes = exact.host_transient_peak_bytes;
-                resource_plan.shared_device_allocations = exact.shared_device_allocations;
-                resource_plan.kernels.extend(exact.kernels);
-            }
-            Err(violation) => {
-                return luminal::op::CandidateFilterResult::reject_with_display(format!(
-                    "resource reject: {violation}"
-                ));
-            }
-        }
-        let planned_bytes = Self::planned_allocation_bytes(&bucket);
-        let display = format_memory_bytes(planned_bytes);
-        if let Err(violation) = validate_resource_plan(&resource_plan, caps, device_resource_limits)
-        {
-            luminal::op::CandidateFilterResult::reject_with_display(format!(
-                "{display}; resource reject: {violation}"
-            ))
-        } else {
-            luminal::op::CandidateFilterResult::accept_with_display(display)
+        match self.install_validated_bucket_set(&candidate.dim_buckets, candidate.buckets) {
+            Ok(()) => luminal::op::CandidateFilterResult::accept_with_display(candidate.display),
+            Err(error) => luminal::op::CandidateFilterResult::reject_with_display(format!(
+                "{}; candidate load reject: {error}",
+                candidate.display
+            )),
         }
     }
 
@@ -4019,6 +4354,18 @@ impl Runtime for CudaRuntime {
             CudaDeviceResourceLimits::query(&stream)
                 .expect("failed to query CUDA hard resource limits during runtime initialization"),
         );
+        // `None` asks cudarc for CU_EVENT_DISABLE_TIMING, so request the CUDA
+        // default explicitly. Reuse both events across every search candidate
+        // and trial to keep event allocation outside the measured path.
+        let event_flags = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let profile_start_event = stream
+            .context()
+            .new_event(event_flags)
+            .expect("failed to create CUDA profiling start event");
+        let profile_end_event = stream
+            .context()
+            .new_event(event_flags)
+            .expect("failed to create CUDA profiling end event");
         Self {
             hlir_buffers: FxHashMap::default(),
             cuda_stream: stream,
@@ -4027,7 +4374,12 @@ impl Runtime for CudaRuntime {
             last_kernel_stats: vec![],
             last_total_time_us: 0.0,
             kernel_cache: FxHashMap::default(),
+            compiled_function_resource_cache: CompiledFunctionResourceCache::default(),
+            region_source_cache: RegionSourceCache::default(),
             profiling: false,
+            profile_start_event,
+            profile_end_event,
+            last_profile_device_duration: None,
             max_intermediate_memory_bytes: None,
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             device_resource_limits,
@@ -4095,48 +4447,17 @@ impl Runtime for CudaRuntime {
                 .sum::<usize>()
     }
 
-    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &DynMap) -> bool {
-        let _ = self.cuda_stream.synchronize();
-        let bucket = self.active();
-        let mut checked = FxHashSet::default();
-        for producer in bucket.output_producers.values().copied() {
-            let mut node_id = producer;
-            while let Some(alias_target) = bucket.output_alias_map.get(&node_id) {
-                node_id = *alias_target;
-            }
-            if !checked.insert(node_id) {
-                continue;
-            }
-            let Some(buf) = Self::bucket_buffer(bucket, &self.cuda_stream, &node_id) else {
-                continue;
-            };
-            let n_bytes = buf.len();
-            if n_bytes == 0 || n_bytes % 4 != 0 {
-                continue;
-            }
-            // Determine buffer dtype from the compiled buffer metadata.
-            // Only check F32 buffers for NaN; integer/bool buffers have no NaN concept
-            // and their bit patterns can produce false positives when reinterpreted as f32.
-            let is_float = bucket
-                .buffer_specs
-                .get(&node_id)
-                .map(|spec| matches!(spec.dtype, DType::F32))
-                .unwrap_or(true);
-
-            if !is_float {
-                continue;
-            }
-
-            let host_bytes: Vec<u8> = match buf.clone_dtoh(&self.cuda_stream) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let f32_slice: &[f32] = bytemuck::cast_slice(&host_bytes);
-            if f32_slice.iter().any(|x| x.is_nan()) {
-                return true;
-            }
-        }
-        false
+    fn profile_prepared_candidate(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &DynMap,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
+        _bucket_context: Option<luminal::op::ProfileBucketContext<'_>>,
+    ) -> (Self::ProfileMetric, String) {
+        Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
+        self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout, early_stop)
     }
 
     #[tracing::instrument(skip_all)]
@@ -4244,10 +4565,16 @@ impl Runtime for CudaRuntime {
         self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
             .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
         materialize_time += timer.elapsed();
+        if self.profiling {
+            self.last_profile_device_duration = None;
+            self.profile_start_event
+                .record(&self.cuda_stream)
+                .expect("failed to record CUDA profiling start event");
+        }
         let total_start = std::time::Instant::now();
         let bucket = &self.compiled_buckets[self.active_bucket];
 
-        for exec_node in toposort(&bucket.exec_graph, None).unwrap() {
+        for &exec_node in &bucket.exec_order {
             let exec_op = &bucket.exec_graph[exec_node];
             trace!("Executing: {:?}", exec_op);
 
@@ -4329,11 +4656,25 @@ impl Runtime for CudaRuntime {
             }
         }
 
+        if self.profiling {
+            self.profile_end_event
+                .record(&self.cuda_stream)
+                .expect("failed to record CUDA profiling end event");
+        }
+
         // Single sync at end - CUDA stream ordering guarantees sequential execution
         let timer = std::time::Instant::now();
         self.cuda_stream.synchronize().unwrap();
         sync_time += timer.elapsed();
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
+        if self.profiling {
+            let elapsed_ms = self
+                .profile_start_event
+                .elapsed_ms(&self.profile_end_event)
+                .expect("failed to measure CUDA profiling events");
+            self.last_profile_device_duration =
+                Some(Duration::from_secs_f64(f64::from(elapsed_ms) / 1_000.0));
+        }
 
         // Populate last_kernel_stats from HostOps that report stats
         let timer = std::time::Instant::now();
@@ -4496,19 +4837,37 @@ impl CudaRuntime {
 
     /// Compile a single LLIR graph into a CompiledBucket.
     fn compile_bucket(&mut self, llir_graph: &LLIRGraph) -> CompiledBucket {
+        self.compile_bucket_with_prepared(llir_graph, None)
+    }
+
+    fn compile_bucket_with_prepared(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        prepared_kernel: Option<&PreparedKernelToHostPlan>,
+    ) -> CompiledBucket {
         let source_limit = self.max_kernel_source_bytes;
         crate::with_kernel_source_limit(source_limit, || {
-            self.compile_bucket_with_current_source_limit(llir_graph)
+            self.compile_bucket_with_current_source_limit(llir_graph, prepared_kernel)
         })
     }
 
     fn compile_bucket_with_current_source_limit(
         &mut self,
         llir_graph: &LLIRGraph,
+        prepared_kernel: Option<&PreparedKernelToHostPlan>,
     ) -> CompiledBucket {
         let mut bucket = CompiledBucket::new();
         let mut exec_graph = StableGraph::default();
         let mut node_to_exec = FxHashMap::default();
+
+        let owned_prepared_kernel = prepared_kernel
+            .is_none()
+            .then(|| crate::kernel::prepare_kernel_to_host_plan(llir_graph));
+        let prepared_kernel = prepared_kernel.unwrap_or_else(|| {
+            owned_prepared_kernel
+                .as_ref()
+                .expect("unprepared bucket compilation must build a kernel plan")
+        });
 
         // Clone the selected LLIR so kernel grouping can modify it. Backend-op
         // selection (including fused RoPE+scatter) has already happened in
@@ -4516,7 +4875,12 @@ impl CudaRuntime {
         let mut llir_graph = llir_graph.clone();
 
         // Compile kernel subgraphs into CudaGraphOps (which implement HostOp)
-        crate::kernel::kernel_to_host(&mut llir_graph, &self.cuda_stream, &mut self.kernel_cache);
+        crate::kernel::kernel_to_host_with_prepared(
+            &mut llir_graph,
+            &self.cuda_stream,
+            &mut self.kernel_cache,
+            Some(prepared_kernel),
+        );
 
         // Extract all runtime metadata we used to recover from the lowered LLIR
         // at execution time. After this point the LLIR is compile-time only.
@@ -4562,52 +4926,11 @@ impl CudaRuntime {
                 let kernel_name = kernel_op.kernel_name();
                 bucket.kernel_names.push(kernel_name);
 
-                // Decide if this node needs a real device buffer.
-                //
-                // The default assumption is "yes" for ordinary kernel ops
-                // (Conv outputs, matmul outputs, etc). FusionStart and
-                // Cuda*Elementwise are the exceptions — they're synthetic
-                // nodes that the fusion rewrites add inside a region; the
-                // megakernel computes them in registers and never writes
-                // to memory, so allocating a buffer would just be waste.
-                //
-                // BUT — and this was the cause of the YOLO crash: if such
-                // a node has a *consumer in a different region*, that
-                // consumer's CudaGraphOp will look up a device pointer for
-                // the producer in the runtime's buffer_map and find none,
-                // pass NULL into the kernel, and dereference it →
-                // `CUDA_ERROR_ILLEGAL_ADDRESS`. Multi-consumer fan-out is
-                // the typical trigger: rule R fuses op X into one region
-                // (FusionStart-wrapping it as input), but X is also used by
-                // an unrelated downstream op that lives in another region.
-                //
-                // Safe over-approximation: if the node is a FusionStart /
-                // Cuda*Elementwise and *any* of its consumers is a FusionStart
-                // (which can only happen when that consumer is the leaf
-                // of a different region) or a non-marker op (e.g. an
-                // unfused Add/Mul reading the value directly), allocate a
-                // buffer so cross-region reads have somewhere to land.
-                let is_marker = kernel_name == "FusionStart" || kernel_name.starts_with("Cuda");
-                let has_external_consumer = is_marker
-                    && llir_graph
-                        .neighbors_directed(node, Direction::Outgoing)
-                        .any(|consumer| {
-                            // A consumer that's a non-kernel op (Output, etc.) always
-                            // needs a real buffer; otherwise check the kernel name.
-                            match llir_graph[consumer].to_dialect::<dyn KernelOp>() {
-                                None => true,
-                                Some(ck) => {
-                                    let cn = ck.kernel_name();
-                                    // FusionEnd is the consumer in the SAME region
-                                    // (so it's absorbed). Anything else — including
-                                    // another FusionStart, which is by definition the
-                                    // leaf of a different region — is external.
-                                    cn != "FusionEnd"
-                                }
-                            }
-                        });
-                let allocated = kernel_op.output_aliases_input().is_none()
-                    && (!is_marker || has_external_consumer);
+                // Static planning already identified exactly which lowered
+                // kernel values survive fusion and require device storage.
+                // Reuse that decision so resource validation and installation
+                // cannot drift or rescan every marker's consumers.
+                let allocated = prepared_kernel.materialized_kernel_nodes().contains(&node);
                 if allocated {
                     bucket.buffer_specs.insert(
                         node,
@@ -4727,6 +5050,7 @@ impl CudaRuntime {
             }
         }
 
+        bucket.exec_order = toposort(&exec_graph, None).unwrap();
         bucket.exec_graph = exec_graph;
         bucket.node_to_exec = node_to_exec;
         bucket.hlir_synced = false;
@@ -4949,180 +5273,106 @@ fn format_flops(flops: usize) -> String {
 pub(crate) fn partition_marked_convex<T, E>(
     g: &StableGraph<T, E, Directed>,
     marked: &FxHashSet<NodeIndex>,
-) -> Result<Vec<FxHashSet<NodeIndex>>, Cycle<NodeIndex>> {
+    topo: &[NodeIndex],
+) -> Vec<FxHashSet<NodeIndex>> {
     if marked.is_empty() {
-        return Ok(vec![]);
+        return vec![];
     }
 
-    // --- Global topo order (also validates DAG) ---
-    let topo = toposort(g, None)?;
-    let topo_len = topo.len();
-
-    // Map NodeIndex <-> topo position
-    let mut idx_to_pos: FxHashMap<NodeIndex, usize> = FxHashMap::default();
-    let mut pos_to_idx: Vec<NodeIndex> = Vec::with_capacity(topo_len);
+    // StableGraph indices may have holes, so keep a dense direct lookup by
+    // node index rather than hashing every node during every candidate.
+    let mut idx_to_pos = vec![usize::MAX; g.node_bound()];
     for (pos, &ni) in topo.iter().enumerate() {
-        idx_to_pos.insert(ni, pos);
-        pos_to_idx.push(ni);
+        idx_to_pos[ni.index()] = pos;
     }
 
-    // --- Full-graph reachability: reach[upos] contains all vpos reachable from u ---
-    // (Bitset DP over topo order)
-    let mut reach: Vec<FixedBitSet> = (0..topo_len)
-        .map(|_| {
-            let mut b = FixedBitSet::with_capacity(topo_len);
-            b.grow(topo_len);
-            b
-        })
-        .collect();
-
-    for &u in topo.iter().rev() {
-        let upos = idx_to_pos[&u];
-        for v in g.neighbors_directed(u, Direction::Outgoing) {
-            if let Some(&vpos) = idx_to_pos.get(&v) {
-                reach[upos].insert(vpos);
-                let rv = reach[vpos].clone();
-                reach[upos].union_with(&rv);
-            }
-        }
-    }
-
-    // --- 1) Weakly-connected components in the marked-induced subgraph ---
+    // The normal CUDA packaging graph has no non-packagable node between two
+    // packagable nodes. Prove that cheaply before building any reachability
+    // state: in that case each marked-induced weak component is already
+    // convex. This is a sufficient global proof; unusual mixed HostOp graphs
+    // fall through to the exact general algorithm below.
     let components = marked_weak_components(g, marked);
-
-    let mut results: Vec<FxHashSet<NodeIndex>> = Vec::new();
-
-    for comp in components {
-        // Component nodes in topo positions (sorted)
-        let mut comp_pos: Vec<usize> = comp
-            .iter()
-            .filter_map(|ni| idx_to_pos.get(ni).copied())
+    let mut has_marked_ancestor = vec![false; g.node_bound()];
+    for &node in topo {
+        has_marked_ancestor[node.index()] = marked.contains(&node)
+            || g.neighbors_directed(node, Direction::Incoming)
+                .any(|pred| has_marked_ancestor[pred.index()]);
+    }
+    let mut has_marked_descendant = vec![false; g.node_bound()];
+    let mut has_unmarked_between = false;
+    for &node in topo.iter().rev() {
+        has_marked_descendant[node.index()] = marked.contains(&node)
+            || g.neighbors_directed(node, Direction::Outgoing)
+                .any(|succ| has_marked_descendant[succ.index()]);
+        has_unmarked_between |= !marked.contains(&node)
+            && has_marked_ancestor[node.index()]
+            && has_marked_descendant[node.index()];
+    }
+    if !has_unmarked_between {
+        return components
+            .into_iter()
+            .map(|component| component.into_iter().collect())
             .collect();
-        comp_pos.sort_unstable();
+    }
 
-        // Membership: in_comp_pos bitset over topo positions
-        let mut in_comp_pos = FixedBitSet::with_capacity(topo_len);
-        in_comp_pos.grow(topo_len);
-        for &p in &comp_pos {
-            in_comp_pos.insert(p);
+    // Exact sparse fallback. For a component's marked node `p`, a block is
+    // non-convex exactly when it already contains a marked `u` for which a
+    // path u ->* p crosses an unmarked node. While walking topologically,
+    // `max_any_ancestor` tracks the latest component node reaching each node,
+    // and `max_tainted_ancestor` tracks the latest one whose path has crossed
+    // an unmarked node. The latter is the single cut barrier needed by the
+    // deterministic greedy sweep. This replaces the old all-pairs
+    // reachability bitsets and witness maps.
+    let mut component_by_node = vec![usize::MAX; g.node_bound()];
+    for (component, nodes) in components.iter().enumerate() {
+        for &node in nodes {
+            component_by_node[node.index()] = component;
         }
-
-        // Membership: in_comp_idx vec over NodeIndex::index() for component-relative DP
-        let mut in_comp_idx = vec![false; g.node_bound()];
-        for &n in &comp {
-            in_comp_idx[n.index()] = true;
-        }
-
-        // --- Component-relative "between" witnesses (path-wise, correct) ---
-        // has_comp_anc[x] == true if x has a component node as an ancestor (or is in comp)
-        let mut has_comp_anc = vec![false; g.node_bound()];
-        for &u in &topo {
-            let mut v = in_comp_idx[u.index()];
-            for p in g.neighbors_directed(u, Direction::Incoming) {
-                v |= has_comp_anc[p.index()];
-                if v {
-                    break;
-                }
-            }
-            has_comp_anc[u.index()] = v;
-        }
-
-        // has_comp_des[x] == true if x has a component node as a descendant (or is in comp)
-        let mut has_comp_des = vec![false; g.node_bound()];
-        for &u in topo.iter().rev() {
-            let mut v = in_comp_idx[u.index()];
-            for s in g.neighbors_directed(u, Direction::Outgoing) {
-                v |= has_comp_des[s.index()];
-                if v {
-                    break;
-                }
-            }
-            has_comp_des[u.index()] = v;
-        }
-
-        // --- Build witness constraints Px/Sx only for true witnesses of THIS component ---
-        // Witness x is UNMARKED and lies on some path comp_node ->* x ->* comp_node.
-        // For each witness x:
-        //   Px(x) = {u in comp | u ->* x}
-        //   Sx(x) = {v in comp | x ->* v}
-        // A valid block cannot contain nodes from both Px(x) and Sx(x).
-        let mut px_map: FxHashMap<NodeIndex, FixedBitSet> = FxHashMap::default();
-        let mut sx_map: FxHashMap<NodeIndex, FixedBitSet> = FxHashMap::default();
-        let mut px_witnesses: FxHashMap<usize, Vec<NodeIndex>> = FxHashMap::default(); // upos -> witnesses where upos ∈ Px
-        let mut sx_witnesses: FxHashMap<usize, Vec<NodeIndex>> = FxHashMap::default(); // vpos -> witnesses where vpos ∈ Sx
-
-        for x in g.node_indices() {
-            if marked.contains(&x) {
-                continue; // must be outside the block (unmarked) to be a witness
-            }
-            if !(has_comp_anc[x.index()] && has_comp_des[x.index()]) {
-                continue; // not between this component's marked nodes
-            }
-
-            let Some(&xpos) = idx_to_pos.get(&x) else {
-                continue;
-            };
-            // Sx = reachable-from-x ∩ component
-            let mut sx = reach[xpos].clone();
-            sx.intersect_with(&in_comp_pos);
-            if sx.is_empty() {
-                continue;
-            }
-
-            // Px = {u in comp | u can reach x}
-            let mut px = FixedBitSet::with_capacity(topo_len);
-            px.grow(topo_len);
-            for &upos in &comp_pos {
-                if reach[upos].contains(xpos) {
-                    px.insert(upos);
-                }
-            }
-            if px.is_empty() {
-                continue;
-            }
-
-            px_map.insert(x, px.clone());
-            sx_map.insert(x, sx.clone());
-
-            for upos in px.ones() {
-                px_witnesses.entry(upos).or_default().push(x);
-            }
-            for vpos in sx.ones() {
-                sx_witnesses.entry(vpos).or_default().push(x);
-            }
-        }
-
-        // --- 3) Deterministic topo sweep partition within this component ---
+    }
+    // Topological positions are encoded as pos + 1 so zero can mean none.
+    let mut max_any_ancestor = vec![0usize; g.node_bound()];
+    let mut max_tainted_ancestor = vec![0usize; g.node_bound()];
+    let mut results: Vec<FxHashSet<NodeIndex>> = Vec::new();
+    for component in 0..components.len() {
+        max_any_ancestor.fill(0);
+        max_tainted_ancestor.fill(0);
         let mut current: FxHashSet<NodeIndex> = FxHashSet::default();
-        let mut block_bits = FixedBitSet::with_capacity(topo_len);
-        block_bits.grow(topo_len);
-
-        for &p in &comp_pos {
-            let violates = would_violate(
-                p,
-                &block_bits,
-                &px_witnesses,
-                &sx_witnesses,
-                &px_map,
-                &sx_map,
-            );
-
-            if violates && !current.is_empty() {
-                results.push(std::mem::take(&mut current));
-                block_bits.clear(); // keeps length
+        let mut block_start = 0usize;
+        for &node in topo {
+            let mut any = 0usize;
+            let mut tainted = 0usize;
+            for predecessor in g.neighbors_directed(node, Direction::Incoming) {
+                any = any.max(max_any_ancestor[predecessor.index()]);
+                tainted = tainted.max(max_tainted_ancestor[predecessor.index()]);
             }
+            if component_by_node[node.index()] == component {
+                any = any.max(idx_to_pos[node.index()] + 1);
+            } else if !marked.contains(&node) {
+                // Every component path reaching this unmarked node is now a
+                // witness-bearing path.
+                tainted = tainted.max(any);
+            }
+            max_any_ancestor[node.index()] = any;
+            max_tainted_ancestor[node.index()] = tainted;
 
-            let ni = pos_to_idx[p];
-            current.insert(ni);
-            block_bits.insert(p);
+            if component_by_node[node.index()] != component {
+                continue;
+            }
+            let position = idx_to_pos[node.index()] + 1;
+            if !current.is_empty() && tainted >= block_start {
+                results.push(std::mem::take(&mut current));
+                block_start = position;
+            } else if current.is_empty() {
+                block_start = position;
+            }
+            current.insert(node);
         }
-
         if !current.is_empty() {
             results.push(current);
         }
     }
 
-    Ok(results)
+    results
 }
 
 /// Deterministic “contiguous marked” components: weakly-connected in the marked-induced subgraph.
@@ -5157,50 +5407,90 @@ fn marked_weak_components<T, E>(
     comps
 }
 
-fn would_violate(
-    p: usize,
-    block_bits: &FixedBitSet,
-    px_witnesses: &FxHashMap<usize, Vec<NodeIndex>>,
-    sx_witnesses: &FxHashMap<usize, Vec<NodeIndex>>,
-    px_map: &FxHashMap<NodeIndex, FixedBitSet>,
-    sx_map: &FxHashMap<NodeIndex, FixedBitSet>,
-) -> bool {
-    // If p ∈ Px(x), block cannot contain any node in Sx(x)
-    if let Some(ws) = px_witnesses.get(&p) {
-        for &x in ws {
-            if let Some(sx) = sx_map.get(&x)
-                && intersects(block_bits, sx)
-            {
-                return true;
-            }
-        }
-    }
-
-    // If p ∈ Sx(x), block cannot contain any node in Px(x)
-    if let Some(ws) = sx_witnesses.get(&p) {
-        for &x in ws {
-            if let Some(px) = px_map.get(&x)
-                && intersects(block_bits, px)
-            {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn intersects(a: &FixedBitSet, b: &FixedBitSet) -> bool {
-    let mut tmp = a.clone();
-    tmp.intersect_with(b);
-    // Note: is_empty() checks if length is 0, not if there are no bits set
-    // Use count_ones() to check if there are any set bits after intersection
-    tmp.count_ones(..) > 0
-}
-
 #[cfg(test)]
 mod arena_plan_tests {
     use super::*;
+
+    fn reference_partition(
+        graph: &StableGraph<(), (), Directed>,
+        marked: &FxHashSet<NodeIndex>,
+        topo: &[NodeIndex],
+    ) -> Vec<FxHashSet<NodeIndex>> {
+        let bound = graph.node_bound();
+        let mut reachable = vec![vec![false; bound]; bound];
+        for &node in topo.iter().rev() {
+            for successor in graph.neighbors_directed(node, Direction::Outgoing) {
+                reachable[node.index()][successor.index()] = true;
+                let successor_reachability = reachable[successor.index()].clone();
+                for (target, successor_reachable) in reachable[node.index()]
+                    .iter_mut()
+                    .zip(successor_reachability)
+                {
+                    *target |= successor_reachable;
+                }
+            }
+        }
+        let mut position = vec![usize::MAX; bound];
+        for (index, &node) in topo.iter().enumerate() {
+            position[node.index()] = index;
+        }
+
+        let mut result = Vec::new();
+        for mut component in marked_weak_components(graph, marked) {
+            component.sort_by_key(|node| position[node.index()]);
+            let mut current = FxHashSet::default();
+            for node in component {
+                let violates = current.iter().copied().any(|prior: NodeIndex| {
+                    graph.node_indices().any(|witness| {
+                        !marked.contains(&witness)
+                            && ((reachable[prior.index()][witness.index()]
+                                && reachable[witness.index()][node.index()])
+                                || (reachable[node.index()][witness.index()]
+                                    && reachable[witness.index()][prior.index()]))
+                    })
+                });
+                if violates && !current.is_empty() {
+                    result.push(std::mem::take(&mut current));
+                }
+                current.insert(node);
+            }
+            if !current.is_empty() {
+                result.push(current);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn sparse_convex_partition_matches_exhaustive_reference() {
+        const NODES: usize = 5;
+        let possible_edges = (0..NODES)
+            .flat_map(|source| ((source + 1)..NODES).map(move |target| (source, target)))
+            .collect::<Vec<_>>();
+
+        for edge_mask in 0..(1usize << possible_edges.len()) {
+            let mut graph = StableGraph::<(), (), Directed>::default();
+            let nodes = (0..NODES).map(|_| graph.add_node(())).collect::<Vec<_>>();
+            for (bit, &(source, target)) in possible_edges.iter().enumerate() {
+                if edge_mask & (1 << bit) != 0 {
+                    graph.add_edge(nodes[source], nodes[target], ());
+                }
+            }
+            let topo = toposort(&graph, None).unwrap();
+            for marked_mask in 1..(1usize << NODES) {
+                let marked = nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(bit, &node)| (marked_mask & (1 << bit) != 0).then_some(node))
+                    .collect::<FxHashSet<_>>();
+                assert_eq!(
+                    partition_marked_convex(&graph, &marked, &topo),
+                    reference_partition(&graph, &marked, &topo),
+                    "edge mask {edge_mask:#x}, marked mask {marked_mask:#x}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn arena_release_plan_retains_and_deduplicates_allocation_pools() {
@@ -5582,6 +5872,9 @@ mod arena_plan_tests {
             &mut buckets,
             &dyn_maps,
             &FxHashMap::default(),
+            &mut CompiledFunctionResourceCache::default(),
+            CandidateResourceCaps::default(),
+            None,
         )
         .unwrap();
         let individual_bytes = buckets
@@ -5738,7 +6031,7 @@ mod arena_plan_tests {
     }
 
     #[test]
-    fn fixed_arena_slot_assignment_respects_dependency_conflicts() {
+    fn fixed_arena_slot_assignment_respects_lifetime_overlap() {
         let a = NodeIndex::new(1);
         let b = NodeIndex::new(2);
         let planned = vec![
@@ -5756,13 +6049,14 @@ mod arena_plan_tests {
             },
         ];
 
-        let mut shareable = CompiledBucket::new();
-        CudaRuntime::assign_fixed_arena_slots(&mut shareable, planned.clone());
-        assert_eq!(shareable.arena_slots.len(), 1);
+        let mut disjoint = CompiledBucket::new();
+        CudaRuntime::assign_fixed_arena_slots(&mut disjoint, planned.clone());
+        assert_eq!(disjoint.arena_slots.len(), 1);
 
-        let mut conflicting = CompiledBucket::new();
-        conflicting.arena_conflicts.insert(ordered_node_pair(a, b));
-        CudaRuntime::assign_fixed_arena_slots(&mut conflicting, planned);
-        assert_eq!(conflicting.arena_slots.len(), 2);
+        let mut overlapping = CompiledBucket::new();
+        let mut planned = planned;
+        planned[1].start = 0;
+        CudaRuntime::assign_fixed_arena_slots(&mut overlapping, planned);
+        assert_eq!(overlapping.arena_slots.len(), 2);
     }
 }

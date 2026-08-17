@@ -405,10 +405,7 @@ impl Default for CompileOptions {
             search_time_limit: std::time::Duration::MAX,
             generation_size: 10,
             mutations: 10,
-            // 3 trials proved too noisy to discriminate fast-vs-slow backends
-            // now that search keeps equivalent alternatives alive; llama has
-            // long used 10 and shows the most stable selections.
-            trials: 5,
+            trials: 3,
             keep_best: 1,
             restart_stagnation: 0,
             candidate_timeout: Some(std::time::Duration::from_secs(60)),
@@ -2247,8 +2244,9 @@ impl Graph {
         let mut expr_cache = FxHashMap::default();
         runtime.clear_intermediate_buffers();
         let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
-        // `profile_start.elapsed()` wraps the whole compile+run, so this is the
-        // candidate-timeout (viability) check, not the per-execution one.
+        // `profile_start.elapsed()` wraps the backend's post-acceptance profile
+        // phase. Hard filtering/preparation is governed by the overall search
+        // time limit; `execution_timeout` separately bounds profiling runs.
         let candidate_timed_out = |elapsed: std::time::Duration| {
             options
                 .candidate_timeout
@@ -2263,7 +2261,7 @@ impl Graph {
             let mut filter_fails = 0usize;
             let mut last_filter_rejection: Option<String> = None;
             // Breakdown of why profiled candidates were invalid, for the give-up message.
-            let (mut n_timed_out, mut n_nan, mut n_invalid_profile, mut n_panicked) = (0, 0, 0, 0);
+            let (mut n_timed_out, mut n_invalid_profile, mut n_panicked) = (0, 0, 0);
             let max_invalid_attempts = 100usize;
             let max_filter_fails = options
                 .limit
@@ -2312,7 +2310,7 @@ impl Graph {
                 // rule that mis-fires and produces an inconsistent kernel op)
                 // must be rejected like any other, not abort the search.
                 let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.candidate_filter_result(
+                    self.prepare_profile_candidate(
                         runtime,
                         &graph,
                         &profile_dyn_map,
@@ -2344,60 +2342,43 @@ impl Graph {
                 let filter_display = filter_result.display;
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    runtime.clear_intermediate_buffers();
                     let profile_start = std::time::Instant::now();
-                    let (rep_metric, rep_display) =
-                        if let Some(bucket_context) = &bucket_profile_context {
-                            runtime.profile_with_bucket_context(
-                                &graph,
-                                &profile_dyn_map,
-                                options.trials,
-                                options.execution_timeout,
-                                // No best exists yet — the initial genome
-                                // establishes the early-stop baseline.
-                                None,
-                                ProfileBucketContext {
-                                    dim_buckets: &bucket_context.dim_buckets,
-                                    bucket_indices: &bucket_context.bucket_indices,
-                                    representative_dyn_map: &bucket_context.representative_dyn_map,
-                                },
-                            )
-                        } else {
-                            runtime.profile(
-                                &graph,
-                                &profile_dyn_map,
-                                options.trials,
-                                options.execution_timeout,
-                                None,
-                            )
-                        };
+                    let (rep_metric, rep_display) = runtime.profile_prepared_candidate(
+                        &graph,
+                        &profile_dyn_map,
+                        options.trials,
+                        options.execution_timeout,
+                        // No best exists yet — the initial genome establishes
+                        // the early-stop baseline.
+                        None,
+                        bucket_profile_context.as_ref().map(|bucket_context| {
+                            ProfileBucketContext {
+                                dim_buckets: &bucket_context.dim_buckets,
+                                bucket_indices: &bucket_context.bucket_indices,
+                                representative_dyn_map: &bucket_context.representative_dyn_map,
+                            }
+                        }),
+                    );
                     let timed_out = candidate_timed_out(profile_start.elapsed());
-                    let has_nan = !timed_out && runtime.has_nan_outputs(&graph, &profile_dyn_map);
-                    if has_nan {
-                        crate::mask_events::NAN_OUTPUT_REJECT.record();
-                    }
                     let invalid_profile = rep_display.starts_with("invalid ");
-                    if !has_nan && !timed_out && !invalid_profile {
+                    if !timed_out && !invalid_profile {
                         log_best_llir(&graph, &format!("candidate=0 {rep_display}"));
                     }
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
-                        has_nan,
                         timed_out,
                         invalid_profile,
                     )
                 }));
 
                 match result {
-                    Ok((metric, disp, false, false, false)) => {
+                    Ok((metric, disp, false, false)) => {
                         break (genome, R::aggregate_profile_metrics(&[metric]), disp, 1);
                     }
-                    Ok((_, _, has_nan, timed_out, invalid_profile)) => {
+                    Ok((_, _, timed_out, invalid_profile)) => {
                         if timed_out {
                             n_timed_out += 1;
-                        } else if has_nan {
-                            n_nan += 1;
                         } else if invalid_profile {
                             n_invalid_profile += 1;
                         }
@@ -2411,7 +2392,7 @@ impl Graph {
                 if invalid_attempts > max_invalid_attempts {
                     panic!(
                         "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts \
-                         (candidate_timed_out={n_timed_out} nan={n_nan} invalid_profile={n_invalid_profile} panicked={n_panicked})"
+                         (candidate_timed_out={n_timed_out} invalid_profile={n_invalid_profile} panicked={n_panicked})"
                     );
                 }
             }
@@ -2525,7 +2506,7 @@ impl Graph {
                 };
 
                 let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.candidate_filter_result(
+                    self.prepare_profile_candidate(
                         runtime,
                         &llir_graph,
                         &profile_dyn_map,
@@ -2556,53 +2537,37 @@ impl Graph {
                     .early_stop_factor
                     .map(|factor| (best_metric.clone(), factor));
                 let profile_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    runtime.clear_intermediate_buffers();
                     let profile_start = std::time::Instant::now();
-                    let (rep_metric, rep_display) =
-                        if let Some(bucket_context) = &bucket_profile_context {
-                            runtime.profile_with_bucket_context(
-                                &llir_graph,
-                                &profile_dyn_map,
-                                options.trials,
-                                options.execution_timeout,
-                                early_stop,
-                                ProfileBucketContext {
-                                    dim_buckets: &bucket_context.dim_buckets,
-                                    bucket_indices: &bucket_context.bucket_indices,
-                                    representative_dyn_map: &bucket_context.representative_dyn_map,
-                                },
-                            )
-                        } else {
-                            runtime.profile(
-                                &llir_graph,
-                                &profile_dyn_map,
-                                options.trials,
-                                options.execution_timeout,
-                                early_stop,
-                            )
-                        };
+                    let (rep_metric, rep_display) = runtime.profile_prepared_candidate(
+                        &llir_graph,
+                        &profile_dyn_map,
+                        options.trials,
+                        options.execution_timeout,
+                        early_stop,
+                        bucket_profile_context.as_ref().map(|bucket_context| {
+                            ProfileBucketContext {
+                                dim_buckets: &bucket_context.dim_buckets,
+                                bucket_indices: &bucket_context.bucket_indices,
+                                representative_dyn_map: &bucket_context.representative_dyn_map,
+                            }
+                        }),
+                    );
                     let timed_out = candidate_timed_out(profile_start.elapsed());
-                    let has_nan =
-                        !timed_out && runtime.has_nan_outputs(&llir_graph, &profile_dyn_map);
-                    if has_nan {
-                        crate::mask_events::NAN_OUTPUT_REJECT.record();
-                    }
                     let invalid_profile = rep_display.starts_with("invalid ");
                     (
                         rep_metric,
                         append_filter_display(rep_display, filter_display.as_deref()),
-                        has_nan,
                         timed_out,
                         invalid_profile,
                     )
                 }));
 
                 let (new_metric, display_metric) = match profile_result {
-                    Ok((metric, display, false, false, false)) => {
+                    Ok((metric, display, false, false)) => {
                         generation_found_non_timeout = true;
                         (R::aggregate_profile_metrics(&[metric]), display)
                     }
-                    Ok((_, _, _, true, _)) | Err(_) => {
+                    Ok((_, _, true, _)) | Err(_) => {
                         // Timed out or panicked — redraw bars and skip.
                         if search_log {
                             for _ in 1..n_bar_lines {
@@ -2614,20 +2579,7 @@ impl Graph {
                         }
                         continue;
                     }
-                    Ok((_, _, true, false, _)) => {
-                        generation_found_non_timeout = true;
-                        // Completed profiling but produced NaNs — redraw bars and skip.
-                        if search_log {
-                            for _ in 1..n_bar_lines {
-                                print!("\x1b[1A");
-                            }
-                            print!("\r\x1b[2K");
-                            render_bars(n_graphs, search_limit, bucket_progress);
-                            std::io::stdout().flush().unwrap();
-                        }
-                        continue;
-                    }
-                    Ok((_, _, false, false, true)) => {
+                    Ok((_, _, false, true)) => {
                         // Backend rejected this candidate during load/profile.
                         if search_log {
                             for _ in 1..n_bar_lines {
@@ -2744,7 +2696,6 @@ impl Graph {
                 pretty_duration::pretty_duration(&start.elapsed(), None)
             );
         }
-
         ranked_candidates
     }
 
@@ -2954,6 +2905,28 @@ impl Graph {
         bucket_profile_context: Option<&SearchProfileBucketContext>,
     ) -> CandidateFilterResult {
         runtime.filter_llir_candidate(
+            llir_graph,
+            CandidateFilterContext {
+                search_options,
+                dyn_map,
+                bucket_context: bucket_profile_context.map(|bucket_context| ProfileBucketContext {
+                    dim_buckets: &bucket_context.dim_buckets,
+                    bucket_indices: &bucket_context.bucket_indices,
+                    representative_dyn_map: &bucket_context.representative_dyn_map,
+                }),
+            },
+        )
+    }
+
+    fn prepare_profile_candidate<R: Runtime + 'static>(
+        &self,
+        runtime: &mut R,
+        llir_graph: &LLIRGraph,
+        dyn_map: &DynMap,
+        search_options: &CompileOptions,
+        bucket_profile_context: Option<&SearchProfileBucketContext>,
+    ) -> CandidateFilterResult {
+        runtime.prepare_profile_candidate(
             llir_graph,
             CandidateFilterContext {
                 search_options,
@@ -4469,6 +4442,62 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PreparedCandidateRuntime {
+        prepared: usize,
+        prepared_profiles: usize,
+        fallback_profiles: usize,
+    }
+
+    impl Runtime for PreparedCandidateRuntime {
+        type Ops = ();
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &DynMap,
+            _: usize,
+            _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
+        ) -> (Self::ProfileMetric, String) {
+            self.fallback_profiles += 1;
+            (0, "fallback".to_string())
+        }
+
+        fn prepare_profile_candidate(
+            &mut self,
+            _: &LLIRGraph,
+            _: CandidateFilterContext<'_>,
+        ) -> CandidateFilterResult {
+            self.prepared += 1;
+            CandidateFilterResult::accept()
+        }
+
+        fn profile_prepared_candidate(
+            &mut self,
+            _: &LLIRGraph,
+            _: &DynMap,
+            _: usize,
+            _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
+            _: Option<ProfileBucketContext<'_>>,
+        ) -> (Self::ProfileMetric, String) {
+            self.prepared_profiles += 1;
+            (0, "prepared".to_string())
+        }
+    }
+
     macro_rules! final_filter_test_op {
         ($name:ident, $sort_name:literal, $rule_name:literal) => {
             #[derive(Debug, Default)]
@@ -4929,6 +4958,7 @@ mod tests {
     fn compile_options_defaults_and_search_time_limit_builder() {
         let opts = CompileOptions::default();
         assert_eq!(opts.limit, 100);
+        assert_eq!(opts.trials, 3);
         assert_eq!(opts.search_time_limit, std::time::Duration::MAX);
         assert!(!opts.egglog_log);
         assert!(!opts.rolling_log);
@@ -5044,6 +5074,26 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(PROFILE_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn search_profiles_the_candidate_prepared_by_the_runtime() {
+        let mut cx = Graph::new();
+        let _ = cx.tensor(1).output();
+
+        let runtime = cx.compile(
+            PreparedCandidateRuntime::default(),
+            CompileOptions::default()
+                .search_graph_limit(1)
+                .search_log(false),
+        );
+
+        assert_eq!(runtime.prepared, 1);
+        assert_eq!(runtime.prepared_profiles, 1);
+        assert_eq!(
+            runtime.fallback_profiles, 0,
+            "a prepared candidate must not be loaded again through Runtime::profile"
+        );
     }
 
     #[test]

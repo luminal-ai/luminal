@@ -461,16 +461,18 @@ extern \"C\" {{
         self.dest_shape.iter().copied().product()
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.dest_shape
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        for expression in self
+            .dest_shape
             .iter()
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.dest_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.index_shape.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.index_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.src_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.out_strides.iter().flat_map(|e| e.dyn_vars()))
-            .collect()
+            .chain(&self.dest_strides)
+            .chain(&self.index_shape)
+            .chain(&self.index_strides)
+            .chain(&self.src_strides)
+            .chain(&self.out_strides)
+        {
+            expression.collect_dyn_vars_into(vars);
+        }
     }
 
     fn output_bytes(&self) -> Expression {

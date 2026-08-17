@@ -77,9 +77,8 @@ impl EgglogOp for CudaUnaryElementwise {
             // Each FusionStart is stamped with ITS input's dtype — it
             // describes how the external producer's buffer is loaded, and the
             // codegen reads every local at its producer's dtype. Stamping the
-            // consumer's dtype instead is illegal by construction whenever
-            // input and output dtypes differ (the post-extraction fusion
-            // region check rejects the mismatch nondeterministically).
+            // consumer's dtype instead would violate the construction
+            // invariant whenever input and output dtypes differ.
             rules.push(Rule::raw(format!(
                 "(rule (
                     (= ?u (Op ({hlir} ?shape ?s ?out_s) (ICons ?x (INil))))
@@ -254,10 +253,10 @@ impl EgglogOp for CudaBinaryElementwise {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        // Preserve every extracted metadata list verbatim. A selected
-        // candidate with inconsistent ranks is rejected by fusion-region
-        // validation; truncating here would erase the contradiction and could
-        // silently change the operation's iteration space.
+        // Preserve every extracted metadata list verbatim. Singleton fusion
+        // rules derive these lists from one matched HLIR operation, so their
+        // rank/layout contract is established by construction; extraction
+        // must not mutate that metadata.
         let out_shape =
             extract_expr_list(egraph, kind_children[1], list_cache, expr_cache).unwrap();
         let a_stride = extract_expr_list(egraph, kind_children[2], list_cache, expr_cache).unwrap();

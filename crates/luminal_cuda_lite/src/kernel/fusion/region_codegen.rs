@@ -24,12 +24,14 @@
 // never enter the kernels Vec — they have no buffers, no launches.
 // =========================================================================
 
-use std::sync::Arc;
+use std::{
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     graph::LLIRGraph,
-    hlir::Input,
     prelude::{
         petgraph::{Direction, algo::toposort, visit::EdgeRef},
         *,
@@ -37,6 +39,7 @@ use luminal::{
 };
 
 use as_any::Downcast;
+use rustc_hash::FxHasher;
 
 use crate::{
     compile_module_image_for_current_device, cuda_dtype,
@@ -50,7 +53,7 @@ use crate::{
 // Compile units — what `kernel_to_host` iterates over instead of nodes.
 // =========================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegionUnit {
     /// The FusionEnd node that anchors this region.
     pub fe_node: NodeIndex,
@@ -69,911 +72,175 @@ pub(crate) struct RegionUnit {
     pub external_inputs: Vec<NodeIndex>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompileUnit {
     Single(NodeIndex),
     Region(RegionUnit),
 }
 
-// =========================================================================
-// Candidate-local region validation.
-// =========================================================================
-
-/// A selected fusion graph violated a contract required by region codegen.
-///
-/// Fusion alternatives remain in the egraph. This error rejects only the
-/// selected LLIR candidate; it never deletes an alternative globally.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FusionValidationError {
-    pub node: NodeIndex,
-    pub reason: String,
-}
-
-impl std::fmt::Display for FusionValidationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "fusion node {} is invalid: {}",
-            self.node.index(),
-            self.reason
-        )
-    }
-}
-
-impl std::error::Error for FusionValidationError {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SemanticRelation {
-    Equal,
-    Different,
-    Unknown,
-}
-
-impl SemanticRelation {
-    fn conjunction(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Different, _) | (_, Self::Different) => Self::Different,
-            (Self::Equal, Self::Equal) => Self::Equal,
-            _ => Self::Unknown,
-        }
-    }
-
-    fn either(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Equal, _) | (_, Self::Equal) => Self::Equal,
-            (Self::Different, Self::Different) => Self::Different,
-            _ => Self::Unknown,
+impl CompileUnit {
+    pub(crate) fn root_node(&self) -> NodeIndex {
+        match self {
+            Self::Single(node) => *node,
+            Self::Region(region) => region.fe_node,
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct FusionLayout<'a> {
-    shape: &'a [Expression],
-    strides: &'a [Expression],
+#[derive(Debug)]
+pub(crate) struct PreparedRegionKernel {
+    pub source: Arc<str>,
+    pub output_size: Expression,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RegionSourceCache {
+    sources: FxHashMap<u64, Vec<CachedRegionSource>>,
+    hits: usize,
+    misses: usize,
+}
+
+impl RegionSourceCache {
+    pub(crate) fn counters(&self) -> (usize, usize) {
+        (self.hits, self.misses)
+    }
+}
+
+#[derive(Debug)]
+struct CachedRegionSource {
+    key: SingletonRegionProgramKey,
+    source: Arc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct OwnedFusionLayout {
-    shape: Vec<Expression>,
+struct FusionStartProgramKey {
     strides: Vec<Expression>,
-}
-
-impl From<FusionLayout<'_>> for OwnedFusionLayout {
-    fn from(layout: FusionLayout<'_>) -> Self {
-        Self {
-            shape: layout.shape.to_vec(),
-            strides: layout.strides.to_vec(),
-        }
-    }
+    dtype: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ExpressionProofKey {
-    lhs: Expression,
-    rhs: Expression,
-    z_witnesses: Vec<usize>,
-    exhaustive: bool,
+enum SingletonElementProgramKey {
+    Unary { opcode: u8, dtype: u8 },
+    Binary { opcode: u8, dtype: u8 },
 }
 
-#[derive(Default)]
-struct FusionValidationCache {
-    expressions: FxHashMap<ExpressionProofKey, SemanticRelation>,
-    symbolic_expressions: FxHashMap<(Expression, Expression), bool>,
-    layouts: FxHashMap<(OwnedFusionLayout, OwnedFusionLayout), SemanticRelation>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SingletonRegionProgramKey {
+    global_dyn_dims: Vec<Symbol>,
+    output_shape: Vec<Expression>,
+    output_strides: Vec<Expression>,
+    output_dtype: u8,
+    inputs: Vec<FusionStartProgramKey>,
+    element: SingletonElementProgramKey,
+    operand_slots: Vec<u16>,
 }
 
-/// Deterministic associative/commutative normalization for the expression
-/// operators where operand order and grouping have no semantic meaning. This
-/// proves common layout equalities without saturating an egraph with every
-/// permutation of a long shape expression.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum CanonicalSemanticExpression {
-    Number(i64),
-    Variable(Symbol),
-    Binary(u8, Box<Self>, Box<Self>),
-    AssociativeCommutative(u8, Vec<Self>),
+// The singleton egglog rules copy the operation's shape/output strides into
+// FusionEnd, and copy each input stride into its FusionStart. Consequently the
+// fields above are a complete source descriptor: repeating the elementwise
+// shape/stride metadata would only make every cache hit hash it twice.
+
+/// Candidate-local fusion work shared by static resource validation and the
+/// subsequent compilation of that exact LLIR. Node indices remain valid when
+/// `compile_bucket` clones the graph because `StableGraph::clone` preserves
+/// them.
+#[derive(Debug)]
+pub(crate) struct PreparedFusionPlan {
+    compile_units: Vec<CompileUnit>,
+    region_kernels: FxHashMap<NodeIndex, PreparedRegionKernel>,
+    absorbed_markers: FxHashSet<NodeIndex>,
 }
 
-fn expression_operator_tag(term: Term) -> Option<(u8, bool)> {
-    Some(match term {
-        Term::Add => (0, true),
-        Term::Sub => (1, false),
-        Term::Mul => (2, true),
-        Term::Div => (3, false),
-        Term::CeilDiv => (4, false),
-        Term::Mod => (5, false),
-        Term::Min => (6, true),
-        Term::Max => (7, true),
-        Term::And => (8, true),
-        Term::Or => (9, true),
-        Term::Gte => (10, false),
-        Term::Lt => (11, false),
-        Term::Num(_) | Term::Var(_) => return None,
-    })
-}
-
-fn append_associative_operand(
-    tag: u8,
-    operand: CanonicalSemanticExpression,
-    operands: &mut Vec<CanonicalSemanticExpression>,
-) {
-    match operand {
-        CanonicalSemanticExpression::AssociativeCommutative(operand_tag, nested)
-            if operand_tag == tag =>
-        {
-            operands.extend(nested);
-        }
-        operand => operands.push(operand),
-    }
-}
-
-fn canonical_semantic_expression(expression: Expression) -> Option<CanonicalSemanticExpression> {
-    let terms = expression.terms.read();
-    let mut stack = Vec::with_capacity(terms.len());
-    for &term in terms.iter() {
-        match term {
-            Term::Num(number) => stack.push(CanonicalSemanticExpression::Number(number)),
-            Term::Var(variable) => stack.push(CanonicalSemanticExpression::Variable(variable)),
-            operator => {
-                // Expression RPN stores rhs before lhs, so the first pop is
-                // the source-level left operand.
-                let lhs = stack.pop()?;
-                let rhs = stack.pop()?;
-                let (tag, associative_commutative) = expression_operator_tag(operator)?;
-                if associative_commutative {
-                    let mut operands = Vec::new();
-                    append_associative_operand(tag, lhs, &mut operands);
-                    append_associative_operand(tag, rhs, &mut operands);
-                    operands.sort_unstable();
-                    stack.push(CanonicalSemanticExpression::AssociativeCommutative(
-                        tag, operands,
-                    ));
-                } else {
-                    stack.push(CanonicalSemanticExpression::Binary(
-                        tag,
-                        Box::new(lhs),
-                        Box::new(rhs),
-                    ));
-                }
-            }
+impl PreparedFusionPlan {
+    pub(crate) fn discover(kernel_topo: &[NodeIndex], llir: &LLIRGraph) -> Self {
+        let (compile_units, absorbed) = build_compile_units(kernel_topo, llir);
+        Self {
+            compile_units,
+            region_kernels: FxHashMap::default(),
+            absorbed_markers: absorbed,
         }
     }
-    (stack.len() == 1).then(|| stack.pop().unwrap())
-}
 
-fn invalid(node: NodeIndex, reason: impl Into<String>) -> FusionValidationError {
-    FusionValidationError {
-        node,
-        reason: reason.into(),
-    }
-}
-
-fn fusion_start(llir: &LLIRGraph, node: NodeIndex) -> Option<&FusionStart> {
-    let op = llir[node].to_dialect::<dyn KernelOp>()?;
-    (***op).downcast_ref::<FusionStart>()
-}
-
-fn fusion_end(llir: &LLIRGraph, node: NodeIndex) -> Option<&FusionEnd> {
-    let op = llir[node].to_dialect::<dyn KernelOp>()?;
-    (***op).downcast_ref::<FusionEnd>()
-}
-
-fn fusion_unary(llir: &LLIRGraph, node: NodeIndex) -> Option<&CudaUnaryElementwise> {
-    let op = llir[node].to_dialect::<dyn KernelOp>()?;
-    (***op).downcast_ref::<CudaUnaryElementwise>()
-}
-
-fn fusion_binary(llir: &LLIRGraph, node: NodeIndex) -> Option<&CudaBinaryElementwise> {
-    let op = llir[node].to_dialect::<dyn KernelOp>()?;
-    (***op).downcast_ref::<CudaBinaryElementwise>()
-}
-
-fn is_fusion_internal(llir: &LLIRGraph, node: NodeIndex) -> bool {
-    fusion_start(llir, node).is_some()
-        || fusion_unary(llir, node).is_some()
-        || fusion_binary(llir, node).is_some()
-}
-
-fn fusion_output_layout(llir: &LLIRGraph, node: NodeIndex) -> Option<FusionLayout<'_>> {
-    if let Some(start) = fusion_start(llir, node) {
-        Some(FusionLayout {
-            shape: &start.shape,
-            strides: &start.strides,
-        })
-    } else if let Some(unary) = fusion_unary(llir, node) {
-        Some(FusionLayout {
-            shape: &unary.shape,
-            strides: &unary.out_strides,
-        })
-    } else if let Some(binary) = fusion_binary(llir, node) {
-        Some(FusionLayout {
-            shape: &binary.out_shape,
-            strides: &binary.out_stride,
-        })
-    } else {
-        fusion_end(llir, node).map(|end| FusionLayout {
-            shape: &end.shape,
-            strides: &end.strides,
-        })
-    }
-}
-
-fn fusion_output_dtype(llir: &LLIRGraph, node: NodeIndex) -> Option<DType> {
-    if let Some(start) = fusion_start(llir, node) {
-        Some(start.dtype)
-    } else if let Some(unary) = fusion_unary(llir, node) {
-        Some(unary.dtype)
-    } else if let Some(binary) = fusion_binary(llir, node) {
-        Some(binary.dtype)
-    } else {
-        fusion_end(llir, node).map(|end| end.dtype)
-    }
-}
-
-fn known_buffer_dtype(llir: &LLIRGraph, node: NodeIndex) -> Option<DType> {
-    if let Some(dtype) = fusion_output_dtype(llir, node) {
-        return Some(dtype);
-    }
-    if let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() {
-        return Some(kernel.output_dtype());
-    }
-    llir[node].to_op::<Input>().map(|input| input.dtype)
-}
-
-fn fusion_storage_dtype_supported(dtype: DType) -> bool {
-    // These formats are packed (or, for TF32, have a storage width different
-    // from `DType::bits()`). Region codegen currently indexes one CUDA scalar
-    // per logical element, so treating them as ordinary pointer element types
-    // would address and allocate the buffer inconsistently.
-    !matches!(
-        dtype,
-        DType::TF32 | DType::F6E2M3 | DType::F6E3M2 | DType::F4E2M1 | DType::I4 | DType::U4
-    )
-}
-
-fn fusion_unary_dtype_supported(op: &str, dtype: DType) -> bool {
-    if op == "Cast" {
-        return fusion_storage_dtype_supported(dtype);
-    }
-    matches!(
-        dtype,
-        DType::F32 | DType::F16 | DType::Bf16 | DType::F8E4M3 | DType::F8E5M2 | DType::F8UE8M0
-    )
-}
-
-fn expression_relation(
-    lhs: Expression,
-    rhs: Expression,
-    dyn_map: Option<&DynMap>,
-    z_witnesses: &[usize],
-    exhaustive: bool,
-    cache: &mut FusionValidationCache,
-) -> SemanticRelation {
-    if lhs == rhs {
-        return SemanticRelation::Equal;
-    }
-
-    // Keep the expressions symbolic for every positive proof. Resolving a
-    // representative dyn_map first would be unsound for dimension buckets:
-    // two expressions can coincide at the representative size but disagree at
-    // another size covered by the same selected candidate.
-    let (lhs_simplified, rhs_simplified) = (lhs.simplify(), rhs.simplify());
-    if lhs_simplified == rhs_simplified {
-        return SemanticRelation::Equal;
-    }
-
-    let key = ExpressionProofKey {
-        lhs: lhs_simplified,
-        rhs: rhs_simplified,
-        z_witnesses: z_witnesses.to_vec(),
-        exhaustive,
-    };
-    if let Some(relation) = cache.expressions.get(&key).copied() {
-        return relation;
-    }
-
-    let symbolic_key = (lhs_simplified, rhs_simplified);
-    let semantically_equal = if let Some(equal) = cache.symbolic_expressions.get(&symbolic_key) {
-        *equal
-    } else {
-        let equal = canonical_semantic_expression(lhs_simplified)
-            .zip(canonical_semantic_expression(rhs_simplified))
-            .is_some_and(|(lhs, rhs)| lhs == rhs)
-            || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                lhs_simplified.egglog_equal(rhs_simplified)
-            }))
-            .unwrap_or(false);
-        cache.symbolic_expressions.insert(symbolic_key, equal);
-        cache
-            .symbolic_expressions
-            .insert((symbolic_key.1, symbolic_key.0), equal);
-        equal
-    };
-    if semantically_equal {
-        cache
-            .expressions
-            .insert(key.clone(), SemanticRelation::Equal);
-        return SemanticRelation::Equal;
-    }
-
-    let empty = FxHashMap::default();
-    let concrete_map = dyn_map.unwrap_or(&empty);
-    let relation = if let (Some(lhs), Some(rhs)) = (
-        eval_expression(lhs_simplified, concrete_map),
-        eval_expression(rhs_simplified, concrete_map),
+    pub(crate) fn prepare_region_kernels_for(
+        &mut self,
+        nodes: &FxHashSet<NodeIndex>,
+        llir: &LLIRGraph,
+        source_cache: &mut RegionSourceCache,
+        global_dyn_dims: &[Symbol],
     ) {
-        if lhs != rhs {
-            // One concrete counterexample is sufficient to refute symbolic
-            // equality.
-            SemanticRelation::Different
-        } else if lhs_simplified.to_symbols().is_empty() && rhs_simplified.to_symbols().is_empty() {
-            // Constant expressions have no other assignment on which they can
-            // diverge. A representative assignment is never used this way.
-            SemanticRelation::Equal
-        } else {
-            SemanticRelation::Unknown
-        }
-    } else {
-        // A single concrete counterexample proves inequality for this
-        // candidate. An exhaustive finite-domain match is also a positive
-        // proof only when every non-z symbol has already disappeared;
-        // non-exhaustive or representative-only matching proves nothing.
-        let mut all_evaluated_equal = true;
-        let mut different = false;
-        for &z in z_witnesses {
-            let mut values = concrete_map.clone();
-            values.insert(Symbol::reserved_index(), z);
-            match (
-                eval_expression(lhs_simplified, &values),
-                eval_expression(rhs_simplified, &values),
-            ) {
-                (Some(lhs), Some(rhs)) if lhs == rhs => {}
-                (Some(_), Some(_)) => {
-                    different = true;
-                    break;
-                }
-                _ => all_evaluated_equal = false,
-            }
-        }
-        if different {
-            SemanticRelation::Different
-        } else if exhaustive
-            && all_evaluated_equal
-            && lhs_simplified.dyn_vars().is_empty()
-            && rhs_simplified.dyn_vars().is_empty()
-        {
-            SemanticRelation::Equal
-        } else {
-            SemanticRelation::Unknown
-        }
-    };
-
-    cache.expressions.insert(key.clone(), relation);
-    cache.expressions.insert(
-        ExpressionProofKey {
-            lhs: key.rhs,
-            rhs: key.lhs,
-            z_witnesses: key.z_witnesses,
-            exhaustive: key.exhaustive,
-        },
-        relation,
-    );
-    relation
-}
-
-fn eval_expression(expression: Expression, values: &DynMap) -> Option<usize> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expression.exec(values)))
-        .ok()
-        .flatten()
-}
-
-fn layout_relation(
-    lhs: FusionLayout<'_>,
-    rhs: FusionLayout<'_>,
-    dyn_map: Option<&DynMap>,
-    cache: &mut FusionValidationCache,
-) -> SemanticRelation {
-    debug_assert_eq!(lhs.shape.len(), lhs.strides.len());
-    debug_assert_eq!(rhs.shape.len(), rhs.strides.len());
-
-    let cache_key = (OwnedFusionLayout::from(lhs), OwnedFusionLayout::from(rhs));
-    if let Some(relation) = cache.layouts.get(&cache_key).copied() {
-        return relation;
-    }
-
-    let lhs_elements = lhs.shape.iter().copied().product::<Expression>();
-    let rhs_elements = rhs.shape.iter().copied().product::<Expression>();
-    let element_relation =
-        expression_relation(lhs_elements, rhs_elements, dyn_map, &[], false, cache);
-    if element_relation == SemanticRelation::Different {
-        cache
-            .layouts
-            .insert(cache_key.clone(), SemanticRelation::Different);
-        cache
-            .layouts
-            .insert((cache_key.1, cache_key.0), SemanticRelation::Different);
-        return SemanticRelation::Different;
-    }
-
-    let concrete_elements = dyn_map
-        .and_then(|values| {
-            eval_expression(lhs_elements, values).zip(eval_expression(rhs_elements, values))
-        })
-        .or_else(|| {
-            let values = FxHashMap::default();
-            eval_expression(lhs_elements, &values).zip(eval_expression(rhs_elements, &values))
-        })
-        .and_then(|(lhs, rhs)| (lhs == rhs).then_some(lhs));
-    let symbolically_fixed_domain = element_relation == SemanticRelation::Equal
-        && lhs_elements.to_symbols().is_empty()
-        && rhs_elements.to_symbols().is_empty();
-    let mut z_witnesses = Vec::new();
-    let mut exhaustive = false;
-    if let Some(elements) = concrete_elements {
-        if symbolically_fixed_domain && elements <= 4_096 {
-            z_witnesses.extend(0..elements);
-            exhaustive = true;
-        } else if elements > 0 {
-            z_witnesses.extend([0, 1, elements / 2, elements - 1]);
-            z_witnesses.retain(|z| *z < elements);
-            z_witnesses.sort_unstable();
-            z_witnesses.dedup();
-        }
-    }
-
-    let lhs_index = flatten_strides(lhs.shape, lhs.strides);
-    let rhs_index = flatten_strides(rhs.shape, rhs.strides);
-    let index_relation = expression_relation(
-        lhs_index,
-        rhs_index,
-        dyn_map,
-        &z_witnesses,
-        exhaustive,
-        cache,
-    );
-    let relation = element_relation.conjunction(index_relation);
-    cache.layouts.insert(cache_key.clone(), relation);
-    cache.layouts.insert((cache_key.1, cache_key.0), relation);
-    relation
-}
-
-fn require_layout_compatible(
-    producer: NodeIndex,
-    consumer: NodeIndex,
-    input_slot: usize,
-    produced: FusionLayout<'_>,
-    expected: FusionLayout<'_>,
-    dyn_map: Option<&DynMap>,
-    cache: &mut FusionValidationCache,
-) -> Result<(), FusionValidationError> {
-    match layout_relation(produced, expected, dyn_map, cache) {
-        SemanticRelation::Equal => {}
-        SemanticRelation::Different => {
-            return Err(invalid(
-                consumer,
-                format!(
-                    "input {input_slot} layout is provably incompatible with producer {}",
-                    producer.index()
-                ),
-            ));
-        }
-        SemanticRelation::Unknown => {
-            return Err(invalid(
-                consumer,
-                format!(
-                    "input {input_slot} layout equivalence with producer {} could not be proved",
-                    producer.index()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn incoming_nodes(llir: &LLIRGraph, node: NodeIndex) -> Vec<NodeIndex> {
-    let mut edges = llir
-        .edges_directed(node, Direction::Incoming)
-        .map(|edge| (edge.id(), edge.source()))
-        .collect::<Vec<_>>();
-    edges.sort_by_key(|(edge, _)| *edge);
-    edges.into_iter().map(|(_, source)| source).collect()
-}
-
-/// Validate only contracts that region codegen actually relies on. Expression
-/// relations are tri-state: structural/concrete/semantic equality is accepted,
-/// concrete inequality is rejected as malformed, and an unproved relation is
-/// rejected as an unsupported layout because codegen erases that metadata.
-pub(crate) fn validate_fusion_regions(
-    llir: &LLIRGraph,
-    dyn_map: Option<&DynMap>,
-) -> Result<(), FusionValidationError> {
-    let mut validation_cache = FusionValidationCache::default();
-    for node in llir.node_indices() {
-        let inputs = incoming_nodes(llir, node);
-
-        if let Some(start) = fusion_start(llir, node) {
-            if inputs.len() != 1 {
-                return Err(invalid(
-                    node,
-                    format!("FusionStart requires 1 input, found {}", inputs.len()),
-                ));
-            }
-            if start.shape.len() != start.strides.len() {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "FusionStart shape rank {} differs from stride rank {}",
-                        start.shape.len(),
-                        start.strides.len()
-                    ),
-                ));
-            }
-            if !fusion_storage_dtype_supported(start.dtype) {
-                return Err(invalid(
-                    node,
-                    format!("FusionStart does not support packed dtype {}", start.dtype),
-                ));
-            }
-            if is_fusion_internal(llir, inputs[0]) {
-                return Err(invalid(
-                    node,
-                    "FusionStart must read a materialized external value, not a region-internal node",
-                ));
-            }
-            if let Some(producer_dtype) = known_buffer_dtype(llir, inputs[0])
-                && producer_dtype != start.dtype
-            {
-                let consumer = llir
-                    .neighbors_directed(node, Direction::Outgoing)
-                    .next()
-                    .map(|n| format!("{:?}", llir[n]))
-                    .unwrap_or_default();
-                return Err(invalid(
-                    node,
-                    format!(
-                        "FusionStart dtype {} disagrees with external producer dtype {} \
-                         (producer: {:.120}; consumer: {consumer:.120})",
-                        start.dtype,
-                        producer_dtype,
-                        format!("{:?}", llir[inputs[0]])
-                    ),
-                ));
-            }
-        } else if let Some(end) = fusion_end(llir, node) {
-            if inputs.len() != 1 {
-                return Err(invalid(
-                    node,
-                    format!("FusionEnd requires 1 input, found {}", inputs.len()),
-                ));
-            }
-            if end.shape.len() != end.strides.len() {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "FusionEnd shape rank {} differs from stride rank {}",
-                        end.shape.len(),
-                        end.strides.len()
-                    ),
-                ));
-            }
-            if !fusion_storage_dtype_supported(end.dtype) {
-                return Err(invalid(
-                    node,
-                    format!("FusionEnd does not support packed dtype {}", end.dtype),
-                ));
-            }
-            if fusion_end(llir, inputs[0]).is_some() || !is_fusion_internal(llir, inputs[0]) {
-                return Err(invalid(
-                    node,
-                    "FusionEnd input must be a FusionStart or Cuda*Elementwise node",
-                ));
-            }
-        } else if let Some(unary) = fusion_unary(llir, node) {
-            if inputs.len() != 1 {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "CudaUnaryElementwise requires 1 input, found {}",
-                        inputs.len()
-                    ),
-                ));
-            }
-            if unary.shape.len() != unary.in_strides.len()
-                || unary.shape.len() != unary.out_strides.len()
-            {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "CudaUnaryElementwise metadata ranks differ: shape {}, input {}, output {}",
-                        unary.shape.len(),
-                        unary.in_strides.len(),
-                        unary.out_strides.len()
-                    ),
-                ));
-            }
-            if !matches!(
-                unary.op.as_str(),
-                "Sin" | "Sqrt" | "Rsqrt" | "Exp" | "Exp2" | "Log2" | "Recip" | "Sigmoid" | "Cast"
-            ) {
-                return Err(invalid(
-                    node,
-                    format!("unsupported unary region opcode {:?}", unary.op),
-                ));
-            }
-            if !fusion_unary_dtype_supported(&unary.op, unary.dtype) {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "unary opcode {} does not support dtype {}",
-                        unary.op, unary.dtype
-                    ),
-                ));
-            }
-            if fusion_end(llir, inputs[0]).is_some() || !is_fusion_internal(llir, inputs[0]) {
-                return Err(invalid(
-                    node,
-                    "CudaUnaryElementwise input must be a FusionStart or Cuda*Elementwise node",
-                ));
-            }
-        } else if let Some(binary) = fusion_binary(llir, node) {
-            if inputs.len() != 2 {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "CudaBinaryElementwise requires 2 inputs, found {}",
-                        inputs.len()
-                    ),
-                ));
-            }
-            if binary.out_shape.len() != binary.a_stride.len()
-                || binary.out_shape.len() != binary.b_stride.len()
-                || binary.out_shape.len() != binary.out_stride.len()
-            {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "CudaBinaryElementwise metadata ranks differ: shape {}, lhs {}, rhs {}, output {}",
-                        binary.out_shape.len(),
-                        binary.a_stride.len(),
-                        binary.b_stride.len(),
-                        binary.out_stride.len()
-                    ),
-                ));
-            }
-            if !matches!(binary.op.as_str(), "Add" | "Mul") {
-                return Err(invalid(
-                    node,
-                    format!("unsupported binary region opcode {:?}", binary.op),
-                ));
-            }
-            if !fusion_storage_dtype_supported(binary.dtype) || binary.dtype == DType::Bool {
-                return Err(invalid(
-                    node,
-                    format!(
-                        "binary opcode {} does not support dtype {}",
-                        binary.op, binary.dtype
-                    ),
-                ));
-            }
-            if inputs.iter().any(|input| {
-                fusion_end(llir, *input).is_some() || !is_fusion_internal(llir, *input)
-            }) {
-                return Err(invalid(
-                    node,
-                    "CudaBinaryElementwise inputs must be FusionStart or Cuda*Elementwise nodes",
-                ));
-            }
-        } else {
-            continue;
-        }
-
-        // Region internals have no standalone compile implementation. Every
-        // outgoing edge must remain in a region; an acyclic chain therefore
-        // terminates at a FusionEnd.
-        if is_fusion_internal(llir, node) {
-            let consumers = llir
-                .neighbors_directed(node, Direction::Outgoing)
-                .collect::<Vec<_>>();
-            if consumers.is_empty() {
-                return Err(invalid(
-                    node,
-                    "region-internal node has no FusionEnd consumer",
-                ));
-            }
-            if consumers.iter().any(|consumer| {
-                fusion_end(llir, *consumer).is_none()
-                    && fusion_unary(llir, *consumer).is_none()
-                    && fusion_binary(llir, *consumer).is_none()
-            }) {
-                return Err(invalid(
-                    node,
-                    "region-internal output escapes without a FusionEnd materialization",
-                ));
-            }
-        }
-
-        // A materialized FE may feed arbitrary external work or a downstream
-        // FS, but may not be treated as an in-register local directly.
-        if fusion_end(llir, node).is_some()
-            && llir
-                .neighbors_directed(node, Direction::Outgoing)
-                .any(|consumer| {
-                    fusion_end(llir, consumer).is_some()
-                        || fusion_unary(llir, consumer).is_some()
-                        || fusion_binary(llir, consumer).is_some()
-                })
-        {
-            return Err(invalid(
-                node,
-                "FusionEnd must cross a FusionStart before entering another region",
-            ));
-        }
-    }
-
-    // Validate per-edge dtype and layout contracts. Unknown symbolic layout
-    // equality fails closed because interior layout metadata is erased.
-    for consumer in llir.node_indices() {
-        let inputs = incoming_nodes(llir, consumer);
-        if let Some(end) = fusion_end(llir, consumer) {
-            let producer = inputs[0];
-            let producer_dtype = fusion_output_dtype(llir, producer).unwrap();
-            if producer_dtype != end.dtype {
-                return Err(invalid(
-                    consumer,
-                    format!(
-                        "FusionEnd dtype {} disagrees with producer dtype {}",
-                        end.dtype, producer_dtype
-                    ),
-                ));
-            }
-            require_layout_compatible(
-                producer,
-                consumer,
-                0,
-                fusion_output_layout(llir, producer).unwrap(),
-                FusionLayout {
-                    shape: &end.shape,
-                    strides: &end.strides,
-                },
-                dyn_map,
-                &mut validation_cache,
-            )?;
-        } else if let Some(unary) = fusion_unary(llir, consumer) {
-            let producer = inputs[0];
-            if unary.op != "Cast" {
-                let producer_dtype = fusion_output_dtype(llir, producer).unwrap();
-                if producer_dtype != unary.dtype {
-                    return Err(invalid(
-                        consumer,
-                        format!(
-                            "unary dtype {} disagrees with producer dtype {}",
-                            unary.dtype, producer_dtype
-                        ),
-                    ));
-                }
-            }
-            require_layout_compatible(
-                producer,
-                consumer,
-                0,
-                fusion_output_layout(llir, producer).unwrap(),
-                FusionLayout {
-                    shape: &unary.shape,
-                    strides: &unary.in_strides,
-                },
-                dyn_map,
-                &mut validation_cache,
-            )?;
-        } else if let Some(binary) = fusion_binary(llir, consumer) {
-            for &producer in &inputs {
-                let producer_dtype = fusion_output_dtype(llir, producer).unwrap();
-                if producer_dtype != binary.dtype {
-                    return Err(invalid(
-                        consumer,
-                        format!(
-                            "binary dtype {} disagrees with producer {} dtype {}",
-                            binary.dtype,
-                            producer.index(),
-                            producer_dtype
-                        ),
-                    ));
-                }
-            }
-
-            let a = FusionLayout {
-                shape: &binary.out_shape,
-                strides: &binary.a_stride,
+        for unit in &self.compile_units {
+            let CompileUnit::Region(region) = unit else {
+                continue;
             };
-            let b = FusionLayout {
-                shape: &binary.out_shape,
-                strides: &binary.b_stride,
-            };
-            let p0 = fusion_output_layout(llir, inputs[0]).unwrap();
-            let p1 = fusion_output_layout(llir, inputs[1]).unwrap();
-            let direct = layout_relation(p0, a, dyn_map, &mut validation_cache)
-                .conjunction(layout_relation(p1, b, dyn_map, &mut validation_cache));
-            let swapped = layout_relation(p0, b, dyn_map, &mut validation_cache)
-                .conjunction(layout_relation(p1, a, dyn_map, &mut validation_cache));
-            match direct.either(swapped) {
-                SemanticRelation::Equal => {}
-                SemanticRelation::Different => {
-                    return Err(invalid(
-                        consumer,
-                        "both binary operand layout assignments are provably incompatible",
-                    ));
-                }
-                SemanticRelation::Unknown => {
-                    return Err(invalid(
-                        consumer,
-                        "binary operand layout equivalence could not be proved",
-                    ));
-                }
-            }
-        }
-    }
-
-    // Region codegen indexes every FS with the root FE's iteration shape. This
-    // check catches a rank panic immediately and requires a positive proof that
-    // the emitted and declared mappings agree.
-    for fe_node in llir
-        .node_indices()
-        .filter(|node| fusion_end(llir, *node).is_some())
-    {
-        let end = fusion_end(llir, fe_node).unwrap();
-        let mut visited = FxHashSet::default();
-        let mut stack = incoming_nodes(llir, fe_node);
-        while let Some(node) = stack.pop() {
-            if !visited.insert(node) {
+            if !nodes.contains(&region.fe_node) || self.region_kernels.contains_key(&region.fe_node)
+            {
                 continue;
             }
-            if let Some(start) = fusion_start(llir, node) {
-                if end.shape.len() != start.strides.len() {
-                    return Err(invalid(
-                        node,
-                        format!(
-                            "FusionStart stride rank {} cannot be indexed by FusionEnd rank {}",
-                            start.strides.len(),
-                            end.shape.len()
-                        ),
-                    ));
-                }
-                let emitted = FusionLayout {
-                    shape: &end.shape,
-                    strides: &start.strides,
-                };
-                let declared = FusionLayout {
-                    shape: &start.shape,
-                    strides: &start.strides,
-                };
-                match layout_relation(emitted, declared, dyn_map, &mut validation_cache) {
-                    SemanticRelation::Equal => {}
-                    SemanticRelation::Different => {
-                        return Err(invalid(
-                            node,
-                            format!(
-                                "FusionEnd {} iteration shape provably changes this FusionStart read mapping",
-                                fe_node.index()
-                            ),
-                        ));
-                    }
-                    SemanticRelation::Unknown => {
-                        return Err(invalid(
-                            node,
-                            format!(
-                                "FusionEnd {} iteration mapping equivalence could not be proved",
-                                fe_node.index()
-                            ),
-                        ));
-                    }
+            let output_size = region_output_size(region, llir);
+            let source = if let Some(fingerprint) =
+                singleton_program_fingerprint(region, llir, global_dyn_dims)
+            {
+                let cached = source_cache.sources.get(&fingerprint).and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|entry| {
+                            singleton_program_matches(&entry.key, region, llir, global_dyn_dims)
+                        })
+                        .map(|entry| Arc::clone(&entry.source))
+                });
+                if let Some(source) = cached {
+                    source_cache.hits += 1;
+                    source
+                } else {
+                    let (source, rendered_output_size) = region_kernel_source(region, llir);
+                    debug_assert_eq!(rendered_output_size, output_size);
+                    let source: Arc<str> = Arc::from(source);
+                    let key = singleton_program_key(region, llir, global_dyn_dims)
+                        .expect("fingerprinted singleton region must have an owned program key");
+                    source_cache
+                        .sources
+                        .entry(fingerprint)
+                        .or_default()
+                        .push(CachedRegionSource {
+                            key,
+                            source: Arc::clone(&source),
+                        });
+                    source_cache.misses += 1;
+                    source
                 }
             } else {
-                stack.extend(incoming_nodes(llir, node));
-            }
+                Arc::from(region_kernel_source(region, llir).0)
+            };
+            self.region_kernels.insert(
+                region.fe_node,
+                PreparedRegionKernel {
+                    source,
+                    output_size,
+                },
+            );
         }
     }
 
-    Ok(())
+    pub(crate) fn compile_units(&self) -> &[CompileUnit] {
+        &self.compile_units
+    }
+
+    pub(crate) fn compile_units_for<'a>(
+        &'a self,
+        nodes: &'a FxHashSet<NodeIndex>,
+    ) -> impl Iterator<Item = &'a CompileUnit> + 'a {
+        self.compile_units
+            .iter()
+            .filter(|unit| nodes.contains(&unit.root_node()))
+    }
+
+    pub(crate) fn region_kernel(&self, fe_node: NodeIndex) -> Option<&PreparedRegionKernel> {
+        self.region_kernels.get(&fe_node)
+    }
+
+    pub(crate) fn absorbed_markers(&self) -> &FxHashSet<NodeIndex> {
+        &self.absorbed_markers
+    }
 }
 
 // =========================================================================
@@ -985,64 +252,10 @@ pub(crate) fn validate_fusion_regions(
 /// Cuda*Elementwise and FusionStart nodes are absorbed into that region and removed
 /// from the per-node iteration. Anything else is wrapped in
 /// `CompileUnit::Single`.
-/// Globally-absorbed FS / FE markers — the set of marker nodes that any
-/// `FusionEnd` in the LLIR walks back to during region detection. A
-/// marker is "absorbed" iff some FE in the LLIR can reach it by walking
-/// incoming edges through `FusionEnd` / Cuda*Elementwise nodes, stopping at
-/// `FusionStart` leaves.
-///
-/// This is computed once over the full LLIR rather than per-convex-
-/// subgraph, because `partition_marked_convex` may put a shared FS leaf
-/// (one whose e-graph congruence-deduplicated it across multiple
-/// regions) into a different subgraph than the FE that absorbs it.
-/// Without this global view, `build_compile_units` running on the FS's
-/// subgraph would not see any FE walking back to the FS and would emit the
-/// FS as `CompileUnit::Single`; marker standalone compilation is not supported.
-pub(crate) fn globally_absorbed_markers(llir_graph: &LLIRGraph) -> FxHashSet<NodeIndex> {
-    let name_of = |idx: NodeIndex| -> Option<&'static str> {
-        llir_graph
-            .node_weight(idx)
-            .and_then(|op| op.to_dialect::<dyn KernelOp>().map(|k| k.kernel_name()))
-    };
-
-    let mut absorbed: FxHashSet<NodeIndex> = FxHashSet::default();
-    for fe in llir_graph.node_indices() {
-        if name_of(fe) != Some("FusionEnd") {
-            continue;
-        }
-        let mut visited: FxHashSet<NodeIndex> = FxHashSet::default();
-        let mut stack: Vec<NodeIndex> = vec![fe];
-        visited.insert(fe);
-        while let Some(cur) = stack.pop() {
-            for pred in llir_graph.neighbors_directed(cur, Direction::Incoming) {
-                if !visited.insert(pred) {
-                    continue;
-                }
-                match name_of(pred) {
-                    Some("FusionStart") => {
-                        absorbed.insert(pred);
-                    }
-                    Some("FusionEnd") => {
-                        absorbed.insert(pred);
-                        stack.push(pred);
-                    }
-                    Some(_) if is_region_elementwise(llir_graph, pred) => {
-                        absorbed.insert(pred);
-                        stack.push(pred);
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    absorbed
-}
-
 pub(crate) fn build_compile_units(
     topo_order: &[NodeIndex],
     llir_graph: &LLIRGraph,
-    globally_absorbed: &FxHashSet<NodeIndex>,
-) -> Vec<CompileUnit> {
+) -> (Vec<CompileUnit>, FxHashSet<NodeIndex>) {
     let name_of = |idx: NodeIndex| -> Option<&'static str> {
         llir_graph
             .node_weight(idx)
@@ -1058,6 +271,13 @@ pub(crate) fn build_compile_units(
 
     for &node in topo_order {
         if name_of(node) != Some("FusionEnd") {
+            continue;
+        }
+
+        if let Some(region) = singleton_region(llir_graph, node) {
+            absorbed.extend(region.elementwise_topo.iter().copied());
+            absorbed.extend(region.fs_nodes.iter().copied());
+            regions.insert(node, region);
             continue;
         }
 
@@ -1080,11 +300,9 @@ pub(crate) fn build_compile_units(
                         // external (outside the region).
                     }
                     Some("FusionEnd") => {
-                        // Defensive traversal only: selected candidates with
-                        // a direct nested FE are rejected by
-                        // `validate_fusion_regions` before compile-unit
-                        // construction. Keep walking here so this structural
-                        // helper remains total for diagnostic/test callers.
+                        // Fusion rewrites do not create direct nested ends.
+                        // Keep walking defensively so this discovery helper
+                        // remains total for hand-built test graphs.
                         absorbed.insert(pred);
                         stack.push(pred);
                     }
@@ -1146,23 +364,125 @@ pub(crate) fn build_compile_units(
 
     // Second pass: emit compile units in original topo order, replacing
     // FE nodes with their RegionUnit and skipping anything absorbed —
-    // either by a region in *this* subgraph (`absorbed`) or by any
-    // region anywhere in the LLIR (`globally_absorbed`). Skipping the
-    // latter prevents shared FS markers whose consumers live in other
-    // convex subgraphs from being emitted as standalone compile units:
-    // those FSes are absorbed by some other region, and the consuming
-    // region reads from FS's external producer.
+    // by any region in the LLIR. Discovery receives the global kernel topo
+    // order, so shared FS markers are present in this one absorbed set even
+    // when convex packaging later places their consumers in another subgraph.
     let mut units: Vec<CompileUnit> = Vec::new();
     for &node in topo_order {
         if let Some(region) = regions.remove(&node) {
             units.push(CompileUnit::Region(region));
-        } else if absorbed.contains(&node) || globally_absorbed.contains(&node) {
+        } else if absorbed.contains(&node) {
             continue;
         } else {
             units.push(CompileUnit::Single(node));
         }
     }
-    units
+    (units, absorbed)
+}
+
+/// Fast path for the only fusion shape currently constructed by the rewrites:
+/// one unary/binary elementwise op bracketed by FusionStart leaves and a
+/// FusionEnd. Avoid the generic region DAG's maps, heap, structural-hash pass,
+/// and duplicate indexing-expression rendering for these tiny regions.
+fn singleton_region(llir_graph: &LLIRGraph, fe_node: NodeIndex) -> Option<RegionUnit> {
+    let mut fe_inputs = llir_graph.neighbors_directed(fe_node, Direction::Incoming);
+    let elementwise = fe_inputs.next()?;
+    if fe_inputs.next().is_some() || !is_region_elementwise(llir_graph, elementwise) {
+        return None;
+    }
+
+    let elem_op = llir_graph[elementwise].to_dialect::<dyn KernelOp>()?;
+    let expected_inputs = if (***elem_op)
+        .downcast_ref::<CudaUnaryElementwise>()
+        .is_some()
+    {
+        1
+    } else if (***elem_op)
+        .downcast_ref::<CudaBinaryElementwise>()
+        .is_some()
+    {
+        2
+    } else {
+        return None;
+    };
+
+    let mut fs_nodes: Vec<NodeIndex> = llir_graph
+        .neighbors_directed(elementwise, Direction::Incoming)
+        .collect();
+    if fs_nodes.len() != expected_inputs
+        || fs_nodes.iter().any(|&node| {
+            llir_graph[node]
+                .to_dialect::<dyn KernelOp>()
+                .and_then(|op| (***op).downcast_ref::<FusionStart>())
+                .is_none()
+        })
+    {
+        return None;
+    }
+
+    // All currently constructed binary region ops are commutative. Order
+    // leaves by their complete structural metadata so source and launch ABI
+    // stay NodeIndex-independent across candidate extraction.
+    fs_nodes.sort_by(|&a, &b| compare_fusion_starts(llir_graph, a, b));
+    // Congruence can make both input edges of `x op x` reference one FS node.
+    // A region has one load/local/launch argument per distinct FS, while both
+    // elementwise edges consume that same local.
+    fs_nodes.dedup();
+    let external_inputs = fs_nodes
+        .iter()
+        .map(|&fs| {
+            llir_graph
+                .neighbors_directed(fs, Direction::Incoming)
+                .next()
+                .expect("FusionStart with no predecessor")
+        })
+        .collect();
+
+    Some(RegionUnit {
+        fe_node,
+        elementwise_topo: vec![elementwise],
+        fs_nodes,
+        external_inputs,
+    })
+}
+
+fn compare_fusion_starts(llir_graph: &LLIRGraph, a: NodeIndex, b: NodeIndex) -> std::cmp::Ordering {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let fusion_start = |node: NodeIndex| {
+        let op = llir_graph[node].to_dialect::<dyn KernelOp>().unwrap();
+        (***op).downcast_ref::<FusionStart>().unwrap()
+    };
+    let a_start = fusion_start(a);
+    let b_start = fusion_start(b);
+    let hash = |start: &FusionStart| {
+        let mut hasher = DefaultHasher::new();
+        for stride in &start.strides {
+            stride.hash_intern_id(&mut hasher);
+        }
+        dtype_program_tag(start.dtype).hash(&mut hasher);
+        hasher.finish()
+    };
+    hash(a_start).cmp(&hash(b_start)).then_with(|| {
+        if a_start.dtype == b_start.dtype
+            && same_expression_slice(&a_start.strides, &b_start.strides)
+        {
+            return std::cmp::Ordering::Equal;
+        }
+        // Resolve the vanishingly rare identity-hash collision structurally.
+        a_start
+            .strides
+            .iter()
+            .map(|expression| expression.to_kernel())
+            .cmp(
+                b_start
+                    .strides
+                    .iter()
+                    .map(|expression| expression.to_kernel()),
+            )
+            .then_with(|| cuda_dtype(a_start.dtype).cmp(cuda_dtype(b_start.dtype)))
+    })
 }
 
 // =========================================================================
@@ -1417,6 +737,257 @@ fn elementwise_body(op: &str, locals: &[&str]) -> String {
     }
 }
 
+fn dtype_program_tag(dtype: DType) -> u8 {
+    match dtype {
+        DType::F32 => 0,
+        DType::F64 => 1,
+        DType::F16 => 2,
+        DType::Bf16 => 3,
+        DType::TF32 => 4,
+        DType::Int => 5,
+        DType::I64 => 6,
+        DType::I4 => 7,
+        DType::U4 => 8,
+        DType::I8 => 9,
+        DType::U8 => 10,
+        DType::I16 => 11,
+        DType::U16 => 12,
+        DType::Bool => 13,
+        DType::F8UE8M0 => 14,
+        DType::F8E4M3 => 15,
+        DType::F8E5M2 => 16,
+        DType::F6E2M3 => 17,
+        DType::F6E3M2 => 18,
+        DType::F4E2M1 => 19,
+    }
+}
+
+fn elementwise_program_tag(op: &str) -> u8 {
+    match op {
+        "Sin" => 0,
+        "Sqrt" => 1,
+        "Rsqrt" => 2,
+        "Exp" => 3,
+        "Exp2" => 4,
+        "Log2" => 5,
+        "Recip" => 6,
+        "Sigmoid" => 7,
+        "Cast" => 8,
+        "Add" => 9,
+        "Mul" => 10,
+        other => panic!("region_codegen: unknown elementwise op {other}"),
+    }
+}
+
+fn region_output_size(region: &RegionUnit, llir_graph: &LLIRGraph) -> Expression {
+    let fe_op = llir_graph[region.fe_node]
+        .to_dialect::<dyn KernelOp>()
+        .expect("FE node must be a KernelOp");
+    let fe: &FusionEnd = (***fe_op)
+        .downcast_ref::<FusionEnd>()
+        .expect("region root must be FusionEnd");
+    fe.shape.iter().copied().product()
+}
+
+fn singleton_program_key(
+    region: &RegionUnit,
+    llir_graph: &LLIRGraph,
+    global_dyn_dims: &[Symbol],
+) -> Option<SingletonRegionProgramKey> {
+    let &[elementwise] = region.elementwise_topo.as_slice() else {
+        return None;
+    };
+    let fe_op = llir_graph[region.fe_node].to_dialect::<dyn KernelOp>()?;
+    let fe = (***fe_op).downcast_ref::<FusionEnd>()?;
+    let inputs = region
+        .fs_nodes
+        .iter()
+        .map(|&node| {
+            let op = llir_graph[node].to_dialect::<dyn KernelOp>().unwrap();
+            let start = (***op).downcast_ref::<FusionStart>().unwrap();
+            FusionStartProgramKey {
+                strides: start.strides.clone(),
+                dtype: dtype_program_tag(start.dtype),
+            }
+        })
+        .collect();
+    let elementwise_op = llir_graph[elementwise].to_dialect::<dyn KernelOp>()?;
+    let element = if let Some(unary) = (***elementwise_op).downcast_ref::<CudaUnaryElementwise>() {
+        SingletonElementProgramKey::Unary {
+            opcode: elementwise_program_tag(&unary.op),
+            dtype: dtype_program_tag(unary.dtype),
+        }
+    } else {
+        let binary = (***elementwise_op).downcast_ref::<CudaBinaryElementwise>()?;
+        SingletonElementProgramKey::Binary {
+            opcode: elementwise_program_tag(&binary.op),
+            dtype: dtype_program_tag(binary.dtype),
+        }
+    };
+    let (operand_slots, operand_count) = singleton_operand_slots(region, llir_graph)?;
+
+    Some(SingletonRegionProgramKey {
+        global_dyn_dims: global_dyn_dims.to_vec(),
+        output_shape: fe.shape.clone(),
+        output_strides: fe.strides.clone(),
+        output_dtype: dtype_program_tag(fe.dtype),
+        inputs,
+        element,
+        operand_slots: operand_slots[..operand_count].to_vec(),
+    })
+}
+
+/// Return the canonical input-local slots for the singleton operation without
+/// allocating. The only currently constructible region operation has at most
+/// two inputs, and Add/Mul source emission orders them by local slot.
+fn singleton_operand_slots(
+    region: &RegionUnit,
+    llir_graph: &LLIRGraph,
+) -> Option<([u16; 2], usize)> {
+    let &[elementwise] = region.elementwise_topo.as_slice() else {
+        return None;
+    };
+    let mut slots = [0; 2];
+    let mut count = 0;
+    for source in llir_graph.neighbors_directed(elementwise, Direction::Incoming) {
+        if count == slots.len() {
+            return None;
+        }
+        slots[count] = region
+            .fs_nodes
+            .iter()
+            .position(|&node| node == source)
+            .and_then(|slot| u16::try_from(slot).ok())?;
+        count += 1;
+    }
+    slots[..count].sort_unstable();
+    Some((slots, count))
+}
+
+/// Allocation-free hash of all CUDA-source-relevant singleton metadata. A
+/// hash hit is always checked by `singleton_program_matches`, so collisions
+/// can only add a comparison and can never return the wrong program.
+fn singleton_program_fingerprint(
+    region: &RegionUnit,
+    llir_graph: &LLIRGraph,
+    global_dyn_dims: &[Symbol],
+) -> Option<u64> {
+    let &[elementwise] = region.elementwise_topo.as_slice() else {
+        return None;
+    };
+    let fe_op = llir_graph[region.fe_node].to_dialect::<dyn KernelOp>()?;
+    let fe = (***fe_op).downcast_ref::<FusionEnd>()?;
+
+    let mut hasher = FxHasher::default();
+    0_u8.hash(&mut hasher); // Cache-key format version.
+    global_dyn_dims.hash(&mut hasher);
+    hash_expression_slice(&fe.shape, &mut hasher);
+    hash_expression_slice(&fe.strides, &mut hasher);
+    dtype_program_tag(fe.dtype).hash(&mut hasher);
+    region.fs_nodes.len().hash(&mut hasher);
+    for &node in &region.fs_nodes {
+        let op = llir_graph[node].to_dialect::<dyn KernelOp>()?;
+        let start = (***op).downcast_ref::<FusionStart>()?;
+        hash_expression_slice(&start.strides, &mut hasher);
+        dtype_program_tag(start.dtype).hash(&mut hasher);
+    }
+
+    let elementwise_op = llir_graph[elementwise].to_dialect::<dyn KernelOp>()?;
+    if let Some(unary) = (***elementwise_op).downcast_ref::<CudaUnaryElementwise>() {
+        0_u8.hash(&mut hasher);
+        elementwise_program_tag(&unary.op).hash(&mut hasher);
+        dtype_program_tag(unary.dtype).hash(&mut hasher);
+    } else {
+        let binary = (***elementwise_op).downcast_ref::<CudaBinaryElementwise>()?;
+        1_u8.hash(&mut hasher);
+        elementwise_program_tag(&binary.op).hash(&mut hasher);
+        dtype_program_tag(binary.dtype).hash(&mut hasher);
+    }
+    let (operand_slots, operand_count) = singleton_operand_slots(region, llir_graph)?;
+    operand_slots[..operand_count].hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn hash_expression_slice(expressions: &[Expression], hasher: &mut FxHasher) {
+    expressions.len().hash(hasher);
+    for expression in expressions {
+        expression.hash_intern_id(hasher);
+    }
+}
+
+fn same_expression_slice(left: &[Expression], right: &[Expression]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.has_same_intern_id(right))
+}
+
+/// Collision-safe comparison against the owned cache entry, performed
+/// directly against LLIR metadata without cloning any vectors.
+fn singleton_program_matches(
+    key: &SingletonRegionProgramKey,
+    region: &RegionUnit,
+    llir_graph: &LLIRGraph,
+    global_dyn_dims: &[Symbol],
+) -> bool {
+    let &[elementwise] = region.elementwise_topo.as_slice() else {
+        return false;
+    };
+    let Some(fe_op) = llir_graph[region.fe_node].to_dialect::<dyn KernelOp>() else {
+        return false;
+    };
+    let Some(fe) = (***fe_op).downcast_ref::<FusionEnd>() else {
+        return false;
+    };
+    if key.global_dyn_dims != global_dyn_dims
+        || !same_expression_slice(&key.output_shape, &fe.shape)
+        || !same_expression_slice(&key.output_strides, &fe.strides)
+        || key.output_dtype != dtype_program_tag(fe.dtype)
+        || key.inputs.len() != region.fs_nodes.len()
+    {
+        return false;
+    }
+    for (input_key, &node) in key.inputs.iter().zip(&region.fs_nodes) {
+        let Some(op) = llir_graph[node].to_dialect::<dyn KernelOp>() else {
+            return false;
+        };
+        let Some(start) = (***op).downcast_ref::<FusionStart>() else {
+            return false;
+        };
+        if !same_expression_slice(&input_key.strides, &start.strides)
+            || input_key.dtype != dtype_program_tag(start.dtype)
+        {
+            return false;
+        }
+    }
+
+    let Some(elementwise_op) = llir_graph[elementwise].to_dialect::<dyn KernelOp>() else {
+        return false;
+    };
+    let element_matches = match &key.element {
+        SingletonElementProgramKey::Unary { opcode, dtype } => (***elementwise_op)
+            .downcast_ref::<CudaUnaryElementwise>()
+            .is_some_and(|unary| {
+                *opcode == elementwise_program_tag(&unary.op)
+                    && *dtype == dtype_program_tag(unary.dtype)
+            }),
+        SingletonElementProgramKey::Binary { opcode, dtype } => (***elementwise_op)
+            .downcast_ref::<CudaBinaryElementwise>()
+            .is_some_and(|binary| {
+                *opcode == elementwise_program_tag(&binary.op)
+                    && *dtype == dtype_program_tag(binary.dtype)
+            }),
+    };
+    if !element_matches {
+        return false;
+    }
+    let Some((operand_slots, operand_count)) = singleton_operand_slots(region, llir_graph) else {
+        return false;
+    };
+    key.operand_slots.as_slice() == &operand_slots[..operand_count]
+}
+
 // =========================================================================
 // Region compilation — emit one CUDA kernel for the whole region.
 // =========================================================================
@@ -1425,7 +996,8 @@ fn elementwise_body(op: &str, locals: &[&str]) -> String {
 pub(crate) struct CompiledRegion {
     pub function: CudaFunction,
     pub module: Arc<CudaModule>,
-    pub kernel_str: String,
+    pub source_bytes: usize,
+    pub has_dyn_dims_param: bool,
     pub grid: (Expression, Expression, Expression),
     pub block: (Expression, Expression, Expression),
     pub shared_mem: Expression,
@@ -1631,11 +1203,22 @@ pub(crate) fn compile_region(
     compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> CompiledRegion {
     let (kernel, out_size) = region_kernel_source(region, llir_graph);
+    compile_prepared_region(&kernel, out_size, stream, compile_cache)
+}
 
-    let (module, function) = if let Some((m, f)) = compile_cache.get(&kernel) {
+pub(crate) fn compile_prepared_region(
+    kernel: &str,
+    out_size: Expression,
+    stream: &Arc<CudaStream>,
+    compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+) -> CompiledRegion {
+    let source_bytes = kernel.len();
+    let has_dyn_dims_param = kernel.contains("dyn_dims");
+
+    let (module, function) = if let Some((m, f)) = compile_cache.get(kernel) {
         (m.clone(), f.clone())
     } else {
-        let ptx = compile_module_image_for_current_device(stream.context(), &kernel)
+        let ptx = compile_module_image_for_current_device(stream.context(), kernel)
             .expect("region kernel PTX compile failed");
         let module = stream
             .context()
@@ -1644,14 +1227,15 @@ pub(crate) fn compile_region(
         let function = module
             .load_function("fused_region_k")
             .expect("region kernel function not found");
-        compile_cache.insert(kernel.clone(), (module.clone(), function.clone()));
+        compile_cache.insert(kernel.to_owned(), (module.clone(), function.clone()));
         (module, function)
     };
 
     CompiledRegion {
         function,
         module,
-        kernel_str: kernel,
+        source_bytes,
+        has_dyn_dims_param,
         grid: (out_size.ceil_div(256), 1.into(), 1.into()),
         block: (out_size.min(256), 1.into(), 1.into()),
         shared_mem: 0.into(),
@@ -1662,298 +1246,13 @@ pub(crate) fn compile_region(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernel::fusion::elementwise::CudaBinaryElementwise;
+    use crate::kernel::fusion::elementwise::{CudaBinaryElementwise, CudaUnaryElementwise};
     use luminal::op::LLIROp;
-    use luminal::prelude::petgraph::algo::toposort;
+    use luminal::prelude::{DType, petgraph::algo::toposort};
 
     /// Helper: wrap a `KernelOp` in an `LLIROp` of the kernel dialect.
     fn llir_of(op: impl KernelOp + 'static) -> LLIROp {
         LLIROp::new::<dyn KernelOp>(Box::new(op) as Box<dyn KernelOp>)
-    }
-
-    #[test]
-    fn fusion_start_with_no_predecessor_is_rejected_before_codegen() {
-        let mut llir: LLIRGraph = LLIRGraph::default();
-        let fs_node = llir.add_node(llir_of(FusionStart::default()));
-        let fadd_node = llir.add_node(llir_of(CudaBinaryElementwise::default()));
-        let fe_node = llir.add_node(llir_of(FusionEnd::default()));
-        llir.add_edge(fs_node, fadd_node, ());
-        llir.add_edge(fadd_node, fe_node, ());
-        let error = validate_fusion_regions(&llir, None).unwrap_err();
-        assert_eq!(error.node, fs_node);
-        assert!(error.reason.contains("requires 1 input"));
-    }
-
-    use crate::kernel::fusion::elementwise::CudaUnaryElementwise;
-    use luminal::prelude::DType;
-
-    fn input_op(dtype: DType) -> LLIROp {
-        LLIROp::new::<Input>(Box::new(Input {
-            node: 0,
-            label: String::new(),
-            dtype,
-        }))
-    }
-
-    fn start(shape: Vec<Expression>, strides: Vec<Expression>, dtype: DType) -> LLIROp {
-        llir_of(FusionStart {
-            shape,
-            strides,
-            dtype,
-        })
-    }
-
-    fn unary(
-        op: &str,
-        shape: Vec<Expression>,
-        in_strides: Vec<Expression>,
-        out_strides: Vec<Expression>,
-        dtype: DType,
-    ) -> LLIROp {
-        llir_of(CudaUnaryElementwise {
-            op: op.to_string(),
-            shape,
-            in_strides,
-            out_strides,
-            dtype,
-        })
-    }
-
-    fn end(shape: Vec<Expression>, strides: Vec<Expression>, dtype: DType) -> LLIROp {
-        llir_of(FusionEnd {
-            shape,
-            strides,
-            dtype,
-        })
-    }
-
-    fn valid_unary_region(op: &str, input_dtype: DType, output_dtype: DType) -> LLIRGraph {
-        let shape = vec![16.into()];
-        let strides = vec![Expression::from('z')];
-        let mut llir = LLIRGraph::default();
-        let input = llir.add_node(input_op(input_dtype));
-        let fs = llir.add_node(start(shape.clone(), strides.clone(), input_dtype));
-        let unary = llir.add_node(unary(
-            op,
-            shape.clone(),
-            strides.clone(),
-            strides.clone(),
-            output_dtype,
-        ));
-        let fe = llir.add_node(end(shape, strides, output_dtype));
-        llir.add_edge(input, fs, ());
-        llir.add_edge(fs, unary, ());
-        llir.add_edge(unary, fe, ());
-        llir
-    }
-
-    #[test]
-    fn fusion_validation_accepts_scalar_and_materialized_split_regions() {
-        let mut scalar = LLIRGraph::default();
-        let input = scalar.add_node(input_op(DType::F32));
-        let fs = scalar.add_node(start(vec![], vec![], DType::F32));
-        let cast = scalar.add_node(unary("Cast", vec![], vec![], vec![], DType::F32));
-        let fe = scalar.add_node(end(vec![], vec![], DType::F32));
-        scalar.add_edge(input, fs, ());
-        scalar.add_edge(fs, cast, ());
-        scalar.add_edge(cast, fe, ());
-        validate_fusion_regions(&scalar, Some(&FxHashMap::default())).unwrap();
-
-        let shape = vec![16.into()];
-        let strides = vec![Expression::from('z')];
-        let mut split = LLIRGraph::default();
-        let input = split.add_node(input_op(DType::F32));
-        let fs0 = split.add_node(start(shape.clone(), strides.clone(), DType::F32));
-        let sin = split.add_node(unary(
-            "Sin",
-            shape.clone(),
-            strides.clone(),
-            strides.clone(),
-            DType::F32,
-        ));
-        let fe0 = split.add_node(end(shape.clone(), strides.clone(), DType::F32));
-        let fs1 = split.add_node(start(shape.clone(), strides.clone(), DType::F32));
-        let sqrt = split.add_node(unary(
-            "Sqrt",
-            shape.clone(),
-            strides.clone(),
-            strides.clone(),
-            DType::F32,
-        ));
-        let fe1 = split.add_node(end(shape, strides, DType::F32));
-        split.add_edge(input, fs0, ());
-        split.add_edge(fs0, sin, ());
-        split.add_edge(sin, fe0, ());
-        split.add_edge(fe0, fs1, ());
-        split.add_edge(fs1, sqrt, ());
-        split.add_edge(sqrt, fe1, ());
-        validate_fusion_regions(&split, Some(&FxHashMap::default())).unwrap();
-    }
-
-    #[test]
-    fn fusion_validation_accepts_semantically_equal_unified_layouts() {
-        let a = Expression::from('a');
-        let b = Expression::from('b');
-        let c = Expression::from('c');
-        let assoc_l = (a + b) + c;
-        let assoc_r = a + (b + c);
-        assert_ne!(assoc_l, assoc_r, "test requires distinct expression ASTs");
-
-        let stride = vec![Expression::from('z')];
-        let mut llir = LLIRGraph::default();
-        let input = llir.add_node(input_op(DType::F32));
-        let fs = llir.add_node(start(vec![assoc_l], stride.clone(), DType::F32));
-        let sin = llir.add_node(unary(
-            "Sin",
-            vec![assoc_l],
-            stride.clone(),
-            stride.clone(),
-            DType::F32,
-        ));
-        let fe = llir.add_node(end(vec![assoc_r], stride, DType::F32));
-        llir.add_edge(input, fs, ());
-        llir.add_edge(fs, sin, ());
-        llir.add_edge(sin, fe, ());
-
-        let dims = [
-            (Symbol::from('a'), 2),
-            (Symbol::from('b'), 3),
-            (Symbol::from('c'), 4),
-        ]
-        .into_iter()
-        .collect();
-        validate_fusion_regions(&llir, Some(&dims)).unwrap();
-    }
-
-    #[test]
-    fn fusion_validation_accepts_exact_fixed_domain_layout_equivalence() {
-        let shape = vec![4.into()];
-        let z = Expression::from('z');
-        let wrapped_z = z % 4;
-        assert!(!wrapped_z.egglog_equal(z));
-
-        let mut llir = LLIRGraph::default();
-        let input = llir.add_node(input_op(DType::F32));
-        let fs = llir.add_node(start(shape.clone(), vec![wrapped_z], DType::F32));
-        let sin = llir.add_node(unary("Sin", shape.clone(), vec![z], vec![z], DType::F32));
-        let fe = llir.add_node(end(shape, vec![z], DType::F32));
-        llir.add_edge(input, fs, ());
-        llir.add_edge(fs, sin, ());
-        llir.add_edge(sin, fe, ());
-
-        validate_fusion_regions(&llir, None).unwrap();
-    }
-
-    #[test]
-    fn fusion_validation_does_not_promote_representative_equality_to_symbolic_equality() {
-        let a = Expression::from('a');
-        let b = Expression::from('b');
-        let z = Expression::from('z');
-        let mut llir = LLIRGraph::default();
-        let input = llir.add_node(input_op(DType::F32));
-        let fs = llir.add_node(start(vec![a], vec![z], DType::F32));
-        let sin = llir.add_node(unary("Sin", vec![a], vec![z], vec![z], DType::F32));
-        let fe = llir.add_node(end(vec![b], vec![z], DType::F32));
-        llir.add_edge(input, fs, ());
-        llir.add_edge(fs, sin, ());
-        llir.add_edge(sin, fe, ());
-
-        let representative = [(Symbol::from('a'), 16), (Symbol::from('b'), 16)]
-            .into_iter()
-            .collect();
-        let error = validate_fusion_regions(&llir, Some(&representative)).unwrap_err();
-        assert!(error.reason.contains("could not be proved"));
-    }
-
-    #[test]
-    fn fusion_validation_rejects_proven_layout_and_rank_mismatches() {
-        let mut wrong_layout = valid_unary_region("Sin", DType::F32, DType::F32);
-        let fe = wrong_layout
-            .node_indices()
-            .find(|node| fusion_end(&wrong_layout, *node).is_some())
-            .unwrap();
-        assert!(wrong_layout.remove_node(fe).is_some());
-        let wrong_fe = wrong_layout.add_node(end(
-            vec![17.into()],
-            vec![Expression::from('z')],
-            DType::F32,
-        ));
-        let producer = wrong_layout
-            .node_indices()
-            .find(|node| fusion_unary(&wrong_layout, *node).is_some())
-            .unwrap();
-        wrong_layout.add_edge(producer, wrong_fe, ());
-        let error =
-            validate_fusion_regions(&wrong_layout, Some(&FxHashMap::default())).unwrap_err();
-        assert!(error.reason.contains("layout") || error.reason.contains("mapping"));
-
-        let shape = vec![2.into(), 3.into()];
-        let mut wrong_rank = LLIRGraph::default();
-        let input = wrong_rank.add_node(input_op(DType::F32));
-        let fs = wrong_rank.add_node(start(
-            shape.clone(),
-            vec![Expression::from('z'), Expression::from('z')],
-            DType::F32,
-        ));
-        let binary = wrong_rank.add_node(llir_of(CudaBinaryElementwise {
-            op: "Add".to_string(),
-            out_shape: shape.clone(),
-            a_stride: vec![Expression::from('z')],
-            b_stride: vec![Expression::from('z'), Expression::from('z')],
-            out_stride: vec![Expression::from('z'), Expression::from('z')],
-            dtype: DType::F32,
-        }));
-        let fe = wrong_rank.add_node(end(
-            shape,
-            vec![Expression::from('z'), Expression::from('z')],
-            DType::F32,
-        ));
-        wrong_rank.add_edge(input, fs, ());
-        wrong_rank.add_edge(fs, binary, ());
-        wrong_rank.add_edge(fs, binary, ());
-        wrong_rank.add_edge(binary, fe, ());
-        let error = validate_fusion_regions(&wrong_rank, None).unwrap_err();
-        assert!(error.reason.contains("metadata ranks differ"));
-    }
-
-    #[test]
-    fn fusion_validation_rejects_nested_end_opcode_and_dtype_contradictions() {
-        let mut nested = valid_unary_region("Sin", DType::F32, DType::F32);
-        let inner = nested
-            .node_indices()
-            .find(|node| fusion_end(&nested, *node).is_some())
-            .unwrap();
-        let outer = nested.add_node(end(
-            vec![16.into()],
-            vec![Expression::from('z')],
-            DType::F32,
-        ));
-        nested.add_edge(inner, outer, ());
-        assert!(
-            validate_fusion_regions(&nested, None)
-                .unwrap_err()
-                .reason
-                .contains("must cross a FusionStart")
-        );
-
-        let bad_opcode = valid_unary_region("Add", DType::F32, DType::F32);
-        assert!(
-            validate_fusion_regions(&bad_opcode, None)
-                .unwrap_err()
-                .reason
-                .contains("unsupported unary")
-        );
-
-        let bad_dtype = valid_unary_region("Sin", DType::F16, DType::F32);
-        assert!(
-            validate_fusion_regions(&bad_dtype, None)
-                .unwrap_err()
-                .reason
-                .contains("unary dtype")
-        );
-
-        let cast = valid_unary_region("Cast", DType::F16, DType::F32);
-        validate_fusion_regions(&cast, None).unwrap();
     }
 
     /// Build the test region used by the canonicalization tests:
@@ -2048,8 +1347,7 @@ mod tests {
 
     fn region_source_and_producers(g: &LLIRGraph) -> (String, Vec<String>) {
         let topo = toposort(g, None).unwrap();
-        let absorbed = globally_absorbed_markers(g);
-        let units = build_compile_units(&topo, g, &absorbed);
+        let (units, _) = build_compile_units(&topo, g);
         let region = units
             .iter()
             .find_map(|u| match u {
@@ -2072,6 +1370,144 @@ mod tests {
             })
             .collect();
         (kernel, producers)
+    }
+
+    #[test]
+    fn prepared_fusion_plan_preserves_compile_units_and_sources() {
+        let (graph, _) = build_test_region(false);
+        let topo = toposort(&graph, None).unwrap();
+        let (expected_units, absorbed) = build_compile_units(&topo, &graph);
+        let all_nodes = topo.iter().copied().collect();
+        let mut prepared = PreparedFusionPlan::discover(&topo, &graph);
+        let mut source_cache = RegionSourceCache::default();
+        prepared.prepare_region_kernels_for(&all_nodes, &graph, &mut source_cache, &[]);
+
+        assert_eq!(prepared.compile_units(), expected_units);
+        assert_eq!(prepared.absorbed_markers(), &absorbed);
+        assert_eq!(
+            prepared
+                .compile_units_for(&all_nodes)
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected_units,
+        );
+        for unit in prepared.compile_units() {
+            let CompileUnit::Region(region) = unit else {
+                continue;
+            };
+            let (source, output_size) = region_kernel_source(region, &graph);
+            let prepared_kernel = prepared.region_kernel(region.fe_node).unwrap();
+            assert_eq!(prepared_kernel.source.as_ref(), source);
+            assert_eq!(prepared_kernel.output_size, output_size);
+        }
+    }
+
+    #[test]
+    fn singleton_region_deduplicates_repeated_fusion_start_inputs() {
+        let shape = vec![8.into()];
+        let strides = vec![Expression::from('z')];
+        let mut graph = LLIRGraph::default();
+        let producer = graph.add_node(llir_of(CudaUnaryElementwise {
+            op: "Sqrt".to_string(),
+            shape: shape.clone(),
+            in_strides: strides.clone(),
+            out_strides: strides.clone(),
+            dtype: DType::F32,
+        }));
+        let start = graph.add_node(llir_of(FusionStart {
+            shape: shape.clone(),
+            strides: strides.clone(),
+            dtype: DType::F32,
+        }));
+        let add = graph.add_node(llir_of(CudaBinaryElementwise {
+            op: "Add".to_string(),
+            out_shape: shape.clone(),
+            a_stride: strides.clone(),
+            b_stride: strides.clone(),
+            out_stride: strides.clone(),
+            dtype: DType::F32,
+        }));
+        let end = graph.add_node(llir_of(FusionEnd {
+            shape,
+            strides,
+            dtype: DType::F32,
+        }));
+        graph.add_edge(producer, start, ());
+        graph.add_edge(start, add, ());
+        graph.add_edge(start, add, ());
+        graph.add_edge(add, end, ());
+
+        let topo = toposort(&graph, None).unwrap();
+        let (units, _) = build_compile_units(&topo, &graph);
+        let region = units
+            .iter()
+            .find_map(|unit| match unit {
+                CompileUnit::Region(region) => Some(region),
+                CompileUnit::Single(_) => None,
+            })
+            .unwrap();
+        assert_eq!(region.fs_nodes, vec![start]);
+        assert_eq!(region.external_inputs, vec![producer]);
+
+        let (source, _) = region_kernel_source(region, &graph);
+        assert!(source.contains("const float *in0"));
+        assert!(!source.contains("in1"));
+        assert!(source.contains("v_0 + v_0"));
+    }
+
+    #[test]
+    fn singleton_source_cache_separates_dynamic_dimension_abis() {
+        let shape = vec![Expression::from('b')];
+        let strides = vec![Expression::from('z')];
+        let mut graph = LLIRGraph::default();
+        let producer = graph.add_node(llir_of(CudaUnaryElementwise {
+            op: "Sqrt".to_string(),
+            shape: shape.clone(),
+            in_strides: strides.clone(),
+            out_strides: strides.clone(),
+            dtype: DType::F32,
+        }));
+        let start = graph.add_node(llir_of(FusionStart {
+            shape: shape.clone(),
+            strides: strides.clone(),
+            dtype: DType::F32,
+        }));
+        let unary = graph.add_node(llir_of(CudaUnaryElementwise {
+            op: "Sin".to_string(),
+            shape: shape.clone(),
+            in_strides: strides.clone(),
+            out_strides: strides.clone(),
+            dtype: DType::F32,
+        }));
+        let end = graph.add_node(llir_of(FusionEnd {
+            shape,
+            strides,
+            dtype: DType::F32,
+        }));
+        graph.add_edge(producer, start, ());
+        graph.add_edge(start, unary, ());
+        graph.add_edge(unary, end, ());
+
+        let topo = toposort(&graph, None).unwrap();
+        let all_nodes = topo.iter().copied().collect();
+        let mut cache = RegionSourceCache::default();
+        let ab = [Symbol::from('a'), Symbol::from('b')];
+        let ba = [Symbol::from('b'), Symbol::from('a')];
+        let prepare = |dims: &[Symbol], cache: &mut RegionSourceCache| {
+            crate::kernel::hlir::set_global_dyn_dims(dims.to_vec());
+            let mut plan = PreparedFusionPlan::discover(&topo, &graph);
+            plan.prepare_region_kernels_for(&all_nodes, &graph, cache, dims);
+            plan.region_kernel(end).unwrap().source.clone()
+        };
+        let source_ab = prepare(&ab, &mut cache);
+        let source_ba = prepare(&ba, &mut cache);
+        let source_ab_again = prepare(&ab, &mut cache);
+        crate::kernel::hlir::clear_global_dyn_dims();
+
+        assert!(source_ab.contains("dyn_dims[1]"));
+        assert!(source_ba.contains("dyn_dims[0]"));
+        assert_eq!(source_ab, source_ab_again);
+        assert_eq!(cache.counters(), (1, 2));
     }
 
     /// Structurally identical regions must emit byte-identical kernel

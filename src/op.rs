@@ -119,6 +119,50 @@ pub trait Runtime {
     ) -> (Self::ProfileMetric, String) {
         self.profile(llir_graph, dyn_map, trials, timeout, early_stop)
     }
+    /// Filter and, when useful for the backend, prepare one candidate for
+    /// profiling. The default preserves the traditional split path: it only
+    /// filters here and [`Runtime::profile_prepared_candidate`] loads the
+    /// candidate through `profile` below. Backends whose hard filter already
+    /// compiles the LLIR can override both hooks to install that exact compiled
+    /// candidate and avoid compiling it again for profiling.
+    ///
+    /// A rejected candidate must not replace the currently loaded executable.
+    fn prepare_profile_candidate(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        context: CandidateFilterContext<'_>,
+    ) -> CandidateFilterResult {
+        self.filter_llir_candidate(llir_graph, context)
+    }
+    /// Profile the candidate accepted by
+    /// [`Runtime::prepare_profile_candidate`]. The default loads it through
+    /// the existing profile entry points. A backend that installed the graph
+    /// while preparing it can override this method to execute the prepared
+    /// graph directly.
+    #[allow(clippy::too_many_arguments)]
+    fn profile_prepared_candidate(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &DynMap,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+        early_stop: Option<(Self::ProfileMetric, f64)>,
+        bucket_context: Option<ProfileBucketContext<'_>>,
+    ) -> (Self::ProfileMetric, String) {
+        self.clear_intermediate_buffers();
+        if let Some(bucket_context) = bucket_context {
+            self.profile_with_bucket_context(
+                llir_graph,
+                dyn_map,
+                trials,
+                timeout,
+                early_stop,
+                bucket_context,
+            )
+        } else {
+            self.profile(llir_graph, dyn_map, trials, timeout, early_stop)
+        }
+    }
     /// Aggregate multiple profile metrics into one comparable metric.
     /// Used for regionalized profiling and best-first bucket-set selection.
     /// Implementations must be coordinate-monotone: replacing any input with
@@ -142,11 +186,6 @@ pub trait Runtime {
     /// Total bytes of intermediate buffers currently allocated.
     fn intermediate_buffer_bytes(&self) -> usize {
         0
-    }
-    /// Check if the most recent execution produced NaN in any output buffer.
-    /// Used by the search to reject NaN-producing graph variants.
-    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &DynMap) -> bool {
-        false
     }
     /// Runtime-specific pre-profile candidate filter. Backends can reject an
     /// extracted LLIR graph before profiling it, for example because it exceeds

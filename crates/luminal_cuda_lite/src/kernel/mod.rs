@@ -217,18 +217,26 @@ pub trait KernelOp: std::fmt::Debug + as_any::AsAny {
     /// Returns the output buffer size in elements.
     fn output_size(&self) -> Expression;
 
-    /// Returns all dynamic variables used by this kernel (for grid dims, strides, etc).
-    /// Default: returns dyn vars from output_size(). Override if the kernel has dyn vars
-    /// in expressions not captured by output_size (e.g., KernelScatter's index_shape).
+    /// Adds all dynamic variables used by this kernel (for grid dims, strides,
+    /// etc.) to an existing set. Reusing the set is important during search,
+    /// where graph materialization visits millions of kernels. Override if the
+    /// kernel has dynamic variables in expressions not captured by
+    /// `output_size` (for example, KernelScatter's index_shape).
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.output_size().collect_dyn_vars_into(vars);
+    }
+
+    /// Convenience wrapper for individual kernel compilation paths.
     fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.output_size().dyn_vars().into_iter().collect()
+        let mut vars = FxHashSet::default();
+        self.collect_dyn_vars_into(&mut vars);
+        vars
     }
 
     /// Returns the output buffer size in bytes (accounts for dtype).
     fn output_bytes(&self) -> Expression;
 
     /// Returns the DType of this kernel's output buffer.
-    /// Used by has_nan_outputs to interpret buffer bytes correctly.
     /// Default: F32 (most kernels output float).
     fn output_dtype(&self) -> DType {
         DType::F32
@@ -352,4 +360,9 @@ luminal::impl_into_ops!(KernelOp);
 
 // Kernel to host op compilation
 mod to_host;
+pub(crate) use to_host::{
+    CompiledFunctionResourceCache, CudaGraphArenaOrdering, PreparedKernelToHostPlan,
+    kernel_to_host_with_prepared, prepare_kernel_to_host_plan,
+    prepare_kernel_to_host_plan_with_topo, prepare_kernel_to_host_plan_with_topo_and_source_cache,
+};
 pub use to_host::{CudaGraphDebugSummary, CudaGraphOp, kernel_to_host};

@@ -866,25 +866,27 @@ extern \"C\" {{
         self.out_shape.iter().copied().product()
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.out_shape
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        for expression in self
+            .out_shape
             .iter()
             .chain(&self.input_shape)
             .chain(&self.input_stride)
             .chain(&self.out_stride)
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.weight_co_stride.dyn_vars())
-            .chain(self.weight_inner_stride.dyn_vars())
-            .chain(self.bias_c_stride.dyn_vars())
-            .chain(self.kernel_h.dyn_vars())
-            .chain(self.kernel_w.dyn_vars())
-            .chain(self.stride_h.dyn_vars())
-            .chain(self.stride_w.dyn_vars())
-            .chain(self.dilation_h.dyn_vars())
-            .chain(self.dilation_w.dyn_vars())
-            .chain(self.pad_h.dyn_vars())
-            .chain(self.pad_w.dyn_vars())
-            .collect()
+            .chain(std::iter::once(&self.weight_co_stride))
+            .chain(std::iter::once(&self.weight_inner_stride))
+            .chain(std::iter::once(&self.bias_c_stride))
+            .chain(std::iter::once(&self.kernel_h))
+            .chain(std::iter::once(&self.kernel_w))
+            .chain(std::iter::once(&self.stride_h))
+            .chain(std::iter::once(&self.stride_w))
+            .chain(std::iter::once(&self.dilation_h))
+            .chain(std::iter::once(&self.dilation_w))
+            .chain(std::iter::once(&self.pad_h))
+            .chain(std::iter::once(&self.pad_w))
+        {
+            expression.collect_dyn_vars_into(vars);
+        }
     }
 
     fn output_bytes(&self) -> Expression {

@@ -332,8 +332,8 @@ extern \"C\" {{
         DType::F32
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.out_shape[0].dyn_vars().into_iter().collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.out_shape[0].collect_dyn_vars_into(vars);
     }
 
     fn bytes_loaded(&self) -> Expression {

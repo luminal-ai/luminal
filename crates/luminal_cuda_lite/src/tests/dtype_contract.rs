@@ -372,7 +372,6 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
                 Err(ResourceViolation::CyclicLlir) => {
                     panic!("choice validation allowed a cyclic LLIR")
                 }
-                Err(ResourceViolation::InvalidFusionRegion { .. }) => {}
                 Ok(_) => {
                     acyclic += 1;
                     base = choices;

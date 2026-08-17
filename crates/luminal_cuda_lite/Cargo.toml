@@ -23,6 +23,7 @@ bytemuck = "1.24.0"
 memmap2 = "0.9.9"
 uuid = {version="1.19.0", features=["v4"]}
 lru = "0.16.2"
+rustc-hash = "2.1.1"
 libc = "0.2"
 libloading = "0.8"
 colorize = "*"

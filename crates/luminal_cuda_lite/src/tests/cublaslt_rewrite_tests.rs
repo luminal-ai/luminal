@@ -858,12 +858,13 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
         return;
     }
 
-    let (m, n, k) = (5, 8, 8);
+    let (n, k) = (8, 8);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
+    let a = cx.tensor(('m', k));
     let b = cx.tensor((k, n));
     let first = a.matmul(b);
     let out = (a + first.sin()).matmul(b).output();
+    cx.set_dim('m', 5);
     let llir = extract_forced_distinct_cublaslt_classes_llir_where(
         &mut cx,
         "ordered matching cuBLASLt prepared reuse",
@@ -873,23 +874,25 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
         },
     );
 
-    let a_data = random_f32_vec(m * k, 0xC001_1001, -0.08, 0.08);
-    let b_data = random_f32_vec(k * n, 0xC001_1002, -0.08, 0.08);
-    let first = reference_matmul_2d(&a_data, &b_data, m, n, k);
-    let dep = a_data
-        .iter()
-        .zip(&first)
-        .map(|(a, first)| a + first.sin())
-        .collect::<Vec<_>>();
-    let expected = reference_matmul_2d(&dep, &b_data, m, n, k);
-
     let mut rt = CudaRuntime::initialize(stream);
     rt.load_llir(&llir);
-    rt.set_data(a.id, a_data);
-    rt.set_data(b.id, b_data);
-    rt.execute(&cx.dyn_map);
+    for (m, seed) in [(5, 0xC001_1001), (7, 0xC001_1011)] {
+        cx.set_dim('m', m);
+        let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
+        let b_data = random_f32_vec(k * n, seed + 1, -0.08, 0.08);
+        let first = reference_matmul_2d(&a_data, &b_data, m, n, k);
+        let dep = a_data
+            .iter()
+            .zip(&first)
+            .map(|(a, first)| a + first.sin())
+            .collect::<Vec<_>>();
+        let expected = reference_matmul_2d(&dep, &b_data, m, n, k);
 
-    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+        rt.set_data(a.id, a_data);
+        rt.set_data(b.id, b_data);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    }
     let summary = rt
         .debug_cuda_graph_summaries()
         .into_iter()
@@ -898,6 +901,11 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
     assert_eq!(
         summary.n_cublaslt_prepared, 1,
         "dependency-ordered matching cuBLASLt calls should share prepared resources"
+    );
+    assert_eq!(
+        summary.cublaslt_capture_counts,
+        vec![2, 2],
+        "both ordered cuBLASLt children should recapture after the shared dynamic shape changes"
     );
     assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
 }
@@ -979,6 +987,7 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
 
     let mut rt = CudaRuntime::initialize(stream);
     rt.load_llir(&llir);
+    let mut workspace_ptr = None;
 
     for (m, seed) in [
         (7usize, 0xC002_0001),
@@ -994,6 +1003,19 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
         rt.set_data(b.id, b_data);
         rt.execute(&cx.dyn_map);
         assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+        let current_workspace_ptr = rt
+            .debug_cuda_graph_summaries()
+            .into_iter()
+            .find(|summary| summary.n_cublaslt == 1)
+            .and_then(|summary| summary.cublaslt_workspace_ptrs.into_iter().next())
+            .expect("captured cuBLASLt should retain a prepared workspace");
+        if let Some(previous_workspace_ptr) = workspace_ptr {
+            assert_eq!(
+                current_workspace_ptr, previous_workspace_ptr,
+                "dynamic-shape recapture should recycle the prepared workspace"
+            );
+        }
+        workspace_ptr = Some(current_workspace_ptr);
     }
 
     let summary = rt
@@ -1003,6 +1025,12 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
         .expect("expected a cuBLASLt-only CudaGraphOp after recapture");
     assert_eq!(summary.n_kernels, 0);
     assert_eq!(summary.n_steps, 1);
+    assert_eq!(
+        summary.cublaslt_capture_counts,
+        vec![2],
+        "m=7 should reuse its first captured child graph after visiting m=9"
+    );
+    assert_eq!(summary.cublaslt_capture_cache_hits, vec![1]);
     assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
 }
 

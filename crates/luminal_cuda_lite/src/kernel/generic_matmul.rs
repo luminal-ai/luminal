@@ -419,18 +419,20 @@ extern \"C\" {{
             .max(Expression::from(1))
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.out_shape
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        for expression in self
+            .out_shape
             .iter()
-            .flat_map(|e| e.dyn_vars())
-            .chain(self.mul_shape.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.k.dyn_vars())
-            .chain(self.lhs_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.rhs_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.sum_input_strides.iter().flat_map(|e| e.dyn_vars()))
-            .chain(self.sum_iter_stride.dyn_vars())
-            .chain(self.out_strides.iter().flat_map(|e| e.dyn_vars()))
-            .collect()
+            .chain(&self.mul_shape)
+            .chain(std::iter::once(&self.k))
+            .chain(&self.lhs_strides)
+            .chain(&self.rhs_strides)
+            .chain(&self.sum_input_strides)
+            .chain(std::iter::once(&self.sum_iter_stride))
+            .chain(&self.out_strides)
+        {
+            expression.collect_dyn_vars_into(vars);
+        }
     }
 
     fn output_bytes(&self) -> Expression {

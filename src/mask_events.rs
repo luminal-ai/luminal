@@ -53,10 +53,8 @@ fn mask_log_enabled() -> bool {
 
 /// Semantic rejections — must become zero for the corresponding check to be
 /// deletable.
-pub static FUSION_REGION_REJECT: MaskEvent = MaskEvent::new("fusion-region-reject");
 pub static ALIAS_HAZARD_REJECT: MaskEvent = MaskEvent::new("alias-hazard-reject");
 pub static CYCLIC_LLIR_REJECT: MaskEvent = MaskEvent::new("cyclic-llir-reject");
-pub static NAN_OUTPUT_REJECT: MaskEvent = MaskEvent::new("nan-output-reject");
 /// Any panic caught while building/filtering/profiling a candidate (arity
 /// asserts, staticness expects, FlashInfer gather recovery, NVRTC failures).
 /// The detail carries the panic payload for attribution.
@@ -74,12 +72,10 @@ pub static AGGREGATE_REJECT: MaskEvent = MaskEvent::new("aggregate-reject");
 /// tracked for completeness.
 pub static RESOURCE_REJECT: MaskEvent = MaskEvent::new("resource-reject");
 
-fn all() -> [&'static MaskEvent; 12] {
+fn all() -> [&'static MaskEvent; 10] {
     [
-        &FUSION_REGION_REJECT,
         &ALIAS_HAZARD_REJECT,
         &CYCLIC_LLIR_REJECT,
-        &NAN_OUTPUT_REJECT,
         &CANDIDATE_PANIC,
         &CHOICE_CYCLE_REPAIR,
         &OPKIND_INCONSISTENT,

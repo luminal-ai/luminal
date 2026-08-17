@@ -780,13 +780,10 @@ extern "C" __global__ void rope_scatter_kernel(
         true
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.idx_flat
-            .dyn_vars()
-            .into_iter()
-            .chain(self.dest_size.dyn_vars())
-            .chain(self.rope.s.dyn_vars())
-            .collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.idx_flat.collect_dyn_vars_into(vars);
+        self.dest_size.collect_dyn_vars_into(vars);
+        self.rope.s.collect_dyn_vars_into(vars);
     }
 
     fn output_size(&self) -> Expression {
@@ -1474,8 +1471,8 @@ extern \"C\" {{
         DType::Bf16
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.out_shape[1].dyn_vars().into_iter().collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.out_shape[1].collect_dyn_vars_into(vars);
     }
 
     fn bytes_loaded(&self) -> Expression {
@@ -1769,13 +1766,10 @@ extern \"C\" {{
         true
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.idx_flat
-            .dyn_vars()
-            .into_iter()
-            .chain(self.dest_size.dyn_vars())
-            .chain(self.rope.out_shape[1].dyn_vars())
-            .collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.idx_flat.collect_dyn_vars_into(vars);
+        self.dest_size.collect_dyn_vars_into(vars);
+        self.rope.out_shape[1].collect_dyn_vars_into(vars);
     }
 
     fn output_size(&self) -> Expression {

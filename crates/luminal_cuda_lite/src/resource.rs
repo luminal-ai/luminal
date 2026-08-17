@@ -35,10 +35,9 @@ use luminal::{
 use crate::{
     host::HostOp,
     kernel::{
-        KernelOp,
-        fusion::region_codegen::{
-            self, CompileUnit, build_compile_units, globally_absorbed_markers,
-        },
+        KernelOp, PreparedKernelToHostPlan,
+        fusion::region_codegen::{CompileUnit, RegionSourceCache},
+        prepare_kernel_to_host_plan_with_topo_and_source_cache,
     },
 };
 
@@ -202,6 +201,11 @@ pub(crate) struct CandidateResourcePlan {
     pub kernels: Vec<KernelResourcePlan>,
 }
 
+pub(crate) struct PreparedStaticLlirPlan {
+    pub resources: CandidateResourcePlan,
+    pub kernel_to_host: PreparedKernelToHostPlan,
+}
+
 impl CandidateResourcePlan {
     pub fn required_intermediate_bytes(&self) -> usize {
         self.planned_intermediate_bytes
@@ -286,10 +290,6 @@ pub enum ResourceViolation {
         name: &'static str,
     },
     CyclicLlir,
-    InvalidFusionRegion {
-        node: usize,
-        reason: String,
-    },
     AliasingHazard {
         name: &'static str,
         reason: &'static str,
@@ -382,12 +382,6 @@ impl std::fmt::Display for ResourceViolation {
                 )
             }
             Self::CyclicLlir => write!(f, "candidate LLIR contains a cycle"),
-            Self::InvalidFusionRegion { node, reason } => {
-                write!(
-                    f,
-                    "fusion node {node} violates its region contract: {reason}"
-                )
-            }
             Self::AliasingHazard { name, reason } => {
                 write!(f, "kernel {name} has an unsafe in-place alias: {reason}")
             }
@@ -418,86 +412,95 @@ pub(crate) fn validate_resource_plan(
     }
 
     for kernel in &plan.kernels {
-        if let (Some(required), Some(limit)) = (kernel.source_bytes, caps.max_kernel_source_bytes)
-            && required > limit
-        {
-            return Err(ResourceViolation::KernelSource {
-                name: kernel.name,
-                required,
-                limit,
-            });
-        }
+        validate_kernel_resource_plan(kernel, caps, device)?;
+    }
+    Ok(())
+}
 
-        for axis in 0..3 {
-            if kernel.grid[axis] == 0 {
-                return Err(ResourceViolation::ZeroLaunchDimension {
-                    name: kernel.name,
-                    kind: "grid",
-                    axis,
-                });
-            }
-            if kernel.block[axis] == 0 {
-                return Err(ResourceViolation::ZeroLaunchDimension {
-                    name: kernel.name,
-                    kind: "block",
-                    axis,
-                });
-            }
-        }
+pub(crate) fn validate_kernel_resource_plan(
+    kernel: &KernelResourcePlan,
+    caps: CandidateResourceCaps,
+    device: Option<CudaDeviceResourceLimits>,
+) -> Result<(), ResourceViolation> {
+    if let (Some(required), Some(limit)) = (kernel.source_bytes, caps.max_kernel_source_bytes)
+        && required > limit
+    {
+        return Err(ResourceViolation::KernelSource {
+            name: kernel.name,
+            required,
+            limit,
+        });
+    }
 
-        let Some(device) = device else {
-            continue;
-        };
-        if kernel.parameter_bytes > device.max_kernel_parameter_bytes {
-            return Err(ResourceViolation::KernelParameters {
+    for axis in 0..3 {
+        if kernel.grid[axis] == 0 {
+            return Err(ResourceViolation::ZeroLaunchDimension {
                 name: kernel.name,
-                required: kernel.parameter_bytes,
-                limit: device.max_kernel_parameter_bytes,
+                kind: "grid",
+                axis,
             });
         }
-        for axis in 0..3 {
-            if kernel.grid[axis] > device.max_grid_dim[axis] {
-                return Err(ResourceViolation::GridDimension {
-                    name: kernel.name,
-                    axis,
-                    required: kernel.grid[axis],
-                    limit: device.max_grid_dim[axis],
-                });
-            }
-            if kernel.block[axis] > device.max_block_dim[axis] {
-                return Err(ResourceViolation::BlockDimension {
-                    name: kernel.name,
-                    axis,
-                    required: kernel.block[axis],
-                    limit: device.max_block_dim[axis],
-                });
-            }
-        }
-        let threads = checked_product(kernel.block, "threads per block")?;
-        let thread_limit = kernel
-            .function_max_threads_per_block
-            .unwrap_or(device.max_threads_per_block)
-            .min(device.max_threads_per_block);
-        if threads > thread_limit {
-            return Err(ResourceViolation::ThreadsPerBlock {
+        if kernel.block[axis] == 0 {
+            return Err(ResourceViolation::ZeroLaunchDimension {
                 name: kernel.name,
-                required: threads,
-                limit: thread_limit,
+                kind: "block",
+                axis,
             });
         }
-        let shared = kernel
-            .dynamic_shared_memory_bytes
-            .checked_add(kernel.static_shared_memory_bytes)
-            .ok_or(ResourceViolation::ArithmeticOverflow {
-                resource: "shared memory",
-            })?;
-        if shared > device.max_shared_memory_per_block {
-            return Err(ResourceViolation::SharedMemory {
+    }
+
+    let Some(device) = device else {
+        return Ok(());
+    };
+    if kernel.parameter_bytes > device.max_kernel_parameter_bytes {
+        return Err(ResourceViolation::KernelParameters {
+            name: kernel.name,
+            required: kernel.parameter_bytes,
+            limit: device.max_kernel_parameter_bytes,
+        });
+    }
+    for axis in 0..3 {
+        if kernel.grid[axis] > device.max_grid_dim[axis] {
+            return Err(ResourceViolation::GridDimension {
                 name: kernel.name,
-                required: shared,
-                limit: device.max_shared_memory_per_block,
+                axis,
+                required: kernel.grid[axis],
+                limit: device.max_grid_dim[axis],
             });
         }
+        if kernel.block[axis] > device.max_block_dim[axis] {
+            return Err(ResourceViolation::BlockDimension {
+                name: kernel.name,
+                axis,
+                required: kernel.block[axis],
+                limit: device.max_block_dim[axis],
+            });
+        }
+    }
+    let threads = checked_product(kernel.block, "threads per block")?;
+    let thread_limit = kernel
+        .function_max_threads_per_block
+        .unwrap_or(device.max_threads_per_block)
+        .min(device.max_threads_per_block);
+    if threads > thread_limit {
+        return Err(ResourceViolation::ThreadsPerBlock {
+            name: kernel.name,
+            required: threads,
+            limit: thread_limit,
+        });
+    }
+    let shared = kernel
+        .dynamic_shared_memory_bytes
+        .checked_add(kernel.static_shared_memory_bytes)
+        .ok_or(ResourceViolation::ArithmeticOverflow {
+            resource: "shared memory",
+        })?;
+    if shared > device.max_shared_memory_per_block {
+        return Err(ResourceViolation::SharedMemory {
+            name: kernel.name,
+            required: shared,
+            limit: device.max_shared_memory_per_block,
+        });
     }
     Ok(())
 }
@@ -542,51 +545,6 @@ pub(crate) fn kernel_parameter_bytes(
         .ok_or(ResourceViolation::ArithmeticOverflow {
             resource: "kernel parameter bytes",
         })
-}
-
-/// Kernel values that must have storage after fusion-region lowering. Compile
-/// unit roots are materialized; region interiors stay in registers unless a
-/// different compile unit consumes one of them as an external input.
-fn materialized_kernel_nodes(
-    llir: &LLIRGraph,
-    compile_units: &[CompileUnit],
-) -> FxHashSet<NodeIndex> {
-    let mut materialized = FxHashSet::default();
-    let mut required_inputs = Vec::new();
-
-    for unit in compile_units {
-        match unit {
-            CompileUnit::Single(node) => {
-                materialized.insert(*node);
-                required_inputs.extend(
-                    llir.edges_directed(*node, Direction::Incoming)
-                        .map(|edge| edge.source()),
-                );
-            }
-            CompileUnit::Region(region) => {
-                materialized.insert(region.fe_node);
-                required_inputs.extend(region.external_inputs.iter().copied());
-            }
-        }
-    }
-
-    // An absorbed register value can also feed a separate compile unit. Its
-    // producer then needs storage even though it is interior to another region.
-    for input in required_inputs {
-        if llir[input]
-            .to_dialect::<dyn KernelOp>()
-            .is_some_and(|kernel| kernel.output_aliases_input().is_none())
-        {
-            materialized.insert(input);
-        }
-    }
-
-    materialized.retain(|node| {
-        llir[*node]
-            .to_dialect::<dyn KernelOp>()
-            .is_some_and(|kernel| kernel.output_aliases_input().is_none())
-    });
-    materialized
 }
 
 fn resolve_alias(mut node: NodeIndex, aliases: &FxHashMap<NodeIndex, NodeIndex>) -> NodeIndex {
@@ -746,43 +704,43 @@ fn validated_topology_and_aliases(
 /// extracted plans cannot bypass the search candidate filter.
 pub(crate) fn validate_static_llir_semantics(llir: &LLIRGraph) -> Result<(), ResourceViolation> {
     validated_topology_and_aliases(llir)?;
-    region_codegen::validate_fusion_regions(llir, None).map_err(|violation| {
-        luminal::mask_events::FUSION_REGION_REJECT.record_with(|| violation.reason.clone());
-        ResourceViolation::InvalidFusionRegion {
-            node: violation.node.index(),
-            reason: violation.reason,
-        }
-    })
+    Ok(())
 }
 
 /// Build a pre-compilation plan. The memory value is a lower bound (rather
 /// than a sum of all intermediates) so it cannot reject a legal graph merely
 /// because non-overlapping buffers are individually large.
+#[cfg(test)]
 pub(crate) fn plan_static_llir_resources(
     llir: &LLIRGraph,
     dyn_map: &DynMap,
 ) -> Result<CandidateResourcePlan, ResourceViolation> {
+    let mut source_cache = RegionSourceCache::default();
+    Ok(prepare_static_llir_resources(llir, dyn_map, &mut source_cache)?.resources)
+}
+
+pub(crate) fn prepare_static_llir_resources(
+    llir: &LLIRGraph,
+    dyn_map: &DynMap,
+    source_cache: &mut RegionSourceCache,
+) -> Result<PreparedStaticLlirPlan, ResourceViolation> {
     let (topo, aliases) = validated_topology_and_aliases(llir)?;
-    region_codegen::validate_fusion_regions(llir, Some(dyn_map)).map_err(|violation| {
-        luminal::mask_events::FUSION_REGION_REJECT.record_with(|| violation.reason.clone());
-        ResourceViolation::InvalidFusionRegion {
-            node: violation.node.index(),
-            reason: violation.reason,
-        }
-    })?;
-    let kernel_topo = topo
-        .iter()
-        .copied()
-        .filter(|node| llir[*node].to_dialect::<dyn KernelOp>().is_some())
-        .collect_vec();
-    let absorbed = globally_absorbed_markers(llir);
-    let compile_units = build_compile_units(&kernel_topo, llir, &absorbed);
-    let materialized_kernel_nodes = materialized_kernel_nodes(llir, &compile_units);
+    let mut global_dyn_dims = dyn_map.keys().copied().collect_vec();
+    global_dyn_dims.sort();
+    let prepared_kernel_to_host = prepare_kernel_to_host_plan_with_topo_and_source_cache(
+        llir,
+        &topo,
+        source_cache,
+        Some(&global_dyn_dims),
+    );
     let mut bytes_by_node = FxHashMap::default();
 
     for node in llir.node_indices() {
         if let Some(kernel) = llir[node].to_dialect::<dyn KernelOp>() {
-            if materialized_kernel_nodes.contains(&node) {
+            if prepared_kernel_to_host
+                .materialized_kernel_nodes()
+                .contains(&node)
+            {
                 let bytes = eval_resource_expression(
                     kernel.output_bytes(),
                     dyn_map,
@@ -800,7 +758,6 @@ pub(crate) fn plan_static_llir_resources(
             }
         }
     }
-
     let mut intermediate_lower_bound_bytes = 0usize;
     for node in topo.iter().copied() {
         let mut live = llir
@@ -818,7 +775,6 @@ pub(crate) fn plan_static_llir_resources(
         )?;
         intermediate_lower_bound_bytes = intermediate_lower_bound_bytes.max(simultaneous);
     }
-
     // Every graph output must remain valid at the return boundary.
     let output_buffers = llir
         .node_indices()
@@ -834,21 +790,28 @@ pub(crate) fn plan_static_llir_resources(
         "graph output bytes",
     )?;
     intermediate_lower_bound_bytes = intermediate_lower_bound_bytes.max(output_bytes);
-
     // Fused regions are the only generated kernels whose source and parameter
     // list grow with the searched graph. Their codegen is pure, so account for
     // them before invoking NVRTC.
-    let kernels = compile_units
-        .into_iter()
+    let kernels = prepared_kernel_to_host
+        .fusion()
+        .compile_units()
+        .iter()
         .filter_map(|unit| match unit {
             CompileUnit::Single(_) => None,
             CompileUnit::Region(region) => Some(region),
         })
         .map(|region| {
-            let (source, output_size) = region_codegen::region_kernel_source(&region, llir);
-            let output_size =
-                eval_resource_expression(output_size, dyn_map, "fused-region output size")?;
-            let has_dyn_dims = source.contains("dyn_dims");
+            let prepared_kernel = prepared_kernel_to_host
+                .fusion()
+                .region_kernel(region.fe_node)
+                .expect("prepared fusion region must have generated kernel source");
+            let output_size = eval_resource_expression(
+                prepared_kernel.output_size,
+                dyn_map,
+                "fused-region output size",
+            )?;
+            let has_dyn_dims = prepared_kernel.source.contains("dyn_dims");
             let fe = llir[region.fe_node]
                 .to_dialect::<dyn KernelOp>()
                 .expect("fused region root must be a kernel op");
@@ -859,7 +822,7 @@ pub(crate) fn plan_static_llir_resources(
             )?;
             Ok(KernelResourcePlan {
                 name: "FusedRegion",
-                source_bytes: Some(source.len()),
+                source_bytes: Some(prepared_kernel.source.len()),
                 parameter_bytes,
                 grid: [output_size.div_ceil(256), 1, 1],
                 block: [output_size.min(256), 1, 1],
@@ -869,14 +832,16 @@ pub(crate) fn plan_static_llir_resources(
             })
         })
         .collect::<Result<Vec<_>, ResourceViolation>>()?;
-
-    Ok(CandidateResourcePlan {
-        intermediate_lower_bound_bytes,
-        planned_intermediate_bytes: None,
-        host_persistent_bytes: 0,
-        host_transient_peak_bytes: 0,
-        shared_device_allocations: Vec::new(),
-        kernels,
+    Ok(PreparedStaticLlirPlan {
+        resources: CandidateResourcePlan {
+            intermediate_lower_bound_bytes,
+            planned_intermediate_bytes: None,
+            host_persistent_bytes: 0,
+            host_transient_peak_bytes: 0,
+            shared_device_allocations: Vec::new(),
+            kernels,
+        },
+        kernel_to_host: prepared_kernel_to_host,
     })
 }
 
