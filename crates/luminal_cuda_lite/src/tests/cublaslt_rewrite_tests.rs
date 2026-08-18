@@ -1012,18 +1012,30 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
     let a = cx.tensor(('m', k));
     let b = cx.tensor((k, n));
     let out = a.matmul(b).output();
+    // Keep the inputs alive so this test isolates dynamic-shape changes from
+    // pointer changes. Pointer-driven recapture is covered separately.
+    a.output();
+    b.output();
     cx.set_dim('m', 7);
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "cuBLASLt-only dynamic graph", |_| true);
 
     let mut rt = CudaRuntime::initialize(stream);
     rt.load_llir(&llir);
     let mut workspace_ptr = None;
-
-    for (m, seed) in [
+    let cases = [
         (7usize, 0xC002_0001),
         (9usize, 0xC002_0002),
         (7usize, 0xC002_0003),
-    ] {
+    ];
+    let max_m = cases.iter().map(|(m, _)| *m).max().unwrap();
+    rt.set_data_with_capacity(
+        a.id,
+        Vec::<f32>::new(),
+        max_m * k * std::mem::size_of::<f32>(),
+    );
+    rt.set_data_with_capacity(b.id, Vec::<f32>::new(), k * n * std::mem::size_of::<f32>());
+
+    for (m, seed) in cases {
         cx.set_dim('m', m);
         let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
         let b_data = random_f32_vec(k * n, seed + 10, -0.08, 0.08);
