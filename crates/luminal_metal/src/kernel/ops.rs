@@ -482,7 +482,7 @@ impl EgglogOp for MetalRMSNorm {
                     (= ?ri_out (ECons (MIter) (ENil)))
                 )
                 ((metal_rms_rinv ?rinv ?x ?eps ?rows ?cols))
-                :ruleset kernel_fuse_late_pre
+                :ruleset kernel_fuse_late_pre_rms
                 :name \"metal rms inverse root mean square\"
             )
             (rule
