@@ -19,7 +19,9 @@ use petgraph::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     any::TypeId,
+    collections::hash_map::DefaultHasher,
     fmt::{Debug, Write as FmtWrite},
+    hash::{Hash, Hasher},
     io::Write,
     ops::{Deref, DerefMut},
     sync::Arc,
@@ -41,7 +43,69 @@ pub(crate) struct PackedLLIRGraph {
     pub(crate) outgoing_targets: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LlirFingerprint(u64, u64);
+
+struct LlirFingerprintHasher {
+    first: DefaultHasher,
+    second: DefaultHasher,
+}
+
+impl LlirFingerprintHasher {
+    fn new() -> Self {
+        let mut first = DefaultHasher::new();
+        let mut second = DefaultHasher::new();
+        0x243f_6a88_85a3_08d3_u64.hash(&mut first);
+        0x1319_8a2e_0370_7344_u64.hash(&mut second);
+        Self { first, second }
+    }
+
+    fn fingerprint(&self) -> LlirFingerprint {
+        LlirFingerprint(self.first.finish(), self.second.finish())
+    }
+}
+
+impl Hasher for LlirFingerprintHasher {
+    fn finish(&self) -> u64 {
+        self.first.finish()
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.first.write(bytes);
+        self.second.write(bytes);
+    }
+}
+
+struct HashWriter<'a>(&'a mut LlirFingerprintHasher);
+
+impl FmtWrite for HashWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0.write(value.as_bytes());
+        Ok(())
+    }
+}
+
 impl PackedLLIRGraph {
+    /// Fingerprint the exact LLIR program represented by this packed graph.
+    /// Packed extraction has deterministic node ordering, so the op sequence
+    /// plus ordered incoming edges completely describes the graph; outgoing
+    /// edges are derived from those inputs and do not need to be hashed again.
+    fn fingerprint(&self) -> LlirFingerprint {
+        let mut hasher = LlirFingerprintHasher::new();
+        self.ops.len().hash(&mut hasher);
+        for op in &self.ops {
+            // Debug is the full semantic representation of a type-erased LLIR
+            // op. Display is intentionally unsuitable: many ops omit their
+            // shape and stride metadata there. Stream directly into the hash
+            // to avoid allocating one String per op and candidate.
+            write!(HashWriter(&mut hasher), "{op:?}").unwrap();
+            hasher.write_u8(0xff);
+        }
+        self.incoming_offsets.hash(&mut hasher);
+        self.incoming_sources.hash(&mut hasher);
+        hasher.fingerprint()
+    }
+
     pub(crate) fn to_stable(&self) -> LLIRGraph {
         let mut graph = LLIRGraph::with_capacity(self.ops.len(), self.incoming_sources.len());
         for op in &self.ops {
@@ -2247,6 +2311,7 @@ impl Graph {
             };
 
         let mut prev_selected: FxHashSet<u64> = FxHashSet::default();
+        let mut explored_llir_hashes: FxHashSet<LlirFingerprint> = FxHashSet::default();
         let mut llir_extractor = LlirExtractor::new(egraph, ops);
         runtime.clear_intermediate_buffers();
         let search_time_limit_reached = || search_started_at.elapsed() >= options.search_time_limit;
@@ -2284,23 +2349,30 @@ impl Graph {
                 };
 
                 let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let graph =
+                    let packed =
                         llir_extractor.extract_indexed_packed(&genome, &self.custom_ops, None);
+                    if !explored_llir_hashes.insert(packed.fingerprint()) {
+                        return None;
+                    }
                     // Profile the deployment graph itself: fully unrolled.
                     // Every scaled-down proxy (collapsed bodies, trip-count
                     // differencing) leaked family-dependent costs and
                     // inverted rankings; measuring the real graph is slower
                     // per candidate but cannot misorder families.
-                    unroll_packed_llir(graph)
+                    Some(unroll_packed_llir(packed))
                 }));
-                let Ok(graph) = graph_result else {
-                    invalid_attempts += 1;
-                    if invalid_attempts > max_invalid_attempts {
-                        panic!(
-                            "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
-                        );
+                let graph = match graph_result {
+                    Ok(Some(graph)) => graph,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        invalid_attempts += 1;
+                        if invalid_attempts > max_invalid_attempts {
+                            panic!(
+                                "Failed to find a viable initial genome after {max_invalid_attempts} invalid attempts"
+                            );
+                        }
+                        continue;
                     }
-                    continue;
                 };
 
                 // A candidate whose LLIR fails to compile (e.g. an egglog
@@ -2468,27 +2540,34 @@ impl Graph {
                 let graph_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let packed =
                         llir_extractor.extract_indexed_packed(&genome, &self.custom_ops, None);
+                    if !explored_llir_hashes.insert(packed.fingerprint()) {
+                        return None;
+                    }
                     let pre_collapse = std::env::var_os("LLIR_DUMP_DIR")
                         .is_some()
                         .then(|| packed.to_stable());
                     // Profile fully unrolled — see initial-genome path.
                     let llir_graph = unroll_packed_llir(packed);
-                    (pre_collapse, llir_graph)
+                    Some((pre_collapse, llir_graph))
                 }));
                 if let Err(payload) = &graph_result {
                     crate::mask_events::CANDIDATE_PANIC
                         .record_with(|| crate::mask_events::panic_payload(payload.as_ref()));
                 }
-                let Ok((pre_collapse, llir_graph)) = graph_result else {
-                    if search_log {
-                        for _ in 1..n_bar_lines {
-                            print!("\x1b[1A");
+                let (pre_collapse, llir_graph) = match graph_result {
+                    Ok(Some(graphs)) => graphs,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        if search_log {
+                            for _ in 1..n_bar_lines {
+                                print!("\x1b[1A");
+                            }
+                            print!("\r\x1b[2K");
+                            render_bars(n_graphs, search_limit, bucket_progress);
+                            std::io::stdout().flush().unwrap();
                         }
-                        print!("\r\x1b[2K");
-                        render_bars(n_graphs, search_limit, bucket_progress);
-                        std::io::stdout().flush().unwrap();
+                        continue;
                     }
-                    continue;
                 };
 
                 let filter_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4813,7 +4892,7 @@ mod tests {
     }
 
     macro_rules! final_filter_test_op {
-        ($name:ident, $sort_name:literal, $rule_name:literal) => {
+        ($name:ident, $sort_name:literal, $rule_name:literal, $extracted:ty) => {
             #[derive(Debug, Default)]
             struct $name;
 
@@ -4858,7 +4937,9 @@ mod tests {
                     _: &mut FxHashMap<&'a ENodeId, Expression>,
                 ) -> (LLIROp, Vec<&'a ENodeId>) {
                     (
-                        LLIROp::new::<dyn ReferenceOp>(Box::new(Self) as Box<dyn ReferenceOp>),
+                        LLIROp::new::<dyn ReferenceOp>(
+                            Box::new(<$extracted>::default()) as Box<dyn ReferenceOp>
+                        ),
                         input_enodes,
                     )
                 }
@@ -4875,8 +4956,56 @@ mod tests {
         };
     }
 
-    final_filter_test_op!(FastButInvalidAfterUnroll, "TestFastSin", "test fast sin");
-    final_filter_test_op!(SlowerValidAfterUnroll, "TestSafeSin", "test safe sin");
+    final_filter_test_op!(
+        FastButInvalidAfterUnroll,
+        "TestFastSin",
+        "test fast sin",
+        FastButInvalidAfterUnroll
+    );
+    final_filter_test_op!(
+        SlowerValidAfterUnroll,
+        "TestSafeSin",
+        "test safe sin",
+        SlowerValidAfterUnroll
+    );
+    final_filter_test_op!(
+        DuplicateFastLlir,
+        "DuplicateFastLlir",
+        "duplicate fast llir",
+        FastButInvalidAfterUnroll
+    );
+
+    #[derive(Default)]
+    struct DuplicateLlirRuntime {
+        profile_calls: usize,
+    }
+
+    impl Runtime for DuplicateLlirRuntime {
+        type Ops = (FastButInvalidAfterUnroll, DuplicateFastLlir);
+        type CompileArg = ();
+        type ExecReturn = ();
+        type ProfileMetric = usize;
+
+        fn initialize(_: Self::CompileArg) -> Self {
+            Self::default()
+        }
+
+        fn load_llir(&mut self, _: &LLIRGraph) {}
+
+        fn execute(&mut self, _: &DynMap) -> Self::ExecReturn {}
+
+        fn profile(
+            &mut self,
+            _: &LLIRGraph,
+            _: &DynMap,
+            _: usize,
+            _: Option<std::time::Duration>,
+            _: Option<(Self::ProfileMetric, f64)>,
+        ) -> (Self::ProfileMetric, String) {
+            self.profile_calls += 1;
+            (0, "same LLIR".to_string())
+        }
+    }
 
     #[derive(Default)]
     struct FinalFilterRuntime {
@@ -5407,6 +5536,26 @@ mod tests {
         assert_eq!(
             runtime.fallback_profiles, 0,
             "a prepared candidate must not be loaded again through Runtime::profile"
+        );
+    }
+
+    #[test]
+    fn search_profiles_each_extracted_llir_only_once() {
+        let mut cx = Graph::new();
+        let input = cx.tensor(8);
+        let _ = input.sin().output();
+
+        let options = CompileOptions::default()
+            .search_graph_limit(16)
+            .generation_size(16)
+            .mutations(1)
+            .search_log(false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xDED0_0111);
+        let runtime = cx.compile_with_rng(DuplicateLlirRuntime::default(), options, &mut rng);
+
+        assert_eq!(
+            runtime.profile_calls, 1,
+            "two e-graph choices that extract to the same LLIR must consume one search slot"
         );
     }
 
