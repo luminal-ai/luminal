@@ -92,7 +92,7 @@ impl EgglogOp for KernelStableSortIdx {
                 (
                     (stable_ranks_part ?ranks ?eqidx ?a_val ?b_val ?x ?out_shape)
                 )
-                :ruleset kernel_fuse_late_pre
+                :ruleset kernel_fuse_late_pre_topk
                 :name \"stable ranks part\"
             )
             (rule

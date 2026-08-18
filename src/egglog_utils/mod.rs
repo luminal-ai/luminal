@@ -45,11 +45,25 @@ const EGGLOG_RULESETS: &[&str] = &[
     // dedicated "fuse late" phase instead of inside the saturating main
     // cycles. The _pre ruleset holds producer stages (e.g. the RoPE angle
     // relation) consumed by rules in the main late ruleset.
-    "kernel_fuse_late_pre",
+    "kernel_fuse_late_pre_rms",
+    "kernel_fuse_late_pre_topk",
+    "kernel_fuse_late_pre_rope",
+    "kernel_fuse_late_pre_sink_attention_base",
+    "kernel_fuse_late_pre_sink_attention_request",
+    "kernel_fuse_late_pre_sink_attention_past",
+    "kernel_fuse_late_pre_sink_attention_finish",
+    "kernel_fuse_late_pre_flashinfer",
     "kernel_fuse_late",
     // Expensive one-shot rules that consume facts produced by the earlier
     // fuse-late runs; scheduled exactly once at the end of the phase.
-    "kernel_fuse_late2",
+    "kernel_fuse_late2_rope",
+    "kernel_fuse_late2_sink_attention",
+    "kernel_fuse_late2_flashinfer_value",
+    "kernel_fuse_late2_flashinfer_softmax_denominator",
+    "kernel_fuse_late2_flashinfer_softmax_source",
+    "kernel_fuse_late2_flashinfer_request",
+    "kernel_fuse_late2_flashinfer_qk",
+    "kernel_fuse_late2_flashinfer_final",
 ];
 
 fn parse_log_flag(value: &str) -> bool {
@@ -320,7 +334,26 @@ fn egglog_final_phases(use_interval_analysis: bool) -> Vec<EgglogSchedulePhase> 
             // makes it a cheap delta join.
             // Depth = the longest relation cascade: invf(pre) → angles →
             // rotation → concat each consume the previous run's facts.
-            schedule: "(seq kernel_fuse_late_pre kernel_fuse_late kernel_fuse_late kernel_fuse_late kernel_fuse_late2)"
+            schedule: "(seq
+                kernel_fuse_late_pre_rms
+                kernel_fuse_late_pre_topk
+                kernel_fuse_late_pre_rope
+                kernel_fuse_late_pre_sink_attention_base
+                kernel_fuse_late_pre_sink_attention_request
+                kernel_fuse_late_pre_sink_attention_past
+                kernel_fuse_late_pre_sink_attention_finish
+                kernel_fuse_late_pre_flashinfer
+                kernel_fuse_late
+                kernel_fuse_late
+                kernel_fuse_late
+                kernel_fuse_late2_rope
+                kernel_fuse_late2_sink_attention
+                kernel_fuse_late2_flashinfer_value
+                kernel_fuse_late2_flashinfer_softmax_denominator
+                kernel_fuse_late2_flashinfer_softmax_source
+                kernel_fuse_late2_flashinfer_request
+                kernel_fuse_late2_flashinfer_qk
+                kernel_fuse_late2_flashinfer_final)"
                 .to_string(),
         },
         EgglogSchedulePhase {

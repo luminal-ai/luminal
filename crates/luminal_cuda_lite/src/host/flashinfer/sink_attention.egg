@@ -1,6 +1,3 @@
-; AUTO-GENERATED from an LLIR dump of the paged reference attention spelling
-; (gptoss-serve's dump_egglog bin) — regenerate from a fresh dump, don't edit.
-;
 ; Paged gpt-oss sink attention (GQA + sink-augmented softmax) -> FA3 host op.
 ;
 ; Masking is hybrid: causal + cross-sequence isolation is a host mask Input,
@@ -12,19 +9,26 @@
 ; qo/kv_indptr are free-floating named Inputs (size-1 joins) wired through
 ; as runtime inputs.
 ;
-; Staging (run order: _pre -> late x3 -> late2): sa_masked (_pre) ->
-; sa_island (late) -> op rule (late2). Depends on flashinfer_attention.egg's
-; const_like / flashinfer_head_dim_ok_16bit.
+; Staging: scaled host-mask base -> requested window term -> window constant ->
+; sa_masked -> sa_island -> op. Depends on flashinfer_attention.egg's
+; const_like / flashinfer_head_dim_ok_16bit facts.
 
 ; (masked, scores, scale_val, window_left): the masked-scores node, the raw
 ; scores it was built from, the softmax scale constant, and the window
 ; (-1.0 = full attention).
 (relation sa_masked (IR IR f64 f64))
 
+; Consumer-demanded staging for the mask prefix.  A scaled host-mask base is
+; cheap to discover.  The longer sliding-window proof is only explored for a
+; term which is the second operand of an Add on one of those bases.
+(relation sa_scaled_mask_base (IR IR f64))
+(relation sa_sliding_mask_request (IR IR f64 IR))
+(relation sa_window_past (IR IR))
+
 ; Full attention: masked = scaled_scores + host_mask.
 (rule
     (
-        (= ?masked (Op (Add ?m_s ?m_a ?m_b ?m_o)
+        (= ?base (Op (Add ?m_s ?m_a ?m_b ?m_o)
             (ICons ?scaled (ICons ?mask (INil)))))
         (= ?scaled (Op (Mul ?sc_s ?sc_a ?sc_b ?sc_o)
             (ICons ?scores (ICons ?scale_c (INil)))))
@@ -32,10 +36,46 @@
         (= ?mask (Input ?mask_idx ?mask_name (F32)))
     )
     (
-        (sa_masked ?masked ?scores ?scale_val -1.0)
+        (sa_scaled_mask_base ?base ?scores ?scale_val)
+        (sa_masked ?base ?scores ?scale_val -1.0)
     )
-    :ruleset kernel_fuse_late_pre
-    :name "SinkAttention masked fact (full)"
+    :ruleset kernel_fuse_late_pre_sink_attention_base
+    :name "SinkAttention scaled host-mask base"
+)
+
+; Only a base which is actually extended by another Add can demand the
+; sliding-window proof for that Add's second operand.
+(rule
+    (
+        (= ?masked (Op (Add ?o_s ?o_a ?o_b ?o_o)
+            (ICons ?base (ICons ?wterm (INil)))))
+        (sa_scaled_mask_base ?base ?scores ?scale_val)
+    )
+    (
+        (sa_sliding_mask_request ?masked ?scores ?scale_val ?wterm)
+    )
+    :ruleset kernel_fuse_late_pre_sink_attention_request
+    :name "request SinkAttention sliding-window proof"
+)
+
+; Prove the requested term through the negative-large mask and comparison,
+; carrying the exact window-start node into the final constant proof.
+(rule
+    (
+        (sa_sliding_mask_request ?masked ?scores ?scale_val ?wterm)
+        (= ?wterm (Op (Mul ?w_s ?w_a ?w_b ?w_o)
+            (ICons ?past_f (ICons ?negbig (INil)))))
+        (const_like ?negbig ?negbig_val)
+        (< ?negbig_val -900000000000000000000000000000.0)
+        (= ?past_f (Op (Cast ?pc_sz (F32)) (ICons ?past (INil))))
+        (= ?past (Op (LessThan ?lt_s ?lt_a ?lt_b ?lt_o)
+            (ICons ?k_posf (ICons ?wstart (INil)))))
+    )
+    (
+        (sa_window_past ?wterm ?wstart)
+    )
+    :ruleset kernel_fuse_late_pre_sink_attention_past
+    :name "prove requested SinkAttention past-window term"
 )
 
 ; Sliding window: masked = (scaled_scores + host_mask) + window_term, where
@@ -44,21 +84,8 @@
 ; FlashInfer's window_left convention).
 (rule
     (
-        (= ?masked (Op (Add ?o_s ?o_a ?o_b ?o_o)
-            (ICons ?base (ICons ?wterm (INil)))))
-        (= ?base (Op (Add ?b_s ?b_a ?b_b ?b_o)
-            (ICons ?scaled (ICons ?mask (INil)))))
-        (= ?scaled (Op (Mul ?sc_s ?sc_a ?sc_b ?sc_o)
-            (ICons ?scores (ICons ?scale_c (INil)))))
-        (const_like ?scale_c ?scale_val)
-        (= ?mask (Input ?mask_idx ?mask_name (F32)))
-        (= ?wterm (Op (Mul ?w_s ?w_a ?w_b ?w_o)
-            (ICons ?past_f (ICons ?negbig (INil)))))
-        (const_like ?negbig ?negbig_val)
-        (< ?negbig_val -900000000000000000000000000000.0)
-        (= ?past_f (Op (Cast ?pc_sz (F32)) (ICons ?past (INil))))
-        (= ?past (Op (LessThan ?lt_s ?lt_a ?lt_b ?lt_o)
-            (ICons ?k_posf (ICons ?wstart (INil)))))
+        (sa_sliding_mask_request ?masked ?scores ?scale_val ?wterm)
+        (sa_window_past ?wterm ?wstart)
         (= ?wstart (Op (Add ?ws_s ?ws_a ?ws_b ?ws_o)
             (ICons ?q_absf (ICons ?negw (INil)))))
         (= ?negw (Op (Mul ?nw_s ?nw_a ?nw_b ?nw_o)
@@ -69,8 +96,8 @@
     (
         (sa_masked ?masked ?scores ?scale_val ?window_val)
     )
-    :ruleset kernel_fuse_late_pre
-    :name "SinkAttention masked fact (sliding window)"
+    :ruleset kernel_fuse_late_pre_sink_attention_finish
+    :name "prove requested SinkAttention sliding-window mask"
 )
 
 ; (out, q_bf16, k_pool, v_pool, flat_gather_idx, sinks_f32,
@@ -200,6 +227,6 @@
         (union ?out ?fi)
         (set (dtype ?fi) (F32))
     )
-    :ruleset kernel_fuse_late2
+    :ruleset kernel_fuse_late2_sink_attention
     :name "SinkAttention op"
 )

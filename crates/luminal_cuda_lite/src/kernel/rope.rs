@@ -577,7 +577,7 @@ impl EgglogOp for RoPEScatterKernel {
                     (union ?scatter ?fused)
                     (set (dtype ?fused) ?dt)
                 )
-                :ruleset kernel_fuse_late2
+                :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope-half scatter exact-layout\"
             )",
         )]
@@ -1024,7 +1024,7 @@ impl EgglogOp for KernelRoPE {
                 (
                     (rope_invf ?invf ?ln_theta ?inv_hd)
                 )
-                :ruleset kernel_fuse_late_pre
+                :ruleset kernel_fuse_late_pre_rope
                 :name \"kernel rope invf stage\"
             )
             (rule
@@ -1173,7 +1173,7 @@ impl EgglogOp for KernelRoPE {
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
                 )
-                :ruleset kernel_fuse_late2
+                :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope half bf16\"
             )",
             segments.join("\n")
@@ -1309,7 +1309,7 @@ impl EgglogOp for KernelRoPE {
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
                 )
-                :ruleset kernel_fuse_late2
+                :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope IEEE-safe concat\"
             )";
         vec![Rule::raw(format!(
