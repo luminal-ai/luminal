@@ -661,6 +661,36 @@ fn cublaslt_beta_preserves_batched_broadcast_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite regression; run with cargo test -p luminal_cuda_lite -- --ignored"]
+fn cublaslt_layout_witnesses_are_consumer_demanded() {
+    let mut cx = Graph::new();
+
+    let a = cx.tensor((4usize, 5usize));
+    let b = cx.tensor((5usize, 6usize));
+    let sliced_c = cx.tensor((4usize, 9usize)).slice((0..4usize, 0..6usize));
+    (a.matmul(b) + sliced_c).output();
+
+    let batched_a = cx.tensor((2usize, 4usize, 5usize));
+    let batched_b = cx.tensor((2usize, 5usize, 6usize));
+    let batched_c = cx.tensor((2usize, 4usize, 6usize));
+    (batched_c * 0.5 + batched_a.matmul(batched_b) * 1.5).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+
+    assert_relation_facts_are_requested(
+        egraph,
+        "cublaslt_valid_leading_dimension",
+        "cublaslt_leading_dimension_request",
+    );
+    assert_relation_facts_are_requested(
+        egraph,
+        "cublaslt_exact_matrix_stride",
+        "cublaslt_matrix_stride_request",
+    );
+}
+
+#[test]
 fn cublaslt_epilogues_reject_permuted_output_layout() {
     let mut relu_cx = Graph::new();
     let a = relu_cx.tensor((4usize, 5usize));
@@ -3742,6 +3772,31 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
         .into_iter()
         .chain(op_ir_nodes(egraph, "cublaslt_scaled"))
         .collect()
+}
+
+fn assert_relation_facts_are_requested(
+    egraph: &SerializedEGraph,
+    proof_relation: &str,
+    request_relation: &str,
+) {
+    let relation_facts = |label: &str| {
+        egraph
+            .enodes
+            .values()
+            .filter_map(|(node_label, children)| (node_label == label).then_some(children.clone()))
+            .collect::<FxHashSet<_>>()
+    };
+    let proofs = relation_facts(proof_relation);
+    let requests = relation_facts(request_relation);
+
+    assert!(
+        !proofs.is_empty(),
+        "expected at least one {proof_relation} fact"
+    );
+    assert!(
+        proofs.is_subset(&requests),
+        "every {proof_relation} fact must have an identical {request_relation} tuple"
+    );
 }
 
 fn ir_class_has_op_kinds(egraph: &SerializedEGraph, kind_labels: &[&str]) -> bool {
