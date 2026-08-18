@@ -19,7 +19,7 @@ use petgraph::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     any::TypeId,
-    collections::hash_map::DefaultHasher,
+    collections::hash_map::{DefaultHasher, Entry},
     fmt::{Debug, Write as FmtWrite},
     hash::{Hash, Hasher},
     io::Write,
@@ -3869,7 +3869,6 @@ fn inline_static_loop_inputs(llir: &mut LLIRGraph) {
 #[derive(Clone)]
 struct MaterializeLoopRegion {
     iters: usize,
-    multiplier: usize,
 }
 
 #[derive(Clone)]
@@ -3901,50 +3900,58 @@ enum MaterializeLoopMarker {
     },
 }
 
-fn context_with_iteration(
-    context: usize,
-    region: usize,
-    iter: usize,
-    regions: &[MaterializeLoopRegion],
-) -> usize {
-    let descriptor = &regions[region];
-    let old_iter = (context / descriptor.multiplier) % descriptor.iters;
-    context - old_iter * descriptor.multiplier + iter * descriptor.multiplier
+struct MaterializeContextLayout {
+    membership: u128,
+    /// Region-local mixed-radix multipliers. Unlike the previous global
+    /// multiplier, this includes only loops that actually contain the node.
+    region_multipliers: Vec<(usize, usize)>,
+    count: usize,
 }
 
-fn canonical_materialize_context(
-    context: usize,
-    mut membership: u128,
-    regions: &[MaterializeLoopRegion],
-) -> usize {
-    let mut canonical = 0;
-    while membership != 0 {
-        let region = membership.trailing_zeros() as usize;
-        let descriptor = &regions[region];
-        canonical += ((context / descriptor.multiplier) % descriptor.iters) * descriptor.multiplier;
-        membership &= membership - 1;
+impl MaterializeContextLayout {
+    fn new(mut membership: u128, regions: &[MaterializeLoopRegion]) -> Option<Self> {
+        let original_membership = membership;
+        let mut region_multipliers = Vec::with_capacity(membership.count_ones() as usize);
+        let mut count = 1usize;
+        while membership != 0 {
+            let region = membership.trailing_zeros() as usize;
+            region_multipliers.push((region, count));
+            count = count.checked_mul(regions[region].iters)?;
+            membership &= membership - 1;
+        }
+        Some(Self {
+            membership: original_membership,
+            region_multipliers,
+            count,
+        })
     }
-    canonical
-}
 
-fn materialize_contexts(membership: u128, regions: &[MaterializeLoopRegion]) -> Vec<usize> {
-    let mut contexts = vec![0usize];
-    for (region, descriptor) in regions.iter().enumerate() {
-        if membership & (1u128 << region) == 0 {
-            continue;
-        }
-        let existing = contexts.clone();
-        contexts.clear();
-        contexts.reserve(existing.len() * descriptor.iters);
-        for iter in 0..descriptor.iters {
-            contexts.extend(
-                existing
-                    .iter()
-                    .map(|context| context + iter * descriptor.multiplier),
-            );
+    fn decode(&self, context: usize, regions: &[MaterializeLoopRegion], iterations: &mut [usize]) {
+        debug_assert!(context < self.count);
+        for &(region, multiplier) in &self.region_multipliers {
+            iterations[region] = (context / multiplier) % regions[region].iters;
         }
     }
-    contexts
+
+    fn encode(
+        &self,
+        assigned_membership: u128,
+        regions: &[MaterializeLoopRegion],
+        iterations: &[usize],
+    ) -> Option<usize> {
+        if self.membership & !assigned_membership != 0 {
+            return None;
+        }
+        let mut context = 0usize;
+        for &(region, multiplier) in &self.region_multipliers {
+            let iter = iterations[region];
+            if iter >= regions[region].iters {
+                return None;
+            }
+            context = context.checked_add(iter.checked_mul(multiplier)?)?;
+        }
+        Some(context)
+    }
 }
 
 struct MaterializeAdjacency {
@@ -4167,7 +4174,6 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
 
     let mut region_by_id: FxHashMap<usize, usize> = FxHashMap::default();
     let mut regions = Vec::with_capacity(loop_regions.len());
-    let mut context_count = 1usize;
     for (&loop_id, region) in &loop_regions {
         if region.iters <= 1 || region.starts.is_empty() {
             return None;
@@ -4175,9 +4181,7 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
         region_by_id.insert(loop_id, regions.len());
         regions.push(MaterializeLoopRegion {
             iters: region.iters,
-            multiplier: context_count,
         });
-        context_count = context_count.checked_mul(region.iters)?;
     }
 
     let mut marker_owner = vec![None; node_bound];
@@ -4284,24 +4288,35 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
         }
     }
 
-    let mut contexts_by_membership: FxHashMap<u128, Vec<usize>> = FxHashMap::default();
-    contexts_by_membership.insert(0, vec![0]);
+    // Nodes only need instances for the loops that contain them. Independent
+    // regions therefore remain independent instead of contributing to a
+    // graph-wide Cartesian product. A membership containing multiple regions
+    // represents genuine nesting, where the product is semantically required.
+    let mut contexts_by_membership: FxHashMap<u128, MaterializeContextLayout> =
+        FxHashMap::default();
+    contexts_by_membership.insert(0, MaterializeContextLayout::new(0, &regions)?);
+    let mut node_instance_offsets = vec![usize::MAX; node_bound];
     let mut final_node_count = 0usize;
     let mut final_edge_count = 0usize;
     for node in 0..node_bound {
         if llir.op(node).is_none() || markers[node].is_some() {
             continue;
         }
-        let contexts = contexts_by_membership
-            .entry(membership[node])
-            .or_insert_with(|| materialize_contexts(membership[node], &regions));
-        final_node_count += contexts.len();
-        final_edge_count += contexts.len() * llir.incoming(node).len();
+        let context_count = match contexts_by_membership.entry(membership[node]) {
+            Entry::Occupied(entry) => entry.get().count,
+            Entry::Vacant(entry) => {
+                entry
+                    .insert(MaterializeContextLayout::new(membership[node], &regions)?)
+                    .count
+            }
+        };
+        node_instance_offsets[node] = final_node_count;
+        final_node_count = final_node_count.checked_add(context_count)?;
+        final_edge_count =
+            final_edge_count.checked_add(context_count.checked_mul(llir.incoming(node).len())?)?;
     }
 
     let mut materialized = LLIRGraph::with_capacity(final_node_count, final_edge_count);
-    let map_len = node_bound.checked_mul(context_count)?;
-    let mut instance_map: Vec<Option<NodeIndex>> = vec![None; map_len];
 
     for node in 0..node_bound {
         let Some(op) = llir.op(node) else {
@@ -4310,22 +4325,29 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
         if markers[node].is_some() {
             continue;
         }
-        for &context in &contexts_by_membership[&membership[node]] {
+        let layout = &contexts_by_membership[&membership[node]];
+        for context in 0..layout.count {
             let materialized_node = materialized.add_node(op.clone());
-            instance_map[node * context_count + context] = Some(materialized_node);
+            debug_assert_eq!(
+                materialized_node.index(),
+                node_instance_offsets[node] + context
+            );
         }
     }
 
+    let mut context_iterations = vec![0usize; regions.len()];
     for node in 0..node_bound {
         if llir.op(node).is_none() || markers[node].is_some() {
             continue;
         }
         let node_membership = membership[node];
-        for &context in &contexts_by_membership[&node_membership] {
-            let target = instance_map[node * context_count + context]?;
+        let node_layout = &contexts_by_membership[&node_membership];
+        for context in 0..node_layout.count {
+            let target = NodeIndex::new(node_instance_offsets[node] + context);
             for &original_source in llir.incoming(node) {
+                node_layout.decode(context, &regions, &mut context_iterations);
+                let mut assigned_membership = node_membership;
                 let mut source = original_source;
-                let mut source_context = context;
                 let mut marker_hops = 0usize;
                 while let Some(marker) = markers[source].as_ref() {
                     marker_hops += 1;
@@ -4338,18 +4360,16 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
                             initial,
                             body_producer,
                         } => {
-                            let descriptor = &regions[*region];
-                            let iter = (source_context / descriptor.multiplier) % descriptor.iters;
+                            let region_bit = 1u128 << *region;
+                            if assigned_membership & region_bit == 0 {
+                                return None;
+                            }
+                            let iter = context_iterations[*region];
                             if iter == 0 {
                                 source = *initial;
                             } else {
                                 source = *body_producer;
-                                source_context = context_with_iteration(
-                                    source_context,
-                                    *region,
-                                    iter - 1,
-                                    &regions,
-                                );
+                                context_iterations[*region] = iter - 1;
                             }
                         }
                         MaterializeLoopMarker::End {
@@ -4357,17 +4377,15 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
                             body_producer,
                         } => {
                             source = *body_producer;
-                            source_context = context_with_iteration(
-                                source_context,
-                                *region,
-                                regions[*region].iters - 1,
-                                &regions,
-                            );
+                            assigned_membership |= 1u128 << *region;
+                            context_iterations[*region] = regions[*region].iters - 1;
                         }
                         MaterializeLoopMarker::Input { region, sources } => {
-                            let descriptor = &regions[*region];
-                            let iter = (source_context / descriptor.multiplier) % descriptor.iters;
-                            source = sources[iter];
+                            let region_bit = 1u128 << *region;
+                            if assigned_membership & region_bit == 0 {
+                                return None;
+                            }
+                            source = sources[context_iterations[*region]];
                         }
                         MaterializeLoopMarker::StaticInput {
                             source: static_source,
@@ -4379,10 +4397,11 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
                             body_producer,
                         } => {
                             source = *body_producer;
-                            let descriptor = &regions[*region];
-                            let iter = (source_context / descriptor.multiplier) % descriptor.iters;
-                            source_context =
-                                context_with_iteration(source_context, *region, iter, &regions);
+                            let region_bit = 1u128 << *region;
+                            if assigned_membership & region_bit == 0 {
+                                assigned_membership |= region_bit;
+                                context_iterations[*region] = 0;
+                            }
                         }
                         MaterializeLoopMarker::OutputSelect {
                             region,
@@ -4390,14 +4409,19 @@ fn materialize_unrolled_view(llir: &impl MaterializeLLIRView) -> Option<LLIRGrap
                             body_producer,
                         } => {
                             source = *body_producer;
-                            source_context =
-                                context_with_iteration(source_context, *region, *iter, &regions);
+                            assigned_membership |= 1u128 << *region;
+                            context_iterations[*region] = *iter;
                         }
                     }
                 }
+                if llir.op(source).is_none() || node_instance_offsets[source] == usize::MAX {
+                    return None;
+                }
+                let source_layout = contexts_by_membership.get(&membership[source])?;
                 let source_context =
-                    canonical_materialize_context(source_context, membership[source], &regions);
-                let materialized_source = instance_map[source * context_count + source_context]?;
+                    source_layout.encode(assigned_membership, &regions, &context_iterations)?;
+                let materialized_source =
+                    NodeIndex::new(node_instance_offsets[source] + source_context);
                 materialized.add_edge(materialized_source, target, ());
             }
         }
@@ -4651,7 +4675,7 @@ mod tests {
         api::{Rule, SortDef, sort},
         base::OP_KIND,
     };
-    use crate::hlir::{ReferenceData, ReferenceOp};
+    use crate::hlir::{Input, LoopEnd, LoopStart, Output, ReferenceData, ReferenceOp, Sin};
     use rand::SeedableRng;
 
     // A rolling candidate is only collapsible if every non-state boundary input
@@ -4688,6 +4712,54 @@ mod tests {
     }
     use crate::tests::{assert_close, random_vec};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn materialize_many_disjoint_loops_without_a_global_cartesian_product() {
+        const N_LOOPS: usize = 64;
+        let mut rolled = LLIRGraph::default();
+        for loop_id in 0..N_LOOPS {
+            let input = rolled.add_node(LLIROp::new::<Input>(Box::new(Input {
+                node: loop_id,
+                label: String::new(),
+                dtype: DType::F32,
+            })));
+            let start = rolled.add_node(LLIROp::new::<LoopStart>(Box::new(LoopStart {
+                loop_id,
+                slot_idx: 0,
+                iters: Expression::from(2),
+                dtype: DType::F32,
+            })));
+            let body = rolled.add_node(LLIROp::new::<dyn ReferenceOp>(
+                Box::new(Sin::default()) as Box<dyn ReferenceOp>
+            ));
+            let end = rolled.add_node(LLIROp::new::<LoopEnd>(Box::new(LoopEnd {
+                loop_id,
+                slot_idx: 0,
+                dtype: DType::F32,
+            })));
+            let output = rolled.add_node(LLIROp::new::<Output>(Box::new(Output {
+                node: loop_id,
+                persist_only: false,
+            })));
+            rolled.add_edge(input, start, ());
+            rolled.add_edge(start, body, ());
+            rolled.add_edge(body, end, ());
+            rolled.add_edge(end, output, ());
+        }
+
+        let materialized = materialize_unrolled_llir(&rolled)
+            .expect("independent loop regions must not multiply one another's contexts");
+
+        // Per region: one input + two body instances + one output, connected
+        // as a three-edge chain. A global product would overflow at 2^64.
+        assert_eq!(materialized.node_count(), N_LOOPS * 4);
+        assert_eq!(materialized.edge_count(), N_LOOPS * 3);
+        assert!(
+            materialized
+                .node_weights()
+                .all(|op| { op.to_op::<LoopStart>().is_none() && op.to_op::<LoopEnd>().is_none() })
+        );
+    }
 
     static SEARCH_DIM_LATE_PASS_CALLED: AtomicBool = AtomicBool::new(false);
     static SEARCH_DIM_LATE_PASS_SAW_C: AtomicBool = AtomicBool::new(false);
