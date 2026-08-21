@@ -1882,3 +1882,98 @@ fn test_gather_preserves_data_dtype() {
 
     assert_close(&rt.get_f32(out), &[2.5], 0.001);
 }
+
+/// Run `f` on both the Metal and reference runtimes over the same input and
+/// return `(metal, reference)` outputs.
+fn metal_and_reference(
+    build: impl Fn(&mut Graph) -> (GraphTensor, GraphTensor),
+    input: &[f32],
+) -> (Vec<f32>, Vec<f32>) {
+    let mut cx = Graph::default();
+    let (a, output) = build(&mut cx);
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let mut metal = MetalRuntime::initialize(());
+    metal.set_data(a, input);
+    let mut metal = cx.search(metal, CompileOptions::default().search_graph_limit(5));
+    metal.allocate_intermediate_buffers(&cx.dyn_map);
+    metal.execute(&cx.dyn_map);
+    let metal_out = metal.get_f32(output);
+
+    let mut cx = Graph::default();
+    let (a, output) = build(&mut cx);
+    cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    let mut reference = cx.search(
+        ReferenceRuntime::default(),
+        CompileOptions::default().search_graph_limit(1),
+    );
+    reference.set_data(a.id, input.to_vec());
+    reference.execute(&cx.dyn_map);
+    let reference_out = reference.get_f32(output).to_vec();
+
+    (metal_out, reference_out)
+}
+
+/// Bit-exact comparison, so NaN matches NaN and the two infinities stay
+/// distinct. `assert_close` cannot express this: every comparison against a
+/// NaN is false, so a NaN mismatch would pass silently.
+fn assert_bit_equal(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "length mismatch");
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            e.to_bits(),
+            "index {i}: got {a} (0x{:08x}), expected {e} (0x{:08x})",
+            a.to_bits(),
+            e.to_bits()
+        );
+    }
+}
+
+#[test]
+fn metal_constant_reproduces_every_f32_bit_pattern() {
+    // Spans the classes decimal formatting could not render: both infinities,
+    // a NaN, both zeros, and a subnormal — plus ordinary finite values.
+    const VALUES: [f32; 10] = [
+        f32::NEG_INFINITY,
+        f32::INFINITY,
+        f32::NAN,
+        0.0,
+        -0.0,
+        f32::MIN_POSITIVE,
+        -1.0,
+        3.5,
+        1e-8,
+        f32::MAX,
+    ];
+    let input = [1.0f32, 2.0, 3.0, 4.0];
+
+    for value in VALUES {
+        let (metal, reference) = metal_and_reference(
+            |cx| {
+                let a = cx.tensor(4);
+                (a, (a * value).output())
+            },
+            &input,
+        );
+        assert_bit_equal(&metal, &reference);
+    }
+}
+
+#[test]
+fn metal_constant_negative_infinity_mask_matches_reference() {
+    // The shape an attention mask takes: adding -inf drives masked positions to
+    // -inf, and softmax over them must agree with the reference backend.
+    let input = [1.0f32, 2.0, 3.0, 4.0];
+    let (metal, reference) = metal_and_reference(
+        |cx| {
+            let a = cx.tensor(4);
+            (a, (a + f32::NEG_INFINITY).output())
+        },
+        &input,
+    );
+    assert_bit_equal(&metal, &reference);
+    assert!(
+        metal.iter().all(|v| *v == f32::NEG_INFINITY),
+        "expected all -inf, got {metal:?}"
+    );
+}

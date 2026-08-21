@@ -2785,12 +2785,14 @@ impl MetalKernelOp for MetalConstant {
         _input_dtypes: &[DType],
         _output_dtype: DType,
     ) -> Option<ComputePipelineState> {
-        // Ensure value is formatted with decimal point for Metal (e.g., -1.0f not -1f)
-        let value_str = if self.value.fract() == 0.0 {
-            format!("{:.1}", self.value)
-        } else {
-            format!("{}", self.value)
-        };
+        // Emit the constant by its f32 bit pattern rather than as a decimal
+        // literal. Decimal formatting is not total over f32: `Display` renders
+        // the infinities as `inf` and NaNs as `NaN`, which with the `f` literal
+        // suffix produced `-inff` / `NaNf` and failed MSL compilation. Round-
+        // tripping the bits reproduces every f32 exactly, including the
+        // non-finite ones, with no value-dependent branch.
+        let value_bits = self.value.to_bits();
+        let value_str = format!("as_type<float>(0x{value_bits:08x}u)");
 
         let source = format!(
             r#"
@@ -2803,7 +2805,7 @@ impl MetalKernelOp for MetalConstant {
                 uint idx [[thread_position_in_grid]]
             ) {{
                 if (idx == 0) {{
-                    out[0] = {value}f;
+                    out[0] = {value};
                 }}
             }}
             "#,
