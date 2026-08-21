@@ -103,7 +103,10 @@ impl<'a> Translator<'a> {
             // Unary ops
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
             "torch.ops.aten.exp.default" => self.translate_exp(node)?,
+            "torch.ops.aten.expm1.default" => self.translate_expm1(node)?,
             "torch.ops.aten.sin.default" => self.translate_unary_op(node, |a| a.sin())?,
+            "torch.ops.aten.sinh.default" => self.translate_sinh(node)?,
+            "torch.ops.aten.tan.default" => self.translate_tan(node)?,
             "torch.ops.aten.cos.default" => self.translate_cos(node)?,
             "torch.ops.aten.acos.default" => self.translate_acos(node)?,
             "torch.ops.aten.acosh.default" => self.translate_acosh(node)?,
@@ -127,8 +130,13 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.gelu.default" => self.translate_gelu(node)?,
             "torch.ops.aten.abs.default" => self.translate_unary_op(node, |a| a.abs())?,
             "torch.ops.aten.log.default" => self.translate_unary_op(node, |a| a.log())?,
+            "torch.ops.aten.log1p.default" => self.translate_log1p(node)?,
             "torch.ops.aten.log2.default" => self.translate_unary_op(node, |a| a.log2())?,
+            "torch.ops.aten.log10.default" => self.translate_log10(node)?,
             "torch.ops.aten.exp2.default" => self.translate_unary_op(node, |a| a.exp2())?,
+            "torch.ops.aten.angle.default" => self.translate_angle(node)?,
+            "torch.ops.aten.isinf.default" => self.translate_isinf(node)?,
+            "torch.ops.aten.ldexp.Tensor" => self.translate_ldexp(node)?,
             "torch.ops.aten.sign.default" => self.translate_sign(node)?,
             "torch.ops.aten.bitwise_not.default" => self.translate_bitwise_not(node)?,
 
@@ -140,9 +148,22 @@ impl<'a> Translator<'a> {
 
             // Shape ops
             "torch.ops.aten.view.default" => self.translate_reshape(node)?,
+            "torch.ops.aten.view_copy.default" => {
+                let value = self.translate_reshape(node)?;
+                super::movement::materialize_tensor(value)
+            }
             "torch.ops.aten.upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
             "torch.ops.aten.repeat.default" => self.translate_repeat(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
+            "torch.ops.aten.permute_copy.default" => {
+                let value = self.translate_permute(node)?;
+                super::movement::materialize_tensor(value)
+            }
+            "torch.ops.aten.narrow_copy.default" => self.translate_narrow_copy(node)?,
+            "torch.ops.aten.unbind_copy.int" => {
+                self.translate_unbind_copy(node)?;
+                return Ok(());
+            }
             "torch.ops.aten.flip.default" => self.translate_flip(node)?,
             "torch.ops.aten.diagonal.default" => self.translate_diagonal(node)?,
             "torch.ops.aten.diagonal_scatter.default" => self.translate_diagonal_scatter(node)?,
@@ -211,6 +232,21 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.sum.dim_IntList" => self.translate_reduction(node, ReductionOp::Sum)?,
             "torch.ops.aten.mean.dim" => self.translate_reduction(node, ReductionOp::Mean)?,
             "torch.ops.aten.amax.default" => self.translate_reduction(node, ReductionOp::Max)?,
+            "torch.ops.aten.linalg_vector_norm.default" => {
+                self.translate_linalg_vector_norm(node)?
+            }
+            "torch.ops.aten.var.default"
+            | "torch.ops.aten.var.dim"
+            | "torch.ops.aten.var.correction" => self.translate_var(node)?,
+            "torch.ops.aten.var_mean.default"
+            | "torch.ops.aten.var_mean.dim"
+            | "torch.ops.aten.var_mean.correction" => {
+                self.translate_var_mean(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.any.default" | "torch.ops.aten.any.dim" | "torch.ops.aten.any.dims" => {
+                self.translate_any(node)?
+            }
 
             // Slice/index ops
             "torch.ops.aten.slice.Tensor" => self.translate_slice(node)?,
@@ -228,6 +264,7 @@ impl<'a> Translator<'a> {
                 let dim = normalize_dim(dim, a.shape.len());
                 a.softmax(dim)
             }
+            "torch.ops.aten._log_softmax.default" => self.translate_log_softmax(node)?,
 
             // LayerNorm
             "torch.ops.aten.native_layer_norm.default" => self.translate_layer_norm(node)?,
@@ -510,6 +547,11 @@ impl<'a> Translator<'a> {
             // Scatter ops
             "torch.ops.aten.scatter.src" => self.translate_scatter_src(node)?,
             "torch.ops.aten.scatter.value" => self.translate_scatter_value(node)?,
+            "torch.ops.aten.scatter.reduce" => self.translate_scatter_src_reduce(node)?,
+            "torch.ops.aten.scatter.value_reduce" => self.translate_scatter_value_reduce(node)?,
+            "torch.ops.aten.scatter_add.default" => self.translate_scatter_add(node)?,
+            "torch.ops.aten.scatter_reduce.two" => self.translate_scatter_reduce(node)?,
+            "torch.ops.aten.index_reduce.default" => self.translate_index_reduce(node)?,
             "torch.ops.aten.index_put_.default" | "torch.ops.aten.index_put.default" => {
                 self.translate_index_put(node)?
             }
@@ -528,7 +570,7 @@ impl<'a> Translator<'a> {
             }
 
             // Sort — handles its own output storage, returns early
-            "torch.ops.aten.sort.default" => {
+            "torch.ops.aten.sort.default" | "torch.ops.aten.sort.stable" => {
                 self.translate_sort(node)?;
                 return Ok(());
             }
@@ -553,6 +595,14 @@ impl<'a> Translator<'a> {
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
                 a % b
+            }
+            "torch.ops.aten.fmod.Scalar" => {
+                let a = self.get_input_tensor(node, 0)?;
+                let value = self.constructor_scalar_arg(node, 1)?;
+                let scalar = self
+                    .typed_scalar_constant(&value, a.dtype)?
+                    .expand_rhs(a.shape);
+                a % scalar
             }
             // Remainder (Python-style modulo). For float tensors aten.remainder
             // returns the same value as `%` would in luminal (Mod follows the

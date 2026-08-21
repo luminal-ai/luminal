@@ -23,6 +23,12 @@ use luminal::prelude::*;
 
 use crate::dim_arith::product_of_dims;
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ScatterReduction {
+    Add,
+    Multiply,
+}
+
 /// Row-major strides as `Expression`s. `stride[i] = prod(dims[i+1..])`.
 pub(super) fn row_major_strides(dims: &[Expression]) -> Vec<Expression> {
     let rank = dims.len();
@@ -146,10 +152,9 @@ pub fn pt2_index_select(
 
 /// Translator-local `scatter_elements` that accepts symbolic shape dims.
 /// Same semantics as `GraphTensor::scatter_elements`.
-pub fn pt2_scatter_elements(
+pub(super) fn pt2_scatter_element_indices(
     data: GraphTensor,
     indices: GraphTensor,
-    updates: GraphTensor,
     axis: usize,
 ) -> GraphTensor {
     let data_dims = data.dims();
@@ -165,7 +170,17 @@ pub fn pt2_scatter_elements(
         .expand_rhs(idx_normalized.shape);
     let flat_dest = non_axis_flat + idx_normalized * stride_tensor;
 
-    let flat_dest_1d = flat_dest.flatten();
+    flat_dest.flatten()
+}
+
+pub fn pt2_scatter_elements(
+    data: GraphTensor,
+    indices: GraphTensor,
+    updates: GraphTensor,
+    axis: usize,
+) -> GraphTensor {
+    let data_dims = data.dims();
+    let flat_dest_1d = pt2_scatter_element_indices(data, indices, axis);
     let flat_updates = updates.flatten();
     let flat_data = data.flatten();
 
@@ -176,6 +191,62 @@ pub fn pt2_scatter_elements(
     let mut result = output_flat;
     result.shape = ShapeTracker::new(data_dims);
     result
+}
+
+/// Scatter with accumulation for ATen's legacy `reduce=` overloads and
+/// `scatter_add`. Core Scatter intentionally implements overwrite/last-write
+/// semantics, so duplicate destinations must be combined before each write.
+///
+/// The update extent controls how many dependent read-modify-write steps the
+/// graph contains and therefore must be concrete at translation time. This is
+/// an explicit graph-topology restriction, not a layout assumption; every
+/// rank, axis, negative index, and duplicate pattern is otherwise handled.
+pub(super) fn pt2_scatter_elements_reduce(
+    data: GraphTensor,
+    indices: GraphTensor,
+    updates: GraphTensor,
+    axis: usize,
+    reduction: ScatterReduction,
+) -> anyhow::Result<GraphTensor> {
+    anyhow::ensure!(
+        indices.shape.len() == updates.shape.len(),
+        "scatter reduction requires index/update ranks to match, got {} and {}",
+        indices.shape.len(),
+        updates.shape.len()
+    );
+    let index_shape = indices.dims();
+    let update_shape = updates.dims();
+    anyhow::ensure!(
+        index_shape
+            .iter()
+            .zip(&update_shape)
+            .all(|(index, update)| index == update || index.egglog_equal(*update)),
+        "scatter reduction currently requires index and update shapes to match"
+    );
+    let update_count = product_of_dims(index_shape.iter().copied())
+        .to_usize()
+        .ok_or_else(|| {
+            anyhow::anyhow!("scatter reduction requires a concrete update element count")
+        })?;
+
+    let flat_destinations = pt2_scatter_element_indices(data, indices, axis);
+    let flat_updates = updates.flatten();
+    let output_shape = data.dims();
+    let mut output = data.flatten();
+
+    for index in 0..update_count {
+        let destination = flat_destinations.slice_along(index..index + 1, 0);
+        let update = flat_updates.slice_along(index..index + 1, 0);
+        let current = output.gather(destination);
+        let combined = match reduction {
+            ScatterReduction::Add => current + update,
+            ScatterReduction::Multiply => current * update,
+        };
+        output = combined.scatter(destination, output);
+    }
+
+    output.shape = ShapeTracker::new(output_shape);
+    Ok(output)
 }
 
 /// Translator-local `scatter_nd` that accepts symbolic shape dims.

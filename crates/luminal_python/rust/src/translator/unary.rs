@@ -144,6 +144,76 @@ impl<'a> Translator<'a> {
         (input * log2_e).exp2()
     }
 
+    pub(crate) fn translate_expm1(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let one = self.constant_like(input, 1.0);
+        Ok(self.real_exp(input) - one)
+    }
+
+    pub(crate) fn translate_log1p(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let one = self.constant_like(input, 1.0);
+        Ok((input + one).log())
+    }
+
+    pub(crate) fn translate_log10(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let ln_ten = self.constant_like(input, std::f64::consts::LN_10);
+        Ok(input.log() / ln_ten)
+    }
+
+    pub(crate) fn translate_sinh(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let output_dtype = input.dtype;
+        let opmath = if matches!(output_dtype, DType::F16 | DType::Bf16) {
+            input.cast(DType::F32)
+        } else {
+            input
+        };
+        Ok(self.real_sinh(opmath).cast(output_dtype))
+    }
+
+    pub(crate) fn real_tan(&mut self, input: GraphTensor) -> GraphTensor {
+        let cosine = self.real_cos(input);
+        input.sin() / cosine
+    }
+
+    pub(crate) fn translate_tan(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_tan(input))
+    }
+
+    pub(crate) fn translate_angle(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let zero = self.constant_like(input, 0.0);
+        Ok(self.real_atan2(zero, input))
+    }
+
+    pub(crate) fn translate_isinf(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        if matches!(
+            input.dtype,
+            DType::F16 | DType::Bf16 | DType::F32 | DType::F64
+        ) {
+            Ok(self.is_inf(input))
+        } else {
+            Ok(self
+                .graph
+                .constant(0)
+                .cast(DType::Bool)
+                .expand_rhs(input.shape))
+        }
+    }
+
+    pub(crate) fn translate_ldexp(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
+        let exponent = self.get_input_tensor(node, 1)?.cast(input.dtype);
+        let (input, exponent) = broadcast_binary(input, exponent);
+        Ok(input * exponent.exp2())
+    }
+
     pub(crate) fn translate_cos(&mut self, node: &Node) -> Result<GraphTensor> {
         let input = self.unary_input(node)?;
         Ok(self.real_cos(input))

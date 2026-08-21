@@ -64,18 +64,28 @@ impl<'a> Translator<'a> {
 
     fn promoted_binary_inputs(&mut self, node: &Node) -> Result<(GraphTensor, GraphTensor)> {
         let dtype = self.output_meta_dtype(node)?;
-        let mut a = self.get_input_tensor(node, 0)?.cast(dtype);
-        let mut b = if let Some(name) = node.inputs[1].arg.as_tensor_name() {
-            self.get_tensor(name)?.cast(dtype)
-        } else {
-            let value = node.inputs[1]
+        let mut operand = |index: usize| -> Result<GraphTensor> {
+            if let Some(name) = node.inputs[index].arg.as_tensor_name() {
+                return Ok(self.get_tensor(name)?.cast(dtype));
+            }
+            let value = node.inputs[index]
                 .arg
                 .as_int()
                 .map(|value| value as f64)
-                .or_else(|| node.inputs[1].arg.as_float())
-                .ok_or_else(|| anyhow::anyhow!("{} requires a numeric RHS", node.target))?;
-            self.scalar_constant(value, dtype)
+                .or_else(|| node.inputs[index].arg.as_float())
+                .or_else(|| {
+                    node.inputs[index]
+                        .arg
+                        .as_bool()
+                        .map(|value| if value { 1.0 } else { 0.0 })
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{} input {index} must be tensor or numeric", node.target)
+                })?;
+            Ok(self.scalar_constant(value, dtype))
         };
+        let mut a = operand(0)?;
+        let mut b = operand(1)?;
         (a, b) = broadcast_binary(a, b);
 
         let sym_ranges = sym_char_ranges(&self.sym_map);
@@ -199,6 +209,27 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_binary_op(&mut self, node: &Node, op: BinaryOp) -> Result<GraphTensor> {
+        if node.inputs[0].arg.as_tensor_name().is_none() {
+            let alpha = self.get_explicit_alpha(node, op)?;
+            let (a, mut b) = self.promoted_binary_inputs(node)?;
+            let is_bool_add = matches!(op, BinaryOp::Add) && a.dtype == DType::Bool;
+            if !is_bool_add && let Some(alpha) = alpha {
+                b = self.apply_scalar_op(b, alpha, BinaryOp::Mul);
+            }
+            if is_bool_add {
+                return Ok(if alpha == Some(0.0) {
+                    a
+                } else {
+                    self.apply_bool_or(a, b)
+                });
+            }
+            return Ok(match op {
+                BinaryOp::Add => a + b,
+                BinaryOp::Mul => a * b,
+                BinaryOp::Sub => a - b,
+                BinaryOp::Div => a / b,
+            });
+        }
         let a = self.get_input_tensor(node, 0)?;
         let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;

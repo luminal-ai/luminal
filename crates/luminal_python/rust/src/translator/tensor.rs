@@ -19,8 +19,6 @@ const TOPK_K_ARG: usize = 1;
 const TOPK_DIM_ARG: usize = 2;
 
 const SORT_INPUT_ARG: usize = 0;
-const SORT_DIM_ARG: usize = 1;
-const SORT_DESCENDING_ARG: usize = 2;
 
 const WHERE_COND_ARG: usize = 0;
 const WHERE_X_ARG: usize = 1;
@@ -755,32 +753,46 @@ impl<'a> Translator<'a> {
 
     pub(crate) fn translate_sort(&mut self, node: &Node) -> Result<()> {
         let a = self.get_input_tensor(node, SORT_INPUT_ARG)?;
-        let dim = if node.inputs.len() > SORT_DIM_ARG {
-            self.get_int_arg(node, SORT_DIM_ARG).unwrap_or(-1)
-        } else {
-            -1
-        };
-        let descending = if node.inputs.len() > SORT_DESCENDING_ARG {
-            self.get_bool_arg(node, SORT_DESCENDING_ARG)
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        // `sort.stable` inserts a keyword-only `stable` argument before dim,
+        // so resolve these by schema name rather than by overload-dependent
+        // position. `stable_argsort` is stable regardless; `stable=None` and
+        // `stable=false` permit stability but do not require instability.
+        let dim = node
+            .inputs
+            .iter()
+            .position(|input| input.name == "dim")
+            .and_then(|index| self.get_int_arg(node, index).ok())
+            .unwrap_or(-1);
+        let descending = node
+            .inputs
+            .iter()
+            .position(|input| input.name == "descending")
+            .and_then(|index| self.get_bool_arg(node, index).ok())
+            .unwrap_or(false);
         let dim = normalize_dim(dim, a.shape.len());
 
         // Determine output names (sort returns (values, indices))
-        let values_name = node
+        let tuple_outputs = node
             .outputs
             .first()
-            .and_then(|o| o.as_tensor.as_ref().map(|t| t.name.clone()));
-        let indices_name =
-            if let Some(ts) = node.outputs.first().and_then(|o| o.as_tensors.as_ref()) {
-                ts.get(1).map(|t| t.name.clone())
-            } else if node.outputs.len() > 1 {
-                node.outputs[1].as_tensor.as_ref().map(|t| t.name.clone())
-            } else {
-                None
-            };
+            .and_then(|output| output.as_tensors.as_ref());
+        let values_name = if let Some(outputs) = tuple_outputs {
+            outputs.first().map(|tensor| tensor.name.clone())
+        } else {
+            node.outputs
+                .first()
+                .and_then(|output| output.as_tensor.as_ref().map(|tensor| tensor.name.clone()))
+        };
+        let indices_name = if let Some(outputs) = tuple_outputs {
+            outputs.get(1).map(|tensor| tensor.name.clone())
+        } else if node.outputs.len() > 1 {
+            node.outputs[1]
+                .as_tensor
+                .as_ref()
+                .map(|tensor| tensor.name.clone())
+        } else {
+            None
+        };
 
         let full_argsort = a.stable_argsort(dim, descending);
 

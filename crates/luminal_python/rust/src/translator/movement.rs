@@ -2,18 +2,29 @@ use anyhow::{Context, Result, bail};
 use luminal::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::pt2_expr::{ExprBounds, canonical_equal_expr, sym_char_ranges};
+use crate::dim_arith::product_of_dims;
+use crate::pt2_expr::{ExprBounds, bounds_of_expr, canonical_equal_expr, sym_char_ranges};
 use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
 use super::Translator;
 
+use super::movement_dynamic::ScatterReduction;
 use super::movement_dynamic::{logical_flat_indices, row_major_strides};
 
 const SCATTER_INPUT_ARG: usize = 0;
 const SCATTER_DIM_ARG: usize = 1;
 const SCATTER_INDEX_ARG: usize = 2;
 const SCATTER_VALUE_ARG: usize = 3;
+
+#[derive(Clone, Copy, Debug)]
+enum ModernScatterReduction {
+    Sum,
+    Product,
+    Mean,
+    Maximum,
+    Minimum,
+}
 
 pub(crate) fn normalize_flip_dims(dims: &[i64], rank: usize) -> Result<Vec<usize>> {
     let mut normalized = Vec::with_capacity(dims.len());
@@ -198,6 +209,26 @@ pub(crate) fn unfold_tensor(
     Ok(result)
 }
 
+pub(crate) fn narrow_copy_tensor(
+    input: GraphTensor,
+    dim: usize,
+    start: Expression,
+    length: Expression,
+) -> Result<GraphTensor> {
+    let start = normalize_slice_bound(start, input.shape.dims[dim]);
+    let end = (start + length).simplify();
+    Ok(materialize_tensor(input.slice_along(start..end, dim)))
+}
+
+pub(crate) fn materialize_tensor(input: GraphTensor) -> GraphTensor {
+    // Copy variants require fresh logical storage even when a sliced view has
+    // contiguous strides. A stride-only check cannot distinguish such a view
+    // from a full allocation, and returning its backing op would expose all
+    // source elements at the PT2 output boundary.
+    let indices = input.graph().iota(Expression::from('z'), input.dims());
+    input.gather(indices)
+}
+
 fn normalize_concat_dims(
     lhs: &mut GraphTensor,
     rhs: &mut GraphTensor,
@@ -379,6 +410,66 @@ impl<'a> Translator<'a> {
             .map(|&d| normalize_dim(d, a.shape.len()))
             .collect();
         Ok(a.permute(axes))
+    }
+
+    pub(crate) fn translate_narrow_copy(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let raw_dim = self.get_int_arg(node, 1)?;
+        anyhow::ensure!(
+            raw_dim >= -(input.shape.len() as i64) && raw_dim < input.shape.len() as i64,
+            "narrow_copy dimension {raw_dim} out of range for rank {}",
+            input.shape.len()
+        );
+        let dim = normalize_dim(raw_dim, input.shape.len());
+        let start = self.get_expr_arg(node, 2)?;
+        let length = self.get_expr_arg(node, 3)?;
+        narrow_copy_tensor(input, dim, start, length)
+    }
+
+    pub(crate) fn translate_unbind_copy(&mut self, node: &Node) -> Result<()> {
+        let input = self.get_input_tensor(node, 0)?;
+        let raw_dim = self.get_int_arg(node, 1).unwrap_or(0);
+        anyhow::ensure!(
+            raw_dim >= -(input.shape.len() as i64) && raw_dim < input.shape.len() as i64,
+            "unbind_copy dimension {raw_dim} out of range for rank {}",
+            input.shape.len()
+        );
+        let dim = normalize_dim(raw_dim, input.shape.len());
+        let output_names: Vec<String> = node
+            .outputs
+            .iter()
+            .flat_map(|output| {
+                output
+                    .as_tensors
+                    .as_ref()
+                    .map(|tensors| {
+                        tensors
+                            .iter()
+                            .map(|tensor| tensor.name.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .or_else(|| {
+                        output
+                            .as_tensor
+                            .as_ref()
+                            .map(|tensor| vec![tensor.name.clone()])
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        let axis_size = input.shape.dims[dim]
+            .to_usize()
+            .context("unbind_copy requires a concrete unbound dimension")?;
+        anyhow::ensure!(
+            output_names.len() == axis_size,
+            "unbind_copy produced {} outputs for an axis of size {axis_size}",
+            output_names.len()
+        );
+        for (index, name) in output_names.into_iter().enumerate() {
+            let selected = input.slice_along(index..index + 1, dim).squeeze(dim);
+            self.tensors.insert(name, materialize_tensor(selected));
+        }
+        Ok(())
     }
 
     pub(crate) fn translate_flip(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -864,32 +955,427 @@ impl<'a> Translator<'a> {
         ))
     }
 
-    pub(crate) fn translate_scatter_value(&mut self, node: &Node) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
-        let dim = self.get_int_arg(node, SCATTER_DIM_ARG)?;
-        let dim = normalize_dim(dim, a.shape.len());
+    fn scatter_reduction(&self, node: &Node) -> Result<ScatterReduction> {
+        let reduce = node
+            .inputs
+            .iter()
+            .find(|input| input.name == "reduce")
+            .and_then(|input| match &input.arg {
+                Argument::Other(value) => value
+                    .as_str()
+                    .or_else(|| value.get("as_string").and_then(|value| value.as_str())),
+                _ => None,
+            })
+            .with_context(|| format!("{} is missing its reduce argument", node.target))?;
+        match reduce {
+            "add" | "sum" => Ok(ScatterReduction::Add),
+            "multiply" | "prod" => Ok(ScatterReduction::Multiply),
+            other => bail!("Unsupported scatter reduction: {other}"),
+        }
+    }
+
+    pub(crate) fn translate_scatter_src_reduce(&mut self, node: &Node) -> Result<GraphTensor> {
+        let data = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let dim = normalize_dim(self.get_int_arg(node, SCATTER_DIM_ARG)?, data.shape.len());
         let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let updates = self.get_input_tensor(node, SCATTER_VALUE_ARG)?;
+        super::movement_dynamic::pt2_scatter_elements_reduce(
+            data,
+            indices.cast(DType::Int),
+            updates,
+            dim,
+            self.scatter_reduction(node)?,
+        )
+    }
+
+    pub(crate) fn translate_scatter_add(&mut self, node: &Node) -> Result<GraphTensor> {
+        let data = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let dim = normalize_dim(self.get_int_arg(node, SCATTER_DIM_ARG)?, data.shape.len());
+        let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let updates = self.get_input_tensor(node, SCATTER_VALUE_ARG)?;
+        super::movement_dynamic::pt2_scatter_elements_reduce(
+            data,
+            indices.cast(DType::Int),
+            updates,
+            dim,
+            ScatterReduction::Add,
+        )
+    }
+
+    fn modern_scatter_reduction(&self, node: &Node) -> Result<ModernScatterReduction> {
+        let reduce = node
+            .inputs
+            .iter()
+            .find(|input| input.name == "reduce")
+            .and_then(|input| match &input.arg {
+                Argument::Other(value) => value
+                    .as_str()
+                    .or_else(|| value.get("as_string").and_then(|value| value.as_str())),
+                _ => None,
+            })
+            .with_context(|| format!("{} is missing its reduce argument", node.target))?;
+        match reduce {
+            "sum" => Ok(ModernScatterReduction::Sum),
+            "prod" => Ok(ModernScatterReduction::Product),
+            "mean" => Ok(ModernScatterReduction::Mean),
+            "amax" => Ok(ModernScatterReduction::Maximum),
+            "amin" => Ok(ModernScatterReduction::Minimum),
+            other => bail!("Unsupported {} reduction: {other}", node.target),
+        }
+    }
+
+    fn scatter_include_self(&self, node: &Node) -> bool {
+        node.inputs
+            .iter()
+            .position(|input| input.name == "include_self")
+            .and_then(|index| self.get_bool_arg(node, index).ok())
+            .unwrap_or(true)
+    }
+
+    fn scatter_extremum(
+        &mut self,
+        current: GraphTensor,
+        incoming: GraphTensor,
+        maximum: bool,
+    ) -> GraphTensor {
+        let ordered = if maximum {
+            self.select(current.ge(incoming), current, incoming)
+        } else {
+            self.select(current.le(incoming), current, incoming)
+        };
+        // ATen propagates NaNs for amax/amin. Comparisons alone would select
+        // whichever ordered arm happens to be the non-NaN value.
+        let can_nan = matches!(
+            current.dtype,
+            DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
+        );
+        if can_nan {
+            let current_nan = self.is_nan(current);
+            let incoming_nan = self.is_nan(incoming);
+            let current_or_ordered = self.select(current_nan, current, ordered);
+            self.select(incoming_nan, incoming, current_or_ordered)
+        } else {
+            ordered
+        }
+    }
+
+    /// Sequential read/modify/write lowering shared by scatter_reduce and
+    /// index_reduce. Core Scatter is overwrite-only, so preserving duplicate
+    /// update order requires one static graph step per update element. A
+    /// bounded symbolic update stream is padded to its compile-time upper
+    /// bound; validity guards make those padding lanes no-ops at runtime.
+    fn reduce_scatter_elements(
+        &mut self,
+        data: GraphTensor,
+        indices: GraphTensor,
+        updates: GraphTensor,
+        axis: usize,
+        reduction: ModernScatterReduction,
+        include_self: bool,
+    ) -> Result<GraphTensor> {
+        anyhow::ensure!(
+            indices.shape.len() == updates.shape.len(),
+            "{} reduction requires index/update ranks to match",
+            if include_self { "scatter" } else { "indexed" }
+        );
+        let index_shape = indices.dims();
+        anyhow::ensure!(
+            index_shape
+                .iter()
+                .zip(updates.dims())
+                .all(|(index, update)| index == &update || index.egglog_equal(update)),
+            "scatter reduction requires index and update shapes to match"
+        );
+        let logical_update_count = product_of_dims(index_shape.iter().copied());
+        let update_count = match logical_update_count.to_usize() {
+            Some(count) => count,
+            None => {
+                let ranges = sym_char_ranges(&self.sym_map);
+                let upper = bounds_of_expr(logical_update_count, &ranges)
+                    .max
+                    .context("scatter/index reduction requires a bounded update extent")?;
+                usize::try_from(upper)
+                    .context("scatter/index reduction update bound must fit usize")?
+            }
+        };
+
+        let mut destinations = super::movement_dynamic::pt2_scatter_element_indices(
+            data,
+            indices.cast(DType::Int),
+            axis,
+        );
+        let mut flat_updates = updates.flatten();
+        let mut valid_updates = None;
+        if logical_update_count.to_usize().is_none() {
+            let right_padding = Expression::from(update_count) - logical_update_count;
+            destinations = destinations.pad_with(
+                &[(Expression::from(0), right_padding)],
+                self.graph.constant(0),
+            );
+            flat_updates = flat_updates.pad_with(
+                &[(Expression::from(0), right_padding)],
+                self.graph.constant(0).cast(updates.dtype),
+            );
+            let valid = self.graph.iota(1, vec![logical_update_count]).pad_with(
+                &[(Expression::from(0), right_padding)],
+                self.graph.constant(0),
+            );
+            let padded_shape = ShapeTracker::new(vec![Expression::from(update_count)]);
+            destinations.shape = padded_shape;
+            flat_updates.shape = padded_shape;
+            let mut valid = valid;
+            valid.shape = padded_shape;
+            valid_updates = Some(valid);
+        }
+        let output_shape = data.dims();
+        let original = data.flatten();
+        let mut output = original;
+        let mut counts = self
+            .graph
+            .iota(if include_self { 1 } else { 0 }, output_shape.clone())
+            .cast(DType::Int)
+            .flatten();
+
+        for index in 0..update_count {
+            let destination = destinations.slice_along(index..index + 1, 0);
+            let incoming = flat_updates.slice_along(index..index + 1, 0);
+            let current = output.gather(destination);
+            let current_count = counts.gather(destination);
+            let zero_count = self.graph.constant(0).expand_rhs(current_count.shape);
+            let first_update = current_count.eq(zero_count);
+
+            let mut combined = match reduction {
+                ModernScatterReduction::Sum | ModernScatterReduction::Mean => {
+                    let accumulated = if data.dtype == DType::Bool {
+                        self.bool_or(current, incoming)
+                    } else {
+                        current + incoming
+                    };
+                    if include_self {
+                        accumulated
+                    } else {
+                        self.select(first_update, incoming, accumulated)
+                    }
+                }
+                ModernScatterReduction::Product => {
+                    let accumulated = if data.dtype == DType::Bool {
+                        self.bool_and(current, incoming)
+                    } else {
+                        current * incoming
+                    };
+                    if include_self {
+                        accumulated
+                    } else {
+                        self.select(first_update, incoming, accumulated)
+                    }
+                }
+                ModernScatterReduction::Maximum | ModernScatterReduction::Minimum => {
+                    let maximum = matches!(reduction, ModernScatterReduction::Maximum);
+                    let accumulated = if data.dtype == DType::Bool {
+                        if maximum {
+                            self.bool_or(current, incoming)
+                        } else {
+                            self.bool_and(current, incoming)
+                        }
+                    } else {
+                        self.scatter_extremum(current, incoming, maximum)
+                    };
+                    if include_self {
+                        accumulated
+                    } else {
+                        self.select(first_update, incoming, accumulated)
+                    }
+                }
+            };
+            let mut next_count =
+                current_count + self.graph.constant(1).expand_rhs(current_count.shape);
+            if let Some(valid_updates) = valid_updates {
+                let valid = valid_updates
+                    .slice_along(index..index + 1, 0)
+                    .ne(zero_count);
+                combined = self.select(valid, combined, current);
+                next_count = self.select(valid, next_count, current_count);
+            }
+            output = combined.scatter(destination, output);
+            counts = next_count.scatter(destination, counts);
+        }
+
+        if matches!(reduction, ModernScatterReduction::Mean) {
+            let zero = self.graph.constant(0).expand_rhs(counts.shape);
+            let has_values = counts.gt(zero);
+            let means = self.mean_divide(output, counts, data.dtype);
+            output = self.select(has_values, means, original);
+        }
+        output.shape = ShapeTracker::new(output_shape);
+        Ok(output)
+    }
+
+    pub(crate) fn translate_scatter_reduce(&mut self, node: &Node) -> Result<GraphTensor> {
+        let data = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let rank = data.shape.len();
+        let raw_dim = self.get_int_arg(node, SCATTER_DIM_ARG)?;
+        let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let mut updates = self.get_input_tensor(node, SCATTER_VALUE_ARG)?;
+        let reduction = self.modern_scatter_reduction(node)?;
+        let include_self = self.scatter_include_self(node);
+        if rank == 0 {
+            anyhow::ensure!(
+                matches!(raw_dim, -1 | 0),
+                "scatter_reduce dimension {raw_dim} out of range for a scalar"
+            );
+            anyhow::ensure!(
+                indices.shape.is_empty() && updates.shape.is_empty(),
+                "scalar scatter_reduce requires scalar index and src"
+            );
+            return Ok(self
+                .reduce_scatter_elements(
+                    data.unsqueeze(0),
+                    indices.unsqueeze(0),
+                    updates.unsqueeze(0),
+                    0,
+                    reduction,
+                    include_self,
+                )?
+                .squeeze(0));
+        }
+        anyhow::ensure!(
+            raw_dim >= -(rank as i64) && raw_dim < rank as i64,
+            "scatter_reduce dimension {raw_dim} out of range for rank {rank}"
+        );
+        let dim = normalize_dim(raw_dim, rank);
+        anyhow::ensure!(
+            indices.shape.len() == data.shape.len() && updates.shape.len() == data.shape.len(),
+            "scatter_reduce requires self, index, and src to have equal rank"
+        );
+        // ATen reads src at the coordinates described by index; src may be
+        // larger than index along any axis, so crop those unused tails.
+        for (axis, size) in indices.dims().into_iter().enumerate() {
+            updates = updates.slice_along(..size, axis);
+        }
+        self.reduce_scatter_elements(data, indices, updates, dim, reduction, include_self)
+    }
+
+    pub(crate) fn translate_index_reduce(&mut self, node: &Node) -> Result<GraphTensor> {
+        let data = self.get_input_tensor(node, 0)?;
+        let rank = data.shape.len();
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let index = self.get_input_tensor(node, 2)?;
+        let source = self.get_input_tensor(node, 3)?;
+        let reduction = self.modern_scatter_reduction(node)?;
+        anyhow::ensure!(
+            !matches!(reduction, ModernScatterReduction::Sum),
+            "index_reduce does not support the sum reduction"
+        );
+        let include_self = self.scatter_include_self(node);
+        if rank == 0 {
+            anyhow::ensure!(
+                matches!(raw_dim, -1 | 0),
+                "index_reduce dimension {raw_dim} out of range for a scalar"
+            );
+            anyhow::ensure!(
+                index.shape.len() == 1 && index.dims()[0].to_usize() == Some(1),
+                "scalar index_reduce requires a one-element index"
+            );
+            anyhow::ensure!(
+                source.shape.is_empty(),
+                "scalar index_reduce requires a scalar source"
+            );
+            return Ok(self
+                .reduce_scatter_elements(
+                    data.unsqueeze(0),
+                    index,
+                    source.unsqueeze(0),
+                    0,
+                    reduction,
+                    include_self,
+                )?
+                .squeeze(0));
+        }
+        anyhow::ensure!(
+            raw_dim >= -(rank as i64) && raw_dim < rank as i64,
+            "index_reduce dimension {raw_dim} out of range for rank {rank}"
+        );
+        let dim = normalize_dim(raw_dim, rank);
+        anyhow::ensure!(
+            index.shape.len() == 1,
+            "index_reduce index must be one-dimensional"
+        );
+        anyhow::ensure!(
+            source.shape.len() == rank,
+            "index_reduce source rank must match self"
+        );
+        anyhow::ensure!(
+            source.dims()[dim] == index.dims()[0]
+                || source.dims()[dim].egglog_equal(index.dims()[0]),
+            "index_reduce index length must equal source size along the reduced dimension"
+        );
+        for axis in 0..rank {
+            if axis != dim {
+                anyhow::ensure!(
+                    source.dims()[axis] == data.dims()[axis]
+                        || source.dims()[axis].egglog_equal(data.dims()[axis]),
+                    "index_reduce source/self sizes must match outside the reduced dimension"
+                );
+            }
+        }
+        let inserted_axes = (0..rank).filter(|&axis| axis != dim).collect::<Vec<_>>();
+        let expanded_index = index.expand_to_shape_on_axes(source.dims(), inserted_axes);
+        self.reduce_scatter_elements(data, expanded_index, source, dim, reduction, include_self)
+    }
+
+    fn scatter_scalar_value(&mut self, node: &Node, data: GraphTensor) -> Result<GraphTensor> {
         let value_arg = &node
             .inputs
             .get(SCATTER_VALUE_ARG)
             .context("scatter.value missing value input")?
             .arg;
-        let value = if let Some(b) = value_arg.as_bool() {
-            self.graph.constant(if b { 1 } else { 0 }).cast(a.dtype)
-        } else if let Some(i) = value_arg.as_int() {
-            self.graph.constant(i).cast(a.dtype)
-        } else if let Some(f) = value_arg.as_float() {
-            self.graph.constant_float(f as f32).cast(a.dtype)
+        Ok(if let Some(value) = value_arg.as_bool() {
+            self.graph
+                .constant(if value { 1 } else { 0 })
+                .cast(data.dtype)
+        } else if let Some(value) = value_arg.as_int() {
+            self.graph.constant(value).cast(data.dtype)
+        } else if let Some(value) = value_arg.as_float() {
+            if data.dtype == DType::F64 {
+                self.graph.constant_float64(value)
+            } else {
+                self.graph.constant_float(value as f32).cast(data.dtype)
+            }
         } else {
-            bail!("scatter.value: unsupported scalar argument {:?}", value_arg);
-        }
-        .expand_rhs(indices.shape);
+            bail!("scatter.value: unsupported scalar argument {value_arg:?}");
+        })
+    }
+
+    pub(crate) fn translate_scatter_value(&mut self, node: &Node) -> Result<GraphTensor> {
+        let a = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let dim = self.get_int_arg(node, SCATTER_DIM_ARG)?;
+        let dim = normalize_dim(dim, a.shape.len());
+        let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let value = self
+            .scatter_scalar_value(node, a)?
+            .expand_rhs(indices.shape);
         Ok(super::movement_dynamic::pt2_scatter_elements(
             a,
             indices.cast(DType::Int),
             value,
             dim,
         ))
+    }
+
+    pub(crate) fn translate_scatter_value_reduce(&mut self, node: &Node) -> Result<GraphTensor> {
+        let data = self.get_input_tensor(node, SCATTER_INPUT_ARG)?;
+        let dim = normalize_dim(self.get_int_arg(node, SCATTER_DIM_ARG)?, data.shape.len());
+        let indices = self.get_input_tensor(node, SCATTER_INDEX_ARG)?;
+        let updates = self
+            .scatter_scalar_value(node, data)?
+            .expand_rhs(indices.shape);
+        super::movement_dynamic::pt2_scatter_elements_reduce(
+            data,
+            indices.cast(DType::Int),
+            updates,
+            dim,
+            self.scatter_reduction(node)?,
+        )
     }
 
     pub(crate) fn translate_index_put(&mut self, node: &Node) -> Result<GraphTensor> {
@@ -947,7 +1433,22 @@ impl<'a> Translator<'a> {
             } else {
                 values.cast(a.dtype)
             };
-            let result = super::movement_dynamic::pt2_scatter_elements(a, idx_full, values, axis);
+            let accumulate = node
+                .inputs
+                .get(3)
+                .and_then(|input| input.arg.as_bool())
+                .unwrap_or(false);
+            let result = if accumulate {
+                super::movement_dynamic::pt2_scatter_elements_reduce(
+                    a,
+                    idx_full,
+                    values,
+                    axis,
+                    ScatterReduction::Add,
+                )?
+            } else {
+                super::movement_dynamic::pt2_scatter_elements(a, idx_full, values, axis)
+            };
             return Ok(result);
         }
         let index_names = if let Some(names) = node.inputs[1].arg.as_tensors() {

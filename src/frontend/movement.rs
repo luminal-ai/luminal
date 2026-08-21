@@ -625,7 +625,7 @@ impl GraphTensor {
             }
             index_expressions.push(ind * phys_size);
             phys_size *= dim;
-            new_dims.push(dim + *start + *end);
+            new_dims.push((dim + *start + *end).simplify());
         }
         new_dims.reverse();
         index_expressions.reverse();
