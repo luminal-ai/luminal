@@ -549,7 +549,11 @@ impl<'a> Translator<'a> {
                 .cast(DType::I64)
                 .expand_rhs(nan_count.shape);
             let valid_count = axis_length - nan_count;
-            let zero = self.graph.constant(0i64).expand_rhs(valid_count.shape);
+            let zero = self
+                .graph
+                .constant(0)
+                .cast(valid_count.dtype)
+                .expand_rhs(valid_count.shape);
             let has_valid = valid_count.gt(zero);
             let kth = (((valid_count - 1).maximum(zero)).cast(DType::F64) * 0.5).cast(DType::I64);
             let sorted = self.nan_last_argsort(base, axis);
