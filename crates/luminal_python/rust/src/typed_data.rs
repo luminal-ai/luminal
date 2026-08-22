@@ -234,8 +234,10 @@ impl From<TypedData> for ReferenceData {
             DType::F32 | DType::TF32 => {
                 let data: Vec<f32> = td
                     .bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
                     .collect();
                 ReferenceData::F32(data)
             }
@@ -243,34 +245,40 @@ impl From<TypedData> for ReferenceData {
                 // Downcast f64 -> f32 for the reference runtime (which only has F32 variant for floats > 32-bit)
                 let data: Vec<f32> = td
                     .bytes
-                    .chunks_exact(8)
-                    .map(|b| {
-                        f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32
-                    })
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from_le_bytes(*b) as f32)
                     .collect();
                 ReferenceData::F32(data)
             }
             DType::F16 => {
                 let data: Vec<half::f16> = td
                     .bytes
-                    .chunks_exact(2)
-                    .map(|b| half::f16::from_le_bytes([b[0], b[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::f16::from_le_bytes(*b))
                     .collect();
                 ReferenceData::F16(data)
             }
             DType::Bf16 => {
                 let data: Vec<half::bf16> = td
                     .bytes
-                    .chunks_exact(2)
-                    .map(|b| half::bf16::from_le_bytes([b[0], b[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::bf16::from_le_bytes(*b))
                     .collect();
                 ReferenceData::Bf16(data)
             }
             DType::Int => {
                 let data: Vec<i32> = td
                     .bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes(*b))
                     .collect();
                 ReferenceData::Int(data)
             }
@@ -286,16 +294,20 @@ impl From<TypedData> for ReferenceData {
             DType::I16 => {
                 let data: Vec<i16> = td
                     .bytes
-                    .chunks_exact(2)
-                    .map(|b| i16::from_le_bytes([b[0], b[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i16::from_le_bytes(*b))
                     .collect();
                 ReferenceData::I16(data)
             }
             DType::U16 => {
                 let data: Vec<i32> = td
                     .bytes
-                    .chunks_exact(2)
-                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as i32)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| u16::from_le_bytes(*b) as i32)
                     .collect();
                 ReferenceData::Int(data)
             }

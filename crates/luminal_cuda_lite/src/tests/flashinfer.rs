@@ -1469,8 +1469,10 @@ fn f32s_to_bf16_bytes(data: &[f32]) -> Vec<u8> {
 
 fn bf16_bytes_to_f32s(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(2)
-        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| half::bf16::from_le_bytes(*c).to_f32())
         .collect()
 }
 

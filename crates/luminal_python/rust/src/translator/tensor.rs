@@ -314,7 +314,9 @@ impl<'a> Translator<'a> {
         // ATen lists the last dimension first: [last_left, last_right,
         // penultimate_left, ...]. GraphTensor::pad expects tensor-axis order.
         let mut pairs = raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0], pair[1]))
             .collect::<Vec<_>>();
         pairs.reverse();
