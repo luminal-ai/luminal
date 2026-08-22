@@ -9,7 +9,9 @@ mod conv;
 mod dispatch;
 mod movement;
 mod movement_dynamic;
+mod pooling;
 mod reduction;
+mod sampling;
 mod tensor;
 mod unary;
 
@@ -359,6 +361,86 @@ impl<'a> Translator<'a> {
             .arg;
         arg.as_bool()
             .with_context(|| format!("Input {idx} of {} is not a bool: {:?}", node.target, arg))
+    }
+
+    pub(crate) fn named_input_index(node: &Node, name: &str) -> Option<usize> {
+        node.inputs.iter().position(|input| input.name == name)
+    }
+
+    pub(crate) fn named_int_arg(&self, node: &Node, name: &str) -> Option<i64> {
+        Self::named_input_index(node, name).and_then(|index| self.get_int_arg(node, index).ok())
+    }
+
+    pub(crate) fn named_float_arg(&self, node: &Node, name: &str) -> Option<f64> {
+        Self::named_input_index(node, name).and_then(|index| self.get_float_arg(node, index).ok())
+    }
+
+    pub(crate) fn named_bool_arg(&self, node: &Node, name: &str) -> Option<bool> {
+        Self::named_input_index(node, name).and_then(|index| self.get_bool_arg(node, index).ok())
+    }
+
+    pub(crate) fn named_tensor_arg(&self, node: &Node, name: &str) -> Result<Option<GraphTensor>> {
+        let tensor_name = node
+            .inputs
+            .iter()
+            .find(|input| input.name == name)
+            .and_then(|input| input.arg.as_tensor_name());
+        tensor_name.map(|name| self.get_tensor(name)).transpose()
+    }
+
+    pub(crate) fn tensor_output_names(node: &Node) -> Vec<String> {
+        node.outputs
+            .iter()
+            .flat_map(|output| {
+                output
+                    .as_tensors
+                    .as_ref()
+                    .map(|values| values.iter().map(|value| value.name.clone()).collect())
+                    .unwrap_or_else(|| {
+                        output
+                            .as_tensor
+                            .as_ref()
+                            .map(|value| vec![value.name.clone()])
+                            .unwrap_or_default()
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn store_tensor_outputs(
+        &mut self,
+        node: &Node,
+        outputs: &[GraphTensor],
+    ) -> Result<()> {
+        let names = Self::tensor_output_names(node);
+        anyhow::ensure!(names.len() == outputs.len(), "tensor output count mismatch");
+        self.tensors
+            .extend(names.into_iter().zip(outputs.iter().copied()));
+        Ok(())
+    }
+
+    pub(crate) fn axis_positions(&mut self, full_shape: &[Expression], axis: usize) -> GraphTensor {
+        let mut positions = self.graph.arange(full_shape[axis]).cast(DType::Int);
+        for (dim, size) in full_shape.iter().copied().enumerate() {
+            if dim != axis {
+                positions = positions.expand_dim(dim, size);
+            }
+        }
+        positions
+    }
+
+    pub(crate) fn full_tensor(
+        &mut self,
+        shape: Vec<Expression>,
+        dtype: DType,
+        value: f64,
+    ) -> GraphTensor {
+        let scalar = if dtype == DType::F64 {
+            self.graph.constant_float64(value)
+        } else {
+            self.graph.constant_float(value as f32)
+        };
+        scalar.cast(dtype).expand_rhs(shape)
     }
 
     pub(crate) fn tensor_meta_to_shape(&self, meta: &TensorMeta) -> Result<Vec<Expression>> {

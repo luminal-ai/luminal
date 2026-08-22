@@ -6,6 +6,7 @@ use crate::pt2_util::*;
 
 use super::Translator;
 use super::reduction::{ArgExtremum, CumExtremum};
+use super::unary::ChebyshevKind;
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_node(&mut self, node: &Node) -> Result<()> {
@@ -99,6 +100,8 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.copysign.Scalar" => self.translate_copysign_scalar(node)?,
             "torch.ops.aten.fmax.default" => self.translate_fmax_fmin(node, true)?,
             "torch.ops.aten.fmin.default" => self.translate_fmax_fmin(node, false)?,
+            "torch.ops.aten.hypot.default" => self.translate_hypot(node)?,
+            "torch.ops.aten.gcd.default" => self.translate_gcd(node)?,
 
             // Unary ops
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
@@ -138,7 +141,77 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.isinf.default" => self.translate_isinf(node)?,
             "torch.ops.aten.ldexp.Tensor" => self.translate_ldexp(node)?,
             "torch.ops.aten.sign.default" => self.translate_sign(node)?,
+            "torch.ops.aten.signbit.default" => self.translate_signbit(node)?,
             "torch.ops.aten.bitwise_not.default" => self.translate_bitwise_not(node)?,
+            "torch.ops.aten.hardtanh.default" => self.translate_hardtanh(node)?,
+            "torch.ops.aten.elu.default" => self.translate_elu(node)?,
+            "torch.ops.aten.leaky_relu.default" => self.translate_leaky_relu(node)?,
+            "torch.ops.aten.round.default" | "torch.ops.aten.round.decimals" => {
+                self.translate_round(node)?
+            }
+            "torch.ops.aten.erfc.default" => self.translate_erfc(node)?,
+            "torch.ops.aten.special_erfcx.default" => self.translate_erfcx(node)?,
+            "torch.ops.aten.lgamma.default" => self.translate_lgamma(node)?,
+            "torch.ops.aten.digamma.default" => self.translate_digamma(node)?,
+            "torch.ops.aten.polygamma.default" => self.translate_polygamma(node)?,
+            bessel @ ("torch.ops.aten.i0.default"
+            | "torch.ops.aten.special_i0e.default"
+            | "torch.ops.aten.special_i1.default"
+            | "torch.ops.aten.special_i1e.default"
+            | "torch.ops.aten.special_modified_bessel_i0.default"
+            | "torch.ops.aten.special_modified_bessel_i1.default") => {
+                let order = usize::from(bessel.contains("i1"));
+                self.translate_modified_bessel(
+                    node,
+                    order,
+                    bessel.contains("i0e") || bessel.contains("i1e"),
+                )?
+            }
+            "torch.ops.aten.special_spherical_bessel_j0.default" => {
+                self.translate_spherical_bessel_j0(node)?
+            }
+            bessel @ ("torch.ops.aten.special_bessel_j0.default"
+            | "torch.ops.aten.special_bessel_j1.default"
+            | "torch.ops.aten.special_bessel_y0.default"
+            | "torch.ops.aten.special_bessel_y1.default") => {
+                let order = usize::from(bessel.contains("j1") || bessel.contains("y1"));
+                self.translate_cylindrical_bessel(node, order, bessel.contains("_y"))?
+            }
+            bessel @ ("torch.ops.aten.special_modified_bessel_k0.default"
+            | "torch.ops.aten.special_modified_bessel_k1.default"
+            | "torch.ops.aten.special_scaled_modified_bessel_k0.default"
+            | "torch.ops.aten.special_scaled_modified_bessel_k1.default") => {
+                let order = usize::from(bessel.contains("k1"));
+                self.translate_modified_bessel_k(node, order, bessel.contains("scaled"))?
+            }
+            "torch.ops.aten.special_airy_ai.default" => self.translate_airy_ai(node)?,
+            "torch.ops.aten.special_ndtri.default" => self.translate_ndtri(node)?,
+            "torch.ops.aten.erfinv.default" => self.translate_erfinv(node)?,
+            "torch.ops.aten.special_chebyshev_polynomial_t.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::First, false)?
+            }
+            "torch.ops.aten.special_chebyshev_polynomial_u.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::Second, false)?
+            }
+            "torch.ops.aten.special_chebyshev_polynomial_v.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::Third, false)?
+            }
+            "torch.ops.aten.special_chebyshev_polynomial_w.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::Fourth, false)?
+            }
+            "torch.ops.aten.special_shifted_chebyshev_polynomial_t.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::First, true)?
+            }
+            "torch.ops.aten.special_shifted_chebyshev_polynomial_u.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::Second, true)?
+            }
+            "torch.ops.aten.special_shifted_chebyshev_polynomial_v.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::Third, true)?
+            }
+            "torch.ops.aten.special_shifted_chebyshev_polynomial_w.default" => {
+                self.translate_chebyshev_polynomial(node, ChebyshevKind::Fourth, true)?
+            }
+            "torch.ops.aten.logcumsumexp.default" => self.translate_logcumsumexp(node)?,
 
             // Cast
             "torch.ops.aten._to_copy.default" => self.translate_to_copy(node)?,
@@ -153,6 +226,10 @@ impl<'a> Translator<'a> {
                 super::movement::materialize_tensor(value)
             }
             "torch.ops.aten.upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
+            "torch.ops.aten.upsample_bilinear2d.vec" => self.translate_upsample_bilinear2d(node)?,
+            "torch.ops.aten._upsample_bilinear2d_aa.default" => {
+                self.translate_upsample_bilinear2d_aa(node)?
+            }
             "torch.ops.aten.repeat.default" => self.translate_repeat(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
             "torch.ops.aten.permute_copy.default" => {
@@ -208,6 +285,10 @@ impl<'a> Translator<'a> {
             }
             "torch.ops.aten.addmv.default" => self.translate_addmv(node)?,
             "torch.ops.aten.addbmm.default" => self.translate_addbmm(node)?,
+            "torch.ops.aten._trilinear.default" => self.translate_trilinear(node)?,
+            "torch.ops.aten.dist.default" => self.translate_dist(node)?,
+            "torch.ops.aten._cdist_forward.default" => self.translate_cdist(node)?,
+            "torch.ops.aten._pdist_forward.default" => self.translate_pdist(node)?,
 
             // addmm: beta*input + alpha*(mat1 @ mat2)
             "torch.ops.aten.addmm.default" => {
@@ -253,9 +334,21 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.select.int" => self.translate_select(node)?,
             "torch.ops.aten.cat.default" => self.translate_cat(node)?,
             "torch.ops.aten.index.Tensor" => self.translate_index_tensor(node)?,
+            "torch.ops.aten.slice_scatter.default" => self.translate_slice_scatter(node)?,
+            "torch.ops.aten.masked_scatter.default" => self.translate_masked_scatter(node)?,
+            "torch.ops.aten.put.default" => self.translate_put(node)?,
+            "torch.ops.aten.nonzero_static.default" => self.translate_nonzero_static(node)?,
+            "torch.ops.aten.repeat_interleave.Tensor" => {
+                self.translate_repeat_interleave_tensor(node)?
+            }
 
             // Embedding
             "torch.ops.aten.embedding.default" => self.translate_embedding(node)?,
+            "torch.ops.aten.embedding_renorm.default" => self.translate_embedding_renorm(node)?,
+            "torch.ops.aten._embedding_bag_forward_only.default" => {
+                self.translate_embedding_bag(node)?;
+                return Ok(());
+            }
 
             // Softmax
             "torch.ops.aten._softmax.default" => {
@@ -271,6 +364,40 @@ impl<'a> Translator<'a> {
 
             // GroupNorm
             "torch.ops.aten.native_group_norm.default" => self.translate_group_norm(node)?,
+
+            // Pooling and batch normalization composites.
+            "torch.ops.aten.avg_pool2d.default" => self.translate_avg_pool(node, 2)?,
+            "torch.ops.aten.avg_pool3d.default" => self.translate_avg_pool(node, 3)?,
+            pool @ ("torch.ops.aten._adaptive_avg_pool2d.default"
+            | "torch.ops.aten._adaptive_avg_pool3d.default") => {
+                self.translate_adaptive_avg_pool(node, 2 + usize::from(pool.contains("3d")))?
+            }
+            pool @ ("torch.ops.aten.max_pool2d_with_indices.default"
+            | "torch.ops.aten.max_pool3d_with_indices.default") => {
+                self.translate_max_pool(node, 2 + usize::from(pool.contains("3d")))?;
+                return Ok(());
+            }
+            "torch.ops.aten.max_pool2d_with_indices_backward.default" => {
+                self.translate_max_pool_backward(node)?
+            }
+            pool @ ("torch.ops.aten.adaptive_max_pool2d.default"
+            | "torch.ops.aten.adaptive_max_pool3d.default") => {
+                self.translate_adaptive_max_pool(node, 2 + usize::from(pool.contains("3d")))?;
+                return Ok(());
+            }
+            pool @ ("torch.ops.aten.fractional_max_pool2d.default"
+            | "torch.ops.aten.fractional_max_pool3d.default") => {
+                self.translate_fractional_max_pool(node, 2 + usize::from(pool.contains("3d")))?;
+                return Ok(());
+            }
+            "torch.ops.aten.grid_sampler_2d.default" => self.translate_grid_sampler(node, 2)?,
+            "torch.ops.aten.grid_sampler_3d.default" => self.translate_grid_sampler(node, 3)?,
+            "torch.ops.aten._native_batch_norm_legit.no_stats"
+            | "torch.ops.aten._native_batch_norm_legit_functional.default"
+            | "torch.ops.aten._batch_norm_with_update_functional.default" => {
+                self.translate_batch_norm_functional(node)?;
+                return Ok(());
+            }
 
             // RMSNorm
             "torch.ops.aten._fused_rms_norm.default" => self.translate_fused_rms_norm(node)?,
@@ -296,6 +423,7 @@ impl<'a> Translator<'a> {
                 let (a, b) = broadcast_binary(a, b);
                 (b * a.log2()).exp2()
             }
+            "torch.ops.aten.pow.Scalar" => self.translate_scalar_base_pow(node)?,
 
             // Creation ops
             "torch.ops.aten.arange.start_step" => self.translate_arange(node)?,
@@ -308,11 +436,18 @@ impl<'a> Translator<'a> {
             // PyTorch's side, and downstream writes overwrite our zeros.
             // Qwen3MoE's MoE block uses `empty_permuted` to allocate the
             // expert-output staging tensor before scatter-adding into it.
-            "torch.ops.aten.empty.memory_format" | "torch.ops.aten.empty_permuted.default" => {
-                self.translate_empty(node)?
-            }
+            "torch.ops.aten.empty.memory_format"
+            | "torch.ops.aten.empty_permuted.default"
+            | "torch.ops.aten.empty_strided.default"
+            | "torch.ops.aten.new_empty_strided.default" => self.translate_empty(node)?,
             // Qwen3-MoE's expert-balance counts tokens-per-expert via histc.
             "torch.ops.aten.histc.default" => self.translate_histc(node)?,
+            "torch.ops.aten.bucketize.Tensor"
+            | "torch.ops.aten.searchsorted.Tensor"
+            | "torch.ops.aten.searchsorted.Scalar" => self.translate_searchsorted(node)?,
+            "torch.ops.aten.tril_indices.default" | "torch.ops.aten.triu_indices.default" => {
+                self.translate_triangular_indices(node)?
+            }
 
             // Grouped matmul (MoE expert dispatch).
             // aten._grouped_mm is the native op; transformers::grouped_mm_fallback
@@ -453,27 +588,7 @@ impl<'a> Translator<'a> {
                 let adjust = a.gt(trunc).cast(DType::F32);
                 trunc + adjust
             }
-            "torch.ops.aten.erf.default" => {
-                let a = self.get_input_tensor(node, 0)?;
-                // Abramowitz & Stegun approximation 7.1.28 (max error ~1.5e-7)
-                // erf(x) = sign(x) * (1 - poly(t) * exp(-x^2))
-                // where t = 1/(1 + 0.3275911*|x|), poly in Horner form
-                let ax = a.abs();
-                let x2 = a * a;
-                let t = (ax * 0.3275911_f32 + 1.0).reciprocal();
-                // Horner: t*(a1 + t*(a2 + t*(a3 + t*(a4 + t*a5))))
-                let poly = t
-                    * (t * (t
-                        * (t * (t * 1.061_405_4_f32 + (-1.453_152_1_f32)) + 1.421_413_8_f32)
-                        + (-0.284_496_72_f32))
-                        + 0.254_829_6_f32);
-                let result_abs =
-                    self.graph.constant_float(1.0).expand_rhs(a.shape) - poly * (x2 * (-1.0)).exp();
-                // sign(x) = 2*(x >= 0) - 1
-                let zero = self.graph.constant_float(0.0).expand_rhs(a.shape);
-                let sign = a.ge(zero).cast(DType::F32) * 2.0 - 1.0;
-                result_abs * sign
-            }
+            "torch.ops.aten.erf.default" => self.translate_erf(node)?,
             "torch.ops.aten.isnan.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 a.ne(a)
@@ -540,7 +655,37 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.argmin.default" => {
                 self.translate_argextremum(node, ArgExtremum::Min)?
             }
-
+            "torch.ops.aten.max.dim" => {
+                self.translate_dim_extremum(node, ArgExtremum::Max)?;
+                return Ok(());
+            }
+            "torch.ops.aten.min.dim" => {
+                self.translate_dim_extremum(node, ArgExtremum::Min)?;
+                return Ok(());
+            }
+            "torch.ops.aten.median.default" | "torch.ops.aten.median.dim" => {
+                self.translate_median(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.nanmedian.default" | "torch.ops.aten.nanmedian.dim" => {
+                self.translate_nanmedian(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten.segment_reduce.default" => self.translate_segment_reduce(node)?,
+            "torch.ops.aten.histogram.bin_ct" | "torch.ops.aten.histogram.bins_tensor" => {
+                self.translate_histogram(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten._histogramdd_bin_edges.default" => {
+                self.translate_histogramdd_bin_edges(node)?;
+                return Ok(());
+            }
+            "torch.ops.aten._histogramdd_from_bin_cts.default" => {
+                self.translate_histogramdd(node, false)?
+            }
+            "torch.ops.aten._histogramdd_from_bin_tensors.default" => {
+                self.translate_histogramdd(node, true)?
+            }
             // Gather (axis-aware)
             "torch.ops.aten.gather.default" => self.translate_gather(node)?,
 

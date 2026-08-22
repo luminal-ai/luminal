@@ -96,6 +96,29 @@ pub(crate) fn copy_tensor(
 }
 
 impl<'a> Translator<'a> {
+    pub(crate) fn translate_trilinear(&mut self, node: &Node) -> Result<GraphTensor> {
+        let mut inputs = [
+            self.get_input_tensor(node, 0)?,
+            self.get_input_tensor(node, 1)?,
+            self.get_input_tensor(node, 2)?,
+        ];
+        for (input, argument) in inputs.iter_mut().zip(3..6) {
+            for raw_dim in self.get_ints_arg(node, argument)? {
+                let dim = normalize_dim(raw_dim, input.shape.len() + 1);
+                *input = input.unsqueeze(dim);
+            }
+        }
+        let (left, middle) = broadcast_binary(inputs[0], inputs[1]);
+        let (product, right) = broadcast_binary(left * middle, inputs[2]);
+        let rank = product.shape.len();
+        let dimensions = self
+            .get_ints_arg(node, 6)?
+            .into_iter()
+            .map(|dim| normalize_dim(dim, rank))
+            .collect::<Vec<_>>();
+        Ok((product * right).sum(dimensions))
+    }
+
     pub(crate) fn constructor_scalar_arg(
         &self,
         node: &Node,
@@ -463,6 +486,132 @@ impl<'a> Translator<'a> {
         Ok(matches.cast(out_dtype).sum(1))
     }
 
+    /// Lower bucketize/searchsorted by comparing each query with every entry
+    /// in its sorted row and reducing the boolean insertion predicate. This is
+    /// O(N) per query, but it is exact, fixed-shape, and uses only existing
+    /// broadcast/comparison/reduction primitives.
+    pub(crate) fn translate_searchsorted(&mut self, node: &Node) -> Result<GraphTensor> {
+        let bucketize = node.target == "torch.ops.aten.bucketize.Tensor";
+        let mut sorted = self.get_input_tensor(node, usize::from(bucketize))?;
+        let query_index = usize::from(!bucketize);
+        let query = if let Some(name) = node.inputs[query_index].arg.as_tensor_name() {
+            self.get_tensor(name)?
+        } else {
+            let scalar = self.constructor_scalar_arg(node, query_index)?;
+            self.typed_scalar_constant(&scalar, sorted.dtype)?
+        };
+
+        anyhow::ensure!(
+            !sorted.shape.is_empty(),
+            "searchsorted requires a sorted sequence with rank at least one"
+        );
+        let sorted_axis = sorted.shape.len() - 1;
+        if let Some(sorter_name) = node
+            .inputs
+            .iter()
+            .find(|input| input.name == "sorter")
+            .and_then(|input| input.arg.as_tensor_name())
+        {
+            let sorter = self.get_tensor(sorter_name)?;
+            sorted = super::movement_dynamic::pt2_gather_elements(sorted, sorter, sorted_axis);
+        }
+
+        let (sorted, query) = ensure_same_dtype(sorted, query);
+        let row_length = sorted.dims()[sorted_axis];
+        let query_rank = query.shape.len();
+        let (boundaries, queries) = if sorted.shape.len() == 1 {
+            let mut boundaries = sorted;
+            for (axis, size) in query.dims().into_iter().enumerate() {
+                boundaries = boundaries.expand_dim(axis, size);
+            }
+            (boundaries, query.expand_dim(query_rank, row_length))
+        } else {
+            anyhow::ensure!(
+                query_rank == sorted.shape.len(),
+                "batched searchsorted requires query and sequence ranks to match"
+            );
+            for axis in 0..sorted_axis {
+                anyhow::ensure!(
+                    query.dims()[axis] == sorted.dims()[axis],
+                    "batched searchsorted prefix dimensions must match"
+                );
+            }
+            let query_width = query.dims()[sorted_axis];
+            (
+                sorted.expand_dim(sorted_axis, query_width),
+                query.expand_dim(query_rank, row_length),
+            )
+        };
+
+        let right = node
+            .inputs
+            .iter()
+            .position(|input| input.name == "right")
+            .and_then(|index| self.get_bool_arg(node, index).ok())
+            .unwrap_or(false)
+            || node.inputs.iter().any(|input| {
+                input.name == "side"
+                    && matches!(&input.arg, Argument::Other(value) if value.as_str() == Some("right") || value.get("as_string").and_then(|v| v.as_str()) == Some("right"))
+            });
+        let before = if right {
+            boundaries.le(queries)
+        } else {
+            boundaries.lt(queries)
+        };
+        let mut result = before.cast(DType::I64).sum(query_rank);
+        if matches!(
+            query.dtype,
+            DType::F16 | DType::Bf16 | DType::F32 | DType::F64
+        ) {
+            let nan = self.is_nan(query);
+            let end = self
+                .graph
+                .constant(row_length)
+                .cast(DType::I64)
+                .expand_rhs(result.shape);
+            result = self.select(nan, end, result);
+        }
+        Ok(result.cast(self.output_meta_dtype(node)?))
+    }
+
+    pub(crate) fn translate_triangular_indices(&mut self, node: &Node) -> Result<GraphTensor> {
+        let rows = self.get_int_arg(node, 0)?;
+        let columns = self.get_int_arg(node, 1)?;
+        anyhow::ensure!(
+            rows >= 0 && columns >= 0,
+            "triangular index dimensions must be nonnegative"
+        );
+        let offset = self.get_int_arg(node, 2).unwrap_or(0);
+        let rows = Expression::from(rows);
+        let columns = Expression::from(columns);
+        let row = self
+            .graph
+            .arange(rows)
+            .cast(DType::I64)
+            .expand_dim(1, columns);
+        let column = self
+            .graph
+            .arange(columns)
+            .cast(DType::I64)
+            .expand_dim(0, rows);
+        let shifted_row = row + offset;
+        let truth = if node.target == "torch.ops.aten.tril_indices.default" {
+            column.le(shifted_row)
+        } else {
+            column.ge(shifted_row)
+        };
+        let output_shape = self.output_meta_shape(node)?;
+        anyhow::ensure!(
+            output_shape.len() == 2,
+            "triangular indices must have rank two"
+        );
+        let coordinates =
+            super::movement::nonzero_static_from_truth(self, truth, output_shape[1], 0);
+        Ok(coordinates
+            .permute(&[1, 0])
+            .cast(self.output_meta_dtype(node)?))
+    }
+
     /// Lower `aten.empty.memory_format` and `aten.empty_permuted.default`.
     ///
     /// Both allocate an uninitialised tensor; the caller is responsible for
@@ -472,7 +621,12 @@ impl<'a> Translator<'a> {
     /// `aten.empty_permuted` additionally takes a `physical_layout` arg
     /// (the storage permutation); for a zero-filled tensor that's a no-op.
     pub(crate) fn translate_empty(&mut self, node: &Node) -> Result<GraphTensor> {
-        let shape = self.get_exprs_arg(node, FULL_SHAPE_ARG)?;
+        let shape_arg = if node.target == "torch.ops.aten.new_empty_strided.default" {
+            1
+        } else {
+            FULL_SHAPE_ARG
+        };
+        let shape = self.get_exprs_arg(node, shape_arg)?;
         let dtype = self.output_meta_dtype(node)?;
         let zero = self.graph.constant_float(0.0).cast(dtype);
         Ok(if shape.is_empty() {
@@ -794,7 +948,12 @@ impl<'a> Translator<'a> {
             None
         };
 
-        let full_argsort = a.stable_argsort(dim, descending);
+        let sort_key = if a.dtype == DType::Bool {
+            a.cast(DType::F32)
+        } else {
+            a
+        };
+        let full_argsort = sort_key.stable_argsort(dim, descending);
 
         if let Some(val_name) = values_name
             && !val_name.is_empty()

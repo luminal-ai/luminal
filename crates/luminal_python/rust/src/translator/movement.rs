@@ -229,6 +229,186 @@ pub(crate) fn materialize_tensor(input: GraphTensor) -> GraphTensor {
     input.gather(indices)
 }
 
+pub(crate) fn slice_scatter_tensor(
+    destination: GraphTensor,
+    source: GraphTensor,
+    dim: usize,
+    start: Expression,
+    step: i64,
+) -> Result<GraphTensor> {
+    anyhow::ensure!(step > 0, "slice_scatter step must be positive, got {step}");
+    anyhow::ensure!(
+        destination.dtype == source.dtype,
+        "slice_scatter source and destination dtypes must match"
+    );
+    anyhow::ensure!(
+        destination.shape.len() == source.shape.len(),
+        "slice_scatter source and destination ranks must match"
+    );
+
+    let destination = materialize_tensor(destination);
+    let source = materialize_tensor(source);
+    let strides = row_major_strides(&destination.dims());
+    let contributions = strides
+        .iter()
+        .enumerate()
+        .map(|(axis, &stride)| {
+            if axis == dim {
+                Expression::from('z') * Expression::from(step) * stride
+            } else {
+                Expression::from('z') * stride
+            }
+        })
+        .collect::<Vec<_>>();
+    let indices = logical_flat_indices(
+        destination.graph(),
+        &source.dims(),
+        &contributions,
+        start * strides[dim],
+    )
+    .flatten();
+    let output = source.flatten().scatter(indices, destination.flatten());
+    Ok(reshape_tensor(output, destination.dims()))
+}
+
+pub(crate) fn masked_scatter_tensor(
+    translator: &mut Translator<'_>,
+    destination: GraphTensor,
+    mask: GraphTensor,
+    source: GraphTensor,
+) -> Result<GraphTensor> {
+    let output_shape = destination.dims();
+    let (mask, destination) = broadcast_binary(mask, destination);
+    anyhow::ensure!(
+        mask.dims() == destination.dims(),
+        "masked_scatter mask must broadcast to the destination shape"
+    );
+    let mask = mask.cast(DType::Int).flatten();
+    let destination = materialize_tensor(destination).flatten();
+    let source = materialize_tensor(source).flatten();
+    if source.dims()[0].to_usize() == Some(0) {
+        return Ok(reshape_tensor(destination, output_shape));
+    }
+    let prefix = mask.cumsum(0);
+    let zero = translator.graph.constant(0).expand_rhs(prefix.shape);
+    let indices = (prefix - 1).maximum(zero);
+    let updates = source.gather(indices);
+    let output = translator.select(mask.cast(DType::Bool), updates, destination);
+    Ok(reshape_tensor(output, output_shape))
+}
+
+pub(crate) fn put_tensor(
+    destination: GraphTensor,
+    mut indices: GraphTensor,
+    source: GraphTensor,
+    accumulate: bool,
+) -> Result<GraphTensor> {
+    if destination.dtype == DType::Bool && accumulate {
+        return Ok(put_tensor(
+            destination.cast(DType::Int),
+            indices,
+            source.cast(DType::Int),
+            true,
+        )?
+        .cast(DType::Bool));
+    }
+    let destination = materialize_tensor(destination);
+    let source = materialize_tensor(source.cast(destination.dtype));
+    let output_shape = destination.dims();
+    let flat_destination = destination.flatten();
+    let flat_size = product_of_dims(output_shape.iter().copied());
+    indices = indices.cast(DType::Int).flatten();
+    let zero = destination.graph().constant(0).expand_rhs(indices.shape);
+    let negative = indices.lt(zero).cast(DType::Int);
+    indices += negative * flat_size;
+    let output = if accumulate {
+        super::movement_dynamic::pt2_scatter_elements_reduce(
+            flat_destination,
+            indices,
+            source.flatten(),
+            0,
+            ScatterReduction::Add,
+        )?
+    } else {
+        source.flatten().scatter(indices, flat_destination)
+    };
+    Ok(reshape_tensor(output, output_shape))
+}
+
+pub(crate) fn nonzero_static_from_truth(
+    translator: &mut Translator<'_>,
+    truth: GraphTensor,
+    size: Expression,
+    fill_value: i64,
+) -> GraphTensor {
+    let input_shape = truth.dims();
+    let rank = input_shape.len();
+    let numel = product_of_dims(input_shape.iter().copied());
+    if rank == 0 {
+        return translator
+            .graph
+            .iota(0, vec![size, Expression::from(rank)])
+            .cast(DType::I64);
+    }
+    if numel.to_usize() == Some(0) {
+        return translator
+            .graph
+            .constant(fill_value)
+            .cast(DType::I64)
+            .expand_rhs(vec![size, Expression::from(rank)]);
+    }
+
+    let truth = materialize_tensor(truth).flatten();
+    let sorted = truth
+        .cast(DType::F32)
+        .stable_argsort(0, true)
+        .cast(DType::Int);
+    let count = truth.cast(DType::Int).sum(0);
+    let positions = translator.graph.arange(size).cast(DType::Int);
+    let zero = translator.graph.constant(0).expand_rhs(positions.shape);
+    let last = translator
+        .graph
+        .constant(numel - 1)
+        .cast(DType::Int)
+        .expand_rhs(positions.shape);
+    let clamped = positions.maximum(zero).minimum(last);
+    let flat_indices = sorted.gather(clamped);
+    let count = count.expand_rhs(positions.shape);
+    let numel_tensor = translator
+        .graph
+        .constant(numel)
+        .cast(DType::Int)
+        .expand_rhs(positions.shape);
+    let valid = translator.bool_and(positions.lt(count), positions.lt(numel_tensor));
+    let fill = translator
+        .graph
+        .constant(fill_value)
+        .cast(DType::I64)
+        .expand_rhs(positions.shape);
+
+    let strides = row_major_strides(&input_shape);
+    let mut columns = Vec::with_capacity(rank);
+    for axis in 0..rank {
+        let numerator = flat_indices.cast(DType::F64);
+        let denominator = translator
+            .graph
+            .constant(strides[axis])
+            .cast(DType::F64)
+            .expand_rhs(numerator.shape);
+        let quotient = (numerator / denominator).cast(DType::I64);
+        let dimension = translator
+            .graph
+            .constant(input_shape[axis])
+            .cast(DType::I64)
+            .expand_rhs(quotient.shape);
+        let coordinate = quotient % dimension;
+        columns.push(translator.select(valid, coordinate, fill).unsqueeze(1));
+    }
+    columns[1..]
+        .iter()
+        .fold(columns[0], |result, column| result.concat_along(*column, 1))
+}
+
 fn normalize_concat_dims(
     lhs: &mut GraphTensor,
     rhs: &mut GraphTensor,
@@ -759,9 +939,212 @@ impl<'a> Translator<'a> {
         Ok(weight.gather(ids_expanded + arange_expanded))
     }
 
+    pub(crate) fn translate_embedding_renorm(&mut self, node: &Node) -> Result<GraphTensor> {
+        let weight = self.get_input_tensor(node, 0)?;
+        anyhow::ensure!(
+            weight.shape.len() == 2,
+            "embedding_renorm requires a matrix"
+        );
+        let indices = self.get_input_tensor(node, 1)?.cast(DType::Int).flatten();
+        let max_norm = self.get_float_arg(node, 2)?;
+        let norm_type = self.get_float_arg(node, 3)?;
+        anyhow::ensure!(
+            norm_type > 0.0,
+            "embedding_renorm requires a positive norm type"
+        );
+
+        let rows = weight.dims()[0];
+        let columns = weight.dims()[1];
+        let row_ids = self
+            .graph
+            .arange(rows)
+            .cast(DType::Int)
+            .expand_dim(1, indices.dims()[0]);
+        let indices = indices.expand_dim(0, rows);
+        let selected_count = row_ids.eq(indices).cast(DType::Int).sum(1);
+        let zero_count = self.graph.constant(0).expand_rhs(selected_count.shape);
+        let selected = selected_count.gt(zero_count);
+
+        let magnitude = self.real_abs(weight);
+        let norm = if norm_type == f64::INFINITY {
+            magnitude.max(1)
+        } else {
+            magnitude
+                .pow(norm_type as f32)
+                .sum(1)
+                .pow((1.0 / norm_type) as f32)
+        };
+        let maximum = self.constant_like(norm, max_norm);
+        let exceeds = norm.gt(maximum);
+        let apply = self.bool_and(selected, exceeds);
+        let scale = maximum / norm;
+        let scale = scale.expand_dim(1, columns);
+        let apply = apply.expand_dim(1, columns);
+        Ok(self.select(apply, weight * scale, weight))
+    }
+
+    pub(crate) fn translate_embedding_bag(&mut self, node: &Node) -> Result<()> {
+        let weight = self.get_input_tensor(node, 0)?;
+        let indices = self.get_input_tensor(node, 1)?.cast(DType::Int);
+        let offsets = self.get_input_tensor(node, 2)?.cast(DType::Int);
+        anyhow::ensure!(
+            weight.shape.len() == 2 && indices.shape.len() == 1 && offsets.shape.len() == 1,
+            "embedding_bag requires matrix weights and one-dimensional indices/offsets"
+        );
+        let mode = self.named_int_arg(node, "mode").unwrap_or(0);
+        anyhow::ensure!(
+            (0..=2).contains(&mode),
+            "unsupported embedding_bag mode {mode}"
+        );
+        let include_last_offset = self
+            .named_bool_arg(node, "include_last_offset")
+            .unwrap_or(false);
+        let padding_idx = self.named_int_arg(node, "padding_idx").unwrap_or(-1);
+
+        let index_count = indices.dims()[0];
+        let bag_count = offsets.dims()[0] - usize::from(include_last_offset);
+        let embedding_size = weight.dims()[1];
+        let positions = self
+            .graph
+            .arange(index_count)
+            .cast(DType::Int)
+            .expand_dim(0, bag_count);
+        let starts = offsets
+            .slice_along(Expression::from(0)..bag_count, 0)
+            .expand_dim(1, index_count);
+        let terminal = self.graph.constant(index_count).cast(DType::Int);
+        let ends = offsets
+            .pad_with(vec![(Expression::from(0), Expression::from(1))], terminal)
+            .slice_along(Expression::from(1)..(bag_count + 1), 0)
+            .expand_dim(1, index_count);
+        let bag_membership = self.bool_and(positions.ge(starts), positions.lt(ends));
+        let mut membership = bag_membership;
+        let expanded_indices = indices.expand_dim(0, bag_count);
+        if padding_idx >= 0 {
+            let padding = self
+                .graph
+                .constant(padding_idx)
+                .cast(DType::Int)
+                .expand_rhs(expanded_indices.shape);
+            membership = self.bool_and(membership, expanded_indices.ne(padding));
+        }
+
+        let flat_weight_indices = (indices * embedding_size).expand_dim(1, embedding_size)
+            + self
+                .graph
+                .arange(embedding_size)
+                .cast(DType::Int)
+                .expand_dim(0, index_count);
+        let gathered = weight.gather(flat_weight_indices).expand_dim(0, bag_count);
+        let membership_values = membership.expand_dim(2, embedding_size);
+        let zero_values = self.full_tensor(gathered.dims(), weight.dtype, 0.0);
+        let mut selected = self.select(membership_values, gathered, zero_values);
+        if let Some(per_sample) = self.named_tensor_arg(node, "per_sample_weights")? {
+            anyhow::ensure!(
+                mode == 0,
+                "per-sample weights require embedding_bag sum mode"
+            );
+            let per_sample = per_sample
+                .cast(weight.dtype)
+                .expand_dim(0, bag_count)
+                .expand_dim(2, embedding_size);
+            selected *= per_sample;
+        }
+
+        let counts = membership.cast(DType::Int).sum(1).cast(DType::I64);
+        let nonempty = counts.gt(self
+            .graph
+            .constant(0)
+            .cast(DType::I64)
+            .expand_rhs(counts.shape));
+        let sum = selected.sum(1);
+        let (output, max_indices) = match mode {
+            0 => {
+                let zeros = self
+                    .graph
+                    .constant(0)
+                    .cast(DType::I64)
+                    .expand_rhs(vec![bag_count]);
+                (sum, zeros)
+            }
+            1 => {
+                let one = self
+                    .graph
+                    .constant(1)
+                    .cast(DType::I64)
+                    .expand_rhs(counts.shape);
+                let safe_counts = self.select(nonempty, counts, one);
+                let mean = sum / safe_counts.cast(weight.dtype).expand_dim(1, embedding_size);
+                (mean, counts)
+            }
+            2 => {
+                let lowest = self
+                    .floating_scalar(f64::NEG_INFINITY, weight.dtype)
+                    .expand_rhs(gathered.shape);
+                let candidates = self.select(membership_values, gathered, lowest);
+                let selected_positions = candidates
+                    .stable_argsort(1, true)
+                    .slice_along(Expression::from(0)..Expression::from(1), 1);
+                let values =
+                    super::movement_dynamic::pt2_gather_elements(candidates, selected_positions, 1)
+                        .squeeze(1);
+                let candidate_indices = expanded_indices.expand_dim(2, embedding_size);
+                let selected_indices = super::movement_dynamic::pt2_gather_elements(
+                    candidate_indices,
+                    selected_positions,
+                    1,
+                )
+                .squeeze(1)
+                .cast(DType::I64);
+                let output_nonempty = nonempty.expand_dim(1, embedding_size);
+                let zero_output = self.full_tensor(values.dims(), weight.dtype, 0.0);
+                let zero_indices = self
+                    .graph
+                    .constant(0)
+                    .cast(DType::I64)
+                    .expand_rhs(selected_indices.shape);
+                (
+                    self.select(output_nonempty, values, zero_output),
+                    self.select(output_nonempty, selected_indices, zero_indices),
+                )
+            }
+            _ => unreachable!(),
+        };
+
+        let offset_to_bag = if mode == 0 && padding_idx < 0 {
+            self.graph
+                .constant(0)
+                .cast(DType::I64)
+                .expand_rhs(vec![Expression::from(0)])
+        } else {
+            let bag_ids = self
+                .graph
+                .arange(bag_count)
+                .cast(DType::I64)
+                .expand_dim(1, index_count);
+            (bag_membership.cast(DType::I64) * bag_ids).sum(0)
+        };
+        let bag_size = if mode == 0 {
+            self.graph
+                .constant(0)
+                .cast(DType::I64)
+                .expand_rhs(vec![bag_count])
+        } else {
+            counts
+        };
+        self.store_tensor_outputs(node, &[output, offset_to_bag, bag_size, max_indices])
+    }
+
     pub(crate) fn translate_index_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
         let source = self.get_input_tensor(node, 0)?;
+        self.translate_index_tensor_from_source(node, source)
+    }
 
+    pub(crate) fn translate_index_tensor_from_source(
+        &mut self,
+        node: &Node,
+        source: GraphTensor,
+    ) -> Result<GraphTensor> {
         // Handle indices as_tensors (all non-None) or as individual args with None entries
         let index_names: Vec<crate::pt2_schema::TensorName>;
         let mut first_non_none_dim = 0usize;
@@ -903,6 +1286,76 @@ impl<'a> Translator<'a> {
             result_shape.extend_from_slice(&remaining_dims);
             Ok(reshape_tensor(gathered, result_shape))
         }
+    }
+
+    pub(crate) fn translate_slice_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
+        let destination = self.get_input_tensor(node, 0)?;
+        let source = self.get_input_tensor(node, 1)?.cast(destination.dtype);
+        let dim = normalize_dim(
+            self.get_int_arg(node, 2).unwrap_or(0),
+            destination.shape.len(),
+        );
+        let start = self
+            .get_expr_arg(node, 3)
+            .unwrap_or_else(|_| Expression::from(0));
+        let start = normalize_slice_bound(start, destination.dims()[dim]);
+        let step = self.get_int_arg(node, 5).unwrap_or(1);
+        slice_scatter_tensor(destination, source, dim, start, step)
+    }
+
+    pub(crate) fn translate_masked_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
+        let destination = self.get_input_tensor(node, 0)?;
+        let mask = self.get_input_tensor(node, 1)?;
+        let source = self.get_input_tensor(node, 2)?.cast(destination.dtype);
+        let output_shape = destination.dims();
+        let output = masked_scatter_tensor(self, destination, mask, source)?;
+        Ok(reshape_tensor(output, output_shape))
+    }
+
+    pub(crate) fn translate_put(&mut self, node: &Node) -> Result<GraphTensor> {
+        let destination = self.get_input_tensor(node, 0)?;
+        let indices = self.get_input_tensor(node, 1)?;
+        let source = self.get_input_tensor(node, 2)?;
+        let accumulate = self.get_bool_arg(node, 3).unwrap_or(false);
+        put_tensor(destination, indices, source, accumulate)
+    }
+
+    pub(crate) fn translate_repeat_interleave_tensor(
+        &mut self,
+        node: &Node,
+    ) -> Result<GraphTensor> {
+        let repeats = self.get_input_tensor(node, 0)?.cast(DType::Int).flatten();
+        let output_size_index = Self::named_input_index(node, "output_size")
+            .context(
+                "repeat_interleave.Tensor has a value-dependent output shape unless output_size is supplied",
+            )?;
+        let output_size = self.get_expr_arg(node, output_size_index).context(
+            "repeat_interleave.Tensor has a value-dependent output shape unless output_size is supplied",
+        )?;
+        let ends = repeats.cumsum(0);
+        let positions = self.graph.arange(output_size).cast(DType::Int);
+        let ends = ends.expand_dim(0, output_size);
+        let positions = positions.expand_dim(1, repeats.dims()[0]);
+        // The interval for input i is [ends[i-1], ends[i]); counting ends
+        // that are <= an output position gives exactly that input index.
+        Ok(ends.le(positions).cast(DType::I64).sum(1).cast(DType::I64))
+    }
+
+    pub(crate) fn translate_nonzero_static(&mut self, node: &Node) -> Result<GraphTensor> {
+        let value = self.get_input_tensor(node, 0)?;
+        let size_index = Self::named_input_index(node, "size").unwrap_or(1);
+        let size = self.get_expr_arg(node, size_index)?;
+        let fill_value = self.named_int_arg(node, "fill_value").unwrap_or(-1);
+        let truth = if matches!(
+            value.dtype,
+            DType::F16 | DType::Bf16 | DType::F32 | DType::F64
+        ) {
+            let zero = self.is_zero(value);
+            self.bool_not(zero)
+        } else {
+            value.ne(self.constant_like(value, 0.0))
+        };
+        Ok(nonzero_static_from_truth(self, truth, size, fill_value))
     }
 
     pub(crate) fn translate_gather(&mut self, node: &Node) -> Result<GraphTensor> {
