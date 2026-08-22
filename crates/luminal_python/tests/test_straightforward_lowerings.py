@@ -76,15 +76,9 @@ class CopyAndStableSortAliases(torch.nn.Module):
 class ScatterAliases(torch.nn.Module):
     def forward(self, value, index, source):
         return (
-            torch.ops.aten.scatter.reduce(
-                value, 1, index, source, reduce="add"
-            ),
-            torch.ops.aten.scatter.reduce(
-                value, 1, index, source, reduce="multiply"
-            ),
-            torch.ops.aten.scatter.value_reduce(
-                value, 1, index, 1.5, reduce="add"
-            ),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="add"),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="multiply"),
+            torch.ops.aten.scatter.value_reduce(value, 1, index, 1.5, reduce="add"),
             torch.ops.aten.scatter.value_reduce(
                 value, 1, index, -0.5, reduce="multiply"
             ),
@@ -104,7 +98,10 @@ def test_small_algebraic_aliases_use_existing_primitives() -> None:
     exponent = torch.tensor([[0, 1, -1], [2, -2, 3]], dtype=torch.int32)
     integers = torch.tensor([[0, 1, -2], [3, 0, 4]], dtype=torch.int64)
     module = SmallAlgebraicAliases()
-    _assert_outputs(_compile(module, value, exponent, integers)(value, exponent, integers), module(value, exponent, integers))
+    _assert_outputs(
+        _compile(module, value, exponent, integers)(value, exponent, integers),
+        module(value, exponent, integers),
+    )
 
 
 def test_copy_aliases_and_stable_sort_preserve_all_outputs() -> None:

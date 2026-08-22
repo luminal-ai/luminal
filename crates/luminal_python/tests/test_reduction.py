@@ -74,15 +74,9 @@ class ComposedReductions(torch.nn.Module):
             torch.ops.aten.linalg_vector_norm.default(value, 1, [0, 2], True),
             torch.ops.aten.linalg_vector_norm.default(value, 2, [], False),
             torch.ops.aten.linalg_vector_norm.default(value, 3.5, [2], False),
-            torch.ops.aten.linalg_vector_norm.default(
-                value, float("inf"), [1], False
-            ),
-            torch.ops.aten.linalg_vector_norm.default(
-                value, float("-inf"), [1], False
-            ),
-            torch.ops.aten.var.correction(
-                value, [1], correction=1, keepdim=True
-            ),
+            torch.ops.aten.linalg_vector_norm.default(value, float("inf"), [1], False),
+            torch.ops.aten.linalg_vector_norm.default(value, float("-inf"), [1], False),
+            torch.ops.aten.var.correction(value, [1], correction=1, keepdim=True),
             variance,
             mean,
         )
@@ -169,9 +163,7 @@ class VarianceOverloads(torch.nn.Module):
 
 
 def test_variance_default_and_dim_overloads_match_eager():
-    value = torch.tensor(
-        [[-2.0, 0.5, 3.0], [4.0, -1.0, 2.0]], dtype=torch.float64
-    )
+    value = torch.tensor([[-2.0, 0.5, 3.0], [4.0, -1.0, 2.0]], dtype=torch.float64)
     module = VarianceOverloads()
     expected = module(value)
     actual = _compile_and_run(module, value)

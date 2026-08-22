@@ -87,14 +87,10 @@ def test_complex_components_and_shape_operations():
 
 class ComplexSplitWithSizes(torch.nn.Module):
     def forward(self, value):
-        return tuple(
-            torch.ops.aten.split_with_sizes.default(value, [1, 3, 2], -1)
-        )
+        return tuple(torch.ops.aten.split_with_sizes.default(value, [1, 3, 2], -1))
 
 
-@pytest.mark.parametrize(
-    "dtype", (torch.complex32, torch.complex64, torch.complex128)
-)
+@pytest.mark.parametrize("dtype", (torch.complex32, torch.complex64, torch.complex128))
 def test_complex_split_with_sizes_preserves_all_outputs(dtype):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
@@ -160,12 +156,8 @@ class ComplexScatterAliases(torch.nn.Module):
         return (
             torch.ops.aten.scatter.src(value, 1, index, source),
             torch.ops.aten.scatter.value(value, 1, index, 0.5 - 0.25j),
-            torch.ops.aten.scatter.reduce(
-                value, 1, index, source, reduce="add"
-            ),
-            torch.ops.aten.scatter.reduce(
-                value, 1, index, source, reduce="multiply"
-            ),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="add"),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="multiply"),
             torch.ops.aten.scatter.value_reduce(
                 value, 1, index, 0.5 - 0.25j, reduce="add"
             ),
@@ -175,7 +167,10 @@ class ComplexScatterAliases(torch.nn.Module):
 
 def _complex_alias_inputs():
     value = torch.tensor(
-        [[0.5 + 0.25j, 1.0 - 0.5j, -0.25 + 0.75j], [0.75 - 0.2j, 1.5 + 0.1j, 0.2 + 0.4j]],
+        [
+            [0.5 + 0.25j, 1.0 - 0.5j, -0.25 + 0.75j],
+            [0.75 - 0.2j, 1.5 + 0.1j, 0.2 + 0.4j],
+        ],
         dtype=torch.complex64,
     )
     other = torch.tensor(

@@ -66,9 +66,7 @@ class ComplexOneDimensionalFfts(torch.nn.Module):
 
 
 def test_complex_one_dimensional_fft_family_even_and_odd_lengths():
-    value = torch.tensor(
-        [1 + 2j, -2 + 0.5j, 0.25 - 1j, 3 + 0j], dtype=torch.complex64
-    )
+    value = torch.tensor([1 + 2j, -2 + 0.5j, 0.25 - 1j, 3 + 0j], dtype=torch.complex64)
     _assert_compiled_matches(ComplexOneDimensionalFfts(), (value,))
 
 

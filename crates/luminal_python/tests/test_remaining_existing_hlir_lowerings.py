@@ -89,9 +89,27 @@ class PolygammaOrders(torch.nn.Module):
 @torch.no_grad()
 def test_polygamma_orders_reflection_poles_and_infinities() -> None:
     values = [
-        -100.2, -20.5, -10.1, -5.0, -2.5, -1.0, -0.5,
-        -0.1, -0.0, 0.0, 1e-6, 0.01, 0.1, 0.5, 1.0,
-        2.0, 10.0, 100.0, float("inf"), float("-inf"), float("nan"),
+        -100.2,
+        -20.5,
+        -10.1,
+        -5.0,
+        -2.5,
+        -1.0,
+        -0.5,
+        -0.1,
+        -0.0,
+        0.0,
+        1e-6,
+        0.01,
+        0.1,
+        0.5,
+        1.0,
+        2.0,
+        10.0,
+        100.0,
+        float("inf"),
+        float("-inf"),
+        float("nan"),
     ]
     module = PolygammaOrders()
     for dtype in (torch.float32, torch.float64):
@@ -115,8 +133,20 @@ class ModifiedBesselFamily(torch.nn.Module):
 @torch.no_grad()
 def test_modified_bessel_family_across_approximation_intervals() -> None:
     values = [
-        float("-inf"), -100.0, -20.0, -8.0, -1.0, -0.0, 0.0,
-        1e-8, 1.0, 8.0, 20.0, 100.0, float("inf"), float("nan"),
+        float("-inf"),
+        -100.0,
+        -20.0,
+        -8.0,
+        -1.0,
+        -0.0,
+        0.0,
+        1e-8,
+        1.0,
+        8.0,
+        20.0,
+        100.0,
+        float("inf"),
+        float("nan"),
     ]
     module = ModifiedBesselFamily()
     for dtype, tolerance in ((torch.float32, 1e-5), (torch.float64, 1e-7)):
@@ -142,9 +172,29 @@ class CylindricalBesselAndAiryFamily(torch.nn.Module):
 @torch.no_grad()
 def test_cylindrical_bessel_and_airy_piecewise_approximations() -> None:
     values = [
-        float("-inf"), -100.0, -10.0, -5.001, -5.0, -2.1001, -2.09,
-        -2.0, -1e-8, -0.0, 0.0, 1e-8, 1.0, 2.0, 2.09, 5.0,
-        5.001, 8.3203353, 20.0, 103.892, 103.893, float("inf"), float("nan"),
+        float("-inf"),
+        -100.0,
+        -10.0,
+        -5.001,
+        -5.0,
+        -2.1001,
+        -2.09,
+        -2.0,
+        -1e-8,
+        -0.0,
+        0.0,
+        1e-8,
+        1.0,
+        2.0,
+        2.09,
+        5.0,
+        5.001,
+        8.3203353,
+        20.0,
+        103.892,
+        103.893,
+        float("inf"),
+        float("nan"),
     ]
     module = CylindricalBesselAndAiryFamily()
     for dtype, tolerance in ((torch.float32, 3e-5), (torch.float64, 3e-7)):
@@ -167,17 +217,38 @@ def test_inverse_probability_functions_cover_tails_and_boundaries() -> None:
         epsilon = torch.finfo(dtype).eps
         erf_value = torch.tensor(
             [
-                float("-inf"), -2.0, -1.0, -1.0 + epsilon, -0.7,
-                -0.0, 0.0, 0.7, 1.0 - epsilon, 1.0, 2.0,
-                float("inf"), float("nan"),
+                float("-inf"),
+                -2.0,
+                -1.0,
+                -1.0 + epsilon,
+                -0.7,
+                -0.0,
+                0.0,
+                0.7,
+                1.0 - epsilon,
+                1.0,
+                2.0,
+                float("inf"),
+                float("nan"),
             ],
             dtype=dtype,
         )
         probability = torch.tensor(
             [
-                float("-inf"), -1.0, -0.0, 0.0, torch.finfo(dtype).tiny,
-                epsilon, 0.1, 0.5, 0.9, 1.0 - epsilon, 1.0, 2.0,
-                float("inf"), float("nan"),
+                float("-inf"),
+                -1.0,
+                -0.0,
+                0.0,
+                torch.finfo(dtype).tiny,
+                epsilon,
+                0.1,
+                0.5,
+                0.9,
+                1.0 - epsilon,
+                1.0,
+                2.0,
+                float("inf"),
+                float("nan"),
             ],
             dtype=dtype,
         )
@@ -363,8 +434,8 @@ class PoolingAndResize(torch.nn.Module):
         max_values, max_indices = torch.ops.aten.max_pool2d_with_indices.default(
             value, [2, 3], [1, 2], [1, 1], [1, 1], True
         )
-        adaptive_values, adaptive_indices = (
-            torch.ops.aten.adaptive_max_pool2d.default(value, [3, 2])
+        adaptive_values, adaptive_indices = torch.ops.aten.adaptive_max_pool2d.default(
+            value, [3, 2]
         )
         max_backward = torch.ops.aten.max_pool2d_with_indices_backward.default(
             torch.ones_like(max_values),
@@ -609,18 +680,10 @@ def test_fixed_shape_3d_sampling_composites() -> None:
 class SegmentReductions(torch.nn.Module):
     def forward(self, value, lengths, offsets):
         return (
-            torch.segment_reduce(
-                value, "sum", lengths=lengths, axis=1, initial=2.0
-            ),
-            torch.segment_reduce(
-                value, "mean", offsets=offsets, axis=1, initial=1.0
-            ),
-            torch.segment_reduce(
-                value, "prod", lengths=lengths, axis=1, initial=-1.0
-            ),
-            torch.segment_reduce(
-                value, "max", offsets=offsets, axis=1, initial=0.5
-            ),
+            torch.segment_reduce(value, "sum", lengths=lengths, axis=1, initial=2.0),
+            torch.segment_reduce(value, "mean", offsets=offsets, axis=1, initial=1.0),
+            torch.segment_reduce(value, "prod", lengths=lengths, axis=1, initial=-1.0),
+            torch.segment_reduce(value, "max", offsets=offsets, axis=1, initial=0.5),
             torch.segment_reduce(value, "min", lengths=lengths, axis=1),
         )
 
