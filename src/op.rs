@@ -395,11 +395,29 @@ pub trait CustomOp: Debug {
 /// Defines an HLIROp that implements a logical operation.
 pub trait HLIROp: Debug + Display + as_any::AsAny {
     fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String;
+
+    /// Return this operation's concrete output dtype from the concrete dtypes
+    /// of its ordered inputs.
+    ///
+    /// Most logical operations preserve the dtype of their first input.
+    /// Operations with different dtype semantics override this method. Keeping
+    /// the rule on the operation makes graph transforms such as loop rolling
+    /// consume the same type contract as the op itself instead of maintaining
+    /// a second opcode-specific inference table.
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        *input_dtypes
+            .first()
+            .unwrap_or_else(|| panic!("{self} has no input and does not declare an output dtype"))
+    }
 }
 
 impl<T: HLIROp> HLIROp for Box<T> {
     fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
         <T as HLIROp>::to_egglog(self, inputs)
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        <T as HLIROp>::output_dtype(self, input_dtypes)
     }
 }
 

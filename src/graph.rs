@@ -836,6 +836,12 @@ impl Graph {
         }
 
         let mut created = 0usize;
+        // Loop markers cross the HLIR -> egglog -> LLIR boundary and therefore
+        // carry the same concrete dtype as the tensor they represent. Compute
+        // those dtypes from the still-unmodified graph before inserting any
+        // markers; an unknown or inconsistent dtype is a compile error, never
+        // an F32 default.
+        let dtype_map = self.concrete_node_dtypes();
         // Track all NodeIndex slots we newly assign for loop-marker ops.
         // StableGraph reuses freed node indices; removals later in this
         // function might target slots that happen to coincide with a new
@@ -858,19 +864,26 @@ impl Graph {
             let initial = candidate.occurrences[0].boundary_inputs[p];
             let body_state_out = candidate.occurrences[0].output_nodes[out_pos];
             let last_state_out = candidate.occurrences[n_iters - 1].output_nodes[out_pos];
+            let dtype = dtype_map[&initial];
+            for (role, node) in [
+                ("loop body state output", body_state_out),
+                ("loop final state output", last_state_out),
+            ] {
+                let actual = dtype_map[&node];
+                assert_eq!(
+                    actual,
+                    dtype,
+                    "loop {loop_id} slot {slot_idx} changes dtype: initial node {} is {dtype:?}, {role} node {} is {actual:?}",
+                    initial.index(),
+                    node.index(),
+                );
+            }
 
-            // Marker dtype fields are placeholders: the e-graph derives each
-            // marker's dtype fact from its input via dtype_prop (see hlir.rs).
-            // Marker dtype fields are placeholders, not sources of truth:
-            // each marker's dtype fact is derived inside the e-graph from
-            // its input by the generic dtype_prop propagation rule (see the
-            // marker EgglogOp impls in hlir.rs). Nothing downstream reads
-            // the field semantically.
             let loop_start = self.graph.add_node(Box::new(LoopStart {
                 loop_id,
                 slot_idx,
                 iters: Expression::from(n_iters as i32),
-                dtype: DType::F32,
+                dtype,
             }));
             added_loop_ops.insert(loop_start);
             self.graph.add_edge(initial, loop_start, ());
@@ -889,7 +902,7 @@ impl Graph {
             let loop_end = self.graph.add_node(Box::new(LoopEnd {
                 loop_id,
                 slot_idx,
-                dtype: DType::F32,
+                dtype,
             }));
             added_loop_ops.insert(loop_end);
             self.graph.add_edge(body_state_out, loop_end, ());
@@ -925,6 +938,15 @@ impl Graph {
             }
 
             let body_input = candidate.occurrences[0].boundary_inputs[p];
+            let dtype = self.uniform_node_dtype(
+                &per_iter_sources,
+                &dtype_map,
+                &format!("loop {loop_id} input stream {p}"),
+            );
+            assert_eq!(
+                dtype, dtype_map[&body_input],
+                "loop {loop_id} input stream {p} body input has a different concrete dtype"
+            );
             if log {
                 println!(
                     "   {:>6}  loop {loop_id} stream {p}: per-iter sources {:?}",
@@ -938,7 +960,7 @@ impl Graph {
             let loop_input = self.graph.add_node(Box::new(LoopInput {
                 loop_id,
                 stream_id: p,
-                dtype: DType::F32,
+                dtype,
             }));
             added_loop_ops.insert(loop_input);
             // Deferred: added at the end with fresh ascending edge ids —
@@ -1023,11 +1045,20 @@ impl Graph {
 
             // Iter-0 body producer feeds the LoopOutput marker.
             let body_output = per_iter_plan[0].0;
+            let per_iter_outputs: Vec<NodeIndex> = per_iter_plan
+                .iter()
+                .map(|(producer, _)| *producer)
+                .collect();
+            let dtype = self.uniform_node_dtype(
+                &per_iter_outputs,
+                &dtype_map,
+                &format!("loop {loop_id} output stream {q}"),
+            );
 
             let loop_output = self.graph.add_node(Box::new(LoopOutput {
                 loop_id,
                 stream_id: q,
-                dtype: DType::F32,
+                dtype,
             }));
             self.graph.add_edge(body_output, loop_output, ());
             added_loop_ops.insert(loop_output);
@@ -1039,7 +1070,7 @@ impl Graph {
                     loop_id,
                     stream_id: q,
                     iter: i,
-                    dtype: DType::F32,
+                    dtype,
                 }));
                 self.graph.add_edge(loop_output, select, ());
                 added_loop_ops.insert(select);
@@ -1092,6 +1123,70 @@ impl Graph {
             );
         }
         created
+    }
+
+    /// Resolve every HLIR node's concrete dtype in topological order.
+    ///
+    /// Each operation owns its dtype contract through
+    /// [`HLIROp::output_dtype`]. There is no graph-level opcode table and no
+    /// fallback dtype: malformed graphs fail before a transform can stamp
+    /// incorrect metadata onto a structural marker.
+    fn concrete_node_dtypes(&self) -> FxHashMap<NodeIndex, DType> {
+        let order = petgraph::algo::toposort(&self.graph, None).unwrap_or_else(|cycle| {
+            panic!("HLIR contains a cycle at node {}", cycle.node_id().index())
+        });
+        let mut dtypes = FxHashMap::default();
+        for node in order {
+            let sources = self.get_sources(node);
+            let input_dtypes: Vec<_> = sources
+                .iter()
+                .map(|source| {
+                    dtypes.get(source).copied().unwrap_or_else(|| {
+                        panic!(
+                            "HLIR node {} ({}) depends on node {} before its concrete dtype is known",
+                            node.index(),
+                            self.graph[node],
+                            source.index(),
+                        )
+                    })
+                })
+                .collect();
+            let dtype = self.graph[node].output_dtype(&input_dtypes);
+            if let Some((_, metadata_dtype)) = self.input_meta.get(&node) {
+                assert_eq!(
+                    dtype,
+                    *metadata_dtype,
+                    "HLIR node {} ({}) has conflicting concrete dtypes: op={dtype:?}, metadata={metadata_dtype:?}",
+                    node.index(),
+                    self.graph[node],
+                );
+            }
+            dtypes.insert(node, dtype);
+        }
+        dtypes
+    }
+
+    fn uniform_node_dtype(
+        &self,
+        nodes: &[NodeIndex],
+        dtypes: &FxHashMap<NodeIndex, DType>,
+        context: &str,
+    ) -> DType {
+        let (&first, rest) = nodes
+            .split_first()
+            .unwrap_or_else(|| panic!("{context} has no tensor sources"));
+        let dtype = dtypes[&first];
+        for &node in rest {
+            let actual = dtypes[&node];
+            assert_eq!(
+                actual,
+                dtype,
+                "{context} mixes concrete dtypes: node {} is {dtype:?}, node {} is {actual:?}",
+                first.index(),
+                node.index(),
+            );
+        }
+        dtype
     }
 
     /// Set a runtime dimension
@@ -4675,7 +4770,9 @@ mod tests {
         api::{Rule, SortDef, sort},
         base::OP_KIND,
     };
-    use crate::hlir::{Input, LoopEnd, LoopStart, Output, ReferenceData, ReferenceOp, Sin};
+    use crate::hlir::{
+        Input, LoopEnd, LoopInput, LoopStart, Output, ReferenceData, ReferenceOp, Sin,
+    };
     use rand::SeedableRng;
 
     // A rolling candidate is only collapsible if every non-state boundary input
@@ -6350,6 +6447,94 @@ mod tests {
             })
             .collect();
         assert_close(rt.get_f32(out.id), &expected);
+    }
+
+    #[test]
+    fn loop_rolling_stamps_concrete_varying_stream_dtypes() {
+        // A transformer-style recurrence carries F32 activations while every
+        // repeated layer receives a distinct BF16 weight. The weight casts are
+        // part of the repeated body, so the rolled boundary itself must retain
+        // BF16 rather than a placeholder chosen independently of its sources.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let weights: Vec<GraphTensor> =
+            (0..4).map(|_| cx.tensor(8).as_dtype(DType::Bf16)).collect();
+        let mut y = x;
+        for weight in weights {
+            y = (y * weight.cast(DType::F32)).sin();
+        }
+        let _ = y.output();
+
+        assert!(
+            cx.auto_roll_loops_prepass_with_log(true) > 0,
+            "expected the repeated weighted recurrence to roll"
+        );
+
+        let loop_inputs: Vec<_> = cx
+            .graph
+            .node_indices()
+            .filter_map(|node| cx.try_get_op::<LoopInput>(node))
+            .collect();
+        assert!(!loop_inputs.is_empty(), "expected a varying weight stream");
+        assert!(
+            loop_inputs.iter().any(|input| input.dtype == DType::Bf16),
+            "expected a concrete BF16 LoopInput, got {loop_inputs:?}"
+        );
+        assert!(
+            cx.graph.node_indices().all(|node| {
+                cx.try_get_op::<LoopStart>(node)
+                    .is_none_or(|start| start.dtype == DType::F32)
+            }),
+            "the carried F32 activation must remain concretely F32"
+        );
+
+        // The concrete field remains the source of truth through egglog
+        // construction; this used to turn every marker field into F32.
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
+    }
+
+    #[test]
+    fn loop_rolling_preserves_integer_gather_stream_dtypes() {
+        // Regression for mixed-type repeated regions: Gather consumes Int
+        // indexes but produces the dtype of its F32 data input. Both facts
+        // must survive rolling without one eclass overwriting the other.
+        let mut cx = Graph::new();
+        let x = cx.tensor(8);
+        let indexes: Vec<GraphTensor> = (0..4)
+            .map(|layer| {
+                cx.named_tensor(format!("indexes.{layer}"), 8)
+                    .as_dtype(DType::Int)
+            })
+            .collect();
+        let mut y = x;
+        for index in indexes {
+            y = y.gather(index).sin();
+        }
+        let _ = y.output();
+
+        assert!(
+            cx.auto_roll_loops_prepass_with_log(true) > 0,
+            "expected the repeated gather recurrence to roll"
+        );
+
+        let loop_inputs: Vec<_> = cx
+            .graph
+            .node_indices()
+            .filter_map(|node| cx.try_get_op::<LoopInput>(node))
+            .collect();
+        assert!(
+            loop_inputs.iter().any(|input| input.dtype == DType::Int),
+            "expected a concrete Int LoopInput, got {loop_inputs:?}"
+        );
+        assert!(
+            cx.graph.node_indices().all(|node| {
+                cx.try_get_op::<LoopStart>(node)
+                    .is_none_or(|start| start.dtype == DType::F32)
+            }),
+            "Gather must preserve the carried F32 activation dtype"
+        );
+
+        cx.build_search_space::<ReferenceRuntime>(CompileOptions::default());
     }
 
     #[test]

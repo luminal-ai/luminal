@@ -85,6 +85,19 @@ fn dtype_fixed_op(kind_sort: &SortDef, dtype_sort: &SortDef) -> Rule {
         .ruleset("dtype_prop")
 }
 
+/// Validate a structural marker's declared dtype against every tensor source.
+/// Marker metadata is a concrete contract, never an inference placeholder.
+fn marker_output_dtype(op: &dyn Display, declared: DType, inputs: &[DType]) -> DType {
+    assert!(!inputs.is_empty(), "{op} has no tensor source");
+    for (index, &actual) in inputs.iter().enumerate() {
+        assert_eq!(
+            actual, declared,
+            "{op} declares {declared:?}, but input {index} is {actual:?}"
+        );
+    }
+    declared
+}
+
 /// Build an IList egglog string from input variable names.
 fn ilist_egglog(inputs: &[&str]) -> String {
     list_to_egglog(inputs, "ICons", "INil")
@@ -316,6 +329,14 @@ impl HLIROp for Input {
             self.node, self.label, self.dtype
         )
     }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        assert!(
+            input_dtypes.is_empty(),
+            "Input cannot consume tensor inputs"
+        );
+        self.dtype
+    }
 }
 
 impl ReferenceOp for Input {
@@ -430,6 +451,10 @@ impl HLIROp for CustomOpKind {
             list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
         )
     }
+
+    fn output_dtype(&self, _input_dtypes: &[DType]) -> DType {
+        self.dtype
+    }
 }
 
 impl ReferenceOp for CustomOpKind {
@@ -495,12 +520,7 @@ impl EgglogOp for LoopStart {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Derived from the `inp` field's class inside the e-graph
-            // (initial value / body producer); the serialized dtype field is
-            // a placeholder. See LoopInput.
-            dtype_propagation_rule(&self.sort(), "inp"),
-        ]
+        vec![dtype_from_field_rule(&self.sort(), "dtype")]
     }
 
     fn extract<'a>(
@@ -546,6 +566,10 @@ impl HLIROp for LoopStart {
             self.dtype,
         )
     }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        marker_output_dtype(self, self.dtype, input_dtypes)
+    }
 }
 
 impl ReferenceOp for LoopStart {
@@ -590,12 +614,7 @@ impl EgglogOp for LoopEnd {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Derived from the `inp` field's class inside the e-graph
-            // (initial value / body producer); the serialized dtype field is
-            // a placeholder. See LoopInput.
-            dtype_propagation_rule(&self.sort(), "inp"),
-        ]
+        vec![dtype_from_field_rule(&self.sort(), "dtype")]
     }
 
     fn extract<'a>(
@@ -634,6 +653,10 @@ impl HLIROp for LoopEnd {
             "(LoopEnd {} {} {} ({:?}))",
             inp[0].1, self.loop_id, self.slot_idx, self.dtype,
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        marker_output_dtype(self, self.dtype, input_dtypes)
     }
 }
 
@@ -680,12 +703,10 @@ impl EgglogOp for LoopInput {
         // that expect raw op kinds at boundary positions can match via the
         // unioned eclass.
         vec![
-            // The marker's class dtype is DERIVED from its input inside the
-            // e-graph (generic first-input propagation) — the serialized
-            // field is not a source of truth. Declaring the field here let a
-            // wrongly-stamped marker corrupt its source class's dtype fact
-            // through the inline union (`:merge new` is last-write-wins).
-            dtype_propagation_op(&self.sort()),
+            // Loop rolling stamps the concrete stream dtype into the marker;
+            // the field is the same type contract consumed by rewrites and
+            // extracted into LLIR.
+            dtype_from_kind_field(&self.sort(), "dtype"),
             Rule::raw(
                 r#"
             (relation identical_inputs (IList))
@@ -767,6 +788,10 @@ impl HLIROp for LoopInput {
             list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
         )
     }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        marker_output_dtype(self, self.dtype, input_dtypes)
+    }
 }
 
 impl ReferenceOp for LoopInput {
@@ -814,10 +839,7 @@ impl EgglogOp for LoopInputStatic {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Derived from the input inside the e-graph; see LoopInput.
-            dtype_propagation_op(&self.sort()),
-        ]
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
     }
 
     fn extract<'a>(
@@ -859,6 +881,10 @@ impl HLIROp for LoopInputStatic {
             self.dtype,
             list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        marker_output_dtype(self, self.dtype, input_dtypes)
     }
 }
 
@@ -904,10 +930,7 @@ impl EgglogOp for LoopOutput {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Derived from the input inside the e-graph; see LoopInput.
-            dtype_propagation_op(&self.sort()),
-        ]
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
     }
 
     fn extract<'a>(
@@ -949,6 +972,10 @@ impl HLIROp for LoopOutput {
             self.dtype,
             list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        marker_output_dtype(self, self.dtype, input_dtypes)
     }
 }
 
@@ -1001,10 +1028,7 @@ impl EgglogOp for LoopOutputSelect {
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        vec![
-            // Derived from the input inside the e-graph; see LoopInput.
-            dtype_propagation_op(&self.sort()),
-        ]
+        vec![dtype_from_kind_field(&self.sort(), "dtype")]
     }
 
     fn extract<'a>(
@@ -1054,6 +1078,10 @@ impl HLIROp for LoopOutputSelect {
             list_to_egglog(&inp.iter().map(|i| &i.1).collect_vec(), "ICons", "INil"),
         )
     }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        marker_output_dtype(self, self.dtype, input_dtypes)
+    }
 }
 
 impl ReferenceOp for LoopOutputSelect {
@@ -1080,6 +1108,14 @@ impl Display for Constant {
 impl HLIROp for Constant {
     fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
         format!("(Op (Constant {:?}) (INil))", self.0)
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        assert!(
+            input_dtypes.is_empty(),
+            "Constant cannot consume tensor inputs"
+        );
+        DType::F32
     }
 }
 
@@ -1143,6 +1179,14 @@ impl HLIROp for ConstantF64 {
     fn to_egglog(&self, _: &[(NodeIndex, String)]) -> String {
         format!("(Op (ConstantF64 {:?}) (INil))", self.0)
     }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        assert!(
+            input_dtypes.is_empty(),
+            "ConstantF64 cannot consume tensor inputs"
+        );
+        DType::F64
+    }
 }
 
 impl EgglogOp for ConstantF64 {
@@ -1199,6 +1243,11 @@ impl HLIROp for Iota {
             self.0.to_egglog(),
             self.1.to_egglog()
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        assert!(input_dtypes.is_empty(), "Iota cannot consume tensor inputs");
+        DType::Int
     }
 }
 impl EgglogOp for Iota {
@@ -1261,6 +1310,11 @@ impl HLIROp for Cast {
             self.1,
             inp[0].1,
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        assert_eq!(input_dtypes.len(), 1, "Cast must consume one tensor input");
+        self.1
     }
 }
 impl EgglogOp for Cast {
@@ -2105,6 +2159,19 @@ impl HLIROp for LessThan {
             ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
         )
     }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        assert_eq!(
+            input_dtypes.len(),
+            2,
+            "LessThan must consume two tensor inputs"
+        );
+        assert_eq!(
+            input_dtypes[0], input_dtypes[1],
+            "LessThan inputs must have the same concrete dtype"
+        );
+        DType::Bool
+    }
 }
 
 impl EgglogOp for LessThan {
@@ -2211,6 +2278,12 @@ impl HLIROp for Gather {
             elist_to_egglog(&self.input_shapes[1].strides),
             ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        *input_dtypes
+            .get(1)
+            .unwrap_or_else(|| panic!("Gather has no data input at position 1"))
     }
 }
 
@@ -2385,6 +2458,12 @@ impl HLIROp for Scatter {
             elist_to_egglog(&self.src_strides),
             ilist_egglog(&[&inputs[0].1, &inputs[1].1, &inputs[2].1]),
         )
+    }
+
+    fn output_dtype(&self, input_dtypes: &[DType]) -> DType {
+        *input_dtypes
+            .get(2)
+            .unwrap_or_else(|| panic!("Scatter has no source input at position 2"))
     }
 }
 
