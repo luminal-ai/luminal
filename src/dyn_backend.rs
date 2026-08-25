@@ -177,7 +177,10 @@ pub fn compile_backend<Rt: Runtime + 'static>(
     // survives cross-binary type identity mismatches with external plugins).
     let label_map = build_label_map(graph);
 
-    graph.build_search_space::<Rt>(CompileOptions::default());
+    let has_selected_schedule = graph.selected_schedule().is_some();
+    if !has_selected_schedule {
+        graph.build_search_space::<Rt>(CompileOptions::default());
+    }
 
     let mut rt = init()?;
 
@@ -205,11 +208,15 @@ pub fn compile_backend<Rt: Runtime + 'static>(
         }
     }
 
-    // Search
-    let mut rt = graph.search(
-        rt,
-        CompileOptions::default().search_graph_limit(args.search_iters),
-    );
+    let mut rt = rt;
+    if has_selected_schedule {
+        graph.load_selected_schedule(&mut rt)?;
+    } else {
+        rt = graph.search(
+            rt,
+            CompileOptions::default().search_graph_limit(args.search_iters),
+        );
+    }
 
     // Rebuild label map after search (graph may have changed)
     let label_map = build_label_map(graph);

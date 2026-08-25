@@ -45,6 +45,28 @@ class CompiledArtifact:
         self._active_binding = binding
         return changed
 
+    def serialize(self) -> bytes:
+        return bytes(self.graph.serialize_artifact())
+
+    @classmethod
+    def deserialize(
+        cls,
+        data,
+        factory,
+        *,
+        device_index=None,
+        external_cuda_graph=False,
+    ):
+        from .luminal import load_compiled_artifact
+
+        graph = load_compiled_artifact(
+            data,
+            factory,
+            device_index=device_index,
+            external_cuda_graph=external_cuda_graph,
+        )
+        return cls(graph)
+
 
 def region_artifact_key(program, **options) -> str | None:
     """Return None when the program contains weights that cannot be rebound."""

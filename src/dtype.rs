@@ -2,7 +2,7 @@ use std::fmt::{Debug, Display};
 
 /// Supported dtypes
 /// This is undergoing development. Our goal is to be as explicit as possible about dtype behavior.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Deserialize, serde::Serialize)]
 pub enum DType {
     /// 32-bit float (8e23m)
     #[default]

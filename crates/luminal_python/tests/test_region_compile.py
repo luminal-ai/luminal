@@ -16,7 +16,7 @@ from luminal.artifact_cache import (
     region_artifact_key,
 )
 from luminal.compiled_model import CompiledModel
-from luminal.region_compile import compile_region
+from luminal.region_compile import compile_region, load_region_artifact
 from luminal.region_export import export_region
 
 
@@ -127,6 +127,21 @@ def test_artifact_cache_compiles_once() -> None:
         searches=1,
     )
     clear_artifact_cache()
+
+
+def test_compiled_artifact_round_trip_cpu() -> None:
+    from luminal.luminal import _reference_factory_capsule
+    from luminal.pt2 import compile as luminal_compile
+
+    inputs = [torch.randn(2, 4), torch.randn(2, 4)]
+    compiled = luminal_compile(_add_graph(), inputs, search_iterations=1)
+    loaded = CompiledArtifact.deserialize(
+        compiled.serialize_artifact(),
+        _reference_factory_capsule(),
+    ).bind()
+
+    (actual,) = loaded(*inputs)
+    torch.testing.assert_close(actual, inputs[0] + inputs[1])
 
 
 def test_shared_artifact_rebinds_inputs_between_models() -> None:
@@ -348,6 +363,29 @@ def test_compile_region_from_fake_cuda_metadata() -> None:
     ]
     (actual,) = compiled(*real_inputs)
     torch.testing.assert_close(actual, real_inputs[0] + real_inputs[1])
+
+
+@pytest.mark.skipif(
+    _CUDA_SKIP_REASON is not None, reason=_CUDA_SKIP_REASON or "CUDA is unavailable"
+)
+def test_region_artifact_round_trip() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        fake_inputs = [
+            torch.empty((2, 4), device="cuda", dtype=torch.float16),
+            torch.empty((2, 4), device="cuda", dtype=torch.float16),
+        ]
+        region = export_region(_add_graph(), fake_inputs)
+
+    compiled = compile_region(region, search_iterations=1)
+    loaded = load_region_artifact(compiled.serialize_artifact(), region)
+    inputs = [
+        torch.randn((2, 4), device="cuda", dtype=torch.float16) for _ in range(2)
+    ]
+
+    (actual,) = loaded(*inputs)
+    torch.testing.assert_close(actual, inputs[0] + inputs[1])
 
 
 @pytest.mark.skipif(
