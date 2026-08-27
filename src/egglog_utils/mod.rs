@@ -13,7 +13,7 @@ use std::{
 };
 use tracing::trace;
 
-use crate::graph::PackedLLIRGraph;
+use crate::search::packed::PackedLLIRGraph;
 
 pub use egraph_serialize::{ClassId, NodeId};
 
@@ -1915,7 +1915,7 @@ struct DenseNode {
 /// hot search loop never has to hash e-graph strings after the initial genome
 /// is converted.
 #[derive(Clone, Debug)]
-pub(crate) struct IndexedChoiceSet {
+pub struct IndexedChoiceSet {
     choices: Vec<DenseIndex>,
     hash: u64,
 }
@@ -1950,7 +1950,7 @@ struct CachedIndexedExtraction {
 /// op-name dispatch table and decoded expression metadata are consequently
 /// candidate-independent and should be built once, not rediscovered for
 /// every LLIR node in every candidate.
-pub(crate) struct LlirExtractor<'a> {
+pub struct LlirExtractor<'a> {
     egraph: &'a SerializedEGraph,
     ops: &'a [Arc<Box<dyn EgglogOp>>],
     op_by_name: FxHashMap<String, usize>,
@@ -1984,7 +1984,7 @@ struct CachedEClass<'a> {
 }
 
 impl<'a> LlirExtractor<'a> {
-    pub(crate) fn new(egraph: &'a SerializedEGraph, ops: &'a [Arc<Box<dyn EgglogOp>>]) -> Self {
+    pub fn new(egraph: &'a SerializedEGraph, ops: &'a [Arc<Box<dyn EgglogOp>>]) -> Self {
         let started_at = std::time::Instant::now();
         let op_by_name = ops
             .iter()
@@ -2177,7 +2177,7 @@ impl<'a> LlirExtractor<'a> {
         self.mutation_nodes[class as usize].as_deref().unwrap()
     }
 
-    pub(crate) fn index_choice_set(&self, choices: &EGraphChoiceSet<'a>) -> IndexedChoiceSet {
+    pub fn index_choice_set(&self, choices: &EGraphChoiceSet<'a>) -> IndexedChoiceSet {
         let mut indexed = vec![NO_DENSE_INDEX; self.indexed_classes.len()];
         let mut hash = 0u64;
         for (&class, &node) in choices {
@@ -2197,16 +2197,16 @@ impl<'a> LlirExtractor<'a> {
         }
     }
 
-    pub(crate) fn random_indexed_choice(&self, rng: &mut impl Rng) -> IndexedChoiceSet {
+    pub fn random_indexed_choice(&self, rng: &mut (impl Rng + ?Sized)) -> IndexedChoiceSet {
         let choices = random_initial_choice(self.egraph, rng);
         self.index_choice_set(&choices)
     }
 
-    pub(crate) fn random_indexed_generation(
+    pub fn random_indexed_generation(
         &self,
         generation_size: usize,
         prev_selected: &mut FxHashSet<u64>,
-        rng: &mut impl Rng,
+        rng: &mut (impl Rng + ?Sized),
     ) -> Vec<IndexedChoiceSet> {
         let mut generation = Vec::with_capacity(generation_size);
         let max_attempts = generation_size.saturating_mul(100);
@@ -2221,13 +2221,13 @@ impl<'a> LlirExtractor<'a> {
         generation
     }
 
-    pub(crate) fn extract_reachable_indexed_generation(
+    pub fn extract_reachable_indexed_generation(
         &mut self,
         base: &IndexedChoiceSet,
         generation_size: usize,
         mutations_per_generation: usize,
         prev_selected: &mut FxHashSet<u64>,
-        rng: &mut impl Rng,
+        rng: &mut (impl Rng + ?Sized),
     ) -> Vec<IndexedChoiceSet> {
         let mut seen_nodes = FxHashSet::default();
         let mut seen_classes = FxHashSet::default();
@@ -2293,12 +2293,12 @@ impl<'a> LlirExtractor<'a> {
     /// Extract through integer-indexed e-classes and e-nodes into a dense
     /// rolled representation. The caller materializes the fully-unrolled
     /// public `StableGraph` directly from this representation.
-    pub(crate) fn extract_indexed_packed(
+    pub fn extract_indexed_packed(
         &mut self,
         choices: &IndexedChoiceSet,
-        custom_ops: &[Box<dyn CustomOp>],
-        custom_op_id_remap: Option<&FxHashMap<usize, usize>>,
+        custom_ops: &[crate::op::LLIROp],
     ) -> PackedLLIRGraph {
+        let custom_op_id_remap: Option<&FxHashMap<usize, usize>> = None;
         let started_at = std::time::Instant::now();
         let profile = llir_profile_enabled();
         let mut cache_hits = 0usize;
@@ -2493,7 +2493,7 @@ impl<'a> LlirExtractor<'a> {
                 .map(|input| self.indexed_node_id(*input))
                 .collect();
             let (op, source_refs) = if let Some(custom_id) = custom_id {
-                (custom_ops[custom_id].to_llir_op(), input_refs)
+                (custom_ops[custom_id].clone(), input_refs)
             } else {
                 self.ops[op_index.unwrap()].extract(
                     self.egraph,
@@ -2765,7 +2765,7 @@ fn cyclic_choice_components<'a>(
 fn repair_choice_cycles<'a>(
     egraph: &'a SerializedEGraph,
     choices: &mut EGraphChoiceSet<'a>,
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
 ) {
     // Repair only the reachable selected term. Unreachable eclasses still need
     // entries for a complete genome, but cycles among those entries cannot
@@ -2961,7 +2961,7 @@ fn non_marker_enode_indices(egraph: &SerializedEGraph, enodes: &[NodeId]) -> Vec
 
 pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
 ) -> EGraphChoiceSet<'a> {
     let mut choices = EGraphChoiceSet::default();
     for (eclass, (label, enodes)) in &egraph.eclasses {
@@ -3141,7 +3141,7 @@ pub fn extract_generation<'a>(
     generation_size: usize,
     mutations_per_generation: usize,
     prev_selected: &mut FxHashSet<u64>,
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
 ) -> Vec<EGraphChoiceSet<'a>> {
     let mutable_classes: Vec<&ClassId> = egraph
         .eclasses
@@ -3166,7 +3166,7 @@ pub fn extract_reachable_generation<'a>(
     generation_size: usize,
     mutations_per_generation: usize,
     prev_selected: &mut FxHashSet<u64>,
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
 ) -> Vec<EGraphChoiceSet<'a>> {
     let mutable_classes = reachable_mutable_choice_classes(egraph, base);
     extract_generation_from_classes(
@@ -3232,7 +3232,7 @@ fn extract_generation_from_classes<'a>(
     generation_size: usize,
     mutations_per_generation: usize,
     prev_selected: &mut FxHashSet<u64>,
-    rng: &mut impl Rng,
+    rng: &mut (impl Rng + ?Sized),
 ) -> Vec<EGraphChoiceSet<'a>> {
     // If there are no mutable classes, we can only return the base if it's unseen
     if mutable_classes.is_empty() {

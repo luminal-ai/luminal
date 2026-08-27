@@ -4,64 +4,21 @@ use std::{
 };
 
 use crate::prelude::*;
+use crate::search::SearchSpace;
 use as_any::{AsAny, Downcast};
 use rustc_hash::FxHashMap;
 
-#[derive(Clone, Copy)]
-pub struct ProfileBucketContext<'a> {
-    pub dim_buckets: &'a FxHashMap<Symbol, Vec<DimBucket>>,
-    pub bucket_indices: &'a DynMap,
-    pub representative_dyn_map: &'a DynMap,
-}
-
-#[derive(Clone, Copy)]
-pub struct CandidateFilterContext<'a> {
-    pub search_options: &'a crate::graph::CompileOptions,
-    pub dyn_map: &'a DynMap,
-    pub bucket_context: Option<ProfileBucketContext<'a>>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CandidateFilterResult {
-    pub accepted: bool,
-    pub display: Option<String>,
-}
-
-impl CandidateFilterResult {
-    pub fn accept() -> Self {
-        Self {
-            accepted: true,
-            display: None,
-        }
-    }
-
-    pub fn accept_with_display(display: impl Into<String>) -> Self {
-        Self {
-            accepted: true,
-            display: Some(display.into()),
-        }
-    }
-
-    pub fn reject() -> Self {
-        Self {
-            accepted: false,
-            display: None,
-        }
-    }
-
-    pub fn reject_with_display(display: impl Into<String>) -> Self {
-        Self {
-            accepted: false,
-            display: Some(display.into()),
-        }
-    }
-}
-
+/// A backend: the ops and rewrites that lower HLIR into its LLIR, a search
+/// strategy over the saturated e-graphs core hands it, and execution of the
+/// programs it selects.
 pub trait Runtime {
     type Ops: IntoEgglogOp;
     type CompileArg;
     type ExecReturn;
-    type ProfileMetric: PartialOrd + Clone + Debug;
+    /// Whether HLIR ops are deleted from the e-graph after saturation so
+    /// only lowered LLIR is extractable. The reference runtime, whose LLIR
+    /// *is* HLIR, sets this to `false`.
+    const CLEANUP_HLIR: bool = true;
     /// Backend-provided egglog layers that run after the normal full-egraph
     /// cleanup schedule. Core keeps this empty; runtimes can use it for
     /// backend-specific analyses and cleanup passes without adding those rules
@@ -87,144 +44,29 @@ pub trait Runtime {
         String::new()
     }
     fn initialize(arg: Self::CompileArg) -> Self;
+    /// Choose one program per bucket of `space` — by any strategy — and leave
+    /// the runtime ready to [`Runtime::execute`].
+    ///
+    /// `dyn_map` is the graph's dyn map after `options.search_dims`; the
+    /// representative values of each bucket come from
+    /// [`SearchSpace::bucket_contexts`]. `rng` is the caller's (possibly
+    /// seeded) RNG. Core ships the building blocks in [`crate::search`]:
+    /// [`crate::search::extract_one`] for a runtime with nothing to rank on,
+    /// [`crate::search::GeneticSearch`] and friends for a runtime that
+    /// profiles, and [`crate::search::genetic_search`] composing them into
+    /// the stock strategy.
+    fn compile(
+        &mut self,
+        space: &SearchSpace,
+        dyn_map: &DynMap,
+        options: &crate::graph::CompileOptions,
+        rng: &mut dyn rand::RngCore,
+    );
+    /// Load one LLIR graph as the executable. [`Runtime::compile`] normally
+    /// loads what it selects; this is the direct path for callers that
+    /// already hold an LLIR graph.
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
     fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn;
-    /// `early_stop` is `Some((best_metric, factor))` when the search already
-    /// holds a best candidate: once this candidate's running mean exceeds
-    /// `best * factor`, the runtime may stop remaining trials and return the
-    /// partial mean. The truncated metric is still returned and ranked
-    /// normally — early stop never changes which candidates are eligible,
-    /// only how much profiling time is spent on ones that have already lost.
-    /// Runtimes are free to ignore it.
-    fn profile(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-    ) -> (Self::ProfileMetric, String);
-    /// Profile one candidate in the context of a specific dynamic-dimension
-    /// bucket. Runtimes with bucket-sensitive lowering can override this so
-    /// search ranks candidates under the same execution model used after
-    /// final bucket compilation.
-    fn profile_with_bucket_context(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-        _bucket_context: ProfileBucketContext<'_>,
-    ) -> (Self::ProfileMetric, String) {
-        self.profile(llir_graph, dyn_map, trials, timeout, early_stop)
-    }
-    /// Filter and, when useful for the backend, prepare one candidate for
-    /// profiling. The default preserves the traditional split path: it only
-    /// filters here and [`Runtime::profile_prepared_candidate`] loads the
-    /// candidate through `profile` below. Backends whose hard filter already
-    /// compiles the LLIR can override both hooks to install that exact compiled
-    /// candidate and avoid compiling it again for profiling.
-    ///
-    /// A rejected candidate must not replace the currently loaded executable.
-    fn prepare_profile_candidate(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        context: CandidateFilterContext<'_>,
-    ) -> CandidateFilterResult {
-        self.filter_llir_candidate(llir_graph, context)
-    }
-    /// Profile the candidate accepted by
-    /// [`Runtime::prepare_profile_candidate`]. The default loads it through
-    /// the existing profile entry points. A backend that installed the graph
-    /// while preparing it can override this method to execute the prepared
-    /// graph directly.
-    #[allow(clippy::too_many_arguments)]
-    fn profile_prepared_candidate(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-        bucket_context: Option<ProfileBucketContext<'_>>,
-    ) -> (Self::ProfileMetric, String) {
-        self.clear_intermediate_buffers();
-        if let Some(bucket_context) = bucket_context {
-            self.profile_with_bucket_context(
-                llir_graph,
-                dyn_map,
-                trials,
-                timeout,
-                early_stop,
-                bucket_context,
-            )
-        } else {
-            self.profile(llir_graph, dyn_map, trials, timeout, early_stop)
-        }
-    }
-    /// Aggregate multiple profile metrics into one comparable metric.
-    /// Used for regionalized profiling and best-first bucket-set selection.
-    /// Implementations must be coordinate-monotone: replacing any input with
-    /// a metric that compares greater must not make the aggregate compare less.
-    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
-        metrics
-            .first()
-            .unwrap_or_else(|| panic!("aggregate_profile_metrics called with empty metrics"))
-            .clone()
-    }
-    /// Allocate a dummy input buffer for a boundary node during per-chunk profiling.
-    /// `node_index` is the HLIR node index used in the Input op's `node` field.
-    /// `num_bytes` is the number of bytes to allocate.
-    fn allocate_dummy_input(&mut self, _node_index: usize, _num_bytes: usize) {}
-    /// Check if an HLIR buffer already exists for a given node index.
-    fn has_hlir_buffer(&self, _node_index: usize) -> bool {
-        false
-    }
-    /// Clear intermediate buffers to prepare for loading a different chunk's LLIR.
-    fn clear_intermediate_buffers(&mut self) {}
-    /// Total bytes of intermediate buffers currently allocated.
-    fn intermediate_buffer_bytes(&self) -> usize {
-        0
-    }
-    /// Runtime-specific pre-profile candidate filter. Backends can reject an
-    /// extracted LLIR graph before profiling it, for example because it exceeds
-    /// a backend-specific resource budget. Core treats this as an opaque
-    /// accept/reject decision and optional display text.
-    fn filter_llir_candidate(
-        &mut self,
-        _llir_graph: &LLIRGraph,
-        _context: CandidateFilterContext<'_>,
-    ) -> CandidateFilterResult {
-        CandidateFilterResult::accept()
-    }
-    /// Runtime-specific filter for a complete retained set of bucket LLIRs.
-    /// Individual buckets may each be viable while their persistent resources
-    /// conflict or exceed a limit when all buckets are retained together.
-    /// Backends with aggregate bucket resources should override this with the
-    /// same dry planning used by [`Runtime::load_llir_buckets`].
-    fn filter_llir_bucket_set(
-        &mut self,
-        _dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
-        _bucket_llirs: &[BucketLLIRRef<'_>],
-        _search_options: &crate::graph::CompileOptions,
-    ) -> CandidateFilterResult {
-        CandidateFilterResult::accept()
-    }
-    /// Load multiple compiled LLIR graphs, one per bucket combination.
-    /// Each entry is (bucket_indices, representative_dyn_map, stitched_llir).
-    /// The runtime dispatches between them in execute() based on dyn_map values.
-    fn load_llir_buckets(
-        &mut self,
-        _dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
-        bucket_llirs: &[BucketLLIR],
-    ) {
-        if bucket_llirs.len() == 1 {
-            self.load_llir(&bucket_llirs[0].2);
-        } else {
-            panic!("This runtime does not support bucketed compilation");
-        }
-    }
 }
 
 /// Optional runtime instrumentation for collecting execution statistics.

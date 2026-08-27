@@ -325,7 +325,6 @@ impl Runtime for MetalRuntime {
     type Ops = crate::kernel::MetalOps;
     type CompileArg = ();
     type ExecReturn = ();
-    type ProfileMetric = Duration;
 
     fn late_egglog_passes(
         ops: &[std::sync::Arc<Box<dyn luminal::op::EgglogOp>>],
@@ -369,8 +368,38 @@ impl Runtime for MetalRuntime {
         }
     }
 
-    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
-        metrics.iter().copied().sum()
+    /// Luminal's stock genetic search, profiled on this device.
+    fn compile(
+        &mut self,
+        space: &luminal::search::SearchSpace,
+        dyn_map: &DynMap,
+        options: &luminal::graph::CompileOptions,
+        rng: &mut dyn luminal::prelude::RngCore,
+    ) {
+        let trials = options.trials;
+        let timeout = options.execution_timeout;
+        let selected = luminal::search::genetic_search(
+            space,
+            dyn_map,
+            options,
+            rng,
+            self,
+            |rt, candidate: &mut luminal::search::Candidate<Duration>, _| {
+                let (duration, display) = rt.profile_llir(
+                    &candidate.llir,
+                    &candidate.profile_dyn_map,
+                    trials,
+                    timeout,
+                    candidate.early_stop,
+                );
+                luminal::search::Outcome::Measured(duration, display)
+            },
+            |_, _: &luminal::search::PendingFinalist<Duration>, _| Ok(()),
+            |_, _| Ok(()),
+            |metrics| metrics.iter().copied().sum(),
+        );
+        self.clear_intermediate_buffers();
+        self.load_llir_buckets(&space.dim_buckets, &selected);
     }
 
     #[tracing::instrument(skip_all)]
@@ -382,44 +411,6 @@ impl Runtime for MetalRuntime {
         self.compiled_buckets = vec![self.compile_bucket(FxHashMap::default(), llir_graph)];
         self.finish_dyn_dims_layout();
         self.activate_bucket(0);
-    }
-
-    #[tracing::instrument(skip_all)]
-    fn profile(
-        &mut self,
-        llir_graph: &LLIRGraph,
-        dyn_map: &DynMap,
-        trials: usize,
-        timeout: Option<std::time::Duration>,
-        early_stop: Option<(Self::ProfileMetric, f64)>,
-    ) -> (Self::ProfileMetric, String) {
-        self.load_llir(llir_graph);
-        self.allocate_intermediate_buffers(dyn_map);
-
-        let trials = trials.max(1);
-        let profile_start = std::time::Instant::now();
-        let mut duration = Duration::default();
-        let mut completed_trials = 0;
-        for _ in 0..trials {
-            let start = std::time::Instant::now();
-            self.execute(dyn_map);
-            duration += start.elapsed();
-            completed_trials += 1;
-            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
-                break;
-            }
-            // A candidate whose running mean has already lost by the
-            // early-stop margin keeps its partial mean; further trials
-            // can only refine a metric that is out of contention.
-            if early_stop.is_some_and(|(best, factor)| {
-                luminal::op::early_stop_exceeded(duration / completed_trials as u32, best, factor)
-            }) {
-                break;
-            }
-        }
-        duration /= completed_trials as u32;
-
-        (duration, format!("{:.2?}", duration))
     }
 
     #[tracing::instrument(skip_all)]
@@ -471,20 +462,67 @@ impl Runtime for MetalRuntime {
             command_buffer.wait_until_completed();
         });
     }
+}
 
-    fn clear_intermediate_buffers(&mut self) {
+impl MetalRuntime {
+    /// Load `llir_graph` and time `trials` executions at `dyn_map`, stopping
+    /// early on `timeout` or once the running mean has lost to `early_stop`.
+    #[tracing::instrument(skip_all)]
+    fn profile_llir(
+        &mut self,
+        llir_graph: &LLIRGraph,
+        dyn_map: &DynMap,
+        trials: usize,
+        timeout: Option<std::time::Duration>,
+        early_stop: Option<(Duration, f64)>,
+    ) -> (Duration, String) {
+        self.clear_intermediate_buffers();
+        self.load_llir(llir_graph);
+        self.allocate_intermediate_buffers(dyn_map);
+
+        let trials = trials.max(1);
+        let profile_start = std::time::Instant::now();
+        let mut duration = Duration::default();
+        let mut completed_trials = 0;
+        for _ in 0..trials {
+            let start = std::time::Instant::now();
+            self.execute(dyn_map);
+            duration += start.elapsed();
+            completed_trials += 1;
+            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
+                break;
+            }
+            // A candidate whose running mean has already lost by the
+            // early-stop margin keeps its partial mean; further trials
+            // can only refine a metric that is out of contention.
+            if early_stop.is_some_and(|(best, factor)| {
+                luminal::op::early_stop_exceeded(duration / completed_trials as u32, best, factor)
+            }) {
+                break;
+            }
+        }
+        duration /= completed_trials as u32;
+
+        (duration, format!("{:.2?}", duration))
+    }
+
+    /// Drop every intermediate buffer.
+    pub fn clear_intermediate_buffers(&mut self) {
         self.buffers.clear();
         self.buffer_lengths.clear();
     }
 
-    fn intermediate_buffer_bytes(&self) -> usize {
+    /// Total bytes of intermediate buffers currently allocated.
+    pub fn intermediate_buffer_bytes(&self) -> usize {
         self.buffers
             .values()
             .map(|buffer| buffer.length() as usize)
             .sum()
     }
 
-    fn load_llir_buckets(
+    /// Load one compiled LLIR per bucket combination; `execute` dispatches
+    /// between them by the dyn map.
+    pub fn load_llir_buckets(
         &mut self,
         dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],

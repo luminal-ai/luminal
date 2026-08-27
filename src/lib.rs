@@ -6,6 +6,7 @@ pub mod graph;
 pub mod hlir;
 pub mod mask_events;
 pub mod op;
+pub mod search;
 pub mod shape;
 pub mod visualization;
 
@@ -20,6 +21,7 @@ pub mod prelude {
     pub use crate::graph::*;
     pub use crate::hlir::ReferenceRuntime;
     pub use crate::op::Runtime;
+    pub use crate::search::{BucketContext, SearchSpace};
     pub use crate::shape::*;
     pub use crate::visualization::{display_graph, display_graph_to_file};
     pub use anyhow;
@@ -29,6 +31,8 @@ pub mod prelude {
     pub use half::{bf16, f16};
     pub use petgraph;
     pub use petgraph::stable_graph::NodeIndex;
+    pub use rand;
+    pub use rand::RngCore;
     pub use rustc_hash::{FxHashMap, FxHashSet};
     pub use tinyvec;
     pub use tracing;

@@ -3209,7 +3209,8 @@ impl Runtime for ReferenceRuntime {
     type Ops = ();
     type CompileArg = ();
     type ExecReturn = ();
-    type ProfileMetric = usize;
+    /// Reference LLIR is HLIR; keep it extractable.
+    const CLEANUP_HLIR: bool = false;
 
     fn initialize(_: Self::CompileArg) -> Self {
         Self {
@@ -3218,19 +3219,20 @@ impl Runtime for ReferenceRuntime {
         }
     }
 
-    fn profile(
+    /// No search: every extractable program is correct by contract and a CPU
+    /// reference has nothing to rank on, so extract one and load it. HLIR
+    /// programs are valid over the whole dynamic domain, so the first
+    /// bucket's program serves every bucket.
+    fn compile(
         &mut self,
-        _: &LLIRGraph,
-        _: &DynMap,
-        _: usize,
-        _: Option<std::time::Duration>,
-        _: Option<(Self::ProfileMetric, f64)>,
-    ) -> (Self::ProfileMetric, String) {
-        (0, "0 ms".to_string())
-    }
-
-    fn aggregate_profile_metrics(metrics: &[Self::ProfileMetric]) -> Self::ProfileMetric {
-        metrics.iter().copied().sum()
+        space: &crate::search::SearchSpace,
+        dyn_map: &DynMap,
+        _options: &CompileOptions,
+        rng: &mut dyn rand::RngCore,
+    ) {
+        let contexts = space.bucket_contexts(dyn_map);
+        let llir = crate::search::extract_one(space, &contexts[0], rng);
+        self.load_llir(&llir);
     }
 
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {

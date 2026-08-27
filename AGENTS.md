@@ -5,6 +5,8 @@ Luminal is a core-and-plugin design, where the core crate `.` contains everythin
 
 All other functionality is split into crates in the `crates/` directory. For instance, the Cuda compiler is in `luminal_cuda_lite` and the autograd engine is in `luminal_training`. `luminal_nn` has common nn modules.
 
+Core's compile pipeline ends at egglog saturation: `Graph::build_search_space` produces a `SearchSpace` (one saturated e-graph per dynamic-dim bucket) and `Runtime::compile` owns everything after it — search strategy, profiling, and loading. The genetic search is provided as utilities in `luminal::search` (`GeneticSearch`, `Finalists`, `BucketLattice`, `genetic_search`, `extract_one`) that a runtime may use, compose, or ignore; core never runs a search itself. The reference runtime extracts one program, Metal calls the stock utility, CUDA drives the state machine explicitly in `crates/luminal_cuda_lite/src/search.rs`.
+
 ## Testing Instructions
 - Find the CI plan in the .github/workflows folder.
 - Currently running `cargo test` in luminal_metal and luminal_cuda_lite require access to an Apple and Nvidia GPU respectively.

@@ -8,6 +8,7 @@ pub mod host;
 pub mod kernel;
 mod resource;
 pub mod runtime;
+mod search;
 use std::{
     cell::Cell,
     ffi::{CStr, CString},

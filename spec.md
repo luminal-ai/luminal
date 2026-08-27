@@ -9,14 +9,16 @@ Frontend Program (PyTorch Core Aten IR, GraphTensor API, StableHLO (future), etc
     -> HLIR Graph
     -> Loop-rolled HLIR Graph
     -> Egglog Saturation (including backend-specific rewrites)
-    -> EGraph
-    -> Extraction Search (Looped)
-        -> Genetic Algorithm chosen graph extraction
-        -> Looped LLIR Graph
-        -> Backend Profiling
-    -> Best-performing unrolled LLIR Graph
-    -> Runtime
+    -> SearchSpace (one saturated e-graph per dynamic-dim bucket)
+    -> Runtime::compile — the runtime's own search strategy, e.g.
+        -> Genetic Algorithm chosen graph extraction (luminal::search)
+        -> Looped LLIR Graph, fully unrolled
+        -> Backend compile + profiling
+        -> Selected LLIR per bucket, loaded
+    -> Runtime::execute
 ```
+
+Everything up to and including saturation is core's; everything after it is the runtime's.
 
 ## Global Contracts
 
@@ -93,19 +95,23 @@ Egglog should be the only phase where rewriting and pattern matching happens. Ev
 
 ## Search
 
-Search samples choices from the saturated e-graph using a genetic algorithm, extracts LLIR candidates, and profiles them with the runtime. Every extractable LLIR graph must be valid. Validity / output checking is _not_ part of the search process, as outputs are assumed to be correct.
+Core stops at the `SearchSpace`: the saturated e-graph of every bucket combination, the registered ops, and the custom ops resolved to LLIR. `Runtime::compile` receives it and chooses one program per bucket by whatever strategy the runtime implements. Every extractable LLIR graph must be valid, so any strategy — including "extract one" — is correct; strategies differ only in performance.
 
-- A profiled candidate counts against the search limit only after extraction and
-  backend filtering succeed.
-- Candidate timeout covers compile plus run viability. Execution timeout covers
-  a profiling trial only.
-- Dynamic-dim buckets create separate search spaces and selected LLIR graphs.
-  Backends that load buckets must dispatch according to runtime `dyn_map`.
-- Profiling uses representative dynamic values, optionally overridden by
-  `CompileOptions`. The final compiled graph must remain valid for the full
-  declared dynamic domain, not only the representative point.
-- Search may rank performance only after semantic equivalence is established.
-  It must not select around a known incorrect candidate.
+Core ships the strategy Luminal has always used as utilities in `luminal::search`, none of which core itself invokes:
+
+- `extract_one`: a cycle-repaired random genome, extracted and unrolled. The whole search for a runtime with nothing to rank on (the reference runtime).
+- `GeneticSearch`: the genetic algorithm as a pull-style state machine. The runtime asks for the next fully-unrolled candidate, evaluates it however it can (profile it, cost it statically, look it up in a cache), and reports `Measured` / `Rejected` / `Invalid`. The state machine owns generations, mutation, stagnation restarts, genome and program dedup, the graph limit, the search time limit, the candidate timeout, the early-stop hint, and progress output.
+- `Finalists`: lazy re-extraction of ranked genomes into deployment graphs under the runtime's hard filter.
+- `BucketLattice`: best-first selection of one finalist per bucket under an aggregate constraint (resources every retained bucket shares).
+- `genetic_search`: closure sugar composing the three into the stock strategy.
+
+Contracts a profiling search must honor:
+
+- A measured candidate counts against the search limit; a runtime-rejected candidate does not.
+- The candidate timeout is checked from hand-out to report. A runtime whose evaluation includes a phase the timeout should not budget (e.g. compilation) restarts the candidate's timer before the phase it should. The execution timeout bounds a single profiling trial.
+- Dynamic-dim buckets create separate search spaces and selected LLIR graphs. A runtime that loads buckets must dispatch according to the runtime `dyn_map`.
+- Profiling uses representative dynamic values: the graph's dyn map after `search_dims`, overridden per bucket by the bucket representative, overridden while profiling by `profile_dims`. The final compiled graph must remain valid for the full declared dynamic domain, not only the representative point.
+- Validity / output checking is _not_ part of search; outputs are assumed correct. Search may rank performance only after semantic equivalence is established and must not select around a known incorrect candidate.
 
 ## Dynamism
 
@@ -123,6 +129,6 @@ A backend is a specific execution environment. Through implementing the Runtime 
 - A set of rewrites that rewrite from HLIR patterns to LLIR patterns, LLIR patterns to other LLIR patterns, or any mix of the two.
 - `.set_data(NodeIndex, T)` and `.get_data(NodeIndex) -> T` for setting and retriving inputs and outputs respectively.
 - `initialize()` to set up the backend, and load any fixed state.
-- `load_llir(llir_graph)` to initialize an LLIR graph in the backend. This is where an LLIR graph is converted to an executable artifact.
+- `compile(search_space, dyn_map, options, rng)` to search the saturated e-graphs by any strategy, select one LLIR graph per bucket, and load it. Profiling, if the strategy profiles, happens inside the runtime.
+- `load_llir(llir_graph)` to initialize an LLIR graph in the backend directly. This is where an LLIR graph is converted to an executable artifact.
 - `execute()` to execute the already-loaded executable artifact.
-- `profile(llir_graph)` to return a fitness metric minimized by search for a given LLIR graph.
