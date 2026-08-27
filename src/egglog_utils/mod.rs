@@ -1938,7 +1938,6 @@ struct CachedIndexedExtraction {
     /// hot path validate a cached immutable op with direct integer loads,
     /// without re-walking its OpKind and IList term.
     dependencies: Box<[(DenseIndex, DenseIndex)]>,
-    custom_op_ids: Option<(usize, usize)>,
     op: crate::op::LLIROp,
     sources: Box<[DenseNode]>,
 }
@@ -2298,7 +2297,6 @@ impl<'a> LlirExtractor<'a> {
         choices: &IndexedChoiceSet,
         custom_ops: &[crate::op::LLIROp],
     ) -> PackedLLIRGraph {
-        let custom_op_id_remap: Option<&FxHashMap<usize, usize>> = None;
         let started_at = std::time::Instant::now();
         let profile = llir_profile_enabled();
         let mut cache_hits = 0usize;
@@ -2351,11 +2349,6 @@ impl<'a> LlirExtractor<'a> {
                         .position(|cached| {
                             cached.dependencies.iter().all(|&(class, selected)| {
                                 self.indexed_selected(choices, class).slot == selected
-                            }) && cached.custom_op_ids.is_none_or(|(original, resolved)| {
-                                custom_op_id_remap
-                                    .and_then(|remap| remap.get(&original).copied())
-                                    .unwrap_or(original)
-                                    == resolved
                             })
                         })
                         .map(|cached_index| (entry_index, cached_index))
@@ -2400,7 +2393,6 @@ impl<'a> LlirExtractor<'a> {
             dependencies.clear();
             let mut op_index = None;
             let mut custom_id = None;
-            let mut original_custom_id = None;
 
             if node_label == "Op" {
                 let kind_class = node_children[0];
@@ -2445,11 +2437,7 @@ impl<'a> LlirExtractor<'a> {
                 if kind_label == "CustomOpKind" {
                     let id_node = self.indexed_node_id(kind_children[0]);
                     let id: usize = self.egraph.enodes[id_node].0.parse().unwrap();
-                    let remapped = custom_op_id_remap
-                        .and_then(|remap| remap.get(&id).copied())
-                        .unwrap_or(id);
-                    custom_id = Some(remapped);
-                    original_custom_id = Some(id);
+                    custom_id = Some(id);
                 } else {
                     op_index = Some(
                         *self
@@ -2528,7 +2516,6 @@ impl<'a> LlirExtractor<'a> {
             }
             let cached = CachedIndexedExtraction {
                 dependencies: dependencies.clone().into_boxed_slice(),
-                custom_op_ids: original_custom_id.zip(custom_id),
                 op,
                 sources: sources.into_boxed_slice(),
             };
