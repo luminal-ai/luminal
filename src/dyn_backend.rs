@@ -29,6 +29,10 @@ use crate::shape::DynMap;
 pub trait DynBackend {
     fn name(&self) -> &str;
 
+    fn artifact_data(&self) -> Option<String> {
+        None
+    }
+
     /// The device type this backend operates on (e.g. "cpu", "cuda").
     /// Used by the Python frontend to decide input tensor placement.
     fn device_type(&self) -> &str {
@@ -127,6 +131,7 @@ pub struct BackendCompileArgs {
     pub weights: Vec<(String, Vec<u8>, DType)>,
     pub tensor_sizes: HashMap<String, usize>,
     pub device_ptrs: HashMap<String, (u64, usize)>,
+    pub backend_artifact: Option<String>,
 }
 
 /// Canonical PyCapsule name for [`BackendFactory`] function-pointer capsules.
@@ -134,7 +139,7 @@ pub struct BackendCompileArgs {
 /// The version is part of the ABI: `BackendCompileArgs` crosses this boundary
 /// by value, so an older plugin must be rejected rather than reading a changed
 /// struct layout.
-pub const BACKEND_FACTORY_CAPSULE_NAME: &std::ffi::CStr = c"luminal.backend_factory.v2";
+pub const BACKEND_FACTORY_CAPSULE_NAME: &std::ffi::CStr = c"luminal.backend_factory.v3";
 
 /// A factory function that compiles a [`Graph`] into a ready-to-execute [`DynBackend`].
 pub type BackendFactory = fn(&mut Graph, BackendCompileArgs) -> Result<Box<dyn DynBackend>, String>;

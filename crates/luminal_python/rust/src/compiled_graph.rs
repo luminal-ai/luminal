@@ -158,12 +158,14 @@ pub struct WeightData {
     pub device_ptrs: HashMap<String, (u64, usize)>,
 }
 
-const ARTIFACT_SCHEMA_VERSION: u32 = 1;
+const ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Deserialize, Serialize)]
 struct CompiledArtifactData {
     schema_version: u32,
     backend: String,
+    #[serde(default)]
+    backend_artifact: Option<String>,
     device_index: Option<usize>,
     external_cuda_graph: bool,
     dyn_map: DynMap,
@@ -255,6 +257,7 @@ impl CompiledGraph {
                 .collect(),
             tensor_sizes,
             device_ptrs,
+            backend_artifact: None,
         };
 
         // Create backend via the factory directly
@@ -338,6 +341,7 @@ impl CompiledGraph {
                 weights: Vec::new(),
                 tensor_sizes: artifact.tensor_sizes.clone(),
                 device_ptrs,
+                backend_artifact: artifact.backend_artifact,
             },
         )?;
         if runtime.name() != artifact.backend {
@@ -430,6 +434,7 @@ impl CompiledGraph {
         let artifact = CompiledArtifactData {
             schema_version: ARTIFACT_SCHEMA_VERSION,
             backend: self.runtime.name().to_string(),
+            backend_artifact: self.runtime.artifact_data(),
             device_index: self.runtime.device_index(),
             external_cuda_graph: self.external_cuda_graph,
             dyn_map: self.graph.dyn_map.clone(),

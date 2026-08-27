@@ -68,20 +68,22 @@ def compile_region(
 
 def load_region_artifact(
     data,
-    region: RegionExport,
     *,
+    input_indices,
+    output_spec,
+    device_index,
     static_outputs=False,
     external_cuda_graph=False,
 ) -> CompiledModel:
     artifact = CompiledArtifact.deserialize(
         data,
         _cuda_factory(),
-        device_index=region.device_index,
+        device_index=device_index,
         external_cuda_graph=external_cuda_graph,
     )
     return artifact.bind(
-        user_indices=region.input_indices,
-        output_spec=region.output_spec,
+        user_indices=input_indices,
+        output_spec=output_spec,
         use_current_stream=True,
         static_outputs=static_outputs,
     )

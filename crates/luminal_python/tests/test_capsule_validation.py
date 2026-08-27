@@ -28,7 +28,7 @@ def test_factory_capsule_uses_versioned_abi_name():
     get_name.restype = ctypes.c_char_p
     get_name.argtypes = [ctypes.py_object]
 
-    assert get_name(_reference_factory_capsule()) == b"luminal.backend_factory.v2"
+    assert get_name(_reference_factory_capsule()) == b"luminal.backend_factory.v3"
 
 
 def test_process_pt2_rejects_capsule_with_wrong_name():
