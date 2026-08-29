@@ -24,7 +24,7 @@ use super::diagnostics::{
 use super::packed::LlirFingerprint;
 use super::unroll::unroll_packed_llir;
 use super::{BucketContext, SearchSpace};
-use crate::egglog_utils::{IndexedChoiceSet, LlirExtractor, SearchPolicy, count_choice_sets_up_to};
+use crate::egglog_utils::{IndexedChoiceSet, LlirExtractor, count_choice_sets_up_to};
 use crate::graph::{CompileOptions, LLIRGraph};
 use crate::shape::DynMap;
 
@@ -143,25 +143,6 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         options: &'a CompileOptions,
         search_started_at: Instant,
     ) -> Self {
-        Self::new_with_policy(
-            space,
-            ctx,
-            options,
-            search_started_at,
-            SearchPolicy::default(),
-        )
-    }
-
-    /// Construct a search whose initial and correlated seeds use a
-    /// runtime-owned policy. Mutation, extraction, and validation remain in
-    /// the generic search machinery.
-    pub fn new_with_policy(
-        space: &'a SearchSpace,
-        ctx: &'a BucketContext<'a>,
-        options: &'a CompileOptions,
-        search_started_at: Instant,
-        search_policy: SearchPolicy,
-    ) -> Self {
         let search_log = options.search_log_enabled();
         let bucket_progress = ctx.progress();
         if search_log {
@@ -185,11 +166,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             space,
             ctx,
             options,
-            extractor: LlirExtractor::new_with_search_policy(
-                ctx.egraph(),
-                &space.ops,
-                search_policy,
-            ),
+            extractor: LlirExtractor::new(ctx.egraph(), &space.ops),
             profile_dyn_map: ctx.profile_dyn_map(options),
             search_limit: count_choice_sets_up_to(ctx.egraph(), options.limit),
             started_at: Instant::now(),
@@ -240,59 +217,6 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
     /// Candidates measured so far (the count the graph limit applies to).
     pub fn measured(&self) -> usize {
         self.n_graphs
-    }
-
-    /// Build one cumulative runtime-preferred seed from the initial viable
-    /// genome. Each individual mutation must produce a valid deployment graph
-    /// and pass `validate`; rejected mutations are skipped. The resulting seed
-    /// is queued ahead of ordinary genetic offspring.
-    ///
-    /// Returns `(accepted mutations, attempted mutations)`. Call this after
-    /// reporting the initial measured candidate and before requesting the next
-    /// candidate.
-    pub fn queue_correlated_seed(
-        &mut self,
-        mut validate: impl FnMut(&LLIRGraph) -> bool,
-    ) -> (usize, usize) {
-        assert_eq!(
-            self.phase,
-            Phase::Evolving,
-            "initial candidate is not viable yet"
-        );
-        assert!(
-            self.outstanding.is_none(),
-            "report the outstanding candidate before seeding"
-        );
-        assert!(self.pending.is_empty(), "correlated seed already queued");
-
-        let mut seed = self.parents[0].1.clone();
-        let mut changed = false;
-        let mutations = self.extractor.correlated_choice_mutations();
-        let attempts = mutations.len();
-        let mut accepted = 0;
-        for mutation in mutations {
-            let Some(candidate) = self.extractor.apply_indexed_mutation(&seed, mutation) else {
-                continue;
-            };
-            let valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let packed = self
-                    .extractor
-                    .extract_indexed_packed(&candidate, &self.space.custom_ops);
-                let llir = unroll_packed_llir(packed);
-                validate(&llir)
-            }))
-            .unwrap_or(false);
-            if valid {
-                seed = candidate;
-                changed = true;
-                accepted += 1;
-            }
-        }
-        if changed && self.prev_selected.insert(seed.hash()) {
-            self.pending.push_back(seed);
-            self.generation_open = true;
-        }
-        (accepted, attempts)
     }
 
     fn time_limit_reached(&self) -> bool {

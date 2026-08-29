@@ -34,7 +34,7 @@ use rand::RngCore;
 use rustc_hash::FxHashMap;
 
 use crate::egglog_utils::SerializedEGraph;
-pub use crate::egglog_utils::{IndexedChoiceSet, LlirExtractor, SearchPolicy};
+pub use crate::egglog_utils::{IndexedChoiceSet, LlirExtractor};
 pub use crate::graph::{BucketLLIR, BucketLLIRRef, DimBucket};
 use crate::graph::{CompileOptions, LLIRGraph};
 use crate::op::{EgglogOp, LLIROp};
