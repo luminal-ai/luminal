@@ -91,6 +91,15 @@ enum Phase {
 }
 
 const MAX_INVALID_INITIAL_ATTEMPTS: usize = 100;
+// Once a valid parent exists, one ordinary generation followed by mutation
+// radii 1, 2, 4, 8, and 16 is enough to distinguish a resource-invalid basin
+// from a transient rejected generation. Search keeps its measured finalists
+// instead of widening forever when every one of those generations is dry.
+const MAX_REJECTED_GENERATION_STREAK: usize = 6;
+
+fn rejected_recovery_exhausted(streak: usize) -> bool {
+    streak >= MAX_REJECTED_GENERATION_STREAK
+}
 
 pub struct GeneticSearch<'a, M> {
     space: &'a SearchSpace,
@@ -264,6 +273,16 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                     if self.pending.is_empty() {
                         if self.generation_open {
                             self.close_generation();
+                        }
+                        if rejected_recovery_exhausted(self.rejected_generation_streak) {
+                            if self.search_log {
+                                self.bars.print_message(
+                                    "   Search  resource-rejected neighborhoods exhausted",
+                                    false,
+                                );
+                            }
+                            self.finish();
+                            return None;
                         }
                         if self.n_graphs >= self.search_limit || self.time_limit_reached() {
                             self.finish();
@@ -694,7 +713,7 @@ fn effective_mutation_count(
 
 #[cfg(test)]
 mod recovery_tests {
-    use super::{effective_mutation_count, next_generation_strategy};
+    use super::{effective_mutation_count, next_generation_strategy, rejected_recovery_exhausted};
 
     #[test]
     fn rejected_generations_expand_from_valid_parents() {
@@ -710,5 +729,16 @@ mod recovery_tests {
     fn ordinary_stagnation_can_still_resample() {
         assert_eq!(next_generation_strategy(true, 7, 3, 4), (0, true));
         assert_eq!(effective_mutation_count(10, 4, 0), 40);
+    }
+
+    #[test]
+    fn rejected_recovery_covers_normal_and_widening_generations() {
+        assert_eq!(effective_mutation_count(10, 1, 1), 1);
+        assert_eq!(effective_mutation_count(10, 1, 2), 2);
+        assert_eq!(effective_mutation_count(10, 1, 3), 4);
+        assert_eq!(effective_mutation_count(10, 1, 4), 8);
+        assert_eq!(effective_mutation_count(10, 1, 5), 16);
+        assert!(!rejected_recovery_exhausted(5));
+        assert!(rejected_recovery_exhausted(6));
     }
 }
