@@ -127,7 +127,7 @@ pub struct GeneticSearch<'a, M> {
     best_metric: Option<M>,
     n_graphs: usize,
     resample_generation: bool,
-    validity_recovery: bool,
+    rejected_generation_streak: usize,
     stagnant_generations: usize,
     generation_found_non_timeout: bool,
     generation_found_new_best: bool,
@@ -193,7 +193,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             best_metric: None,
             n_graphs: 0,
             resample_generation: false,
-            validity_recovery: false,
+            rejected_generation_streak: 0,
             stagnant_generations: 0,
             generation_found_non_timeout: false,
             generation_found_new_best: false,
@@ -545,9 +545,13 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         // rejected entirely by a runtime hard filter is different: the known
         // parents are still valid, while another random generation may remain
         // overwhelmingly invalid. Recover from those parents with the minimum
-        // mutation radius on the next generation.
-        (self.validity_recovery, self.resample_generation) = next_generation_strategy(
+        // mutation radius on the next generation. If that radius also has no
+        // viable member, expand it geometrically so search can cross a valley
+        // of resource-invalid intermediate genomes without naming or forcing
+        // either endpoint.
+        (self.rejected_generation_streak, self.resample_generation) = next_generation_strategy(
             self.generation_found_non_timeout,
+            self.rejected_generation_streak,
             self.options.restart_stagnation,
             self.stagnant_generations,
         );
@@ -561,39 +565,61 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
     fn breed(&mut self, rng: &mut dyn RngCore) {
         let options = self.options;
         let budget = (self.search_limit - self.n_graphs).min(options.generation_size);
-        let offspring = if self.resample_generation {
+        let mut offspring = if self.resample_generation {
             self.extractor
                 .random_indexed_generation(budget, &mut self.prev_selected, rng)
         } else {
-            let per_parent = budget.div_ceil(self.parents.len());
-            let mut offspring = Vec::new();
-            for (_, parent_genome) in &self.parents {
-                let remaining = budget.saturating_sub(offspring.len());
-                if remaining == 0 {
-                    break;
+            // Stagnation kick: escaping a family basin needs multi-gene jumps,
+            // so mutation counts escalate with consecutive stagnant
+            // generations (capped 16x).
+            let kick = if options.restart_stagnation > 0
+                && self.stagnant_generations >= options.restart_stagnation
+            {
+                (1 + self.stagnant_generations - options.restart_stagnation).min(16)
+            } else {
+                1
+            };
+            loop {
+                let mutations = effective_mutation_count(
+                    options.mutations,
+                    kick,
+                    self.rejected_generation_streak,
+                );
+                let per_parent = budget.div_ceil(self.parents.len());
+                let mut generated = Vec::new();
+                for (_, parent_genome) in &self.parents {
+                    let remaining = budget.saturating_sub(generated.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    generated.extend(self.extractor.extract_reachable_indexed_generation(
+                        parent_genome,
+                        per_parent.min(remaining),
+                        mutations,
+                        &mut self.prev_selected,
+                        rng,
+                    ));
                 }
-                // Stagnation kick: escaping a family basin needs multi-gene
-                // jumps, so mutation counts escalate with consecutive
-                // stagnant generations (capped 16x).
-                let kick = if options.restart_stagnation > 0
-                    && self.stagnant_generations >= options.restart_stagnation
-                {
-                    (1 + self.stagnant_generations - options.restart_stagnation).min(16)
-                } else {
-                    1
-                };
-                let mutations =
-                    effective_mutation_count(options.mutations, kick, self.validity_recovery);
-                offspring.extend(self.extractor.extract_reachable_indexed_generation(
-                    parent_genome,
-                    per_parent.min(remaining),
-                    mutations,
-                    &mut self.prev_selected,
-                    rng,
-                ));
+                if !generated.is_empty() || self.rejected_generation_streak == 0 {
+                    break generated;
+                }
+
+                let next_streak = self.rejected_generation_streak.saturating_add(1);
+                let next_mutations = effective_mutation_count(options.mutations, kick, next_streak);
+                if next_mutations == mutations {
+                    break generated;
+                }
+                self.rejected_generation_streak = next_streak;
             }
-            offspring
         };
+        // If every widening parent neighborhood has already been enumerated,
+        // make one ordinary unbiased restart before declaring the space
+        // exhausted.
+        if offspring.is_empty() && self.rejected_generation_streak > 0 {
+            offspring =
+                self.extractor
+                    .random_indexed_generation(budget, &mut self.prev_selected, rng);
+        }
         self.pending.extend(offspring);
     }
 
@@ -630,22 +656,40 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
 
 fn next_generation_strategy(
     generation_found_non_timeout: bool,
+    rejected_generation_streak: usize,
     restart_stagnation: usize,
     stagnant_generations: usize,
-) -> (bool, bool) {
-    let validity_recovery = !generation_found_non_timeout;
+) -> (usize, bool) {
+    let rejected_generation_streak = if generation_found_non_timeout {
+        0
+    } else {
+        rejected_generation_streak.saturating_add(1)
+    };
     let stagnation_resample = restart_stagnation > 0
         && stagnant_generations >= restart_stagnation
         && stagnant_generations % 2 == 0;
-    (validity_recovery, !validity_recovery && stagnation_resample)
+    (
+        rejected_generation_streak,
+        rejected_generation_streak == 0 && stagnation_resample,
+    )
 }
 
-fn effective_mutation_count(configured: usize, kick: usize, validity_recovery: bool) -> usize {
-    if validity_recovery {
-        1
-    } else {
-        configured * kick
+fn effective_mutation_count(
+    configured: usize,
+    kick: usize,
+    rejected_generation_streak: usize,
+) -> usize {
+    if rejected_generation_streak == 0 {
+        return configured.saturating_mul(kick);
     }
+    let max_recovery = configured.saturating_mul(16).max(1);
+    let shift = u32::try_from(rejected_generation_streak.saturating_sub(1))
+        .unwrap_or(u32::MAX)
+        .min(usize::BITS - 1);
+    1usize
+        .checked_shl(shift)
+        .unwrap_or(usize::MAX)
+        .min(max_recovery)
 }
 
 #[cfg(test)]
@@ -653,14 +697,18 @@ mod recovery_tests {
     use super::{effective_mutation_count, next_generation_strategy};
 
     #[test]
-    fn all_rejected_generation_backs_off_from_valid_parents() {
-        assert_eq!(next_generation_strategy(false, 3, 2), (true, false));
-        assert_eq!(effective_mutation_count(10, 4, true), 1);
+    fn rejected_generations_expand_from_valid_parents() {
+        assert_eq!(next_generation_strategy(false, 0, 3, 2), (1, false));
+        assert_eq!(effective_mutation_count(10, 4, 1), 1);
+        assert_eq!(next_generation_strategy(false, 1, 3, 3), (2, false));
+        assert_eq!(effective_mutation_count(10, 4, 2), 2);
+        assert_eq!(effective_mutation_count(10, 4, 5), 16);
+        assert_eq!(effective_mutation_count(10, 4, 99), 160);
     }
 
     #[test]
     fn ordinary_stagnation_can_still_resample() {
-        assert_eq!(next_generation_strategy(true, 3, 4), (false, true));
-        assert_eq!(effective_mutation_count(10, 4, false), 40);
+        assert_eq!(next_generation_strategy(true, 7, 3, 4), (0, true));
+        assert_eq!(effective_mutation_count(10, 4, 0), 40);
     }
 }
