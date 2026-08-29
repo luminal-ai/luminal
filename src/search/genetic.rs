@@ -127,6 +127,7 @@ pub struct GeneticSearch<'a, M> {
     best_metric: Option<M>,
     n_graphs: usize,
     resample_generation: bool,
+    validity_recovery: bool,
     stagnant_generations: usize,
     generation_found_non_timeout: bool,
     generation_found_new_best: bool,
@@ -192,6 +193,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             best_metric: None,
             n_graphs: 0,
             resample_generation: false,
+            validity_recovery: false,
             stagnant_generations: 0,
             generation_found_non_timeout: false,
             generation_found_new_best: false,
@@ -539,11 +541,16 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
             self.stagnant_generations += 1;
         }
         // Every other stagnant generation past the threshold explores from
-        // fresh random genomes instead of the converged parents.
-        let stagnation_resample = self.options.restart_stagnation > 0
-            && self.stagnant_generations >= self.options.restart_stagnation
-            && self.stagnant_generations % 2 == 0;
-        self.resample_generation = !self.generation_found_non_timeout || stagnation_resample;
+        // fresh random genomes instead of the converged parents. A generation
+        // rejected entirely by a runtime hard filter is different: the known
+        // parents are still valid, while another random generation may remain
+        // overwhelmingly invalid. Recover from those parents with the minimum
+        // mutation radius on the next generation.
+        (self.validity_recovery, self.resample_generation) = next_generation_strategy(
+            self.generation_found_non_timeout,
+            self.options.restart_stagnation,
+            self.stagnant_generations,
+        );
         self.generation_found_non_timeout = false;
         self.generation_found_new_best = false;
         self.generation_open = false;
@@ -575,10 +582,12 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
                 } else {
                     1
                 };
+                let mutations =
+                    effective_mutation_count(options.mutations, kick, self.validity_recovery);
                 offspring.extend(self.extractor.extract_reachable_indexed_generation(
                     parent_genome,
                     per_parent.min(remaining),
-                    options.mutations * kick,
+                    mutations,
                     &mut self.prev_selected,
                     rng,
                 ));
@@ -616,5 +625,42 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         }
         self.finish();
         std::mem::take(&mut self.ranked)
+    }
+}
+
+fn next_generation_strategy(
+    generation_found_non_timeout: bool,
+    restart_stagnation: usize,
+    stagnant_generations: usize,
+) -> (bool, bool) {
+    let validity_recovery = !generation_found_non_timeout;
+    let stagnation_resample = restart_stagnation > 0
+        && stagnant_generations >= restart_stagnation
+        && stagnant_generations % 2 == 0;
+    (validity_recovery, !validity_recovery && stagnation_resample)
+}
+
+fn effective_mutation_count(configured: usize, kick: usize, validity_recovery: bool) -> usize {
+    if validity_recovery {
+        1
+    } else {
+        configured * kick
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{effective_mutation_count, next_generation_strategy};
+
+    #[test]
+    fn all_rejected_generation_backs_off_from_valid_parents() {
+        assert_eq!(next_generation_strategy(false, 3, 2), (true, false));
+        assert_eq!(effective_mutation_count(10, 4, true), 1);
+    }
+
+    #[test]
+    fn ordinary_stagnation_can_still_resample() {
+        assert_eq!(next_generation_strategy(true, 3, 4), (false, true));
+        assert_eq!(effective_mutation_count(10, 4, false), 40);
     }
 }
