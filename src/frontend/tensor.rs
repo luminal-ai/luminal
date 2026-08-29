@@ -57,22 +57,27 @@ impl GraphTensor {
         self.graph().get_op_mut::<Input>(self.id).label = name.to_string();
     }
 
+    /// Materialize this tensor in contiguous row-major order when its current
+    /// shape is a non-contiguous view. Contiguous tensors are returned
+    /// unchanged.
+    pub fn contiguous(self) -> GraphTensor {
+        if self.shape.is_contiguous() {
+            return self;
+        }
+        let dims = self.dims();
+        let total = dims.iter().copied().reduce(|a, b| a * b).unwrap();
+        let idx = self.graph().iota(Expression::from('z'), total);
+        let mut gathered = self.gather(idx);
+        gathered.shape = ShapeTracker::new(dims);
+        gathered
+    }
+
     /// Mark this tensor as an observable output. Unlike [`GraphTensor::persist`],
     /// this protects the tensor's logical value from a later in-place update.
     /// If the tensor has non-contiguous strides (e.g. from transpose + merge_dims),
     /// inserts a gather to materialize contiguous data before the output node.
     pub fn output(&self) -> GraphTensor {
-        let source = if self.shape.is_contiguous() {
-            *self
-        } else {
-            // Insert gather to make physically contiguous
-            let dims = self.dims();
-            let total = dims.iter().copied().reduce(|a, b| a * b).unwrap();
-            let idx = self.graph().iota('z', total);
-            let mut gathered = self.gather(idx);
-            gathered.shape = ShapeTracker::new(dims);
-            gathered
-        };
+        let source = self.contiguous();
         self.output_raw(source, false)
     }
 

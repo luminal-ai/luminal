@@ -17,6 +17,43 @@ use crate::search::packed::PackedLLIRGraph;
 
 pub use egraph_serialize::{ClassId, NodeId};
 
+fn neutral_enode_score(_: &SerializedEGraph, _: &NodeId) -> u64 {
+    0
+}
+
+fn allow_every_enode(_: &SerializedEGraph, _: &NodeId) -> bool {
+    true
+}
+
+fn no_correlated_preference(_: &SerializedEGraph, _: &NodeId) -> u8 {
+    0
+}
+
+/// Backend-owned heuristics for seeding the generic e-graph schedule search.
+///
+/// Core owns genome construction and validation. A runtime can supply its
+/// knowledge of lowering tiers and alternatives without teaching core any
+/// backend op names. The default preserves the neutral random search.
+#[derive(Clone, Copy, Debug)]
+pub struct SearchPolicy {
+    /// Rank an e-node for the initial genome. Larger values are preferred.
+    pub initial_enode_score: fn(&SerializedEGraph, &NodeId) -> u64,
+    /// Defer conditionally legal e-nodes when another alternative is present.
+    pub initial_enode_allowed: fn(&SerializedEGraph, &NodeId) -> bool,
+    /// Rank alternatives to try cumulatively after the first viable genome.
+    pub correlated_enode_priority: fn(&SerializedEGraph, &NodeId) -> u8,
+}
+
+impl Default for SearchPolicy {
+    fn default() -> Self {
+        Self {
+            initial_enode_score: neutral_enode_score,
+            initial_enode_allowed: allow_every_enode,
+            correlated_enode_priority: no_correlated_preference,
+        }
+    }
+}
+
 pub mod api;
 pub mod base;
 
@@ -1920,6 +1957,18 @@ pub struct IndexedChoiceSet {
     hash: u64,
 }
 
+impl IndexedChoiceSet {
+    pub(crate) fn hash(&self) -> u64 {
+        self.hash
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IndexedChoiceMutation {
+    class: DenseIndex,
+    target: DenseIndex,
+}
+
 struct IndexedEClass<'a> {
     id: &'a ClassId,
     label: &'a str,
@@ -1952,6 +2001,7 @@ struct CachedIndexedExtraction {
 pub struct LlirExtractor<'a> {
     egraph: &'a SerializedEGraph,
     ops: &'a [Arc<Box<dyn EgglogOp>>],
+    search_policy: SearchPolicy,
     op_by_name: FxHashMap<String, usize>,
     list_cache: FxHashMap<&'a NodeId, Vec<Expression>>,
     expr_cache: FxHashMap<&'a NodeId, Expression>,
@@ -1984,6 +2034,14 @@ struct CachedEClass<'a> {
 
 impl<'a> LlirExtractor<'a> {
     pub fn new(egraph: &'a SerializedEGraph, ops: &'a [Arc<Box<dyn EgglogOp>>]) -> Self {
+        Self::new_with_search_policy(egraph, ops, SearchPolicy::default())
+    }
+
+    pub fn new_with_search_policy(
+        egraph: &'a SerializedEGraph,
+        ops: &'a [Arc<Box<dyn EgglogOp>>],
+        search_policy: SearchPolicy,
+    ) -> Self {
         let started_at = std::time::Instant::now();
         let op_by_name = ops
             .iter()
@@ -2031,6 +2089,7 @@ impl<'a> LlirExtractor<'a> {
         let extractor = Self {
             egraph,
             ops,
+            search_policy,
             op_by_name,
             list_cache: FxHashMap::default(),
             expr_cache: FxHashMap::default(),
@@ -2197,8 +2256,63 @@ impl<'a> LlirExtractor<'a> {
     }
 
     pub fn random_indexed_choice(&self, rng: &mut (impl Rng + ?Sized)) -> IndexedChoiceSet {
-        let choices = random_initial_choice(self.egraph, rng);
+        let choices = random_initial_choice_with_policy(self.egraph, rng, self.search_policy);
         self.index_choice_set(&choices)
+    }
+
+    /// Return the runtime-preferred alternatives in a deterministic order.
+    pub(crate) fn correlated_choice_mutations(&self) -> Vec<IndexedChoiceMutation> {
+        let mut mutations = Vec::new();
+        for (class_index, class) in self.indexed_classes.iter().enumerate() {
+            if !class.searchable {
+                continue;
+            }
+            let target = class
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, node)| {
+                    let priority =
+                        (self.search_policy.correlated_enode_priority)(self.egraph, node);
+                    (priority > 0).then_some((
+                        priority,
+                        node.as_ref().starts_with("synth_"),
+                        DenseIndex::try_from(slot).expect("too many e-nodes in e-class"),
+                    ))
+                })
+                .max_by_key(|(priority, synthesized, _)| (*priority, *synthesized));
+            let Some((_, _, target)) = target else {
+                continue;
+            };
+            mutations.push(IndexedChoiceMutation {
+                class: DenseIndex::try_from(class_index).expect("too many e-classes to index"),
+                target,
+            });
+        }
+        mutations.sort_unstable_by(|a, b| {
+            self.indexed_classes[a.class as usize]
+                .id
+                .as_ref()
+                .cmp(self.indexed_classes[b.class as usize].id.as_ref())
+        });
+        mutations
+    }
+
+    pub(crate) fn apply_indexed_mutation(
+        &self,
+        base: &IndexedChoiceSet,
+        mutation: IndexedChoiceMutation,
+    ) -> Option<IndexedChoiceSet> {
+        let class = &self.indexed_classes[mutation.class as usize];
+        let current = base.choices[mutation.class as usize];
+        if current == mutation.target {
+            return None;
+        }
+        let mut specialized = base.clone();
+        specialized.hash ^= hash_choice_entry(class.id, &class.nodes[current as usize]);
+        specialized.hash ^= hash_choice_entry(class.id, &class.nodes[mutation.target as usize]);
+        specialized.choices[mutation.class as usize] = mutation.target;
+        Some(specialized)
     }
 
     pub fn random_indexed_generation(
@@ -2950,6 +3064,23 @@ pub fn random_initial_choice<'a>(
     egraph: &'a SerializedEGraph,
     rng: &mut (impl Rng + ?Sized),
 ) -> EGraphChoiceSet<'a> {
+    random_initial_choice_with_policy(egraph, rng, SearchPolicy::default())
+}
+
+/// Draw an explicitly neutral genome for extraction tests and fuzzing.
+pub fn random_exploratory_choice<'a>(
+    egraph: &'a SerializedEGraph,
+    rng: &mut (impl Rng + ?Sized),
+) -> EGraphChoiceSet<'a> {
+    random_initial_choice(egraph, rng)
+}
+
+/// Draw a metadata-safe initial genome using runtime-owned ranking hints.
+pub fn random_initial_choice_with_policy<'a>(
+    egraph: &'a SerializedEGraph,
+    rng: &mut (impl Rng + ?Sized),
+    policy: SearchPolicy,
+) -> EGraphChoiceSet<'a> {
     let mut choices = EGraphChoiceSet::default();
     for (eclass, (label, enodes)) in &egraph.eclasses {
         if !is_search_choice_eclass(label) {
@@ -2978,7 +3109,17 @@ pub fn random_initial_choice<'a>(
         } else {
             Vec::new()
         };
+        let allowed_opkind_indices: Vec<usize> = consistent_opkind_indices
+            .iter()
+            .copied()
+            .filter(|&i| (policy.initial_enode_allowed)(egraph, &enodes[i]))
+            .collect();
         let marker_free = non_marker_enode_indices(egraph, enodes);
+        let backend_allowed: Vec<usize> = enodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, node)| (policy.initial_enode_allowed)(egraph, node).then_some(i))
+            .collect();
         if !consistent_opkind_indices.is_empty() && consistent_opkind_indices.len() < enodes.len() {
             crate::mask_events::OPKIND_INCONSISTENT.record();
         }
@@ -2986,24 +3127,55 @@ pub fn random_initial_choice<'a>(
             crate::mask_events::MARKER_CHOICE_RESTRICTED.record();
         }
         let restrict = |pool: Vec<usize>| -> Vec<usize> {
-            if marker_free.is_empty() {
-                return pool;
-            }
-            let filtered: Vec<usize> = pool
-                .iter()
-                .copied()
-                .filter(|i| marker_free.contains(i))
-                .collect();
-            if filtered.is_empty() { pool } else { filtered }
+            let restrict_to = |pool: Vec<usize>, allowed: &[usize]| {
+                if allowed.is_empty() {
+                    return pool;
+                }
+                let filtered: Vec<usize> = pool
+                    .iter()
+                    .copied()
+                    .filter(|i| allowed.contains(i))
+                    .collect();
+                if filtered.is_empty() { pool } else { filtered }
+            };
+            let pool = restrict_to(pool, &marker_free);
+            restrict_to(pool, &backend_allowed)
         };
+        let allowed_opkind_indices = restrict(allowed_opkind_indices);
         let consistent_opkind_indices = restrict(consistent_opkind_indices);
         let synth_indices = restrict(synth_indices);
-        let pick_idx = if !consistent_opkind_indices.is_empty() {
+        let fallback_indices = restrict((0..enodes.len()).collect());
+        let ranked_candidates = if !allowed_opkind_indices.is_empty() {
+            &allowed_opkind_indices
+        } else if !consistent_opkind_indices.is_empty() {
+            &consistent_opkind_indices
+        } else {
+            &fallback_indices
+        };
+        let highest_score = ranked_candidates
+            .iter()
+            .map(|&i| (policy.initial_enode_score)(egraph, &enodes[i]))
+            .max()
+            .unwrap_or(0);
+        let preferred_indices: Vec<usize> = if highest_score > 0 {
+            ranked_candidates
+                .iter()
+                .copied()
+                .filter(|&i| (policy.initial_enode_score)(egraph, &enodes[i]) == highest_score)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let pick_idx = if !preferred_indices.is_empty() {
+            preferred_indices[rng.random_range(0..preferred_indices.len())]
+        } else if !allowed_opkind_indices.is_empty() {
+            allowed_opkind_indices[rng.random_range(0..allowed_opkind_indices.len())]
+        } else if !consistent_opkind_indices.is_empty() {
             consistent_opkind_indices[rng.random_range(0..consistent_opkind_indices.len())]
         } else if !synth_indices.is_empty() {
             synth_indices[rng.random_range(0..synth_indices.len())]
-        } else if !marker_free.is_empty() {
-            marker_free[rng.random_range(0..marker_free.len())]
+        } else if !fallback_indices.is_empty() {
+            fallback_indices[rng.random_range(0..fallback_indices.len())]
         } else {
             rng.random_range(0..enodes.len())
         };
@@ -3607,8 +3779,9 @@ fn egglog_to_llir_from_root_cached<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        EGraphChoiceSet, LateEgglogPass, OpTextParts, SerializedEGraph, count_choice_sets_up_to,
-        egglog_setup_with_options, random_initial_choice, run_egglog_with_late_passes,
+        EGraphChoiceSet, LateEgglogPass, LlirExtractor, OpTextParts, SearchPolicy,
+        SerializedEGraph, count_choice_sets_up_to, egglog_setup_with_options,
+        random_initial_choice, random_initial_choice_with_policy, run_egglog_with_late_passes,
         validate_choice_set,
     };
     use crate::egglog_utils::api::{Rule, SortDef, sort};
@@ -3815,6 +3988,68 @@ mod tests {
                 "seed {seed} retained a reachable cycle"
             );
         }
+    }
+
+    fn test_policy_score(egraph: &SerializedEGraph, node: &NodeId) -> u64 {
+        u64::from(egraph.enodes[node].0 == "Preferred")
+    }
+
+    fn test_policy_allowed(egraph: &SerializedEGraph, node: &NodeId) -> bool {
+        egraph.enodes[node].0 != "Deferred"
+    }
+
+    fn test_policy_correlated_priority(egraph: &SerializedEGraph, node: &NodeId) -> u8 {
+        u8::from(egraph.enodes[node].0 == "Deferred")
+    }
+
+    #[test]
+    fn runtime_search_policy_ranks_and_correlates_without_core_op_knowledge() {
+        let class = ClassId::from("kind");
+        let ordinary = NodeId::from("ordinary");
+        let preferred = NodeId::from("preferred");
+        let deferred = NodeId::from("deferred");
+        let mut egraph = SerializedEGraph {
+            enodes: FxHashMap::default(),
+            eclasses: FxHashMap::default(),
+            node_to_class: FxHashMap::default(),
+            roots: vec![class.clone()],
+        };
+        egraph.eclasses.insert(
+            class.clone(),
+            (
+                "OpKind".into(),
+                vec![ordinary.clone(), preferred.clone(), deferred.clone()],
+            ),
+        );
+        for (node, name) in [
+            (&ordinary, "Ordinary"),
+            (&preferred, "Preferred"),
+            (&deferred, "Deferred"),
+        ] {
+            egraph
+                .enodes
+                .insert(node.clone(), (name.into(), Vec::new()));
+            egraph.node_to_class.insert(node.clone(), class.clone());
+        }
+        let policy = SearchPolicy {
+            initial_enode_score: test_policy_score,
+            initial_enode_allowed: test_policy_allowed,
+            correlated_enode_priority: test_policy_correlated_priority,
+        };
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let initial = random_initial_choice_with_policy(&egraph, &mut rng, policy);
+        assert_eq!(initial[&class], &preferred);
+
+        let extractor = LlirExtractor::new_with_search_policy(&egraph, &[], policy);
+        let indexed = extractor.index_choice_set(&initial);
+        let mutations = extractor.correlated_choice_mutations();
+        assert_eq!(mutations.len(), 1);
+        assert!(
+            extractor
+                .apply_indexed_mutation(&indexed, mutations[0])
+                .is_some()
+        );
     }
 
     #[test]
