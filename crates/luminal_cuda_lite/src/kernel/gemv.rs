@@ -292,6 +292,314 @@ extern \"C\" {{
 }
 
 // ═══════════════════════════════════════════════════════════
+// Decode GEMV with a column-bias and optional promotion epilogue.
+//
+// A conventional BF16 linear layer is commonly spelled as
+//
+//   Cast<F32>(Add<Bf16>(Matmul<Bf16>(x, w), bias))
+//
+// during inference.  For M=1 the plain warp GEMV above followed by an
+// elementwise fusion still requires a second kernel.  This alternative keeps
+// the graph's two BF16 rounding points (matmul output, then bias-add output)
+// but writes the final promoted value directly to F32, so the elementwise
+// epilogue disappears.  The rewrite is layout- and dtype-constrained and is
+// therefore useful to any BF16/F16 decoder linear, not a model-specific path.
+// ═══════════════════════════════════════════════════════════
+
+#[derive(Default, Debug, Clone)]
+pub struct KernelGemvBias {
+    n: Expression,
+    k: Expression,
+    dtype: DType,
+    output_dtype: DType,
+}
+
+impl EgglogOp for KernelGemvBias {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelGemvBias",
+            &[
+                ("n", EXPRESSION),
+                ("k", EXPRESSION),
+                ("dtype", DTYPE),
+                ("output_dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        3
+    }
+
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec![
+            "(relation kernel_gemv_m1_bias
+                (IR IR IR IR Expression Expression DType))"
+                .to_string(),
+        ]
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        let m_variants: [(&str, &str); 2] = [
+            (
+                "static",
+                "(= ?out_shape (ECons (MNum 1) (ECons ?n (ENil))))\n                            (= ?semantic_m (MNum 1))",
+            ),
+            (
+                "dyn",
+                "(= ?out_shape (ECons ?m (ECons ?n (ENil))))\n                            (= ?semantic_m ?m)\n                            (= ?m_lower (lower ?m))\n                            (= ?m_upper (upper ?m))\n                            (> ?m_lower 0)\n                            (< ?m_upper 2)",
+            ),
+        ];
+        let mut rules = m_variants
+            .into_iter()
+            .flat_map(|(variant, m_cond)| ["Bf16", "F16"].map(move |dt| (variant, m_cond, dt)))
+            .map(|(variant, m_cond, dt)| {
+                Rule::raw(format!(
+                    "(rule
+                        (
+                            (= ?sum (Op (GenericMatmul
+                                ?out_shape ?mul_shape ?k
+                                ?a_stride ?b_stride
+                                ?sum_in_stride ?k_stride ?sum_out_stride
+                                ?matmul_dtype)
+                                (ICons ?a (ICons ?b (INil)))))
+
+                            {m_cond}
+                            (generic_matmul_exact_2d
+                                ?sum ?semantic_m ?n ?k ({dt}))
+                            (= ?matmul_dtype ({dt}))
+                            (!= ?n (MNum 0))
+                            (!= ?k (MNum 1))
+
+                            ; The Add must consume the contiguous matmul output
+                            ; without a view and broadcast a contiguous column
+                            ; bias across the (runtime-singleton) row axis.
+                            (= ?add (Op (Add ?out_shape
+                                ?sum_add_stride ?bias_add_stride ?add_out_stride)
+                                (ICons ?sum (ICons ?bias (INil)))))
+                            (= ?sum_add_stride ?add_out_stride)
+                            (= ?bias_add_stride
+                                (ECons (MNum 0) (ECons (MIter) (ENil))))
+                            (= ?bias_dt (dtype ?bias))
+                            (= ?bias_dt ({dt}))
+                            (= ?add_dt (dtype ?add))
+                            (= ?add_dt ({dt}))
+
+                        )
+                        (
+                            (kernel_gemv_m1_bias
+                                ?add ?a ?b ?bias ?n ?k ({dt}))
+                        )
+                        :ruleset matmul_backend
+                        :name \"prove kernel gemv m1 bias {dt} {variant}\"
+                    )"
+                ))
+            })
+            .collect::<Vec<_>>();
+        rules.extend([
+            Rule::raw(
+                "(rule
+                    ((kernel_gemv_m1_bias ?add ?a ?b ?bias ?n ?k ?dt))
+                    (
+                        (let ?gemv (Op (KernelGemvBias ?n ?k ?dt ?dt)
+                            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+                        (union ?add ?gemv)
+                        (set (dtype ?gemv) ?dt)
+                    )
+                    :ruleset matmul_backend
+                    :name \"kernel gemv m1 bias epilogue\"
+                )",
+            ),
+            Rule::raw(
+                "(rule
+                    (
+                        (kernel_gemv_m1_bias ?add ?a ?b ?bias ?n ?k ?dt)
+                        (= ?out (Op (Cast ?cast_size (F32))
+                            (ICons ?add (INil))))
+                    )
+                    (
+                        (let ?gemv (Op (KernelGemvBias ?n ?k ?dt (F32))
+                            (ICons ?a (ICons ?b (ICons ?bias (INil))))))
+                        (union ?out ?gemv)
+                        (set (dtype ?gemv) (F32))
+                    )
+                    :ruleset matmul_backend
+                    :name \"kernel gemv m1 bias f32 epilogue\"
+                )",
+            ),
+        ]);
+        rules
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                n: extract_expr(egraph, kind_children[0], expr_cache).unwrap(),
+                k: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
+                dtype: extract_dtype(egraph, kind_children[2]),
+                output_dtype: extract_dtype(egraph, kind_children[3]),
+            }) as Box<dyn KernelOp>),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelGemvBias {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<Symbol, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .n
+            .dyn_vars()
+            .into_iter()
+            .chain(self.k.dyn_vars())
+            .collect::<FxHashSet<_>>();
+        let ty = cuda_dtype(self.dtype);
+        let output_ty = cuda_dtype(self.output_dtype);
+        let includes = dtype_includes(&[self.dtype, self.output_dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n = self.n.to_kernel();
+        let k = self.k.to_kernel();
+
+        let vectorized = self.k.to_usize().map(|k| k % 8 == 0).unwrap_or(false);
+        let body = if vectorized {
+            format!(
+                r#"
+        const uint4* xr = (const uint4*)x;
+        const uint4* wr = (const uint4*)(w + row * ({k}));
+        long long chunks = ({k}) / 8;
+        float acc = 0.0f;
+        for (long long c = lane; c < chunks; c += 32) {{
+            uint4 xv = xr[c];
+            uint4 wv = wr[c];
+            const {ty}* xe = (const {ty}*)&xv;
+            const {ty}* we = (const {ty}*)&wv;
+            #pragma unroll
+            for (int e = 0; e < 8; e++) {{
+                acc += (float)xe[e] * (float)we[e];
+            }}
+        }}"#
+            )
+        } else {
+            format!(
+                r#"
+        const {ty}* wr = w + row * ({k});
+        float acc = 0.0f;
+        for (long long i = lane; i < ({k}); i += 32) {{
+            acc += (float)x[i] * (float)wr[i];
+        }}"#
+            )
+        };
+
+        let store = if self.output_dtype == DType::F32 {
+            "out[row] = (float)rounded_sum;"
+        } else {
+            "out[row] = rounded_sum;"
+        };
+        let kernel = format!(
+            "{includes}
+#define FULL_MASK 0xffffffff
+{dyn_defines}
+extern \"C\" {{
+    __global__ void gemv_bias_k({output_ty} *out, const {ty} *x, const {ty} *w, const {ty} *bias{dyn_dims_param}) {{
+        long long row = (long long)blockIdx.x * {WARPS_PER_BLOCK} + (threadIdx.x >> 5);
+        if (row >= ({n})) return;
+        int lane = threadIdx.x & 31;
+{body}
+
+        #pragma unroll
+        for (int s = 16; s > 0; s /= 2) {{
+            acc += __shfl_down_sync(FULL_MASK, acc, s);
+        }}
+        if (lane == 0) {{
+            // Preserve the source graph's BF16/F16 matmul rounding, then its
+            // BF16/F16 bias-add rounding, before exposing the F32 result.
+            {ty} rounded_dot = ({ty})acc;
+            {ty} rounded_sum = ({ty})((float)rounded_dot + (float)bias[row]);
+            {store}
+        }}
+    }}
+}}"
+        );
+
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("gemv_bias_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+
+        (
+            func,
+            module,
+            kernel,
+            (self.n.ceil_div(WARPS_PER_BLOCK), 1.into(), 1.into()),
+            (TPB.into(), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.n
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.n * self.output_dtype.bits()).ceil_div(8)
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.output_dtype
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        ((self.n * self.k + self.k + self.n) * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        self.n * self.k * 2 + self.n
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "GemvBias"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
 // Tensor-core scaled FP8 GEMV:
 //   out_bf16[n] = (Σ_k x_f8[k]·w_f8[n,k]) · in_scale·w_scale
 //

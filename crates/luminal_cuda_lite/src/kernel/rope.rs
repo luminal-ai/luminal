@@ -215,7 +215,11 @@ pub struct RoPEHalfKernel {
     pub pitch: usize,
     /// Column offset of this head group within the input row.
     pub offset: usize,
+    /// Source projection dtype.
     pub dtype: DType,
+    /// Materialized rotation dtype. Keeping this distinct permits the common
+    /// F32-projection → BF16-attention boundary to round in this kernel.
+    pub output_dtype: DType,
 }
 
 impl Default for RoPEHalfKernel {
@@ -227,6 +231,7 @@ impl Default for RoPEHalfKernel {
             pitch: 2,
             offset: 0,
             dtype: DType::F32,
+            output_dtype: DType::F32,
         }
     }
 }
@@ -241,7 +246,7 @@ impl HLIROp for RoPEHalfKernel {
     fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
         assert_eq!(inputs.len(), 3, "RoPEHalf has x, cos, and sin inputs");
         format!(
-            "(Op (KernelRoPEHalf {} {} {} {} {} {} ({:?})) {})",
+            "(Op (KernelRoPEHalf {} {} {} {} {} {} ({:?}) ({:?})) {})",
             self.s.to_egglog(),
             Expression::from(self.h).to_egglog(),
             Expression::from(self.d).to_egglog(),
@@ -249,6 +254,7 @@ impl HLIROp for RoPEHalfKernel {
             Expression::from(self.pitch).to_egglog(),
             Expression::from(self.offset).to_egglog(),
             self.dtype,
+            self.output_dtype,
             list_to_egglog(&[&inputs[0].1, &inputs[1].1, &inputs[2].1], "ICons", "INil"),
         )
     }
@@ -266,7 +272,8 @@ impl EgglogOp for RoPEHalfKernel {
                 ("out_width", EXPRESSION),
                 ("pitch", EXPRESSION),
                 ("offset", EXPRESSION),
-                ("dtype", DTYPE),
+                ("input_dtype", DTYPE),
+                ("output_dtype", DTYPE),
             ],
         )
     }
@@ -278,8 +285,8 @@ impl EgglogOp for RoPEHalfKernel {
     fn rewrites(&self) -> Vec<Rule> {
         vec![Rule::raw(
             "(rule
-                ((= ?rope (Op (KernelRoPEHalf ?s ?h ?d ?out_width ?pitch ?offset ?dt) ?inputs)))
-                ((set (dtype ?rope) ?dt))
+                ((= ?rope (Op (KernelRoPEHalf ?s ?h ?d ?out_width ?pitch ?offset ?in_dt ?out_dt) ?inputs)))
+                ((set (dtype ?rope) ?out_dt))
                 :ruleset dtype_prop
                 :name \"kernel-rope-half-dtype\"
             )",
@@ -323,6 +330,7 @@ impl EgglogOp for RoPEHalfKernel {
                 pitch,
                 offset,
                 dtype: extract_dtype(egraph, kind_children[6]),
+                output_dtype: extract_dtype(egraph, kind_children[7]),
             }) as Box<dyn KernelOp>),
             input_enodes,
         )
@@ -349,13 +357,14 @@ impl KernelOp for RoPEHalfKernel {
         let offset = self.offset;
         assert!(d.is_multiple_of(2), "RoPE head_dim must be even");
         let half = d / 2;
-        let ty = crate::cuda_dtype(self.dtype);
-        let includes = crate::kernel::hlir::dtype_includes(&[self.dtype]);
+        let in_ty = crate::cuda_dtype(self.dtype);
+        let out_ty = crate::cuda_dtype(self.output_dtype);
+        let includes = crate::kernel::hlir::dtype_includes(&[self.dtype, self.output_dtype]);
         let kernel = format!(
             r#"{includes}
 extern "C" __global__ void rope_half_kernel(
-    {ty}* __restrict__ out,
-    const {ty}* __restrict__ x,
+    {out_ty}* __restrict__ out,
+    const {in_ty}* __restrict__ x,
     const float* __restrict__ cos_,
     const float* __restrict__ sin_
 ) {{
@@ -367,18 +376,18 @@ extern "C" __global__ void rope_half_kernel(
     int h_idx = sh - s_idx * H;
     int tid = threadIdx.x;
 
-    const {ty}* xr   = x    + (long long)s_idx * {pitch} + {offset} + h_idx * D;
+    const {in_ty}* xr   = x    + (long long)s_idx * {pitch} + {offset} + h_idx * D;
     const float* cosr = cos_ + (long long)s_idx * HALF;
     const float* sinr = sin_ + (long long)s_idx * HALF;
-    {ty}* yr = out + (long long)sh * D;
+    {out_ty}* yr = out + (long long)sh * D;
 
     for (int j = tid; j < HALF; j += {TPB}) {{
         float x0 = (float)xr[j];
         float x1 = (float)xr[j + HALF];
         float c = cosr[j];
         float s = sinr[j];
-        yr[j] = ({ty})(x0 * c - x1 * s);
-        yr[j + HALF] = ({ty})(x1 * c + x0 * s);
+        yr[j] = ({out_ty})(x0 * c - x1 * s);
+        yr[j + HALF] = ({out_ty})(x1 * c + x0 * s);
     }}
 }}
 "#
@@ -418,11 +427,11 @@ extern "C" __global__ void rope_half_kernel(
     }
 
     fn output_bytes(&self) -> Expression {
-        (self.output_size() * self.dtype.bits()).ceil_div(8)
+        (self.output_size() * self.output_dtype.bits()).ceil_div(8)
     }
 
     fn output_dtype(&self) -> DType {
-        self.dtype
+        self.output_dtype
     }
 
     fn bytes_loaded(&self) -> Expression {
@@ -464,6 +473,20 @@ pub fn apply_rope_half(
     cos: GraphTensor,
     sin: GraphTensor,
 ) -> GraphTensor {
+    apply_rope_half_as(x, offset, h, d, cos, sin, x.dtype)
+}
+
+/// [`apply_rope_half`] with an explicit output dtype. Rotation math remains
+/// F32; only the final store is converted.
+pub fn apply_rope_half_as(
+    x: GraphTensor,
+    offset: usize,
+    h: usize,
+    d: usize,
+    cos: GraphTensor,
+    sin: GraphTensor,
+    output_dtype: DType,
+) -> GraphTensor {
     assert_eq!(cos.dtype, DType::F32, "RoPE cos must be F32");
     assert_eq!(sin.dtype, DType::F32, "RoPE sin must be F32");
     let x_dims = x.dims();
@@ -479,14 +502,15 @@ pub fn apply_rope_half(
         pitch,
         offset,
         dtype: x.dtype,
+        output_dtype,
     };
     let cx = unsafe { &mut *x.graph_ref };
     let id = cx.add_op(kern, &[x.id, cos.id, sin.id]);
     GraphTensor::from_id(
         id,
-        ShapeTracker::new_with_element_bits((s, h * d), x.dtype.bits()),
+        ShapeTracker::new_with_element_bits((s, h * d), output_dtype.bits()),
         cx,
-        x.dtype,
+        output_dtype,
     )
 }
 
@@ -534,7 +558,8 @@ impl EgglogOp for RoPEScatterKernel {
                 ("dest_shape", ELIST),
                 ("index_shape", ELIST),
                 ("index_strides", ELIST),
-                ("dtype", DTYPE),
+                ("input_dtype", DTYPE),
+                ("output_dtype", DTYPE),
             ],
         )
     }
@@ -556,10 +581,10 @@ impl EgglogOp for RoPEScatterKernel {
                             (ECons (MIter) (ENil))))
                     (= ?dest_strides ?out_strides)
                     (= ?rope (Op
-                        (KernelRoPEHalf ?s ?h ?d ?out_width ?pitch ?offset ?dt)
+                        (KernelRoPEHalf ?s ?h ?d ?out_width ?pitch ?offset ?in_dt ?out_dt)
                         (ICons ?x (ICons ?cos (ICons ?sin (INil))))))
-                    (= ?dt (dtype ?x))
-                    (= ?dt (dtype ?dest))
+                    (= ?in_dt (dtype ?x))
+                    (= ?out_dt (dtype ?dest))
                     (= (Int) (dtype ?indexes))
                     (= (F32) (dtype ?cos))
                     (= (F32) (dtype ?sin))
@@ -571,11 +596,11 @@ impl EgglogOp for RoPEScatterKernel {
                 (
                     (let ?fused (Op
                         (KernelRoPEHalfScatter ?s ?h ?d ?out_width ?pitch ?offset
-                            ?dest_shape ?index_shape ?index_strides ?dt)
+                            ?dest_shape ?index_shape ?index_strides ?in_dt ?out_dt)
                         (ICons ?dest (ICons ?indexes
                             (ICons ?x (ICons ?cos (ICons ?sin (INil))))))))
                     (union ?scatter ?fused)
-                    (set (dtype ?fused) ?dt)
+                    (set (dtype ?fused) ?out_dt)
                 )
                 :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope-half scatter exact-layout\"
@@ -627,6 +652,7 @@ impl EgglogOp for RoPEScatterKernel {
                     pitch,
                     offset,
                     dtype: extract_dtype(egraph, kind_children[9]),
+                    output_dtype: extract_dtype(egraph, kind_children[10]),
                 },
                 dest_size: dest_shape.into_iter().product(),
                 idx_flat: luminal::shape::flatten_strides(&index_shape, &index_strides),
@@ -655,8 +681,10 @@ impl KernelOp for RoPEScatterKernel {
         let pitch = self.rope.pitch;
         let offset = self.rope.offset;
         let half = d / 2;
-        let ty = crate::cuda_dtype(self.rope.dtype);
-        let includes = crate::kernel::hlir::dtype_includes(&[self.rope.dtype]);
+        let in_ty = crate::cuda_dtype(self.rope.dtype);
+        let out_ty = crate::cuda_dtype(self.rope.output_dtype);
+        let includes =
+            crate::kernel::hlir::dtype_includes(&[self.rope.dtype, self.rope.output_dtype]);
 
         let vars: FxHashSet<Symbol> = self
             .idx_flat
@@ -677,9 +705,9 @@ impl KernelOp for RoPEScatterKernel {
             r#"{includes}
 {dyn_defines}
 extern "C" __global__ void rope_scatter_kernel(
-    {ty}* __restrict__ dest,
+    {out_ty}* __restrict__ dest,
     const int* __restrict__ indexes,
-    const {ty}* __restrict__ x,
+    const {in_ty}* __restrict__ x,
     const float* __restrict__ cos_,
     const float* __restrict__ sin_{dyn_dims_param}
 ) {{
@@ -692,7 +720,7 @@ extern "C" __global__ void rope_scatter_kernel(
     int h_idx = sh - s_idx * H;
     int tid = threadIdx.x;
 
-    const {ty}* xr   = x    + (long long)s_idx * {pitch} + {offset} + h_idx * D;
+    const {in_ty}* xr   = x    + (long long)s_idx * {pitch} + {offset} + h_idx * D;
     const float* cosr = cos_ + (long long)s_idx * HALF;
     const float* sinr = sin_ + (long long)s_idx * HALF;
 
@@ -705,14 +733,14 @@ extern "C" __global__ void rope_scatter_kernel(
             long long const_z = (long long)s_idx * KVD + (long long)h_idx * D + j;
             int idx = indexes[{idx_expr}];
             if (idx >= 0 && idx < ({dest_n})) {{
-                dest[idx] = ({ty})(x0 * c - x1 * s);
+                dest[idx] = ({out_ty})(x0 * c - x1 * s);
             }}
         }}
         {{
             long long const_z = (long long)s_idx * KVD + (long long)h_idx * D + j + HALF;
             int idx = indexes[{idx_expr}];
             if (idx >= 0 && idx < ({dest_n})) {{
-                dest[idx] = ({ty})(x1 * c + x0 * s);
+                dest[idx] = ({out_ty})(x1 * c + x0 * s);
             }}
         }}
     }}
@@ -791,11 +819,11 @@ extern "C" __global__ void rope_scatter_kernel(
     }
 
     fn output_bytes(&self) -> Expression {
-        (self.dest_size * self.rope.dtype.bits()).ceil_div(8)
+        (self.dest_size * self.rope.output_dtype.bits()).ceil_div(8)
     }
 
     fn output_dtype(&self) -> DType {
-        self.rope.dtype
+        self.rope.output_dtype
     }
 
     fn bytes_loaded(&self) -> Expression {
@@ -804,7 +832,7 @@ extern "C" __global__ void rope_scatter_kernel(
     }
 
     fn bytes_stored(&self) -> Expression {
-        (self.rope.s * self.rope.h * self.rope.d * self.rope.dtype.bits()).ceil_div(8)
+        (self.rope.s * self.rope.h * self.rope.d * self.rope.output_dtype.bits()).ceil_div(8)
     }
 
     fn flops(&self) -> Expression {

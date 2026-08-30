@@ -552,6 +552,9 @@ impl EgglogOp for KernelRMSNorm {
                             (ICons ?xb (ICons ?w (INil)))))
                         (union ?out ?krms)
                         (set (dtype ?krms) (Bf16))
+                        ; Once the fused kernel is legal, the decomposed norm
+                        ; only adds large temporaries and launch latency.
+                        (delete (Op (Cast ?o_size (Bf16)) (ICons ?wgt (INil))))
                     )
                     :ruleset kernel_fuse_late
                     :name \"kernel rms norm bf16 {variant}\"

@@ -104,8 +104,9 @@ fn cuda_dtype(dtype: DType) -> &'static str {
 
 const CUDA_NVRTC_INCLUDE_PATHS: [&str; 2] = ["/usr/local/cuda/include", "/usr/include"];
 
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) enum CudaModuleImageCompileFailure {
+pub enum CudaModuleImageCompileFailure {
     ComputeCapability(DriverError),
     Nvrtc {
         stage: &'static str,
@@ -114,8 +115,9 @@ pub(crate) enum CudaModuleImageCompileFailure {
     NoModuleImageProduced,
 }
 
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) struct CudaModuleImageCompileError {
+pub struct CudaModuleImageCompileError {
     pub target_arch: Option<String>,
     pub driver_version: Option<i32>,
     pub runtime_version: Option<i32>,
@@ -496,7 +498,8 @@ fn get_cubin(program: nvrtc_sys::nvrtcProgram) -> Result<Vec<u8>, NvrtcError> {
     Ok(cubin)
 }
 
-pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
+#[doc(hidden)]
+pub fn compile_module_image_for_current_device<S: AsRef<str>>(
     ctx: &Arc<CudaContext>,
     src: S,
 ) -> Result<Ptx, CudaModuleImageCompileError> {

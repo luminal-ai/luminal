@@ -159,6 +159,10 @@ impl EgglogOp for KernelStableSortIdx {
                     (let ?kr (Op (KernelStableSortIdx ?out_shape) (ICons ?x (INil))))
                     (union ?sorted ?kr)
                     (set (dtype ?kr) (Int))
+                    ; The exact O(E^2) decomposition is a proof spelling, not
+                    ; a useful CUDA fallback after this kernel has matched.
+                    (delete (Op (Scatter ?sc_ds ?sc_dst ?sc_is ?sc_istr ?sc_ss)
+                        (ICons ?zeros (ICons ?adj (ICons ?vals (INil))))))
                 )
                 :ruleset kernel_fuse_late
                 :name \"kernel stable ranks descending\"

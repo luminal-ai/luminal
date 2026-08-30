@@ -13,7 +13,7 @@
 //! the first call the `OnceLock` makes subsequent lookups free.
 
 use std::{
-    ffi::c_void,
+    ffi::{c_char, c_void},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
@@ -92,6 +92,42 @@ pub type RunFn = unsafe extern "C" fn(
     page_size: i32,
     head_dim: i32,
     dtype: i32,
+    sm_scale: f32,
+    window_left: i32,
+    stream: *mut c_void,
+) -> i32;
+
+pub type SinkDecodePlanFn = unsafe extern "C" fn(
+    float_workspace: *mut c_void,
+    float_ws_size: usize,
+    int_workspace: *mut c_void,
+    int_ws_size: usize,
+    page_locked_int_workspace: *mut c_void,
+    kv_indptr_h: *mut i32,
+    batch_size: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    enable_cuda_graph: bool,
+    stream: *mut c_void,
+    plan_info_out: *mut i64,
+    plan_info_len_out: *mut i32,
+) -> i32;
+
+pub type SinkDecodeRunFn = unsafe extern "C" fn(
+    float_workspace: *mut c_void,
+    int_workspace: *mut c_void,
+    plan_info_vec: *mut i64,
+    plan_info_len: i32,
+    q: *const c_void,
+    k_cache: *const c_void,
+    v_cache: *const c_void,
+    kv_indptr: *mut i32,
+    kv_indices: *mut i32,
+    sink: *const f32,
+    output: *mut c_void,
+    batch_size: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
     sm_scale: f32,
     window_left: i32,
     stream: *mut c_void,
@@ -191,6 +227,7 @@ pub type Fa3PrefillPlanFn = unsafe extern "C" fn(
     num_qo_heads: i32,
     num_kv_heads: i32,
     page_size: i32,
+    enable_cuda_graph: bool,
     stream: *mut c_void,
     plan_info_out: *mut i64,
     plan_info_len_out: *mut i32,
@@ -209,6 +246,49 @@ pub type Fa3PrefillRunFn = unsafe extern "C" fn(
     nnz_qo: i32,
     num_qo_heads: i32,
     num_kv_heads: i32,
+    page_size: i32,
+    sm_scale: f32,
+    window_left: i32,
+    stream: *mut c_void,
+) -> i32;
+
+pub type Fa3SinkDecodeRunFn = unsafe extern "C" fn(
+    q: *const c_void,
+    k_cache: *const c_void,
+    v_cache: *const c_void,
+    kv_indices: *const i32,
+    kv_indptr: *const i32,
+    sink: *const f32,
+    output: *mut c_void,
+    batch_size: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    sm_scale: f32,
+    window_left: i32,
+    token_major_output: bool,
+    stream: *mut c_void,
+) -> i32;
+
+pub type ExternalFa3InitFn = unsafe extern "C" fn(library_path: *const c_char) -> i32;
+
+pub type ExternalFa3SinkDecodeRunFn = unsafe extern "C" fn(
+    float_workspace: *mut c_void,
+    float_workspace_size: usize,
+    int_workspace: *mut c_void,
+    int_workspace_size: usize,
+    q: *const c_void,
+    k_cache: *const c_void,
+    v_cache: *const c_void,
+    page_table: *const i32,
+    qo_indptr: *const i32,
+    kv_indptr: *const i32,
+    sink: *const f32,
+    output: *mut c_void,
+    batch_size: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    max_context_len: i32,
+    num_pages: i32,
     page_size: i32,
     sm_scale: f32,
     window_left: i32,
@@ -240,6 +320,8 @@ pub struct FlashInferLib {
     _lib: libloading::Library,
     pub plan: PlanFn,
     pub run: RunFn,
+    pub sink_decode_plan: SinkDecodePlanFn,
+    pub sink_decode_run: SinkDecodeRunFn,
     pub extract_slot_indices: ExtractFn,
     pub prepare_decode_metadata: PrepareDecodeMetadataFn,
     pub transpose_output: TransposeOutputFn,
@@ -290,6 +372,10 @@ impl FlashInferLib {
         let lib = unsafe { libloading::Library::new(path)? };
         let plan: PlanFn = unsafe { *lib.get::<PlanFn>(b"flashinfer_batch_decode_plan\0")? };
         let run: RunFn = unsafe { *lib.get::<RunFn>(b"flashinfer_batch_decode_run\0")? };
+        let sink_decode_plan: SinkDecodePlanFn =
+            unsafe { *lib.get::<SinkDecodePlanFn>(b"flashinfer_sink_decode_plan\0")? };
+        let sink_decode_run: SinkDecodeRunFn =
+            unsafe { *lib.get::<SinkDecodeRunFn>(b"flashinfer_sink_decode_run\0")? };
         let extract_slot_indices: ExtractFn =
             unsafe { *lib.get::<ExtractFn>(b"flashinfer_extract_slot_indices\0")? };
         let prepare_decode_metadata: PrepareDecodeMetadataFn = unsafe {
@@ -305,6 +391,8 @@ impl FlashInferLib {
             _lib: lib,
             plan,
             run,
+            sink_decode_plan,
+            sink_decode_run,
             extract_slot_indices,
             prepare_decode_metadata,
             transpose_output,
@@ -324,7 +412,11 @@ pub struct Fa3Lib {
     _lib: libloading::Library,
     pub prefill_plan: Fa3PrefillPlanFn,
     pub prefill_run: Fa3PrefillRunFn,
+    pub sink_decode_run: Fa3SinkDecodeRunFn,
+    pub external_init: ExternalFa3InitFn,
+    pub external_sink_decode_run: ExternalFa3SinkDecodeRunFn,
     pub transpose_output_f32: Fa3TransposeFn,
+    pub transpose_output_bf16: Fa3TransposeFn,
     pub transpose_q_bf16: Fa3TransposeFn,
 }
 
@@ -372,15 +464,28 @@ impl Fa3Lib {
             unsafe { *lib.get::<Fa3PrefillPlanFn>(b"flashinfer_fa3_prefill_plan\0")? };
         let prefill_run: Fa3PrefillRunFn =
             unsafe { *lib.get::<Fa3PrefillRunFn>(b"flashinfer_fa3_prefill_run\0")? };
+        let sink_decode_run: Fa3SinkDecodeRunFn =
+            unsafe { *lib.get::<Fa3SinkDecodeRunFn>(b"flashinfer_sink_decode_run\0")? };
+        let external_init: ExternalFa3InitFn =
+            unsafe { *lib.get::<ExternalFa3InitFn>(b"luminal_external_fa3_init\0")? };
+        let external_sink_decode_run: ExternalFa3SinkDecodeRunFn = unsafe {
+            *lib.get::<ExternalFa3SinkDecodeRunFn>(b"luminal_external_fa3_sink_decode_run\0")?
+        };
         let transpose_output_f32: Fa3TransposeFn =
             unsafe { *lib.get::<Fa3TransposeFn>(b"flashinfer_fa3_transpose_output_f32\0")? };
+        let transpose_output_bf16: Fa3TransposeFn =
+            unsafe { *lib.get::<Fa3TransposeFn>(b"flashinfer_fa3_transpose_output_bf16\0")? };
         let transpose_q_bf16: Fa3TransposeFn =
             unsafe { *lib.get::<Fa3TransposeFn>(b"flashinfer_fa3_transpose_q_bf16\0")? };
         Ok(Self {
             _lib: lib,
             prefill_plan,
             prefill_run,
+            sink_decode_run,
+            external_init,
+            external_sink_decode_run,
             transpose_output_f32,
+            transpose_output_bf16,
             transpose_q_bf16,
         })
     }

@@ -1,3 +1,4 @@
+use half::bf16;
 use luminal::{
     dtype::DType,
     egglog_utils::{ClassId, NodeId, SerializedEGraph, random_initial_choice, validate_choice_set},
@@ -874,6 +875,39 @@ fn cuda_graph_cublaslt_only_executes_correctly() {
     assert_eq!(summary.n_kernels, 0);
     assert_eq!(summary.n_steps, 1);
     assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
+}
+
+#[test]
+fn cuda_graph_cublaslt_bf16_output_keeps_storage_dtype() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream)
+        || !crate::host::cublaslt::cublaslt_graph_capture_supported(&stream)
+    {
+        return;
+    }
+
+    let (m, n, k) = (1, 96, 64);
+    let mut cx = Graph::new();
+    let a = cx.tensor((m, k)).as_dtype(DType::Bf16);
+    let b = cx.tensor((k, n)).as_dtype(DType::Bf16);
+    let out = a.matmul(b).output();
+    let llir = extract_forced_cublaslt_llir_where(&mut cx, "BF16 cuBLASLt output dtype", |llir| {
+        cublaslt_type_tuples(llir)
+            .iter()
+            .any(|types| types.3 == DType::Bf16)
+    });
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(a, vec![bf16::from_f32(0.25); m * k]);
+    rt.set_data(b, vec![bf16::from_f32(0.5); k * n]);
+    rt.execute(&cx.dyn_map);
+
+    let result = rt.get_bf16(out);
+    assert_eq!(result.len(), m * n);
+    assert!(result.iter().all(|value| value.to_f32() == 8.0));
 }
 
 #[test]

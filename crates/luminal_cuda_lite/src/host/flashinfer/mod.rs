@@ -292,11 +292,15 @@ const FLOAT_WORKSPACE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
 const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 static FLOAT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
 static INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
+// SinkAttention reuses one host-side plan across layers in a runtime tick.
+// Keep its plan data separate from FlashInferAttention so a mixed graph cannot
+// overwrite the cached plan's integer workspace between sink-attention layers.
+static SINK_INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
 
 pub(crate) fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
     SharedDeviceMemoryAllocation {
         key: "flashinfer-global-workspaces",
-        bytes: FLOAT_WORKSPACE_SIZE + INT_WORKSPACE_SIZE,
+        bytes: FLOAT_WORKSPACE_SIZE + 2 * INT_WORKSPACE_SIZE,
     }
 }
 
@@ -304,10 +308,12 @@ pub(crate) fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation 
 /// them is discarded. Resource planning must therefore keep charging them to
 /// later candidates, including candidates with no FlashInfer op of their own.
 pub(crate) fn resident_shared_device_memory_allocations() -> Vec<SharedDeviceMemoryAllocation> {
-    (FLOAT_WORKSPACE.get().is_some() || INT_WORKSPACE.get().is_some())
-        .then(shared_device_memory_allocation)
-        .into_iter()
-        .collect()
+    (FLOAT_WORKSPACE.get().is_some()
+        || INT_WORKSPACE.get().is_some()
+        || SINK_INT_WORKSPACE.get().is_some())
+    .then(shared_device_memory_allocation)
+    .into_iter()
+    .collect()
 }
 
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
@@ -1166,6 +1172,19 @@ fn flashinfer_workspaces(
     (float_ws, float_ptr, int_ws, int_ptr)
 }
 
+fn sink_attention_workspaces(
+    stream: &Arc<CudaStream>,
+) -> (&'static CudaSlice<u8>, u64, &'static CudaSlice<u8>, u64) {
+    static POINTERS: OnceLock<(u64, u64)> = OnceLock::new();
+    let float_ws = FLOAT_WORKSPACE
+        .get_or_init(|| unsafe { stream.alloc::<u8>(FLOAT_WORKSPACE_SIZE).unwrap() });
+    let int_ws = SINK_INT_WORKSPACE
+        .get_or_init(|| unsafe { stream.alloc::<u8>(INT_WORKSPACE_SIZE).unwrap() });
+    let &(float_ptr, int_ptr) =
+        POINTERS.get_or_init(|| (float_ws.device_ptr(stream).0, int_ws.device_ptr(stream).0));
+    (float_ws, float_ptr, int_ws, int_ptr)
+}
+
 fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
     let len = bytes.len() / std::mem::size_of::<i32>();
     let mut bytes = std::mem::ManuallyDrop::new(bytes);
@@ -1255,7 +1274,7 @@ mod resource_tests {
         // Capacity tier 256: kv indptr (8), current-c (4), indices
         // (1024), last-page length (4), and temporary output (512).
         assert_eq!(spec.prepared_device_bytes().unwrap(), 1_552);
-        assert_eq!(shared_device_memory_allocation().bytes, 136 * 1024 * 1024);
+        assert_eq!(shared_device_memory_allocation().bytes, 144 * 1024 * 1024);
     }
 
     #[test]

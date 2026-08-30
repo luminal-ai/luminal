@@ -4,12 +4,9 @@
 //! stronger search invariant: every selectable LLIR graph from the same e-graph
 //! must produce finite, numerically close outputs for the same runtime inputs.
 
-#[allow(dead_code)]
-#[path = "../../../../examples/llama/src/model.rs"]
-mod llama_model;
-
 use half::bf16;
 use luminal::{dtype::DType, prelude::*, shape::Expression};
+use luminal_nn::{gather_rows, scatter_rows};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use super::utilities::{CudaSearchEquivalenceFuzzer, get_cuda_stream, random_f32_vec};
@@ -53,24 +50,47 @@ fn gather_experts(
     weights.gather(expert_flat_idx)
 }
 
+fn llama_rope(input: GraphTensor, positions: GraphTensor, head_dim: usize) -> GraphTensor {
+    let input = input.split_dims(1, head_dim).transpose(0, 1);
+    let freqs = input
+        .graph()
+        .arange_options(0, head_dim, 2)
+        .cast(DType::F32)
+        / head_dim as f32;
+    let inv_freqs = 500_000_f32.pow(freqs).reciprocal();
+    let angles = positions
+        .cast(DType::F32)
+        .expand_dim(1, 1)
+        .matmul(inv_freqs.expand_dim(0, 1));
+    let x0 = input.slice((.., .., ..head_dim / 2));
+    let x1 = input.slice((.., .., head_dim / 2..));
+    let cos = angles.cos().expand_dim(0, x0.dims()[0]);
+    let sin = angles.sin().expand_dim(0, x0.dims()[0]);
+    (x0 * cos - x1 * sin)
+        .concat_along(x1 * cos + x0 * sin, 2)
+        .transpose(0, 1)
+        .merge_dims(1, 2)
+}
+
 #[test]
 fn llama_architecture_search_space_equivalence_fuzz() {
     let Some(stream) = get_cuda_stream() else {
         return;
     };
 
+    const LAYERS: usize = 2;
     const SEQ: usize = 2;
     const CTX: usize = 3;
     const SLOTS: usize = 4;
-
-    let config = llama_model::LlamaConfig {
-        layers: 2,
-        hidden: 32,
-        intermediate: 64,
-        head_dim: 8,
-        kv_groups: 2,
-        vocab_size: 64,
-    };
+    const HIDDEN: usize = 32;
+    const INTERMEDIATE: usize = 64;
+    const HEAD_DIM: usize = 8;
+    const KV_GROUPS: usize = 2;
+    const VOCAB_SIZE: usize = 64;
+    const N_HEADS: usize = HIDDEN / HEAD_DIM;
+    const N_KV_HEADS: usize = N_HEADS / KV_GROUPS;
+    const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
+    const EPS: f32 = 1e-5;
 
     let mut cx = Graph::default();
     cx.set_dim('s', SEQ);
@@ -80,11 +100,103 @@ fn llama_architecture_search_space_equivalence_fuzz() {
     let q_pos = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
     let scatter_idx = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
     let gather_idx = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
-    let kv_cache = llama_model::KVCache::new_with_config(&mut cx, SLOTS, config);
-    let llama = llama_model::Llama::init_with_config(&mut cx, config);
+    let embedding = cx
+        .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
+        .persist();
+    let mut parameters = vec![embedding];
+    let mut cache_inputs = Vec::with_capacity(2 * LAYERS);
+    let mut cache_outputs = Vec::with_capacity(LAYERS);
+    let mut x = embedding.gather(
+        (input * HIDDEN).expand_dim(1, HIDDEN)
+            + input
+                .graph()
+                .arange(HIDDEN)
+                .expand_dim(0, Expression::from('s')),
+    );
 
-    let (logits, cache_outputs) = llama.forward(input, q_pos, scatter_idx, gather_idx, &kv_cache);
-    let logits = logits.output();
+    for layer in 0..LAYERS {
+        let parameter = |cx: &mut Graph, suffix: &str, shape: (usize, usize)| {
+            cx.named_tensor(format!("model.layers.{layer}.{suffix}"), shape)
+                .persist()
+        };
+        let attn_norm = cx
+            .named_tensor(
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                HIDDEN,
+            )
+            .persist();
+        let mlp_norm = cx
+            .named_tensor(
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                HIDDEN,
+            )
+            .persist();
+        let q_weight = parameter(&mut cx, "self_attn.q_proj.weight", (HIDDEN, HIDDEN));
+        let k_weight = parameter(&mut cx, "self_attn.k_proj.weight", (KV_DIM, HIDDEN));
+        let v_weight = parameter(&mut cx, "self_attn.v_proj.weight", (KV_DIM, HIDDEN));
+        let o_weight = parameter(&mut cx, "self_attn.o_proj.weight", (HIDDEN, HIDDEN));
+        let gate_weight = parameter(&mut cx, "mlp.gate_proj.weight", (INTERMEDIATE, HIDDEN));
+        let up_weight = parameter(&mut cx, "mlp.up_proj.weight", (INTERMEDIATE, HIDDEN));
+        let down_weight = parameter(&mut cx, "mlp.down_proj.weight", (HIDDEN, INTERMEDIATE));
+        parameters.extend([
+            attn_norm,
+            mlp_norm,
+            q_weight,
+            k_weight,
+            v_weight,
+            o_weight,
+            gate_weight,
+            up_weight,
+            down_weight,
+        ]);
+
+        let k_cache = cx
+            .named_tensor(format!("kv_cache.{layer}.k"), (SLOTS, KV_DIM))
+            .persist();
+        let v_cache = cx
+            .named_tensor(format!("kv_cache.{layer}.v"), (SLOTS, KV_DIM))
+            .persist();
+        cache_inputs.extend([k_cache, v_cache]);
+
+        let x_attn = rms_norm(x, attn_norm, EPS);
+        let q = llama_rope(x_attn.matmul(q_weight.t()), q_pos, HEAD_DIM);
+        let k = llama_rope(x_attn.matmul(k_weight.t()), q_pos, HEAD_DIM);
+        let v = x_attn.matmul(v_weight.t());
+        let k_out = scatter_rows(k, scatter_idx, k_cache, KV_DIM);
+        let v_out = scatter_rows(v, scatter_idx, v_cache, KV_DIM);
+        let k_ctx = gather_rows(k_out, gather_idx, KV_DIM);
+        let v_ctx = gather_rows(v_out, gather_idx, KV_DIM);
+
+        let q = (q * 1.0).split_dims(1, HEAD_DIM).transpose(0, 1);
+        let k_ctx = k_ctx.split_dims(1, HEAD_DIM).permute((1, 2, 0));
+        let v_ctx = v_ctx.split_dims(1, HEAD_DIM).transpose(0, 1);
+        let k_ctx = k_ctx.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0;
+        let v_ctx = v_ctx.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0;
+        let scores = q.matmul(k_ctx) / (HEAD_DIM as f32).sqrt();
+        let context = Expression::from('c');
+        let causal = scores.graph().triu(context, 1).cast(scores.dtype) * -1e10;
+        let row_offsets = (q_pos * context).expand_dim(1, context);
+        let col_offsets = scores
+            .graph()
+            .arange(context)
+            .expand_dim(0, Expression::from('s'));
+        let mask = causal.gather(row_offsets + col_offsets);
+        let weights = (scores + mask.expand_dim(0, N_HEADS)).softmax(2);
+        let attn_out = weights.matmul(v_ctx).transpose(0, 1).merge_dims(1, 2);
+        x += attn_out.matmul(o_weight.t());
+
+        let x_mlp = rms_norm(x, mlp_norm, EPS);
+        let gated = x_mlp.matmul(gate_weight.t()).swish() * x_mlp.matmul(up_weight.t());
+        x += gated.matmul(down_weight.t());
+        cache_outputs.push((k_out, v_out));
+    }
+
+    let final_norm = cx.named_tensor("model.norm.weight", HIDDEN).persist();
+    let lm_head = cx
+        .named_tensor("lm_head.weight", (VOCAB_SIZE, HIDDEN))
+        .persist();
+    parameters.extend([final_norm, lm_head]);
+    let logits = rms_norm(x, final_norm, EPS).matmul(lm_head.t()).output();
     let mut fuzzer = CudaSearchEquivalenceFuzzer::new(&mut cx, &stream)
         .seed(0x5EED_1234)
         .samples(SEARCH_EQUIV_SAMPLES)
@@ -105,11 +217,10 @@ fn llama_architecture_search_space_equivalence_fuzz() {
         .input_i32(scatter_idx.id, vec![1, 2])
         .input_i32(gather_idx.id, vec![0, 1, 2]);
 
-    let kv_dim = config.kv_dim();
-    for tensor in kv_cache.tensors() {
-        fuzzer = fuzzer.input_f32(tensor.id, vec![0.0; SLOTS * kv_dim]);
+    for tensor in cache_inputs {
+        fuzzer = fuzzer.input_f32(tensor.id, vec![0.0; SLOTS * KV_DIM]);
     }
-    for tensor in llama.parameter_tensors() {
+    for tensor in parameters {
         let elements = tensor
             .dims()
             .iter()

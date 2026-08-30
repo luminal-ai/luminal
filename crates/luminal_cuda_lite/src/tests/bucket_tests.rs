@@ -299,8 +299,8 @@ fn test_bucket_switch_preserves_weights() {
     rt.execute(&cx.dyn_map);
     assert_eq!(
         rt.debug_resident_bucket_arena_indices(),
-        vec![0],
-        "switching to decode must evict the prefill arena first"
+        vec![0, 1],
+        "the two-entry graph cache should retain the prefill/decode hot pair"
     );
     let result_1a = rt.get_f32(c);
 
@@ -312,8 +312,8 @@ fn test_bucket_switch_preserves_weights() {
     rt.execute(&cx.dyn_map);
     assert_eq!(
         rt.debug_resident_bucket_arena_indices(),
-        vec![1],
-        "switching to prefill must leave only its arena resident"
+        vec![0, 1],
+        "switching to prefill should reuse both resident hot-pair arenas"
     );
     let result_3 = rt.get_f32(c);
 
@@ -324,8 +324,8 @@ fn test_bucket_switch_preserves_weights() {
     rt.execute(&cx.dyn_map);
     assert_eq!(
         rt.debug_resident_bucket_arena_indices(),
-        vec![0],
-        "switching back must still preserve one-live-arena ownership"
+        vec![0, 1],
+        "switching back must preserve the bounded two-arena cache"
     );
     let result_1b = rt.get_f32(c);
 

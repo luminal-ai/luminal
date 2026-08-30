@@ -39,6 +39,7 @@ pub type Ops = (
     hlir::Ops,
     argmax::KernelArgmax,
     gemv::KernelGemv,
+    gemv::KernelGemvBias,
     gemv::KernelGemvF8,
     moe_gemv::KernelMoEGemv,
     rms_norm::KernelRMSNorm,

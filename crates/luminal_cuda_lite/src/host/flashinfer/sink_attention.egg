@@ -24,6 +24,22 @@
 (relation sa_scaled_mask_base (IR IR f64))
 (relation sa_sliding_mask_request (IR IR f64 IR))
 (relation sa_window_past (IR IR))
+; Normalized BF16 query boundary. This accepts both the legacy
+; Cast(BF16)(RoPE-F32) spelling and a RoPE kernel which rounds directly at its
+; BF16 store; both feed the same explicit F32 reference attention proof.
+(relation sa_q_bf (IR IR))
+
+(rule
+    (
+        (= (Bf16) (dtype ?q_bf))
+        (= ?q_f (Op (Cast ?qf_sz (F32)) (ICons ?q_bf (INil))))
+    )
+    (
+        (sa_q_bf ?q_f ?q_bf)
+    )
+    :ruleset kernel_fuse_late_pre_sink_attention_base
+    :name "SinkAttention BF16 query boundary"
+)
 
 ; Full attention: masked = scaled_scores + host_mask.
 (rule
@@ -129,8 +145,7 @@
         (= ?v_ctx (Op (Cast ?vc_sz (F32)) (ICons ?v_gathered (INil))))
 
         ; ── Q: the bf16 island operand, cast back up for the F32 chain ──
-        (= ?q_bf (Op (Cast ?qb_sz (Bf16)) (ICons ?q_rope (INil))))
-        (= ?q_f (Op (Cast ?qf_sz (F32)) (ICons ?q_bf (INil))))
+        (sa_q_bf ?q_f ?q_bf)
 
         ; ── Q·K^T: (nheads, s, c, hd) mul + reduce over hd ──
         (= ?qk (Op (Mul
@@ -147,7 +162,10 @@
         ; ── Row max, then max(row_max, sink) in the lt-select spelling ──
         (= ?rmax (Op (Max ?rm_shape ?context_tokens ?rm_in ?rm_iter ?rm_out)
             (ICons ?masked (INil))))
-        (= ?sinks_f (Op (Cast ?sk_sz (F32)) (ICons ?sinks_w (INil))))
+        ; The sink operand is semantically F32. It may be an explicit cast of
+        ; a low-precision graph weight or an F32 input promoted once by the
+        ; weight loader; the downstream arithmetic is identical.
+        (= (F32) (dtype ?sinks_f))
         (= ?lt (Op (LessThan ?lt_s ?lt_a ?lt_b ?lt_o)
             (ICons ?rmax (ICons ?sinks_f (INil)))))
         (= ?lt_f (Op (Cast ?ltf_sz (F32)) (ICons ?lt (INil))))
@@ -216,17 +234,164 @@
 (rule
     (
         (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?input_tokens ?scale_val ?window_val)
+        (= ?out (Op (Sum ?force_o_shape ?force_context ?force_o_in ?force_o_iter ?force_o_out)
+            (ICons ?force_pv (INil))))
         (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
         (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
     )
     (
         (let ?fi (Op (SinkAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?input_tokens ?scale_val ?window_val)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?input_tokens ?scale_val ?window_val (F32) 0.0)
             (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
                 (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
         (union ?out ?fi)
         (set (dtype ?fi) (F32))
+        ; This exact dense attention chain scales its intermediate as
+        ; heads*s*context and is not a serving-safe fallback once the
+        ; FlashInfer island has been proven. Removing its matched root also
+        ; keeps random search genomes from choosing a short-context winner
+        ; that violates the memory cap later in the same dynamic bucket.
+        (delete (Op (Sum ?force_o_shape ?force_context ?force_o_in ?force_o_iter ?force_o_out)
+            (ICons ?force_pv (INil))))
     )
     :ruleset kernel_fuse_late2_sink_attention
     :name "SinkAttention op"
+)
+
+; When the immediate graph consumer rounds the reference F32 attention
+; result to BF16, expose FA3's already-rounded native BF16 output directly.
+; This preserves the exact numerical boundary while removing the native
+; BF16 -> F32 -> BF16 storage round trip. At decode s=1 the layouts are also
+; byte-identical, allowing the host op to write straight to the graph buffer.
+(rule
+    (
+        (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?input_tokens ?scale_val ?window_val)
+        (= ?cast (Op (Cast ?cast_size (Bf16)) (ICons ?out (INil))))
+        (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
+        (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
+    )
+    (
+        (let ?fi (Op (SinkAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?input_tokens ?scale_val ?window_val (Bf16) 0.0)
+            (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
+                (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
+        (union ?cast ?fi)
+        (set (dtype ?fi) (Bf16))
+        ; The F32 SinkAttention spelling would only upcast the same rounded
+        ; FA3 BF16 bytes before this exact cast rounds them back. Once this
+        ; consumer is proven, retain only the direct native-storage spelling
+        ; so extraction cannot reintroduce the redundant two-kernel path.
+        (delete (Op (Cast ?cast_size (Bf16)) (ICons ?out (INil))))
+    )
+    :ruleset kernel_fuse_late2_sink_attention
+    :name "SinkAttention native BF16 consumer"
+)
+
+; The model spells a non-affine transpose/merge materialization as
+; Gather(Iota, data). When that exact token-major value is immediately
+; rounded to BF16 for a tensor-core consumer, FA3's native output already has
+; both the requested byte order and storage dtype. Expose it directly rather
+; than launching heads->tokens Gather plus Cast after every attention layer.
+;
+; The index tensor is flat because the materialization gathers an iota of the
+; total element count, while the data tracker retains the logical
+; `(s, heads * dim)` view. Reusing those factors in the index product proves
+; this is a full layout-only materialization, not arbitrary attention indexing.
+(rule
+    (
+        (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?input_tokens ?scale_val ?window_val)
+        (= ?materialized (Op (Gather
+            (ECons (MMul ?input_tokens ?q_width) (ENil)) ?index_strides
+            (ECons ?input_tokens (ECons ?q_width (ENil))) ?data_strides)
+            (ICons ?iota (ICons ?out (INil)))))
+        (= ?iota (Op (Iota ?iota_expr ?iota_range) (INil)))
+        (= ?cast (Op (Cast ?cast_size (Bf16)) (ICons ?materialized (INil))))
+        (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
+        (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
+    )
+    (
+        (let ?fi (Op (SinkAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?input_tokens ?scale_val ?window_val (Bf16) 1.0)
+            (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
+                (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
+        (union ?cast ?fi)
+        (set (dtype ?fi) (Bf16))
+        (delete (Op (Cast ?cast_size (Bf16)) (ICons ?materialized (INil))))
+    )
+    :ruleset kernel_fuse_late2_sink_attention
+    :name "SinkAttention token-major BF16 consumer"
+)
+
+; The gather's tracker metadata is allowed to retain the pre-materialization
+; heads-major view. In that spelling its data shape is not necessarily the
+; canonical `(tokens, heads*dim)` pair above, even though a full flat Iota
+; still proves the same row-major materialization. Match that invariant
+; directly: equal Iota range and Cast size prove that every logical attention
+; element is gathered exactly once, in order. This is a model-independent
+; contiguous-view boundary, not an arbitrary attention gather.
+(rule
+    (
+        (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?input_tokens ?scale_val ?window_val)
+        (= ?materialized (Op (Gather
+            ?gather_out_shape ?index_strides ?gather_data_shape ?data_strides)
+            (ICons ?iota (ICons ?out (INil)))))
+        (= ?iota (Op (Iota ?iota_expr ?iota_range) (INil)))
+        (= ?cast (Op (Cast ?cast_size (Bf16)) (ICons ?materialized (INil))))
+        (= ?iota_range ?cast_size)
+        (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
+        (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
+    )
+    (
+        (let ?fi (Op (SinkAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim ?input_tokens ?scale_val ?window_val (Bf16) 1.0)
+            (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
+                (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
+        (union ?cast ?fi)
+        (set (dtype ?fi) (Bf16))
+        (delete (Op (Cast ?cast_size (Bf16)) (ICons ?materialized (INil))))
+    )
+    :ruleset kernel_fuse_late2_sink_attention
+    :name "SinkAttention flat-Iota token-major BF16 consumer"
+)
+
+; Kernel lowering and generic elementwise fusion run before final cleanup.
+; They can therefore leave a KernelCast or FusionEnd in the same eclass as
+; the proven token-major SinkAttention even though the frontend Cast was
+; deleted above. Both alternatives execute the heads-major F32 attention and
+; materialize a transpose before rounding back to BF16. Once the exact
+; token-major consumer proof has fired, those spellings are strictly more
+; work and have the same storage contract; remove them at the final backend
+; selection boundary so a one-candidate search is deterministic.
+(rule
+    (
+        (= ?tm (Op (SinkAttention
+            ?nheads ?nkv ?hdim ?input_tokens ?scale ?window (Bf16) 1.0)
+            ?tm_inputs))
+        (= ?fallback (Op (KernelCast ?size ?src_dtype ?dst_dtype)
+            ?fallback_inputs))
+        (= ?tm ?fallback)
+    )
+    (
+        (delete (Op (KernelCast ?size ?src_dtype ?dst_dtype)
+            ?fallback_inputs))
+    )
+    :ruleset base_cleanup
+    :name "prefer token-major SinkAttention over cast fallback"
+)
+
+(rule
+    (
+        (= ?tm (Op (SinkAttention
+            ?nheads ?nkv ?hdim ?input_tokens ?scale ?window (Bf16) 1.0)
+            ?tm_inputs))
+        (= ?fallback (Op (FusionEnd ?shape ?strides (Bf16))
+            ?fallback_inputs))
+        (= ?tm ?fallback)
+    )
+    (
+        (delete (Op (FusionEnd ?shape ?strides (Bf16))
+            ?fallback_inputs))
+    )
+    :ruleset base_cleanup
+    :name "prefer token-major SinkAttention over fused fallback"
 )

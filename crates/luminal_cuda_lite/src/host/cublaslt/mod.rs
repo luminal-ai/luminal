@@ -1254,8 +1254,12 @@ fn autotune_select(
     candidates: &[cublasLtMatmulHeuristicResult_t],
     ptrs: LtMatmulPointers,
 ) -> Option<cublasLtMatmulHeuristicResult_t> {
-    const REPS: usize = 3;
-    let mut best: Option<(f64, usize)> = None;
+    const REPS: usize = 16;
+    let log = std::env::var_os("LUMINAL_CUBLASLT_AUTOTUNE_LOG").is_some_and(|v| v == "1");
+    let timing_flags = Some(crate::cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let start = stream.context().new_event(timing_flags).ok()?;
+    let end = stream.context().new_event(timing_flags).ok()?;
+    let mut best: Option<(f32, usize)> = None;
     for (idx, candidate) in candidates.iter().enumerate() {
         prepared.heuristic = unsafe { std::ptr::read(candidate) };
         // Warmup + validity check: a candidate may fail at execution.
@@ -1265,7 +1269,9 @@ fn autotune_select(
         if stream.synchronize().is_err() {
             return None;
         }
-        let start = std::time::Instant::now();
+        if start.record(stream).is_err() {
+            return None;
+        }
         let mut failed = false;
         for _ in 0..REPS {
             if prepared.enqueue(stream, ptrs).is_err() {
@@ -1273,13 +1279,32 @@ fn autotune_select(
                 break;
             }
         }
-        if failed || stream.synchronize().is_err() {
+        if failed || end.record(stream).is_err() || end.synchronize().is_err() {
             continue;
         }
-        let elapsed = start.elapsed().as_secs_f64() / REPS as f64;
-        if best.is_none_or(|(b, _)| elapsed < b) {
-            best = Some((elapsed, idx));
+        let Ok(elapsed_ms) = start.elapsed_ms(&end) else {
+            continue;
+        };
+        let elapsed_us = elapsed_ms * 1_000.0 / REPS as f32;
+        if log {
+            eprintln!(
+                "CUBLASLT_AUTOTUNE m={} n={} k={} candidate={} workspace={} elapsed_us={elapsed_us:.6}",
+                prepared.spec.problem.m,
+                prepared.spec.problem.n,
+                prepared.spec.problem.k,
+                idx,
+                candidate.workspaceSize,
+            );
         }
+        if best.is_none_or(|(b, _)| elapsed_us < b) {
+            best = Some((elapsed_us, idx));
+        }
+    }
+    if log && let Some((elapsed_us, idx)) = best {
+        eprintln!(
+            "CUBLASLT_AUTOTUNE_SELECTED m={} n={} k={} candidate={} elapsed_us={elapsed_us:.6}",
+            prepared.spec.problem.m, prepared.spec.problem.n, prepared.spec.problem.k, idx,
+        );
     }
     best.map(|(_, idx)| unsafe { std::ptr::read(&candidates[idx]) })
 }
@@ -1816,6 +1841,10 @@ impl HostOp for CuBlasLt {
 
     fn output_bytes(&self) -> Expression {
         (self.output_size() * self.d_dtype.bits()).ceil_div(8)
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.d_dtype
     }
 
     fn device_memory_plan(

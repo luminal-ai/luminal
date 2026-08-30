@@ -910,6 +910,25 @@ fn fused_argmax_matches_decomposed() {
 }
 
 #[test]
+fn fused_argmax_matches_dynamic_bf16_serving_shape() {
+    let mut cx = Graph::default();
+    let x = cx
+        .named_tensor("logits", ('n', 201_088))
+        .as_dtype(DType::Bf16);
+    let _out = x.argmax(1).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_enode(&cx, "KernelArgmax", None),
+        "dynamic bf16 serving argmax must offer the fused kernel"
+    );
+    assert!(
+        !egraph_has_op_alternatives(&cx, &["KernelArgmaxKind", "KernelMaxKind"]),
+        "the argmax output must not retain the decomposed KernelMax candidate"
+    );
+}
+
+#[test]
 fn fused_swiglu_matches_decomposed() {
     use crate::kernel::swiglu::fused_swiglu;
     const ROWS: usize = 3;
@@ -964,6 +983,78 @@ fn gemv_m1_matches_reference_qwen_shapes() {
 #[test]
 fn gemv_m1_matches_reference() {
     gemv_m1_case(384, 512, 0xA1);
+}
+
+#[test]
+fn gemv_m1_bias_epilogue_matches_bf16_rounding_contract() {
+    const K: usize = 128;
+    const N: usize = 96;
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    let to_bf16_f32 = |values: Vec<f32>| {
+        values
+            .into_iter()
+            .map(|value| bf16::from_f32(value).to_f32())
+            .collect::<Vec<_>>()
+    };
+    let x_data = to_bf16_f32(random_f32_vec(K, 0xB1A5, -0.5, 0.5));
+    let w_data = to_bf16_f32(random_f32_vec(N * K, 0xB1A6, -0.5, 0.5));
+    let bias_data = to_bf16_f32(random_f32_vec(N, 0xB1A7, -0.5, 0.5));
+
+    let mut cx = Graph::default();
+    let x = cx.tensor((1, K)).as_dtype(DType::Bf16);
+    let w = cx.tensor((N, K)).as_dtype(DType::Bf16);
+    let bias = cx.tensor(N).as_dtype(DType::Bf16);
+    let matmul = x.matmul(w.t());
+    let out = (matmul + bias.expand_lhs([1])).cast(DType::F32).output();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_enode(&cx, "KernelGemvBias", None),
+        "m=1 low-precision matmul + column bias must offer the fused epilogue"
+    );
+
+    let llir = extract_forced_kernel_llir(
+        &cx,
+        "KernelGemvBias",
+        "GemvBias",
+        DTYPE_FORCED_EXTRACTION,
+        true,
+    );
+    let xb = x_data
+        .iter()
+        .copied()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let wb = w_data
+        .iter()
+        .copied()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let bb = bias_data
+        .iter()
+        .copied()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.set_data(x, xb);
+    rt.set_data(w, wb);
+    rt.set_data(bias, bb);
+    rt.load_llir(&llir);
+    rt.execute(&cx.dyn_map);
+    let result = rt.get_f32(out.id);
+
+    let expected = (0..N)
+        .map(|row| {
+            let dot = (0..K)
+                .map(|col| x_data[col] * w_data[row * K + col])
+                .sum::<f32>();
+            let rounded_dot = bf16::from_f32(dot).to_f32();
+            bf16::from_f32(rounded_dot + bias_data[row]).to_f32()
+        })
+        .collect::<Vec<_>>();
+    let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR * (K as f32).sqrt();
+    assert_close(&result, &expected, tol, tol);
 }
 
 #[test]
@@ -1353,7 +1444,7 @@ fn rope_scatter_fusion_matches_reference() {
     // apply_rope_half on a head group inside a fused (s, pitch) row, scattered
     // in place into a cache pool. Egglog keeps both materialized and fused
     // representations available for measured search.
-    use crate::kernel::rope::apply_rope_half;
+    use crate::kernel::rope::apply_rope_half_as;
     use luminal_nn::scatter_rows;
 
     const S: usize = 3;
@@ -1368,10 +1459,7 @@ fn rope_scatter_fusion_matches_reference() {
         return;
     };
 
-    let x_data: Vec<f32> = random_f32_vec(S * PITCH, 0x20, -1.0, 1.0)
-        .into_iter()
-        .map(|v| bf16::from_f32(v).to_f32())
-        .collect();
+    let x_data: Vec<f32> = random_f32_vec(S * PITCH, 0x20, -1.0, 1.0);
     let cos_data = random_f32_vec(S * HALF, 0x21, -1.0, 1.0);
     let sin_data = random_f32_vec(S * HALF, 0x22, -1.0, 1.0);
     let cache_data: Vec<f32> = random_f32_vec(SLOTS * KVD, 0x23, -1.0, 1.0)
@@ -1381,12 +1469,12 @@ fn rope_scatter_fusion_matches_reference() {
     let idx_data: Vec<i32> = vec![4, 7, 2];
 
     let mut cx = Graph::default();
-    let x = cx.tensor((S, PITCH)).as_dtype(DType::Bf16);
+    let x = cx.tensor((S, PITCH));
     let cos = cx.tensor((S, HALF));
     let sin = cx.tensor((S, HALF));
     let cache = cx.tensor((SLOTS, KVD)).as_dtype(DType::Bf16);
     let idx = cx.tensor(S).as_dtype(DType::Int);
-    let k_rope = apply_rope_half(x, OFFSET, H, D, cos, sin);
+    let k_rope = apply_rope_half_as(x, OFFSET, H, D, cos, sin, DType::Bf16);
     let out = scatter_rows(k_rope, idx, cache, KVD)
         .cast(DType::F32)
         .output();
@@ -1438,12 +1526,11 @@ fn rope_scatter_fusion_matches_reference() {
         }
     }
 
-    let xb: Vec<bf16> = x_data.iter().map(|v| bf16::from_f32(*v)).collect();
     let cacheb: Vec<bf16> = cache_data.iter().map(|v| bf16::from_f32(*v)).collect();
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
 
     let load = |rt: &mut CudaRuntime| {
-        rt.set_data(x, xb.clone());
+        rt.set_data(x, x_data.clone());
         rt.set_data(cos, cos_data.clone());
         rt.set_data(sin, sin_data.clone());
         rt.set_data(cache, cacheb.clone());

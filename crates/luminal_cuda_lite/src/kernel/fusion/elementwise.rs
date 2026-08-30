@@ -101,6 +101,25 @@ impl EgglogOp for CudaUnaryElementwise {
         // constant tolerance windows — V2 violations under the exact-HLIR
         // reproduction ruling. See the exact-HLIR reproduction ruling.
 
+        // Give a flat Cast its own well-formed singleton region. This makes
+        // adjacent elementwise work eligible for the safe forward-growth
+        // rules without rewriting an existing FusionStart boundary.
+        rules.push(Rule::raw(
+            "(rule (
+                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?x (INil))))
+                (= ?dt_in (dtype ?x))
+             ) (
+                (let ?shape (ECons ?size (ENil)))
+                (let ?stride (ECons (MIter) (ENil)))
+                (let ?fs (Op (FusionStart ?shape ?stride ?dt_in) (ICons ?x (INil))))
+                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?stride ?stride ?dt_out)
+                               (ICons ?fs (INil))))
+                (let ?fe (Op (FusionEnd ?shape ?stride ?dt_out) (ICons ?elem (INil))))
+                (union ?cast ?fe)
+                (set (dtype ?fe) ?dt_out)
+             ) :ruleset kernel_lower :name \"cuda-elem-singleton-Cast\")",
+        ));
+
         rules
     }
 

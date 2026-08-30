@@ -103,9 +103,38 @@ impl EgglogOp for KernelArgmax {
                     (let ?am (Op (KernelArgmax ?out_shape ?cols ?dt) (ICons ?x (INil))))
                     (union ?out ?am)
                     (set (dtype ?am) (Int))
+                    ; The decomposed frontend spelling expands several
+                    ; vocab-sized temporaries and is never competitive once
+                    ; this last-axis kernel is legal. Removing the exact
+                    ; matched root makes greedy sampling deterministic under
+                    ; schedule search and prevents an infeasible fallback.
+                    (delete (Op (Max ?out_shape ?cols ?out_in_strides (MIter) ?out_out_strides)
+                        (ICons ?prod (INil))))
                 )
                 :ruleset kernel_specialize
                 :name \"kernel argmax last axis\"
+            )
+            ; `Max` is lowered to KernelMax before conditional HLIR cleanup,
+            ; so deleting only the proof root above can still leave the
+            ; decomposed reduction as an extraction candidate. Once argmax
+            ; has matched, remove that exact same-eclass backend alternative
+            ; in the final cleanup phase. The other Max in the proof (the
+            ; floating-point row maximum) is in a different eclass.
+            (rule
+                (
+                    (= ?am (Op (KernelArgmax ?out_shape ?cols ?dt) (ICons ?x (INil))))
+                    (= ?km (Op (KernelMax ?km_shape ?km_cols ?km_in_strides
+                                      ?km_iter_stride ?km_out_strides ?km_dt)
+                               ?km_inputs))
+                    (= ?am ?km)
+                )
+                (
+                    (delete (Op (KernelMax ?km_shape ?km_cols ?km_in_strides
+                                           ?km_iter_stride ?km_out_strides ?km_dt)
+                                ?km_inputs))
+                )
+                :ruleset base_cleanup
+                :name \"prefer fused argmax over decomposed max\"
             )",
         )]
     }
@@ -251,7 +280,10 @@ extern \"C\" {{
             kernel,
             (n_rows, 1.into(), 1.into()),
             (TPB.into(), 1.into(), 1.into()),
-            64.into(),
+            // warp_vals[32] + warp_idxs[32], both four-byte elements. The
+            // previous 64-byte launch contract under-allocated shared memory
+            // by 4x and let fused greedy sampling corrupt the CUDA context.
+            (2 * (TPB / 32) * std::mem::size_of::<u32>()).into(),
             FxHashMap::default(),
         )
     }
