@@ -14,9 +14,7 @@ use luminal::dtype::DType;
 use luminal::prelude::*;
 
 use crate::runtime::CudaRuntime;
-use crate::tests::utilities::{
-    ForcedExtractionConfig, egraph_has_op_alternatives, extract_forced_kernel_llir,
-};
+use crate::tests::utilities::egraph_has_op_alternatives;
 use crate::tests::utilities::{get_cuda_stream, random_f32_vec, random_i32_vec};
 
 const S: usize = 3;
@@ -702,16 +700,14 @@ fn mini_qwen_f32_stage_bisect() {
 }
 
 #[test]
-fn mini_qwen_stage5_exclude_moe_gemv() {
+fn mini_qwen_stage5_lite_fallback() {
     let Some(stream) = get_cuda_stream() else {
         return;
     };
     let d = mini_data();
     let (m, reference, _n_out) = reference_run(5, || {
         let mut m = build_mini_qwen_stage(DType::F32, 5);
-        m.cx.build_search_space_exclude_ops::<CudaRuntime, crate::kernel::moe_gemv::KernelMoEGemv>(
-            CompileOptions::default(),
-        );
+        m.cx.build_search_space::<CudaRuntime>(CompileOptions::default());
         let mut rt = CudaRuntime::initialize(stream.clone());
         set_inputs(&m, &d, DType::F32, &mut rt);
         rt =
@@ -949,8 +945,7 @@ fn rope_rule_rejects_nonzero_safe_padding() {
 }
 
 #[test]
-fn rope_scatter_fused_and_materialized_alternatives_coexist() {
-    use crate::kernel::KernelOp;
+fn rope_scatter_materialized_fallback_remains_in_lite() {
     use luminal_nn::scatter_rows;
 
     let mut cx = Graph::default();
@@ -963,23 +958,13 @@ fn rope_scatter_fused_and_materialized_alternatives_coexist() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_op_alternatives(&cx, &["KernelScatterNoCopy", "KernelRoPEScatterFused"]),
-        "materialized KernelRoPE+scatter and exact-deinterleave fusion must coexist"
+        egraph_has_op_alternatives(&cx, &["KernelScatterNoCopy"]),
+        "Lite must retain the materialized KernelRoPE plus scatter fallback"
     );
-
-    let fused = extract_forced_kernel_llir(
-        &cx,
-        "KernelRoPEScatterFused",
-        "RoPEScatterFused",
-        ForcedExtractionConfig::new(0xA11C_E000)
-            .attempts_per_node(64)
-            .node_seed_stride(64),
-        true,
+    assert!(
+        !egraph_has_op_alternatives(&cx, &["KernelRoPEScatterFused"]),
+        "the fused RoPE scatter specialization belongs to full CUDA"
     );
-    assert!(fused.node_weights().any(|op| {
-        op.to_dialect::<dyn KernelOp>()
-            .is_some_and(|kernel| kernel.kernel_name() == "RoPEScatterFused")
-    }));
 }
 
 #[test]

@@ -875,6 +875,44 @@ pub struct KernelRoPE {
     inv_hd: f64,
 }
 
+impl KernelRoPE {
+    /// Construct the shared RoPE descriptor for a full-CUDA fused consumer.
+    #[doc(hidden)]
+    pub fn from_parts(
+        out_shape: Vec<Expression>,
+        width: usize,
+        ln_theta: f64,
+        inv_hd: f64,
+    ) -> Self {
+        Self {
+            out_shape,
+            width,
+            ln_theta,
+            inv_hd,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn out_shape(&self) -> &[Expression] {
+        &self.out_shape
+    }
+
+    #[doc(hidden)]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    #[doc(hidden)]
+    pub fn ln_theta(&self) -> f64 {
+        self.ln_theta
+    }
+
+    #[doc(hidden)]
+    pub fn inv_hd(&self) -> f64 {
+        self.inv_hd
+    }
+}
+
 use luminal::{
     egglog_utils::{
         api::{Rule, SortDef, sort},
@@ -1517,315 +1555,5 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "RoPEFused"
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-// KernelRoPEScatterFused — egglog-selected alternative to KernelRoPE followed
-// by KernelScatterNoCopy through the exact `(s, heads*hd)` deinterleave view.
-// It rotates and writes straight into the cache pool; output aliases dest.
-// ═══════════════════════════════════════════════════════════
-
-#[derive(Debug, Clone)]
-pub struct KernelRoPEScatterFused {
-    rope: KernelRoPE,
-    /// Total element count of the scatter destination (the cache pool).
-    dest_size: Expression,
-    /// Flattened scatter-index expression over `z`, where `z` is the element
-    /// position in the (s, heads·hd) deinterleaved index grid.
-    idx_flat: Expression,
-}
-
-impl Default for KernelRoPEScatterFused {
-    fn default() -> Self {
-        Self {
-            rope: KernelRoPE::default(),
-            dest_size: 1.into(),
-            idx_flat: Expression::from('z'),
-        }
-    }
-}
-
-impl EgglogOp for KernelRoPEScatterFused {
-    fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "KernelRoPEScatterFused",
-            &[
-                ("out_shape", ELIST),
-                ("out_width", EXPRESSION),
-                ("head_stride", EXPRESSION),
-                ("width", EXPRESSION),
-                ("ln_theta", F64),
-                ("inv_hd", F64),
-                ("dest_shape", ELIST),
-                ("index_shape", ELIST),
-                ("index_strides", ELIST),
-            ],
-        )
-    }
-
-    fn n_inputs(&self) -> usize {
-        4
-    }
-
-    fn rewrites(&self) -> Vec<Rule> {
-        vec![Rule::raw(
-            "(rule
-                (
-                    (= ?out_shape
-                        (ECons ?heads (ECons ?seq (ECons ?hd (ENil)))))
-                    (= ?index_shape (ECons ?seq (ECons ?out_width (ENil))))
-                    ; Exact deinterleave view of KernelRoPE's physical
-                    ; `(heads, seq, hd)` output:
-                    ; (z/hd)*(hd*seq) + z%hd.
-                    (= ?src_strides
-                        (ECons (MMul (MIter) ?hd)
-                            (ECons
-                                (MAdd
-                                    (MMul (MDiv (MIter) ?hd) ?head_stride)
-                                    (MMod (MIter) ?hd))
-                                (ENil))))
-                    (= ?rope (Op
-                        (KernelRoPE ?out_shape ?out_width ?head_stride
-                            ?width ?ln_theta ?inv_hd)
-                        (ICons ?x (ICons ?pos (INil)))))
-                    (= ?scatter (Op
-                        (KernelScatterNoCopy ?dest_shape ?dest_strides
-                            ?index_shape ?index_strides ?src_strides ?out_strides (Bf16))
-                        (ICons ?dest (ICons ?indexes (ICons ?rope (INil))))))
-                    (= ?dest_strides ?out_strides)
-                    (= (Bf16) (dtype ?x))
-                    (= (Bf16) (dtype ?dest))
-                    (= (Int) (dtype ?indexes))
-                    (= (Int) (dtype ?pos))
-                )
-                (
-                    (let ?fused (Op
-                        (KernelRoPEScatterFused ?out_shape ?out_width ?head_stride
-                            ?width ?ln_theta ?inv_hd ?dest_shape ?index_shape ?index_strides)
-                        (ICons ?dest (ICons ?indexes (ICons ?x (ICons ?pos (INil)))))))
-                    (union ?scatter ?fused)
-                    (set (dtype ?fused) (Bf16))
-                )
-                :ruleset post_cleanup
-                :name \"kernel rope scatter exact-deinterleave\"
-            )",
-        )]
-    }
-
-    fn cleanup(&self) -> bool {
-        false
-    }
-
-    fn extract<'a>(
-        &'a self,
-        egraph: &'a SerializedEGraph,
-        kind_children: &[&'a ENodeId],
-        input_enodes: Vec<&'a ENodeId>,
-        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
-        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
-    ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let out_shape =
-            extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap();
-        let width = extract_expr(egraph, kind_children[3], expr_cache)
-            .unwrap()
-            .to_usize()
-            .expect("RoPE width must be static");
-        let parse_f64 = |child: &'a ENodeId| {
-            egraph.enodes[child]
-                .0
-                .replace('"', "")
-                .parse::<f64>()
-                .unwrap()
-        };
-        let dest_shape =
-            extract_expr_list(egraph, kind_children[6], list_cache, expr_cache).unwrap();
-        let index_shape =
-            extract_expr_list(egraph, kind_children[7], list_cache, expr_cache).unwrap();
-        let index_strides =
-            extract_expr_list(egraph, kind_children[8], list_cache, expr_cache).unwrap();
-        (
-            LLIROp::new::<dyn KernelOp>(Box::new(Self {
-                rope: KernelRoPE {
-                    out_shape,
-                    width,
-                    ln_theta: parse_f64(kind_children[4]),
-                    inv_hd: parse_f64(kind_children[5]),
-                },
-                dest_size: dest_shape.into_iter().product(),
-                idx_flat: luminal::shape::flatten_strides(&index_shape, &index_strides),
-            }) as Box<dyn KernelOp>),
-            input_enodes,
-        )
-    }
-}
-
-impl KernelOp for KernelRoPEScatterFused {
-    fn compile(
-        &self,
-        stream: &Arc<CudaStream>,
-        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
-    ) -> (
-        CudaFunction,
-        Arc<CudaModule>,
-        String,
-        (Expression, Expression, Expression),
-        (Expression, Expression, Expression),
-        Expression,
-        FxHashMap<Symbol, CudaSlice<u8>>,
-    ) {
-        let heads = self.rope.out_shape[0]
-            .to_usize()
-            .expect("RoPE heads is static");
-        let seq = self.rope.out_shape[1];
-        let hd = self.rope.out_shape[2]
-            .to_usize()
-            .expect("RoPE head_dim is static");
-        let w = self.rope.width;
-        let half = hd / 2;
-        let lnt = self.rope.ln_theta as f32;
-        let inv_hd = self.rope.inv_hd as f32;
-        let kvd = heads * hd;
-
-        let vars: FxHashSet<Symbol> = self.all_dyn_vars();
-        let (dyn_defines, _sorted) = crate::kernel::hlir::generate_dyn_dims_defines(&vars);
-        let dyn_dims_param = if vars.is_empty() {
-            ""
-        } else {
-            ", const int* dyn_dims"
-        };
-        let idx_expr = self.idx_flat.to_kernel();
-        let dest_n = self.dest_size.to_kernel();
-
-        let kernel = format!(
-            "#include <cuda_bf16.h>
-{dyn_defines}
-extern \"C\" {{
-    __global__ void rope_scatter_fused_k(__nv_bfloat16 *dest, const int *indexes, const __nv_bfloat16 *x, const int *pos{dyn_dims_param}) {{
-        long long s = blockIdx.y;
-        int h = blockIdx.z;
-        int i = blockIdx.x * blockDim.x + threadIdx.x;
-        if (i >= {hd}) return;
-        int fi = (i < {half}) ? i : (i - {half});
-        float v = (float)(2 * fi);
-        float freq = ((v * {inv_hd:.10e}f) * {lnt:.10e}f) * 1.442695f;
-        float invf = 1.0f / exp2f(freq);
-        float angle = (float)pos[s] * invf;
-        float sb = __bfloat162float(__float2bfloat16(sinf(angle)));
-        float cb = __bfloat162float(__float2bfloat16(sinf(angle * -1.0f + 1.570796f)));
-        long long xbase = s * {w} + (long long)h * {hd};
-        float out_v;
-        if (i < {half}) {{
-            float x0 = __bfloat162float(x[xbase + i]);
-            float x1 = __bfloat162float(x[xbase + i + {half}]);
-            float x0c = __bfloat162float(__float2bfloat16(x0 * cb));
-            float x1s = __bfloat162float(__float2bfloat16(x1 * sb));
-            float x1sn = __bfloat162float(__float2bfloat16(x1s * -1.0f));
-            out_v = x0c + x1sn;
-        }} else {{
-            float x1 = __bfloat162float(x[xbase + i]);
-            float x0 = __bfloat162float(x[xbase + i - {half}]);
-            float x1c = __bfloat162float(__float2bfloat16(x1 * cb));
-            float x0s = __bfloat162float(__float2bfloat16(x0 * sb));
-            out_v = x1c + x0s;
-        }}
-        long long const_z = s * {kvd} + (long long)h * {hd} + i;
-        int idx = indexes[{idx_expr}];
-        if (idx >= 0 && idx < ({dest_n})) {{
-            dest[idx] = __float2bfloat16(out_v);
-        }}
-    }}
-}}"
-        );
-
-        let (module, func) = if let Some((m, f)) = compile_cache.get(&kernel) {
-            (m.clone(), f.clone())
-        } else {
-            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
-            let module = stream.context().load_module(ptx).unwrap();
-            let func = module.load_function("rope_scatter_fused_k").unwrap();
-            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
-            (module, func)
-        };
-
-        let tpb = hd.min(256);
-        (
-            func,
-            module,
-            kernel,
-            (
-                Expression::from(hd.div_ceil(tpb)),
-                seq,
-                Expression::from(heads),
-            ),
-            (
-                Expression::from(tpb),
-                Expression::from(1usize),
-                Expression::from(1usize),
-            ),
-            Expression::from(0usize),
-            FxHashMap::default(),
-        )
-    }
-
-    fn build_params(
-        &self,
-        _stream: &Arc<CudaStream>,
-        _output_ptr: u64,
-        input_ptrs: &[u64],
-        _internal_bufs: &[cudarc::driver::CudaSlice<u8>],
-        dyn_dims_ptr: u64,
-    ) -> Vec<u64> {
-        // rope_scatter_fused_k: (dest, indexes, x, pos [, dyn_dims]).
-        // Writes in place through dest (input 0), not through output_ptr.
-        let mut params = vec![input_ptrs[0], input_ptrs[1], input_ptrs[2], input_ptrs[3]];
-        if dyn_dims_ptr != 0 {
-            params.push(dyn_dims_ptr);
-        }
-        params
-    }
-
-    fn output_aliases_input(&self) -> Option<usize> {
-        Some(0)
-    }
-
-    fn mutates_aliased_input(&self) -> bool {
-        true
-    }
-
-    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
-        self.idx_flat.collect_dyn_vars_into(vars);
-        self.dest_size.collect_dyn_vars_into(vars);
-        self.rope.out_shape[1].collect_dyn_vars_into(vars);
-    }
-
-    fn output_size(&self) -> Expression {
-        self.dest_size
-    }
-
-    fn output_bytes(&self) -> Expression {
-        self.dest_size * 2
-    }
-
-    fn output_dtype(&self) -> DType {
-        DType::Bf16
-    }
-
-    fn bytes_loaded(&self) -> Expression {
-        let rotated: Expression = self.rope.out_shape.iter().copied().product();
-        rotated * 2 + rotated * 4 + self.rope.out_shape[1] * 4
-    }
-
-    fn bytes_stored(&self) -> Expression {
-        self.rope.out_shape.iter().copied().product::<Expression>() * 2
-    }
-
-    fn flops(&self) -> Expression {
-        self.rope.out_shape.iter().copied().product::<Expression>() * 16
-    }
-
-    fn kernel_name(&self) -> &'static str {
-        "RoPEScatterFused"
     }
 }

@@ -576,8 +576,7 @@ fn cublaslt_and_gemv_reject_permuted_mul_to_sum_layout() {
     )
     .output();
 
-    // Exercise the scaled-quantized spelling consumed by KernelGemvF8 and
-    // cublaslt_scaled as well.
+    // Exercise the scaled-quantized spelling consumed by cublaslt_scaled.
     let raw_activation = cx.tensor((1usize, 5usize));
     let input_scale = cx.tensor(());
     let weight_scale = cx.tensor(());
@@ -600,10 +599,6 @@ fn cublaslt_and_gemv_reject_permuted_mul_to_sum_layout() {
     assert!(
         op_ir_nodes(egraph, "KernelGemv").is_empty(),
         "GEMV must not replace a reduction whose surviving columns are permuted"
-    );
-    assert!(
-        op_ir_nodes(egraph, "KernelGemvF8").is_empty(),
-        "FP8 GEMV must not replace a reduction whose surviving columns are permuted"
     );
     assert!(
         ir_class_has_op_kinds(egraph, &["KernelSum", "GenericMatmul"]),

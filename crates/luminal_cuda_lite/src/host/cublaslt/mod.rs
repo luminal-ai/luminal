@@ -1871,6 +1871,17 @@ impl HostOp for CuBlasLt {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone)]
+    struct TestArityTwoFp8(crate::kernel::quant_f8::KernelQuantF8);
+
+    impl luminal::op::CustomOp for TestArityTwoFp8 {
+        fn to_llir_op(&self) -> LLIROp {
+            LLIROp::new::<dyn crate::kernel::KernelOp>(
+                Box::new(self.0.clone()) as Box<dyn crate::kernel::KernelOp>
+            )
+        }
+    }
+
     #[test]
     fn matmul_spec_resolution_is_shared_with_resource_prepare_key() {
         let op = CuBlasLt {
@@ -1924,14 +1935,24 @@ mod tests {
 
     #[test]
     fn staged_arity_two_fp8_activation_reaches_scaled_cublaslt() {
-        use crate::kernel::swiglu::fused_swiglu_quant;
-
         let mut cx = Graph::default();
         let activation = cx.tensor((1usize, 32usize)).as_dtype(DType::Bf16);
         let input_scale = cx.tensor(());
         let weight_scale = cx.tensor(());
         let weight = cx.tensor((8usize, 16usize)).as_dtype(DType::F8E4M3);
-        let quantized = fused_swiglu_quant(activation, 16, input_scale);
+        // The consumer contract is intentionally generic: any arity-two F8
+        // custom op whose last input is the activation scale is eligible.
+        // Wrap Lite's real FP8 quant primitive so the graph and LLIR contracts
+        // remain semantically aligned without depending on a full-only fused
+        // producer.
+        let quantized = cx.custom_op(
+            TestArityTwoFp8(crate::kernel::quant_f8::KernelQuantF8::from_size(
+                16usize.into(),
+            )),
+            vec![activation, input_scale],
+            (1usize, 16usize),
+            DType::F8E4M3,
+        );
         let matmul = quantized.matmul(weight.t()).cast(DType::F32);
         (matmul * (input_scale * weight_scale).expand_rhs(matmul.dims())).output();
 

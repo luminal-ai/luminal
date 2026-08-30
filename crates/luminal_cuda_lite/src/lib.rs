@@ -78,7 +78,12 @@ mod kernel_source_limit_tests {
     }
 }
 
-fn cuda_dtype(dtype: DType) -> &'static str {
+/// Map a Luminal dtype to the CUDA C++ storage type used by generated kernels.
+///
+/// This is public so full CUDA can layer additional kernels on Lite's shared
+/// code-generation/runtime foundation without duplicating the dtype contract.
+#[doc(hidden)]
+pub fn cuda_dtype(dtype: DType) -> &'static str {
     match dtype {
         DType::F64 => "double",
         DType::F32 => "float",

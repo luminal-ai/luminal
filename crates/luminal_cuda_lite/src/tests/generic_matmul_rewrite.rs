@@ -1,4 +1,3 @@
-use half::bf16;
 use luminal::prelude::*;
 
 use crate::runtime::CudaRuntime;
@@ -123,49 +122,6 @@ fn generic_matmul_fp8_fallback_accumulates_and_outputs_f32() {
     assert_close(&rt.get_f32(output.id), &[17.0], 0.0, 0.0);
 }
 
-#[test]
-fn kernel_gemv_f8_absorbs_promoted_casts_and_reads_raw_fp8() {
-    const K: usize = 32;
-    const N: usize = 8;
-    let Some(stream) = get_cuda_stream() else {
-        return;
-    };
-    if !gpu_supports_dtype(DType::F8E4M3) {
-        return;
-    }
-
-    let mut cx = Graph::default();
-    let x = cx.tensor((1, K)).as_dtype(DType::Bf16);
-    let weight = cx.tensor((N, K)).as_dtype(DType::F8E4M3);
-    let input_scale = cx.tensor(());
-    let weight_scale = cx.tensor(());
-    let x_f32 = x.cast(DType::F32);
-    let quantized = (x_f32 / input_scale.expand_rhs(x_f32.dims())).cast(DType::F8E4M3);
-    let matmul = quantized.matmul(weight.t());
-    let output = (matmul * (input_scale * weight_scale).expand_rhs(matmul.dims()))
-        .cast(DType::Bf16)
-        .cast(DType::F32)
-        .output();
-
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    let llir = extract_forced_kernel_llir(&mut cx, "KernelGemvF8");
-    assert!(
-        llir_kernel_names(&llir).contains(&"GemvF8"),
-        "the FP8 GEMV backend must remain deterministically extractable"
-    );
-
-    let mut rt = CudaRuntime::initialize(stream);
-    rt.load_llir(&llir);
-    rt.set_data(x, vec![bf16::from_f32(0.5); K]);
-    rt.set_data(weight, vec![0x38u8; N * K]);
-    rt.set_data(input_scale, vec![0.5f32]);
-    rt.set_data(weight_scale, vec![0.25f32]);
-    rt.execute(&cx.dyn_map);
-
-    // q=1, w=1, dot=32, and the dequant scale is 0.5*0.25.
-    assert_close(&rt.get_f32(output.id), &[4.0; N], 0.0, 0.0);
-}
-
 fn seeded_data(len: usize, scale: f32, bias: f32) -> Vec<f32> {
     (0..len)
         .map(|i| {
@@ -176,14 +132,10 @@ fn seeded_data(len: usize, scale: f32, bias: f32) -> Vec<f32> {
 }
 
 fn extract_forced_kernel_llir(cx: &mut Graph, egglog_kind: &str) -> LLIRGraph {
-    let runtime_kernel_name = match egglog_kind {
-        "KernelGemvF8" => "GemvF8",
-        other => other,
-    };
     extract_forced_kernel_llir_with_config(
         cx,
         egglog_kind,
-        runtime_kernel_name,
+        egglog_kind,
         ForcedExtractionConfig::new(0x9EEE_0000)
             .attempts_per_node(128)
             .node_seed_stride(1 << 16),
