@@ -77,6 +77,7 @@ pub fn metal_factory(
             rt.set_data(node, bytes_to_reference_data(bytes, dtype));
         },
         None,
+        |_, _| Ok(()),
         |rt| Box::new(MetalDynBackend { runtime: rt }),
     )
 }

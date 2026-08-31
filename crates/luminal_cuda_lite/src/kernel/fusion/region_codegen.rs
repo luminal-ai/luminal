@@ -447,42 +447,24 @@ fn singleton_region(llir_graph: &LLIRGraph, fe_node: NodeIndex) -> Option<Region
 }
 
 fn compare_fusion_starts(llir_graph: &LLIRGraph, a: NodeIndex, b: NodeIndex) -> std::cmp::Ordering {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let fusion_start = |node: NodeIndex| {
         let op = llir_graph[node].to_dialect::<dyn KernelOp>().unwrap();
         (***op).downcast_ref::<FusionStart>().unwrap()
     };
     let a_start = fusion_start(a);
     let b_start = fusion_start(b);
-    let hash = |start: &FusionStart| {
-        let mut hasher = DefaultHasher::new();
-        for stride in &start.strides {
-            stride.hash_intern_id(&mut hasher);
-        }
-        dtype_program_tag(start.dtype).hash(&mut hasher);
-        hasher.finish()
-    };
-    hash(a_start).cmp(&hash(b_start)).then_with(|| {
-        if a_start.dtype == b_start.dtype
-            && same_expression_slice(&a_start.strides, &b_start.strides)
-        {
-            return std::cmp::Ordering::Equal;
-        }
-        // Resolve the vanishingly rare identity-hash collision structurally.
-        a_start
-            .strides
-            .iter()
-            .map(|expression| expression.to_kernel())
-            .cmp(
-                b_start
-                    .strides
-                    .iter()
-                    .map(|expression| expression.to_kernel()),
-            )
-            .then_with(|| cuda_dtype(a_start.dtype).cmp(cuda_dtype(b_start.dtype)))
-    })
+    a_start
+        .strides
+        .iter()
+        .map(|expression| expression.to_kernel())
+        .cmp(
+            b_start
+                .strides
+                .iter()
+                .map(|expression| expression.to_kernel()),
+        )
+        .then_with(|| cuda_dtype(a_start.dtype).cmp(cuda_dtype(b_start.dtype)))
+        .then_with(|| a.index().cmp(&b.index()))
 }
 
 // =========================================================================
@@ -1453,6 +1435,31 @@ mod tests {
         assert!(source.contains("const float *in0"));
         assert!(!source.contains("in1"));
         assert!(source.contains("v_0 + v_0"));
+    }
+
+    #[test]
+    fn singleton_region_orders_inputs_by_structure() {
+        let shape = vec![8.into()];
+        let mut graph = LLIRGraph::default();
+        let indexed = graph.add_node(llir_of(FusionStart {
+            shape: shape.clone(),
+            strides: vec![Expression::from('z')],
+            dtype: DType::F32,
+        }));
+        let broadcast = graph.add_node(llir_of(FusionStart {
+            shape,
+            strides: vec![0.into()],
+            dtype: DType::F32,
+        }));
+
+        assert_eq!(
+            compare_fusion_starts(&graph, broadcast, indexed),
+            std::cmp::Ordering::Less,
+        );
+        assert_eq!(
+            compare_fusion_starts(&graph, indexed, broadcast),
+            std::cmp::Ordering::Greater,
+        );
     }
 
     #[test]

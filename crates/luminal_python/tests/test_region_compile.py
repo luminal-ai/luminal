@@ -401,8 +401,10 @@ def test_region_artifact_round_trip_without_cuda_recompile() -> None:
     compiled = compile_region(region, search_iterations=1)
     artifact = compiled.serialize_artifact()
     payload = json.loads(artifact)
-    assert payload["schema_version"] == 2
-    assert json.loads(payload["backend_artifact"])["images"]
+    assert payload["schema_version"] == 3
+    backend_artifact = json.loads(payload["backend_artifact"])
+    assert backend_artifact["version"] == 2
+    assert backend_artifact["images"]
     loaded = load_region_artifact(
         artifact,
         input_indices=region.input_indices,

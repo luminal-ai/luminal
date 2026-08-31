@@ -1991,8 +1991,11 @@ impl<'a> LlirExtractor<'a> {
             .map(|(index, op)| (op.sort().name, index))
             .collect();
 
+        let mut classes = egraph.eclasses.keys().collect::<Vec<_>>();
+        classes.sort_unstable_by(|left, right| left.as_ref().cmp(right.as_ref()));
+
         let mut class_to_index = FxHashMap::default();
-        for (index, class) in egraph.eclasses.keys().enumerate() {
+        for (index, class) in classes.into_iter().enumerate() {
             let index = DenseIndex::try_from(index).expect("too many e-classes to index");
             class_to_index.insert(class, index);
         }
@@ -3607,9 +3610,9 @@ fn egglog_to_llir_from_root_cached<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        EGraphChoiceSet, LateEgglogPass, OpTextParts, SerializedEGraph, count_choice_sets_up_to,
-        egglog_setup_with_options, random_initial_choice, run_egglog_with_late_passes,
-        validate_choice_set,
+        EGraphChoiceSet, LateEgglogPass, LlirExtractor, OpTextParts, SerializedEGraph,
+        count_choice_sets_up_to, egglog_setup_with_options, random_initial_choice,
+        run_egglog_with_late_passes, validate_choice_set,
     };
     use crate::egglog_utils::api::{Rule, SortDef, sort};
     use crate::egglog_utils::base::OP_KIND;
@@ -3704,6 +3707,26 @@ mod tests {
             node_to_class: FxHashMap::default(),
             roots: Vec::new(),
         }
+    }
+
+    #[test]
+    fn llir_extractor_indexes_eclasses_by_id() {
+        let root = ClassId::from("c");
+        let mut egraph = egraph(vec![
+            eclass("c", "Shape", 1),
+            eclass("a", "Shape", 1),
+            eclass("b", "Shape", 1),
+        ]);
+        egraph.roots.push(root);
+
+        let extractor = LlirExtractor::new(&egraph, &[]);
+        let ids = extractor
+            .indexed_classes
+            .iter()
+            .map(|class| class.id.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["a", "b", "c"]);
     }
 
     #[test]

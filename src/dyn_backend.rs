@@ -169,6 +169,7 @@ pub type SetDevicePtrFn<'a, Rt> = &'a dyn Fn(&mut Rt, NodeIndex, u64, usize);
 /// - `init`: create the concrete runtime
 /// - `set_raw`: upload raw bytes + dtype to a node
 /// - `set_device_ptr`: optional zero-copy device pointer setter
+/// - `finalize`: perform backend-specific finalization after schedule selection
 /// - `wrap`: wrap the final runtime in a `Box<dyn DynBackend>`
 pub fn compile_backend<Rt: Runtime + 'static>(
     graph: &mut Graph,
@@ -176,6 +177,7 @@ pub fn compile_backend<Rt: Runtime + 'static>(
     init: impl FnOnce() -> Result<Rt, String>,
     set_raw: impl Fn(&mut Rt, NodeIndex, Vec<u8>, DType),
     set_device_ptr: Option<SetDevicePtrFn<'_, Rt>>,
+    finalize: impl FnOnce(&mut Graph, &mut Rt) -> Result<(), String>,
     wrap: impl FnOnce(Rt) -> Box<dyn DynBackend>,
 ) -> Result<Box<dyn DynBackend>, String> {
     // Build label map from input_meta (plain data — no downcast needed,
@@ -222,6 +224,8 @@ pub fn compile_backend<Rt: Runtime + 'static>(
             CompileOptions::default().search_graph_limit(args.search_iters),
         );
     }
+
+    finalize(graph, &mut rt)?;
 
     // Rebuild label map after search (graph may have changed)
     let label_map = build_label_map(graph);
@@ -510,6 +514,7 @@ pub fn reference_factory(
             }
         },
         None,
+        |_, _| Ok(()),
         |rt| Box::new(ReferenceDynBackend { runtime: rt }),
     )
 }

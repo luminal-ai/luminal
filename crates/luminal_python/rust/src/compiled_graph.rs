@@ -158,7 +158,7 @@ pub struct WeightData {
     pub device_ptrs: HashMap<String, (u64, usize)>,
 }
 
-const ARTIFACT_SCHEMA_VERSION: u32 = 2;
+const ARTIFACT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Deserialize, Serialize)]
 struct CompiledArtifactData {
