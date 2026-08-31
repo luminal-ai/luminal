@@ -913,9 +913,11 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     }
 
     fn remove_cached_bucket_device_buffer(bucket: &mut CompiledBucket, node: NodeIndex) {
-        if bucket.cached_buffer_ptrs.remove(&node).is_some()
-            || bucket.cached_device_buffers.remove(&node).is_some()
-        {
+        // Evaluate both removals: short-circuiting here leaves the DeviceBuffer
+        // behind whenever its pointer cache entry exists.
+        let removed_ptr = bucket.cached_buffer_ptrs.remove(&node).is_some();
+        let removed_buffer = bucket.cached_device_buffers.remove(&node).is_some();
+        if removed_ptr || removed_buffer {
             bucket.materialization_dirty_nodes.insert(node);
         }
     }
@@ -1534,6 +1536,59 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             .extend(self.output_ptr_registrations.keys().copied());
         self.resolved_output_bucket = None;
         self.pending_output_copies.clear();
+    }
+
+    /// Detach direct external outputs whose registrations changed before the
+    /// arena plan refreshes dynamic logical lengths.
+    ///
+    /// A zero-copy output view has exactly the byte capacity supplied by its
+    /// caller. When a dynamic output grows, the old view can therefore be too
+    /// small even though a replacement registration is already pending. The
+    /// arena must regain the data node first; `apply_output_ptr_registrations`
+    /// will install the replacement external view after buffer preparation.
+    fn detach_dirty_external_output_bindings(&mut self) {
+        if self.resolved_output_bucket != Some(self.active_bucket) {
+            return;
+        }
+
+        let dirty_data_nodes = self
+            .dirty_output_ptr_registrations
+            .iter()
+            .filter_map(
+                |hlir_output| match self.resolved_output_registrations.get(hlir_output) {
+                    Some(ResolvedOutputRegistration::External { data_node }) => Some(*data_node),
+                    _ => None,
+                },
+            )
+            .collect::<FxHashSet<_>>();
+        if dirty_data_nodes.is_empty() {
+            return;
+        }
+
+        // If several HLIR outputs resolve to the same data node, invalidate
+        // them together so no surviving registration keeps a stale direct
+        // binding alive while another one is being replaced.
+        let affected_outputs = self
+            .resolved_output_registrations
+            .iter()
+            .filter_map(|(hlir_output, resolved)| match resolved {
+                ResolvedOutputRegistration::External { data_node }
+                    if dirty_data_nodes.contains(data_node) =>
+                {
+                    Some(*hlir_output)
+                }
+                _ => None,
+            })
+            .collect_vec();
+        self.dirty_output_ptr_registrations
+            .extend(affected_outputs.iter().copied());
+        for hlir_output in affected_outputs {
+            self.resolved_output_registrations.remove(&hlir_output);
+        }
+        for data_node in dirty_data_nodes {
+            self.external_output_buffers.remove(&data_node);
+            Self::remove_cached_bucket_device_buffer(self.active_mut(), data_node);
+        }
     }
 
     fn current_hlir_device_binding(&self, hlir_input: NodeIndex) -> Option<(u64, usize)> {
@@ -2914,7 +2969,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             self.validated_resource_signatures
                 .insert(resource_validation_signature);
         }
-        // Arena bindings must preserve caller-provided output pointers.
+        // A changed direct output may have only the previous request's exact
+        // capacity. Detach it before refreshing dynamic lengths so the arena
+        // is rebound first and the replacement registration is applied below.
+        self.detach_dirty_external_output_bindings();
+
+        // Arena bindings must preserve unchanged caller-provided output pointers.
         let external_output_nodes = if self.resolved_output_bucket == Some(bucket_idx) {
             self.resolved_output_registrations
                 .values()
@@ -6270,6 +6330,36 @@ mod arena_plan_tests {
             rt.dirty_output_ptr_registrations,
             FxHashSet::from_iter([output])
         );
+    }
+
+    #[test]
+    fn dirty_external_output_is_detached_before_dynamic_arena_refresh() {
+        let mut rt = CudaRuntime::new().unwrap();
+        let output = NodeIndex::new(126);
+        let data_node = NodeIndex::new(7);
+        let allocation = rt.cuda_stream.alloc_zeros::<u8>(16).unwrap();
+        let ptr = allocation.device_ptr(&rt.cuda_stream).0;
+
+        rt.resolved_output_bucket = Some(rt.active_bucket);
+        rt.output_ptr_registrations.insert(output, (ptr, 16));
+        rt.dirty_output_ptr_registrations.insert(output);
+        rt.resolved_output_registrations
+            .insert(output, ResolvedOutputRegistration::External { data_node });
+        let external = unsafe { rt.cuda_stream.upgrade_device_ptr::<u8>(ptr, 16) };
+        rt.external_output_buffers
+            .insert(data_node, std::mem::ManuallyDrop::new(external));
+        CudaRuntime::cache_bucket_device_buffer(
+            rt.active_mut(),
+            data_node,
+            DeviceBuffer::new(ptr, 16),
+        );
+
+        rt.detach_dirty_external_output_bindings();
+
+        assert!(!rt.external_output_buffers.contains_key(&data_node));
+        assert!(!rt.active().cached_device_buffers.contains_key(&data_node));
+        assert!(!rt.resolved_output_registrations.contains_key(&output));
+        assert!(rt.dirty_output_ptr_registrations.contains(&output));
     }
 
     #[test]
