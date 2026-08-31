@@ -287,9 +287,9 @@ fn test_bucket_switch_preserves_weights() {
         &mut rng,
     );
     assert_eq!(
-        rt.debug_resident_bucket_arena_indices(),
+        rt.debug_bucket_indices_bound_to_shared_arena(),
         vec![1],
-        "stitched load should prepare only the selected prefill bucket"
+        "stitched load should bind only the selected prefill layout"
     );
 
     // Execute with bucket 1 (s=1)
@@ -298,9 +298,9 @@ fn test_bucket_switch_preserves_weights() {
     rt.set_data(b_tensor, b_data.clone());
     rt.execute(&cx.dyn_map);
     assert_eq!(
-        rt.debug_resident_bucket_arena_indices(),
+        rt.debug_bucket_indices_bound_to_shared_arena(),
         vec![0, 1],
-        "the two-entry graph cache should retain the prefill/decode hot pair"
+        "prefill and decode layouts should share the runtime arena"
     );
     let result_1a = rt.get_f32(c);
 
@@ -311,9 +311,9 @@ fn test_bucket_switch_preserves_weights() {
     rt.set_data(b_tensor, b_data.clone());
     rt.execute(&cx.dyn_map);
     assert_eq!(
-        rt.debug_resident_bucket_arena_indices(),
+        rt.debug_bucket_indices_bound_to_shared_arena(),
         vec![0, 1],
-        "switching to prefill should reuse both resident hot-pair arenas"
+        "switching to prefill should preserve both shared-arena bindings"
     );
     let result_3 = rt.get_f32(c);
 
@@ -323,9 +323,9 @@ fn test_bucket_switch_preserves_weights() {
     rt.set_data(b_tensor, b_data.clone());
     rt.execute(&cx.dyn_map);
     assert_eq!(
-        rt.debug_resident_bucket_arena_indices(),
+        rt.debug_bucket_indices_bound_to_shared_arena(),
         vec![0, 1],
-        "switching back must preserve the bounded two-arena cache"
+        "switching back must preserve both shared-arena bindings"
     );
     let result_1b = rt.get_f32(c);
 

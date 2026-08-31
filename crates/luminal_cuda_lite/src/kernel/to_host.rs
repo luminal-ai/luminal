@@ -4738,7 +4738,7 @@ pub(crate) fn kernel_to_host_with_prepared(
     // a single fused CUDA function anchored at each region's root
     // FusionEnd; the absorbed nodes have no consumers outside the region
     // and never need their own buffers. Removing them keeps later
-    // per-execute walks (e.g., `allocate_intermediate_buffers`) from
+    // per-execute walks (e.g., intermediate-buffer planning) from
     // chewing through dead nodes every decode token.
     //
     // Root FusionEnd nodes are NOT in `globally_absorbed` (they were the

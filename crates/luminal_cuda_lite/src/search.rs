@@ -30,7 +30,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         let contexts = space.bucket_contexts(dyn_map);
         let mut finalists = Vec::with_capacity(contexts.len());
         for ctx in &contexts {
-            self.park_all_bucket_arenas();
             let mut search = GeneticSearch::<Duration>::new(space, ctx, options, search_started_at);
             while let Some(mut candidate) = search.next_candidate(rng) {
                 let outcome = self.evaluate_candidate(&mut candidate, ctx, options);
@@ -55,7 +54,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             else {
                 panic!("{}", lattice.failure_message());
             };
-            self.park_all_bucket_arenas();
             let refs = lattice.llirs(&set);
             let compiled = catch_unwind(AssertUnwindSafe(|| {
                 self.compile_and_validate_bucket_set(&space.dim_buckets, &refs)
@@ -77,7 +75,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             match compiled {
                 Ok(validated) => {
                     let _selected = lattice.select(set);
-                    self.park_all_bucket_arenas();
                     self.install_validated_bucket_set(&space.dim_buckets, validated)
                         .unwrap_or_else(|error| {
                             panic!("failed to install the selected CUDA bucket set: {error}")
@@ -230,7 +227,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         ctx: &BucketContext<'_>,
         options: &CompileOptions,
     ) -> Result<Duration, String> {
-        self.park_all_bucket_arenas();
         let candidate =
             self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)?;
         self.install_validated_bucket_set(ctx.dim_buckets(), candidate.buckets)
@@ -264,7 +260,6 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         pending: &PendingFinalist<Duration>,
         ctx: &BucketContext<'_>,
     ) -> Result<(), String> {
-        self.park_all_bucket_arenas();
         // This genome was already compiled and timed during search. Re-run the
         // exact CUDA/resource checks for deployment, but do not apply the
         // cheap candidate-planning node guard: that guard bounds exploration
