@@ -31,20 +31,16 @@ fn eclass_has_op_kind(egraph: &SerializedEGraph, eclass: &ClassId, kind_label: &
     })
 }
 
-/// True when one boundary eclass retains both:
-/// - an FS that can read a materialized producer whose eclass contains an FE;
-/// - the CUDA elementwise form that absorbs that producer into its consumer.
-///
-/// Some correlated selections through this egraph structure are cyclic, but
-/// deleting the FS would also erase the legal materialized split selection.
-fn egraph_has_split_and_absorbed_boundary(cx: &Graph, absorbed_kind: &str) -> bool {
+/// True when a materialized `FusionEnd -> FusionStart` boundary remains in the
+/// serialized e-graph. Destructive fusion subsumes every metadata-compatible
+/// boundary, so simple elementwise chains must leave none behind.
+fn egraph_has_materialized_fusion_boundary(cx: &Graph) -> bool {
     let egraph = cx.egraph().expect("search space should be built");
     egraph
         .eclasses
         .iter()
-        .any(|(boundary_class, (sort, nodes))| {
+        .any(|(_boundary_class, (sort, nodes))| {
             sort == "IR"
-                && eclass_has_op_kind(egraph, boundary_class, absorbed_kind)
                 && nodes.iter().any(|node| {
                     let Some((label, children)) = egraph.enodes.get(node) else {
                         return false;
@@ -221,10 +217,9 @@ fn static_planning_accepts_split_and_fused_regions_but_rejects_cycle() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_two_unary_ops_fuse() {
     // Marker form: `a.sin().sqrt()` should fuse into a region with FusedSin
-    // and FusedSqrt under one FusionEnd (per pair-fuse U→U).
+    // and FusedSqrt under one FusionEnd.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let _b = a.sin().sqrt().output();
@@ -242,8 +237,8 @@ fn test_two_unary_ops_fuse() {
 #[test]
 fn test_stride_mismatch_prevents_fusion() {
     // A permute between sin and sqrt gives sqrt a non-contiguous view of sin's
-    // contiguous output, so sqrt's in_strides != its out_strides and the
-    // non-linear `?s ?s` match in the pair-fuse U→U rule can't fire.
+    // contiguous output, so the two singleton-region boundary contracts do
+    // not match and the destructive inline rule cannot fire.
     let mut cx = Graph::new();
     let a = cx.tensor((3, 4));
     let _b = a.sin().permute((1, 0)).sqrt().output();
@@ -262,8 +257,8 @@ fn test_stride_mismatch_prevents_fusion() {
 
 #[test]
 fn test_reduction_prevents_unary_fusion() {
-    // A reduction between two unaries is not elementwise, so pair-fuse U→U
-    // (which only matches adjacent elementwise pairs) must not fire across
+    // A reduction between two unaries is not seeded as an elementwise region,
+    // so there is no FE -> FS boundary for the inline rule to dissolve across
     // the reduction.
     let mut cx = Graph::new();
     let a = cx.tensor((4, 4));
@@ -298,7 +293,6 @@ fn test_unary_fusion_preserves_output() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_three_unary_ops_fuse() {
     // A chain of 3 pure-elementwise unaries with matching strides should be
     // reachable as a single marker region containing all three elementwise ops.
@@ -317,10 +311,9 @@ fn test_three_unary_ops_fuse() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_four_unary_ops_fuse() {
     // 4-op chain should collapse into a single marker region containing all
-    // four elementwise ops (one pair-fuse + repeated grow-FE→U firings).
+    // four elementwise ops after every compatible boundary is subsumed.
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     let _b = a.sin().sqrt().exp2().log2().output();
@@ -558,23 +551,18 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
 
         for end in end_nodes {
             let mut internal: Vec<String> = Vec::new();
-            // Count distinct external input *tensors*, not distinct FusionStart
-            // node indices. Egglog rule firings can emit multiple FusionStart
-            // enodes that all wrap the same source tensor (e.g. when the same
-            // `a` is consumed at two sites inside the fused region, each
-            // pair-fuse / grow firing mints its own FusionStart). Those are
-            // logically one FusionStart per the design invariant
-            // ("N = number of distinct external input tensors").
+            // Count distinct external input *tensors*, not FusionStart node
+            // indices. A shared source can feed several sites in one region;
+            // those edges still represent one external tensor.
             let mut start_sources: FxHashSet<NodeIndex> = FxHashSet::default();
             let mut visited: FxHashSet<NodeIndex> = FxHashSet::default();
             visited.insert(end);
             let mut stack = vec![end];
 
-            // Resolve chains of nested FusionStart wrappers (cascade artifact)
-            // to the real external source. A FusionStart whose incoming neighbor
-            // is itself a FusionStart is a cascade layer, not a new external
-            // tensor. A FusionEnd predecessor is a real external region output
-            // in the generic singleton-region model, so do not walk through it.
+            // Resolve any nested FusionStart wrappers defensively to the real
+            // external source. Canonical destructive fusion does not create
+            // such wrappers, but other e-graph alternatives may still contain
+            // identity marker layers.
             let resolve_source = |mut n: NodeIndex| -> NodeIndex {
                 loop {
                     match name_of(n).as_deref() {
@@ -597,15 +585,9 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
                     }
                     match name_of(pred).as_deref() {
                         Some("FusionStart") => {
-                            // If this FS's predecessor is itself a FE (or a
-                            // chain of FS/FE wrappers that eventually hits a
-                            // non-marker op inside the region), the FS is a
-                            // cascade artifact, not a real external boundary.
-                            // Walk past it and its upstream FE into the same
-                            // region. Otherwise treat the predecessor as the
-                            // external source tensor — which may be a KernelOp
-                            // *or* a non-KernelOp (HLIR loadable) node, so we
-                            // can't gate counting on `name_of` being `Some`.
+                            // Treat the predecessor as the external source
+                            // tensor, which may be either a KernelOp or a
+                            // non-KernelOp (HLIR loadable) node.
                             let mut inc =
                                 llir.neighbors_directed(pred, petgraph::Direction::Incoming);
                             match inc.next() {
@@ -618,11 +600,8 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
                             }
                         }
                         Some("FusionEnd") => {
-                            // Transparent: inner FusionEnds are cascade-wart
-                            // artifacts from grow rules re-firing and creating
-                            // nested `FE(Op(FE(...)))` wrappers. They don't
-                            // represent real work or a real boundary — walk
-                            // past them and do not count them as internal ops.
+                            // Treat a nested marker as transparent. It is not
+                            // work and must not affect the region summary.
                             stack.push(pred);
                         }
                         Some(other) => {
@@ -638,10 +617,8 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
             }
 
             internal.sort();
-            // Skip singleton regions: every elementwise op has a seeded
-            // `FE(Op(FS(...)))` form, so random extraction will surface
-            // many one-op regions that are equivalent to not fusing. We
-            // only care about regions that represent real multi-op fusion.
+            // Singleton regions are valid seeds, but these structural tests
+            // only care about actual multi-op fusion.
             if internal.len() < 2 {
                 continue;
             }
@@ -664,14 +641,14 @@ fn sorted_names(items: &[&str]) -> Vec<String> {
     v
 }
 
-// ---- Structural tests: the expected fused shape is reachable ----
+// ---- Structural tests: destructive fusion emits the expected shape ----
 
 #[test]
 fn test_single_binary_does_not_fuse_alone() {
     // A lone elementwise op gets a seeded singleton region by design; we
     // filter singletons out in `extract_all_fused_regions`. What this test
     // asserts is that no *multi-op* region appears for a standalone binary
-    // — nothing to grow into.
+    // — there is no adjacent compatible boundary to dissolve.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -685,11 +662,9 @@ fn test_single_binary_does_not_fuse_alone() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_chain_of_binaries_fuses() {
     // `(a + b) * c`: three external inputs collapse into one region with
-    // internal [Add, Mul] and 3 FusionStarts. Exercises the B-B pair-fuse
-    // rules emitted from FusionEnd::rewrites.
+    // internal [Add, Mul] and 3 FusionStarts.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -707,7 +682,6 @@ fn test_chain_of_binaries_fuses() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_binary_then_unary_fuses() {
     // `sin(a + b)`: binary feeds a unary inside one fused region.
     let mut cx = Graph::new();
@@ -726,7 +700,6 @@ fn test_binary_then_unary_fuses() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_unary_then_binary_fuses() {
     // `sin(a) + b`: unary feeds a binary inside one fused region.
     let mut cx = Graph::new();
@@ -745,7 +718,6 @@ fn test_unary_then_binary_fuses() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_diamond_dag_fuses() {
     // The canonical diamond-DAG example agreed with the user:
     //   t = a + b; u = exp2(t); v = sin(t); w = u * a; out = w + v
@@ -876,7 +848,6 @@ fn test_diamond_dag_preserves_output() {
 // ---- Marker invariant tests ----
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_fused_region_has_exactly_one_end() {
     // Design invariant: a fused region always has exactly one FusionEnd.
     // Uses the diamond DAG so there's real fan-in/out inside the region.
@@ -904,7 +875,6 @@ fn test_fused_region_has_exactly_one_end() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_fused_region_starts_match_distinct_external_tensors() {
     // Design invariant: FusionStart count == number of distinct external input
     // tensors, NOT number of edges crossing the boundary. In the diamond DAG
@@ -923,11 +893,9 @@ fn test_fused_region_starts_match_distinct_external_tensors() {
 
     let regions = extract_all_fused_regions(&mut cx);
     let expected = sorted_names(&["FusedAdd", "FusedAdd", "FusedExp2", "FusedMul", "FusedSin"]);
-    // Multiple 5-op extractions are reachable: the merge-FE-FE rule fires
-    // across paths that may have minted distinct FS enodes for the shared
-    // tensor `a` at separate sites. The design invariant is that *some*
-    // extraction collapses those into the deduped form (one FS per distinct
-    // tensor → 2 FS for {a, b}); we don't require every random sample to.
+    // Other e-graph choices can spell shared inputs with distinct marker
+    // enodes. The invariant is that extraction exposes the deduplicated form:
+    // one FusionStart per distinct tensor, hence two for {a, b}.
     let matching: Vec<&FusedRegion> = regions
         .iter()
         .filter(|r| r.internal_ops_sorted == expected)
@@ -946,18 +914,15 @@ fn test_fused_region_starts_match_distinct_external_tensors() {
     );
 }
 
-// ---- Targeted rule-family tests (one per family / orientation) ----
+// ---- Targeted destructive-boundary tests ----
 //
-// The structural and diamond tests above hit several rule families at once.
-// These narrow tests pin each rule family / orientation independently so a
-// regression in one rule shows up as a single failing test rather than a
-// confusing diamond mismatch.
+// These narrow tests cover different producer/consumer topologies handled by
+// the single generic FE -> FS Egglog rule.
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_pair_fuse_unary_unary_marker_form() {
-    // Pair-fuse U→U: `a.sin().sqrt()` should be reachable as a marker-bracketed
-    // region containing FusedSin and FusedSqrt (with one FusionStart for `a`).
+fn test_destructive_inline_unary_chain() {
+    // `a.sin().sqrt()` becomes one marker-bracketed region containing FusedSin
+    // and FusedSqrt, with one FusionStart for `a`.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let _b = a.sin().sqrt().output();
@@ -973,10 +938,8 @@ fn test_pair_fuse_unary_unary_marker_form() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_pair_fuse_unary_to_binary_rhs() {
-    // Pair-fuse U→B (RHS variant): `a + b.sin()`. The unary is on the
-    // binary's B input, so the rule's RHS-orientation version is what fires.
+fn test_destructive_inline_unary_into_binary_rhs() {
+    // `a + b.sin()` exercises a unary producer on a binary's RHS.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -994,11 +957,8 @@ fn test_pair_fuse_unary_to_binary_rhs() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_pair_fuse_binary_to_binary_rhs() {
-    // Pair-fuse B→B (RHS variant): `c * (a + b)`. The inner binary feeds the
-    // outer binary's B input, exercising the mirror direction of the rule
-    // covered by test_chain_of_binaries_fuses.
+fn test_destructive_inline_binary_into_binary_rhs() {
+    // `c * (a + b)` exercises a binary producer on another binary's RHS.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -1017,12 +977,9 @@ fn test_pair_fuse_binary_to_binary_rhs() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_grow_fe_to_binary_rhs() {
-    // Grow FE→B (RHS variant): `c + (a.sin() + b)`. Once the inner
-    // `a.sin() + b` is fused, the outer `+ c` consumes that FE on its B input
-    // (because we wrote `c + (...)` — `c` is on LHS, FE on RHS), exercising
-    // grow-FE-B-rhs to absorb the outer Add into the same region.
+fn test_destructive_inline_nested_binary_rhs() {
+    // `c + (a.sin() + b)` exercises transitive boundary dissolution when a
+    // fused inner expression feeds the outer binary's RHS.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -1035,17 +992,15 @@ fn test_grow_fe_to_binary_rhs() {
         regions
             .iter()
             .any(|r| r.internal_ops_sorted == expected && r.start_count == 3),
-        "expected a 3-op fused region of {expected:?} with 3 FusionStarts (grow into RHS), \
+        "expected a 3-op fused region of {expected:?} with 3 FusionStarts (nested RHS), \
          got: {regions:#?}"
     );
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_merge_two_regions_at_outer_binary() {
-    // Merge: `(sin(a) + b) + (sqrt(c) + d)`. Each side grows its unary region
-    // through the inner Add, so both sides become FEs. The outer Add can then
-    // fire merge-FE-FE-Add to produce a single region.
+fn test_destructive_inline_binary_fanin() {
+    // `(sin(a) + b) + (sqrt(c) + d)` exercises compatible boundaries on both
+    // sides of an outer binary and must produce one maximal region.
     let mut cx = Graph::new();
     let a = cx.tensor(8);
     let b = cx.tensor(8);
@@ -1059,7 +1014,7 @@ fn test_merge_two_regions_at_outer_binary() {
         regions
             .iter()
             .any(|r| r.internal_ops_sorted == expected && r.start_count == 4),
-        "expected a 5-op merged region (two pair-fused sides combined at outer Add) with \
+        "expected a 5-op region (both sides combined at outer Add) with \
          4 FusionStarts, got: {regions:#?}"
     );
 }
@@ -1215,16 +1170,13 @@ extern "C" __global__ void fused_k(float* out, const float* a, const float* b, l
 }
 
 // =========================================================================
-// Cast fusion: explicit HLIR Casts are the only dtype changes inside a
-// region (grow-FE-Cast and grow-Cast-FS in markers.rs).
+// Cast fusion: explicit HLIR Casts are the only dtype changes inside a region.
 // =========================================================================
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_cast_after_unary_fuses() {
-    // grow-FE-Cast: `a.sin().cast(Bf16)` should be reachable as one region
-    // with the cast as an interior elementwise node, instead of a separate
-    // KernelCast kernel reading the region's f32 output buffer.
+    // `a.sin().cast(Bf16)` becomes one region with the cast as an interior
+    // elementwise node instead of a separate KernelCast reading f32 output.
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     let _b = a.sin().cast(luminal::dtype::DType::Bf16).output();
@@ -1240,10 +1192,9 @@ fn test_cast_after_unary_fuses() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_cast_producer_absorbed_into_region() {
-    // grow-Cast-FS: a bf16 input cast to f32 then consumed by a unary chain
-    // should pull the cast inside the region.
+    // A bf16 input cast to f32 and then consumed by a unary chain should keep
+    // the cast inside the region.
     let mut cx = Graph::new();
     let a = cx.tensor(16).as_dtype(luminal::dtype::DType::Bf16);
     let _b = a.cast(luminal::dtype::DType::F32).sin().output();
@@ -1259,36 +1210,33 @@ fn test_cast_producer_absorbed_into_region() {
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_cast_split_boundary_and_absorbed_choice_coexist() {
+fn test_cast_boundary_is_destructively_absorbed() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     a.sin().cast(luminal::dtype::DType::Bf16).sqrt().output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_split_and_absorbed_boundary(&cx, "CudaUnaryElementwise"),
-        "cast growth must retain materialized-split and absorbed alternatives"
+        !egraph_has_materialized_fusion_boundary(&cx),
+        "cast fusion must subsume the materialized FE -> FS boundary"
     );
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_unary_split_boundary_and_absorbed_choice_coexist() {
+fn test_unary_boundary_is_destructively_absorbed() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     a.sin().sqrt().reciprocal().output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_split_and_absorbed_boundary(&cx, "CudaUnaryElementwise"),
-        "unary growth must retain materialized-split and absorbed alternatives"
+        !egraph_has_materialized_fusion_boundary(&cx),
+        "unary fusion must subsume the materialized FE -> FS boundary"
     );
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
+fn test_binary_lhs_boundary_is_destructively_absorbed() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     let b = cx.tensor(16);
@@ -1296,14 +1244,13 @@ fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_split_and_absorbed_boundary(&cx, "CudaBinaryElementwise"),
-        "binary-LHS growth must retain materialized-split and absorbed alternatives"
+        !egraph_has_materialized_fusion_boundary(&cx),
+        "binary-LHS fusion must subsume the materialized FE -> FS boundary"
     );
 }
 
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
-fn test_binary_rhs_split_boundary_and_absorbed_choice_coexist() {
+fn test_binary_rhs_boundary_is_destructively_absorbed() {
     let mut cx = Graph::new();
     let a = cx.tensor(16);
     let b = cx.tensor(16);
@@ -1311,8 +1258,8 @@ fn test_binary_rhs_split_boundary_and_absorbed_choice_coexist() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_split_and_absorbed_boundary(&cx, "CudaBinaryElementwise"),
-        "binary-RHS growth must retain materialized-split and absorbed alternatives"
+        !egraph_has_materialized_fusion_boundary(&cx),
+        "binary-RHS fusion must subsume the materialized FE -> FS boundary"
     );
 }
 

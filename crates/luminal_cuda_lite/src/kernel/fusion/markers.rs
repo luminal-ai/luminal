@@ -7,8 +7,8 @@
 //     reads),
 //   - exactly 1 FusionEnd per region.
 //
-// `FusionEnd::rewrites()` carries the seven rule families that build and
-// extend regions (pair-fuse / grow / merge); the actual single-kernel
+// `FusionEnd::rewrites()` carries the destructive Egglog rule that dissolves
+// compatible boundaries between singleton regions; the actual single-kernel
 // codegen lives in `region_codegen`. Both markers' `compile()` is
 // `unreachable!()` — region codegen folds them away
 // before kernel_to_host's compile loop reaches an interior node.
@@ -64,10 +64,9 @@ impl EgglogOp for FusionStart {
         1
     }
     fn rewrites(&self) -> Vec<Rule> {
-        // No idempotence rule. `FusionStart(FusionStart(x)) ≡ FusionStart(x)`
-        // would unify nested markers and create eclass cycles via the
-        // pair-fuse rules; without it, occasional re-firings produce extra
-        // semantically-correct identity layers, bounded by the run schedule.
+        // No idempotence rule: boundary normalization belongs to the
+        // destructive FE -> FS rule below, which removes the exact spelling
+        // it absorbs instead of adding equivalent marker layers.
         Vec::new()
     }
     fn cleanup(&self) -> bool {
@@ -145,126 +144,36 @@ impl EgglogOp for FusionEnd {
     }
 
     fn egglog_declarations(&self) -> Vec<String> {
-        vec![
-            "(ruleset fusion_grow_safe_late)".to_string(),
-            "(ruleset fusion_merge_safe_late)".to_string(),
-        ]
+        vec!["(ruleset fusion_inline_safe_late)".to_string()]
     }
 
     fn rewrites(&self) -> Vec<Rule> {
-        // Grow already well-formed regions through adjacent elementwise work.
-        // These rules are legality-by-construction:
-        // - one shared `?shape` fixes the iteration domain;
-        // - the producer FusionEnd stride is reused as the exact consumer
-        //   input stride, so no transpose/view is crossed;
-        // - every external FusionStart is stamped with its producer dtype;
-        // - every interior/result node is stamped with its own result dtype.
+        // Every eligible CUDA elementwise op is first lowered to a singleton
+        // `FusionStart -> Cuda*Elementwise -> FusionEnd` region.  Fuse two
+        // adjacent regions by destructively dissolving the materialized
+        // boundary between them.  Matching the complete boundary contract
+        // makes the rewrite legality-by-construction: shape, physical stride,
+        // and dtype must all agree exactly.
         //
-        // Deliberately do not union a FusionStart with an absorbed producer.
-        // That older rule family could make cyclic eclasses. Forward growth
-        // and binary merge cover chains and DAG joins without changing an
-        // existing region boundary's eclass.
-        let mut rules = Vec::new();
-        let unaries: &[(&str, &str)] = &[
-            ("Sin", "Sin"),
-            ("Sqrt", "Sqrt"),
-            ("Exp2", "Exp2"),
-            ("Log2", "Log2"),
-            ("Recip", "Recip"),
-        ];
-        let binaries: &[(&str, &str)] = &[("Add", "Add"), ("Mul", "Mul")];
-
-        // U(FE(inner)): match the FE's materialized output layout exactly at
-        // U's input, then carry U's possibly different output layout forward.
-        for (hlir, opcode) in unaries {
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?fe (Op (FusionEnd ?shape ?in_s ?dt_in) (ICons ?inner (INil))))
-                    (= ?u (Op ({hlir} ?shape ?in_s ?out_s) (ICons ?fe (INil))))
-                    (= ?dt_out (dtype ?u))
-                 ) (
-                    (let ?elem (Op (CudaUnaryElementwise \"{opcode}\" ?shape ?in_s ?out_s ?dt_out)
-                                   (ICons ?inner (INil))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt_out) (ICons ?elem (INil))))
-                    (union ?u ?new_fe)
-                    (set (dtype ?new_fe) ?dt_out)
-                 ) :ruleset fusion_grow_safe_late :name \"grow-safe-FE-U-{hlir}\")"
-            )));
-        }
-
-        // Cast is flat elementwise and its HLIR contract requires `size` to
-        // equal the input buffer's element count. Since the matched FE is an
-        // alternative in that exact input eclass, retaining its iteration
-        // domain and layout is exact even when egglog has not normalized the
-        // corresponding symbolic product to `size`.
-        rules.push(Rule::raw(
+        // The `subsume` is essential.  Unioning the boundary with the producer
+        // interior while retaining the `FusionStart(FusionEnd(...))` spelling
+        // leaves a cyclic extraction and, across a DAG, enumerates every split
+        // versus absorbed partition.  Subsumption removes that spelling from
+        // both future matching and extraction, so each boundary is fused once
+        // and the e-graph retains only the canonical absorbed representation.
+        vec![Rule::raw(
             "(rule (
-                (= ?fe (Op (FusionEnd ?shape ?s ?dt_in) (ICons ?inner (INil))))
-                (= ?cast (Op (Cast ?size ?dt_out) (ICons ?fe (INil))))
+                (= ?producer_fe
+                   (Op (FusionEnd ?shape ?stride ?dt) (ICons ?producer_inner (INil))))
+                (= ?boundary
+                   (Op (FusionStart ?shape ?stride ?dt) (ICons ?producer_fe (INil))))
              ) (
-                (let ?elem (Op (CudaUnaryElementwise \"Cast\" ?shape ?s ?s ?dt_out)
-                               (ICons ?inner (INil))))
-                (let ?new_fe (Op (FusionEnd ?shape ?s ?dt_out) (ICons ?elem (INil))))
-                (union ?cast ?new_fe)
-                (set (dtype ?new_fe) ?dt_out)
-             ) :ruleset fusion_grow_safe_late :name \"grow-safe-FE-Cast\")",
-        ));
-
-        // B(FE(inner), external) and its mirror. Dtypes are per-value rather
-        // than assumed uniform, which preserves mixed bf16/f32 arithmetic.
-        for (hlir, opcode) in binaries {
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?fe (Op (FusionEnd ?shape ?a_s ?dt_a) (ICons ?inner_a (INil))))
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?fe (ICons ?b (INil)))))
-                    (= ?dt_b (dtype ?b))
-                    (= ?dt_out (dtype ?bin))
-                 ) (
-                    (let ?fs_b (Op (FusionStart ?shape ?b_s ?dt_b) (ICons ?b (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt_out)
-                                   (ICons ?inner_a (ICons ?fs_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt_out) (ICons ?elem (INil))))
-                    (union ?bin ?new_fe)
-                    (set (dtype ?new_fe) ?dt_out)
-                 ) :ruleset fusion_grow_safe_late :name \"grow-safe-FE-B-lhs-{hlir}\")"
-            )));
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?fe (Op (FusionEnd ?shape ?b_s ?dt_b) (ICons ?inner_b (INil))))
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?a (ICons ?fe (INil)))))
-                    (= ?dt_a (dtype ?a))
-                    (= ?dt_out (dtype ?bin))
-                 ) (
-                    (let ?fs_a (Op (FusionStart ?shape ?a_s ?dt_a) (ICons ?a (INil))))
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt_out)
-                                   (ICons ?fs_a (ICons ?inner_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt_out) (ICons ?elem (INil))))
-                    (union ?bin ?new_fe)
-                    (set (dtype ?new_fe) ?dt_out)
-                 ) :ruleset fusion_grow_safe_late :name \"grow-safe-FE-B-rhs-{hlir}\")"
-            )));
-
-            // Join two independently well-formed regions at one binary op.
-            rules.push(Rule::raw(format!(
-                "(rule (
-                    (= ?fe_a (Op (FusionEnd ?shape ?a_s ?dt_a) (ICons ?inner_a (INil))))
-                    (= ?fe_b (Op (FusionEnd ?shape ?b_s ?dt_b) (ICons ?inner_b (INil))))
-                    (= ?bin (Op ({hlir} ?shape ?a_s ?b_s ?out_s)
-                                 (ICons ?fe_a (ICons ?fe_b (INil)))))
-                    (= ?dt_out (dtype ?bin))
-                 ) (
-                    (let ?elem (Op (CudaBinaryElementwise \"{opcode}\" ?shape ?a_s ?b_s ?out_s ?dt_out)
-                                   (ICons ?inner_a (ICons ?inner_b (INil)))))
-                    (let ?new_fe (Op (FusionEnd ?shape ?out_s ?dt_out) (ICons ?elem (INil))))
-                    (union ?bin ?new_fe)
-                    (set (dtype ?new_fe) ?dt_out)
-                 ) :ruleset fusion_merge_safe_late :name \"merge-safe-FE-FE-{hlir}\")"
-            )));
-        }
-
-        rules
+                (union ?boundary ?producer_inner)
+                (subsume
+                    (Op (FusionStart ?shape ?stride ?dt) (ICons ?producer_fe (INil))))
+             ) :ruleset fusion_inline_safe_late
+                :name \"inline-safe-FE-through-FS\")",
+        )]
     }
 
     fn cleanup(&self) -> bool {

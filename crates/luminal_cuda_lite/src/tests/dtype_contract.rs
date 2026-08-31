@@ -311,12 +311,10 @@ fn test_bf16_reciprocal_region_compiles() {
     assert_close(&result, &expected, tol, tol);
 }
 
-/// Growth keeps both materialized and absorbed FS/FE boundary choices. Some
-/// correlated choices form an LLIR cycle; reject those selected candidates
-/// without deleting the legal acyclic choices from the egraph.
+/// Destructive FE -> FS subsumption must make the bf16 cast/residual topology
+/// acyclic by construction instead of relying on candidate-time rejection.
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework): the cycle-producing absorbed-boundary choices this exercises no longer exist"]
-fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
+fn bf16_cast_sandwich_fusion_is_acyclic_by_construction() {
     use luminal::egglog_utils::{
         egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
         validate_choice_set,
@@ -340,7 +338,6 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
     let mut base = random_initial_choice(egraph, &mut rng);
     let mut seen = FxHashSet::default();
     seen.insert(hash_choice_set(&base));
-    let mut cycles = 0;
     let mut acyclic = 0;
     for _ in 0..100 {
         let generation = extract_generation(egraph, &base, 16, 4, &mut seen, &mut rng);
@@ -350,8 +347,7 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
         for choices in generation {
             match validate_choice_set(egraph, &choices, ops) {
                 Err(error) if error.contains("dependency cycle") => {
-                    cycles += 1;
-                    continue;
+                    panic!("destructive fusion produced a cyclic choice: {error}")
                 }
                 Err(_) => continue,
                 Ok(()) => {}
@@ -378,21 +374,11 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
                 }
                 Err(other) => panic!("unexpected static candidate rejection: {other}"),
             }
-            if cycles > 0 && acyclic > 0 {
-                break;
-            }
-        }
-        if cycles > 0 && acyclic > 0 {
-            break;
         }
     }
     assert!(
-        cycles > 0,
-        "expected to exercise at least one cyclic choice"
-    );
-    assert!(
         acyclic > 0,
-        "cycle validation must retain legal acyclic materialized/absorbed choices"
+        "expected at least one legal candidate from the destructively fused graph"
     );
 }
 

@@ -270,18 +270,14 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
 }
 
 pub(crate) fn safe_fusion_late_pass() -> luminal::egglog_utils::LateEgglogPass {
-    // Six bounded forward/merge rounds cover the short arithmetic, RoPE, and
-    // routing chains common in inference graphs without putting the large
-    // joins in core's saturating main loop.
+    // Singleton elementwise regions already exist when this late pass runs.
+    // One Egglog round sees every materialized FE -> FS boundary in the DAG;
+    // the rule dissolves and subsumes those boundaries simultaneously, giving
+    // us maximal destructive fusion without enumerating fusion partitions.
     luminal::egglog_utils::LateEgglogPass::new(
         "",
         "(seq
-            fusion_grow_safe_late fusion_merge_safe_late
-            fusion_grow_safe_late fusion_merge_safe_late
-            fusion_grow_safe_late fusion_merge_safe_late
-            fusion_grow_safe_late fusion_merge_safe_late
-            fusion_grow_safe_late fusion_merge_safe_late
-            fusion_grow_safe_late fusion_merge_safe_late
+            fusion_inline_safe_late
             (saturate expr)
             (saturate cleanup)
             (saturate post_cleanup)
