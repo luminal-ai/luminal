@@ -10,16 +10,19 @@ pub(crate) mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
 
-/// Baseline host operations shared by Lite and supersets of the CUDA backend.
-///
-/// This deliberately excludes [`moe::fused::FusedMoE`], allowing a derived
-/// backend to supply a different implementation of the same egglog operation
-/// without registering two constructors with the same sort name.
-pub type BaseOps = (
+/// Host operations whose implementations are shared unchanged by Lite and
+/// CUDA supersets. A superset can register its own `SinkAttention` operation
+/// while reusing this tuple and avoiding a duplicate egglog constructor.
+pub type OpsWithoutSinkAttention = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
     flashinfer::FlashInferAttention,
+);
+
+/// Lite's baseline operations, excluding only its replaceable fused MoE.
+pub type BaseOps = (
+    OpsWithoutSinkAttention,
     flashinfer::sink_attention::SinkAttention,
 );
 
@@ -242,6 +245,28 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     /// operation type supplied by another crate.
     fn cuda_graph_capture_arity(&self) -> Option<usize> {
         None
+    }
+
+    /// Input indices whose pointer identity is baked into a captured child
+    /// graph. `None` conservatively tracks every graph input. Operations may
+    /// omit planner-only buffers that are not consumed by captured kernels.
+    fn cuda_graph_capture_pointer_inputs(&self) -> Option<&'static [usize]> {
+        None
+    }
+
+    /// Input indices whose logical shapes are baked into captured launch
+    /// geometry. `None` conservatively inspects the output and every input.
+    /// This is separate from pointer tracking so payload-sized buffers can
+    /// grow without forcing recapture when kernels consume their live length
+    /// or contents from device metadata.
+    fn cuda_graph_capture_shape_inputs(&self) -> Option<&'static [usize]> {
+        None
+    }
+
+    /// Dynamic dimensions baked into captured launch geometry but not
+    /// necessarily recoverable from graph-visible buffer sizes.
+    fn cuda_graph_capture_dyn_dims(&self) -> Vec<Symbol> {
+        vec![]
     }
 
     /// Prepare stable allocations and metadata before child-graph capture.

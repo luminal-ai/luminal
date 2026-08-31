@@ -13,7 +13,7 @@
 //! the first call the `OnceLock` makes subsequent lookups free.
 
 use std::{
-    ffi::{c_char, c_void},
+    ffi::c_void,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     process::Command,
@@ -269,32 +269,6 @@ pub type Fa3SinkDecodeRunFn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
-pub type ExternalFa3InitFn = unsafe extern "C" fn(library_path: *const c_char) -> i32;
-
-pub type ExternalFa3SinkDecodeRunFn = unsafe extern "C" fn(
-    float_workspace: *mut c_void,
-    float_workspace_size: usize,
-    int_workspace: *mut c_void,
-    int_workspace_size: usize,
-    q: *const c_void,
-    k_cache: *const c_void,
-    v_cache: *const c_void,
-    page_table: *const i32,
-    qo_indptr: *const i32,
-    kv_indptr: *const i32,
-    sink: *const f32,
-    output: *mut c_void,
-    batch_size: i32,
-    num_qo_heads: i32,
-    num_kv_heads: i32,
-    max_context_len: i32,
-    num_pages: i32,
-    page_size: i32,
-    sm_scale: f32,
-    window_left: i32,
-    stream: *mut c_void,
-) -> i32;
-
 /// Shared shape for both FA3 layout-transpose entry points (the bf16-q and
 /// f32-output variants differ only in the loaded symbol).
 pub type Fa3TransposeFn = unsafe extern "C" fn(
@@ -413,8 +387,6 @@ pub struct Fa3Lib {
     pub prefill_plan: Fa3PrefillPlanFn,
     pub prefill_run: Fa3PrefillRunFn,
     pub sink_decode_run: Fa3SinkDecodeRunFn,
-    pub external_init: ExternalFa3InitFn,
-    pub external_sink_decode_run: ExternalFa3SinkDecodeRunFn,
     pub transpose_output_f32: Fa3TransposeFn,
     pub transpose_output_bf16: Fa3TransposeFn,
     pub transpose_q_bf16: Fa3TransposeFn,
@@ -466,11 +438,6 @@ impl Fa3Lib {
             unsafe { *lib.get::<Fa3PrefillRunFn>(b"flashinfer_fa3_prefill_run\0")? };
         let sink_decode_run: Fa3SinkDecodeRunFn =
             unsafe { *lib.get::<Fa3SinkDecodeRunFn>(b"flashinfer_sink_decode_run\0")? };
-        let external_init: ExternalFa3InitFn =
-            unsafe { *lib.get::<ExternalFa3InitFn>(b"luminal_external_fa3_init\0")? };
-        let external_sink_decode_run: ExternalFa3SinkDecodeRunFn = unsafe {
-            *lib.get::<ExternalFa3SinkDecodeRunFn>(b"luminal_external_fa3_sink_decode_run\0")?
-        };
         let transpose_output_f32: Fa3TransposeFn =
             unsafe { *lib.get::<Fa3TransposeFn>(b"flashinfer_fa3_transpose_output_f32\0")? };
         let transpose_output_bf16: Fa3TransposeFn =
@@ -482,8 +449,6 @@ impl Fa3Lib {
             prefill_plan,
             prefill_run,
             sink_decode_run,
-            external_init,
-            external_sink_decode_run,
             transpose_output_f32,
             transpose_output_bf16,
             transpose_q_bf16,

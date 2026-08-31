@@ -211,20 +211,12 @@ struct CompiledCapturedHost {
 impl CompiledCapturedHost {
     fn captured_pointer_nodes(&self) -> Vec<NodeIndex> {
         let host = self.host_op.as_ref().as_ref();
-        if host.as_any().downcast_ref::<SinkAttention>().is_some() {
-            // qo_indptr remains planner-only. Uniform decode consumes the live
-            // kv_indptr from its captured kernel, while prefill merely tracks
-            // the extra stable pointer harmlessly.
-            std::iter::once(self.node)
-                .chain(self.inputs[..4].iter().copied())
-                .chain(self.inputs.get(5).copied())
-                .chain(self.inputs.get(6).copied())
-                .collect()
-        } else {
-            std::iter::once(self.node)
-                .chain(self.inputs.iter().copied())
-                .collect()
-        }
+        let inputs: Box<dyn Iterator<Item = NodeIndex> + '_> =
+            match host.cuda_graph_capture_pointer_inputs() {
+                Some(indices) => Box::new(indices.iter().map(|&index| self.inputs[index])),
+                None => Box::new(self.inputs.iter().copied()),
+            };
+        std::iter::once(self.node).chain(inputs).collect()
     }
 
     fn prepare_graph_capture(
@@ -1041,28 +1033,11 @@ impl CudaGraphOp {
             let pointer_nodes = op.captured_pointer_nodes();
             library_buffer_nodes.extend(pointer_nodes.iter().copied());
             captured_host_buffer_nodes.extend(pointer_nodes);
-            if let Some(attention) = op
-                .host_op
-                .as_ref()
-                .as_ref()
-                .as_any()
-                .downcast_ref::<SinkAttention>()
-            {
-                // FA3 graph mode keeps context growth within a fixed request
-                // geometry in its per-tick workspace. Query rows and the
-                // request indptr geometry both affect captured launch shapes;
-                // continuous batching can change `r` while `s` stays in the
-                // same token bucket, so retain both as capture boundaries.
-                attention
-                    .batch_dim
-                    .collect_dyn_vars_into(&mut captured_host_dyn_dims);
-                // The serving attention ABI uses `r` for indptr rows. These
-                // planner-only buffers are not guaranteed to appear in the
-                // materialized graph-size map, so record the geometry symbol
-                // explicitly rather than relying only on size discovery.
-                captured_host_dyn_dims.insert(Symbol::from('r'));
-                for node in op.inputs.iter().skip(4).take(2) {
-                    if let Some(size) = buffer_sizes.get(node) {
+            let host = op.host_op.as_ref().as_ref();
+            captured_host_dyn_dims.extend(host.cuda_graph_capture_dyn_dims());
+            if let Some(indices) = host.cuda_graph_capture_shape_inputs() {
+                for &index in indices {
+                    if let Some(size) = buffer_sizes.get(&op.inputs[index]) {
                         size.collect_dyn_vars_into(&mut captured_host_dyn_dims);
                     }
                 }

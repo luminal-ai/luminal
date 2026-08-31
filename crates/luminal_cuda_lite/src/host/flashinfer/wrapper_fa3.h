@@ -72,21 +72,6 @@ int flashinfer_sink_decode_run(
     float sm_scale, int window_left, bool token_major_output,
     cudaStream_t stream);
 
-// Optional standalone FlashAttention-3 adapter. The supplied library must
-// export the pinned FA3 `run_mha_fwd` and `run_mha_fwd_combine` C++ symbols.
-int luminal_external_fa3_init(const char* library_path);
-
-int luminal_external_fa3_sink_decode_run(
-    void* float_workspace, size_t float_workspace_size,
-    void* int_workspace, size_t int_workspace_size,
-    const void* q, const void* k_cache, const void* v_cache,
-    const int32_t* token_indices, const int32_t* qo_indptr,
-    const int32_t* kv_indptr,
-    const float* sink, void* output,
-    int batch_size, int num_qo_heads, int num_kv_heads,
-    int max_context_len, int num_pages, int page_size,
-    float sm_scale, int window_left, cudaStream_t stream);
-
 // (s, heads, dim) bf16 → (heads, s, dim) f32, one fused pass.
 int flashinfer_fa3_transpose_output_f32(
     const void* src, void* dst,

@@ -75,7 +75,9 @@ struct CachedPlan {
 static PLAN_CACHE: std::sync::Mutex<Option<CachedPlan>> = std::sync::Mutex::new(None);
 static DECODE_PLAN_CACHE: std::sync::Mutex<Option<CachedPlan>> = std::sync::Mutex::new(None);
 
-#[derive(Debug)]
+pub const SINK_ATTENTION_INPUTS: usize = 7;
+
+#[derive(Debug, Clone)]
 pub struct SinkAttention {
     pub num_qo_heads: usize,
     pub num_kv_heads: usize,
@@ -96,6 +98,31 @@ pub struct SinkAttention {
     pub token_major_output: bool,
 }
 
+/// The seven runtime buffers shared by native and derived sink-attention
+/// implementations. Superset backends can reuse the graph contract without
+/// copying Lite's native FA3 planner or kernel implementation.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct SinkAttentionBuffers {
+    pub q: DeviceBuffer,
+    pub k_pool: DeviceBuffer,
+    pub v_pool: DeviceBuffer,
+    pub kv_indices: DeviceBuffer,
+    pub qo_indptr: DeviceBuffer,
+    pub kv_indptr: DeviceBuffer,
+    pub sinks: DeviceBuffer,
+    pub output: DeviceBuffer,
+}
+
+/// Validated uniform-decode geometry shared by native and derived attention
+/// implementations.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkAttentionDecodeGeometry {
+    pub batch_size: usize,
+    pub total_pages: usize,
+}
+
 impl Default for SinkAttention {
     fn default() -> Self {
         Self {
@@ -113,20 +140,7 @@ impl Default for SinkAttention {
 
 impl EgglogOp for SinkAttention {
     fn sort(&self) -> SortDef {
-        sort(
-            OP_KIND,
-            "SinkAttention",
-            &[
-                ("num_qo_heads", EXPRESSION),
-                ("num_kv_heads", EXPRESSION),
-                ("head_dim", EXPRESSION),
-                ("batch_dim", EXPRESSION),
-                ("sm_scale", F64),
-                ("window_left", F64),
-                ("output_dtype", DTYPE),
-                ("token_major_output", F64),
-            ],
-        )
+        sink_attention_sort("SinkAttention")
     }
 
     fn n_inputs(&self) -> usize {
@@ -151,68 +165,13 @@ impl EgglogOp for SinkAttention {
         _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let num_qo_heads = extract_expr(egraph, kind_children[0], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let num_kv_heads = extract_expr(egraph, kind_children[1], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let head_dim = extract_expr(egraph, kind_children[2], expr_cache)
-            .unwrap()
-            .exec(&FxHashMap::default())
-            .unwrap();
-        let batch_dim = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
-        let sm_scale: f64 = egraph.enodes[kind_children[4]]
-            .0
-            .replace('"', "")
-            .parse()
-            .unwrap();
-        let window_left = egraph.enodes[kind_children[5]]
-            .0
-            .replace('"', "")
-            .parse::<f64>()
-            .unwrap()
-            .round() as i64;
-        let output_dtype = extract_dtype(egraph, kind_children[6]);
-        let token_major_output = egraph.enodes[kind_children[7]]
-            .0
-            .replace('"', "")
-            .parse::<f64>()
-            .unwrap()
-            != 0.0;
-
-        let extracted = Self {
-            num_qo_heads,
-            num_kv_heads,
-            head_dim,
-            batch_dim,
-            sm_scale,
-            window_left,
-            output_dtype,
-            token_major_output,
-        };
+        let (extracted, final_inputs) =
+            extract_sink_attention(egraph, kind_children, input_enodes, expr_cache);
 
         // JIT at extract time so the ~45s nvcc cost never lands inside a
         // GA profiling trial (same rationale as FlashInferAttention).
-        let _ = jit::ensure_compiled_fa3(head_dim, window_left >= 0);
-        let _ = jit::ensure_compiled(head_dim, window_left >= 0);
-
-        // The rule passes the FLAT gather index (proof anchor); recover the
-        // compact per-token page table the kernel consumes.
-        let flat_idx_node = input_enodes[3];
-        let gather_idx = super::find_indptrs::try_find_compact_gather_idx(egraph, flat_idx_node)
-            .expect("SinkAttention matched a gather without recoverable compact gather_idx");
-        let final_inputs = vec![
-            input_enodes[0], // q (bf16)
-            input_enodes[1], // k_pool
-            input_enodes[2], // v_pool
-            gather_idx,      // compact kv_indices
-            input_enodes[4], // qo_indptr
-            input_enodes[5], // kv_indptr
-            input_enodes[6], // sinks (f32)
-        ];
+        let _ = jit::ensure_compiled_fa3(extracted.head_dim, extracted.window_left >= 0);
+        let _ = jit::ensure_compiled(extracted.head_dim, extracted.window_left >= 0);
 
         let op = LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>);
         (op, final_inputs)
@@ -223,34 +182,177 @@ impl EgglogOp for SinkAttention {
     }
 }
 
+/// Construct the common descriptor sort under a backend-owned operation
+/// name. This keeps superset alternatives ABI-compatible with Lite's native
+/// `SinkAttention` without registering the same sort twice.
+#[doc(hidden)]
+pub fn sink_attention_sort(name: &'static str) -> SortDef {
+    sort(
+        OP_KIND,
+        name,
+        &[
+            ("num_qo_heads", EXPRESSION),
+            ("num_kv_heads", EXPRESSION),
+            ("head_dim", EXPRESSION),
+            ("batch_dim", EXPRESSION),
+            ("sm_scale", F64),
+            ("window_left", F64),
+            ("output_dtype", DTYPE),
+            ("token_major_output", F64),
+        ],
+    )
+}
+
+/// Extract the common sink-attention descriptor and recover the compact page
+/// table from the rewrite's flat gather proof anchor.
+#[doc(hidden)]
+pub fn extract_sink_attention<'a>(
+    egraph: &'a SerializedEGraph,
+    kind_children: &[&'a ENodeId],
+    input_enodes: Vec<&'a ENodeId>,
+    expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+) -> (SinkAttention, Vec<&'a ENodeId>) {
+    let num_qo_heads = extract_expr(egraph, kind_children[0], expr_cache)
+        .unwrap()
+        .exec(&FxHashMap::default())
+        .unwrap();
+    let num_kv_heads = extract_expr(egraph, kind_children[1], expr_cache)
+        .unwrap()
+        .exec(&FxHashMap::default())
+        .unwrap();
+    let head_dim = extract_expr(egraph, kind_children[2], expr_cache)
+        .unwrap()
+        .exec(&FxHashMap::default())
+        .unwrap();
+    let batch_dim = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+    let sm_scale = egraph.enodes[kind_children[4]]
+        .0
+        .replace('"', "")
+        .parse()
+        .unwrap();
+    let window_left = egraph.enodes[kind_children[5]]
+        .0
+        .replace('"', "")
+        .parse::<f64>()
+        .unwrap()
+        .round() as i64;
+    let output_dtype = extract_dtype(egraph, kind_children[6]);
+    let token_major_output = egraph.enodes[kind_children[7]]
+        .0
+        .replace('"', "")
+        .parse::<f64>()
+        .unwrap()
+        != 0.0;
+    let descriptor = SinkAttention {
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        batch_dim,
+        sm_scale,
+        window_left,
+        output_dtype,
+        token_major_output,
+    };
+
+    assert_eq!(input_enodes.len(), SINK_ATTENTION_INPUTS);
+    let gather_idx = super::find_indptrs::try_find_compact_gather_idx(egraph, input_enodes[3])
+        .expect("SinkAttention matched a gather without recoverable compact gather_idx");
+    let final_inputs = vec![
+        input_enodes[0],
+        input_enodes[1],
+        input_enodes[2],
+        gather_idx,
+        input_enodes[4],
+        input_enodes[5],
+        input_enodes[6],
+    ];
+    (descriptor, final_inputs)
+}
+
 impl SinkAttention {
-    fn external_fa3_library(&self) -> Option<String> {
-        (self.head_dim == 64 && self.output_dtype == DType::Bf16 && self.token_major_output)
-            .then(|| std::env::var("LUMINAL_EXTERNAL_FA3_LIBRARY").ok())
-            .flatten()
+    /// Bind and validate the stable seven-input attention ABI.
+    #[doc(hidden)]
+    pub fn bind_buffers(
+        &self,
+        self_node: NodeIndex,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+    ) -> anyhow::Result<SinkAttentionBuffers> {
+        anyhow::ensure!(
+            inputs.len() == SINK_ATTENTION_INPUTS,
+            "SinkAttention expects {SINK_ATTENTION_INPUTS} inputs, got {}",
+            inputs.len()
+        );
+        let get = |node: NodeIndex, what: &str| {
+            buffers
+                .get(&node)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("SinkAttention: missing buffer for {what}"))
+        };
+        Ok(SinkAttentionBuffers {
+            q: get(inputs[0], "q")?,
+            k_pool: get(inputs[1], "k_pool")?,
+            v_pool: get(inputs[2], "v_pool")?,
+            kv_indices: get(inputs[3], "kv_indices")?,
+            qo_indptr: get(inputs[4], "qo_indptr")?,
+            kv_indptr: get(inputs[5], "kv_indptr")?,
+            sinks: get(inputs[6], "sinks")?,
+            output: get(self_node, "output")?,
+        })
     }
 
-    fn initialize_external_fa3(&self) -> anyhow::Result<Option<&'static jit::Fa3Lib>> {
-        let Some(path) = self.external_fa3_library() else {
+    /// Return the concrete scale passed to native or derived kernels.
+    #[doc(hidden)]
+    pub fn resolved_sm_scale(&self) -> f32 {
+        if self.sm_scale == 0.0 {
+            1.0 / (self.head_dim as f32).sqrt()
+        } else {
+            self.sm_scale as f32
+        }
+    }
+
+    /// Validate the common uniform-decode buffer contract.
+    #[doc(hidden)]
+    pub fn decode_geometry(
+        &self,
+        inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+        io: &SinkAttentionBuffers,
+        default_min_batch: usize,
+    ) -> anyhow::Result<Option<SinkAttentionDecodeGeometry>> {
+        let Some((batch_size, total_pages)) =
+            self.uniform_decode_geometry(inputs, buffers, dyn_map, default_min_batch)
+        else {
             return Ok(None);
         };
-        let path = std::ffi::CString::new(path)
-            .map_err(|_| anyhow::anyhow!("LUMINAL_EXTERNAL_FA3_LIBRARY contains a NUL byte"))?;
-        let lib = jit::ensure_compiled_fa3(self.head_dim, self.window_left >= 0);
-        let ret = unsafe { (lib.external_init)(path.as_ptr()) };
-        anyhow::ensure!(ret == 0, "SinkAttention: external FA3 init failed ({ret})");
-        Ok(Some(lib))
+        let native_bytes = batch_size * self.num_qo_heads * self.head_dim * 2;
+        let output_bytes =
+            batch_size * self.num_qo_heads * self.head_dim * (self.output_dtype.bits() / 8);
+        anyhow::ensure!(
+            io.q.capacity() >= native_bytes && io.output.capacity() >= output_bytes,
+            "SinkAttention decode q/output is too small for batch {batch_size}"
+        );
+        anyhow::ensure!(
+            io.kv_indices.len() >= total_pages * std::mem::size_of::<i32>(),
+            "SinkAttention decode kv_indices buffer smaller than kv_indptr total"
+        );
+        Ok(Some(SinkAttentionDecodeGeometry {
+            batch_size,
+            total_pages,
+        }))
     }
 
     /// Return `(request_count, total_pages)` when the descriptor is a uniform
     /// one-query-row decode batch. Serving buffers carry authoritative host
     /// mirrors, so this check adds no device synchronization. Direct callers
     /// without mirrors simply retain the planned FA3 prefill path.
-    fn uniform_decode_geometry(
+    pub fn uniform_decode_geometry(
         &self,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
+        default_min_batch: usize,
     ) -> Option<(usize, usize)> {
         let supported_output = (self.output_dtype == DType::Bf16)
             || (self.output_dtype == DType::F32 && !self.token_major_output);
@@ -267,11 +369,7 @@ impl SinkAttention {
         let min_batch = std::env::var("LUMINAL_CUDA_SINK_DECODE_MIN_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(if self.external_fa3_library().is_some() {
-                1
-            } else {
-                3
-            });
+            .unwrap_or(default_min_batch);
         if logical_rows < min_batch {
             return None;
         }
@@ -587,12 +685,8 @@ impl SinkAttention {
         dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         if let Some((batch_size, total_pages)) =
-            self.uniform_decode_geometry(inputs, buffers, dyn_map)
+            self.uniform_decode_geometry(inputs, buffers, dyn_map, 3)
         {
-            if self.initialize_external_fa3()?.is_some() {
-                let _ = sink_attention_workspaces(stream);
-                return Ok(());
-            }
             self.plan_decode(stream, inputs, buffers, 0, true, batch_size, total_pages)?;
             if self.output_dtype != DType::Bf16 || !self.token_major_output {
                 let temp_bytes = (batch_size * self.num_qo_heads * self.head_dim * 2).max(1);
@@ -623,11 +717,8 @@ impl SinkAttention {
         execution_id: u64,
     ) -> anyhow::Result<()> {
         if let Some((batch_size, total_pages)) =
-            self.uniform_decode_geometry(inputs, buffers, dyn_map)
+            self.uniform_decode_geometry(inputs, buffers, dyn_map, 3)
         {
-            if self.initialize_external_fa3()?.is_some() {
-                return Ok(());
-            }
             self.plan_decode(
                 stream,
                 inputs,
@@ -645,6 +736,27 @@ impl SinkAttention {
 }
 
 impl HostOp for SinkAttention {
+    fn cuda_graph_capture_pointer_inputs(&self) -> Option<&'static [usize]> {
+        // qo_indptr is planner-only for native FA3. Uniform decode consumes
+        // live kv_indptr, while prefill harmlessly tracks its stable pointer.
+        Some(&[0, 1, 2, 3, 5, 6])
+    }
+
+    fn cuda_graph_capture_shape_inputs(&self) -> Option<&'static [usize]> {
+        // Context payload growth stays on the body-only fast path. Only the
+        // request-indptr shapes participate in native launch geometry.
+        Some(&[4, 5])
+    }
+
+    fn cuda_graph_capture_dyn_dims(&self) -> Vec<Symbol> {
+        let mut dims = FxHashSet::default();
+        self.batch_dim.collect_dyn_vars_into(&mut dims);
+        // Serving uses `r` for indptr rows, including in paths where those
+        // planner-only buffers do not retain a materialized size expression.
+        dims.insert(Symbol::from('r'));
+        dims.into_iter().collect()
+    }
+
     fn prepare_cuda_graph_capture(
         &self,
         stream: &Arc<CudaStream>,
@@ -688,29 +800,23 @@ impl HostOp for SinkAttention {
         dyn_map: &DynMap,
         execution_id: u64,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            inputs.len() == 7,
-            "SinkAttention expects 7 inputs, got {}",
-            inputs.len()
-        );
-        let buf = |n: NodeIndex, what: &str| -> anyhow::Result<DeviceBuffer> {
-            buffers
-                .get(&n)
-                .copied()
-                .ok_or_else(|| anyhow::anyhow!("SinkAttention: missing buffer for {what}"))
-        };
-        let q = buf(inputs[0], "q")?;
-        let k_pool = buf(inputs[1], "k_pool")?;
-        let v_pool = buf(inputs[2], "v_pool")?;
-        let kv_indices = buf(inputs[3], "kv_indices")?;
-        let qo_indptr_buf = buf(inputs[4], "qo_indptr")?;
-        let kv_indptr_buf = buf(inputs[5], "kv_indptr")?;
-        let sinks = buf(inputs[6], "sinks")?;
-        let out = buf(self_node, "output")?;
+        let io = self.bind_buffers(self_node, inputs, buffers)?;
+        let SinkAttentionBuffers {
+            q,
+            k_pool,
+            v_pool,
+            kv_indices,
+            qo_indptr: qo_indptr_buf,
+            kv_indptr: kv_indptr_buf,
+            sinks,
+            output: out,
+        } = io;
 
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
-        let decode_geometry = self.uniform_decode_geometry(inputs, buffers, dyn_map);
+        let decode_geometry = self
+            .decode_geometry(inputs, buffers, dyn_map, &io, 3)?
+            .map(|geometry| (geometry.batch_size, geometry.total_pages));
         if std::env::var_os("LUMINAL_CUDA_DEBUG_SINK_DECODE").is_some() {
             eprintln!(
                 "SinkAttention decode candidate: geometry={decode_geometry:?} dtype={:?} token_major={} rows={:?} qo_bytes={} kv_bytes={} q_host={} kv_host={} s={:?} r={:?} c={:?}",
@@ -728,71 +834,7 @@ impl HostOp for SinkAttention {
         }
         if let Some((batch_size, total_pages)) = decode_geometry {
             let native_bytes = batch_size * self.num_qo_heads * self.head_dim * 2;
-            let output_bytes =
-                batch_size * self.num_qo_heads * self.head_dim * (self.output_dtype.bits() / 8);
-            anyhow::ensure!(
-                q.capacity() >= native_bytes && out.capacity() >= output_bytes,
-                "SinkAttention decode q/output is too small for batch {batch_size}"
-            );
-            anyhow::ensure!(
-                kv_indices.len() >= total_pages * std::mem::size_of::<i32>(),
-                "SinkAttention decode kv_indices buffer smaller than kv_indptr total"
-            );
-            let sm_scale = if self.sm_scale == 0.0 {
-                1.0 / (self.head_dim as f32).sqrt()
-            } else {
-                self.sm_scale as f32
-            };
-            if let Some(external) = self.initialize_external_fa3()? {
-                let max_context_len = std::env::var("LUMINAL_EXTERNAL_FA3_MAX_CONTEXT")
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|&value| value > 0)
-                    .unwrap_or(4096);
-                let page_size = std::env::var("LUMINAL_KV_PAGE_SIZE")
-                    .ok()
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .filter(|&value| value > 0 && value.is_power_of_two())
-                    .unwrap_or(1);
-                let page_bytes = self.num_kv_heads * self.head_dim * 2 * page_size;
-                anyhow::ensure!(
-                    page_bytes > 0 && k_pool.len().is_multiple_of(page_bytes),
-                    "SinkAttention: malformed BF16 KV cache size"
-                );
-                let num_pages = k_pool.len() / page_bytes;
-                let (_float_ws, float_ws_ptr, _int_ws, int_ws_ptr) =
-                    sink_attention_workspaces(stream);
-                let run_ret = unsafe {
-                    (external.external_sink_decode_run)(
-                        float_ws_ptr as *mut std::ffi::c_void,
-                        super::FLOAT_WORKSPACE_SIZE,
-                        int_ws_ptr as *mut std::ffi::c_void,
-                        INT_WORKSPACE_SIZE,
-                        q.ptr() as *const std::ffi::c_void,
-                        k_pool.ptr() as *const std::ffi::c_void,
-                        v_pool.ptr() as *const std::ffi::c_void,
-                        kv_indices.ptr() as *const i32,
-                        qo_indptr_buf.ptr() as *const i32,
-                        kv_indptr_buf.ptr() as *const i32,
-                        sinks.ptr() as *const f32,
-                        out.ptr() as *mut std::ffi::c_void,
-                        batch_size as i32,
-                        self.num_qo_heads as i32,
-                        self.num_kv_heads as i32,
-                        max_context_len as i32,
-                        num_pages as i32,
-                        page_size as i32,
-                        sm_scale,
-                        self.window_left as i32,
-                        cu_stream,
-                    )
-                };
-                anyhow::ensure!(
-                    run_ret == 0,
-                    "SinkAttention: external FA3 decode failed ({run_ret})"
-                );
-                return Ok(());
-            }
+            let sm_scale = self.resolved_sm_scale();
             let mut plan = self.plan_decode(
                 stream,
                 inputs,
@@ -1095,11 +1137,7 @@ impl HostOp for SinkAttention {
             );
         }
 
-        let sm_scale = if self.sm_scale == 0.0 {
-            1.0 / (self.head_dim as f32).sqrt()
-        } else {
-            self.sm_scale as f32
-        };
+        let sm_scale = self.resolved_sm_scale();
         let run_ret = unsafe {
             (lib.prefill_run)(
                 int_ws_ptr as *mut std::ffi::c_void,

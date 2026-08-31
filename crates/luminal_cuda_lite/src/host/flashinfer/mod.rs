@@ -304,6 +304,13 @@ pub(crate) fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation 
     }
 }
 
+/// Resource-plan identity for the workspaces shared by Lite's native
+/// attention and backend-owned derived attention implementations.
+#[doc(hidden)]
+pub fn sink_attention_shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
+    shared_device_memory_allocation()
+}
+
 /// Process-global workspaces survive after the graph that first requested
 /// them is discarded. Resource planning must therefore keep charging them to
 /// later candidates, including candidates with no FlashInfer op of their own.
@@ -1183,6 +1190,27 @@ fn sink_attention_workspaces(
     let &(float_ptr, int_ptr) =
         POINTERS.get_or_init(|| (float_ws.device_ptr(stream).0, int_ws.device_ptr(stream).0));
     (float_ws, float_ptr, int_ws, int_ptr)
+}
+
+/// Stable device pointer and size for attention execution scratch that is safe
+/// to share between stream-serialized native and backend-owned implementations.
+/// Native integer schedules remain private because they persist from planning
+/// until a later captured graph launch.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct SinkAttentionFloatWorkspace {
+    pub ptr: u64,
+    pub bytes: usize,
+}
+
+#[doc(hidden)]
+pub fn sink_attention_float_workspace(stream: &Arc<CudaStream>) -> SinkAttentionFloatWorkspace {
+    let float = FLOAT_WORKSPACE
+        .get_or_init(|| unsafe { stream.alloc::<u8>(FLOAT_WORKSPACE_SIZE).unwrap() });
+    SinkAttentionFloatWorkspace {
+        ptr: float.device_ptr(stream).0,
+        bytes: FLOAT_WORKSPACE_SIZE,
+    }
 }
 
 fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
