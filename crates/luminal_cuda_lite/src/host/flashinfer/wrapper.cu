@@ -83,89 +83,6 @@ using DecodeParamsT = BatchDecodeParams<T, T, T, IdType>;
 template <typename T>
 using PrefillParamsT = BatchPrefillPagedParams<T, T, T, IdType>;
 
-// Page size is exactly one in the inference server, so the sequence length is
-// simply the page-table span. This removes the otherwise-required
-// `last_page_len` side buffer from SinkAttention's established ABI.
-template <typename T>
-struct PageOnePagedKV : paged_kv_t<T, IdType> {
-  using Base = paged_kv_t<T, IdType>;
-  using Base::Base;
-
-  __host__ __device__ __forceinline__ uint32_t get_length(uint32_t batch_idx) const {
-    return this->indptr[batch_idx + 1] - this->indptr[batch_idx];
-  }
-};
-
-template <typename T>
-struct SinkDecodeParams {
-  using DTypeQ = T;
-  using DTypeKV = T;
-  using DTypeO = T;
-  using IdType = ::IdType;
-
-  T* q;
-  IdType* q_rope_offset;
-  PageOnePagedKV<T> paged_kv;
-  T* o;
-  float* lse;
-  float* maybe_alibi_slopes;
-  uint32_t padded_batch_size;
-  uint32_t num_qo_heads;
-  IdType q_stride_n;
-  IdType q_stride_h;
-  int32_t window_left;
-  float logits_soft_cap;
-  float sm_scale;
-  float rope_rcp_scale;
-  float rope_rcp_theta;
-  IdType* request_indices;
-  IdType* kv_tile_indices;
-  IdType* o_indptr;
-  IdType* kv_chunk_size_ptr;
-  bool* block_valid_mask;
-  bool partition_kv;
-  float* sink;
-
-  __host__ __device__ __forceinline__ int32_t get_qo_len(int32_t) const { return 1; }
-  __host__ __device__ __forceinline__ int32_t get_kv_len(int32_t batch_idx) const {
-    return paged_kv.get_length(batch_idx);
-  }
-};
-
-// FlashInfer's generated FA2 attention-sink variant. `kv_tile_idx == 0`
-// inserts the sink exactly once before split-KV states are merged.
-struct DecodeAttentionSink : AttentionVariantBase {
-  static constexpr bool use_softmax = true;
-  uint32_t window_left, qo_len, kv_len;
-  float sm_scale_log2;
-
-  template <typename Params>
-  __device__ __host__ DecodeAttentionSink(const Params& params, uint32_t batch_idx,
-                                          uint8_t*) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
-    sm_scale_log2 = params.sm_scale * math::log2e;
-  }
-
-  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-    return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
-  })
-
-  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
-    // decode.cuh applies OutputTransform once per vector register. Keep m/d
-    // immutable so every component receives the same sink normalization.
-    // This decoder deliberately uses a non-split schedule (see its planner),
-    // hence the sink is inserted exactly once for every output row.
-    float log_sink = params.sink[qo_head_idx] * math::log2e;
-    float m_new = (log_sink > m) ? log_sink : m;
-    float sink_scale = math::ptx_exp2(m - m_new);
-    float d_new = math::ptx_exp2(log_sink - m_new) + d * sink_scale;
-    float d_rcp = (m_new != -math::inf) ? math::ptx_rcp(d_new) : 0.f;
-    return output * sink_scale * d_rcp;
-  })
-};
-
 // Forward declarations
 namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
@@ -181,7 +98,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                     float* tmp_s, bool enable_pdl,
                                                     cudaStream_t stream);
 }
-
 // Explicit instantiation: decode kernels (f32 only up to HEAD_DIM 256 —
 // f32 at 512 needs vec_bits 512 which exceeds cp.async's 256-bit limit)
 #if LUMINAL_HEAD_DIM <= 256
@@ -198,11 +114,6 @@ template cudaError_t flashinfer::BatchDecodeWithPagedKVCacheDispatched<
     HEAD_DIM, POS_ENCODING_MODE, Variant, DecodeParamsT<__nv_bfloat16>>(
     DecodeParamsT<__nv_bfloat16> params, __nv_bfloat16* tmp_v, float* tmp_s, bool enable_pdl,
     cudaStream_t stream);
-
-template cudaError_t flashinfer::BatchDecodeWithPagedKVCacheDispatched<
-    HEAD_DIM, POS_ENCODING_MODE, DecodeAttentionSink, SinkDecodeParams<__nv_bfloat16>>(
-    SinkDecodeParams<__nv_bfloat16> params, __nv_bfloat16* tmp_v, float* tmp_s,
-    bool enable_pdl, cudaStream_t stream);
 
 // Explicit instantiation: prefill kernels (f16 + bf16, causal mask, CTA_TILE_Q=16/64/128)
 #define LUMINAL_INSTANTIATE_PREFILL(T, CTA_TILE_Q)                                          \
@@ -506,129 +417,6 @@ static int batch_prefill_run_t(
     return (int)status;
 }
 
-static int sink_decode_plan(
-    void* float_workspace, size_t float_ws_size,
-    void* int_workspace, size_t int_ws_size,
-    void* page_locked_int_workspace,
-    int32_t* kv_indptr_h, int batch_size,
-    int num_qo_heads, int num_kv_heads,
-    bool enable_cuda_graph, cudaStream_t stream,
-    int64_t* plan_info_out, int* plan_info_len_out) {
-  DecodePlanInfo plan_info;
-  (void)float_workspace;
-  (void)float_ws_size;
-  (void)kv_indptr_h;
-  (void)num_qo_heads;
-  (void)num_kv_heads;
-  if (batch_size < 0) return -1;
-
-  // At head_dim=64/GQA=8 a decode CTA already parallelizes each sequence
-  // across 128 threads. Avoid split-KV: its state merge has no hook for
-  // adding a denominator-only sink after the per-chunk LSEs are produced.
-  // The compact identity schedule also makes planning independent of context
-  // lengths and cheap to capture.
-  size_t request_offset = 0;
-  size_t kv_tile_offset = ((size_t)batch_size * sizeof(IdType) + 15) & ~size_t(15);
-  size_t o_indptr_offset =
-      (kv_tile_offset + (size_t)batch_size * sizeof(IdType) + 15) & ~size_t(15);
-  size_t chunk_offset =
-      (o_indptr_offset + (size_t)(batch_size + 1) * sizeof(IdType) + 15) & ~size_t(15);
-  size_t used = chunk_offset + sizeof(IdType);
-  if (used > int_ws_size) return -2;
-
-  auto* host = static_cast<uint8_t*>(page_locked_int_workspace);
-  auto* request = reinterpret_cast<IdType*>(host + request_offset);
-  auto* kv_tile = reinterpret_cast<IdType*>(host + kv_tile_offset);
-  auto* o_indptr = reinterpret_cast<IdType*>(host + o_indptr_offset);
-  auto* chunk = reinterpret_cast<IdType*>(host + chunk_offset);
-  for (int i = 0; i < batch_size; ++i) {
-    request[i] = i;
-    kv_tile[i] = 0;
-    o_indptr[i] = i;
-  }
-  o_indptr[batch_size] = batch_size;
-  chunk[0] = 1;
-  cudaError_t status = cudaMemcpyAsync(
-      int_workspace, page_locked_int_workspace, used, cudaMemcpyHostToDevice, stream);
-  if (status != cudaSuccess) return (int)status;
-
-  plan_info.padded_batch_size = batch_size;
-  plan_info.v_offset = 0;
-  plan_info.s_offset = 0;
-  plan_info.request_indices_offset = request_offset;
-  plan_info.kv_tile_indices_offset = kv_tile_offset;
-  plan_info.o_indptr_offset = o_indptr_offset;
-  plan_info.block_valid_mask_offset = 0;
-  plan_info.kv_chunk_size_ptr_offset = chunk_offset;
-  plan_info.enable_cuda_graph = enable_cuda_graph;
-  plan_info.split_kv = false;
-  auto vec = plan_info.ToVector();
-  *plan_info_len_out = (int)vec.size();
-  std::memcpy(plan_info_out, vec.data(), vec.size() * sizeof(int64_t));
-  return 0;
-}
-
-static int sink_decode_run(
-    void* float_workspace, void* int_workspace,
-    int64_t* plan_info_vec, int plan_info_len,
-    const __nv_bfloat16* q, const __nv_bfloat16* k_cache,
-    const __nv_bfloat16* v_cache, int32_t* kv_indptr,
-    int32_t* kv_indices, const float* sink, __nv_bfloat16* output,
-    int batch_size, int num_qo_heads, int num_kv_heads,
-    float sm_scale, int window_left, cudaStream_t stream) {
-  using Params = SinkDecodeParams<__nv_bfloat16>;
-  DecodePlanInfo plan_info;
-  plan_info.FromVector(std::vector<int64_t>(plan_info_vec, plan_info_vec + plan_info_len));
-
-  PageOnePagedKV<__nv_bfloat16> paged_kv(
-      (uint32_t)num_kv_heads, /*page_size=*/1, HEAD_DIM,
-      (uint32_t)batch_size, QKVLayout::kNHD,
-      const_cast<__nv_bfloat16*>(k_cache), const_cast<__nv_bfloat16*>(v_cache),
-      kv_indices, kv_indptr, /*last_page_len=*/nullptr);
-  Params params{};
-  params.q = const_cast<__nv_bfloat16*>(q);
-  params.q_rope_offset = nullptr;
-  params.paged_kv = paged_kv;
-  params.o = output;
-  params.lse = nullptr;
-  params.maybe_alibi_slopes = nullptr;
-  params.padded_batch_size = plan_info.padded_batch_size;
-  params.num_qo_heads = (uint32_t)num_qo_heads;
-  // SinkAttention's graph spelling is [heads, batch, dim]. Decode supports
-  // arbitrary Q strides, so consume it directly without a transpose.
-  params.q_stride_n = HEAD_DIM;
-  params.q_stride_h = batch_size * HEAD_DIM;
-  params.window_left = window_left;
-  params.logits_soft_cap = 0.f;
-  params.sm_scale = sm_scale;
-  params.rope_rcp_scale = 1.f;
-  params.rope_rcp_theta = 1.f;
-  params.request_indices =
-      GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.request_indices_offset);
-  params.kv_tile_indices =
-      GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_tile_indices_offset);
-  params.o_indptr = GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.o_indptr_offset);
-  params.kv_chunk_size_ptr =
-      GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_chunk_size_ptr_offset);
-  params.block_valid_mask = nullptr;
-  params.partition_kv = false;
-  params.sink = const_cast<float*>(sink);
-
-  __nv_bfloat16* tmp_v = nullptr;
-  float* tmp_s = nullptr;
-  if (plan_info.split_kv) {
-    tmp_v = GetPtrFromBaseOffset<__nv_bfloat16>(float_workspace, plan_info.v_offset);
-    tmp_s = GetPtrFromBaseOffset<float>(float_workspace, plan_info.s_offset);
-    if (plan_info.enable_cuda_graph) {
-      params.block_valid_mask =
-          GetPtrFromBaseOffset<bool>(int_workspace, plan_info.block_valid_mask_offset);
-    }
-  }
-  return (int)flashinfer::BatchDecodeWithPagedKVCacheDispatched<
-      HEAD_DIM, POS_ENCODING_MODE, DecodeAttentionSink>(
-      params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
-}
-
 extern "C" {
 
 int flashinfer_batch_decode_plan(
@@ -719,36 +507,6 @@ int flashinfer_batch_decode_run(
         default:
             return -1;
     }
-}
-
-int flashinfer_sink_decode_plan(
-    void* float_workspace, size_t float_ws_size,
-    void* int_workspace, size_t int_ws_size,
-    void* page_locked_int_workspace,
-    int32_t* kv_indptr_h, int batch_size,
-    int num_qo_heads, int num_kv_heads,
-    bool enable_cuda_graph, cudaStream_t stream,
-    int64_t* plan_info_out, int* plan_info_len_out) {
-  return sink_decode_plan(
-      float_workspace, float_ws_size, int_workspace, int_ws_size,
-      page_locked_int_workspace, kv_indptr_h, batch_size, num_qo_heads,
-      num_kv_heads, enable_cuda_graph, stream, plan_info_out,
-      plan_info_len_out);
-}
-
-int flashinfer_sink_decode_run(
-    void* float_workspace, void* int_workspace,
-    int64_t* plan_info_vec, int plan_info_len,
-    const void* q, const void* k_cache, const void* v_cache,
-    int32_t* kv_indptr, int32_t* kv_indices, const float* sink,
-    void* output, int batch_size, int num_qo_heads, int num_kv_heads,
-    float sm_scale, int window_left, cudaStream_t stream) {
-  return sink_decode_run(
-      float_workspace, int_workspace, plan_info_vec, plan_info_len,
-      (const __nv_bfloat16*)q, (const __nv_bfloat16*)k_cache,
-      (const __nv_bfloat16*)v_cache, kv_indptr, kv_indices, sink,
-      (__nv_bfloat16*)output, batch_size, num_qo_heads, num_kv_heads,
-      sm_scale, window_left, stream);
 }
 
 void flashinfer_prepare_decode_metadata(

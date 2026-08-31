@@ -7,7 +7,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
 // dtype codes shared with the Rust side: 0 = f32, 1 = f16, 2 = bf16.
 // Q / K / V / output buffers must all use the same dtype.
 
@@ -42,26 +41,6 @@ int flashinfer_batch_decode_run(
     int dtype,
     float sm_scale, int window_left,
     cudaStream_t stream);
-
-// BF16, page-size-one decoder with a learned per-query-head attention sink.
-// This uses FlashInfer's parallel/split-KV decode scheduler. Q is allowed to
-// be graph-native heads-major; output is token-major.
-int flashinfer_sink_decode_plan(
-    void* float_workspace, size_t float_ws_size,
-    void* int_workspace, size_t int_ws_size,
-    void* page_locked_int_workspace,
-    int32_t* kv_indptr_h, int batch_size,
-    int num_qo_heads, int num_kv_heads,
-    bool enable_cuda_graph, cudaStream_t stream,
-    int64_t* plan_info_out, int* plan_info_len_out);
-
-int flashinfer_sink_decode_run(
-    void* float_workspace, void* int_workspace,
-    int64_t* plan_info_vec, int plan_info_len,
-    const void* q, const void* k_cache, const void* v_cache,
-    int32_t* kv_indptr, int32_t* kv_indices, const float* sink,
-    void* output, int batch_size, int num_qo_heads, int num_kv_heads,
-    float sm_scale, int window_left, cudaStream_t stream);
 
 // Copy compact slot/page indices into FlashInfer's page table.
 // slot_idx shape: (c,) i32, out shape: (c,) i32.

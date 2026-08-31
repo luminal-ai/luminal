@@ -10,20 +10,14 @@ pub(crate) mod cublaslt;
 pub mod flashinfer;
 pub mod moe;
 
-/// Host operations whose implementations are shared unchanged by Lite and
-/// CUDA supersets. A superset can register its own `SinkAttention` operation
-/// while reusing this tuple and avoiding a duplicate egglog constructor.
-pub type OpsWithoutSinkAttention = (
+/// Generic host operations shared unchanged by Lite and CUDA supersets.
+/// Hardware- or model-specialized attention operations belong to the
+/// superset backend and compose with this tuple as additional alternatives.
+pub type BaseOps = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
     flashinfer::FlashInferAttention,
-);
-
-/// Lite's baseline operations, excluding only its replaceable fused MoE.
-pub type BaseOps = (
-    OpsWithoutSinkAttention,
-    flashinfer::sink_attention::SinkAttention,
 );
 
 /// The complete Lite host operation set.
@@ -247,6 +241,21 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         None
     }
 
+    /// Identify mutable device state shared by captured instances of this
+    /// operation. Instances naming the same resource can share one parent
+    /// graph only when their equivalence keys match; otherwise the compiler
+    /// retains their ordinary standalone HostOp boundaries.
+    ///
+    /// This is a correctness contract, not an extraction preference. It lets
+    /// superset backends describe coordinated library planner state without
+    /// teaching Lite's graph compiler about their concrete operation types.
+    fn cuda_graph_capture_shared_state(
+        &self,
+        _inputs: &[NodeIndex],
+    ) -> Option<CudaGraphCaptureSharedState> {
+        None
+    }
+
     /// Input indices whose pointer identity is baked into a captured child
     /// graph. `None` conservatively tracks every graph input. Operations may
     /// omit planner-only buffers that are not consumed by captured kernels.
@@ -354,9 +363,18 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
     }
 }
 
+/// Compatibility identity for mutable state shared by captured HostOps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaGraphCaptureSharedState {
+    pub resource: &'static str,
+    pub equivalence_key: Vec<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::DeviceBuffer;
+    use crate::runtime::CudaRuntime;
+    use luminal::op::{IntoEgglogOp, Runtime};
 
     #[test]
     fn device_buffer_host_mirror_is_explicit_and_borrowed() {
@@ -368,5 +386,17 @@ mod tests {
         assert_eq!(mirrored.host_bytes(), Some(host.as_slice()));
         assert_eq!(mirrored.ptr(), 0x1000);
         assert_eq!(mirrored.len(), 16);
+    }
+
+    #[test]
+    fn lite_registers_generic_attention_but_not_sink_attention() {
+        let ops = <CudaRuntime as Runtime>::Ops::into_vec();
+        assert_eq!(
+            ops.iter()
+                .filter(|op| op.sort().name == "FlashInferAttention")
+                .count(),
+            1
+        );
+        assert!(ops.iter().all(|op| op.sort().name != "SinkAttention"));
     }
 }

@@ -36,7 +36,7 @@ use crate::{
         },
         flashinfer::{
             FlashInferAttention, FlashInferDecodeCaptureSignature, FlashInferDecodePointers,
-            FlashInferPrepareKey, PreparedFlashInferDecode, sink_attention::SinkAttention,
+            FlashInferPrepareKey, PreparedFlashInferDecode,
         },
     },
     kernel::{
@@ -3980,9 +3980,9 @@ impl CudaGraphOp {
         state.flashinfer_prepare_cache = flashinfer_prepare_cache_plan;
         state.last_dyn_values = dyn_map.clone();
         state.last_buffer_ptrs = buffer_ptrs;
-        // Execution-time library preparation needs planner-only inputs (for
-        // example SinkAttention indptrs) that are intentionally absent from
-        // captured kernel pointer sets. A full build is authoritative for the
+        // Execution-time library preparation can need planner-only inputs that
+        // are intentionally absent from captured kernel pointer sets. A full
+        // build is authoritative for the
         // complete binding snapshot, including cached-binding rebuilds.
         state.last_buffers = buffers.clone();
 
@@ -4074,7 +4074,6 @@ pub(crate) fn prepare_kernel_to_host_plan_with_topo(
         global_topo_order,
         &mut source_cache,
         None,
-        true,
     )
 }
 
@@ -4083,56 +4082,39 @@ pub(crate) fn prepare_kernel_to_host_plan_with_topo_and_source_cache(
     global_topo_order: &[NodeIndex],
     source_cache: &mut region_codegen::RegionSourceCache,
     known_global_dyn_dims: Option<&[Symbol]>,
-    capture_sink_attention: bool,
 ) -> PreparedKernelToHostPlan {
     let profile = std::env::var_os("LUMINAL_CUDA_PROFILE_PLAN").is_some();
     let source_counters_before = source_cache.counters();
     let total_start = Instant::now();
     let classify_start = Instant::now();
-    // SinkAttention layers share one FA3 integer scheduling workspace. They
-    // may be captured into one model graph only when every occurrence uses
-    // the same descriptor buffers and scheduling geometry. Heterogeneous
-    // graphs retain the ordinary HostOp boundaries rather than risking one
-    // plan overwriting another before launch.
-    let sink_capture_keys = global_topo_order
-        .iter()
-        .filter_map(|&node| {
-            let host = llir_graph[node].to_dialect::<dyn HostOp>()?;
-            let attention = host
-                .as_ref()
-                .as_ref()
-                .as_any()
-                .downcast_ref::<SinkAttention>()?;
-            let inputs = llir_graph
-                .edges_directed(node, Direction::Incoming)
-                .sorted_by_key(|edge| edge.id())
-                .map(|edge| edge.source())
-                .collect_vec();
-            (inputs.len() == 7).then(|| {
-                (
-                    inputs[4],
-                    inputs[5],
-                    attention.num_qo_heads,
-                    attention.num_kv_heads,
-                    attention.head_dim,
-                )
-            })
-        })
-        .collect_vec();
-    // Enforce an explicit disable at the classifier boundary too. Some
-    // direct/fallback compilation paths do not carry a representative resource
-    // dyn-map, so relying only on the caller-provided bucket decision could
-    // ignore the diagnostic exact-plan-only setting in the final stitch.
-    let sink_capture_globally_enabled = std::env::var("LUMINAL_CUDA_CAPTURE_SINK_MAX_Q")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map(|max_rows| max_rows > 0)
-        .unwrap_or(true);
-    let sink_capture_safe = sink_capture_globally_enabled
-        && capture_sink_attention
-        && sink_capture_keys
-            .first()
-            .is_some_and(|first| sink_capture_keys.iter().all(|key| key == first));
+    let mut first_capture_state = FxHashMap::default();
+    let mut capture_state_resource_by_node = FxHashMap::default();
+    let mut incompatible_capture_state = FxHashSet::default();
+    for &node in global_topo_order {
+        let Some(op) = llir_graph[node].to_dialect::<dyn HostOp>() else {
+            continue;
+        };
+        let inputs = llir_graph
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|edge| edge.id())
+            .map(|edge| edge.source())
+            .collect_vec();
+        let Some(state) = op
+            .as_ref()
+            .as_ref()
+            .cuda_graph_capture_shared_state(&inputs)
+        else {
+            continue;
+        };
+        capture_state_resource_by_node.insert(node, state.resource);
+        if let Some(first) = first_capture_state.get(state.resource) {
+            if first != &state.equivalence_key {
+                incompatible_capture_state.insert(state.resource);
+            }
+        } else {
+            first_capture_state.insert(state.resource, state.equivalence_key);
+        }
+    }
     let mut graph_packagable_ops = FxHashSet::default();
     let mut kernel_topo_order = Vec::with_capacity(global_topo_order.len());
     let mut materialized_kernel_nodes = FxHashSet::default();
@@ -4171,9 +4153,10 @@ pub(crate) fn prepare_kernel_to_host_plan_with_topo_and_source_cache(
                                 llir_graph.edges_directed(node, Direction::Incoming).count();
                             incoming == flashinfer.graph_inputs() || incoming == 6
                         })
-                    || (sink_capture_safe
-                        && host.as_any().downcast_ref::<SinkAttention>().is_some())
-                    || host.cuda_graph_capture_arity().is_some()
+                    || (host.cuda_graph_capture_arity().is_some()
+                        && capture_state_resource_by_node
+                            .get(&node)
+                            .is_none_or(|resource| !incompatible_capture_state.contains(resource)))
             })
         {
             graph_packagable_ops.insert(node);
@@ -4580,12 +4563,7 @@ pub(crate) fn kernel_to_host_with_prepared(
             }
 
             let host = host_op.as_ref().as_ref();
-            let captured_arity = if host.as_any().downcast_ref::<SinkAttention>().is_some() {
-                Some(7)
-            } else {
-                host.cuda_graph_capture_arity()
-            };
-            if let Some(captured_arity) = captured_arity {
+            if let Some(captured_arity) = host.cuda_graph_capture_arity() {
                 let inputs: Vec<NodeIndex> = llir_graph
                     .edges_directed(*node, Direction::Incoming)
                     .sorted_by_key(|edge| edge.id())

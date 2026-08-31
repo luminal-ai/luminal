@@ -23,7 +23,7 @@ use luminal::{
     graph::LLIRGraph,
     hlir::Output,
     prelude::{
-        DynMap, Expression, FxHashMap, FxHashSet, NodeIndex, Symbol,
+        DynMap, Expression, FxHashMap, FxHashSet, NodeIndex,
         petgraph::{
             Direction,
             algo::toposort,
@@ -847,23 +847,11 @@ pub(crate) fn prepare_static_llir_resources(
     let (topo, aliases) = validated_topology_and_aliases(llir)?;
     let mut global_dyn_dims = dyn_map.keys().copied().collect_vec();
     global_dyn_dims.sort();
-    // Keep FA3 inside the enclosing graph by default; SinkAttention records
-    // request-indptr rows as an explicit recapture boundary. A lower threshold
-    // is available for backend experiments, and zero provides a diagnostic
-    // exact-plan-only fallback.
-    let sink_capture_max_q = std::env::var("LUMINAL_CUDA_CAPTURE_SINK_MAX_Q")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
-    let capture_sink_attention = dyn_map
-        .get(&Symbol::from('s'))
-        .is_some_and(|rows| *rows <= sink_capture_max_q);
     let prepared_kernel_to_host = prepare_kernel_to_host_plan_with_topo_and_source_cache(
         llir,
         &topo,
         source_cache,
         Some(&global_dyn_dims),
-        capture_sink_attention,
     );
     let mut bytes_by_node = FxHashMap::default();
 

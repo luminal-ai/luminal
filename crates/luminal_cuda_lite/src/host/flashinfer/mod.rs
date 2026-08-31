@@ -1,6 +1,5 @@
 pub mod find_indptrs;
 pub mod jit;
-pub mod sink_attention;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -292,43 +291,31 @@ const FLOAT_WORKSPACE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
 const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 static FLOAT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
 static INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
-// SinkAttention reuses one host-side plan across layers in a runtime tick.
-// Keep its plan data separate from FlashInferAttention so a mixed graph cannot
-// overwrite the cached plan's integer workspace between sink-attention layers.
-static SINK_INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
 
-pub(crate) fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
+#[doc(hidden)]
+pub fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
     SharedDeviceMemoryAllocation {
         key: "flashinfer-global-workspaces",
-        bytes: FLOAT_WORKSPACE_SIZE + 2 * INT_WORKSPACE_SIZE,
+        bytes: FLOAT_WORKSPACE_SIZE + INT_WORKSPACE_SIZE,
     }
-}
-
-/// Resource-plan identity for the workspaces shared by Lite's native
-/// attention and backend-owned derived attention implementations.
-#[doc(hidden)]
-pub fn sink_attention_shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
-    shared_device_memory_allocation()
 }
 
 /// Process-global workspaces survive after the graph that first requested
 /// them is discarded. Resource planning must therefore keep charging them to
 /// later candidates, including candidates with no FlashInfer op of their own.
 pub(crate) fn resident_shared_device_memory_allocations() -> Vec<SharedDeviceMemoryAllocation> {
-    (FLOAT_WORKSPACE.get().is_some()
-        || INT_WORKSPACE.get().is_some()
-        || SINK_INT_WORKSPACE.get().is_some())
-    .then(shared_device_memory_allocation)
-    .into_iter()
-    .collect()
+    (FLOAT_WORKSPACE.get().is_some() || INT_WORKSPACE.get().is_some())
+        .then(shared_device_memory_allocation)
+        .into_iter()
+        .collect()
 }
 
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
 
 /// Process-wide page-locked (pinned) staging buffer for FlashInfer's
-/// host-side plan writes. Allocated once, never freed; shared by the FA2 and
-/// FA3 (SinkAttention) plan paths.
-pub(crate) fn page_locked_workspace() -> &'static PageLockedPtr {
+/// host-side plan writes. Allocated once and never freed.
+#[doc(hidden)]
+pub fn page_locked_workspace() -> &'static PageLockedPtr {
     PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
@@ -339,7 +326,8 @@ pub(crate) fn page_locked_workspace() -> &'static PageLockedPtr {
     })
 }
 
-pub(crate) struct PageLockedPtr(pub(crate) *mut u8);
+#[doc(hidden)]
+pub struct PageLockedPtr(pub *mut u8);
 
 // SAFETY: The pointer is page-locked CUDA memory allocated once via
 // posix_memalign + cudaHostRegister and only mutated during OnceLock
@@ -1179,41 +1167,27 @@ fn flashinfer_workspaces(
     (float_ws, float_ptr, int_ws, int_ptr)
 }
 
-fn sink_attention_workspaces(
-    stream: &Arc<CudaStream>,
-) -> (&'static CudaSlice<u8>, u64, &'static CudaSlice<u8>, u64) {
-    static POINTERS: OnceLock<(u64, u64)> = OnceLock::new();
-    let float_ws = FLOAT_WORKSPACE
-        .get_or_init(|| unsafe { stream.alloc::<u8>(FLOAT_WORKSPACE_SIZE).unwrap() });
-    let int_ws = SINK_INT_WORKSPACE
-        .get_or_init(|| unsafe { stream.alloc::<u8>(INT_WORKSPACE_SIZE).unwrap() });
-    let &(float_ptr, int_ptr) =
-        POINTERS.get_or_init(|| (float_ws.device_ptr(stream).0, int_ws.device_ptr(stream).0));
-    (float_ws, float_ptr, int_ws, int_ptr)
-}
-
-/// Stable device pointer and size for attention execution scratch that is safe
-/// to share between stream-serialized native and backend-owned implementations.
-/// Native integer schedules remain private because they persist from planning
-/// until a later captured graph launch.
+/// Stable shared float scratch used by generic FlashInfer operations and by
+/// backend-owned attention implementations executing on the same stream.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
-pub struct SinkAttentionFloatWorkspace {
+pub struct FlashInferFloatWorkspace {
     pub ptr: u64,
     pub bytes: usize,
 }
 
 #[doc(hidden)]
-pub fn sink_attention_float_workspace(stream: &Arc<CudaStream>) -> SinkAttentionFloatWorkspace {
+pub fn flashinfer_float_workspace(stream: &Arc<CudaStream>) -> FlashInferFloatWorkspace {
     let float = FLOAT_WORKSPACE
         .get_or_init(|| unsafe { stream.alloc::<u8>(FLOAT_WORKSPACE_SIZE).unwrap() });
-    SinkAttentionFloatWorkspace {
+    FlashInferFloatWorkspace {
         ptr: float.device_ptr(stream).0,
         bytes: FLOAT_WORKSPACE_SIZE,
     }
 }
 
-fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
+#[doc(hidden)]
+pub fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
     let len = bytes.len() / std::mem::size_of::<i32>();
     let mut bytes = std::mem::ManuallyDrop::new(bytes);
     unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut i32, len, len) }
@@ -1302,7 +1276,10 @@ mod resource_tests {
         // Capacity tier 256: kv indptr (8), current-c (4), indices
         // (1024), last-page length (4), and temporary output (512).
         assert_eq!(spec.prepared_device_bytes().unwrap(), 1_552);
-        assert_eq!(shared_device_memory_allocation().bytes, 144 * 1024 * 1024);
+        assert_eq!(
+            shared_device_memory_allocation().bytes,
+            FLOAT_WORKSPACE_SIZE + INT_WORKSPACE_SIZE
+        );
     }
 
     #[test]

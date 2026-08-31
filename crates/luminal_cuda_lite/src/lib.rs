@@ -390,7 +390,8 @@ fn cuda_driver_diagnostics() -> (Option<i32>, Option<i32>) {
 /// instead of launching kernels whose symbols aren't in the cubin
 /// (`CUDA_ERROR_NOT_FOUND`). Defaults to 8 (Ampere) if detection fails, so
 /// detection problems don't silently disable the feature on capable GPUs.
-pub(crate) fn device_compute_major() -> i32 {
+#[doc(hidden)]
+pub fn device_compute_major() -> i32 {
     static MAJOR: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *MAJOR.get_or_init(|| {
         // Override to validate the older-arch fallback path (e.g. force a
