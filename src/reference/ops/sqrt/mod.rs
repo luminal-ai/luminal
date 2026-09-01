@@ -1,7 +1,9 @@
 //! Elementwise square root.
 
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `SqrtFunctionalGeneric(input) -> out`
 ///
@@ -71,7 +73,11 @@ impl BufferTensorIrOp for SqrtFunctionalDps {
 
 impl Bufferizable for SqrtFunctionalDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 1, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 1,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -111,9 +117,12 @@ impl BufferTensorIrOp for SqrtMutating {
 }
 
 impl Bufferizable for SqrtMutating {
-
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -152,7 +161,6 @@ impl OpMatcher for SqrtFunctionalMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("layout", 1)]
     }
@@ -186,7 +194,6 @@ impl OpMatcher for SqrtMutatingMatcher {
         ]
     }
 
-
     fn extract(&self, _site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         Box::new(SqrtMutating)
     }
@@ -201,6 +208,9 @@ impl OpMatcher for SqrtMutatingMatcher {
 
 use crate::buffer_tensor_ir::ReferenceKernelCtx;
 
-pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    _op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     ctx.unary_elementwise(|x| x.sqrt())
 }

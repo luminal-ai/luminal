@@ -1,7 +1,9 @@
 //! Elementwise base-2 logarithm.
 
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `Log2FunctionalGeneric(input) -> out`
 ///
@@ -71,7 +73,11 @@ impl BufferTensorIrOp for Log2FunctionalDps {
 
 impl Bufferizable for Log2FunctionalDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 1, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 1,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -111,9 +117,12 @@ impl BufferTensorIrOp for Log2Mutating {
 }
 
 impl Bufferizable for Log2Mutating {
-
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -152,7 +161,6 @@ impl OpMatcher for Log2FunctionalMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("layout", 1)]
     }
@@ -186,7 +194,6 @@ impl OpMatcher for Log2MutatingMatcher {
         ]
     }
 
-
     fn extract(&self, _site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         Box::new(Log2Mutating)
     }
@@ -201,6 +208,9 @@ impl OpMatcher for Log2MutatingMatcher {
 
 use crate::buffer_tensor_ir::ReferenceKernelCtx;
 
-pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    _op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     ctx.unary_elementwise(|x| x.log2())
 }

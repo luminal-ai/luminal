@@ -6,7 +6,6 @@ pub use expression::*;
 
 use std::ops::{Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeTo, RangeToInclusive};
 
-
 fn get_start_bound<D: Into<IntExpr> + Copy>(bound: Bound<D>) -> IntExpr {
     match bound {
         Bound::Included(x) => x.into(),
@@ -173,9 +172,7 @@ impl<A: Into<IntExpr> + Copy, B: Into<IntExpr> + Copy> ToSlice for &[(A, B)] {
     }
 }
 
-impl<const N: usize, A: Into<IntExpr> + Copy, B: Into<IntExpr> + Copy> ToSlice
-    for &[(A, B); N]
-{
+impl<const N: usize, A: Into<IntExpr> + Copy, B: Into<IntExpr> + Copy> ToSlice for &[(A, B); N] {
     fn to_range_vec(self) -> Vec<(IntExpr, IntExpr)> {
         self.iter().map(|i| (i.0.into(), i.1.into())).collect()
     }
@@ -312,9 +309,7 @@ impl<S: Into<IntExpr> + Copy, E: Into<IntExpr> + Copy> ToPad for &[(S, E)] {
     }
 }
 
-impl<const N: usize, S: Into<IntExpr> + Copy, E: Into<IntExpr> + Copy> ToPad
-    for &[(S, E); N]
-{
+impl<const N: usize, S: Into<IntExpr> + Copy, E: Into<IntExpr> + Copy> ToPad for &[(S, E); N] {
     fn to_pad_vec(self) -> Vec<(IntExpr, IntExpr)> {
         self.iter()
             .map(|(s, e)| ((*s).into(), (*e).into()))
@@ -444,13 +439,8 @@ impl<A: Into<IntExpr>, B: Into<IntExpr>, C: Into<IntExpr>, D: Into<IntExpr>> ToS
     }
 }
 
-impl<
-    A: Into<IntExpr>,
-    B: Into<IntExpr>,
-    C: Into<IntExpr>,
-    D: Into<IntExpr>,
-    E: Into<IntExpr>,
-> ToShape for (A, B, C, D, E)
+impl<A: Into<IntExpr>, B: Into<IntExpr>, C: Into<IntExpr>, D: Into<IntExpr>, E: Into<IntExpr>>
+    ToShape for (A, B, C, D, E)
 {
     fn to_shape(self) -> Vec<IntExpr> {
         vec![

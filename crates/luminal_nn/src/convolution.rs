@@ -64,9 +64,7 @@ impl ConvND {
         let kernel_product: usize = kernel.iter().product();
 
         Self {
-            weight: cx
-                .named_tensor(ns.leaf("weight"), (ch_out, ch_in * kernel_product))
-                ,
+            weight: cx.named_tensor(ns.leaf("weight"), (ch_out, ch_in * kernel_product)),
             bias: if bias {
                 Some(cx.named_tensor(ns.leaf("bias"), ch_out))
             } else {
@@ -235,8 +233,8 @@ impl ConvND {
 #[cfg(test)]
 mod tests {
     use super::ConvND;
-    use luminal::prelude::Ns;
     use candle_core::{Device, Tensor};
+    use luminal::prelude::Ns;
 
     fn assert_close(a: &[f32], b: &[f32]) {
         assert_eq!(
@@ -343,7 +341,17 @@ mod tests {
     #[test]
     fn conv1d_values_match_expected_window_sums() -> candle_core::Result<()> {
         let mut cx = luminal::graph::Graph::new();
-        let conv = ConvND::new(1, 1, vec![3], vec![1], vec![1], vec![1], true, &Ns::root().child("conv"), &mut cx);
+        let conv = ConvND::new(
+            1,
+            1,
+            vec![3],
+            vec![1],
+            vec![1],
+            vec![1],
+            true,
+            &Ns::root().child("conv"),
+            &mut cx,
+        );
 
         let input = [1., 2., 3., 4., 5.];
         let weight = [1., 1., 1.];
@@ -386,7 +394,17 @@ mod tests {
     #[test]
     fn conv1d_shapes_follow_stride_and_padding() {
         let mut cx = luminal::graph::Graph::new();
-        let conv = ConvND::new(1, 1, vec![3], vec![2], vec![1], vec![1], false, &Ns::root().child("conv"), &mut cx);
+        let conv = ConvND::new(
+            1,
+            1,
+            vec![3],
+            vec![2],
+            vec![1],
+            vec![1],
+            false,
+            &Ns::root().child("conv"),
+            &mut cx,
+        );
 
         // expected length: floor((padded_len - dilation*(k-1) -1)/stride +1)
         // padded_len = 7 + 2 = 9
@@ -452,7 +470,10 @@ mod forward_tests {
         let out = conv.forward(x).output();
         let rt = luminal::test_support::run_reference(
             &cx,
-            &[(x.id, x_data.clone().into()), (conv.weight.id, w_data.clone().into())],
+            &[
+                (x.id, x_data.clone().into()),
+                (conv.weight.id, w_data.clone().into()),
+            ],
         );
         let got = rt.get_f32(out.id).unwrap().clone();
 

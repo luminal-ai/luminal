@@ -15,11 +15,10 @@
 //! surgery. The DPS form of an op therefore displays the SAME label; DPS-ness
 //! is visible in the operand list (trailing destinations), not the name.
 
-// The instance re-exports are the op-authoring surface: since the extractor
-// went registry-driven it constructs instances only through matchers, so the
-// non-test build no longer names these types — their remaining consumers are
-// tests and the upcoming reference-backend/DPS work (same situation as the
-// `#![allow(dead_code)]` note in `layout_ir.rs`).
+// The instance re-exports are the op-authoring and runtime-dispatch surface.
+// The extractor constructs instances through matchers, while the reference
+// kernel registry downcasts plan ops to their concrete DPS types and tests name
+// selected functional or mutating forms directly.
 #![allow(unused_imports)]
 
 // Kernel-bearing op modules are visible to the rest of `crate::reference`
@@ -29,8 +28,6 @@ pub(in crate::reference) mod add;
 pub(in crate::reference) mod cast;
 pub(in crate::reference) mod constant;
 pub(in crate::reference) mod div;
-pub(in crate::reference) mod trunc_div;
-pub(in crate::reference) mod trunc_rem;
 pub(in crate::reference) mod exp;
 pub(in crate::reference) mod exp2;
 pub(in crate::reference) mod gather;
@@ -49,6 +46,8 @@ pub(in crate::reference) mod reduce_sum;
 pub(in crate::reference) mod scatter;
 pub(in crate::reference) mod sin;
 pub(in crate::reference) mod sqrt;
+pub(in crate::reference) mod trunc_div;
+pub(in crate::reference) mod trunc_rem;
 
 // The functional forms, the mutating forms, and Poison are exported: a DPS
 // form is an implementation detail of its op pair, entering the world solely
@@ -71,8 +70,8 @@ pub use index_map_apply_view::IndexMapApplyView;
 pub use iota::Iota;
 pub use less_than::LessThan;
 pub use log2::{Log2Functional, Log2Mutating};
-pub use modulo::{ModFunctional, ModMutating};
 pub use materialize_layout_copy::MaterializeLayoutCopy;
+pub use modulo::{ModFunctional, ModMutating};
 pub use mul::{MulFunctional, MulMutating};
 pub use poison::Poison;
 pub use recip::{RecipFunctional, RecipMutating};
@@ -110,8 +109,6 @@ pub use add::{AddFunctionalMatcher, AddMutatingInputAliasSafeMatcher, AddMutatin
 pub use cast::CastMatcher;
 pub use constant::ConstantMatcher;
 pub use div::{DivFunctionalMatcher, DivMutatingMatcher};
-pub use trunc_div::{TruncDivFunctional, TruncDivFunctionalDps, TruncDivFunctionalMatcher};
-pub use trunc_rem::{TruncRemFunctional, TruncRemFunctionalDps, TruncRemFunctionalMatcher};
 pub use exp::{ExpFunctionalMatcher, ExpMutatingMatcher};
 pub use exp2::{Exp2FunctionalMatcher, Exp2MutatingMatcher};
 pub use gather::GatherMatcher;
@@ -120,8 +117,8 @@ pub use index_map_apply_view::IndexMapApplyViewMatcher;
 pub use iota::IotaMatcher;
 pub use less_than::LessThanMatcher;
 pub use log2::{Log2FunctionalMatcher, Log2MutatingMatcher};
-pub use modulo::{ModFunctionalMatcher, ModMutatingMatcher};
 pub use materialize_layout_copy::MaterializeLayoutCopyMatcher;
+pub use modulo::{ModFunctionalMatcher, ModMutatingMatcher};
 pub use mul::{MulFunctionalMatcher, MulMutatingMatcher};
 pub use recip::{RecipFunctionalMatcher, RecipMutatingMatcher};
 pub use reduce_max::ReduceMaxMatcher;
@@ -129,6 +126,8 @@ pub use reduce_sum::ReduceSumMatcher;
 pub use scatter::{ScatterFunctionalMatcher, ScatterMutatingMatcher};
 pub use sin::{SinFunctionalMatcher, SinMutatingMatcher};
 pub use sqrt::{SqrtFunctionalMatcher, SqrtMutatingMatcher};
+pub use trunc_div::{TruncDivFunctional, TruncDivFunctionalDps, TruncDivFunctionalMatcher};
+pub use trunc_rem::{TruncRemFunctional, TruncRemFunctionalDps, TruncRemFunctionalMatcher};
 
 /// THE registration list: every built-in matcher, one line per registered
 /// implementation. Adding an op = writing its module (instances + traits +

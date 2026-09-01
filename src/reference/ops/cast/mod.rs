@@ -109,7 +109,6 @@ impl OpMatcher for CastMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("dtype", 1), ("out_layout", 2)]
     }
@@ -128,7 +127,10 @@ impl OpMatcher for CastMatcher {
 
 use crate::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
 
-pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    _op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     // The conversion is driven by the BUFFER types the plan annotated —
     // the op needs no dtype field of its own. Covered pairs only;
     // anything else refuses loudly (never a silent reinterpretation).
@@ -255,7 +257,10 @@ pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut Referen
                  explicit op in the model, never as a cast"
             );
         }
-        (TypedBuffer::F32(_) | TypedBuffer::I32(_) | TypedBuffer::I64(_), TypedBuffer::Bool8(_)) => {
+        (
+            TypedBuffer::F32(_) | TypedBuffer::I32(_) | TypedBuffer::I64(_),
+            TypedBuffer::Bool8(_),
+        ) => {
             anyhow::bail!(
                 "cast number -> Bool8 is not a reinterpretation: the != 0 \
                  reading is a PROJECTION and must appear as an explicit \

@@ -9,7 +9,9 @@
 //! rank-0 destination. No mutating form — there is nothing to mutate.
 
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `ConstantGeneric() -> out`
 ///
@@ -75,7 +77,11 @@ impl BufferTensorIrOp for ConstantDps {
 
 impl Bufferizable for ConstantDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -115,13 +121,14 @@ impl OpMatcher for ConstantMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("value", 0), ("out_layout", 1)]
     }
 
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
-        Box::new(Constant { value: site.child_f64(0) })
+        Box::new(Constant {
+            value: site.child_f64(0),
+        })
     }
 }
 

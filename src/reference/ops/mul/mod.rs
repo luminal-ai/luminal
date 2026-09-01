@@ -1,7 +1,9 @@
 //! Elementwise multiplication.
 
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `MulFunctionalGeneric(lhs, rhs) -> out`
 ///
@@ -74,7 +76,11 @@ impl BufferTensorIrOp for MulFunctionalDps {
 
 impl Bufferizable for MulFunctionalDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 2, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 2,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -115,9 +121,12 @@ impl BufferTensorIrOp for MulMutating {
 }
 
 impl Bufferizable for MulMutating {
-
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -156,7 +165,6 @@ impl OpMatcher for MulFunctionalMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("out_layout", 2)]
     }
@@ -190,7 +198,6 @@ impl OpMatcher for MulMutatingMatcher {
         ]
     }
 
-
     fn extract(&self, _site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         Box::new(MulMutating)
     }
@@ -209,16 +216,21 @@ use crate::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
 /// overflow is a loud kernel error, never a wrapped value — until the
 /// landing-D bounds proofs gate Int ops statically, this dynamic check
 /// is the soundness floor.
-pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    _op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a * b),
         TypedBuffer::I32(_) => ctx.binary_elementwise_i32(|a, b| {
-            a.checked_mul(b)
-                .ok_or_else(|| anyhow::anyhow!("i32 mul overflow: {a} * {b} (ints are non-wrapping)"))
+            a.checked_mul(b).ok_or_else(|| {
+                anyhow::anyhow!("i32 mul overflow: {a} * {b} (ints are non-wrapping)")
+            })
         }),
         TypedBuffer::I64(_) => ctx.binary_elementwise_i64(|a, b| {
-            a.checked_mul(b)
-                .ok_or_else(|| anyhow::anyhow!("i64 mul overflow: {a} * {b} (ints are non-wrapping)"))
+            a.checked_mul(b).ok_or_else(|| {
+                anyhow::anyhow!("i64 mul overflow: {a} * {b} (ints are non-wrapping)")
+            })
         }),
         other => anyhow::bail!("mul has no {} arm", other.type_name()),
     }

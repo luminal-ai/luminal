@@ -1,9 +1,0 @@
-buffers (3):
-  pinned[lhs_buffer_id / BufferLit(20)] [caller, ro]
-  pinned[rhs_buffer_id / BufferLit(21)] [caller, ro]
-  pinned[out_buffer_id / BufferLit(22)] [caller, rw]
-ops (1):
-  MatMulFusedGeneric: [pinned[lhs_buffer_id / BufferLit(20)], pinned[rhs_buffer_id / BufferLit(21)], pinned[out_buffer_id / BufferLit(22)]] -> [pinned[out_buffer_id / BufferLit(22)]]
-anti (0):
-outputs (1):
-  out 0 -> pinned[out_buffer_id / BufferLit(22)]

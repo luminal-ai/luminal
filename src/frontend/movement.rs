@@ -52,10 +52,7 @@ impl GraphTensor {
             .logical
             .apply_movement(
                 &(self.id, current_dims),
-                crate::graph::Movement::ExpandDim {
-                    axis,
-                    size: size.clone(),
-                },
+                crate::graph::Movement::ExpandDim { axis, size },
             )
             .expect("logical movement insertion failed");
         self.dims.insert(axis, size);
@@ -460,7 +457,7 @@ impl GraphTensor {
                         .graph()
                         .constant(data_strides[d])
                         .expand_rhs(ar_flat.dims());
-                    base_expanded = base_expanded + ar_flat * stride_tensor;
+                    base_expanded += ar_flat * stride_tensor;
                 }
                 base_expanded
             };
@@ -686,14 +683,14 @@ impl GraphTensor {
                             from_end: out_rank - 1 - p,
                             extent: window_counts[p],
                         }),
-                        strides[p].into(),
+                        strides[p],
                     )),
                     Box::new(crate::graph::MapEntry::Mul(
                         Box::new(crate::graph::MapEntry::Coord {
                             from_end: out_rank - 1 - (n + p),
                             extent: kernel[p],
                         }),
-                        dilation[p].into(),
+                        dilation[p],
                     )),
                 )
             })
@@ -1268,169 +1265,4 @@ mod tests {
             ],
         );
     }
-
-    //     // #[test]
-    //     // fn test_cumsum() {
-    //     //     let mut cx = Graph::new();
-    //     //     let a = cx.constant(1.).expand_dim(0, 3);
-    //     //     let b = a.cumsum_last_dim().retrieve();
-    //     //     let c = a
-    //     //         .expand_dim(1, 3)
-    //     //         .permute((1, 0))
-    //     //         .cumsum_last_dim()
-    //     //         .permute((1, 0))
-    //     //         .retrieve();
-    //     //     cx.execute();
-
-    //     //     assert_exact(&b.data(), &[1., 2., 3.]);
-    //     //     assert_exact(&c.data(), &[1., 1., 1., 2., 2., 2., 3., 3., 3.]);
-    //     // }
-
-    //     // #[test]
-    //     // fn test_pool_1d() {
-    //     //     let mut cx = Graph::new();
-
-    //     //     let inp1 = cx.tensor(5).set([1., 2., 3., 4., 5.]);
-    //     //     let inp2 = cx
-    //     //         .tensor((2, 5))
-    //     //         .set([[15., 14., 13., 12., 11.], [1., 2., 3., 4., 5.]]);
-    //     //     // Stride 1
-    //     //     let out1 = inp1.pool_last_dim(3, 1, 1).retrieve();
-    //     //     // Stride 2
-    //     //     let out2 = inp1.pool_last_dim(3, 2, 1).retrieve();
-    //     //     // Stride 3
-    //     //     let out3 = inp1.pool_last_dim(3, 3, 1).retrieve();
-    //     //     // Dilation 2
-    //     //     let out4 = inp1.pool_last_dim(3, 1, 2).retrieve();
-    //     //     // Dilation 2 Padding 1
-    //     //     let out5 = inp1.pad(((1, 1),)).pool_last_dim(3, 1, 2).retrieve();
-    //     //     // Stride 1 Batch 2
-    //     //     let out6 = inp2.pool_last_dim(3, 1, 1).retrieve();
-    //     //     // Stride 3
-    //     //     let out7 = inp2.pool_last_dim(3, 3, 1).retrieve();
-    //     //     // Dilation 2
-    //     //     let out8 = inp2.pool_last_dim(3, 1, 2).retrieve();
-    //     //     // Dilation 2 Padding 1
-    //     //     let out9 = inp2.pad(((0, 0), (1, 1))).pool_last_dim(3, 1, 2).retrieve();
-
-    //     //     cx.execute();
-
-    //     //     assert_exact(&out1.data(), &[1., 2., 3., 2., 3., 4., 3., 4., 5.]);
-    //     //     assert_exact(&out2.data(), &[1., 2., 3., 3., 4., 5.]);
-    //     //     assert_exact(&out3.data(), &[1., 2., 3.]);
-    //     //     assert_exact(&out4.data(), &[1., 3., 5.]);
-    //     //     assert_exact(&out5.data(), &[0., 2., 4., 1., 3., 5., 2., 4., 0.]);
-    //     //     assert_exact(
-    //     //         &out6.data(),
-    //     //         &[
-    //     //             15., 14., 13., 14., 13., 12., 13., 12., 11., 1., 2., 3., 2., 3., 4., 3., 4., 5.,
-    //     //         ],
-    //     //     );
-    //     //     assert_exact(&out7.data(), &[15., 14., 13., 1., 2., 3.]);
-    //     //     assert_exact(&out8.data(), &[15., 13., 11., 1., 3., 5.]);
-    //     //     assert_exact(
-    //     //         &out9.data(),
-    //     //         &[
-    //     //             0., 14., 12., 15., 13., 11., 14., 12., 0., 0., 2., 4., 1., 3., 5., 2., 4., 0.,
-    //     //         ],
-    //     //     );
-    //     // }
-
-    //     // #[test]
-    //     // fn test_pool_1d_dims() {
-    //     //     let mut cx = Graph::new();
-
-    //     //     let inp1 = cx.tensor((4, 4)).set(vec![
-    //     //         1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16.,
-    //     //     ]);
-    //     //     // Stride 1
-    //     //     let out1 = inp1.pool_last_dim(3, 1, 1).retrieve();
-
-    //     //     cx.execute();
-
-    //     //     assert_exact(
-    //     //         &out1.data(),
-    //     //         &[
-    //     //             1., 2., 3., 2., 3., 4., 5., 6., 7., 6., 7., 8., 9., 10., 11., 10., 11., 12., 13.,
-    //     //             14., 15., 14., 15., 16.,
-    //     //         ],
-    //     //     );
-    //     // }
-
-    //     // #[test]
-    //     // fn test_pool_2d() {
-    //     //     let mut cx = Graph::new();
-
-    //     //     let inp1 = cx.tensor((4, 4)).set(vec![
-    //     //         1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16.,
-    //     //     ]);
-    //     //     // 3x3 kernel
-    //     //     let out1 = inp1
-    //     //         // Pool first dim first by moving it to end
-    //     //         .permute((1, 0))
-    //     //         .pool_last_dim(3, 1, 1)
-    //     //         // Now move other dim to end
-    //     //         .permute((1, 2, 0))
-    //     //         .pool_last_dim(3, 1, 1)
-    //     //         // Now swap middle two dims
-    //     //         .permute((0, 2, 1, 3))
-    //     //         // Now merge both pooled dimensions
-    //     //         .reshape((4, 3, 3))
-    //     //         .retrieve();
-
-    //     //     cx.execute();
-
-    //     //     assert_exact(
-    //     //         &out1.data(),
-    //     //         &[
-    //     //             1.00, 2.00, 3.00, 5.00, 6.00, 7.00, 9.00, 10.00, 11.00, 2.00, 3.00, 4.00, 6.00,
-    //     //             7.00, 8.00, 10.00, 11.00, 12.00, 5.00, 6.00, 7.00, 9.00, 10.00, 11.00, 13.00,
-    //     //             14.00, 15.00, 6.00, 7.00, 8.00, 10.00, 11.00, 12.00, 14.00, 15.00, 16.00,
-    //     //         ],
-    //     //     );
-    //     // }
-
-    //     // #[test]
-    //     // fn test_pool_1d_dilation() {
-    //     //     let mut cx = Graph::new();
-
-    //     //     let inp1 = cx.tensor(5).set(vec![1., 2., 3., 4., 5.]);
-    //     //     // Stride 1
-    //     //     let out1 = inp1.pool_last_dim(2, 1, 2).retrieve();
-    //     //     // Stride 2
-    //     //     let out2 = inp1.pool_last_dim(2, 2, 2).retrieve();
-    //     //     // Stride 3
-    //     //     let out3 = inp1.pool_last_dim(2, 3, 2).retrieve();
-
-    //     //     cx.execute();
-
-    //     //     assert_exact(&out1.data(), &[1., 3., 2., 4., 3., 5.]);
-    //     //     assert_exact(&out2.data(), &[1., 3., 3., 5.]);
-    //     //     assert_exact(&out3.data(), &[1., 3.]);
-    //     // }
-
-    //     // #[test]
-    //     // fn test_rotate_half() {
-    //     //     let mut cx = Graph::new();
-    //     //     let a = cx.tensor((3, 2));
-    //     //     a.set(vec![1.4325, 2.492428, 3.127365, 33.2834, 4.18734, 23.854]);
-    //     //     let x1 = a.slice((.., ..1)).contiguous();
-    //     //     let x2 = a.slice((.., 1..)).contiguous();
-    //     //     let c = (-x2).concat_along(x1, 1);
-    //     //     c.retrieve();
-    //     //     cx.execute();
-
-    //     //     let d_dev = Cpu::default();
-    //     //     let d_a = d_dev.tensor_from_vec(
-    //     //         vec![1.4325, 2.492428, 3.127365, 33.2834, 4.18734, 23.854],
-    //     //         (dfdx::shapes::Const::<3>, dfdx::shapes::Const::<2>),
-    //     //     );
-    //     //     let d_x1 = d_a.clone().slice((.., ..1));
-    //     //     let d_x2 = d_a.slice((.., 1..));
-    //     //     let d_c = (-d_x2, d_x1)
-    //     //         .concat_along(dfdx::shapes::Axis::<1>)
-    //     //         .realize::<Rank2<3, 2>>();
-
-    //     //     assert_close(&c.data(), &d_c.as_vec());
-    //     // }
 }

@@ -38,7 +38,9 @@ pub fn reference_allow_list() -> Vec<&'static str> {
         .iter()
         .map(|matcher| matcher.egglog_constructor())
         .filter(|constructor| {
-            let label = constructor.strip_prefix("LayoutTensorOp").unwrap_or(constructor);
+            let label = constructor
+                .strip_prefix("LayoutTensorOp")
+                .unwrap_or(constructor);
             implemented.contains(label)
         })
         .collect()
@@ -107,23 +109,32 @@ impl ReferenceRuntime {
             .logical
             .native_parts()
             .map_err(|reason| anyhow!("native load refused: {reason}"))?;
-        let mut runtime = Self::default();
-        runtime.native = Some(NativeSpec {
-            pre_schedule,
-            input_slots,
-            output_slots,
-            post_checks,
-            labeled_checks,
-            binding_seeds: String::new(),
-            ops: None,
-        });
-        Ok(runtime)
+        Ok(Self {
+            native: Some(NativeSpec {
+                pre_schedule,
+                input_slots,
+                output_slots,
+                post_checks,
+                labeled_checks,
+                binding_seeds: String::new(),
+                ops: None,
+            }),
+            ..Self::default()
+        })
     }
 
     /// BINDING: seed a dynamic dim's range (bounds-on-vars — never a pin).
-    pub fn bind_dyn_range(&mut self, var: impl Into<crate::shape::Symbol>, lower: u64, upper: u64) -> Result<()> {
+    pub fn bind_dyn_range(
+        &mut self,
+        var: impl Into<crate::shape::Symbol>,
+        lower: u64,
+        upper: u64,
+    ) -> Result<()> {
         let var = var.into();
-        let spec = self.native.as_mut().ok_or_else(|| anyhow!("bind before load"))?;
+        let spec = self
+            .native
+            .as_mut()
+            .ok_or_else(|| anyhow!("bind before load"))?;
         spec.binding_seeds.push_str(&format!(
             "(set (lower-bound-of (IntVar \"{var}\")) (bigint {lower}))\n\
              (set (upper-bound-of (IntVar \"{var}\")) (bigint {upper}))\n"
@@ -143,7 +154,10 @@ impl ReferenceRuntime {
         lower: i64,
         upper: i64,
     ) -> Result<()> {
-        let spec = self.native.as_mut().ok_or_else(|| anyhow!("bind before load"))?;
+        let spec = self
+            .native
+            .as_mut()
+            .ok_or_else(|| anyhow!("bind before load"))?;
         anyhow::ensure!(lower <= upper, "empty value range [{lower}, {upper}]");
         let name = spec
             .input_slots
@@ -162,7 +176,10 @@ impl ReferenceRuntime {
     /// The ALLOWABLE-OPS inventory for this runtime (per-runtime API,
     /// deliberately unstandardized — ruling 2026-07-30).
     pub fn with_ops(&mut self, ops: Vec<&'static str>) -> Result<()> {
-        let spec = self.native.as_mut().ok_or_else(|| anyhow!("with_ops before load"))?;
+        let spec = self
+            .native
+            .as_mut()
+            .ok_or_else(|| anyhow!("with_ops before load"))?;
         spec.ops = Some(ops);
         Ok(())
     }
@@ -175,7 +192,10 @@ impl ReferenceRuntime {
         input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
         options: &crate::implementation_search::ImplementationSearchOptions,
     ) -> Result<crate::implementation_search::SearchOutcome> {
-        let spec = self.native.take().ok_or_else(|| anyhow!("search before load"))?;
+        let spec = self
+            .native
+            .take()
+            .ok_or_else(|| anyhow!("search before load"))?;
         let text = format!(
             "{}{}{}{}",
             spec.pre_schedule,
@@ -228,9 +248,7 @@ impl ReferenceRuntime {
         }
         let saturation_nanos = saturation_start.elapsed().as_nanos();
         let serialize_start = std::time::Instant::now();
-        let serialized = egraph
-            .serialize(egglog::SerializeConfig::default())
-            .egraph;
+        let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
         let serialize_nanos = serialize_start.elapsed().as_nanos();
         let mut outcome = crate::implementation_search::search_implementations_with_ops(
             &serialized,
@@ -270,7 +288,10 @@ impl ReferenceRuntime {
     }
 
     pub fn execute(&mut self) -> Result<()> {
-        let plan = self.plan.as_ref().ok_or_else(|| anyhow!("no plan loaded"))?;
+        let plan = self
+            .plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("no plan loaded"))?;
 
         // Materialize every buffer: staged caller data where provided
         // (variant-checked against the buffer's DTYPE, length-checked
@@ -281,10 +302,16 @@ impl ReferenceRuntime {
         let mut storage: FxHashMap<BufferId, TypedBuffer> = FxHashMap::default();
         for (id, buffer) in &plan.buffers {
             let dims = buffer.dims.as_ref().ok_or_else(|| {
-                anyhow!("buffer {} has no numeric geometry (symbolic dims are not executable yet)", buffer.label)
+                anyhow!(
+                    "buffer {} has no numeric geometry (symbolic dims are not executable yet)",
+                    buffer.label
+                )
             })?;
             let dtype = buffer.dtype.ok_or_else(|| {
-                anyhow!("buffer {} has no dtype (dtype-of row never reached the plan)", buffer.label)
+                anyhow!(
+                    "buffer {} has no dtype (dtype-of row never reached the plan)",
+                    buffer.label
+                )
             })?;
             let numel = Self::numel(dims);
             let staged = buffer.lit.and_then(|lit| self.staged.get(&lit));
@@ -348,7 +375,10 @@ impl ReferenceRuntime {
                         .get(&slot.buffer)
                         .ok_or_else(|| anyhow!("input slot references unknown buffer"))?;
                     let lit = buffer.lit.ok_or_else(|| {
-                        anyhow!("input buffer {} has no BufferLit id to bind by", buffer.label)
+                        anyhow!(
+                            "input buffer {} has no BufferLit id to bind by",
+                            buffer.label
+                        )
                     })?;
                     ensure!(
                         self.staged.contains_key(&lit),
@@ -361,8 +391,8 @@ impl ReferenceRuntime {
 
         // Execute in dependency order (anti-edges are real edges, so WAR
         // ordering rides the same toposort).
-        let order = toposort(&plan.dag, None)
-            .map_err(|_| anyhow!("bufferized plan has a cycle"))?;
+        let order =
+            toposort(&plan.dag, None).map_err(|_| anyhow!("bufferized plan has a cycle"))?;
         for index in order {
             match &plan.dag[index] {
                 BufferNode::BufferInput { .. } | BufferNode::BufferOutput { .. } => {}
@@ -383,7 +413,9 @@ impl ReferenceRuntime {
                     );
                     *dest = data;
                 }
-                BufferNode::Compute { op, reads, writes, .. } => {
+                BufferNode::Compute {
+                    op, reads, writes, ..
+                } => {
                     let mut operands = Vec::with_capacity(reads.len());
                     let mut operand_dims = Vec::with_capacity(reads.len());
                     for id in reads {
@@ -406,7 +438,11 @@ impl ReferenceRuntime {
                             .ok_or_else(|| anyhow!("{} writes unknown buffer", op.label()))?;
                         dests.push(existing.zeroed_like());
                     }
-                    let mut ctx = ReferenceKernelCtx { operands, operand_dims, dests };
+                    let mut ctx = ReferenceKernelCtx {
+                        operands,
+                        operand_dims,
+                        dests,
+                    };
                     match kernels::kernel_for(op.as_ref()) {
                         Some(kernel) => (kernel.execute)(op.as_ref(), &mut ctx)
                             .with_context(|| format!("executing {}", op.label()))?,
@@ -447,11 +483,6 @@ impl ReferenceRuntime {
     /// The i64 twin of [`Self::get_f32`].
     pub fn get_i64(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<i64>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_i64()
-    }
-
-    /// Buffer-id read for search internals.
-    pub fn get_f32_buffer(&self, buffer: i64) -> Result<&Vec<f32>> {
-        self.get_typed(buffer)?.as_f32()
     }
 
     fn output_buffer(&self, tensor: petgraph::graph::NodeIndex) -> Result<i64> {
@@ -520,7 +551,11 @@ mod tests {
         let table = crate::reference::kernels::reference_kernels();
         let mut seen = std::collections::HashSet::new();
         for kernel in table {
-            assert!(seen.insert(kernel.op_type), "duplicate registry row for {}", kernel.label);
+            assert!(
+                seen.insert(kernel.op_type),
+                "duplicate registry row for {}",
+                kernel.label
+            );
             assert!(
                 !kernel.label.contains("Mutating") && !kernel.label.contains("View"),
                 "the reference runtime is out-of-place and view-free; {} cannot have a kernel",
@@ -660,7 +695,11 @@ mod tests {
             let data_y: Vec<f32> = (0..pin * 2).map(|v| (v as f32) * 0.5 - 1.0).collect();
 
             // GOLDEN per pin (pinned from their ReferenceRuntime — Step 4b).
-            let expected = match pin { 3 => vec![-1.0, -1.0, 0.0, 2.0, 5.0, 9.0], 5 => vec![-1.0, -1.0, 0.0, 2.0, 5.0, 9.0, 14.0, 20.0, 27.0, 35.0], _ => unreachable!() };
+            let expected = match pin {
+                3 => vec![-1.0, -1.0, 0.0, 2.0, 5.0, 9.0],
+                5 => vec![-1.0, -1.0, 0.0, 2.0, 5.0, 9.0, 14.0, 20.0, 27.0, 35.0],
+                _ => unreachable!(),
+            };
             let (cx2, x2, y2, out2) = build(pin);
             let program = cx2.logical.native_program().expect("native program");
             assert!(
@@ -759,10 +798,7 @@ mod tests {
         );
         let ours = run_reference(&cx2, &[(x2.id, x_data.into()), (y2.id, y_data.into())]);
         assert_close(ours.get_f32(plain2.id).unwrap(), &expected_plain);
-        assert_close(
-            ours.get_f32(dilated2.id).unwrap(),
-            &expected_dilated,
-        );
+        assert_close(ours.get_f32(dilated2.id).unwrap(), &expected_dilated);
     }
 
     /// PAD differential, 1-D, THROUGH THE BOOL BRIDGE with zero frontend
@@ -783,7 +819,11 @@ mod tests {
             let x_data = vec![10.0, 20.0, 30.0, 40.0];
 
             // GOLDEN per fill (pinned from their ReferenceRuntime — Step 4b).
-            let expected = if fill == 0.0 { vec![0.0, 10.0, 20.0, 30.0, 40.0, 0.0, 0.0] } else { vec![2.5, 10.0, 20.0, 30.0, 40.0, 2.5, 2.5] };
+            let expected = if fill == 0.0 {
+                vec![0.0, 10.0, 20.0, 30.0, 40.0, 0.0, 0.0]
+            } else {
+                vec![2.5, 10.0, 20.0, 30.0, 40.0, 2.5, 2.5]
+            };
             let (cx2, x2, out2) = build(fill);
             let program = cx2.logical.native_program().expect("native program");
             assert!(
@@ -812,7 +852,17 @@ mod tests {
             let x_data: Vec<f32> = (0..12).map(|v| v as f32 + 1.0).collect();
 
             // GOLDEN per fill (pinned from their ReferenceRuntime — Step 4b).
-            let expected = if fill == 0.0 { vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 5.0, 6.0, 7.0, 8.0, 0.0, 0.0, 0.0, 9.0, 10.0, 11.0, 12.0, 0.0] } else { vec![-1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, 1.0, 2.0, 3.0, 4.0, -1.5, -1.5, -1.5, 5.0, 6.0, 7.0, 8.0, -1.5, -1.5, -1.5, 9.0, 10.0, 11.0, 12.0, -1.5] };
+            let expected = if fill == 0.0 {
+                vec![
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0,
+                    5.0, 6.0, 7.0, 8.0, 0.0, 0.0, 0.0, 9.0, 10.0, 11.0, 12.0, 0.0,
+                ]
+            } else {
+                vec![
+                    -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, -1.5, 1.0, 2.0, 3.0, 4.0, -1.5,
+                    -1.5, -1.5, 5.0, 6.0, 7.0, 8.0, -1.5, -1.5, -1.5, 9.0, 10.0, 11.0, 12.0, -1.5,
+                ]
+            };
             let (cx2, x2, out2) = build(fill);
             let program = cx2.logical.native_program().expect("native program");
             assert!(
@@ -824,7 +874,6 @@ mod tests {
             assert_close(ours.get_f32(out2.id).unwrap(), &expected);
         }
     }
-
 
     /// COORDINATE-FORM GATHER differential (ruling 2026-07-31): the
     /// primary gather — one Int coordinate tensor per data axis — records
@@ -842,8 +891,8 @@ mod tests {
             (cx, data, row, col, out)
         };
         let data_vals: Vec<f32> = (0..12).map(|v| v as f32 * 1.5 + 1.0).collect();
-        let row_ints = vec![0i32, 2, 1, 2, 0, 1];
-        let col_ints = vec![3i32, 0, 2, 3, 1, 0];
+        let row_ints = [0i32, 2, 1, 2, 0, 1];
+        let col_ints = [3i32, 0, 2, 3, 1, 0];
         let row_vals: Vec<i32> = row_ints.to_vec();
         let col_vals: Vec<i32> = col_ints.to_vec();
 
@@ -856,7 +905,8 @@ mod tests {
             "coordinate-form gather expected in the model:\n{}",
             program.text
         );
-        let ours = run_reference(&cx2,
+        let ours = run_reference(
+            &cx2,
             &[
                 (data2.id, data_vals.into()),
                 (row2.id, row_vals.into()),
@@ -881,14 +931,16 @@ mod tests {
             (cx, dest, row, col, src, out)
         };
         let dest_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
-        let row_ints = vec![0i32, 1, 2, 1];
-        let col_ints = vec![1i32, 3, 0, 0];
+        let row_ints = [0i32, 1, 2, 1];
+        let col_ints = [1i32, 3, 0, 0];
         let row_vals: Vec<i32> = row_ints.to_vec();
         let col_vals: Vec<i32> = col_ints.to_vec();
         let src_vals = vec![100.0, 200.0, 300.0, 400.0];
 
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
-        let expected = vec![0.0, 100.0, 2.0, 3.0, 400.0, 5.0, 6.0, 200.0, 300.0, 9.0, 10.0, 11.0];
+        let expected = vec![
+            0.0, 100.0, 2.0, 3.0, 400.0, 5.0, 6.0, 200.0, 300.0, 9.0, 10.0, 11.0,
+        ];
         let (cx2, dest2, row2, col2, src2, out2) = build();
         let program = cx2.logical.native_program().expect("native program");
         assert!(
@@ -896,7 +948,8 @@ mod tests {
             "coordinate-form scatter expected in the model:\n{}",
             program.text
         );
-        let ours = run_reference(&cx2,
+        let ours = run_reference(
+            &cx2,
             &[
                 (dest2.id, dest_vals.into()),
                 (row2.id, row_vals.into()),
@@ -929,7 +982,10 @@ mod tests {
             "flat sugar lowers to coordinate gather:\n{}",
             program.text
         );
-        let ours = run_reference(&cx, &[(data.id, data_vals.into()), (idx.id, idx_vals.into())]);
+        let ours = run_reference(
+            &cx,
+            &[(data.id, data_vals.into()), (idx.id, idx_vals.into())],
+        );
         assert_close(ours.get_f32(out.id).unwrap(), &expected);
     }
 
@@ -947,7 +1003,9 @@ mod tests {
         let dest_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
         let idx_vals = vec![3i32, 0, 11, 6];
         let src_vals = vec![100.0f32, 200.0, 300.0, 400.0];
-        let expected = vec![200.0, 1.0, 2.0, 100.0, 4.0, 5.0, 400.0, 7.0, 8.0, 9.0, 10.0, 300.0];
+        let expected = vec![
+            200.0, 1.0, 2.0, 100.0, 4.0, 5.0, 400.0, 7.0, 8.0, 9.0, 10.0, 300.0,
+        ];
 
         let program = cx.logical.native_program().expect("native program");
         assert!(
@@ -955,8 +1013,13 @@ mod tests {
             "flat sugar lowers to coordinate scatter:\n{}",
             program.text
         );
-        let ours = run_reference(&cx,
-            &[(dest.id, dest_vals.into()), (idx.id, idx_vals.into()), (src.id, src_vals.into())],
+        let ours = run_reference(
+            &cx,
+            &[
+                (dest.id, dest_vals.into()),
+                (idx.id, idx_vals.into()),
+                (src.id, src_vals.into()),
+            ],
         );
         assert_close(ours.get_f32(out.id).unwrap(), &expected);
     }
@@ -995,9 +1058,7 @@ mod tests {
     fn differential_dynamic_arange() {
         let mut cx = Graph::new();
         cx.set_dim('a', 5);
-        let out = cx
-            .arange(crate::shape::IntExpr::from('a'))
-            .output();
+        let out = cx.arange(crate::shape::IntExpr::from('a')).output();
 
         let expected = vec![0i32, 1, 2, 3, 4];
         let ours = run_reference(&cx, &[]);
@@ -1065,7 +1126,11 @@ mod tests {
         cx.logical.native_program().expect("native program");
         let ours = crate::test_support::run_reference_with_ranges(
             &cx,
-            &[(data.id, data_vals.into()), (idx.id, idx_vals.into()), (upd.id, upd_vals.into())],
+            &[
+                (data.id, data_vals.into()),
+                (idx.id, idx_vals.into()),
+                (upd.id, upd_vals.into()),
+            ],
             &[(idx.id, -3, 2)],
         );
         assert_close(ours.get_f32(out.id).unwrap(), &expected);
@@ -1090,7 +1155,11 @@ mod tests {
         cx.logical.native_program().expect("native program");
         let ours = crate::test_support::run_reference_with_ranges(
             &cx,
-            &[(data.id, data_vals.into()), (idx.id, idx_vals.into()), (upd.id, upd_vals.into())],
+            &[
+                (data.id, data_vals.into()),
+                (idx.id, idx_vals.into()),
+                (upd.id, upd_vals.into()),
+            ],
             &[(idx.id, 0, 2)],
         );
         assert_close(ours.get_f32(out.id).unwrap(), &expected);
@@ -1120,7 +1189,9 @@ mod tests {
             program.text
         );
         let mut egraph = crate::egglog_snippet::new_egraph();
-        egraph.parse_and_run_program(None, &text).expect("program runs");
+        egraph
+            .parse_and_run_program(None, &text)
+            .expect("program runs");
         let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
         let allow = crate::reference::reference_allow_list();
         let extracted = crate::extractor::extract_layout_ir_with_ops(&serialized, Some(&allow))
@@ -1154,9 +1225,13 @@ mod tests {
         let mut cx = Graph::new();
         let x = cx.tensor((2, 3));
         let _out = x.output();
-        cx.logical.poison("synthetic guard tripped at t0 (mechanism test)".to_string());
+        cx.logical
+            .poison("synthetic guard tripped at t0 (mechanism test)".to_string());
         let reason = cx.logical.poisoned().expect("poison recorded");
-        assert!(reason.contains("synthetic guard"), "attributable reason: {reason}");
+        assert!(
+            reason.contains("synthetic guard"),
+            "attributable reason: {reason}"
+        );
         assert!(cx.logical.native_program().is_err());
     }
 
@@ -1186,7 +1261,8 @@ mod tests {
         let expected_d = vec![0.9092974, 0.5984721, 0.7780732];
         let (cx2, b2, c2, g2, e2, a2, d2) = build();
         cx2.logical.native_program().expect("native program");
-        let ours = run_reference(&cx2,
+        let ours = run_reference(
+            &cx2,
             &[
                 (b2.id, b_data.into()),
                 (c2.id, c_data.into()),
@@ -1299,11 +1375,17 @@ mod tests {
         let v12f: Vec<f32> = (0..12).map(|v| 12.0 - v as f32).collect();
 
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
-        let expected_flatten = vec![0.0, 16.5, 30.0, 40.5, 48.0, 52.5, 54.0, 52.5, 48.0, 40.5, 30.0, 16.5];
+        let expected_flatten = vec![
+            0.0, 16.5, 30.0, 40.5, 48.0, 52.5, 54.0, 52.5, 48.0, 40.5, 30.0, 16.5,
+        ];
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
-        let expected_merge = vec![-0.0, -5.0, -16.0, -27.0, -32.0, -25.0, 0.0, 49.0, 128.0, 243.0, 400.0, 605.0];
+        let expected_merge = vec![
+            -0.0, -5.0, -16.0, -27.0, -32.0, -25.0, 0.0, 49.0, 128.0, 243.0, 400.0, 605.0,
+        ];
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
-        let expected_split = vec![-2.0, -3.0, -3.0, -2.0, 0.0, 3.0, 7.0, 12.0, 18.0, 25.0, 33.0, 42.0];
+        let expected_split = vec![
+            -2.0, -3.0, -3.0, -2.0, 0.0, 3.0, 7.0, 12.0, 18.0, 25.0, 33.0, 42.0,
+        ];
         let (cx2, a2, b2, c2, d2, e2, f2, split2, merge2, flatten2) = build();
         let ours = run_reference(
             &cx2,
@@ -1318,10 +1400,7 @@ mod tests {
         );
         assert_close(ours.get_f32(split2.id).unwrap(), &expected_split);
         assert_close(ours.get_f32(merge2.id).unwrap(), &expected_merge);
-        assert_close(
-            ours.get_f32(flatten2.id).unwrap(),
-            &expected_flatten,
-        );
+        assert_close(ours.get_f32(flatten2.id).unwrap(), &expected_flatten);
     }
 
     /// REPEAT differential: tiling strides (z % d) lift into IntTruncRem
@@ -1339,7 +1418,9 @@ mod tests {
         let y_data: Vec<f32> = (0..12).map(|v| v as f32 + 0.5).collect();
 
         // GOLDEN (pinned from their ReferenceRuntime before its deletion — Step 4b ruling).
-        let expected = vec![0.5, 3.0, 7.5, 3.5, 9.0, 16.5, 6.5, 15.0, 25.5, 9.5, 21.0, 34.5];
+        let expected = vec![
+            0.5, 3.0, 7.5, 3.5, 9.0, 16.5, 6.5, 15.0, 25.5, 9.5, 21.0, 34.5,
+        ];
         let (cx2, x2, y2, out2) = build();
         let ours = run_reference(&cx2, &[(x2.id, x_data.into()), (y2.id, y_data.into())]);
         assert_close(ours.get_f32(out2.id).unwrap(), &expected);

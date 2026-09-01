@@ -24,7 +24,9 @@
 //! slots first, the variable tail last.
 
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// Walk the LayoutTensorCons spine at `child` counting elements — the
 /// shared rank reader for both scatter matchers (same class-resolving walk
@@ -146,7 +148,11 @@ impl BufferTensorIrOp for ScatterFunctionalDps {
 
 impl Bufferizable for ScatterFunctionalDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: self.dest_index(), result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: self.dest_index(),
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -192,7 +198,11 @@ impl BufferTensorIrOp for ScatterMutating {
 
 impl Bufferizable for ScatterMutating {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -234,13 +244,14 @@ impl OpMatcher for ScatterFunctionalMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("out_layout", 3)]
     }
 
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
-        Box::new(ScatterFunctional { rank: coordinate_rank(site, 2) })
+        Box::new(ScatterFunctional {
+            rank: coordinate_rank(site, 2),
+        })
     }
 }
 
@@ -268,9 +279,10 @@ impl OpMatcher for ScatterMutatingMatcher {
         ]
     }
 
-
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
-        Box::new(ScatterMutating { rank: coordinate_rank(site, 2) })
+        Box::new(ScatterMutating {
+            rank: coordinate_rank(site, 2),
+        })
     }
 }
 

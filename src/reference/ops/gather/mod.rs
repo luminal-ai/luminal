@@ -12,7 +12,9 @@
 //! is answered from that stored rank.
 
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `GatherGeneric(data, coord0, .., coord{r-1}) -> out`
 ///
@@ -96,7 +98,11 @@ impl BufferTensorIrOp for GatherDps {
 
 impl Bufferizable for GatherDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: self.dest_index(), result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: self.dest_index(),
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -138,7 +144,6 @@ impl OpMatcher for GatherMatcher {
             },
         ]
     }
-
 
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("out_layout", 2)]
@@ -207,7 +212,10 @@ use crate::reference::kernels::{coordinate_columns, expect_op, move_gathered};
 /// Coordinate gather: `dest[flat] = data[coords(flat)]` with loud
 /// bounds checks (out-of-bounds is UB per the scatter/gather ruling,
 /// surfaced loudly).
-pub(in crate::reference) fn kernel(op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     let op = expect_op::<GatherDps>(op)?;
     let rank = op.rank;
     let data_dims = &ctx.operand_dims[0];

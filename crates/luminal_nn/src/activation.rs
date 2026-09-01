@@ -61,10 +61,7 @@ mod tests {
 
     /// The M3 ladder end-to-end (full genetic search; scalar-constant
     /// broadcasts route via materialize — rediagnosis 2026-08-12).
-    fn run_unary(
-        build: impl Fn(GraphTensor) -> GraphTensor,
-        input: Vec<f32>,
-    ) -> Vec<f32> {
+    fn run_unary(build: impl Fn(GraphTensor) -> GraphTensor, input: Vec<f32>) -> Vec<f32> {
         let mut cx = Graph::new();
         let x = cx.tensor(input.len());
         let out = build(x).output();

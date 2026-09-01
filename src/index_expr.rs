@@ -59,7 +59,13 @@ pub fn parse_int_expr(
     depth: usize,
     expected_shape: Option<&egraph_serialize::ClassId>,
 ) -> Option<IotaExpr> {
-    parse_int_expr_memo(site, class, depth, expected_shape, &mut std::collections::HashMap::new())
+    parse_int_expr_memo(
+        site,
+        class,
+        depth,
+        expected_shape,
+        &mut std::collections::HashMap::new(),
+    )
 }
 
 /// Memo entry: a finished parse, or the in-progress cycle guard.
@@ -108,7 +114,8 @@ fn parse_int_expr_tainting(
     }
     memo.insert(class.clone(), ParseMemo::InProgress);
     let mut local_taint = false;
-    let parsed = parse_int_expr_uncached(site, class, depth, expected_shape, memo, &mut local_taint);
+    let parsed =
+        parse_int_expr_uncached(site, class, depth, expected_shape, memo, &mut local_taint);
     if parsed.is_none() && local_taint {
         memo.remove(class);
         *tainted = true;
@@ -140,21 +147,26 @@ fn parse_int_expr_uncached(
         // out-coordinate and cannot parse (loud kernel refusal instead
         // of a silently misread axis).
         if let Some(expected) = expected_shape {
-            let Some(owner_class) = site.class_of_child(coord, 0) else { continue };
+            let Some(owner_class) = site.class_of_child(coord, 0) else {
+                continue;
+            };
             if owner_class != *expected {
                 continue;
             }
         }
-        let Some(axis_class) = site.class_of_child(coord, 1) else { continue };
+        let Some(axis_class) = site.class_of_child(coord, 1) else {
+            continue;
+        };
         return Some(IotaExpr::Coord(
-            site.node_in_class_parse_i64(&axis_class)? as usize,
+            site.node_in_class_parse_i64(&axis_class)? as usize
         ));
     }
     // Binary kinds: BACKTRACK across every representation in the class —
     // a saturated class holds many equal spellings, and the first node of
     // a kind may have children outside the parsed subset while a sibling
     // spelling parses fine.
-    let binary_kinds: [(&str, fn(Box<IotaExpr>, Box<IotaExpr>) -> IotaExpr); 6] = [
+    type BinaryIotaBuilder = fn(Box<IotaExpr>, Box<IotaExpr>) -> IotaExpr;
+    let binary_kinds: [(&str, BinaryIotaBuilder); 6] = [
         ("IntAdd", |a, b| IotaExpr::Add(a, b)),
         ("IntMul", |a, b| IotaExpr::Mul(a, b)),
         ("IntTruncDiv", |a, b| IotaExpr::TruncDiv(a, b)),
@@ -164,22 +176,51 @@ fn parse_int_expr_uncached(
     ];
     for (kind, build) in binary_kinds {
         for node in site.nodes_in_class_value(class, kind) {
-            let Some(lhs_class) = site.class_of_child(node, 0) else { continue };
-            let Some(rhs_class) = site.class_of_child(node, 1) else { continue };
-            let Some(lhs) = parse_int_expr_tainting(site, &lhs_class, depth - 1, expected_shape, memo, tainted) else { continue };
-            let Some(rhs) = parse_int_expr_tainting(site, &rhs_class, depth - 1, expected_shape, memo, tainted) else { continue };
+            let Some(lhs_class) = site.class_of_child(node, 0) else {
+                continue;
+            };
+            let Some(rhs_class) = site.class_of_child(node, 1) else {
+                continue;
+            };
+            let Some(lhs) =
+                parse_int_expr_tainting(site, &lhs_class, depth - 1, expected_shape, memo, tainted)
+            else {
+                continue;
+            };
+            let Some(rhs) =
+                parse_int_expr_tainting(site, &rhs_class, depth - 1, expected_shape, memo, tainted)
+            else {
+                continue;
+            };
             return Some(build(Box::new(lhs), Box::new(rhs)));
         }
     }
     for cast in site.nodes_in_class_value(class, "IntCastFromBool") {
-        let Some(bool_class) = site.class_of_child(cast, 0) else { continue };
-        let Some(less_than) = site.nodes_in_class_value(&bool_class, "BoolLessThanInt").next() else {
+        let Some(bool_class) = site.class_of_child(cast, 0) else {
             continue;
         };
-        let Some(lhs_class) = site.class_of_child(less_than, 0) else { continue };
-        let Some(rhs_class) = site.class_of_child(less_than, 1) else { continue };
-        let Some(lhs) = parse_int_expr_tainting(site, &lhs_class, depth - 1, expected_shape, memo, tainted) else { continue };
-        let Some(rhs) = parse_int_expr_tainting(site, &rhs_class, depth - 1, expected_shape, memo, tainted) else { continue };
+        let Some(less_than) = site
+            .nodes_in_class_value(&bool_class, "BoolLessThanInt")
+            .next()
+        else {
+            continue;
+        };
+        let Some(lhs_class) = site.class_of_child(less_than, 0) else {
+            continue;
+        };
+        let Some(rhs_class) = site.class_of_child(less_than, 1) else {
+            continue;
+        };
+        let Some(lhs) =
+            parse_int_expr_tainting(site, &lhs_class, depth - 1, expected_shape, memo, tainted)
+        else {
+            continue;
+        };
+        let Some(rhs) =
+            parse_int_expr_tainting(site, &rhs_class, depth - 1, expected_shape, memo, tainted)
+        else {
+            continue;
+        };
         return Some(IotaExpr::LessThanCast(Box::new(lhs), Box::new(rhs)));
     }
     None

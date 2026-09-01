@@ -2,8 +2,10 @@
 //! chosen by extraction. An ordinary op (no special-casing): its cost falls
 //! out of the tensor sizes it reads and writes.
 
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `CopyGeneric(input) -> out`
 ///
@@ -75,7 +77,11 @@ impl BufferTensorIrOp for MaterializeLayoutCopyDps {
 
 impl Bufferizable for MaterializeLayoutCopyDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 1, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 1,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -114,7 +120,6 @@ impl OpMatcher for MaterializeLayoutCopyMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("layout", 1)]
     }
@@ -138,7 +143,10 @@ use crate::reference::kernels::move_gathered;
 /// reference runtime holds every buffer dense row-major (no view reads in
 /// its allow list), so materializing a copy IS an element copy — but only
 /// under identical geometry, which is checked loudly rather than assumed.
-pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    _op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         ctx.operand_dims[0] == ctx.operand_dims[1],
         "copy kernel: input geometry {:?} vs dest geometry {:?} — a shape-changing \

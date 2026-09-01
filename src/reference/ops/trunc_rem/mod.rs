@@ -1,7 +1,9 @@
 //! TruncRem: see the match rules for the gating story.
 
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `TruncRemFunctionalGeneric(numerator, denominator) -> out` — functional form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +66,11 @@ impl BufferTensorIrOp for TruncRemFunctionalDps {
 
 impl Bufferizable for TruncRemFunctionalDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 2, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 2,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 

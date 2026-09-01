@@ -80,8 +80,7 @@ mod tests {
         let mut expected = vec![0f32; 8];
         for r in 0..2 {
             for c in 0..4 {
-                expected[r * 4 + c] =
-                    (0..3).map(|k| x_data[r * 3 + k] * w_data[k * 4 + c]).sum();
+                expected[r * 4 + c] = (0..3).map(|k| x_data[r * 3 + k] * w_data[k * 4 + c]).sum();
             }
         }
 
@@ -133,7 +132,6 @@ mod tests {
     }
 }
 
-
 /// Per-tensor-quantized fp8 linear (the nvidia/modelopt form —
 /// quantization is MODEL DEFINITION, ruling 2026-08-12): the weight is
 /// an E4M3FN tensor and TWO F32 scalars accompany it — a static input
@@ -173,10 +171,7 @@ impl Fp8Linear {
             Some(self.inp),
             "Fp8Linear input width"
         );
-        let in_scale = self
-            .input_scale
-            .expand_lhs(&dims[..])
-            .reciprocal();
+        let in_scale = self.input_scale.expand_lhs(&dims[..]).reciprocal();
         let quantized = (input * in_scale).cast(DType::F8E4M3);
         let wide = quantized.cast(DType::F32);
         let weight_wide = self.weight.cast(DType::F32).permute((1, 0));
@@ -217,8 +212,7 @@ mod fp8_tests {
         let weight_scale = 2.0f32;
         // (out, in) row-major weight codes.
         let weight_f32 = [0.5f32, -1.5, 2.0, 3.5, -0.0625, 448.0];
-        let weight_codes: Vec<F8E4M3> =
-            weight_f32.iter().map(|w| F8E4M3::from_f32(*w)).collect();
+        let weight_codes: Vec<F8E4M3> = weight_f32.iter().map(|w| F8E4M3::from_f32(*w)).collect();
 
         // Host reference with the identical quantization math.
         let quant = |v: f32| F8E4M3::from_f32((v / input_scale).clamp(-448.0, 448.0)).to_f32();

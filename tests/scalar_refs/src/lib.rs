@@ -39,8 +39,8 @@ pub fn ref_paged_step(
     q: &[f32],
     k_new: &[f32],
     v_new: &[f32],
-    k_cache: &mut Vec<f32>,
-    v_cache: &mut Vec<f32>,
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
     gather: &[usize],
     scatter_slot: usize,
     n_heads: usize,
@@ -86,7 +86,13 @@ pub fn ref_layer_norm(x: &[f32], epsilon: f32) -> Vec<f32> {
 
 /// MoE forward for one row, k = 1: softmax routing, best expert's
 /// matmul scaled by its routing weight.
-pub fn ref_moe_k1(x: &[f32], router: &[f32], experts: &[f32], d: usize, e_count: usize) -> Vec<f32> {
+pub fn ref_moe_k1(
+    x: &[f32],
+    router: &[f32],
+    experts: &[f32],
+    d: usize,
+    e_count: usize,
+) -> Vec<f32> {
     let logits: Vec<f32> = (0..e_count)
         .map(|e| (0..d).map(|i| x[i] * router[i * e_count + e]).sum())
         .collect();
@@ -110,8 +116,8 @@ pub fn ref_block_step(
     wv: &[f32],
     wo: &[f32],
     ff: &dyn Fn(&[f32]) -> Vec<f32>,
-    k_cache: &mut Vec<f32>,
-    v_cache: &mut Vec<f32>,
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
     gather: &[usize],
     scatter_slot: usize,
     n_heads: usize,
@@ -122,7 +128,15 @@ pub fn ref_block_step(
     let k = ref_matmul(x, wk, d, d);
     let v = ref_matmul(x, wv, d, d);
     let attn = ref_paged_step(
-        &q, &k, &v, k_cache, v_cache, gather, scatter_slot, n_heads, head_dim,
+        &q,
+        &k,
+        &v,
+        k_cache,
+        v_cache,
+        gather,
+        scatter_slot,
+        n_heads,
+        head_dim,
     );
     let attn_proj = ref_matmul(&attn, wo, d, d);
     let x1: Vec<f32> = x.iter().zip(&attn_proj).map(|(a, b)| a + b).collect();
@@ -132,7 +146,6 @@ pub fn ref_block_step(
 
 /// GQA paged-attention reference, one new token: query head h reads
 /// KV head h / (n_heads / n_kv_heads).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub fn ref_paged_step_gqa(
     q: &[f32],
@@ -201,7 +214,7 @@ pub fn ref_silu(x: &[f32]) -> Vec<f32> {
 pub fn ref_gelu_tanh(x: &[f32]) -> Vec<f32> {
     x.iter()
         .map(|v| {
-            let scaled = 1.5957691216 * v * (1.0 + 0.044715 * v * v);
+            let scaled = 1.595_769_2 * v * (1.0 + 0.044715 * v * v);
             v / (1.0 + (-scaled).exp())
         })
         .collect()

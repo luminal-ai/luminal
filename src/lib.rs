@@ -1,26 +1,25 @@
 pub mod dtype;
+#[path = "egglog_core/egglog_utils/mod.rs"]
 pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;
 pub mod reference_binding;
-pub mod mask_events;
 pub mod shape;
 
-// The logical-SSA layout compiler (the egglog_layout_trial graft, M0: vendored
-// unwired). Egglog program assembly + registries live beside the ops; the
-// fixture suite runs as core tests. See src/egglog/checkpoint_5/ for the core
-// preamble and fixtures.
+// The logical-SSA layout compiler. Egglog program assembly and registries live
+// beside the ops; the fixture suite runs as core tests. See src/egglog_core/
+// for the core preamble and fixtures.
 pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;
 pub mod egglog_snippet;
-pub mod index_expr;
-pub mod subst_primitive;
 pub mod extractor;
+pub mod implementation_search;
+pub mod index_expr;
 pub mod layout_ir;
 pub mod logical_op;
-pub mod implementation_search;
 pub mod reference;
+pub mod subst_primitive;
 pub mod test_support;
 pub mod visualization;
 

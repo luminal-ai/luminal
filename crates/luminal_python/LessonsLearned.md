@@ -12,7 +12,7 @@ to prevent similar issues in the future.
 Both bugs only appeared on roughly 50% of test runs. The source of non-determinism is
 `FxHashMap` (a fixed-seed hash map). The egglog optimizer's `SerializedEGraph::new` builds
 `Vec<NodeId>` orderings for each e-class by iterating a `FxHashMap`, producing non-deterministic
-node orderings. `random_initial_choice()` in `src/egglog_utils/mod.rs` then randomly picks one
+node orderings. `random_initial_choice()` in `src/egglog_core/egglog_utils/mod.rs` then randomly picks one
 e-node per e-class as the starting representation for the profiling phase. The combination means
 some runs pick a correct kernel and some pick a broken one from the same e-class.
 

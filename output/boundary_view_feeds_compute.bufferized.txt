@@ -1,8 +1,0 @@
-buffers (2):
-  pinned[x_buffer_id / BufferLit(40)] [caller, ro]
-  pinned[y_buffer_id / BufferLit(41)] [caller, rw]
-ops (1):
-  SqrtFunctionalGeneric: [pinned[x_buffer_id / BufferLit(40)], pinned[y_buffer_id / BufferLit(41)]] -> [pinned[y_buffer_id / BufferLit(41)]]
-anti (0):
-outputs (1):
-  out 0 -> pinned[y_buffer_id / BufferLit(41)]

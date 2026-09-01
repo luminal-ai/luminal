@@ -153,10 +153,16 @@ fn build_model() -> Model {
             wv: cx.named_tensor(format!("wv{layer}"), (KV_DIM, HIDDEN)),
             wo: cx.named_tensor(format!("wo{layer}"), (HIDDEN, HIDDEN)),
             router: cx.named_tensor(format!("router{layer}"), (NUM_EXPERTS, HIDDEN)),
-            gate_up: cx
-                .named_tensor_dtyped(format!("gu{layer}"), (NUM_EXPERTS, MOE_INTER * 2, HIDDEN), DType::Bf16),
-            down: cx
-                .named_tensor_dtyped(format!("dn{layer}"), (NUM_EXPERTS, HIDDEN, MOE_INTER), DType::Bf16),
+            gate_up: cx.named_tensor_dtyped(
+                format!("gu{layer}"),
+                (NUM_EXPERTS, MOE_INTER * 2, HIDDEN),
+                DType::Bf16,
+            ),
+            down: cx.named_tensor_dtyped(
+                format!("dn{layer}"),
+                (NUM_EXPERTS, HIDDEN, MOE_INTER),
+                DType::Bf16,
+            ),
             k_cache: cx.named_tensor(format!("kc{layer}"), (MAX_SEQ, KV_DIM)),
             v_cache: cx.named_tensor(format!("vc{layer}"), (MAX_SEQ, KV_DIM)),
         };
@@ -236,7 +242,6 @@ fn main() {
     let mut step_times = Vec::new();
 
     for seed in 0..seeds {
-        luminal::mask_events::reset();
         let mut model = build_model();
         // Two 's' buckets (decode + prefill) like the real examples — the
         // single-combo stitched load path has an unrelated constant-upload

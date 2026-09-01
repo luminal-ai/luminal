@@ -113,7 +113,6 @@ impl OpMatcher for LessThanMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("out_layout", 2)]
     }

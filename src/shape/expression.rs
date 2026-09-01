@@ -14,12 +14,13 @@ use std::{
 };
 
 use crate::egglog_utils::{self, SerializedEGraph, extract_expr};
-use egglog::{ast::Span, prelude::RustSpan, var};
+use egglog::var;
 
 type ExprBox = GenerationalBox<Vec<Term>, SyncStorage>;
 
 pub static EXPR_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
-static SIMPLIFY_CACHE: OnceLock<Mutex<LruCache<IntegerExpression, IntegerExpression>>> = OnceLock::new();
+static SIMPLIFY_CACHE: OnceLock<Mutex<LruCache<IntegerExpression, IntegerExpression>>> =
+    OnceLock::new();
 static INTERVAL_SIMPLIFY_CACHE: OnceLock<Mutex<LruCache<IntervalSimplifyKey, IntegerExpression>>> =
     OnceLock::new();
 static EXPRESSION_INTERNER: OnceLock<RwLock<FxHashMap<Vec<Term>, ExprBox>>> = OnceLock::new();
@@ -147,7 +148,6 @@ impl IntegerExpression {
             .map(|i| i.read().unwrap().len())
             .unwrap_or(0)
     }
-
 }
 
 impl Hash for IntegerExpression {
@@ -324,7 +324,10 @@ impl IntegerExpression {
 
     /// Does this expression contain any coordinate atoms?
     pub fn contains_coords(&self) -> bool {
-        self.terms.read().iter().any(|term| matches!(term, Term::Coord(_)))
+        self.terms
+            .read()
+            .iter()
+            .any(|term| matches!(term, Term::Coord(_)))
     }
 
     pub fn to_egglog(&self) -> String {
@@ -510,7 +513,11 @@ impl IntegerExpression {
         IntegerExpression::new(terms)
     }
     /// Substitute an expression for a variable
-    pub fn substitute(self, var: impl Into<crate::shape::Symbol>, expr: impl Into<IntegerExpression>) -> Self {
+    pub fn substitute(
+        self,
+        var: impl Into<crate::shape::Symbol>,
+        expr: impl Into<IntegerExpression>,
+    ) -> Self {
         let var = var.into();
         let mut new_terms = vec![];
         let t = expr.into().terms.read();
@@ -1183,7 +1190,10 @@ fn egglog_simplify(e: IntegerExpression) -> IntegerExpression {
 }
 
 #[tracing::instrument(skip_all)]
-fn egglog_simplify_with_intervals(e: IntegerExpression, intervals: &DynDimIntervals) -> IntegerExpression {
+fn egglog_simplify_with_intervals(
+    e: IntegerExpression,
+    intervals: &DynDimIntervals,
+) -> IntegerExpression {
     let key = IntervalSimplifyKey {
         expr: e,
         intervals: canonical_intervals(intervals),
@@ -1257,7 +1267,10 @@ mod tests {
     fn test_empty_sum_is_zero() {
         // Sanity check the additive identity stays 0 (it always was).
         let empty: Vec<IntegerExpression> = vec![];
-        assert_eq!(empty.into_iter().sum::<IntegerExpression>(), IntegerExpression::from(0));
+        assert_eq!(
+            empty.into_iter().sum::<IntegerExpression>(),
+            IntegerExpression::from(0)
+        );
     }
 
     #[test]
@@ -1268,7 +1281,15 @@ mod tests {
         assert_eq!(((a * 1) + 0) / 1 + (1 - 1), a);
         // Evaluation after simplification
         let n = (x + (256 - (x % 256))).simplify();
-        assert_eq!(n.exec(&[(crate::shape::Symbol::from('x'), 767)].into_iter().collect()).unwrap(), 768);
+        assert_eq!(
+            n.exec(
+                &[(crate::shape::Symbol::from('x'), 767)]
+                    .into_iter()
+                    .collect()
+            )
+            .unwrap(),
+            768
+        );
     }
 
     #[test]
@@ -1293,7 +1314,9 @@ mod tests {
     #[test]
     fn test_interval_simplifications() {
         let s = expr('s');
-        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(0, 127))].into_iter().collect();
+        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(0, 127))]
+            .into_iter()
+            .collect();
 
         assert_eq!((s % 128).simplify_with_intervals(&intervals), s);
         assert_eq!((s / 128).simplify_with_intervals(&intervals), expr(0));
@@ -1320,7 +1343,9 @@ mod tests {
     #[test]
     fn test_singleton_interval_substitutes_dynamic_var() {
         let s = expr('s');
-        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(1, 1))].into_iter().collect();
+        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(1, 1))]
+            .into_iter()
+            .collect();
 
         assert_eq!((s + 127).simplify_with_intervals(&intervals), expr(128));
         assert_eq!((s.lt(2)).simplify_with_intervals(&intervals), expr(1));
@@ -1329,7 +1354,9 @@ mod tests {
     #[test]
     fn test_interval_simplification_requires_proof() {
         let s = expr('s');
-        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(0, 256))].into_iter().collect();
+        let intervals = [(crate::shape::Symbol::from('s'), DimInterval::new(0, 256))]
+            .into_iter()
+            .collect();
 
         assert_ne!((s % 128).simplify_with_intervals(&intervals), s);
         assert_ne!(s.lt(128).simplify_with_intervals(&intervals), expr(1));

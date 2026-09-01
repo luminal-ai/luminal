@@ -2,8 +2,10 @@
 //! elements densely (the index map and output shape are op metadata, not
 //! operands).
 
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `IndexMapApplyMaterialize(input) -> out`
 ///
@@ -38,7 +40,9 @@ impl Bufferizable for IndexMapApplyMaterialize {}
 
 impl ToDps for IndexMapApplyMaterialize {
     fn to_dps(&self) -> Option<Box<dyn LayoutIrOp>> {
-        Some(Box::new(IndexMapApplyMaterializeDps { entries: self.entries.clone() }))
+        Some(Box::new(IndexMapApplyMaterializeDps {
+            entries: self.entries.clone(),
+        }))
     }
 }
 
@@ -82,7 +86,11 @@ impl BufferTensorIrOp for IndexMapApplyMaterializeDps {
 
 impl Bufferizable for IndexMapApplyMaterializeDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 1, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 1,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -121,13 +129,14 @@ impl OpMatcher for IndexMapApplyMaterializeMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("index_map", 1), ("shape", 2), ("out_layout", 3)]
     }
 
     fn extract(&self, site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
-        Box::new(IndexMapApplyMaterialize { entries: parse_map_entries(site) })
+        Box::new(IndexMapApplyMaterialize {
+            entries: parse_map_entries(site),
+        })
     }
 }
 
@@ -151,7 +160,9 @@ fn parse_map_entries(site: &ExtractionSite<'_>) -> Option<Vec<super::iota::IotaE
     let out_shape = site.child_class(2);
     let mut memo = std::collections::HashMap::new();
     for map_node in site.nodes_in_class_value(&map_class, "IndexMapLit") {
-        let Some(head) = site.class_of_child(map_node, 0) else { continue };
+        let Some(head) = site.class_of_child(map_node, 0) else {
+            continue;
+        };
         if let Some(entries) = parse_entry_list(site, &head, 64, &out_shape, &mut memo) {
             return Some(entries);
         }
@@ -169,13 +180,25 @@ fn parse_entry_list(
     if depth == 0 {
         return None;
     }
-    if site.nodes_in_class_value(class, "IntExprNil").next().is_some() {
+    if site
+        .nodes_in_class_value(class, "IntExprNil")
+        .next()
+        .is_some()
+    {
         return Some(Vec::new());
     }
     for cons in site.nodes_in_class_value(class, "IntExprCons") {
-        let Some(element) = site.class_of_child(cons, 0) else { continue };
-        let Some(tail) = site.class_of_child(cons, 1) else { continue };
-        let Some(expr) = super::iota::parse_int_expr_memo(site, &element, 64, Some(out_shape), memo) else { continue };
+        let Some(element) = site.class_of_child(cons, 0) else {
+            continue;
+        };
+        let Some(tail) = site.class_of_child(cons, 1) else {
+            continue;
+        };
+        let Some(expr) =
+            super::iota::parse_int_expr_memo(site, &element, 64, Some(out_shape), memo)
+        else {
+            continue;
+        };
         if let Some(mut rest) = parse_entry_list(site, &tail, depth - 1, out_shape, memo) {
             rest.insert(0, expr);
             return Some(rest);

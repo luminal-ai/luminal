@@ -23,7 +23,7 @@ use luminal::{
     graph::LLIRGraph,
     hlir::Output,
     prelude::{
-        IntExpr, FxHashMap, FxHashSet, NodeIndex,
+        FxHashMap, FxHashSet, IntExpr, NodeIndex,
         petgraph::{
             Direction,
             algo::toposort,
@@ -656,7 +656,6 @@ fn validate_mutating_aliases(
             .map(|edge| edge.source())
             .collect_vec();
         let Some(input) = inputs.get(input_index).copied() else {
-            luminal::mask_events::ALIAS_HAZARD_REJECT.record();
             return Err(ResourceViolation::AliasingHazard {
                 name: kernel.kernel_name(),
                 reason: "the declared aliased input is missing",
@@ -688,7 +687,6 @@ fn validate_mutating_aliases(
             .count()
             != 1
         {
-            luminal::mask_events::ALIAS_HAZARD_REJECT.record();
             return Err(ResourceViolation::AliasingHazard {
                 name: kernel.kernel_name(),
                 reason: "another kernel input aliases the mutated buffer",
@@ -719,7 +717,6 @@ fn validate_mutating_aliases(
             if pure_alias || ancestors.contains(&consumer) {
                 continue;
             }
-            luminal::mask_events::ALIAS_HAZARD_REJECT.record();
             return Err(ResourceViolation::AliasingHazard {
                 name: kernel.kernel_name(),
                 reason: "a competing read is not ordered before the mutation",
@@ -733,10 +730,7 @@ fn validate_mutating_aliases(
 fn validated_topology_and_aliases(
     llir: &LLIRGraph,
 ) -> Result<(Vec<NodeIndex>, FxHashMap<NodeIndex, NodeIndex>), ResourceViolation> {
-    let topo = toposort(llir, None).map_err(|_| {
-        luminal::mask_events::CYCLIC_LLIR_REJECT.record();
-        ResourceViolation::CyclicLlir
-    })?;
+    let topo = toposort(llir, None).map_err(|_| ResourceViolation::CyclicLlir)?;
     let aliases = validate_mutating_aliases(llir, &topo)?;
     Ok((topo, aliases))
 }
@@ -747,7 +741,6 @@ fn validated_topology_and_aliases(
 pub(crate) fn validate_static_llir_semantics(llir: &LLIRGraph) -> Result<(), ResourceViolation> {
     validated_topology_and_aliases(llir)?;
     region_codegen::validate_fusion_regions(llir, None).map_err(|violation| {
-        luminal::mask_events::FUSION_REGION_REJECT.record_with(|| violation.reason.clone());
         ResourceViolation::InvalidFusionRegion {
             node: violation.node.index(),
             reason: violation.reason,
@@ -764,7 +757,6 @@ pub(crate) fn plan_static_llir_resources(
 ) -> Result<CandidateResourcePlan, ResourceViolation> {
     let (topo, aliases) = validated_topology_and_aliases(llir)?;
     region_codegen::validate_fusion_regions(llir, Some(dyn_map)).map_err(|violation| {
-        luminal::mask_events::FUSION_REGION_REJECT.record_with(|| violation.reason.clone());
         ResourceViolation::InvalidFusionRegion {
             node: violation.node.index(),
             reason: violation.reason,

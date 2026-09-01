@@ -444,7 +444,7 @@ pub struct ExtractedGraph {
 pub enum ExtractedNode {
     /// A program input boundary: a LayoutTensor backed by a pre-assigned buffer.
     /// Not a `LayoutOp` — it is a (caller-owned) storage specification.
-    BufferInput(InputNode),
+    BufferInput(Box<InputNode>),
     /// A dataflow op producing one or more LayoutTensor outputs.
     LayoutOp(OpNode),
     /// A program output boundary: final LayoutTensors that must be written into
@@ -914,8 +914,10 @@ impl DotEmitter {
                     label.push_str("<TD></TD>");
                     continue;
                 }
-                label.push_str("<TD CELLPADDING=\"0\"><TABLE BORDER=\"0\" CELLBORDER=\"0\" \
-                                CELLSPACING=\"0\" CELLPADDING=\"3\">");
+                label.push_str(
+                    "<TD CELLPADDING=\"0\"><TABLE BORDER=\"0\" CELLBORDER=\"0\" \
+                                CELLSPACING=\"0\" CELLPADDING=\"3\">",
+                );
                 let mut first_row = true;
                 for slot in slots {
                     if !first_row {
@@ -1076,7 +1078,14 @@ impl DotEmitter {
 
     /// An edge with explicit color and line style (dependency-ordering
     /// rendering).
-    pub(crate) fn styled_edge(&mut self, from: usize, to: usize, label: &str, color: &str, style: &str) {
+    pub(crate) fn styled_edge(
+        &mut self,
+        from: usize,
+        to: usize,
+        label: &str,
+        color: &str,
+        style: &str,
+    ) {
         self.body.push_str(&format!(
             "  n{from} -> n{to} [label=\"{}\", color=\"{color}\", fontcolor=\"{color}\", style=\"{style}\"];\n",
             dot_escape(label)
@@ -1158,4 +1167,3 @@ pub(crate) fn slot_port(slot: &str) -> String {
         .collect();
     format!("p_{sanitized}")
 }
-

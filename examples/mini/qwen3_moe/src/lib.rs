@@ -30,11 +30,11 @@ fn moe_lm_new(
                     wk: Linear::new(d, d, false, &a.child("k_proj"), cx),
                     wv: Linear::new(d, d, false, &a.child("v_proj"), cx),
                     wo: Linear::new(d, d, false, &a.child("o_proj"), cx),
-                    ff: FeedForward::Moe(MoE {
+                    ff: FeedForward::Moe(Box::new(MoE {
                         expert_weights: cx.named_tensor(mlp_ns.leaf("experts"), (experts, d, d)),
                         router: cx.named_tensor(mlp_ns.leaf("router"), (d, experts)),
                         k: top_k,
-                    }),
+                    })),
                     n_heads,
                     n_kv_heads: n_heads,
                     head_dim: d / n_heads,
@@ -94,9 +94,12 @@ impl MiniQwen3Moe {
         layers: usize,
         cx: &mut Graph,
     ) -> Self {
-        let (embed, blocks, final_norm) =
-            moe_lm_new(vocab, d, experts, top_k, n_heads, layers, cx);
-        Self { embed, blocks, final_norm }
+        let (embed, blocks, final_norm) = moe_lm_new(vocab, d, experts, top_k, n_heads, layers, cx);
+        Self {
+            embed,
+            blocks,
+            final_norm,
+        }
     }
 
     pub fn forward(

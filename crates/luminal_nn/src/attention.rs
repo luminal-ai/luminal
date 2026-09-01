@@ -227,8 +227,14 @@ pub fn paged_attention_masked(
         .split_dims(1, head_dim)
         .split_dims(1, kv_groups)
         .permute((1, 2, 0, 3));
-    let k = k.split_dims(1, head_dim).permute((1, 2, 0)).expand_dim(1, kv_groups);
-    let v = v.split_dims(1, head_dim).permute((1, 0, 2)).expand_dim(1, kv_groups);
+    let k = k
+        .split_dims(1, head_dim)
+        .permute((1, 2, 0))
+        .expand_dim(1, kv_groups);
+    let v = v
+        .split_dims(1, head_dim)
+        .permute((1, 0, 2))
+        .expand_dim(1, kv_groups);
 
     let scores = q.matmul(k) * score_scale;
     let mask = mask.expand_dim(0, n_kv_heads).expand_dim(1, kv_groups);
@@ -305,8 +311,11 @@ fn paged_attention_core(
     let mut mask = row_vals.lt(col_vals).cast(DType::F32) * -1e9;
     if let Some(window) = window {
         // masked where col < row − (window − 1)
-        let outside = col_vals.lt(row_vals - (window as f32 - 1.0)).cast(DType::F32) * -1e9;
-        mask = mask + outside;
+        let outside = col_vals
+            .lt(row_vals - (window as f32 - 1.0))
+            .cast(DType::F32)
+            * -1e9;
+        mask += outside;
     }
 
     // Broadcast (s, ctx) → (n_kv_heads, kv_groups, s, ctx)
@@ -367,10 +376,18 @@ pub fn rope_pairing_matrix(head_dim: usize, interleaved: bool) -> Vec<f32> {
     for column in 0..head_dim {
         // rot(x)[column] = ±x[source]  ⇒  R[source, column] = ±1
         let (source, sign) = if interleaved {
-            if column % 2 == 0 { (column + 1, -1.0) } else { (column - 1, 1.0) }
+            if column % 2 == 0 {
+                (column + 1, -1.0)
+            } else {
+                (column - 1, 1.0)
+            }
         } else {
             let half = head_dim / 2;
-            if column < half { (column + half, -1.0) } else { (column - half, 1.0) }
+            if column < half {
+                (column + half, -1.0)
+            } else {
+                (column - half, 1.0)
+            }
         };
         rot[source * head_dim + column] = sign;
     }
@@ -516,7 +533,7 @@ pub fn attention(
     q: GraphTensor,
     k: GraphTensor,
     v: GraphTensor,
-    n_heads: usize,
+    _n_heads: usize,
     head_dim: usize,
 ) -> GraphTensor {
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -537,8 +554,8 @@ mod tests {
     use super::{gather_rows, paged_attention, paged_attention_positional, scatter_rows};
     use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
-    use luminal::shape::IntExpr;
     use luminal::reference::ReferenceRuntime;
+    use luminal::shape::IntExpr;
     use rustc_hash::FxHashMap;
 
     fn assert_close(ours: &[f32], expected: &[f32]) {
@@ -812,7 +829,10 @@ mod tests {
             ],
         );
         assert_close(rt.get_f32(attn_pos.id).expect("positional attn"), &attn_ref);
-        assert_close(rt.get_f32(attn_expr.id).expect("expression attn"), &attn_ref);
+        assert_close(
+            rt.get_f32(attn_expr.id).expect("expression attn"),
+            &attn_ref,
+        );
         assert_close(rt.get_f32(k_pos_out.id).expect("k cache"), &k_cache_ref);
         assert_close(rt.get_f32(v_pos_out.id).expect("v cache"), &v_cache_ref);
     }

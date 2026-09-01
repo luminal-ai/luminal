@@ -5,9 +5,9 @@
 //! load/bind/with_ops/search.
 
 use petgraph::{
+    Direction,
     stable_graph::{NodeIndex, StableDiGraph},
     visit::EdgeRef,
-    Direction,
 };
 use rustc_hash::FxHashSet;
 
@@ -147,7 +147,7 @@ impl Graph {
 // silently mistranslating.
 
 use crate::shape::{IntExpr, Term};
-use anyhow::{bail, Result as AnyResult};
+use anyhow::{Result as AnyResult, bail};
 
 /// One index-map entry, in-memory. Movement composition happens on this
 /// tree — substituting our OWN just-emitted terms, never reconstructing
@@ -176,19 +176,19 @@ impl MapEntry {
     fn substitute(&self, replacement: &[MapEntry], prev_rank: usize) -> MapEntry {
         match self {
             MapEntry::Coord { from_end, .. } => replacement[prev_rank - 1 - from_end].clone(),
-            MapEntry::Lit(value) => MapEntry::Lit(value.clone()),
+            MapEntry::Lit(value) => MapEntry::Lit(*value),
             MapEntry::Add(a, b) => MapEntry::Add(
                 Box::new(a.substitute(replacement, prev_rank)),
                 Box::new(b.substitute(replacement, prev_rank)),
             ),
             MapEntry::Mul(a, e) => {
-                MapEntry::Mul(Box::new(a.substitute(replacement, prev_rank)), e.clone())
+                MapEntry::Mul(Box::new(a.substitute(replacement, prev_rank)), *e)
             }
             MapEntry::Div(a, e) => {
-                MapEntry::Div(Box::new(a.substitute(replacement, prev_rank)), e.clone())
+                MapEntry::Div(Box::new(a.substitute(replacement, prev_rank)), *e)
             }
             MapEntry::Rem(a, e) => {
-                MapEntry::Rem(Box::new(a.substitute(replacement, prev_rank)), e.clone())
+                MapEntry::Rem(Box::new(a.substitute(replacement, prev_rank)), *e)
             }
             MapEntry::Min(a, b) => MapEntry::Min(
                 Box::new(a.substitute(replacement, prev_rank)),
@@ -991,7 +991,7 @@ impl LogicalGraph {
         (0..rank)
             .map(|p| MapEntry::Coord {
                 from_end: rank - 1 - p,
-                extent: dims[p].clone(),
+                extent: dims[p],
             })
             .collect()
     }
@@ -1037,10 +1037,10 @@ impl LogicalGraph {
                 for (q, &p) in axes.iter().enumerate() {
                     replacement[p] = MapEntry::Coord {
                         from_end: prev_rank - 1 - q,
-                        extent: prev_dims[p].clone(),
+                        extent: prev_dims[p],
                     };
                 }
-                let new_dims = axes.iter().map(|&p| prev_dims[p].clone()).collect();
+                let new_dims = axes.iter().map(|&p| prev_dims[p]).collect();
                 (replacement, new_dims)
             }
             Movement::ExpandDim { axis, size } => {
@@ -1054,7 +1054,7 @@ impl LogicalGraph {
                         let q = if p < axis { p } else { p + 1 };
                         MapEntry::Coord {
                             from_end: new_rank - 1 - q,
-                            extent: prev_dims[p].clone(),
+                            extent: prev_dims[p],
                         }
                     })
                     .collect();
@@ -1078,7 +1078,7 @@ impl LogicalGraph {
                             let q = if p < axis { p } else { p - 1 };
                             MapEntry::Coord {
                                 from_end: new_rank - 1 - q,
-                                extent: prev_dims[p].clone(),
+                                extent: prev_dims[p],
                             }
                         }
                     })
@@ -1114,7 +1114,7 @@ impl LogicalGraph {
                             let q = if p < axis { p } else { p + 1 };
                             MapEntry::Coord {
                                 from_end: new_rank - 1 - q,
-                                extent: prev_dims[p].clone(),
+                                extent: prev_dims[p],
                             }
                         }
                     })
@@ -1129,7 +1129,7 @@ impl LogicalGraph {
                     self.poison(format!("merge_dims ({axis1},{axis2}) vs rank {prev_rank}"));
                     return None;
                 }
-                let inner = prev_dims[axis2].clone();
+                let inner = prev_dims[axis2];
                 let merged = (prev_dims[axis1] * prev_dims[axis2]).simplify();
                 let new_rank = prev_rank - 1;
                 let merged_coord = MapEntry::Coord {
@@ -1146,7 +1146,7 @@ impl LogicalGraph {
                             let q = if p < axis2 { p } else { p - 1 };
                             MapEntry::Coord {
                                 from_end: new_rank - 1 - q,
-                                extent: prev_dims[p].clone(),
+                                extent: prev_dims[p],
                             }
                         }
                     })
@@ -1169,7 +1169,7 @@ impl LogicalGraph {
                         if repeats[p].to_usize() == Some(1) {
                             MapEntry::Coord {
                                 from_end: prev_rank - 1 - p,
-                                extent: prev_dims[p].clone(),
+                                extent: prev_dims[p],
                             }
                         } else {
                             let tiled = (prev_dims[p] * repeats[p]).simplify();
@@ -1178,7 +1178,7 @@ impl LogicalGraph {
                                     from_end: prev_rank - 1 - p,
                                     extent: tiled,
                                 }),
-                                prev_dims[p].clone(),
+                                prev_dims[p],
                             )
                         }
                     })
@@ -1201,7 +1201,7 @@ impl LogicalGraph {
                 let replacement = (0..prev_rank)
                     .map(|p| MapEntry::Coord {
                         from_end: prev_rank - 1 - p,
-                        extent: new_dims[p].clone(),
+                        extent: new_dims[p],
                     })
                     .collect();
                 (replacement, new_dims)

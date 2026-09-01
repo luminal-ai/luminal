@@ -115,7 +115,6 @@ impl SerializedEGraph {
     }
 }
 
-
 pub fn extract_expr<'a>(
     egraph: &'a SerializedEGraph,
     node: &'a NodeId,
@@ -247,4 +246,3 @@ pub fn extract_expr<'a>(
     expr_cache.insert(node, e);
     Some(e)
 }
-

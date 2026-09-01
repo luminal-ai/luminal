@@ -3,8 +3,8 @@
 
 use luminal::prelude::*;
 use luminal::shape::IntExpr;
-use scalar_refs::*;
 use mini_qwen3_moe::MiniQwen3Moe;
+use scalar_refs::*;
 
 /// MoE-family harness: 1 block + embed + tied logits, one decode step.
 /// (The gemma4_moe variant — final-logit soft-capping — duplicates this
@@ -34,7 +34,9 @@ fn mini_moe_family() {
 
     let embed_w = weights(VOCAB * D, 400);
     let block = &blocks[0];
-    let luminal_nn::FeedForward::Moe(moe) = &block.ff else { unreachable!() };
+    let luminal_nn::FeedForward::Moe(moe) = &block.ff else {
+        unreachable!()
+    };
     let pairs: Vec<(petgraph::graph::NodeIndex, TypedBuffer)> = vec![
         (ids.id, vec![token as i32].into()),
         (embed.weight.id, embed_w.clone().into()),

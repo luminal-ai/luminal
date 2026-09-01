@@ -4,9 +4,9 @@
 
 use luminal::prelude::*;
 use luminal::shape::IntExpr;
-use scalar_refs::*;
 use luminal_nn::FeedForward;
 use mini_gemma4_moe::MiniGemma4Moe;
+use scalar_refs::*;
 
 /// MoE-family harness: 1 block + embed + tied logits, one decode
 /// step; `softcap` = the gemma4_moe final-logit soft-capping.
@@ -36,7 +36,9 @@ fn mini_moe_family(softcap: f32) {
 
     let embed_w = weights(VOCAB * D, 400);
     let block = &blocks[0];
-    let FeedForward::Moe(moe) = &block.ff else { unreachable!() };
+    let FeedForward::Moe(moe) = &block.ff else {
+        unreachable!()
+    };
     let pairs: Vec<(petgraph::graph::NodeIndex, TypedBuffer)> = vec![
         (ids.id, vec![token as i32].into()),
         (embed.weight.id, embed_w.clone().into()),

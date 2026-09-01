@@ -27,7 +27,13 @@ pub fn width_term(dtype: DType) -> String {
 /// set_data keying). `stem` namespaces the lets ("t{idx}" for the
 /// translator, "nat{idx}" for the native path). Returns the binding text;
 /// the buffer-tensor let is named `{stem}_buffer_tensor`.
-pub fn input_binding(stem: &str, idx: usize, logical_name: &str, shape: &str, width: &str) -> String {
+pub fn input_binding(
+    stem: &str,
+    idx: usize,
+    logical_name: &str,
+    shape: &str,
+    width: &str,
+) -> String {
     format!(
         "(let {stem}_layout (RightMajorContiguousElementLayoutLit {shape} {width}))\n\
          (let {stem}_layout_tensor (LayoutTensorLit {logical_name} {stem}_layout))\n\
@@ -42,7 +48,13 @@ pub fn input_binding(stem: &str, idx: usize, logical_name: &str, shape: &str, wi
 /// byte representation by casting (the Bool8 ruling) — the model's output
 /// naming stays on the logical value. Buffer id = the output key. Returns
 /// the binding text; the buffer-tensor let is named `{stem}_buffer_tensor`.
-pub fn output_binding(stem: &str, key: usize, value_name: &str, shape: &str, dtype: DType) -> String {
+pub fn output_binding(
+    stem: &str,
+    key: usize,
+    value_name: &str,
+    shape: &str,
+    dtype: DType,
+) -> String {
     let (boundary_name, cast_text) = if dtype == DType::Bool {
         let bool8_name = format!("{stem}_bool8");
         (
@@ -87,5 +99,4 @@ pub fn boundary_lists(
 }
 
 /// The standard schedule tail shared by every assembled reference program.
-pub const SCHEDULE: &str =
-    "(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))\n\n";
+pub const SCHEDULE: &str = "(run-schedule (saturate (saturate (run)) (run subst-walk)) (run materializing-copy-mint) (run layout-tensor-op-metadata) (saturate (run fixpoint-invariants)))\n\n";

@@ -14,8 +14,6 @@ impl MoE {
         let e_dim = *self.router.dims().last().unwrap();
         let (_, in_size, out_size) = self.expert_weights.dims3();
         let io = in_size * out_size;
-        let k_expr = IntExpr::from(self.k);
-
         // 1. Routing probabilities: [batch.., E]
         let routing_weights = activations.matmul(self.router).softmax(n - 1);
 
@@ -35,7 +33,7 @@ impl MoE {
             let mut stride = e_dim;
             let mut acc = IntExpr::from(0);
             for i in (0..n - 1).rev() {
-                acc = acc + c[i] * stride;
+                acc += c[i] * stride;
                 stride = (stride * idx_dims[i]).simplify();
             }
             acc
@@ -74,7 +72,7 @@ impl MoE {
         let expert_out = expanded_act.matmul(gathered).squeeze(n); // [batch.., k, out]
 
         // 6. Weighted sum over experts: [batch.., k, out] * [batch.., k, 1] → sum(k) → [batch.., out]
-        let mut weights_exp = top_k_values.unsqueeze(top_k_values.dims().len()); // [batch.., k, 1]
+        let weights_exp = top_k_values.unsqueeze(top_k_values.dims().len()); // [batch.., k, 1]
         let weights_exp = weights_exp.expand(expert_out.dims());
         (expert_out * weights_exp).sum(n - 1)
     }
@@ -133,7 +131,9 @@ mod tests {
             let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
             let denom: f32 = exps.iter().sum();
-            let best = (0..E).max_by(|a, b| logits[*a].partial_cmp(&logits[*b]).unwrap()).unwrap();
+            let best = (0..E)
+                .max_by(|a, b| logits[*a].partial_cmp(&logits[*b]).unwrap())
+                .unwrap();
             let weight = exps[best] / denom;
             let w = &expert_vals[best * IN * OUT..(best + 1) * IN * OUT];
             for o in 0..OUT {
@@ -153,7 +153,6 @@ mod tests {
         assert_close(rt.get_f32(out.id).expect("output"), &expected);
     }
 }
-
 
 /// The full-fidelity top-k mixture (Qwen3-MoE form, ruling 2026-08-12):
 /// scores = softmax over ALL experts FIRST, then top-k selection, then
@@ -189,7 +188,10 @@ impl MoETopK {
     ) -> Self {
         Self {
             router: Linear::new_permuted(hidden, experts, false, &ns.child("gate"), cx),
-            gate_up: cx.named_tensor(ns.leaf("gate_up_weights"), (experts, 2 * intermediate, hidden)),
+            gate_up: cx.named_tensor(
+                ns.leaf("gate_up_weights"),
+                (experts, 2 * intermediate, hidden),
+            ),
             down: cx.named_tensor(ns.leaf("down_weights"), (experts, hidden, intermediate)),
             experts,
             top_k,
@@ -286,8 +288,8 @@ impl MoETopK {
 #[cfg(test)]
 mod topk_tests {
     use super::MoETopK;
-    use scalar_refs::*;
     use luminal::prelude::*;
+    use scalar_refs::*;
 
     /// The full Qwen3-MoE chain against a scalar reference: softmax over
     /// ALL experts first, top-k by stable ranking, renormalized picked
@@ -316,7 +318,7 @@ mod topk_tests {
         for s_i in 0..S {
             let xr = &x_vals[s_i * H..(s_i + 1) * H];
             // Router logits (x @ router.t()) then softmax over E.
-            let mut logits = vec![0f32; E];
+            let mut logits = [0f32; E];
             for (e, logit) in logits.iter_mut().enumerate() {
                 *logit = (0..H).map(|j| xr[j] * router_vals[e * H + j]).sum();
             }
@@ -333,7 +335,7 @@ mod topk_tests {
                 let weight = probs[*expert] / picked_sum;
                 // Fused gate;up: (2I, H) rows.
                 let w = &gate_up_vals[expert * 2 * I * H..(expert + 1) * 2 * I * H];
-                let mut projected = vec![0f32; 2 * I];
+                let mut projected = [0f32; 2 * I];
                 for (r, slot) in projected.iter_mut().enumerate() {
                     *slot = (0..H).map(|j| xr[j] * w[r * H + j]).sum();
                 }
@@ -404,7 +406,7 @@ mod topk_tests {
         let mut expected = vec![0f32; S * H];
         for s_i in 0..S {
             let xr = &x_vals[s_i * H..(s_i + 1) * H];
-            let mut logits = vec![0f32; E];
+            let mut logits = [0f32; E];
             for (e, logit) in logits.iter_mut().enumerate() {
                 *logit = (0..H).map(|j| xr[j] * router_vals[e * H + j]).sum();
             }
@@ -419,7 +421,7 @@ mod topk_tests {
             for expert in &picked {
                 let weight = probs[*expert] / picked_sum;
                 let w = &gate_up_vals[expert * 2 * I * H..(expert + 1) * 2 * I * H];
-                let mut projected = vec![0f32; 2 * I];
+                let mut projected = [0f32; 2 * I];
                 for (r, slot) in projected.iter_mut().enumerate() {
                     *slot = (0..H).map(|j| xr[j] * w[r * H + j]).sum();
                 }
@@ -439,7 +441,10 @@ mod topk_tests {
         }
 
         // Stage the SLICES of the same value streams per expert.
-        let mut pairs: Vec<(petgraph::graph::NodeIndex, luminal::buffer_tensor_ir::TypedBuffer)> = vec![
+        let mut pairs: Vec<(
+            petgraph::graph::NodeIndex,
+            luminal::buffer_tensor_ir::TypedBuffer,
+        )> = vec![
             (x.id, x_vals.into()),
             (moe.router.weight.id, router_vals.into()),
         ];
@@ -447,7 +452,10 @@ mod topk_tests {
             let fused = &gate_up_vals[e * 2 * I * H..(e + 1) * 2 * I * H];
             pairs.push((gate.id, fused[..I * H].to_vec().into()));
             pairs.push((up.id, fused[I * H..].to_vec().into()));
-            pairs.push((down.id, down_vals[e * H * I..(e + 1) * H * I].to_vec().into()));
+            pairs.push((
+                down.id,
+                down_vals[e * H * I..(e + 1) * H * I].to_vec().into(),
+            ));
         }
         let rt = luminal::test_support::run_reference(&cx, &pairs);
         assert_close(rt.get_f32(out.id).expect("moe out"), &expected);

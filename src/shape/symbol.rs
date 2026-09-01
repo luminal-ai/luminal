@@ -1,9 +1,7 @@
 //! String-backed symbolic-dimension names (our landing of PR #396's
-//! design, ruling 2026-08-13): `Symbol` is a Copy handle — a
-//! `GenerationalBox<String, SyncStorage>` owned by a process-global
-//! owner, the same generational_box pattern `IntegerExpression` uses
-//! for its terms — so `Term` stays Copy while names are
-//! arbitrary-length. Names validate against `[A-Za-z][A-Za-z0-9_]*`
+//! design, ruling 2026-08-13): `Symbol` is a Copy handle to one
+//! process-global interned `&'static str`, so `Term` stays Copy while
+//! names are arbitrary-length. Names validate against `[A-Za-z][A-Za-z0-9_]*`
 //! with no doubled underscore and are REJECTED, never sanitized
 //! (sanitizing is not injective — "a.b" and "a-b" must not collide).
 //! The alphabet guarantees by construction that a name is a valid
@@ -12,37 +10,24 @@
 //! retired 'z' (z-var retirement, 2026-08-06) — every name is an
 //! ordinary symbol.
 //!
-//! Equality/hash read THROUGH the handle and compare/hash the NAME
-//! string (never the arena slot + generation — derived impls would
-//! break the moment two handles named the same thing); Ord is BY
-//! NAME, so any order-dependent downstream (slot assignment on real
-//! backends) is deterministic in the name vocabulary, not in
-//! interning order. Construction still interns — one arena slot per
-//! distinct name — but that is a leak-avoidance optimization, not a
-//! correctness requirement.
+//! Equality, hashing, and ordering are by name, so any order-dependent
+//! downstream behavior (such as backend slot assignment) is deterministic
+//! in the name vocabulary, not in interning order. Construction interns one
+//! leaked string per distinct name; this is the same bounded process-lifetime
+//! storage contract as the old symbol interner, without an interior-mutable
+//! handle inside map keys.
 
-use generational_box::{AnyStorage, GenerationalBox, GenerationalBoxId, Owner, SyncStorage};
 use rustc_hash::FxHashMap;
 use std::sync::{
     OnceLock, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 
-type NameBox = GenerationalBox<String, SyncStorage>;
-
-static NAME_OWNER: OnceLock<Owner<SyncStorage>> = OnceLock::new();
-static NAME_INTERNER: OnceLock<RwLock<FxHashMap<String, NameBox>>> = OnceLock::new();
-/// One bounded leak per interned name so `name()` can keep handing out
-/// `&'static str` (exactly the leak the old `u32`-index interner made).
-static LEAKED_NAMES: OnceLock<RwLock<FxHashMap<GenerationalBoxId, &'static str>>> = OnceLock::new();
+static NAME_INTERNER: OnceLock<RwLock<FxHashMap<String, &'static str>>> = OnceLock::new();
 static FRESH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn interner() -> &'static RwLock<FxHashMap<String, NameBox>> {
+fn interner() -> &'static RwLock<FxHashMap<String, &'static str>> {
     NAME_INTERNER.get_or_init(|| RwLock::new(FxHashMap::default()))
-}
-
-fn leaked_names() -> &'static RwLock<FxHashMap<GenerationalBoxId, &'static str>> {
-    LEAKED_NAMES.get_or_init(|| RwLock::new(FxHashMap::default()))
 }
 
 fn is_well_formed(name: &str) -> bool {
@@ -56,8 +41,8 @@ fn is_well_formed(name: &str) -> bool {
 }
 
 /// An interned symbolic-dimension name.
-#[derive(Clone, Copy)]
-pub struct Symbol(NameBox);
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Symbol(&'static str);
 
 impl Symbol {
     /// Intern a validated name — panics loudly on malformed input.
@@ -82,15 +67,9 @@ impl Symbol {
         if let Some(&existing) = guard.get(name) {
             return Symbol(existing);
         }
-        let box_ = NAME_OWNER
-            .get_or_init(SyncStorage::owner)
-            .insert(name.to_string());
-        leaked_names()
-            .write()
-            .unwrap()
-            .insert(box_.id(), Box::leak(name.to_string().into_boxed_str()));
-        guard.insert(name.to_string(), box_);
-        Symbol(box_)
+        let interned: &'static str = Box::leak(name.to_string().into_boxed_str());
+        guard.insert(name.to_string(), interned);
+        Symbol(interned)
     }
 
     /// A fresh symbol no prior name can collide with — replaces the old
@@ -101,50 +80,19 @@ impl Symbol {
     }
 
     pub fn name(&self) -> &'static str {
-        leaked_names().read().unwrap()[&self.0.id()]
-    }
-}
-
-impl PartialEq for Symbol {
-    fn eq(&self, other: &Self) -> bool {
-        // Same arena slot is definitionally the same name; otherwise
-        // compare the name strings through the handles.
-        self.0.ptr_eq(&other.0) || *self.0.read() == *other.0.read()
-    }
-}
-
-impl Eq for Symbol {}
-
-impl std::hash::Hash for Symbol {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.read().hash(state);
-    }
-}
-
-impl PartialOrd for Symbol {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Symbol {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.0.ptr_eq(&other.0) {
-            return std::cmp::Ordering::Equal;
-        }
-        self.0.read().cmp(&other.0.read())
+        self.0
     }
 }
 
 impl std::fmt::Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.read())
+        f.write_str(self.0)
     }
 }
 
 impl std::fmt::Debug for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0.read())
+        f.write_str(self.0)
     }
 }
 
@@ -168,7 +116,7 @@ impl From<&str> for Symbol {
 
 impl serde::Serialize for Symbol {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0.read())
+        serializer.serialize_str(self.0)
     }
 }
 

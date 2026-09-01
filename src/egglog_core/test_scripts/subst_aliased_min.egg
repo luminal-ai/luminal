@@ -1,7 +1,6 @@
-; TEMPORARY PROBE (subst-primitive experiment): minimal recreation of
-; the boundary_aliased_views crossed-bounds weld — a (2,3) row-major
-; offset substituted under BOTH single-row maps. If the tripwire fires
-; here, the weld needs only two sigmas over one region.
+; Regression for the boundary_aliased_views crossed-bounds weld: a
+; (2,3) row-major offset substituted under BOTH single-row maps. The
+; two substitutions must remain distinct under the subst primitive.
 
 (let probe_src (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprNil)))))
 (let probe_c_row (CoordVar probe_src 1))

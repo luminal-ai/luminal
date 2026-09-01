@@ -4,7 +4,9 @@
 //! buffer (the Must tie) and lowering folds the op to a producer redirect.
 
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `IndexMapApplyViewGeneric(input) -> out`
 ///
@@ -43,7 +45,11 @@ impl BufferTensorIrOp for IndexMapApplyView {
 
 impl Bufferizable for IndexMapApplyView {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -81,7 +87,6 @@ impl OpMatcher for IndexMapApplyViewMatcher {
             },
         ]
     }
-
 
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("index_map", 1), ("shape", 2), ("out_layout", 3)]

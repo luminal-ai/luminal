@@ -62,17 +62,6 @@ impl<T: BufferTensorIrOp + Clone + 'static> CloneBufferTensorIrOp for T {
     }
 }
 
-/// What an op IS once every aliasing decision is behind it: its identity and
-/// its memory effects — the surface the BufferTensor layer, the lowering, and
-/// (eventually) the execution engine consume. Deliberately free of analysis
-/// concerns: `Bufferizable` (the aliasing contract) and `ToDps` are the
-/// ANALYSIS-time surfaces, and by this layer their questions are all answered.
-///
-/// Every value-level op is one automatically (`LayoutIrOp` has this as a
-/// supertrait); planner-synthesized ops like [`BufferCopy`] implement ONLY
-/// this trait — they have no logical semantics, no egglog constructor, and
-/// never meet the analyzer.
-
 /// Typed reference storage (rulings 2026-07-28, 2026-07-30, and the
 /// typed-buffers ruling 2026-08-11: NO value ever rides a buffer of
 /// another type — "no smuggling data in invalid types"). Floats live
@@ -295,10 +284,7 @@ impl ReferenceKernelCtx {
     /// returns Result so checked arithmetic refuses loudly (ints are
     /// semantically NON-WRAPPING — ruling 2026-08-11; an overflow is a
     /// loud kernel error, never a wrapped value).
-    pub fn binary_elementwise_i32(
-        &mut self,
-        f: impl Fn(i32, i32) -> Result<i32>,
-    ) -> Result<()> {
+    pub fn binary_elementwise_i32(&mut self, f: impl Fn(i32, i32) -> Result<i32>) -> Result<()> {
         let lhs = self.operands[0].as_i32()?;
         let rhs = self.operands[1].as_i32()?;
         anyhow::ensure!(
@@ -314,10 +300,7 @@ impl ReferenceKernelCtx {
     }
 
     /// The i64 twin of [`Self::binary_elementwise_i32`].
-    pub fn binary_elementwise_i64(
-        &mut self,
-        f: impl Fn(i64, i64) -> Result<i64>,
-    ) -> Result<()> {
+    pub fn binary_elementwise_i64(&mut self, f: impl Fn(i64, i64) -> Result<i64>) -> Result<()> {
         let lhs = self.operands[0].as_i64()?;
         let rhs = self.operands[1].as_i64()?;
         anyhow::ensure!(
@@ -419,6 +402,16 @@ impl<T: 'static> AsAnyOp for T {
     }
 }
 
+/// What an op IS once every aliasing decision is behind it: its identity and
+/// its memory effects — the surface the BufferTensor layer, the lowering, and
+/// (eventually) the execution engine consume. Deliberately free of analysis
+/// concerns: `Bufferizable` (the aliasing contract) and `ToDps` are the
+/// ANALYSIS-time surfaces, and by this layer their questions are all answered.
+///
+/// Every value-level op is one automatically (`LayoutIrOp` has this as a
+/// supertrait); planner-synthesized ops like [`BufferCopy`] implement ONLY
+/// this trait — they have no logical semantics, no egglog constructor, and
+/// never meet the analyzer.
 pub trait BufferTensorIrOp: OpSlotNames + CloneBufferTensorIrOp + AsAnyOp + Debug {
     /// The op's IR name (see the label policy in [`crate::reference::ops`]).
     fn label(&self) -> &str;
@@ -712,8 +705,7 @@ impl BufferTensorIrGraph {
                         VisualKind::LayoutIr,
                         &op.tooltip,
                     );
-                    let out_ports =
-                        crate::layout_ir::tied_out_ports(&in_slots, &out_slots, &ties);
+                    let out_ports = crate::layout_ir::tied_out_ports(&in_slots, &out_slots, &ties);
                     for (result, output) in op.outputs.iter().enumerate() {
                         let value_id = emitter.value_node(output);
                         emitter.edge_from_slot(op_id, &out_ports[result], value_id);
@@ -798,8 +790,7 @@ impl BufferTensorIrGraph {
                         "",
                     );
                     op_ids.insert(index, op_id);
-                    let out_ports =
-                        crate::layout_ir::tied_out_ports(&in_slots, &out_slots, ties);
+                    let out_ports = crate::layout_ir::tied_out_ports(&in_slots, &out_slots, ties);
                     for (i, tensor) in operands.iter().enumerate() {
                         if let Some(value_id) =
                             residence(&mut emitter, &mut buffer_ids, &mut wired, tensor)
@@ -861,9 +852,7 @@ impl BufferTensorIrGraph {
                         continue;
                     }
                     let operand_backed = match &self.dag[edge.target()] {
-                        BtNode::Op { operands, .. } => {
-                            operands.iter().any(|t| &t.value == value)
-                        }
+                        BtNode::Op { operands, .. } => operands.iter().any(|t| &t.value == value),
                         _ => true,
                     };
                     if operand_backed {
@@ -924,9 +913,9 @@ pub(crate) fn build_buffer_tensor_ir(
     let mut next_position: usize = 0;
 
     let link = |dag: &mut DiGraph<BtNode, BtEdge>,
-                    producer: &HashMap<(ClassId, BufferId), NodeIndex>,
-                    tensor: &BufferTensor,
-                    to: NodeIndex| {
+                producer: &HashMap<(ClassId, BufferId), NodeIndex>,
+                tensor: &BufferTensor,
+                to: NodeIndex| {
         if let Some(&from) = producer.get(&(tensor.value.clone(), tensor.buffer.clone())) {
             dag.add_edge(
                 from,
@@ -988,8 +977,8 @@ pub(crate) fn build_buffer_tensor_ir(
                         continue;
                     }
                     let target = results[result].buffer.clone();
-                    let needs_bytes = op.op.operand_reads_memory(operand)
-                        || !op.op.result_writes_memory(result);
+                    let needs_bytes =
+                        op.op.operand_reads_memory(operand) || !op.op.result_writes_memory(result);
                     if needs_bytes {
                         let src = operands[operand].clone();
                         let dst = BufferTensor {
@@ -1015,7 +1004,10 @@ pub(crate) fn build_buffer_tensor_ir(
                         // DEFINED producer (chained DPS: a real op's result
                         // used as a pure dest) must never be relocated — that
                         // would silently move where the earlier op writes.
-                        let old = (operands[operand].value.clone(), operands[operand].buffer.clone());
+                        let old = (
+                            operands[operand].value.clone(),
+                            operands[operand].buffer.clone(),
+                        );
                         if let Some(&producer_node) = producer.get(&old) {
                             let relocatable = dag.edges(producer_node).next().is_none()
                                 && matches!(
@@ -1065,7 +1057,10 @@ pub(crate) fn build_buffer_tensor_ir(
                         // Materialize-into-destination: a boundary transport.
                         // (A producer pinned to write `dest` directly makes
                         // src == dest and skips this.)
-                        if buffers.get(&dest).is_some_and(|b| b.access == Access::ReadOnly) {
+                        if buffers
+                            .get(&dest)
+                            .is_some_and(|b| b.access == Access::ReadOnly)
+                        {
                             anyhow::bail!(
                                 "output slot {} requires materializing a value into \
                                  read-only buffer {:?}: ReadOnly access forbids the \
@@ -1107,8 +1102,7 @@ pub(crate) fn build_buffer_tensor_ir(
         }
     }
     debug_assert_eq!(
-        next_position,
-        analysis.op_count,
+        next_position, analysis.op_count,
         "BufferTensor op positions diverged from analysis positions"
     );
 
@@ -1192,11 +1186,11 @@ pub(crate) fn optimize(bt: BufferTensorIrGraph) -> BufferTensorIrGraph {
     // every placement decision below (HashMap order is not reproducible).
     let mut discovery: Vec<BufferId> = Vec::new();
     let touch = |buffer: &BufferId,
-                     index: NodeIndex,
-                     touchers: &mut HashMap<BufferId, Vec<NodeIndex>>,
-                     first_toucher: &mut HashMap<BufferId, NodeIndex>,
-                     last_toucher: &mut HashMap<BufferId, NodeIndex>,
-                     discovery: &mut Vec<BufferId>| {
+                 index: NodeIndex,
+                 touchers: &mut HashMap<BufferId, Vec<NodeIndex>>,
+                 first_toucher: &mut HashMap<BufferId, NodeIndex>,
+                 last_toucher: &mut HashMap<BufferId, NodeIndex>,
+                 discovery: &mut Vec<BufferId>| {
         touchers.entry(buffer.clone()).or_default().push(index);
         if !first_toucher.contains_key(buffer) {
             first_toucher.insert(buffer.clone(), index);
@@ -1206,7 +1200,12 @@ pub(crate) fn optimize(bt: BufferTensorIrGraph) -> BufferTensorIrGraph {
     };
     for index in dag.node_indices() {
         match &dag[index] {
-            node @ BtNode::Op { op, operands, results, .. } => {
+            node @ BtNode::Op {
+                op,
+                operands,
+                results,
+                ..
+            } => {
                 if is_poison_shaped(node) {
                     let system = results
                         .iter()
@@ -1234,19 +1233,40 @@ pub(crate) fn optimize(bt: BufferTensorIrGraph) -> BufferTensorIrGraph {
                 // buffer, so the buffer is still touched.)
                 for (operand, tensor) in operands.iter().enumerate() {
                     if op.operand_reads_memory(operand) {
-                        touch(&tensor.buffer, index, &mut touchers, &mut first_toucher, &mut last_toucher, &mut discovery);
+                        touch(
+                            &tensor.buffer,
+                            index,
+                            &mut touchers,
+                            &mut first_toucher,
+                            &mut last_toucher,
+                            &mut discovery,
+                        );
                     }
                 }
                 for (result, tensor) in results.iter().enumerate() {
                     if op.result_writes_memory(result) {
-                        touch(&tensor.buffer, index, &mut touchers, &mut first_toucher, &mut last_toucher, &mut discovery);
+                        touch(
+                            &tensor.buffer,
+                            index,
+                            &mut touchers,
+                            &mut first_toucher,
+                            &mut last_toucher,
+                            &mut discovery,
+                        );
                         final_resident.insert(tensor.buffer.clone(), (tensor.clone(), index));
                     }
                 }
             }
             BtNode::Input { slots } => {
                 for slot in slots {
-                    touch(&slot.buffer, index, &mut touchers, &mut first_toucher, &mut last_toucher, &mut discovery);
+                    touch(
+                        &slot.buffer,
+                        index,
+                        &mut touchers,
+                        &mut first_toucher,
+                        &mut last_toucher,
+                        &mut discovery,
+                    );
                     // The caller-installed resident: the free's operand when
                     // nothing in the program ever writes the buffer.
                     final_resident
@@ -1256,7 +1276,14 @@ pub(crate) fn optimize(bt: BufferTensorIrGraph) -> BufferTensorIrGraph {
             }
             BtNode::Output { slots } => {
                 for slot in slots {
-                    touch(&slot.buffer, index, &mut touchers, &mut first_toucher, &mut last_toucher, &mut discovery);
+                    touch(
+                        &slot.buffer,
+                        index,
+                        &mut touchers,
+                        &mut first_toucher,
+                        &mut last_toucher,
+                        &mut discovery,
+                    );
                 }
             }
         }
@@ -1477,9 +1504,8 @@ pub(crate) fn install_anti_edges(bt: &mut BufferTensorIrGraph) {
             })
             .collect();
         for reader in readers {
-            let ordered =
-                petgraph::algo::has_path_connecting(&frozen, reader, *writer, None)
-                    || petgraph::algo::has_path_connecting(&frozen, *writer, reader, None);
+            let ordered = petgraph::algo::has_path_connecting(&frozen, reader, *writer, None)
+                || petgraph::algo::has_path_connecting(&frozen, *writer, reader, None);
             if !ordered {
                 bt.dag.add_edge(
                     reader,
@@ -1534,6 +1560,7 @@ pub(crate) fn install_anti_edges(bt: &mut BufferTensorIrGraph) {
 ///     and BEFORE B's free — otherwise some legal schedule uses storage
 ///     that does not exist yet, or has already been destroyed;
 ///   * a free has out-degree ZERO (nothing may ever depend on one).
+///
 /// A buffer without a record certifies as CallerFrees — the declared-absence
 /// semantics; real pipeline graphs always carry records (input validation
 /// requires both declarations).
@@ -1673,13 +1700,25 @@ pub(crate) fn validate(bt: &BufferTensorIrGraph) -> Result<()> {
                 let free_shaped = results.is_empty() && !operands.is_empty();
                 if alloc_shaped {
                     for tensor in results {
-                        note(&tensor.buffer, index, &mut allocs, &mut seen, &mut lifetime_order);
+                        note(
+                            &tensor.buffer,
+                            index,
+                            &mut allocs,
+                            &mut seen,
+                            &mut lifetime_order,
+                        );
                     }
                     continue;
                 }
                 if free_shaped {
                     for tensor in operands {
-                        note(&tensor.buffer, index, &mut frees, &mut seen, &mut lifetime_order);
+                        note(
+                            &tensor.buffer,
+                            index,
+                            &mut frees,
+                            &mut seen,
+                            &mut lifetime_order,
+                        );
                     }
                     continue;
                 }
@@ -1688,23 +1727,47 @@ pub(crate) fn validate(bt: &BufferTensorIrGraph) -> Result<()> {
                 // invisible; their readers are touchers in their own right).
                 for (operand, tensor) in operands.iter().enumerate() {
                     if op.operand_reads_memory(operand) {
-                        note(&tensor.buffer, index, &mut touchers, &mut seen, &mut lifetime_order);
+                        note(
+                            &tensor.buffer,
+                            index,
+                            &mut touchers,
+                            &mut seen,
+                            &mut lifetime_order,
+                        );
                     }
                 }
                 for (result, tensor) in results.iter().enumerate() {
                     if op.result_writes_memory(result) {
-                        note(&tensor.buffer, index, &mut touchers, &mut seen, &mut lifetime_order);
+                        note(
+                            &tensor.buffer,
+                            index,
+                            &mut touchers,
+                            &mut seen,
+                            &mut lifetime_order,
+                        );
                     }
                 }
             }
             BtNode::Input { slots } => {
                 for slot in slots {
-                    note(&slot.buffer, index, &mut touchers, &mut seen, &mut lifetime_order);
+                    note(
+                        &slot.buffer,
+                        index,
+                        &mut touchers,
+                        &mut seen,
+                        &mut lifetime_order,
+                    );
                 }
             }
             BtNode::Output { slots } => {
                 for slot in slots {
-                    note(&slot.buffer, index, &mut touchers, &mut seen, &mut lifetime_order);
+                    note(
+                        &slot.buffer,
+                        index,
+                        &mut touchers,
+                        &mut seen,
+                        &mut lifetime_order,
+                    );
                     output_bound.entry(slot.buffer.clone()).or_insert(index);
                 }
             }
@@ -1792,8 +1855,7 @@ pub(crate) fn validate(bt: &BufferTensorIrGraph) -> Result<()> {
         let buffer_touchers = touchers.get(buffer).map(Vec::as_slice).unwrap_or(&[]);
         for &alloc in buffer_allocs {
             for &toucher in buffer_touchers {
-                if !petgraph::algo::has_path_connecting(&bt.dag, alloc, toucher, Some(&mut space))
-                {
+                if !petgraph::algo::has_path_connecting(&bt.dag, alloc, toucher, Some(&mut space)) {
                     anyhow::bail!(
                         "plan validation failed: {} touches buffer {:?} \
                          unordered against its allocation — some legal \
@@ -1806,8 +1868,7 @@ pub(crate) fn validate(bt: &BufferTensorIrGraph) -> Result<()> {
         }
         for &free in buffer_frees {
             for &toucher in buffer_touchers {
-                if !petgraph::algo::has_path_connecting(&bt.dag, toucher, free, Some(&mut space))
-                {
+                if !petgraph::algo::has_path_connecting(&bt.dag, toucher, free, Some(&mut space)) {
                     anyhow::bail!(
                         "plan validation failed: {} touches buffer {:?} \
                          unordered against its free — some legal schedule \
@@ -2253,8 +2314,21 @@ mod f8e4m3_semantics {
             }
         }
         probes.extend_from_slice(&[
-            447.9, 448.0, 448.1, 500.0, 1e9, -447.9, -448.0, -448.1, -500.0, -1e9,
-            1e-12, -1e-12, 0.0, -0.0, f32::NAN,
+            447.9,
+            448.0,
+            448.1,
+            500.0,
+            1e9,
+            -447.9,
+            -448.0,
+            -448.1,
+            -500.0,
+            -1e9,
+            1e-12,
+            -1e-12,
+            0.0,
+            -0.0,
+            f32::NAN,
         ]);
         for value in probes {
             let ours = kernel_quantize(value).to_bits();

@@ -1,7 +1,9 @@
 //! Elementwise division.
 
-use crate::layout_ir::{AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{
+    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
+};
 
 /// `DivFunctionalGeneric(numerator, denominator) -> out`
 ///
@@ -74,7 +76,11 @@ impl BufferTensorIrOp for DivFunctionalDps {
 
 impl Bufferizable for DivFunctionalDps {
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 2, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 2,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -115,9 +121,12 @@ impl BufferTensorIrOp for DivMutating {
 }
 
 impl Bufferizable for DivMutating {
-
     fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo { operand: 0, result: 0, sharing: Sharing::Must }]
+        vec![AliasInfo {
+            operand: 0,
+            result: 0,
+            sharing: Sharing::Must,
+        }]
     }
 }
 
@@ -156,7 +165,6 @@ impl OpMatcher for DivFunctionalMatcher {
         ]
     }
 
-
     fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
         &[("out_layout", 2)]
     }
@@ -190,7 +198,6 @@ impl OpMatcher for DivMutatingMatcher {
         ]
     }
 
-
     fn extract(&self, _site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
         Box::new(DivMutating)
     }
@@ -211,7 +218,10 @@ use crate::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
 /// zero) and gets its own operators, LogicalTruncDiv/LogicalTruncRem
 /// (ruling 2026-08-11, landing D) — Div on Int would be a silent
 /// semantics substitution.
-pub(in crate::reference) fn kernel(_op: &dyn BufferTensorIrOp, ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+pub(in crate::reference) fn kernel(
+    _op: &dyn BufferTensorIrOp,
+    ctx: &mut ReferenceKernelCtx,
+) -> anyhow::Result<()> {
     match &ctx.operands[0] {
         TypedBuffer::F32(_) => ctx.binary_elementwise(|a, b| a / b),
         other => anyhow::bail!(

@@ -1,7 +1,7 @@
 //! The poison-value producer synthesized by the DPS rewrite.
 
-use crate::layout_ir::{Bufferizable, LayoutIrOp, ToDps};
 use crate::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
+use crate::layout_ir::{Bufferizable, LayoutIrOp, ToDps};
 
 /// `Poison() -> out0` — no operands, one result whose contents are undefined
 /// (garbage). It exists only to give an appended destination operand a

@@ -12,9 +12,9 @@
 //! as data (the multi-sequence page-table form). Those variants are
 //! the [`PositionSlots`] / [`PageTable`] drivers below.
 
-use luminal::prelude::anyhow;
-use luminal::prelude::Ns;
 use luminal::graph::Graph;
+use luminal::prelude::Ns;
+use luminal::prelude::anyhow;
 use luminal::prelude::{GraphTensor, TypedBuffer};
 use luminal::reference::ReferenceRuntime;
 
@@ -118,7 +118,11 @@ impl PositionSlots {
     /// frontier, q_pos = the frontier (the step-invariant decode form —
     /// gather_idx stays the full 0..slots arange, masked by position).
     pub fn step(&mut self) -> anyhow::Result<(TypedBuffer, TypedBuffer)> {
-        anyhow::ensure!(self.pos < self.slots, "sequence exceeded {} slots", self.slots);
+        anyhow::ensure!(
+            self.pos < self.slots,
+            "sequence exceeded {} slots",
+            self.slots
+        );
         let scatter: TypedBuffer = vec![self.pos as i32].into();
         let q_pos: TypedBuffer = vec![self.pos as i32].into();
         self.pos += 1;
@@ -220,13 +224,7 @@ impl PageTable {
                 row += 1;
             }
         }
-        Ok((
-            scatter.into(),
-            gather.into(),
-            mask.into(),
-            total_s,
-            total_c,
-        ))
+        Ok((scatter.into(), gather.into(), mask.into(), total_s, total_c))
     }
 }
 

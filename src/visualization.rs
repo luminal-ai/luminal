@@ -49,7 +49,9 @@ impl ToDot for crate::egglog_utils::SerializedEGraph {
         let mut classes: Vec<_> = self.eclasses.iter().collect();
         classes.sort_by_key(|(class, _)| class.to_string());
 
-        let mut out = String::from("digraph SerializedEGraph {\n  compound=true;\n  node [shape=box, style=\"rounded,filled\", fillcolor=\"#ede9fe\", color=\"#7c3aed\", fontname=\"Helvetica\"];\n");
+        let mut out = String::from(
+            "digraph SerializedEGraph {\n  compound=true;\n  node [shape=box, style=\"rounded,filled\", fillcolor=\"#ede9fe\", color=\"#7c3aed\", fontname=\"Helvetica\"];\n",
+        );
         // (cluster index, anchor node index) per class — edges point at the
         // anchor and clip at the cluster border via lhead.
         let mut anchors = FxHashMap::default();
@@ -111,7 +113,9 @@ impl ToDot for crate::graph::LogicalGraph {
         for (id, key) in self.viz_outputs() {
             out_keys.entry(id.index()).or_default().push(key);
         }
-        let mut out = String::from("digraph LogicalGraph {\n  node [fontname=\"Helvetica\"];\n  edge [fontname=\"Helvetica\"];\n");
+        let mut out = String::from(
+            "digraph LogicalGraph {\n  node [fontname=\"Helvetica\"];\n  edge [fontname=\"Helvetica\"];\n",
+        );
         for (id, node) in self.viz_nodes() {
             if !live.contains(&id) {
                 continue;

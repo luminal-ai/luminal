@@ -21,7 +21,12 @@ impl Embedding {
         }
     }
 
-    pub fn new_permuted(n_embeddings: usize, embedding_dim: usize, ns: &Ns, cx: &mut Graph) -> Self {
+    pub fn new_permuted(
+        n_embeddings: usize,
+        embedding_dim: usize,
+        ns: &Ns,
+        cx: &mut Graph,
+    ) -> Self {
         Self {
             weight: cx.named_tensor(ns.leaf("weight"), (embedding_dim, n_embeddings)),
             permute: true,
@@ -121,7 +126,10 @@ mod tests {
         let model = Embedding::new(3, 4, &Ns::root().child("embed"), &mut cx);
         let ids = cx.tensor_dtyped((2, 3), DType::Int);
         let out = model.forward(ids).output();
-        assert_eq!(out.dims(), vec![IntExpr::from(2), IntExpr::from(3), IntExpr::from(4)]);
+        assert_eq!(
+            out.dims(),
+            vec![IntExpr::from(2), IntExpr::from(3), IntExpr::from(4)]
+        );
 
         let id_ints = [1usize, 0, 2, 1, 0, 1];
         let ids_data: Vec<i32> = id_ints.iter().map(|v| *v as i32).collect();

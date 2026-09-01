@@ -369,13 +369,12 @@ impl Walk<'_> {
                     // row is never force-retired (independent live material
                     // keeps its flag; an already-subsumed original merges
                     // sticky either way).
-                    let copy = if node.subsumed
-                        && !state.contains(&name, RawValues(args.clone()))?
-                    {
-                        state.add_subsumed(&name, RawValues(args))?
-                    } else {
-                        state.add(&name, RawValues(args))?
-                    };
+                    let copy =
+                        if node.subsumed && !state.contains(&name, RawValues(args.clone()))? {
+                            state.add_subsumed(&name, RawValues(args))?
+                        } else {
+                            state.add(&name, RawValues(args))?
+                        };
                     match self.images.get(eclass) {
                         // The first e-node copied names the class; the rest are
                         // further ways to say the same one.
@@ -590,7 +589,7 @@ pub fn subst(egraph: &mut EGraph, root: Value, map: Value) -> Result<Value, Erro
 /// IndexMap) -> IntExpr`, the union-on-set memo idiom. Substitution
 /// distributes over syntax, never over memo tables keyed by syntax:
 /// walking a memo row and substituting inside its KEY mints
-/// memo rows about the WRONG key (probe_aliased_min: the sigma-1 walk
+/// memo rows about the WRONG key (subst_aliased_min: the sigma-1 walk
 /// copied `int-subst-of(c_row, row0_map)` out of the zero class as
 /// `int-subst-of(1, row0_map)` and welded 0 = 1). Upstream design gap
 /// to raise with #60: "constructor rows = the term structure" is

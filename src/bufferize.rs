@@ -77,7 +77,7 @@ use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::layout_ir::{
-    must_ties, permits_sharing, Access, ExtractedGraph, ExtractedNode, FreedBy, LayoutIrOp,
+    Access, ExtractedGraph, ExtractedNode, FreedBy, LayoutIrOp, must_ties, permits_sharing,
 };
 
 // =============================================================================
@@ -253,7 +253,11 @@ impl BufferIrGraph {
                 Owner::Caller => "caller",
                 Owner::System => "system",
             };
-            let writable = if buffer.access == Access::ReadWrite { "rw" } else { "ro" };
+            let writable = if buffer.access == Access::ReadWrite {
+                "rw"
+            } else {
+                "ro"
+            };
             out.push_str(&format!(
                 "  {} [{owner}, {writable}]\n",
                 self.buffer_name(&buffer.id)
@@ -265,7 +269,9 @@ impl BufferIrGraph {
         for idx in self.dag.node_indices() {
             match &self.dag[idx] {
                 BufferNode::BufferInput { .. } => {}
-                BufferNode::Compute { op, reads, writes, .. } => op_lines.push(format!(
+                BufferNode::Compute {
+                    op, reads, writes, ..
+                } => op_lines.push(format!(
                     "  {}: [{}] -> [{}]",
                     op.label(),
                     self.names(reads),
@@ -280,8 +286,11 @@ impl BufferIrGraph {
                     let mut slots: Vec<&OutputBinding> = slots.iter().collect();
                     slots.sort_by_key(|slot| slot.index);
                     for slot in slots {
-                        output_lines
-                            .push(format!("  out {} -> {}", slot.index, self.buffer_name(&slot.buffer)));
+                        output_lines.push(format!(
+                            "  out {} -> {}",
+                            slot.index,
+                            self.buffer_name(&slot.buffer)
+                        ));
                     }
                 }
             }
@@ -354,7 +363,9 @@ impl BufferIrGraph {
                     // supplies is the edge's label, not the box's.
                     ("Input".to_string(), "rounded,filled", "#dbeafe", "#2563eb")
                 }
-                BufferNode::Compute { op, reads, ties, .. } => {
+                BufferNode::Compute {
+                    op, reads, ties, ..
+                } => {
                     // Single-source rules only (<HR/> separators, borderless
                     // cells): a CELLBORDER next to the outer BORDER renders
                     // as an ugly double line.
@@ -422,8 +433,7 @@ impl BufferIrGraph {
             let weight = edge.weight();
             // Dependency ordering (Anti edges and the alloc -> first-toucher
             // edge, whose port marks it) renders dashed; bytes render solid.
-            let is_dependency =
-                weight.kind == EdgeKind::Anti || weight.port == "alloc";
+            let is_dependency = weight.kind == EdgeKind::Anti || weight.port == "alloc";
             let (c, style) = if is_dependency {
                 ("#000000", "dashed")
             } else {
@@ -452,7 +462,10 @@ impl BufferIrGraph {
                         label = dot_escape(&self.buffer_name(&weight.buffer));
                     }
                 }
-                if let BufferNode::Compute { op, writes, ties, .. } = &self.dag[edge.source()] {
+                if let BufferNode::Compute {
+                    op, writes, ties, ..
+                } = &self.dag[edge.source()]
+                {
                     if let Some(result) = writes.iter().position(|b| b == &weight.buffer) {
                         if let Some(&(operand, _)) = ties.iter().find(|(_, r)| *r == result) {
                             tail = format!(
@@ -837,7 +850,9 @@ impl<'a> Analyzer<'a> {
     fn happens_before(&self, reader_site: Option<(usize, usize)>, writer_op: usize) -> bool {
         match reader_site {
             None => false,
-            Some((reader_op, _)) => reader_op != writer_op && self.reachable[reader_op].contains(&writer_op),
+            Some((reader_op, _)) => {
+                reader_op != writer_op && self.reachable[reader_op].contains(&writer_op)
+            }
         }
     }
 
@@ -960,7 +975,8 @@ impl<'a> Analyzer<'a> {
             return;
         }
         let decided_in_place = self.try_in_place(op, operand, result);
-        self.in_place.insert((op.position, operand), decided_in_place);
+        self.in_place
+            .insert((op.position, operand), decided_in_place);
         if decided_in_place {
             // Commit: the tied result now shares the operand's buffer.
             let operand_value = &op.operands[operand];
@@ -1014,7 +1030,11 @@ impl<'a> Analyzer<'a> {
         // reader (no dependence path to this op) is a conflict, not a free pass.
         // Skipped entirely for non-writing candidates: there is no new write to
         // interfere with anything.
-        let raw_scan = if introduces_write { self.reads.clone() } else { Vec::new() };
+        let raw_scan = if introduces_write {
+            self.reads.clone()
+        } else {
+            Vec::new()
+        };
         for read in raw_scan {
             if read.site == Some((op.position, operand)) {
                 // "A use cannot conflict with itself. Note: just being the same
@@ -1110,7 +1130,9 @@ impl<'a> Analyzer<'a> {
     fn alias_set_is_read_only(&mut self, operand_value: &ClassId) -> bool {
         // The read-only seeds are few; check each against the operand's set.
         let read_only: Vec<ClassId> = self.facts.read_only.iter().cloned().collect();
-        read_only.iter().any(|ro| self.alias.same(ro, operand_value))
+        read_only
+            .iter()
+            .any(|ro| self.alias.same(ro, operand_value))
     }
 }
 
@@ -1165,9 +1187,7 @@ fn validate_input_program(graph: &ExtractedGraph) -> Result<()> {
             continue;
         };
         for (operand, input) in op.inputs.iter().enumerate() {
-            if undefined.contains(&input.value)
-                && op.op.operand_reads_memory(operand)
-            {
+            if undefined.contains(&input.value) && op.op.operand_reads_memory(operand) {
                 anyhow::bail!(
                     "invalid input program: op {} reads undefined contents \
                      through operand {}: undefined (poison) values are \
@@ -1222,8 +1242,10 @@ fn validate_input_program(graph: &ExtractedGraph) -> Result<()> {
                 .entry(input.buffer.id_eclass.clone())
                 .or_default()
                 .insert(input.value.eclass.clone());
-            input_layouts
-                .insert(input.value.eclass.clone(), input.value.layout.eclass.clone());
+            input_layouts.insert(
+                input.value.eclass.clone(),
+                input.value.layout.eclass.clone(),
+            );
         }
     }
     let mut output_buffers: Vec<ClassId> = Vec::new();
@@ -1286,9 +1308,7 @@ fn validate_input_program(graph: &ExtractedGraph) -> Result<()> {
         // named the same layout twice), not region analysis.
         for (i, a) in demanded.iter().enumerate() {
             for b in &demanded[i + 1..] {
-                if input_layouts.get(a).is_some()
-                    && input_layouts.get(a) == input_layouts.get(b)
-                {
+                if input_layouts.contains_key(a) && input_layouts.get(a) == input_layouts.get(b) {
                     anyhow::bail!(
                         "invalid input program: output buffer {} is demanded \
                          to hold two different values ({} and {}) under the \
@@ -1319,7 +1339,11 @@ pub fn bufferize(graph: &ExtractedGraph) -> Result<BufferIrGraph> {
 /// stays `None` for symbolic geometry, and numeric consumers bail loudly.
 fn annotate_buffer_geometry(plan: &mut BufferIrGraph, graph: &ExtractedGraph) -> Result<()> {
     use std::collections::HashMap as Map;
-    type Geometry = (Option<Vec<i64>>, Option<i64>, Option<crate::dtype::PlanDtype>);
+    type Geometry = (
+        Option<Vec<i64>>,
+        Option<i64>,
+        Option<crate::dtype::PlanDtype>,
+    );
     let mut value_geometry: Map<ClassId, Geometry> = Map::new();
     let mut boundary_lits: Map<ClassId, i64> = Map::new();
     for node in graph.dag.node_weights() {
@@ -1434,7 +1458,9 @@ fn annotate_buffer_geometry(plan: &mut BufferIrGraph, graph: &ExtractedGraph) ->
         })
         .collect();
     for (src, dst) in copy_pairs {
-        let Some(source) = plan.buffers.get(&src) else { continue };
+        let Some(source) = plan.buffers.get(&src) else {
+            continue;
+        };
         let (dims, bits, dtype) = (source.dims.clone(), source.element_bits, source.dtype);
         if let Some(buffer) = plan.buffers.get_mut(&dst) {
             if buffer.dims.is_none() {
@@ -1507,7 +1533,11 @@ pub(crate) fn buffer_tensor_plan(
             position,
             iface: op.op.as_ref(),
             operands: op.inputs.iter().map(|input| input.value.clone()).collect(),
-            results: op.outputs.iter().map(|output| output.eclass.clone()).collect(),
+            results: op
+                .outputs
+                .iter()
+                .map(|output| output.eclass.clone())
+                .collect(),
         })
         .collect();
 
@@ -1521,7 +1551,9 @@ pub(crate) fn buffer_tensor_plan(
     // (assignment and graph building never read `facts`).
     let seeds = find_seeds(graph, &order, &analysis_ops);
     for seed in &seeds {
-        facts.pinned.insert(seed.poison.clone(), seed.buffer_eclass.clone());
+        facts
+            .pinned
+            .insert(seed.poison.clone(), seed.buffer_eclass.clone());
     }
 
     let mut analysis = Analyzer::new(&analysis_ops, &facts).run()?;
@@ -1742,7 +1774,12 @@ fn validate_plan(dag: &DiGraph<BufferNode, BufferEdge>) -> Result<()> {
                      writer must be folded before the WAR scan"
                 );
             }
-            BufferNode::Compute { op, reads, writes, ties } => {
+            BufferNode::Compute {
+                op,
+                reads,
+                writes,
+                ties,
+            } => {
                 if reads.is_empty()
                     && !writes.is_empty()
                     && (0..writes.len()).all(|result| op.result_is_undefined(result))
@@ -1758,8 +1795,7 @@ fn validate_plan(dag: &DiGraph<BufferNode, BufferEdge>) -> Result<()> {
                         op.label()
                     );
                 }
-                let derives =
-                    |result: usize| ties.iter().any(|(_, r)| *r == result);
+                let derives = |result: usize| ties.iter().any(|(_, r)| *r == result);
                 if !reads.is_empty()
                     && !writes.is_empty()
                     && (0..reads.len()).all(|operand| !op.operand_reads_memory(operand))
@@ -1974,9 +2010,7 @@ pub(crate) fn lower(bt: crate::buffer_tensor_ir::BufferTensorIrGraph) -> Result<
                     }
                     let source = producer
                         .iter()
-                        .find(|((value, buffer), _)| {
-                            *value == slot.value && *buffer != slot.buffer
-                        })
+                        .find(|((value, buffer), _)| *value == slot.value && *buffer != slot.buffer)
                         .map(|((_, buffer), node)| (buffer.clone(), *node));
                     if let Some((src_buffer, from)) = source {
                         let copy = dag.add_node(BufferNode::BufferCopy {
@@ -2037,10 +2071,8 @@ pub(crate) fn lower(bt: crate::buffer_tensor_ir::BufferTensorIrGraph) -> Result<
         if operand_backed {
             continue; // the operand-derived edge already exists
         }
-        let (Some(&from), Some(&to)) = (
-            lowered.get(&edge.source()),
-            lowered.get(&edge.target()),
-        ) else {
+        let (Some(&from), Some(&to)) = (lowered.get(&edge.source()), lowered.get(&edge.target()))
+        else {
             continue;
         };
         let buffer = match &bt_dag[edge.source()] {
@@ -2288,7 +2320,10 @@ mod tests {
         .clone();
         g.output(&x, "D");
         let err = bufferize(&g.build()).unwrap_err();
-        assert!(err.to_string().contains("reads undefined contents"), "{err}");
+        assert!(
+            err.to_string().contains("reads undefined contents"),
+            "{err}"
+        );
     }
 
     /// A read-only input donated as the in-place destination: writing it is
@@ -2318,7 +2353,9 @@ mod tests {
     /// (never op-internal allocations), and never undefined contents.
     #[test]
     fn builtin_ops_declare_out_of_place_defaults() {
-        use crate::reference::ops::{AddFunctional, IndexMapApplyMaterialize, ReduceSum, SqrtFunctional};
+        use crate::reference::ops::{
+            AddFunctional, IndexMapApplyMaterialize, ReduceSum, SqrtFunctional,
+        };
         let ops: Vec<Box<dyn LayoutIrOp>> = vec![
             Box::new(AddFunctional),
             Box::new(SqrtFunctional),
@@ -2388,7 +2425,6 @@ mod tests {
             pinned,
             read_only,
             output_values: vec![cid("r")],
-            ..Default::default()
         };
         let analysis = Analyzer::new(&ops, &facts).run().unwrap();
         assert_eq!(analysis.in_place.get(&(0, 1)), Some(&false));
@@ -2403,7 +2439,10 @@ mod tests {
         let x = g.input_binding("x", "B", Some(Access::ReadWrite), None, "rm");
         g.output(&x, "B");
         let err = bufferize(&g.build()).unwrap_err();
-        assert!(err.to_string().contains("no deallocation responsibility"), "{err}");
+        assert!(
+            err.to_string().contains("no deallocation responsibility"),
+            "{err}"
+        );
     }
 
     /// INPUT-PROGRAM VALIDATION: every boundary buffer must DECLARE its
@@ -2421,10 +2460,13 @@ mod tests {
             &[&x],
             &[("y", "rm")],
         )[0]
-            .clone();
+        .clone();
         g.output(&y, "D");
         let err = bufferize(&g.build()).unwrap_err();
-        assert!(err.to_string().contains("declares no access level"), "{err}");
+        assert!(
+            err.to_string().contains("declares no access level"),
+            "{err}"
+        );
     }
 
     /// INPUT-PROGRAM VALIDATION, output arm (user-directed): a boundary
@@ -2437,7 +2479,10 @@ mod tests {
         let e = g.op(Box::new(EmptyOp), &[], &[("e", "rm")])[0].clone();
         g.output(&e, "D");
         let err = bufferize(&g.build()).unwrap_err();
-        assert!(err.to_string().contains("returning undefined contents"), "{err}");
+        assert!(
+            err.to_string().contains("returning undefined contents"),
+            "{err}"
+        );
     }
 
     /// Cross-operand gate helper: an op reading x through operand 0 while
@@ -2447,7 +2492,6 @@ mod tests {
             reads: vec![true, false],
             in_place_operand: Some(1),
             not_conflicting,
-            ..Default::default()
         };
         let ops = vec![AnalysisOp {
             position: 0,
@@ -2504,8 +2548,16 @@ mod tests {
         impl crate::layout_ir::Bufferizable for DoubleTie {
             fn alias_info(&self) -> Vec<AliasInfo> {
                 vec![
-                    AliasInfo { operand: 0, result: 0, sharing: Sharing::Must },
-                    AliasInfo { operand: 1, result: 0, sharing: Sharing::Must },
+                    AliasInfo {
+                        operand: 0,
+                        result: 0,
+                        sharing: Sharing::Must,
+                    },
+                    AliasInfo {
+                        operand: 1,
+                        result: 0,
+                        sharing: Sharing::Must,
+                    },
                 ]
             }
         }
@@ -2619,7 +2671,11 @@ mod tests {
             ..Default::default()
         };
         let mut analysis = Analyzer::new(&ops, &facts).run().unwrap();
-        assert_eq!(analysis.in_place.get(&(0, 0)), Some(&true), "view admits first");
+        assert_eq!(
+            analysis.in_place.get(&(0, 0)),
+            Some(&true),
+            "view admits first"
+        );
         assert_eq!(
             analysis.in_place.get(&(1, 0)),
             Some(&false),
@@ -2652,8 +2708,9 @@ mod tests {
             op_count: 1,
         };
         let assignment = Bufferizer::assign(&graph, &order, &mut analysis, &[]);
-        let bt = crate::buffer_tensor_ir::build_buffer_tensor_ir(&graph, &order, assignment, &analysis)
-            .expect("construction never errors on a rejected view");
+        let bt =
+            crate::buffer_tensor_ir::build_buffer_tensor_ir(&graph, &order, assignment, &analysis)
+                .expect("construction never errors on a rejected view");
         let plan = lower(bt).expect("a rejected view repairs, never errors");
         // The repair copy (x's buffer -> fresh alloc) plus the boundary copy
         // (fresh alloc -> slot E).
@@ -2701,7 +2758,6 @@ mod tests {
             reads: vec![false],
             in_place_operand: Some(0),
             not_conflicting: true,
-            ..Default::default()
         };
         let reader = MockOp {
             reads: vec![true],
@@ -2761,8 +2817,16 @@ mod tests {
             ..Default::default()
         };
         let analysis = Analyzer::new(&ops, &facts).run().unwrap();
-        assert_eq!(analysis.in_place.get(&(1, 0)), Some(&true), "output-nearer op wins");
-        assert_eq!(analysis.in_place.get(&(0, 0)), Some(&false), "loser vetoed by commit");
+        assert_eq!(
+            analysis.in_place.get(&(1, 0)),
+            Some(&true),
+            "output-nearer op wins"
+        );
+        assert_eq!(
+            analysis.in_place.get(&(0, 0)),
+            Some(&false),
+            "loser vetoed by commit"
+        );
     }
 
     /// RANK 9: NO built-in declares the unconditional sharing permit — ops
@@ -2771,8 +2835,12 @@ mod tests {
     /// blanket permit the engine would have to trust.
     #[test]
     fn builtin_ops_declare_no_unconditional_permits() {
+        use crate::reference::ops::{
+            AddFunctional, AddMutating, DivFunctional, ExpFunctional, IndexMapApplyMaterialize,
+            MaterializeLayoutCopy, MulFunctional, ReduceMax, ReduceSum, SqrtFunctional,
+            SqrtMutating,
+        };
         use crate::test_support::test_ops::AddMulFused;
-        use crate::reference::ops::{AddFunctional, AddMutating, DivFunctional, ExpFunctional, IndexMapApplyMaterialize, MaterializeLayoutCopy, MulFunctional, ReduceMax, ReduceSum, SqrtFunctional, SqrtMutating};
         let ops: Vec<Box<dyn LayoutIrOp>> = vec![
             Box::new(SqrtFunctional),
             Box::new(ExpFunctional),
@@ -2789,7 +2857,9 @@ mod tests {
         ];
         for op in &ops {
             assert!(
-                op.alias_info().iter().all(|info| info.sharing == Sharing::Must),
+                op.alias_info()
+                    .iter()
+                    .all(|info| info.sharing == Sharing::Must),
                 "{}",
                 op.label()
             );
@@ -2820,7 +2890,10 @@ mod tests {
     fn validator_rejects_self_copy() {
         let d = vbuf("D");
         let mut dag = DiGraph::new();
-        dag.add_node(BufferNode::BufferCopy { src: d.clone(), dst: d.clone() });
+        dag.add_node(BufferNode::BufferCopy {
+            src: d.clone(),
+            dst: d.clone(),
+        });
         let err = validate_plan(&dag).unwrap_err();
         assert!(err.to_string().contains("self-copy"), "{err}");
     }

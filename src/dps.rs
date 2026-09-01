@@ -17,11 +17,11 @@
 
 use egraph_serialize::ClassId;
 
-use crate::reference::ops::Poison;
 use crate::layout_ir::{
     ExtractedEdge, ExtractedGraph, ExtractedNode, LayoutTensorInfo, LogicalInfo, OpInput, OpNode,
     Provenance,
 };
+use crate::reference::ops::Poison;
 
 /// Rewrite every DPS-capable op into its destination-passing form. Out of
 /// place: the source graph is untouched.

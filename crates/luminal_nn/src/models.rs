@@ -44,9 +44,9 @@ impl Mlp {
 /// The FFN flavor a decoder block carries.
 pub enum FeedForward {
     /// up → relu → down.
-    Dense { up: Linear, down: Linear },
+    Dense { up: Box<Linear>, down: Box<Linear> },
     /// Mixture of experts (top-k routing).
-    Moe(MoE),
+    Moe(Box<MoE>),
 }
 
 impl FeedForward {
@@ -145,7 +145,6 @@ impl TinyDecoder {
     }
 }
 
-
 /// RUNG 5 (2026-08-07): real llama anatomy minus rope (ruling: rope/cos
 /// deferred for the initial reference runtime) — pre-RMSNorms, GQA
 /// attention over the paged KV cache (n_kv_heads < n_heads), SwiGLU FFN,
@@ -178,7 +177,14 @@ pub struct LlamaBlock {
 }
 
 impl LlamaBlock {
-    pub fn new(d: usize, ff: usize, n_heads: usize, n_kv_heads: usize, ns: &Ns, cx: &mut Graph) -> Self {
+    pub fn new(
+        d: usize,
+        ff: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        ns: &Ns,
+        cx: &mut Graph,
+    ) -> Self {
         Self::new_with_ffn(d, ff, n_heads, n_kv_heads, GatedFfn::SwiGlu, ns, cx)
     }
 
@@ -198,7 +204,13 @@ impl LlamaBlock {
         Self {
             ffn_kind,
             attn_norm: crate::LayerNorm::new(
-                d, false, false, false, 1e-5, &ns.child("input_layernorm"), cx,
+                d,
+                false,
+                false,
+                false,
+                1e-5,
+                &ns.child("input_layernorm"),
+                cx,
             ),
             wq: Linear::new(d, d, false, &attn.child("q_proj"), cx),
             wk: Linear::new(d, kv_dim, false, &attn.child("k_proj"), cx),
@@ -206,7 +218,13 @@ impl LlamaBlock {
             wo: Linear::new(d, d, false, &attn.child("o_proj"), cx),
             qk_norm: None,
             ffn_norm: crate::LayerNorm::new(
-                d, false, false, false, 1e-5, &ns.child("post_attention_layernorm"), cx,
+                d,
+                false,
+                false,
+                false,
+                1e-5,
+                &ns.child("post_attention_layernorm"),
+                cx,
             ),
             gate: Linear::new(d, ff, false, &mlp.child("gate_proj"), cx),
             up: Linear::new(d, ff, false, &mlp.child("up_proj"), cx),
@@ -481,15 +499,24 @@ impl GemmaBlock {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         // QK-norm before RoPE; attention scale folded into q.
         let q = crate::rotary_apply(
-            crate::rms_norm_heads(self.wq.forward(normed), self.head_dim, self.q_norm + 1.0, 1e-6)
-                * scale,
+            crate::rms_norm_heads(
+                self.wq.forward(normed),
+                self.head_dim,
+                self.q_norm + 1.0,
+                1e-6,
+            ) * scale,
             self.head_dim,
             rope_cos,
             rope_sin,
             rope_rot,
         );
         let k = crate::rotary_apply(
-            crate::rms_norm_heads(self.wk.forward(normed), self.head_dim, self.k_norm + 1.0, 1e-6),
+            crate::rms_norm_heads(
+                self.wk.forward(normed),
+                self.head_dim,
+                self.k_norm + 1.0,
+                1e-6,
+            ),
             self.head_dim,
             rope_cos,
             rope_sin,
@@ -537,15 +564,24 @@ impl GemmaBlock {
         let normed = self.input_norm.forward(x);
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let q = crate::rotary_apply(
-            crate::rms_norm_heads(self.wq.forward(normed), self.head_dim, self.q_norm + 1.0, 1e-6)
-                * scale,
+            crate::rms_norm_heads(
+                self.wq.forward(normed),
+                self.head_dim,
+                self.q_norm + 1.0,
+                1e-6,
+            ) * scale,
             self.head_dim,
             rope_cos,
             rope_sin,
             rope_rot,
         );
         let k = crate::rotary_apply(
-            crate::rms_norm_heads(self.wk.forward(normed), self.head_dim, self.k_norm + 1.0, 1e-6),
+            crate::rms_norm_heads(
+                self.wk.forward(normed),
+                self.head_dim,
+                self.k_norm + 1.0,
+                1e-6,
+            ),
             self.head_dim,
             rope_cos,
             rope_sin,
@@ -580,12 +616,10 @@ mod tests {
     use crate::{Embedding, Linear, MoE};
     use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
-    use luminal::shape::IntExpr;
     use luminal::reference::ReferenceRuntime;
+    use luminal::shape::IntExpr;
     use rustc_hash::FxHashMap;
     use scalar_refs::*;
-
-
 
     /// MODEL 1: a full 4→8→6→3 MLP, batch 2, through the search ladder —
     /// every layer's weights and biases bound as named tensors, the whole
@@ -622,8 +656,11 @@ mod tests {
                     for k in 0..in_w {
                         acc += activation[r * width + k] * w[k * out_w + c];
                     }
-                    next[r * out_w + c] =
-                        if index != DIMS.len() - 2 { acc.max(0.0) } else { acc };
+                    next[r * out_w + c] = if index != DIMS.len() - 2 {
+                        acc.max(0.0)
+                    } else {
+                        acc
+                    };
                 }
             }
             activation = next;
@@ -654,12 +691,6 @@ mod tests {
         rt.execute().expect("winner executes");
         assert_close(rt.get_f32(out.id).expect("output"), &activation);
     }
-
-
-
-
-
-
 
     /// RUNG 5: the llama-anatomy block (RMSNorm + GQA kv_groups=2 +
     /// SwiGLU, no rope) — one decode step through the DEFAULT ladder vs
@@ -780,7 +811,9 @@ mod tests {
             trials: 1,
             seed: 0,
         };
-        eprintln!("config | wall | saturation | extract | exec(best) | genomes refused (cycles/dead-ends)");
+        eprintln!(
+            "config | wall | saturation | extract | exec(best) | genomes refused (cycles/dead-ends)"
+        );
         // (layers, d, use_default_budget): the fixed 8-genome budget gives
         // comparable refusal RATES; depth ≥ 2 needs the default budget to
         // complete at all (the choice-cycle cliff — see the report).
@@ -801,8 +834,18 @@ mod tests {
 
             let start = std::time::Instant::now();
             let mut cx = Graph::new();
-            let blocks: Vec<LlamaBlock> =
-                (0..layers).map(|l| LlamaBlock::new(d, ff, n_heads, n_kv, &Ns::root().child("layers").index(l), &mut cx)).collect();
+            let blocks: Vec<LlamaBlock> = (0..layers)
+                .map(|l| {
+                    LlamaBlock::new(
+                        d,
+                        ff,
+                        n_heads,
+                        n_kv,
+                        &Ns::root().child("layers").index(l),
+                        &mut cx,
+                    )
+                })
+                .collect();
             let x = cx.tensor((1, d));
             let caches: Vec<_> = (0..layers)
                 .map(|_| (cx.tensor((SLOTS6, kv_dim)), cx.tensor((SLOTS6, kv_dim))))
@@ -838,8 +881,14 @@ mod tests {
                 pairs.push((block.gate.weight.id, weights(d * ff, 95 + layer).into()));
                 pairs.push((block.up.weight.id, weights(d * ff, 96 + layer).into()));
                 pairs.push((block.down.weight.id, weights(ff * d, 97 + layer).into()));
-                pairs.push((caches[layer].0.id, weights(SLOTS6 * kv_dim, 98 + layer).into()));
-                pairs.push((caches[layer].1.id, weights(SLOTS6 * kv_dim, 99 + layer).into()));
+                pairs.push((
+                    caches[layer].0.id,
+                    weights(SLOTS6 * kv_dim, 98 + layer).into(),
+                ));
+                pairs.push((
+                    caches[layer].1.id,
+                    weights(SLOTS6 * kv_dim, 99 + layer).into(),
+                ));
             }
             let data: FxHashMap<_, _> = pairs.iter().cloned().collect();
             let mut rt = ReferenceRuntime::load(&cx).expect("native load");
@@ -877,8 +926,9 @@ mod tests {
     #[ignore = "diagnostic — run explicitly by name (release)"]
     fn probe_deadlock_anatomy() {
         let mut cx = Graph::new();
-        let blocks: Vec<LlamaBlock> =
-            (0..2).map(|l| LlamaBlock::new(8, 12, 4, 2, &Ns::root().child("layers").index(l), &mut cx)).collect();
+        let blocks: Vec<LlamaBlock> = (0..2)
+            .map(|l| LlamaBlock::new(8, 12, 4, 2, &Ns::root().child("layers").index(l), &mut cx))
+            .collect();
         let x = cx.tensor((1, 8));
         let caches: Vec<_> = (0..2)
             .map(|_| (cx.tensor((4, 4)), cx.tensor((4, 4))))
@@ -921,8 +971,7 @@ mod tests {
         }
         let data: rustc_hash::FxHashMap<_, _> = pairs.iter().cloned().collect();
         for seed in 0..16 {
-            let mut rt =
-                luminal::reference::ReferenceRuntime::load(&cx).expect("native load");
+            let mut rt = luminal::reference::ReferenceRuntime::load(&cx).expect("native load");
             let outcome = rt.search(
                 &data,
                 &luminal::implementation_search::ImplementationSearchOptions {
@@ -935,7 +984,9 @@ mod tests {
             );
             match outcome {
                 Err(_) => {
-                    eprintln!("[anatomy] seed {seed} refused; last failure dissected by the search's own session (see exemplars above); re-deriving:");
+                    eprintln!(
+                        "[anatomy] seed {seed} refused; last failure dissected by the search's own session (see exemplars above); re-deriving:"
+                    );
                     // Re-run the same single genome through a session we
                     // control so the blockage record is inspectable.
                     // (search consumed the runtime; rebuild the pipeline)
@@ -947,17 +998,12 @@ mod tests {
                     );
                     let mut egraph = luminal::egglog_snippet::new_egraph();
                     egraph.parse_and_run_program(None, &text).expect("runs");
-                    let serialized =
-                        egraph.serialize(egglog::SerializeConfig::default()).egraph;
+                    let serialized = egraph.serialize(egglog::SerializeConfig::default()).egraph;
                     let allow = luminal::reference::reference_allow_list();
-                    let mut session = luminal::extractor::ExtractionSession::new(
-                        &serialized,
-                        Some(&allow),
-                    );
-                    let index = luminal::extractor::producer_index_with_ops(
-                        &serialized,
-                        Some(&allow),
-                    );
+                    let mut session =
+                        luminal::extractor::ExtractionSession::new(&serialized, Some(&allow));
+                    let index =
+                        luminal::extractor::producer_index_with_ops(&serialized, Some(&allow));
                     use rand::{Rng, SeedableRng};
                     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                     let mut genome = luminal::extractor::Genome::default();
@@ -969,7 +1015,9 @@ mod tests {
                         eprintln!("{}", session.blockage_anatomy());
                         return;
                     }
-                    eprintln!("[anatomy] re-derived genome extracted (serialization nondeterminism) — trying next seed");
+                    eprintln!(
+                        "[anatomy] re-derived genome extracted (serialization nondeterminism) — trying next seed"
+                    );
                 }
                 Ok(_) => continue,
             }
@@ -978,11 +1026,6 @@ mod tests {
     }
 
     // ── shared scalar-reference pieces (single query row, s = 1) ──
-
-
-
-
-
 
     struct BlockFixture {
         cx: Graph,
@@ -1005,7 +1048,9 @@ mod tests {
     const FF_HIDDEN: usize = 6;
     const EXPERTS: usize = 2;
 
-    fn block_fixture(ff: fn(&mut Graph) -> FeedForward) -> (BlockFixture, GraphTensor, GraphTensor, GraphTensor) {
+    fn block_fixture(
+        ff: fn(&mut Graph) -> FeedForward,
+    ) -> (BlockFixture, GraphTensor, GraphTensor, GraphTensor) {
         let mut cx = Graph::new();
         let embed = Embedding::new(VOCAB, D, &Ns::root().child("embed"), &mut cx);
         let a = Ns::root().child("attn");
@@ -1037,7 +1082,16 @@ mod tests {
         let kc = kc.output();
         let vc = vc.output();
         (
-            BlockFixture { cx, block, embed, ids, k_cache, v_cache, gather_idx, scatter_idx },
+            BlockFixture {
+                cx,
+                block,
+                embed,
+                ids,
+                k_cache,
+                v_cache,
+                gather_idx,
+                scatter_idx,
+            },
             logits,
             kc,
             vc,
@@ -1047,7 +1101,12 @@ mod tests {
     /// Everything the block binds, with deterministic weights; returns
     /// (tensor-keyed data map, scalar-side copies).
     #[allow(clippy::type_complexity)]
-    fn block_data(fx: &BlockFixture) -> (FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>, Vec<(petgraph::graph::NodeIndex, TypedBuffer)>) {
+    fn block_data(
+        fx: &BlockFixture,
+    ) -> (
+        FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
+        Vec<(petgraph::graph::NodeIndex, TypedBuffer)>,
+    ) {
         let token = 3usize;
         let mut pairs: Vec<(petgraph::graph::NodeIndex, TypedBuffer)> = vec![
             (fx.ids.id, vec![token as i32].into()),
@@ -1082,9 +1141,14 @@ mod tests {
         let x: Vec<f32> = embed_w[token * D..(token + 1) * D].to_vec();
         let mut k_cache = weights(SLOTS * D, 6);
         let mut v_cache = weights(SLOTS * D, 8);
-        let (wq, wk, wv, wo) =
-            (weights(D * D, 2), weights(D * D, 3), weights(D * D, 4), weights(D * D, 5));
-        let ff: Box<dyn Fn(&[f32]) -> Vec<f32>> = match &fx.block.ff {
+        let (wq, wk, wv, wo) = (
+            weights(D * D, 2),
+            weights(D * D, 3),
+            weights(D * D, 4),
+            weights(D * D, 5),
+        );
+        type FfnReference = dyn Fn(&[f32]) -> Vec<f32>;
+        let ff: Box<FfnReference> = match &fx.block.ff {
             FeedForward::Dense { .. } => {
                 let (up, down) = (weights(D * FF_HIDDEN, 9), weights(FF_HIDDEN * D, 10));
                 Box::new(move |x: &[f32]| {
@@ -1101,8 +1165,19 @@ mod tests {
             }
         };
         let x2 = ref_block_step(
-            &x, &wq, &wk, &wv, &wo, &*ff, &mut k_cache, &mut v_cache, &[0, 1], 1, N_HEADS,
-            HEAD_DIM, D,
+            &x,
+            &wq,
+            &wk,
+            &wv,
+            &wo,
+            &*ff,
+            &mut k_cache,
+            &mut v_cache,
+            &[0, 1],
+            1,
+            N_HEADS,
+            HEAD_DIM,
+            D,
         );
         // Tied logits: x2 · Eᵀ.
         let logits: Vec<f32> = (0..VOCAB)
@@ -1116,8 +1191,20 @@ mod tests {
     #[test]
     fn decoder_block_matches_scalar_reference() {
         let (fx, logits, kc, vc) = block_fixture(|cx| FeedForward::Dense {
-            up: Linear::new(D, FF_HIDDEN, false, &Ns::root().child("up"), cx),
-            down: Linear::new(FF_HIDDEN, D, false, &Ns::root().child("down"), cx),
+            up: Box::new(Linear::new(
+                D,
+                FF_HIDDEN,
+                false,
+                &Ns::root().child("up"),
+                cx,
+            )),
+            down: Box::new(Linear::new(
+                FF_HIDDEN,
+                D,
+                false,
+                &Ns::root().child("down"),
+                cx,
+            )),
         });
         let (data, pairs) = block_data(&fx);
         let (ref_logits, ref_kc, ref_vc) = block_reference(&fx);
@@ -1146,11 +1233,11 @@ mod tests {
     #[test]
     fn moe_decoder_block_matches_scalar_reference() {
         let (fx, logits, kc, vc) = block_fixture(|cx| {
-            FeedForward::Moe(MoE {
+            FeedForward::Moe(Box::new(MoE {
                 expert_weights: cx.named_tensor("Experts", (EXPERTS, D, D)),
                 router: cx.named_tensor("Router", (D, EXPERTS)),
                 k: 1,
-            })
+            }))
         });
         let (_, pairs) = block_data(&fx);
         let (ref_logits, ref_kc, ref_vc) = block_reference(&fx);
@@ -1186,15 +1273,29 @@ mod tests {
             let mut blocks = Vec::new();
             for l in 0..LAYERS {
                 let lns = Ns::root().child("layers").index(l);
-                norms.push(crate::LayerNorm::new(D, false, false, true, EPS, &lns.child("norm"), &mut cx));
+                norms.push(crate::LayerNorm::new(
+                    D,
+                    false,
+                    false,
+                    true,
+                    EPS,
+                    &lns.child("norm"),
+                    &mut cx,
+                ));
                 blocks.push(DecoderBlock {
                     wq: Linear::new(D, D, false, &lns.child("q"), &mut cx),
                     wk: Linear::new(D, D, false, &lns.child("k"), &mut cx),
                     wv: Linear::new(D, D, false, &lns.child("v"), &mut cx),
                     wo: Linear::new(D, D, false, &lns.child("o"), &mut cx),
                     ff: FeedForward::Dense {
-                        up: Linear::new(D, FF_HIDDEN, false, &lns.child("up"), &mut cx),
-                        down: Linear::new(FF_HIDDEN, D, false, &lns.child("down"), &mut cx),
+                        up: Box::new(Linear::new(D, FF_HIDDEN, false, &lns.child("up"), &mut cx)),
+                        down: Box::new(Linear::new(
+                            FF_HIDDEN,
+                            D,
+                            false,
+                            &lns.child("down"),
+                            &mut cx,
+                        )),
                     },
                     n_heads: N_HEADS,
                     n_kv_heads: N_HEADS,
@@ -1205,7 +1306,15 @@ mod tests {
                 embed,
                 norms,
                 blocks,
-                final_norm: crate::LayerNorm::new(D, false, false, true, EPS, &Ns::root().child("final_norm"), &mut cx),
+                final_norm: crate::LayerNorm::new(
+                    D,
+                    false,
+                    false,
+                    true,
+                    EPS,
+                    &Ns::root().child("final_norm"),
+                    &mut cx,
+                ),
             };
             let ids = cx.tensor_dtyped(1, DType::Int);
             let cache_inputs: Vec<(GraphTensor, GraphTensor)> = (0..LAYERS)
@@ -1252,7 +1361,11 @@ mod tests {
                 pairs.push((block.wk.weight.id, wk.into()));
                 pairs.push((block.wv.weight.id, wv.into()));
                 pairs.push((block.wo.weight.id, wo.into()));
-                let FeedForward::Dense { up: up_l, down: down_l } = &block.ff else {
+                let FeedForward::Dense {
+                    up: up_l,
+                    down: down_l,
+                } = &block.ff
+                else {
                     unreachable!()
                 };
                 pairs.push((up_l.weight.id, up.into()));
@@ -1322,9 +1435,9 @@ mod tests {
 #[cfg(test)]
 mod forward_rope_tests {
     use super::LlamaBlock;
-    use scalar_refs::*;
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
+    use scalar_refs::*;
 
     /// forward_rope ≡ the hand-composed IntExpr path: one graph, one
     /// set of block weights, the same decode-step inputs — the new
@@ -1346,8 +1459,15 @@ mod forward_rope_tests {
         let position = 1usize;
 
         let mut cx = Graph::new();
-        let block = LlamaBlock::new(D, FF, N_HEADS, N_KV_HEADS, &Ns::root().child("blk"), &mut cx)
-            .with_qk_norm(&Ns::root().child("blk"), &mut cx);
+        let block = LlamaBlock::new(
+            D,
+            FF,
+            N_HEADS,
+            N_KV_HEADS,
+            &Ns::root().child("blk"),
+            &mut cx,
+        )
+        .with_qk_norm(&Ns::root().child("blk"), &mut cx);
         let x = cx.tensor((1, D));
         let k_cache = cx.tensor((SLOTS, KV_DIM));
         let v_cache = cx.tensor((SLOTS, KV_DIM));
@@ -1359,7 +1479,15 @@ mod forward_rope_tests {
         let rope_rot = cx.tensor((HEAD_DIM, HEAD_DIM));
 
         let (out_rope, k_rope, v_rope) = block.forward_rope(
-            x, k_cache, v_cache, gather_idx, scatter_idx, q_pos, rope_cos, rope_sin, rope_rot,
+            x,
+            k_cache,
+            v_cache,
+            gather_idx,
+            scatter_idx,
+            q_pos,
+            rope_cos,
+            rope_sin,
+            rope_rot,
         );
         let out_rope = out_rope.output();
         let k_rope = k_rope.output();
@@ -1415,7 +1543,10 @@ mod forward_rope_tests {
         let (cos, sin) = crate::rope_tables_split_half(&[position as f32], HEAD_DIM, 10_000.0, 1.0);
         pairs.push((rope_cos.id, cos.into()));
         pairs.push((rope_sin.id, sin.into()));
-        pairs.push((rope_rot.id, crate::rope_pairing_matrix(HEAD_DIM, false).into()));
+        pairs.push((
+            rope_rot.id,
+            crate::rope_pairing_matrix(HEAD_DIM, false).into(),
+        ));
         for (seed, tensor) in [
             block.wq.weight,
             block.wk.weight,
