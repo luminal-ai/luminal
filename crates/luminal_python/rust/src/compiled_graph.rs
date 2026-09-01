@@ -163,6 +163,8 @@ const ARTIFACT_SCHEMA_VERSION: u32 = 3;
 #[derive(Deserialize, Serialize)]
 struct CompiledArtifactData {
     schema_version: u32,
+    #[serde(default, rename = "luminal_artifact_key")]
+    cache_key: Option<String>,
     backend: String,
     #[serde(default)]
     backend_artifact: Option<String>,
@@ -209,6 +211,7 @@ pub struct CompiledGraph {
     pub writeback_outputs: Vec<(usize, String)>,
     tensor_sizes: HashMap<String, usize>,
     external_cuda_graph: bool,
+    serializable: bool,
 }
 
 impl CompiledGraph {
@@ -244,6 +247,7 @@ impl CompiledGraph {
             tensor_sizes,
             device_ptrs,
         } = weight_data;
+        let serializable = weights.is_empty() && device_ptrs.is_empty();
         let artifact_tensor_sizes = tensor_sizes.clone();
 
         // Build compile args from WeightData.
@@ -296,6 +300,7 @@ impl CompiledGraph {
             writeback_outputs,
             tensor_sizes: artifact_tensor_sizes,
             external_cuda_graph,
+            serializable,
         })
     }
 
@@ -306,6 +311,7 @@ impl CompiledGraph {
         device_index: Option<usize>,
         external_cuda_graph: bool,
     ) -> Result<Self, String> {
+        let serializable = device_ptrs.is_empty();
         let artifact: CompiledArtifactData =
             serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
         if artifact.schema_version != ARTIFACT_SCHEMA_VERSION {
@@ -379,6 +385,7 @@ impl CompiledGraph {
             writeback_outputs: artifact.writeback_outputs,
             tensor_sizes: artifact.tensor_sizes,
             external_cuda_graph,
+            serializable,
         })
     }
 
@@ -413,7 +420,17 @@ impl CompiledGraph {
 
 #[pymethods]
 impl CompiledGraph {
-    fn serialize_artifact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+    #[pyo3(signature = (cache_key=None))]
+    fn serialize_artifact<'py>(
+        &self,
+        py: Python<'py>,
+        cache_key: Option<String>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        if !self.serializable {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "compiled artifacts with bound weights or input pointers are not serializable",
+            ));
+        }
         let schedule = self.graph.selected_schedule().cloned().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("compiled graph has no selected schedule")
         })?;
@@ -433,6 +450,7 @@ impl CompiledGraph {
 
         let artifact = CompiledArtifactData {
             schema_version: ARTIFACT_SCHEMA_VERSION,
+            cache_key,
             backend: self.runtime.name().to_string(),
             backend_artifact: self.runtime.artifact_data(),
             device_index: self.runtime.device_index(),

@@ -152,12 +152,14 @@ def test_region_artifact_loads_once_and_binds_each_model(monkeypatch) -> None:
     monkeypatch.setattr(region_compile_module, "_cuda_factory", object)
 
     common = {"device_index": 0, "external_cuda_graph": True}
-    assert load_region_artifact(
-        b"{}", input_indices=(0,), output_spec="first", **common
-    ) == 1
-    assert load_region_artifact(
-        b"{}", input_indices=(1,), output_spec="second", **common
-    ) == 2
+    assert (
+        load_region_artifact(b"{}", input_indices=(0,), output_spec="first", **common)
+        == 1
+    )
+    assert (
+        load_region_artifact(b"{}", input_indices=(1,), output_spec="second", **common)
+        == 2
+    )
     assert loads == 1
     assert [binding["user_indices"] for binding in bindings] == [(0,), (1,)]
     stats = artifact_cache_stats()
@@ -168,8 +170,13 @@ def test_region_artifact_loads_once_and_binds_each_model(monkeypatch) -> None:
 
 def test_loaded_artifact_uses_structural_identity() -> None:
     clear_artifact_cache()
-    first = json.dumps({"luminal_artifact_key": "region", "value": 1}).encode()
-    second = json.dumps({"luminal_artifact_key": "region", "value": 2}).encode()
+    common = {
+        "luminal_artifact_key": "region",
+        "schema_version": 3,
+        "backend": "cuda_lite",
+    }
+    first = json.dumps({**common, "value": 1}).encode()
+    second = json.dumps({**common, "value": 2}).encode()
     artifact = object()
 
     assert get_or_load(first, lambda: artifact, device_index=0) is artifact
@@ -177,9 +184,29 @@ def test_loaded_artifact_uses_structural_identity() -> None:
     clear_artifact_cache()
 
 
+def test_loaded_artifact_identity_includes_compatibility() -> None:
+    clear_artifact_cache()
+    first = json.dumps(
+        {"luminal_artifact_key": "region", "schema_version": 3, "backend": "cuda_lite"}
+    ).encode()
+    second = json.dumps(
+        {"luminal_artifact_key": "region", "schema_version": 3, "backend": "reference"}
+    ).encode()
+    artifacts = [object(), object()]
+
+    assert get_or_load(first, lambda: artifacts[0]) is artifacts[0]
+    assert get_or_load(second, lambda: artifacts[1]) is artifacts[1]
+    clear_artifact_cache()
+
+
 def test_compiled_artifact_serializes_structural_identity() -> None:
     clear_artifact_cache()
-    graph = type("Graph", (), {"serialize_artifact": lambda self: b"{}"})()
+
+    class Graph:
+        def serialize_artifact(self, cache_key=None):
+            return json.dumps({"luminal_artifact_key": cache_key}).encode()
+
+    graph = Graph()
     artifact = get_or_compile("region", lambda: CompiledArtifact(graph))
 
     assert json.loads(artifact.serialize())["luminal_artifact_key"] == "region"
@@ -199,6 +226,23 @@ def test_compiled_artifact_round_trip_cpu() -> None:
 
     (actual,) = loaded(*inputs)
     torch.testing.assert_close(actual, inputs[0] + inputs[1])
+
+
+def test_compiled_artifact_rejects_bound_weights() -> None:
+    from luminal.pt2 import compile as luminal_compile
+
+    class Weighted(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("weight", torch.randn(4))
+
+        def forward(self, value):
+            return value * self.weight
+
+    compiled = luminal_compile(Weighted(), [torch.randn(4)], search_iterations=1)
+
+    with pytest.raises(RuntimeError, match="bound weights"):
+        compiled.serialize_artifact()
 
 
 def test_compiled_artifact_rejects_old_schema() -> None:
@@ -464,9 +508,7 @@ def test_region_artifact_round_trip_without_cuda_recompile() -> None:
         output_spec=region.output_spec,
         device_index=region.device_index,
     )
-    inputs = [
-        torch.randn((2, 4), device="cuda", dtype=torch.float16) for _ in range(2)
-    ]
+    inputs = [torch.randn((2, 4), device="cuda", dtype=torch.float16) for _ in range(2)]
 
     (actual,) = loaded(*inputs)
     torch.testing.assert_close(actual, inputs[0] + inputs[1])

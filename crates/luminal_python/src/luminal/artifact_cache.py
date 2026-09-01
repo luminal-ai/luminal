@@ -58,12 +58,11 @@ class CompiledArtifact:
         return changed
 
     def serialize(self) -> bytes:
-        data = bytes(self.graph.serialize_artifact())
-        if self.cache_key is None:
-            return data
-        payload = json.loads(data)
-        payload[_CACHE_KEY_FIELD] = self.cache_key
-        return json.dumps(payload, separators=(",", ":")).encode()
+        if self.weight_refs:
+            raise RuntimeError(
+                "compiled artifacts with bound weights are not serializable"
+            )
+        return bytes(self.graph.serialize_artifact(self.cache_key))
 
     @classmethod
     def deserialize(
@@ -167,12 +166,19 @@ def get_or_load(data, load_artifact, **options):
 
     global _loads, _load_reuse_hits, _load_seconds
 
-    payload = json.loads(bytes(data))
+    data = bytes(data)
+    payload = json.loads(data)
     identity = payload.get(_CACHE_KEY_FIELD)
     if identity is None:
-        identity = hashlib.sha256(bytes(data)).hexdigest()
+        identity = hashlib.sha256(data).hexdigest()
 
-    digest = hashlib.sha256(str(identity).encode())
+    compatibility = (
+        payload.get("schema_version"),
+        payload.get("backend"),
+        payload.get("device_index"),
+        payload.get("external_cuda_graph"),
+    )
+    digest = hashlib.sha256(repr((identity, compatibility)).encode())
     digest.update(repr(sorted(options.items())).encode())
     key = f"loaded:{digest.hexdigest()}"
 
