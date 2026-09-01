@@ -12,11 +12,11 @@ from torch import fx
 
 import luminal.region_compile as region_compile_module
 from luminal.artifact_cache import (
-    ArtifactCacheStats,
     CompiledArtifact,
     artifact_cache_stats,
     clear_artifact_cache,
     get_or_compile,
+    get_or_load,
     region_artifact_key,
 )
 from luminal.compiled_model import CompiledModel
@@ -125,11 +125,64 @@ def test_artifact_cache_compiles_once() -> None:
     assert get_or_compile("region", compile_artifact) is artifact
     assert get_or_compile("region", compile_artifact) is artifact
     assert calls == 1
-    assert artifact_cache_stats() == ArtifactCacheStats(
-        unique_artifacts=1,
-        reuse_hits=1,
-        searches=1,
-    )
+    stats = artifact_cache_stats()
+    assert (stats.unique_artifacts, stats.reuse_hits, stats.searches) == (1, 1, 1)
+    assert stats.search_seconds > 0
+    clear_artifact_cache()
+
+
+def test_region_artifact_loads_once_and_binds_each_model(monkeypatch) -> None:
+    clear_artifact_cache()
+    bindings = []
+
+    class Artifact:
+        def bind(self, **kwargs):
+            bindings.append(kwargs)
+            return len(bindings)
+
+    artifact = Artifact()
+    loads = 0
+
+    def deserialize(*args, **kwargs):
+        nonlocal loads
+        loads += 1
+        return artifact
+
+    monkeypatch.setattr(CompiledArtifact, "deserialize", deserialize)
+    monkeypatch.setattr(region_compile_module, "_cuda_factory", object)
+
+    common = {"device_index": 0, "external_cuda_graph": True}
+    assert load_region_artifact(
+        b"{}", input_indices=(0,), output_spec="first", **common
+    ) == 1
+    assert load_region_artifact(
+        b"{}", input_indices=(1,), output_spec="second", **common
+    ) == 2
+    assert loads == 1
+    assert [binding["user_indices"] for binding in bindings] == [(0,), (1,)]
+    stats = artifact_cache_stats()
+    assert (stats.loads, stats.load_reuse_hits) == (1, 1)
+    assert stats.load_seconds > 0
+    clear_artifact_cache()
+
+
+def test_loaded_artifact_uses_structural_identity() -> None:
+    clear_artifact_cache()
+    first = json.dumps({"luminal_artifact_key": "region", "value": 1}).encode()
+    second = json.dumps({"luminal_artifact_key": "region", "value": 2}).encode()
+    artifact = object()
+
+    assert get_or_load(first, lambda: artifact, device_index=0) is artifact
+    assert get_or_load(second, lambda: object(), device_index=0) is artifact
+    clear_artifact_cache()
+
+
+def test_compiled_artifact_serializes_structural_identity() -> None:
+    clear_artifact_cache()
+    graph = type("Graph", (), {"serialize_artifact": lambda self: b"{}"})()
+    artifact = get_or_compile("region", lambda: CompiledArtifact(graph))
+
+    assert json.loads(artifact.serialize())["luminal_artifact_key"] == "region"
     clear_artifact_cache()
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .artifact_cache import CompiledArtifact, region_artifact_key
+from .artifact_cache import CompiledArtifact, get_or_load, region_artifact_key
 from .compiled_model import CompiledModel
 from .pt2 import _save_and_compile
 from .region_export import RegionExport
@@ -75,9 +75,15 @@ def load_region_artifact(
     static_outputs=False,
     external_cuda_graph=False,
 ) -> CompiledModel:
-    artifact = CompiledArtifact.deserialize(
+    artifact = get_or_load(
         data,
-        _cuda_factory(),
+        lambda: CompiledArtifact.deserialize(
+            data,
+            _cuda_factory(),
+            device_index=device_index,
+            external_cuda_graph=external_cuda_graph,
+        ),
+        backend="cuda",
         device_index=device_index,
         external_cuda_graph=external_cuda_graph,
     )
