@@ -271,7 +271,7 @@ fn padded_output_binding_does_not_remove_the_row_major_route() {
 
 /// The ONE preamble rule that unions a strided chain with the left-major
 /// literal — arm (3a) of DOWNWARD LAYOUT DISCOVERY
-/// (`src/egglog/checkpoint_5/egglog_preamble.egg`, "(3a) contiguous
+/// (`src/egglog_core/egglog_preamble.egg`, "(3a) contiguous
 /// discovery"), quoted verbatim so the ablation cannot drift.
 const LEFT_MAJOR_DISCOVERY_RULE: &str = "(rule
   (

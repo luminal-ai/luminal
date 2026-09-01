@@ -799,7 +799,6 @@ impl CudaRuntime {
         unsafe { self.set_output_device_ptr(id, ptr, buffer.len()) };
     }
 
-
     pub fn output_is_zero_copy(&self, id: impl ToId) -> bool {
         let producer = self.find_producer_node(id);
         let data_node = self.follow_aliases(producer);
@@ -3398,7 +3397,6 @@ impl Runtime for CudaRuntime {
         let mut resource_plan = match plan_static_llir_resources(llir_graph, &allocation_dyn_map) {
             Ok(plan) => plan,
             Err(violation) => {
-                luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
                 return luminal::op::CandidateFilterResult::reject_with_display(format!(
                     "candidate reject: {violation}"
                 ));
@@ -3406,7 +3404,6 @@ impl Runtime for CudaRuntime {
         };
         if let Err(violation) = validate_resource_plan(&resource_plan, caps, device_resource_limits)
         {
-            luminal::mask_events::RESOURCE_REJECT.record_with(|| violation.to_string());
             return luminal::op::CandidateFilterResult::reject_with_display(format!(
                 "resource reject: {violation}"
             ));

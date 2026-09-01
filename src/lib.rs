@@ -4,17 +4,16 @@
 #![allow(clippy::mutable_key_type)]
 
 pub mod dtype;
+#[path = "egglog_core/egglog_utils/mod.rs"]
 pub mod egglog_utils;
 pub mod frontend;
 pub mod graph;
-pub mod mask_events;
 pub mod runtime_binding;
 pub mod shape;
 
-// The logical-SSA layout compiler (the egglog_layout_trial graft, M0: vendored
-// unwired). Egglog program assembly + registries live beside the ops; the
-// fixture suite runs as core tests. See src/egglog/checkpoint_5/ for the core
-// preamble and fixtures.
+// The logical-SSA layout compiler. Egglog program assembly and registries live
+// beside the ops; the fixture suite runs as core tests. See src/egglog_core/
+// for the core preamble and fixtures.
 pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;

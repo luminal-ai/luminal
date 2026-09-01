@@ -1,7 +1,0 @@
-buffers (1):
-  pinned[iota_output_buffer_id / BufferLit(300)] [caller, rw]
-ops (1):
-  IotaGeneric: [pinned[iota_output_buffer_id / BufferLit(300)]] -> [pinned[iota_output_buffer_id / BufferLit(300)]]
-anti (0):
-outputs (1):
-  out 0 -> pinned[iota_output_buffer_id / BufferLit(300)]

@@ -589,7 +589,7 @@ pub fn subst(egraph: &mut EGraph, root: Value, map: Value) -> Result<Value, Erro
 /// IndexMap) -> IntExpr`, the union-on-set memo idiom. Substitution
 /// distributes over syntax, never over memo tables keyed by syntax:
 /// walking a memo row and substituting inside its KEY mints
-/// memo rows about the WRONG key (probe_aliased_min: the sigma-1 walk
+/// memo rows about the WRONG key (subst_aliased_min: the sigma-1 walk
 /// copied `int-subst-of(c_row, row0_map)` out of the zero class as
 /// `int-subst-of(1, row0_map)` and welded 0 = 1). Upstream design gap
 /// to raise with #60: "constructor rows = the term structure" is

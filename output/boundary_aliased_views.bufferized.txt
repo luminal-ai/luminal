@@ -1,7 +1,0 @@
-buffers (1):
-  pinned[shared_buffer_id / BufferLit(220)] [caller, rw]
-ops (0):
-anti (0):
-outputs (2):
-  out 0 -> pinned[shared_buffer_id / BufferLit(220)]
-  out 1 -> pinned[shared_buffer_id / BufferLit(220)]

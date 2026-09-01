@@ -140,7 +140,7 @@ pub fn new_egraph() -> egglog::EGraph {
 /// snippets are always included; the matcher contributions come from
 /// the caller.
 pub fn assembled_program_for(matchers: &[Box<dyn crate::layout_ir::OpMatcher>]) -> String {
-    let core = include_str!("egglog/checkpoint_5/egglog_preamble.egg");
+    let core = include_str!("egglog_core/egglog_preamble.egg");
     let mut snippets: Vec<EgglogSnippet> = Vec::new();
     for op in crate::logical_op::built_in_logical_ops() {
         snippets.extend(op.snippets());

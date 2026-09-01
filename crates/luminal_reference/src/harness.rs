@@ -11,11 +11,11 @@ use std::fs;
 use luminal::extractor;
 use luminal::layout_ir::ExtractedGraph;
 
-/// Fixture scripts live in the WORKSPACE-ROOT egglog tree; this crate
+/// Fixture scripts live in the WORKSPACE-ROOT Egglog core tree; this crate
 /// runs two directories below it.
 fn fixture_path(script: &str) -> String {
     format!(
-        "{}/../../src/egglog/checkpoint_5/test_scripts/{script}",
+        "{}/../../src/egglog_core/test_scripts/{script}",
         env!("CARGO_MANIFEST_DIR")
     )
 }

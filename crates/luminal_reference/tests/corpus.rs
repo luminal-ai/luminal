@@ -7,11 +7,11 @@
 //! subst_range_guard_example live here and pin the substitution guard
 //! semantics.
 
-/// The fixture corpus lives in the WORKSPACE-ROOT egglog tree; this
+/// The fixture corpus lives in the WORKSPACE-ROOT Egglog core tree; this
 /// crate runs two directories below it.
 const SCRIPTS_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../src/egglog/checkpoint_5/test_scripts"
+    "/../../src/egglog_core/test_scripts"
 );
 
 #[test]
@@ -32,28 +32,17 @@ fn corpus_scripts_all_green() {
         scripts.retain(|s| keep.contains(s.as_str()));
     }
     assert!(!scripts.is_empty(), "corpus found no scripts");
-    // Bit-rotted scripts, skipped LOUDLY: foldr_example references
-    // element-to-strided-demand, deleted by the affine migration
-    // (2026-08-05); nothing ran the corpus in the merge tree until
-    // this gate existed, so the rot went unnoticed. Deletion or
-    // rewrite is a ruling.
-    const STALE_SCRIPTS: &[&str] = &["foldr_example.egg"];
     // The corpus assembles against THE REFERENCE REGISTRY — not a
     // superset. Every script here must be expressible in the vocabulary
     // the reference runtime actually ships; a script that needs a
     // view/fused/mutating spelling belongs in that runtime's own fixture
     // tree, gated by that runtime's own corpus. That is a property of
-    // the file's HOME, never of a name filter (`STALE_SCRIPTS` above is
-    // for bit-rot, and is not a vocabulary escape hatch).
+    // the file's HOME, never of a name filter.
     let program_head = luminal::egglog_snippet::assembled_program_for(
         &luminal_reference::ops::built_in_matchers(),
     );
     let mut failures = Vec::new();
     for script in &scripts {
-        if STALE_SCRIPTS.contains(&script.as_str()) {
-            eprintln!("[corpus] SKIPPING stale script {script} (see STALE_SCRIPTS)");
-            continue;
-        }
         let started = std::time::Instant::now();
         eprintln!("[corpus] running {script}");
         let source = std::fs::read_to_string(format!("{dir}/{script}")).expect("script readable");

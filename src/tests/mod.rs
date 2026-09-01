@@ -40,19 +40,6 @@ pub fn assert_exact<T: PartialEq + Debug>(a_vec: &[T], b_vec: &[T]) {
     }
 }
 
-pub fn random_array<const N: usize>() -> [f32; N] {
-    let mut rng = rng();
-    random_array_rng(&mut rng)
-}
-
-pub fn random_array_rng<const N: usize, R: Rng>(rng: &mut R) -> [f32; N] {
-    let mut arr = [0.; N];
-    for i in &mut arr {
-        *i = rng.random_range(-0.5..0.5);
-    }
-    arr
-}
-
 pub fn random_vec(n: usize) -> Vec<f32> {
     let mut rng = rng();
     random_vec_rng(n, &mut rng)

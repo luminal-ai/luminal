@@ -11,7 +11,7 @@ use luminal::bufferize::BufferId;
 use luminal::layout_ir::ExtractedNode;
 
 /// The restored multi-output fixture script (deleted from
-/// `src/egglog/checkpoint_5/test_scripts/` at aff22598).
+/// `src/egglog_core/test_scripts/` at aff22598).
 const ADD_MUL_FUSED: &str = include_str!("../fixtures/add_mul_fused.egg");
 
 /// GENOME WALK, consistent-fused: both boundary classes choose the SAME
