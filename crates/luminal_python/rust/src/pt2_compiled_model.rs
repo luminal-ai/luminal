@@ -158,32 +158,7 @@ pub fn process_pt2(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e:#}")))
 }
 
-#[pyfunction]
-#[pyo3(signature = (
-    artifact,
-    factory_capsule,
-    weight_device_ptrs=None,
-    device_index=None,
-    external_cuda_graph=false,
-))]
-pub fn load_compiled_artifact(
-    artifact: &[u8],
-    factory_capsule: &Bound<'_, PyCapsule>,
-    weight_device_ptrs: Option<HashMap<String, (u64, usize)>>,
-    device_index: Option<usize>,
-    external_cuda_graph: bool,
-) -> PyResult<CompiledGraph> {
-    CompiledGraph::from_artifact(
-        artifact,
-        backend_factory(factory_capsule)?,
-        weight_device_ptrs.unwrap_or_default(),
-        device_index,
-        external_cuda_graph,
-    )
-    .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-}
-
-fn backend_factory(factory_capsule: &Bound<'_, PyCapsule>) -> PyResult<BackendFactory> {
+pub(crate) fn backend_factory(factory_capsule: &Bound<'_, PyCapsule>) -> PyResult<BackendFactory> {
     let expected = ::luminal::dyn_backend::BACKEND_FACTORY_CAPSULE_NAME;
     match factory_capsule.name()? {
         Some(name) => {

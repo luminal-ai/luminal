@@ -20,6 +20,10 @@ use std::{
 };
 use tracing;
 
+mod artifact;
+
+pub use artifact::{ScheduleBucket, SelectedSchedule};
+
 pub type LLIRGraph = StableGraph<LLIROp, ()>;
 pub type HLIRGraph = StableGraph<Box<dyn HLIROp>, ()>;
 

@@ -6,10 +6,12 @@ use luminal::{
 };
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::typed_data::TypedData;
+
+mod artifact;
+pub(crate) use artifact::load_compiled_artifact;
 
 /// Copy a CPU buffer into Rust-owned storage.
 ///
@@ -158,36 +160,6 @@ pub struct WeightData {
     pub device_ptrs: HashMap<String, (u64, usize)>,
 }
 
-const ARTIFACT_SCHEMA_VERSION: u32 = 3;
-
-#[derive(Deserialize, Serialize)]
-struct CompiledArtifactData {
-    schema_version: u32,
-    #[serde(default, rename = "luminal_artifact_key")]
-    cache_key: Option<String>,
-    backend: String,
-    #[serde(default)]
-    backend_artifact: Option<String>,
-    device_index: Option<usize>,
-    external_cuda_graph: bool,
-    dyn_map: DynMap,
-    input_meta: Vec<(usize, String, DType)>,
-    tensor_sizes: HashMap<String, usize>,
-    tensor_ids: Vec<(String, usize)>,
-    input_names: Vec<String>,
-    input_dtypes: Vec<u32>,
-    output_names: Vec<String>,
-    output_ids: Vec<usize>,
-    output_shapes: Vec<Vec<usize>>,
-    output_shape_exprs: Vec<Vec<Expression>>,
-    output_dtypes: Vec<u32>,
-    input_shape_exprs: Vec<Vec<Expression>>,
-    dim_param_map: DimParamMap,
-    dim_bounds: DimBoundsMap,
-    writeback_outputs: Vec<(usize, String)>,
-    schedule: luminal::graph::SelectedSchedule,
-}
-
 #[pyclass(unsendable)]
 pub struct CompiledGraph {
     pub graph: Graph,
@@ -304,91 +276,6 @@ impl CompiledGraph {
         })
     }
 
-    pub fn from_artifact(
-        bytes: &[u8],
-        factory: BackendFactory,
-        device_ptrs: HashMap<String, (u64, usize)>,
-        device_index: Option<usize>,
-        external_cuda_graph: bool,
-    ) -> Result<Self, String> {
-        let serializable = device_ptrs.is_empty();
-        let artifact: CompiledArtifactData =
-            serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-        if artifact.schema_version != ARTIFACT_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported artifact schema {}, expected {}",
-                artifact.schema_version, ARTIFACT_SCHEMA_VERSION
-            ));
-        }
-        if artifact.device_index != device_index {
-            return Err(format!(
-                "artifact device {:?} does not match requested device {:?}",
-                artifact.device_index, device_index
-            ));
-        }
-        if artifact.external_cuda_graph != external_cuda_graph {
-            return Err("artifact CUDA graph mode does not match requested mode".to_string());
-        }
-
-        let input_meta = artifact
-            .input_meta
-            .iter()
-            .map(|(node, label, dtype)| (NodeIndex::new(*node), (label.clone(), *dtype)))
-            .collect();
-        let mut graph =
-            Graph::from_selected_schedule(artifact.dyn_map, input_meta, artifact.schedule);
-        let runtime = luminal::dyn_backend::compile_backend_from_factory(
-            factory,
-            &mut graph,
-            BackendCompileArgs {
-                search_iters: 0,
-                device_index,
-                external_cuda_graph,
-                weights: Vec::new(),
-                tensor_sizes: artifact.tensor_sizes.clone(),
-                device_ptrs,
-                backend_artifact: artifact.backend_artifact,
-            },
-        )?;
-        if runtime.name() != artifact.backend {
-            return Err(format!(
-                "artifact backend '{}' does not match loaded backend '{}'",
-                artifact.backend,
-                runtime.name()
-            ));
-        }
-
-        let label_map = luminal::dyn_backend::build_label_map(&graph);
-        Ok(Self {
-            graph,
-            runtime,
-            tensor_ids: artifact
-                .tensor_ids
-                .into_iter()
-                .map(|(name, node)| (name, NodeIndex::new(node)))
-                .collect(),
-            label_map,
-            input_names: artifact.input_names,
-            input_dtypes: artifact.input_dtypes,
-            output_names: artifact.output_names,
-            output_ids: artifact
-                .output_ids
-                .into_iter()
-                .map(NodeIndex::new)
-                .collect(),
-            output_shapes: artifact.output_shapes,
-            output_shape_exprs: artifact.output_shape_exprs,
-            output_dtypes: artifact.output_dtypes,
-            input_shape_exprs: artifact.input_shape_exprs,
-            dim_param_map: artifact.dim_param_map,
-            dim_bounds: artifact.dim_bounds,
-            writeback_outputs: artifact.writeback_outputs,
-            tensor_sizes: artifact.tensor_sizes,
-            external_cuda_graph,
-            serializable,
-        })
-    }
-
     fn output_node_at(&self, position: usize) -> PyResult<NodeIndex> {
         self.output_ids.get(position).copied().ok_or_else(|| {
             pyo3::exceptions::PyIndexError::new_err(format!(
@@ -426,54 +313,8 @@ impl CompiledGraph {
         py: Python<'py>,
         cache_key: Option<String>,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        if !self.serializable {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "compiled artifacts with bound weights or input pointers are not serializable",
-            ));
-        }
-        let schedule = self.graph.selected_schedule().cloned().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("compiled graph has no selected schedule")
-        })?;
-        let mut input_meta = self
-            .graph
-            .input_meta
-            .iter()
-            .map(|(node, (label, dtype))| (node.index(), label.clone(), *dtype))
-            .collect::<Vec<_>>();
-        input_meta.sort_by_key(|(node, _, _)| *node);
-        let mut tensor_ids = self
-            .tensor_ids
-            .iter()
-            .map(|(name, node)| (name.clone(), node.index()))
-            .collect::<Vec<_>>();
-        tensor_ids.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let artifact = CompiledArtifactData {
-            schema_version: ARTIFACT_SCHEMA_VERSION,
-            cache_key,
-            backend: self.runtime.name().to_string(),
-            backend_artifact: self.runtime.artifact_data(),
-            device_index: self.runtime.device_index(),
-            external_cuda_graph: self.external_cuda_graph,
-            dyn_map: self.graph.dyn_map.clone(),
-            input_meta,
-            tensor_sizes: self.tensor_sizes.clone(),
-            tensor_ids,
-            input_names: self.input_names.clone(),
-            input_dtypes: self.input_dtypes.clone(),
-            output_names: self.output_names.clone(),
-            output_ids: self.output_ids.iter().map(|node| node.index()).collect(),
-            output_shapes: self.output_shapes.clone(),
-            output_shape_exprs: self.output_shape_exprs.clone(),
-            output_dtypes: self.output_dtypes.clone(),
-            input_shape_exprs: self.input_shape_exprs.clone(),
-            dim_param_map: self.dim_param_map.clone(),
-            dim_bounds: self.dim_bounds.clone(),
-            writeback_outputs: self.writeback_outputs.clone(),
-            schedule,
-        };
-        let bytes = serde_json::to_vec(&artifact)
-            .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
+        let bytes = artifact::serialize(self, cache_key)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         Ok(PyBytes::new(py, &bytes))
     }
 

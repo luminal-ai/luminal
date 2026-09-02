@@ -139,7 +139,7 @@ pub struct BackendCompileArgs {
 /// The version is part of the ABI: `BackendCompileArgs` crosses this boundary
 /// by value, so an older plugin must be rejected rather than reading a changed
 /// struct layout.
-pub const BACKEND_FACTORY_CAPSULE_NAME: &std::ffi::CStr = c"luminal.backend_factory.v3";
+pub const BACKEND_FACTORY_CAPSULE_NAME: &std::ffi::CStr = c"luminal.backend_factory.v2";
 
 /// A factory function that compiles a [`Graph`] into a ready-to-execute [`DynBackend`].
 pub type BackendFactory = fn(&mut Graph, BackendCompileArgs) -> Result<Box<dyn DynBackend>, String>;
@@ -219,6 +219,7 @@ pub fn compile_backend<Rt: Runtime + 'static>(
     if has_selected_schedule {
         graph.load_selected_schedule(&mut rt)?;
     } else {
+        // Search
         rt = graph.search(
             rt,
             CompileOptions::default().search_graph_limit(args.search_iters),

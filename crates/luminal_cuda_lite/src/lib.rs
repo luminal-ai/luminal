@@ -3,6 +3,7 @@
 // `use luminal_cuda_lite::...` imports.
 extern crate self as luminal_cuda_lite;
 
+mod artifact;
 pub mod dyn_backend;
 pub mod host;
 pub mod kernel;
@@ -24,6 +25,7 @@ use cudarc::{cublaslt::CudaBlasLT, driver::CudaStream};
 #[cfg(test)]
 mod tests;
 
+use artifact::{ModuleImageLookup, lookup_module_image, module_key, record_module_image};
 use cudarc::{
     driver::{CudaContext, DriverError, sys as driver_sys},
     nvrtc::{
@@ -522,6 +524,25 @@ pub fn compile_module_image_for_current_device<S: AsRef<str>>(
     })?;
     let target_arch = format!("sm_{major}{minor}");
     let nvrtc_options = cuda_nvrtc_compile_options(&target_arch);
+    let source = src.as_ref();
+    let module_key = module_key(source);
+    match lookup_module_image(&module_key) {
+        ModuleImageLookup::Hit(image) => return Ok(Ptx::from_binary(image)),
+        ModuleImageLookup::Missing { available } => {
+            return Err(build_module_image_compile_error(
+                Some(target_arch),
+                driver_version,
+                runtime_version,
+                &nvrtc_options,
+                None,
+                CudaModuleImageCompileFailure::ArtifactMiss {
+                    key: module_key,
+                    available,
+                },
+            ));
+        }
+        ModuleImageLookup::Compile => {}
+    }
 
     // NVRTC compile time grows super-linearly with source size. The active
     // runtime installs its configured budget around compilation; direct calls
@@ -612,6 +633,7 @@ pub fn compile_module_image_for_current_device<S: AsRef<str>>(
         ));
     }
 
+    record_module_image(&module_key, &cubin);
     Ok(Ptx::from_binary(cubin))
 }
 
