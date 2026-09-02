@@ -816,15 +816,23 @@ impl<'a> Translator<'a> {
         );
         let output_names = Self::tensor_output_names(node);
         anyhow::ensure!(!output_names.is_empty(), "batch norm has no tensor outputs");
-        let functional = node.target != "torch.ops.aten._native_batch_norm_legit.no_stats";
+        let no_training =
+            node.target == "torch.ops.aten._native_batch_norm_legit_no_training.default";
+        let functional = matches!(
+            node.target.as_str(),
+            "torch.ops.aten._native_batch_norm_legit_functional.default"
+                | "torch.ops.aten._batch_norm_with_update_functional.default"
+        );
         let training = if node.target == "torch.ops.aten._batch_norm_with_update_functional.default"
         {
             true
+        } else if no_training {
+            false
         } else {
             self.named_bool_arg(node, "training").unwrap_or(true)
         };
         anyhow::ensure!(
-            training || functional,
+            training || functional || no_training,
             "batch norm without running stats requires training=true"
         );
         let momentum = self.named_float_arg(node, "momentum").unwrap_or(0.1);
@@ -839,15 +847,26 @@ impl<'a> Translator<'a> {
         let axes = (0..input.shape.len())
             .filter(|&axis| axis != 1)
             .collect::<Vec<_>>();
-        let batch_mean = compute.mean(axes.clone());
-        let expanded_mean = batch_mean.expand_to_shape_on_axes(compute.shape, axes.clone());
-        let centered = compute - expanded_mean;
-        let batch_var = centered.square().mean(axes.clone());
+        let (batch_mean, batch_var) = if training {
+            let batch_mean = compute.mean(axes.clone());
+            let expanded_mean = batch_mean.expand_to_shape_on_axes(compute.shape, axes.clone());
+            let centered = compute - expanded_mean;
+            let batch_var = centered.square().mean(axes.clone());
+            (Some(batch_mean), Some(batch_var))
+        } else {
+            // Inference uses only the stored running statistics. Besides being
+            // dead work, adding batch reductions here makes every eval-mode
+            // BatchNorm layer unnecessarily enlarge the compiler search space.
+            (None, None)
+        };
 
         let running_mean = self.named_tensor_arg(node, "running_mean")?;
         let running_var = self.named_tensor_arg(node, "running_var")?;
         let (mean, variance) = if training {
-            (batch_mean, batch_var)
+            (
+                batch_mean.context("training batch norm requires batch mean")?,
+                batch_var.context("training batch norm requires batch variance")?,
+            )
         } else {
             (
                 running_mean
@@ -879,10 +898,13 @@ impl<'a> Translator<'a> {
         self.tensors
             .insert(output_names[0].clone(), output.cast(input.dtype));
 
-        for (index, statistic) in [(1, batch_mean), (2, invstd)] {
+        for (index, statistic) in [(1, batch_mean), (2, Some(invstd))] {
             if output_names.len() > index {
                 if training {
-                    self.tensors.insert(output_names[index].clone(), statistic);
+                    self.tensors.insert(
+                        output_names[index].clone(),
+                        statistic.context("training batch norm statistic is missing")?,
+                    );
                 } else {
                     self.store_zero_for_output(&output_names[index])?;
                 }
@@ -898,6 +920,8 @@ impl<'a> Translator<'a> {
                 running_mean.context("functional batch norm requires running_mean")?;
             let running_var = running_var.context("functional batch norm requires running_var")?;
             let (mean_out, var_out) = if training {
+                let batch_mean = batch_mean.context("training batch norm requires batch mean")?;
+                let batch_var = batch_var.context("training batch norm requires batch variance")?;
                 let mean_out = running_mean * (1.0 - momentum as f32)
                     + batch_mean.cast(running_mean.dtype) * momentum as f32;
                 let count = product_of_dims(axes.iter().map(|&axis| input.dims()[axis]));

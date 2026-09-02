@@ -393,6 +393,7 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.grid_sampler_2d.default" => self.translate_grid_sampler(node, 2)?,
             "torch.ops.aten.grid_sampler_3d.default" => self.translate_grid_sampler(node, 3)?,
             "torch.ops.aten._native_batch_norm_legit.no_stats"
+            | "torch.ops.aten._native_batch_norm_legit_no_training.default"
             | "torch.ops.aten._native_batch_norm_legit_functional.default"
             | "torch.ops.aten._batch_norm_with_update_functional.default" => {
                 self.translate_batch_norm_functional(node)?;
