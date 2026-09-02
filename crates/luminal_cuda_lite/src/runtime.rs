@@ -54,6 +54,32 @@ const MIN_SEARCH_CACHE_EVICTION_HEADROOM_BYTES: usize = 1024 * 1024 * 1024;
 const SEARCH_CACHE_EVICTION_HEADROOM_DIVISOR: usize = 50;
 const MIN_SEARCH_CANDIDATE_NODE_ALLOWANCE: usize = 1024;
 
+fn materialized_bucket_evictions(
+    materialized: &[bool],
+    lru: &VecDeque<usize>,
+    keep: usize,
+    capacity: usize,
+) -> Vec<usize> {
+    let projected = materialized.iter().filter(|resident| **resident).count()
+        + usize::from(!materialized.get(keep).copied().unwrap_or(false));
+    let mut remaining = projected.saturating_sub(capacity);
+    let mut evictions = Vec::with_capacity(remaining);
+
+    for candidate in lru.iter().copied().chain(0..materialized.len()) {
+        if remaining == 0 {
+            break;
+        }
+        if candidate != keep
+            && materialized.get(candidate).copied().unwrap_or(false)
+            && !evictions.contains(&candidate)
+        {
+            evictions.push(candidate);
+            remaining -= 1;
+        }
+    }
+    evictions
+}
+
 fn search_candidate_node_limit(baseline_nodes: usize) -> usize {
     baseline_nodes.saturating_add(MIN_SEARCH_CANDIDATE_NODE_ALLOWANCE)
 }
@@ -484,6 +510,11 @@ pub struct CudaRuntimeImpl<O> {
     // Per-bucket compiled state
     compiled_buckets: Vec<CompiledBucket>,
     active_bucket: usize,
+    /// Optional cap on concurrently materialized bucket CUDA graphs. Compiled
+    /// kernels and the shared arena remain resident; only driver graph state
+    /// is evicted and rebuilt when an older bucket is needed again.
+    max_materialized_buckets: Option<usize>,
+    materialized_bucket_lru: VecDeque<usize>,
     /// Bucket definitions per dimension (empty = single-bucket mode)
     dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
 
@@ -627,6 +658,27 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.set_max_memory_bytes(Some(max_memory_gib.saturating_mul(1024 * 1024 * 1024)));
     }
 
+    /// Bound the number of compiled buckets that retain materialized CUDA
+    /// graph executables. This is useful for large serving models whose
+    /// kernels and shared intermediate arena fit comfortably, but whose many
+    /// scheduler shapes otherwise accumulate excessive CUDA driver graph
+    /// memory. A value of `None` preserves the default unbounded residency;
+    /// `Some(0)` is invalid because the active bucket must remain usable.
+    pub fn set_max_materialized_buckets(&mut self, max_buckets: Option<usize>) {
+        assert!(
+            max_buckets != Some(0),
+            "materialized bucket capacity must be positive"
+        );
+        self.max_materialized_buckets = max_buckets;
+        self.materialized_bucket_lru
+            .retain(|bucket_idx| *bucket_idx < self.compiled_buckets.len());
+    }
+
+    pub fn with_max_materialized_buckets(mut self, max_buckets: usize) -> Self {
+        self.set_max_materialized_buckets(Some(max_buckets));
+        self
+    }
+
     /// Configure a hard per-kernel generated CUDA source limit. The runtime
     /// defaults to 512 KiB because NVRTC compilation is synchronous and cannot
     /// be interrupted by `candidate_timeout`; pass `None` to the setter below
@@ -766,6 +818,60 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         for bucket_idx in 0..self.compiled_buckets.len() {
             self.release_bucket_cuda_graphs(bucket_idx);
         }
+        self.materialized_bucket_lru.clear();
+    }
+
+    fn bucket_has_materialized_cuda_graphs(&self, bucket_idx: usize) -> bool {
+        self.compiled_buckets[bucket_idx]
+            .exec_graph
+            .node_weights()
+            .any(|exec_op| {
+                exec_op
+                    .internal
+                    .as_any()
+                    .downcast_ref::<CudaGraphOp>()
+                    .is_some_and(CudaGraphOp::is_materialized)
+            })
+    }
+
+    /// Make room for the active bucket before it materializes. Eviction is
+    /// deliberately performed before construction so peak driver graph memory
+    /// never includes both the old resident set and its replacement.
+    fn prepare_materialized_bucket_slot(&mut self, bucket_idx: usize) {
+        let Some(capacity) = self.max_materialized_buckets else {
+            return;
+        };
+
+        self.materialized_bucket_lru
+            .retain(|resident| *resident != bucket_idx && *resident < self.compiled_buckets.len());
+        self.materialized_bucket_lru.push_back(bucket_idx);
+
+        let materialized = (0..self.compiled_buckets.len())
+            .map(|idx| self.bucket_has_materialized_cuda_graphs(idx))
+            .collect::<Vec<_>>();
+        let evictions = materialized_bucket_evictions(
+            &materialized,
+            &self.materialized_bucket_lru,
+            bucket_idx,
+            capacity,
+        );
+        if evictions.is_empty() {
+            return;
+        }
+
+        self.cuda_stream
+            .synchronize()
+            .expect("failed to synchronize before evicting bucket CUDA graphs");
+        for &evicted in &evictions {
+            self.release_bucket_cuda_graphs(evicted);
+        }
+        self.materialized_bucket_lru
+            .retain(|resident| !evictions.contains(resident));
+        self.cuda_stream
+            .synchronize()
+            .expect("failed to synchronize after evicting bucket CUDA graphs");
+        Self::trim_device_graph_memory(&self.cuda_stream)
+            .expect("failed to trim CUDA graph memory after bucket eviction");
     }
 
     fn release_all_arenas(&mut self) {
@@ -4872,6 +4978,8 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             validated_resource_signatures: FxHashSet::default(),
             compiled_buckets: vec![CompiledBucket::new()],
             active_bucket: 0,
+            max_materialized_buckets: None,
+            materialized_bucket_lru: VecDeque::new(),
             dim_buckets: FxHashMap::default(),
             output_ptr_registrations: FxHashMap::default(),
             dirty_output_ptr_registrations: FxHashSet::default(),
@@ -4991,6 +5099,7 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             self.prepare_bucket_direct_profile(self.active_bucket, dyn_map)
                 .unwrap_or_else(|e| panic!("direct CUDA candidate preparation failed: {e}"));
         } else if !external_capture {
+            self.prepare_materialized_bucket_slot(self.active_bucket);
             self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
                 .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
         }
@@ -6156,6 +6265,25 @@ mod arena_plan_tests {
         assert!(search_cache_under_pressure(gib, 100 * gib));
         assert!(!search_cache_under_pressure(2 * gib, 24 * gib));
         assert!(search_cache_under_pressure(900 * 1024 * 1024, 24 * gib));
+    }
+
+    #[test]
+    fn materialized_bucket_capacity_evicts_lru_before_new_bucket() {
+        let materialized = [true, true, false];
+        let lru = VecDeque::from([1, 0, 2]);
+
+        assert_eq!(
+            materialized_bucket_evictions(&materialized, &lru, 2, 1),
+            vec![1, 0]
+        );
+        assert_eq!(
+            materialized_bucket_evictions(&materialized, &lru, 2, 2),
+            vec![1]
+        );
+        assert_eq!(
+            materialized_bucket_evictions(&materialized, &lru, 1, 1),
+            vec![0]
+        );
     }
 
     #[test]
