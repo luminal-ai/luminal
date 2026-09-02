@@ -344,10 +344,7 @@ impl<'a, M: PartialOrd + Clone + Debug> GeneticSearch<'a, M> {
         // Losers are the most expensive candidates to evaluate: a candidate
         // whose running metric is already `factor ×` worse than the best can
         // stop early — its partial metric is ranked normally and cannot win.
-        let early_stop = self
-            .options
-            .early_stop_factor
-            .and_then(|factor| self.best_metric.clone().map(|best| (best, factor)));
+        let early_stop = self.best_metric.clone().zip(self.options.early_stop_factor);
         Candidate {
             id,
             llir,

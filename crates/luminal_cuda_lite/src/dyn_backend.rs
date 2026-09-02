@@ -5,6 +5,12 @@ use luminal::dyn_backend::{BackendCompileArgs, DynBackend, compile_backend};
 use luminal::op::IntoEgglogOp;
 use luminal::prelude::*;
 
+use std::sync::{Arc, Mutex};
+
+use crate::artifact::{
+    ModuleArtifact, capture_selected_schedule, module_artifact_session, serialize_module_artifact,
+    with_module_artifact_session,
+};
 use crate::cudarc::driver::CudaContext;
 use crate::runtime::{CudaRuntimeImpl, DefaultCudaOps};
 
@@ -12,11 +18,15 @@ use crate::runtime::{CudaRuntimeImpl, DefaultCudaOps};
 pub struct CudaDynBackend<O = DefaultCudaOps> {
     pub runtime: CudaRuntimeImpl<O>,
     backend_name: &'static str,
+    module_artifact: Arc<Mutex<ModuleArtifact>>,
 }
 
 impl<O: IntoEgglogOp + 'static> DynBackend for CudaDynBackend<O> {
     fn name(&self) -> &str {
         self.backend_name
+    }
+    fn artifact_data(&self) -> Option<String> {
+        Some(serialize_module_artifact(&self.module_artifact))
     }
     fn device_type(&self) -> &str {
         "cuda"
@@ -110,25 +120,32 @@ pub fn cuda_factory_for<O: IntoEgglogOp + 'static>(
     let cuda_ctx = CudaContext::new(device_index).map_err(|e| format!("CUDA init failed: {e}"))?;
     let stream = cuda_ctx.default_stream();
     let external_cuda_graph = args.external_cuda_graph;
-    compile_backend::<CudaRuntimeImpl<O>>(
-        graph,
-        args,
-        || {
-            let mut runtime = CudaRuntimeImpl::<O>::initialize(stream);
-            runtime.set_external_cuda_graph(external_cuda_graph);
-            Ok(runtime)
-        },
-        |rt, node, bytes, _dtype| {
-            rt.set_data(node, bytes);
-        },
-        Some(&|rt, node, ptr, n| unsafe { rt.set_device_ptr(node, ptr, n) }),
-        |rt| {
-            Box::new(CudaDynBackend {
-                runtime: rt,
-                backend_name,
-            })
-        },
-    )
+    let module_artifact = module_artifact_session(&cuda_ctx, args.backend_artifact.as_deref())?;
+    let backend_artifact = Arc::clone(&module_artifact);
+    let capture_artifact = Arc::clone(&module_artifact);
+    with_module_artifact_session(module_artifact, || {
+        compile_backend::<CudaRuntimeImpl<O>>(
+            graph,
+            args,
+            || {
+                let mut runtime = CudaRuntimeImpl::<O>::initialize(stream);
+                runtime.set_external_cuda_graph(external_cuda_graph);
+                Ok(runtime)
+            },
+            |rt, node, bytes, _dtype| {
+                rt.set_data(node, bytes);
+            },
+            Some(&|rt, node, ptr, n| unsafe { rt.set_device_ptr(node, ptr, n) }),
+            |graph, rt| capture_selected_schedule(graph, rt, &capture_artifact),
+            |rt| {
+                Box::new(CudaDynBackend {
+                    runtime: rt,
+                    backend_name,
+                    module_artifact: backend_artifact,
+                })
+            },
+        )
+    })
 }
 
 pub type CudaLiteDynBackend = CudaDynBackend<DefaultCudaOps>;

@@ -230,6 +230,13 @@ impl<'a, M: PartialOrd + Clone + Debug> BucketLattice<'a, M> {
     /// `LLIR_DUMP_DIR`) as `(bucket_indices, representative_dyn_map, llir)`
     /// per bucket.
     pub fn select(self, set: BucketSet) -> Vec<BucketLLIR> {
+        self.select_with_genomes(set)
+            .into_iter()
+            .map(super::SelectedProgram::into_bucket_llir)
+            .collect()
+    }
+
+    pub fn select_with_genomes(self, set: BucketSet) -> Vec<super::SelectedProgram> {
         if self.search_log && self.rejections > 0 {
             println!(
                 "   {:>6}  aggregate fallback: selected per-bucket finalist ranks {:?} after {} rejection(s)",
@@ -244,11 +251,12 @@ impl<'a, M: PartialOrd + Clone + Debug> BucketLattice<'a, M> {
             .map(|(bucket, idx)| {
                 let ctx = bucket.bucket_context();
                 let finalist = bucket.take(idx);
-                (
-                    ctx.bucket_indices().clone(),
-                    ctx.representative_dyn_map.clone(),
-                    finalist.llir,
-                )
+                super::SelectedProgram {
+                    bucket_indices: ctx.bucket_indices().clone(),
+                    representative_dyn_map: ctx.representative_dyn_map.clone(),
+                    genome: finalist.genome,
+                    llir: finalist.llir,
+                }
             })
             .collect()
     }

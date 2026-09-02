@@ -27,6 +27,7 @@ pub type FinalistValidator<'v, M> =
 /// A viable deployment graph and the metric its genome measured.
 pub struct Finalist<M> {
     pub metric: M,
+    pub genome: IndexedChoiceSet,
     pub llir: LLIRGraph,
     /// Rolled graph before unrolling, kept only under `LLIR_DUMP_PRE_UNROLL`.
     pub pre_unroll: Option<LLIRGraph>,
@@ -37,6 +38,7 @@ pub struct PendingFinalist<M> {
     /// 1-based rank among the measured genomes.
     pub rank: usize,
     pub metric: M,
+    pub genome: IndexedChoiceSet,
     pub llir: LLIRGraph,
     /// Dyn values the hard filter should judge the graph at: the bucket
     /// representative when bucketed, otherwise the profiling dyn map.
@@ -175,6 +177,7 @@ impl<'a, M: Clone + Debug> Finalists<'a, M> {
                     return Some(PendingFinalist {
                         rank,
                         metric,
+                        genome,
                         llir,
                         dyn_map: self.filter_dyn_map.clone(),
                         pre_unroll,
@@ -240,6 +243,7 @@ impl<'a, M: Clone + Debug> Finalists<'a, M> {
         }
         self.finalists.push(Finalist {
             metric: pending.metric,
+            genome: pending.genome,
             pre_unroll: pending.pre_unroll,
             llir: pending.llir,
         });

@@ -454,7 +454,7 @@ use crate::{
 use egglog::{ArcSort, CommandOutput, EGraph, Value};
 use egglog_reports::ReportLevel;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 ///  This is snapshot of an EGraph with Rust native hash maps and sets for enabling more native traversal / algorithm writing.
 ///  The name comes from the serialize egraph crates, which returns a ETermDAG, which caused issues, so this is a homebrew semi-static egraph
 pub struct SerializedEGraph {
@@ -2197,6 +2197,39 @@ impl<'a> LlirExtractor<'a> {
             choices: indexed,
             hash,
         }
+    }
+
+    pub(crate) fn named_choices(&self, choices: &IndexedChoiceSet) -> Vec<(String, String)> {
+        self.indexed_classes
+            .iter()
+            .enumerate()
+            .filter(|(_, class)| class.searchable)
+            .map(|(index, class)| {
+                let slot = choices.choices[index] as usize;
+                (class.id.to_string(), class.nodes[slot].to_string())
+            })
+            .collect()
+    }
+
+    pub(crate) fn index_named_choices(&self, choices: &[(String, String)]) -> IndexedChoiceSet {
+        let choices = choices
+            .iter()
+            .map(|(class, node)| {
+                let class = self
+                    .egraph
+                    .eclasses
+                    .keys()
+                    .find(|candidate| candidate.as_ref() == class)
+                    .unwrap_or_else(|| panic!("artifact references unknown e-class '{class}'"));
+                let node = self.egraph.eclasses[class]
+                    .1
+                    .iter()
+                    .find(|candidate| candidate.as_ref() == node)
+                    .unwrap_or_else(|| panic!("artifact references unknown e-node '{node}'"));
+                (class, node)
+            })
+            .collect();
+        self.index_choice_set(&choices)
     }
 
     pub fn random_indexed_choice(&self, rng: &mut (impl Rng + ?Sized)) -> IndexedChoiceSet {

@@ -97,7 +97,7 @@ impl<'a> From<&'a BucketLLIR> for BucketLLIRRef<'a> {
 
 /// A bucket for a dynamic dimension, defining a range of valid values.
 /// For an exact value, use `min == max` (zero-length range).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct DimBucket {
     pub min: usize,
     pub max: usize,
@@ -412,6 +412,7 @@ pub struct Graph {
     /// Stored as plain data so it survives cross-binary type identity mismatches
     /// when external backend plugins are compiled separately.
     pub input_meta: FxHashMap<NodeIndex, (String, DType)>,
+    selected_schedule: Option<SelectedSchedule>,
 }
 
 impl Graph {
@@ -1758,6 +1759,7 @@ impl Graph {
             "dim buckets must be configured in CompileOptions before build_search_space; search cannot change buckets after build",
         );
         runtime.compile(space, &self.dyn_map, &options, rng);
+        self.selected_schedule = runtime.selected_schedule();
         runtime
     }
 }

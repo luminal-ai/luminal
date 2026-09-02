@@ -8,10 +8,12 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use cudarc::driver::CudaContext;
+use luminal::op::IntoEgglogOp;
+use luminal::prelude::Graph;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{cuda_nvrtc_compile_options, loaded_nvrtc_version};
+use crate::{cuda_nvrtc_compile_options, loaded_nvrtc_version, runtime::CudaRuntimeImpl};
 
 thread_local! {
     static MODULE_ARTIFACT_SESSION: RefCell<Option<Arc<Mutex<ModuleArtifact>>>> =
@@ -110,6 +112,24 @@ pub(crate) fn finish_module_artifact_capture(artifact: &Mutex<ModuleArtifact>) {
     let mut artifact = artifact.lock().unwrap();
     artifact.loading = true;
     artifact.capturing = false;
+}
+
+/// Recompile the selected schedule into a fresh capture so rejected search
+/// candidates are not included in the saved artifact.
+pub(crate) fn capture_selected_schedule<O: IntoEgglogOp + 'static>(
+    graph: &mut Graph,
+    runtime: &mut CudaRuntimeImpl<O>,
+    artifact: &Mutex<ModuleArtifact>,
+) -> Result<(), String> {
+    if module_artifact_is_loading(artifact) {
+        return Ok(());
+    }
+
+    begin_module_artifact_capture(artifact);
+    runtime.clear_kernel_cache();
+    graph.load_selected_schedule(runtime)?;
+    finish_module_artifact_capture(artifact);
+    Ok(())
 }
 
 pub(crate) fn module_key(source: &str) -> String {

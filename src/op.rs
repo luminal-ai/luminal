@@ -62,10 +62,25 @@ pub trait Runtime {
         options: &crate::graph::CompileOptions,
         rng: &mut dyn rand::RngCore,
     );
+    fn selected_schedule(&self) -> Option<crate::graph::SelectedSchedule> {
+        None
+    }
     /// Load one LLIR graph as the executable. [`Runtime::compile`] normally
     /// loads what it selects; this is the direct path for callers that
     /// already hold an LLIR graph.
     fn load_llir(&mut self, llir_graph: &LLIRGraph);
+    fn load_llir_buckets(
+        &mut self,
+        _dim_buckets: &FxHashMap<Symbol, Vec<crate::graph::DimBucket>>,
+        bucket_llirs: &[crate::graph::BucketLLIR],
+    ) {
+        assert_eq!(
+            bucket_llirs.len(),
+            1,
+            "runtime does not support LLIR buckets"
+        );
+        self.load_llir(&bucket_llirs[0].2);
+    }
     fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn;
 }
 

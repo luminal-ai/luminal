@@ -419,6 +419,7 @@ pub type DefaultCudaOps = (crate::kernel::Ops, crate::host::Ops);
 
 pub struct CudaRuntimeImpl<O> {
     _ops: PhantomData<fn() -> O>,
+    pub(crate) selected_schedule: Option<luminal::graph::SelectedSchedule>,
     // Shared state across all buckets
     // Keep this private: every mutation must go through the buffer APIs so
     // `changed_hlir` and resource-input validation stay in sync with the map.
@@ -554,6 +555,10 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     /// caller-owned CUDA graph can capture them.
     pub fn set_external_cuda_graph(&mut self, enabled: bool) {
         self.external_cuda_graph = enabled;
+    }
+
+    pub(crate) fn clear_kernel_cache(&mut self) {
+        self.kernel_cache.clear();
     }
 
     fn select_execution_stream(&mut self, stream: Arc<CudaStream>) {
@@ -4837,6 +4842,7 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
             .expect("failed to create CUDA profiling end event");
         Self {
             _ops: PhantomData,
+            selected_schedule: None,
             hlir_buffers: FxHashMap::default(),
             hlir_host_mirrors: FxHashMap::default(),
             owned_stream: Arc::clone(&stream),
@@ -4887,9 +4893,21 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         self.search_and_load(space, dyn_map, options, rng);
     }
 
+    fn selected_schedule(&self) -> Option<luminal::graph::SelectedSchedule> {
+        self.selected_schedule.clone()
+    }
+
     #[tracing::instrument(skip_all)]
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
         self.try_load_llir(llir_graph).unwrap();
+    }
+
+    fn load_llir_buckets(
+        &mut self,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
+        bucket_llirs: &[BucketLLIR],
+    ) {
+        CudaRuntimeImpl::load_llir_buckets(self, dim_buckets, bucket_llirs);
     }
 
     #[tracing::instrument(skip_all)]

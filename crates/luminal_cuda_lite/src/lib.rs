@@ -120,6 +120,10 @@ pub enum CudaModuleImageCompileFailure {
         error: NvrtcError,
     },
     NoModuleImageProduced,
+    ArtifactMiss {
+        key: String,
+        available: usize,
+    },
 }
 
 #[doc(hidden)]
@@ -148,6 +152,12 @@ impl std::fmt::Display for CudaModuleImageCompileError {
             }
             CudaModuleImageCompileFailure::NoModuleImageProduced => {
                 write!(f, ": NVRTC produced no CUBIN for the selected target")?;
+            }
+            CudaModuleImageCompileFailure::ArtifactMiss { key, available } => {
+                write!(
+                    f,
+                    ": CUBIN {key} is missing from the artifact ({available} saved)"
+                )?;
             }
         }
         if let Some(version) = self.driver_version {
