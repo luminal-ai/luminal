@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use super::{CompiledGraph, DimBoundsMap, DimParamMap};
 use crate::pt2_compiled_model::backend_factory;
 
-const ARTIFACT_SCHEMA_VERSION: u32 = 3;
+const ARTIFACT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Deserialize, Serialize)]
 struct CompiledArtifactData {

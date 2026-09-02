@@ -5,6 +5,7 @@ use std::{
 };
 
 use petgraph::{
+    algo::toposort,
     stable_graph::NodeIndex,
     visit::{EdgeRef, NodeIndexable},
 };
@@ -20,38 +21,47 @@ use crate::{
     shape::{DynMap, Symbol},
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 struct LlirFingerprint(u64, u64);
 
 fn fingerprint_llir(llir: &LLIRGraph) -> LlirFingerprint {
-    fn hash(seed: u64, llir: &LLIRGraph) -> u64 {
+    fn hash_node(seed: u64, op: &crate::op::LLIROp, inputs: &[LlirFingerprint]) -> u64 {
         let mut hasher = DefaultHasher::new();
         seed.hash(&mut hasher);
-        llir.node_bound().hash(&mut hasher);
-        llir.edge_count().hash(&mut hasher);
-        for index in 0..llir.node_bound() {
-            let node = NodeIndex::new(index);
-            match llir.node_weight(node) {
-                Some(op) => {
-                    1u8.hash(&mut hasher);
-                    write!(&mut HashWriter(&mut hasher), "{op:?}").unwrap();
-                    let mut incoming = llir
-                        .edges_directed(node, petgraph::Direction::Incoming)
-                        .map(|edge| (edge.id().index(), edge.source().index()))
-                        .collect::<Vec<_>>();
-                    incoming.sort_unstable();
-                    incoming.hash(&mut hasher);
-                }
-                None => 0u8.hash(&mut hasher),
-            }
-        }
+        write!(&mut HashWriter(&mut hasher), "{op:?}").unwrap();
+        inputs.hash(&mut hasher);
         hasher.finish()
     }
 
-    LlirFingerprint(
-        hash(0x243f_6a88_85a3_08d3, llir),
-        hash(0x1319_8a2e_0370_7344, llir),
-    )
+    let mut node_fingerprints = vec![None; llir.node_bound()];
+    for node in toposort(llir, None).expect("LLIR must be acyclic") {
+        let mut incoming = llir
+            .edges_directed(node, petgraph::Direction::Incoming)
+            .map(|edge| (edge.id().index(), edge.source()))
+            .collect::<Vec<_>>();
+        incoming.sort_unstable_by_key(|(edge, _)| *edge);
+        let inputs = incoming
+            .into_iter()
+            .map(|(_, source)| node_fingerprints[source.index()].unwrap())
+            .collect::<Vec<_>>();
+        let op = &llir[node];
+        node_fingerprints[node.index()] = Some(LlirFingerprint(
+            hash_node(0x243f_6a88_85a3_08d3, op, &inputs),
+            hash_node(0x1319_8a2e_0370_7344, op, &inputs),
+        ));
+    }
+
+    let mut nodes = node_fingerprints.into_iter().flatten().collect::<Vec<_>>();
+    nodes.sort_unstable_by_key(|fingerprint| (fingerprint.0, fingerprint.1));
+    let mut first = DefaultHasher::new();
+    let mut second = DefaultHasher::new();
+    0x243f_6a88_85a3_08d3_u64.hash(&mut first);
+    0x1319_8a2e_0370_7344_u64.hash(&mut second);
+    llir.edge_count().hash(&mut first);
+    llir.edge_count().hash(&mut second);
+    nodes.hash(&mut first);
+    nodes.hash(&mut second);
+    LlirFingerprint(first.finish(), second.finish())
 }
 
 struct HashWriter<'a>(&'a mut DefaultHasher);
@@ -89,13 +99,18 @@ impl SelectedSchedule {
             .iter()
             .zip(selected)
             .map(|(bucket, selected)| {
-                let extractor = LlirExtractor::new(&bucket.egraph, &space.ops);
+                let mut extractor = LlirExtractor::new(&bucket.egraph, &space.ops);
+                let choices = extractor.named_choices(&selected.genome);
+                let indexed = extractor.index_named_choices(&choices);
+                let llir = unroll_packed_llir(
+                    extractor.extract_indexed_packed(&indexed, &space.custom_ops),
+                );
                 ScheduleBucket {
                     egraph: bucket.egraph.clone(),
-                    choices: extractor.named_choices(&selected.genome),
+                    choices,
                     bucket_indices: selected.bucket_indices.clone(),
                     representative_dyn_map: selected.representative_dyn_map.clone(),
-                    unrolled_llir_fingerprint: fingerprint_llir(&selected.llir),
+                    unrolled_llir_fingerprint: fingerprint_llir(&llir),
                 }
             })
             .collect();
@@ -174,6 +189,27 @@ mod tests {
     use super::*;
     use crate::{graph::CompileOptions, hlir::ReferenceRuntime};
 
+    fn renumber_llir(llir: &LLIRGraph) -> LLIRGraph {
+        let nodes = llir.node_indices().collect::<Vec<_>>();
+        let mut rebuilt = LLIRGraph::default();
+        let mapping = nodes
+            .iter()
+            .rev()
+            .map(|&node| (node, rebuilt.add_node(llir[node].clone())))
+            .collect::<FxHashMap<_, _>>();
+        for &target in nodes.iter().rev() {
+            let mut incoming = llir
+                .edges_directed(target, petgraph::Direction::Incoming)
+                .map(|edge| (edge.id().index(), edge.source()))
+                .collect::<Vec<_>>();
+            incoming.sort_unstable_by_key(|(edge, _)| *edge);
+            for (_, source) in incoming {
+                rebuilt.add_edge(mapping[&source], mapping[&target], ());
+            }
+        }
+        rebuilt
+    }
+
     fn selected_schedule() -> (Graph, SelectedSchedule) {
         let mut graph = Graph::new();
         let _ = graph.tensor(4).sin().output();
@@ -217,5 +253,29 @@ mod tests {
             .load_selected_schedule(&mut ReferenceRuntime::initialize(()))
             .unwrap_err();
         assert!(error.contains("fingerprint mismatch"), "{error}");
+    }
+
+    #[test]
+    fn reference_compile_retains_selected_schedule() {
+        let mut graph = Graph::new();
+        let _ = graph.tensor(4).sin().output();
+        let _runtime = graph.compile(ReferenceRuntime::initialize(()), CompileOptions::default());
+
+        assert!(graph.selected_schedule().is_some());
+    }
+
+    #[test]
+    fn llir_fingerprint_ignores_graph_allocation_order() {
+        let (graph, _) = selected_schedule();
+        let space = graph.search_space().unwrap();
+        let ctx = &space.bucket_contexts(&graph.dyn_map)[0];
+        let mut extractor = LlirExtractor::new(ctx.egraph(), &space.ops);
+        let genome = extractor.random_indexed_choice(&mut rand::rng());
+        let llir = unroll_packed_llir(extractor.extract_indexed_packed(&genome, &[]));
+
+        assert_eq!(
+            fingerprint_llir(&llir),
+            fingerprint_llir(&renumber_llir(&llir))
+        );
     }
 }

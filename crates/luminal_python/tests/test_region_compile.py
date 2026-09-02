@@ -172,7 +172,7 @@ def test_loaded_artifact_uses_structural_identity() -> None:
     clear_artifact_cache()
     common = {
         "luminal_artifact_key": "region",
-        "schema_version": 3,
+        "schema_version": 4,
         "backend": "cuda_lite",
     }
     first = json.dumps({**common, "value": 1}).encode()
@@ -187,10 +187,10 @@ def test_loaded_artifact_uses_structural_identity() -> None:
 def test_loaded_artifact_identity_includes_compatibility() -> None:
     clear_artifact_cache()
     first = json.dumps(
-        {"luminal_artifact_key": "region", "schema_version": 3, "backend": "cuda_lite"}
+        {"luminal_artifact_key": "region", "schema_version": 4, "backend": "cuda_lite"}
     ).encode()
     second = json.dumps(
-        {"luminal_artifact_key": "region", "schema_version": 3, "backend": "reference"}
+        {"luminal_artifact_key": "region", "schema_version": 4, "backend": "reference"}
     ).encode()
     artifacts = [object(), object()]
 
@@ -498,7 +498,7 @@ def test_region_artifact_round_trip_without_cuda_recompile() -> None:
     compiled = compile_region(region, search_iterations=1)
     artifact = compiled.serialize_artifact()
     payload = json.loads(artifact)
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     backend_artifact = json.loads(payload["backend_artifact"])
     assert backend_artifact["version"] == 2
     assert backend_artifact["images"]

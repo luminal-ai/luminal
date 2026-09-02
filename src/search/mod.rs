@@ -233,9 +233,23 @@ pub fn extract_one(
     ctx: &BucketContext<'_>,
     rng: &mut dyn RngCore,
 ) -> LLIRGraph {
+    extract_one_selected(space, ctx, rng).llir
+}
+
+pub fn extract_one_selected(
+    space: &SearchSpace,
+    ctx: &BucketContext<'_>,
+    rng: &mut dyn RngCore,
+) -> SelectedProgram {
     let mut extractor = LlirExtractor::new(ctx.egraph(), &space.ops);
     let genome = extractor.random_indexed_choice(rng);
-    unroll_packed_llir(extractor.extract_indexed_packed(&genome, &space.custom_ops))
+    let llir = unroll_packed_llir(extractor.extract_indexed_packed(&genome, &space.custom_ops));
+    SelectedProgram {
+        bucket_indices: ctx.bucket_indices().clone(),
+        representative_dyn_map: ctx.representative_dyn_map.clone(),
+        genome,
+        llir,
+    }
 }
 
 /// The stock strategy: genetic search in every bucket, lazy finalists under

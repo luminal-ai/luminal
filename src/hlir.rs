@@ -3185,6 +3185,7 @@ impl_reference_data_from_array_ref!(bool, Bool);
 pub struct ReferenceRuntime {
     pub buffers: FxHashMap<NodeIndex, ReferenceData>,
     pub graph: StableGraph<Arc<Box<dyn ReferenceOp>>, ()>,
+    selected_schedule: Option<crate::graph::SelectedSchedule>,
 }
 
 impl ReferenceRuntime {
@@ -3216,6 +3217,7 @@ impl Runtime for ReferenceRuntime {
         Self {
             buffers: Default::default(),
             graph: Default::default(),
+            selected_schedule: None,
         }
     }
 
@@ -3231,8 +3233,16 @@ impl Runtime for ReferenceRuntime {
         rng: &mut dyn rand::RngCore,
     ) {
         let contexts = space.bucket_contexts(dyn_map);
-        let llir = crate::search::extract_one(space, &contexts[0], rng);
-        self.load_llir(&llir);
+        let selected = contexts
+            .iter()
+            .map(|ctx| crate::search::extract_one_selected(space, ctx, rng))
+            .collect::<Vec<_>>();
+        self.load_llir(&selected[0].llir);
+        self.selected_schedule = crate::graph::SelectedSchedule::from_search(space, &selected);
+    }
+
+    fn selected_schedule(&self) -> Option<crate::graph::SelectedSchedule> {
+        self.selected_schedule.clone()
     }
 
     fn load_llir(&mut self, llir_graph: &LLIRGraph) {
@@ -3254,6 +3264,14 @@ impl Runtime for ReferenceRuntime {
         }
 
         self.graph = graph;
+    }
+
+    fn load_llir_buckets(
+        &mut self,
+        _dim_buckets: &FxHashMap<Symbol, Vec<crate::graph::DimBucket>>,
+        bucket_llirs: &[crate::graph::BucketLLIR],
+    ) {
+        self.load_llir(&bucket_llirs[0].2);
     }
 
     fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
