@@ -1,11 +1,9 @@
 use std::fmt::{Debug, Display};
 
 /// Supported dtypes
-/// This is undergoing development. Our goal is to be as explicit as possible about dtype behavior.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum DType {
     /// 32-bit float (8e23m)
-    #[default]
     F32,
     /// 64-bit float (11e52m)
     F64,

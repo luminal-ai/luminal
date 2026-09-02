@@ -2,12 +2,13 @@
 //! fixed-arity, using a placeholder LayoutTensor in absent slots?
 //! Observational probes — the deliverable is findings, not green.
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 
 fn base_program() -> String {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize));
-    let w = cx.tensor((4usize, 3usize));
+    let x = cx.tensor((2usize, 4usize), DType::F32);
+    let w = cx.tensor((4usize, 3usize), DType::F32);
     let _out = x.matmul(w).output();
     cx.logical
         .bound_program(&test_runtime::TestRuntimeBindings)

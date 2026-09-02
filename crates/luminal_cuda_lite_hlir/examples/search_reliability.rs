@@ -140,31 +140,31 @@ struct Model {
 
 fn build_model() -> Model {
     let mut cx = Graph::default();
-    let x_in = cx.named_tensor("x", ('s', HIDDEN));
-    let scatter_idx = cx.named_tensor_dtyped("scatter_idx", 's', DType::Int);
-    let gather_idx = cx.named_tensor_dtyped("gather_idx", 'c', DType::Int);
+    let x_in = cx.named_tensor("x", ('s', HIDDEN), DType::F32);
+    let scatter_idx = cx.named_tensor("scatter_idx", 's', DType::Int);
+    let gather_idx = cx.named_tensor("gather_idx", 'c', DType::Int);
     let mut layers = Vec::new();
     let mut cache_outs = Vec::new();
     let mut x = x_in;
     for layer in 0..LAYERS {
         let inputs = LayerInputs {
-            wq: cx.named_tensor(format!("wq{layer}"), (HIDDEN, HIDDEN)),
-            wk: cx.named_tensor(format!("wk{layer}"), (KV_DIM, HIDDEN)),
-            wv: cx.named_tensor(format!("wv{layer}"), (KV_DIM, HIDDEN)),
-            wo: cx.named_tensor(format!("wo{layer}"), (HIDDEN, HIDDEN)),
-            router: cx.named_tensor(format!("router{layer}"), (NUM_EXPERTS, HIDDEN)),
-            gate_up: cx.named_tensor_dtyped(
+            wq: cx.named_tensor(format!("wq{layer}"), (HIDDEN, HIDDEN), DType::F32),
+            wk: cx.named_tensor(format!("wk{layer}"), (KV_DIM, HIDDEN), DType::F32),
+            wv: cx.named_tensor(format!("wv{layer}"), (KV_DIM, HIDDEN), DType::F32),
+            wo: cx.named_tensor(format!("wo{layer}"), (HIDDEN, HIDDEN), DType::F32),
+            router: cx.named_tensor(format!("router{layer}"), (NUM_EXPERTS, HIDDEN), DType::F32),
+            gate_up: cx.named_tensor(
                 format!("gu{layer}"),
                 (NUM_EXPERTS, MOE_INTER * 2, HIDDEN),
                 DType::Bf16,
             ),
-            down: cx.named_tensor_dtyped(
+            down: cx.named_tensor(
                 format!("dn{layer}"),
                 (NUM_EXPERTS, HIDDEN, MOE_INTER),
                 DType::Bf16,
             ),
-            k_cache: cx.named_tensor(format!("kc{layer}"), (MAX_SEQ, KV_DIM)),
-            v_cache: cx.named_tensor(format!("vc{layer}"), (MAX_SEQ, KV_DIM)),
+            k_cache: cx.named_tensor(format!("kc{layer}"), (MAX_SEQ, KV_DIM), DType::F32),
+            v_cache: cx.named_tensor(format!("vc{layer}"), (MAX_SEQ, KV_DIM), DType::F32),
         };
         let normed = x.std_norm(1, 1e-6);
         let q = normed.matmul(inputs.wq.t());

@@ -87,9 +87,6 @@ members = [
     "tests/test_runtime",
 ]
 
-[patch.crates-io]
-candle-kernels = { git = "https://github.com/huggingface/candle.git", rev = "a0dbd8b8aef6bde9adca3e8ad90791609d64974b" }
-
 # Model examples are logical definitions only. Executable applications
 # belong to runtime crates, which bind and run these backend-neutral graphs.
 

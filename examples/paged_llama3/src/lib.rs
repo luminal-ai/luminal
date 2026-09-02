@@ -4,10 +4,13 @@
 //! crates. This crate specifies only the fixed-width logical graph.
 
 pub use llama3::{Llama3, Llama3Dims};
+#[path = "../../common/model_support.rs"]
+mod model_support;
+
+use crate::model_support::{KvCachePool, Namespace};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::prelude::{GraphTensor, Ns};
-use luminal_nn::KvCachePool;
+use luminal::prelude::GraphTensor;
 
 /// Fixed batch width of the step-invariant tick graph.
 pub const ROWS: usize = 2;
@@ -31,19 +34,20 @@ impl BatchStep {
     pub fn build(dims: &Llama3Dims, slots: usize) -> Self {
         let mut cx = Graph::new();
         let model = Llama3::init(&mut cx, dims);
-        let tokens = cx.tensor_dtyped(ROWS, DType::Int);
-        let rope_cos = cx.tensor((ROWS, dims.head_dim));
-        let rope_sin = cx.tensor((ROWS, dims.head_dim));
-        let rope_rot = cx.tensor((dims.head_dim, dims.head_dim));
-        let gather_idx = cx.tensor_dtyped(slots, DType::Int);
-        let scatter_idx = cx.tensor_dtyped(ROWS, DType::Int);
-        let mask = cx.tensor((ROWS, slots));
-        let pool = KvCachePool::new(
+        let tokens = cx.tensor(ROWS, DType::Int);
+        let rope_cos = cx.tensor((ROWS, dims.head_dim), DType::F32);
+        let rope_sin = cx.tensor((ROWS, dims.head_dim), DType::F32);
+        let rope_rot = cx.tensor((dims.head_dim, dims.head_dim), DType::F32);
+        let gather_idx = cx.tensor(slots, DType::Int);
+        let scatter_idx = cx.tensor(ROWS, DType::Int);
+        let mask = cx.tensor((ROWS, slots), DType::F32);
+        let pool = crate::model_support::named_kv_cache_pool(
             &mut cx,
             dims.layers,
             slots,
             dims.kv_dim(),
-            &Ns::root().child("cache"),
+            DType::F32,
+            &Namespace::root().child("cache"),
         );
 
         let mut x = model.embed.forward(tokens);
@@ -61,9 +65,13 @@ impl BatchStep {
                 rope_rot,
             );
             x = next;
-            cache_outs.push((k_cache.output(), v_cache.output()));
+            cache_outs.push((k_cache, v_cache));
         }
         let logits = model.lm_head.forward(model.final_norm.forward(x)).output();
+        let cache_outs = cache_outs
+            .into_iter()
+            .map(|(keys, values)| (keys.output(), values.output()))
+            .collect();
 
         Self {
             cx,

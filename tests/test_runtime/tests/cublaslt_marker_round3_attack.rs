@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node, NodeId};
@@ -258,7 +259,7 @@ fn pitch_factor_classes(s: &EGraph, layout_class: &ClassId) -> Vec<ClassId> {
 /// round-8b vocabulary (no form tag): the OPERATION fixes the view's row
 /// count, and a padded layout overrides it with its pitch.
 ///
-/// NOTE (round-8b): with the form child deleted this oracle necessarily
+/// Round 8b: with the form child deleted this oracle necessarily
 /// mirrors the production derivation, where before it could disagree
 /// about orientation. Its remaining independent content is the padding
 /// override and the dead-axis policy.
@@ -1358,9 +1359,9 @@ fn rc3_second_output_layout_stays_coherent() {
 fn rc4_bias_relu_chain_no_stale_d() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
-        let b = cx.tensor(3usize);
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let b = cx.tensor(3usize, DType::F32);
         let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -1712,34 +1713,34 @@ fn rp2_decoration_depth_enode_count() {
         (
             "plain",
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
                 let _ = x.matmul(w).output();
             }),
         ),
         (
             "relu",
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
                 let _ = x.matmul(w).relu().output();
             }),
         ),
         (
             "bias",
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
-                let b = cx.tensor(3usize);
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let b = cx.tensor(3usize, DType::F32);
                 let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
             }),
         ),
         (
             "bias+relu",
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
-                let b = cx.tensor(3usize);
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let b = cx.tensor(3usize, DType::F32);
                 let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
             }),
         ),
@@ -1801,8 +1802,8 @@ fn rp3_product_at_scale() {
                 let mut cx = Graph::new();
                 for i in 0..n {
                     let (m, k, nn) = if same { (4, 8, 3) } else { (4 + i, 8, 2 + i) };
-                    let x = cx.tensor((m, k));
-                    let w = cx.tensor((k, nn));
+                    let x = cx.tensor((m, k), DType::F32);
+                    let w = cx.tensor((k, nn), DType::F32);
                     let _ = x.matmul(w).output();
                 }
                 cx.logical
@@ -2842,8 +2843,8 @@ fn ru2_left_major_only_election_field_check() {
 fn ru3_m1_corner_multiplicity() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((1usize, 4usize));
-        let w = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((1usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 3usize), DType::F32);
         let _ = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -3024,14 +3025,14 @@ fn ru3_m1_corner_multiplicity() {
 fn ru4_weld_harvesting_is_cross_tensor() {
     fn gemv(with_stranger: bool) -> String {
         let mut cx = Graph::new();
-        let x = cx.tensor((1usize, 4usize));
-        let w = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((1usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 3usize), DType::F32);
         let _ = x.matmul(w).output();
         if with_stranger {
             // The bait: an unrelated [1,37] tensor whose row coordinate is
             // ALSO the zero class (extent-1 row) and whose cols literal is
             // 37 — exactly what round 4 harvested.
-            let stranger = cx.tensor((1usize, 37usize));
+            let stranger = cx.tensor((1usize, 37usize), DType::F32);
             let _ = (stranger + stranger).output();
         }
         cx.logical

@@ -623,7 +623,7 @@ spelling. Two needed more than that:
 - `crates/luminal_cuda_lite_hlir/src/tests/flashinfer.rs` — main writes
   `named_tensor(name, dim).as_dtype(Int)`; `as_dtype` was DELETED here
   (frontend purity rulings 2026-07-30), so the branch's
-  `named_tensor_dtyped(name, dim, Int)` is kept with main's new `token_dim` /
+  `named_tensor(name, dim, Int)` is kept with main's new `token_dim` /
   `context_dim` variables.
 - `crates/luminal_metal/src/tests.rs` — main REPLACES its own test
   `dynamic_const_codegen_uses_dyn_buffer` with

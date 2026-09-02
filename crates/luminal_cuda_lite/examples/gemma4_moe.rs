@@ -19,28 +19,34 @@ fn main() {
 
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
-    use gemma4_moe::{Gemma4Dims, Gemma4Moe};
-    use luminal::prelude::*;
-    use luminal_nn::{
-        rope_pairing_matrix, rope_tables_partial, rope_tables_split_half, KvCachePool,
+    use gemma4_moe::{
+        model_support::{named_heterogeneous_kv_cache_pool, Namespace},
+        Gemma4Dims, Gemma4Moe,
     };
+    use luminal::prelude::*;
+    use luminal_nn::{rope_pairing_matrix, rope_tables_partial, rope_tables_split_half};
 
     const SLOTS: usize = 4;
     let dims = Gemma4Dims::gemma4_26b_a4b();
     let mut cx = Graph::new();
     let model = Gemma4Moe::init(&mut cx, &dims);
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let sliding_cos = cx.tensor((1, dims.sliding_head_dim));
-    let sliding_sin = cx.tensor((1, dims.sliding_head_dim));
-    let sliding_rot = cx.tensor((dims.sliding_head_dim, dims.sliding_head_dim));
-    let full_cos = cx.tensor((1, dims.full_head_dim));
-    let full_sin = cx.tensor((1, dims.full_head_dim));
-    let full_rot = cx.tensor((dims.full_head_dim, dims.full_head_dim));
-    let gather_idx = cx.tensor_dtyped(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool =
-        KvCachePool::new_heterogeneous(&mut cx, SLOTS, &dims.kv_dims(), &Ns::root().child("cache"));
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let sliding_cos = cx.tensor((1, dims.sliding_head_dim), DType::F32);
+    let sliding_sin = cx.tensor((1, dims.sliding_head_dim), DType::F32);
+    let sliding_rot = cx.tensor((dims.sliding_head_dim, dims.sliding_head_dim), DType::F32);
+    let full_cos = cx.tensor((1, dims.full_head_dim), DType::F32);
+    let full_sin = cx.tensor((1, dims.full_head_dim), DType::F32);
+    let full_rot = cx.tensor((dims.full_head_dim, dims.full_head_dim), DType::F32);
+    let gather_idx = cx.tensor(SLOTS, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_heterogeneous_kv_cache_pool(
+        &mut cx,
+        SLOTS,
+        &dims.kv_dims(),
+        DType::F32,
+        &Namespace::root().child("cache"),
+    );
     let (logits, _) = model.forward(
         token,
         q_pos,

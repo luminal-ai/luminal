@@ -21,8 +21,8 @@ impl BenchmarkPattern for AddVec {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
-        let b = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
+        let b = cx.tensor(size.value, DType::F32);
         let _ = (a + b).output();
     }
 }
@@ -41,8 +41,8 @@ impl BenchmarkPattern for MulVec {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
-        let b = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
+        let b = cx.tensor(size.value, DType::F32);
         let _ = (a * b).output();
     }
 }
@@ -61,8 +61,8 @@ impl BenchmarkPattern for ModVec {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
-        let b = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
+        let b = cx.tensor(size.value, DType::F32);
         let _ = (a % b).output();
     }
 }
@@ -81,8 +81,8 @@ impl BenchmarkPattern for LessThanVec {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
-        let b = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
+        let b = cx.tensor(size.value, DType::F32);
         let _ = a.lt(b).output();
     }
 }
@@ -105,7 +105,7 @@ impl BenchmarkPattern for SumReduce {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.sum(0).output();
     }
 }
@@ -124,7 +124,7 @@ impl BenchmarkPattern for MaxReduce {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.max(0).output();
     }
 }
@@ -147,7 +147,7 @@ impl BenchmarkPattern for Exp2Bench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.exp2().output();
     }
 }
@@ -166,7 +166,7 @@ impl BenchmarkPattern for Log2Bench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.log2().output();
     }
 }
@@ -185,7 +185,7 @@ impl BenchmarkPattern for SinBench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.sin().output();
     }
 }
@@ -204,7 +204,7 @@ impl BenchmarkPattern for RecipBench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.reciprocal().output();
     }
 }
@@ -223,7 +223,7 @@ impl BenchmarkPattern for SqrtBench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         let _ = a.sqrt().output();
     }
 }
@@ -251,9 +251,9 @@ impl BenchmarkPattern for GatherBench {
         // indices: 1D tensor selecting num_indices elements
         let num_indices = 1024.min(size.value);
 
-        let data = cx.tensor(size.value);
+        let data = cx.tensor(size.value, DType::F32);
         // Indices must be integer type for gather operation
-        let indices = cx.tensor_dtyped(num_indices, luminal::dtype::DType::Int);
+        let indices = cx.tensor(num_indices, luminal::dtype::DType::Int);
         let _ = data.gather1d(indices).output();
     }
 }
@@ -272,7 +272,7 @@ impl BenchmarkPattern for CastBench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let a = cx.tensor(size.value);
+        let a = cx.tensor(size.value, DType::F32);
         // Cast to f16 then back to f32 to measure round-trip cost
         let _ = a
             .cast(luminal::dtype::DType::F16)

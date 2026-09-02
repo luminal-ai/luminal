@@ -1,4 +1,5 @@
 //! throwaway diagnostic (deleted before landing)
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use test_runtime::cublaslt_marker::CublasLt;
@@ -13,17 +14,17 @@ const PIN: &[&str] = &[
 fn diag_a5() {
     {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize));
-        let w1 = cx.tensor((4usize, 4usize));
-        let w2 = cx.tensor((4usize, 4usize));
+        let x = cx.tensor((4usize, 4usize), DType::F32);
+        let w1 = cx.tensor((4usize, 4usize), DType::F32);
+        let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
         let _ = y.matmul(w2.permute((1usize, 0usize))).output();
     };
     let program = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize));
-        let w1 = cx.tensor((4usize, 4usize));
-        let w2 = cx.tensor((4usize, 4usize));
+        let x = cx.tensor((4usize, 4usize), DType::F32);
+        let w1 = cx.tensor((4usize, 4usize), DType::F32);
+        let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
         let _ = y.matmul(w2.permute((1usize, 0usize))).output();
         cx.logical

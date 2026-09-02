@@ -3,6 +3,7 @@
 //!
 //! Run by name with --nocapture.
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 
@@ -148,7 +149,7 @@ fn logical_apply_classes(s: &EGraph) -> Vec<(ClassId, String)> {
 #[test]
 fn probe_a_bare_transpose_view() {
     let mut cx = Graph::new();
-    let w = cx.tensor((4usize, 3usize)); // stored row-major [4,3]
+    let w = cx.tensor((4usize, 3usize), DType::F32); // stored row-major [4,3]
     let _t = w.permute((1usize, 0usize)).output(); // [3,4] view
     let program = cx
         .logical
@@ -218,8 +219,8 @@ fn probe_a_bare_transpose_view() {
 #[test]
 fn probe_b_matmul_amk_bnk() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize));
-    let w = cx.tensor((3usize, 4usize)); // stored [n,k]
+    let x = cx.tensor((2usize, 4usize), DType::F32);
+    let w = cx.tensor((3usize, 4usize), DType::F32); // stored [n,k]
     let _out = x.matmul(w.permute((1usize, 0usize))).output();
     let program = cx
         .logical

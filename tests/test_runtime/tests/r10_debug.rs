@@ -1,4 +1,5 @@
 //! ROUND-10 scratch debug probe (not a gate).
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
@@ -42,8 +43,8 @@ fn ops_in(s: &EGraph, class: &ClassId) -> Vec<String> {
 fn r10_debug_fixture1() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 4usize));
-        let w = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((2usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 3usize), DType::F32);
         let _out = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -144,9 +145,9 @@ fn r10_debug_fixture1() {
 fn r10_debug_c6() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
-        let c = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let c = cx.tensor((4usize, 3usize), DType::F32);
         let _ = ((x.matmul(w) * 2.0) + c).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -320,9 +321,9 @@ fn r10_debug_c6() {
 fn r10_debug_a4() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize));
-        let w1 = cx.tensor((4usize, 4usize));
-        let w2 = cx.tensor((4usize, 4usize));
+        let x = cx.tensor((4usize, 4usize), DType::F32);
+        let w1 = cx.tensor((4usize, 4usize), DType::F32);
+        let w2 = cx.tensor((4usize, 4usize), DType::F32);
         let y = x.matmul(w1);
         let _ = y.matmul(w2).output();
         cx.logical
@@ -367,8 +368,8 @@ fn r10_debug_a4() {
 fn r10_debug_g2_mincost() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
         let y = x.matmul(w);
         let _ = y.output();
         let _ = (y * 2.0).output();
@@ -576,8 +577,8 @@ fn r10_debug_rc3() {
 fn r10_debug_bufferize() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
         let _ = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)

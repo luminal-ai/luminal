@@ -6,8 +6,8 @@ use luminal_reference::ReferenceRuntime;
 
 fn main() -> Result<()> {
     let mut cx = Graph::new();
-    let a = cx.tensor((3, 1));
-    let b = cx.tensor((1, 4));
+    let a = cx.tensor((3, 1), DType::F32);
+    let b = cx.tensor((1, 4), DType::F32);
     let c = a.matmul(b).output();
 
     let pairs = vec![

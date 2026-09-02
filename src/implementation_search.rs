@@ -1237,6 +1237,7 @@ mod tests {
     use egglog::SerializeConfig;
     use rustc_hash::FxHashMap;
 
+    use luminal::dtype::DType;
     use luminal::graph::Graph;
     use luminal::implementation_search::{
         ImplementationSearchOptions, bucketed_search_implementations, select_bucket,
@@ -1251,8 +1252,8 @@ mod tests {
     fn search_returns_a_correct_plan_and_dedups_duplicate_plans() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor(4);
-            let y = cx.tensor(4);
+            let x = cx.tensor(4, DType::F32);
+            let y = cx.tensor(4, DType::F32);
             let a = (x + y).output();
             let m = (x * y).output();
             (cx, x, y, a, m)
@@ -1352,8 +1353,8 @@ mod tests {
         }
 
         let mut cx = Graph::new();
-        let x = cx.tensor(4);
-        let y = cx.tensor(4);
+        let x = cx.tensor(4, DType::F32);
+        let y = cx.tensor(4, DType::F32);
         let _sum = (x + y).output();
         let _product = (x * y).output();
         let program = cx
@@ -1434,8 +1435,8 @@ mod tests {
         let build = |dim: usize| {
             let mut cx = Graph::new();
             cx.set_dim('a', dim);
-            let x = cx.tensor(('a', 2));
-            let y = cx.tensor(('a', 2));
+            let x = cx.tensor(('a', 2), DType::F32);
+            let y = cx.tensor(('a', 2), DType::F32);
             let out = (x * y).output();
             (cx, x, y, out)
         };

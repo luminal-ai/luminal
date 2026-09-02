@@ -1,4 +1,7 @@
-use gemma3::{Gemma3, Gemma3Dims};
+use gemma3::{
+    Gemma3, Gemma3Dims,
+    model_support::{Namespace, named_kv_cache_pool},
+};
 use luminal::prelude::*;
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {
@@ -56,21 +59,22 @@ fn gemma3_4b_full_forward_contract_builds() {
     let d = Gemma3Dims::gemma3_4b();
     let mut cx = Graph::new();
     let model = Gemma3::init(&mut cx, &d);
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let local_cos = cx.tensor((1, d.head_dim));
-    let local_sin = cx.tensor((1, d.head_dim));
-    let global_cos = cx.tensor((1, d.head_dim));
-    let global_sin = cx.tensor((1, d.head_dim));
-    let rope_rot = cx.tensor((d.head_dim, d.head_dim));
-    let gather_idx = cx.tensor_dtyped(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool = luminal_nn::KvCachePool::new(
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let local_cos = cx.tensor((1, d.head_dim), DType::F32);
+    let local_sin = cx.tensor((1, d.head_dim), DType::F32);
+    let global_cos = cx.tensor((1, d.head_dim), DType::F32);
+    let global_sin = cx.tensor((1, d.head_dim), DType::F32);
+    let rope_rot = cx.tensor((d.head_dim, d.head_dim), DType::F32);
+    let gather_idx = cx.tensor(SLOTS, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_kv_cache_pool(
         &mut cx,
         d.layers,
         SLOTS,
         d.kv_dim(),
-        &Ns::root().child("cache"),
+        DType::F32,
+        &Namespace::root().child("cache"),
     );
 
     let (logits, cache_out) = model.forward(

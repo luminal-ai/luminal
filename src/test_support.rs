@@ -24,7 +24,7 @@ pub mod test_ops {
     /// Functional form: pure dataflow, conservative [`Bufferizable`] defaults
     /// (every operand read, both results freshly allocated). Elementwise: element
     /// `i` of each input is read before element `i` of either output is written
-    /// (op-level all-pairs claim — see the NOTE on
+    /// (op-level all-pairs claim documented by
     /// `bufferizes_to_elementwise_access`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct AddMulFused;
@@ -2133,6 +2133,7 @@ pub fn harness_search_options() -> crate::implementation_search::ImplementationS
 
 #[cfg(test)]
 mod stage4b_probes {
+    use luminal::dtype::DType;
 
     /// (History: this module held the Step-4b degenerate-broadcast
     /// unsoundness pin — the stride recovery walks welding the zero
@@ -2148,7 +2149,7 @@ mod stage4b_probes {
     #[test]
     fn pinned_pure_identity_output() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor(2);
+        let a = cx.tensor(2, DType::F32);
         let b = a.output();
         let rt =
             luminal_reference::harness::run_reference(&cx, &[(a.id, vec![1.0f32, 2.0].into())]);
@@ -2259,7 +2260,7 @@ mod stage4b_probes {
         for lead in [1usize, 2usize] {
             eprintln!("[rejoin-probe] ===== lead extent {lead} =====");
             let mut cx = luminal::graph::Graph::new();
-            let x = cx.tensor((lead, 8usize));
+            let x = cx.tensor((lead, 8usize), DType::F32);
             let heads = x.split_dims(1, 4);
             let x1 = heads.slice_along(0..2, 2);
             let x2 = heads.slice_along(2..4, 2);
@@ -2431,8 +2432,8 @@ mod stage4b_probes {
     #[ignore = "diagnostic — run explicitly by name"]
     fn specimen_1235_full_schedule() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor((1usize, 2usize, 3usize));
-        let b = cx.tensor((3usize, 5usize));
+        let a = cx.tensor((1usize, 2usize, 3usize), DType::F32);
+        let b = cx.tensor((3usize, 5usize), DType::F32);
         let _out = a.matmul(b).output();
         let (pre, _is, _os, post, _labeled) = cx
             .logical
@@ -2464,7 +2465,7 @@ mod stage4b_probes {
         let specimens: Vec<(&str, String)> = vec![
             ("slice_pad(27x10)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((27usize, 10usize));
+                let a = cx.tensor((27usize, 10usize), DType::F32);
                 let _out = a
                     .slice((2..6, 7..10))
                     .pad(((1usize, 2usize), (1usize, 0usize)), 0.)
@@ -2477,8 +2478,8 @@ mod stage4b_probes {
             }),
             ("batch_matmul(2,3,4)x(4,5)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((2usize, 3usize, 4usize));
-                let b = cx.tensor((4usize, 5usize));
+                let a = cx.tensor((2usize, 3usize, 4usize), DType::F32);
+                let b = cx.tensor((4usize, 5usize), DType::F32);
                 let _out = a.matmul(b).output();
                 let (pre, _is, _os, _post, _labeled) = cx
                     .logical
@@ -2488,8 +2489,8 @@ mod stage4b_probes {
             }),
             ("specimen(1,2,3)x(3,5)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((1usize, 2usize, 3usize));
-                let b = cx.tensor((3usize, 5usize));
+                let a = cx.tensor((1usize, 2usize, 3usize), DType::F32);
+                let b = cx.tensor((3usize, 5usize), DType::F32);
                 let _out = a.matmul(b).output();
                 let (pre, _is, _os, _post, _labeled) = cx
                     .logical
@@ -2499,7 +2500,7 @@ mod stage4b_probes {
             }),
             ("rejoin_lead1(1,8)", {
                 let mut cx = luminal::graph::Graph::new();
-                let x = cx.tensor((1usize, 8usize));
+                let x = cx.tensor((1usize, 8usize), DType::F32);
                 let heads = x.split_dims(1, 4);
                 let x1 = heads.slice_along(0..2, 2);
                 let x2 = heads.slice_along(2..4, 2);
@@ -2567,7 +2568,7 @@ mod stage4b_probes {
         let specimens: Vec<(&str, String)> = vec![
             ("slice_pad(27x10)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((27usize, 10usize));
+                let a = cx.tensor((27usize, 10usize), DType::F32);
                 let _out = a
                     .slice((2..6, 7..10))
                     .pad(((1usize, 2usize), (1usize, 0usize)), 0.)
@@ -2583,8 +2584,8 @@ mod stage4b_probes {
             }),
             ("batch_matmul(2,3,4,5)", {
                 let mut cx = luminal::graph::Graph::new();
-                let a = cx.tensor((2usize, 3usize, 4usize));
-                let b = cx.tensor((4usize, 5usize));
+                let a = cx.tensor((2usize, 3usize, 4usize), DType::F32);
+                let b = cx.tensor((4usize, 5usize), DType::F32);
                 let _out = a.matmul(b).output();
                 let (pre, _is, _os, post, _labeled) = cx
                     .logical
@@ -2707,7 +2708,7 @@ mod stage4b_probes {
     #[test]
     fn degenerate_broadcast_runs_clean() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor(1);
+        let a = cx.tensor(1, DType::F32);
         let b = (a * 2.0).output();
         let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, vec![0.5f32].into())]);
         let got = rt.get_f32(b.id).unwrap();
@@ -2913,8 +2914,8 @@ mod subst_guard_study {
     fn interface_specs_report_pristine_labels_and_named_outputs() {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::default();
-        let a = cx.named_tensor("blocks.0.wq.weight", (2usize, 3usize));
-        let b = cx.tensor((2usize, 3usize));
+        let a = cx.named_tensor("blocks.0.wq.weight", (2usize, 3usize), DType::F32);
+        let b = cx.tensor((2usize, 3usize), DType::F32);
         let _ = (a + b).output_named("logits");
 
         let inputs = cx.logical.input_specs();
@@ -2944,7 +2945,7 @@ mod subst_guard_study {
             "authored output name reaches the IR text"
         );
 
-        let c = cx.tensor((2usize, 3usize));
+        let c = cx.tensor((2usize, 3usize), DType::F32);
         let _ = c.output_named("logits");
         assert!(
             cx.logical
@@ -2956,8 +2957,8 @@ mod subst_guard_study {
 
         // Stage 3: duplicate INPUT labels poison at the choke point.
         let mut cx2 = Graph::default();
-        let _a = cx2.named_tensor("blocks.0.wq.weight", (2usize,));
-        let _b = cx2.named_tensor("blocks.0.wq.weight", (2usize,));
+        let _a = cx2.named_tensor("blocks.0.wq.weight", (2usize,), DType::F32);
+        let _b = cx2.named_tensor("blocks.0.wq.weight", (2usize,), DType::F32);
         assert!(
             cx2.logical
                 .model_text()
@@ -2983,8 +2984,8 @@ mod subst_guard_study {
         cx.set_dim('b', 3);
         let ab = IntExpr::from('a') + IntExpr::from('b');
         let ba = IntExpr::from('b') + IntExpr::from('a');
-        let x = cx.named_tensor_dtyped("x", (ab,), DType::F32);
-        let y = cx.named_tensor_dtyped("y", (ba,), DType::F32);
+        let x = cx.named_tensor("x", (ab,), DType::F32);
+        let y = cx.named_tensor("y", (ba,), DType::F32);
         let doubled = (x + x).output();
         let summed = (y * y).output();
         // MIXED-SPELLING elementwise: a+b meets b+a directly — the
@@ -3021,7 +3022,7 @@ mod subst_guard_study {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::default();
         cx.set_dim('s', 1);
-        let x = cx.named_tensor_dtyped("x", ('s', 3usize), DType::F32);
+        let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
         let out = (x.squeeze(0) * 2.0).output();
         let rt = luminal_reference::harness::run_reference(
             &cx,
@@ -3031,7 +3032,7 @@ mod subst_guard_study {
 
         let mut cx = Graph::default();
         cx.set_dim('s', 2);
-        let x = cx.named_tensor_dtyped("x", ('s', 3usize), DType::F32);
+        let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
         let _ = (x.squeeze(0) * 2.0).output();
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
         let data: rustc_hash::FxHashMap<_, _> = [(
@@ -3061,8 +3062,8 @@ mod subst_guard_study {
         let mut cx = Graph::default();
         cx.set_dim('s', 3);
         cx.set_dim('t', 2);
-        let x = cx.named_tensor_dtyped("x", ('s',), DType::F32);
-        let y = cx.named_tensor_dtyped("y", ('t',), DType::F32);
+        let x = cx.named_tensor("x", ('s',), DType::F32);
+        let y = cx.named_tensor("y", ('t',), DType::F32);
         let padded = x.pad_along(1, 1, 0, 0.0).output();
         let joined = x.concat_along(y, 0).output();
         let rt = luminal_reference::harness::run_reference(
@@ -3084,7 +3085,7 @@ mod subst_guard_study {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::default();
         cx.set_dim('s', 5);
-        let x = cx.named_tensor_dtyped("x", ('s',), DType::F32);
+        let x = cx.named_tensor("x", ('s',), DType::F32);
         let out = x.unfold((3usize,), (1usize,), (1usize,)).sum(1).output();
         let rt = luminal_reference::harness::run_reference(
             &cx,
@@ -3094,7 +3095,7 @@ mod subst_guard_study {
 
         let mut cx = Graph::default();
         cx.set_dim('s', 2);
-        let x = cx.named_tensor_dtyped("x", ('s',), DType::F32);
+        let x = cx.named_tensor("x", ('s',), DType::F32);
         let _ = x.unfold((3usize,), (1usize,), (1usize,)).sum(1).output();
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
         let data: rustc_hash::FxHashMap<_, _> = [(
@@ -3874,7 +3875,7 @@ mod ring_ignition_battery {
         use luminal::prelude::{DType, Graph};
         let mut cx = Graph::new();
         cx.set_dim('s', 5);
-        let x = cx.named_tensor_dtyped("x", ('s',), DType::F32);
+        let x = cx.named_tensor("x", ('s',), DType::F32);
         let _out = x.unfold((3usize,), (1usize,), (1usize,)).sum(1).output();
         let (pre, _inputs, _outputs, _post, _labeled) = cx
             .logical

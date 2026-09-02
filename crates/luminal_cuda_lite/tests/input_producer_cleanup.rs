@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use luminal::buffer_tensor_ir::TypedBuffer;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 use luminal::prelude::{FxHashMap, NodeIndex};
@@ -56,8 +57,8 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
 /// transpose-sandwich + double-transpose collapse produced the welds.
 fn marker_matmul() -> (Graph, NodeIndex, NodeIndex) {
     let mut cx = Graph::new();
-    let a = cx.tensor((4usize, 8usize));
-    let b = cx.tensor((8usize, 3usize));
+    let a = cx.tensor((4usize, 8usize), DType::F32);
+    let b = cx.tensor((8usize, 3usize), DType::F32);
     let _out = a.matmul(b).output();
     (cx, a.id, b.id)
 }
@@ -411,8 +412,8 @@ const NAMED_OUTPUT: &str = "logits";
 /// transpose collapse, so the same input producers are minted.
 fn named_marker_matmul() -> Graph {
     let mut cx = Graph::new();
-    let a = cx.named_tensor(NAMED_INPUTS[0], (4usize, 8usize));
-    let b = cx.named_tensor(NAMED_INPUTS[1], (8usize, 3usize));
+    let a = cx.named_tensor(NAMED_INPUTS[0], (4usize, 8usize), DType::F32);
+    let b = cx.named_tensor(NAMED_INPUTS[1], (8usize, 3usize), DType::F32);
     let _out = a.matmul(b).output_named(NAMED_OUTPUT);
     cx
 }

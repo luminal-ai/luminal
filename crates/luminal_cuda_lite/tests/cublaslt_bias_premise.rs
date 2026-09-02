@@ -14,8 +14,8 @@
 //! per-feature vector on D's rows, cuBLASLt's only bias axis.
 //!
 //! CPU-side, on the e-graph the search reads (`CudaRuntime::saturated_egraph`):
-//!  * POSITIVE: `x[4,8] @ w[8,3] + b[3]`, spelled exactly as
-//!    `luminal_nn::Linear` with bias spells it (`expand_lhs` over the batch
+//!  * POSITIVE: `x[4,8] @ w[8,3] + b[3]`, spelled by
+//!    `luminal_nn::linear` with a bias (`expand_lhs` over the batch
 //!    axis — rank-1 `[n]` applied through `(CoordVar d_shape 0)` into
 //!    `[m, n]`), mints `LayoutTensorOpCublasLtBias`, and its D layout class
 //!    holds `LeftMajorContiguousElementLayoutLit` — minted by DISCOVERY
@@ -34,11 +34,10 @@ use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
-use luminal::prelude::{FxHashMap, NodeIndex, Ns};
+use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal_cuda_lite::ops::cublaslt::exec::{bind_destination, plan_call, LtOrder};
 use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtDps};
 use luminal_cuda_lite::CudaRuntime;
-use luminal_nn::Linear;
 
 /// Deterministic values (the shared example seeding discipline).
 fn weights(n: usize, seed: usize) -> Vec<f32> {
@@ -51,15 +50,15 @@ const M: usize = 4; // batch rows (the recorder's m)
 const K: usize = 8;
 const N: usize = 3; // features (the recorder's n = the sibling call's m)
 
-/// The pin graph PLUS a per-feature bias, spelled as `luminal_nn::Linear`
-/// with bias spells it: `y = x.matmul(w) + b.expand_lhs(&[m])`.
+/// The pin graph plus a per-feature bias, spelled by `luminal_nn::linear`:
+/// `y = x.matmul(w) + b.expand_lhs(&[m])`.
 fn linear_with_bias() -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
     let mut cx = Graph::new();
-    let fc = Linear::new(K, N, true, &Ns::root().child("fc"), &mut cx);
-    let x = cx.tensor((M, K));
-    let out = fc.forward(x).output();
-    let bias = fc.bias.expect("Linear::new(.., true, ..) carries a bias");
-    (cx, x.id, fc.weight.id, bias.id, out.id)
+    let weight = cx.named_tensor("fc.weight", (K, N), DType::F32);
+    let bias = cx.named_tensor("fc.bias", N, DType::F32);
+    let x = cx.tensor((M, K), DType::F32);
+    let out = luminal_nn::linear(x, weight, Some(bias)).output();
+    (cx, x.id, weight.id, bias.id, out.id)
 }
 
 fn count(egraph: &EGraph, op: &str) -> usize {
@@ -341,9 +340,9 @@ fn search_elects_the_bias_form_and_binds_a_col_d() {
 #[test]
 fn per_row_bias_does_not_mint_the_bias_form() {
     let mut cx = Graph::new();
-    let x = cx.tensor((M, K));
-    let w = cx.tensor((K, N));
-    let b_rows = cx.tensor(M);
+    let x = cx.tensor((M, K), DType::F32);
+    let w = cx.tensor((K, N), DType::F32);
+    let b_rows = cx.tensor(M, DType::F32);
     // [4] -> [4, 3] along the FEATURE axis: entry (CoordVar d_shape 1),
     // i.e. bias[i] added to every element of row i — cuBLASLt's epilogue
     // cannot express this for the sibling call (its bias runs along the

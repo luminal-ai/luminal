@@ -23,6 +23,7 @@
 //! program (a marker-comment slice), so what runs without the rule is
 //! byte-identical everywhere else.
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 
 /// The assembled program for the canonical fixture, with the recorder's
@@ -31,8 +32,8 @@ use luminal::graph::Graph;
 fn bounded_program(iters: usize, with_collapse: bool) -> String {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 4usize));
-        let w = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((2usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 3usize), DType::F32);
         let _out = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)

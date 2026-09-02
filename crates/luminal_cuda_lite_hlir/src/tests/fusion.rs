@@ -249,7 +249,7 @@ fn test_two_unary_ops_fuse() {
     // Marker form: `a.sin().sqrt()` should fuse into a region with FusedSin
     // and FusedSqrt under one FusionEnd (per pair-fuse U→U).
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
     let _b = a.sin().sqrt().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -268,7 +268,7 @@ fn test_stride_mismatch_prevents_fusion() {
     // contiguous output, so sqrt's in_strides != its out_strides and the
     // non-linear `?s ?s` match in the pair-fuse U→U rule can't fire.
     let mut cx = Graph::new();
-    let a = cx.tensor((3, 4));
+    let a = cx.tensor((3, 4), DType::F32);
     let _b = a.sin().permute((1, 0)).sqrt().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -289,7 +289,7 @@ fn test_reduction_prevents_unary_fusion() {
     // (which only matches adjacent elementwise pairs) must not fire across
     // the reduction.
     let mut cx = Graph::new();
-    let a = cx.tensor((4, 4));
+    let a = cx.tensor((4, 4), DType::F32);
     let _b = a.sin().sum(1).sqrt().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -326,7 +326,7 @@ fn test_three_unary_ops_fuse() {
     // A chain of 3 pure-elementwise unaries with matching strides should be
     // reachable as a single marker region containing all three elementwise ops.
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
     let _b = a.sin().sqrt().exp2().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -345,7 +345,7 @@ fn test_four_unary_ops_fuse() {
     // 4-op chain should collapse into a single marker region containing all
     // four elementwise ops (one pair-fuse + repeated grow-FE→U firings).
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
     let _b = a.sin().sqrt().exp2().log2().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -698,8 +698,8 @@ fn test_single_binary_does_not_fuse_alone() {
     // asserts is that no *multi-op* region appears for a standalone binary
     // — nothing to grow into.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let _c = (a + b).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -716,9 +716,9 @@ fn test_chain_of_binaries_fuses() {
     // internal [Add, Mul] and 3 FusionStarts. Exercises the B-B pair-fuse
     // rules emitted from FusionEnd::rewrites.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
-    let c = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
+    let c = cx.tensor(8, DType::F32);
     let _d = ((a + b) * c).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -736,8 +736,8 @@ fn test_chain_of_binaries_fuses() {
 fn test_binary_then_unary_fuses() {
     // `sin(a + b)`: binary feeds a unary inside one fused region.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let _c = (a + b).sin().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -755,8 +755,8 @@ fn test_binary_then_unary_fuses() {
 fn test_unary_then_binary_fuses() {
     // `sin(a) + b`: unary feeds a binary inside one fused region.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let _c = (a.sin() + b).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -781,8 +781,8 @@ fn test_diamond_dag_fuses() {
     // Mul(x, LOG2E).exp2(), which would add a constant input and a Mul op and
     // obscure the diamond topology this test is checking.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let t = a + b;
     let u = t.exp2();
     let v = t.sin();
@@ -807,8 +807,8 @@ fn test_reduction_blocks_binary_fusion() {
     // A reduction between a binary and anything downstream is not elementwise,
     // so Add and SumReduce must never appear in the same fused region.
     let mut cx = Graph::new();
-    let a = cx.tensor((4, 4));
-    let b = cx.tensor((4, 4));
+    let a = cx.tensor((4, 4), DType::F32);
+    let b = cx.tensor((4, 4), DType::F32);
     let _c = (a + b).sum(1).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -828,8 +828,8 @@ fn test_stride_mismatch_blocks_binary_fusion() {
     // so the binary fusion rule's stride-compatibility check must prevent the
     // Add from being absorbed into any fused region.
     let mut cx = Graph::new();
-    let a = cx.tensor((3, 4));
-    let b = cx.tensor((4, 3));
+    let a = cx.tensor((3, 4), DType::F32);
+    let b = cx.tensor((4, 3), DType::F32);
     let _c = (a + b.permute((1, 0))).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -907,8 +907,8 @@ fn test_fused_region_has_exactly_one_end() {
     // Uses the diamond DAG so there's real fan-in/out inside the region.
     // See test_diamond_dag_fuses for why we use exp2 directly.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let t = a + b;
     let u = t.exp2();
     let v = t.sin();
@@ -938,8 +938,8 @@ fn test_fused_region_starts_match_distinct_external_tensors() {
     // count is 2 ({a, b}).
     // See test_diamond_dag_fuses for why we use exp2 directly.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let t = a + b;
     let u = t.exp2();
     let v = t.sin();
@@ -984,7 +984,7 @@ fn test_pair_fuse_unary_unary_marker_form() {
     // Pair-fuse U→U: `a.sin().sqrt()` should be reachable as a marker-bracketed
     // region containing FusedSin and FusedSqrt (with one FusionStart for `a`).
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
     let _b = a.sin().sqrt().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1003,8 +1003,8 @@ fn test_pair_fuse_unary_to_binary_rhs() {
     // Pair-fuse U→B (RHS variant): `a + b.sin()`. The unary is on the
     // binary's B input, so the rule's RHS-orientation version is what fires.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
     let _c = (a + b.sin()).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1025,9 +1025,9 @@ fn test_pair_fuse_binary_to_binary_rhs() {
     // outer binary's B input, exercising the mirror direction of the rule
     // covered by test_chain_of_binaries_fuses.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
-    let c = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
+    let c = cx.tensor(8, DType::F32);
     let _d = (c * (a + b)).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1049,9 +1049,9 @@ fn test_grow_fe_to_binary_rhs() {
     // (because we wrote `c + (...)` — `c` is on LHS, FE on RHS), exercising
     // grow-FE-B-rhs to absorb the outer Add into the same region.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
-    let c = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
+    let c = cx.tensor(8, DType::F32);
     let _d = (c + (a.sin() + b)).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1072,10 +1072,10 @@ fn test_merge_two_regions_at_outer_binary() {
     // through the inner Add, so both sides become FEs. The outer Add can then
     // fire merge-FE-FE-Add to produce a single region.
     let mut cx = Graph::new();
-    let a = cx.tensor(8);
-    let b = cx.tensor(8);
-    let c = cx.tensor(8);
-    let d = cx.tensor(8);
+    let a = cx.tensor(8, DType::F32);
+    let b = cx.tensor(8, DType::F32);
+    let c = cx.tensor(8, DType::F32);
+    let d = cx.tensor(8, DType::F32);
     let _e = ((a.sin() + b) + (c.sqrt() + d)).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1251,7 +1251,7 @@ fn test_cast_after_unary_fuses() {
     // with the cast as an interior elementwise node, instead of a separate
     // KernelCast kernel reading the region's f32 output buffer.
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
     let _b = a.sin().cast(luminal::dtype::DType::Bf16).output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1270,7 +1270,7 @@ fn test_cast_producer_absorbed_into_region() {
     // grow-Cast-FS: a bf16 input cast to f32 then consumed by a unary chain
     // should pull the cast inside the region.
     let mut cx = Graph::new();
-    let a = cx.tensor_dtyped(16, luminal::dtype::DType::Bf16);
+    let a = cx.tensor(16, luminal::dtype::DType::Bf16);
     let _b = a.cast(luminal::dtype::DType::F32).sin().output();
 
     let regions = extract_all_fused_regions(&mut cx);
@@ -1287,7 +1287,7 @@ fn test_cast_producer_absorbed_into_region() {
 #[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_cast_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
     a.sin().cast(luminal::dtype::DType::Bf16).sqrt().output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -1301,7 +1301,7 @@ fn test_cast_split_boundary_and_absorbed_choice_coexist() {
 #[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_unary_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
     a.sin().sqrt().reciprocal().output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -1315,8 +1315,8 @@ fn test_unary_split_boundary_and_absorbed_choice_coexist() {
 #[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
-    let b = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
+    let b = cx.tensor(16, DType::F32);
     (a.sin() + b).sqrt().output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -1330,8 +1330,8 @@ fn test_binary_lhs_split_boundary_and_absorbed_choice_coexist() {
 #[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework)"]
 fn test_binary_rhs_split_boundary_and_absorbed_choice_coexist() {
     let mut cx = Graph::new();
-    let a = cx.tensor(16);
-    let b = cx.tensor(16);
+    let a = cx.tensor(16, DType::F32);
+    let b = cx.tensor(16, DType::F32);
     (a + b.sin()).sqrt().output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());

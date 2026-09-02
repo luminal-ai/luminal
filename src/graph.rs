@@ -82,25 +82,16 @@ impl Graph {
         self.dyn_map.insert(dimension.into(), val);
     }
 
-    pub fn tensor(&mut self, shape: impl ToShape) -> GraphTensor {
-        self.named_tensor_dtyped("", shape, DType::default())
-    }
-
     /// Create a new tensor with shape S and this dtype. Dtype is DECLARED
     /// at creation (purity ruling 2026-07-30: as_dtype is gone — a
     /// different dtype downstream is a logical cast, never a mutation of
     /// the declaration).
-    pub fn tensor_dtyped(&mut self, shape: impl ToShape, dtype: DType) -> GraphTensor {
-        self.named_tensor_dtyped("", shape, dtype)
+    pub fn tensor(&mut self, shape: impl ToShape, dtype: DType) -> GraphTensor {
+        self.named_tensor("", shape, dtype)
     }
 
-    /// Create a new tensor with shape S and a name. This name will show up on the graph when displayed
-    pub fn named_tensor(&mut self, name: impl ToString, shape: impl ToShape) -> GraphTensor {
-        self.named_tensor_dtyped(name, shape, DType::default())
-    }
-
-    /// Named + dtyped input declaration — the one true constructor.
-    pub fn named_tensor_dtyped(
+    /// Create a new tensor with a name, shape, and dtype. This name will show up on the graph when displayed.
+    pub fn named_tensor(
         &mut self,
         name: impl ToString,
         shape: impl ToShape,
@@ -599,7 +590,7 @@ impl LogicalGraph {
         // pristine label. Anonymous inputs auto-name "arg.{k}" in
         // declaration order (the ExportedProgram/ONNX convention for
         // positional user inputs); duplicate labels POISON at the one
-        // choke point (uniqueness is a tree-address corollary under Ns,
+        // choke point (uniqueness follows from hierarchical module namespaces,
         // and this tripwire catches hand-authored collisions); and the
         // label ALONE is the input's identity in the IR text — the
         // "{label}_{slot}" mangle is dead, its anti-hash-cons job done
@@ -1657,8 +1648,8 @@ mod logical_petgraph_tests {
     #[test]
     fn tensor_ids_are_petgraph_values_with_ported_operand_edges() {
         let mut cx = Graph::new();
-        let lhs = cx.named_tensor("lhs", (2usize, 3usize));
-        let rhs = cx.named_tensor("rhs", (2usize, 3usize));
+        let lhs = cx.named_tensor("lhs", (2usize, 3usize), DType::F32);
+        let rhs = cx.named_tensor("rhs", (2usize, 3usize), DType::F32);
         let sum = lhs + rhs;
         let viewed = sum.expand_dim(0, 4usize).output();
 

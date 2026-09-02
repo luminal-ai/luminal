@@ -543,7 +543,7 @@ pub(super) mod tests {
     fn unsigned_abs_is_the_identity() {
         let mut cx = Graph::new();
         for dtype in [DType::U4, DType::U8, DType::U16] {
-            let x = cx.tensor_dtyped(4, dtype);
+            let x = cx.tensor(4, dtype);
             assert_eq!(
                 x.abs().id,
                 x.id,
@@ -589,7 +589,7 @@ pub(super) mod tests {
             .map(|e| e.to_usize().unwrap())
             .collect_vec();
         let mut cx = Graph::new();
-        let a = cx.tensor(shape.clone());
+        let a = cx.tensor(shape.clone(), DType::F32);
         let b = func(a).output();
 
         let v = random_vec(shape.iter().copied().product());
@@ -755,7 +755,7 @@ pub(super) mod tests {
     #[test]
     fn test_topk_indexes() {
         let mut cx = Graph::new();
-        let x = cx.tensor((2, 4));
+        let x = cx.tensor((2, 4), DType::F32);
         let out = x.topk_indexes(2, 1).cast(DType::F32).output();
 
         // row 0: [0.1, 3.0, 2.0, -1.0] → top-2 desc = idx 1, 2

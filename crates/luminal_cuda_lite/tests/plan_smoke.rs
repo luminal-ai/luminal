@@ -4,14 +4,15 @@
 //! without the `device` feature refuses loudly.
 
 use luminal::bufferize::BufferNode;
+use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::{kernels, CudaRuntime};
 
 #[test]
 fn search_produces_a_codegen_complete_plan() {
     let mut cx = luminal::graph::Graph::new();
-    let a = cx.tensor((2usize, 3usize));
-    let b = cx.tensor((2usize, 3usize));
+    let a = cx.tensor((2usize, 3usize), DType::F32);
+    let b = cx.tensor((2usize, 3usize), DType::F32);
     let _out = ((a + b) * a).output();
 
     let mut rt = CudaRuntime::load(&cx).expect("load");

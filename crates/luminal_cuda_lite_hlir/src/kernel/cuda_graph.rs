@@ -762,8 +762,8 @@ mod tests {
         };
         let size = 1024;
         let mut cx = Graph::default();
-        let a = cx.tensor(size).persist();
-        let b = cx.tensor(size).persist();
+        let a = cx.tensor(size, DType::F32).persist();
+        let b = cx.tensor(size, DType::F32).persist();
         let c = ((a + b) * a + b).output();
 
         let mut rt = CudaRuntime::initialize(stream);
@@ -794,8 +794,8 @@ mod tests {
         };
         let size = 2048;
         let mut cx = Graph::default();
-        let a = cx.tensor(size).persist();
-        let b = cx.tensor(size).persist();
+        let a = cx.tensor(size, DType::F32).persist();
+        let b = cx.tensor(size, DType::F32).persist();
         let c = (a + b + a + b).output();
 
         let mut rt = CudaRuntime::initialize(stream);
@@ -830,8 +830,8 @@ mod tests {
         };
         let size = 512;
         let mut cx = Graph::default();
-        let a = cx.tensor('s');
-        let b = cx.tensor('s');
+        let a = cx.tensor('s', DType::F32);
+        let b = cx.tensor('s', DType::F32);
         let c = (a + b).output();
         let d = (c * a).output();
 
@@ -874,8 +874,8 @@ mod tests {
         };
         let size = 1024;
         let mut cx = Graph::default();
-        let a = cx.tensor(size);
-        let b = cx.tensor(size);
+        let a = cx.tensor(size, DType::F32);
+        let b = cx.tensor(size, DType::F32);
         let c = (a + b).output();
 
         let mut rt = CudaRuntime::initialize(stream);
@@ -900,8 +900,8 @@ mod tests {
         };
         let size = 4096;
         let mut cx = Graph::default();
-        let a = cx.tensor(size).persist();
-        let b = cx.tensor(size).persist();
+        let a = cx.tensor(size, DType::F32).persist();
+        let b = cx.tensor(size, DType::F32).persist();
         let mut result = a + b;
         for _ in 0..5 {
             result += a;
@@ -936,8 +936,8 @@ mod tests {
             return;
         };
         let mut cx = Graph::default();
-        let a = cx.tensor('s');
-        let b = cx.tensor('s');
+        let a = cx.tensor('s', DType::F32);
+        let b = cx.tensor('s', DType::F32);
         let c = ((a + b) * a).output();
 
         let initial_size = 128;

@@ -26,6 +26,7 @@
 
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
@@ -176,8 +177,8 @@ fn cublaslt_contracts_are_registered_host_call_claims() {
 #[test]
 fn canonical_2d_matmul_elects_the_marker() {
     let mut cx = Graph::new();
-    let a = cx.tensor((4usize, 8usize));
-    let b = cx.tensor((8usize, 3usize));
+    let a = cx.tensor((4usize, 8usize), DType::F32);
+    let b = cx.tensor((8usize, 3usize), DType::F32);
     let _out = a.matmul(b).output();
 
     let pairs: Vec<(NodeIndex, TypedBuffer)> =
@@ -224,7 +225,7 @@ fn election_row_conv() {
     use mini_conv::MiniConvNet;
     let mut cx = Graph::new();
     let model = MiniConvNet::new(1, 2, 3, 2, &mut cx);
-    let x = cx.tensor((1, 1, 5, 5));
+    let x = cx.tensor((1, 1, 5, 5), DType::F32);
     let _out = model.forward(x).output();
     let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
         (x.id, weights(25, 1).into()),
@@ -245,11 +246,11 @@ fn election_row_llama3() {
     const D: usize = 8;
     let mut cx = Graph::new();
     let model = MiniLlama3::new(VOCAB, D, 12, 4, 2, 1, &mut cx);
-    let ids = cx.tensor_dtyped(1, DType::Int);
-    let k_cache = cx.tensor((4, 4));
-    let v_cache = cx.tensor((4, 4));
-    let gather_idx = cx.tensor_dtyped(2, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
+    let ids = cx.tensor(1, DType::Int);
+    let k_cache = cx.tensor((4, 4), DType::F32);
+    let v_cache = cx.tensor((4, 4), DType::F32);
+    let gather_idx = cx.tensor(2, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];
     let (logits, _caches_out) =
         model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
@@ -285,11 +286,11 @@ fn election_row_qwen3() {
     const HD: usize = 2;
     let mut cx = Graph::new();
     let model = MiniQwen3::new(VOCAB, D, 12, 4, 2, 1, &mut cx);
-    let ids = cx.tensor_dtyped(1, DType::Int);
-    let k_cache = cx.tensor((4, 4));
-    let v_cache = cx.tensor((4, 4));
-    let gather_idx = cx.tensor_dtyped(2, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
+    let ids = cx.tensor(1, DType::Int);
+    let k_cache = cx.tensor((4, 4), DType::F32);
+    let v_cache = cx.tensor((4, 4), DType::F32);
+    let gather_idx = cx.tensor(2, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];
     let (logits, _caches_out) =
         model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
@@ -325,8 +326,8 @@ fn election_row_whisper() {
     const FF: usize = 6;
     let mut cx = Graph::new();
     let model = MiniWhisper::new(D, FF, 2, &mut cx);
-    let audio = cx.tensor((2, D));
-    let tokens = cx.tensor((1, D));
+    let audio = cx.tensor((2, D), DType::F32);
+    let tokens = cx.tensor((1, D), DType::F32);
     let _out = model.forward(audio, tokens).output();
     let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
         (audio.id, weights(2 * D, 1).into()),
@@ -351,26 +352,23 @@ fn election_row_whisper() {
 fn election_row_qwen3_moe() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
-    use luminal_nn::FeedForward;
     use mini_qwen3_moe::MiniQwen3Moe;
 
     const VOCAB: usize = 5;
     const D: usize = 4;
     let mut cx = Graph::new();
     let model = MiniQwen3Moe::new(VOCAB, D, 2, 1, 2, 1, &mut cx);
-    let ids = cx.tensor_dtyped(1, DType::Int);
-    let k_cache = cx.tensor((4, D));
-    let v_cache = cx.tensor((4, D));
-    let gather_idx = cx.tensor_dtyped(2, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
+    let ids = cx.tensor(1, DType::Int);
+    let k_cache = cx.tensor((4, D), DType::F32);
+    let v_cache = cx.tensor((4, D), DType::F32);
+    let gather_idx = cx.tensor(2, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];
     let (logits, _) = model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
     let _logits = logits.output();
 
     let block = &model.blocks[0];
-    let FeedForward::Moe(moe) = &block.ff else {
-        unreachable!()
-    };
+    let moe = &block.moe;
     let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
         (ids.id, vec![2i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 1).into()),
@@ -392,26 +390,23 @@ fn election_row_qwen3_moe() {
 fn election_row_gemma4_moe() {
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
-    use luminal_nn::FeedForward;
     use mini_gemma4_moe::MiniGemma4Moe;
 
     const VOCAB: usize = 5;
     const D: usize = 4;
     let mut cx = Graph::new();
     let model = MiniGemma4Moe::new(VOCAB, D, 2, 1, 2, 1, &mut cx);
-    let ids = cx.tensor_dtyped(1, DType::Int);
-    let k_cache = cx.tensor((4, D));
-    let v_cache = cx.tensor((4, D));
-    let gather_idx = cx.tensor_dtyped(2, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
+    let ids = cx.tensor(1, DType::Int);
+    let k_cache = cx.tensor((4, D), DType::F32);
+    let v_cache = cx.tensor((4, D), DType::F32);
+    let gather_idx = cx.tensor(2, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
     let caches = vec![(k_cache, v_cache)];
     let (logits, _) = model.forward(ids, &caches, gather_idx, scatter_idx, IntExpr::from(1usize));
     let _logits = logits.output();
 
     let block = &model.blocks[0];
-    let FeedForward::Moe(moe) = &block.ff else {
-        unreachable!()
-    };
+    let moe = &block.moe;
     let pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
         (ids.id, vec![2i32].into()),
         (model.embed.weight.id, weights(VOCAB * D, 1).into()),
@@ -448,16 +443,26 @@ fn election_row_gemma3() {
     const LAYERS: usize = 2;
 
     let mut cx = Graph::new();
-    let ids = cx.tensor_dtyped(1, DType::Int);
+    let ids = cx.tensor(1, DType::Int);
     let caches: Vec<_> = (0..LAYERS)
-        .map(|_| (cx.tensor((SLOTS, KV_DIM)), cx.tensor((SLOTS, KV_DIM))))
+        .map(|_| {
+            (
+                cx.tensor((SLOTS, KV_DIM), DType::F32),
+                cx.tensor((SLOTS, KV_DIM), DType::F32),
+            )
+        })
         .collect();
-    let gather_idx = cx.tensor_dtyped(2, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
+    let gather_idx = cx.tensor(2, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
     let rope_inputs: Vec<_> = (0..LAYERS)
-        .map(|_| (cx.tensor((1, HD)), cx.tensor((1, HD))))
+        .map(|_| {
+            (
+                cx.tensor((1, HD), DType::F32),
+                cx.tensor((1, HD), DType::F32),
+            )
+        })
         .collect();
-    let rope_rot = cx.tensor((HD, HD));
+    let rope_rot = cx.tensor((HD, HD), DType::F32);
     let model = MiniGemma3::new(VOCAB, D, FF, NH, NKV, HD, LAYERS, 1, 2, &mut cx);
     let (logits, _caches_out) = model.forward(
         ids,

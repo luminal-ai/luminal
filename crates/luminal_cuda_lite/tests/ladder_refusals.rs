@@ -19,11 +19,10 @@
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::graph::Graph;
 use luminal::implementation_search::ImplementationSearchOptions;
-use luminal::prelude::Ns;
-use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal::shape::IntExpr;
 use luminal_cuda_lite::CudaRuntime;
-use luminal_nn::LlamaBlock;
+use mini_llama3::{model_support::Namespace, MiniLlama3Layer};
 
 /// Deterministic pseudo-random weights (the nn harness's `weights`
 /// discipline: value content is irrelevant, only geometry matters).
@@ -48,24 +47,29 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
     const CTX: usize = 2;
 
     let mut cx = Graph::new();
-    let blocks: Vec<LlamaBlock> = (0..layers)
+    let blocks: Vec<MiniLlama3Layer> = (0..layers)
         .map(|l| {
-            LlamaBlock::new(
+            MiniLlama3Layer::new(
                 d,
                 ff,
                 n_heads,
                 n_kv,
-                &Ns::root().child("layers").index(l),
+                &Namespace::root().child("layers").index(l),
                 &mut cx,
             )
         })
         .collect();
-    let x = cx.tensor((1, d));
+    let x = cx.tensor((1, d), DType::F32);
     let caches: Vec<_> = (0..layers)
-        .map(|_| (cx.tensor((SLOTS, kv_dim)), cx.tensor((SLOTS, kv_dim))))
+        .map(|_| {
+            (
+                cx.tensor((SLOTS, kv_dim), DType::F32),
+                cx.tensor((SLOTS, kv_dim), DType::F32),
+            )
+        })
         .collect();
-    let gather_idx = cx.tensor_dtyped(CTX, luminal::dtype::DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, luminal::dtype::DType::Int);
+    let gather_idx = cx.tensor(CTX, luminal::dtype::DType::Int);
+    let scatter_idx = cx.tensor(1, luminal::dtype::DType::Int);
     let mut h = x;
     for (layer, block) in blocks.iter().enumerate() {
         let (next, kc, vc) = block.forward(

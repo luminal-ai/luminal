@@ -20,23 +20,26 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
-    use luminal_nn::KvCachePool;
-    use whisper::{Whisper, WhisperDims};
+    use whisper::{
+        model_support::{named_kv_cache_pool, Namespace},
+        Whisper, WhisperDims,
+    };
 
     let dims = WhisperDims::whisper_tiny_en();
     let mut cx = Graph::new();
     let model = Whisper::init(&mut cx, &dims);
-    let mel = cx.tensor((dims.n_mels, dims.mel_frames()));
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let gather_idx = cx.tensor_dtyped(dims.text_ctx, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool = KvCachePool::new(
+    let mel = cx.tensor((dims.n_mels, dims.mel_frames()), DType::F32);
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(dims.text_ctx, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_kv_cache_pool(
         &mut cx,
         dims.text_layers,
         dims.text_ctx,
         dims.state,
-        &Ns::root().child("cache"),
+        DType::F32,
+        &Namespace::root().child("cache"),
     );
     let encoded = model.encode(mel);
     let (logits, _) = model.decode_step(token, q_pos, encoded, &pool, gather_idx, scatter_idx);

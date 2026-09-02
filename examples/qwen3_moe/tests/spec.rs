@@ -1,5 +1,8 @@
 use luminal::prelude::*;
-use qwen3_moe::{Qwen3Moe, Qwen3MoeDims};
+use qwen3_moe::{
+    Qwen3Moe, Qwen3MoeDims,
+    model_support::{Namespace, named_kv_cache_pool},
+};
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {
     tensor
@@ -30,19 +33,20 @@ fn qwen3_30b_a3b_full_forward_contract_builds() {
     let d = Qwen3MoeDims::qwen3_30b_a3b();
     let mut cx = Graph::new();
     let model = Qwen3Moe::init(&mut cx, &d);
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let rope_cos = cx.tensor((1, d.head_dim));
-    let rope_sin = cx.tensor((1, d.head_dim));
-    let rope_rot = cx.tensor((d.head_dim, d.head_dim));
-    let gather_idx = cx.tensor_dtyped(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool = luminal_nn::KvCachePool::new(
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let rope_cos = cx.tensor((1, d.head_dim), DType::F32);
+    let rope_sin = cx.tensor((1, d.head_dim), DType::F32);
+    let rope_rot = cx.tensor((d.head_dim, d.head_dim), DType::F32);
+    let gather_idx = cx.tensor(SLOTS, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_kv_cache_pool(
         &mut cx,
         d.layers,
         SLOTS,
         d.kv_dim(),
-        &Ns::root().child("cache"),
+        DType::F32,
+        &Namespace::root().child("cache"),
     );
 
     let (logits, cache_out) = model.forward(

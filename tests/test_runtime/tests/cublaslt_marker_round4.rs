@@ -3,6 +3,7 @@
 //! OUTPUT layout (creator-rewrite certified).
 
 use luminal::bufferize::BufferId;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::{Bufferizable, ExtractedNode, Sharing};
 use test_runtime::cublaslt_marker::{CuDim, CuEpilogue, CublasLt, CublasLtDps, CublasLtForm};
@@ -87,8 +88,8 @@ fn t6a_bufferize_all_four_forms() {
             "base",
             CublasLtForm::Base,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
                 let _ = x.matmul(w).output();
             }),
         ),
@@ -96,9 +97,9 @@ fn t6a_bufferize_all_four_forms() {
             "bias",
             CublasLtForm::Bias,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
-                let b = cx.tensor(3usize);
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let b = cx.tensor(3usize, DType::F32);
                 let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
             }),
         ),
@@ -106,9 +107,9 @@ fn t6a_bufferize_all_four_forms() {
             "accumulate",
             CublasLtForm::Accumulate,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
-                let c = cx.tensor((4usize, 3usize));
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let c = cx.tensor((4usize, 3usize), DType::F32);
                 let _ = (x.matmul(w) + c).output();
             }),
         ),
@@ -116,10 +117,10 @@ fn t6a_bufferize_all_four_forms() {
             "accumulate-bias",
             CublasLtForm::AccumulateBias,
             Box::new(|cx: &mut Graph| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
-                let c = cx.tensor((4usize, 3usize));
-                let b = cx.tensor(3usize);
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
+                let c = cx.tensor((4usize, 3usize), DType::F32);
+                let b = cx.tensor(3usize, DType::F32);
                 let _ = ((x.matmul(w) + c) + b.expand_dim(0, 4usize)).output();
             }),
         ),
@@ -262,10 +263,10 @@ fn t6a_bufferize_all_four_forms() {
 fn t6a_accumulate_intermediate_c_donation_observed() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
-        let y = cx.tensor((4usize, 3usize));
-        let z = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let y = cx.tensor((4usize, 3usize), DType::F32);
+        let z = cx.tensor((4usize, 3usize), DType::F32);
         let c = y + z; // intermediate C (program-freed once consumed)
                        // Original boundary-flowing spelling (restored under
                        // escape-and-disclose: the view-produced bound output escapes);

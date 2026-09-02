@@ -2,79 +2,37 @@ use luminal::prelude::*;
 use luminal::shape::IntExpr;
 
 /// Token embedding: a (n_embeddings, embedding_dim) table indexed by Int
-/// token ids. Forward is a row-gather over the flattened index tensor —
-/// the B-tail path (gather1d → coordinate gather), no legacy Module/
-/// SerializeModule machinery; weights bind through the ladder like any
-/// other named tensor.
-pub struct Embedding {
-    pub weight: GraphTensor,
-    permute: bool,
-    embedding_dim: usize,
+/// token ids. The weight is supplied by the caller with shape
+/// `(n_embeddings, embedding_dim)`.
+pub fn embedding(input: GraphTensor, weight: GraphTensor) -> GraphTensor {
+    assert_eq!(input.dtype, DType::Int, "embedding indices must be Int");
+    assert_eq!(weight.rank(), 2, "embedding weight must be rank two");
+    let in_dims = input.dims();
+    let flat = input.flatten();
+    let rows = crate::attention::gather_rows(weight, flat); // (N, D)
+
+    // Rebuild the batch shape with recorded splits: (N, D) → (in_dims.., D)
+    let mut out = rows.view();
+    for axis in 0..in_dims.len().saturating_sub(1) {
+        let inner: IntExpr = in_dims[axis + 1..]
+            .iter()
+            .copied()
+            .fold(IntExpr::from(1), |acc, d| acc * d)
+            .simplify();
+        out = out.split_dims(axis, inner);
+    }
+    out.finish()
 }
 
-impl Embedding {
-    pub fn new(n_embeddings: usize, embedding_dim: usize, ns: &Ns, cx: &mut Graph) -> Self {
-        Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (n_embeddings, embedding_dim)),
-            permute: false,
-            embedding_dim,
-        }
-    }
-
-    pub fn new_permuted(
-        n_embeddings: usize,
-        embedding_dim: usize,
-        ns: &Ns,
-        cx: &mut Graph,
-    ) -> Self {
-        Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (embedding_dim, n_embeddings)),
-            permute: true,
-            embedding_dim,
-        }
-    }
-
-    /// input: Int indices of any shape; output: input.dims() + [embedding_dim].
-    pub fn forward(&self, input: GraphTensor) -> GraphTensor {
-        assert_eq!(input.dtype, DType::Int, "embedding indices must be Int");
-        let in_dims = input.dims();
-        let table = if self.permute {
-            self.weight.permute((1, 0))
-        } else {
-            self.weight
-        };
-        let flat = input.flatten();
-        let rows = crate::attention::gather_rows(table, flat, self.embedding_dim); // (N, D)
-
-        // Rebuild the batch shape: (N, D) → (in_dims.., D) — ONE apply
-        // (ruling 2026-08-26); the split arithmetic composes at map
-        // construction inside this one call.
-        let mut chain = rows.view();
-        for axis in 0..in_dims.len().saturating_sub(1) {
-            // Frontend simplification restored (revert ruling 2026-08-27).
-            let inner: IntExpr = in_dims[axis + 1..]
-                .iter()
-                .copied()
-                .fold(IntExpr::from(1), |acc, d| acc * d)
-                .simplify();
-            chain = chain.split_dims(axis, inner);
-        }
-        chain.finish()
-    }
-
-    /// Reverse from embedding space to token distribution (tied head).
-    pub fn reverse(&self, input: GraphTensor) -> GraphTensor {
-        if self.permute {
-            input.matmul(self.weight)
-        } else {
-            input.matmul(self.weight.permute((1, 0)))
-        }
-    }
+/// Project embedding-space values back to token logits using a tied embedding table.
+pub fn embedding_projection(input: GraphTensor, weight: GraphTensor) -> GraphTensor {
+    assert_eq!(weight.rank(), 2, "embedding weight must be rank two");
+    input.matmul(weight.permute((1, 0)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Embedding;
+    use super::embedding;
     use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
@@ -97,9 +55,9 @@ mod tests {
     #[test]
     fn embedding_looks_up_rows() {
         let mut cx = Graph::new();
-        let model = Embedding::new(3, 4, &Ns::root().child("embed"), &mut cx);
-        let ids = cx.tensor_dtyped(3, DType::Int);
-        let out = model.forward(ids).output();
+        let ids = cx.tensor(3, DType::Int);
+        let weight = cx.tensor((3, 4), DType::F32);
+        let out = embedding(ids, weight).output();
         assert_eq!(out.dims(), vec![IntExpr::from(3), IntExpr::from(4)]);
 
         let ids_data = vec![1i32, 0, 2];
@@ -111,12 +69,12 @@ mod tests {
 
         let mut data = FxHashMap::default();
         data.insert(ids.id, ids_data.clone().into());
-        data.insert(model.weight.id, WEIGHT.to_vec().into());
+        data.insert(weight.id, WEIGHT.to_vec().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.search(&data, &ImplementationSearchOptions::default())
             .expect("search finds a plan");
         rt.set_data(ids.id, ids_data);
-        rt.set_data(model.weight.id, WEIGHT.to_vec());
+        rt.set_data(weight.id, WEIGHT.to_vec());
         rt.execute().expect("winner executes");
         assert_close(rt.get_f32(out.id).expect("output"), &expected);
     }
@@ -126,9 +84,9 @@ mod tests {
     #[test]
     fn embedding_batches_rebuild_shape() {
         let mut cx = Graph::new();
-        let model = Embedding::new(3, 4, &Ns::root().child("embed"), &mut cx);
-        let ids = cx.tensor_dtyped((2, 3), DType::Int);
-        let out = model.forward(ids).output();
+        let ids = cx.tensor((2, 3), DType::Int);
+        let weight = cx.tensor((3, 4), DType::F32);
+        let out = embedding(ids, weight).output();
         assert_eq!(
             out.dims(),
             vec![IntExpr::from(2), IntExpr::from(3), IntExpr::from(4)]
@@ -143,12 +101,12 @@ mod tests {
 
         let mut data = FxHashMap::default();
         data.insert(ids.id, ids_data.clone().into());
-        data.insert(model.weight.id, WEIGHT.to_vec().into());
+        data.insert(weight.id, WEIGHT.to_vec().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.search(&data, &ImplementationSearchOptions::default())
             .expect("search finds a plan");
         rt.set_data(ids.id, ids_data);
-        rt.set_data(model.weight.id, WEIGHT.to_vec());
+        rt.set_data(weight.id, WEIGHT.to_vec());
         rt.execute().expect("winner executes");
         assert_close(rt.get_f32(out.id).expect("output"), &expected);
     }

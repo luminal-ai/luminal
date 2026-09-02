@@ -72,15 +72,15 @@ struct MiniTransformerLayer {
 impl MiniTransformerLayer {
     fn init(cx: &mut Graph) -> Self {
         Self {
-            attn_norm_w: cx.tensor(HIDDEN),
-            wq: cx.tensor((HIDDEN, HIDDEN)),
-            wk: cx.tensor((HIDDEN, HIDDEN)),
-            wv: cx.tensor((HIDDEN, HIDDEN)),
-            wo: cx.tensor((HIDDEN, HIDDEN)),
-            mlp_norm_w: cx.tensor(HIDDEN),
-            w_gate: cx.tensor((INTERMEDIATE, HIDDEN)),
-            w_up: cx.tensor((INTERMEDIATE, HIDDEN)),
-            w_down: cx.tensor((HIDDEN, INTERMEDIATE)),
+            attn_norm_w: cx.tensor(HIDDEN, DType::F32),
+            wq: cx.tensor((HIDDEN, HIDDEN), DType::F32),
+            wk: cx.tensor((HIDDEN, HIDDEN), DType::F32),
+            wv: cx.tensor((HIDDEN, HIDDEN), DType::F32),
+            wo: cx.tensor((HIDDEN, HIDDEN), DType::F32),
+            mlp_norm_w: cx.tensor(HIDDEN, DType::F32),
+            w_gate: cx.tensor((INTERMEDIATE, HIDDEN), DType::F32),
+            w_up: cx.tensor((INTERMEDIATE, HIDDEN), DType::F32),
+            w_down: cx.tensor((HIDDEN, INTERMEDIATE), DType::F32),
         }
     }
 
@@ -263,7 +263,7 @@ fn test_mini_transformer_layer() {
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((SEQ, HIDDEN));
+    let input = cx.tensor((SEQ, HIDDEN), DType::F32);
     let layer = MiniTransformerLayer::init(&mut cx);
     let out = layer.forward(input).output();
 
@@ -297,7 +297,7 @@ fn test_mini_transformer_two_layers() {
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((SEQ, HIDDEN));
+    let input = cx.tensor((SEQ, HIDDEN), DType::F32);
     let layer1 = MiniTransformerLayer::init(&mut cx);
     let layer2 = MiniTransformerLayer::init(&mut cx);
     let x = layer1.forward(input);
@@ -357,7 +357,7 @@ fn test_transformer_multi_seed() {
 
     for seed in [42u64, 99, 777] {
         let mut cx = Graph::default();
-        let input = cx.tensor((SEQ, HIDDEN));
+        let input = cx.tensor((SEQ, HIDDEN), DType::F32);
         let layer = MiniTransformerLayer::init(&mut cx);
         let out = layer.forward(input).output();
 
@@ -390,8 +390,8 @@ fn test_rms_norm_cuda() {
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((SEQ, HIDDEN));
-    let weight = cx.tensor(HIDDEN);
+    let input = cx.tensor((SEQ, HIDDEN), DType::F32);
+    let weight = cx.tensor(HIDDEN, DType::F32);
     let out = rms_norm(input, weight, 1e-5).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -426,11 +426,11 @@ fn test_self_attention_cuda() {
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((SEQ, HIDDEN));
-    let wq = cx.tensor((HIDDEN, HIDDEN));
-    let wk = cx.tensor((HIDDEN, HIDDEN));
-    let wv = cx.tensor((HIDDEN, HIDDEN));
-    let wo = cx.tensor((HIDDEN, HIDDEN));
+    let input = cx.tensor((SEQ, HIDDEN), DType::F32);
+    let wq = cx.tensor((HIDDEN, HIDDEN), DType::F32);
+    let wk = cx.tensor((HIDDEN, HIDDEN), DType::F32);
+    let wv = cx.tensor((HIDDEN, HIDDEN), DType::F32);
+    let wo = cx.tensor((HIDDEN, HIDDEN), DType::F32);
     let out = self_attention(input, wq, wk, wv, wo).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -473,10 +473,10 @@ fn test_swiglu_mlp_cuda() {
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((SEQ, HIDDEN));
-    let w_gate = cx.tensor((INTERMEDIATE, HIDDEN));
-    let w_up = cx.tensor((INTERMEDIATE, HIDDEN));
-    let w_down = cx.tensor((HIDDEN, INTERMEDIATE));
+    let input = cx.tensor((SEQ, HIDDEN), DType::F32);
+    let w_gate = cx.tensor((INTERMEDIATE, HIDDEN), DType::F32);
+    let w_up = cx.tensor((INTERMEDIATE, HIDDEN), DType::F32);
+    let w_down = cx.tensor((HIDDEN, INTERMEDIATE), DType::F32);
     let out = swiglu_mlp(input, w_gate, w_up, w_down).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -522,7 +522,7 @@ fn test_rolled_chained_scalar_muls() {
         return;
     };
     let mut cx = Graph::default();
-    let x = cx.tensor((1, 4, 32));
+    let x = cx.tensor((1, 4, 32), DType::F32);
     let chained = ((x * 2.0_f32) * 3.0_f32) * 5.0_f32;
     let out = (chained + x).output();
 

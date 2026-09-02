@@ -7,6 +7,7 @@
 #![cfg(feature = "device")]
 
 use luminal::buffer_tensor_ir::TypedBuffer;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
@@ -70,8 +71,8 @@ fn assert_close(want: &[f32], got: &[f32], what: &str) {
 #[test]
 fn elementwise_chain() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize));
-    let b = cx.tensor((2usize, 3usize));
+    let a = cx.tensor((2usize, 3usize), DType::F32);
+    let b = cx.tensor((2usize, 3usize), DType::F32);
     let out = ((a + b) * a).sqrt().exp().output();
     let (want, got) = run_both(
         &cx,
@@ -87,7 +88,7 @@ fn elementwise_chain() {
 #[test]
 fn reduce_and_broadcast() {
     let mut cx = Graph::new();
-    let a = cx.tensor((3usize, 4usize));
+    let a = cx.tensor((3usize, 4usize), DType::F32);
     // Softmax-ish: exp(x) / sum(exp(x)) over the last axis.
     let e = a.exp();
     let out = (e / e.sum(1).expand_dim(1, 4)).output();
@@ -102,7 +103,7 @@ fn reduce_and_broadcast() {
 #[test]
 fn movement_materialize() {
     let mut cx = Graph::new();
-    let a = cx.tensor((4usize, 5usize));
+    let a = cx.tensor((4usize, 5usize), DType::F32);
     // slice + pad => index-map materialize territory.
     let out = a
         .slice((1..3, 1..4))
@@ -116,7 +117,7 @@ fn movement_materialize() {
 fn iota_arange() {
     let mut cx = Graph::new();
     let idx = cx.arange(6usize);
-    let a = cx.tensor(6usize);
+    let a = cx.tensor(6usize, DType::F32);
     let out = (a * idx.cast(luminal::dtype::DType::F32)).output();
     let (want, got) = run_both(&cx, &[(a.id, vec![2.0; 6])], out.id);
     assert_close(&want, &got, "arange*x");
@@ -125,7 +126,7 @@ fn iota_arange() {
 #[test]
 fn gather_rows() {
     let mut cx = Graph::new();
-    let table = cx.tensor((5usize, 3usize));
+    let table = cx.tensor((5usize, 3usize), DType::F32);
     let rows = cx.arange(2usize); // rows 0 and 1
     let out = table.gather1d(rows).output();
     let (want, got) = run_both(
@@ -139,8 +140,8 @@ fn gather_rows() {
 #[test]
 fn scatter_write() {
     let mut cx = Graph::new();
-    let init = cx.tensor(6usize);
-    let src = cx.tensor(2usize);
+    let init = cx.tensor(6usize, DType::F32);
+    let src = cx.tensor(2usize, DType::F32);
     let coords = cx.arange(2usize); // write positions 0 and 1
     let out = init.scatter(&[coords], src).output();
     let (want, got) = run_both(

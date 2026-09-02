@@ -107,9 +107,9 @@ fn test_scatter_copy_and_nocopy_coexist_when_dest_unshared() {
     let mut cx = Graph::default();
 
     // dest: a 10-element buffer, src: 3 values, indexes: 3 indices
-    let dest = cx.tensor(10).persist();
-    let src = cx.tensor(3).persist();
-    let indexes = cx.tensor_dtyped(3, DType::Int).persist();
+    let dest = cx.tensor(10, DType::F32).persist();
+    let src = cx.tensor(3, DType::F32).persist();
+    let indexes = cx.tensor(3, DType::Int).persist();
 
     // scatter src into dest at indexes
     let _result = src.scatter(indexes, dest).output();
@@ -131,10 +131,10 @@ fn test_scatter_copy_and_nocopy_coexist_when_dest_unshared() {
 #[test]
 fn test_scatter_nocopy_rejected_when_old_dest_is_observed_output() {
     let mut cx = Graph::default();
-    let dest = cx.tensor(10);
+    let dest = cx.tensor(10, DType::F32);
     dest.output();
-    let src = cx.tensor(3).persist();
-    let indexes = cx.tensor_dtyped(3, DType::Int).persist();
+    let src = cx.tensor(3, DType::F32).persist();
+    let indexes = cx.tensor(3, DType::Int).persist();
     src.scatter(indexes, dest).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -163,9 +163,9 @@ fn test_scatter_nocopy_candidate_rejected_when_dest_has_unordered_read() {
     let mut cx = Graph::default();
 
     // dest: a 10-element buffer, src: 3 values, indexes: 3 indices
-    let dest = cx.tensor(10).persist();
-    let src = cx.tensor(3).persist();
-    let indexes = cx.tensor_dtyped(3, DType::Int).persist();
+    let dest = cx.tensor(10, DType::F32).persist();
+    let src = cx.tensor(3, DType::F32).persist();
+    let indexes = cx.tensor(3, DType::Int).persist();
 
     // scatter src into dest at indexes
     let scatter_result = src.scatter(indexes, dest);
@@ -201,10 +201,10 @@ fn test_scatter_nocopy_candidate_rejected_for_unordered_later_input_read() {
 
     let mut cx = Graph::default();
 
-    let dest = cx.tensor(10).persist();
-    let src = cx.tensor(3).persist();
-    let scatter_indexes = cx.tensor_dtyped(3, DType::Int).persist();
-    let read_indexes = cx.tensor_dtyped(1, DType::Int).persist();
+    let dest = cx.tensor(10, DType::F32).persist();
+    let src = cx.tensor(3, DType::F32).persist();
+    let scatter_indexes = cx.tensor(3, DType::Int).persist();
+    let read_indexes = cx.tensor(1, DType::Int).persist();
 
     let scatter_result = src.scatter(scatter_indexes, dest);
     let _dest_also_read = dest.gather(read_indexes).output();
@@ -226,9 +226,9 @@ fn test_scatter_nocopy_candidate_rejected_for_unordered_later_input_read() {
 #[test]
 fn test_scatter_nocopy_allows_ordered_prior_read() {
     let mut cx = Graph::default();
-    let dest = cx.tensor(5).persist();
-    let delta = cx.tensor(5).persist();
-    let indexes = cx.tensor_dtyped(5, DType::Int).persist();
+    let dest = cx.tensor(5, DType::F32).persist();
+    let delta = cx.tensor(5, DType::F32).persist();
+    let indexes = cx.tensor(5, DType::Int).persist();
     let src = dest + delta;
     src.scatter(indexes, dest).output();
 
@@ -249,9 +249,9 @@ fn test_scatter_nocopy_not_selected_for_expanded_dest_layout() {
 
     let mut cx = Graph::default();
 
-    let dest = cx.tensor(128).expand_dim(0, 4).persist();
-    let src = cx.tensor((4, 128)).persist();
-    let indexes = cx.tensor_dtyped((4, 128), DType::Int).persist();
+    let dest = cx.tensor(128, DType::F32).expand_dim(0, 4).persist();
+    let src = cx.tensor((4, 128), DType::F32).persist();
+    let indexes = cx.tensor((4, 128), DType::Int).persist();
 
     let _result = src.scatter(indexes, dest).output();
 
@@ -280,11 +280,11 @@ fn test_scatter_execution_correctness() {
     let mut cx = Graph::default();
 
     // dest: [0.0, 1.0, 2.0, 3.0, 4.0]
-    let dest = cx.tensor(5).persist();
+    let dest = cx.tensor(5, DType::F32).persist();
     // src: [10.0, 20.0, 30.0]
-    let src = cx.tensor(3).persist();
+    let src = cx.tensor(3, DType::F32).persist();
     // indexes: [1, 3, 4]
-    let indexes = cx.tensor_dtyped(3, DType::Int).persist();
+    let indexes = cx.tensor(3, DType::Int).persist();
 
     let result = src.scatter(indexes, dest).output();
 
@@ -334,11 +334,11 @@ fn test_scatter_kv_cache_roundtrip() {
     let mut cx = Graph::default();
 
     // KV cache: [5] elements (simulating a small cache)
-    let cache_in = cx.named_tensor("cache", 5).persist();
+    let cache_in = cx.named_tensor("cache", 5, DType::F32).persist();
     // New value to scatter: [1] element
-    let src = cx.tensor(1).persist();
+    let src = cx.tensor(1, DType::F32).persist();
     // Index: [1] element (position to write)
-    let indexes = cx.tensor_dtyped(1, DType::Int).persist();
+    let indexes = cx.tensor(1, DType::Int).persist();
 
     // scatter src into cache at index position
     let cache_out = src.scatter(indexes, cache_in);
@@ -435,13 +435,13 @@ fn test_scatter_dual_cache() {
     let mut cx = Graph::default();
 
     // Two caches (like K and V)
-    let k_cache = cx.named_tensor("k_cache", 5).persist();
-    let v_cache = cx.named_tensor("v_cache", 5).persist();
+    let k_cache = cx.named_tensor("k_cache", 5, DType::F32).persist();
+    let v_cache = cx.named_tensor("v_cache", 5, DType::F32).persist();
 
     // Input values
-    let k_new = cx.tensor(1).persist();
-    let v_new = cx.tensor(1).persist();
-    let indexes = cx.tensor_dtyped(1, DType::Int).persist();
+    let k_new = cx.tensor(1, DType::F32).persist();
+    let v_new = cx.tensor(1, DType::F32).persist();
+    let indexes = cx.tensor(1, DType::Int).persist();
 
     // Scatter into both caches
     let k_out = k_new.scatter(indexes, k_cache);
@@ -568,11 +568,11 @@ fn test_scatter_dual_cache_accumulates_without_roundtrip() {
 
     let mut cx = Graph::default();
 
-    let k_cache = cx.named_tensor("k_cache", 5).persist();
-    let v_cache = cx.named_tensor("v_cache", 5).persist();
-    let k_new = cx.tensor(1).persist();
-    let v_new = cx.tensor(1).persist();
-    let indexes = cx.tensor_dtyped(1, DType::Int).persist();
+    let k_cache = cx.named_tensor("k_cache", 5, DType::F32).persist();
+    let v_cache = cx.named_tensor("v_cache", 5, DType::F32).persist();
+    let k_new = cx.tensor(1, DType::F32).persist();
+    let v_new = cx.tensor(1, DType::F32).persist();
+    let indexes = cx.tensor(1, DType::Int).persist();
 
     let k_out = k_new.scatter(indexes, k_cache);
     let v_out = v_new.scatter(indexes, v_cache);
@@ -637,14 +637,10 @@ fn test_scatter_rows_dynamic_prefill_roundtrip() {
     const S: usize = 5;
 
     let mut cx = Graph::default();
-    let src = cx.named_tensor("src", ('s', D)).persist();
-    let scatter_idx = cx
-        .named_tensor_dtyped("scatter_idx", 's', DType::Int)
-        .persist();
-    let gather_idx = cx
-        .named_tensor_dtyped("gather_idx", 's', DType::Int)
-        .persist();
-    let cache = cx.named_tensor("cache", (SLOTS, D)).persist();
+    let src = cx.named_tensor("src", ('s', D), DType::F32).persist();
+    let scatter_idx = cx.named_tensor("scatter_idx", 's', DType::Int).persist();
+    let gather_idx = cx.named_tensor("gather_idx", 's', DType::Int).persist();
+    let cache = cx.named_tensor("cache", (SLOTS, D), DType::F32).persist();
 
     let updated = scatter_rows(src, scatter_idx, cache, D);
     let gathered = gather_rows(updated, gather_idx, D).output();
@@ -819,18 +815,20 @@ fn test_tiny_gqa_attention_batched_matches_sequential_prefill() {
     const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
 
     let mut cx = Graph::default();
-    let q = cx.named_tensor("q", ('s', Q_DIM)).persist();
-    let k = cx.named_tensor("k", ('s', KV_DIM)).persist();
-    let v = cx.named_tensor("v", ('s', KV_DIM)).persist();
-    let scatter_idx = cx
-        .named_tensor_dtyped("scatter_idx", 's', DType::Int)
+    let q = cx.named_tensor("q", ('s', Q_DIM), DType::F32).persist();
+    let k = cx.named_tensor("k", ('s', KV_DIM), DType::F32).persist();
+    let v = cx.named_tensor("v", ('s', KV_DIM), DType::F32).persist();
+    let scatter_idx = cx.named_tensor("scatter_idx", 's', DType::Int).persist();
+    let gather_idx = cx.named_tensor("gather_idx", 'c', DType::Int).persist();
+    let attn_mask = cx
+        .named_tensor("attn_mask", ('s', 'c'), DType::F32)
         .persist();
-    let gather_idx = cx
-        .named_tensor_dtyped("gather_idx", 'c', DType::Int)
+    let k_cache = cx
+        .named_tensor("k_cache", (SLOTS, KV_DIM), DType::F32)
         .persist();
-    let attn_mask = cx.named_tensor("attn_mask", ('s', 'c')).persist();
-    let k_cache = cx.named_tensor("k_cache", (SLOTS, KV_DIM)).persist();
-    let v_cache = cx.named_tensor("v_cache", (SLOTS, KV_DIM)).persist();
+    let v_cache = cx
+        .named_tensor("v_cache", (SLOTS, KV_DIM), DType::F32)
+        .persist();
     let (attn_out, k_out, v_out) = tiny_gqa_attention(
         q,
         k,
@@ -947,14 +945,14 @@ fn test_original_gqa_attention_batched_matches_sequential_prefill() {
     const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
 
     let mut cx = Graph::default();
-    let q = cx.named_tensor("q", ('s', Q_DIM)).persist();
-    let k = cx.named_tensor("k", ('s', KV_DIM)).persist();
-    let v = cx.named_tensor("v", ('s', KV_DIM)).persist();
+    let q = cx.named_tensor("q", ('s', Q_DIM), DType::F32).persist();
+    let k = cx.named_tensor("k", ('s', KV_DIM), DType::F32).persist();
+    let v = cx.named_tensor("v", ('s', KV_DIM), DType::F32).persist();
     let k_cache = cx
-        .named_tensor("k_cache", (N_KV_HEADS, SLOTS, HEAD_DIM))
+        .named_tensor("k_cache", (N_KV_HEADS, SLOTS, HEAD_DIM), DType::F32)
         .persist();
     let v_cache = cx
-        .named_tensor("v_cache", (N_KV_HEADS, SLOTS, HEAD_DIM))
+        .named_tensor("v_cache", (N_KV_HEADS, SLOTS, HEAD_DIM), DType::F32)
         .persist();
     let (attn_out, k_out, v_out) = tiny_original_gqa_attention(
         q, k, v, k_cache, v_cache, N_HEADS, N_KV_HEADS, HEAD_DIM, SLOTS,
@@ -1045,7 +1043,7 @@ fn test_dynamic_expanded_causal_mask_softmax() {
     const S: usize = 5;
 
     let mut cx = Graph::default();
-    let mask = cx.named_tensor("mask", ('s', 'c')).persist();
+    let mask = cx.named_tensor("mask", ('s', 'c'), DType::F32).persist();
     let weights = mask.expand_dim(0, H).softmax(2).output();
 
     cx.set_dim('s', S);
@@ -1100,8 +1098,10 @@ fn test_tiny_gqa_value_matmul_with_expanded_kv() {
     const KV_DIM: usize = N_KV_HEADS * HEAD_DIM;
 
     let mut cx = Graph::default();
-    let v_full = cx.named_tensor("v_full", ('c', KV_DIM)).persist();
-    let mask = cx.named_tensor("mask", ('s', 'c')).persist();
+    let v_full = cx
+        .named_tensor("v_full", ('c', KV_DIM), DType::F32)
+        .persist();
+    let mask = cx.named_tensor("mask", ('s', 'c'), DType::F32).persist();
     let v = gqa_expand_v(
         v_full,
         IntExpr::from('c'),
@@ -1180,9 +1180,11 @@ fn test_broadcast_merge_gqa_value_matmul_matches_cpu() {
 
     let mut cx = Graph::default();
     let v_full = cx
-        .named_tensor("v_full", (N_KV_HEADS, 'c', HEAD_DIM))
+        .named_tensor("v_full", (N_KV_HEADS, 'c', HEAD_DIM), DType::F32)
         .persist();
-    let weights = cx.named_tensor("weights", (N_HEADS, 's', 'c')).persist();
+    let weights = cx
+        .named_tensor("weights", (N_HEADS, 's', 'c'), DType::F32)
+        .persist();
     let v_3d = v_full.expand_dim(1, KV_GROUPS).merge_dims(0, 1);
     let out = weights.matmul(v_3d).output();
 
@@ -1247,7 +1249,7 @@ fn test_transpose_merge_split_roundtrip_matches_cpu() {
     const D: usize = 6;
 
     let mut cx = Graph::default();
-    let x = cx.named_tensor("x", (H, 's', D)).persist();
+    let x = cx.named_tensor("x", (H, 's', D), DType::F32).persist();
     let flat = x.transpose(0, 1).merge_dims(1, 2);
     let roundtrip = flat.split_dims(1, D).transpose(0, 1).output();
 
@@ -1289,8 +1291,8 @@ fn test_batched_moe_x_expand_matmul_matches_cpu() {
     const O: usize = 11;
 
     let mut cx = Graph::default();
-    let x = cx.named_tensor("x", ('s', H)).persist();
-    let w = cx.named_tensor("w", ('s', K, H, O)).persist();
+    let x = cx.named_tensor("x", ('s', H), DType::F32).persist();
+    let w = cx.named_tensor("w", ('s', K, H, O), DType::F32).persist();
     let out = x
         .expand_dim(1, K)
         .unsqueeze(2)
@@ -1352,7 +1354,7 @@ fn test_batched_topk_axis1_matches_cpu() {
     const K: usize = 8;
 
     let mut cx = Graph::default();
-    let routing = cx.named_tensor("routing", ('s', E)).persist();
+    let routing = cx.named_tensor("routing", ('s', E), DType::F32).persist();
     let topk = routing.topk_indexes(K, 1).output();
 
     cx.set_dim('s', S);
@@ -1395,7 +1397,7 @@ fn test_batched_argsort_axis1_matches_cpu() {
     const E: usize = 128;
 
     let mut cx = Graph::default();
-    let routing = cx.named_tensor("routing", ('s', E)).persist();
+    let routing = cx.named_tensor("routing", ('s', E), DType::F32).persist();
     let argsort = routing.argsort(1, true).output();
 
     cx.set_dim('s', S);
@@ -1439,7 +1441,7 @@ fn test_dynamic_3d_sum_axis1_matches_cpu() {
     const B: usize = 11;
 
     let mut cx = Graph::default();
-    let input = cx.named_tensor("input", ('s', A, B)).persist();
+    let input = cx.named_tensor("input", ('s', A, B), DType::F32).persist();
     let out = input.sum(1).output();
 
     cx.set_dim('s', S);
@@ -1489,7 +1491,7 @@ fn test_batched_argsort_ranks_axis1_matches_cpu() {
     const E: usize = 128;
 
     let mut cx = Graph::default();
-    let routing = cx.named_tensor("routing", ('s', E)).persist();
+    let routing = cx.named_tensor("routing", ('s', E), DType::F32).persist();
     let z = IntExpr::from('z');
     let row = z / (E * E);
     let compare_col = (z / E) % E;
@@ -1547,9 +1549,7 @@ fn test_dynamic_3d_flat_index_iota_rows() {
     let z = IntExpr::from('z');
     let row = z / (E * E);
     let col = z % E;
-    let idx = cx
-        .iota(row * E + col, (IntExpr::from('s'), E, E))
-        .output();
+    let idx = cx.iota(row * E + col, (IntExpr::from('s'), E, E)).output();
 
     cx.set_dim('s', S);
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -1585,9 +1585,7 @@ fn test_dynamic_2d_to_3d_gather_rows() {
     const E: usize = 128;
 
     let mut cx = Graph::default();
-    let data = cx
-        .named_tensor_dtyped("data", ('s', E), DType::Int)
-        .persist();
+    let data = cx.named_tensor("data", ('s', E), DType::Int).persist();
     let z = IntExpr::from('z');
     let row = z / (E * E);
     let col = z % E;
@@ -1634,10 +1632,10 @@ fn test_batched_gather_experts_matches_cpu() {
     const D2: usize = 7;
 
     let mut cx = Graph::default();
-    let topk = cx
-        .named_tensor_dtyped("topk", ('s', K), DType::Int)
+    let topk = cx.named_tensor("topk", ('s', K), DType::Int).persist();
+    let weights = cx
+        .named_tensor("weights", (E, D1, D2), DType::F32)
         .persist();
-    let weights = cx.named_tensor("weights", (E, D1, D2)).persist();
     let io = D1 * D2;
     let base = topk * io;
     let within = cx.iota(IntExpr::from('z'), (D1, D2));

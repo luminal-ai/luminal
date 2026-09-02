@@ -889,7 +889,7 @@ pub fn test_unary_cuda<T: TestDType>(
     let n_elements: usize = shape.iter().product();
 
     let mut cx = Graph::default();
-    let a = cx.tensor(shape.clone());
+    let a = cx.tensor(shape.clone(), DType::F32);
     let b = func(a).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -961,8 +961,8 @@ pub fn test_binary_cuda<T: TestDType>(
     let b_elements: usize = b_shape.iter().product();
 
     let mut cx = Graph::default();
-    let a: GraphTensor = cx.tensor(a_shape.clone());
-    let b = cx.tensor(b_shape.clone());
+    let a: GraphTensor = cx.tensor(a_shape.clone(), DType::F32);
+    let b = cx.tensor(b_shape.clone(), DType::F32);
     let c = func(a, b).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -1028,8 +1028,8 @@ pub fn test_mod(
     let b_elements: usize = b_shape.iter().product();
 
     let mut cx = Graph::default();
-    let a = cx.tensor(a_shape.clone());
-    let b = cx.tensor(b_shape.clone());
+    let a = cx.tensor(a_shape.clone(), DType::F32);
+    let b = cx.tensor(b_shape.clone(), DType::F32);
     let c = func(a, b).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());

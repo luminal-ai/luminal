@@ -185,8 +185,8 @@ mod tests {
         // 2026-08-27 ruling: the F32-accumulator contract is the user's
         // explicit cast spelling — matmul itself never casts.
         let mut cx = Graph::new();
-        let lhs = cx.tensor_dtyped((2, 4), DType::F8E4M3);
-        let rhs = cx.tensor_dtyped((4, 3), DType::F8E4M3);
+        let lhs = cx.tensor((2, 4), DType::F8E4M3);
+        let rhs = cx.tensor((4, 3), DType::F8E4M3);
 
         let out = lhs.cast(DType::F32).matmul(rhs.cast(DType::F32)).output();
 
@@ -204,8 +204,8 @@ mod tests {
         // 2026-08-27 ruling: fp8 x fp8 is NOT special — matmul is
         // broadcast+reduce in the shared dtype, no casts, no poison.
         let mut cx = Graph::new();
-        let lhs = cx.tensor_dtyped((2, 4), DType::F8E4M3);
-        let rhs = cx.tensor_dtyped((4, 3), DType::F8E4M3);
+        let lhs = cx.tensor((2, 4), DType::F8E4M3);
+        let rhs = cx.tensor((4, 3), DType::F8E4M3);
 
         let out = lhs.matmul(rhs).output();
 
@@ -221,8 +221,8 @@ mod tests {
     #[test]
     fn mixed_dtype_matmul_without_explicit_precision_is_a_loud_recorder_error() {
         let mut cx = Graph::new();
-        let lhs = cx.tensor_dtyped((2, 4), DType::F32);
-        let rhs = cx.tensor_dtyped((4, 3), DType::F16);
+        let lhs = cx.tensor((2, 4), DType::F32);
+        let rhs = cx.tensor((4, 3), DType::F16);
 
         let _ = lhs.matmul(rhs);
 
@@ -240,8 +240,8 @@ mod tests {
         // panic with a misleading message instead of surfacing the
         // cast-explicitly poison.
         let mut cx = Graph::new();
-        let lhs = cx.tensor_dtyped((2, 4), DType::Int);
-        let rhs = cx.tensor_dtyped((4, 3), DType::F32);
+        let lhs = cx.tensor((2, 4), DType::Int);
+        let rhs = cx.tensor((4, 3), DType::F32);
 
         let _ = lhs.matmul(rhs);
 

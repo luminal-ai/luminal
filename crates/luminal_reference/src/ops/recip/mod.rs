@@ -9,8 +9,7 @@ use luminal::layout_ir::{
 ///
 /// Functional form: pure dataflow, conservative [`Bufferizable`] defaults
 /// (every operand read, the result freshly allocated). Elementwise: element
-/// `i` of `input` is read before element `i` of `out` is written (op-level
-/// all-pairs claim — see the NOTE on `bufferizes_to_elementwise_access`).
+/// `i` of `input` is read before element `i` of `out` is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecipFunctional;
 

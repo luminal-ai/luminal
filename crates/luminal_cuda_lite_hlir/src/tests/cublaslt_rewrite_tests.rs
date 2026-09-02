@@ -168,9 +168,9 @@ fn build_mixed_chain_graph(
 ) -> (Graph, NodeIndex, NodeIndex, NodeIndex, NodeIndex) {
     let m = m.into();
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let pre = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let pre = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = ((a + pre).matmul(b).exp()).output();
     (cx, a.id, pre.id, b.id, out.id)
 }
@@ -489,8 +489,8 @@ fn cublaslt_rewrites_cover_batched_row_order_layout_pairs() {
 #[test]
 fn cublaslt_rewrites_cover_flux2_qk_transposed_matmul() {
     let mut cx = Graph::new();
-    let q = cx.tensor((8usize, 4usize));
-    let k = cx.tensor((8usize, 4usize));
+    let q = cx.tensor((8usize, 4usize), DType::F32);
+    let k = cx.tensor((8usize, 4usize), DType::F32);
     let _out = q.matmul(k.t()).output();
 
     assert_cublaslt_rewrite(cx, "flux2 q @ k.t()", |llir| {
@@ -502,9 +502,9 @@ fn cublaslt_rewrites_cover_flux2_qk_transposed_matmul() {
 #[test]
 fn cublaslt_rewrites_cover_flux2_linear_bias_epilogue() {
     let mut cx = Graph::new();
-    let x = cx.tensor((8usize, 4usize));
-    let weight = cx.tensor((6usize, 4usize));
-    let bias = cx.tensor(6usize);
+    let x = cx.tensor((8usize, 4usize), DType::F32);
+    let weight = cx.tensor((6usize, 4usize), DType::F32);
+    let bias = cx.tensor(6usize, DType::F32);
     let _out = (x.matmul(weight.t()) + bias.expand_dim(0, 8usize)).output();
 
     assert_cublaslt_epilogue_rewrite(
@@ -518,8 +518,8 @@ fn cublaslt_rewrites_cover_flux2_linear_bias_epilogue() {
 #[test]
 fn cublaslt_preserves_legal_matmul_backend_choices() {
     let mut cx = Graph::new();
-    let q = cx.tensor((8usize, 4usize));
-    let k = cx.tensor((8usize, 4usize));
+    let q = cx.tensor((8usize, 4usize), DType::F32);
+    let k = cx.tensor((8usize, 4usize), DType::F32);
     let _out = q.matmul(k.t()).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -560,15 +560,15 @@ fn permute_matmul_columns(tensor: GraphTensor) -> GraphTensor {
 #[test]
 fn cublaslt_and_gemv_reject_permuted_mul_to_sum_layout() {
     let mut cx = Graph::new();
-    let activation = cx.tensor_dtyped((1usize, 5usize), DType::Bf16);
-    let weight = cx.tensor_dtyped((6usize, 5usize), DType::Bf16);
+    let activation = cx.tensor((1usize, 5usize), DType::Bf16);
+    let weight = cx.tensor((6usize, 5usize), DType::Bf16);
     matmul_with_permuted_reduction_columns(activation, weight.t()).output();
 
     // Mirror GraphTensor::matmul's explicit FP8 -> F32 semantic promotion so
     // the same malformed reduction also exercises the FP8 cuBLASLt/GEMV
     // consumers, not only the ordinary 16-bit families.
-    let fp8_activation = cx.tensor_dtyped((1usize, 5usize), DType::F8E4M3);
-    let fp8_weight = cx.tensor_dtyped((6usize, 5usize), DType::F8E4M3);
+    let fp8_activation = cx.tensor((1usize, 5usize), DType::F8E4M3);
+    let fp8_weight = cx.tensor((6usize, 5usize), DType::F8E4M3);
     matmul_with_permuted_reduction_columns(
         fp8_activation.cast(DType::F32),
         fp8_weight.t().cast(DType::F32),
@@ -577,9 +577,9 @@ fn cublaslt_and_gemv_reject_permuted_mul_to_sum_layout() {
 
     // Exercise the scaled-quantized spelling consumed by KernelGemvF8 and
     // cublaslt_scaled as well.
-    let raw_activation = cx.tensor((1usize, 5usize));
-    let input_scale = cx.tensor(());
-    let weight_scale = cx.tensor(());
+    let raw_activation = cx.tensor((1usize, 5usize), DType::F32);
+    let input_scale = cx.tensor((), DType::F32);
+    let weight_scale = cx.tensor((), DType::F32);
     let quantized = (raw_activation / input_scale.expand_rhs((1usize, 5usize))).cast(DType::F8E4M3);
     let scaled_sum = matmul_with_permuted_reduction_columns(
         quantized.cast(DType::F32),
@@ -613,17 +613,17 @@ fn cublaslt_and_gemv_reject_permuted_mul_to_sum_layout() {
 #[test]
 fn cublaslt_post_matmul_fusions_reject_permuted_output_layout() {
     let mut alpha_cx = Graph::new();
-    let a = alpha_cx.tensor((4usize, 5usize));
-    let b = alpha_cx.tensor((5usize, 6usize));
+    let a = alpha_cx.tensor((4usize, 5usize), DType::F32);
+    let b = alpha_cx.tensor((5usize, 6usize), DType::F32);
     (permute_matmul_columns(a.matmul(b)) * 1.5).output();
     assert_no_forced_cublaslt_llir_where(&mut alpha_cx, "permuted matmul alpha", |llir| {
         cublaslt_scale_value_tuples(llir).contains(&(1.5, 0.0))
     });
 
     let mut beta_cx = Graph::new();
-    let a = beta_cx.tensor((4usize, 5usize));
-    let b = beta_cx.tensor((5usize, 6usize));
-    let c = beta_cx.tensor((4usize, 6usize));
+    let a = beta_cx.tensor((4usize, 5usize), DType::F32);
+    let b = beta_cx.tensor((5usize, 6usize), DType::F32);
+    let c = beta_cx.tensor((4usize, 6usize), DType::F32);
     (permute_matmul_columns(a.matmul(b)) + c).output();
     assert_no_forced_cublaslt_llir_where(&mut beta_cx, "permuted matmul beta", |llir| {
         cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
@@ -635,9 +635,9 @@ fn cublaslt_beta_rejects_clamped_c_leading_dimension() {
     let z = IntExpr::from('z');
 
     let mut ld_cx = Graph::new();
-    let a = ld_cx.tensor((4usize, 5usize));
-    let b = ld_cx.tensor((5usize, 6usize));
-    let mut c = ld_cx.tensor((4usize, 6usize));
+    let a = ld_cx.tensor((4usize, 5usize), DType::F32);
+    let b = ld_cx.tensor((5usize, 6usize), DType::F32);
+    let mut c = ld_cx.tensor((4usize, 6usize), DType::F32);
     // Logical rows overlap: ldc=3 is smaller than the six columns. Runtime
     // clamping ldc to six would silently change which C values are added.
     c.shape = ShapeTracker::new_strided((4usize, 6usize), (z * 3usize, z));
@@ -650,9 +650,11 @@ fn cublaslt_beta_rejects_clamped_c_leading_dimension() {
 #[test]
 fn cublaslt_beta_preserves_batched_broadcast_c() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 4usize, 5usize));
-    let b = cx.tensor((2usize, 5usize, 6usize));
-    let c = cx.tensor((4usize, 6usize)).expand_dim(0, 2usize);
+    let a = cx.tensor((2usize, 4usize, 5usize), DType::F32);
+    let b = cx.tensor((2usize, 5usize, 6usize), DType::F32);
+    let c = cx
+        .tensor((4usize, 6usize), DType::F32)
+        .expand_dim(0, 2usize);
     (a.matmul(b) + c).output();
 
     assert_cublaslt_rewrite(cx, "batched broadcast C", |llir| {
@@ -663,14 +665,14 @@ fn cublaslt_beta_preserves_batched_broadcast_c() {
 #[test]
 fn cublaslt_epilogues_reject_permuted_output_layout() {
     let mut relu_cx = Graph::new();
-    let a = relu_cx.tensor((4usize, 5usize));
-    let b = relu_cx.tensor((5usize, 6usize));
+    let a = relu_cx.tensor((4usize, 5usize), DType::F32);
+    let b = relu_cx.tensor((5usize, 6usize), DType::F32);
     permute_matmul_columns(a.matmul(b)).relu().output();
     assert_no_forced_cublaslt_epilogue_rewrite(relu_cx, "permuted matmul relu", "RELU", None);
 
     let mut gelu_cx = Graph::new();
-    let a = gelu_cx.tensor((4usize, 5usize));
-    let b = gelu_cx.tensor((5usize, 6usize));
+    let a = gelu_cx.tensor((4usize, 5usize), DType::F32);
+    let b = gelu_cx.tensor((5usize, 6usize), DType::F32);
     permute_matmul_columns(a.matmul(b))
         .gelu_fast_tanh_approximation()
         .output();
@@ -687,16 +689,22 @@ fn cublaslt_rank4_matmuls_do_not_drop_leading_batch_axes() {
     // rank-4 matmul must stay on the semantic reduction/GenericMatmul paths
     // until a rewrite explicitly proves that both leading axes can flatten.
     for case in LAYOUT_CASES {
-        let a = cx.tensor(if case.a_col_major {
-            (outer, batch, k, m)
-        } else {
-            (outer, batch, m, k)
-        });
-        let b = cx.tensor(if case.b_col_major {
-            (outer, batch, n, k)
-        } else {
-            (outer, batch, k, n)
-        });
+        let a = cx.tensor(
+            if case.a_col_major {
+                (outer, batch, k, m)
+            } else {
+                (outer, batch, m, k)
+            },
+            DType::F32,
+        );
+        let b = cx.tensor(
+            if case.b_col_major {
+                (outer, batch, n, k)
+            } else {
+                (outer, batch, k, n)
+            },
+            DType::F32,
+        );
         let a = if case.a_col_major {
             a.transpose(2, 3)
         } else {
@@ -713,10 +721,10 @@ fn cublaslt_rank4_matmuls_do_not_drop_leading_batch_axes() {
     // Also cover promoted FP8 operands and the scaled-linear spelling. These
     // could otherwise reach both the ordinary F32 and FP8-specific batched
     // rules after GraphTensor::matmul inserts its semantic F32 casts.
-    let activation = cx.tensor((outer, batch, m, k));
-    let weight_storage = cx.tensor_dtyped((outer, batch, n, k), DType::F8E4M3);
-    let input_scale = cx.tensor(());
-    let weight_scale = cx.tensor(());
+    let activation = cx.tensor((outer, batch, m, k), DType::F32);
+    let weight_storage = cx.tensor((outer, batch, n, k), DType::F8E4M3);
+    let input_scale = cx.tensor((), DType::F32);
+    let weight_scale = cx.tensor((), DType::F32);
     let quantized = (activation / input_scale.expand_rhs((outer, batch, m, k))).cast(DType::F8E4M3);
     let dequant_scale = (input_scale * weight_scale).expand_rhs((outer, batch, m, n));
     (quantized.matmul(weight_storage.transpose(2, 3)) * dequant_scale).output();
@@ -820,8 +828,8 @@ fn cuda_graph_cublaslt_only_executes_correctly() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "cuBLASLt-only graph", |_| true);
 
@@ -860,8 +868,8 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
 
     let (m, n, k) = (5, 8, 8);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let first = a.matmul(b);
     let out = (a + first.sin()).matmul(b).output();
     let llir = extract_forced_distinct_cublaslt_classes_llir_where(
@@ -916,8 +924,8 @@ fn cuda_graph_cublaslt_skips_prepare_when_unrelated_dyn_dim_changes() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).output();
     a.output();
     b.output();
@@ -971,8 +979,8 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
 
     let (n, k) = (11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor(('m', k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor(('m', k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).output();
     cx.set_dim('m', 7);
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "cuBLASLt-only dynamic graph", |_| true);
@@ -1017,8 +1025,8 @@ fn cublaslt_with_dynamic_c_spec_is_captured() {
 
     let (n, k) = (11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor(('c', k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor(('c', k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).output();
     cx.set_dim('c', 7);
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "dynamic c cuBLASLt graph", |_| true);
@@ -1061,8 +1069,8 @@ fn bucket_range_and_singleton_cublaslt_buckets_are_captured() {
 
     let (n, k) = (11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor(('s', k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor(('s', k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).output();
     cx.set_dim('s', 1);
     let llir =
@@ -1564,10 +1572,10 @@ fn cublaslt_fp8_e4m3_beta_candidate_executes_2d_matmul_plus_f32_c() {
 
     let (m, n, k) = (16, 16, 16);
     let mut cx = Graph::new();
-    let a = cx.tensor_dtyped((m, k), DType::F8E4M3);
-    let b_input = cx.tensor_dtyped((n, k), DType::F8E4M3);
+    let a = cx.tensor((m, k), DType::F8E4M3);
+    let b_input = cx.tensor((n, k), DType::F8E4M3);
     let b = b_input.t();
-    let c = cx.tensor_dtyped((m, n), DType::F32);
+    let c = cx.tensor((m, n), DType::F32);
     let out = (a.matmul(b).cast(DType::F32) + c).output();
     let expected_tuple = (
         DType::F8E4M3,
@@ -1615,10 +1623,10 @@ fn cublaslt_fp8_scaled_candidate_executes_2d_matmul_f32_output() {
 
     let (m, n, k) = (16, 16, 16);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let a_scale = cx.tensor(());
-    let b_scale = cx.tensor(());
-    let b_input = cx.tensor_dtyped((n, k), DType::F8E4M3);
+    let a = cx.tensor((m, k), DType::F32);
+    let a_scale = cx.tensor((), DType::F32);
+    let b_scale = cx.tensor((), DType::F32);
+    let b_input = cx.tensor((n, k), DType::F8E4M3);
     let b = b_input.t();
     let scaled_a = (a / a_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
     let out =
@@ -1670,12 +1678,12 @@ fn cublaslt_fp8_scaled_candidate_executes_2d_matmul_f32_output() {
 fn cublaslt_fp8_scaled_candidate_reaches_fused_output_scale_consumer() {
     let (m, n, k) = (16, 16, 16);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let a_scale = cx.tensor(());
-    let b_scale = cx.tensor(());
-    let b_input = cx.tensor_dtyped((n, k), DType::F8E4M3);
+    let a = cx.tensor((m, k), DType::F32);
+    let a_scale = cx.tensor((), DType::F32);
+    let b_scale = cx.tensor((), DType::F32);
+    let b_input = cx.tensor((n, k), DType::F8E4M3);
     let b = b_input.t();
-    let side = cx.tensor((m, n));
+    let side = cx.tensor((m, n), DType::F32);
     let scaled_a = (a / a_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
     let scaled_out = scaled_a.matmul(b).cast(DType::F32) * (a_scale * b_scale).expand_rhs((m, n));
     (scaled_out * side).output();
@@ -1697,13 +1705,13 @@ fn cublaslt_fp8_scaled_candidate_reaches_fused_output_scale_consumer() {
 fn cublaslt_fp8_scaled_candidates_reach_fused_mlp_consumer() {
     let (m, n, k) = (16, 32, 16);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let gate_input_scale = cx.tensor(());
-    let gate_weight_scale = cx.tensor(());
-    let up_input_scale = cx.tensor(());
-    let up_weight_scale = cx.tensor(());
-    let gate_weight = cx.tensor_dtyped((n, k), DType::F8E4M3);
-    let up_weight = cx.tensor_dtyped((n, k), DType::F8E4M3);
+    let a = cx.tensor((m, k), DType::F32);
+    let gate_input_scale = cx.tensor((), DType::F32);
+    let gate_weight_scale = cx.tensor((), DType::F32);
+    let up_input_scale = cx.tensor((), DType::F32);
+    let up_weight_scale = cx.tensor((), DType::F32);
+    let gate_weight = cx.tensor((n, k), DType::F8E4M3);
+    let up_weight = cx.tensor((n, k), DType::F8E4M3);
 
     let scaled_gate_a = (a / gate_input_scale.expand_rhs((m, k))).cast(DType::F8E4M3);
     let gate = scaled_gate_a.matmul(gate_weight.t()).cast(DType::F32)
@@ -1738,10 +1746,10 @@ fn cublaslt_fp8_scaled_candidate_executes_batched_matmul_f32_output() {
 
     let (batch, m, n, k) = (2, 16, 16, 16);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let a_scale = cx.tensor(());
-    let b_scale = cx.tensor(());
-    let b_input = cx.tensor_dtyped((batch, n, k), DType::F8E4M3);
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let a_scale = cx.tensor((), DType::F32);
+    let b_scale = cx.tensor((), DType::F32);
+    let b_input = cx.tensor((batch, n, k), DType::F8E4M3);
     let b = b_input.transpose(1, 2);
     let scaled_a = (a / a_scale.expand_rhs((batch, m, k))).cast(DType::F8E4M3);
     let matmul = scaled_a.matmul(b);
@@ -1889,8 +1897,8 @@ fn build_fp8_2d_cast_matmul_f32_graph(
     n: usize,
     k: usize,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let a = cx.tensor_dtyped((m, k), a_dtype);
-    let b_input = cx.tensor_dtyped((n, k), b_dtype);
+    let a = cx.tensor((m, k), a_dtype);
+    let b_input = cx.tensor((n, k), b_dtype);
     let b = b_input.t();
 
     let out = a.matmul(b).output();
@@ -1906,8 +1914,8 @@ fn build_fp8_batched_cast_matmul_f32_graph(
     n: usize,
     k: usize,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let a = cx.tensor_dtyped((batch, m, k), a_dtype);
-    let b_input = cx.tensor_dtyped((batch, n, k), b_dtype);
+    let a = cx.tensor((batch, m, k), a_dtype);
+    let b_input = cx.tensor((batch, n, k), b_dtype);
     let b = b_input.transpose(1, 2);
 
     let out = a.matmul(b).output();
@@ -2203,9 +2211,9 @@ fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_c() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let c = cx.tensor((m, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
+    let c = cx.tensor((m, n), DType::F32);
     let out = (a.matmul(b) + c).output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional beta=1", |llir| {
         cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
@@ -2237,9 +2245,9 @@ fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_sliced_c() {
     let (m, n, k, c_padding) = (7, 11, 5, 3);
     let c_parent_n = n + c_padding;
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let c_base = cx.tensor((m, c_parent_n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
+    let c_base = cx.tensor((m, c_parent_n), DType::F32);
     let c = c_base.slice((0..m, 0..n));
     let out = (a.matmul(b) + c).output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional beta=1 sliced C", |llir| {
@@ -2277,9 +2285,9 @@ fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_c() {
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let c = cx.tensor((batch, m, n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let c = cx.tensor((batch, m, n), DType::F32);
     let out = (a.matmul(b) + c).output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional batched beta=1", |llir| {
         cublaslt_scale_value_tuples(llir).contains(&(1.0, 1.0))
@@ -2311,9 +2319,9 @@ fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_sliced_c() {
     let (batch, m, n, k, c_padding) = (3, 5, 4, 6, 2);
     let c_parent_n = n + c_padding;
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let c_base = cx.tensor((batch, m, c_parent_n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let c_base = cx.tensor((batch, m, c_parent_n), DType::F32);
     let c = c_base.slice((0..batch, 0..m, 0..n));
     let out = (a.matmul(b) + c).output();
     let llir =
@@ -2353,9 +2361,9 @@ fn cublaslt_beta_one_candidate_executes_2d_matmul_plus_offset_c() {
     let (m, n, k) = (7, 11, 5);
     let (c_parent_m, c_parent_n) = (m + 2, n + 3);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let c_base = cx.tensor((c_parent_m, c_parent_n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
+    let c_base = cx.tensor((c_parent_m, c_parent_n), DType::F32);
     let c = c_base.slice((1..(m + 1), 2..(n + 2)));
     let out = (a.matmul(b) + c).output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional beta=1 offset C", |llir| {
@@ -2394,9 +2402,9 @@ fn cublaslt_beta_one_candidate_executes_batched_matmul_plus_offset_c() {
     let (batch, m, n, k) = (3, 5, 4, 6);
     let (c_parent_batch, c_parent_m, c_parent_n) = (batch + 1, m + 2, n + 3);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let c_base = cx.tensor((c_parent_batch, c_parent_m, c_parent_n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let c_base = cx.tensor((c_parent_batch, c_parent_m, c_parent_n), DType::F32);
     let c = c_base.slice((1..(batch + 1), 1..(m + 1), 2..(n + 2)));
     let out = (a.matmul(b) + c).output();
     let llir =
@@ -2441,9 +2449,9 @@ fn cublaslt_scaled_alpha_beta_candidate_executes_2d_matmul_plus_c() {
     let (m, n, k) = (7, 11, 5);
     let (alpha, beta) = (1.5, 0.5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let c = cx.tensor((m, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
+    let c = cx.tensor((m, n), DType::F32);
     let out = (a.matmul(b) * alpha + c * beta).output();
     let llir =
         extract_forced_cublaslt_llir_where(&mut cx, "functional scaled alpha beta", |llir| {
@@ -2477,9 +2485,9 @@ fn cublaslt_scaled_alpha_beta_candidate_executes_batched_matmul_plus_c() {
     let (batch, m, n, k) = (3, 5, 4, 6);
     let (alpha, beta) = (1.5, 0.5);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let c = cx.tensor((batch, m, n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let c = cx.tensor((batch, m, n), DType::F32);
     let out = (a.matmul(b) * alpha + c * beta).output();
     let llir = extract_forced_cublaslt_llir_where(
         &mut cx,
@@ -2516,8 +2524,8 @@ fn cublaslt_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
     for case in LAYOUT_CASES {
         let (m, n, k) = (7, 11, 5);
         let mut cx = Graph::new();
-        let a_storage = cx.tensor(if case.a_col_major { (k, m) } else { (m, k) });
-        let b_storage = cx.tensor(if case.b_col_major { (n, k) } else { (k, n) });
+        let a_storage = cx.tensor(if case.a_col_major { (k, m) } else { (m, k) }, DType::F32);
+        let b_storage = cx.tensor(if case.b_col_major { (n, k) } else { (k, n) }, DType::F32);
         let a = if case.a_col_major {
             a_storage.t()
         } else {
@@ -2528,7 +2536,7 @@ fn cublaslt_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
         } else {
             b_storage
         };
-        let bias = cx.tensor(n);
+        let bias = cx.tensor(n, DType::F32);
         let bias_expanded = bias.expand_dim(0, m);
         let out = (a.matmul(b) + bias_expanded).output();
         let llir = extract_forced_cublaslt_llir_where(
@@ -2572,9 +2580,9 @@ fn cublaslt_bias_epilogue_candidate_executes_batched_matmul_plus_column_bias() {
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let bias = cx.tensor(n);
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let bias = cx.tensor(n, DType::F32);
     let bias_expanded = bias.expand_dim(0, m).expand_dim(0, batch);
     let out = (a.matmul(b) + bias_expanded).output();
     let llir =
@@ -2614,9 +2622,9 @@ fn cublaslt_relu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let bias = cx.tensor(n);
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
+    let bias = cx.tensor(n, DType::F32);
     let bias_expanded = bias.expand_dim(0, m);
     let out = (a.matmul(b) + bias_expanded).relu().output();
     let llir =
@@ -2656,9 +2664,9 @@ fn cublaslt_relu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bia
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let bias = cx.tensor(n);
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let bias = cx.tensor(n, DType::F32);
     let bias_expanded = bias.expand_dim(0, m).expand_dim(0, batch);
     let out = (a.matmul(b) + bias_expanded).relu().output();
     let llir = extract_forced_cublaslt_llir_where(
@@ -2701,8 +2709,8 @@ fn cublaslt_gelu_epilogue_candidate_executes_2d_matmul() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).gelu_fast_tanh_approximation().output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional gelu epilogue", |llir| {
         cublaslt_epilogues(llir).contains(&"GELU")
@@ -2730,8 +2738,8 @@ fn cublaslt_gelu_epilogue_candidate_executes_batched_matmul() {
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
     let out = a.matmul(b).gelu_fast_tanh_approximation().output();
     let llir =
         extract_forced_cublaslt_llir_where(&mut cx, "functional batched gelu epilogue", |llir| {
@@ -2763,9 +2771,9 @@ fn cublaslt_gelu_bias_epilogue_candidate_executes_2d_matmul_plus_column_bias() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
-    let bias = cx.tensor(n);
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
+    let bias = cx.tensor(n, DType::F32);
     let bias_expanded = bias.expand_dim(0, m);
     let out = (a.matmul(b) + bias_expanded)
         .gelu_fast_tanh_approximation()
@@ -2810,9 +2818,9 @@ fn cublaslt_gelu_bias_epilogue_candidate_executes_batched_matmul_plus_column_bia
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let bias = cx.tensor(n);
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let bias = cx.tensor(n, DType::F32);
     let bias_expanded = bias.expand_dim(0, m).expand_dim(0, batch);
     let out = (a.matmul(b) + bias_expanded)
         .gelu_fast_tanh_approximation()
@@ -2857,8 +2865,8 @@ fn cublaslt_relu_epilogue_candidate_executes_2d_matmul() {
 
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor((m, k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).relu().output();
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "functional relu epilogue", |llir| {
         cublaslt_epilogues(llir).contains(&"RELU")
@@ -2886,8 +2894,8 @@ fn cublaslt_relu_epilogue_candidate_executes_batched_matmul() {
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
     let out = a.matmul(b).relu().output();
     let llir =
         extract_forced_cublaslt_llir_where(&mut cx, "functional batched relu epilogue", |llir| {
@@ -2923,9 +2931,9 @@ fn cublaslt_row_order_beta_one_candidate_executes_2d_layout_pairs() {
         let b_shape = if case.b_col_major { (n, k) } else { (k, n) };
 
         let mut cx = Graph::new();
-        let a_input = cx.tensor(a_shape);
-        let b_input = cx.tensor(b_shape);
-        let c = cx.tensor((m, n));
+        let a_input = cx.tensor(a_shape, DType::F32);
+        let b_input = cx.tensor(b_shape, DType::F32);
+        let c = cx.tensor((m, n), DType::F32);
         let a = if case.a_col_major {
             a_input.t()
         } else {
@@ -2969,9 +2977,9 @@ fn cublaslt_row_order_beta_one_candidate_executes_batched_row_major_matmul_plus_
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
-    let c = cx.tensor((batch, m, n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
+    let c = cx.tensor((batch, m, n), DType::F32);
     let out = (a.matmul(b) + c).output();
     let expected_orders = ("ROW", "ROW", "ROW", "ROW");
     let llir =
@@ -3009,8 +3017,8 @@ fn cublaslt_row_order_candidate_executes_2d_layout_pairs() {
         let b_shape = if case.b_col_major { (n, k) } else { (k, n) };
 
         let mut cx = Graph::new();
-        let a_input = cx.tensor(a_shape);
-        let b_input = cx.tensor(b_shape);
+        let a_input = cx.tensor(a_shape, DType::F32);
+        let b_input = cx.tensor(b_shape, DType::F32);
         let a = if case.a_col_major {
             a_input.t()
         } else {
@@ -3051,8 +3059,8 @@ fn cublaslt_row_order_candidate_executes_large_lm_head_like_projection() {
 
     let (m, n, k) = (1, 128_256, 64);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b_input = cx.tensor((n, k));
+    let a = cx.tensor((m, k), DType::F32);
+    let b_input = cx.tensor((n, k), DType::F32);
     let b = b_input.t();
     let out = a.matmul(b).output();
     let expected_orders = ("ROW", "COL", "ROW", "ROW");
@@ -3090,10 +3098,10 @@ fn cublaslt_row_order_beta_one_candidate_executes_llama_mlp_residual_like_projec
 
     let (m, n, k) = (1, 4096, 64);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k));
-    let b_input = cx.tensor((n, k));
+    let a = cx.tensor((m, k), DType::F32);
+    let b_input = cx.tensor((n, k), DType::F32);
     let b = b_input.t();
-    let c = cx.tensor((m, n));
+    let c = cx.tensor((m, n), DType::F32);
     let out = (a.matmul(b) + c).output();
     let expected_orders = ("ROW", "COL", "ROW", "ROW");
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "mlp residual row-order", |llir| {
@@ -3130,8 +3138,8 @@ fn cublaslt_row_order_candidate_executes_batched_row_major_matmul() {
 
     let (batch, m, n, k) = (3, 5, 4, 6);
     let mut cx = Graph::new();
-    let a = cx.tensor((batch, m, k));
-    let b = cx.tensor((batch, k, n));
+    let a = cx.tensor((batch, m, k), DType::F32);
+    let b = cx.tensor((batch, k, n), DType::F32);
     let out = a.matmul(b).output();
     let expected_orders = ("ROW", "ROW", "ROW", "ROW");
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "batched row-order row-major", |llir| {
@@ -3164,10 +3172,8 @@ fn build_2d_layout_graph(
 ) -> Graph {
     let (m, n, k) = (7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx
-        .tensor_dtyped(if case.a_col_major { (k, m) } else { (m, k) }, a_dtype);
-    let b = cx
-        .tensor_dtyped(if case.b_col_major { (n, k) } else { (k, n) }, b_dtype);
+    let a = cx.tensor(if case.a_col_major { (k, m) } else { (m, k) }, a_dtype);
+    let b = cx.tensor(if case.b_col_major { (n, k) } else { (k, n) }, b_dtype);
     let a = if case.a_col_major { a.t() } else { a };
     let b = if case.b_col_major { b.t() } else { b };
     build(&mut cx, a, b, m, n, k).output();
@@ -3190,18 +3196,22 @@ fn build_batched_layout_graph(
 ) -> Graph {
     let (batch, m, n, k) = (3, 7, 11, 5);
     let mut cx = Graph::new();
-    let a = cx
-        .tensor_dtyped(if case.a_col_major {
+    let a = cx.tensor(
+        if case.a_col_major {
             (batch, k, m)
         } else {
             (batch, m, k)
-        }, a_dtype);
-    let b = cx
-        .tensor_dtyped(if case.b_col_major {
+        },
+        a_dtype,
+    );
+    let b = cx.tensor(
+        if case.b_col_major {
             (batch, n, k)
         } else {
             (batch, k, n)
-        }, b_dtype);
+        },
+        b_dtype,
+    );
     let a = if case.a_col_major {
         a.transpose(1, 2)
     } else {
@@ -3230,14 +3240,14 @@ fn build_2d_matmul_graph(case: LayoutCase, dtype: DType) -> Graph {
 
 fn build_2d_matmul_plus_c_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let c = cx.tensor_dtyped((m, n), dtype);
+        let c = cx.tensor((m, n), dtype);
         add_commuted(a.matmul(b), c, commuted)
     })
 }
 
 fn build_2d_matmul_plus_sliced_c_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let c = cx.tensor_dtyped((m, n + 3), dtype).slice((0..m, 0..n));
+        let c = cx.tensor((m, n + 3), dtype).slice((0..m, 0..n));
         add_commuted(a.matmul(b), c, commuted)
     })
 }
@@ -3245,7 +3255,7 @@ fn build_2d_matmul_plus_sliced_c_graph(case: LayoutCase, dtype: DType, commuted:
 fn build_2d_matmul_plus_offset_c_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
         let c = cx
-            .tensor_dtyped((m + 2, n + 3), dtype)
+            .tensor((m + 2, n + 3), dtype)
             .slice((1..(m + 1), 2..(n + 2)));
         add_commuted(a.matmul(b), c, commuted)
     })
@@ -3257,28 +3267,28 @@ fn build_2d_matmul_plus_transposed_c_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let c = cx.tensor_dtyped((n, m), dtype).t();
+        let c = cx.tensor((n, m), dtype).t();
         add_commuted(a.matmul(b), c, commuted)
     })
 }
 
 fn build_2d_scaled_alpha_beta_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let c = cx.tensor_dtyped((m, n), dtype);
+        let c = cx.tensor((m, n), dtype);
         add_commuted(a.matmul(b) * 1.5, c * 0.5, commuted)
     })
 }
 
 fn build_2d_matmul_plus_column_bias_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(n, dtype).expand_dim(0, m);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m);
         add_commuted(a.matmul(b), bias, commuted)
     })
 }
 
 fn build_2d_matmul_plus_row_bias_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(m, dtype).expand_dim(1, n);
+        let bias = cx.tensor(m, dtype).expand_dim(1, n);
         add_commuted(a.matmul(b), bias, commuted)
     })
 }
@@ -3289,7 +3299,7 @@ fn build_2d_matmul_plus_column_bias_relu_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(n, dtype).expand_dim(0, m);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m);
         add_commuted(a.matmul(b), bias, commuted).relu()
     })
 }
@@ -3300,7 +3310,7 @@ fn build_2d_matmul_plus_column_bias_gelu_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(n, dtype).expand_dim(0, m);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m);
         add_commuted(a.matmul(b), bias, commuted).gelu_fast_tanh_approximation()
     })
 }
@@ -3312,8 +3322,8 @@ fn build_2d_matmul_plus_column_bias_activation_plus_c_graph(
     activation: impl FnOnce(GraphTensor) -> GraphTensor,
 ) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(n, dtype).expand_dim(0, m);
-        let residual = cx.tensor_dtyped((m, n), dtype);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m);
+        let residual = cx.tensor((m, n), dtype);
         add_commuted(activation(a.matmul(b) + bias), residual, commuted)
     })
 }
@@ -3324,7 +3334,7 @@ fn build_2d_matmul_plus_column_bias_scaled_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(n, dtype).expand_dim(0, m);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m);
         add_commuted(a.matmul(b), bias, commuted) * 1.5
     })
 }
@@ -3335,7 +3345,7 @@ fn build_2d_matmul_plus_row_bias_relu_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_2d_graph(case, dtype, |cx, a, b, m, n, _| {
-        let bias = cx.tensor_dtyped(m, dtype).expand_dim(1, n);
+        let bias = cx.tensor(m, dtype).expand_dim(1, n);
         add_commuted(a.matmul(b), bias, commuted).relu()
     })
 }
@@ -3356,7 +3366,7 @@ fn build_batched_matmul_graph(case: LayoutCase, dtype: DType) -> Graph {
 
 fn build_batched_matmul_plus_c_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let c = cx.tensor_dtyped((batch, m, n), dtype);
+        let c = cx.tensor((batch, m, n), dtype);
         add_commuted(a.matmul(b), c, commuted)
     })
 }
@@ -3368,7 +3378,7 @@ fn build_batched_matmul_plus_sliced_c_graph(
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
         let c = cx
-            .tensor_dtyped((batch, m, n + 3), dtype)
+            .tensor((batch, m, n + 3), dtype)
             .slice((0..batch, 0..m, 0..n));
         add_commuted(a.matmul(b), c, commuted)
     })
@@ -3380,7 +3390,7 @@ fn build_batched_matmul_plus_offset_c_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let c = cx.tensor_dtyped((batch + 1, m + 2, n + 3), dtype).slice((
+        let c = cx.tensor((batch + 1, m + 2, n + 3), dtype).slice((
             1..(batch + 1),
             1..(m + 1),
             2..(n + 2),
@@ -3395,14 +3405,14 @@ fn build_batched_matmul_plus_transposed_c_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let c = cx.tensor_dtyped((batch, n, m), dtype).transpose(1, 2);
+        let c = cx.tensor((batch, n, m), dtype).transpose(1, 2);
         add_commuted(a.matmul(b), c, commuted)
     })
 }
 
 fn build_batched_scaled_alpha_beta_graph(case: LayoutCase, dtype: DType, commuted: bool) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let c = cx.tensor_dtyped((batch, m, n), dtype);
+        let c = cx.tensor((batch, m, n), dtype);
         add_commuted(a.matmul(b) * 1.5, c * 0.5, commuted)
     })
 }
@@ -3413,10 +3423,7 @@ fn build_batched_matmul_plus_column_bias_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let bias = cx
-            .tensor_dtyped(n, dtype)
-            .expand_dim(0, m)
-            .expand_dim(0, batch);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m).expand_dim(0, batch);
         add_commuted(a.matmul(b), bias, commuted)
     })
 }
@@ -3427,10 +3434,7 @@ fn build_batched_matmul_plus_row_bias_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let bias = cx
-            .tensor_dtyped(m, dtype)
-            .expand_dim(1, n)
-            .expand_dim(0, batch);
+        let bias = cx.tensor(m, dtype).expand_dim(1, n).expand_dim(0, batch);
         add_commuted(a.matmul(b), bias, commuted)
     })
 }
@@ -3441,10 +3445,7 @@ fn build_batched_matmul_plus_column_bias_relu_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let bias = cx
-            .tensor_dtyped(n, dtype)
-            .expand_dim(0, m)
-            .expand_dim(0, batch);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m).expand_dim(0, batch);
         add_commuted(a.matmul(b), bias, commuted).relu()
     })
 }
@@ -3455,10 +3456,7 @@ fn build_batched_matmul_plus_column_bias_gelu_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let bias = cx
-            .tensor_dtyped(n, dtype)
-            .expand_dim(0, m)
-            .expand_dim(0, batch);
+        let bias = cx.tensor(n, dtype).expand_dim(0, m).expand_dim(0, batch);
         add_commuted(a.matmul(b), bias, commuted).gelu_fast_tanh_approximation()
     })
 }
@@ -3469,10 +3467,7 @@ fn build_batched_matmul_plus_row_bias_relu_graph(
     commuted: bool,
 ) -> Graph {
     build_same_dtype_batched_graph(case, dtype, |cx, a, b, batch, m, n, _| {
-        let bias = cx
-            .tensor_dtyped(m, dtype)
-            .expand_dim(1, n)
-            .expand_dim(0, batch);
+        let bias = cx.tensor(m, dtype).expand_dim(1, n).expand_dim(0, batch);
         add_commuted(a.matmul(b), bias, commuted).relu()
     })
 }

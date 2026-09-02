@@ -18,8 +18,8 @@ fn generic_matmul_covers_noncontiguous_merged_head_projection() {
     let hidden = heads * head_dim;
     let out_dim = 7;
 
-    let attn = cx.tensor((heads, seq, head_dim));
-    let weight = cx.tensor((out_dim, hidden));
+    let attn = cx.tensor((heads, seq, head_dim), DType::F32);
+    let weight = cx.tensor((out_dim, hidden), DType::F32);
     let merged = attn.transpose(0, 1).merge_dims(1, 2);
     merged.matmul(weight.t()).output();
 
@@ -46,8 +46,8 @@ fn generic_matmul_executes_noncontiguous_merged_head_projection() {
     let hidden = heads * head_dim;
     let out_dim = 7;
 
-    let attn = cx.tensor((heads, seq, head_dim));
-    let weight = cx.tensor((out_dim, hidden));
+    let attn = cx.tensor((heads, seq, head_dim), DType::F32);
+    let weight = cx.tensor((out_dim, hidden), DType::F32);
     let merged = attn.transpose(0, 1).merge_dims(1, 2);
     let output = merged.matmul(weight.t()).output();
 
@@ -99,8 +99,8 @@ fn generic_matmul_fp8_fallback_accumulates_and_outputs_f32() {
     }
 
     let mut cx = Graph::default();
-    let a = cx.tensor_dtyped((1, K), DType::F8E4M3);
-    let b_storage = cx.tensor_dtyped((1, K), DType::F8E4M3);
+    let a = cx.tensor((1, K), DType::F8E4M3);
+    let b_storage = cx.tensor((1, K), DType::F8E4M3);
     // Keep the spelling used by existing FP8 model code. The trailing cast is
     // now a no-op because GraphTensor::matmul itself returns F32.
     let output = a.matmul(b_storage.t()).cast(DType::F32).output();
@@ -135,10 +135,10 @@ fn kernel_gemv_f8_absorbs_promoted_casts_and_reads_raw_fp8() {
     }
 
     let mut cx = Graph::default();
-    let x = cx.tensor_dtyped((1, K), DType::Bf16);
-    let weight = cx.tensor_dtyped((N, K), DType::F8E4M3);
-    let input_scale = cx.tensor(());
-    let weight_scale = cx.tensor(());
+    let x = cx.tensor((1, K), DType::Bf16);
+    let weight = cx.tensor((N, K), DType::F8E4M3);
+    let input_scale = cx.tensor((), DType::F32);
+    let weight_scale = cx.tensor((), DType::F32);
     let x_f32 = x.cast(DType::F32);
     let quantized = (x_f32 / input_scale.expand_rhs(x_f32.dims())).cast(DType::F8E4M3);
     let matmul = quantized.matmul(weight.t());

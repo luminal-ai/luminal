@@ -497,8 +497,8 @@ pub(super) mod tests {
             .map(|e| e.to_usize().unwrap())
             .collect_vec();
         let mut cx = Graph::new();
-        let a = cx.tensor(a_shape.clone());
-        let b = cx.tensor(b_shape.clone());
+        let a = cx.tensor(a_shape.clone(), luminal::dtype::DType::F32);
+        let b = cx.tensor(b_shape.clone(), luminal::dtype::DType::F32);
         let c = func(a, b).output();
 
         let lhs_values = lhs_transform(random_vec(a_shape.iter().copied().product()));
@@ -524,8 +524,8 @@ pub(super) mod tests {
     #[should_panic(expected = "Dims must match to add tensors.")]
     fn test_add_rejects_implicit_broadcast() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
-        let b = cx.tensor((1, 3));
+        let a = cx.tensor((2, 3), luminal::dtype::DType::F32);
+        let b = cx.tensor((1, 3), luminal::dtype::DType::F32);
         let _ = a + b;
     }
 
@@ -533,8 +533,8 @@ pub(super) mod tests {
     #[should_panic(expected = "Dims must match to multiply tensors.")]
     fn test_mul_rejects_implicit_broadcast() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
-        let b = cx.tensor((1, 3));
+        let a = cx.tensor((2, 3), luminal::dtype::DType::F32);
+        let b = cx.tensor((1, 3), luminal::dtype::DType::F32);
         let _ = a * b;
     }
 
@@ -542,8 +542,8 @@ pub(super) mod tests {
     #[should_panic(expected = "Dims must match to mod tensors.")]
     fn test_mod_rejects_implicit_broadcast() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
-        let b = cx.tensor((1, 3));
+        let a = cx.tensor((2, 3), luminal::dtype::DType::F32);
+        let b = cx.tensor((1, 3), luminal::dtype::DType::F32);
         let _ = a % b;
     }
 
@@ -551,8 +551,8 @@ pub(super) mod tests {
     #[should_panic(expected = "Dims must match to lt tensors.")]
     fn test_lt_rejects_implicit_broadcast() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
-        let b = cx.tensor((1, 3));
+        let a = cx.tensor((2, 3), luminal::dtype::DType::F32);
+        let b = cx.tensor((1, 3), luminal::dtype::DType::F32);
         let _ = a.lt(b);
     }
 

@@ -2,6 +2,7 @@
 //! VIEW cost in the e-graph, relative to the measured matmul-block baseline?
 //! This is the marginal number behind the (A x B) = ((B^T)(A^T))^T estimate.
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 
 fn nodes(text: &str, name: &str) -> usize {
@@ -34,8 +35,8 @@ fn nodes(text: &str, name: &str) -> usize {
 fn transpose_view_marginal_cost() {
     // P0: the scaling test's own block, A[m,k],B[k,n]-spelled.
     let mut cx = Graph::new();
-    let x = cx.tensor((32usize, 48usize));
-    let w = cx.tensor((48usize, 64usize));
+    let x = cx.tensor((32usize, 48usize), DType::F32);
+    let w = cx.tensor((48usize, 64usize), DType::F32);
     let _ = x.matmul(w).relu().output();
     let p0 = cx
         .logical
@@ -45,8 +46,8 @@ fn transpose_view_marginal_cost() {
 
     // P1: same block, plus ONE transposing view on the output.
     let mut cx = Graph::new();
-    let x = cx.tensor((32usize, 48usize));
-    let w = cx.tensor((48usize, 64usize));
+    let x = cx.tensor((32usize, 48usize), DType::F32);
+    let w = cx.tensor((48usize, 64usize), DType::F32);
     let _ = x.matmul(w).relu().permute((1usize, 0usize)).output();
     let p1 = cx
         .logical
@@ -56,8 +57,8 @@ fn transpose_view_marginal_cost() {
 
     // P2: A[m,k],B[n,k]-spelled -- the permute folds into the operand's index map.
     let mut cx = Graph::new();
-    let x = cx.tensor((32usize, 48usize));
-    let w = cx.tensor((64usize, 48usize));
+    let x = cx.tensor((32usize, 48usize), DType::F32);
+    let w = cx.tensor((64usize, 48usize), DType::F32);
     let _ = x.matmul(w.permute((1usize, 0usize))).relu().output();
     let p2 = cx
         .logical

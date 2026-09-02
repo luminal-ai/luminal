@@ -7,7 +7,7 @@ use rand::{SeedableRng, rngs::SmallRng};
 /// Returns (cx, input_node, output_node).
 fn build_dynamic_add_graph() -> (Graph, NodeIndex, NodeIndex) {
     let mut cx = Graph::default();
-    let a = cx.tensor(('s', 4));
+    let a = cx.tensor(('s', 4), DType::F32);
     let b = (a + a).output();
     (cx, a.id, b.id)
 }
@@ -16,8 +16,8 @@ fn build_dynamic_add_graph() -> (Graph, NodeIndex, NodeIndex) {
 /// Computes (s, K) @ (K, N) -> (s, N)
 fn build_dynamic_matmul_graph(k: usize, n: usize) -> (Graph, NodeIndex, NodeIndex, NodeIndex) {
     let mut cx = Graph::default();
-    let a = cx.tensor(('s', k));
-    let b = cx.tensor((k, n));
+    let a = cx.tensor(('s', k), DType::F32);
+    let b = cx.tensor((k, n), DType::F32);
     let c = a.matmul(b).output();
     (cx, a.id, b.id, c.id)
 }

@@ -1,11 +1,14 @@
 use hf_hub::api::sync::Api;
+
+#[path = "../../../examples/common/model_support.rs"]
+mod model_support;
+use crate::model_support::{LayerNorm, Namespace, gather_rows, scatter_rows};
 use luminal::{
     dtype::DType,
     graph::{CompileOptions, DimBucket, Graph},
     prelude::{F32Pow, GraphTensor, Runtime},
 };
 use luminal_metal::MetalRuntime;
-use luminal_nn::{LayerNorm, gather_rows, scatter_rows};
 use luminal_tracing::luminal_filter;
 use rustc_hash::FxHashSet;
 use std::{
@@ -106,11 +109,11 @@ impl KVCache {
         let mut v_caches = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
             k_caches.push(
-                cx.named_tensor(format!("kv_cache.{l}.k"), (num_slots, KV_DIM))
+                cx.named_tensor(format!("kv_cache.{l}.k"), (num_slots, KV_DIM), DType::F32)
                     .persist(),
             );
             v_caches.push(
-                cx.named_tensor(format!("kv_cache.{l}.v"), (num_slots, KV_DIM))
+                cx.named_tensor(format!("kv_cache.{l}.v"), (num_slots, KV_DIM), DType::F32)
                     .persist(),
             );
         }
@@ -128,63 +131,75 @@ impl Llama {
     fn init(cx: &mut Graph) -> Self {
         let mut layers = Vec::with_capacity(LAYERS);
         for l in 0..LAYERS {
+            let layer_ns = Namespace::root().child("model").child("layers").index(l);
             layers.push(LlamaLayer {
                 up: cx
                     .named_tensor(
                         format!("model.layers.{l}.mlp.up_proj.weight"),
                         (INTERMEDIATE, HIDDEN),
+                        DType::F32,
                     )
                     .persist(),
                 gate: cx
                     .named_tensor(
                         format!("model.layers.{l}.mlp.gate_proj.weight"),
                         (INTERMEDIATE, HIDDEN),
+                        DType::F32,
                     )
                     .persist(),
                 down: cx
                     .named_tensor(
                         format!("model.layers.{l}.mlp.down_proj.weight"),
                         (HIDDEN, INTERMEDIATE),
+                        DType::F32,
                     )
                     .persist(),
                 q_proj: cx
                     .named_tensor(
                         format!("model.layers.{l}.self_attn.q_proj.weight"),
                         (HIDDEN, HIDDEN),
+                        DType::F32,
                     )
                     .persist(),
                 k_proj: cx
                     .named_tensor(
                         format!("model.layers.{l}.self_attn.k_proj.weight"),
                         (KV_DIM, HIDDEN),
+                        DType::F32,
                     )
                     .persist(),
                 v_proj: cx
                     .named_tensor(
                         format!("model.layers.{l}.self_attn.v_proj.weight"),
                         (KV_DIM, HIDDEN),
+                        DType::F32,
                     )
                     .persist(),
                 o_proj: cx
                     .named_tensor(
                         format!("model.layers.{l}.self_attn.o_proj.weight"),
                         (HIDDEN, HIDDEN),
+                        DType::F32,
                     )
                     .persist(),
                 attn_rms: LayerNorm::new(
                     HIDDEN,
-                    Some(&format!("model.layers.{l}.input_layernorm.weight")),
-                    None,
+                    true,
+                    false,
                     false,
                     RMS_NORM_EPS,
+                    DType::F32,
+                    &layer_ns.child("input_layernorm"),
                     cx,
                 ),
                 mlp_rms: LayerNorm::new(
                     HIDDEN,
-                    Some(&format!("model.layers.{l}.post_attention_layernorm.weight")),
-                    None,
+                    true,
+                    false,
                     false,
                     RMS_NORM_EPS,
+                    DType::F32,
+                    &layer_ns.child("post_attention_layernorm"),
                     cx,
                 ),
             });
@@ -192,15 +207,21 @@ impl Llama {
 
         Self {
             embedding: cx
-                .named_tensor("model.embed_tokens.weight", (VOCAB_SIZE, HIDDEN))
+                .named_tensor(
+                    "model.embed_tokens.weight",
+                    (VOCAB_SIZE, HIDDEN),
+                    DType::F32,
+                )
                 .persist(),
             layers,
             lm_norm: LayerNorm::new(
                 HIDDEN,
-                Some("model.norm.weight"),
-                None,
+                true,
+                false,
                 false,
                 RMS_NORM_EPS,
+                DType::F32,
+                &Namespace::root().child("model").child("norm"),
                 cx,
             ),
         }
@@ -291,11 +312,11 @@ fn attention(
     gather_idx: GraphTensor,
     attn_mask: GraphTensor,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, KV_DIM);
-    let v_cache_out = scatter_rows(v, scatter_idx, v_cache, KV_DIM);
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache);
+    let v_cache_out = scatter_rows(v, scatter_idx, v_cache);
 
-    let k = gather_rows(k_cache_out, gather_idx, KV_DIM);
-    let v_ctx = gather_rows(v_cache_out, gather_idx, KV_DIM);
+    let k = gather_rows(k_cache_out, gather_idx);
+    let v_ctx = gather_rows(v_cache_out, gather_idx);
 
     let q = (q_rope * 1.0).split_dims(1, HEAD_DIM).transpose(0, 1);
     let k = k.split_dims(1, HEAD_DIM).permute((1, 2, 0));
@@ -426,11 +447,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .to_vec();
 
     let mut cx = Graph::default();
-    let input = cx.named_tensor_dtyped("input", 's', DType::Int);
-    let q_pos_t = cx.named_tensor_dtyped("q_pos", 's', DType::Int);
-    let scatter_idx_t = cx.named_tensor_dtyped("scatter_idx", 's', DType::Int);
-    let gather_idx_t = cx.named_tensor_dtyped("gather_idx", 'c', DType::Int);
-    let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'));
+    let input = cx.named_tensor("input", 's', DType::Int);
+    let q_pos_t = cx.named_tensor("q_pos", 's', DType::Int);
+    let scatter_idx_t = cx.named_tensor("scatter_idx", 's', DType::Int);
+    let gather_idx_t = cx.named_tensor("gather_idx", 'c', DType::Int);
+    let attn_mask_t = cx.named_tensor("attn_mask", ('s', 'c'), DType::F32);
     let kv_cache = KVCache::new(&mut cx, MAX_SEQ_LEN);
     let (logits, cache_outputs) = Llama::init(&mut cx).forward(
         input,

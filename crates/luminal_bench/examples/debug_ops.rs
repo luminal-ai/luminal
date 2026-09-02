@@ -105,21 +105,21 @@ impl Case {
     fn build(&self, cx: &mut Graph, size: usize) {
         let out = match self {
             Case::Mul => {
-                let x = cx.tensor(size);
+                let x = cx.tensor(size, DType::F32);
                 x * x
             }
-            Case::Sigmoid => cx.tensor(size).sigmoid(),
-            Case::Tanh => cx.tensor(size).tanh(),
+            Case::Sigmoid => cx.tensor(size, DType::F32).sigmoid(),
+            Case::Tanh => cx.tensor(size, DType::F32).tanh(),
             Case::GeluInner => {
-                let x = cx.tensor(size);
+                let x = cx.tensor(size, DType::F32);
                 (0.797_884_6_f32 * x * (1. + 0.044_715_f32 * x * x)).tanh()
             }
-            Case::Gelu => cx.tensor(size).gelu(),
+            Case::Gelu => cx.tensor(size, DType::F32).gelu(),
             Case::LayerNorm => {
                 // Mirror `crates/luminal_bench/src/patterns.rs`: normalize along last axis.
                 let hidden_dim = 128usize;
                 let batch_seq = (size / hidden_dim).max(1);
-                cx.tensor((batch_seq, hidden_dim)).layer_norm(1, 1e-5)
+                cx.tensor((batch_seq, hidden_dim), DType::F32).layer_norm(1, 1e-5)
             }
         };
         let _ = out.output();

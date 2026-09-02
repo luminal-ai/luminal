@@ -15,7 +15,7 @@
 //! (used to diff before/after captures across the Phase-3 landing).
 
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode};
-use luminal::dtype::PlanDtype;
+use luminal::dtype::{DType, PlanDtype};
 use luminal::prelude::FxHashMap;
 use luminal_cuda_lite::kernels::Coords;
 use luminal_cuda_lite::{kernels, CudaRuntime};
@@ -137,8 +137,8 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal_cuda_lite:
         (
             "elementwise",
             searched_plan(|cx| {
-                let a = cx.tensor((2usize, 3usize));
-                let b = cx.tensor((2usize, 3usize));
+                let a = cx.tensor((2usize, 3usize), DType::F32);
+                let b = cx.tensor((2usize, 3usize), DType::F32);
                 let _ = ((a + b) * a).output();
                 [
                     (a.id, vec![1.0f32, 2., 3., 4., 5., 6.].into()),
@@ -151,8 +151,8 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal_cuda_lite:
         (
             "matmul",
             searched_plan(|cx| {
-                let x = cx.tensor((4usize, 8usize));
-                let w = cx.tensor((8usize, 3usize));
+                let x = cx.tensor((4usize, 8usize), DType::F32);
+                let w = cx.tensor((8usize, 3usize), DType::F32);
                 let _ = x.matmul(w).output();
                 [
                     (x.id, vec![0.5f32; 32].into()),
@@ -165,8 +165,8 @@ fn representative_plans() -> Vec<(&'static str, BufferIrGraph<luminal_cuda_lite:
         (
             "mul_sum",
             searched_plan(|cx| {
-                let a = cx.tensor((3usize, 4usize));
-                let b = cx.tensor((3usize, 4usize));
+                let a = cx.tensor((3usize, 4usize), DType::F32);
+                let b = cx.tensor((3usize, 4usize), DType::F32);
                 let _ = (a * b).sum(1).output();
                 [
                     (a.id, vec![1.0f32; 12].into()),
@@ -541,7 +541,7 @@ mod strided {
     /// refusals: a layout the lowerer cannot spell numerically bails
     /// loudly — never identity, never a guessed extent.
     ///
-    /// NOTE THE MOVED SEAM. A SYMBOLIC domain now refuses one step
+    /// THE SEAM HAS MOVED. A SYMBOLIC domain now refuses one step
     /// EARLIER, at `from_descriptors`, because the slot's extents ARE
     /// its layout's domain (there is no dims field to disagree with).
     /// The domain-mismatch refusal survives only where two DIFFERENT

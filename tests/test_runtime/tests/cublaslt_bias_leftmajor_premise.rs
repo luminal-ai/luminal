@@ -32,6 +32,7 @@
 use std::collections::BTreeSet;
 
 use egglog::SerializeConfig;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 
@@ -82,9 +83,9 @@ fn d_class_ops_for(s: &EGraph, op: &str) -> Vec<BTreeSet<String>> {
 /// output's SSA name and slot key.
 fn recorded_bias_program() -> (String, String, usize) {
     let mut cx = Graph::new();
-    let x = cx.tensor((4usize, 8usize));
-    let w = cx.tensor((8usize, 3usize));
-    let b = cx.tensor(3usize);
+    let x = cx.tensor((4usize, 8usize), DType::F32);
+    let w = cx.tensor((8usize, 3usize), DType::F32);
+    let b = cx.tensor(3usize, DType::F32);
     let out = (x.matmul(w) + b.expand_dim(0, 4usize)).output();
     let text = cx
         .logical

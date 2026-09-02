@@ -230,9 +230,9 @@ mod tests {
         use crate::tests::random_vec;
 
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
-        let b = cx.tensor((2, 3));
-        let c = cx.tensor((2, 3));
+        let a = cx.tensor((2, 3), DType::F32);
+        let b = cx.tensor((2, 3), DType::F32);
+        let c = cx.tensor((2, 3), DType::F32);
         let stacked = cx.stack(&[a, b, c], 0).output();
 
         let a_data = random_vec(6);

@@ -76,10 +76,10 @@ fn llama_architecture_search_space_equivalence_fuzz() {
     cx.set_dim('s', SEQ);
     cx.set_dim('c', CTX);
 
-    let input = cx.named_tensor_dtyped("input", 's', DType::Int);
-    let q_pos = cx.named_tensor_dtyped("q_pos", 's', DType::Int);
-    let scatter_idx = cx.named_tensor_dtyped("scatter_idx", 's', DType::Int);
-    let gather_idx = cx.named_tensor_dtyped("gather_idx", 'c', DType::Int);
+    let input = cx.named_tensor("input", 's', DType::Int);
+    let q_pos = cx.named_tensor("q_pos", 's', DType::Int);
+    let scatter_idx = cx.named_tensor("scatter_idx", 's', DType::Int);
+    let gather_idx = cx.named_tensor("gather_idx", 'c', DType::Int);
     let kv_cache = llama_model::KVCache::new_with_config(&mut cx, SLOTS, config);
     let llama = llama_model::Llama::init_with_config(&mut cx, config);
 
@@ -138,16 +138,16 @@ fn gemma_architecture_search_space_equivalence_fuzz() {
     const EPS: f32 = 1e-6;
 
     let mut cx = Graph::default();
-    let input = cx.tensor((SEQ, HIDDEN));
-    let attn_norm_w = cx.tensor(HIDDEN);
-    let post_attn_norm_w = cx.tensor(HIDDEN);
-    let pre_ff_norm_w = cx.tensor(HIDDEN);
-    let post_ff_norm_w = cx.tensor(HIDDEN);
-    let proj_w = cx.tensor((Q_DIM, HIDDEN));
-    let o_proj_w = cx.tensor((HIDDEN, Q_DIM));
-    let w_gate = cx.tensor((INTERMEDIATE, HIDDEN));
-    let w_up = cx.tensor((INTERMEDIATE, HIDDEN));
-    let w_down = cx.tensor((HIDDEN, INTERMEDIATE));
+    let input = cx.tensor((SEQ, HIDDEN), DType::F32);
+    let attn_norm_w = cx.tensor(HIDDEN, DType::F32);
+    let post_attn_norm_w = cx.tensor(HIDDEN, DType::F32);
+    let pre_ff_norm_w = cx.tensor(HIDDEN, DType::F32);
+    let post_ff_norm_w = cx.tensor(HIDDEN, DType::F32);
+    let proj_w = cx.tensor((Q_DIM, HIDDEN), DType::F32);
+    let o_proj_w = cx.tensor((HIDDEN, Q_DIM), DType::F32);
+    let w_gate = cx.tensor((INTERMEDIATE, HIDDEN), DType::F32);
+    let w_up = cx.tensor((INTERMEDIATE, HIDDEN), DType::F32);
+    let w_down = cx.tensor((HIDDEN, INTERMEDIATE), DType::F32);
 
     let normed = rms_norm(input, attn_norm_w, EPS);
     let proj_out = normed.matmul(proj_w.t()).matmul(o_proj_w.t());
@@ -205,15 +205,13 @@ fn moe_architecture_search_space_equivalence_fuzz() {
     const EPS: f32 = 1e-6;
 
     let mut cx = Graph::default();
-    let router_input = cx.tensor(('s', HIDDEN));
-    let expert_input = cx.tensor(('s', HIDDEN));
-    let router_scale = cx.tensor(HIDDEN);
-    let router_proj = cx.tensor((NUM_EXPERTS, HIDDEN));
-    let per_expert_scale = cx.tensor(NUM_EXPERTS);
-    let gate_up_weights = cx
-        .tensor_dtyped((NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN), DType::Bf16);
-    let down_weights = cx
-        .tensor_dtyped((NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
+    let router_input = cx.tensor(('s', HIDDEN), DType::F32);
+    let expert_input = cx.tensor(('s', HIDDEN), DType::F32);
+    let router_scale = cx.tensor(HIDDEN, DType::F32);
+    let router_proj = cx.tensor((NUM_EXPERTS, HIDDEN), DType::F32);
+    let per_expert_scale = cx.tensor(NUM_EXPERTS, DType::F32);
+    let gate_up_weights = cx.tensor((NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN), DType::Bf16);
+    let down_weights = cx.tensor((NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
 
     let n = router_input.dims().len();
     let e_dim = *router_proj.dims().first().unwrap();
@@ -299,12 +297,10 @@ fn moe_architecture_reference_runtime_fuzz() {
     const MOE_INTERMEDIATE: usize = 6;
 
     let mut cx = Graph::default();
-    let input = cx.tensor(('s', HIDDEN));
-    let router = cx.tensor((NUM_EXPERTS, HIDDEN));
-    let gate_up_weights = cx
-        .tensor_dtyped((NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN), DType::Bf16);
-    let down_weights = cx
-        .tensor_dtyped((NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
+    let input = cx.tensor(('s', HIDDEN), DType::F32);
+    let router = cx.tensor((NUM_EXPERTS, HIDDEN), DType::F32);
+    let gate_up_weights = cx.tensor((NUM_EXPERTS, MOE_INTERMEDIATE * 2, HIDDEN), DType::Bf16);
+    let down_weights = cx.tensor((NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
 
     let n = input.dims().len();
     let e_dim = *router.dims().first().unwrap();

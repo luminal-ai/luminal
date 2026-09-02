@@ -220,8 +220,8 @@ mod tests {
     #[test]
     fn logical_graph_dot_smoke() {
         let mut cx = Graph::new();
-        let a = cx.tensor(2);
-        let b = cx.tensor(2);
+        let a = cx.tensor(2, DType::F32);
+        let b = cx.tensor(2, DType::F32);
         let _c = (a + b).output();
         let dot = cx.logical.to_dot().expect("recorded model renders");
         assert!(dot.contains("digraph"), "header missing:\n{dot}");

@@ -1,10 +1,6 @@
 ; Layout Tensor Op Scatter Mutating — writes INTO init's storage: the
 ; output layout tensor must carry INIT'S OWN layout (the mutating
-; precondition, discharged here at match time as always). NOTE the write
-; gate is layout-descriptor injectivity only: scatter's WRITE MAP is
-; data-dependent (the coordinates), and duplicate coordinates are UB by
-; ruling — the standard provable-injectivity gate of the elementwise
-; mutating tier cannot apply and is deliberately absent.
+; precondition, discharged here at match time as always).
 (rule
   (
     (= ?out_logical (LogicalScatter ?init_logical ?coordinate_list ?src_logical))

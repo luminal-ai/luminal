@@ -13,8 +13,8 @@ pub fn kernel_add_bandwidth_test() {
     let size = 64 * 1024 * 1024;
 
     let mut cx = Graph::default();
-    let a = cx.tensor(size).persist();
-    let b = cx.tensor(size).persist();
+    let a = cx.tensor(size, DType::F32).persist();
+    let b = cx.tensor(size, DType::F32).persist();
     let output = (a + b).output();
 
     // Generate test data

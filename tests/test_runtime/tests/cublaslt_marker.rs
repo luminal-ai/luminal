@@ -6,6 +6,7 @@
 use std::time::Instant;
 
 use luminal::buffer_tensor_ir::OpSlotNames;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use test_runtime::cublaslt_marker::{CuEpilogue, CublasLt};
@@ -65,8 +66,8 @@ fn single_pinned(text: &str) -> (CublasLt, Vec<String>) {
 
 fn record_plain_2d() -> String {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize));
-    let w = cx.tensor((4usize, 3usize));
+    let x = cx.tensor((2usize, 4usize), DType::F32);
+    let w = cx.tensor((4usize, 3usize), DType::F32);
     let _out = x.matmul(w).output();
     cx.logical
         .bound_program(&test_runtime::TestRuntimeBindings)
@@ -130,14 +131,14 @@ fn fixture1_plain_2d_amk_bkn_spec_field_by_field() {
 // ---------------------------------------------------------------------------
 // Fixture 2 — the folded-permute spelling A[m,k], B[n,k] on the LIVE
 // recorder: x.matmul(w.permute((1,0))),
-// the Linear::new_permuted case. Round-1 algebra minted ZERO here; the
-// marker must mint one, with trans_a = T.
+// Round-1 algebra minted ZERO here; the marker must mint one, with
+// trans_a = T.
 // ---------------------------------------------------------------------------
 
 fn record_amk_bnk() -> String {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize));
-    let w = cx.tensor((3usize, 4usize)); // stored [n, k]
+    let x = cx.tensor((2usize, 4usize), DType::F32);
+    let w = cx.tensor((3usize, 4usize), DType::F32); // stored [n, k]
     let _out = x.matmul(w.permute((1usize, 0usize))).output();
     cx.logical
         .bound_program(&test_runtime::TestRuntimeBindings)
@@ -182,7 +183,7 @@ fn fixture2_amk_bnk_live_recorder_mints() {
 /// A reading (the map disambiguates); a shape-derived design would have to
 /// guess.
 ///
-/// ROUND-9 NOTE (2026-08-25): the assertions below are UNCHANGED and still
+/// ROUND 9 (2026-08-25): the assertions below are UNCHANGED and still
 /// hold, but the mechanism that satisfies them moved. Round 5 read the
 /// operation off the map's ENTRY ORDER. Round 9 reads it off the operand
 /// layout PRE-COMPOSED WITH that map: the composed broadcast chain of a
@@ -195,8 +196,8 @@ fn fixture2_amk_bnk_live_recorder_mints() {
 fn fixture2b_square_amk_bnk_single_reading() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 4usize));
-        let w = cx.tensor((4usize, 4usize));
+        let x = cx.tensor((2usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 4usize), DType::F32);
         let _out = x.matmul(w.permute((1usize, 0usize))).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -248,9 +249,9 @@ fn fixture2b_square_amk_bnk_single_reading() {
 
 fn record_two_same_shape_matmuls() -> String {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize));
-    let wq = cx.tensor((4usize, 3usize));
-    let wk = cx.tensor((4usize, 3usize));
+    let x = cx.tensor((2usize, 4usize), DType::F32);
+    let wq = cx.tensor((4usize, 3usize), DType::F32);
+    let wk = cx.tensor((4usize, 3usize), DType::F32);
     let _q = x.matmul(wq).output();
     let _k = x.matmul(wk).output();
     cx.logical

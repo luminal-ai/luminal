@@ -38,8 +38,8 @@
 ; layout data, no bounds guards.
 ; ============================================================================
 ; --- "A[m,k], B[n,k] -> A[m,k], B[k,n]" ------------------------------------
-; The recorder's folded-permute spelling (Linear::new_permuted /
-; x.matmul(w.permute((1,0)))): b stored [n,k], read through map (c1 c0).
+; The recorder's folded-permute spelling
+; x.matmul(w.permute((1,0))): b stored [n,k], read through map (c1 c0).
 ; RHS: the b position holds the rank-2 transpose VIEW of b (shape [k,n])
 ; read through the standard canonical map (c0 c1); the a position is
 ; reused unchanged; the two outs are the same value — union them.

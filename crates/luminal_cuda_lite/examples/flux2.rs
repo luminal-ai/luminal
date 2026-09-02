@@ -33,12 +33,12 @@ fn run() -> anyhow::Result<()> {
 
     let mut cx = Graph::new();
     let model = Flux2Transformer::init(&mut cx);
-    let latent = cx.tensor((IMAGE_TOKENS, IN_CHANNELS));
-    let text = cx.tensor((TEXT_TOKENS, JOINT_ATTENTION_DIM));
-    let rope_cos = cx.tensor((TOKENS, HEAD_DIM));
-    let rope_sin = cx.tensor((TOKENS, HEAD_DIM));
-    let timestep = cx.tensor(1);
-    let guidance = cx.tensor(1);
+    let latent = cx.tensor((IMAGE_TOKENS, IN_CHANNELS), DType::F32);
+    let text = cx.tensor((TEXT_TOKENS, JOINT_ATTENTION_DIM), DType::F32);
+    let rope_cos = cx.tensor((TOKENS, HEAD_DIM), DType::F32);
+    let rope_sin = cx.tensor((TOKENS, HEAD_DIM), DType::F32);
+    let timestep = cx.tensor(1, DType::F32);
+    let guidance = cx.tensor(1, DType::F32);
     let velocity = model
         .forward(latent, text, rope_cos, rope_sin, timestep, guidance)
         .output();
