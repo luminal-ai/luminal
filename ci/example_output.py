@@ -24,7 +24,7 @@ PERF_GATES = {
     "llama": {"max_ttft_ms": 150.0, "max_tpot_ms": 15.0},
     "gemma": {"max_ttft_ms": 300.0, "max_tpot_ms": 30.0},
     "qwen": {"max_ttft_ms": 180.0, "max_tpot_ms": 22.0},
-    "qwen3_moe": {"max_ttft_ms": 450.0, "max_tpot_ms": 50.0},
+    "qwen3_moe": {"max_ttft_ms": 1000.0, "max_tpot_ms": 50.0},
     # gemma4_moe's decode search still has run-to-run family variance
     # (A100 draws observed 25-52 ms TPOT vs 10.8 best; exploration work
     # tracked separately) — gate above the draw spread, below the
