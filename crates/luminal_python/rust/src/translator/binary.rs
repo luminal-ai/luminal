@@ -55,6 +55,37 @@ impl<'a> Translator<'a> {
             .transpose()
     }
 
+    /// The dtype torch recorded for this node's output — division's result
+    /// type depends on the operand types and the rounding mode, and export
+    /// already ran that rule and wrote the answer down, so read it.
+    pub(crate) fn recorded_output_dtype(&self, node: &Node) -> Option<DType> {
+        let name = node
+            .outputs
+            .first()?
+            .as_tensor
+            .as_ref()
+            .map(|t| t.name.clone())?;
+        self.tensor_meta(&name)
+            .map(|meta| torch_dtype_int_to_luminal(meta.dtype))
+    }
+
+    /// Promote both operands ahead of a true division.
+    ///
+    /// Must happen before the divide, not after: `a / b` lowers to
+    /// `a * b.reciprocal()`, so an integral `b` emits `Recip` on an integer,
+    /// which no backend region contract accepts.
+    pub(crate) fn promote_for_true_division(
+        &self,
+        node: &Node,
+        a: GraphTensor,
+        b: GraphTensor,
+    ) -> (GraphTensor, GraphTensor) {
+        let Some(target) = self.recorded_output_dtype(node) else {
+            return (a, b);
+        };
+        (a.cast(target), b.cast(target))
+    }
+
     pub(crate) fn translate_binary_op(&mut self, node: &Node, op: BinaryOp) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         let alpha = self.get_explicit_alpha(node, op)?;
@@ -81,9 +112,20 @@ impl<'a> Translator<'a> {
                 BinaryOp::Add => a + b,
                 BinaryOp::Mul => a * b,
                 BinaryOp::Sub => a - b,
-                BinaryOp::Div => a / b,
+                BinaryOp::Div => {
+                    let (a, b) = self.promote_for_true_division(node, a, b);
+                    a / b
+                }
             })
         } else {
+            // `x / 2` is div.Tensor with an int argument, not div.Scalar, so the
+            // scalar routes below need the same promotion. Each casts its scalar
+            // to a.dtype, so promoting `a` promotes both sides.
+            let a = if matches!(op, BinaryOp::Div) {
+                self.promote_for_true_division(node, a, a).0
+            } else {
+                a
+            };
             if let Some(f) = arg1.as_float() {
                 return Ok(self.apply_scalar_op_with_alpha(a, f, alpha, op));
             }
@@ -105,7 +147,12 @@ impl<'a> Translator<'a> {
         node: &Node,
         op: BinaryOp,
     ) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
+        let mut a = self.get_input_tensor(node, 0)?;
+        if matches!(op, BinaryOp::Div) {
+            // The scalar is cast to `a.dtype` below, so promoting `a` promotes
+            // both sides. int / 2 is float in torch, and Recip needs it anyway.
+            (a, _) = self.promote_for_true_division(node, a, a);
+        }
         let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;
         if let Some(f) = arg1.as_float() {

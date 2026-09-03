@@ -40,6 +40,7 @@ Dispositions:
 | `7e7deb2a` | #404 | Spec | FILE-LEVEL (`spec.md`) | branch `merge/main-404-spec` | ruling 7 of 2026-09-02: *"this is just a snapshot, we'll update it later"* — the text describes main's architecture (translator-fed HLIR, loop-rolling, genetic LLIR extraction), NOT this branch's; see **#404 spec.md** below for the line-by-line divergence |
 | `d6d26cbe` | #402 | translate_module: hand back the translated graph without the pytorch wrappings | FILE-LEVEL (4 seam files) + SUPERSEDED (the `scatter_nd` fix) | branch `merge/main-402-translate-seam` | the seam's REQUIREMENT for the python re-attachment: a host must be able to take the translated graph WITHOUT inheriting luminal's dim buckets or search budget — see **#402 translate_module** below |
 | `be22fa60` | #405 | ci: stop running the OpInfo suite in the main Python CUDA job | FILE-LEVEL | branch `merge/main-405-ci-opinfo` | — (the ignore flag is a main-side CI decision; nothing in this workflow runs on this branch) |
+| `ad437d8c` | #403 | luminal_python: promote integer operands on true division | FILE-LEVEL | branch `merge/main-403-int-div-promote` | the promotion point is a REQUIREMENT on the M4 translator re-attachment: this branch lowers `a / b` to `a * b.reciprocal()` exactly as main does, and `LogicalRecip` on an Int64 buffer refuses in the reference kernel — see **#403 int true division** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -892,3 +893,75 @@ pytest environment as `os.environ.copy()` INSIDE `TestRunner.run`, a
 `@app.cls(image=image, ...)`), so it copies the *container's* environment —
 variables set on the GitHub runner never reach it. Both are requirements on the
 M4 translator re-attachment, alongside #398's own.
+
+## #403 int true division — banked, and the same trap exists here
+
+`crates/luminal_python/rust/src/translator/{binary.rs, unary.rs}` take main's
+diff unchanged. Both hunks applied 3-way with no conflict and the diff-of-diffs
+against `ad437d8c` is EMPTY for both paths — unusually, this python commit
+needed no re-spelling at all, because every symbol it reaches for already
+exists here under main's name: `Translator::tensor_meta`
+(`translator/mod.rs:160`), `torch_dtype_int_to_luminal` (`pt2_util.rs:216`,
+reached through the `use crate::pt2_util::*` glob), `Node::outputs: Vec<TensorRef>`
+and `TensorRef::as_tensor` (`pt2_schema.rs:39,50`), and `GraphTensor::dtype` as
+a public field. Nothing in the hunk touches a `ShapeTracker`, a `.shape`, or an
+`Expression`, which is why it escaped the usual three renames.
+
+**What it fixes.** `ensure_same_dtype` implements `torch.promote_types`, which
+is right for add/mul/sub — but ATen builds `div` with
+`build_borrowing_binary_float_op`, whose config sets
+`promote_integer_inputs_to_float(true)`, so `TensorIterator::compute_types`
+rewrites an integral common dtype to `get_default_dtype()`. `int / int` is
+float; `int * int` is int. Rather than reimplement that rule (the default dtype
+is process-global, the rule includes bool, and `div.Tensor_mode` reverses it for
+trunc/floor), main READS the answer torch already recorded: the exported program
+carries a dtype for every intermediate, so `recorded_output_dtype(node)` pulls
+the output dtype straight out of the node's `TensorMeta`.
+
+The three paths, and why all three were needed: `a / b` with a tensor argument;
+`x / 2`, which serializes as `div.Tensor` with an INT argument rather than
+`div.Scalar` and so takes `translate_binary_op`'s scalar fallback; and
+`translate_binary_scalar_op` proper. Main's message records patching the wrong
+one first. The scalar routes cast their scalar to `a.dtype`, so promoting `a`
+promotes both sides — hence the `self.promote_for_true_division(node, a, a).0`
+spelling. And the promotion happens BEFORE the divide, never after: casting the
+result is too late, because `Recip` has already been emitted on an integer.
+
+The `unary.rs` half is a separate silent wrong answer, not the crash:
+`div.Tensor_mode` with `rounding_mode=None` cast the float quotient back to
+`a.dtype`, turning `3.5` into `3`. `rounding_mode=None` IS true division and
+returns float, so the cast now goes to `recorded_output_dtype`, and to nothing
+at all when export recorded none.
+
+**The core-side observation, which is why this row carries an intent.** The
+defect main hit is not a translator artifact — the identical lowering shape is
+live on this branch:
+
+- `src/frontend/binary.rs:119-125`, `impl Div<GraphTensor> for GraphTensor`, is
+  `self * rhs.reciprocal()`.
+- `src/frontend/unary.rs:116-128`, `GraphTensor::reciprocal`, records
+  `LogicalOp::Recip` with `self.dtype` propagated UNCHANGED.
+- `src/logical_op/recip/dtype.egg` propagates the input dtype to the output
+  unconditionally, so an Int64 input yields an Int64 `LogicalRecip` class; no
+  rule refuses it, and the search happily extracts it.
+- The refusal lands at execution instead, in
+  `ReferenceKernelCtx::unary_elementwise_typed` (`src/buffer_tensor_ir.rs:440`),
+  which has an F32 arm and an F64 arm and bails by name on anything else:
+  *"unary transcendental has no i64 arm (cast at the call site; a silent bridge
+  through f32 would hide a precision change)"*. That is main's "unary opcode
+  Recip does not support dtype Int64" in this branch's vocabulary — a LATER,
+  louder failure at the same place in the pipeline.
+
+So when the translator is re-attached at M4, the promotion has to be re-applied
+at the same point (before the divide, reading export's recorded dtype), and it
+cannot be recovered by casting the quotient. Whether `GraphTensor::div` itself
+should promote integral operands is a SEPARATE frontend question and is NOT
+settled by this row: the Rust operator is not obliged to follow torch's
+process-global default-dtype rule, and the branch's own doctrine is that a
+dtype never changes implicitly. What is settled is that a caller who divides
+two Int64 tensors today gets a kernel refusal, not an answer.
+
+**Not verified here.** Main's numbers — the five-path dtype/value table against
+torch, Prompt-Guard-86M at cosine 1.0 / max abs diff 7e-06, mdeberta-v3-base
+compiling — are main's, run against main's HLIR backend. `crates/luminal_python`
+is not a workspace member on this branch, so none of it was rebuilt or rerun.
