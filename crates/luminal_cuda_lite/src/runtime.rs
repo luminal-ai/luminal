@@ -870,6 +870,12 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
         self.cuda_stream
             .synchronize()
             .expect("failed to synchronize after evicting bucket CUDA graphs");
+        // Releasing a bucket also drops prepared library workspaces and
+        // internal buffers allocated from CUDA's stream-ordered pool. The
+        // graph allocator cannot reuse pages retained there, so trim both
+        // independent pools before materializing the replacement bucket.
+        Self::trim_current_memory_pool(&self.cuda_stream)
+            .expect("failed to trim CUDA memory pool after bucket eviction");
         Self::trim_device_graph_memory(&self.cuda_stream)
             .expect("failed to trim CUDA graph memory after bucket eviction");
     }
