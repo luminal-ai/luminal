@@ -110,6 +110,30 @@ impl TorchDType {
         }
         Err(code)
     }
+
+    /// Returns the ordinary real storage dtype used for one component of a
+    /// complex tensor. Complex values are represented by the PT2 frontend as
+    /// pairs of these dtypes; complex is deliberately not a first-class HLIR
+    /// dtype.
+    pub fn complex_component_dtype(self) -> Option<DType> {
+        match self {
+            TorchDType::ComplexHalf => Some(DType::F16),
+            TorchDType::ComplexFloat => Some(DType::F32),
+            TorchDType::ComplexDouble => Some(DType::F64),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_complex(self) -> bool {
+        self.complex_component_dtype().is_some()
+    }
+
+    /// Number of real-component elements in each logical PyTorch element.
+    #[inline]
+    pub fn storage_factor(self) -> usize {
+        if self.is_complex() { 2 } else { 1 }
+    }
 }
 
 /// PyTorch dtype → luminal `DType`. `Err(self)` for variants luminal's IR

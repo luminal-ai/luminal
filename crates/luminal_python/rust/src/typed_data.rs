@@ -166,6 +166,12 @@ impl TypedData {
             crate::torch_dtype::TorchDType::Byte => Self::from_raw(bytes, DType::U8),
             crate::torch_dtype::TorchDType::Char => Self::from_raw(bytes, DType::I8),
             crate::torch_dtype::TorchDType::Short => Self::from_raw(bytes, DType::I16),
+            // Complex is represented by the PT2 frontend as interleaved
+            // ordinary real components. The bytes already have exactly that
+            // layout, so only the internal storage tag changes here.
+            crate::torch_dtype::TorchDType::ComplexHalf => Self::from_raw(bytes, DType::F16),
+            crate::torch_dtype::TorchDType::ComplexFloat => Self::from_raw(bytes, DType::F32),
+            crate::torch_dtype::TorchDType::ComplexDouble => Self::from_raw(bytes, DType::F64),
             other => panic!(
                 "from_pytorch_bytes: PT2 dtype {} (code {}) isn't a first-class \
                  IR type — no luminal mapping.",

@@ -114,6 +114,7 @@ pub enum Argument {
     Tensor(TensorArg),
     Int(IntArg),
     Float(FloatArg),
+    Complex(ComplexArg),
     Bool(BoolArg),
     Ints(IntsArg),
     SymInts(SymIntsArg),
@@ -145,6 +146,17 @@ pub struct IntArg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FloatArg {
     pub as_float: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplexArg {
+    pub as_complex: ComplexValue,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplexValue {
+    pub real: f64,
+    pub imag: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +285,13 @@ impl Argument {
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Argument::Float(f) => Some(f.as_float),
+            _ => None,
+        }
+    }
+
+    pub fn as_complex(&self) -> Option<(f64, f64)> {
+        match self {
+            Argument::Complex(value) => Some((value.as_complex.real, value.as_complex.imag)),
             _ => None,
         }
     }

@@ -51,8 +51,120 @@ impl<'a> Translator<'a> {
         node.inputs
             .iter()
             .position(|input| input.name == "alpha")
-            .map(|idx| self.get_float_arg(node, idx))
+            .map(|idx| {
+                node.inputs[idx]
+                    .arg
+                    .as_bool()
+                    .map(|value| if value { 1.0 } else { 0.0 })
+                    .map(Ok)
+                    .unwrap_or_else(|| self.get_float_arg(node, idx))
+            })
             .transpose()
+    }
+
+    fn promoted_binary_inputs(&mut self, node: &Node) -> Result<(GraphTensor, GraphTensor)> {
+        let dtype = self.output_meta_dtype(node)?;
+        let mut a = self.get_input_tensor(node, 0)?.cast(dtype);
+        let mut b = if let Some(name) = node.inputs[1].arg.as_tensor_name() {
+            self.get_tensor(name)?.cast(dtype)
+        } else {
+            let value = node.inputs[1]
+                .arg
+                .as_int()
+                .map(|value| value as f64)
+                .or_else(|| node.inputs[1].arg.as_float())
+                .ok_or_else(|| anyhow::anyhow!("{} requires a numeric RHS", node.target))?;
+            self.scalar_constant(value, dtype)
+        };
+        (a, b) = broadcast_binary(a, b);
+
+        let sym_ranges = sym_char_ranges(&self.sym_map);
+        normalize_equal_dims(&mut a, &mut b, &sym_ranges);
+        let lhs_dims = a.dims();
+        let rhs_dims = b.dims();
+        anyhow::ensure!(
+            same_dims(&lhs_dims, &rhs_dims, &sym_ranges),
+            "binary op {} still has mismatched dims after broadcast: lhs={lhs_dims:?} rhs={rhs_dims:?} inputs={:?}",
+            node.target,
+            node.inputs
+        );
+        Ok((a, b))
+    }
+
+    pub(crate) fn translate_atan2(&mut self, node: &Node) -> Result<GraphTensor> {
+        let (y, x) = self.promoted_binary_inputs(node)?;
+        let output_dtype = y.dtype;
+        let (y, x) = if matches!(output_dtype, DType::F16 | DType::Bf16) {
+            (y.cast(DType::F32), x.cast(DType::F32))
+        } else {
+            (y, x)
+        };
+        Ok(self.real_atan2(y, x).cast(output_dtype))
+    }
+
+    pub(crate) fn translate_copysign(&mut self, node: &Node) -> Result<GraphTensor> {
+        let (magnitude, sign) = self.promoted_binary_inputs(node)?;
+        let magnitude = self.real_abs(magnitude);
+        Ok(self.copy_sign(magnitude, sign))
+    }
+
+    pub(crate) fn translate_copysign_scalar(&mut self, node: &Node) -> Result<GraphTensor> {
+        let dtype = self.output_meta_dtype(node)?;
+        let magnitude = self.get_input_tensor(node, 0)?.cast(dtype);
+        let magnitude = self.real_abs(magnitude);
+        let sign = node.inputs[1]
+            .arg
+            .as_int()
+            .map(|value| value as f64)
+            .or_else(|| node.inputs[1].arg.as_float())
+            .ok_or_else(|| anyhow::anyhow!("{} requires a numeric RHS", node.target))?;
+
+        // Egglog's scalar value domain equates +0.0 and -0.0. Preserve the
+        // compile-time scalar sign structurally instead of inserting it as a
+        // graph constant; multiplication also produces the required -0.0 for
+        // a zero magnitude.
+        Ok(if sign.is_sign_negative() {
+            magnitude * -1.0
+        } else {
+            magnitude
+        })
+    }
+
+    pub(crate) fn translate_fmax_fmin(
+        &mut self,
+        node: &Node,
+        maximum: bool,
+    ) -> Result<GraphTensor> {
+        let (a, b) = self.promoted_binary_inputs(node)?;
+        let comparison = if maximum { a.gt(b) } else { a.lt(b) };
+        let mut result = self.select(comparison, a, b);
+
+        if matches!(a.dtype, DType::F16 | DType::Bf16 | DType::F32 | DType::F64) {
+            // Unlike maximum/minimum, fmax/fmin ignore a NaN when the other
+            // operand is numeric. If both are NaN, selecting either preserves
+            // the required NaN result.
+            let a_nan = self.is_nan(a);
+            let b_nan = self.is_nan(b);
+            result = self.select(a_nan, b, result);
+            result = self.select(b_nan, a, result);
+
+            // C fmax/fmin semantics choose a deterministic zero sign rather
+            // than whichever equal operand happened to win the comparison.
+            let a_zero = self.is_zero(a);
+            let b_zero = self.is_zero(b);
+            let both_zero = self.bool_and(a_zero, b_zero);
+            let zero = self.constant_like(a, 0.0);
+            let signed_zero = if maximum { zero } else { zero * -1.0 };
+            result = self.select(both_zero, signed_zero, result);
+        }
+        Ok(result)
+    }
+
+    /// Lower boolean OR through numeric HLIR ops until HLIR has native logical ops.
+    pub(crate) fn apply_bool_or(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        let a = a.cast(DType::F32);
+        let b = b.cast(DType::F32);
+        (a + b - a * b).cast(DType::Bool)
     }
 
     /// The dtype torch recorded for this node's output — division's result
@@ -93,7 +205,8 @@ impl<'a> Translator<'a> {
         if let Some(name) = arg1.as_tensor_name() {
             let b = self.get_tensor(name)?;
             let (a, mut b) = ensure_same_dtype(a, b);
-            if let Some(alpha) = alpha {
+            let is_bool_add = matches!(op, BinaryOp::Add) && a.dtype == DType::Bool;
+            if !is_bool_add && let Some(alpha) = alpha {
                 b = self.apply_scalar_op(b, alpha, BinaryOp::Mul);
             }
             let (mut a, mut b) = broadcast_binary(a, b);
@@ -107,6 +220,16 @@ impl<'a> Translator<'a> {
                     node.target,
                     node.inputs
                 );
+            }
+            if is_bool_add {
+                // PyTorch defines bool + bool as logical OR. Its alpha scales
+                // the RHS in boolean space, so zero drops it and any nonzero
+                // integral value leaves its truth value unchanged.
+                return Ok(if alpha == Some(0.0) {
+                    a
+                } else {
+                    self.apply_bool_or(a, b)
+                });
             }
             Ok(match op {
                 BinaryOp::Add => a + b,

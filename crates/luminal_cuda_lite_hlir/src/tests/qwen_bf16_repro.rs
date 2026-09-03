@@ -87,7 +87,12 @@ fn qk_norm(x: GraphTensor, weight: GraphTensor, n_heads: usize) -> GraphTensor {
     }
 }
 
-fn rotary(input: GraphTensor, pos_ids: GraphTensor, n_heads: usize) -> GraphTensor {
+fn rotary_with_pad_value(
+    input: GraphTensor,
+    pos_ids: GraphTensor,
+    n_heads: usize,
+    pad_value: f32,
+) -> GraphTensor {
     let input = input.split_dims(1, HEAD_DIM).transpose(0, 1);
     let freqs = input
         .graph()
@@ -114,10 +119,14 @@ fn rotary(input: GraphTensor, pos_ids: GraphTensor, n_heads: usize) -> GraphTens
     let x0_out = x0 * cos - x1 * sin;
     let x1_out = x1 * cos + x0 * sin;
 
-    x0_out
-        .concat_along(x1_out, 2)
-        .transpose(0, 1)
-        .merge_dims(1, 2)
+    (x0_out.pad_along(0, x1_out.dims()[2], 2, pad_value)
+        + x1_out.pad_along(x0_out.dims()[2], 0, 2, pad_value))
+    .transpose(0, 1)
+    .merge_dims(1, 2)
+}
+
+fn rotary(input: GraphTensor, pos_ids: GraphTensor, n_heads: usize) -> GraphTensor {
+    rotary_with_pad_value(input, pos_ids, n_heads, 0.0)
 }
 
 fn attention(
@@ -838,15 +847,10 @@ fn rope_rule_fires_and_matches() {
     let out = rotary(x, pos, N_HEADS).cast(DType::F32).output();
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
 
-    let egraph = cx.egraph().unwrap();
-    let has = egraph.enodes.values().any(|(h, ch)| {
-        h == "Op"
-            && !ch.is_empty()
-            && egraph.eclasses.get(&ch[0]).is_some_and(|(_l, ns)| {
-                ns.iter().any(|n| egraph.enodes[n].0.contains("KernelRoPE"))
-            })
-    });
-    assert!(has, "rope rule should fire on the bf16 rotary chain");
+    assert!(
+        egraph_has_kernel_rope(&cx),
+        "rope rule should fire on the bf16 rotary chain"
+    );
 
     // CPU reference: half-rotation rope on bf16-rounded inputs.
     let bf = |v: f32| half::bf16::from_f32(v).to_f32();
@@ -896,6 +900,51 @@ fn rope_rule_fires_and_matches() {
         1e-2,
         crate::tests::utilities::GENOME_FUZZ_COUNT,
         0x72,
+    );
+}
+
+fn egraph_has_kernel_rope(cx: &Graph) -> bool {
+    let egraph = cx.egraph().unwrap();
+    egraph.enodes.values().any(|(h, ch)| {
+        h == "Op"
+            && !ch.is_empty()
+            && egraph.eclasses.get(&ch[0]).is_some_and(|(_l, ns)| {
+                ns.iter().any(|n| egraph.enodes[n].0.contains("KernelRoPE"))
+            })
+    })
+}
+
+#[test]
+fn rope_rule_matches_ieee_safe_concat_without_cuda() {
+    let mut cx = Graph::default();
+    let x = cx.tensor((S, Q_DIM)).cast(DType::Bf16);
+    let pos = cx.tensor(S).as_dtype(DType::Int);
+    rotary(x, pos, N_HEADS).output();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(egraph_has_kernel_rope(&cx));
+}
+
+#[test]
+fn rope_rule_matches_ieee_safe_concat_with_symbolic_sequence() {
+    let mut cx = Graph::default();
+    let x = cx.tensor(('s', Q_DIM)).cast(DType::Bf16);
+    let pos = cx.tensor('s').as_dtype(DType::Int);
+    rotary(x, pos, N_HEADS).output();
+    cx.set_dim('s', S);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(egraph_has_kernel_rope(&cx));
+}
+
+#[test]
+fn rope_rule_rejects_nonzero_safe_padding() {
+    let mut cx = Graph::default();
+    let x = cx.tensor((S, Q_DIM)).cast(DType::Bf16);
+    let pos = cx.tensor(S).as_dtype(DType::Int);
+    rotary_with_pad_value(x, pos, N_HEADS, 1.0).output();
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_kernel_rope(&cx),
+        "nonzero inactive padding is not semantically equivalent to concat"
     );
 }
 

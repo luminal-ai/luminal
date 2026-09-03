@@ -96,20 +96,15 @@ fn solve_single_var_dim(expr: &IntExpr, dim_val: usize) -> Option<(Symbol, usize
     Some((var, candidate))
 }
 
-/// Convert luminal `DType` to a PT2 dtype code via `TorchDType`. Panics
-/// for luminal-specific dtypes that have no PyTorch counterpart (`I4`,
-/// `U4`, the F6 / F4 families, ...).
-fn luminal_dtype_to_pt2_code(dtype: DType) -> u32 {
-    crate::torch_dtype::TorchDType::try_from(dtype)
-        .map(|t| t.code())
-        .unwrap_or_else(|d| panic!("luminal_dtype_to_pt2_code: unsupported dtype {d:?}"))
-}
-
 /// Common intermediate result from translating a model graph.
 pub struct GraphTranslation {
     pub graph: Graph,
     pub tensor_ids: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
+    /// Public PT2 input dtypes. These cannot be inferred from the HLIR Input
+    /// node because frontend compound types (complex) use a real component
+    /// dtype internally.
+    pub input_dtypes: Vec<u32>,
     pub output_names: Vec<String>,
     /// Output node identities in exactly the same order as `output_names`.
     /// Names are not unique when a functionalized mutation is also returned.
@@ -146,6 +141,7 @@ pub struct CompiledGraph {
     /// Cached label → NodeIndex map for O(1) lookups in set_weight_* methods.
     label_map: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
+    pub input_dtypes: Vec<u32>,
     pub output_names: Vec<String>,
     pub output_ids: Vec<NodeIndex>,
     pub output_shapes: Vec<Vec<usize>>,
@@ -175,6 +171,7 @@ impl CompiledGraph {
             mut graph,
             tensor_ids,
             input_names,
+            input_dtypes,
             output_names,
             output_ids,
             output_shape_exprs,
@@ -218,6 +215,7 @@ impl CompiledGraph {
             tensor_ids,
             label_map,
             input_names,
+            input_dtypes,
             output_names,
             output_ids,
             output_shapes,
@@ -269,19 +267,7 @@ impl CompiledGraph {
     /// Get the PT2 dtype codes for all inputs (in order of input_names).
     #[getter]
     fn input_dtypes(&self) -> Vec<u32> {
-        self.input_names
-            .iter()
-            .map(|name| {
-                if let Some(&node_id) = self.tensor_ids.get(name)
-                    && let Some(input) = (*self.graph.graph[node_id])
-                        .as_any()
-                        .downcast_ref::<luminal::hlir::Input>()
-                {
-                    return luminal_dtype_to_pt2_code(input.dtype);
-                }
-                7 // default to f32
-            })
-            .collect()
+        self.input_dtypes.clone()
     }
 
     /// Get the list of output tensor names.
@@ -657,35 +643,29 @@ impl CompiledGraph {
 
     /// Read an output as i8 without widening.
     fn get_output_i8(&self, name: &str) -> PyResult<Vec<i8>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_i8(*node_id))
+        Ok(self.runtime.get_output_i8(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_i8_at(&self, position: usize) -> PyResult<Vec<i8>> {
+        Ok(self.runtime.get_output_i8(self.output_node_at(position)?))
     }
 
     /// Read an output as u8 without widening.
     fn get_output_u8(&self, name: &str) -> PyResult<Vec<u8>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_u8(*node_id))
+        Ok(self.runtime.get_output_u8(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_u8_at(&self, position: usize) -> PyResult<Vec<u8>> {
+        Ok(self.runtime.get_output_u8(self.output_node_at(position)?))
     }
 
     /// Read an output as i16 without widening.
     fn get_output_i16(&self, name: &str) -> PyResult<Vec<i16>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_i16(*node_id))
+        Ok(self.runtime.get_output_i16(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_i16_at(&self, position: usize) -> PyResult<Vec<i16>> {
+        Ok(self.runtime.get_output_i16(self.output_node_at(position)?))
     }
 
     /// Read an output as f64. Strict: the producer node must already

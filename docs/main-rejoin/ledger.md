@@ -42,6 +42,7 @@ Dispositions:
 | `be22fa60` | #405 | ci: stop running the OpInfo suite in the main Python CUDA job | FILE-LEVEL | branch `merge/main-405-ci-opinfo` | — (the ignore flag is a main-side CI decision; nothing in this workflow runs on this branch) |
 | `ad437d8c` | #403 | luminal_python: promote integer operands on true division | FILE-LEVEL | branch `merge/main-403-int-div-promote` | the promotion point is a REQUIREMENT on the M4 translator re-attachment: this branch lowers `a / b` to `a * b.reciprocal()` exactly as main does, and `LogicalRecip` on an Int64 buffer refuses in the reference kernel — see **#403 int true division** below |
 | `eb7a5d6e` | #407 | metal: add fused RMSNorm and simd-group reductions | FILE-LEVEL (park) + INTENT-ONLY (CL) | branch `merge/main-407-metal-rmsnorm` | REQUIREMENT FOR CL: the live CUDA `reduce` codegen is a serial per-output loop with NO warp-level reduction, and no fused RMSNorm op exists — main`s `simd_sum`/`simd_max` block reduction is the CUDA-applicable half; see **#407 metal RMSNorm + simd reductions** below |
+| `62d3cc0d` | #406 | Expand PyTorch lowering and complex dtype coverage | MIXED — FILE-LEVEL (24 python files + `docs/design/associative-fold.md`) / FILE-LEVEL (7 files into the `cuda_lite_hlir` park) / RE-EXPRESSED (core: `ne` -> Bool, NaN-safe `pad`) / N/A (`examples/gemma4_moe`, `src/graph.rs`) / DROPPED-AS-INERT (`rowmajor-empty`) | branch `merge/main-406-pt-lowering` (two commits) | LUM-803 (ideal value types) and LUM-804 (native Bool8 select) — see **#406 PyTorch lowering + complex dtypes** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1097,3 +1098,137 @@ recorder emits, with the equivalence reasoning left to the general rules.
   declared reads and writes; it would NOT get to invent a per-element input
   count, and it would not get a different cost for choosing a different
   shader. Do not port `bytes_loaded`.
+
+## #406 PyTorch lowering + complex dtypes — the largest split of the walk
+
+Main's `62d3cc0d` is 38 files, +4833/-279: 24 in `crates/luminal_python`, one
+new design doc, 7 in `crates/luminal_cuda_lite`, 4 in live core, one example,
+one CI-adjacent default. It splits cleanly along this branch's own seams, so it
+lands as two commits. **P4a landed; P4b landed — see the P4b subsection at the
+end of this section.**
+
+### FILE-LEVEL: the python park (24 files + `docs/design/associative-fold.md`)
+
+Main's content, this branch's spellings, per the standing park rule. Six files
+are new and came across verbatim: `translator/complex.rs` (1681 lines),
+`tests/test_{binary,complex,constructors,reduction,straightforward_lowerings}.py`,
+and `docs/design/associative-fold.md`.
+
+**The headline is complex dtypes without a complex dtype.** `ComplexTensor` is
+a pair of ordinary real tensors carried in a side map
+(`Translator::complex_tensors`), never an HLIR/logical dtype — main's own
+comment says so: *"Complex never becomes an HLIR dtype."* A complex INPUT
+arrives as PyTorch's interleaved real/imaginary storage, so
+`create_input_value` appends a trailing extent-2 axis to the declared shape,
+mints ONE real-valued named tensor over it, and splits it into components with
+`ComplexTensor::from_interleaved`; on the way out, `pack` re-interleaves. Every
+real-only lowering path that is handed a complex name now refuses by name
+(`get_tensor`: *"Complex tensor {name} reached a real-only lowering; add a
+frontend complex lowering"*) instead of silently translating the real half.
+That design — components in the frontend, interleaving only at the storage
+boundary — is directly reusable here, and it is the right shape for this branch
+too: it needs no new dtype, no new op, and no e-graph change.
+
+Riding along: `output_meta_dtype(node)` (PT2 metadata is authoritative for
+torch promotion, the same trick #403 used for true division), `constant_like`
+replacing hand-rolled `constant_float(..).cast(..).expand_rhs(..)` chains
+throughout `unary.rs`, `real_constructor_scalar` for the `*_like` family, and
+`translate_diagonal` / `translate_flip`.
+
+Four files conflicted; every resolution takes main's content in the branch's
+spelling. `translator/mod.rs` takes main's `create_input_value` in all three
+`InputKind` arms and its new `output_meta_dtype`, keeping
+`named_tensor_dtyped(name, shape, dtype)` for main's
+`named_tensor(name, shape).as_dtype(dtype)` (the `cdeb73c7` purity ruling) and
+`Result<IntExpr>` on `dim_size_to_expr`. `movement_dynamic.rs` takes main's
+`pub(super)` widening of `row_major_strides` at `&[IntExpr]`.
+`translator/tensor.rs` takes main's `real_constructor_scalar`-based
+`translate_full_like` whole (it replaces the branch's `constant_float(val)`
+line). `translator/unary.rs` takes main's `constant_like`-based `real_acos`
+whole.
+
+**Residue** (diff-of-diffs against `62d3cc0d`, per file): fourteen of the
+twenty-five files are EMPTY, including every `.py` file and the design doc.
+The rest is exclusively the three known re-spellings —
+`Expression` -> `IntExpr`, `X.shape` -> `X.legacy_tracker_ref()` /
+`X.legacy_tracker_mut()` for tracker access and `X.dims()` where the shape is
+passed BY VALUE to `expand_rhs` / `expand_to_shape_on_axes`, and
+`named_tensor(..).as_dtype(dt)` -> `named_tensor_dtyped(.., dt)`. Line counts:
+`complex.rs` 122, `movement.rs` 72, `mod.rs` 34, `tensor.rs` 24,
+`movement_dynamic.rs` 24, `reduction.rs` 10, and 2 apiece in
+`compiled_graph.rs` / `unary.rs` (hunk-header context only). Main's
+`graph().iota(Expression::from('z'), shape)` is banked as
+`IntExpr::from('z')`, matching the park's existing spelling at
+`movement_dynamic.rs:51` and `tensor.rs:338` — and it is a DANGLING call either
+way, because this branch's `Graph::iota` (`src/frontend/other.rs:35`) takes
+`(shape, closure_over_coordinates)` and its doc says outright *"The old
+flat-'z' interface is DELETED"*. That is the standing park cost, alongside
+`Graph::constant_float64` from #398 and `early_stop_exceeded` from #386.
+
+### FILE-LEVEL: 7 files into the `cuda_lite_hlir` park
+
+`src/dyn_backend.rs`, `src/kernel/{hlir,rope,to_host}.rs`, `src/runtime.rs`,
+`src/tests/{op_functional_tests,qwen_bf16_repro}.rs`, path-rewritten from
+main's `crates/luminal_cuda_lite/` into `crates/luminal_cuda_lite_hlir/`. The
+park TRACKS main's HLIR CUDA crate; this branch's live `crates/luminal_cuda_lite`
+is a DIFFERENT crate (the CL backend) and none of this goes near it — `runtime.rs`
+in particular exists in both and only the park's copy is touched.
+
+Residue: `dyn_backend.rs`, `to_host.rs`, `op_functional_tests.rs` and
+`qwen_bf16_repro.rs` are EMPTY. `hlir.rs` is one `Expression` -> `IntExpr`.
+`rope.rs` is seven, all the same rename, six of them inside egglog `relation`
+declarations — see the note under #407: in the parks' `.rs` files the sort name
+is spelled `IntExpr` too, following `ab3b5c66`. `runtime.rs` differs only in
+hunk-header line numbers (`@@ -611` vs `@@ -628`, and so on): the park's
+`runtime.rs` has drifted ~18 lines from main's through the accumulated park
+stubs (`early_stop_exceeded`, the `alloc_state_buffer` / `bind_*` drift), and
+the CONTENT of all three hunks is identical.
+
+One conflict, in `rope.rs`, at the head of the `angle_stage` egglog string:
+main adds six new relations next to the one the park had already re-spelled.
+Resolved to main's content, renamed.
+
+### N/A — two paths that do not exist here
+
+- **`examples/gemma4_moe/src/main.rs` (+1/-1)** — a comment update from
+  *"(5s candidate / 1s execution)"* to *"(60s candidate ...)"*. This branch's
+  `examples/gemma4_moe` has NO `src/main.rs`: it is `lib.rs` + `model.rs`,
+  because model-zoo members here are backend-neutral graph definitions and the
+  executables live under the runtime crate (`Cargo.toml`'s own comment).
+  Nothing to patch.
+- **`src/graph.rs` (+2/-2)** — the `CompileOptions::candidate_timeout` default
+  moving 5s -> 60s, plus its doc. `CompileOptions` does not exist on this
+  branch and `candidate_timeout` appears nowhere in `src/` or any live crate;
+  `src/graph.rs` here is the RECORDER. The *intent* — a 5-second per-candidate
+  viability budget is too tight once candidates are big — is worth remembering
+  when `ImplementationSearchOptions` grows a timeout, but there is no field to
+  move today.
+
+### DROPPED-AS-INERT — `rowmajor-empty`
+
+Main adds one line to `src/egglog_utils/base.rs`:
+
+```rust
+p.add_rule(rewrite("rowmajor-empty", rowmajor(nil()), nil()).ruleset("expr"));
+```
+
+The file is NOT deleted here, it MOVED: `src/egglog_core/egglog_utils/base.rs`,
+and it is live — `base_expression_egglog()` is what
+`IntegerExpression::egglog_equal` and the expression simplifier feed to egglog
+(`src/shape/expression.rs:636`, `:1162`, `:1215`). The rule would apply
+cleanly, and it closes a real hole in main's rowmajor recursion: the cons rule
+handles lists of length >= 2, `rowmajor-base` handles length 1, and NOTHING
+handled `RowMajor(ENil)` — a rank-0 shape, which is exactly what #406's new
+scalar constructors produce a lot of.
+
+It is not carried because on THIS branch it can never fire. `RowMajor` survives
+only as a vestigial sort in the shared expression program: nothing in `src/`,
+`crates/luminal_reference`, `crates/luminal_cuda_lite`, `crates/luminal_nn` or
+`examples/` constructs one (`grep -rn RowMajor`, excluding `egglog_core` and the
+parks, returns nothing), and `base_cleanup_egglog()` explicitly DELETES any
+`RowMajor` node that appears (`src/egglog_core/egglog_utils/base.rs:1427`, in
+the `sort_cleanups` table whose doc calls these "intermediate helper nodes").
+Adding an unfireable rule to a program that is rebuilt and re-run on every
+`egglog_equal` and every expression simplification is pure cost on a hot path.
+**If `RowMajor` is ever revived as a live construct here, this rule comes with
+it** — the hole it fixes is real, and it is a one-liner.
