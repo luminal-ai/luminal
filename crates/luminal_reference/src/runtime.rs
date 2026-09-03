@@ -386,6 +386,13 @@ impl ReferenceRuntime {
                     TypedBuffer::F32(values.clone())
                 }
                 (PlanDtype::F32, None) => TypedBuffer::F32(vec![0.0; numel]),
+                // F64 is EXECUTABLE here (ruling 2026-09-02, main #398's
+                // f64 unary kernels re-expressed): a double-precision
+                // model runs in double precision, never on an F32 bridge.
+                (PlanDtype::F64, Some(TypedBuffer::F64(values))) => {
+                    TypedBuffer::F64(values.clone())
+                }
+                (PlanDtype::F64, None) => TypedBuffer::F64(vec![0.0; numel]),
                 (PlanDtype::Int, Some(TypedBuffer::I32(values))) => {
                     TypedBuffer::I32(values.clone())
                 }
@@ -415,7 +422,7 @@ impl ReferenceRuntime {
                 ),
                 (other, None) => anyhow::bail!(
                     "buffer {} has dtype {other:?}, which the reference \
-                     runtime cannot execute (f32, i32, i64, bool only)",
+                     runtime cannot execute (f32, f64, i32, i64, bool only)",
                     buffer.label
                 ),
             };
@@ -605,6 +612,13 @@ impl ReferenceRuntime {
     /// 0 or 1 — the two legal codes).
     pub fn get_bool8(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<u8>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_bool8()
+    }
+
+    /// The f64 twin of [`Self::get_f32`] — native double-precision
+    /// output readback (ruling 2026-09-02: F64 executes, so it also
+    /// reads back as f64 and never through an f32 narrowing).
+    pub fn get_f64(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<f64>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_f64()
     }
 
     /// The i32 twin of [`Self::get_f32`] — native Int output readback
@@ -1699,6 +1713,48 @@ mod tests {
         let (cx2, x2, s2) = build();
         let ours = run_reference(&cx2, &[(x2.id, x_data.into())]);
         assert_close(ours.get_f32(s2.id).unwrap(), &expected);
+    }
+
+    /// F64 IS A REAL EXECUTABLE DTYPE (ruling 2026-09-02, main #398's
+    /// `f64_fn` unary kernels re-expressed). Main's
+    /// `reference_unary_ops_execute_f64_natively` rewritten against
+    /// this branch's runtime: an F64 input through `sqrt` on the real
+    /// search-and-execute ladder, read back as `f64`, BIT-EXACT
+    /// against `f64::sqrt`.
+    ///
+    /// The assertion is exact equality, not a tolerance, and `1e300`
+    /// is the load-bearing value: it has no f32 representation at all,
+    /// so any bridge through F32 anywhere in staging, execution or
+    /// readback turns it into an infinity and this test fails. `0.1`
+    /// covers the quieter direction — its f32 round trip differs from
+    /// its f64 value in the 9th significant digit.
+    #[test]
+    fn f64_unary_round_trips_exactly() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(4, DType::F64);
+        let out = x.sqrt().output();
+
+        let values = vec![2.0f64, 3.0, 0.1, 1e300];
+        let rt = crate::harness::run_reference(&cx, &[(x.id, TypedBuffer::F64(values.clone()))]);
+
+        let expected: Vec<f64> = values.iter().map(|v| v.sqrt()).collect();
+        assert_eq!(
+            rt.get_f64(out.id).unwrap(),
+            &expected,
+            "F64 sqrt must be bit-exact double precision, never an f32 bridge"
+        );
+        assert!(
+            expected[3].is_finite(),
+            "sqrt(1e300) is finite in f64 and infinite in f32 — the whole point"
+        );
+        // And the readback is TYPED: asking for f32 refuses by name
+        // rather than narrowing.
+        let err = rt.get_f32(out.id).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected an f32 buffer, found f64"),
+            "typed readback must refuse, got: {err}"
+        );
     }
 
     /// TYPED-BUFFERS LANDING B PINS (2026-08-11).

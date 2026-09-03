@@ -65,7 +65,10 @@ impl<T: BufferTensorIrOp + Clone + 'static> CloneBufferTensorIrOp for T {
 /// Typed reference storage (rulings 2026-07-28, 2026-07-30, and the
 /// typed-buffers ruling 2026-08-11: NO value ever rides a buffer of
 /// another type — "no smuggling data in invalid types"). Floats live
-/// as f32; 32-bit integers as i32 and 64-bit as i64, NATIVE values
+/// as f32, or as f64 where the model asked for double precision
+/// (ruling 2026-09-02: F64 is a real executable dtype here, never an
+/// F32 bridge wearing an F64 tag); 32-bit integers as i32 and 64-bit
+/// as i64, NATIVE values
 /// (every bit pattern legal — total-code dtypes), which is what makes
 /// index arithmetic exact past f32's 2^24 ceiling; booleans live as
 /// Bool8 CODES — one u8 per element, exactly 0x00 or 0x01, every other
@@ -77,6 +80,11 @@ impl<T: BufferTensorIrOp + Clone + 'static> CloneBufferTensorIrOp for T {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedBuffer {
     F32(Vec<f32>),
+    /// Double-precision floats. A model that declares F64 executes in
+    /// F64: silently bridging through F32 would hide a precision
+    /// downgrade behind a dtype tag, which is the one thing the
+    /// deleted HLIR panic existed to refuse.
+    F64(Vec<f64>),
     I32(Vec<i32>),
     I64(Vec<i64>),
     Bool8(Vec<u8>),
@@ -107,6 +115,7 @@ impl TypedBuffer {
     pub fn len(&self) -> usize {
         match self {
             TypedBuffer::F32(values) => values.len(),
+            TypedBuffer::F64(values) => values.len(),
             TypedBuffer::I32(values) => values.len(),
             TypedBuffer::I64(values) => values.len(),
             TypedBuffer::Bool8(bits) => bits.len(),
@@ -121,6 +130,7 @@ impl TypedBuffer {
     pub fn type_name(&self) -> &'static str {
         match self {
             TypedBuffer::F32(_) => "f32",
+            TypedBuffer::F64(_) => "f64",
             TypedBuffer::I32(_) => "i32",
             TypedBuffer::I64(_) => "i64",
             TypedBuffer::Bool8(_) => "bool8",
@@ -139,6 +149,20 @@ impl TypedBuffer {
         match self {
             TypedBuffer::F32(values) => Ok(values),
             other => anyhow::bail!("expected an f32 buffer, found {}", other.type_name()),
+        }
+    }
+
+    pub fn as_f64(&self) -> Result<&Vec<f64>> {
+        match self {
+            TypedBuffer::F64(values) => Ok(values),
+            other => anyhow::bail!("expected an f64 buffer, found {}", other.type_name()),
+        }
+    }
+
+    pub fn as_f64_mut(&mut self) -> Result<&mut Vec<f64>> {
+        match self {
+            TypedBuffer::F64(values) => Ok(values),
+            other => anyhow::bail!("expected an f64 buffer, found {}", other.type_name()),
         }
     }
 
@@ -203,6 +227,7 @@ impl TypedBuffer {
     pub fn zeroed_like(&self) -> TypedBuffer {
         match self {
             TypedBuffer::F32(values) => TypedBuffer::F32(vec![0.0; values.len()]),
+            TypedBuffer::F64(values) => TypedBuffer::F64(vec![0.0; values.len()]),
             TypedBuffer::I32(values) => TypedBuffer::I32(vec![0; values.len()]),
             TypedBuffer::I64(values) => TypedBuffer::I64(vec![0; values.len()]),
             TypedBuffer::Bool8(bits) => TypedBuffer::Bool8(vec![0u8; bits.len()]),
@@ -217,6 +242,14 @@ impl TypedBuffer {
 // pattern is a legal value for these dtypes). Bool8 deliberately has NO
 // From impl — caller bytes must pass the validated [`TypedBuffer::bool8`]
 // constructor.
+//
+// F64 deliberately has no `From` impl either, for a different reason:
+// Rust's default float type is f64, so `vec![1.0, 2.0].into()` — the
+// spelling every staging site here uses — would SILENTLY become an F64
+// buffer the moment such an impl exists, and an F32 program would fail
+// at execute with a staging-variant refusal instead of running. A
+// dtype must never change because a literal was unsuffixed: F64
+// staging is spelled `TypedBuffer::F64(values)`, in full.
 impl From<Vec<f32>> for TypedBuffer {
     fn from(values: Vec<f32>) -> Self {
         TypedBuffer::F32(values)
@@ -261,6 +294,40 @@ impl ReferenceKernelCtx {
         anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
         for (out, x) in dest.iter_mut().zip(input) {
             *out = f(*x);
+        }
+        Ok(())
+    }
+
+    /// dest0[i] = f64_fn(operand0[i]) over an F64 operand, or
+    /// f32_fn(operand0[i]) over an F32 one — main's `UnaryKernels`
+    /// struct (#398) re-expressed for this branch's storage. Main
+    /// carried four widths (f32/f16/bf16/f64); there is no f16 or
+    /// bf16 TypedBuffer here, so this carries two, and every other
+    /// variant refuses BY NAME rather than bridging through f32: a
+    /// caller who asked for double precision must not be handed
+    /// single-precision arithmetic behind an F64 tag.
+    pub fn unary_elementwise_typed(
+        &mut self,
+        f32_fn: impl Fn(f32) -> f32,
+        f64_fn: impl Fn(f64) -> f64,
+    ) -> Result<()> {
+        let double = match &self.operands[0] {
+            TypedBuffer::F32(_) => false,
+            TypedBuffer::F64(_) => true,
+            other => anyhow::bail!(
+                "unary transcendental has no {} arm (cast at the call site; \
+                 a silent bridge through f32 would hide a precision change)",
+                other.type_name()
+            ),
+        };
+        if !double {
+            return self.unary_elementwise(f32_fn);
+        }
+        let input = self.operands[0].as_f64()?;
+        let dest = self.dests[0].as_f64_mut()?;
+        anyhow::ensure!(input.len() == dest.len(), "unary kernel length mismatch");
+        for (out, x) in dest.iter_mut().zip(input) {
+            *out = f64_fn(*x);
         }
         Ok(())
     }

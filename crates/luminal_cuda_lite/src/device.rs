@@ -48,6 +48,11 @@ fn typed_to_bytes(data: &TypedBuffer) -> &[u8] {
         TypedBuffer::I64(v) => bytemuck_cast(v),
         TypedBuffer::Bool8(v) => v.as_slice(),
         TypedBuffer::F8E4M3(_) => unreachable!("dtype_bytes refuses F8 first"),
+        // F64 is executable on the reference runtime (ruling
+        // 2026-09-02) but has no CL kernel and no device
+        // representation, so `dtype_bytes` refuses it by name before a
+        // buffer ever reaches this bridge.
+        TypedBuffer::F64(_) => unreachable!("dtype_bytes refuses F64 first"),
     }
 }
 

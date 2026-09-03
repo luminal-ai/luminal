@@ -138,5 +138,5 @@ pub(crate) fn kernel(
     _op: &dyn BufferTensorIrOp,
     ctx: &mut ReferenceKernelCtx,
 ) -> anyhow::Result<()> {
-    ctx.unary_elementwise(|x| x.log2())
+    ctx.unary_elementwise_typed(|x| x.log2(), |x| x.log2())
 }

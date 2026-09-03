@@ -29,3 +29,76 @@ jobs:
               run: uv run maturin develop --manifest-path rust/Cargo.toml --profile release
             - name: Run pytest
               run: uv run pytest tests/test_hlir_ops.py tests/test_unary.py -v -m "not slow"
+
+    # OpInfo CI is intentionally disabled while backend coverage is widened.
+    # Uncomment this job when its expected failures are ready to run in CI.
+    # python_opinfo_tests:
+    #     name: Python OpInfo (${{ matrix.shard }}/32)
+    #     runs-on: ubuntu-latest
+    #     container:
+    #         image: ghcr.io/luminal-ai/luminal-docker:cpu
+    #     timeout-minutes: 45
+    #     strategy:
+    #         # Unsupported operators are expected to fail while coverage widens.
+    #         # Every shard must still run so their union remains the full suite.
+    #         fail-fast: false
+    #         matrix:
+    #             shard:
+    #                 - 0
+    #                 - 1
+    #                 - 2
+    #                 - 3
+    #                 - 4
+    #                 - 5
+    #                 - 6
+    #                 - 7
+    #                 - 8
+    #                 - 9
+    #                 - 10
+    #                 - 11
+    #                 - 12
+    #                 - 13
+    #                 - 14
+    #                 - 15
+    #                 - 16
+    #                 - 17
+    #                 - 18
+    #                 - 19
+    #                 - 20
+    #                 - 21
+    #                 - 22
+    #                 - 23
+    #                 - 24
+    #                 - 25
+    #                 - 26
+    #                 - 27
+    #                 - 28
+    #                 - 29
+    #                 - 30
+    #                 - 31
+    #     defaults:
+    #         run:
+    #             working-directory: crates/luminal_python
+    #     env:
+    #         LUMINAL_OPINFO_SHARD_COUNT: "32"
+    #         LUMINAL_OPINFO_SHARD_INDEX: ${{ matrix.shard }}
+    #         LUMINAL_TEST_DEVICE: cpu
+    #
+    #     steps:
+    #         - uses: actions/checkout@v6
+    #         - name: Update Rust toolchain
+    #           run: rustup update
+    #         - name: Build maturin extension
+    #           run: uv run maturin develop --manifest-path rust/Cargo.toml --profile release
+    #         - name: Run complete OpInfo shard
+    #           run: >-
+    #               uv run pytest tests/test_opinfo.py -v -m "not slow"
+    #               --randomly-dont-reorganize --randomly-seed=0
+    #               --junitxml=opinfo-shard-${{ matrix.shard }}.xml
+    #         - name: Upload OpInfo report
+    #           if: always()
+    #           uses: actions/upload-artifact@v6
+    #           with:
+    #               name: python-opinfo-${{ matrix.shard }}
+    #               path: crates/luminal_python/opinfo-shard-${{ matrix.shard }}.xml
+    #               if-no-files-found: warn

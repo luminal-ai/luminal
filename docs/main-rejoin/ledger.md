@@ -31,6 +31,7 @@ Dispositions:
 | `7d2817fa` | — | luminal_python: search_iterations pass through more places | FILE-LEVEL | branch `merge/main-7d2817fa-search-iterations` | parked crate: re-point `search_iterations` at `ImplementationSearchOptions` when luminal_python is re-attached to the recorder |
 | `bea18ecf` | #389 | Sdpa gqa fixes | FILE-LEVEL | branch `merge/main-389-sdpa-gqa` | parked crate + non-gating `ci/`: RULED 2026-09-02 (ruling 1) — `ci/example_output.py` SYNCS main's numbers for now, by decision; the loosened gemma / gemma4_moe TPOT figures are main's HLIR cuda_lite draws and still have to be re-baselined against CL A100 draws before they gate anything here |
 | `499d0779` | #386 | Search: early-stop candidate profiling against the best-so-far metric | MIXED — RE-EXPRESSED (core: running mean + fifth positional cutoff + predicate) / FILE-LEVEL (parks, with a stubbed predicate) | branch `merge/main-386-early-stop` (two commits) | REQUIREMENT FOR CL (ruling 4): a device `PlanProfiler` that times candidates on device, mirroring `ReferenceProfiler`'s design, and then honours the cutoff — until then `StaticProfiler` accepts and ignores it; see **#386 early-stop profiling** below |
+| `6a5313f2` | #398 | Support for PyTorch OpInfo tests | MIXED — FILE-LEVEL (python + workflow) / RE-EXPRESSED (`TypedBuffer::F64` + typed unary kernels) / DROPPED (`ConstantF64`, the empty-Vec fix) | branch `merge/main-398-opinfo` (two commits) | OpInfo harness, the arange-metadata and acos/acosh lowerings = M4 translator requirements; typed `LogicalConstant`; F32<->F64 cast policy; F64 on CL — see **#398 OpInfo + F64** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -242,3 +243,133 @@ profiler's design** — warmup, timed trials, a mean metric, and the same
 lower-bound cutoff — at which point `StaticProfiler`'s ignored argument becomes
 a real one. That is a larger question than the cutoff itself, and it is not in
 this batch.
+
+## #398 OpInfo + F64 — what landed, and what is owed
+
+RULED 2026-09-02 (ruling 1): *"this is good and should get its content
+merged"*. Split in two commits, because the commit is two things.
+
+**FILE-LEVEL (commit 1).** All 13 `crates/luminal_python/**` files plus
+`.github/workflows/test-python-native.yml` (the OpInfo shard job, committed
+commented-out) take main's diff. The crate is not a workspace member here, so
+none of it builds or runs; it is banked so the OpInfo harness — main's only
+broad conformance oracle, 373 lines of `tests/test_opinfo.py` — is not lost,
+and so the two genuine lowering fixes riding along are recorded as text:
+
+- **`translate_arange` trusts export's output metadata** instead of
+  recomputing `(end-start)/step`. The old code collected every *decodable*
+  positional argument with a `filter_map`, which silently dropped float and
+  bool values and shifted the survivors into the wrong start/end/step slots;
+  the rewrite resolves `start`/`step` by PT2 schema NAME and takes the length
+  from `output_meta_shape`, which is already correct for fractional and
+  negative steps (`arange(-1, 2, 2)`) and for empty ranges.
+- **`acos` / `acosh` lowerings** (Chebyshev-style polynomial + the
+  `1 - x` square-root fold, and `log(x + sqrt(x^2 - 1))`) in
+  `translator/unary.rs`.
+
+Both are REQUIREMENTS on the M4 re-attachment: when the translator is
+re-expressed against the recorder frontend they must not be silently
+re-broken.
+
+Four files conflicted and were resolved keeping this branch's spellings, never
+main's (the standing rule): `compiled_graph.rs` takes main's new
+`copy_host_bytes` helper but keeps the `IntExpr` doc comment;
+`translator/attention.rs` takes main's f64 default SDPA scale with the
+branch's `legacy_tracker_ref()` indentation; `translator/binary.rs` takes
+main's `scalar_constant` + alpha plumbing with `expand_rhs(a.dims())` for
+main's `expand_rhs(a.shape)`; `translator/tensor.rs` takes main's schema-name
+arange with `Expr(IntExpr)` for `Expr(Expression)` and `indices.dims()` for
+`indices.shape`. `main`'s new `Translator::scalar_constant` calls
+`Graph::constant_float64`, which this branch does not have — a DANGLING
+reference banked at main's spelling, the same standing cost as
+`early_stop_exceeded` in the #386 parks.
+
+**UNCARRIED.** `src/dyn_backend.rs` (+56) and `src/hlir.rs` (+240/-53) are
+deleted on this branch and were dropped from the pick. Of their content:
+
+- The **`bytes_to_reference_data` empty-Vec dtype fix** is DROPPED, not owed:
+  it repairs `ReferenceData::from_raw_parts` reinterpreting an empty byte
+  slice as F32 regardless of the declared dtype. `TypedBuffer` holds typed
+  `Vec`s and never reinterprets bytes, so the hazard cannot recur here.
+- **`ConstantF64`** is SUPERSEDED and deliberately NOT ported. Main's own
+  commit calls it temporary — *"should be removed ASAP once the SSA changeset
+  lands, by having Constant be typed"* — and typed constants ARE this
+  branch's design: `LogicalOp::Constant(f64)` already carries an f64 payload
+  and `LogicalGraph::op` already takes an explicit `DType`. What blocks
+  `Graph::constant_float64` today is one line of egglog, not an op:
+  `src/logical_op/constant/dtype.egg` sets `(dtype-of (LogicalConstant ?v))`
+  to `(F32)` UNCONDITIONALLY, so a constant cannot be minted at any other
+  dtype. **Owed:** give `LogicalConstant` a dtype — either a second
+  constructor child or a `dtype-of` seed written by the recorder — and then
+  `constant_float64` is a three-line frontend method. Until then a parked
+  `scalar_constant` call to it stays dangling.
+- The **`f64_fn` arms** ARE re-expressed; see below.
+
+**RE-EXPRESSED (commit 2): F64 as a real executable dtype.** Ruling 1
+answered intent-row question 2 in the affirmative, so main's five `f64_fn`
+kernel arms became a `TypedBuffer::F64(Vec<f64>)` variant and a typed unary
+dispatch. The pieces:
+
+- `TypedBuffer::F64(Vec<f64>)` in `src/buffer_tensor_ir.rs`, with `len`,
+  `type_name` (`"f64"`), `as_f64` / `as_f64_mut` and `zeroed_like`.
+  DELIBERATELY **no** `From<Vec<f64>>`, unlike F32/I32/I64: Rust's default
+  float type is f64, so the moment that impl exists the staging spelling
+  every test here uses — `vec![1.0, 2.0, 3.0].into()`, unsuffixed — silently
+  becomes an F64 buffer. Adding it turned 13 green tests red with
+  "BufferLit(0) is F32; staged f64 data is the wrong type", and that is the
+  BENIGN failure mode; the malignant one is an F64-annotated graph quietly
+  accepting the same literals. A dtype must never change because a literal
+  was unsuffixed, so F64 staging is spelled `TypedBuffer::F64(values)`, in
+  full. (Bool8 has no `From` either, for its own reason: caller bytes must
+  pass the validated two-legal-codes door.)
+- `ReferenceKernelCtx::unary_elementwise_typed(f32_fn, f64_fn)` — main's
+  `UnaryKernels` struct re-expressed. Main carried four fields (f32, f16,
+  bf16, f64); this branch has no f16/bf16 storage, so it carries two, and an
+  operand of any other type still refuses loudly by name. `unary_elementwise`
+  (F32-only) stays for callers that mean F32 only.
+- The six unary transcendental kernels take it: `sqrt`, `exp2`, `log2`,
+  `sin`, `recip` — main's exact five — plus `exp`, which is branch-only (main
+  spells it `exp2`) and is the same family, so leaving it F32-only would be
+  an arbitrary hole.
+- Storage and readback: the `PlanDtype::F64` arm in
+  `ReferenceRuntime::materialize` (staged F64 accepted, zeros otherwise) and
+  `ReferenceRuntime::get_f64`. The reference BINDING needed no change — it
+  emits `(bits-of (F64))` through the generic `{dtype:?}` arm, and the
+  preamble already sets that row to 64.
+- `crates/luminal_cuda_lite/src/device.rs` gains an F64 arm in
+  `typed_to_bytes` so its exhaustive match stays exhaustive. The arm is
+  `unreachable!`, not a transport path: `dtype_bytes` has no `PlanDtype::F64`
+  row, so CL refuses an F64 buffer by name before the bridge is ever reached.
+  Giving CL F64 *transport* without F64 *kernels* would be the half-done
+  version, so it is not done. **Owed:** F64 on CL, if it is ever wanted, is a
+  codegen question, not a storage one.
+
+**Not carried: F32 <-> F64 casts.** The cast kernel gains no F64 arm, so an
+F64 program must be F64 end to end. F32 -> F64 is an exact widening and would
+be uncontroversial; F64 -> F32 is a lossy NARROWING, and this branch's cast
+policy (2026-08-11) has a rule for float -> int (refuse) and for int -> float
+(checked-exact) but says nothing about float -> float narrowing. Rather than
+invent one in passing, both directions are left refusing by name at the
+kernel's catch-all. **Owed:** a float-narrowing cast policy, and then the two
+arms.
+
+**No proof gate.** F64 is a float, and the non-wrapping ruling of 2026-08-11
+gates Int and Int64 only — the ops' `match_functional.egg` non-Int arms are
+spelled `(!= ?value_dtype (Int)) (!= ?value_dtype (Int64))`, so F64 mints
+through them unchanged with no egglog edit at all.
+
+**Test.** `luminal_reference::runtime::tests::f64_unary_round_trips_exactly`
+is main's `reference_unary_ops_execute_f64_natively` re-expressed against the
+branch's runtime: an F64 input through `sqrt` on the real search-and-execute
+ladder, asserting BIT-EXACT equality against `f64::sqrt` on values whose f32
+round trip is provably lossier (`2.0`, `3.0`, `0.1`, `1e300`), plus the
+readback typed as `f64` via `get_f64`. `1e300` is the load-bearing one: it is
+not representable in f32 at all, so the assertion fails outright if anything
+in the path bridges through F32. The test also asserts that `get_f32` on
+that output REFUSES ("expected an f32 buffer, found f64") rather than
+narrowing.
+
+Main's other two Rust tests do not move: `f64_constant_to_egglog_round_trips_exactly`
+tests `ConstantF64`, which is superseded, and
+`empty_bytes_preserve_reference_dtype` tests a `from_raw_parts` hazard that
+does not exist here.
