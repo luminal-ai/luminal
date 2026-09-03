@@ -10,6 +10,19 @@ from torch import fx
 from luminal.region_export import _fresh_export_inputs, export_region
 
 
+def _tensor_reporting_device(device: str) -> torch.Tensor:
+    class DeviceTensor(torch.Tensor):
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_subclass(cls, torch.empty(1), require_grad=False)
+
+        @property
+        def device(self):
+            return torch.device(device)
+
+    return DeviceTensor()
+
+
 def _linear_graph() -> fx.GraphModule:
     graph = fx.Graph()
     x = graph.placeholder("x")
@@ -290,3 +303,29 @@ def test_export_region_surfaces_export_error(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="ValueError: original export failure"):
         export_region(_linear_graph(), [torch.randn(3, 8)] * 3)
+
+
+def test_export_region_records_fake_cuda_device() -> None:
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        inputs = [torch.randn(2, 4, device="cuda:0") for _ in range(2)]
+        graph = fx.symbolic_trace(lambda left, right: left + right)
+        region = export_region(graph, inputs)
+
+    assert region.device_index == 0
+
+
+def test_export_region_rejects_multiple_cuda_devices() -> None:
+    inputs = [
+        _tensor_reporting_device("cuda:0"),
+        _tensor_reporting_device("cuda:1"),
+    ]
+    with pytest.raises(ValueError, match="span multiple logical devices"):
+        export_region(fx.symbolic_trace(lambda left, right: left + right), inputs)
+
+
+def test_export_region_rejects_nonzero_cuda_device() -> None:
+    inputs = [_tensor_reporting_device("cuda:1") for _ in range(2)]
+    with pytest.raises(ValueError, match="only logical CUDA device 0"):
+        export_region(fx.symbolic_trace(lambda left, right: left + right), inputs)

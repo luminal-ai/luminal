@@ -19,6 +19,9 @@ impl DynBackend for CudaLiteDynBackend {
     fn device_type(&self) -> &str {
         "cuda"
     }
+    fn device_index(&self) -> Option<usize> {
+        Some(self.runtime.device_index())
+    }
 
     fn set_data_bytes(&mut self, node: NodeIndex, bytes: Vec<u8>, _dtype: DType) {
         self.runtime.set_data(node, bytes);
@@ -56,7 +59,12 @@ impl DynBackend for CudaLiteDynBackend {
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {
         self.runtime.get_bool(node)
     }
-    fn execute(&mut self, dyn_map: &DynMap) {
+    fn execute(&mut self, dyn_map: &DynMap, stream: Option<u64>) {
+        if let Some(stream) = stream {
+            unsafe { self.runtime.use_borrowed_stream(stream) };
+        } else {
+            self.runtime.use_owned_stream();
+        }
         self.runtime.execute(dyn_map);
     }
     fn supports_device_ptrs(&self) -> bool {
@@ -87,12 +95,25 @@ pub fn cuda_lite_factory(
     graph: &mut Graph,
     args: BackendCompileArgs,
 ) -> Result<Box<dyn DynBackend>, String> {
-    let cuda_ctx = CudaContext::new(0).map_err(|e| format!("CUDA init failed: {e}"))?;
+    let device_index = args
+        .device_index
+        .ok_or_else(|| "CUDA backend requires a device index".to_string())?;
+    if device_index != 0 {
+        return Err(format!(
+            "CUDA backend currently supports only logical device 0, got {device_index}"
+        ));
+    }
+    let cuda_ctx = CudaContext::new(device_index).map_err(|e| format!("CUDA init failed: {e}"))?;
     let stream = cuda_ctx.default_stream();
+    let external_cuda_graph = args.external_cuda_graph;
     compile_backend::<CudaRuntime>(
         graph,
         args,
-        || Ok(CudaRuntime::initialize(stream)),
+        || {
+            let mut runtime = CudaRuntime::initialize(stream);
+            runtime.external_cuda_graph = external_cuda_graph;
+            Ok(runtime)
+        },
         |rt, node, bytes, _dtype| {
             rt.set_data(node, bytes);
         },

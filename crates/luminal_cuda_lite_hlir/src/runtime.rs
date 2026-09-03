@@ -397,6 +397,7 @@ pub struct CudaRuntime {
     // Keep this private: every mutation must go through the buffer APIs so
     // `changed_hlir` and resource-input validation stay in sync with the map.
     hlir_buffers: FxHashMap<NodeIndex, CudaInput>,
+    owned_stream: Arc<CudaStream>,
     cuda_stream: Arc<CudaStream>,
     changed_hlir: FxHashSet<NodeIndex>,
     pub(crate) cuda_graph_timings: Vec<(CudaGraphTiming, Uuid)>,
@@ -420,6 +421,11 @@ pub struct CudaRuntime {
     /// Resource-relevant input state covered by the most recent aggregate
     /// retained-bucket validation.
     last_resource_input_signature: FxHashMap<NodeIndex, ResourceInputFootprint>,
+    /// Owned-stream execution is blocking; borrowed-stream execution leaves
+    /// completion ordered on the caller's stream.
+    synchronize_stream: bool,
+    /// Launch kernels directly so an enclosing runtime can capture them.
+    pub(crate) external_cuda_graph: bool,
     /// High-water intermediate allocation reused across candidate loads and
     /// bucket switches. At most one compiled bucket may borrow it at a time.
     persistent_arena: Option<PersistentArena>,
@@ -471,6 +477,36 @@ impl CudaRuntime {
         let stream = ctx.default_stream();
 
         Ok(Self::initialize(stream))
+    }
+
+    pub fn device_index(&self) -> usize {
+        self.owned_stream.context().ordinal()
+    }
+
+    /// # Safety
+    ///
+    /// `raw_stream` must be a live CUDA stream on this runtime's context. Its
+    /// owner must keep it alive while this runtime may retain or use it.
+    pub unsafe fn use_borrowed_stream(&mut self, raw_stream: u64) {
+        let context = self.owned_stream.context();
+        let raw_stream = raw_stream as usize as sys::CUstream;
+        let stream = unsafe { context.wrap_borrowed_stream(raw_stream) };
+        self.select_execution_stream(stream);
+        self.synchronize_stream = false;
+    }
+
+    pub fn use_owned_stream(&mut self) {
+        self.select_execution_stream(Arc::clone(&self.owned_stream));
+        self.synchronize_stream = true;
+    }
+
+    fn select_execution_stream(&mut self, stream: Arc<CudaStream>) {
+        self.cuda_stream = Arc::clone(&stream);
+        for bucket in &mut self.compiled_buckets {
+            for op in bucket.exec_graph.node_weights_mut() {
+                op.stream = Arc::clone(&stream);
+            }
+        }
     }
 
     /// Read-only view of installed HLIR inputs.
@@ -1246,13 +1282,14 @@ impl CudaRuntime {
         unsafe { self.copy_outputs_to_device_ptrs(&[(id.to_id(), dest_ptr, n_bytes)]) };
     }
 
-    /// Copy several output tensors to external CUDA device pointers and wait once.
+    /// Copy several output tensors to external CUDA device pointers.
     ///
     /// Resolving every source before submitting any work makes the operation
     /// all-or-nothing with respect to runtime lookup failures. More importantly,
     /// callers which need to commit many functionalized mutations (for example
-    /// every K/V tensor in a StaticCache) do not pay one stream synchronization
-    /// per tensor.
+    /// every K/V tensor in a StaticCache) enqueue one batch. Owned-stream mode
+    /// waits once for the batch; borrowed-stream mode leaves it on the caller's
+    /// stream.
     ///
     /// # Safety
     /// Every destination pointer must name a live CUDA allocation with at least
@@ -1285,7 +1322,9 @@ impl CudaRuntime {
                 .expect("cuMemcpyDtoDAsync failed");
             }
         }
-        self.cuda_stream.synchronize().unwrap();
+        if self.synchronize_stream {
+            self.cuda_stream.synchronize().unwrap();
+        }
     }
 
     fn restore_external_output_node(&mut self, data_node: NodeIndex) {
@@ -1767,6 +1806,7 @@ impl CudaRuntime {
         bucket: &mut CompiledBucket,
         stream: &Arc<CudaStream>,
         dyn_dims: &DynMap,
+        external_output_nodes: &FxHashSet<NodeIndex>,
     ) {
         let profile_alloc = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let alloc_profile_start = std::time::Instant::now();
@@ -1893,9 +1933,11 @@ impl CudaRuntime {
             bucket.materialization_fully_dirty = true;
         }
         let arena_ptr = bucket.arena.as_ref().unwrap().device_ptr(stream).0;
+        // Don't allow arena allocation to overwrite a user-provided output pointer.
         let buffer_updates = bucket
             .logical_buffer_offsets
             .iter()
+            .filter(|(logical_node, _)| !external_output_nodes.contains(logical_node))
             .filter_map(|(logical_node, offset)| {
                 let len = bucket.logical_buffer_bytes.get(logical_node).copied()?;
                 let ptr = arena_ptr.checked_add(*offset as u64)?;
@@ -2789,6 +2831,19 @@ impl CudaRuntime {
             new_arena_bytes,
             cached_ptrs_after_alloc,
         ) = {
+            // Preserve caller-provided output pointers for this bucket.
+            // Arena allocation must not replace them with internal buffer pointers.
+            let external_output_nodes = if self.resolved_output_bucket == Some(bucket_idx) {
+                self.resolved_output_registrations
+                    .values()
+                    .filter_map(|resolved| match resolved {
+                        ResolvedOutputRegistration::External { data_node } => Some(*data_node),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                FxHashSet::default()
+            };
             let bucket = &mut self.compiled_buckets[bucket_idx];
             let stabilize_intermediate_pointers = bucket.stabilize_intermediate_pointers;
             let was_hlir_synced = bucket.hlir_synced;
@@ -2804,6 +2859,7 @@ impl CudaRuntime {
                         bucket,
                         &self.cuda_stream,
                         &allocation_dyn_map,
+                        &external_output_nodes,
                     );
                     bucket.last_allocation_dyn_map = allocation_dyn_map.clone();
                 }
@@ -2825,7 +2881,12 @@ impl CudaRuntime {
                     bucket.cached_buffer_ptrs.len(),
                 )
             } else {
-                Self::allocate_intermediate_buffers(bucket, &self.cuda_stream, dyn_map);
+                Self::allocate_intermediate_buffers(
+                    bucket,
+                    &self.cuda_stream,
+                    dyn_map,
+                    &external_output_nodes,
+                );
                 (
                     stabilize_intermediate_pointers,
                     was_hlir_synced,
@@ -4394,6 +4455,7 @@ impl Runtime for CudaRuntime {
             .expect("failed to create CUDA profiling end event");
         Self {
             hlir_buffers: FxHashMap::default(),
+            owned_stream: Arc::clone(&stream),
             cuda_stream: stream,
             changed_hlir: FxHashSet::default(),
             cuda_graph_timings: vec![],
@@ -4410,6 +4472,8 @@ impl Runtime for CudaRuntime {
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             device_resource_limits,
             last_resource_input_signature: FxHashMap::default(),
+            synchronize_stream: true,
+            external_cuda_graph: false,
             persistent_arena: None,
             resource_length_sensitive_hlir: FxHashSet::default(),
             validated_resource_signatures: FxHashSet::default(),
@@ -4585,11 +4649,20 @@ impl Runtime for CudaRuntime {
         self.apply_output_ptr_registrations();
         output_registration_time += timer.elapsed();
 
-        // Materialize CUDA graphs before timed execution. The first real launch
-        // should only patch an already-instantiated graph, not build it from scratch.
+        let external_capture = self.external_cuda_graph
+            && !self.profiling
+            && self.cuda_stream.capture_status().is_ok_and(|status| {
+                status
+                    == cudarc::driver::sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+            });
+
+        // vLLM warms up each shape before capture. Reuse those prepared
+        // resources while capturing instead of touching Luminal's private graph.
         let timer = std::time::Instant::now();
-        self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
-            .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
+        if !external_capture {
+            self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
+                .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
+        }
         materialize_time += timer.elapsed();
         if self.profiling {
             self.last_profile_device_duration = None;
@@ -4612,14 +4685,22 @@ impl Runtime for CudaRuntime {
             .entered();
             if let Some(cuda_graph) = exec_op.internal.as_any().downcast_ref::<CudaGraphOp>() {
                 let timer = std::time::Instant::now();
-                cuda_graph
-                    .launch_materialized(&exec_op.stream)
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "CUDA graph launch error in {:?}: {e}",
-                            exec_op.internal.stats_name().unwrap_or("unknown")
-                        );
-                    });
+                let result = if self.external_cuda_graph && !self.profiling {
+                    // allow vLLM to capture kernels
+                    let buffers = self
+                        .buffer_map_for_exec_op(bucket, exec_op, false)
+                        .unwrap_or_else(|e| panic!("CUDA execute buffer resolution failed: {e}"))
+                        .expect("CUDA execute requires all CudaGraphOp buffers");
+                    cuda_graph.launch_steps(&exec_op.stream, &buffers, dyn_map)
+                } else {
+                    cuda_graph.launch_materialized(&exec_op.stream)
+                };
+                result.unwrap_or_else(|e| {
+                    panic!(
+                        "CUDA launch error in {:?}: {e}",
+                        exec_op.internal.stats_name().unwrap_or("unknown")
+                    );
+                });
                 graph_launch_time += timer.elapsed();
                 graph_launches += 1;
             } else {
@@ -4688,9 +4769,12 @@ impl Runtime for CudaRuntime {
                 .expect("failed to record CUDA profiling end event");
         }
 
-        // Single sync at end - CUDA stream ordering guarantees sequential execution
+        // Standalone execution is blocking. Embedded callers already use
+        // stream ordering and must not be synchronized here.
         let timer = std::time::Instant::now();
-        self.cuda_stream.synchronize().unwrap();
+        if self.synchronize_stream {
+            self.cuda_stream.synchronize().unwrap();
+        }
         sync_time += timer.elapsed();
         self.last_total_time_us = total_start.elapsed().as_secs_f64() * 1_000_000.0;
         if self.profiling {

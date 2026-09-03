@@ -28,7 +28,7 @@ impl DynBackend for MetalDynBackend {
     fn get_output_f32(&self, node: NodeIndex) -> Vec<f32> {
         self.runtime.get_f32(node)
     }
-    fn execute(&mut self, dyn_map: &DynMap) {
+    fn execute(&mut self, dyn_map: &DynMap, _stream: Option<u64>) {
         self.runtime.execute(dyn_map);
     }
 }

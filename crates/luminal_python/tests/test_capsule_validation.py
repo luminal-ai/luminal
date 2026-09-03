@@ -12,6 +12,7 @@ import ctypes
 import pytest
 
 from luminal import process_pt2
+from luminal.luminal import _reference_factory_capsule
 
 
 def _new_capsule(name: bytes):
@@ -20,6 +21,14 @@ def _new_capsule(name: bytes):
     PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     dummy = ctypes.c_void_p(0xDEADBEEF)
     return PyCapsule_New(ctypes.byref(dummy), name, None)
+
+
+def test_factory_capsule_uses_versioned_abi_name():
+    get_name = ctypes.pythonapi.PyCapsule_GetName
+    get_name.restype = ctypes.c_char_p
+    get_name.argtypes = [ctypes.py_object]
+
+    assert get_name(_reference_factory_capsule()) == b"luminal.backend_factory.v2"
 
 
 def test_process_pt2_rejects_capsule_with_wrong_name():
