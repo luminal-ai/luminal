@@ -11,6 +11,28 @@ impl Graph {
         GraphTensor::from_id(id, (), self, DType::Int)
     }
 
+    /// An EXACT scalar `I64` constant, assembled from 16-bit limbs.
+    ///
+    /// `constant` records a `LogicalIota`, and `src/logical_op/iota/dtype.egg`
+    /// pins every iota's dtype to `(Int)` — 32 bits — unconditionally. So a
+    /// literal wider than `i32` cannot be minted directly: the reference
+    /// kernel's `TypedBuffer::I32` arm does `i32::try_from(value)` and
+    /// REFUSES ("iota value {value} overflows i32 (ints are non-wrapping)"),
+    /// and casting after the fact is too late because the narrow buffer is
+    /// already the value. Horner assembly instead keeps every limb inside
+    /// `i32`, casts each to `I64` FIRST, and does all four multiplies and
+    /// adds in 64-bit — covering the complete signed range, `i64::MIN`
+    /// included, with no new op and no wrapping.
+    pub fn constant_i64(&mut self, value: i64) -> GraphTensor {
+        let base = self.constant(1i64 << 16).cast(DType::I64);
+        let mut result = self.constant(value >> 48).cast(DType::I64);
+        for shift in [32, 16, 0] {
+            let limb = self.constant((value >> shift) & 0xffff).cast(DType::I64);
+            result = result * base + limb;
+        }
+        result
+    }
+
     /// A scalar float constant
     pub fn constant_float(&mut self, i: f32) -> GraphTensor {
         let id = self
@@ -176,6 +198,21 @@ mod tests {
 
         // need to assert close because some unaries (exp and log) are (good) approximations
         assert_close(rt.get_f32(b.id).unwrap(), &ref_b.to_vec1::<f32>().unwrap())
+    }
+
+    /// `constant` records an iota, and the iota dtype rule pins every iota
+    /// to 32-bit `Int`, so a wide literal cannot be minted directly — the
+    /// reference kernel refuses it rather than truncating. `constant_i64`
+    /// assembles the value from four 16-bit limbs, each of which fits
+    /// `i32`, with every multiply and add done after the cast to `I64`.
+    #[test]
+    fn constant_i64_preserves_full_width_values() {
+        for value in [i64::MIN, -(1i64 << 40) + 7, -1, 0, 1i64 << 40, i64::MAX] {
+            let mut cx = Graph::new();
+            let c = cx.constant_i64(value).output();
+            let rt = luminal_reference::harness::run_reference(&cx, &[]);
+            assert_eq!(rt.get_i64(c.id).unwrap(), &vec![value], "value {value}");
+        }
     }
 
     proptest! {
