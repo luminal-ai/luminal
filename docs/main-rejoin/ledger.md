@@ -35,6 +35,7 @@ Dispositions:
 | `db3c80fd` | #399 | Add native narrow integer HLIR dtypes | MIXED — FILE-LEVEL (python) / RE-EXPRESSED (I8/U8/I16 TypedBuffer + kernels, int-safe `abs`) | branch `merge/main-399-narrow-ints` (two commits) | **CARVE-OUT to confirm at review**: I8/U8/I16 wrap, I32/I64 stay checked — see **#399 narrow ints** below |
 | `727918cd` | #394 | Optimize CUDA graph materialization and StaticCache writebacks | FILE-LEVEL (parks) + INTENT-ONLY (core) | branch `merge/main-394-cuda-graph-park` | REQUIREMENT FOR THE CL EXECUTOR: durable external device-pointer registration, exact binding-delta graph patching, cached reverse indexes, resource-signature reuse — see **#394 CL executor persistence** below |
 | `b3b975ae` | #396 | shape: name symbolic dimensions instead of numbering them a..z | FILE-LEVEL (parks) + LANDED-BY-EQUIVALENT (core, `90f687bf`) + RE-EXPRESSED (`Symbol::try_new_dim`) | branch `merge/main-396-symbol-parked` | core: resolve later — the branch's own Symbol is the keeper; the PT2 remap and Metal's `dyn[]` slot layout are re-attachment requirements; see **#396 Symbol** below |
+| `2fbf5b6a` | #400 | cuda_lite: retype dim maps | DROPPED | — | ruling 5 of 2026-09-02: *"okay, we can drop"*. But the mismatch it repairs is now VERIFIABLY PRESENT in the park — see **#400 dropped** below, which names all 8 sites |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -648,3 +649,51 @@ still rejected, never sanitized. Test:
    per-graph DISCOVERED slot layout replaces `dyn[byte - b'a']`. Under any
    scheme, a 27th dim writes past an unchecked pointer, so this is a
    soundness requirement on the metal re-attachment, not a cleanup.
+
+## #400 dropped — and the state of the park it would have fixed
+
+RULED 2026-09-02 (ruling 5): *"okay, we can drop"*. No code lands. The
+row above is the whole disposition; this note exists so the reason survives,
+and because the picture changed underneath the ruling.
+
+**What the commit is.** Pure bookkeeping in main's own history. #396 converted
+`crates/luminal_cuda_lite`'s dim-map keys from `char` to `Symbol`; #394 added
+new `char`-keyed code at the same time; a squash-merge race meant #396's diff
+never touched the lines #394 had just added, so 8 signatures were left
+mismatched and the crate did not compile. #400 retypes those 8. No behaviour
+changes and no capability arrives.
+
+**Why it was still reasonable to drop.** At the time of the ruling the park
+was a frozen pre-#396 snapshot: self-consistently `char`-keyed, with nothing
+broken to fix, and the live CL crate has none of these functions (it uses
+`match_functional.egg` matchers and `bufferize.rs` plans, not a `runtime.rs`
+of this shape).
+
+**What is true NOW, having applied #394 (P3) and #396 (P4) to the park.** The
+park has inherited main's race exactly. Verified after this batch's earlier
+commits, all in `crates/luminal_cuda_lite_hlir/`:
+
+| file | line | current | #400 would make it |
+| --- | --- | --- | --- |
+| `src/kernel/to_host.rs` | 496 | `kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>>` | `FxHashMap<Symbol, Vec<usize>>` |
+| `src/kernel/to_host.rs` | 521 | same, at the local | `FxHashMap<Symbol, Vec<usize>>` |
+| `src/kernel/to_host.rs` | 1370 | `dyn_map: &FxHashMap<char, usize>` | `&DynMap` |
+| `src/runtime.rs` | 81 | `allocation_dyn_maps: Vec<Vec<(char, usize)>>` | `Vec<Vec<(Symbol, usize)>>` |
+| `src/runtime.rs` | 2964 | `allocation_dyn_map: &FxHashMap<char, usize>` | `&DynMap` |
+| `src/runtime.rs` | 2965 | `-> Vec<FxHashMap<char, usize>>` | `-> Vec<DynMap>` |
+| `src/runtime.rs` | 2984 | `allocation_dyn_map: &FxHashMap<char, usize>` | `&DynMap` |
+| `src/runtime.rs` | 5223 | `vec![vec![('a', a)]]` | `vec![vec![(Symbol::from('a'), a)]]` |
+
+This costs nothing today — the park is not a workspace member and does not
+compile for a dozen other reasons (it names `luminal::hlir`,
+`luminal::dyn_backend`, `HostOp`, `as_dtype`, `persist`, `early_stop_exceeded`,
+none of which exist here). It is recorded because "the park tracks main" is
+the standing policy, and a park that has inherited main's compile break
+without main's fix is a slightly worse mirror than one that has both. If the
+ruling is revisited, applying it is one command:
+
+```
+git diff 2fbf5b6a^ 2fbf5b6a \
+  | sed "s#crates/luminal_cuda_lite/#crates/luminal_cuda_lite_hlir/#g" \
+  | git apply -3
+```
