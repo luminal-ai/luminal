@@ -663,6 +663,38 @@ fn cublaslt_beta_preserves_batched_broadcast_c() {
 }
 
 #[test]
+#[ignore = "expensive CUDA rewrite regression; run with cargo test -p luminal_cuda_lite -- --ignored"]
+fn cublaslt_layout_witnesses_are_consumer_demanded() {
+    let mut cx = Graph::new();
+
+    let a = cx.tensor((4usize, 5usize), DType::F32);
+    let b = cx.tensor((5usize, 6usize), DType::F32);
+    let sliced_c = cx
+        .tensor((4usize, 9usize), DType::F32)
+        .slice((0..4usize, 0..6usize));
+    (a.matmul(b) + sliced_c).output();
+
+    let batched_a = cx.tensor((2usize, 4usize, 5usize), DType::F32);
+    let batched_b = cx.tensor((2usize, 5usize, 6usize), DType::F32);
+    let batched_c = cx.tensor((2usize, 4usize, 6usize), DType::F32);
+    (batched_c * 0.5 + batched_a.matmul(batched_b) * 1.5).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let egraph = cx.egraph().expect("search space should have an e-graph");
+
+    assert_relation_facts_are_requested(
+        egraph,
+        "cublaslt_valid_leading_dimension",
+        "cublaslt_leading_dimension_request",
+    );
+    assert_relation_facts_are_requested(
+        egraph,
+        "cublaslt_exact_matrix_stride",
+        "cublaslt_matrix_stride_request",
+    );
+}
+
+#[test]
 fn cublaslt_epilogues_reject_permuted_output_layout() {
     let mut relu_cx = Graph::new();
     let a = relu_cx.tensor((4usize, 5usize), DType::F32);
@@ -866,12 +898,13 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
         return;
     }
 
-    let (m, n, k) = (5, 8, 8);
+    let (n, k) = (8, 8);
     let mut cx = Graph::new();
-    let a = cx.tensor((m, k), DType::F32);
+    let a = cx.tensor(('m', k), DType::F32);
     let b = cx.tensor((k, n), DType::F32);
     let first = a.matmul(b);
     let out = (a + first.sin()).matmul(b).output();
+    cx.set_dim('m', 5);
     let llir = extract_forced_distinct_cublaslt_classes_llir_where(
         &mut cx,
         "ordered matching cuBLASLt prepared reuse",
@@ -881,23 +914,25 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
         },
     );
 
-    let a_data = random_f32_vec(m * k, 0xC001_1001, -0.08, 0.08);
-    let b_data = random_f32_vec(k * n, 0xC001_1002, -0.08, 0.08);
-    let first = reference_matmul_2d(&a_data, &b_data, m, n, k);
-    let dep = a_data
-        .iter()
-        .zip(&first)
-        .map(|(a, first)| a + first.sin())
-        .collect::<Vec<_>>();
-    let expected = reference_matmul_2d(&dep, &b_data, m, n, k);
-
     let mut rt = CudaRuntime::initialize(stream);
     rt.load_llir(&llir);
-    rt.set_data(a.id, a_data);
-    rt.set_data(b.id, b_data);
-    rt.execute(&cx.dyn_map);
+    for (m, seed) in [(5, 0xC001_1001), (7, 0xC001_1011)] {
+        cx.set_dim('m', m);
+        let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
+        let b_data = random_f32_vec(k * n, seed + 1, -0.08, 0.08);
+        let first = reference_matmul_2d(&a_data, &b_data, m, n, k);
+        let dep = a_data
+            .iter()
+            .zip(&first)
+            .map(|(a, first)| a + first.sin())
+            .collect::<Vec<_>>();
+        let expected = reference_matmul_2d(&dep, &b_data, m, n, k);
 
-    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+        rt.set_data(a.id, a_data);
+        rt.set_data(b.id, b_data);
+        rt.execute(&cx.dyn_map);
+        assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+    }
     let summary = rt
         .debug_cuda_graph_summaries()
         .into_iter()
@@ -906,6 +941,11 @@ fn mixed_cuda_graph_reuses_prepared_for_ordered_matching_cublaslt_ops() {
     assert_eq!(
         summary.n_cublaslt_prepared, 1,
         "dependency-ordered matching cuBLASLt calls should share prepared resources"
+    );
+    assert_eq!(
+        summary.cublaslt_capture_counts,
+        vec![2, 2],
+        "both ordered cuBLASLt children should recapture after the shared dynamic shape changes"
     );
     assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
 }
@@ -982,17 +1022,30 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
     let a = cx.tensor(('m', k), DType::F32);
     let b = cx.tensor((k, n), DType::F32);
     let out = a.matmul(b).output();
+    // Keep the inputs alive so this test isolates dynamic-shape changes from
+    // pointer changes. Pointer-driven recapture is covered separately.
+    a.output();
+    b.output();
     cx.set_dim('m', 7);
     let llir = extract_forced_cublaslt_llir_where(&mut cx, "cuBLASLt-only dynamic graph", |_| true);
 
     let mut rt = CudaRuntime::initialize(stream);
     rt.load_llir(&llir);
-
-    for (m, seed) in [
+    let mut workspace_ptr = None;
+    let cases = [
         (7usize, 0xC002_0001),
         (9usize, 0xC002_0002),
         (7usize, 0xC002_0003),
-    ] {
+    ];
+    let max_m = cases.iter().map(|(m, _)| *m).max().unwrap();
+    rt.set_data_with_capacity(
+        a.id,
+        Vec::<f32>::new(),
+        max_m * k * std::mem::size_of::<f32>(),
+    );
+    rt.set_data_with_capacity(b.id, Vec::<f32>::new(), k * n * std::mem::size_of::<f32>());
+
+    for (m, seed) in cases {
         cx.set_dim('m', m);
         let a_data = random_f32_vec(m * k, seed, -0.08, 0.08);
         let b_data = random_f32_vec(k * n, seed + 10, -0.08, 0.08);
@@ -1002,6 +1055,19 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
         rt.set_data(b.id, b_data);
         rt.execute(&cx.dyn_map);
         assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+        let current_workspace_ptr = rt
+            .debug_cuda_graph_summaries()
+            .into_iter()
+            .find(|summary| summary.n_cublaslt == 1)
+            .and_then(|summary| summary.cublaslt_workspace_ptrs.into_iter().next())
+            .expect("captured cuBLASLt should retain a prepared workspace");
+        if let Some(previous_workspace_ptr) = workspace_ptr {
+            assert_eq!(
+                current_workspace_ptr, previous_workspace_ptr,
+                "dynamic-shape recapture should recycle the prepared workspace"
+            );
+        }
+        workspace_ptr = Some(current_workspace_ptr);
     }
 
     let summary = rt
@@ -1011,6 +1077,12 @@ fn cuda_graph_cublaslt_only_recaptures_on_dynamic_shape_change() {
         .expect("expected a cuBLASLt-only CudaGraphOp after recapture");
     assert_eq!(summary.n_kernels, 0);
     assert_eq!(summary.n_steps, 1);
+    assert_eq!(
+        summary.cublaslt_capture_counts,
+        vec![2],
+        "m=7 should reuse its first captured child graph after visiting m=9"
+    );
+    assert_eq!(summary.cublaslt_capture_cache_hits, vec![1]);
     assert_eq!(rt.debug_standalone_cublaslt_host_ops(), 0);
 }
 
@@ -3698,6 +3770,31 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
         .into_iter()
         .chain(op_ir_nodes(egraph, "cublaslt_scaled"))
         .collect()
+}
+
+fn assert_relation_facts_are_requested(
+    egraph: &SerializedEGraph,
+    proof_relation: &str,
+    request_relation: &str,
+) {
+    let relation_facts = |label: &str| {
+        egraph
+            .enodes
+            .values()
+            .filter_map(|(node_label, children)| (node_label == label).then_some(children.clone()))
+            .collect::<FxHashSet<_>>()
+    };
+    let proofs = relation_facts(proof_relation);
+    let requests = relation_facts(request_relation);
+
+    assert!(
+        !proofs.is_empty(),
+        "expected at least one {proof_relation} fact"
+    );
+    assert!(
+        proofs.is_subset(&requests),
+        "every {proof_relation} fact must have an identical {request_relation} tuple"
+    );
 }
 
 fn ir_class_has_op_kinds(egraph: &SerializedEGraph, kind_labels: &[&str]) -> bool {

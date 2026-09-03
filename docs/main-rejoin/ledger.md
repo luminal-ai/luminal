@@ -43,6 +43,7 @@ Dispositions:
 | `ad437d8c` | #403 | luminal_python: promote integer operands on true division | FILE-LEVEL | branch `merge/main-403-int-div-promote` | the promotion point is a REQUIREMENT on the M4 translator re-attachment: this branch lowers `a / b` to `a * b.reciprocal()` exactly as main does, and `LogicalRecip` on an Int64 buffer refuses in the reference kernel — see **#403 int true division** below |
 | `eb7a5d6e` | #407 | metal: add fused RMSNorm and simd-group reductions | FILE-LEVEL (park) + INTENT-ONLY (CL) | branch `merge/main-407-metal-rmsnorm` | REQUIREMENT FOR CL: the live CUDA `reduce` codegen is a serial per-output loop with NO warp-level reduction, and no fused RMSNorm op exists — main`s `simd_sum`/`simd_max` block reduction is the CUDA-applicable half; see **#407 metal RMSNorm + simd reductions** below |
 | `62d3cc0d` | #406 | Expand PyTorch lowering and complex dtype coverage | MIXED — FILE-LEVEL (24 python files + `docs/design/associative-fold.md`) / FILE-LEVEL (7 files into the `cuda_lite_hlir` park) / RE-EXPRESSED (core: `ne` -> Bool, NaN-safe `pad`) / N/A (`examples/gemma4_moe`, `src/graph.rs`) / DROPPED-AS-INERT (`rowmajor-empty`) | branch `merge/main-406-pt-lowering` (two commits) | LUM-803 (ideal value types) and LUM-804 (native Bool8 select) — see **#406 PyTorch lowering + complex dtypes** below |
+| `b37eea15` | #409 | Compile-time optimization | FILE-LEVEL (26 files into the `cuda_lite_hlir` park, 1 into the metal park) + UNCARRIED (5 core files, intent recorded) + N/A (`examples/llama`) | branch `merge/main-409-compile-time-park` | RULED 2026-09-03: *"move all this stuff to the hlir park and we'll get to it later. We don't actually need to do much here."* The dense-integer e-graph extraction index, the prepare/profile candidate split, and the two `Expression` intern-identity helpers are the pieces worth revisiting — see **#409 compile-time optimization** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1389,6 +1390,224 @@ exists here.
 **Owed** (the same debt #398 booked for `LogicalConstant`): give `LogicalIota` a
 dtype instead of pinning `(Int)`, and `constant_i64` becomes
 `constant(value).cast(DType::I64)` — one node instead of nine.
+
+## #409 compile-time optimization — parked wholesale; the core ideas recorded
+
+RULED 2026-09-03: *"move all this stuff to the hlir park and we'll get to it
+later. We don't actually need to do much here."* Main's `b37eea15` is 33 files,
++5990/-4217, and it is main's biggest single compile-time push: a dense-integer
+e-graph extraction index, a candidate prepare/profile split, cheaper topology
+and alias validation, demand-gated cuBLASLt layout witnesses, and a
+materialization fix. **Twenty-seven of the thirty-three files are backend files
+this branch parks, and they went to the parks unchanged in substance. Nothing
+landed in live core.**
+
+### FILE-LEVEL: 26 files into the `cuda_lite_hlir` park
+
+`crates/luminal_cuda_lite/**` path-rewritten to
+`crates/luminal_cuda_lite_hlir/**` at the same relative path, including
+`Cargo.toml` (which gains `rustc-hash = "2.1.1"`) and
+`examples/egglog_saturation.rs`. The park TRACKS main's HLIR CUDA crate; this
+branch's live `crates/luminal_cuda_lite` is a DIFFERENT crate (the CL backend)
+and none of this went near it.
+
+What the 26 files carry, in main's own terms:
+
+- **`src/kernel/to_host.rs` (+2169/-…, the largest)** — the CUDA-graph op grows
+  reverse indexes it previously recomputed: `cublaslt_users_by_buffer`,
+  `cublaslt_users_by_dyn_dim` and a precomputed `internal_buffer_dyn_dims`
+  union, so a pointer or dimension change can name the affected kernels
+  directly instead of asking every kernel for its dimension set. It also
+  DELETES `extra_buffer_lifetimes` and `extra_buffer_conflicts` from the op
+  (and `extra_buffer_conflicts` from the `HostOp` trait in `src/host/mod.rs`),
+  the arena-refinement hooks that the new plan preparation makes redundant.
+- **`src/resource.rs` (+602/-…)** — `validate_mutating_aliases` stops rebuilding
+  an ancestor hash set per mutation and rescanning every edge. It now
+  propagates two `u64` bitsets over the topological order — `reaches_mutation`
+  (64 mutations at a time, in reverse topo order) and `includes_mutation`
+  (along the alias-parent forest) — so every ancestor query is answered in a
+  batch, `MUTATIONS_PER_BATCH` at a time. `validated_topology_and_aliases`
+  gains a `LUMINAL_CUDA_PROFILE_STATIC_VALIDATION` timing channel, and fusion
+  validation moves out of `validate_static_llir_semantics` into the new
+  `prepare_static_llir_resources`.
+- **`src/kernel/fusion/region_codegen.rs` (+1892/-…)** — late fusion matching is
+  factored out and region source generation is cached behind a
+  `RegionSourceCache` that `prepare_static_llir_resources` threads through, so
+  a candidate's region source is generated once rather than once per
+  validation pass.
+- **`src/runtime.rs` (+1260/-…)** — `filter_llir_candidate` becomes
+  `compile_and_validate_profile_candidate`, returning
+  `Result<ValidatedProfileCandidate, CandidateFilterResult>` instead of a bare
+  filter verdict: the candidate that survives the filter IS the compiled,
+  resource-validated bucket set, and it is installed rather than recompiled for
+  profiling. That is the backend half of the core `prepare_profile_candidate` /
+  `profile_prepared_candidate` split recorded below.
+- **`src/host/cublaslt/cublaslt_output_witness.egg` (+139/-…)** — the layout
+  witnesses become DEMAND-GATED: `cublaslt_leading_dimension_request` /
+  `cublaslt_matrix_stride_request` relations are asserted by consumers, and the
+  `cublaslt_valid_leading_dimension` / `cublaslt_exact_matrix_stride` facts are
+  only computed for requested pairs. `src/tests/cublaslt_rewrite_tests.rs` adds
+  `cublaslt_layout_witnesses_are_consumer_demanded` to pin exactly that, and
+  `src/host/flashinfer/flashinfer_attention.egg` (-1063 net) is a large
+  contraction of the same kind.
+- The remainder — `src/kernel/{conv2d,cuda_graph,fusion/elementwise,
+  fusion/markers,generic_matmul,hlir,mod,moe_gemv,other_ops,rms_norm,rope,
+  topk}.rs`, `src/host/{mod,cublaslt/mod}.rs`,
+  `src/host/flashinfer/sink_attention.egg`,
+  `src/tests/{dtype_contract,fusion}.rs`, `examples/egglog_saturation.rs` — is
+  signature churn following those five, plus the Metal RMS late-fusion ruleset
+  split (`kernel_fuse_late_pre` -> `kernel_fuse_late_pre_rms`).
+
+**Conflicts and resolutions.** Five files conflicted, every one of them because
+the park has DRIFTED from main's preimage in ways this walk deliberately keeps.
+Each resolution takes main's content in the park's existing spelling:
+
+| file | conflicts | why | resolution |
+| --- | --- | --- | --- |
+| `src/resource.rs` | 5 | the park drops `luminal::mask_events::*` (this branch deleted `src/mask_events.rs`) and spells `Expression` as `IntExpr` | main's postimage, `Expression` -> `IntExpr`, every `mask_events` statement dropped and the `toposort(..).map_err` closure collapsed back to one line, exactly as the park already had it |
+| `src/kernel/fusion/region_codegen.rs` | 5 | `Expression` -> `IntExpr` only | main's postimage, renamed |
+| `src/kernel/to_host.rs` | 3 | `IntExpr`, plus the #400 `char`-keyed dim maps the park deliberately keeps | main's content; `kernel_users_by_dyn_dim` stays `FxHashMap<char, Vec<usize>>` while main's NEW `cublaslt_users_by_dyn_dim` / `internal_buffer_dyn_dims` keep `Symbol` — i.e. the park still mirrors main's own #396/#394 race, which #400 (dropped, ruling 5 of 2026-09-02) would have repaired |
+| `src/runtime.rs` | 1 | the `mask_events` drop again, in `compile_and_validate_profile_candidate` | main's content minus the two `RESOURCE_REJECT.record_with` calls |
+| `src/tests/cublaslt_rewrite_tests.rs` | 1 | the park carries `Graph::tensor(shape, dtype)` (#452 in live core) | `cx.tensor(('m', k), DType::F32)` |
+
+Main's newly ADDED lines were re-spelled the same way: two `IntExpr::from` in
+`to_host.rs`, and the six `cx.tensor(..)` calls in the new
+`cublaslt_layout_witnesses_are_consumer_demanded` test, which take
+`DType::F32`.
+
+**Residue** (diff-of-diffs against `b37eea15`, per file, path-rewritten).
+Twelve of the twenty-six files are EMPTY: `Cargo.toml`, all three `.egg` files,
+`src/host/{mod,cublaslt/mod}.rs`, `src/kernel/{cuda_graph,fusion/markers,
+rms_norm}.rs`, `src/tests/{dtype_contract,fusion}.rs` and
+`examples/egglog_saturation.rs`. The rest is exclusively the known
+re-spellings; for the four files with new content it is verifiable more
+strongly than by eye. **Drift-invariance check**: for every one of the 26
+files, `diff(main preimage, park before)` and `diff(main postimage, park
+after)` are the SAME set of lines — i.e. this commit changed the park by
+exactly main's diff and added no new divergence — except in the four places
+just named, where the delta is precisely the re-spelling of main's own added
+lines. `src/runtime.rs`, the file with the most park drift, has 90 drift lines
+before and the identical 90 after.
+
+### FILE-LEVEL: 1 file into the metal park
+
+`crates/luminal_metal/src/kernel/ops.rs` (+1/-1): `MetalRMSNorm`'s inverse
+root-mean-square rule moves from ruleset `kernel_fuse_late_pre` to
+`kernel_fuse_late_pre_rms`. Applied cleanly.
+
+### N/A — `examples/llama`
+
+`examples/llama/src/main.rs` (+1/-1), `SEARCH_TRIALS` 10 -> 3. There is no
+`examples/llama` on this branch; the model zoo has `examples/llama3` and
+`examples/llama3_1_fp8`, neither of which has that constant. Nothing to patch.
+
+### UNCARRIED — five core files, and what each one is worth
+
+Per the ruling, live core was not edited. What follows is the record.
+
+**`src/egglog_utils/mod.rs` (+905/-67) — the dense-integer extraction index.**
+Main introduces `LlirExtractor<'a>`: reusable state built ONCE per serialized
+e-graph (op-name dispatch table, decoded expression metadata, per-class and
+per-node caches) and then reused across the hundreds of candidates a search
+extracts from that immutable e-graph. On top of it sits `IndexedChoiceSet`, a
+compact genome of dense `DenseIndex` integers that `index_choice_set` converts
+from the public `EGraphChoiceSet` once, so *"the compiler's hot search loop
+never has to hash e-graph strings after the initial genome is converted"*;
+`extract_indexed_packed` then extracts through integer-indexed e-classes into a
+dense rolled representation, and `CachedIndexedExtraction` records the exact
+selected bindings that can invalidate a cached immutable op so the hot path
+validates with direct integer loads rather than re-walking an `OpKind` and its
+`IList` term.
+
+The branch's counterpart is `src/extractor.rs`, and it has already had the
+first half of this idea landed for a different reason: PR #439 (`fe7ec9da`)
+memoized the recursive `ClassRenderer` string rendering that was the extraction
+wall, and `plan_fingerprint` (`src/extractor.rs:884`) dedups candidates. But
+its caches are still keyed by `ClassId` / `NodeId` — `egraph_serialize` string
+handles (`src/extractor.rs:6`), e.g. `memo: HashMap<ClassId, Option<Plan>>` —
+so every memo probe on the hot path still hashes a string. **The dense-integer
+index is the recorded follow-on to the render memo**, and it is the same
+measurement that motivated both: per-genome cost is now dominated by
+`bufferize` + `relax_to_fixpoint`, with extraction second. Landing it here
+means interning `ClassId`/`NodeId` into dense indices once per e-graph and
+re-keying `Extractor`'s memo, `tensor_bytes_cache` and stable-key memo on
+those.
+
+**`src/graph.rs` (+992/-407) — main's search driver, plus one real bug fix.**
+`src/graph.rs` on this branch is the RECORDER (its own header: *"the old
+layout-bearing HLIR graph and compile ladder are gone"*); main's is the compile
++ search driver. The hunks are not portable. One of them is worth naming
+anyway: **the disjoint-loop Cartesian-product materialization fix.** Main's
+loop materializer gave every node an instance for every loop region in the
+graph, so N independent regions multiplied — main's own new test is
+`materialize_many_disjoint_loops_without_a_global_cartesian_product`, whose
+comment notes *"a global product would overflow at 2^64"*. The fix computes a
+per-node `membership: u128` bitset of the regions that actually contain it and
+keys the instance layout on that (`contexts_by_membership`), with
+`checked_add`/`checked_mul` on the node and edge counts: *"Nodes only need
+instances for the loops that contain them. Independent regions therefore remain
+independent instead of contributing to a graph-wide Cartesian product. A
+membership containing multiple regions represents genuine nesting, where the
+product is semantically required."* **This branch has no loop-rolling stage at
+all** — structure reaches egglog through the logical ops' own `.egg` estates —
+so there is no materializer to fix. The invariant is the thing to keep: any
+future instancing pass must scope instances to containment, not to the graph.
+
+**`src/op.rs` (+49/-…) — the prepare/profile candidate split.** `Runtime` gains
+`prepare_profile_candidate` (defaulting to `filter_llir_candidate`) and
+`profile_prepared_candidate` (defaulting to `clear_intermediate_buffers` then
+`profile` / `profile_with_bucket_context`), so *"backends whose hard filter
+already compiles the LLIR can override both hooks to install that exact
+compiled candidate and avoid compiling it again for profiling"*, with the
+contract that *"a rejected candidate must not replace the currently loaded
+executable"*. The same commit DELETES `Runtime::has_nan_outputs`. `src/op.rs`
+does not exist on this branch. **This is a direct requirement on the owed CL
+device profiler** (booked under #386, ruling 4): when a `PlanProfiler` that
+times candidates on device is written, it should be given this two-hook shape
+from the start — the CL backend compiles a plan to validate it, and profiling
+it a second time from source would repeat that work.
+
+**`src/mask_events.rs` (+6/-…)** — main retires `FUSION_REGION_REJECT` and
+`NAN_OUTPUT_REJECT` (the counters whose checks this commit deleted) and drops
+the `all()` array from 12 to 10. The file does not exist here; the branch
+deleted the whole mask-events channel, which is exactly why every park file
+that touches it carries the `mask_events`-free drift described above.
+
+**`src/shape/expression.rs` (+26/-2) — the one hunk that would apply verbatim.**
+Two of the three additions are useful and portable TODAY:
+
+```rust
+pub fn hash_intern_id<H: Hasher>(&self, state: &mut H) { self.terms.id().hash(state); }
+pub fn has_same_intern_id(&self, other: &Self) -> bool { self.terms.id() == other.terms.id() }
+```
+
+`terms` is a `GenerationalBox` here as on main and `terms.id()` is already used
+in this branch's own tests (`src/shape/expression.rs:1471`, `:1480`), so both
+compile as written. They exist to let a caller hash or compare an expression by
+its hash-consed identity instead of walking its term vector — the hot-path
+concern the dense index above is built around. **Recorded as optional-later,
+not landed**: nothing on this branch calls them yet, and adding public API to
+`IntegerExpression` ahead of its first consumer is how dead surface
+accumulates. The third addition, `collect_dyn_vars_into(&self, vars: &mut
+FxHashSet<Symbol>)`, is DEAD here: it is the allocation-free counterpart to
+`Expression::dyn_vars`, and `dyn_vars` was deleted from this branch by the
+z-var retirement (`grep -rn 'dyn_vars' src/` returns nothing), along with
+`Symbol::is_reserved` which its filter calls.
+
+### N/A — the cuBLASLt zero-workspace fix
+
+Main's `src/host/cublaslt/mod.rs` hunk makes the workspace `Arc`-shared and
+recyclable, and guards the degenerate case: when `self._workspace.len() == 0`
+it passes a NULL pointer and a zero size to `cublasLtMatmul` instead of a
+dangling one. **The live CL crate cannot reach that state.** It owns a fixed
+workspace — `const WORKSPACE_BYTES: usize = 32 * 1024 * 1024`
+(`crates/luminal_cuda_lite/src/ops/cublaslt/device_call.rs:38`), allocated with
+`alloc_zeros::<u8>(WORKSPACE_BYTES)` at `:291`, fed to the heuristic preference
+at `:306` and passed to the matmul at `:376` — so the size is a compile-time
+constant, never zero, and never derived from a per-spec `workspace_size` that
+a heuristic could return as 0. The recycling half of the fix is a main-side
+allocator concern with no counterpart here.
+
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
 Ruling 4b's "option i" (`select_by_index`: packed 2N iota + two `scatter1d` +

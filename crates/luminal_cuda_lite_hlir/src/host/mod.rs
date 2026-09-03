@@ -171,15 +171,6 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         None
     }
 
-    /// Returns pairs of extra buffer nodes that must not share arena storage.
-    ///
-    /// This refines `extra_buffer_lifetimes` for host ops with internal DAGs:
-    /// two buffers may have disjoint positions in one topological order while
-    /// still being unordered by real dependencies, so CUDA could overlap them.
-    fn extra_buffer_conflicts(&self) -> Option<Vec<(NodeIndex, NodeIndex)>> {
-        None
-    }
-
     /// Returns buffer size requirements for extra nodes (node -> size in elements).
     ///
     /// Called during buffer allocation to ensure all required buffers exist.

@@ -577,7 +577,7 @@ impl EgglogOp for RoPEScatterKernel {
                     (union ?scatter ?fused)
                     (set (dtype ?fused) ?dt)
                 )
-                :ruleset kernel_fuse_late2
+                :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope-half scatter exact-layout\"
             )",
         )]
@@ -780,13 +780,10 @@ extern "C" __global__ void rope_scatter_kernel(
         true
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.idx_flat
-            .dyn_vars()
-            .into_iter()
-            .chain(self.dest_size.dyn_vars())
-            .chain(self.rope.s.dyn_vars())
-            .collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.idx_flat.collect_dyn_vars_into(vars);
+        self.dest_size.collect_dyn_vars_into(vars);
+        self.rope.s.collect_dyn_vars_into(vars);
     }
 
     fn output_size(&self) -> IntExpr {
@@ -1027,7 +1024,7 @@ impl EgglogOp for KernelRoPE {
                 (
                     (rope_invf ?invf ?ln_theta ?inv_hd)
                 )
-                :ruleset kernel_fuse_late_pre
+                :ruleset kernel_fuse_late_pre_rope
                 :name \"kernel rope invf stage\"
             )
             (rule
@@ -1176,7 +1173,7 @@ impl EgglogOp for KernelRoPE {
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
                 )
-                :ruleset kernel_fuse_late2
+                :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope half bf16\"
             )",
             segments.join("\n")
@@ -1312,7 +1309,7 @@ impl EgglogOp for KernelRoPE {
                     (union ?cat ?kr)
                     (set (dtype ?kr) (Bf16))
                 )
-                :ruleset kernel_fuse_late2
+                :ruleset kernel_fuse_late2_rope
                 :name \"kernel rope IEEE-safe concat\"
             )";
         vec![Rule::raw(format!(
@@ -1474,8 +1471,8 @@ extern \"C\" {{
         DType::Bf16
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.out_shape[1].dyn_vars().into_iter().collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.out_shape[1].collect_dyn_vars_into(vars);
     }
 
     fn bytes_loaded(&self) -> IntExpr {
@@ -1769,13 +1766,10 @@ extern \"C\" {{
         true
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.idx_flat
-            .dyn_vars()
-            .into_iter()
-            .chain(self.dest_size.dyn_vars())
-            .chain(self.rope.out_shape[1].dyn_vars())
-            .collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.idx_flat.collect_dyn_vars_into(vars);
+        self.dest_size.collect_dyn_vars_into(vars);
+        self.rope.out_shape[1].collect_dyn_vars_into(vars);
     }
 
     fn output_size(&self) -> IntExpr {

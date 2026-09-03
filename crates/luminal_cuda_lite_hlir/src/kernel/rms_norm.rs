@@ -507,7 +507,7 @@ impl EgglogOp for KernelRMSNorm {
                 (
                     (rms_rinv ?rin ?xf ?xb ?eps ?cols)
                 )
-                :ruleset kernel_fuse_late_pre
+                :ruleset kernel_fuse_late_pre_rms
                 :name \"rms rinv core\"
             )"
         .to_string();
