@@ -79,6 +79,13 @@ pub(crate) fn simplify_expr_with_ranges(
     simplify_bound_expr(expr, sym_ranges).expr
 }
 
+pub(crate) fn bounds_of_expr(
+    expr: IntExpr,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
+) -> ExprBounds {
+    simplify_bound_expr(expr, sym_ranges).bounds
+}
+
 pub(crate) fn same_expr_with_ranges(
     lhs: IntExpr,
     rhs: IntExpr,
