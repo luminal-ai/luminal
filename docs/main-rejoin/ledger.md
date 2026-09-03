@@ -36,6 +36,7 @@ Dispositions:
 | `727918cd` | #394 | Optimize CUDA graph materialization and StaticCache writebacks | FILE-LEVEL (parks) + INTENT-ONLY (core) | branch `merge/main-394-cuda-graph-park` | REQUIREMENT FOR THE CL EXECUTOR: durable external device-pointer registration, exact binding-delta graph patching, cached reverse indexes, resource-signature reuse — see **#394 CL executor persistence** below |
 | `b3b975ae` | #396 | shape: name symbolic dimensions instead of numbering them a..z | FILE-LEVEL (parks) + LANDED-BY-EQUIVALENT (core, `90f687bf`) + RE-EXPRESSED (`Symbol::try_new_dim`) | branch `merge/main-396-symbol-parked` | core: resolve later — the branch's own Symbol is the keeper; the PT2 remap and Metal's `dyn[]` slot layout are re-attachment requirements; see **#396 Symbol** below |
 | `2fbf5b6a` | #400 | cuda_lite: retype dim maps | DROPPED | — | ruling 5 of 2026-09-02: *"okay, we can drop"*. But the mismatch it repairs is now VERIFIABLY PRESENT in the park — see **#400 dropped** below, which names all 8 sites |
+| `1d07093c` | #401 | Reuse persistent CUDA intermediate arena | FILE-LEVEL (park) + INTENT-ONLY (core) | branch `merge/main-401-arena-park` | REQUIREMENT FOR THE CL EXECUTOR: honour the plan's `BufferAlloc`/`BufferFree` against one runtime-owned high-water slab; park-don't-free, keep-the-largest, re-attach-only-if-wanted — see **#401 persistent arena** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -697,3 +698,53 @@ git diff 2fbf5b6a^ 2fbf5b6a \
   | sed "s#crates/luminal_cuda_lite/#crates/luminal_cuda_lite_hlir/#g" \
   | git apply -3
 ```
+
+## #401 persistent arena — the three rules, and where they would land
+
+RULED 2026-09-02 (ruling 6): *"just put this in the HLIR version and we'll
+merge it later"*.
+
+**FILE-LEVEL.** `crates/luminal_cuda_lite/src/runtime.rs` (+204/-74)
+path-rewritten into `crates/luminal_cuda_lite_hlir/src/runtime.rs`. Applied
+cleanly over the park's drift, including the three earlier commits of this
+batch; every content line is main's, and the diff-of-diffs against `1d07093c`
+is empty modulo hunk offsets. Not a workspace member, so nothing builds.
+
+**What the commit does.** Previously every bucket switch, candidate load,
+profiling call and `clear_intermediate_buffers` FREED the bucket's
+intermediate arena — a single big `CudaSlice<u8>` sub-divided by per-node
+offsets — and the next bucket allocated a fresh one. Now a runtime-scoped
+`PersistentArena { allocation, pool }` is PARKED instead of freed
+(`park_bucket_arena` / `park_all_bucket_arenas`), only the LARGEST allocation
+is kept (`retain_larger_arena`), and it is re-attached to the next active
+bucket (`attach_persistent_arena`) only when that bucket's `arena_bytes != 0`.
+A park discards graph-specific bindings only — cached buffer pointers, device
+buffers, dirty-node sets, `hlir_synced` — while the device pointer survives.
+`release_all_arenas` remains the true-free path, and
+`intermediate_buffer_bytes` now counts the parked allocation too.
+
+**INTENT for CL.** The branch has NO analogue and, importantly, has not yet
+reached the problem: `crates/luminal_cuda_lite/src/device.rs` materializes one
+fresh `alloc_zeros` per `BufferId` per execute and treats the plan's
+`BufferAlloc`/`BufferFree` nodes as explicit no-ops, and CL's search profiles
+candidates on the reference HOST executor (a documented cost proxy), so it
+never churns device arenas. When CL grows on-device candidate profiling or
+bucketed re-execution, the re-expression is a persistent-allocation field on
+`CudaRuntime` plus honouring `BufferAlloc`/`BufferFree` against ONE
+runtime-owned high-water slab in `device.rs`, kept across `execute` calls
+rather than dropped with the `storage` map.
+
+The transferable design is three rules:
+
+1. **Park, don't free**, on graph replacement.
+2. **Keep only the largest** allocation.
+3. **Re-attach only when the incoming plan actually wants intermediates.**
+
+And one ordering discipline a naive re-expression WOULD drop: the free must be
+enqueued stream-ordered BEFORE the memory pool is synchronized and trimmed.
+
+Main's one new test, `clear_parks_and_reattaches_the_same_persistent_arena`,
+cannot move — it is device-gated and pokes
+`rt.compiled_buckets[0].arena` / `rt.persistent_arena` directly, fields absent
+from this branch's `CudaRuntime`. A branch-side equivalent has to be written
+fresh against `device.rs` storage and would need an A100.

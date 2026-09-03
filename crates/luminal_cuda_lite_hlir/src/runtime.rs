@@ -334,6 +334,16 @@ struct ArenaReleasePlan {
     pools_to_trim: Vec<sys::CUmemoryPool>,
 }
 
+/// One runtime-owned intermediate allocation parked between compiled buckets.
+///
+/// Search replaces the active `CompiledBucket` for every candidate. Keeping the
+/// allocation here lets the next bucket reuse the same device pointer without
+/// retaining any graph-specific offsets, lengths, or launch bindings.
+struct PersistentArena {
+    allocation: CudaSlice<u8>,
+    pool: Option<sys::CUmemoryPool>,
+}
+
 struct ValidatedBucketSet {
     compiled_buckets: Vec<CompiledBucket>,
     representative_dyn_maps: Vec<DynMap>,
@@ -374,6 +384,9 @@ pub struct CudaRuntime {
     /// Resource-relevant input state covered by the most recent aggregate
     /// retained-bucket validation.
     last_resource_input_signature: FxHashMap<NodeIndex, ResourceInputFootprint>,
+    /// High-water intermediate allocation reused across candidate loads and
+    /// bucket switches. At most one compiled bucket may borrow it at a time.
+    persistent_arena: Option<PersistentArena>,
     /// Boundary inputs whose logical byte length is read by a HostOp resource
     /// plan. External inputs not in this set cannot change hard-resource
     /// accounting, regardless of pointer or logical-size churn.
@@ -499,17 +512,137 @@ impl CudaRuntime {
         let _ = Self::trim_current_memory_pool(&self.cuda_stream);
     }
 
-    fn take_bucket_arena(bucket: &mut CompiledBucket, releases: &mut ArenaReleasePlan) {
-        let arena = bucket.arena.take();
+    fn detach_bucket_arena(bucket: &mut CompiledBucket) -> Option<PersistentArena> {
+        let allocation = bucket.arena.take();
         let pool = bucket.arena_pool.take();
-        if let Some(arena) = arena {
-            releases.record_arena(pool);
-            // Enqueue the stream-ordered free before finish_arena_releases
-            // synchronizes and trims the pool that owns this allocation.
-            drop(arena);
-        } else {
-            debug_assert!(pool.is_none(), "arena pool recorded without an arena");
+        match allocation {
+            Some(allocation) => Some(PersistentArena { allocation, pool }),
+            None => {
+                debug_assert!(pool.is_none(), "arena pool recorded without an arena");
+                None
+            }
         }
+    }
+
+    fn release_arena(arena: PersistentArena, releases: &mut ArenaReleasePlan) {
+        releases.record_arena(arena.pool);
+        // Enqueue the stream-ordered free before finish_arena_releases
+        // synchronizes and trims the pool that owns this allocation.
+        drop(arena.allocation);
+    }
+
+    fn take_bucket_arena(bucket: &mut CompiledBucket, releases: &mut ArenaReleasePlan) {
+        if let Some(arena) = Self::detach_bucket_arena(bucket) {
+            Self::release_arena(arena, releases);
+        }
+    }
+
+    fn retain_larger_arena(
+        retained: &mut Option<PersistentArena>,
+        candidate: PersistentArena,
+        releases: &mut ArenaReleasePlan,
+    ) {
+        if retained
+            .as_ref()
+            .is_some_and(|current| current.allocation.len() >= candidate.allocation.len())
+        {
+            Self::release_arena(candidate, releases);
+        } else {
+            if let Some(current) = retained.take() {
+                Self::release_arena(current, releases);
+            }
+            *retained = Some(candidate);
+        }
+    }
+
+    /// Park every resident bucket arena at runtime scope, retaining only the
+    /// largest allocation if an invariant violation left more than one live.
+    fn park_all_bucket_arenas(&mut self) {
+        let has_resident_arena = self
+            .compiled_buckets
+            .iter()
+            .any(|bucket| bucket.arena.is_some());
+        if has_resident_arena {
+            self.cuda_stream
+                .synchronize()
+                .expect("failed to synchronize before parking CUDA arenas");
+        }
+
+        let mut persistent = self.persistent_arena.take();
+        let mut releases = ArenaReleasePlan::default();
+        for bucket in &mut self.compiled_buckets {
+            if let Some(arena) = Self::detach_bucket_arena(bucket) {
+                Self::retain_larger_arena(&mut persistent, arena, &mut releases);
+            }
+            bucket.cached_buffer_ptrs.clear();
+            bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
+            bucket.hlir_synced = false;
+        }
+        self.persistent_arena = persistent;
+        Self::finish_arena_releases(&self.cuda_stream, releases)
+            .expect("failed to release superseded persistent CUDA arenas");
+    }
+
+    fn park_bucket_arena(&mut self, bucket_idx: usize) {
+        if self.compiled_buckets[bucket_idx].arena.is_some() {
+            self.cuda_stream
+                .synchronize()
+                .expect("failed to synchronize before parking a CUDA arena");
+        }
+
+        let arena = {
+            let bucket = &mut self.compiled_buckets[bucket_idx];
+            let arena = Self::detach_bucket_arena(bucket);
+            bucket.cached_buffer_ptrs.clear();
+            bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
+            bucket.hlir_synced = false;
+            arena
+        };
+        if let Some(arena) = arena {
+            let mut persistent = self.persistent_arena.take();
+            let mut releases = ArenaReleasePlan::default();
+            Self::retain_larger_arena(&mut persistent, arena, &mut releases);
+            self.persistent_arena = persistent;
+            Self::finish_arena_releases(&self.cuda_stream, releases)
+                .expect("failed to release a superseded persistent CUDA arena");
+        }
+    }
+
+    fn attach_persistent_arena(&mut self, bucket_idx: usize) {
+        if self.compiled_buckets[bucket_idx].arena_bytes == 0 {
+            return;
+        }
+        debug_assert!(
+            self.compiled_buckets[bucket_idx].arena.is_none(),
+            "cannot attach a persistent arena to a bucket that already owns one"
+        );
+        let Some(arena) = self.persistent_arena.take() else {
+            return;
+        };
+        let bucket = &mut self.compiled_buckets[bucket_idx];
+        bucket.arena = Some(arena.allocation);
+        bucket.arena_pool = arena.pool;
+    }
+
+    fn release_all_arenas(&mut self) {
+        let mut releases = ArenaReleasePlan::default();
+        if let Some(arena) = self.persistent_arena.take() {
+            Self::release_arena(arena, &mut releases);
+        }
+        for bucket in &mut self.compiled_buckets {
+            Self::take_bucket_arena(bucket, &mut releases);
+            bucket.cached_buffer_ptrs.clear();
+            bucket.cached_device_buffers.clear();
+            bucket.materialization_dirty_nodes.clear();
+            bucket.materialization_fully_dirty = true;
+            bucket.hlir_synced = false;
+        }
+        Self::finish_arena_releases(&self.cuda_stream, releases)
+            .expect("failed to release CUDA intermediate arenas");
     }
 
     fn finish_arena_releases(
@@ -691,22 +824,14 @@ impl CudaRuntime {
 
     #[cfg(test)]
     pub(crate) fn preserve_intermediate_buffers_for_debug(&mut self) {
-        let mut releases = ArenaReleasePlan::default();
+        self.release_all_arenas();
         for bucket in &mut self.compiled_buckets {
             bucket.preserve_intermediate_buffers_for_debug = true;
             bucket.logical_buffer_offsets.clear();
             bucket.logical_buffer_bytes.clear();
             bucket.logical_buffer_capacity_bytes.clear();
-            bucket.cached_buffer_ptrs.clear();
-            bucket.cached_device_buffers.clear();
-            bucket.materialization_dirty_nodes.clear();
-            bucket.materialization_fully_dirty = true;
-            bucket.hlir_synced = false;
-            Self::take_bucket_arena(bucket, &mut releases);
             bucket.arena_bytes = 0;
         }
-        Self::finish_arena_releases(&self.cuda_stream, releases)
-            .expect("failed to release CUDA arenas for debug preservation");
     }
 
     fn resolve_runtime_buffer(
@@ -1537,17 +1662,7 @@ impl CudaRuntime {
     /// Free all intermediate buffers to reclaim GPU memory.
     /// They will be re-allocated on the next `execute()` call.
     pub fn free_intermediate_buffers(&mut self) {
-        let mut releases = ArenaReleasePlan::default();
-        for bucket in &mut self.compiled_buckets {
-            Self::take_bucket_arena(bucket, &mut releases);
-            bucket.cached_buffer_ptrs.clear();
-            bucket.cached_device_buffers.clear();
-            bucket.materialization_dirty_nodes.clear();
-            bucket.materialization_fully_dirty = true;
-            bucket.hlir_synced = false;
-        }
-        Self::finish_arena_releases(&self.cuda_stream, releases)
-            .expect("failed to release CUDA intermediate arenas");
+        self.release_all_arenas();
     }
 
     #[tracing::instrument(skip_all)]
@@ -3611,12 +3726,9 @@ impl CudaRuntime {
         // Rebind CUDA context to thread after cleanup to ensure valid state
         let _ = self.cuda_stream.context().bind_to_thread();
 
-        // Drop old arenas before replacing executable state, retaining the pool
-        // each allocation belongs to even if another pool is current now.
-        let mut releases = ArenaReleasePlan::default();
-        for old_bucket in &mut self.compiled_buckets {
-            Self::take_bucket_arena(old_bucket, &mut releases);
-        }
+        // Preserve the high-water allocation while replacing graph-specific
+        // bucket metadata. The new bucket will rebuild all pointer bindings.
+        self.park_all_bucket_arenas();
         self.compiled_buckets = vec![bucket];
         self.active_bucket = 0;
         self.invalidate_output_registration_resolution();
@@ -3624,7 +3736,7 @@ impl CudaRuntime {
         self.validated_resource_signatures.clear();
         self.resource_length_sensitive_hlir =
             Self::resource_length_sensitive_hlir_inputs(&self.compiled_buckets);
-        Self::finish_arena_releases(&self.cuda_stream, releases)?;
+        self.attach_persistent_arena(self.active_bucket);
         // Reclaim search-profiling residue from the async allocator pool before
         // the stitched-graph arena allocates (see try_load_llir_buckets).
         self.release_pooled_memory();
@@ -3668,10 +3780,7 @@ impl CudaRuntime {
         // Only now replace the old executable state.
         let _ = self.cuda_stream.synchronize();
         let _ = self.cuda_stream.context().bind_to_thread();
-        let mut releases = ArenaReleasePlan::default();
-        for old_bucket in &mut self.compiled_buckets {
-            Self::take_bucket_arena(old_bucket, &mut releases);
-        }
+        self.park_all_bucket_arenas();
         self.dim_buckets = dim_buckets.clone();
         self.compiled_buckets = compiled_buckets;
         self.invalidate_output_registration_resolution();
@@ -3683,7 +3792,7 @@ impl CudaRuntime {
         // bucket. Select it before prebuilding so only that active bucket gets an
         // arena; dispatch evicts it before lazily preparing another bucket.
         self.active_bucket = self.compiled_buckets.len().saturating_sub(1);
-        Self::finish_arena_releases(&self.cuda_stream, releases)?;
+        self.attach_persistent_arena(self.active_bucket);
         self.last_resource_input_signature = if input_lengths_complete {
             self.current_resource_input_signature()
         } else {
@@ -3888,6 +3997,7 @@ impl Runtime for CudaRuntime {
             max_kernel_source_bytes: Some(DEFAULT_MAX_KERNEL_SOURCE_BYTES),
             device_resource_limits,
             last_resource_input_signature: FxHashMap::default(),
+            persistent_arena: None,
             resource_length_sensitive_hlir: FxHashSet::default(),
             validated_resource_signatures: FxHashSet::default(),
             compiled_buckets: vec![CompiledBucket::new()],
@@ -3935,24 +4045,19 @@ impl Runtime for CudaRuntime {
     }
 
     fn clear_intermediate_buffers(&mut self) {
-        let mut releases = ArenaReleasePlan::default();
-        for bucket in &mut self.compiled_buckets {
-            Self::take_bucket_arena(bucket, &mut releases);
-            bucket.cached_buffer_ptrs.clear();
-            bucket.cached_device_buffers.clear();
-            bucket.materialization_dirty_nodes.clear();
-            bucket.materialization_fully_dirty = true;
-            bucket.hlir_synced = false;
-        }
-        Self::finish_arena_releases(&self.cuda_stream, releases)
-            .expect("failed to clear CUDA intermediate arenas");
+        self.park_all_bucket_arenas();
     }
 
     fn intermediate_buffer_bytes(&self) -> usize {
-        self.compiled_buckets
-            .iter()
-            .map(|b| b.arena.as_ref().map(|arena| arena.len()).unwrap_or(0))
-            .sum()
+        self.persistent_arena
+            .as_ref()
+            .map(|arena| arena.allocation.len())
+            .unwrap_or(0)
+            + self
+                .compiled_buckets
+                .iter()
+                .map(|b| b.arena.as_ref().map(|arena| arena.len()).unwrap_or(0))
+                .sum::<usize>()
     }
 
     fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &DynMap) -> bool {
@@ -4011,10 +4116,7 @@ impl Runtime for CudaRuntime {
         Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         // Clear active bucket's arena before loading new LLIR for profiling.
         if !self.compiled_buckets.is_empty() {
-            let mut releases = ArenaReleasePlan::default();
-            Self::take_bucket_arena(self.active_mut(), &mut releases);
-            Self::finish_arena_releases(&self.cuda_stream, releases)
-                .expect("failed to release the previous CUDA profiling arena");
+            self.park_bucket_arena(self.active_bucket);
         }
         if let Err(e) = self.try_load_llir(llir_graph) {
             return Self::invalid_profile_metric(e);
@@ -4038,10 +4140,7 @@ impl Runtime for CudaRuntime {
         }
         Self::dump_candidate_llir_for_postmortem(llir_graph, dyn_map);
         if !self.compiled_buckets.is_empty() {
-            let mut releases = ArenaReleasePlan::default();
-            Self::take_bucket_arena(self.active_mut(), &mut releases);
-            Self::finish_arena_releases(&self.cuda_stream, releases)
-                .expect("failed to release the previous CUDA profiling arena");
+            self.park_bucket_arena(self.active_bucket);
         }
         let bucket_llirs = vec![(
             bucket_context.bucket_indices.clone(),
@@ -4076,19 +4175,12 @@ impl Runtime for CudaRuntime {
         if self.compiled_buckets.len() > 1 {
             let idx = self.resolve_bucket(dyn_map);
             if idx != self.active_bucket {
-                // Free the old bucket's intermediates to avoid holding 2 full sets in GPU memory
+                // Transfer the one high-water allocation between buckets; only
+                // graph-specific bindings are discarded.
                 let old = self.active_bucket;
-                let mut releases = ArenaReleasePlan::default();
-                Self::take_bucket_arena(&mut self.compiled_buckets[old], &mut releases);
-                self.compiled_buckets[old].cached_buffer_ptrs.clear();
-                self.compiled_buckets[old].cached_device_buffers.clear();
-                self.compiled_buckets[old]
-                    .materialization_dirty_nodes
-                    .clear();
-                self.compiled_buckets[old].materialization_fully_dirty = true;
-                Self::finish_arena_releases(&self.cuda_stream, releases)
-                    .expect("failed to release the previous CUDA bucket arena");
+                self.park_bucket_arena(old);
                 self.active_bucket = idx;
+                self.attach_persistent_arena(idx);
                 // Mark bucket as needing HLIR sync since it may have missed changes
                 self.compiled_buckets[idx].hlir_synced = false;
             }
@@ -5081,6 +5173,44 @@ mod arena_plan_tests {
 
         assert_eq!(releases.arenas_released, 3);
         assert_eq!(releases.pools_to_trim, vec![pool]);
+    }
+
+    #[test]
+    fn clear_parks_and_reattaches_the_same_persistent_arena() {
+        let Ok(mut rt) = CudaRuntime::new() else {
+            return;
+        };
+        let arena = unsafe { rt.cuda_stream.alloc::<u8>(4096).unwrap() };
+        let ptr = arena.device_ptr(&rt.cuda_stream).0;
+        rt.compiled_buckets[0].arena = Some(arena);
+        rt.compiled_buckets[0].arena_bytes = 1024;
+
+        Runtime::clear_intermediate_buffers(&mut rt);
+
+        assert!(rt.compiled_buckets[0].arena.is_none());
+        assert_eq!(
+            rt.persistent_arena
+                .as_ref()
+                .map(|arena| arena.allocation.device_ptr(&rt.cuda_stream).0),
+            Some(ptr)
+        );
+        assert_eq!(Runtime::intermediate_buffer_bytes(&rt), 4096);
+
+        rt.attach_persistent_arena(0);
+
+        assert!(rt.persistent_arena.is_none());
+        assert_eq!(
+            rt.compiled_buckets[0]
+                .arena
+                .as_ref()
+                .map(|arena| arena.device_ptr(&rt.cuda_stream).0),
+            Some(ptr)
+        );
+
+        rt.free_intermediate_buffers();
+        assert!(rt.compiled_buckets[0].arena.is_none());
+        assert!(rt.persistent_arena.is_none());
+        assert_eq!(Runtime::intermediate_buffer_bytes(&rt), 0);
     }
 
     #[test]
