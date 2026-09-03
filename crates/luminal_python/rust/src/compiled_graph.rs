@@ -191,6 +191,8 @@ impl CompiledGraph {
         weight_data: WeightData,
         factory: BackendFactory,
         search_iters: usize,
+        device_index: Option<usize>,
+        external_cuda_graph: bool,
     ) -> Result<CompiledGraph, String> {
         let GraphTranslation {
             mut graph,
@@ -215,6 +217,8 @@ impl CompiledGraph {
         // Build compile args from WeightData.
         let compile_args = BackendCompileArgs {
             search_iters,
+            device_index,
+            external_cuda_graph,
             weights: weights
                 .iter()
                 .map(|(label, td)| (label.clone(), td.bytes.clone(), td.dtype))
@@ -338,6 +342,12 @@ impl CompiledGraph {
     #[getter]
     fn device_type(&self) -> &str {
         self.runtime.device_type()
+    }
+
+    /// The logical CUDA device used by this backend, or None for CPU.
+    #[getter]
+    fn device_index(&self) -> Option<usize> {
+        self.runtime.device_index()
     }
 
     /// Whether the active backend supports device pointer operations (zero-copy GPU I/O).
@@ -600,8 +610,9 @@ impl CompiledGraph {
     }
 
     /// Execute the graph.
-    fn run(&mut self) {
-        self.runtime.execute(&self.graph.dyn_map);
+    #[pyo3(signature = (stream=None))]
+    fn run(&mut self, stream: Option<u64>) {
+        self.runtime.execute(&self.graph.dyn_map, stream);
     }
 
     /// Return the HLIR graph as a DOT string for visualization.

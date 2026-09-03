@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 luminal = { path = "../.." }
 luminal_tracing = { path = "../luminal_tracing" }
-cudarc = { version = "0.19.8", features = ["cuda-version-from-build-system", "fallback-latest"] }
+cudarc = { git = "https://github.com/luminal-ai/cudarc.git", rev = "a42f3897b6d00aded8e6ac7ad258c72d8bad5596", features = ["cuda-version-from-build-system", "fallback-latest"] }
 anyhow = "1.0"
 as-any = "0.3.2"
 itertools = "0.12.1"

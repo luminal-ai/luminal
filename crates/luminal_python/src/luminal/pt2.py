@@ -9,12 +9,18 @@ import inspect
 import os
 import shutil
 import tempfile
+from functools import partial
 
 import torch
 
-from .compiled_model import CompiledModel
+from .artifact_cache import CompiledArtifact, get_or_compile
 from .luminal import process_pt2
-from .main import _collect_weight_pointers, _detect_factory_capsule, _load_cpu_weights
+from .main import (
+    _collect_weight_pointers,
+    _cuda_device_index,
+    _detect_factory_capsule,
+    _load_cpu_weights,
+)
 
 # ---------------------------------------------------------------------------
 # DynamicCache <> pytree registration
@@ -198,7 +204,7 @@ def _decomp_table():
     return table
 
 
-def _collect_input_device_ptrs(ep, user_inputs):
+def _collect_input_device_ptrs(ep, user_inputs, device_index):
     """Map user-input placeholder names to (device_ptr, n_bytes) for live,
     contiguous CUDA nn.Parameters. Parameters are read-only in inference
     graphs, so the search can safely alias their memory; buffers and
@@ -208,6 +214,7 @@ def _collect_input_device_ptrs(ep, user_inputs):
     search's ones-buffer seeding."""
     from torch.export.graph_signature import InputKind
 
+    _cuda_device_index(user_inputs, expected=device_index)
     user_specs = [
         s for s in ep.graph_signature.input_specs if s.kind == InputKind.USER_INPUT
     ]
@@ -287,32 +294,20 @@ def _lower_sym_sum(ep) -> None:
         gm.recompile()
 
 
-def _save_and_compile(
+def _compile_artifact(
     ep_or_path,
     factory,
     search_iterations,
-    user_indices=None,
-    input_device_ptrs=None,
-    scalar_output_positions=(),
+    input_device_ptrs,
+    device_index,
+    external_cuda_graph,
 ):
-    """Compile a PT2 model via Rust, return CompiledModel.
-
-    Args:
-        ep_or_path: Either an ExportedProgram (will be saved to a temp file) or
-            a path to an already-saved .pt2 file. Baked weights come from
-            ep.state_dict (the AOT compile() path); torch.compile graphs carry
-            weights as ordinary inputs and have an empty state_dict.
-        factory: PyCapsule wrapping the BackendFactory to use.
-    """
     owns_tmpdir = not isinstance(ep_or_path, str)
     tmpdir = tempfile.mkdtemp(prefix="luminal_") if owns_tmpdir else None
     try:
         if owns_tmpdir:
             pt2_path = os.path.join(tmpdir, "model.pt2")
-            # `_example_inputs` is an optional copy of the arguments used to create an
-            # ExportedProgram and is not part of the executable graph's semantics. vLLM
-            # invokes compiler backends during torch.compile tracing, so these inputs may
-            # be FakeTensors, which Luminal does not currently serialize or consume.
+            # Fake example inputs are not part of the executable program.
             ep_or_path._example_inputs = None
             _lower_sym_sum(ep_or_path)  # serde gap workaround; see docstring
             torch.export.save(ep_or_path, pt2_path)
@@ -321,30 +316,69 @@ def _save_and_compile(
             pt2_path = ep_or_path
             weight_source = {}
 
-        # Collect weight pointers for Rust (avoids duplicate GPU buffer allocation)
+        resolved_device = _cuda_device_index(
+            weight_source.values(), expected=device_index
+        )
         keep_alive, weight_device_ptrs, cpu_weights = _collect_weight_pointers(
-            weight_source
+            weight_source, device_index=resolved_device
         )
         if input_device_ptrs:
             weight_device_ptrs.update(input_device_ptrs)
 
-        # Compile with device pointers — search uses actual weight memory (zero-copy)
         compiled = process_pt2(
-            pt2_path, "", search_iterations, factory, weight_device_ptrs
+            pt2_path,
+            "",
+            search_iterations,
+            factory,
+            weight_device_ptrs,
+            resolved_device,
+            external_cuda_graph,
         )
-
-        # Load CPU weights after compilation
         _load_cpu_weights(compiled, cpu_weights)
-
-        return CompiledModel(
-            compiled,
-            weight_refs=keep_alive,
-            user_indices=user_indices,
-            scalar_output_positions=scalar_output_positions,
-        )
+        return CompiledArtifact(compiled, keep_alive)
     finally:
         if owns_tmpdir and tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _save_and_compile(
+    ep_or_path,
+    factory,
+    search_iterations,
+    user_indices=None,
+    output_spec=None,
+    input_device_ptrs=None,
+    scalar_output_positions=(),
+    device_index=None,
+    use_current_stream=False,
+    static_outputs=False,
+    external_cuda_graph=False,
+    artifact_key=None,
+):
+    """Compile a PT2 model via Rust, return CompiledModel."""
+
+    compile_artifact = partial(
+        _compile_artifact,
+        ep_or_path,
+        factory,
+        search_iterations,
+        input_device_ptrs,
+        device_index,
+        external_cuda_graph,
+    )
+
+    artifact = (
+        get_or_compile(artifact_key, compile_artifact)
+        if artifact_key is not None
+        else compile_artifact()
+    )
+    return artifact.bind(
+        user_indices=user_indices,
+        output_spec=output_spec,
+        scalar_output_positions=scalar_output_positions,
+        use_current_stream=use_current_stream,
+        static_outputs=static_outputs,
+    )
 
 
 def _safe_int_bound(value):
@@ -582,6 +616,7 @@ def compile(
         example_args = tuple(example_input)
     else:
         example_args = (example_input,)
+    device_index = _cuda_device_index(example_args)
 
     kwargs = export_kwargs or {}
     extra = _export_kwargs()
@@ -627,7 +662,7 @@ def compile(
         )
         ep = ep.run_decompositions(_decomp_table())
 
-    return _save_and_compile(ep, factory, search_iterations)
+    return _save_and_compile(ep, factory, search_iterations, device_index=device_index)
 
 
 def _drop_input_guards(ep):
@@ -810,6 +845,7 @@ def _eager_pt2_compile(
     factory,
     search_iterations,
     scalar_output_positions=(),
+    device_index=None,
 ):
     """Run torch.export → save → Rust compile end-to-end. Returns CompiledModel.
 
@@ -853,7 +889,8 @@ def _eager_pt2_compile(
     # duplicating the full parameter set on device (OOM at ~2x weights for
     # whole-model compiles) and profiling with synthetic data. Nothing is
     # baked: the runtime still takes pointers per call.
-    input_device_ptrs = _collect_input_device_ptrs(ep, user_inputs)
+    device_index = _cuda_device_index(user_inputs, expected=device_index)
+    input_device_ptrs = _collect_input_device_ptrs(ep, user_inputs, device_index)
 
     del ep, gm
     gc.collect()
@@ -868,6 +905,7 @@ def _eager_pt2_compile(
             user_indices=user_indices,
             input_device_ptrs=input_device_ptrs,
             scalar_output_positions=scalar_output_positions,
+            device_index=device_index,
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -907,6 +945,7 @@ class _LazyDynamicCompiledModel:
         factory,
         search_iterations,
         scalar_output_positions=(),
+        device_index=None,
     ):
         self._gm = gm
         self._user_inputs = user_inputs
@@ -914,6 +953,7 @@ class _LazyDynamicCompiledModel:
         self._dynamic_shapes = dynamic_shapes
         self._search_iterations = search_iterations
         self._scalar_output_positions = scalar_output_positions
+        self._device_index = device_index
         self._factory = factory
         self._compiled = None
 
@@ -927,6 +967,7 @@ class _LazyDynamicCompiledModel:
                 self._factory,
                 self._search_iterations,
                 self._scalar_output_positions,
+                self._device_index,
             )
             # Drop references we no longer need post-compile.
             self._gm = None
@@ -986,6 +1027,7 @@ def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
     user_inputs, post_strip_subindices, strip_ok = _strip_symint_placeholders(
         gm, user_inputs
     )
+    device_index = _cuda_device_index(user_inputs)
     dynamic_shapes = _build_dynamic_shapes_from_gm(gm) if strip_ok else None
 
     # Arg positions surviving the SymInt strip; None when nothing was
@@ -1009,6 +1051,7 @@ def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
             factory,
             search_iterations,
             scalar_output_positions,
+            device_index,
         )
 
     return _eager_pt2_compile(
@@ -1019,4 +1062,5 @@ def pt2_backend(gm, example_inputs, factory=None, search_iterations=None):
         factory,
         search_iterations,
         scalar_output_positions,
+        device_index,
     )

@@ -9,6 +9,34 @@ from .dtype_util import torch_dtype_code as _torch_dtype_code
 # ---------------------------------------------------------------------------
 
 
+def _cuda_device_index(tensors, expected=None):
+    """Return one CUDA device index and enforce the current cuda:0 contract."""
+    indices = {
+        tensor.device.index
+        for tensor in tensors
+        if torch.is_tensor(tensor) and tensor.device.type == "cuda"
+    }
+    if None in indices:
+        raise ValueError("CUDA tensor metadata must include a logical device index")
+    if len(indices) > 1:
+        raise ValueError(
+            f"CUDA tensors span multiple logical devices: {sorted(indices)}"
+        )
+
+    observed = next(iter(indices), None)
+    if expected is not None and observed is not None and observed != expected:
+        raise ValueError(
+            f"CUDA tensor is on logical device {observed}, but the compiled "
+            f"runtime uses logical device {expected}"
+        )
+    selected = expected if expected is not None else observed
+    if selected not in (None, 0):
+        raise ValueError(
+            f"Luminal currently supports only logical CUDA device 0, got {selected}"
+        )
+    return selected
+
+
 def _detect_factory_capsule(example_inputs):
     """Pick the best built-in factory capsule based on input device."""
     # Dynamo can prefix `example_inputs` with SymInt entries when shapes are
@@ -31,7 +59,7 @@ def _detect_factory_capsule(example_inputs):
     return _reference_factory_capsule()
 
 
-def _collect_weight_pointers(weights):
+def _collect_weight_pointers(weights, device_index=None):
     """Partition weight tensors into CUDA device pointers and CPU host pointers.
 
     Preserves native dtype — no forced conversion to float32.
@@ -45,6 +73,7 @@ def _collect_weight_pointers(weights):
         - device_ptrs: {name: (device_ptr, n_bytes)}
         - cpu_ptrs: {name: (host_ptr, n_bytes, dtype_code)}
     """
+    _cuda_device_index(weights.values(), expected=device_index)
     keep_alive = []
     device_ptrs = {}
     cpu_ptrs = {}

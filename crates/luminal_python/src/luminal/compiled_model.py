@@ -6,6 +6,7 @@ import torch
 
 from .dtype_util import code_to_torch_dtype
 from .dtype_util import torch_dtype_code as _torch_dtype_code
+from .main import _cuda_device_index
 
 
 def _cuda_input_binding_signature(tensor, n_bytes: int) -> tuple:
@@ -41,7 +42,11 @@ class CompiledModel:
         weight_refs=None,
         input_names=None,
         user_indices=None,
+        output_spec=None,
         scalar_output_positions=(),
+        use_current_stream=False,
+        static_outputs=False,
+        artifact=None,
     ):
         """Initialize with a compiled CompiledGraph from Rust.
 
@@ -52,6 +57,11 @@ class CompiledModel:
             user_indices: When torch.compile lifts model parameters into extra args,
                 this tells __call__ which arg positions are actual user inputs.
                 None means all args are user inputs (PT2 path).
+            output_spec: Optional pytree structure expected by the caller.
+            use_current_stream: Run CUDA work on PyTorch's current stream instead
+                of the backend's owned stream.
+            static_outputs: Reuse maximum-capacity CUDA output buffers across
+                calls and return views with the current runtime shapes.
         """
         self._graph = graph_result
         self._input_names = input_names or graph_result.input_names
@@ -70,12 +80,23 @@ class CompiledModel:
         self._has_dynamic_dims = getattr(graph_result, "has_dynamic_dims", False)
         self._weight_refs = weight_refs or []
         self._user_indices = user_indices
+        self._output_spec = output_spec
         self._scalar_output_positions = frozenset(scalar_output_positions)
+        self._use_current_stream = use_current_stream
+        self._static_outputs = static_outputs
+        self._static_output_tensors = None
+        self._artifact = artifact
+        self._binding = object()
         self.skip_input_names = frozenset()
         self._is_gpu = getattr(graph_result, "device_type", "cpu") != "cpu"
+        self._device_index = getattr(graph_result, "device_index", None)
+        if self._is_gpu and self._device_index is None:
+            raise RuntimeError("CUDA CompiledGraph did not report a device index")
         self._supports_device_ptrs = getattr(
             graph_result, "supports_device_ptrs", False
         )
+        if static_outputs and not (self._is_gpu and self._supports_device_ptrs):
+            raise ValueError("static outputs require CUDA device-pointer support")
         # name -> (device, pointer, required bytes, dtype, strong tensor ref).
         # CUDA bindings are persistent in the runtime; only changed metadata
         # needs to cross PyO3 on subsequent calls.
@@ -130,6 +151,10 @@ class CompiledModel:
         Returns:
             Tuple of PyTorch tensors containing the model outputs
         """
+        binding_changed = self._artifact is not None and self._artifact.activate(
+            self._binding
+        )
+
         # Drop stripped SymInt args, if any.
         if self._user_indices is not None:
             user_inputs = [inputs[i] for i in self._user_indices]
@@ -141,13 +166,11 @@ class CompiledModel:
                 f"Expected {len(self._input_names)} inputs, got {len(user_inputs)}"
             )
 
-        # Device for outputs: prefer any CUDA input — inputs include lifted
-        # weights, and user_inputs[0] may be a CPU-resident weight (offloaded
-        # models) while activations live on the GPU.
-        input_device = next(
-            (t.device for t in user_inputs if t.is_cuda),
-            user_inputs[0].device if user_inputs else torch.device("cpu"),
-        )
+        if self._is_gpu:
+            _cuda_device_index(user_inputs, expected=self._device_index)
+            input_device = torch.device("cuda", self._device_index)
+        else:
+            input_device = user_inputs[0].device if user_inputs else torch.device("cpu")
 
         # Auto-detect dynamic dims from input shapes
         if self._has_dynamic_dims:
@@ -186,7 +209,7 @@ class CompiledModel:
                 n_bytes = t.numel() * t.element_size()
                 signature = _cuda_input_binding_signature(t, n_bytes)
                 previous = self._cuda_input_bindings.get(name)
-                if previous is None or previous[:4] != signature:
+                if binding_changed or previous is None or previous[:4] != signature:
                     self._graph.set_input_device_ptr(name, t.data_ptr(), n_bytes)
                 # Commit only after a changed registration succeeds. Retaining
                 # the tensor prevents allocator reuse while Rust holds its
@@ -260,6 +283,32 @@ class CompiledModel:
             torch.bool: ("get_output_bool", torch.bool),
         }
 
+        if self._static_outputs:
+            for i in self._writeback_by_pos:
+                name = self._output_names[i]
+                target = user_inputs[self._writeback_input_pos[i]]
+                out_dtype = output_torch_dtypes[i]
+                expected_numel = math.prod(output_shapes[i])
+                if not (
+                    hasattr(self._graph, "copy_outputs_to_device_ptrs_at")
+                    and target.is_cuda
+                    and target.is_contiguous()
+                    and target.dtype == out_dtype
+                    and target.numel() == expected_numel
+                ):
+                    raise ValueError(
+                        f"static writeback '{name}' requires a contiguous CUDA "
+                        f"tensor with dtype {out_dtype} and {expected_numel} elements"
+                    )
+                n_bytes = target.numel() * target.element_size()
+                signature = _cuda_input_binding_signature(target, n_bytes)
+                previous = self._cuda_writeback_bindings.get(i)
+                if previous is not None and previous[:4] != signature:
+                    raise ValueError(
+                        f"static writeback '{name}' target allocation changed"
+                    )
+                self._cuda_writeback_bindings[i] = (*signature, target)
+
         def _read_typed_output(
             position: int, name: str, shape, out_dtype
         ) -> torch.Tensor:
@@ -320,6 +369,22 @@ class CompiledModel:
         _use_zero_copy = self._supports_device_ptrs
         output_tensors = []
         if _use_zero_copy:
+            if self._static_outputs and self._static_output_tensors is None:
+                self._static_output_tensors = []
+                for i, (shape, out_dtype) in enumerate(
+                    zip(self._output_shapes, output_torch_dtypes)
+                ):
+                    if i in self._writeback_by_pos:
+                        self._static_output_tensors.append(None)
+                        continue
+                    if out_dtype not in _zero_copy_native_floats:
+                        raise TypeError(
+                            f"static output '{self._output_names[i]}' has "
+                            f"unsupported dtype {out_dtype}"
+                        )
+                    out = torch.empty(shape, dtype=out_dtype, device=input_device)
+                    self._static_output_tensors.append(out)
+
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
                 if i in self._writeback_by_pos:
@@ -329,19 +394,36 @@ class CompiledModel:
                     # front can redirect one cache writeback into another.
                     # Preserve positional semantics with the batched post-run
                     # device copies below.
-                    if i in self._cuda_writeback_bindings:
-                        self._graph.clear_output_device_ptr_at(i)
-                        del self._cuda_writeback_bindings[i]
                     output_tensors.append(None)
                     continue
-                out = torch.empty(shape, dtype=out_dtype, device=input_device)
+                if self._static_outputs:
+                    out = self._static_output_tensors[i]
+                    capacity_shape = tuple(out.shape)
+                    shape = tuple(shape)
+                    if len(shape) != len(capacity_shape) or any(
+                        current > capacity
+                        for current, capacity in zip(shape, capacity_shape)
+                    ):
+                        raise ValueError(
+                            f"output '{name}' shape {shape} exceeds static "
+                            f"capacity {capacity_shape}"
+                        )
+                    out = out.view(-1)[: math.prod(shape)].view(shape)
+                else:
+                    out = torch.empty(shape, dtype=out_dtype, device=input_device)
                 if out_dtype in _zero_copy_native_floats:
+                    # The allocation has maximum capacity, but the runtime
+                    # needs the current logical byte length for dynamic shapes.
                     self._graph.set_output_device_ptr_at(
                         i, out.data_ptr(), out.numel() * out.element_size()
                     )
                 output_tensors.append(out)
 
-        self._graph.run()
+        if self._use_current_stream:
+            stream = torch.cuda.current_stream(self._device_index)
+            self._graph.run(stream.cuda_stream)
+        else:
+            self._graph.run()
 
         outputs = []
         gpu_writebacks = []
@@ -385,7 +467,10 @@ class CompiledModel:
         if gpu_writebacks:
             self._graph.copy_outputs_to_device_ptrs_at(gpu_writebacks)
 
-        return tuple(
+        flat_outputs = tuple(
             output.item() if i in self._scalar_output_positions else output
             for i, output in enumerate(outputs)
         )
+        if self._output_spec is not None:
+            return torch.utils._pytree.tree_unflatten(flat_outputs, self._output_spec)
+        return flat_outputs

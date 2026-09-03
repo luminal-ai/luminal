@@ -48,6 +48,7 @@ Dispositions:
 | `b745d102` | #413 | metal: emit constants by f32 bit pattern | FILE-LEVEL (2 metal-park files) | branch `merge/main-413-metal-constants` | RULED 2026-09-03: *"same 413 is fine. we can just merge this and check later."* The CHECK is done and the answer is NO: live CUDA constant codegen has the same defect — see **#413 metal constants** below |
 | `38640588` | #416 | Allow vLLM FX region compilation | FILE-LEVEL (11 python-park files + 1 into the `cuda_lite_hlir` park) + DROPPED (the zero-extent slice special case, by ruling) + RE-EXPRESSED (one recording-only pin) | branch `merge/main-416-vllm-regions` | RULED 2026-09-03: *"let's not special case slices producing extent zero for now"* — and the answer to *"nothing bad should happen?"* is: nothing does; the shared-destination invariant is already enforced by the conflict engine — see **#416 vLLM regions** below |
 | `477d3626` | #417 | Preserve concrete dtypes through loop rolling | INTENT-ONLY (the law written into the estate beside `dtype-of`) | branch `merge/main-417-dtype-contract` | RULED 2026-09-03: *"This is good, let's merge it."* Nothing is file-mergeable — `src/hlir.rs` and `src/op.rs` are deleted and `src/graph.rs` is a different file (the recorder). The principle main paid for is already this branch's design and is now written down; the `output_dtype` table, `concrete_node_dtypes` and the marker assertions are uncarried — see **#417 dtype contracts** below |
+| `6681720b` | #418 | Add CUDA serving runtime support for vLLM integration | FILE-LEVEL (12 python-park files + 4 into the `cuda_lite_hlir` park + 1 metal-park file) + UNCARRIED (`src/dyn_backend.rs`, deleted on this branch) | branch `merge/main-418-serving-parks` | RULED 2026-09-03: *"we'll record only, we'll eventually have to get to parity."* Five EMBEDDABILITY REQUIREMENTS on the live CL executor, each checked against today's `crates/luminal_cuda_lite/src/device.rs`: device selection, a caller-owned borrowed stream with a synchronize-or-not policy, fixed-capacity caller-owned output buffers, functionalized mutation writebacks, and a versioned FFI seam — see **#418 vLLM serving** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -2098,6 +2099,194 @@ reader does not mistake an empty ruleset for a live propagation.
 not name a future requirement: main's end state is this branch's starting
 state. What is owed is only that it stay that way, which is what the comment is
 for.
+
+## #418 vLLM serving — parks banked; embeddability requirements recorded (parity owed)
+
+RULED 2026-09-03: *"we'll record only, we'll eventually have to get to
+parity."* Main's `6681720b` (+1249/-171, 18 files) is the commit that makes
+luminal EMBEDDABLE: a host process (vLLM) selects the device, hands luminal its
+own CUDA stream, supplies the output allocations, captures luminal's kernels
+into the host's own CUDA graph, and reuses one compiled artifact across
+rebindings. Seventeen of the eighteen files are park files and went across
+untouched. The eighteenth is core and does not exist here.
+
+### FILE-LEVEL: 17 files, residue EMPTY on every one
+
+Twelve `crates/luminal_python/**` (`rust/src/{compiled_graph,
+pt2_compiled_model}.rs`, `src/luminal/{__init__,artifact_cache,compiled_model,
+main,pt2,region_compile,region_export}.py`, `tests/{test_capsule_validation,
+test_region_compile,test_region_export}.py` — `artifact_cache.py` is new,
++130), four into the `cuda_lite_hlir` park (`Cargo.toml`, `src/runtime.rs`,
+`src/dyn_backend.rs`, `src/kernel/to_host.rs`, path-rewritten from
+`crates/luminal_cuda_lite/`), and one metal-park file
+(`crates/luminal_metal/src/dyn_backend.rs`, +1/-1, the `execute` signature).
+
+**Every one applied cleanly — no conflicts, and NO re-spelling was needed.**
+The diff-of-diffs check (main's per-file hunk set, path-rewritten, versus the
+hunk set actually banked, normalized for line offsets) is byte-IDENTICAL for
+all 17. The park conventions were re-checked afterwards and hold:
+`named_tensor_dtyped` is still 0 occurrences in `crates/luminal_python`; no
+added line reintroduces `Expression` or a Rust `.shape` field access (the two
+`.shape` hits in the added Python are `torch.Tensor.shape`); and the park's own
+drift survives untouched (`early_stop_exceeded` still at
+`crates/luminal_cuda_lite_hlir/src/runtime.rs:55`, `IntExpr` still spelled in
+`runtime.rs` and `kernel/to_host.rs`). None of the three crates is a workspace
+member, so nothing was built.
+
+What the park now carries, in main's terms: `CudaRuntime` gains an
+`owned_stream` beside its execution `cuda_stream` plus
+`use_borrowed_stream(raw: u64)` / `use_owned_stream()` /
+`select_execution_stream()`, and a `synchronize_stream` flag that makes the
+terminal `self.cuda_stream.synchronize()` — and the batched writeback sync in
+`copy_outputs_to_device_ptrs` — CONDITIONAL: owned-stream execution stays
+blocking, borrowed-stream execution leaves completion ordered on the caller's
+stream. `external_cuda_graph` makes `execute` detect an ACTIVE capture on the
+caller's stream and, in that case, skip luminal's own graph materialization and
+launch the individual steps (`CudaGraphOp::launch_steps`, the `enqueue_prepared`
+/ `validate_pointers` / `requires_output_buffer` split in
+`kernel/to_host.rs`) so the host's capture picks them up. Arena allocation
+learns to EXCLUDE caller-registered output nodes
+(`external_output_nodes` threaded into `allocate_intermediate_buffers`), so a
+reallocation cannot silently overwrite a pointer the host owns. `Cargo.toml`
+re-points `cudarc` at the `luminal-ai` fork.
+On the Python side `CompiledModel` gains `use_current_stream`,
+`static_outputs` (fixed max-capacity CUDA output buffers reused across calls,
+returned as views at the current runtime shapes), `device_index` enforcement
+via `_cuda_device_index`, and an `artifact` handle whose `activate(binding)`
+returns True when the shared compiled artifact was last used by a DIFFERENT
+binding — the signal to re-register every input device pointer.
+`artifact_cache.py` keys structurally identical FX regions (symbol names
+normalized) so separate positional bindings share one search.
+
+### UNCARRIED: `src/dyn_backend.rs` (+18/-5)
+
+The file was deleted on this branch; there is no `DynBackend` trait, no
+`BackendCompileArgs`, and no PyCapsule seam (`grep -rn 'pyo3\|PyCapsule\|
+BackendFactory' src/` returns nothing — the python crate is parked, not
+attached to the recorder). Main's five changes there, recorded for the
+re-attachment:
+
+- `fn device_index(&self) -> Option<usize>` on the trait, defaulting to `None`.
+- `fn execute(&mut self, dyn_map: &DynMap, stream: Option<u64>)` — the raw
+  borrowed stream is threaded through the trait itself, and
+  `ReferenceDynBackend::execute` asserts `stream.is_none()`.
+- `BackendCompileArgs` gains `device_index: Option<usize>` and
+  `external_cuda_graph: bool`.
+- `BACKEND_FACTORY_CAPSULE_NAME` bumped `"luminal.backend_factory"` ->
+  `"luminal.backend_factory.v2"`, with the reason stated in the doc comment:
+  *"The version is part of the ABI: `BackendCompileArgs` crosses this boundary
+  by value, so an older plugin must be rejected rather than reading a changed
+  struct layout."* Note this REPLACES the previous comment, which promised the
+  name would never change for compatibility with older producers — main
+  deliberately reversed that promise, and the versioned form is the one worth
+  copying.
+
+### THE FIVE EMBEDDABILITY REQUIREMENTS (recorded, nothing acted on)
+
+Each is stated as a requirement on the live CL executor — `execute_plan` in
+`crates/luminal_cuda_lite/src/device.rs`, called from
+`CudaRuntime::execute` (`crates/luminal_cuda_lite/src/runtime.rs:299-307`) —
+with today's state verified in the tree, not assumed.
+
+**(1) Explicit CUDA device selection.** *Today: device 0 is hardcoded, and the
+context is created per call.* `crates/luminal_cuda_lite/src/device.rs:156`:
+
+```rust
+let ctx = CudaContext::new(0).context("no CUDA device 0")?;
+```
+
+`execute_plan` takes only `(plan, staged)`; `CudaRuntime::execute(&mut self)`
+(`runtime.rs:299`) takes nothing at all, and `CudaRuntime` holds no context or
+device field. Main's shape is the parameterized one: the device index arrives
+in `BackendCompileArgs`, the factory refuses a missing index outright
+(*"CUDA backend requires a device index"*), the runtime reports it back through
+`device_index()`, and the Python side cross-checks that every input tensor
+lives on that logical device (`main.py::_cuda_device_index`). Requirement: the
+device is an argument of the call, reported back to the host, and a mismatch
+between the host's tensors and the executor's device is a loud refusal. (Main
+still restricts to logical device 0 — the multi-device work is the plumbing,
+not the capability.)
+
+**(2) Execution on a caller-owned stream the executor neither destroys nor
+synchronizes.** *Today: the context's default stream, created per call, with an
+unconditional terminal synchronize.* `device.rs:157`
+(`let stream = ctx.default_stream();`) and `device.rs:456`
+(`stream.synchronize().context("stream sync")?;`), followed by blocking
+`memcpy_dtoh` per output slot (`device.rs:472`). There is no way to pass a
+stream in and no flag that suppresses the sync. Requirement, in two halves:
+(a) an entry point that takes a raw `CUstream` from the host, wraps it BORROWED
+(main: `context.wrap_borrowed_stream`, behind an `unsafe fn` whose contract is
+that the owner keeps it alive), and re-points every launch at it — the executor
+must never destroy it; and (b) an explicit SYNCHRONIZE-OR-NOT policy tied to
+that choice: owned stream => blocking, as today; borrowed stream => return with
+the work merely enqueued, completion ordered on the caller's stream, and the
+D2H readback path must then be optional too, because a host that supplied its
+own output buffers does not want the copy at all. Main spells the policy as one
+bool, `synchronize_stream`, set by whichever of `use_owned_stream` /
+`use_borrowed_stream` was called.
+
+**(3) Fixed-capacity, stable-address, caller-owned output buffers the planner
+must not reuse.** *Today: the executor allocates every buffer itself, fresh,
+per call, and hands back host copies.* Phase 1 allocates one `alloc_zeros` per
+plan buffer including the ones backing output slots (`device.rs:198`); Phase 4
+copies each output slot's backing buffer D2H into a fresh `Vec<u8>` and returns
+owned `TypedBuffer`s keyed by slot index (`device.rs:466-476`), which
+`CudaRuntime` stores in `outputs_host` (`runtime.rs:51`, `:307`). So output
+storage is neither caller-owned nor stable across calls, and its address is not
+even stable across two executions of the same plan. The requirement has three
+parts a host needs simultaneously: the host supplies the output pointer; that
+pointer is FIXED-CAPACITY (allocated once at the maximum shape and re-viewed at
+the current runtime shape, which is main's `static_outputs` — CUDA-graph
+capture demands a stable address, so a per-shape allocation is not an option);
+and the planner/allocator must be forbidden from handing that buffer's range to
+anything else (main's fix is literally a filter — `external_output_nodes`
+excluded from `logical_buffer_offsets` before arena assignment).
+**The seam already exists and already says so.** `device.rs:215-222`, the
+CONTRACT-1 bind-time check, is written for exactly this future:
+
+> distinct BufferIds must be backed by disjoint device ranges … Fresh
+> `alloc_zeros` per buffer makes this hold by construction today; the assert is
+> the contract's enforcement face for when raw caller pointers arrive at this
+> binding surface. Loud refusal, never mistranslation.
+
+That is where a caller pointer table would be bound, and the disjointness
+assert is what would catch a host handing in two overlapping ranges.
+
+**(4) Functionalized mutation writebacks.** *Today: absent from the executor,
+though the PLAN ontology already has the vocabulary.* A serving host's KV
+cache is a caller tensor that the graph logically returns a new value for and
+the host wants written back in place; main batches every such copy into one
+`copy_outputs_to_device_ptrs` submission and (post-#418) syncs it only in
+owned-stream mode, with `CompiledModel` refusing a writeback target that is not
+a contiguous CUDA tensor of the right dtype and element count, and refusing
+outright if the target's allocation CHANGED between calls. Here, `grep -rni
+'writeback\|donat' crates/luminal_cuda_lite/src/*.rs` finds exactly one hit,
+and it is a comment: the escape guard at `device.rs:126-132`, which reasons
+about DONATED boundary storage while refusing a plan whose output is backed by
+`FreedBy::Program`. The plan level is genuinely ready — `Owner::{Caller,
+System}` (`src/bufferize.rs:115-120`), `Access::{ReadOnly, ReadWrite}` and
+`FreedBy::{Caller, Program}` (`src/layout_ir/mod.rs:704-721`, deliberately
+orthogonal: *"permission to clobber bytes never implies responsibility to
+destroy storage"*) are exactly the facts a writeback needs. What is missing is
+only the executor seam: a way to name the caller's destination pointer for an
+output slot, and a batched, once-synchronized (or not-synchronized) copy to it.
+
+**(5) A versioned FFI seam.** *Today: none, and none is owed yet — but the
+version discipline is.* There is no python attachment on this branch at all
+(see UNCARRIED above), so nothing crosses a C boundary from live core. When one
+is built, main's rule is the one to adopt: the capsule name CARRIES the ABI
+version (`luminal.backend_factory.v2`) precisely because the argument struct
+crosses by value, so bumping the name is how an older producer gets a clean
+rejection instead of a reinterpreted struct — and #418 is itself the proof, a
+commit that added two fields to `BackendCompileArgs` and one parameter to
+`DynBackend::execute` in the same breath. Note the python park's
+`test_capsule_validation.py` already pins name-mismatch rejection, so the test
+shape is banked even though the seam is not.
+
+**Nothing here is a defect.** The CL executor is a correct standalone executor;
+every gap above is a capability it was never asked for. This section exists so
+that when it IS asked for, the list is already written and already measured
+against the code.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

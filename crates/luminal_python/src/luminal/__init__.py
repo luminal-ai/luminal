@@ -2,6 +2,7 @@
 
 # Import Python components
 # Register DynamicCache pytree serialization once at import time
+from .artifact_cache import ArtifactCacheStats, artifact_cache_stats
 from .cache_utils import _register_cache_serialization
 from .compiled_model import CompiledModel
 
@@ -15,6 +16,8 @@ _register_cache_serialization()
 # Re-export everything for clean package interface
 __all__ = [
     "CompiledModel",
+    "ArtifactCacheStats",
+    "artifact_cache_stats",
     "luminal_backend",
     "register_backend",
     "CompiledGraph",
