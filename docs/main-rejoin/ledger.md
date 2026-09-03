@@ -1389,3 +1389,45 @@ exists here.
 **Owed** (the same debt #398 booked for `LogicalConstant`): give `LogicalIota` a
 dtype instead of pinning `(Int)`, and `constant_i64` becomes
 `constant(value).cast(DType::I64)` — one node instead of nine.
+## #406 pad — the select construction REVERTED (2026-09-03)
+
+Ruling 4b's "option i" (`select_by_index`: packed 2N iota + two `scatter1d` +
+`gather1d`, landed in PR #471 / `0e6e7868`) was measured and reverted the same
+day. The core lib test suite went from ~15 s to >76 minutes (killed); a
+`sample` of the live binary put every surviving thread — the rank-≥2 pad
+consumers `test_pad_2d`, `test_concat`, `test_slice_pad`, `test_unfold`,
+`test_cumulative`, `test_stack` — inside `egglog::EGraph::run_schedule` with
+the time in `luminal::subst_primitive::{substitute, Walk::collect, Walk::build}`.
+The study (opus agent, worktree pad-study, AFTER state): rank-1 pad saturates
+in 72 ms (670 classes / 1238 e-nodes vs 177 / 321 for a bare multiply; 7
+applies instead of 1; winning plan 18 buffers instead of 4); a rank-2 pad of
+`(4,8)` by one cell per axis does not finish saturation in 15 minutes. Padding
+width and tensor size are irrelevant; RANK is everything. Mechanism: each
+`scatter1d`/`gather1d` flattens and `unflatten_to`s, minting
+`LogicalIndexMapApply` chains whose entries are `IntTruncDiv`/`IntTruncRem`
+(6 at rank 1, 23 at rank 2, nested at rank 2); native affine composition has
+no arm for div/rem entries (`egglog_preamble.egg` ~4066-4079), so every link
+falls through to the `:naive` subst-walk rule (~4007-4015) whose `Walk::collect`
+copies the whole reachable region per generation and re-mints a
+`LayoutTensorLit` per parent layout per apply. The gather coordinate
+`even + index` is an add of two iotas that no rule folds back into an iota,
+so `gather/unification_4.egg` (all-iota coordinates ≡ view) can never fire —
+pad's read cannot fold back into the views-stage seam. The rank-1 tests the
+commit pinned could not see any of this.
+
+**What this revert does.** `pad` and `pad_with` return to the clamped-view ×
+mask arithmetic; `pad(padding, 0.0)` records NO fill term (the graph is the
+pre-#406 one in the common case); `pad_with` keeps the typed scalar fill
+through `masked + (1 - mask) * fill` with the `1` minted as an Int constant
+cast to the input dtype. `select_by_index` is deleted. The NaN test
+`pad_fill_is_exact_beside_non_finite_values` is deleted because the leak is
+back: `0 * NaN` / `0 * Inf` poisons the padding. The typed-fill test is F32:
+an Int tensor pads through the same arithmetic but Int add/mul are
+proof-gated and refuse without a `bind_value_range` attestation. `ne → Bool`
+and `constant_i64` from the same commit are untouched.
+
+**Tickets.** LUM-805 (Bug) records this blowup, the measurements and the full
+analysis; LUM-804 still owns the fix — a native `Bool8` select op, never a
+gather construction. Any future pad construction is gated by the rank-≥2
+pad-family proptests actually finishing, not by named rank-1 tests.
+
