@@ -39,6 +39,7 @@ Dispositions:
 | `1d07093c` | #401 | Reuse persistent CUDA intermediate arena | FILE-LEVEL (park) + INTENT-ONLY (core) | branch `merge/main-401-arena-park` | REQUIREMENT FOR THE CL EXECUTOR: honour the plan's `BufferAlloc`/`BufferFree` against one runtime-owned high-water slab; park-don't-free, keep-the-largest, re-attach-only-if-wanted — see **#401 persistent arena** below |
 | `7e7deb2a` | #404 | Spec | FILE-LEVEL (`spec.md`) | branch `merge/main-404-spec` | ruling 7 of 2026-09-02: *"this is just a snapshot, we'll update it later"* — the text describes main's architecture (translator-fed HLIR, loop-rolling, genetic LLIR extraction), NOT this branch's; see **#404 spec.md** below for the line-by-line divergence |
 | `d6d26cbe` | #402 | translate_module: hand back the translated graph without the pytorch wrappings | FILE-LEVEL (4 seam files) + SUPERSEDED (the `scatter_nd` fix) | branch `merge/main-402-translate-seam` | the seam's REQUIREMENT for the python re-attachment: a host must be able to take the translated graph WITHOUT inheriting luminal's dim buckets or search budget — see **#402 translate_module** below |
+| `be22fa60` | #405 | ci: stop running the OpInfo suite in the main Python CUDA job | FILE-LEVEL | branch `merge/main-405-ci-opinfo` | — (the ignore flag is a main-side CI decision; nothing in this workflow runs on this branch) |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -857,3 +858,37 @@ mistake for the contract. Dropped.
 Two bullets in main's own commit message — `DynBackend::move_buffer` and
 `CudaRuntime::write_external` — describe code that is absent from main
 entirely. Do not go looking for them.
+
+## #405 OpInfo out of the Python CUDA job — one line, banked
+
+One line of `.github/workflows/test-python-cuda.yml`, applied cleanly at
+file level: the Modal pytest invocation gains `--ignore=tests/test_opinfo.py`.
+
+This is the other half of #398. That commit banked main's OpInfo harness
+(`crates/luminal_python/tests/test_opinfo.py`, ~6100 parametrized aten cases,
+each of which compiles a graph) and the workflow that names it. Main then
+discovered the cost: "Python CUDA Tests" runs the whole `tests/` directory
+under a 120-minute job limit, and two consecutive main runs were cancelled at
+the timeout, taking *every other* Python CUDA test down with them. The ignore
+flag unblocks the rest of the suite.
+
+**Why it is a pure bank here.** The job's triggers are `push` /
+`pull_request_target` on `main` plus `workflow_dispatch`; it never fires for
+this branch, and `crates/luminal_python` is not a workspace member, so no
+pytest of any kind executes here. The line is carried so that the parked
+workflow stays byte-identical to main's and the *reason* it is there survives
+the park: without it, a future re-attachment that turns this workflow back on
+would inherit main's timeout, not main's fix.
+
+**What is still owed, and is main's problem as much as ours.** The OpInfo
+cases now run nowhere. `test_opinfo.py` already supports sharding through
+`LUMINAL_OPINFO_SHARD_INDEX` / `LUMINAL_OPINFO_SHARD_COUNT`, and #398 banked a
+commented-out 32-way CPU shard job at `.github/workflows/test-python-native.yml`
+line 95 — still commented out here. Giving the cases a home needs a decision
+about which runner owns them, and, for the Modal path, a way to pass those two
+variables into the container: `modal_pytest_runner.py` line 217 builds the
+pytest environment as `os.environ.copy()` INSIDE `TestRunner.run`, a
+`@modal.method()` executing in the Modal container (line 202,
+`@app.cls(image=image, ...)`), so it copies the *container's* environment —
+variables set on the GitHub runner never reach it. Both are requirements on the
+M4 translator re-attachment, alongside #398's own.
