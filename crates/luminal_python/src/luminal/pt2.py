@@ -707,6 +707,67 @@ def _build_dynamic_shapes_from_dim_arg(dynamic_dim, example_args):
     return (spec,) + rest
 
 
+def translate_module(gm, example_inputs, dynamic_shapes=None):
+    """Translate a Dynamo graph module and STOP — no backend compilation.
+
+    Shaped like a torch.compile backend, but returns a `TranslatedModule`
+    instead of a callable: the HLIR graph, its name maps, shape expressions,
+    write-back outputs and weights, with nothing lowered yet.
+
+    That is the difference from `pt2_backend`, which translates and compiles in
+    one step and so fixes the search budget, the dim buckets and the graph
+    itself at that moment. A host that wants to choose those — or to extend the
+    graph before lowering — needs the translation on its own. It also owns the
+    result outright, so no part of serving has to re-enter the interpreter.
+
+    Returns `(TranslatedModule, placeholder_names, keep_alive)`. The names are Dynamo's
+    (`l_input_ids_`), positionally matching the graph's inputs; the translated
+    graph names them `args_N`, and the mapping exists nowhere else.
+    """
+    from .luminal import translate_module as _translate_module
+
+    user_inputs = list(example_inputs)
+    user_inputs, _post_strip, _strip_ok = _strip_symint_placeholders(gm, user_inputs)
+    # AFTER the strip: it removes symint placeholders from `gm`, so what remains
+    # aligns one-to-one with `user_inputs`. Reading them before, or zipping
+    # against the original `example_inputs`, silently misaligns the names.
+    placeholders = [n.name for n in gm.graph.nodes if n.op == "placeholder"]
+
+    try:
+        ep = torch.export.export(
+            gm, tuple(user_inputs), dynamic_shapes=dynamic_shapes, **_export_kwargs()
+        )
+    except Exception:
+        if dynamic_shapes is None:
+            raise
+        ep = torch.export.export(gm, tuple(user_inputs), **_export_kwargs())
+    # LUM-499, same as the compile path: dropped before run_decompositions
+    # calls ep.module().
+    _drop_input_guards(ep)
+    _drop_dead_data_dependent_ops(ep.graph_module)
+    ep = ep.run_decompositions(_decomp_table())
+
+    tmpdir = tempfile.mkdtemp(prefix="luminal_translate_")
+    try:
+        pt2_path = os.path.join(tmpdir, "model.pt2")
+        torch.export.save(ep, pt2_path)
+        # Weights arrive as ordinary graph inputs, keyed by placeholder name,
+        # so their device pointers can be bound without a second copy.
+        named = {
+            name: tensor
+            for name, tensor in zip(placeholders, user_inputs)
+            if isinstance(tensor, torch.Tensor) and tensor.is_cuda
+        }
+        keep_alive, weight_device_ptrs, _cpu = _collect_weight_pointers(named)
+        module = _translate_module(pt2_path, "", weight_device_ptrs)
+        # `keep_alive` is returned, not attached: the bound pointers borrow from
+        # these tensors — including any contiguous copies made here — and the
+        # caller must hold them until it has taken the translation.
+        return module, placeholders, keep_alive
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _eager_pt2_compile(
     gm,
     user_inputs,
