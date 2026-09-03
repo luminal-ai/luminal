@@ -38,6 +38,114 @@ def _complex_randn(*shape: int, dtype=torch.complex64) -> torch.Tensor:
     )
 
 
+class SmallAlgebraicAliases(torch.nn.Module):
+    def forward(self, value, exponent, integers):
+        return (
+            torch.ops.aten.any.default(value),
+            torch.ops.aten.any.dim(value, -1, True),
+            torch.ops.aten.any.dims(value, [], False),
+            torch.ops.aten.log1p.default(value),
+            torch.ops.aten.expm1.default(value),
+            torch.ops.aten.log10.default(value + 2.0),
+            torch.ops.aten.sinh.default(value),
+            torch.ops.aten.tan.default(value),
+            torch.ops.aten.angle.default(value),
+            torch.ops.aten.isinf.default(value),
+            torch.ops.aten.isinf.default(integers),
+            torch.ops.aten.ldexp.Tensor(value, exponent),
+        )
+
+
+class CopyAndStableSortAliases(torch.nn.Module):
+    def forward(self, value):
+        permuted = torch.ops.aten.permute_copy.default(value, [1, 0])
+        unbound = torch.ops.aten.unbind_copy.int(permuted, 0)
+        sorted_values, sorted_indices = torch.ops.aten.sort.stable(
+            value, stable=True, dim=-1, descending=True
+        )
+        return (
+            torch.ops.aten.view_copy.default(value, [2, 6]),
+            permuted,
+            torch.ops.aten.narrow_copy.default(permuted, -1, 1, 2),
+            *unbound,
+            sorted_values,
+            sorted_indices,
+        )
+
+
+class ScatterAliases(torch.nn.Module):
+    def forward(self, value, index, source):
+        return (
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="add"),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="multiply"),
+            torch.ops.aten.scatter.value_reduce(value, 1, index, 1.5, reduce="add"),
+            torch.ops.aten.scatter.value_reduce(
+                value, 1, index, -0.5, reduce="multiply"
+            ),
+            torch.ops.aten.scatter_add.default(value, 1, index, source),
+        )
+
+
+class OptionalIndexPutAccumulate(torch.nn.Module):
+    def forward(self, value, index, source):
+        return torch.ops.aten.index_put.default(
+            value, [None, index], source, accumulate=True
+        )
+
+
+def test_small_algebraic_aliases_use_existing_primitives() -> None:
+    value = torch.tensor([[0.0, 0.25, -0.5], [1.0, 0.0, 0.75]])
+    exponent = torch.tensor([[0, 1, -1], [2, -2, 3]], dtype=torch.int32)
+    integers = torch.tensor([[0, 1, -2], [3, 0, 4]], dtype=torch.int64)
+    module = SmallAlgebraicAliases()
+    _assert_outputs(
+        _compile(module, value, exponent, integers)(value, exponent, integers),
+        module(value, exponent, integers),
+    )
+
+
+def test_copy_aliases_and_stable_sort_preserve_all_outputs() -> None:
+    value = torch.tensor(
+        [[3.0, 1.0, 3.0, 2.0], [0.0, 4.0, 4.0, -1.0], [2.0, 2.0, 1.0, 0.0]]
+    )
+    module = CopyAndStableSortAliases()
+    _assert_outputs(_compile(module, value)(value), module(value))
+
+
+def test_scatter_aliases_accumulate_duplicate_destinations_in_order() -> None:
+    value = torch.tensor([[2.0, 3.0, 5.0], [7.0, 11.0, 13.0]])
+    index = torch.tensor([[0, 0, 2], [1, 1, 1]])
+    source = torch.tensor([[2.0, 3.0, 4.0], [0.5, 2.0, -1.0]])
+    module = ScatterAliases()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        expected = module(value, index, source)
+        actual = _compile(module, value, index, source)(value, index, source)
+    _assert_outputs(actual, expected)
+
+
+def test_optional_index_put_accumulates_real_and_complex_duplicates() -> None:
+    index = torch.tensor([1, 1, 3])
+    module = OptionalIndexPutAccumulate()
+    for value, source in (
+        (
+            torch.arange(10, dtype=torch.float32).reshape(2, 5),
+            torch.tensor([[2.0, 3.0, 4.0], [-1.0, 0.5, 7.0]]),
+        ),
+        (
+            _complex_randn(2, 5),
+            torch.tensor(
+                [[2 + 1j, 3 - 4j, 4 + 0j], [-1 + 2j, 0.5j, 7 - 3j]],
+                dtype=torch.complex64,
+            ),
+        ),
+    ):
+        _assert_outputs(
+            _compile(module, value, index, source)(value, index, source),
+            module(value, index, source),
+        )
+
+
 class LinearComposites(torch.nn.Module):
     def __init__(self, alpha, beta):
         super().__init__()

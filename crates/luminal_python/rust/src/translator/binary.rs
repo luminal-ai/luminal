@@ -64,18 +64,28 @@ impl<'a> Translator<'a> {
 
     fn promoted_binary_inputs(&mut self, node: &Node) -> Result<(GraphTensor, GraphTensor)> {
         let dtype = self.output_meta_dtype(node)?;
-        let mut a = self.get_input_tensor(node, 0)?.cast(dtype);
-        let mut b = if let Some(name) = node.inputs[1].arg.as_tensor_name() {
-            self.get_tensor(name)?.cast(dtype)
-        } else {
-            let value = node.inputs[1]
+        let mut operand = |index: usize| -> Result<GraphTensor> {
+            if let Some(name) = node.inputs[index].arg.as_tensor_name() {
+                return Ok(self.get_tensor(name)?.cast(dtype));
+            }
+            let value = node.inputs[index]
                 .arg
                 .as_int()
                 .map(|value| value as f64)
-                .or_else(|| node.inputs[1].arg.as_float())
-                .ok_or_else(|| anyhow::anyhow!("{} requires a numeric RHS", node.target))?;
-            self.scalar_constant(value, dtype)
+                .or_else(|| node.inputs[index].arg.as_float())
+                .or_else(|| {
+                    node.inputs[index]
+                        .arg
+                        .as_bool()
+                        .map(|value| if value { 1.0 } else { 0.0 })
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{} input {index} must be tensor or numeric", node.target)
+                })?;
+            Ok(self.scalar_constant(value, dtype))
         };
+        let mut a = operand(0)?;
+        let mut b = operand(1)?;
         (a, b) = broadcast_binary(a, b);
 
         let sym_ranges = sym_char_ranges(&self.sym_map);
@@ -160,6 +170,70 @@ impl<'a> Translator<'a> {
         Ok(result)
     }
 
+    /// Stable hypot avoids overflow from directly squaring the larger input.
+    pub(crate) fn translate_hypot(&mut self, node: &Node) -> Result<GraphTensor> {
+        let (lhs, rhs) = self.promoted_binary_inputs(node)?;
+        let lhs = self.real_abs(lhs);
+        let rhs = self.real_abs(rhs);
+        let lhs_infinite = self.is_inf(lhs);
+        let rhs_infinite = self.is_inf(rhs);
+        let any_infinite = self.bool_or(lhs_infinite, rhs_infinite);
+        let larger = lhs.maximum(rhs);
+        let smaller = lhs.minimum(rhs);
+        let zero = self.constant_like(larger, 0.0);
+        let ratio = smaller / larger;
+        let finite = larger * (self.constant_like(larger, 1.0) + ratio.square()).sqrt();
+        let both_zero = self.is_zero(larger);
+        let result = self.select(both_zero, zero, finite);
+        let infinity = self.constant_like(larger, f64::INFINITY);
+        Ok(self.select(any_infinite, infinity, result))
+    }
+
+    pub(crate) fn translate_gcd(&mut self, node: &Node) -> Result<GraphTensor> {
+        let output_dtype = self.output_meta_dtype(node)?;
+        let (lhs, rhs) = self.promoted_binary_inputs(node)?;
+        // Signed I64 covers every supported input dtype, including U8. The
+        // Euclidean algorithm needs at most 93 divisions for 64-bit inputs;
+        // 128 static rounds leave margin without tensor-controlled looping.
+        let mut lhs = lhs.cast(DType::I64);
+        let mut rhs = rhs.cast(DType::I64);
+        let zero = self.constant_like(lhs, 0.0);
+        let one = self.constant_like(lhs, 1.0);
+        for _ in 0..128 {
+            let finished = self.is_zero(rhs);
+            let safe_rhs = self.select(finished, one, rhs);
+            let remainder = lhs % safe_rhs;
+            lhs = self.select(finished, lhs, rhs);
+            rhs = self.select(finished, zero, remainder);
+        }
+        let negative = lhs.lt(zero);
+        let magnitude = self.select(negative, -lhs, lhs);
+        Ok(magnitude.cast(output_dtype))
+    }
+
+    pub(crate) fn translate_scalar_base_pow(&mut self, node: &Node) -> Result<GraphTensor> {
+        let exponent = self
+            .get_input_tensor(node, 1)?
+            .cast(self.output_meta_dtype(node)?);
+        let base = self.get_float_arg(node, 0)?;
+        let magnitude = self.constant_like(exponent, base.abs());
+        let mut result = self.real_exp(exponent * magnitude.log());
+
+        let zero_exponent = self.is_zero(exponent);
+        let one = self.constant_like(exponent, 1.0);
+        result = self.select(zero_exponent, one, result);
+        if base < 0.0 {
+            let truncated = exponent.cast(DType::I64).cast(exponent.dtype);
+            let integral = self.is_zero(exponent - truncated);
+            let odd = (truncated % self.constant_like(exponent, 2.0))
+                .ne(self.constant_like(exponent, 0.0));
+            let signed = self.select(odd, result * -1.0, result);
+            let nan = self.constant_like(exponent, f64::NAN);
+            result = self.select(integral, signed, nan);
+        }
+        Ok(result)
+    }
+
     /// Lower boolean OR through numeric HLIR ops until HLIR has native logical ops.
     pub(crate) fn apply_bool_or(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
         let a = a.cast(DType::F32);
@@ -199,6 +273,27 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_binary_op(&mut self, node: &Node, op: BinaryOp) -> Result<GraphTensor> {
+        if node.inputs[0].arg.as_tensor_name().is_none() {
+            let alpha = self.get_explicit_alpha(node, op)?;
+            let (a, mut b) = self.promoted_binary_inputs(node)?;
+            let is_bool_add = matches!(op, BinaryOp::Add) && a.dtype == DType::Bool;
+            if !is_bool_add && let Some(alpha) = alpha {
+                b = self.apply_scalar_op(b, alpha, BinaryOp::Mul);
+            }
+            if is_bool_add {
+                return Ok(if alpha == Some(0.0) {
+                    a
+                } else {
+                    self.apply_bool_or(a, b)
+                });
+            }
+            return Ok(match op {
+                BinaryOp::Add => a + b,
+                BinaryOp::Mul => a * b,
+                BinaryOp::Sub => a - b,
+                BinaryOp::Div => a / b,
+            });
+        }
         let a = self.get_input_tensor(node, 0)?;
         let alpha = self.get_explicit_alpha(node, op)?;
         let arg1 = &node.inputs[1].arg;

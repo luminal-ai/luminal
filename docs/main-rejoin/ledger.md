@@ -44,6 +44,7 @@ Dispositions:
 | `eb7a5d6e` | #407 | metal: add fused RMSNorm and simd-group reductions | FILE-LEVEL (park) + INTENT-ONLY (CL) | branch `merge/main-407-metal-rmsnorm` | REQUIREMENT FOR CL: the live CUDA `reduce` codegen is a serial per-output loop with NO warp-level reduction, and no fused RMSNorm op exists — main`s `simd_sum`/`simd_max` block reduction is the CUDA-applicable half; see **#407 metal RMSNorm + simd reductions** below |
 | `62d3cc0d` | #406 | Expand PyTorch lowering and complex dtype coverage | MIXED — FILE-LEVEL (24 python files + `docs/design/associative-fold.md`) / FILE-LEVEL (7 files into the `cuda_lite_hlir` park) / RE-EXPRESSED (core: `ne` -> Bool, NaN-safe `pad`) / N/A (`examples/gemma4_moe`, `src/graph.rs`) / DROPPED-AS-INERT (`rowmajor-empty`) | branch `merge/main-406-pt-lowering` (two commits) | LUM-803 (ideal value types) and LUM-804 (native Bool8 select) — see **#406 PyTorch lowering + complex dtypes** below |
 | `b37eea15` | #409 | Compile-time optimization | FILE-LEVEL (26 files into the `cuda_lite_hlir` park, 1 into the metal park) + UNCARRIED (5 core files, intent recorded) + N/A (`examples/llama`) | branch `merge/main-409-compile-time-park` | RULED 2026-09-03: *"move all this stuff to the hlir park and we'll get to it later. We don't actually need to do much here."* The dense-integer e-graph extraction index, the prepare/profile candidate split, and the two `Expression` intern-identity helpers are the pieces worth revisiting — see **#409 compile-time optimization** below |
+| `2f820521` | #414 | Expand PyTorch ATen lowering coverage | FILE-LEVEL (19 python-park files + 2 into the `cuda_lite_hlir` park) + LANDED-BY-EQUIVALENT (`src/frontend/movement.rs`) + N/A (`examples/flux2`) | branch `merge/main-414-aten-coverage` | RULED 2026-09-03: *"we can also do 414 in one go."* ~115 new ATen overloads = M4 translator requirements; the `as_float` non-finite JSON decoding is a correctness nugget worth keeping — see **#414 ATen coverage** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1607,6 +1608,165 @@ at `:306` and passed to the matmul at `:376` — so the size is a compile-time
 constant, never zero, and never derived from a per-spec `workspace_size` that
 a heuristic could return as 0. The recycling half of the fix is a main-side
 allocator concern with no counterpart here.
+
+## #414 ATen coverage — banked in one go
+
+RULED 2026-09-03: *"we can also do 414 in one go."* Main's `2f820521` is
+23 files, +8134/-121, and 19 of them are the python park.
+
+### FILE-LEVEL: 19 files in `crates/luminal_python`
+
+Fourteen Rust files (two of them new — `translator/pooling.rs`, 928 lines, and
+`translator/sampling.rs`, 314) and five pytest files (`test_fft.py` and
+`test_remaining_existing_hlir_lowerings.py` new). Main's content, this
+branch's spellings, per the standing park rule.
+
+**What it adds.** Roughly 115 new `torch.ops.aten.*` overloads reach a
+lowering, in recognizable families:
+
+- **Elementwise + special functions** — `hypot`, `gcd`, `expm1`, `sinh`, `tan`,
+  `log1p`, `log10`, `angle`, `isinf`, `signbit`, `hardtanh`, `elu`,
+  `leaky_relu`, `round.default`/`round.decimals`, `erfc`, `erfinv`,
+  `special_erfcx`, `lgamma`, `digamma`, `polygamma`, `i0`, and the whole Bessel
+  / Chebyshev-polynomial / Airy / `ndtri` block. `erf` itself moves out of the
+  giant `dispatch.rs` match arm into `translate_erf`.
+- **Pooling and normalization** (`translator/pooling.rs`) — `avg_pool2d/3d`,
+  `_adaptive_avg_pool2d/3d`, `max_pool2d/3d_with_indices` (+ the 2d backward),
+  `adaptive_max_pool2d/3d`, `fractional_max_pool2d/3d`, `grid_sampler_2d/3d`,
+  and the `_native_batch_norm_legit` / `_batch_norm_with_update_functional`
+  family.
+- **Reductions and statistics** — `var` / `var_mean` in all three overloads,
+  `any.default/dim/dims`, `max.dim`, `min.dim`, `median`/`nanmedian`,
+  `logcumsumexp`, `linalg_vector_norm`, `dist`, `_cdist_forward`,
+  `_pdist_forward`, `_trilinear`, `segment_reduce`, and the `histogram` /
+  `_histogramdd_*` set.
+- **Scatter/gather with reductions** — `scatter.reduce`,
+  `scatter.value_reduce`, `scatter_add`, `scatter_reduce.two`, `index_reduce`,
+  `slice_scatter`, `masked_scatter`, `put`, `nonzero_static`,
+  `embedding_renorm`, `_embedding_bag_forward_only`.
+- **Sampling and sorting** (`translator/sampling.rs`) — `sort.default` and
+  `sort.stable`.
+- **Constructors and copies** — `empty.memory_format`, `empty_permuted`,
+  `empty_strided`, `new_empty_strided`, `tril_indices`, `triu_indices`,
+  `view_copy`, `permute_copy`, `narrow_copy`, `unbind_copy.int`,
+  `upsample_bilinear2d.vec` and its antialiased form.
+
+Two pieces of the mechanism are worth naming because they are reusable
+requirements, not just op count. First, `translator/mod.rs` grows a
+**by-name argument reader** — `named_input_index` / `named_int_arg` /
+`named_float_arg` / `named_bool_arg` / `named_tensor_arg` — plus
+`tensor_output_names` / `store_tensor_outputs` for multi-output ops and two
+constructors (`axis_positions`, `full_tensor`). Main's own comment on the
+`sort` change says why: *"`sort.stable` inserts a keyword-only `stable`
+argument before dim, so resolve these by schema name rather than by
+overload-dependent position."* Positional argument indices are not stable
+across ATen overloads, and every lowering that used them was one overload away
+from silently reading the wrong argument. Second, `reduce_scatter_elements` is
+a **sequential read/modify/write** lowering shared by `scatter_reduce` and
+`index_reduce`: core `Scatter` is overwrite-only, so preserving duplicate
+update order needs one static graph step per update element, and a symbolic
+update stream is padded to its compile-time upper bound
+(`bounds_of_expr(..).max`, the new `pt2_expr::bounds_of_expr`) with validity
+guards making the padding lanes no-ops. That is an expensive shape, and it is
+the kind of thing an ordered-scatter primitive would collapse — the same
+argument LUM-804 makes for select.
+
+**The correctness nugget, so it is not lost in the bulk.**
+`pt2_schema.rs`'s `Argument::as_float` learns to decode non-finite floats:
+
+```rust
+// PT2 JSON cannot encode IEEE non-finite values as JSON numbers,
+// so torch serializes them as strings inside the usual as_float
+// wrapper (notably linalg_vector_norm's +/-Infinity orders).
+Argument::Other(value) => value.get("as_float").and_then(Value::as_str)
+    .and_then(|value| match value {
+        "Infinity" | "+Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        "NaN" => Some(f64::NAN),
+        _ => value.parse().ok(),
+    }),
+```
+
+Before this, `linalg_vector_norm(x, ord=inf)` — the infinity norm, a perfectly
+ordinary call — did not fail: `as_float` returned `None` and the argument
+silently took whatever default the lowering had. **Any future PT2 boundary on
+this branch inherits the same trap**: JSON has no encoding for `Infinity` or
+`NaN`, so a serializer must use strings, and a reader that only accepts
+`Value::Number` will silently mis-read them. That is a requirement on the M4
+translator re-attachment, and it is not python-specific.
+
+**Application and conflicts.** Applied as one 3-way patch (the "in one go"
+path — no file was taken wholesale). Six hunks conflicted in five files,
+every one because the park has drifted, and every resolution takes main's
+content in the park's spelling:
+
+| file | conflict | resolution |
+| --- | --- | --- |
+| `translator/dispatch.rs` | the park still had `erf` inline in the match arm | main's `self.translate_erf(node)?` |
+| `translator/mod.rs` | the park's `tensor_meta_to_shape` returns `Result<Vec<IntExpr>>` | main's seven new helpers inserted above it, `Expression` -> `IntExpr` |
+| `translator/movement_dynamic.rs` | `row_major_strides` already widened to `pub(super)` at `&[IntExpr]` by #406 | main's new `ScatterReduction` enum ahead of it |
+| `translator/tensor.rs` | `sort`'s dim/descending read (`a.shape.len()` here is `a.legacy_tracker_ref().len()`) | main's by-schema-name resolution, re-spelled |
+| `translator/movement.rs` (x2) | the whole `reduce_scatter_elements` block landed on top of the park's `translate_scatter_value` | main's block, re-spelled |
+
+**Residue** (diff-of-diffs against `2f820521`, per file). All five `.py`
+files, `pt2_schema.rs` and `typed_data.rs` are EMPTY, and so are both new Rust
+files apart from re-spellings. Everything else is exclusively the standing
+park re-spellings — `Expression` -> `IntExpr`, and `X.shape` ->
+`X.legacy_tracker_ref()` / `X.legacy_tracker_mut()` / `X.dims()` by whether the
+tracker is read, mutated, or passed by value. **Drift-invariance check**: for
+every carried file, `diff(main preimage, park before)` and `diff(main
+postimage, park after)` differ ONLY by re-spellings of main's own added lines;
+nothing pre-existing moved. In particular `movement_dynamic.rs` keeps the park
+version of the `pt2_scatter_nd` trailing-offset scaffolding — the #402 row
+recorded main's fix there as SUPERSEDED (this branch fixed the same defect by a
+stronger mechanism in `src/frontend/movement.rs:563`), and this commit does not
+quietly reintroduce main's version.
+
+Two park costs stay as they are, and are noted so nobody "fixes" them by
+accident: the crate's `.gather(` / `.scatter(` calls are still main's spelling
+in 11 places (only the lines earlier batches happened to touch became
+`gather1d` / `scatter1d`), and `ShapeTracker` — which the re-spelled
+`legacy_tracker_ref()` / `legacy_tracker_mut()` return — no longer exists
+anywhere in this branch's `src/`. The park does not build, and this commit does
+not change that.
+
+### FILE-LEVEL: 2 files into the `cuda_lite_hlir` park
+
+`src/runtime.rs` and `src/tests/flashinfer.rs`, path-rewritten. Pure Rust
+1.98 clippy churn: `bytes.chunks_exact(N).map(|c| T::from_ne_bytes([c[0],
+...]))` becomes `bytes.as_chunks::<N>().0.iter().map(|b|
+T::from_ne_bytes(*b))` in `get_i16` / `get_i32` / `get_i64` / `get_f64` and in
+the bf16 test helper. Applied cleanly; residue empty.
+
+**The same pattern exists in the live CL crate** at
+`crates/luminal_cuda_lite/src/device.rs:73`, `:79` and `:85` (three
+`chunks_exact` readers). It is not touched here — nothing in this commit's
+scope reaches the live crate, the workspace clippy gate is green as-is, and
+converting them is a standalone cleanup, not part of this walk.
+
+### LANDED-BY-EQUIVALENT — `src/frontend/movement.rs`
+
+Main's one core hunk (+1/-1) adds `.simplify()` to pad's output dims:
+`new_dims.push((dim + *start + *end).simplify())`. **This branch already does
+exactly that**, at `src/frontend/movement.rs:1121`:
+
+```rust
+let out_dims: Vec<IntExpr> = dims.iter().zip(&padding)
+    .map(|(d, (s, e))| (*d + *s + *e).simplify())
+    .collect();
+```
+
+with the comment on the line above naming its provenance — *"Frontend
+simplification restored (revert ruling 2026-08-27)"*. No edit; live core is
+untouched by this commit.
+
+### N/A — `examples/flux2/src/main.rs`
+
++4/-2, the same `chunks_exact` -> `as_chunks` churn in
+`read_safetensors_f32`. This branch's `examples/flux2` has no `src/main.rs`:
+it is `lib.rs` + `transformer.rs`, because model-zoo members here are
+backend-neutral graph definitions and the executables live under the runtime
+crate. Nothing to patch.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

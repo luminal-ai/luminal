@@ -285,6 +285,18 @@ impl Argument {
     pub fn as_float(&self) -> Option<f64> {
         match self {
             Argument::Float(f) => Some(f.as_float),
+            // PT2 JSON cannot encode IEEE non-finite values as JSON numbers,
+            // so torch serializes them as strings inside the usual as_float
+            // wrapper (notably linalg_vector_norm's +/-Infinity orders).
+            Argument::Other(value) => value
+                .get("as_float")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| match value {
+                    "Infinity" | "+Infinity" => Some(f64::INFINITY),
+                    "-Infinity" => Some(f64::NEG_INFINITY),
+                    "NaN" => Some(f64::NAN),
+                    _ => value.parse().ok(),
+                }),
             _ => None,
         }
     }

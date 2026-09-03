@@ -1616,15 +1616,19 @@ impl CudaRuntime {
             "get_i16: buffer dtype is {buf_dtype:?}, expected I16"
         );
         self.get_output_data(id)
-            .chunks_exact(2)
-            .map(|bytes| i16::from_ne_bytes([bytes[0], bytes[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_ne_bytes(*bytes))
             .collect_vec()
     }
 
     pub fn get_i32(&self, id: impl ToId) -> Vec<i32> {
         self.get_output_data(id)
-            .chunks_exact(4)
-            .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect_vec()
     }
 
@@ -1642,8 +1646,10 @@ impl CudaRuntime {
             );
         }
         self.get_output_data(id)
-            .chunks_exact(8)
-            .map(|c| i64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_ne_bytes(*bytes))
             .collect_vec()
     }
 
@@ -1661,8 +1667,10 @@ impl CudaRuntime {
             );
         }
         self.get_output_data(id)
-            .chunks_exact(8)
-            .map(|c| f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| f64::from_ne_bytes(*bytes))
             .collect_vec()
     }
 

@@ -85,6 +85,185 @@ def test_complex_components_and_shape_operations():
         _assert_close(result, reference, rtol=0, atol=0)
 
 
+class ComplexSplitWithSizes(torch.nn.Module):
+    def forward(self, value):
+        return tuple(torch.ops.aten.split_with_sizes.default(value, [1, 3, 2], -1))
+
+
+@pytest.mark.parametrize("dtype", (torch.complex32, torch.complex64, torch.complex128))
+def test_complex_split_with_sizes_preserves_all_outputs(dtype):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        value = torch.randn(6, 4, dtype=dtype).T
+        expected = ComplexSplitWithSizes()(value)
+        actual = _compile_and_run(ComplexSplitWithSizes(), value)
+    for result, reference in zip(actual, expected):
+        _assert_close(result, reference, rtol=0, atol=0)
+
+
+class ComplexPredicateAliases(torch.nn.Module):
+    def forward(self, value, other, condition):
+        return (
+            torch.ops.aten.any.default(value),
+            torch.ops.aten.any.dim(value, -1, True),
+            torch.ops.aten.any.dims(value, [], False),
+            torch.ops.aten.where.self(condition, value, other),
+            torch.ops.aten.angle.default(value),
+            torch.ops.aten.isinf.default(value),
+            torch.ops.aten.isnan.default(value),
+            torch.ops.aten.eq.Scalar(value, 0.5 - 0.25j),
+            torch.ops.aten.ne.Scalar(value, 0.5 - 0.25j),
+            torch.ops.aten.logical_and.default(value, other),
+            torch.ops.aten.logical_not.default(value),
+            torch.ops.aten.logical_or.default(value, other),
+            torch.ops.aten.logical_xor.default(value, other),
+        )
+
+
+class ComplexUnaryAlias(torch.nn.Module):
+    def __init__(self, op):
+        super().__init__()
+        self.op = op
+
+    def forward(self, value):
+        return self.op(value)
+
+
+class ComplexPowerAndScaleAliases(torch.nn.Module):
+    def forward(self, value, other, magnitude, phase, exponent):
+        return (
+            torch.ops.aten.polar.default(magnitude, phase),
+            torch.ops.aten.pow.Tensor_Scalar(value, 1.5 - 0.25j),
+            torch.ops.aten.pow.Tensor_Tensor(value, other),
+            torch.ops.aten.ldexp.Tensor(value, exponent),
+        )
+
+
+class ComplexCopyAliases(torch.nn.Module):
+    def forward(self, value):
+        permuted = torch.ops.aten.permute_copy.default(value, [1, 0])
+        unbound = torch.ops.aten.unbind_copy.int(permuted, 0)
+        return (
+            torch.ops.aten.view_copy.default(value, [3, 2]),
+            permuted,
+            torch.ops.aten.narrow_copy.default(permuted, -1, 0, 1),
+            *unbound,
+        )
+
+
+class ComplexScatterAliases(torch.nn.Module):
+    def forward(self, value, index, source):
+        return (
+            torch.ops.aten.scatter.src(value, 1, index, source),
+            torch.ops.aten.scatter.value(value, 1, index, 0.5 - 0.25j),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="add"),
+            torch.ops.aten.scatter.reduce(value, 1, index, source, reduce="multiply"),
+            torch.ops.aten.scatter.value_reduce(
+                value, 1, index, 0.5 - 0.25j, reduce="add"
+            ),
+            torch.ops.aten.scatter_add.default(value, 1, index, source),
+        )
+
+
+def _complex_alias_inputs():
+    value = torch.tensor(
+        [
+            [0.5 + 0.25j, 1.0 - 0.5j, -0.25 + 0.75j],
+            [0.75 - 0.2j, 1.5 + 0.1j, 0.2 + 0.4j],
+        ],
+        dtype=torch.complex64,
+    )
+    other = torch.tensor(
+        [[1.25 - 0.5j, 0.5 + 0.3j, 0.75 - 0.1j], [0.4 + 0.6j, 1.1 - 0.7j, 0.8 + 0.2j]],
+        dtype=torch.complex64,
+    )
+    condition = torch.tensor([[True, False, True], [False, True, False]])
+    magnitude = torch.tensor([[0.5, 1.0, 1.5], [2.0, 0.75, 0.25]])
+    phase = torch.tensor([[0.0, 0.5, -0.25], [1.0, -1.5, 2.0]])
+    exponent = torch.tensor([[0, 1, -1], [2, -2, 3]], dtype=torch.int32)
+    return value, other, condition, magnitude, phase, exponent
+
+
+def _assert_complex_alias_module(module, *inputs):
+    expected = module(*inputs)
+    actual = _compile_and_run(module, *inputs)
+    for result, reference in zip(actual, expected):
+        _assert_close(result, reference, rtol=5e-4, atol=5e-5)
+
+
+def test_complex_predicate_aliases_lower_through_real_components():
+    value, other, condition, _, _, _ = _complex_alias_inputs()
+    _assert_complex_alias_module(ComplexPredicateAliases(), value, other, condition)
+
+
+@pytest.mark.parametrize(
+    "op",
+    (
+        torch.ops.aten.exp2.default,
+        torch.ops.aten.expm1.default,
+        torch.ops.aten.log.default,
+        torch.ops.aten.log1p.default,
+        torch.ops.aten.log2.default,
+        torch.ops.aten.log10.default,
+        torch.ops.aten.reciprocal.default,
+        torch.ops.aten.rsqrt.default,
+        torch.ops.aten.sigmoid.default,
+        torch.ops.aten.sin.default,
+        torch.ops.aten.sinh.default,
+        torch.ops.aten.sqrt.default,
+        torch.ops.aten.tan.default,
+        torch.ops.aten.tanh.default,
+    ),
+    ids=lambda op: op.name().replace("aten::", "").replace(".", "_"),
+)
+def test_complex_unary_aliases_lower_through_real_components(op):
+    value, _, _, _, _, _ = _complex_alias_inputs()
+    module = ComplexUnaryAlias(op)
+    expected = module(value)
+    (actual,) = _compile_and_run(module, value)
+    _assert_close(actual, expected, rtol=5e-4, atol=5e-5)
+
+
+def test_complex_power_and_scale_aliases_lower_through_real_components():
+    value, other, _, magnitude, phase, exponent = _complex_alias_inputs()
+    _assert_complex_alias_module(
+        ComplexPowerAndScaleAliases(),
+        value,
+        other,
+        magnitude,
+        phase,
+        exponent,
+    )
+
+
+def test_complex_copy_aliases_materialize_every_output():
+    value = torch.randn(2, 3, dtype=torch.complex64)
+    module = ComplexCopyAliases()
+    expected = module(value)
+    actual = _compile_and_run(module, value)
+    for result, reference in zip(actual, expected):
+        _assert_close(result, reference, rtol=0, atol=0)
+
+
+def test_complex_scatter_aliases_preserve_duplicate_updates():
+    value = torch.tensor(
+        [[2.0 + 0.5j, 3.0 - 0.25j, 5.0 + 1.0j]],
+        dtype=torch.complex64,
+    )
+    index = torch.tensor([[0, 0]])
+    source = torch.tensor(
+        [[2.0 + 1.0j, 3.0 - 0.5j]],
+        dtype=torch.complex64,
+    )
+    module = ComplexScatterAliases()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        expected = module(value, index, source)
+        actual = _compile_and_run(module, value, index, source)
+    for result, reference in zip(actual, expected):
+        _assert_close(result, reference, rtol=3e-4, atol=3e-5)
+
+
 class MixedComplexReal(torch.nn.Module):
     def forward(self, z, x):
         return (
