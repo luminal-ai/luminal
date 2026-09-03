@@ -45,6 +45,7 @@ Dispositions:
 | `62d3cc0d` | #406 | Expand PyTorch lowering and complex dtype coverage | MIXED — FILE-LEVEL (24 python files + `docs/design/associative-fold.md`) / FILE-LEVEL (7 files into the `cuda_lite_hlir` park) / RE-EXPRESSED (core: `ne` -> Bool, NaN-safe `pad`) / N/A (`examples/gemma4_moe`, `src/graph.rs`) / DROPPED-AS-INERT (`rowmajor-empty`) | branch `merge/main-406-pt-lowering` (two commits) | LUM-803 (ideal value types) and LUM-804 (native Bool8 select) — see **#406 PyTorch lowering + complex dtypes** below |
 | `b37eea15` | #409 | Compile-time optimization | FILE-LEVEL (26 files into the `cuda_lite_hlir` park, 1 into the metal park) + UNCARRIED (5 core files, intent recorded) + N/A (`examples/llama`) | branch `merge/main-409-compile-time-park` | RULED 2026-09-03: *"move all this stuff to the hlir park and we'll get to it later. We don't actually need to do much here."* The dense-integer e-graph extraction index, the prepare/profile candidate split, and the two `Expression` intern-identity helpers are the pieces worth revisiting — see **#409 compile-time optimization** below |
 | `2f820521` | #414 | Expand PyTorch ATen lowering coverage | FILE-LEVEL (19 python-park files + 2 into the `cuda_lite_hlir` park) + LANDED-BY-EQUIVALENT (`src/frontend/movement.rs`) + N/A (`examples/flux2`) | branch `merge/main-414-aten-coverage` | RULED 2026-09-03: *"we can also do 414 in one go."* ~115 new ATen overloads = M4 translator requirements; the `as_float` non-finite JSON decoding is a correctness nugget worth keeping — see **#414 ATen coverage** below |
+| `b745d102` | #413 | metal: emit constants by f32 bit pattern | FILE-LEVEL (2 metal-park files) | branch `merge/main-413-metal-constants` | RULED 2026-09-03: *"same 413 is fine. we can just merge this and check later."* The CHECK is done and the answer is NO: live CUDA constant codegen has the same defect — see **#413 metal constants** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1767,6 +1768,73 @@ untouched by this commit.
 it is `lib.rs` + `transformer.rs`, because model-zoo members here are
 backend-neutral graph definitions and the executables live under the runtime
 crate. Nothing to patch.
+
+## #413 metal constants — banked, and the same defect is live in CUDA
+
+RULED 2026-09-03: *"same 413 is fine. we can just merge this and check
+later."* Two files, `crates/luminal_metal/src/{kernel/ops.rs, tests.rs}`,
+applied cleanly at file level; residue EMPTY for both (drift-invariance check:
+the park's 320- and 205-line drift sets are identical before and after). No
+re-spelling was needed.
+
+**The bug main fixed.** `MetalConstant` rendered its value as a decimal literal
+with an `f` suffix, with a `fract() == 0.0` branch to force a decimal point.
+`Display` is not total over `f32`: it renders the infinities as `inf` and NaNs
+as `NaN`, so `-f32::INFINITY` became `-inff` and a NaN became `NaNf`, neither
+of which is valid MSL. Shader compilation failed and the runtime PANICKED,
+while `ReferenceRuntime` evaluated the same graph fine — a backend-only
+divergence on perfectly ordinary values. The fix emits the bit pattern,
+`as_type<float>(0x{bits:08x}u)`, an idiom already used for the RMSNorm epsilon
+in that same file: exact for every `f32`, with no value-dependent branch. The
+tests compare `MetalRuntime` against `ReferenceRuntime` over both infinities, a
+NaN, both zeros, a subnormal and ordinary finite values using BIT equality,
+because NaN compares false under `assert_close` and a NaN mismatch would
+otherwise pass silently.
+
+### CHECK (recorded, NOT acted on): the live CUDA constant has the same defect
+
+The question asked was whether `crates/luminal_cuda_lite/src/ops/constant/`
+renders non-finite `f32` safely — bit pattern or literal. **It renders a
+literal, and it is not safe.** `crates/luminal_cuda_lite/src/ops/constant/mod.rs:96`:
+
+```rust
+let value = constant.value;                       // ConstantDps::value: f64, mod.rs:46
+let source = format!(
+    r#"extern "C" __global__ void k({to}* out, unsigned long long n) {{
+    unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ({to}){value};
+}}"#
+);
+```
+
+`{value}` is `Display` on an `f64`, so `f32::INFINITY` emits
+`out[i] = (float)inf;` and a NaN emits `out[i] = (float)NaN;`. Neither `inf`
+nor `NaN` is a defined identifier in CUDA C++ (the spellings are `INFINITY` and
+`NAN`, from `<cmath>`), so NVRTC fails to compile the kernel. It is the same
+failure mode as Metal's, one layer down: the literal is not a valid token
+rather than a valid token with the wrong value.
+
+**It is reachable.** Nothing between the frontend and the kernel rejects a
+non-finite constant: `Graph::constant_float` (`src/frontend/other.rs:37`)
+records `LogicalOp::Constant(i as f64)` with no finiteness check, and the
+matcher reads it straight back as `site.child_f64(0)`
+(`crates/luminal_cuda_lite/src/ops/constant/mod.rs`, `ConstantMatcher::extract`).
+Non-finite values are already ordinary traffic on this branch — the pad
+NaN-safety tests landed under #406 build tensors containing `f32::INFINITY`,
+`f32::NEG_INFINITY` and NaN (`src/frontend/movement.rs:1570`, `:1571`) — and
+`pad_with` mints its fill through `constant_float`, so a `pad(.., f32::NEG_INFINITY)`
+(the natural fill for a max-pool or a masked softmax) is exactly the call that
+would produce an uncompilable kernel on CUDA while passing on the reference
+runtime.
+
+**Not acted on, per the ruling.** The fix is the same one-liner main used and
+would be smaller here — CUDA has `__int_as_float(0x...)` as the direct analogue
+of MSL's `as_type<float>` — but it needs a decision about which dtype the bits
+belong to (`ConstantDps::value` is `f64` while the destination dtype comes from
+`ctx.dest_dtypes[0]`, so the emitted literal has to be reinterpreted at the
+DESTINATION width, not at f32 unconditionally), and it wants a
+reference-vs-CUDA bit-equality test of the shape main added on the Metal side.
+Recorded here as an open pin.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
