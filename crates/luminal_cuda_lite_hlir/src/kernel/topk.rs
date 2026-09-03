@@ -92,7 +92,7 @@ impl EgglogOp for KernelStableSortIdx {
                 (
                     (stable_ranks_part ?ranks ?eqidx ?a_val ?b_val ?x ?out_shape)
                 )
-                :ruleset kernel_fuse_late_pre
+                :ruleset kernel_fuse_late_pre_topk
                 :name \"stable ranks part\"
             )
             (rule
@@ -285,8 +285,8 @@ extern \"C\" {{
         DType::Int
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
-        self.out_shape[0].dyn_vars().into_iter().collect()
+    fn collect_dyn_vars_into(&self, vars: &mut FxHashSet<Symbol>) {
+        self.out_shape[0].collect_dyn_vars_into(vars);
     }
 
     fn bytes_loaded(&self) -> IntExpr {

@@ -55,6 +55,8 @@ fn parse_cublas_op(s: &str) -> cublasOperation_t {
     }
 }
 
+type CuBlasLtResourcePrepareCache = Mutex<Option<(Vec<(Symbol, usize)>, CuBlasLtPrepareKey)>>;
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct CuBlasLt {
@@ -88,6 +90,7 @@ pub struct CuBlasLt {
     a_scale_input: bool,
     b_scale_input: bool,
     cublaslt: OnceLock<Arc<CudaBlasLT>>,
+    resource_prepare_cache: CuBlasLtResourcePrepareCache,
 }
 
 // Useless default for IntoEgglogOp
@@ -124,6 +127,7 @@ impl Default for CuBlasLt {
             a_scale_input: false,
             b_scale_input: false,
             cublaslt: OnceLock::new(),
+            resource_prepare_cache: Mutex::new(None),
         }
     }
 }
@@ -302,6 +306,7 @@ impl EgglogOp for CuBlasLt {
             a_scale_input: false,
             b_scale_input: false,
             cublaslt: OnceLock::new(),
+            resource_prepare_cache: Mutex::new(None),
         };
         trace!(?extracted_state);
 
@@ -398,6 +403,7 @@ impl EgglogOp for CuBlasLtScaled {
             a_scale_input: true,
             b_scale_input: true,
             cublaslt: OnceLock::new(),
+            resource_prepare_cache: Mutex::new(None),
         };
         trace!(?extracted_state);
 
@@ -752,7 +758,7 @@ pub(crate) struct PreparedCuBlasLtMatmul {
     spec: LtMatmulSpec,
     resources: LtRawDescriptors,
     heuristic: cublasLtMatmulHeuristicResult_t,
-    _workspace: CudaSlice<u8>,
+    _workspace: Arc<CudaSlice<u8>>,
     workspace_ptr: u64,
     _a_scale: Option<CudaSlice<f32>>,
     default_a_scale_ptr: Option<u64>,
@@ -763,6 +769,14 @@ pub(crate) struct PreparedCuBlasLtMatmul {
 }
 
 impl PreparedCuBlasLtMatmul {
+    pub(crate) fn workspace(&self) -> Arc<CudaSlice<u8>> {
+        Arc::clone(&self._workspace)
+    }
+
+    pub(crate) fn workspace_ptr(&self) -> u64 {
+        self.workspace_ptr
+    }
+
     fn update_descriptor_pointers(
         &self,
         stream: &Arc<CudaStream>,
@@ -807,6 +821,12 @@ impl PreparedCuBlasLtMatmul {
         self.update_descriptor_pointers(stream, ptrs)?;
         let alpha_ptr = self.spec.compute.alpha.as_ptr();
         let beta_ptr = self.spec.compute.beta.as_ptr();
+        let workspace_bytes = self._workspace.len();
+        let workspace_ptr = if workspace_bytes == 0 {
+            std::ptr::null_mut()
+        } else {
+            self.workspace_ptr as *mut std::ffi::c_void
+        };
         unsafe {
             cublasLtMatmul(
                 *self.cublaslt.handle(),
@@ -822,8 +842,8 @@ impl PreparedCuBlasLtMatmul {
                 ptrs.d as *mut std::ffi::c_void,
                 self.resources.d_desc,
                 &self.heuristic.algo,
-                self.workspace_ptr as *mut std::ffi::c_void,
-                self.spec.workspace_size,
+                workspace_ptr,
+                workspace_bytes,
                 stream.cu_stream() as *mut _,
             )
             .result()?;
@@ -950,6 +970,16 @@ pub(crate) fn prepare_cublaslt_matmul(
     spec: &LtMatmulSpec,
     ptrs: LtMatmulPointers,
 ) -> anyhow::Result<PreparedCuBlasLtMatmul> {
+    prepare_cublaslt_matmul_with_workspace(stream, cublaslt, spec, ptrs, None)
+}
+
+pub(crate) fn prepare_cublaslt_matmul_with_workspace(
+    stream: &Arc<CudaStream>,
+    cublaslt: &Arc<CudaBlasLT>,
+    spec: &LtMatmulSpec,
+    ptrs: LtMatmulPointers,
+    recycled_workspace: Option<Arc<CudaSlice<u8>>>,
+) -> anyhow::Result<PreparedCuBlasLtMatmul> {
     #[cfg(test)]
     CUBLASLT_PREPARE_COUNT.fetch_add(1, Ordering::SeqCst);
 
@@ -964,10 +994,6 @@ pub(crate) fn prepare_cublaslt_matmul(
 
     let mut resources = LtRawDescriptors::default();
     let heuristic: cublasLtMatmulHeuristicResult_t;
-
-    let workspace = unsafe { stream.alloc::<u8>(spec.workspace_size)? };
-    let (workspace_ptr, workspace_guard) = workspace.device_ptr(stream);
-    drop(workspace_guard);
 
     let a_scale = if cuda_dtype_needs_tensorwide_scale(spec.a.dtype) {
         Some(stream.clone_htod(&[1.0f32])?)
@@ -989,7 +1015,6 @@ pub(crate) fn prepare_cublaslt_matmul(
     } else {
         None
     };
-
     unsafe {
         cublasLtMatmulDescCreate(
             &mut resources.matmul_desc,
@@ -1101,7 +1126,6 @@ pub(crate) fn prepare_cublaslt_matmul(
             set_strided_batch_layout(desc, spec.problem.batch_count, matrix.batch_stride)?;
         }
     }
-
     let heuristic_cache = CUBLASLT_HEURISTIC_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     let cached_heuristic = {
         let cache = heuristic_cache.lock().unwrap();
@@ -1150,7 +1174,24 @@ pub(crate) fn prepare_cublaslt_matmul(
         candidates.extend_from_slice(&results[..algo_count as usize]);
         heuristic = candidates[0];
     }
-
+    // The preference's workspace limit controls which algorithms cuBLASLt may
+    // return; it is not the amount selected algorithm actually needs. Allocate
+    // only that algorithm's requirement. Most Llama GEMM/GEMV choices need no
+    // workspace, so allocating the full 32 MiB limit here was the dominant
+    // cold graph-construction cost.
+    let should_autotune = !from_cache && candidates.len() > 1 && autotune_allowed(stream, ptrs);
+    let required_workspace_bytes = if should_autotune {
+        spec.workspace_size
+    } else {
+        heuristic.workspaceSize
+    };
+    let workspace = match recycled_workspace {
+        Some(workspace) if workspace.len() >= required_workspace_bytes => workspace,
+        _ if required_workspace_bytes == 0 => Arc::new(stream.null::<u8>()?),
+        _ => Arc::new(unsafe { stream.alloc::<u8>(required_workspace_bytes)? }),
+    };
+    let (workspace_ptr, workspace_guard) = workspace.device_ptr(stream);
+    drop(workspace_guard);
     let mut prepared = PreparedCuBlasLtMatmul {
         cublaslt: cublaslt.clone(),
         spec: *spec,
@@ -1167,8 +1208,7 @@ pub(crate) fn prepare_cublaslt_matmul(
     };
 
     if !from_cache {
-        if candidates.len() > 1
-            && autotune_allowed(stream, ptrs)
+        if should_autotune
             && let Some(best) = autotune_select(stream, &mut prepared, &candidates, ptrs)
         {
             prepared.heuristic = best;
@@ -1584,9 +1624,28 @@ impl CuBlasLt {
         &self,
         dyn_map: &DynMap,
     ) -> anyhow::Result<CuBlasLtPrepareKey> {
-        Ok(CuBlasLtPrepareKey {
+        let mut signature = dyn_map
+            .iter()
+            .map(|(symbol, value)| (*symbol, *value))
+            .collect::<Vec<_>>();
+        signature.sort_unstable_by_key(|(symbol, _)| *symbol);
+        if let Some((cached_signature, key)) = self
+            .resource_prepare_cache
+            .lock()
+            .expect("cuBLASLt resource cache lock poisoned")
+            .as_ref()
+            && *cached_signature == signature
+        {
+            return Ok(*key);
+        }
+        let key = CuBlasLtPrepareKey {
             spec: self.resolve_matmul_spec(dyn_map)?,
-        })
+        };
+        *self
+            .resource_prepare_cache
+            .lock()
+            .expect("cuBLASLt resource cache lock poisoned") = Some((signature, key));
+        Ok(key)
     }
 
     pub(crate) fn resolve_for_graph(
@@ -1630,14 +1689,21 @@ impl CuBlasLt {
         Ok(CuBlasLtResolvedGraphCall { spec, ptrs })
     }
 
-    pub(crate) fn prepare_resolved_for_graph(
+    pub(crate) fn prepare_resolved_for_graph_with_workspace(
         &self,
         stream: &Arc<CudaStream>,
         resolved: CuBlasLtResolvedGraphCall,
+        recycled_workspace: Option<Arc<CudaSlice<u8>>>,
     ) -> anyhow::Result<PreparedCuBlasLtMatmul> {
         let _span = span!(Level::TRACE, "cuBLASLT_prepare_graph").entered();
         let cublaslt = self.get_cublaslt(stream)?;
-        prepare_cublaslt_matmul(stream, &cublaslt, &resolved.spec, resolved.ptrs)
+        prepare_cublaslt_matmul_with_workspace(
+            stream,
+            &cublaslt,
+            &resolved.spec,
+            resolved.ptrs,
+            recycled_workspace,
+        )
     }
 
     #[cfg(test)]
@@ -1803,6 +1869,13 @@ mod tests {
         assert_eq!(spec.c.ld, 3);
         assert_eq!(spec.d.ld, 3);
         assert_eq!(spec.workspace_size, CuBlasLt::WORKSPACE_SIZE_BYTES);
+
+        let changed_dyn_map = FxHashMap::from_iter([(Symbol::from('m'), 11)]);
+        let changed_key = op.prepare_key_for_resources(&changed_dyn_map).unwrap();
+        assert_eq!(changed_key.spec.problem.m, 11);
+
+        let restored_key = op.prepare_key_for_resources(&dyn_map).unwrap();
+        assert_eq!(restored_key, prepare_key);
     }
 
     #[test]

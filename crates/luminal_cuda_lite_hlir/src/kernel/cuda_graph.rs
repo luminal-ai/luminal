@@ -33,6 +33,33 @@ impl CudaGraphHandle {
         }
     }
 
+    /// Begins a standalone stream capture. The resulting graph is returned by
+    /// [`Self::end_standalone_capture`] and can be embedded as a child graph.
+    pub fn begin_standalone_capture(stream: &CudaStream) -> Result<(), DriverError> {
+        stream.context().bind_to_thread()?;
+        unsafe {
+            sys::cuStreamBeginCapture_v2(
+                stream.cu_stream(),
+                CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED,
+            )
+            .result()
+        }
+    }
+
+    /// Ends a standalone stream capture and takes ownership of its graph.
+    pub fn end_standalone_capture(stream: &CudaStream) -> Result<Self, DriverError> {
+        let ctx = stream.context().clone();
+        ctx.bind_to_thread()?;
+        let mut graph = MaybeUninit::uninit();
+        unsafe {
+            sys::cuStreamEndCapture(stream.cu_stream(), graph.as_mut_ptr()).result()?;
+            Ok(Self {
+                cu_graph: graph.assume_init(),
+                ctx,
+            })
+        }
+    }
+
     /// Adds a kernel node to the graph. kernel_params must remain valid for graph lifetime.
     pub unsafe fn add_kernel_node(
         &mut self,
@@ -114,6 +141,27 @@ impl CudaGraphHandle {
                 self.cu_graph,
                 dependencies.as_ptr(),
                 dependencies.len(),
+            )
+            .result()?;
+            Ok(node.assume_init())
+        }
+    }
+
+    /// Adds a reusable child graph as one dependency node in this graph.
+    pub fn add_child_graph_node(
+        &mut self,
+        dependencies: &[CUgraphNode],
+        child: &CudaGraphHandle,
+    ) -> Result<CUgraphNode, DriverError> {
+        self.ctx.bind_to_thread()?;
+        let mut node = MaybeUninit::uninit();
+        unsafe {
+            sys::cuGraphAddChildGraphNode(
+                node.as_mut_ptr(),
+                self.cu_graph,
+                dependencies.as_ptr(),
+                dependencies.len(),
+                child.cu_graph,
             )
             .result()?;
             Ok(node.assume_init())

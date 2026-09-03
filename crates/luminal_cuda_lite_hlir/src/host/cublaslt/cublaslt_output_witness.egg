@@ -51,10 +51,97 @@
 ; Runtime clamps a descriptor's leading dimension up to the minimum accepted
 ; by cuBLASLt.  A fusion is semantic only when that clamp is a no-op.  Unknown
 ; symbolic inequalities deliberately remain unfused.
+(relation cublaslt_leading_dimension_request (Expression Expression))
 (relation cublaslt_valid_leading_dimension (Expression Expression))
 
+; Find only C layouts which are attached to a pointwise Add that can consume an
+; exact cuBLASLt output.  Reading the last two axes through nth_from_end keeps
+; the discovery rank-independent without introducing another intermediate
+; relation or another saturation step.
+
 (rule
-    ((= ?ld (MMul (MIter) ?minimum)))
+    (
+        (= ?add (Op (Add ?shape ?matmul_strides ?c_strides ?out_strides)
+            (ICons ?matmul (ICons ?c (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            ?shape ?matmul_strides ?pointwise_zero_strides ?pointwise_size)
+        (= ?minimum (nth_from_end ?shape 0))
+        (= ?ld (nth_from_end ?c_strides 1))
+        (= (MIter) (nth_from_end ?c_strides 0))
+        (!= ?ld (MNum 0))
+    )
+    ((cublaslt_leading_dimension_request ?ld ?minimum))
+    :ruleset matmul_backend
+    :name "discover direct cublaslt beta input"
+)
+
+(rule
+    (
+        (= ?add (Op (Add ?shape ?c_strides ?matmul_strides ?out_strides)
+            (ICons ?c (ICons ?matmul (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            ?shape ?matmul_strides ?pointwise_zero_strides ?pointwise_size)
+        (= ?minimum (nth_from_end ?shape 0))
+        (= ?ld (nth_from_end ?c_strides 1))
+        (= (MIter) (nth_from_end ?c_strides 0))
+        (!= ?ld (MNum 0))
+    )
+    ((cublaslt_leading_dimension_request ?ld ?minimum))
+    :ruleset matmul_backend
+    :name "discover commuted direct cublaslt beta input"
+)
+
+(rule
+    (
+        (= ?scale (Op (Constant ?scale_value) (INil)))
+        (= ?scaled_c (Op (Mul ?shape ?c_strides ?scale_strides ?scaled_out_strides)
+            (ICons ?c (ICons ?scale (INil)))))
+        (= ?add (Op (Add ?shape ?matmul_strides ?scaled_add_strides ?out_strides)
+            (ICons ?matmul (ICons ?scaled_c (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            ?shape ?matmul_strides ?pointwise_zero_strides ?pointwise_size)
+        (= ?minimum (nth_from_end ?shape 0))
+        (= ?ld (nth_from_end ?c_strides 1))
+        (= (MIter) (nth_from_end ?c_strides 0))
+        (!= ?ld (MNum 0))
+    )
+    ((cublaslt_leading_dimension_request ?ld ?minimum))
+    :ruleset matmul_backend
+    :name "discover scaled cublaslt beta input"
+)
+
+(rule
+    (
+        (= ?scale (Op (Constant ?scale_value) (INil)))
+        (= ?scaled_c (Op (Mul ?shape ?c_strides ?scale_strides ?scaled_out_strides)
+            (ICons ?c (ICons ?scale (INil)))))
+        (= ?add (Op (Add ?shape ?scaled_add_strides ?matmul_strides ?out_strides)
+            (ICons ?scaled_c (ICons ?matmul (INil)))))
+        (cublaslt_exact_pointwise_output
+            ?matmul ?d_order
+            ?m ?n ?ldd ?batch ?stride_d ?d_dtype
+            ?shape ?matmul_strides ?pointwise_zero_strides ?pointwise_size)
+        (= ?minimum (nth_from_end ?shape 0))
+        (= ?ld (nth_from_end ?c_strides 1))
+        (= (MIter) (nth_from_end ?c_strides 0))
+        (!= ?ld (MNum 0))
+    )
+    ((cublaslt_leading_dimension_request ?ld ?minimum))
+    :ruleset matmul_backend
+    :name "discover commuted scaled cublaslt beta input"
+)
+
+(rule
+    (
+        (cublaslt_leading_dimension_request ?ld ?minimum)
+        (= ?ld (MMul (MIter) ?minimum))
+    )
     ((cublaslt_valid_leading_dimension ?ld ?minimum))
     :ruleset matmul_backend
     :name "prove exact symbolic cublaslt leading dimension"
@@ -62,6 +149,7 @@
 
 (rule
     (
+        (cublaslt_leading_dimension_request ?ld ?minimum)
         (cublaslt_stride_coefficient ?ld ?ld_value)
         (= ?minimum (MNum ?minimum_value))
         (>= ?ld_value ?minimum_value)
@@ -73,10 +161,57 @@
 
 ; D is a newly materialized canonical tensor, so its batched descriptor stride
 ; must be exactly one full matrix (not merely non-overlapping).
+(relation cublaslt_matrix_stride_request (Expression Expression Expression))
 (relation cublaslt_exact_matrix_stride (Expression Expression Expression))
+
+; A request is tied to one concrete cuBLASLt output descriptor.  The proof rules
+; below retain all symbolic, commuted, and fixed-layout cases; they simply no
+; longer enumerate row/column triples unrelated to a descriptor.
+(rule
+    (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "COL"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+        (= ?ldd ?descriptor_m)
+    )
+    ((cublaslt_matrix_stride_request
+        ?stride_d ?descriptor_n ?descriptor_m))
+    :ruleset matmul_backend
+    :name "request batched col-order cublaslt matrix stride proof"
+)
 
 (rule
     (
+        (= ?matmul (Op (cublaslt
+            ?descriptor_m ?descriptor_n ?k
+            ?a_layout ?b_layout
+            ?a_order ?b_order ?c_order "ROW"
+            ?lda ?ldb ?ldc ?ldd
+            ?batch
+            ?stride_a ?stride_b ?stride_c ?stride_d
+            ?a_dtype ?b_dtype ?c_dtype ?d_dtype
+            ?compute_type ?scale_dtype
+            ?alpha ?beta ?epilogue)
+            ?inputs))
+        (= ?ldd ?descriptor_n)
+    )
+    ((cublaslt_matrix_stride_request
+        ?stride_d ?descriptor_m ?descriptor_n))
+    :ruleset matmul_backend
+    :name "request batched row-order cublaslt matrix stride proof"
+)
+
+(rule
+    (
+        (cublaslt_matrix_stride_request ?stride ?rows ?cols)
         (= ?stride (MMul ?rows ?cols))
     )
     ((cublaslt_exact_matrix_stride ?stride ?rows ?cols))
@@ -86,6 +221,7 @@
 
 (rule
     (
+        (cublaslt_matrix_stride_request ?stride ?rows ?cols)
         (= ?stride (MMul ?cols ?rows))
     )
     ((cublaslt_exact_matrix_stride ?stride ?rows ?cols))
@@ -95,6 +231,7 @@
 
 (rule
     (
+        (cublaslt_matrix_stride_request ?stride ?rows ?cols)
         (cublaslt_stride_coefficient ?stride ?stride_value)
         (= ?rows (MNum ?rows_value))
         (= ?cols (MNum ?cols_value))

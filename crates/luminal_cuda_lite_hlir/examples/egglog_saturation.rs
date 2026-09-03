@@ -30,9 +30,23 @@ const EGGLOG_RULESETS: &[&str] = &[
     // One-shot structural-fusion rulesets (FlashInfer mask facts, RoPE/RMS
     // cascades) that ops emit into. Declared so their rules register even
     // though this measurement harness's schedule doesn't run the late phase.
-    "kernel_fuse_late_pre",
+    "kernel_fuse_late_pre_rms",
+    "kernel_fuse_late_pre_topk",
+    "kernel_fuse_late_pre_rope",
+    "kernel_fuse_late_pre_sink_attention_base",
+    "kernel_fuse_late_pre_sink_attention_request",
+    "kernel_fuse_late_pre_sink_attention_past",
+    "kernel_fuse_late_pre_sink_attention_finish",
+    "kernel_fuse_late_pre_flashinfer",
     "kernel_fuse_late",
-    "kernel_fuse_late2",
+    "kernel_fuse_late2_rope",
+    "kernel_fuse_late2_sink_attention",
+    "kernel_fuse_late2_flashinfer_value",
+    "kernel_fuse_late2_flashinfer_softmax_denominator",
+    "kernel_fuse_late2_flashinfer_softmax_source",
+    "kernel_fuse_late2_flashinfer_request",
+    "kernel_fuse_late2_flashinfer_qk",
+    "kernel_fuse_late2_flashinfer_final",
 ];
 const MOE_SEQ: usize = 2;
 const MOE_HIDDEN: usize = 16;

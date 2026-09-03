@@ -154,7 +154,7 @@ fn semantically_equal_ununified_fusion_end_metadata_survives_cleanup() {
 }
 
 #[test]
-fn static_validation_accepts_split_and_fused_regions_but_rejects_cycle() {
+fn static_planning_accepts_split_and_fused_regions_but_rejects_cycle() {
     let fusion_start = || {
         LLIROp::new::<dyn KernelOp>(Box::new(FusionStart {
             shape: vec![16.into()],
@@ -206,29 +206,6 @@ fn static_validation_accepts_split_and_fused_regions_but_rejects_cycle() {
     fused.add_edge(sin, sqrt, ());
     fused.add_edge(sqrt, fe, ());
     assert!(plan_static_llir_resources(&fused, &FxHashMap::default()).is_ok());
-
-    // Candidate-local fusion validation must reject contradictory metadata
-    // before compile-unit construction or source generation.
-    let mut malformed = LLIRGraph::default();
-    let input = malformed.add_node(LLIROp::new::<luminal::hlir::Input>(Box::default()));
-    let fs = malformed.add_node(fusion_start());
-    let sin = malformed.add_node(LLIROp::new::<dyn KernelOp>(Box::new(
-        CudaUnaryElementwise {
-            op: "Sin".to_string(),
-            shape: vec![16.into()],
-            in_strides: vec![],
-            out_strides: vec![1.into()],
-            dtype: luminal::dtype::DType::F32,
-        },
-    )));
-    let fe = malformed.add_node(fusion_end());
-    malformed.add_edge(input, fs, ());
-    malformed.add_edge(fs, sin, ());
-    malformed.add_edge(sin, fe, ());
-    assert!(matches!(
-        plan_static_llir_resources(&malformed, &FxHashMap::default()),
-        Err(ResourceViolation::InvalidFusionRegion { .. })
-    ));
 
     let mut cyclic = LLIRGraph::default();
     let fs = cyclic.add_node(fusion_start());
@@ -556,9 +533,7 @@ fn extract_all_fused_regions(cx: &mut Graph) -> Vec<FusedRegion> {
         );
         match plan_static_llir_resources(&llir, &cx.dyn_map) {
             Ok(_) => {}
-            Err(ResourceViolation::CyclicLlir | ResourceViolation::InvalidFusionRegion { .. }) => {
-                continue;
-            }
+            Err(ResourceViolation::CyclicLlir) => continue,
             Err(other) => panic!("unexpected static candidate rejection: {other}"),
         }
 
