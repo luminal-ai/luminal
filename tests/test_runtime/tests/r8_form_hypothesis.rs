@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 
@@ -136,8 +137,8 @@ fn report(name: &str, s: &EGraph) -> (usize, usize) {
 fn e1a_right_major_contiguous_live_recorder() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((2usize, 4usize));
-        let w = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((2usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 3usize), DType::F32);
         let _ = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -221,9 +222,9 @@ fn e1a_estate_padded_strided() {
 fn e1c_pitch_is_canonical_per_layout_class() {
     let live = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
-        let b = cx.tensor(3usize);
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let b = cx.tensor(3usize, DType::F32);
         let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)

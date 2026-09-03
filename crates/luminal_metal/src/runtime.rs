@@ -220,7 +220,7 @@ impl MetalRuntime {
 
         for node in cx.graph.node_indices() {
             if let Some(input) = (*cx.graph[node]).as_any().downcast_ref::<Input>()
-                && let Ok(tensor) = st.tensor(&input.label)
+                && let Ok(tensor) = st.tensor(&input.label, DType::F32)
             {
                 let buffer = self.buffer_from_safetensor(&tensor, input.dtype);
                 self.input_data.remove(&node);

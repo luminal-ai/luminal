@@ -4,6 +4,7 @@
 //! these justify inlining the ONE-LEVEL fill pattern into the dance
 //! premises and deleting the constant-fill relation.
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 
 #[test]
@@ -11,8 +12,8 @@ fn e2_fill_depth_from_live_recorder() {
     for (name, text) in [
         ("relu", {
             let mut cx = Graph::new();
-            let x = cx.tensor((4usize, 8usize));
-            let w = cx.tensor((8usize, 3usize));
+            let x = cx.tensor((4usize, 8usize), DType::F32);
+            let w = cx.tensor((8usize, 3usize), DType::F32);
             let _ = x.matmul(w).relu().output();
             cx.logical
                 .bound_program(&test_runtime::TestRuntimeBindings)
@@ -21,9 +22,9 @@ fn e2_fill_depth_from_live_recorder() {
         }),
         ("bias+relu", {
             let mut cx = Graph::new();
-            let x = cx.tensor((4usize, 8usize));
-            let w = cx.tensor((8usize, 3usize));
-            let b = cx.tensor(3usize);
+            let x = cx.tensor((4usize, 8usize), DType::F32);
+            let w = cx.tensor((8usize, 3usize), DType::F32);
+            let b = cx.tensor(3usize, DType::F32);
             let _ = (x.matmul(w) + b.expand_dim(0, 4usize)).relu().output();
             cx.logical
                 .bound_program(&test_runtime::TestRuntimeBindings)

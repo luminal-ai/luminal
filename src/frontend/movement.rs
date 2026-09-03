@@ -924,7 +924,7 @@ impl GraphTensor {
     /// ```
     /// # use luminal::prelude::*;
     /// # let mut cx = Graph::new();
-    /// let a = cx.tensor((5, 10));
+    /// let a = cx.tensor((5, 10), DType::F32);
     /// let b = a.slice((2..4, 1..)); // 2x9 tensor
     /// assert_eq!(b.dims(), vec![IntExpr::from(2), IntExpr::from(9)]);
     /// ```
@@ -994,7 +994,7 @@ impl GraphTensor {
     /// ```
     /// # use luminal::prelude::*;
     /// # let mut cx = Graph::new();
-    /// let a = cx.tensor((5, 10));
+    /// let a = cx.tensor((5, 10), DType::F32);
     /// let b = a.slice_along(4.., 1); // 5x6 tensor
     /// assert_eq!(b.dims(), vec![IntExpr::from(5), IntExpr::from(6)]);
     /// ```
@@ -1363,7 +1363,7 @@ mod tests {
     #[test]
     fn test_unfold_floor_div_shape_for_odd_window_numerator() {
         let mut cx = Graph::new();
-        let inp = cx.tensor((80, 3000));
+        let inp = cx.tensor((80, 3000), DType::F32);
         let out = inp.pad(((0, 0), (1, 1)), 0.).unfold((1, 3), (1, 2), (1, 1));
         assert_eq!(out.dims(), &[80, 1500, 1, 3]);
     }
@@ -1371,7 +1371,7 @@ mod tests {
     #[test]
     fn test_unsqueeze() {
         let mut cx = Graph::new();
-        let inp = cx.tensor((2, 2, 3));
+        let inp = cx.tensor((2, 2, 3), DType::F32);
         let out1 = inp.unsqueeze(1);
         let out2 = inp.unsqueeze(3);
         assert_eq!(out1.dims(), &[2, 1, 2, 3]);
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn test_repeat_is_view_only() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
+        let a = cx.tensor((2, 3), DType::F32);
         let repeated = a.repeat((2, 2));
 
         assert_ne!(
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn test_repeat_runtime_values() {
         let mut cx = Graph::new();
-        let a = cx.tensor((2, 3));
+        let a = cx.tensor((2, 3), DType::F32);
         let repeated = (a.repeat((2, 2)) * 1.0).output();
 
         let rt = luminal_reference::harness::run_reference(

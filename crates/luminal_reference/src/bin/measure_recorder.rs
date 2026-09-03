@@ -72,8 +72,8 @@ fn main() {
 
     if which.is_empty() || which == "matmul2d" {
         measure("matmul2d", |cx| {
-            let x = cx.tensor((8, 16));
-            let w = cx.tensor((16, 12));
+            let x = cx.tensor((8, 16), DType::F32);
+            let w = cx.tensor((16, 12), DType::F32);
             let out = x.matmul(w).output();
             (
                 vec![(x.id, random_vec(8 * 16)), (w.id, random_vec(16 * 12))],
@@ -84,8 +84,8 @@ fn main() {
 
     if which.is_empty() || which == "permuted" {
         measure("permuted_matmul", |cx| {
-            let x = cx.tensor((8, 16));
-            let w = cx.tensor((12, 16));
+            let x = cx.tensor((8, 16), DType::F32);
+            let w = cx.tensor((12, 16), DType::F32);
             let out = x.matmul(w.permute((1, 0))).output();
             (
                 vec![(x.id, random_vec(8 * 16)), (w.id, random_vec(12 * 16))],
@@ -96,9 +96,9 @@ fn main() {
 
     if which.is_empty() || which == "attention" {
         measure("attention_block", |cx| {
-            let q = cx.tensor((1, 2, 6, 8));
-            let k = cx.tensor((1, 2, 6, 8));
-            let v = cx.tensor((1, 2, 6, 8));
+            let q = cx.tensor((1, 2, 6, 8), DType::F32);
+            let k = cx.tensor((1, 2, 6, 8), DType::F32);
+            let v = cx.tensor((1, 2, 6, 8), DType::F32);
             let scores = q.matmul(k.permute((0, 1, 3, 2))) * (1.0 / (8f32).sqrt());
             let probs = scores.softmax(3);
             let out = probs.matmul(v).output();
@@ -115,7 +115,7 @@ fn main() {
 
     if which.is_empty() || which == "cumsum" {
         measure("cumsum_rank4", |cx| {
-            let x = cx.tensor((2, 3, 4, 5));
+            let x = cx.tensor((2, 3, 4, 5), DType::F32);
             let out = x.cumsum(3).output();
             (vec![(x.id, random_vec(120))], out)
         });

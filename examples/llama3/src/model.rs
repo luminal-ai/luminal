@@ -6,17 +6,20 @@
 //! heads at head_dim 128, split-half rope at theta 500 000 with NO
 //! scaling (this checkpoint's rope_scaling is null — the 3.1-family
 //! frequency ramp belongs to the fp8 example), SwiGLU FFN, UNTIED
-//! lm_head, slot-pool KV cache ([`luminal_nn::KvCachePool`] — cache
+//! lm_head, and a caller-supplied slot-pool KV cache — cache
 //! structure is model definition; this model uses the position-slots
 //! form). Projections are UNFUSED: the old [v;q;k]/[gate;up] byte
 //! fusion was a GEMV batching choice, not architecture, and the
 //! unfused spelling keeps original HF tensor names and no slice
 //! triple. Rope is the concat-free pairing-matrix spelling.
 
+use crate::model_support::{
+    AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
+    causal_bias, paged_attention, rotary_apply,
+};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::prelude::{GraphTensor, Ns};
-use luminal_nn::{Embedding, GatedFfn, KvCachePool, LayerNorm, Linear, LlamaBlock};
+use luminal::prelude::GraphTensor;
 
 #[derive(Clone)]
 pub struct Llama3Dims {
@@ -47,6 +50,22 @@ impl Llama3Dims {
         }
     }
 
+    /// Same anatomy (GQA, learned norms, untied head, SwiGLU) at
+    /// smoke-test scale.
+    pub fn tiny() -> Self {
+        Self {
+            vocab: 29,
+            hidden: 16,
+            intermediate: 24,
+            head_dim: 4,
+            n_heads: 4,
+            n_kv_heads: 2,
+            layers: 2,
+            rope_theta: 10_000.0,
+            rms_eps: 1e-5,
+        }
+    }
+
     pub fn q_dim(&self) -> usize {
         self.n_heads * self.head_dim
     }
@@ -56,10 +75,120 @@ impl Llama3Dims {
     }
 }
 
+pub struct Llama3Layer {
+    pub attn_norm: LayerNorm,
+    pub wq: Linear,
+    pub wk: Linear,
+    pub wv: Linear,
+    pub wo: Linear,
+    pub ffn_norm: LayerNorm,
+    pub gate: Linear,
+    pub up: Linear,
+    pub down: Linear,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl Llama3Layer {
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_rope(
+        &self,
+        x: GraphTensor,
+        k_cache: GraphTensor,
+        v_cache: GraphTensor,
+        gather_idx: GraphTensor,
+        scatter_idx: GraphTensor,
+        q_pos: GraphTensor,
+        rope_cos: GraphTensor,
+        rope_sin: GraphTensor,
+        rope_rot: GraphTensor,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let normed = self.attn_norm.forward(x);
+        let q = rotary_apply(
+            self.wq.forward(normed),
+            self.head_dim,
+            rope_cos,
+            rope_sin,
+            rope_rot,
+        );
+        let k = rotary_apply(
+            self.wk.forward(normed),
+            self.head_dim,
+            rope_cos,
+            rope_sin,
+            rope_rot,
+        );
+        let context_positions = q.graph().arange(gather_idx.dims1());
+        let result = paged_attention(
+            q,
+            k,
+            self.wv.forward(normed),
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(q_pos, context_positions),
+            AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
+        );
+        let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
+        let x = x + self.wo.forward(attn);
+        let ff_in = self.ffn_norm.forward(x);
+        let ff = self
+            .down
+            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        (x + ff, k_cache, v_cache)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_rope_masked(
+        &self,
+        x: GraphTensor,
+        k_cache: GraphTensor,
+        v_cache: GraphTensor,
+        gather_idx: GraphTensor,
+        scatter_idx: GraphTensor,
+        mask: GraphTensor,
+        rope_cos: GraphTensor,
+        rope_sin: GraphTensor,
+        rope_rot: GraphTensor,
+    ) -> (GraphTensor, GraphTensor, GraphTensor) {
+        let normed = self.attn_norm.forward(x);
+        let q = rotary_apply(
+            self.wq.forward(normed),
+            self.head_dim,
+            rope_cos,
+            rope_sin,
+            rope_rot,
+        );
+        let k = rotary_apply(
+            self.wk.forward(normed),
+            self.head_dim,
+            rope_cos,
+            rope_sin,
+            rope_rot,
+        );
+        let result = paged_attention(
+            q,
+            k,
+            self.wv.forward(normed),
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            mask,
+            AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
+        );
+        let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
+        let x = x + self.wo.forward(attn);
+        let ff_in = self.ffn_norm.forward(x);
+        let ff = self
+            .down
+            .forward(self.gate.forward(ff_in).silu() * self.up.forward(ff_in));
+        (x + ff, k_cache, v_cache)
+    }
+}
+
 pub struct Llama3 {
     pub dims: Llama3Dims,
     pub embed: Embedding,
-    pub blocks: Vec<LlamaBlock>,
+    pub blocks: Vec<Llama3Layer>,
     pub final_norm: LayerNorm,
     /// UNTIED head — a real (vocab, hidden) checkpoint tensor.
     pub lm_head: Linear,
@@ -75,7 +204,8 @@ impl Llama3 {
             embed: Embedding::new(
                 dims.vocab,
                 dims.hidden,
-                &Ns::root().child("model").child("embed_tokens"),
+                DType::F32,
+                &Namespace::root().child("model").child("embed_tokens"),
                 cx,
             ),
             blocks,
@@ -85,14 +215,16 @@ impl Llama3 {
                 false,
                 false,
                 dims.rms_eps,
-                &Ns::root().child("model").child("norm"),
+                DType::F32,
+                &Namespace::root().child("model").child("norm"),
                 cx,
             ),
-            lm_head: Linear::new_permuted(
+            lm_head: Linear::new(
                 dims.hidden,
                 dims.vocab,
                 false,
-                &Ns::root().child("lm_head"),
+                DType::F32,
+                &Namespace::root().child("lm_head"),
                 cx,
             ),
         }
@@ -100,48 +232,85 @@ impl Llama3 {
 
     /// Literal construction: learned per-layer norm weights at this
     /// checkpoint's eps 1e-5, NO qk-norm (a Qwen3 feature, absent
-    /// here), HF (out, in) linears bound untransposed.
-    fn block(l: usize, d: &Llama3Dims, cx: &mut Graph) -> LlamaBlock {
-        let ns = Ns::root().child("model").child("layers").index(l);
+    /// here), with checkpoint linears transposed to canonical (in, out) at staging.
+    fn block(l: usize, d: &Llama3Dims, cx: &mut Graph) -> Llama3Layer {
+        let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
-        LlamaBlock {
-            ffn_kind: GatedFfn::SwiGlu,
+        Llama3Layer {
             attn_norm: LayerNorm::new(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child("input_layernorm"),
                 cx,
             ),
-            wq: Linear::new_permuted(d.hidden, d.q_dim(), false, &attn.child("q_proj"), cx),
-            wk: Linear::new_permuted(d.hidden, d.kv_dim(), false, &attn.child("k_proj"), cx),
-            wv: Linear::new_permuted(d.hidden, d.kv_dim(), false, &attn.child("v_proj"), cx),
-            wo: Linear::new_permuted(d.q_dim(), d.hidden, false, &attn.child("o_proj"), cx),
-            qk_norm: None,
+            wq: Linear::new(
+                d.hidden,
+                d.q_dim(),
+                false,
+                DType::F32,
+                &attn.child("q_proj"),
+                cx,
+            ),
+            wk: Linear::new(
+                d.hidden,
+                d.kv_dim(),
+                false,
+                DType::F32,
+                &attn.child("k_proj"),
+                cx,
+            ),
+            wv: Linear::new(
+                d.hidden,
+                d.kv_dim(),
+                false,
+                DType::F32,
+                &attn.child("v_proj"),
+                cx,
+            ),
+            wo: Linear::new(
+                d.q_dim(),
+                d.hidden,
+                false,
+                DType::F32,
+                &attn.child("o_proj"),
+                cx,
+            ),
             ffn_norm: LayerNorm::new(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child("post_attention_layernorm"),
                 cx,
             ),
-            gate: Linear::new_permuted(
+            gate: Linear::new(
                 d.hidden,
                 d.intermediate,
                 false,
+                DType::F32,
                 &mlp.child("gate_proj"),
                 cx,
             ),
-            up: Linear::new_permuted(d.hidden, d.intermediate, false, &mlp.child("up_proj"), cx),
-            down: Linear::new_permuted(
+            up: Linear::new(
+                d.hidden,
+                d.intermediate,
+                false,
+                DType::F32,
+                &mlp.child("up_proj"),
+                cx,
+            ),
+            down: Linear::new(
                 d.intermediate,
                 d.hidden,
                 false,
+                DType::F32,
                 &mlp.child("down_proj"),
                 cx,
             ),

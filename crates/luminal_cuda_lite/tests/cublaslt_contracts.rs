@@ -23,7 +23,7 @@
 use cudarc::driver::{CudaContext, CudaSlice};
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
-use luminal::prelude::{FxHashMap, NodeIndex};
+use luminal::prelude::{DType, FxHashMap, NodeIndex};
 
 /// The universal escape-and-disclose readback (the device_fidelity
 /// pattern): fetch the backing bytes + binding, walk each output
@@ -340,21 +340,20 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
 }
 
 /// THE BIAS FORM END TO END (ruling 2026-09-01 — NEEDS A100 RUN): the
-/// marker-elected plan for `x[4,8] @ w[8,3] + b[3]` (spelled as
-/// `luminal_nn::Linear` with bias spells it) executes through the
+/// marker-elected plan for `x[4,8] @ w[8,3] + b[3]` (spelled with
+/// `luminal_nn::linear`) executes through the
 /// host-call arm with the BIAS epilogue under the sibling's COL D, against
 /// the decomposed route, tolerance-based. The seed is the one the CPU pin
 /// (`tests/cublaslt_bias_premise.rs`) measured electing `CublasLtBias`.
 #[test]
 fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
-    use luminal::prelude::Ns;
     let build = || {
         let mut cx = luminal::graph::Graph::new();
-        let fc = luminal_nn::Linear::new(8, 3, true, &Ns::root().child("fc"), &mut cx);
-        let x = cx.tensor((4usize, 8usize));
-        let out = fc.forward(x).output();
-        let bias = fc.bias.expect("bias");
-        (cx, x.id, fc.weight.id, bias.id, out.id)
+        let weight = cx.named_tensor("fc.weight", (8, 3), DType::F32);
+        let bias = cx.named_tensor("fc.bias", 3, DType::F32);
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let out = luminal_nn::linear(x, weight, Some(bias)).output();
+        (cx, x.id, weight.id, bias.id, out.id)
     };
     let data_for =
         |x: NodeIndex, w: NodeIndex, b: NodeIndex| -> FxHashMap<NodeIndex, TypedBuffer> {
@@ -423,8 +422,8 @@ fn marker_elected_bias_plan_matches_decomposed_route_tolerance_based() {
 fn marker_elected_plan_matches_decomposed_route_tolerance_based() {
     let build = || {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor((4usize, 8usize));
-        let b = cx.tensor((8usize, 3usize));
+        let a = cx.tensor((4usize, 8usize), DType::F32);
+        let b = cx.tensor((8usize, 3usize), DType::F32);
         let out = a.matmul(b).output();
         (cx, a, b, out)
     };

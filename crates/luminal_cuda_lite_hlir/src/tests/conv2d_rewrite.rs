@@ -39,9 +39,9 @@ fn conv2d_bias_hlir(
 
 fn build_conv_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, GraphTensor) {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 5usize, 6usize));
-    let weight = cx.tensor((3usize, 2usize * 3 * 2));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 5usize, 6usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize * 3 * 2), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     let out = conv2d_bias_hlir(x, weight, bias, 3, 2).output();
     (cx, x, weight, bias, out)
 }
@@ -61,9 +61,9 @@ fn conv2d_bias_padded_hlir(
 
 fn build_padded_conv_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, GraphTensor) {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize, 5usize));
-    let weight = cx.tensor((3usize, 2usize * 3 * 3));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 4usize, 5usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize * 3 * 3), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     let out = conv2d_bias_padded_hlir(x, weight, bias, 3, 1).output();
     (cx, x, weight, bias, out)
 }
@@ -75,9 +75,9 @@ fn nearest_upsample_2x_hlir(x: GraphTensor) -> GraphTensor {
 
 fn build_upsample_conv_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, GraphTensor) {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize, 4usize));
-    let weight = cx.tensor((3usize, 2usize * 3 * 3));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 3usize, 4usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize * 3 * 3), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     let up = nearest_upsample_2x_hlir(x);
     let out = conv2d_bias_padded_hlir(up, weight, bias, 3, 1).output();
     (cx, x, weight, bias, out)
@@ -95,9 +95,9 @@ fn conv1x1_bias_hlir(x: GraphTensor, weight: GraphTensor, bias: GraphTensor) -> 
 
 fn build_conv1x1_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, GraphTensor) {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 4usize, 5usize));
-    let weight = cx.tensor((3usize, 2usize));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 4usize, 5usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     let out = conv1x1_bias_hlir(x, weight, bias).output();
     (cx, x, weight, bias, out)
 }
@@ -242,9 +242,9 @@ fn generic_conv2d_rewrite_matches_conv1x1_matmul_bias() {
 #[test]
 fn generic_conv2d_rewrite_requires_conv_output_shape() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 5usize, 6usize));
-    let weight = cx.tensor((3usize, 2usize * 3 * 2));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 5usize, 6usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize * 3 * 2), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     conv2d_matmul_without_conv_output_shape(x, weight, bias, 3, 2).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -259,9 +259,9 @@ fn generic_conv2d_rewrite_requires_conv_output_shape() {
 #[test]
 fn generic_conv2d_rewrite_rejects_same_shape_non_unfold_gather() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 5usize, 6usize));
-    let weight = cx.tensor((3usize, 2usize * 3 * 2));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 5usize, 6usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize * 3 * 2), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     conv2d_bias_same_shape_wrong_indices(x, weight, bias, 3, 2).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -276,9 +276,9 @@ fn generic_conv2d_rewrite_rejects_same_shape_non_unfold_gather() {
 #[test]
 fn generic_conv2d_rewrite_rejects_wrong_patch_axis_order() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 5usize, 6usize));
-    let weight = cx.tensor((3usize, 2usize * 3 * 2));
-    let bias = cx.tensor(3usize);
+    let x = cx.tensor((2usize, 5usize, 6usize), DType::F32);
+    let weight = cx.tensor((3usize, 2usize * 3 * 2), DType::F32);
+    let bias = cx.tensor(3usize, DType::F32);
     conv2d_bias_wrong_patch_axis_order(x, weight, bias, 3, 2).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());

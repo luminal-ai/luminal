@@ -4,12 +4,15 @@
 //! 1e6 unscaled, UNTIED lm_head, and the MoE FFN on every layer — 128
 //! experts, top-8, NO shared expert, router in F32 with the Qwen3
 //! scoring order (softmax over all experts FIRST, then top-k, then
-//! renormalize — norm_topk_prob) via [`luminal_nn::MoETopK`].
+//! renormalize — norm_topk_prob).
 
+use crate::model_support::{
+    AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
+    TopKRoutes, causal_bias, paged_attention,
+};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::prelude::{GraphTensor, Ns};
-use luminal_nn::{Embedding, KvCachePool, LayerNorm, Linear, MoETopK};
+use luminal::prelude::GraphTensor;
 
 #[derive(Clone)]
 pub struct Qwen3MoeDims {
@@ -52,9 +55,76 @@ impl Qwen3MoeDims {
     }
 }
 
+/// Qwen3's model-specific routed SwiGLU feed-forward network.
+pub struct Qwen3MoeFfn {
+    pub router: Linear,
+    pub gate_up: GraphTensor,
+    pub down: GraphTensor,
+    pub top_k: usize,
+    pub intermediate: usize,
+}
+
+impl Qwen3MoeFfn {
+    fn from_per_expert(
+        router: Linear,
+        parts: &[(GraphTensor, GraphTensor, GraphTensor)],
+        top_k: usize,
+    ) -> Self {
+        let (gate, _, _) = parts.first().expect("Qwen3 MoE requires an expert");
+        let intermediate = gate.dims()[0]
+            .to_usize()
+            .expect("Qwen3 expert intermediate size must be static");
+        let mut gate_up: Option<GraphTensor> = None;
+        let mut down: Option<GraphTensor> = None;
+        for (gate_part, up_part, down_part) in parts {
+            let gate_up_part = gate_part.concat_along(*up_part, 0).expand_dim(0, 1);
+            let down_part = down_part.expand_dim(0, 1);
+            gate_up = Some(match gate_up {
+                Some(stack) => stack.concat_along(gate_up_part, 0),
+                None => gate_up_part,
+            });
+            down = Some(match down {
+                Some(stack) => stack.concat_along(down_part, 0),
+                None => down_part,
+            });
+        }
+
+        Self {
+            router,
+            gate_up: gate_up.expect("Qwen3 MoE requires an expert"),
+            down: down.expect("Qwen3 MoE requires an expert"),
+            top_k,
+            intermediate,
+        }
+    }
+
+    fn forward(&self, input: GraphTensor) -> GraphTensor {
+        let probabilities = self.router.forward(input).softmax(1);
+        let expert_ids = probabilities.topk_indexes(self.top_k, 1);
+        let routes = TopKRoutes::from_scores(probabilities, expert_ids).normalize();
+
+        let gate_up = routes.select(self.gate_up);
+        let projected = routes
+            .dispatch(input)
+            .expand_dim(2, 1)
+            .matmul(gate_up.permute((0, 1, 3, 2)))
+            .squeeze(2);
+        let gate = projected.slice_along(..self.intermediate, 2);
+        let up = projected.slice_along(self.intermediate.., 2);
+        let hidden_states = gate.silu() * up;
+
+        let down = routes.select(self.down);
+        let routed_output = hidden_states
+            .expand_dim(2, 1)
+            .matmul(down.permute((0, 1, 3, 2)))
+            .squeeze(2);
+        routes.combine(routed_output)
+    }
+}
+
 pub struct Qwen3MoeBlock {
     /// Per-expert (gate, up, down) handles — the HF checkpoint
-    /// anatomy; the MoE stacks them IN-GRAPH.
+    /// anatomy; the Qwen3 feed-forward network stacks them in-graph.
     pub expert_parts: Vec<(GraphTensor, GraphTensor, GraphTensor)>,
     pub attn_norm: LayerNorm,
     pub wq: Linear,
@@ -64,7 +134,7 @@ pub struct Qwen3MoeBlock {
     pub q_norm: GraphTensor,
     pub k_norm: GraphTensor,
     pub ffn_norm: LayerNorm,
-    pub moe: MoETopK,
+    pub moe: Qwen3MoeFfn,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -72,7 +142,7 @@ pub struct Qwen3MoeBlock {
 
 impl Qwen3MoeBlock {
     fn new(l: usize, d: &Qwen3MoeDims, cx: &mut Graph) -> Self {
-        let ns = Ns::root().child("model").child("layers").index(l);
+        let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         let experts = mlp.child("experts");
@@ -83,14 +153,17 @@ impl Qwen3MoeBlock {
                     cx.named_tensor(
                         expert.child("gate_proj").leaf("weight"),
                         (d.moe_intermediate, d.hidden),
+                        DType::F32,
                     ),
                     cx.named_tensor(
                         expert.child("up_proj").leaf("weight"),
                         (d.moe_intermediate, d.hidden),
+                        DType::F32,
                     ),
                     cx.named_tensor(
                         expert.child("down_proj").leaf("weight"),
                         (d.hidden, d.moe_intermediate),
+                        DType::F32,
                     ),
                 )
             })
@@ -102,26 +175,63 @@ impl Qwen3MoeBlock {
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child("input_layernorm"),
                 cx,
             ),
-            wq: Linear::new_permuted(d.hidden, d.q_dim(), false, &attn.child("q_proj"), cx),
-            wk: Linear::new_permuted(d.hidden, d.kv_dim(), false, &attn.child("k_proj"), cx),
-            wv: Linear::new_permuted(d.hidden, d.kv_dim(), false, &attn.child("v_proj"), cx),
-            wo: Linear::new_permuted(d.q_dim(), d.hidden, false, &attn.child("o_proj"), cx),
-            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim),
-            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim),
+            wq: Linear::new(
+                d.hidden,
+                d.q_dim(),
+                false,
+                DType::F32,
+                &attn.child("q_proj"),
+                cx,
+            ),
+            wk: Linear::new(
+                d.hidden,
+                d.kv_dim(),
+                false,
+                DType::F32,
+                &attn.child("k_proj"),
+                cx,
+            ),
+            wv: Linear::new(
+                d.hidden,
+                d.kv_dim(),
+                false,
+                DType::F32,
+                &attn.child("v_proj"),
+                cx,
+            ),
+            wo: Linear::new(
+                d.q_dim(),
+                d.hidden,
+                false,
+                DType::F32,
+                &attn.child("o_proj"),
+                cx,
+            ),
+            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), d.head_dim, DType::F32),
+            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), d.head_dim, DType::F32),
             ffn_norm: LayerNorm::new(
                 d.hidden,
                 true,
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child("post_attention_layernorm"),
                 cx,
             ),
-            moe: MoETopK::from_per_expert(
-                Linear::new_permuted(d.hidden, d.experts, false, &mlp.child("gate"), cx),
+            moe: Qwen3MoeFfn::from_per_expert(
+                Linear::new(
+                    d.hidden,
+                    d.experts,
+                    false,
+                    DType::F32,
+                    &mlp.child("gate"),
+                    cx,
+                ),
                 &expert_parts,
                 d.top_k,
             ),
@@ -160,21 +270,17 @@ impl Qwen3MoeBlock {
             rope_sin,
             rope_rot,
         );
-        let (attn, k_cache, v_cache) = luminal_nn::paged_attention_positional(
+        let context_positions = q.graph().arange(gather_idx.dims1());
+        let result = paged_attention(
             q,
             k,
             self.wv.forward(normed),
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            q_pos,
-            self.n_heads,
-            self.n_kv_heads,
-            self.head_dim,
-            None,
-            1.0 / (self.head_dim as f32).sqrt(),
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(q_pos, context_positions),
+            AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
+        let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
         let x = x + self.wo.forward(attn);
         let ff = self.moe.forward(self.ffn_norm.forward(x));
         (x + ff, k_cache, v_cache)
@@ -199,7 +305,8 @@ impl Qwen3Moe {
             embed: Embedding::new(
                 dims.vocab,
                 dims.hidden,
-                &Ns::root().child("model").child("embed_tokens"),
+                DType::F32,
+                &Namespace::root().child("model").child("embed_tokens"),
                 cx,
             ),
             blocks,
@@ -209,14 +316,16 @@ impl Qwen3Moe {
                 false,
                 false,
                 dims.rms_eps,
-                &Ns::root().child("model").child("norm"),
+                DType::F32,
+                &Namespace::root().child("model").child("norm"),
                 cx,
             ),
-            lm_head: Linear::new_permuted(
+            lm_head: Linear::new(
                 dims.hidden,
                 dims.vocab,
                 false,
-                &Ns::root().child("lm_head"),
+                DType::F32,
+                &Namespace::root().child("lm_head"),
                 cx,
             ),
         }

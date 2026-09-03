@@ -1,374 +1,450 @@
 use luminal::prelude::*;
 use luminal::shape::IntExpr;
 
-/// Gather entire rows from a 2D tensor using row indices.
+use crate::{CacheAccess, KvCache};
+
+const MASKED_SCORE: f32 = -1e10;
+
+fn flattened_rows(tensor: GraphTensor) -> (GraphTensor, Vec<IntExpr>) {
+    assert!(tensor.rank() >= 2, "row operations require rank >= 2");
+    let payload_dims = tensor.dims()[1..].to_vec();
+    let mut flattened = tensor.view();
+    while flattened.rank() > 2 {
+        flattened = flattened.merge_dims(1, 2);
+    }
+    (flattened.finish(), payload_dims)
+}
+
+fn restore_row_payload(tensor: GraphTensor, payload_dims: &[IntExpr]) -> GraphTensor {
+    let mut tensor = tensor.view();
+    for axis in 0..payload_dims.len().saturating_sub(1) {
+        let inner = payload_dims[axis + 1..]
+            .iter()
+            .copied()
+            .fold(IntExpr::from(1), |acc, dim| acc * dim)
+            .simplify();
+        tensor = tensor.split_dims(axis + 1, inner);
+    }
+    tensor.finish()
+}
+
+/// Gather entries along the first axis while preserving all trailing axes.
 ///
-/// - `data`: (R, D) tensor
-/// - `indices`: (N,) Int tensor of row indices
-/// - `d`: the number of columns (D), must match data's second dimension
-///
-/// Returns: (N, D) tensor where output[i] = data[indices[i]]
-///
-/// COORDINATE form, not flat sugar — the 2026-07-31 "coordinate form
-/// is THE primary" ruling. (Historically this also dodged the
-/// Int-in-f32 smuggling's 2^24 cliff; typed buffers now make flat
-/// index arithmetic exact too, but per-axis coordinates remain the
-/// primary spelling and keep every component bounded by its axis
-/// extent.)
-pub fn gather_rows(data: GraphTensor, indices: GraphTensor, d: usize) -> GraphTensor {
-    assert_eq!(indices.dtype, DType::Int);
+/// `data` has shape `[rows, ...payload]`, `indices` has shape `[n]`, and
+/// the result has shape `[n, ...payload]`.
+pub fn gather_rows(data: GraphTensor, indices: GraphTensor) -> GraphTensor {
+    assert_eq!(indices.dtype, DType::Int, "row indices must be Int");
+    assert_eq!(indices.rank(), 1, "row indices must be rank 1");
+    let (data, payload_dims) = flattened_rows(data);
     let n = indices.dims1();
-    let rows = indices.expand_dim(1, d); // (N, D)
-    let cols = data.graph().iota((n, d), |c| c[1]); // (N, D) coordinate iota
-    data.gather(&[rows, cols])
+    let width = data.dims()[1];
+    let rows = indices.expand_dim(1, width);
+    let cols = data.graph().iota((n, width), |coordinate| coordinate[1]);
+    restore_row_payload(data.gather(&[rows, cols]), &payload_dims)
 }
 
-/// Scatter entire rows into a 2D tensor using row indices.
+/// Overwrite entries along the first axis while preserving trailing axes.
 ///
-/// - `src`: (N, D) tensor of values to write
-/// - `indices`: (N,) Int tensor of destination row indices
-/// - `dest`: (R, D) tensor to write into (copied first, then overwritten at index positions)
-/// - `d`: the number of columns (D)
-///
-/// Returns: (R, D) tensor where output = copy(dest); output[indices[i]] = src[i]
-///
-/// Coordinate form for the same exactness reason as [`gather_rows`].
-pub fn scatter_rows(
-    src: GraphTensor,
-    indices: GraphTensor,
-    dest: GraphTensor,
-    d: usize,
-) -> GraphTensor {
-    assert_eq!(indices.dtype, DType::Int);
+/// `src` has shape `[n, ...payload]`, `indices` has shape `[n]`, and
+/// `dest` has shape `[rows, ...payload]`.
+pub fn scatter_rows(src: GraphTensor, indices: GraphTensor, dest: GraphTensor) -> GraphTensor {
+    assert_eq!(indices.dtype, DType::Int, "row indices must be Int");
+    assert_eq!(indices.rank(), 1, "row indices must be rank 1");
+    assert_eq!(
+        src.dims()[0],
+        indices.dims1(),
+        "source/index length mismatch"
+    );
+    assert_eq!(
+        &src.dims()[1..],
+        &dest.dims()[1..],
+        "source and destination row shapes must match"
+    );
+    let (src, payload_dims) = flattened_rows(src);
+    let (dest, _) = flattened_rows(dest);
     let n = indices.dims1();
-    let rows = indices.expand_dim(1, d); // (N, D) over src's shape
-    let cols = src.graph().iota((n, d), |c| c[1]); // (N, D) coordinate iota
-    dest.scatter(&[rows, cols], src)
+    let width = src.dims()[1];
+    let rows = indices.expand_dim(1, width);
+    let cols = src.graph().iota((n, width), |coordinate| coordinate[1]);
+    restore_row_payload(dest.scatter(&[rows, cols], src), &payload_dims)
 }
 
-/// Pure HLIR paged attention for one layer with causal masking.
-///
-/// Inputs:
-/// - `q`:           (s, hidden)         f32 — query vectors
-/// - `k_new`:       (s, kv_dim)         f32 — new key vectors
-/// - `v_new`:       (s, kv_dim)         f32 — new value vectors
-/// - `k_cache`:     (num_slots, kv_dim) f32 — key cache (preallocated)
-/// - `v_cache`:     (num_slots, kv_dim) f32 — value cache (preallocated)
-/// - `gather_idx`:  (ctx_len,)          Int — which cache slots to read
-/// - `scatter_idx`: (s,)                Int — which cache slots to write new KV into
-/// - `prev_seq`:    number of previously cached tokens (for causal mask offset)
-/// - `n_heads`:     number of query heads
-/// - `n_kv_heads`:  number of KV heads (for GQA)
-/// - `head_dim`:    dimension per head
-///
-/// Returns: (attn_out, k_cache_new, v_cache_new)
-///   - `attn_out`:     (s, hidden)         f32
-///   - `k_cache_new`:  (num_slots, kv_dim) f32
-///   - `v_cache_new`:  (num_slots, kv_dim) f32
-#[allow(clippy::too_many_arguments)]
-pub fn paged_attention(
-    q: GraphTensor,
-    k_new: GraphTensor,
-    v_new: GraphTensor,
-    k_cache: GraphTensor,
-    v_cache: GraphTensor,
-    gather_idx: GraphTensor,
-    scatter_idx: GraphTensor,
-    prev_seq: IntExpr,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-) -> (GraphTensor, GraphTensor, GraphTensor) {
-    paged_attention_windowed(
-        q,
-        k_new,
-        v_new,
-        k_cache,
-        v_cache,
-        gather_idx,
-        scatter_idx,
-        prev_seq,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        None,
-        1.0 / (head_dim as f32).sqrt(),
-    )
+/// The head layout and score scale for grouped-query attention.
+#[derive(Clone, Copy, Debug)]
+pub struct AttentionGeometry {
+    pub query_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub scale: f32,
 }
 
-/// [`paged_attention`] with an optional SLIDING WINDOW (gemma's local
-/// layers): position j is additionally masked when j < i − (window − 1),
-/// i.e. a query attends at most `window` trailing positions (itself
-/// included), in the same position vocabulary the causal mask uses.
-/// `score_scale` makes the scale's HOME explicit: 1/√head_dim here for
-/// the scale-on-scores spelling, or 1.0 when the caller folds the scale
-/// into Q (gemma).
-#[allow(clippy::too_many_arguments)]
-pub fn paged_attention_windowed(
-    q: GraphTensor,
-    k_new: GraphTensor,
-    v_new: GraphTensor,
-    k_cache: GraphTensor,
-    v_cache: GraphTensor,
-    gather_idx: GraphTensor,
-    scatter_idx: GraphTensor,
-    prev_seq: IntExpr,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    window: Option<usize>,
-    score_scale: f32,
-) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let s = q.dims()[0];
-    let ctx = gather_idx.dims()[0];
-    // Query positions synthesized in-graph: row i sits at prev_seq + i.
-    let row_vals = q
-        .graph()
-        .iota(s, |c| c[0] + prev_seq)
-        .expand_dim(1, ctx)
-        .cast(DType::F32); // (s, ctx)
-    paged_attention_core(
-        q,
-        k_new,
-        v_new,
-        k_cache,
-        v_cache,
-        gather_idx,
-        scatter_idx,
-        row_vals,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        window,
-        score_scale,
-    )
-}
-
-/// [`paged_attention_windowed`] with the query positions fed as DATA —
-/// a `q_pos` (s,) Int input tensor — instead of a `prev_seq`
-/// IntExpr. An IntExpr is baked concrete into the searched plan
-/// (bucketed search pins the representative), so a decode loop that
-/// wants ONE search and N executes needs the position to arrive through
-/// a buffer like any other per-step input. Same cache/gather/mask
-/// semantics: context slot j is visible to row i iff j ≤ q_pos[i], so
-/// unwritten cache slots (j beyond the write frontier) are masked out
-/// by the same comparison. The full-size example decode loops are built
-/// on this form.
-#[allow(clippy::too_many_arguments)]
-pub fn paged_attention_positional(
-    q: GraphTensor,
-    k_new: GraphTensor,
-    v_new: GraphTensor,
-    k_cache: GraphTensor,
-    v_cache: GraphTensor,
-    gather_idx: GraphTensor,
-    scatter_idx: GraphTensor,
-    q_pos: GraphTensor,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    window: Option<usize>,
-    score_scale: f32,
-) -> (GraphTensor, GraphTensor, GraphTensor) {
-    assert_eq!(q_pos.dtype, DType::Int);
-    let ctx = gather_idx.dims()[0];
-    let row_vals = q_pos.expand_dim(1, ctx).cast(DType::F32); // (s, ctx)
-    paged_attention_core(
-        q,
-        k_new,
-        v_new,
-        k_cache,
-        v_cache,
-        gather_idx,
-        scatter_idx,
-        row_vals,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        window,
-        score_scale,
-    )
-}
-
-/// [`paged_attention_positional`] with the ADDITIVE MASK arriving as
-/// DATA — an (s, ctx) F32 input of 0.0 (visible) / large-negative
-/// (hidden) — instead of deriving from positions in-graph. This is the
-/// PAGE-TABLE cache form's contract (see [`crate::PageTable`]): one
-/// slot pool serves several sequences per tick, and only the host's
-/// table knows which context columns belong to which query row, so
-/// causality AND cross-sequence isolation ride the mask together.
-#[allow(clippy::too_many_arguments)]
-pub fn paged_attention_masked(
-    q: GraphTensor,
-    k_new: GraphTensor,
-    v_new: GraphTensor,
-    k_cache: GraphTensor,
-    v_cache: GraphTensor,
-    gather_idx: GraphTensor,
-    scatter_idx: GraphTensor,
-    mask: GraphTensor,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    score_scale: f32,
-) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let kv_dim = n_kv_heads * head_dim;
-    let kv_groups = n_heads / n_kv_heads;
-    let s = q.dims()[0];
-    let ctx = gather_idx.dims()[0];
-    assert_eq!(mask.dims(), vec![s, ctx], "mask is (s, ctx)");
-
-    let k_cache = scatter_rows(k_new, scatter_idx, k_cache, kv_dim);
-    let v_cache = scatter_rows(v_new, scatter_idx, v_cache, kv_dim);
-    let k = gather_rows(k_cache, gather_idx, kv_dim);
-    let v = gather_rows(v_cache, gather_idx, kv_dim);
-
-    // Each reshape construct mints ONE apply (ruling 2026-08-26).
-    let q = q
-        .view()
-        .split_dims(1, head_dim)
-        .split_dims(1, kv_groups)
-        .permute((1, 2, 0, 3))
-        .finish();
-    let k = k
-        .view()
-        .split_dims(1, head_dim)
-        .permute((1, 2, 0))
-        .expand_dim(1, kv_groups)
-        .finish();
-    let v = v
-        .view()
-        .split_dims(1, head_dim)
-        .permute((1, 0, 2))
-        .expand_dim(1, kv_groups)
-        .finish();
-
-    let scores = q.matmul(k) * score_scale;
-    let mask = mask
-        .view()
-        .expand_dim(0, n_kv_heads)
-        .expand_dim(1, kv_groups)
-        .finish();
-    let weights = (scores + mask).softmax(3);
-    let out = weights.matmul(v);
-    let out = out
-        .view()
-        .permute((2, 0, 1, 3))
-        .merge_dims(1, 2)
-        .merge_dims(1, 2)
-        .finish();
-    (out, k_cache, v_cache)
-}
-
-/// Shared body: `row_vals` (s, ctx) F32 carries each query row's
-/// absolute position, however the caller sourced it.
-#[allow(clippy::too_many_arguments)]
-fn paged_attention_core(
-    q: GraphTensor,
-    k_new: GraphTensor,
-    v_new: GraphTensor,
-    k_cache: GraphTensor,
-    v_cache: GraphTensor,
-    gather_idx: GraphTensor,
-    scatter_idx: GraphTensor,
-    row_vals: GraphTensor,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    window: Option<usize>,
-    score_scale: f32,
-) -> (GraphTensor, GraphTensor, GraphTensor) {
-    let kv_dim = n_kv_heads * head_dim;
-    let kv_groups = n_heads / n_kv_heads;
-    let scale = score_scale;
-    let s = q.dims()[0];
-    let ctx = gather_idx.dims()[0];
-    let cx = q.graph();
-
-    // ── Phase 1: Write new KV into cache ──
-    let k_cache = scatter_rows(k_new, scatter_idx, k_cache, kv_dim);
-    let v_cache = scatter_rows(v_new, scatter_idx, v_cache, kv_dim);
-
-    // ── Phase 2: Gather context KV from cache ──
-    let k = gather_rows(k_cache, gather_idx, kv_dim); // (ctx, kv_dim)
-    let v = gather_rows(v_cache, gather_idx, kv_dim); // (ctx, kv_dim)
-
-    // ── Phase 3: Reshape for multi-head attention ──
-    // Q: (s, hidden) → (s, n_heads, head_dim) → (s, n_kv_heads, kv_groups, head_dim)
-    //                 → (n_kv_heads, kv_groups, s, head_dim)
-    // ONE apply (ruling 2026-08-26).
-    let q = q
-        .view()
-        .split_dims(1, head_dim) // (s, n_heads, head_dim)
-        .split_dims(1, kv_groups) // (s, n_kv_heads, kv_groups, head_dim)
-        .permute((1, 2, 0, 3)) // (n_kv_heads, kv_groups, s, head_dim)
-        .finish();
-
-    // K: (ctx, kv_dim) → (n_kv_heads, kv_groups, head_dim, ctx); the
-    // kv_groups broadcast rides the SAME one apply.
-    let k = k
-        .view()
-        .split_dims(1, head_dim) // (ctx, n_kv_heads, head_dim)
-        .permute((1, 2, 0)) // (n_kv_heads, head_dim, ctx)
-        .expand_dim(1, kv_groups) // (n_kv_heads, kv_groups, head_dim, ctx)
-        .finish();
-
-    // V: (ctx, kv_dim) → (n_kv_heads, kv_groups, ctx, head_dim), same.
-    let v = v
-        .view()
-        .split_dims(1, head_dim) // (ctx, n_kv_heads, head_dim)
-        .permute((1, 0, 2)) // (n_kv_heads, ctx, head_dim)
-        .expand_dim(1, kv_groups) // (n_kv_heads, kv_groups, ctx, head_dim)
-        .finish();
-
-    // ── Phase 4: Attention ──
-
-    // QK^T: (n_kv_heads, kv_groups, s, head_dim) @ (n_kv_heads, kv_groups, head_dim, ctx)
-    //     → (n_kv_heads, kv_groups, s, ctx)
-    let scores = q.matmul(k) * scale;
-
-    // Build causal mask: the query at absolute position row_vals[i] can
-    // attend to context j iff j <= row_vals[i].
-    // mask[i,j] = -1e9 where row_vals[i] < col_vals[j], else 0
-    let col_vals = cx.arange(ctx).expand_dim(0, s).cast(DType::F32); // (s, ctx)
-    let mut mask = row_vals.lt(col_vals).cast(DType::F32) * -1e9;
-    if let Some(window) = window {
-        // masked where col < row − (window − 1)
-        let outside = col_vals
-            .lt(row_vals - (window as f32 - 1.0))
-            .cast(DType::F32)
-            * -1e9;
-        mask += outside;
+impl AttentionGeometry {
+    /// Create a head layout with the standard inverse-square-root score scale.
+    pub fn new(query_heads: usize, kv_heads: usize, head_dim: usize) -> Self {
+        Self::with_scale(
+            query_heads,
+            kv_heads,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+        )
     }
 
-    // Broadcast (s, ctx) → (n_kv_heads, kv_groups, s, ctx) — ONE apply.
-    let mask = mask
+    /// Create a head layout with an explicit score scale.
+    pub fn with_scale(query_heads: usize, kv_heads: usize, head_dim: usize, scale: f32) -> Self {
+        let geometry = Self {
+            query_heads,
+            kv_heads,
+            head_dim,
+            scale,
+        };
+        geometry.validate();
+        geometry
+    }
+
+    pub fn groups(self) -> usize {
+        self.validate();
+        self.query_heads / self.kv_heads
+    }
+
+    fn validate(self) {
+        assert!(self.query_heads > 0, "query_heads must be nonzero");
+        assert!(self.kv_heads > 0, "kv_heads must be nonzero");
+        assert!(self.head_dim > 0, "head_dim must be nonzero");
+        assert_eq!(
+            self.query_heads % self.kv_heads,
+            0,
+            "query_heads must be divisible by kv_heads"
+        );
+        assert!(self.scale.is_finite(), "attention scale must be finite");
+    }
+}
+
+/// Output of a paged-attention operation, including the updated cache value.
+#[derive(Clone, Copy)]
+pub struct PagedAttentionOutput {
+    pub output: GraphTensor,
+    pub cache: KvCache,
+}
+
+fn assert_vector(tensor: GraphTensor, name: &str) {
+    assert_eq!(tensor.rank(), 1, "{name} must be rank 1");
+    assert_eq!(tensor.dtype, DType::Int, "{name} must be Int");
+}
+
+/// Build an additive causal bias from explicit logical token positions.
+///
+/// Query and key positions need not match their physical cache slots or their
+/// order in the gathered context.
+pub fn causal_bias(query_positions: GraphTensor, key_positions: GraphTensor) -> GraphTensor {
+    assert_vector(query_positions, "query_positions");
+    assert_vector(key_positions, "key_positions");
+    let query_count = query_positions.dims1();
+    let key_count = key_positions.dims1();
+    query_positions
+        .expand_dim(1, key_count)
+        .lt(key_positions.expand_dim(0, query_count))
+        .cast(DType::F32)
+        * MASKED_SCORE
+}
+
+/// Build an additive bias that isolates queries and keys by sequence ID.
+///
+/// This can be added to [`causal_bias`] or [`sliding_window_bias`] when a
+/// gathered context interleaves multiple sequences in an arbitrary order.
+pub fn sequence_isolation_bias(
+    query_sequence_ids: GraphTensor,
+    key_sequence_ids: GraphTensor,
+) -> GraphTensor {
+    assert_vector(query_sequence_ids, "query_sequence_ids");
+    assert_vector(key_sequence_ids, "key_sequence_ids");
+    let query_count = query_sequence_ids.dims1();
+    let key_count = key_sequence_ids.dims1();
+    let same_sequence = query_sequence_ids
+        .expand_dim(1, key_count)
+        .eq(key_sequence_ids.expand_dim(0, query_count))
+        .cast(DType::F32);
+    same_sequence * -MASKED_SCORE + MASKED_SCORE
+}
+
+/// Build a causal additive bias restricted to a trailing logical window.
+pub fn sliding_window_bias(
+    query_positions: GraphTensor,
+    key_positions: GraphTensor,
+    window: usize,
+) -> GraphTensor {
+    assert!(window > 0, "attention window must be nonzero");
+    assert_vector(query_positions, "query_positions");
+    assert_vector(key_positions, "key_positions");
+    let query_count = query_positions.dims1();
+    let key_count = key_positions.dims1();
+    let queries = query_positions.expand_dim(1, key_count);
+    let keys = key_positions.expand_dim(0, query_count);
+    let future = queries.lt(keys).cast(DType::F32);
+    let before_window = keys
+        .cast(DType::F32)
+        .lt(queries.cast(DType::F32) - (window as f32 - 1.0))
+        .cast(DType::F32);
+    (future + before_window) * MASKED_SCORE
+}
+
+/// Map each item in a packed tensor to the sequence containing it.
+///
+/// `indptr` contains the cumulative sequence boundaries and has shape
+/// `[batch + 1]`; the result has shape `[item_count]`.
+pub fn packed_sequence_ids(indptr: GraphTensor, item_count: IntExpr) -> GraphTensor {
+    assert_vector(indptr, "indptr");
+    let boundary_count = indptr.dims1();
+    let items = indptr
+        .graph()
+        .arange(item_count)
+        .expand_dim(1, boundary_count);
+    let boundaries = indptr.expand_dim(0, item_count);
+    boundaries
+        .le(items)
+        .cast(DType::Int)
+        .sum(1)
+        .cast(DType::Int)
+        - 1
+}
+
+fn packed_position_bias(
+    query_positions: GraphTensor,
+    query_indptr: GraphTensor,
+    context_indptr: GraphTensor,
+    context_count: IntExpr,
+    window: Option<usize>,
+) -> GraphTensor {
+    assert_vector(query_positions, "query_positions");
+    assert_vector(query_indptr, "query_indptr");
+    assert_vector(context_indptr, "context_indptr");
+    assert_eq!(
+        query_indptr.dims1(),
+        context_indptr.dims1(),
+        "query and context indptrs must describe the same batch"
+    );
+    if let Some(window) = window {
+        assert!(window > 0, "attention window must be nonzero");
+    }
+
+    let query_count = query_positions.dims1();
+    let query_sequence = packed_sequence_ids(query_indptr, query_count);
+    let context_sequence = packed_sequence_ids(context_indptr, context_count);
+    let context_range = query_positions.graph().arange(context_count);
+    let context_start = context_indptr.gather(&[context_sequence]);
+    let context_positions = context_range - context_start;
+
+    let same_sequence = query_sequence
+        .expand_dim(1, context_count)
+        .eq(context_sequence.expand_dim(0, query_count));
+    let queries = query_positions.expand_dim(1, context_count);
+    let keys = context_positions.expand_dim(0, query_count);
+    let mut allowed = same_sequence.cast(DType::F32) * keys.le(queries).cast(DType::F32);
+    if let Some(window) = window {
+        allowed *= (queries.cast(DType::F32) - (window as f32 - 1.0))
+            .le(keys.cast(DType::F32))
+            .cast(DType::F32);
+    }
+    allowed * -MASKED_SCORE + MASKED_SCORE
+}
+
+/// Build an additive causal bias for packed variable-length sequences.
+///
+/// Context rows for each sequence must be ordered by logical position within
+/// that sequence. The physical cache slots may have any layout. Runtime
+/// indptr inputs participate in integer arithmetic and therefore need valid
+/// value-range attestations when the selected runtime requires them.
+pub fn packed_causal_bias(
+    query_positions: GraphTensor,
+    query_indptr: GraphTensor,
+    context_indptr: GraphTensor,
+    context_count: IntExpr,
+) -> GraphTensor {
+    packed_position_bias(
+        query_positions,
+        query_indptr,
+        context_indptr,
+        context_count,
+        None,
+    )
+}
+
+/// Packed causal bias with a trailing logical attention window.
+pub fn packed_sliding_window_bias(
+    query_positions: GraphTensor,
+    query_indptr: GraphTensor,
+    context_indptr: GraphTensor,
+    context_count: IntExpr,
+    window: usize,
+) -> GraphTensor {
+    packed_position_bias(
+        query_positions,
+        query_indptr,
+        context_indptr,
+        context_count,
+        Some(window),
+    )
+}
+
+/// Convert an additive score bias into grouped-query score layout.
+///
+/// Rank-2 input is shared by every head. Rank-3 input supplies one bias per
+/// query head. Rank-4 input is already in canonical grouped-query layout.
+pub fn grouped_query_score_bias(bias: GraphTensor, geometry: AttentionGeometry) -> GraphTensor {
+    let groups = geometry.groups();
+    match bias.rank() {
+        2 => bias
+            .view()
+            .expand_dim(0, geometry.kv_heads)
+            .expand_dim(1, groups)
+            .finish(),
+        3 => {
+            assert_eq!(
+                bias.dims()[0],
+                IntExpr::from(geometry.query_heads),
+                "rank-3 attention bias must have one row per query head"
+            );
+            bias.split_dims(0, groups)
+        }
+        4 => {
+            assert_eq!(
+                &bias.dims()[..2],
+                &[IntExpr::from(geometry.kv_heads), IntExpr::from(groups)],
+                "rank-4 attention bias must use grouped-query head layout"
+            );
+            bias
+        }
+        rank => panic!("attention bias must have rank 2, 3, or 4, got {rank}"),
+    }
+}
+
+/// Compute scaled grouped-query scores in
+/// `[kv_heads, groups, queries, context]` layout.
+pub fn grouped_query_scores(
+    query: GraphTensor,
+    keys: GraphTensor,
+    geometry: AttentionGeometry,
+) -> GraphTensor {
+    let groups = geometry.groups();
+    assert_eq!(query.rank(), 2, "query must have shape [queries, width]");
+    assert_eq!(keys.rank(), 2, "keys must have shape [context, width]");
+    assert_eq!(
+        query.dims()[1],
+        IntExpr::from(geometry.query_heads * geometry.head_dim),
+        "query width does not match attention geometry"
+    );
+    assert_eq!(
+        keys.dims()[1],
+        IntExpr::from(geometry.kv_heads * geometry.head_dim),
+        "key width does not match attention geometry"
+    );
+
+    let query = query
         .view()
-        .expand_dim(0, n_kv_heads)
-        .expand_dim(1, kv_groups)
+        .split_dims(1, geometry.head_dim)
+        .split_dims(1, groups)
+        .permute((1, 2, 0, 3))
         .finish();
-    let scores = scores + mask;
+    let keys = keys
+        .view()
+        .split_dims(1, geometry.head_dim)
+        .permute((1, 2, 0))
+        .expand_dim(1, groups)
+        .finish();
+    query.matmul(keys) * geometry.scale
+}
 
-    // Softmax over context dimension (axis 3)
-    let weights = scores.softmax(3);
+/// Apply grouped-query attention weights to values and merge the query heads.
+pub fn grouped_query_apply(
+    weights: GraphTensor,
+    values: GraphTensor,
+    geometry: AttentionGeometry,
+) -> GraphTensor {
+    let groups = geometry.groups();
+    assert_eq!(weights.rank(), 4, "attention weights must be rank 4");
+    assert_eq!(values.rank(), 2, "values must have shape [context, width]");
+    assert_eq!(
+        weights.dims()[0],
+        IntExpr::from(geometry.kv_heads),
+        "attention weight KV-head count does not match geometry"
+    );
+    assert_eq!(
+        weights.dims()[1],
+        IntExpr::from(groups),
+        "attention weight group count does not match geometry"
+    );
+    assert_eq!(
+        weights.dims()[3],
+        values.dims()[0],
+        "attention context length does not match values"
+    );
+    assert_eq!(
+        values.dims()[1],
+        IntExpr::from(geometry.kv_heads * geometry.head_dim),
+        "value width does not match attention geometry"
+    );
 
-    // Weighted sum: (n_kv_heads, kv_groups, s, ctx) @ (n_kv_heads, kv_groups, ctx, head_dim)
-    //            → (n_kv_heads, kv_groups, s, head_dim)
-    let out = weights.matmul(v);
-
-    // ── Phase 5: Reshape output ──
-    // (n_kv_heads, kv_groups, s, head_dim) → (s, n_kv_heads, kv_groups, head_dim)
-    // Head merge as an EXPLICIT view (A2: no tracker reassignment —
-    // the old code silently reinterpreted the permuted view as fresh
-    // contiguous storage): (s, n_kv, groups, hd) -> (s, n_heads*hd).
-    let out = out
+    let values = values
+        .view()
+        .split_dims(1, geometry.head_dim)
+        .permute((1, 0, 2))
+        .expand_dim(1, groups)
+        .finish();
+    weights
+        .matmul(values)
         .view()
         .permute((2, 0, 1, 3))
         .merge_dims(1, 2)
         .merge_dims(1, 2)
-        .finish();
+        .finish()
+}
 
-    (out, k_cache, v_cache)
+/// Grouped-query attention over already materialized keys and values.
+///
+/// `score_bias` may have shape `[queries, context]`,
+/// `[query_heads, queries, context]`, or the canonical grouped-query score
+/// shape `[kv_heads, groups, queries, context]`.
+pub fn grouped_query_attention(
+    query: GraphTensor,
+    keys: GraphTensor,
+    values: GraphTensor,
+    score_bias: GraphTensor,
+    geometry: AttentionGeometry,
+) -> GraphTensor {
+    let scores = grouped_query_scores(query, keys, geometry);
+    let bias = grouped_query_score_bias(score_bias, geometry).cast(scores.dtype);
+    assert_eq!(
+        bias.dims(),
+        scores.dims(),
+        "attention bias dimensions do not match scores"
+    );
+    grouped_query_apply((scores + bias).softmax(3), values, geometry)
+}
+
+/// Write new keys and values, read the requested context, and evaluate GQA.
+///
+/// Cache allocation and page-table policy stay outside this function. The
+/// caller supplies physical write/read slots and an additive score bias built
+/// from logical sequence metadata.
+pub fn paged_attention(
+    query: GraphTensor,
+    new_keys: GraphTensor,
+    new_values: GraphTensor,
+    cache: KvCache,
+    access: CacheAccess,
+    score_bias: GraphTensor,
+    geometry: AttentionGeometry,
+) -> PagedAttentionOutput {
+    assert_eq!(
+        query.dims()[0],
+        access.write_slots.dims1(),
+        "one cache write slot is required per query"
+    );
+    let cache = cache.write(access.write_slots, new_keys, new_values);
+    let context = cache.read(access.read_slots);
+    PagedAttentionOutput {
+        output: grouped_query_attention(query, context.keys, context.values, score_bias, geometry),
+        cache,
+    }
 }
 
 /// Rotary embedding applied through a PAIRING MATRIX — the concat-free
@@ -393,7 +469,6 @@ pub fn rotary_apply(
     let heads = x.split_dims(1, head_dim); // (s, n, head_dim)
     let dims = heads.dims();
     let rotated = heads.matmul(rot); // (s, n, head_dim)
-    // ONE broadcast apply each (ruling 2026-08-26).
     let cos = cos.view().unsqueeze(1).expand(dims.clone()).finish();
     let sin = sin.view().unsqueeze(1).expand(dims).finish();
     (heads * cos + rotated * sin).merge_dims(1, 2)
@@ -428,7 +503,7 @@ pub fn rope_pairing_matrix(head_dim: usize, interleaved: bool) -> Vec<f32> {
 }
 
 /// Host-side split-half rope tables for decode positions: row p gets
-/// cos/sin(pos[p]·scale · theta^(−2j/head_dim)) at BOTH slots (j and
+/// `cos/sin(pos[p] * scale * theta^(-2j/head_dim))` at both slots (j and
 /// j+h/2) of frequency j — the full-width tables [`rotary_apply`]
 /// consumes. Dual-theta families (gemma) call this once per layer role.
 pub fn rope_tables_split_half(
@@ -444,54 +519,6 @@ pub fn rope_tables_split_half(
         for j in 0..half {
             let freq = theta.powf(-2.0 * j as f32 / head_dim as f32);
             let arg = position * pos_scale * freq;
-            cos_row[j] = arg.cos();
-            cos_row[j + half] = arg.cos();
-            sin_row[j] = arg.sin();
-            sin_row[j + half] = arg.sin();
-        }
-        cos.extend(cos_row);
-        sin.extend(sin_row);
-    }
-    (cos, sin)
-}
-
-/// Host-side split-half rope tables with the LLAMA-3.1 frequency ramp
-/// (rope_scaling type "llama3"): frequencies whose wavelength exceeds
-/// `original_max / low_freq_factor` divide by `factor`; wavelengths
-/// below `original_max / high_freq_factor` keep their frequency; the
-/// band between interpolates smoothly. Full-width rows (both half
-/// slots), same consumption contract as [`rope_tables_split_half`].
-#[allow(clippy::too_many_arguments)]
-pub fn rope_tables_llama3_scaled(
-    positions: &[f32],
-    head_dim: usize,
-    theta: f32,
-    factor: f32,
-    low_freq_factor: f32,
-    high_freq_factor: f32,
-    original_max_positions: f32,
-) -> (Vec<f32>, Vec<f32>) {
-    let half = head_dim / 2;
-    let low_freq_wavelen = original_max_positions / low_freq_factor;
-    let high_freq_wavelen = original_max_positions / high_freq_factor;
-    let scaled_freq = |freq: f32| -> f32 {
-        let wavelen = 2.0 * std::f32::consts::PI / freq;
-        if wavelen > low_freq_wavelen {
-            freq / factor
-        } else if wavelen < high_freq_wavelen {
-            freq
-        } else {
-            let smooth = (original_max_positions / wavelen - low_freq_factor)
-                / (high_freq_factor - low_freq_factor);
-            (1.0 - smooth) * freq / factor + smooth * freq
-        }
-    };
-    let (mut cos, mut sin) = (Vec::new(), Vec::new());
-    for &position in positions {
-        let (mut cos_row, mut sin_row) = (vec![0f32; head_dim], vec![0f32; head_dim]);
-        for j in 0..half {
-            let base = theta.powf(-2.0 * j as f32 / head_dim as f32);
-            let arg = position * scaled_freq(base);
             cos_row[j] = arg.cos();
             cos_row[j + half] = arg.cos();
             sin_row[j] = arg.sin();
@@ -582,7 +609,6 @@ pub fn attention(
     );
     let sq = q.dims()[0];
     let sk = k.dims()[0];
-    // ONE apply per operand reshape (ruling 2026-08-26).
     let q = q.view().split_dims(1, head_dim).permute((1, 0, 2)).finish(); // (nh, sq, hd)
     let k = k.view().split_dims(1, head_dim).permute((1, 2, 0)).finish(); // (nh, hd, sk)
     let v = v.view().split_dims(1, head_dim).permute((1, 0, 2)).finish(); // (nh, sk, hd)
@@ -595,7 +621,11 @@ pub fn attention(
 
 #[cfg(test)]
 mod tests {
-    use super::{gather_rows, paged_attention, paged_attention_positional, scatter_rows};
+    use super::{
+        AttentionGeometry, causal_bias, gather_rows, grouped_query_attention, packed_causal_bias,
+        paged_attention, scatter_rows, sequence_isolation_bias, sliding_window_bias,
+    };
+    use crate::{CacheAccess, KvCache};
     use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
     use luminal::shape::IntExpr;
@@ -616,9 +646,9 @@ mod tests {
     #[test]
     fn gather_rows_selects_rows() {
         let mut cx = Graph::new();
-        let data = cx.tensor((4, 3));
-        let idx = cx.tensor_dtyped(2, DType::Int);
-        let out = gather_rows(data, idx, 3).output();
+        let data = cx.tensor((4, 3), DType::F32);
+        let idx = cx.tensor(2, DType::Int);
+        let out = gather_rows(data, idx).output();
 
         let data_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
         let idx_vals = vec![2i32, 0];
@@ -636,15 +666,42 @@ mod tests {
         assert_close(rt.get_f32(out.id).expect("output"), &expected);
     }
 
+    #[test]
+    fn gather_rows_preserves_trailing_axes() {
+        let mut cx = Graph::new();
+        let data = cx.tensor((3, 2, 2), DType::F32);
+        let indices = cx.tensor(2, DType::Int);
+        let output = gather_rows(data, indices).output();
+        assert_eq!(
+            output.dims(),
+            vec![IntExpr::from(2), IntExpr::from(2), IntExpr::from(2)]
+        );
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (
+                    data.id,
+                    (0..12).map(|value| value as f32).collect::<Vec<_>>().into(),
+                ),
+                (indices.id, vec![2i32, 0].into()),
+            ],
+        );
+        assert_close(
+            rt.get_f32(output.id).expect("gathered rows"),
+            &[8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0],
+        );
+    }
+
     /// Row scatter through the M3 ladder: copy dest, replace the indexed
     /// rows with src.
     #[test]
     fn scatter_rows_replaces_rows() {
         let mut cx = Graph::new();
-        let src = cx.tensor((2, 3));
-        let idx = cx.tensor_dtyped(2, DType::Int);
-        let dest = cx.tensor((4, 3));
-        let out = scatter_rows(src, idx, dest, 3).output();
+        let src = cx.tensor((2, 3), DType::F32);
+        let idx = cx.tensor(2, DType::Int);
+        let dest = cx.tensor((4, 3), DType::F32);
+        let out = scatter_rows(src, idx, dest).output();
         assert_eq!(out.dims(), dest.dims());
 
         let src_vals = vec![100.0f32, 101.0, 102.0, 200.0, 201.0, 202.0];
@@ -670,8 +727,9 @@ mod tests {
 
     /// Full paged attention, decode step: one new token (s=1) after one
     /// cached token, 2 KV heads with no grouping (kv_groups=1), head_dim 2.
-    /// The scalar loops below provide the reference for the plan selected by
-    /// implementation search and executed by the reference runtime.
+    /// Reference computed by scalar loops below; run_reference drives the full
+    /// search ladder (rediagnosis 2026-08-12: it is not a plain
+    /// extraction shortcut).
     #[test]
     fn paged_attention_decode_step_matches_scalar_reference() {
         const N_HEADS: usize = 2;
@@ -683,29 +741,27 @@ mod tests {
         let prev_seq = 1usize;
 
         let mut cx = Graph::new();
-        let q = cx.tensor((1, HIDDEN));
-        let k_new = cx.tensor((1, HIDDEN));
-        let v_new = cx.tensor((1, HIDDEN));
-        let k_cache = cx.tensor((SLOTS, HIDDEN));
-        let v_cache = cx.tensor((SLOTS, HIDDEN));
-        let gather_idx = cx.tensor_dtyped(CTX, DType::Int);
-        let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-        let (attn, k_cache_new, v_cache_new) = paged_attention(
+        let q = cx.tensor((1, HIDDEN), DType::F32);
+        let k_new = cx.tensor((1, HIDDEN), DType::F32);
+        let v_new = cx.tensor((1, HIDDEN), DType::F32);
+        let k_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let v_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let gather_idx = cx.tensor(CTX, DType::Int);
+        let scatter_idx = cx.tensor(1, DType::Int);
+        let query_positions = cx.iota(1, |c| c[0] + IntExpr::from(prev_seq));
+        let key_positions = cx.arange(CTX);
+        let result = paged_attention(
             q,
             k_new,
             v_new,
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            IntExpr::from(prev_seq),
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(query_positions, key_positions),
+            AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let attn = attn.output();
-        let k_cache_new = k_cache_new.output();
-        let v_cache_new = v_cache_new.output();
+        let attn = result.output.output();
+        let k_cache_new = result.cache.keys.output();
+        let v_cache_new = result.cache.values.output();
 
         let q_vals = vec![0.5f32, -0.3, 0.8, 0.1];
         let k_new_vals = vec![0.2f32, 0.4, -0.1, 0.3];
@@ -762,15 +818,75 @@ mod tests {
         assert_close(rt.get_f32(v_cache_new.id).expect("v cache"), &v_cache_ref);
     }
 
-    /// The positional (data-masked) form against a scalar reference
-    /// where the mask BINDS: the query sits at position 1 while the
-    /// gather covers slots 0..3, so slot 2 must be masked out (it is
-    /// beyond the write frontier and holds stale cache rows). Also
-    /// pins positional ≡ the IntExpr form: same fixture, both
-    /// attention spellings in one graph, outputs asserted against the
-    /// same reference.
     #[test]
-    fn paged_attention_positional_masks_beyond_position() {
+    fn grouped_query_attention_shares_each_kv_head_across_its_query_group() {
+        const QUERY_HEADS: usize = 4;
+        const KV_HEADS: usize = 2;
+        const HEAD_DIM: usize = 2;
+        const CONTEXT: usize = 2;
+
+        let mut cx = Graph::new();
+        let query = cx.tensor((1, QUERY_HEADS * HEAD_DIM), DType::F32);
+        let keys = cx.tensor((CONTEXT, KV_HEADS * HEAD_DIM), DType::F32);
+        let values = cx.tensor((CONTEXT, KV_HEADS * HEAD_DIM), DType::F32);
+        let bias = cx.tensor((1, CONTEXT), DType::F32);
+        let output = grouped_query_attention(
+            query,
+            keys,
+            values,
+            bias,
+            AttentionGeometry::new(QUERY_HEADS, KV_HEADS, HEAD_DIM),
+        )
+        .output();
+
+        let query_values = vec![0.5, -0.3, 0.8, 0.1, -0.2, 0.7, 0.4, -0.6];
+        let key_values = vec![0.2, 0.4, -0.1, 0.3, 0.6, -0.5, 0.9, 0.2];
+        let value_values = vec![1.0, -1.0, 0.5, 2.0, -0.5, 0.25, 1.5, -0.75];
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let groups = QUERY_HEADS / KV_HEADS;
+        let mut expected = vec![0.0; QUERY_HEADS * HEAD_DIM];
+        for query_head in 0..QUERY_HEADS {
+            let kv_head = query_head / groups;
+            let query_head_values =
+                &query_values[query_head * HEAD_DIM..(query_head + 1) * HEAD_DIM];
+            let mut scores = [0.0; CONTEXT];
+            for (context, score) in scores.iter_mut().enumerate() {
+                let key_offset = context * KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM;
+                *score = query_head_values
+                    .iter()
+                    .zip(&key_values[key_offset..key_offset + HEAD_DIM])
+                    .map(|(a, b)| a * b)
+                    .sum::<f32>()
+                    * scale;
+            }
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exponentials = scores.map(|score| (score - max).exp());
+            let denominator: f32 = exponentials.iter().sum();
+            for (context, exponential) in exponentials.iter().enumerate() {
+                let value_offset = context * KV_HEADS * HEAD_DIM + kv_head * HEAD_DIM;
+                for lane in 0..HEAD_DIM {
+                    expected[query_head * HEAD_DIM + lane] +=
+                        exponential / denominator * value_values[value_offset + lane];
+                }
+            }
+        }
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query.id, query_values.into()),
+                (keys.id, key_values.into()),
+                (values.id, value_values.into()),
+                (bias.id, vec![0.0f32; CONTEXT].into()),
+            ],
+        );
+        assert_close(rt.get_f32(output.id).expect("GQA output"), &expected);
+    }
+
+    /// Runtime positions and graph-derived positions build the same causal
+    /// score bias and both exclude stale cache rows beyond the write frontier.
+    #[test]
+    fn paged_attention_runtime_positions_mask_future_context() {
         const N_HEADS: usize = 2;
         const N_KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 2;
@@ -780,46 +896,38 @@ mod tests {
         let q_position = 1usize;
 
         let mut cx = Graph::new();
-        let q = cx.tensor((1, HIDDEN));
-        let k_new = cx.tensor((1, HIDDEN));
-        let v_new = cx.tensor((1, HIDDEN));
-        let k_cache = cx.tensor((SLOTS, HIDDEN));
-        let v_cache = cx.tensor((SLOTS, HIDDEN));
-        let gather_idx = cx.tensor_dtyped(CTX, DType::Int);
-        let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-        let q_pos = cx.tensor_dtyped(1, DType::Int);
-        let (attn_pos, k_pos_out, v_pos_out) = paged_attention_positional(
+        let q = cx.tensor((1, HIDDEN), DType::F32);
+        let k_new = cx.tensor((1, HIDDEN), DType::F32);
+        let v_new = cx.tensor((1, HIDDEN), DType::F32);
+        let k_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let v_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let gather_idx = cx.tensor(CTX, DType::Int);
+        let scatter_idx = cx.tensor(1, DType::Int);
+        let q_pos = cx.tensor(1, DType::Int);
+        let key_positions = cx.arange(CTX);
+        let result_pos = paged_attention(
             q,
             k_new,
             v_new,
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            q_pos,
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            None,
-            1.0 / (HEAD_DIM as f32).sqrt(),
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(q_pos, key_positions),
+            AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let (attn_expr, _, _) = paged_attention(
+        let expr_positions = cx.iota(1, |c| c[0] + IntExpr::from(q_position));
+        let result_expr = paged_attention(
             q,
             k_new,
             v_new,
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            IntExpr::from(q_position),
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(expr_positions, key_positions),
+            AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let attn_pos = attn_pos.output();
-        let attn_expr = attn_expr.output();
-        let k_pos_out = k_pos_out.output();
-        let v_pos_out = v_pos_out.output();
+        let attn_pos = result_pos.output.output();
+        let attn_expr = result_expr.output.output();
+        let k_pos_out = result_pos.cache.keys.output();
+        let v_pos_out = result_pos.cache.values.output();
 
         let q_vals = vec![0.5f32, -0.3, 0.8, 0.1];
         let k_new_vals = vec![0.2f32, 0.4, -0.1, 0.3];
@@ -879,19 +987,93 @@ mod tests {
         assert_close(rt.get_f32(k_pos_out.id).expect("k cache"), &k_cache_ref);
         assert_close(rt.get_f32(v_pos_out.id).expect("v cache"), &v_cache_ref);
     }
+
+    #[test]
+    fn packed_causal_bias_isolates_variable_length_sequences() {
+        let mut cx = Graph::new();
+        let query_positions = cx.tensor(3, DType::Int);
+        let query_indptr = cx.tensor(3, DType::Int);
+        let context_indptr = cx.tensor(3, DType::Int);
+        let bias = packed_causal_bias(
+            query_positions,
+            query_indptr,
+            context_indptr,
+            IntExpr::from(5),
+        )
+        .output();
+
+        let rt = luminal_reference::harness::run_reference_with_ranges(
+            &cx,
+            &[
+                (query_positions.id, vec![1i32, 2, 0].into()),
+                (query_indptr.id, vec![0i32, 2, 3].into()),
+                (context_indptr.id, vec![0i32, 3, 5].into()),
+            ],
+            &[
+                (query_positions.id, 0, 2),
+                (query_indptr.id, 0, 3),
+                (context_indptr.id, 0, 5),
+            ],
+        );
+        assert_close(
+            rt.get_f32(bias.id).expect("packed bias"),
+            &[
+                0.0, 0.0, -1e10, -1e10, -1e10, 0.0, 0.0, 0.0, -1e10, -1e10, -1e10, -1e10, -1e10,
+                0.0, -1e10,
+            ],
+        );
+    }
+
+    #[test]
+    fn sliding_window_bias_masks_future_and_old_context() {
+        let mut cx = Graph::new();
+        let query_positions = cx.tensor(1, DType::Int);
+        let key_positions = cx.tensor(5, DType::Int);
+        let bias = sliding_window_bias(query_positions, key_positions, 2).output();
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query_positions.id, vec![3i32].into()),
+                (key_positions.id, vec![0i32, 1, 2, 3, 4].into()),
+            ],
+        );
+        assert_close(
+            rt.get_f32(bias.id).expect("sliding-window bias"),
+            &[-1e10, -1e10, 0.0, 0.0, -1e10],
+        );
+    }
+
+    #[test]
+    fn sequence_isolation_bias_supports_interleaved_context() {
+        let mut cx = Graph::new();
+        let query_sequences = cx.tensor(2, DType::Int);
+        let key_sequences = cx.tensor(4, DType::Int);
+        let bias = sequence_isolation_bias(query_sequences, key_sequences).output();
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (query_sequences.id, vec![7i32, 9].into()),
+                (key_sequences.id, vec![9i32, 7, 9, 7].into()),
+            ],
+        );
+        assert_close(
+            rt.get_f32(bias.id).expect("sequence-isolation bias"),
+            &[-1e10, 0.0, -1e10, 0.0, 0.0, -1e10, 0.0, -1e10],
+        );
+    }
 }
 
 #[cfg(test)]
-mod masked_tests {
-    use super::paged_attention_masked;
+mod score_bias_tests {
+    use super::{AttentionGeometry, paged_attention};
+    use crate::{CacheAccess, KvCache};
     use luminal::prelude::*;
 
-    /// The data-mask form against a scalar reference that honors the
-    /// mask array literally — including a hidden slot the positional
-    /// form would have shown (proving the mask, not the positions, is
-    /// in charge).
+    /// A caller-provided score bias can hide an otherwise visible context row.
     #[test]
-    fn paged_attention_masked_matches_scalar_reference() {
+    fn paged_attention_accepts_arbitrary_score_bias() {
         const N_HEADS: usize = 2;
         const N_KV_HEADS: usize = 2;
         const HEAD_DIM: usize = 2;
@@ -900,29 +1082,24 @@ mod masked_tests {
         const CTX: usize = 3;
 
         let mut cx = Graph::new();
-        let q = cx.tensor((1, HIDDEN));
-        let k_new = cx.tensor((1, HIDDEN));
-        let v_new = cx.tensor((1, HIDDEN));
-        let k_cache = cx.tensor((SLOTS, HIDDEN));
-        let v_cache = cx.tensor((SLOTS, HIDDEN));
-        let gather_idx = cx.tensor_dtyped(CTX, DType::Int);
-        let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-        let mask = cx.tensor((1, CTX));
-        let (attn, _, _) = paged_attention_masked(
+        let q = cx.tensor((1, HIDDEN), DType::F32);
+        let k_new = cx.tensor((1, HIDDEN), DType::F32);
+        let v_new = cx.tensor((1, HIDDEN), DType::F32);
+        let k_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let v_cache = cx.tensor((SLOTS, HIDDEN), DType::F32);
+        let gather_idx = cx.tensor(CTX, DType::Int);
+        let scatter_idx = cx.tensor(1, DType::Int);
+        let mask = cx.tensor((1, CTX), DType::F32);
+        let result = paged_attention(
             q,
             k_new,
             v_new,
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
             mask,
-            N_HEADS,
-            N_KV_HEADS,
-            HEAD_DIM,
-            1.0 / (HEAD_DIM as f32).sqrt(),
+            AttentionGeometry::new(N_HEADS, N_KV_HEADS, HEAD_DIM),
         );
-        let attn = attn.output();
+        let attn = result.output.output();
 
         let q_vals = vec![0.5f32, -0.3, 0.8, 0.1];
         let k_new_vals = vec![0.2f32, 0.4, -0.1, 0.3];

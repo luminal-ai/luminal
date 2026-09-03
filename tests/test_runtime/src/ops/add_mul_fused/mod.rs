@@ -16,9 +16,7 @@ use luminal::layout_ir::{
 ///
 /// Functional form: pure dataflow, conservative [`Bufferizable`] defaults
 /// (every operand read, both results freshly allocated). Elementwise: element
-/// `i` of each input is read before element `i` of either output is written
-/// (op-level all-pairs claim — see the NOTE on
-/// `bufferizes_to_elementwise_access`).
+/// `i` of each input is read before element `i` of either output is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddMulFused;
 

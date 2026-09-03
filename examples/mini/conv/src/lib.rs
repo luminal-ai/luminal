@@ -2,8 +2,11 @@
 //! from luminal_nn per the 2026-08-13 ruling: mini model definitions
 //! live in their example crates; luminal_nn keeps only building blocks).
 
+#[path = "../../../common/model_support.rs"]
+mod model_support;
+
+use crate::model_support::{ConvND, Linear, Namespace};
 use luminal::prelude::*;
-use luminal_nn::{ConvND, Linear};
 
 /// The yolo-family mini: two valid-padding conv layers with relu, then a
 /// linear classification head over the flattened features.
@@ -26,7 +29,8 @@ impl MiniConvNet {
                 [1, 1],
                 [0, 0],
                 false,
-                &Ns::root().child("conv1"),
+                DType::F32,
+                &Namespace::root().child("conv1"),
                 cx,
             ),
             conv2: ConvND::new(
@@ -37,10 +41,18 @@ impl MiniConvNet {
                 [1, 1],
                 [0, 0],
                 false,
-                &Ns::root().child("conv2"),
+                DType::F32,
+                &Namespace::root().child("conv2"),
                 cx,
             ),
-            head: Linear::new(c2, classes, false, &Ns::root().child("head"), cx),
+            head: Linear::new(
+                c2,
+                classes,
+                false,
+                DType::F32,
+                &Namespace::root().child("head"),
+                cx,
+            ),
             classes,
         }
     }
@@ -49,10 +61,8 @@ impl MiniConvNet {
     pub fn forward(&self, x: GraphTensor) -> GraphTensor {
         let x = self.conv1.forward(x).relu(); // (1, c1, 3, 3)
         let x = self.conv2.forward(x).relu(); // (1, c2, 1, 1)
-                                              // Flatten features keeping the batch axis — ONE construct, ONE
-                                              // apply (ruling 2026-08-26): (1, c2, 1, 1) → (1, c2).
-        let features = x.view().merge_dims(2, 3).merge_dims(1, 2).finish();
-        let logits = self.head.forward(features); // (1, classes)
+        let flat = x.flatten(); // (c2,)
+        let logits = self.head.forward(flat.expand_lhs(1)); // (1, classes)
         let _ = self.classes;
         logits.squeeze(0)
     }

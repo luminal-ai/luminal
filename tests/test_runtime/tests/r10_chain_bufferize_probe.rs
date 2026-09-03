@@ -10,6 +10,7 @@
 //!
 //! Observational: prints the DPS ops and the buffer plan; asserts only
 //! that bufferize succeeds and counts BufferCopy occurrences honestly.
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 
@@ -38,9 +39,9 @@ fn bufferize_and_report(name: &str, text: &str, prefer: &[&str]) {
 fn matmul_then_elementwise_bufferize() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
-        let c = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let c = cx.tensor((4usize, 3usize), DType::F32);
         // Mul, not Add: Add is the C-fold decorator's own pattern, which
         // would fuse into the call instead of standing downstream.
         let y = x.matmul(w) * c;
@@ -64,9 +65,9 @@ fn matmul_then_elementwise_bufferize() {
 fn chained_matmuls_bufferize() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w1 = cx.tensor((8usize, 3usize));
-        let w2 = cx.tensor((3usize, 5usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w1 = cx.tensor((8usize, 3usize), DType::F32);
+        let w2 = cx.tensor((3usize, 5usize), DType::F32);
         // The original boundary-flowing spelling (restored under
         // escape-and-disclose, ruling 2026-08-27: a view-produced bound
         // output escapes, so no dodge is needed). The probe's subject is

@@ -1,56 +1,38 @@
 use luminal::prelude::*;
 
-/// A simple linear layer
-pub struct Linear {
-    pub weight: GraphTensor,
-    pub bias: Option<GraphTensor>,
-    permute: bool,
-}
-
-impl Linear {
-    pub fn new(inp: usize, out: usize, bias: bool, ns: &Ns, cx: &mut Graph) -> Self {
-        Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (inp, out)),
-            bias: if bias {
-                Some(cx.named_tensor(ns.leaf("bias"), out))
-            } else {
-                None
-            },
-            permute: false,
-        }
-    }
-
-    pub fn new_permuted(inp: usize, out: usize, bias: bool, ns: &Ns, cx: &mut Graph) -> Self {
-        Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (out, inp)),
-            bias: if bias {
-                Some(cx.named_tensor(ns.leaf("bias"), out))
-            } else {
-                None
-            },
-            permute: true,
-        }
-    }
-}
-
-impl Linear {
-    pub fn forward(&self, input: GraphTensor) -> GraphTensor {
-        let output = input.matmul(if self.permute {
-            self.weight.permute((1, 0))
-        } else {
-            self.weight
-        });
-        if let Some(bias) = self.bias {
-            output + bias.expand_lhs(&output.dims()[..output.dims().len() - 1])
-        } else {
-            output
-        }
+/// Apply a linear projection with a canonical `(in_features, out_features)` weight.
+pub fn linear(input: GraphTensor, weight: GraphTensor, bias: Option<GraphTensor>) -> GraphTensor {
+    assert_eq!(weight.rank(), 2, "linear weight must be rank two");
+    assert_eq!(
+        input.dtype, weight.dtype,
+        "linear input/weight dtype mismatch"
+    );
+    assert_eq!(
+        input.dims().last(),
+        weight.dims().first(),
+        "linear input width does not match weight"
+    );
+    let output = input.matmul(weight);
+    if let Some(bias) = bias {
+        assert_eq!(bias.rank(), 1, "linear bias must be rank one");
+        assert_eq!(
+            bias.dtype, output.dtype,
+            "linear output/bias dtype mismatch"
+        );
+        assert_eq!(
+            bias.dims().first(),
+            output.dims().last(),
+            "linear bias width does not match output"
+        );
+        output + bias.expand_lhs(&output.dims()[..output.dims().len() - 1])
+    } else {
+        output
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Linear;
+    use super::linear;
     use luminal::implementation_search::ImplementationSearchOptions;
     use luminal::prelude::*;
     use luminal_reference::ReferenceRuntime;
@@ -71,9 +53,9 @@ mod tests {
     #[test]
     fn linear_forward_matches_hand_reference() {
         let mut cx = Graph::new();
-        let model = Linear::new(3, 4, false, &Ns::root().child("fc"), &mut cx);
-        let x = cx.tensor((2, 3));
-        let out = model.forward(x).output();
+        let x = cx.tensor((2, 3), DType::F32);
+        let weight = cx.tensor((3, 4), DType::F32);
+        let out = linear(x, weight, None).output();
 
         let x_data = vec![1., 2., 3., 4., 5., 6.];
         let w_data: Vec<f32> = (1..=12).map(|v| v as f32 * 0.1).collect();
@@ -86,12 +68,12 @@ mod tests {
 
         let mut data = FxHashMap::default();
         data.insert(x.id, x_data.clone().into());
-        data.insert(model.weight.id, w_data.clone().into());
+        data.insert(weight.id, w_data.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.search(&data, &ImplementationSearchOptions::default())
             .expect("search finds a plan");
         rt.set_data(x.id, x_data);
-        rt.set_data(model.weight.id, w_data);
+        rt.set_data(weight.id, w_data);
         rt.execute().expect("winner executes");
         assert_close(rt.get_f32(out.id).expect("output"), &expected);
     }
@@ -100,9 +82,10 @@ mod tests {
     #[test]
     fn linear_bias_broadcasts_over_the_batch() {
         let mut cx = Graph::new();
-        let model = Linear::new(2, 3, true, &Ns::root().child("fc"), &mut cx);
-        let x = cx.tensor((2, 2));
-        let out = model.forward(x).output();
+        let x = cx.tensor((2, 2), DType::F32);
+        let weight = cx.tensor((2, 3), DType::F32);
+        let bias = cx.tensor(3, DType::F32);
+        let out = linear(x, weight, Some(bias)).output();
 
         let x_data = vec![1., 2., 3., 4.];
         let w_data = vec![1., 0., 2., 0., 1., 3.];
@@ -119,77 +102,60 @@ mod tests {
 
         let mut data = FxHashMap::default();
         data.insert(x.id, x_data.clone().into());
-        data.insert(model.weight.id, w_data.clone().into());
-        data.insert(model.bias.unwrap().id, b_data.clone().into());
+        data.insert(weight.id, w_data.clone().into());
+        data.insert(bias.id, b_data.clone().into());
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.search(&data, &ImplementationSearchOptions::default())
             .expect("search finds a plan");
         rt.set_data(x.id, x_data);
-        rt.set_data(model.weight.id, w_data);
-        rt.set_data(model.bias.unwrap().id, b_data);
+        rt.set_data(weight.id, w_data);
+        rt.set_data(bias.id, b_data);
         rt.execute().expect("winner executes");
         assert_close(rt.get_f32(out.id).expect("output"), &expected);
     }
 }
 
-/// Per-tensor-quantized fp8 linear (the nvidia/modelopt form —
-/// quantization is MODEL DEFINITION, ruling 2026-08-12): the weight is
-/// an E4M3FN tensor and TWO F32 scalars accompany it — a static input
-/// scale (calibration) and the weight scale. The forward spells the
-/// quantization explicitly in model text:
+/// Apply a per-tensor-quantized FP8 linear projection.
+///
+/// The weight is `(out_features, in_features)` E4M3FN and two F32 scalars
+/// accompany it: a static input scale and a weight scale. The computation is:
 ///   q = cast_f8(x / input_scale)            (RNE, saturating ±448)
 ///   y = (cast_f32(q) @ cast_f32(Wᵀ)) · (input_scale · weight_scale)
-/// which is numerically the fp8×fp8 GEMM with f32 accumulation. The
-/// weight STAYS an F8E4M3 buffer end to end; the widening casts are
-/// the explicit dequant reads.
-pub struct Fp8Linear {
-    /// (out, in) E4M3FN weight — HF orientation, bound untransposed.
-    pub weight: GraphTensor,
-    /// () F32 static input scale.
-    pub input_scale: GraphTensor,
-    /// () F32 weight scale.
-    pub weight_scale: GraphTensor,
-    inp: usize,
-    out: usize,
-}
-
-impl Fp8Linear {
-    pub fn new(inp: usize, out: usize, ns: &Ns, cx: &mut Graph) -> Self {
-        Self {
-            weight: cx.named_tensor_dtyped(ns.leaf("weight"), (out, inp), DType::F8E4M3),
-            input_scale: cx.named_tensor(ns.leaf("input_scale"), ()),
-            weight_scale: cx.named_tensor(ns.leaf("weight_scale"), ()),
-            inp,
-            out,
-        }
-    }
-
-    pub fn forward(&self, input: GraphTensor) -> GraphTensor {
-        let dims = input.dims();
-        assert_eq!(
-            dims.last().and_then(|d| d.to_usize()),
-            Some(self.inp),
-            "Fp8Linear input width"
-        );
-        let in_scale = self.input_scale.expand_lhs(&dims[..]).reciprocal();
-        let quantized = (input * in_scale).cast(DType::F8E4M3);
-        let wide = quantized.cast(DType::F32);
-        let weight_wide = self.weight.cast(DType::F32).permute((1, 0));
-        let raw = wide.matmul(weight_wide);
-        let out_dims = raw.dims();
-        let rescale = (self.input_scale.expand_lhs(&out_dims[..]))
-            * (self.weight_scale.expand_lhs(&out_dims[..]));
-        raw * rescale
-    }
-
-    pub fn out_features(&self) -> usize {
-        self.out
-    }
+/// This is numerically an FP8×FP8 GEMM with F32 accumulation.
+pub fn fp8_linear(
+    input: GraphTensor,
+    weight: GraphTensor,
+    input_scale: GraphTensor,
+    weight_scale: GraphTensor,
+) -> GraphTensor {
+    assert_eq!(weight.rank(), 2, "FP8 linear weight must be rank two");
+    assert_eq!(weight.dtype, DType::F8E4M3, "FP8 linear weight dtype");
+    assert!(input_scale.dims().is_empty(), "input scale must be scalar");
+    assert!(
+        weight_scale.dims().is_empty(),
+        "weight scale must be scalar"
+    );
+    assert_eq!(input_scale.dtype, DType::F32, "input scale dtype");
+    assert_eq!(weight_scale.dtype, DType::F32, "weight scale dtype");
+    let dims = input.dims();
+    assert_eq!(
+        dims.last(),
+        weight.dims().get(1),
+        "FP8 linear input width does not match weight"
+    );
+    let in_scale = input_scale.expand_lhs(&dims[..]).reciprocal();
+    let quantized = (input * in_scale).cast(DType::F8E4M3);
+    let wide = quantized.cast(DType::F32);
+    let weight_wide = weight.cast(DType::F32).permute((1, 0));
+    let raw = wide.matmul(weight_wide);
+    let out_dims = raw.dims();
+    let rescale = input_scale.expand_lhs(&out_dims[..]) * weight_scale.expand_lhs(&out_dims[..]);
+    raw * rescale
 }
 
 #[cfg(test)]
 mod fp8_tests {
-    use super::Fp8Linear;
+    use super::fp8_linear;
     use luminal::prelude::float8::F8E4M3;
     use luminal::prelude::*;
 
@@ -203,9 +169,11 @@ mod fp8_tests {
         const IN: usize = 3;
         const OUT: usize = 2;
         let mut cx = Graph::new();
-        let layer = Fp8Linear::new(IN, OUT, &Ns::root().child("fc"), &mut cx);
-        let x = cx.tensor((1, IN));
-        let out = layer.forward(x).output();
+        let x = cx.tensor((1, IN), DType::F32);
+        let weight = cx.tensor((OUT, IN), DType::F8E4M3);
+        let input_scale_tensor = cx.tensor((), DType::F32);
+        let weight_scale_tensor = cx.tensor((), DType::F32);
+        let out = fp8_linear(x, weight, input_scale_tensor, weight_scale_tensor).output();
 
         let x_vals = vec![0.37f32, -1.42, 2.6];
         let input_scale = 0.5f32;
@@ -229,9 +197,9 @@ mod fp8_tests {
             &cx,
             &[
                 (x.id, x_vals.into()),
-                (layer.weight.id, weight_codes.into()),
-                (layer.input_scale.id, vec![input_scale].into()),
-                (layer.weight_scale.id, vec![weight_scale].into()),
+                (weight.id, weight_codes.into()),
+                (input_scale_tensor.id, vec![input_scale].into()),
+                (weight_scale_tensor.id, vec![weight_scale].into()),
             ],
         );
         let ours = rt.get_f32(out.id).expect("fp8 linear out");

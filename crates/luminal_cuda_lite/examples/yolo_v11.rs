@@ -26,7 +26,11 @@ fn run() -> anyhow::Result<()> {
     use yolo_v11::model::{YoloV11, IMG_SIZE};
 
     let mut cx = Graph::new();
-    let image = cx.named_tensor("input.image", (1usize, 3usize, IMG_SIZE, IMG_SIZE));
+    let image = cx.named_tensor(
+        "input.image",
+        (1usize, 3usize, IMG_SIZE, IMG_SIZE),
+        DType::F32,
+    );
     let model = YoloV11::init(&mut cx);
     let detections = model.forward(image).output();
     let pairs = support::device::seeded_graph_inputs(

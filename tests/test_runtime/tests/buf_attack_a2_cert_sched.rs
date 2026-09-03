@@ -20,6 +20,7 @@
 //! alloc is handed to the caller (FreedBy::Caller, no free), zero boundary
 //! copies, and the slot's binding discloses the elected layout. P1's
 //! claimed elimination arrived as escape semantics.
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 
@@ -108,8 +109,8 @@ fn report(name: &str, text: &str) {
 fn a2_single_view_to_bound() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
         let _ = x.matmul(w).transpose(0, 1).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -125,8 +126,8 @@ fn a2_single_view_to_bound() {
 fn a2_double_view_roundtrip() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
         let _ = x.matmul(w).transpose(0, 1).transpose(0, 1).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -142,9 +143,9 @@ fn a2_double_view_roundtrip() {
 fn a2_view_fanout() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
-        let c = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
+        let c = cx.tensor((4usize, 3usize), DType::F32);
         let y = x.matmul(w);
         let _ = y.transpose(0, 1).output();
         let _ = (y * c).output();
@@ -171,8 +172,8 @@ fn a2_view_fanout() {
 fn a2_two_slots_same_value() {
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 8usize));
-        let w = cx.tensor((8usize, 3usize));
+        let x = cx.tensor((4usize, 8usize), DType::F32);
+        let w = cx.tensor((8usize, 3usize), DType::F32);
         let y = x.matmul(w);
         let _ = y.transpose(0, 1).output();
         let _ = y.output();

@@ -29,6 +29,7 @@
 
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferIrGraph, BufferNode};
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::implementation_search::ImplementationSearchOptions;
 use luminal::prelude::{FxHashMap, NodeIndex};
@@ -245,8 +246,8 @@ fn flat_index(layout: &luminal_cuda_lite::CudaLayout, out_coord: &[usize]) -> i6
 #[test]
 fn transpose_consumer_folds_and_carries_the_swap_map() {
     let mut cx = Graph::new();
-    let x = cx.tensor((2usize, 3usize));
-    let c = cx.tensor((3usize, 2usize));
+    let x = cx.tensor((2usize, 3usize), DType::F32);
+    let c = cx.tensor((3usize, 2usize), DType::F32);
     let _out = (x.permute((1, 0)) * c).output();
 
     let plan = plan_for(
@@ -289,8 +290,8 @@ fn transpose_consumer_folds_and_carries_the_swap_map() {
 #[test]
 fn slice_consumer_folds_and_carries_the_offset_map() {
     let mut cx = Graph::new();
-    let x = cx.tensor((4usize, 6usize));
-    let c = cx.tensor((2usize, 6usize));
+    let x = cx.tensor((4usize, 6usize), DType::F32);
+    let c = cx.tensor((2usize, 6usize), DType::F32);
     let _out = (x.slice((1..3, ..)) * c).output();
 
     let plan = plan_for(
@@ -330,8 +331,8 @@ fn slice_consumer_folds_and_carries_the_offset_map() {
 #[test]
 fn broadcast_consumer_folds_and_carries_the_stride0_map() {
     let mut cx = Graph::new();
-    let x = cx.tensor(3usize);
-    let c = cx.tensor((2usize, 3usize));
+    let x = cx.tensor(3usize, DType::F32);
+    let c = cx.tensor((2usize, 3usize), DType::F32);
     let _out = (x.expand_dim(0, 2) * c).output();
 
     let plan = plan_for(
@@ -372,9 +373,9 @@ fn broadcast_consumer_folds_and_carries_the_stride0_map() {
 #[test]
 fn chained_matmul_folds_all_movement() {
     let mut cx = Graph::new();
-    let a = cx.tensor((2usize, 3usize));
-    let b = cx.tensor((3usize, 4usize));
-    let c = cx.tensor((4usize, 2usize));
+    let a = cx.tensor((2usize, 3usize), DType::F32);
+    let b = cx.tensor((3usize, 4usize), DType::F32);
+    let c = cx.tensor((4usize, 2usize), DType::F32);
     let _out = a.matmul(b).matmul(c).output();
 
     let plan = plan_for(

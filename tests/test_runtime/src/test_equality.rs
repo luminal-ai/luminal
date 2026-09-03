@@ -260,7 +260,7 @@ mod tests {
     }
 
     /// Out-of-domain coordinates and symbolic extents refuse loudly —
-    /// but NOTE the honesty limit this reader inherits from Option B:
+    /// but retains the honesty limit this reader inherits from Option B:
     /// the DOMAIN is checked (coords vs the layout's shape); the RANGE
     /// is not a layout fact for offset forms, so `dense_f32`'s
     /// backing-length check is the only reach fence.

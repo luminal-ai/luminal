@@ -77,8 +77,8 @@ fn bench_matmul(
 
         // Build graph and run search once per size; the benchmark loop only measures execution.
         let mut cx = Graph::default();
-        let a = cx.tensor((m, k));
-        let b_tensor = cx.tensor((k, n));
+        let a = cx.tensor((m, k), DType::F32);
+        let b_tensor = cx.tensor((k, n), DType::F32);
         let _ = a.matmul(b_tensor).output();
 
         let input_sizes: Vec<(NodeIndex, usize)> = cx
@@ -151,7 +151,7 @@ fn bench_softmax(
         let cols = dim;
 
         let mut cx = Graph::default();
-        let x = cx.tensor((rows, cols));
+        let x = cx.tensor((rows, cols), DType::F32);
         let _ = x.softmax(1).output();
 
         let input_sizes: Vec<(NodeIndex, usize)> = cx
@@ -224,7 +224,7 @@ fn bench_layer_norm(
         let batch_seq = (size_value / hidden_dim).max(1);
 
         let mut cx = Graph::default();
-        let x = cx.tensor((batch_seq, hidden_dim));
+        let x = cx.tensor((batch_seq, hidden_dim), DType::F32);
         // LayerNorm along last axis with epsilon
         let _ = x.layer_norm(1, 1e-5).output();
 
@@ -300,7 +300,7 @@ fn bench_gelu(
         let size_value = size.value;
 
         let mut cx = Graph::default();
-        let x = cx.tensor(size_value);
+        let x = cx.tensor(size_value, DType::F32);
         let _ = x.gelu().output();
 
         let input_sizes: Vec<(NodeIndex, usize)> = cx
@@ -371,9 +371,9 @@ fn bench_attention(
 
         let mut cx = Graph::default();
 
-        let q = cx.tensor((seq_len, head_dim));
-        let k = cx.tensor((seq_len, head_dim));
-        let v = cx.tensor((seq_len, head_dim));
+        let q = cx.tensor((seq_len, head_dim), DType::F32);
+        let k = cx.tensor((seq_len, head_dim), DType::F32);
+        let v = cx.tensor((seq_len, head_dim), DType::F32);
 
         let scores = q.matmul(k.permute((1, 0)));
         let scale = 1.0 / (head_dim as f32).sqrt();

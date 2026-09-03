@@ -1,14 +1,15 @@
 //! ROUND-11 gate (g): square programs saturate with bounded node counts
 //! under the full default schedule (the termination anchor at work on the
 //! corners where the sandwich is self-adjoint).
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 
 #[test]
 fn r11_squares_saturate_bounded() {
     let a3 = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize));
-        let w = cx.tensor((4usize, 4usize));
+        let x = cx.tensor((4usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 4usize), DType::F32);
         let _ = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
@@ -20,7 +21,7 @@ fn r11_squares_saturate_bounded() {
 
     let a6b = {
         let mut cx = Graph::new();
-        let x = cx.tensor((4usize, 4usize));
+        let x = cx.tensor((4usize, 4usize), DType::F32);
         let _ = x.matmul(x.permute((1usize, 0usize))).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)

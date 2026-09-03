@@ -5,4 +5,7 @@
 
 pub mod model;
 
+#[path = "../../common/model_support.rs"]
+pub mod model_support;
+
 pub use model::{Whisper, WhisperDims};

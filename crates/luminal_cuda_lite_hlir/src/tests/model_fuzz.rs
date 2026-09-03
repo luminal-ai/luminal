@@ -77,10 +77,10 @@ fn fuzz_mlp(seq: usize, hidden: usize, intermediate: usize, seed: u64) {
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((seq, hidden));
-    let w_gate = cx.tensor((intermediate, hidden));
-    let w_up = cx.tensor((intermediate, hidden));
-    let w_down = cx.tensor((hidden, intermediate));
+    let input = cx.tensor((seq, hidden), DType::F32);
+    let w_gate = cx.tensor((intermediate, hidden), DType::F32);
+    let w_up = cx.tensor((intermediate, hidden), DType::F32);
+    let w_down = cx.tensor((hidden, intermediate), DType::F32);
     let out = swiglu_mlp(input, w_gate, w_up, w_down).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -138,9 +138,9 @@ fn fuzz_norm_proj(seq: usize, hidden: usize, proj_dim: usize, eps: f32, seed: u6
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((seq, hidden));
-    let norm_w = cx.tensor(hidden);
-    let proj_w = cx.tensor((proj_dim, hidden));
+    let input = cx.tensor((seq, hidden), DType::F32);
+    let norm_w = cx.tensor(hidden, DType::F32);
+    let proj_w = cx.tensor((proj_dim, hidden), DType::F32);
     let out = rms_norm(input, norm_w, eps).matmul(proj_w.t()).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -203,14 +203,14 @@ fn fuzz_layer_no_attn(
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((seq, hidden));
-    let attn_norm_w = cx.tensor(hidden);
-    let proj_w = cx.tensor((proj_dim, hidden));
-    let o_proj_w = cx.tensor((hidden, proj_dim));
-    let mlp_norm_w = cx.tensor(hidden);
-    let w_gate = cx.tensor((intermediate, hidden));
-    let w_up = cx.tensor((intermediate, hidden));
-    let w_down = cx.tensor((hidden, intermediate));
+    let input = cx.tensor((seq, hidden), DType::F32);
+    let attn_norm_w = cx.tensor(hidden, DType::F32);
+    let proj_w = cx.tensor((proj_dim, hidden), DType::F32);
+    let o_proj_w = cx.tensor((hidden, proj_dim), DType::F32);
+    let mlp_norm_w = cx.tensor(hidden, DType::F32);
+    let w_gate = cx.tensor((intermediate, hidden), DType::F32);
+    let w_up = cx.tensor((intermediate, hidden), DType::F32);
+    let w_down = cx.tensor((hidden, intermediate), DType::F32);
 
     let normed = rms_norm(input, attn_norm_w, eps);
     let proj_out = normed.matmul(proj_w.t()).matmul(o_proj_w.t());
@@ -312,10 +312,10 @@ fn fuzz_mlp_hlir_only(seq: usize, hidden: usize, intermediate: usize, seed: u64)
     };
 
     let mut cx = Graph::default();
-    let input = cx.tensor((seq, hidden));
-    let w_gate = cx.tensor((intermediate, hidden));
-    let w_up = cx.tensor((intermediate, hidden));
-    let w_down = cx.tensor((hidden, intermediate));
+    let input = cx.tensor((seq, hidden), DType::F32);
+    let w_gate = cx.tensor((intermediate, hidden), DType::F32);
+    let w_up = cx.tensor((intermediate, hidden), DType::F32);
+    let w_down = cx.tensor((hidden, intermediate), DType::F32);
     let out = swiglu_mlp(input, w_gate, w_up, w_down).output();
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
@@ -461,16 +461,16 @@ mod gemma {
         };
 
         let mut cx = Graph::default();
-        let input = cx.tensor((SEQ, HIDDEN));
-        let attn_norm_w = cx.tensor(HIDDEN);
-        let post_attn_norm_w = cx.tensor(HIDDEN);
-        let pre_ff_norm_w = cx.tensor(HIDDEN);
-        let post_ff_norm_w = cx.tensor(HIDDEN);
-        let proj_w = cx.tensor((Q_DIM, HIDDEN));
-        let o_proj_w = cx.tensor((HIDDEN, Q_DIM));
-        let w_gate = cx.tensor((INTERMEDIATE, HIDDEN));
-        let w_up = cx.tensor((INTERMEDIATE, HIDDEN));
-        let w_down = cx.tensor((HIDDEN, INTERMEDIATE));
+        let input = cx.tensor((SEQ, HIDDEN), DType::F32);
+        let attn_norm_w = cx.tensor(HIDDEN, DType::F32);
+        let post_attn_norm_w = cx.tensor(HIDDEN, DType::F32);
+        let pre_ff_norm_w = cx.tensor(HIDDEN, DType::F32);
+        let post_ff_norm_w = cx.tensor(HIDDEN, DType::F32);
+        let proj_w = cx.tensor((Q_DIM, HIDDEN), DType::F32);
+        let o_proj_w = cx.tensor((HIDDEN, Q_DIM), DType::F32);
+        let w_gate = cx.tensor((INTERMEDIATE, HIDDEN), DType::F32);
+        let w_up = cx.tensor((INTERMEDIATE, HIDDEN), DType::F32);
+        let w_down = cx.tensor((HIDDEN, INTERMEDIATE), DType::F32);
 
         let normed = rms_norm(input, attn_norm_w, EPS);
         let proj_out = normed.matmul(proj_w.t()).matmul(o_proj_w.t());
@@ -636,9 +636,9 @@ mod qwen {
         const VOCAB: usize = 512;
 
         let mut cx = Graph::default();
-        let input = cx.tensor((SEQ, HIDDEN));
-        let norm_w = cx.tensor(HIDDEN);
-        let embedding = cx.tensor((VOCAB, HIDDEN));
+        let input = cx.tensor((SEQ, HIDDEN), DType::F32);
+        let norm_w = cx.tensor(HIDDEN, DType::F32);
+        let embedding = cx.tensor((VOCAB, HIDDEN), DType::F32);
         let out = rms_norm(input, norm_w, EPS).matmul(embedding.t()).output();
 
         cx.build_search_space::<CudaRuntime>(CompileOptions::default());

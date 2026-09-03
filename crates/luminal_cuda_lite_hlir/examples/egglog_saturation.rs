@@ -175,11 +175,11 @@ fn build_case(case: Case) -> Graph {
     let mut cx = Graph::new();
     let out = match case {
         Case::Mul => {
-            let x = cx.tensor((64, 64));
+            let x = cx.tensor((64, 64), DType::F32);
             x * x
         }
         Case::UnaryChain(n) => {
-            let mut x = cx.tensor((64, 64));
+            let mut x = cx.tensor((64, 64), DType::F32);
             for i in 0..n {
                 x = match i % 6 {
                     0 => x.sin(),
@@ -192,18 +192,18 @@ fn build_case(case: Case) -> Graph {
             }
             x
         }
-        Case::Gelu => cx.tensor((64, 64)).gelu(),
-        Case::Softmax => cx.tensor((128, 128)).softmax(1),
-        Case::LayerNorm => cx.tensor((128, 128)).layer_norm(1, 1e-5),
+        Case::Gelu => cx.tensor((64, 64), DType::F32).gelu(),
+        Case::Softmax => cx.tensor((128, 128), DType::F32).softmax(1),
+        Case::LayerNorm => cx.tensor((128, 128), DType::F32).layer_norm(1, 1e-5),
         Case::Matmul => {
-            let a = cx.tensor((32, 64));
-            let b = cx.tensor((64, 32));
+            let a = cx.tensor((32, 64), DType::F32);
+            let b = cx.tensor((64, 32), DType::F32);
             a.matmul(b)
         }
         Case::Attention => {
-            let q = cx.tensor((64, 32));
-            let k = cx.tensor((64, 32));
-            let v = cx.tensor((64, 32));
+            let q = cx.tensor((64, 32), DType::F32);
+            let k = cx.tensor((64, 32), DType::F32);
+            let v = cx.tensor((64, 32), DType::F32);
             let scores = q.matmul(k.permute((1, 0))) * (1.0 / 32.0_f32.sqrt());
             scores.softmax(1).matmul(v)
         }
@@ -224,12 +224,12 @@ fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
     let hd = dim / heads;
     let mlp = dim * 2;
     let attn_scale = 1.0f32 / (hd as f32).sqrt();
-    let mut x = cx.tensor_dtyped((seq, dim), DType::F16);
+    let mut x = cx.tensor((seq, dim), DType::F16);
     for _ in 0..blocks {
         // adaLN modulation: a Linear from a conditioning vector produces 6 (dim,)
         // chunks (shift/scale/gate ×2), each broadcast over seq.
-        let temb = cx.tensor_dtyped((1, dim), DType::F16);
-        let mod_lin = cx.tensor_dtyped((dim, dim * 6), DType::F16);
+        let temb = cx.tensor((1, dim), DType::F16);
+        let mod_lin = cx.tensor((dim, dim * 6), DType::F16);
         let m = temb.matmul(mod_lin); // (1, 6*dim)
         let chunk = |mm: GraphTensor, i: usize| {
             mm.slice((.., i * dim..(i + 1) * dim))
@@ -240,10 +240,10 @@ fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
         let (shift2, scale2, gate2) = (chunk(m, 3), chunk(m, 4), chunk(m, 5));
         // ── attention sublayer ──
         let h = x.layer_norm(1, 1e-5) * (scale1 + 1.0) + shift1;
-        let qw = cx.tensor_dtyped((dim, dim), DType::F16);
-        let kw = cx.tensor_dtyped((dim, dim), DType::F16);
-        let vw = cx.tensor_dtyped((dim, dim), DType::F16);
-        let ow = cx.tensor_dtyped((dim, dim), DType::F16);
+        let qw = cx.tensor((dim, dim), DType::F16);
+        let kw = cx.tensor((dim, dim), DType::F16);
+        let vw = cx.tensor((dim, dim), DType::F16);
+        let ow = cx.tensor((dim, dim), DType::F16);
         let q = h.matmul(qw).split_dims(1, hd).permute((1, 0, 2));
         let k = h.matmul(kw).split_dims(1, hd).permute((1, 0, 2));
         let v = h.matmul(vw).split_dims(1, hd).permute((1, 0, 2));
@@ -256,8 +256,8 @@ fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
         x += gate1 * attn;
         // ── gelu MLP sublayer ──
         let h2 = x.layer_norm(1, 1e-5) * (scale2 + 1.0) + shift2;
-        let up = cx.tensor_dtyped((dim, mlp), DType::F16);
-        let down = cx.tensor_dtyped((mlp, dim), DType::F16);
+        let up = cx.tensor((dim, mlp), DType::F16);
+        let down = cx.tensor((mlp, dim), DType::F16);
         x += gate2 * h2.matmul(up).gelu().matmul(down);
     }
     x
@@ -265,12 +265,13 @@ fn build_flux_block(cx: &mut Graph, blocks: usize) -> GraphTensor {
 
 fn build_qwen_moe(cx: &mut Graph) -> GraphTensor {
     cx.set_dim('s', MOE_SEQ);
-    let x = cx.tensor(('s', MOE_HIDDEN));
-    let router = cx.tensor((MOE_NUM_EXPERTS, MOE_HIDDEN));
-    let gate_up_weights = cx
-        .tensor_dtyped((MOE_NUM_EXPERTS, MOE_INTERMEDIATE * 2, MOE_HIDDEN), DType::Bf16);
-    let down_weights = cx
-        .tensor_dtyped((MOE_NUM_EXPERTS, MOE_HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
+    let x = cx.tensor(('s', MOE_HIDDEN), DType::F32);
+    let router = cx.tensor((MOE_NUM_EXPERTS, MOE_HIDDEN), DType::F32);
+    let gate_up_weights = cx.tensor(
+        (MOE_NUM_EXPERTS, MOE_INTERMEDIATE * 2, MOE_HIDDEN),
+        DType::Bf16,
+    );
+    let down_weights = cx.tensor((MOE_NUM_EXPERTS, MOE_HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
 
     let n = x.dims().len();
     let e_dim = *router.dims().first().unwrap();
@@ -303,15 +304,16 @@ fn build_qwen_moe(cx: &mut Graph) -> GraphTensor {
 
 fn build_gemma_moe(cx: &mut Graph) -> GraphTensor {
     cx.set_dim('s', MOE_SEQ);
-    let router_input = cx.tensor(('s', MOE_HIDDEN));
-    let expert_input = cx.tensor(('s', MOE_HIDDEN));
-    let router_scale = cx.tensor(MOE_HIDDEN);
-    let router_proj = cx.tensor((MOE_NUM_EXPERTS, MOE_HIDDEN));
-    let per_expert_scale = cx.tensor(MOE_NUM_EXPERTS);
-    let gate_up_weights = cx
-        .tensor_dtyped((MOE_NUM_EXPERTS, MOE_INTERMEDIATE * 2, MOE_HIDDEN), DType::Bf16);
-    let down_weights = cx
-        .tensor_dtyped((MOE_NUM_EXPERTS, MOE_HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
+    let router_input = cx.tensor(('s', MOE_HIDDEN), DType::F32);
+    let expert_input = cx.tensor(('s', MOE_HIDDEN), DType::F32);
+    let router_scale = cx.tensor(MOE_HIDDEN, DType::F32);
+    let router_proj = cx.tensor((MOE_NUM_EXPERTS, MOE_HIDDEN), DType::F32);
+    let per_expert_scale = cx.tensor(MOE_NUM_EXPERTS, DType::F32);
+    let gate_up_weights = cx.tensor(
+        (MOE_NUM_EXPERTS, MOE_INTERMEDIATE * 2, MOE_HIDDEN),
+        DType::Bf16,
+    );
+    let down_weights = cx.tensor((MOE_NUM_EXPERTS, MOE_HIDDEN, MOE_INTERMEDIATE), DType::Bf16);
 
     let n = router_input.dims().len();
     let e_dim = *router_proj.dims().first().unwrap();

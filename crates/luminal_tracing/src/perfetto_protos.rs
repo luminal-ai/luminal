@@ -488,8 +488,6 @@ pub struct AndroidGameInterventionListConfig {
 }
 /// Custom configuration for the "android.input.inputevent" data source.
 ///
-/// NOTE: Input traces can only be taken on debuggable (userdebug/eng) builds!
-///
 /// Next ID: 5
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AndroidInputEventConfig {
@@ -716,9 +714,6 @@ pub struct AndroidSdkSyspropGuardConfig {
     /// integration with the track_event data source in RenderEngine.
     /// If false or omitted, the simpler ATrace fallback is used.
     ///
-    /// NOTE: once enabled, Skia will only revert to ATrace if SurfaceFlinger is
-    /// restarted.
-    ///
     /// Specifically this sets the following system properties:
     ///    - debug.tracing.ctl.renderengine.skia_tracing_enabled
     ///    - debug.tracing.ctl.renderengine.skia_use_perfetto_track_events
@@ -731,9 +726,6 @@ pub struct AndroidSdkSyspropGuardConfig {
     /// with the track_event data source. hwui_package_name_filter
     /// can be used to control which apps are affected.
     /// If false or omitted, the simpler ATrace fallback is used.
-    ///
-    /// NOTE: once enabled, Skia will only revert to ATrace if the app is
-    /// restarted.
     ///
     /// ATTENTION: affects ALL HWUI APPS if hwui_package_name_filter is not set!
     /// If filtering is NOT set, this controls these GLOBAL system properties:

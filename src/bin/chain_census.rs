@@ -39,33 +39,33 @@ fn census(name: &str, build: impl Fn(&mut Graph)) {
 
 fn main() {
     census("scalar_broadcast_rank4", |cx| {
-        let x = cx.tensor((2, 3, 4, 5));
+        let x = cx.tensor((2, 3, 4, 5), DType::F32);
         let _ = (x * 2.0f32).output();
     });
     census("stable_argsort_rank2", |cx| {
-        let x = cx.tensor((4, 8));
+        let x = cx.tensor((4, 8), DType::F32);
         let _ = x.stable_argsort(1, false).output();
     });
     census("topk_rank3", |cx| {
-        let x = cx.tensor((2, 4, 8));
+        let x = cx.tensor((2, 4, 8), DType::F32);
         let _ = x.topk_indexes(2, 2).output();
     });
     census("gather_elements_rank3", |cx| {
-        let x = cx.tensor((2, 4, 8));
-        let idx = cx.tensor_dtyped((2, 4, 3), DType::Int);
+        let x = cx.tensor((2, 4, 8), DType::F32);
+        let idx = cx.tensor((2, 4, 3), DType::Int);
         let _ = x.gather_elements(idx, 2).output();
     });
     census("concat_rank3", |cx| {
-        let a = cx.tensor((2, 4, 8));
-        let b = cx.tensor((2, 4, 8));
+        let a = cx.tensor((2, 4, 8), DType::F32);
+        let b = cx.tensor((2, 4, 8), DType::F32);
         let _ = a.concat_along(b, 2).output();
     });
     census("cumsum_rank4", |cx| {
-        let x = cx.tensor((2, 3, 4, 5));
+        let x = cx.tensor((2, 3, 4, 5), DType::F32);
         let _ = x.cumsum(3).output();
     });
     census("expand_pytorch_rank4", |cx| {
-        let x = cx.tensor((2, 1, 4, 1));
+        let x = cx.tensor((2, 1, 4, 1), DType::F32);
         let _ = x.expand((2, 3, 4, 5)).output();
     });
 }

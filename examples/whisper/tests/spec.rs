@@ -1,5 +1,8 @@
 use luminal::prelude::*;
-use whisper::{Whisper, WhisperDims};
+use whisper::{
+    Whisper, WhisperDims,
+    model_support::{Namespace, named_kv_cache_pool},
+};
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {
     tensor
@@ -43,17 +46,18 @@ fn whisper_tiny_en_full_forward_contract_builds() {
         input_dims(&cx, "model.encoder.conv2.weight"),
         vec![d.state, d.state, 3]
     );
-    let mel = cx.tensor((d.n_mels, d.mel_frames()));
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let gather_idx = cx.tensor_dtyped(d.text_ctx, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool = luminal_nn::KvCachePool::new(
+    let mel = cx.tensor((d.n_mels, d.mel_frames()), DType::F32);
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let gather_idx = cx.tensor(d.text_ctx, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_kv_cache_pool(
         &mut cx,
         d.text_layers,
         d.text_ctx,
         d.state,
-        &Ns::root().child("cache"),
+        DType::F32,
+        &Namespace::root().child("cache"),
     );
 
     let encoded = model.encode(mel);

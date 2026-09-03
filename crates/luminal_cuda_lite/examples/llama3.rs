@@ -19,27 +19,31 @@ fn main() {
 
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
-    use llama3::{Llama3, Llama3Dims};
+    use llama3::{
+        model_support::{named_kv_cache_pool, Namespace},
+        Llama3, Llama3Dims,
+    };
     use luminal::prelude::*;
-    use luminal_nn::{rope_pairing_matrix, rope_tables_split_half, KvCachePool};
+    use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};
 
     const SLOTS: usize = 4;
     let dims = Llama3Dims::llama3_8b();
     let mut cx = Graph::new();
     let model = Llama3::init(&mut cx, &dims);
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let rope_cos = cx.tensor((1, dims.head_dim));
-    let rope_sin = cx.tensor((1, dims.head_dim));
-    let rope_rot = cx.tensor((dims.head_dim, dims.head_dim));
-    let gather_idx = cx.tensor_dtyped(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool = KvCachePool::new(
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let rope_cos = cx.tensor((1, dims.head_dim), DType::F32);
+    let rope_sin = cx.tensor((1, dims.head_dim), DType::F32);
+    let rope_rot = cx.tensor((dims.head_dim, dims.head_dim), DType::F32);
+    let gather_idx = cx.tensor(SLOTS, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_kv_cache_pool(
         &mut cx,
         dims.layers,
         SLOTS,
         dims.kv_dim(),
-        &Ns::root().child("cache"),
+        DType::F32,
+        &Namespace::root().child("cache"),
     );
     let (logits, _) = model.forward(
         token,

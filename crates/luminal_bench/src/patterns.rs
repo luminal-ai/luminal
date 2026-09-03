@@ -78,8 +78,8 @@ impl BenchmarkPattern for MatMulBench {
     }
 
     fn build_graph(&self, cx: &mut Graph, _size: BenchSize) {
-        let a = cx.tensor((self.size.m, self.size.k));
-        let b = cx.tensor((self.size.k, self.size.n));
+        let a = cx.tensor((self.size.m, self.size.k), DType::F32);
+        let b = cx.tensor((self.size.k, self.size.n), DType::F32);
         let _ = a.matmul(b).output();
     }
 }
@@ -108,7 +108,7 @@ impl BenchmarkPattern for SoftmaxBench {
         let rows = size.value / dim;
         let cols = dim;
 
-        let x = cx.tensor((rows, cols));
+        let x = cx.tensor((rows, cols), DType::F32);
         // Softmax along last axis (axis 1)
         let _ = x.softmax(1).output();
     }
@@ -136,7 +136,7 @@ impl BenchmarkPattern for LayerNormBench {
         let hidden_dim = 128;
         let batch_seq = size.value / hidden_dim;
 
-        let x = cx.tensor((batch_seq.max(1), hidden_dim));
+        let x = cx.tensor((batch_seq.max(1), hidden_dim), DType::F32);
         // LayerNorm along last axis with epsilon
         let _ = x.layer_norm(1, 1e-5).output();
     }
@@ -160,7 +160,7 @@ impl BenchmarkPattern for GeLUBench {
     }
 
     fn build_graph(&self, cx: &mut Graph, size: BenchSize) {
-        let x = cx.tensor(size.value);
+        let x = cx.tensor(size.value, DType::F32);
         let _ = x.gelu().output();
     }
 }
@@ -205,9 +205,9 @@ impl BenchmarkPattern for AttentionBench {
         let head_dim = self.head_dim;
 
         // Q, K, V tensors: (seq_len, head_dim)
-        let q = cx.tensor((seq_len, head_dim));
-        let k = cx.tensor((seq_len, head_dim));
-        let v = cx.tensor((seq_len, head_dim));
+        let q = cx.tensor((seq_len, head_dim), DType::F32);
+        let k = cx.tensor((seq_len, head_dim), DType::F32);
+        let v = cx.tensor((seq_len, head_dim), DType::F32);
 
         // Attention: softmax(Q @ K^T / sqrt(d)) @ V
         // Q @ K^T -> (seq_len, seq_len)

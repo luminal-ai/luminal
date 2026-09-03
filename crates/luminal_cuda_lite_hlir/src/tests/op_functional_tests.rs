@@ -214,7 +214,7 @@ fn run_argsort_test(rows: usize, cols: usize, seed: u64) {
     let total = rows * cols;
 
     let mut cx = Graph::default();
-    let input = cx.tensor((rows, cols));
+    let input = cx.tensor((rows, cols), DType::F32);
     let sorted_dim0 = input.stable_argsort(0, true).output(); // descend
     let sorted_dim1 = input.stable_argsort(1, false).output(); // ascend
 
@@ -314,16 +314,6 @@ fn run_argsort_test(rows: usize, cols: usize, seed: u64) {
     }
 }
 
-// NOTE: Argsort proptest disabled due to pre-existing bug where argsort output shape
-// through e-graph compilation returns only `rows` elements instead of `rows * cols`.
-// proptest! {
-//     #![proptest_config(ProptestConfig::with_cases(10))]
-//     #[test]
-//     fn test_argsort(seed in any::<u64>()) {
-//         run_argsort_test(5, 500, seed);
-//     }
-// }
-
 /// Test F32 -> F16 -> F32 cast roundtrip with edge-case values.
 #[test]
 #[allow(clippy::approx_constant, clippy::excessive_precision)]
@@ -415,9 +405,9 @@ fn fuzz_test_cuda_genomes_impl(seed: u64) {
 
     // Build a graph with operations that have rewrite alternatives
     let mut cx = Graph::default();
-    let a = cx.tensor((4, 8));
-    let b = cx.tensor((8, 4));
-    let c = cx.tensor((4, 4));
+    let a = cx.tensor((4, 8), DType::F32);
+    let b = cx.tensor((8, 4), DType::F32);
+    let c = cx.tensor((4, 4), DType::F32);
 
     // Matmul + add + relu creates opportunities for rewrites
     let d = a.matmul(b);
@@ -583,8 +573,8 @@ fn run_embed_test(vocab_size: usize, embed_dim: usize, seq_len: usize, seed: u64
     };
 
     let mut cx = Graph::default();
-    let token_ids = cx.tensor_dtyped(seq_len, luminal::dtype::DType::Int);
-    let embed_table = cx.tensor((vocab_size, embed_dim));
+    let token_ids = cx.tensor(seq_len, luminal::dtype::DType::Int);
+    let embed_table = cx.tensor((vocab_size, embed_dim), DType::F32);
     let output = embed_table
         .gather(
             (token_ids * embed_dim).expand_dim(1, embed_dim)
@@ -649,8 +639,8 @@ fn flattened_dynamic_row_gather_embed_candidates_are_equivalent() {
     const SEED: u64 = 0xE6BE_DD1A;
 
     let mut cx = Graph::default();
-    let dynamic_rows = cx.tensor_dtyped(PICKS, DType::Int);
-    let table = cx.tensor((ROWS, ROW_STRIDE));
+    let dynamic_rows = cx.tensor(PICKS, DType::Int);
+    let table = cx.tensor((ROWS, ROW_STRIDE), DType::F32);
     let flat_table = table.flatten();
     let flat_indices =
         (dynamic_rows * ROW_STRIDE).expand_dim(1, WIDTH) + cx.arange(WIDTH).expand_dim(0, PICKS);
@@ -717,8 +707,8 @@ fn kernel_embed_rejects_noncontiguous_index_view() {
     const SIDE: usize = 4;
 
     let mut cx = Graph::default();
-    let dynamic_rows = cx.tensor_dtyped(SIDE, DType::Int);
-    let table = cx.tensor(SIDE * SIDE);
+    let dynamic_rows = cx.tensor(SIDE, DType::Int);
+    let table = cx.tensor(SIDE * SIDE, DType::F32);
     let flat_indices =
         (dynamic_rows * SIDE).expand_dim(1, SIDE) + cx.arange(SIDE).expand_dim(0, SIDE);
     let _output = table.gather(flat_indices.permute((1, 0))).output();
@@ -740,8 +730,8 @@ fn kernel_embed_rejects_noncontiguous_table_view() {
     const WIDTH: usize = 4;
 
     let mut cx = Graph::default();
-    let dynamic_rows = cx.tensor_dtyped(ROWS, DType::Int);
-    let storage = cx.tensor((WIDTH, ROWS));
+    let dynamic_rows = cx.tensor(ROWS, DType::Int);
+    let storage = cx.tensor((WIDTH, ROWS), DType::F32);
     let table = storage.permute((1, 0));
     let flat_indices =
         (dynamic_rows * WIDTH).expand_dim(1, WIDTH) + cx.arange(WIDTH).expand_dim(0, ROWS);

@@ -1,464 +1,557 @@
-use crate::Linear;
 use luminal::prelude::*;
 
-/// A layer of E experts and a router
-pub struct MoE {
-    pub expert_weights: GraphTensor, // [E, in, out]
-    pub router: GraphTensor,         // [in, E]
-    pub k: usize,
+/// A fixed number of selected experts for every token.
+///
+/// The final axis of `expert_ids` and `weights` is the route-slot axis. All
+/// preceding axes identify tokens. Routing policy is intentionally external:
+/// callers decide how scores are produced, which experts are selected, and
+/// whether the selected weights are normalized.
+#[derive(Clone, Copy)]
+pub struct TopKRoutes {
+    expert_ids: GraphTensor,
+    weights: GraphTensor,
 }
 
-impl MoE {
-    pub fn forward(&self, activations: GraphTensor) -> GraphTensor {
-        let n = activations.dims().len();
-        let e_dim = *self.router.dims().last().unwrap();
-        let (_, in_size, out_size) = self.expert_weights.dims3();
-        let io = in_size * out_size;
-
-        // 1. Routing probabilities: [batch.., E]
-        let routing_weights = activations.matmul(self.router).softmax(n - 1);
-
-        // 2. Top-k expert indices: [batch.., k] (Int)
-        let top_k_indices = routing_weights.topk_indexes(self.k, n - 1);
-
-        // 3. Gather top-k routing values: [batch.., k]
-        //    flat_idx = batch_row * E + expert_idx
-        //    iota(z / k * E) gives batch_row * E at each position in [batch.., k]
-        // Batch-row offset · E as a coordinate function: leading batch
-        // axes carry their row-major strides scaled by E; the trailing k
-        // axis contributes 0 (P1, 2026-08-07 — the old flat form recorded
-        // a TruncDiv chain here).
-        let idx_dims = top_k_indices.dims();
-        let row_offsets = activations.graph().iota(idx_dims.clone(), |c| {
-            let n = idx_dims.len();
-            let mut stride = e_dim;
-            let mut acc = IntExpr::from(0);
-            for i in (0..n - 1).rev() {
-                acc += c[i] * stride;
-                // Frontend simplification restored (revert ruling 2026-08-27).
-                stride = (stride * idx_dims[i]).simplify();
-            }
-            acc
-        });
-        // Int-native flat-index assembly (2026-08-11): both operands are
-        // already Int; the old f32 round trip ended in a refused cast.
-        let routing_flat_idx = row_offsets + top_k_indices;
-        let top_k_values = routing_weights.gather1d(routing_flat_idx); // [batch.., k]
-
-        // 4. Gather expert weight matrices: [batch.., k, in, out]
-        //    flat_idx[.., ki, i, o] = expert_idx[.., ki] * in*out + i * out + o
-        let base = top_k_indices * io; // [batch.., k] (Int)
-        let within = activations
-            .graph()
-            .iota((in_size, out_size), |c| c[0] * out_size + c[1]); // [in, out] (Int)
-
-        // Expand base to [batch.., k, in, out] — ONE apply (2026-08-26).
-        let exp_base = base.expand_rhs((in_size, out_size));
-
-        // Expand within to [batch.., k, in, out] — ONE apply.
-        let exp_within = within.expand_lhs(base.dims());
-
-        let expert_flat_idx = exp_base + exp_within;
-        let gathered = self.expert_weights.gather1d(expert_flat_idx); // [batch.., k, in, out]
-
-        // 5. Batched matmul: [batch.., k, 1, in] @ [batch.., k, in, out] → [batch.., k, out]
-        let expanded_act = activations
-            .view()
-            .expand_dim(n - 1, self.k) // [batch.., k, in]
-            .unsqueeze(n) // [batch.., k, 1, in]
-            .finish();
-        let expert_out = expanded_act.matmul(gathered).squeeze(n); // [batch.., k, out]
-
-        // 6. Weighted sum over experts: [batch.., k, out] * [batch.., k, 1] → sum(k) → [batch.., out]
-        let weights_exp = top_k_values
-            .view()
-            .unsqueeze(top_k_values.dims().len()) // [batch.., k, 1]
-            .expand(expert_out.dims())
-            .finish();
-        (expert_out * weights_exp).sum(n - 1)
+impl TopKRoutes {
+    /// Construct routes from already-selected expert IDs and route weights.
+    pub fn new(expert_ids: GraphTensor, weights: GraphTensor) -> Self {
+        assert_eq!(
+            expert_ids.dtype,
+            DType::Int,
+            "TopKRoutes expert IDs must be Int"
+        );
+        assert!(
+            expert_ids.rank() > 0,
+            "TopKRoutes requires a final route-slot axis"
+        );
+        assert_same_graph(expert_ids, weights, "TopKRoutes");
+        assert_same_shape(
+            &expert_ids.dims(),
+            &weights.dims(),
+            "TopKRoutes expert IDs and weights",
+        );
+        Self {
+            expert_ids,
+            weights,
+        }
     }
+
+    /// Select route weights from the last axis of a score tensor.
+    ///
+    /// This performs no activation or normalization. For example, a model can
+    /// pass softmax probabilities, sigmoid scores, or raw learned weights.
+    pub fn from_scores(scores: GraphTensor, expert_ids: GraphTensor) -> Self {
+        assert_same_graph(scores, expert_ids, "TopKRoutes::from_scores");
+        let score_dims = scores.dims();
+        let route_dims = expert_ids.dims();
+        assert!(
+            !score_dims.is_empty(),
+            "scores and expert IDs require an expert/route axis"
+        );
+        assert_eq!(
+            score_dims.len(),
+            route_dims.len(),
+            "scores and expert IDs must have the same rank"
+        );
+        assert_same_shape(
+            &score_dims[..score_dims.len() - 1],
+            &route_dims[..route_dims.len() - 1],
+            "scores and expert IDs token axes",
+        );
+
+        let token_rank = route_dims.len() - 1;
+        let mut coords = Vec::with_capacity(score_dims.len());
+        for axis in 0..token_rank {
+            coords.push(scores.graph().iota(route_dims.clone(), |c| c[axis]));
+        }
+        coords.push(expert_ids);
+        Self::new(expert_ids, scores.gather(&coords))
+    }
+
+    pub fn expert_ids(&self) -> GraphTensor {
+        self.expert_ids
+    }
+
+    pub fn weights(&self) -> GraphTensor {
+        self.weights
+    }
+
+    /// The final axis containing the selected expert slots.
+    pub fn route_axis(&self) -> usize {
+        self.expert_ids.rank() - 1
+    }
+
+    /// Replace the route weights without changing the selected experts.
+    pub fn with_weights(self, weights: GraphTensor) -> Self {
+        Self::new(self.expert_ids, weights)
+    }
+
+    /// Normalize each token's selected weights to sum to one.
+    pub fn normalize(self) -> Self {
+        let axis = self.route_axis();
+        let slots = self.expert_ids.dims()[axis];
+        let denominator = self.weights.sum(axis).expand_dim(axis, slots);
+        self.with_weights(self.weights / denominator)
+    }
+
+    /// Broadcast token inputs across the route-slot axis.
+    ///
+    /// `input` begins with the token axes and may have any trailing payload
+    /// shape. For example, `[batch, sequence, hidden]` becomes
+    /// `[batch, sequence, K, hidden]`.
+    pub fn dispatch(&self, input: GraphTensor) -> GraphTensor {
+        assert_same_graph(self.expert_ids, input, "TopKRoutes::dispatch");
+        let route_dims = self.expert_ids.dims();
+        let token_rank = self.route_axis();
+        let input_dims = input.dims();
+        assert!(
+            input_dims.len() >= token_rank,
+            "input does not contain all route token axes"
+        );
+        assert_same_shape(
+            &route_dims[..token_rank],
+            &input_dims[..token_rank],
+            "route and input token axes",
+        );
+        input.expand_dim(token_rank, route_dims[token_rank])
+    }
+
+    /// Select an arbitrary tensor from an expert parameter bank.
+    ///
+    /// The parameter bank's first axis is the expert axis. `[E, ...]` becomes
+    /// `[..., K, ...]`, prefixed by the routes' token and slot axes.
+    pub fn select(&self, expert_tensor: GraphTensor) -> GraphTensor {
+        select_expert_tensor(self.expert_ids, expert_tensor)
+    }
+
+    /// Apply route weights and sum over the route-slot axis.
+    pub fn combine(&self, routed_output: GraphTensor) -> GraphTensor {
+        assert_same_graph(self.expert_ids, routed_output, "TopKRoutes::combine");
+        let route_dims = self.expert_ids.dims();
+        let output_dims = routed_output.dims();
+        assert!(
+            output_dims.len() >= route_dims.len(),
+            "routed output does not contain all route axes"
+        );
+        assert_same_shape(
+            &route_dims,
+            &output_dims[..route_dims.len()],
+            "routes and routed output prefix",
+        );
+        let weights = self
+            .weights
+            .cast(routed_output.dtype)
+            .expand_rhs(&output_dims[route_dims.len()..]);
+        (routed_output * weights).sum(self.route_axis())
+    }
+
+    /// Convert structured top-k routes into the general flat route table.
+    pub fn into_routes(self) -> Routes {
+        let route_dims = self.expert_ids.dims();
+        let token_rank = self.route_axis();
+        let token_dims = &route_dims[..token_rank];
+        let token_count = token_dims
+            .iter()
+            .copied()
+            .fold(IntExpr::from(1), |acc, dim| acc * dim)
+            .simplify();
+        let token_ids = self.expert_ids.graph().iota(route_dims.clone(), |c| {
+            let mut id = IntExpr::from(0);
+            let mut stride = IntExpr::from(1);
+            for axis in (0..token_rank).rev() {
+                id += c[axis] * stride;
+                stride = (stride * token_dims[axis]).simplify();
+            }
+            id
+        });
+        let slot_ids = self
+            .expert_ids
+            .graph()
+            .iota(route_dims.clone(), |c| c[token_rank]);
+        Routes::new(
+            token_ids.flatten(),
+            self.expert_ids.flatten(),
+            slot_ids.flatten(),
+            self.weights.flatten(),
+            token_count,
+            route_dims[token_rank],
+        )
+    }
+}
+
+/// A general sparse token-to-expert routing table.
+///
+/// Each element describes one route. `(token_id, slot_id)` pairs must be
+/// unique, and `slot_id` must be in `0..max_routes_per_token`. This uniqueness
+/// lets [`Routes::combine`] use ordinary assignment scatter followed by a sum;
+/// it does not require scatter-add semantics.
+#[derive(Clone, Copy)]
+pub struct Routes {
+    token_ids: GraphTensor,
+    expert_ids: GraphTensor,
+    slot_ids: GraphTensor,
+    weights: GraphTensor,
+    token_count: IntExpr,
+    max_routes_per_token: IntExpr,
+}
+
+impl Routes {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        token_ids: GraphTensor,
+        expert_ids: GraphTensor,
+        slot_ids: GraphTensor,
+        weights: GraphTensor,
+        token_count: impl Into<IntExpr>,
+        max_routes_per_token: impl Into<IntExpr>,
+    ) -> Self {
+        assert_eq!(token_ids.dtype, DType::Int, "route token IDs must be Int");
+        assert_eq!(expert_ids.dtype, DType::Int, "route expert IDs must be Int");
+        assert_eq!(slot_ids.dtype, DType::Int, "route slot IDs must be Int");
+        assert_eq!(token_ids.rank(), 1, "route tensors must be rank one");
+        for tensor in [expert_ids, slot_ids, weights] {
+            assert_same_graph(token_ids, tensor, "Routes");
+            assert_same_shape(&token_ids.dims(), &tensor.dims(), "route table columns");
+        }
+        Self {
+            token_ids,
+            expert_ids,
+            slot_ids,
+            weights,
+            token_count: token_count.into(),
+            max_routes_per_token: max_routes_per_token.into(),
+        }
+    }
+
+    pub fn token_ids(&self) -> GraphTensor {
+        self.token_ids
+    }
+
+    pub fn expert_ids(&self) -> GraphTensor {
+        self.expert_ids
+    }
+
+    pub fn slot_ids(&self) -> GraphTensor {
+        self.slot_ids
+    }
+
+    pub fn weights(&self) -> GraphTensor {
+        self.weights
+    }
+
+    pub fn token_count(&self) -> IntExpr {
+        self.token_count
+    }
+
+    pub fn max_routes_per_token(&self) -> IntExpr {
+        self.max_routes_per_token
+    }
+
+    /// Replace the route weights without changing the routing table.
+    pub fn with_weights(self, weights: GraphTensor) -> Self {
+        Self::new(
+            self.token_ids,
+            self.expert_ids,
+            self.slot_ids,
+            weights,
+            self.token_count,
+            self.max_routes_per_token,
+        )
+    }
+
+    /// Gather token inputs into route order.
+    ///
+    /// The first input axis is the flattened token axis. `[T, ...]` becomes
+    /// `[R, ...]`.
+    pub fn dispatch(&self, input: GraphTensor) -> GraphTensor {
+        assert_same_graph(self.token_ids, input, "Routes::dispatch");
+        let input_dims = input.dims();
+        assert!(
+            !input_dims.is_empty(),
+            "dispatched input must have a token axis"
+        );
+        assert_same_shape(
+            &[self.token_count],
+            &input_dims[..1],
+            "route token count and input token axis",
+        );
+
+        let payload_dims = &input_dims[1..];
+        let out_dims = route_output_shape(self.token_ids, payload_dims);
+        let mut coords = Vec::with_capacity(input_dims.len());
+        coords.push(self.token_ids.expand_rhs(payload_dims));
+        for axis in 0..payload_dims.len() {
+            coords.push(input.graph().iota(out_dims.clone(), |c| c[axis + 1]));
+        }
+        input.gather(&coords)
+    }
+
+    /// Select an arbitrary tensor from an expert parameter bank.
+    ///
+    /// The parameter bank's first axis is the expert axis. `[E, ...]` becomes
+    /// `[R, ...]`.
+    pub fn select(&self, expert_tensor: GraphTensor) -> GraphTensor {
+        select_expert_tensor(self.expert_ids, expert_tensor)
+    }
+
+    /// Apply route weights, scatter into unique token/slot positions, and sum
+    /// the slot axis.
+    ///
+    /// `[R, ...]` becomes `[T, ...]`. The temporary semantic shape is
+    /// `[T, max_routes_per_token, ...]`.
+    pub fn combine(&self, routed_output: GraphTensor) -> GraphTensor {
+        assert_same_graph(self.token_ids, routed_output, "Routes::combine");
+        let output_dims = routed_output.dims();
+        assert!(
+            !output_dims.is_empty(),
+            "routed output must have a route axis"
+        );
+        assert_same_shape(
+            &self.token_ids.dims(),
+            &output_dims[..1],
+            "route table and routed output route axes",
+        );
+
+        let payload_dims = &output_dims[1..];
+        let weights = self
+            .weights
+            .cast(routed_output.dtype)
+            .expand_rhs(payload_dims);
+        let weighted = routed_output * weights;
+
+        let mut destination_dims = Vec::with_capacity(output_dims.len() + 1);
+        destination_dims.push(self.token_count);
+        destination_dims.push(self.max_routes_per_token);
+        destination_dims.extend_from_slice(payload_dims);
+        let destination = routed_output
+            .graph()
+            .constant(0)
+            .cast(routed_output.dtype)
+            .expand_rhs(destination_dims);
+
+        let mut coords = Vec::with_capacity(output_dims.len() + 1);
+        coords.push(self.token_ids.expand_rhs(payload_dims));
+        coords.push(self.slot_ids.expand_rhs(payload_dims));
+        for axis in 0..payload_dims.len() {
+            coords.push(
+                routed_output
+                    .graph()
+                    .iota(output_dims.clone(), |c| c[axis + 1]),
+            );
+        }
+        destination.scatter(&coords, weighted).sum(1)
+    }
+}
+
+fn select_expert_tensor(expert_ids: GraphTensor, expert_tensor: GraphTensor) -> GraphTensor {
+    assert_same_graph(expert_ids, expert_tensor, "expert selection");
+    assert_eq!(
+        expert_ids.dtype,
+        DType::Int,
+        "selected expert IDs must be Int"
+    );
+    let expert_dims = expert_tensor.dims();
+    assert!(
+        !expert_dims.is_empty(),
+        "expert parameter bank must have an expert axis"
+    );
+    let route_dims = expert_ids.dims();
+    let parameter_dims = &expert_dims[1..];
+    let out_dims = route_output_shape(expert_ids, parameter_dims);
+    let mut coords = Vec::with_capacity(expert_dims.len());
+    coords.push(expert_ids.expand_rhs(parameter_dims));
+    for axis in 0..parameter_dims.len() {
+        coords.push(
+            expert_tensor
+                .graph()
+                .iota(out_dims.clone(), |c| c[route_dims.len() + axis]),
+        );
+    }
+    expert_tensor.gather(&coords)
+}
+
+fn route_output_shape(routes: GraphTensor, payload_dims: &[IntExpr]) -> Vec<IntExpr> {
+    let mut dims = routes.dims();
+    dims.extend_from_slice(payload_dims);
+    dims
+}
+
+fn assert_same_graph(lhs: GraphTensor, rhs: GraphTensor, context: &str) {
+    assert!(
+        lhs.graph_ref == rhs.graph_ref,
+        "{context} tensors must belong to the same graph"
+    );
+}
+
+fn assert_same_shape(lhs: &[IntExpr], rhs: &[IntExpr], context: &str) {
+    assert!(
+        lhs.len() == rhs.len()
+            && lhs
+                .iter()
+                .zip(rhs)
+                .all(|(left, right)| left == right || left.egglog_equal(*right)),
+        "{context} shapes differ: {lhs:?} vs {rhs:?}"
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::MoE;
+    use super::{Routes, TopKRoutes};
     use luminal::prelude::*;
 
-    fn assert_close(ours: &[f32], expected: &[f32]) {
-        assert_eq!(ours.len(), expected.len(), "length mismatch");
-        for (index, (a, b)) in ours.iter().zip(expected).enumerate() {
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert!(
-                (a - b).abs() <= 1e-4 * b.abs().max(1.0),
-                "element {index}: ours {a} vs expected {b}"
+                (actual - expected).abs() <= 1e-4 * expected.abs().max(1.0),
+                "element {index}: {actual} != {expected}"
             );
         }
     }
 
-    /// Full MoE forward (router softmax → topk → routing-value and
-    /// expert-weight gathers → batched matmul → weighted sum) against a
-    /// scalar reference, k=1 over 2 experts. Runs the plain extraction
-    /// path — the chain rides stable_argsort's rank scatter, both flat
-    /// gather sugars, and Int↔F32 index arithmetic.
     #[test]
-    fn moe_forward_matches_scalar_reference() {
-        const E: usize = 2;
-        const IN: usize = 2;
-        const OUT: usize = 2;
-        const BATCH: usize = 3;
-
-        let mut cx = Graph::new();
-        let model = MoE {
-            expert_weights: cx.named_tensor("Experts", (E, IN, OUT)),
-            router: cx.named_tensor("Router", (IN, E)),
-            k: 1,
-        };
-        let x = cx.tensor((BATCH, IN));
-        let out = model.forward(x).output();
-
-        let x_vals = vec![1.0f32, 0.5, -1.0, 2.0, 0.25, -0.75];
-        // Router picks expert 0 for positive-x0-heavy rows, expert 1 otherwise
-        // (logits differ per row; no ties).
-        let router_vals = vec![2.0f32, -1.0, -0.5, 1.5];
-        let expert_vals: Vec<f32> = (0..E * IN * OUT).map(|v| v as f32 * 0.3 - 1.0).collect();
-
-        // Scalar reference.
-        let mut expected = vec![0.0f32; BATCH * OUT];
-        for b in 0..BATCH {
-            let xr = &x_vals[b * IN..(b + 1) * IN];
-            let mut logits = [0.0f32; E];
-            for (e, logit) in logits.iter_mut().enumerate() {
-                *logit = (0..IN).map(|i| xr[i] * router_vals[i * E + e]).sum();
-            }
-            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-            let denom: f32 = exps.iter().sum();
-            let best = (0..E)
-                .max_by(|a, b| logits[*a].partial_cmp(&logits[*b]).unwrap())
-                .unwrap();
-            let weight = exps[best] / denom;
-            let w = &expert_vals[best * IN * OUT..(best + 1) * IN * OUT];
-            for o in 0..OUT {
-                expected[b * OUT + o] =
-                    (0..IN).map(|i| xr[i] * w[i * OUT + o]).sum::<f32>() * weight;
-            }
-        }
-
-        let rt = luminal_reference::harness::run_reference(
-            &cx,
-            &[
-                (x.id, x_vals.into()),
-                (model.router.id, router_vals.into()),
-                (model.expert_weights.id, expert_vals.into()),
-            ],
-        );
-        assert_close(rt.get_f32(out.id).expect("output"), &expected);
-    }
-}
-
-/// The full-fidelity top-k mixture (Qwen3-MoE form, ruling 2026-08-12):
-/// scores = softmax over ALL experts FIRST, then top-k selection, then
-/// the selected probabilities RENORMALIZE to sum 1 (norm_topk_prob).
-/// Expert weights are host-pre-stacked — gate_up [E, 2·I, H] (each
-/// expert's gate rows then up rows) and down [E, H, I] — and fetched
-/// per selected expert by COORDINATE-form gather (the primary; flat
-/// indices at expert-tensor scale would also be provable but the
-/// coordinate spelling never builds them). The in-graph gate/up split
-/// slices a COMPUTE output (no concat downstream — not the divergence
-/// road).
-pub struct MoETopK {
-    /// (E, hidden) router — F32, learned; HF orientation.
-    pub router: Linear,
-    /// (E, 2·intermediate, hidden) stacked gate;up weights.
-    pub gate_up: GraphTensor,
-    /// (E, hidden, intermediate) stacked down weights.
-    pub down: GraphTensor,
-    pub experts: usize,
-    pub top_k: usize,
-    pub hidden: usize,
-    pub intermediate: usize,
-}
-
-impl MoETopK {
-    pub fn new(
-        hidden: usize,
-        intermediate: usize,
-        experts: usize,
-        top_k: usize,
-        ns: &Ns,
-        cx: &mut Graph,
-    ) -> Self {
-        Self {
-            router: Linear::new_permuted(hidden, experts, false, &ns.child("gate"), cx),
-            gate_up: cx.named_tensor(
-                ns.leaf("gate_up_weights"),
-                (experts, 2 * intermediate, hidden),
-            ),
-            down: cx.named_tensor(ns.leaf("down_weights"), (experts, hidden, intermediate)),
-            experts,
-            top_k,
-            hidden,
-            intermediate,
-        }
-    }
-
-    /// Build the (E, 2I, H)/(E, H, I) stacks IN-GRAPH from per-expert
-    /// (gate, up, down) tensors — checkpoint anatomy enters unfused and
-    /// the graph performs the fusion (ruling 2026-08-12: no
-    /// value-transforming preparation steps). Dims derive from the
-    /// parts; gate/up are (I, H), down is (H, I).
-    pub fn from_per_expert(
-        router: Linear,
-        parts: &[(GraphTensor, GraphTensor, GraphTensor)],
-        top_k: usize,
-    ) -> Self {
-        let experts = parts.len();
-        let (gate0, _, _) = parts[0];
-        let intermediate = gate0.dims()[0].to_usize().expect("static intermediate");
-        let hidden = gate0.dims()[1].to_usize().expect("static hidden");
-        let mut gate_up_stack: Option<GraphTensor> = None;
-        let mut down_stack: Option<GraphTensor> = None;
-        for (gate, up, down) in parts {
-            let fused = gate.concat_along(*up, 0).expand_dim(0, 1); // (1, 2I, H)
-            let down_row = down.expand_dim(0, 1); // (1, H, I)
-            gate_up_stack = Some(match gate_up_stack {
-                Some(acc) => acc.concat_along(fused, 0),
-                None => fused,
-            });
-            down_stack = Some(match down_stack {
-                Some(acc) => acc.concat_along(down_row, 0),
-                None => down_row,
-            });
-        }
-        Self {
-            router,
-            gate_up: gate_up_stack.expect("at least one expert"),
-            down: down_stack.expect("at least one expert"),
-            experts,
-            top_k,
-            hidden,
-            intermediate,
-        }
-    }
-
-    /// x (s, hidden) → (s, hidden).
-    pub fn forward(&self, x: GraphTensor) -> GraphTensor {
-        let s = x.dims()[0];
-        let (k, h, i2) = (self.top_k, self.hidden, 2 * self.intermediate);
-        let cx = x.graph();
-
-        // 1. Qwen3 scoring order: softmax over ALL experts, THEN top-k.
-        let probs = self.router.forward(x).softmax(1); // (s, E)
-        let idx = probs.topk_indexes(k, 1); // (s, k) Int
-
-        // 2. Selected probabilities, renormalized to sum 1.
-        let row_of = cx.iota((s, k), |c| c[0]);
-        let picked = probs.gather(&[row_of, idx]); // (s, k)
-        let denom = picked.sum(1).expand_dim(1, k);
-        let weights = picked / denom;
-
-        // 3. Fetch the selected experts' gate_up matrices: (s, k, 2I, H).
-        let e4 = idx.expand_rhs((i2, h)); // ONE apply (2026-08-26)
-        let r4 = cx.iota((s, k, i2, h), |c| c[2]);
-        let c4 = cx.iota((s, k, i2, h), |c| c[3]);
-        let gate_up = self.gate_up.gather(&[e4, r4, c4]);
-
-        // 4. Per-expert projection: (s,k,1,H) @ (s,k,H,2I) → (s,k,2I).
-        let x_e = x.view().expand_dim(1, k).expand_dim(2, 1).finish(); // (s,k,1,H)
-        let projected = x_e.matmul(gate_up.permute((0, 1, 3, 2))).squeeze(2);
-
-        // 5. SwiGLU on the fused halves (slices of a compute output).
-        let gate = projected.slice_along(..self.intermediate, 2);
-        let up = projected.slice_along(self.intermediate.., 2);
-        let hidden_states = gate.silu() * up; // (s, k, I)
-
-        // 6. Down projection: (s,k,1,I) @ (s,k,I,H) → (s,k,H).
-        let e_down = idx.expand_rhs((h, self.intermediate)); // ONE apply
-        let r_down = cx.iota((s, k, h, self.intermediate), |c| c[2]);
-        let c_down = cx.iota((s, k, h, self.intermediate), |c| c[3]);
-        let down = self.down.gather(&[e_down, r_down, c_down]); // (s,k,H,I)
-        let out_e = hidden_states
-            .expand_dim(2, 1)
-            .matmul(down.permute((0, 1, 3, 2)))
-            .squeeze(2); // (s, k, H)
-
-        // 7. Weighted sum over the k experts.
-        (out_e * weights.expand_dim(2, h)).sum(1)
-    }
-}
-
-#[cfg(test)]
-mod topk_tests {
-    use super::MoETopK;
-    use luminal::prelude::*;
-    use scalar_refs::*;
-
-    /// The full Qwen3-MoE chain against a scalar reference: softmax over
-    /// ALL experts first, top-k by stable ranking, renormalized picked
-    /// probabilities, per-expert fused gate;up projection, SwiGLU on the
-    /// sliced halves, down projection, weighted sum.
-    #[test]
-    fn moe_topk_matches_scalar_reference() {
-        const S: usize = 2;
-        const H: usize = 4;
-        const I: usize = 3;
-        const E: usize = 4;
+    fn top_k_routes_select_dispatch_normalize_and_combine() {
+        const TOKENS: usize = 2;
+        const EXPERTS: usize = 3;
         const K: usize = 2;
+        const INPUT: usize = 2;
+        const OUTPUT: usize = 2;
 
         let mut cx = Graph::new();
-        let moe = MoETopK::new(H, I, E, K, &Ns::root().child("mlp"), &mut cx);
-        let x = cx.tensor((S, H));
-        let out = moe.forward(x).output();
+        let scores = cx.tensor((TOKENS, EXPERTS), DType::F32);
+        let expert_ids = cx.tensor((TOKENS, K), DType::Int);
+        let input = cx.tensor((TOKENS, INPUT), DType::F32);
+        let expert_weights = cx.tensor((EXPERTS, INPUT, OUTPUT), DType::F32);
 
-        let x_vals = weights(S * H, 3);
-        let router_vals = weights(E * H, 5); // (E, H) HF orientation
-        let gate_up_vals = weights(E * 2 * I * H, 7);
-        let down_vals = weights(E * H * I, 9);
+        let routes = TopKRoutes::from_scores(scores, expert_ids).normalize();
+        let dispatched = routes.dispatch(input);
+        let selected = routes.select(expert_weights);
+        let routed = dispatched.unsqueeze(2).matmul(selected).squeeze(2);
+        let output = routes.combine(routed).output();
 
-        // Scalar reference.
-        let mut expected = vec![0f32; S * H];
-        for s_i in 0..S {
-            let xr = &x_vals[s_i * H..(s_i + 1) * H];
-            // Router logits (x @ router.t()) then softmax over E.
-            let mut logits = [0f32; E];
-            for (e, logit) in logits.iter_mut().enumerate() {
-                *logit = (0..H).map(|j| xr[j] * router_vals[e * H + j]).sum();
-            }
-            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-            let denom: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|e| e / denom).collect();
-            // Top-k, largest first, stable (ties by lower index).
-            let mut order: Vec<usize> = (0..E).collect();
-            order.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap().then(a.cmp(b)));
-            let picked: Vec<usize> = order[..K].to_vec();
-            let picked_sum: f32 = picked.iter().map(|e| probs[*e]).sum();
-            for expert in &picked {
-                let weight = probs[*expert] / picked_sum;
-                // Fused gate;up: (2I, H) rows.
-                let w = &gate_up_vals[expert * 2 * I * H..(expert + 1) * 2 * I * H];
-                let mut projected = [0f32; 2 * I];
-                for (r, slot) in projected.iter_mut().enumerate() {
-                    *slot = (0..H).map(|j| xr[j] * w[r * H + j]).sum();
-                }
-                let hidden: Vec<f32> = (0..I)
-                    .map(|r| {
-                        let g = projected[r];
-                        let silu = g / (1.0 + (-g).exp());
-                        silu * projected[I + r]
-                    })
-                    .collect();
-                let d = &down_vals[expert * H * I..(expert + 1) * H * I];
-                for r in 0..H {
-                    let v: f32 = (0..I).map(|j| hidden[j] * d[r * I + j]).sum();
-                    expected[s_i * H + r] += weight * v;
-                }
-            }
-        }
-
-        let rt = luminal_reference::harness::run_reference(
-            &cx,
-            &[
-                (x.id, x_vals.into()),
-                (moe.router.weight.id, router_vals.into()),
-                (moe.gate_up.id, gate_up_vals.into()),
-                (moe.down.id, down_vals.into()),
-            ],
-        );
-        assert_close(rt.get_f32(out.id).expect("moe out"), &expected);
-    }
-
-    /// THE IN-GRAPH STACKING SPELLING (ruling 2026-08-12: no
-    /// value-transforming preparation steps): per-expert gate/up/down
-    /// enter as separate named tensors — HF checkpoint anatomy — and
-    /// the graph itself builds (E, 2I, H)/(E, H, I) by concat, feeding
-    /// the same runtime-indexed gather. This is a DIVERGENCE PROBE as
-    /// much as a fidelity test: gather-downstream-of-concat is
-    /// structurally adjacent to the slice-of-concat rejoin family, so
-    /// first runs happen under the RSS watchdog.
-    #[test]
-    fn moe_topk_in_graph_stacking_matches_scalar_reference() {
-        const S: usize = 2;
-        const H: usize = 4;
-        const I: usize = 3;
-        const E: usize = 4;
-        const K: usize = 2;
-
-        let mut cx = Graph::new();
-        let per_expert: Vec<(GraphTensor, GraphTensor, GraphTensor)> = (0..E)
-            .map(|e| {
-                (
-                    cx.named_tensor(format!("experts.{e}.gate_proj.weight"), (I, H)),
-                    cx.named_tensor(format!("experts.{e}.up_proj.weight"), (I, H)),
-                    cx.named_tensor(format!("experts.{e}.down_proj.weight"), (H, I)),
-                )
-            })
-            .collect();
-        let router = crate::Linear::new_permuted(H, E, false, &Ns::root().child("gate"), &mut cx);
-        let moe = MoETopK::from_per_expert(router, &per_expert, K);
-        let x = cx.tensor((S, H));
-        let out = moe.forward(x).output();
-
-        let x_vals = weights(S * H, 3);
-        let router_vals = weights(E * H, 5);
-        let gate_up_vals = weights(E * 2 * I * H, 7);
-        let down_vals = weights(E * H * I, 9);
-
-        // Identical scalar reference as the host-stacked test.
-        let mut expected = vec![0f32; S * H];
-        for s_i in 0..S {
-            let xr = &x_vals[s_i * H..(s_i + 1) * H];
-            let mut logits = [0f32; E];
-            for (e, logit) in logits.iter_mut().enumerate() {
-                *logit = (0..H).map(|j| xr[j] * router_vals[e * H + j]).sum();
-            }
-            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-            let denom: f32 = exps.iter().sum();
-            let probs: Vec<f32> = exps.iter().map(|e| e / denom).collect();
-            let mut order: Vec<usize> = (0..E).collect();
-            order.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap().then(a.cmp(b)));
-            let picked: Vec<usize> = order[..K].to_vec();
-            let picked_sum: f32 = picked.iter().map(|e| probs[*e]).sum();
-            for expert in &picked {
-                let weight = probs[*expert] / picked_sum;
-                let w = &gate_up_vals[expert * 2 * I * H..(expert + 1) * 2 * I * H];
-                let mut projected = [0f32; 2 * I];
-                for (r, slot) in projected.iter_mut().enumerate() {
-                    *slot = (0..H).map(|j| xr[j] * w[r * H + j]).sum();
-                }
-                let hidden: Vec<f32> = (0..I)
-                    .map(|r| {
-                        let g = projected[r];
-                        let silu = g / (1.0 + (-g).exp());
-                        silu * projected[I + r]
-                    })
-                    .collect();
-                let d = &down_vals[expert * H * I..(expert + 1) * H * I];
-                for r in 0..H {
-                    let v: f32 = (0..I).map(|j| hidden[j] * d[r * I + j]).sum();
-                    expected[s_i * H + r] += weight * v;
-                }
-            }
-        }
-
-        // Stage the SLICES of the same value streams per expert.
-        let mut pairs: Vec<(
-            petgraph::graph::NodeIndex,
-            luminal::buffer_tensor_ir::TypedBuffer,
-        )> = vec![
-            (x.id, x_vals.into()),
-            (moe.router.weight.id, router_vals.into()),
+        let score_values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 1.0];
+        let id_values = vec![2, 0, 1, 2];
+        let input_values = vec![1.0, 2.0, -1.0, 3.0];
+        let expert_values = vec![
+            1.0, 0.0, 0.0, 1.0, // expert 0
+            2.0, 0.0, 0.0, 2.0, // expert 1
+            1.0, 1.0, 1.0, -1.0, // expert 2
         ];
-        for (e, (gate, up, down)) in per_expert.iter().enumerate() {
-            let fused = &gate_up_vals[e * 2 * I * H..(e + 1) * 2 * I * H];
-            pairs.push((gate.id, fused[..I * H].to_vec().into()));
-            pairs.push((up.id, fused[I * H..].to_vec().into()));
-            pairs.push((
-                down.id,
-                down_vals[e * H * I..(e + 1) * H * I].to_vec().into(),
-            ));
-        }
-        let rt = luminal_reference::harness::run_reference(&cx, &pairs);
-        assert_close(rt.get_f32(out.id).expect("moe out"), &expected);
+        let expected = vec![2.5, -0.25, -4.0 / 3.0, 13.0 / 3.0];
+
+        let runtime = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (scores.id, score_values.into()),
+                (expert_ids.id, id_values.into()),
+                (input.id, input_values.into()),
+                (expert_weights.id, expert_values.into()),
+            ],
+        );
+        assert_close(runtime.get_f32(output.id).expect("output"), &expected);
+    }
+
+    #[test]
+    fn top_k_routes_preserve_all_token_axes() {
+        let mut cx = Graph::new();
+        let expert_ids = cx.tensor((2, 3, 2), DType::Int);
+        let weights = cx.tensor((2, 3, 2), DType::F32);
+        let routes = TopKRoutes::new(expert_ids, weights);
+
+        let dispatched = routes.dispatch(cx.tensor((2, 3, 4), DType::F32));
+        let selected = routes.select(cx.tensor((5, 4, 6), DType::F32));
+        let combined = routes.combine(cx.tensor((2, 3, 2, 7), DType::F32));
+
+        let concrete = |tensor: GraphTensor| {
+            tensor
+                .dims()
+                .iter()
+                .map(|dim| dim.to_usize().expect("static test dimension"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(concrete(dispatched), vec![2, 3, 2, 4]);
+        assert_eq!(concrete(selected), vec![2, 3, 2, 4, 6]);
+        assert_eq!(concrete(combined), vec![2, 3, 7]);
+    }
+
+    #[test]
+    fn general_routes_scatter_into_slots_then_sum() {
+        const TOKENS: usize = 3;
+        const EXPERTS: usize = 2;
+        const ROUTES: usize = 5;
+        const SLOTS: usize = 2;
+        const WIDTH: usize = 2;
+
+        let mut cx = Graph::new();
+        let token_ids = cx.tensor(ROUTES, DType::Int);
+        let expert_ids = cx.tensor(ROUTES, DType::Int);
+        let slot_ids = cx.tensor(ROUTES, DType::Int);
+        let weights = cx.tensor(ROUTES, DType::F32);
+        let input = cx.tensor((TOKENS, WIDTH), DType::F32);
+        let expert_weights = cx.tensor((EXPERTS, WIDTH, WIDTH), DType::F32);
+
+        let routes = Routes::new(token_ids, expert_ids, slot_ids, weights, TOKENS, SLOTS);
+        let dispatched = routes.dispatch(input);
+        let selected = routes.select(expert_weights);
+        let routed = dispatched.unsqueeze(1).matmul(selected).squeeze(1);
+        let output = routes.combine(routed).output();
+
+        let token_values = vec![2, 0, 1, 2, 0];
+        let expert_values = vec![1, 0, 1, 0, 1];
+        let slot_values = vec![1, 0, 0, 0, 1];
+        let weight_values = vec![0.4, 0.25, 1.0, 0.6, 0.75];
+        let input_values = vec![1.0, 2.0, -1.0, 3.0, 2.0, -2.0];
+        let matrix_values = vec![
+            1.0, 0.0, 0.0, 1.0, // expert 0: identity
+            2.0, 0.0, 0.0, 2.0, // expert 1: 2 * identity
+        ];
+        let expected = vec![1.75, 3.5, -2.0, 6.0, 2.8, -2.8];
+
+        let runtime = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (token_ids.id, token_values.into()),
+                (expert_ids.id, expert_values.into()),
+                (slot_ids.id, slot_values.into()),
+                (weights.id, weight_values.into()),
+                (input.id, input_values.into()),
+                (expert_weights.id, matrix_values.into()),
+            ],
+        );
+        assert_close(runtime.get_f32(output.id).expect("output"), &expected);
+    }
+
+    #[test]
+    fn top_k_routes_convert_to_general_routes() {
+        const TOKENS: usize = 2;
+        const K: usize = 2;
+        const WIDTH: usize = 2;
+
+        let mut cx = Graph::new();
+        let expert_ids = cx.tensor((TOKENS, K), DType::Int);
+        let weights = cx.tensor((TOKENS, K), DType::F32);
+        let routed = cx.tensor((TOKENS, K, WIDTH), DType::F32);
+        let top_k = TopKRoutes::new(expert_ids, weights);
+        let structured = top_k.combine(routed).output();
+        let general = top_k
+            .into_routes()
+            .combine(routed.merge_dims(0, 1))
+            .output();
+
+        let runtime = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (expert_ids.id, vec![0, 1, 1, 0].into()),
+                (weights.id, vec![0.25, 0.75, 0.6, 0.4].into()),
+                (
+                    routed.id,
+                    vec![1.0, 2.0, 3.0, 4.0, -1.0, 2.0, 5.0, 1.0].into(),
+                ),
+            ],
+        );
+        assert_close(
+            runtime.get_f32(general.id).expect("general output"),
+            runtime.get_f32(structured.id).expect("structured output"),
+        );
     }
 }

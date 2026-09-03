@@ -666,11 +666,6 @@ impl ReferenceRuntime {
         self.get_typed(self.output_buffer(tensor)?)?.as_i16()
     }
 
-    /// Buffer-id read for search internals.
-    pub fn get_f32_buffer(&self, buffer: i64) -> Result<&Vec<f32>> {
-        self.get_typed(buffer)?.as_f32()
-    }
-
     fn output_buffer(&self, tensor: petgraph::graph::NodeIndex) -> Result<i64> {
         self.output_buffers
             .get(&tensor)
@@ -823,10 +818,10 @@ mod tests {
     fn differential_simple_elementwise_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let b = cx.tensor(3);
-            let c = cx.tensor(3);
-            let g = cx.tensor(3);
-            let e = cx.tensor(3);
+            let b = cx.tensor(3, DType::F32);
+            let c = cx.tensor(3, DType::F32);
+            let g = cx.tensor(3, DType::F32);
+            let e = cx.tensor(3, DType::F32);
             let a = (b * c + g).output();
             let d = (b * c / e).sin().output();
             (cx, b, c, g, e, a, d)
@@ -859,8 +854,8 @@ mod tests {
     fn differential_permuted_mul_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor((2, 3));
-            let y = cx.tensor((3, 2));
+            let x = cx.tensor((2, 3), DType::F32);
+            let y = cx.tensor((3, 2), DType::F32);
             let out = (x.permute((1, 0)) * y).output();
             (cx, x, y, out)
         };
@@ -880,8 +875,8 @@ mod tests {
     fn differential_subtraction_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor(4);
-            let y = cx.tensor(4);
+            let x = cx.tensor(4, DType::F32);
+            let y = cx.tensor(4, DType::F32);
             let out = (x - y).output();
             (cx, x, y, out)
         };
@@ -902,8 +897,8 @@ mod tests {
     fn differential_matmul_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let a = cx.tensor((2, 3));
-            let b = cx.tensor((3, 4));
+            let a = cx.tensor((2, 3), DType::F32);
+            let b = cx.tensor((3, 4), DType::F32);
             let c = a.matmul(b).output();
             (cx, a, b, c)
         };
@@ -927,8 +922,8 @@ mod tests {
             let build = |dim: usize| {
                 let mut cx = Graph::new();
                 cx.set_dim('a', dim);
-                let x = cx.tensor(('a', 2));
-                let y = cx.tensor(('a', 2));
+                let x = cx.tensor(('a', 2), DType::F32);
+                let y = cx.tensor(('a', 2), DType::F32);
                 let out = (x * y).output();
                 (cx, x, y, out)
             };
@@ -967,7 +962,7 @@ mod tests {
     fn differential_slice_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor(8);
+            let x = cx.tensor(8, DType::F32);
             let out = (x.slice(2..6) + x.slice(1..5)).output();
             (cx, x, out)
         };
@@ -997,7 +992,7 @@ mod tests {
     fn differential_two_dim_slice_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor((4, 5));
+            let x = cx.tensor((4, 5), DType::F32);
             let out = x.slice((1..3, 2..5)).output();
             (cx, x, out)
         };
@@ -1027,9 +1022,9 @@ mod tests {
     fn differential_unfold_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor(8);
+            let x = cx.tensor(8, DType::F32);
             let plain = x.unfold(3, 2, 1).output(); // windows at 0,2,4
-            let y = cx.tensor(10);
+            let y = cx.tensor(10, DType::F32);
             let dilated = y.unfold(3, 2, 2).output(); // effective window 5
             (cx, x, y, plain, dilated)
         };
@@ -1065,7 +1060,7 @@ mod tests {
         for fill in [0.0f32, 2.5f32] {
             let build = |fill: f32| {
                 let mut cx = Graph::new();
-                let x = cx.tensor(4);
+                let x = cx.tensor(4, DType::F32);
                 let out = x.pad((1, 2), fill).output();
                 (cx, x, out)
             };
@@ -1101,7 +1096,7 @@ mod tests {
         for fill in [0.0f32, -1.5f32] {
             let build = |fill: f32| {
                 let mut cx = Graph::new();
-                let x = cx.tensor((3, 4));
+                let x = cx.tensor((3, 4), DType::F32);
                 let out = x.pad(((1, 0), (2, 1)), fill).output();
                 (cx, x, out)
             };
@@ -1143,9 +1138,9 @@ mod tests {
     fn differential_native_coordinate_gather() {
         let build = || {
             let mut cx = Graph::new();
-            let data = cx.tensor((3, 4));
-            let row = cx.tensor_dtyped((2, 3), luminal::dtype::DType::Int);
-            let col = cx.tensor_dtyped((2, 3), luminal::dtype::DType::Int);
+            let data = cx.tensor((3, 4), DType::F32);
+            let row = cx.tensor((2, 3), luminal::dtype::DType::Int);
+            let col = cx.tensor((2, 3), luminal::dtype::DType::Int);
             let out = data.gather(&[row, col]).output();
             (cx, data, row, col, out)
         };
@@ -1185,10 +1180,10 @@ mod tests {
     fn differential_native_coordinate_scatter() {
         let build = || {
             let mut cx = Graph::new();
-            let dest = cx.tensor((3, 4));
-            let row = cx.tensor_dtyped(4, luminal::dtype::DType::Int);
-            let col = cx.tensor_dtyped(4, luminal::dtype::DType::Int);
-            let src = cx.tensor(4);
+            let dest = cx.tensor((3, 4), DType::F32);
+            let row = cx.tensor(4, luminal::dtype::DType::Int);
+            let col = cx.tensor(4, luminal::dtype::DType::Int);
+            let src = cx.tensor(4, DType::F32);
             let out = dest.scatter(&[row, col], src).output();
             (cx, dest, row, col, src, out)
         };
@@ -1230,8 +1225,8 @@ mod tests {
     #[test]
     fn differential_flat_gather1d_sugar() {
         let mut cx = Graph::new();
-        let data = cx.tensor((3, 4));
-        let idx = cx.tensor_dtyped((2, 3), luminal::dtype::DType::Int);
+        let data = cx.tensor((3, 4), DType::F32);
+        let idx = cx.tensor((2, 3), luminal::dtype::DType::Int);
         let out = data.gather1d(idx).output();
         assert_eq!(out.dims(), idx.dims(), "out shape = index shape");
 
@@ -1262,9 +1257,9 @@ mod tests {
     #[test]
     fn differential_flat_scatter1d_sugar() {
         let mut cx = Graph::new();
-        let dest = cx.tensor((2, 6));
-        let idx = cx.tensor_dtyped(4, luminal::dtype::DType::Int);
-        let src = cx.tensor(4);
+        let dest = cx.tensor((2, 6), DType::F32);
+        let idx = cx.tensor(4, luminal::dtype::DType::Int);
+        let src = cx.tensor(4, DType::F32);
         let out = src.scatter1d(idx, dest).output();
         assert_eq!(out.dims(), dest.dims(), "out shape = dest shape");
 
@@ -1359,8 +1354,8 @@ mod tests {
     #[test]
     fn differential_gather_elements_axis1() {
         let mut cx = Graph::new();
-        let data = cx.tensor((2, 3));
-        let idx = cx.tensor_dtyped((2, 2), luminal::dtype::DType::Int);
+        let data = cx.tensor((2, 3), DType::F32);
+        let idx = cx.tensor((2, 2), luminal::dtype::DType::Int);
         let out = data.gather_elements(idx, 1).output();
 
         let data_vals: Vec<f32> = (0..6).map(|v| v as f32 * 10.0).collect();
@@ -1387,9 +1382,9 @@ mod tests {
     #[test]
     fn differential_scatter_elements_axis0() {
         let mut cx = Graph::new();
-        let data = cx.tensor((3, 2));
-        let idx = cx.tensor_dtyped((1, 2), luminal::dtype::DType::Int);
-        let upd = cx.tensor((1, 2));
+        let data = cx.tensor((3, 2), DType::F32);
+        let idx = cx.tensor((1, 2), luminal::dtype::DType::Int);
+        let upd = cx.tensor((1, 2), DType::F32);
         let out = data.scatter_elements(idx, upd, 0).output();
         assert_eq!(out.dims(), data.dims());
 
@@ -1419,9 +1414,9 @@ mod tests {
     #[test]
     fn differential_scatter_nd_row_case() {
         let mut cx = Graph::new();
-        let data = cx.tensor((3, 2));
-        let idx = cx.tensor_dtyped((2, 1), luminal::dtype::DType::Int);
-        let upd = cx.tensor((2, 2));
+        let data = cx.tensor((3, 2), DType::F32);
+        let idx = cx.tensor((2, 1), luminal::dtype::DType::Int);
+        let upd = cx.tensor((2, 2), DType::F32);
         let out = data.scatter_nd(idx, upd).output();
         assert_eq!(out.dims(), data.dims());
 
@@ -1451,9 +1446,9 @@ mod tests {
     #[test]
     fn scatter_conflicting_writes_panic() {
         let mut cx = Graph::new();
-        let dest = cx.tensor(6);
-        let idx = cx.tensor_dtyped(3, luminal::dtype::DType::Int);
-        let src = cx.tensor(3);
+        let dest = cx.tensor(6, DType::F32);
+        let idx = cx.tensor(3, luminal::dtype::DType::Int);
+        let src = cx.tensor(3, DType::F32);
         let out = src.scatter1d(idx, dest).output();
 
         let (pre, input_slots, output_slots, post, _labeled) = cx
@@ -1515,7 +1510,7 @@ mod tests {
     #[test]
     fn recorder_poisons_refuse_loudly() {
         let mut cx = Graph::new();
-        let x = cx.tensor((2, 3));
+        let x = cx.tensor((2, 3), DType::F32);
         let _out = x.output();
         cx.logical
             .poison("synthetic guard tripped at t0 (mechanism test)".to_string());
@@ -1537,10 +1532,10 @@ mod tests {
     fn differential_native_recorder_simple_elementwise() {
         let build = || {
             let mut cx = Graph::new();
-            let b = cx.tensor(3);
-            let c = cx.tensor(3);
-            let g = cx.tensor(3);
-            let e = cx.tensor(3);
+            let b = cx.tensor(3, DType::F32);
+            let c = cx.tensor(3, DType::F32);
+            let g = cx.tensor(3, DType::F32);
+            let e = cx.tensor(3, DType::F32);
             let a = (b * c + g).output();
             let d = (b * c / e).sin().output();
             (cx, b, c, g, e, a, d)
@@ -1581,8 +1576,8 @@ mod tests {
         use luminal::dtype::DType;
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor((2, 3));
-            let y = cx.tensor((2, 3));
+            let x = cx.tensor((2, 3), DType::F32);
+            let y = cx.tensor((2, 3), DType::F32);
             let out = (x.lt(y).cast(DType::F32) * 3.0 + 1.0).output();
             (cx, x, y, out)
         };
@@ -1614,8 +1609,8 @@ mod tests {
     fn differential_bool8_boundary_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor((2, 3));
-            let y = cx.tensor((2, 3));
+            let x = cx.tensor((2, 3), DType::F32);
+            let y = cx.tensor((2, 3), DType::F32);
             let out = x.lt(y).output();
             (cx, x, y, out)
         };
@@ -1659,14 +1654,14 @@ mod tests {
     fn differential_reshapes_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let a = cx.tensor(12);
-            let b = cx.tensor((3, 4));
+            let a = cx.tensor(12, DType::F32);
+            let b = cx.tensor((3, 4), DType::F32);
             let split_out = (a.split_dims(0, 4) * b).output(); // [12] -> [3,4]
-            let c = cx.tensor((3, 4));
-            let d = cx.tensor(12);
+            let c = cx.tensor((3, 4), DType::F32);
+            let d = cx.tensor(12, DType::F32);
             let merge_out = (c.merge_dims(0, 1) * d).output(); // [3,4] -> [12]
-            let e = cx.tensor((2, 3, 2));
-            let f = cx.tensor(12);
+            let e = cx.tensor((2, 3, 2), DType::F32);
+            let f = cx.tensor(12, DType::F32);
             let flatten_out = (e.flatten() * f).output(); // [2,3,2] -> [12]
             (cx, a, b, c, d, e, f, split_out, merge_out, flatten_out)
         };
@@ -1712,8 +1707,8 @@ mod tests {
     fn differential_repeat_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor(3);
-            let y = cx.tensor(12);
+            let x = cx.tensor(3, DType::F32);
+            let y = cx.tensor(12, DType::F32);
             let out = (x.repeat(4) * y).output();
             (cx, x, y, out)
         };
@@ -1735,7 +1730,7 @@ mod tests {
     fn differential_sum_reduce_against_reference_runtime() {
         let build = || {
             let mut cx = Graph::new();
-            let x = cx.tensor((2, 3));
+            let x = cx.tensor((2, 3), DType::F32);
             let s = x.sum(0).output();
             (cx, x, s)
         };
@@ -1762,8 +1757,8 @@ mod tests {
     #[test]
     fn narrow_int_add_wraps_at_its_own_width() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(2, DType::I8);
-        let b = cx.tensor_dtyped(2, DType::I8);
+        let a = cx.tensor(2, DType::I8);
+        let b = cx.tensor(2, DType::I8);
         let out = (a + b).output();
         let rt = crate::harness::run_reference(
             &cx,
@@ -1775,8 +1770,8 @@ mod tests {
         assert_eq!(rt.get_i8(out.id).unwrap(), &vec![-128i8, 127]);
 
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(2, DType::U8);
-        let b = cx.tensor_dtyped(2, DType::U8);
+        let a = cx.tensor(2, DType::U8);
+        let b = cx.tensor(2, DType::U8);
         let out = (a + b).output();
         let rt = crate::harness::run_reference(
             &cx,
@@ -1788,8 +1783,8 @@ mod tests {
         assert_eq!(rt.get_u8(out.id).unwrap(), &vec![0u8, 255]);
 
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(2, DType::I16);
-        let b = cx.tensor_dtyped(2, DType::I16);
+        let a = cx.tensor(2, DType::I16);
+        let b = cx.tensor(2, DType::I16);
         let out = (a + b).output();
         let rt = crate::harness::run_reference(
             &cx,
@@ -1812,7 +1807,7 @@ mod tests {
         let source = vec![-32_769i32, -129, -128, -1, 0, 127, 128, 255, 256];
 
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(9, DType::Int);
+        let x = cx.tensor(9, DType::Int);
         let out = x.cast(DType::I8).output();
         let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
         assert_eq!(
@@ -1821,7 +1816,7 @@ mod tests {
         );
 
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(9, DType::Int);
+        let x = cx.tensor(9, DType::Int);
         let out = x.cast(DType::U8).output();
         let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
         assert_eq!(
@@ -1830,7 +1825,7 @@ mod tests {
         );
 
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(9, DType::Int);
+        let x = cx.tensor(9, DType::Int);
         let out = x.cast(DType::I16).output();
         let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
         assert_eq!(
@@ -1840,7 +1835,7 @@ mod tests {
 
         // The wide half of the policy, unchanged by the carve-out.
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(1, DType::I64);
+        let x = cx.tensor(1, DType::I64);
         let _out = x.cast(DType::Int).output();
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
@@ -1868,7 +1863,7 @@ mod tests {
     #[test]
     fn integer_abs_executes_and_wraps_at_the_signed_minimum() {
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(4, DType::I16);
+        let x = cx.tensor(4, DType::I16);
         let out = x.abs().output();
         let rt = crate::harness::run_reference(
             &cx,
@@ -1879,7 +1874,7 @@ mod tests {
         // Int stays proof-gated (2026-08-11), so the caller attests the
         // range; inside it the answer is exact.
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(4, DType::Int);
+        let x = cx.tensor(4, DType::Int);
         let out = x.abs().output();
         let rt = crate::harness::run_reference_with_ranges(
             &cx,
@@ -1899,7 +1894,7 @@ mod tests {
     fn float_to_narrow_int_cast_is_refused_at_authoring() {
         let refusal = std::panic::catch_unwind(|| {
             let mut cx = luminal::graph::Graph::new();
-            let x = cx.tensor_dtyped(4, DType::F32);
+            let x = cx.tensor(4, DType::F32);
             let _ = x.cast(DType::I8);
         })
         .unwrap_err();
@@ -1929,7 +1924,7 @@ mod tests {
     #[test]
     fn f64_unary_round_trips_exactly() {
         let mut cx = luminal::graph::Graph::new();
-        let x = cx.tensor_dtyped(4, DType::F64);
+        let x = cx.tensor(4, DType::F64);
         let out = x.sqrt().output();
 
         let values = vec![2.0f64, 3.0, 0.1, 1e300];
@@ -1965,8 +1960,8 @@ mod tests {
     #[test]
     fn differential_bool8_input_staging() {
         let mut cx = luminal::graph::Graph::new();
-        let mask = cx.tensor_dtyped(4, DType::Bool);
-        let x = cx.tensor(4);
+        let mask = cx.tensor(4, DType::Bool);
+        let x = cx.tensor(4, DType::F32);
         let out = (mask.cast(DType::F32) * x).output();
 
         let x_vals = vec![2.0f32, 3.0, 5.0, 7.0];
@@ -1981,8 +1976,8 @@ mod tests {
 
         // (b) staging never converts: f32 into the boolean buffer refuses
         let mut cx2 = luminal::graph::Graph::new();
-        let mask2 = cx2.tensor_dtyped(4, DType::Bool);
-        let x2 = cx2.tensor(4);
+        let mask2 = cx2.tensor(4, DType::Bool);
+        let x2 = cx2.tensor(4, DType::F32);
         let out2 = (mask2.cast(DType::F32) * x2).output();
         let _ = out2;
         let mut rt2 = ReferenceRuntime::load(&cx2).expect("native load");
@@ -2006,7 +2001,7 @@ mod tests {
     #[test]
     fn differential_int_output_reads_native() {
         let mut cx = luminal::graph::Graph::new();
-        let idx = cx.tensor_dtyped(5, DType::Int);
+        let idx = cx.tensor(5, DType::Int);
         let out = (idx * 3usize).output();
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(idx.id, 0, 4).expect("range binds");
@@ -2030,8 +2025,8 @@ mod tests {
     fn int_add_proof_gating() {
         // Act 1: unproven plain add refuses at search.
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(1, DType::Int);
-        let b = cx.tensor_dtyped(1, DType::Int);
+        let a = cx.tensor(1, DType::Int);
+        let b = cx.tensor(1, DType::Int);
         let _out = (a + b).output();
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();
@@ -2053,8 +2048,8 @@ mod tests {
 
         // Act 2: the same graph under declared value ranges proves and runs.
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(1, DType::Int);
-        let b = cx.tensor_dtyped(1, DType::Int);
+        let a = cx.tensor(1, DType::Int);
+        let b = cx.tensor(1, DType::Int);
         let out = (a + b).output();
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(a.id, 0, 1000).expect("range binds");
@@ -2074,8 +2069,8 @@ mod tests {
     #[test]
     fn trunc_div_gating() {
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(4, DType::Int);
-        let b = cx.tensor_dtyped(4, DType::Int);
+        let a = cx.tensor(4, DType::Int);
+        let b = cx.tensor(4, DType::Int);
         let out = a.trunc_div(b).output();
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         rt.bind_value_range(a.id, -100, 100).expect("range binds");
@@ -2093,8 +2088,8 @@ mod tests {
         // Without the divisor attestation the same graph REFUSES: the
         // bounds admit zero, so no implementation exists to find.
         let mut cx = luminal::graph::Graph::new();
-        let a = cx.tensor_dtyped(1, DType::Int);
-        let b = cx.tensor_dtyped(1, DType::Int);
+        let a = cx.tensor(1, DType::Int);
+        let b = cx.tensor(1, DType::Int);
         let _out = a.trunc_div(b).output();
         let mut rt = ReferenceRuntime::load(&cx).expect("native load");
         let mut data = FxHashMap::default();

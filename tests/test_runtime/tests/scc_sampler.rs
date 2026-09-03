@@ -41,6 +41,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use luminal::dtype::DType;
 use luminal::extractor::{edges_have_cycle, ExtractionSession, Genome, SamplingSpace};
 use luminal::graph::Graph;
 use luminal::implementation_search::{
@@ -407,8 +408,8 @@ fn marker_matmul_components_span_different_logical_values() {
 /// The 2D canonical matmul the round-11 marker matches: A[4,8] . B[8,3].
 fn marker_matmul_program() -> String {
     let mut cx = Graph::new();
-    let a = cx.tensor((4usize, 8usize));
-    let b = cx.tensor((8usize, 3usize));
+    let a = cx.tensor((4usize, 8usize), DType::F32);
+    let b = cx.tensor((8usize, 3usize), DType::F32);
     let _out = a.matmul(b).output();
     cx.logical
         .bound_program(&test_runtime::TestRuntimeBindings)
@@ -431,9 +432,9 @@ fn marker_matmul_program() -> String {
 /// BEFORE the schedule so saturation sees it.
 fn re_description_program() -> String {
     let mut cx = Graph::new();
-    let x = cx.tensor(4usize);
-    let y = cx.tensor(4usize);
-    let z = cx.tensor(4usize);
+    let x = cx.tensor(4usize, DType::F32);
+    let y = cx.tensor(4usize, DType::F32);
+    let z = cx.tensor(4usize, DType::F32);
     let a = x + y;
     let b = a - x;
     let c = z + b;

@@ -1,9 +1,14 @@
-//! MiniDit — the backend-neutral FLUX.2 family model definition.
-//!
-//! Runtime applications and execution smoke tests live in runtime crates.
+//! MiniDit — the flux2 family mini MODEL DEFINITION (relocated out of
+//! luminal_nn 2026-08-13: model definitions live in their example
+//! crates; luminal_nn keeps only the building blocks). The runner in
+//! src/main.rs drives one denoising velocity prediction; the scalar
+//! fidelity test lives in tests/fidelity.rs.
 
+#[path = "../../../common/model_support.rs"]
+mod model_support;
+
+use crate::model_support::{scatter_rows, LayerNorm, Linear, Namespace};
 use luminal::prelude::*;
-use luminal_nn::{scatter_rows, LayerNorm, Linear};
 
 /// MiniDit — the flux2 family mini. Family-unique constructs carried
 /// faithfully: sinusoidal t/guidance conditioning summed through SiLU
@@ -76,45 +81,230 @@ impl MiniDit {
     ) -> Self {
         let head_dim = d / n_heads;
         Self {
-            x_embed: Linear::new(in_channels, d, false, &Ns::root().child("x_embed"), cx),
-            ctx_embed: Linear::new(txt_dim, d, false, &Ns::root().child("ctx_embed"), cx),
-            t_mlp1: Linear::new(2 * t_half, d, false, &Ns::root().child("t_mlp1"), cx),
-            t_mlp2: Linear::new(d, d, false, &Ns::root().child("t_mlp2"), cx),
-            g_mlp1: Linear::new(2 * t_half, d, false, &Ns::root().child("g_mlp1"), cx),
-            g_mlp2: Linear::new(d, d, false, &Ns::root().child("g_mlp2"), cx),
-            mod_img: Linear::new(d, 6 * d, false, &Ns::root().child("mod_img"), cx),
-            mod_txt: Linear::new(d, 6 * d, false, &Ns::root().child("mod_txt"), cx),
-            mod_single: Linear::new(d, 3 * d, false, &Ns::root().child("mod_single"), cx),
-            norm_out: Linear::new(d, 2 * d, false, &Ns::root().child("norm_out"), cx),
-            proj_out: Linear::new(d, in_channels, false, &Ns::root().child("proj_out"), cx),
-            img_q: Linear::new(d, d, false, &Ns::root().child("img_q"), cx),
-            img_k: Linear::new(d, d, false, &Ns::root().child("img_k"), cx),
-            img_v: Linear::new(d, d, false, &Ns::root().child("img_v"), cx),
-            img_out: Linear::new(d, d, false, &Ns::root().child("img_out"), cx),
-            txt_q: Linear::new(d, d, false, &Ns::root().child("txt_q"), cx),
-            txt_k: Linear::new(d, d, false, &Ns::root().child("txt_k"), cx),
-            txt_v: Linear::new(d, d, false, &Ns::root().child("txt_v"), cx),
-            txt_out: Linear::new(d, d, false, &Ns::root().child("txt_out"), cx),
-            img_qnorm: cx.named_tensor("ImgQNorm", head_dim),
-            img_knorm: cx.named_tensor("ImgKNorm", head_dim),
-            txt_qnorm: cx.named_tensor("TxtQNorm", head_dim),
-            txt_knorm: cx.named_tensor("TxtKNorm", head_dim),
-            ff_in: Linear::new(d, 2 * mlp, false, &Ns::root().child("ff_in"), cx),
-            ff_out: Linear::new(mlp, d, false, &Ns::root().child("ff_out"), cx),
-            ctx_ff_in: Linear::new(d, 2 * mlp, false, &Ns::root().child("ctx_ff_in"), cx),
-            ctx_ff_out: Linear::new(mlp, d, false, &Ns::root().child("ctx_ff_out"), cx),
+            x_embed: Linear::new(
+                in_channels,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("x_embed"),
+                cx,
+            ),
+            ctx_embed: Linear::new(
+                txt_dim,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("ctx_embed"),
+                cx,
+            ),
+            t_mlp1: Linear::new(
+                2 * t_half,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("t_mlp1"),
+                cx,
+            ),
+            t_mlp2: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("t_mlp2"),
+                cx,
+            ),
+            g_mlp1: Linear::new(
+                2 * t_half,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("g_mlp1"),
+                cx,
+            ),
+            g_mlp2: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("g_mlp2"),
+                cx,
+            ),
+            mod_img: Linear::new(
+                d,
+                6 * d,
+                false,
+                DType::F32,
+                &Namespace::root().child("mod_img"),
+                cx,
+            ),
+            mod_txt: Linear::new(
+                d,
+                6 * d,
+                false,
+                DType::F32,
+                &Namespace::root().child("mod_txt"),
+                cx,
+            ),
+            mod_single: Linear::new(
+                d,
+                3 * d,
+                false,
+                DType::F32,
+                &Namespace::root().child("mod_single"),
+                cx,
+            ),
+            norm_out: Linear::new(
+                d,
+                2 * d,
+                false,
+                DType::F32,
+                &Namespace::root().child("norm_out"),
+                cx,
+            ),
+            proj_out: Linear::new(
+                d,
+                in_channels,
+                false,
+                DType::F32,
+                &Namespace::root().child("proj_out"),
+                cx,
+            ),
+            img_q: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("img_q"),
+                cx,
+            ),
+            img_k: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("img_k"),
+                cx,
+            ),
+            img_v: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("img_v"),
+                cx,
+            ),
+            img_out: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("img_out"),
+                cx,
+            ),
+            txt_q: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("txt_q"),
+                cx,
+            ),
+            txt_k: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("txt_k"),
+                cx,
+            ),
+            txt_v: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("txt_v"),
+                cx,
+            ),
+            txt_out: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("txt_out"),
+                cx,
+            ),
+            img_qnorm: cx.named_tensor("ImgQNorm", head_dim, DType::F32),
+            img_knorm: cx.named_tensor("ImgKNorm", head_dim, DType::F32),
+            txt_qnorm: cx.named_tensor("TxtQNorm", head_dim, DType::F32),
+            txt_knorm: cx.named_tensor("TxtKNorm", head_dim, DType::F32),
+            ff_in: Linear::new(
+                d,
+                2 * mlp,
+                false,
+                DType::F32,
+                &Namespace::root().child("ff_in"),
+                cx,
+            ),
+            ff_out: Linear::new(
+                mlp,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("ff_out"),
+                cx,
+            ),
+            ctx_ff_in: Linear::new(
+                d,
+                2 * mlp,
+                false,
+                DType::F32,
+                &Namespace::root().child("ctx_ff_in"),
+                cx,
+            ),
+            ctx_ff_out: Linear::new(
+                mlp,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("ctx_ff_out"),
+                cx,
+            ),
             single_proj: Linear::new(
                 d,
                 3 * d + 2 * mlp,
                 false,
-                &Ns::root().child("single_proj"),
+                DType::F32,
+                &Namespace::root().child("single_proj"),
                 cx,
             ),
-            single_out_attn: Linear::new(d, d, false, &Ns::root().child("single_out_attn"), cx),
-            single_out_mlp: Linear::new(mlp, d, false, &Ns::root().child("single_out_mlp"), cx),
-            single_qnorm: cx.named_tensor("SglQNorm", head_dim),
-            single_knorm: cx.named_tensor("SglKNorm", head_dim),
-            ln: LayerNorm::new(d, false, false, true, 1e-6, &Ns::root().child("ln"), cx),
+            single_out_attn: Linear::new(
+                d,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("single_out_attn"),
+                cx,
+            ),
+            single_out_mlp: Linear::new(
+                mlp,
+                d,
+                false,
+                DType::F32,
+                &Namespace::root().child("single_out_mlp"),
+                cx,
+            ),
+            single_qnorm: cx.named_tensor("SglQNorm", head_dim, DType::F32),
+            single_knorm: cx.named_tensor("SglKNorm", head_dim, DType::F32),
+            ln: LayerNorm::new(
+                d,
+                false,
+                false,
+                true,
+                1e-6,
+                DType::F32,
+                &Namespace::root().child("ln"),
+                cx,
+            ),
             d,
             head_dim,
             mlp,
@@ -186,24 +376,13 @@ impl MiniDit {
             let dims = x.dims();
             x * g.expand(dims)
         };
-        // ONE apply per reshape/broadcast construct (ruling 2026-08-26).
-        let heads = |x: GraphTensor| {
-            x.view()
-                .split_dims(1, self.head_dim)
-                .permute((1, 0, 2))
-                .finish()
-        }; // (H,S,hd)
-        let unheads = |x: GraphTensor| x.view().permute((1, 0, 2)).merge_dims(1, 2).finish(); // (S,d)
+        let heads = |x: GraphTensor| x.split_dims(1, self.head_dim).permute((1, 0, 2)); // (H,S,hd)
+        let unheads = |x: GraphTensor| x.permute((1, 0, 2)).merge_dims(1, 2); // (S,d)
         let head_rms = |x: GraphTensor, weight: GraphTensor| {
             let dims = x.dims();
             let inv = ((x * x).mean(2) + 1e-6).sqrt().reciprocal(); // (H,S)
-            x * inv.view().unsqueeze(2).expand(dims.clone()).finish()
-                * weight
-                    .view()
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                    .expand(dims)
-                    .finish()
+            x * inv.unsqueeze(2).expand(dims.clone())
+                * weight.unsqueeze(0).unsqueeze(0).expand(dims)
         };
         let rope = |x: GraphTensor| {
             // Interleaved-pair rotation via the pairing matrix — the
@@ -211,8 +390,8 @@ impl MiniDit {
             // rope(x) = x ⊙ cos + (x @ R) ⊙ sin on (H, S, hd).
             let dims = x.dims();
             let rotated = x.matmul(rope_rot);
-            x * rope_cos.view().unsqueeze(0).expand(dims.clone()).finish()
-                + rotated * rope_sin.view().unsqueeze(0).expand(dims).finish()
+            x * rope_cos.unsqueeze(0).expand(dims.clone())
+                + rotated * rope_sin.unsqueeze(0).expand(dims)
         };
         let sdpa = |q: GraphTensor, k: GraphTensor, v: GraphTensor| {
             let scale = 1.0 / (self.head_dim as f32).sqrt();
@@ -278,8 +457,7 @@ impl MiniDit {
         let mut hidden = scatter_rows(
             img,
             img_positions,
-            scatter_rows(txt, txt_positions, joint_base, d),
-            d,
+            scatter_rows(txt, txt_positions, joint_base),
         ); // (s, d)
         let (s_shift, s_scale, s_gate) = triple(m_single, 0);
         let normed = ada(self.ln.forward(hidden), s_scale, s_shift);
@@ -322,10 +500,10 @@ pub fn mini_dit_rope_tables(s_txt: usize, h: usize, w: usize) -> (Vec<f32>, Vec<
     }
     let (mut cos, mut sin) = (Vec::new(), Vec::new());
     for id in ids {
-        for value in id {
+        for coordinate in id {
             for _ in 0..2 {
-                cos.push(value.cos());
-                sin.push(value.sin());
+                cos.push(coordinate.cos());
+                sin.push(coordinate.sin());
             }
         }
     }

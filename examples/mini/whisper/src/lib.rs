@@ -2,8 +2,11 @@
 //! ruling 2026-08-13: mini model definitions live in their example
 //! crates; luminal_nn keeps only the building blocks).
 
+#[path = "../../../common/model_support.rs"]
+mod model_support;
+
+use crate::model_support::{attention, LayerNorm, Linear, Namespace};
 use luminal::prelude::*;
-use luminal_nn::{attention, LayerNorm, Linear};
 
 /// The whisper-family mini: one encoder block (bidirectional
 /// self-attention, GELU FFN) and one decoder cross-attention block that
@@ -29,18 +32,37 @@ pub struct MiniWhisper {
 
 impl MiniWhisper {
     pub fn new(d: usize, ff: usize, n_heads: usize, cx: &mut Graph) -> Self {
-        let ns = Ns::root();
-        let linear =
-            |a, b, seg: &str, cx: &mut Graph| Linear::new(a, b, false, &Ns::root().child(seg), cx);
+        let ns = Namespace::root();
+        let linear = |a, b, seg: &str, cx: &mut Graph| {
+            Linear::new(a, b, false, DType::F32, &Namespace::root().child(seg), cx)
+        };
         Self {
-            enc_norm: LayerNorm::new(d, false, false, true, 1e-5, &ns.child("enc_norm"), cx),
+            enc_norm: LayerNorm::new(
+                d,
+                false,
+                false,
+                true,
+                1e-5,
+                DType::F32,
+                &ns.child("enc_norm"),
+                cx,
+            ),
             enc_wq: linear(d, d, "enc_wq", cx),
             enc_wk: linear(d, d, "enc_wk", cx),
             enc_wv: linear(d, d, "enc_wv", cx),
             enc_wo: linear(d, d, "enc_wo", cx),
             enc_up: linear(d, ff, "enc_up", cx),
             enc_down: linear(ff, d, "enc_down", cx),
-            dec_norm: LayerNorm::new(d, false, false, true, 1e-5, &ns.child("dec_norm"), cx),
+            dec_norm: LayerNorm::new(
+                d,
+                false,
+                false,
+                true,
+                1e-5,
+                DType::F32,
+                &ns.child("dec_norm"),
+                cx,
+            ),
             dec_wq: linear(d, d, "dec_wq", cx),
             dec_wk: linear(d, d, "dec_wk", cx),
             dec_wv: linear(d, d, "dec_wv", cx),

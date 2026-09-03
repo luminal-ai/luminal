@@ -20,6 +20,7 @@
 
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
@@ -33,8 +34,8 @@ fn weights(n: usize, seed: usize) -> Vec<f32> {
 #[test]
 fn canonical_2d_matmul_searches_green_at_the_harness_budget() {
     let mut cx = Graph::new();
-    let a = cx.tensor((4usize, 8usize));
-    let b = cx.tensor((8usize, 3usize));
+    let a = cx.tensor((4usize, 8usize), DType::F32);
+    let b = cx.tensor((8usize, 3usize), DType::F32);
     let _out = a.matmul(b).output();
 
     let mut rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");

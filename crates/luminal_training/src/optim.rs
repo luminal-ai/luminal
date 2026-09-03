@@ -16,8 +16,8 @@
 //! use luminal_training::{Backward, Optimizer, SGD};
 //!
 //! let mut cx = Graph::new();
-//! let w = cx.tensor((3, 4));
-//! let x = cx.tensor((2, 3));
+//! let w = cx.tensor((3, 4), DType::F32);
+//! let x = cx.tensor((2, 3), DType::F32);
 //! let loss = x.matmul(w).sum((0, 1));
 //! let grads = cx.backward(loss, &[w]);
 //! let opt = SGD::new(1e-2).momentum(0.9);
@@ -115,7 +115,7 @@ impl Optimizer for SGD {
         grads: &[GraphTensor],
     ) -> OptimizerStep {
         assert_eq!(params.len(), grads.len());
-        let lr = cx.tensor(());
+        let lr = cx.tensor((), DType::F32);
         let mut step = OptimizerStep {
             new_params: vec![],
             state_in: vec![],
@@ -130,7 +130,7 @@ impl Optimizer for SGD {
                 g_eff += *w * self.weight_decay;
             }
             let direction = if self.momentum != 0.0 {
-                let buf = cx.tensor(dims.clone());
+                let buf = cx.tensor(dims.clone(), DType::F32);
                 let buf_new = (buf * self.momentum + g_eff).output();
                 step.state_in.push(buf);
                 step.state_out.push(buf_new);
@@ -203,7 +203,7 @@ impl Optimizer for AdamW {
         grads: &[GraphTensor],
     ) -> OptimizerStep {
         assert_eq!(params.len(), grads.len());
-        let alpha_t = cx.tensor(());
+        let alpha_t = cx.tensor((), DType::F32);
         let mut step = OptimizerStep {
             new_params: vec![],
             state_in: vec![],
@@ -214,7 +214,7 @@ impl Optimizer for AdamW {
         // Decoupled decay uses the unscheduled base lr, fed separately so
         // schedules on α_t don't have to alter the decay strength.
         let lr = if self.weight_decay != 0.0 {
-            let lr = cx.tensor(());
+            let lr = cx.tensor((), DType::F32);
             step.scalar_in.push(lr);
             Some(lr)
         } else {
@@ -223,8 +223,8 @@ impl Optimizer for AdamW {
         for (w, g) in params.iter().zip(grads) {
             let dims = w.dims();
             let size = static_size(w);
-            let m_in = cx.tensor(dims.clone());
-            let v_in = cx.tensor(dims.clone());
+            let m_in = cx.tensor(dims.clone(), DType::F32);
+            let v_in = cx.tensor(dims.clone(), DType::F32);
             let m_new = (m_in * self.beta1 + *g * (1.0 - self.beta1)).output();
             let v_new = (v_in * self.beta2 + *g * *g * (1.0 - self.beta2)).output();
             let update = m_new / (v_new.sqrt() + self.eps);

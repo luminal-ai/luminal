@@ -1825,10 +1825,10 @@ mod tests {
         use crate::kernel::swiglu::fused_swiglu_quant;
 
         let mut cx = Graph::default();
-        let activation = cx.tensor_dtyped((1usize, 32usize), DType::Bf16);
-        let input_scale = cx.tensor(());
-        let weight_scale = cx.tensor(());
-        let weight = cx.tensor_dtyped((8usize, 16usize), DType::F8E4M3);
+        let activation = cx.tensor((1usize, 32usize), DType::Bf16);
+        let input_scale = cx.tensor((), DType::F32);
+        let weight_scale = cx.tensor((), DType::F32);
+        let weight = cx.tensor((8usize, 16usize), DType::F8E4M3);
         let quantized = fused_swiglu_quant(activation, 16, input_scale);
         let matmul = quantized.matmul(weight.t()).cast(DType::F32);
         (matmul * (input_scale * weight_scale).expand_rhs(matmul.dims())).output();

@@ -156,7 +156,7 @@
 ; has an injectivity fact (the strided no-overlap fold was deleted
 ; 2026-08-05), and assembly's gates would refuse every viewed reading.
 ;
-; WELD-SOUNDNESS NOTE: at extent 1 the map-entry spelling below can match
+; WELD SOUNDNESS: at extent 1 the map-entry spelling below can match
 ; maps welded into the transpose pattern's classes; every such match has
 ; the welded axis at extent 1, where the coordinate contributes a single
 ; value, so the matched map is still injective on its domain and the

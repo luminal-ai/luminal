@@ -10,11 +10,14 @@
 //! graph — faithful to the parked example), exact-erf GELU MLPs, and
 //! the TIED output head. No rope, no RMSNorm, no GQA.
 
+use crate::model_support::{
+    AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
+    causal_bias, paged_attention,
+};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::prelude::{GraphTensor, Ns};
+use luminal::prelude::GraphTensor;
 use luminal::shape::IntExpr;
-use luminal_nn::{Embedding, KvCachePool, LayerNorm, Linear};
 
 #[derive(Clone)]
 pub struct WhisperDims {
@@ -42,6 +45,21 @@ impl WhisperDims {
             text_ctx: 448,
             vocab: 51_864,
             ff: 1536,
+            eps: 1e-5,
+        }
+    }
+
+    pub fn tiny() -> Self {
+        Self {
+            n_mels: 4,
+            audio_ctx: 6,
+            state: 8,
+            heads: 2,
+            audio_layers: 2,
+            text_layers: 2,
+            text_ctx: 8,
+            vocab: 19,
+            ff: 12,
             eps: 1e-5,
         }
     }
@@ -91,12 +109,19 @@ pub struct WhisperAttn {
 }
 
 impl WhisperAttn {
-    fn new(ns: &Ns, d: &WhisperDims, cx: &mut Graph) -> Self {
+    fn new(ns: &Namespace, d: &WhisperDims, cx: &mut Graph) -> Self {
         Self {
-            q: Linear::new_permuted(d.state, d.state, true, &ns.child("q_proj"), cx),
-            k: Linear::new_permuted(d.state, d.state, false, &ns.child("k_proj"), cx),
-            v: Linear::new_permuted(d.state, d.state, true, &ns.child("v_proj"), cx),
-            out: Linear::new_permuted(d.state, d.state, true, &ns.child("out_proj"), cx),
+            q: Linear::new(d.state, d.state, true, DType::F32, &ns.child("q_proj"), cx),
+            k: Linear::new(d.state, d.state, false, DType::F32, &ns.child("k_proj"), cx),
+            v: Linear::new(d.state, d.state, true, DType::F32, &ns.child("v_proj"), cx),
+            out: Linear::new(
+                d.state,
+                d.state,
+                true,
+                DType::F32,
+                &ns.child("out_proj"),
+                cx,
+            ),
             heads: d.heads,
             head_dim: d.head_dim(),
         }
@@ -126,28 +151,25 @@ impl WhisperAttn {
         scatter_idx: GraphTensor,
         q_pos: GraphTensor,
     ) -> (GraphTensor, GraphTensor, GraphTensor) {
-        let (attn, k_cache, v_cache) = luminal_nn::paged_attention_positional(
-            self.q.forward(x),
+        let query = self.q.forward(x);
+        let context_positions = query.graph().arange(gather_idx.dims1());
+        let result = paged_attention(
+            query,
             self.k.forward(x),
             self.v.forward(x),
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            q_pos,
-            self.heads,
-            self.heads, // MHA: no KV grouping
-            self.head_dim,
-            None,
-            1.0 / (self.head_dim as f32).sqrt(),
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(q_pos, context_positions),
+            AttentionGeometry::new(self.heads, self.heads, self.head_dim),
         );
+        let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
         (self.out.forward(attn), k_cache, v_cache)
     }
 }
 
-fn layer_norm(d: &WhisperDims, ns: &Ns, cx: &mut Graph) -> LayerNorm {
+fn layer_norm(d: &WhisperDims, ns: &Namespace, cx: &mut Graph) -> LayerNorm {
     // torch LayerNorm: mean-centered, learned weight AND bias.
-    LayerNorm::new(d.state, true, true, true, d.eps, ns, cx)
+    LayerNorm::new(d.state, true, true, true, d.eps, DType::F32, ns, cx)
 }
 
 pub struct EncoderLayer {
@@ -185,8 +207,8 @@ pub struct Whisper {
 
 impl Whisper {
     pub fn init(cx: &mut Graph, d: &WhisperDims) -> Self {
-        let enc = Ns::root().child("model").child("encoder");
-        let dec = Ns::root().child("model").child("decoder");
+        let enc = Namespace::root().child("model").child("encoder");
+        let dec = Namespace::root().child("model").child("decoder");
         let enc_layers = (0..d.audio_layers)
             .map(|l| {
                 let ns = enc.child("layers").index(l);
@@ -194,8 +216,8 @@ impl Whisper {
                     attn_norm: layer_norm(d, &ns.child("self_attn_layer_norm"), cx),
                     attn: WhisperAttn::new(&ns.child("self_attn"), d, cx),
                     ff_norm: layer_norm(d, &ns.child("final_layer_norm"), cx),
-                    fc1: Linear::new_permuted(d.state, d.ff, true, &ns.child("fc1"), cx),
-                    fc2: Linear::new_permuted(d.ff, d.state, true, &ns.child("fc2"), cx),
+                    fc1: Linear::new(d.state, d.ff, true, DType::F32, &ns.child("fc1"), cx),
+                    fc2: Linear::new(d.ff, d.state, true, DType::F32, &ns.child("fc2"), cx),
                 }
             })
             .collect();
@@ -208,8 +230,8 @@ impl Whisper {
                     cross_norm: layer_norm(d, &ns.child("encoder_attn_layer_norm"), cx),
                     cross_attn: WhisperAttn::new(&ns.child("encoder_attn"), d, cx),
                     ff_norm: layer_norm(d, &ns.child("final_layer_norm"), cx),
-                    fc1: Linear::new_permuted(d.state, d.ff, true, &ns.child("fc1"), cx),
-                    fc2: Linear::new_permuted(d.ff, d.state, true, &ns.child("fc2"), cx),
+                    fc1: Linear::new(d.state, d.ff, true, DType::F32, &ns.child("fc1"), cx),
+                    fc2: Linear::new(d.ff, d.state, true, DType::F32, &ns.child("fc2"), cx),
                 }
             })
             .collect();
@@ -219,26 +241,34 @@ impl Whisper {
                 .named_tensor(
                     enc.child("conv1").leaf("weight"),
                     (d.state, d.n_mels, 3usize),
+                    DType::F32,
                 )
-                .merge_dims(1, 2),
-            conv1_b: cx.named_tensor(enc.child("conv1").leaf("bias"), d.state),
+                .view()
+                .merge_dims(1, 2)
+                .finish(),
+            conv1_b: cx.named_tensor(enc.child("conv1").leaf("bias"), d.state, DType::F32),
             conv2_w: cx
                 .named_tensor(
                     enc.child("conv2").leaf("weight"),
                     (d.state, d.state, 3usize),
+                    DType::F32,
                 )
-                .merge_dims(1, 2),
-            conv2_b: cx.named_tensor(enc.child("conv2").leaf("bias"), d.state),
+                .view()
+                .merge_dims(1, 2)
+                .finish(),
+            conv2_b: cx.named_tensor(enc.child("conv2").leaf("bias"), d.state, DType::F32),
             enc_pos: cx.named_tensor(
                 enc.child("embed_positions").leaf("weight"),
                 (d.audio_ctx, d.state),
+                DType::F32,
             ),
             enc_layers,
             enc_final_norm: layer_norm(d, &enc.child("layer_norm"), cx),
-            embed: Embedding::new(d.vocab, d.state, &dec.child("embed_tokens"), cx),
+            embed: Embedding::new(d.vocab, d.state, DType::F32, &dec.child("embed_tokens"), cx),
             dec_pos: cx.named_tensor(
                 dec.child("embed_positions").leaf("weight"),
                 (d.text_ctx, d.state),
+                DType::F32,
             ),
             dec_layers,
             dec_final_norm: layer_norm(d, &dec.child("layer_norm"), cx),
@@ -274,7 +304,7 @@ impl Whisper {
         scatter_idx: GraphTensor,
     ) -> (GraphTensor, Vec<(GraphTensor, GraphTensor)>) {
         assert_eq!(token.dtype, DType::Int);
-        let pos_row = luminal_nn::gather_rows(self.dec_pos, q_pos, self.dims.state);
+        let pos_row = luminal_nn::gather_rows(self.dec_pos, q_pos);
         let mut x = self.embed.forward(token) + pos_row;
         let mut caches_out = Vec::with_capacity(self.dec_layers.len());
         for (layer_index, layer) in self.dec_layers.iter().enumerate() {

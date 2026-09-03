@@ -374,7 +374,7 @@ fn preload_safetensors(graph: &Graph, file_path: &str) -> anyhow::Result<Preload
         if let Some(input) = (*graph.graph[node_id])
             .as_any()
             .downcast_ref::<luminal::hlir::Input>()
-            && let Ok(tensor) = st.tensor(&input.label)
+            && let Ok(tensor) = st.tensor(&input.label, DType::F32)
         {
             let types = bytes_to_typed(tensor.data(), safetensors_dtype_to_pt2(tensor.dtype()));
             weights.push((input.label.clone(), types));

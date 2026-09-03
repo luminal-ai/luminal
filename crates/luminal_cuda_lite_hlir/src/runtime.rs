@@ -882,7 +882,7 @@ impl CudaRuntime {
         let st = SafeTensors::deserialize(&mmap).unwrap();
         for node in cx.graph.node_indices() {
             if let Some(Input { label, .. }) = (*cx.graph[node]).as_any().downcast_ref::<Input>()
-                && let Ok(tensor) = st.tensor(label)
+                && let Ok(tensor) = st.tensor(label, DType::F32)
             {
                 self.changed_hlir.insert(node);
                 match tensor.dtype() {

@@ -1,4 +1,7 @@
-use gemma4_moe::{Gemma4Dims, Gemma4Moe};
+use gemma4_moe::{
+    Gemma4Dims, Gemma4Moe,
+    model_support::{Namespace, named_heterogeneous_kv_cache_pool},
+};
 use luminal::prelude::*;
 
 fn static_dims(tensor: GraphTensor) -> Vec<usize> {
@@ -58,21 +61,22 @@ fn gemma4_26b_a4b_full_forward_contract_builds() {
     let d = Gemma4Dims::gemma4_26b_a4b();
     let mut cx = Graph::new();
     let model = Gemma4Moe::init(&mut cx, &d);
-    let token = cx.tensor_dtyped(1, DType::Int);
-    let q_pos = cx.tensor_dtyped(1, DType::Int);
-    let sliding_cos = cx.tensor((1, d.sliding_head_dim));
-    let sliding_sin = cx.tensor((1, d.sliding_head_dim));
-    let sliding_rot = cx.tensor((d.sliding_head_dim, d.sliding_head_dim));
-    let full_cos = cx.tensor((1, d.full_head_dim));
-    let full_sin = cx.tensor((1, d.full_head_dim));
-    let full_rot = cx.tensor((d.full_head_dim, d.full_head_dim));
-    let gather_idx = cx.tensor_dtyped(SLOTS, DType::Int);
-    let scatter_idx = cx.tensor_dtyped(1, DType::Int);
-    let pool = luminal_nn::KvCachePool::new_heterogeneous(
+    let token = cx.tensor(1, DType::Int);
+    let q_pos = cx.tensor(1, DType::Int);
+    let sliding_cos = cx.tensor((1, d.sliding_head_dim), DType::F32);
+    let sliding_sin = cx.tensor((1, d.sliding_head_dim), DType::F32);
+    let sliding_rot = cx.tensor((d.sliding_head_dim, d.sliding_head_dim), DType::F32);
+    let full_cos = cx.tensor((1, d.full_head_dim), DType::F32);
+    let full_sin = cx.tensor((1, d.full_head_dim), DType::F32);
+    let full_rot = cx.tensor((d.full_head_dim, d.full_head_dim), DType::F32);
+    let gather_idx = cx.tensor(SLOTS, DType::Int);
+    let scatter_idx = cx.tensor(1, DType::Int);
+    let pool = named_heterogeneous_kv_cache_pool(
         &mut cx,
         SLOTS,
         &d.kv_dims(),
-        &Ns::root().child("cache"),
+        DType::F32,
+        &Namespace::root().child("cache"),
     );
 
     let (logits, cache_out) = model.forward(

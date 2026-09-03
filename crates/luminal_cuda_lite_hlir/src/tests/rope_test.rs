@@ -33,9 +33,9 @@ fn rope_matches_cpu_reference() {
     let h = 4;
     let d = 32;
     let mut cx = Graph::default();
-    let x = cx.tensor((s, h, d));
-    let cos = cx.tensor((s, d));
-    let sin = cx.tensor((s, d));
+    let x = cx.tensor((s, h, d), DType::F32);
+    let cos = cx.tensor((s, d), DType::F32);
+    let sin = cx.tensor((s, d), DType::F32);
     let y = apply_rope(x, cos, sin).output();
 
     let x_data: Vec<f32> = (0..s * h * d).map(|i| ((i as f32) * 0.013).sin()).collect();
@@ -73,9 +73,9 @@ fn rope_flux2_shape() {
     let h = 48;
     let d = 128;
     let mut cx = Graph::default();
-    let x = cx.tensor((s, h, d));
-    let cos = cx.tensor((s, d));
-    let sin = cx.tensor((s, d));
+    let x = cx.tensor((s, h, d), DType::F32);
+    let cos = cx.tensor((s, d), DType::F32);
+    let sin = cx.tensor((s, d), DType::F32);
     let y = apply_rope(x, cos, sin).output();
 
     use rand::{Rng, SeedableRng};

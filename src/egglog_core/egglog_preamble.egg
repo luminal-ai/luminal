@@ -1863,10 +1863,6 @@
 ;      are degenerate geometries that deserve their own kernels anyway.
 ;      An extent provably EXACTLY 1 makes the coordinate identically
 ;      zero — see THE EXTENT-1 COLLAPSE rule below the coordinate route.
-;      NOTE: Vars get NO categorical route — an empty-instance pin
-;      ((union (IntVar "n") (IntLit 0))) legally puts a IntVar in the zero class,
-;      so a maybe-zero IntVar must stay uncertified (the value route certifies Vars
-;      whose seeded lower bound is >= 1).
 ;   THE PRODUCT ROUTE: ZZ[v...] is an integral domain — a product of two
 ;      nonzero polynomials is nonzero. OPERATOR-EXTENSION OBLIGATION
 ;      (discharged for the Stage D1 division family, re-audit per new
@@ -2937,16 +2933,6 @@
 ; (the reproducer hung). Subsume of a constructed node creates it
 ; already unmatchable, so the twin is dead at birth.
 ;
-; NOTE on (!= ?coefficient_sum 0/1): these are PRIMITIVE i64
-; comparisons on a value bound in this rule — primitives never merge,
-; so the comparison is timing-independent and fail-safe, unlike a
-; CLASS-level (!= ?class (IntLit 0)) test (banned; that meaning shifts as
-; unions land — consume provably-cannot-union-with-zero instead). The
-; certificate relations are over IntExpr classes and do not apply to
-; primitive values; wrapping the primitive in (IntLit ...) just to query a
-; certificate would mint a term and add a lattice-propagation delay for
-; zero safety gain.
-
 ; coefficient sum = 0: the sum IS the zero expression — a sound road
 ; into the zero ideal; both orientations of the matched node die.
 (rule

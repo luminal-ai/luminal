@@ -5,6 +5,7 @@
 
 use std::time::Instant;
 
+use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use test_runtime::cublaslt_marker::{CuEpilogue, CublasLt};
@@ -23,8 +24,8 @@ const PIN: &[&str] = &[
 fn record_blocks(geometries: &[(usize, usize, usize)]) -> String {
     let mut cx = Graph::new();
     for &(m, k, n) in geometries {
-        let x = cx.tensor((m, k));
-        let w = cx.tensor((k, n));
+        let x = cx.tensor((m, k), DType::F32);
+        let w = cx.tensor((k, n), DType::F32);
         let _out = x.matmul(w).relu().output();
     }
     cx.logical

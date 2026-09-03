@@ -11,8 +11,8 @@ use tinyvec::ArrayVec;
 /// ```rust
 /// use luminal::prelude::*;
 /// let mut cx = Graph::new();
-/// let a = cx.tensor(3);
-/// let b = cx.tensor(3);
+/// let a = cx.tensor(3, DType::F32);
+/// let b = cx.tensor(3, DType::F32);
 /// let c = a + b;
 /// // The graph `cx` now has `a` and `b` loading nodes, and an add node resulting in `c`
 /// ```

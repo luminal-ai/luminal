@@ -61,7 +61,7 @@ fn coordinate_rank(site: &ExtractionSite<'_>, child: usize) -> usize {
 /// Matched in egglog only when the output layout IS init's layout (the
 /// precondition, discharged at match time). The Must tie is relocatable as
 /// always: a rejected mutation copies init into the tied result's fresh
-/// buffer and mutates there. NOTE: no write-map injectivity gate exists or
+/// buffer and mutates there. No write-map injectivity gate exists or
 /// can — scatter's writes are data-dependent, and duplicate coordinates
 /// are UB by ruling. No reference kernel exists for this form (the
 /// reference runtime is out-of-place only, ruling 2026-08-05/06).

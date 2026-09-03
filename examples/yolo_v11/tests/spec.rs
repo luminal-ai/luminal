@@ -33,7 +33,7 @@ fn yolo11n_dimensions_are_exact() {
 #[test]
 fn yolo11n_full_forward_contract_builds() {
     let mut cx = Graph::new();
-    let image = cx.tensor((1usize, 3usize, IMG_SIZE, IMG_SIZE));
+    let image = cx.tensor((1usize, 3usize, IMG_SIZE, IMG_SIZE), DType::F32);
     let model = YoloV11::init(&mut cx);
     assert_eq!(input_dims(&cx, "model.0.conv.weight"), vec![16, 3, 3, 3]);
     assert_eq!(

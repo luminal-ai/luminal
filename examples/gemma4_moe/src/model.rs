@@ -9,17 +9,20 @@
 //! per-head RMS norm on every layer; q/k take learned QK-norms.
 //! Attention scale is 1.0 (none). Seven learned norms per layer wrap a
 //! PARALLEL dense+MoE FF stage; the whole residual stream multiplies a
-//! checkpoint per-layer scalar. The MoE router reads the RAW residual
+//! learned per-layer scalar. The MoE router reads the RAW residual
 //! (std-normed × router.scale × 1/√hidden) while experts read the
 //! pre_ff_2-normed stream; top-8 weights renormalize then multiply the
 //! learned per_expert_scale. Gating is the tanh-approx GELU in sigmoid
 //! form everywhere. Logits softcap at 30. Embeddings tie with the
 //! √hidden normalizer in-graph over the unscaled table.
 
+use crate::model_support::{
+    AttentionGeometry, CacheAccess, Embedding, KvCache, KvCachePool, LayerNorm, Linear, Namespace,
+    TopKRoutes, causal_bias, paged_attention, sliding_window_bias,
+};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::prelude::{GraphTensor, Ns};
-use luminal_nn::{Embedding, KvCachePool, LayerNorm, Linear};
+use luminal::prelude::GraphTensor;
 
 pub const SLIDING_WINDOW: usize = 1024;
 
@@ -61,6 +64,28 @@ impl Gemma4Dims {
             sliding_kv_heads: 8,
             full_head_dim: 512,
             full_kv_heads: 2,
+            full_partial_rotary: 0.25,
+            rms_eps: 1e-6,
+            logit_softcap: 30.0,
+        }
+    }
+
+    pub fn tiny() -> Self {
+        Self {
+            vocab: 23,
+            hidden: 8,
+            dense_intermediate: 6,
+            moe_intermediate: 4,
+            experts: 4,
+            top_k: 2,
+            n_heads: 2,
+            layers: 2, // layer 0 sliding, layer 1 full (pattern 2)
+            sliding_pattern: 2,
+            window: 3,
+            sliding_head_dim: 4,
+            sliding_kv_heads: 2,
+            full_head_dim: 8,
+            full_kv_heads: 1,
             full_partial_rotary: 0.25,
             rms_eps: 1e-6,
             logit_softcap: 30.0,
@@ -113,26 +138,33 @@ pub struct Gemma4MoeFfn {
 }
 
 impl Gemma4MoeFfn {
-    fn new(ns: &Ns, d: &Gemma4Dims, cx: &mut Graph) -> Self {
+    fn new(ns: &Namespace, d: &Gemma4Dims, cx: &mut Graph) -> Self {
         let router = ns.child("router");
         let experts = ns.child("experts");
         Self {
-            router_proj: Linear::new_permuted(
+            router_proj: Linear::new(
                 d.hidden,
                 d.experts,
                 false,
+                DType::F32,
                 &router.child("proj"),
                 cx,
             ),
-            router_scale: cx.named_tensor(router.leaf("scale"), d.hidden),
-            per_expert_scale: cx.named_tensor(router.leaf("per_expert_scale"), d.experts),
+            router_scale: cx.named_tensor(router.leaf("scale"), d.hidden, DType::F32),
+            per_expert_scale: cx.named_tensor(
+                router.leaf("per_expert_scale"),
+                d.experts,
+                DType::F32,
+            ),
             gate_up: cx.named_tensor(
                 experts.leaf("gate_up_proj"),
                 (d.experts, 2 * d.moe_intermediate, d.hidden),
+                DType::F32,
             ),
             down: cx.named_tensor(
                 experts.leaf("down_proj"),
                 (d.experts, d.hidden, d.moe_intermediate),
+                DType::F32,
             ),
             hidden: d.hidden,
             intermediate: d.moe_intermediate,
@@ -143,47 +175,39 @@ impl Gemma4MoeFfn {
 
     /// `raw` drives routing; `normed` feeds the experts.
     fn forward(&self, raw: GraphTensor, normed: GraphTensor) -> GraphTensor {
-        let s = raw.dims()[0];
-        let (k, h, i2) = (self.top_k, self.hidden, 2 * self.intermediate);
-        let cx = raw.graph();
+        let h = self.hidden;
 
         // Router: std-normed raw stream × router.scale × 1/sqrt(hidden).
         let scale = self.router_scale.expand_lhs(&raw.dims()[..1]);
         let router_hidden = raw.std_norm(1, self.rms_eps) * scale * (h as f32).sqrt().recip();
         let probs = self.router_proj.forward(router_hidden).softmax(1);
-        let idx = probs.topk_indexes(k, 1); // (s, k)
+        let expert_ids = probs.topk_indexes(self.top_k, 1);
+        let routes = TopKRoutes::from_scores(probs, expert_ids).normalize();
+        let scaled_weights = routes.weights() * routes.select(self.per_expert_scale);
+        let routes = routes.with_weights(scaled_weights);
 
-        let row_of = cx.iota((s, k), |c| c[0]);
-        let picked = probs.gather(&[row_of, idx]);
-        let denom = picked.sum(1).expand_dim(1, k);
-        let weights = (picked / denom) * self.per_expert_scale.gather(&[idx]);
-
-        let e4 = idx.expand_dim(2, i2).expand_dim(3, h);
-        let r4 = cx.iota((s, k, i2, h), |c| c[2]);
-        let c4 = cx.iota((s, k, i2, h), |c| c[3]);
-        let gate_up = self.gate_up.gather(&[e4, r4, c4]);
-        let x_e = normed.expand_dim(1, k).expand_dim(2, 1);
-        let projected = x_e.matmul(gate_up.permute((0, 1, 3, 2))).squeeze(2);
+        let gate_up = routes.select(self.gate_up);
+        let projected = routes
+            .dispatch(normed)
+            .expand_dim(2, 1)
+            .matmul(gate_up.permute((0, 1, 3, 2)))
+            .squeeze(2);
 
         let gate = projected.slice_along(..self.intermediate, 2);
         let up = projected.slice_along(self.intermediate.., 2);
         let hidden_states = gemma_gelu(gate) * up;
 
-        let e_down = idx.expand_dim(2, h).expand_dim(3, self.intermediate);
-        let r_down = cx.iota((s, k, h, self.intermediate), |c| c[2]);
-        let c_down = cx.iota((s, k, h, self.intermediate), |c| c[3]);
-        let down = self.down.gather(&[e_down, r_down, c_down]);
-        let out_e = hidden_states
+        let down = routes.select(self.down);
+        let routed_output = hidden_states
             .expand_dim(2, 1)
             .matmul(down.permute((0, 1, 3, 2)))
             .squeeze(2);
-
-        (out_e * weights.expand_dim(2, h)).sum(1)
+        routes.combine(routed_output)
     }
 }
 
 /// The tanh-approx GELU in sigmoid form (fewer e-graph nodes).
-#[allow(clippy::excessive_precision)] // Literal matches the checkpoint formula.
+#[allow(clippy::excessive_precision)]
 fn gemma_gelu(x: GraphTensor) -> GraphTensor {
     x * (x * 1.595_769_1 * (x * x * 0.044715 + 1.0)).sigmoid()
 }
@@ -220,7 +244,7 @@ impl Gemma4Block {
         let kv_heads = d.kv_heads(l);
         let q_dim = d.n_heads * head_dim;
         let kv_dim = head_dim * kv_heads;
-        let ns = Ns::root()
+        let ns = Namespace::root()
             .child("model")
             .child("language_model")
             .child("layers")
@@ -234,6 +258,7 @@ impl Gemma4Block {
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child(segment),
                 cx,
             )
@@ -246,32 +271,64 @@ impl Gemma4Block {
             post_ff_norm_1: rms("post_feedforward_layernorm_1", cx),
             pre_ff_norm_2: rms("pre_feedforward_layernorm_2", cx),
             post_ff_norm_2: rms("post_feedforward_layernorm_2", cx),
-            layer_scalar: cx.named_tensor(ns.leaf("layer_scalar"), 1),
-            wq: Linear::new_permuted(d.hidden, q_dim, false, &attn.child("q_proj"), cx),
-            wk: Linear::new_permuted(d.hidden, kv_dim, false, &attn.child("k_proj"), cx),
-            wv: sliding
-                .then(|| Linear::new_permuted(d.hidden, kv_dim, false, &attn.child("v_proj"), cx)),
-            wo: Linear::new_permuted(q_dim, d.hidden, false, &attn.child("o_proj"), cx),
-            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), head_dim),
-            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), head_dim),
-            gate: Linear::new_permuted(
+            layer_scalar: cx.named_tensor(ns.leaf("layer_scalar"), 1, DType::F32),
+            wq: Linear::new(
+                d.hidden,
+                q_dim,
+                false,
+                DType::F32,
+                &attn.child("q_proj"),
+                cx,
+            ),
+            wk: Linear::new(
+                d.hidden,
+                kv_dim,
+                false,
+                DType::F32,
+                &attn.child("k_proj"),
+                cx,
+            ),
+            wv: sliding.then(|| {
+                Linear::new(
+                    d.hidden,
+                    kv_dim,
+                    false,
+                    DType::F32,
+                    &attn.child("v_proj"),
+                    cx,
+                )
+            }),
+            wo: Linear::new(
+                q_dim,
+                d.hidden,
+                false,
+                DType::F32,
+                &attn.child("o_proj"),
+                cx,
+            ),
+            q_norm: cx.named_tensor(attn.child("q_norm").leaf("weight"), head_dim, DType::F32),
+            k_norm: cx.named_tensor(attn.child("k_norm").leaf("weight"), head_dim, DType::F32),
+            gate: Linear::new(
                 d.hidden,
                 d.dense_intermediate,
                 false,
+                DType::F32,
                 &mlp.child("gate_proj"),
                 cx,
             ),
-            up: Linear::new_permuted(
+            up: Linear::new(
                 d.hidden,
                 d.dense_intermediate,
                 false,
+                DType::F32,
                 &mlp.child("up_proj"),
                 cx,
             ),
-            down: Linear::new_permuted(
+            down: Linear::new(
                 d.dense_intermediate,
                 d.hidden,
                 false,
+                DType::F32,
                 &mlp.child("down_proj"),
                 cx,
             ),
@@ -318,21 +375,22 @@ impl Gemma4Block {
             rope_rot,
         );
         let v = luminal_nn::rms_norm_heads_unweighted(v_raw, self.head_dim, d.rms_eps);
-        let (attn, k_cache, v_cache) = luminal_nn::paged_attention_positional(
+        let context_positions = q.graph().arange(gather_idx.dims1());
+        let score_bias = if self.sliding {
+            sliding_window_bias(q_pos, context_positions, d.window)
+        } else {
+            causal_bias(q_pos, context_positions)
+        };
+        let result = paged_attention(
             q,
             k,
             v,
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            q_pos,
-            d.n_heads,
-            self.kv_heads,
-            self.head_dim,
-            self.sliding.then_some(d.window),
-            1.0, // gemma-4 text attention: no score scale
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            score_bias,
+            AttentionGeometry::with_scale(d.n_heads, self.kv_heads, self.head_dim, 1.0),
         );
+        let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
         let x = x + self.post_attn_norm.forward(self.wo.forward(attn));
 
         let dense = self.down.forward(
@@ -344,9 +402,6 @@ impl Gemma4Block {
         let moe = self.post_ff_norm_2.forward(moe);
         let ff_out = self.post_ff_norm.forward(dense + moe);
         let x = x + ff_out;
-        // The released checkpoint stores one scalar per layer (`[1]`). Add
-        // the sequence axis, then explicitly broadcast that singleton across
-        // hidden width; elementwise ops do not imply broadcasting.
         let scalar = self
             .layer_scalar
             .expand_lhs(&x.dims()[..1])
@@ -364,13 +419,19 @@ pub struct Gemma4Moe {
 
 impl Gemma4Moe {
     pub fn init(cx: &mut Graph, dims: &Gemma4Dims) -> Self {
-        let text = Ns::root().child("model").child("language_model");
+        let text = Namespace::root().child("model").child("language_model");
         let blocks = (0..dims.layers)
             .map(|l| Gemma4Block::new(l, dims, cx))
             .collect();
         Self {
             dims: dims.clone(),
-            embed: Embedding::new(dims.vocab, dims.hidden, &text.child("embed_tokens"), cx),
+            embed: Embedding::new(
+                dims.vocab,
+                dims.hidden,
+                DType::F32,
+                &text.child("embed_tokens"),
+                cx,
+            ),
             blocks,
             final_norm: LayerNorm::new(
                 dims.hidden,
@@ -378,6 +439,7 @@ impl Gemma4Moe {
                 false,
                 false,
                 dims.rms_eps,
+                DType::F32,
                 &text.child("norm"),
                 cx,
             ),

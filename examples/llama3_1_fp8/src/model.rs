@@ -6,14 +6,17 @@
 //! of every layer linear with static input scales (modelopt
 //! calibration). Quantization is MODEL DEFINITION: the weights stage
 //! and store as F8E4M3 buffers and the quantize/dequant chain is
-//! spelled in model text ([`luminal_nn::Fp8Linear`]). Embeddings and
+//! spelled in model text ([`luminal_nn::fp8_linear`]). Embeddings and
 //! the (untied) lm_head are bf16 in the checkpoint — numeric tensors,
 //! not quantization — staged f32 like every zoo example.
 
+use crate::model_support::{
+    AttentionGeometry, CacheAccess, Embedding, Fp8Linear, KvCache, KvCachePool, LayerNorm, Linear,
+    Namespace, causal_bias, paged_attention,
+};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
-use luminal::prelude::{GraphTensor, Ns};
-use luminal_nn::{Embedding, Fp8Linear, KvCachePool, LayerNorm, Linear};
+use luminal::prelude::GraphTensor;
 
 #[derive(Clone)]
 pub struct Fp8Dims {
@@ -81,7 +84,7 @@ pub struct Fp8Block {
 
 impl Fp8Block {
     fn new(l: usize, d: &Fp8Dims, cx: &mut Graph) -> Self {
-        let ns = Ns::root().child("model").child("layers").index(l);
+        let ns = Namespace::root().child("model").child("layers").index(l);
         let attn = ns.child("self_attn");
         let mlp = ns.child("mlp");
         Self {
@@ -91,6 +94,7 @@ impl Fp8Block {
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child("input_layernorm"),
                 cx,
             ),
@@ -104,6 +108,7 @@ impl Fp8Block {
                 false,
                 false,
                 d.rms_eps,
+                DType::F32,
                 &ns.child("post_attention_layernorm"),
                 cx,
             ),
@@ -144,21 +149,17 @@ impl Fp8Block {
             rope_sin,
             rope_rot,
         );
-        let (attn, k_cache, v_cache) = luminal_nn::paged_attention_positional(
+        let context_positions = q.graph().arange(gather_idx.dims1());
+        let result = paged_attention(
             q,
             k,
             self.wv.forward(normed),
-            k_cache,
-            v_cache,
-            gather_idx,
-            scatter_idx,
-            q_pos,
-            self.n_heads,
-            self.n_kv_heads,
-            self.head_dim,
-            None,
-            1.0 / (self.head_dim as f32).sqrt(),
+            KvCache::new(k_cache, v_cache),
+            CacheAccess::new(scatter_idx, gather_idx),
+            causal_bias(q_pos, context_positions),
+            AttentionGeometry::new(self.n_heads, self.n_kv_heads, self.head_dim),
         );
+        let (attn, k_cache, v_cache) = (result.output, result.cache.keys, result.cache.values);
         let x = x + self.wo.forward(attn);
         let ff_in = self.ffn_norm.forward(x);
         let ff = self
@@ -186,7 +187,8 @@ impl Llama31Fp8 {
             embed: Embedding::new(
                 dims.vocab,
                 dims.hidden,
-                &Ns::root().child("model").child("embed_tokens"),
+                DType::F32,
+                &Namespace::root().child("model").child("embed_tokens"),
                 cx,
             ),
             blocks,
@@ -196,14 +198,16 @@ impl Llama31Fp8 {
                 false,
                 false,
                 dims.rms_eps,
-                &Ns::root().child("model").child("norm"),
+                DType::F32,
+                &Namespace::root().child("model").child("norm"),
                 cx,
             ),
-            lm_head: Linear::new_permuted(
+            lm_head: Linear::new(
                 dims.hidden,
                 dims.vocab,
                 false,
-                &Ns::root().child("lm_head"),
+                DType::F32,
+                &Namespace::root().child("lm_head"),
                 cx,
             ),
         }

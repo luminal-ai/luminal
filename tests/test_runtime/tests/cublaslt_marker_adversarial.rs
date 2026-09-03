@@ -8,6 +8,7 @@
 //! the all-ones corner) — must not panic; readings stay bounded and
 //! every elected spec is sound.
 
+use luminal::dtype::DType;
 use luminal::layout_ir::ExtractedNode;
 use test_runtime::cublaslt_marker::CublasLt;
 
@@ -152,8 +153,8 @@ fn fixture7_m1_degenerate_no_panic() {
     use luminal::graph::Graph;
     let text = {
         let mut cx = Graph::new();
-        let x = cx.tensor((1usize, 4usize));
-        let w = cx.tensor((4usize, 3usize));
+        let x = cx.tensor((1usize, 4usize), DType::F32);
+        let w = cx.tensor((4usize, 3usize), DType::F32);
         let _out = x.matmul(w).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)

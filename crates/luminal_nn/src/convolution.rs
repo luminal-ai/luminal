@@ -5,33 +5,20 @@ use luminal::prelude::*;
 /// The layer expects inputs shaped like `[batch..., channels, spatial...]` where the number of
 /// spatial dimensions is greater than zero. The kernel configuration controls how many spatial
 /// axes are convolved (N) and must be shorter than the input rank (K): `K > N` is asserted.
-// NOTE (Step 4b): modules no longer call .persist() at authoring time —
-// persistence is a RUNTIME-BINDING choice (purity ruling 2026-07-30);
-// the recorder poisons persist_only outputs until the binding-side API
-// lands at 4d/M4.
-pub struct ConvND {
-    pub weight: GraphTensor, // (ch_out, ch_in * kernel_product)
-    pub bias: Option<GraphTensor>,
+#[derive(Clone, Debug)]
+pub struct ConvNdConfig {
     kernel: Vec<usize>,
     stride: Vec<usize>,
     dilation: Vec<usize>,
     padding: Vec<usize>,
-    ch_in: usize,
-    ch_out: usize,
 }
 
-impl ConvND {
-    #[allow(clippy::too_many_arguments)]
+impl ConvNdConfig {
     pub fn new(
-        ch_in: usize,
-        ch_out: usize,
         kernel: impl AsRef<[usize]>,
         stride: impl AsRef<[usize]>,
         dilation: impl AsRef<[usize]>,
         padding: impl AsRef<[usize]>,
-        bias: bool,
-        ns: &Ns,
-        cx: &mut Graph,
     ) -> Self {
         let kernel = kernel.as_ref().to_vec();
         let stride = stride.as_ref().to_vec();
@@ -61,26 +48,20 @@ impl ConvND {
             padding.len()
         );
 
-        let kernel_product: usize = kernel.iter().product();
-
         Self {
-            weight: cx.named_tensor(ns.leaf("weight"), (ch_out, ch_in * kernel_product)),
-            bias: if bias {
-                Some(cx.named_tensor(ns.leaf("bias"), ch_out))
-            } else {
-                None
-            },
             kernel,
             stride,
             dilation,
             padding,
-            ch_in,
-            ch_out,
         }
     }
 
-    /// Apply convolution to an input shaped `[batch..., channels, spatial...]`.
-    pub fn forward(&self, input: GraphTensor) -> GraphTensor {
+    fn apply(
+        &self,
+        input: GraphTensor,
+        weight: GraphTensor,
+        bias: Option<GraphTensor>,
+    ) -> GraphTensor {
         let input_dims = input.dims();
         let rank = input_dims.len();
         let spatial = self.kernel.len();
@@ -91,19 +72,16 @@ impl ConvND {
         );
 
         let batch_len = rank - spatial - 1;
+        assert_eq!(weight.rank(), 2, "convolution weight must be rank two");
         assert_eq!(
-            input_dims[batch_len],
-            IntExpr::from(self.ch_in),
-            "Input channel dimension ({}) must match ch_in ({})",
-            input_dims[batch_len],
-            self.ch_in
+            input.dtype, weight.dtype,
+            "convolution input/weight dtype mismatch"
         );
+        let kernel_product: usize = self.kernel.iter().product();
         assert_eq!(
-            self.weight.dims()[0],
-            IntExpr::from(self.ch_out),
-            "Weight output channels ({}) must match ch_out ({})",
-            self.weight.dims()[0],
-            self.ch_out
+            input_dims[batch_len] * kernel_product,
+            weight.dims()[1],
+            "convolution input channels do not match weight"
         );
 
         // Pad only the spatial dimensions.
@@ -125,10 +103,7 @@ impl ConvND {
             dilation_shape[axis] = self.dilation[i];
         }
 
-        // unfold yields [window..., kernel...] — windows already in front.
-        // The unfold AND the patches reshape below are one logical
-        // construct (im2col), so the whole thing composes into ONE apply
-        // (ruling 2026-08-26) via the chain-returning unfold.
+        // Keep the unfold and patch reshape in one logical view operation.
         let unfolded = padded.unfold_view(kernel_shape, stride_shape, dilation_shape);
         let unfolded_dims = unfolded.dims();
 
@@ -148,56 +123,59 @@ impl ConvND {
         order2.extend(rank + batch_len + 1..rank + batch_len + 1 + spatial);
         // kernel batch dims and kernel channel dim (to be merged away)
         order2.extend(rank..rank + batch_len + 1);
-        // The whole patches reshape — permute + every merge — rides the
-        // SAME one apply as the unfold above (ruling 2026-08-26).
-        let mut patches_chain = unfolded.permute(order2);
+        let mut patches = unfolded.permute(order2);
 
         // Drop kernel axes for batch + channel by merging them into the previous dimension.
         for _ in 0..=batch_len {
-            let last = patches_chain.rank();
-            patches_chain = patches_chain.merge_dims(last - 2, last - 1);
+            let last = patches.rank();
+            patches = patches.merge_dims(last - 2, last - 1);
         }
 
         // Flatten channel and kernel spatial dimensions together.
         for _ in 0..spatial {
             let channel_axis = batch_len + spatial;
-            patches_chain = patches_chain.merge_dims(channel_axis, channel_axis + 1);
+            patches = patches.merge_dims(channel_axis, channel_axis + 1);
         }
 
         // Collapse batch dimensions into one and output dimensions into one for matmul.
         for _ in 1..batch_len {
-            patches_chain = patches_chain.merge_dims(0, 1);
+            patches = patches.merge_dims(0, 1);
         }
         for _ in 1..spatial {
-            patches_chain = patches_chain.merge_dims(1, 2);
+            patches = patches.merge_dims(1, 2);
         }
-        let patches = patches_chain.finish();
 
-        let out = patches.matmul(self.weight.permute((1, 0)));
+        let mut out = patches.finish().matmul(weight.permute((1, 0)));
 
-        // Restore batch and spatial dimensions, then move the channel
-        // dimension ahead of the spatial axes — again ONE construct,
-        // ONE apply. The collapse loops merged k dims into 1, so restore
-        // splits k-1 times: splitting by every dim including the
-        // outermost would leave a spurious leading 1-dim.
+        // Restore batch and spatial dimensions. The collapse loops merged
+        // k dims into 1, so restore splits k-1 times: splitting by every dim
+        // including the outermost would leave a spurious leading 1-dim.
         let batch_dims = self.input_batch_dims(&input_dims, batch_len);
-        let mut out_chain = out.view();
+        let mut out_view = out.view();
         for dim in batch_dims.iter().skip(1).rev() {
-            out_chain = out_chain.split_dims(0, *dim);
+            out_view = out_view.split_dims(0, *dim);
         }
         for dim in output_dims.iter().skip(1).rev() {
-            out_chain = out_chain.split_dims(batch_len, *dim);
+            out_view = out_view.split_dims(batch_len, *dim);
         }
 
-        // [batch..., ch_out, spatial...]
+        // Move channel dimension ahead of the spatial axes: [batch..., ch_out, spatial...]
         let mut final_order: Vec<usize> = (0..batch_len).collect();
         final_order.push(batch_len + spatial);
         final_order.extend(batch_len..batch_len + spatial);
-        let out = out_chain.permute(final_order).finish();
+        out = out_view.permute(final_order).finish();
 
-        if let Some(_b) = self.bias {
-            todo!()
-            // out += b.expand(out.shape);
+        if let Some(bias) = bias {
+            assert_eq!(bias.rank(), 1, "convolution bias must be rank one");
+            assert_eq!(
+                bias.dtype, out.dtype,
+                "convolution output/bias dtype mismatch"
+            );
+            assert_eq!(bias.dims()[0], weight.dims()[0], "convolution bias width");
+            let out_dims = out.dims();
+            out += bias
+                .expand_lhs(&out_dims[..batch_len])
+                .expand_rhs(&out_dims[batch_len + 1..]);
         }
 
         out
@@ -207,14 +185,14 @@ impl ConvND {
         input_dims[..batch_len].to_vec()
     }
 
-    pub fn infer_output_shape(&self, input: &[usize]) -> Vec<usize> {
+    pub fn infer_output_shape(&self, input: &[usize], ch_in: usize, ch_out: usize) -> Vec<usize> {
         let rank = input.len();
         let spatial = self.kernel.len();
 
         assert!(rank > spatial, "expected input rank > spatial dims");
         let batch_len = rank - spatial - 1;
         assert_eq!(
-            input[batch_len], self.ch_in,
+            input[batch_len], ch_in,
             "input channel dimension does not match ch_in",
         );
 
@@ -233,17 +211,27 @@ impl ConvND {
             .collect();
 
         let mut shape = batch_prefix.to_vec();
-        shape.push(self.ch_out);
+        shape.push(ch_out);
         shape.extend(out_spatial);
         shape
     }
 }
 
+/// Apply an N-dimensional convolution with a caller-supplied canonical
+/// `(out_channels, in_channels * kernel_elements)` weight.
+pub fn conv_nd(
+    input: GraphTensor,
+    weight: GraphTensor,
+    bias: Option<GraphTensor>,
+    config: &ConvNdConfig,
+) -> GraphTensor {
+    config.apply(input, weight, bias)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ConvND;
+    use super::ConvNdConfig;
     use candle_core::{Device, Tensor};
-    use luminal::prelude::Ns;
 
     fn assert_close(a: &[f32], b: &[f32]) {
         assert_eq!(
@@ -262,21 +250,19 @@ mod tests {
     }
 
     fn candle_conv1d_output(
-        conv: &ConvND,
+        conv: &ConvNdConfig,
+        ch_in: usize,
+        ch_out: usize,
         input: &[f32],
         width: usize,
         weight: &[f32],
         bias: Option<&[f32]>,
     ) -> candle_core::Result<Vec<f32>> {
         let device = Device::Cpu;
-        let input = Tensor::from_vec(input.to_vec(), (1, conv.ch_in, width), &device)?;
-        let weight = Tensor::from_vec(
-            weight.to_vec(),
-            (conv.ch_out, conv.ch_in, conv.kernel[0]),
-            &device,
-        )?;
+        let input = Tensor::from_vec(input.to_vec(), (1, ch_in, width), &device)?;
+        let weight = Tensor::from_vec(weight.to_vec(), (ch_out, ch_in, conv.kernel[0]), &device)?;
         let bias = match bias {
-            Some(b) => Some(Tensor::from_vec(b.to_vec(), conv.ch_out, &device)?),
+            Some(b) => Some(Tensor::from_vec(b.to_vec(), ch_out, &device)?),
             None => None,
         };
 
@@ -289,7 +275,7 @@ mod tests {
         )?;
         let output = match bias {
             Some(bias) => {
-                let bias = bias.reshape((1, conv.ch_out, 1))?;
+                let bias = bias.reshape((1, ch_out, 1))?;
                 output.broadcast_add(&bias)?
             }
             None => output,
@@ -298,22 +284,24 @@ mod tests {
     }
 
     fn candle_conv2d_output(
-        conv: &ConvND,
+        conv: &ConvNdConfig,
+        channels: (usize, usize),
         input: &[f32],
         height: usize,
         width: usize,
         weight: &[f32],
         bias: Option<&[f32]>,
     ) -> candle_core::Result<Vec<f32>> {
+        let (ch_in, ch_out) = channels;
         let device = Device::Cpu;
-        let input = Tensor::from_vec(input.to_vec(), (1, conv.ch_in, height, width), &device)?;
+        let input = Tensor::from_vec(input.to_vec(), (1, ch_in, height, width), &device)?;
         let weight = Tensor::from_vec(
             weight.to_vec(),
-            (conv.ch_out, conv.ch_in, conv.kernel[0], conv.kernel[1]),
+            (ch_out, ch_in, conv.kernel[0], conv.kernel[1]),
             &device,
         )?;
         let bias = match bias {
-            Some(b) => Some(Tensor::from_vec(b.to_vec(), conv.ch_out, &device)?),
+            Some(b) => Some(Tensor::from_vec(b.to_vec(), ch_out, &device)?),
             None => None,
         };
 
@@ -339,7 +327,7 @@ mod tests {
         )?;
         let output = match bias {
             Some(bias) => {
-                let bias = bias.reshape((1, conv.ch_out, 1, 1))?;
+                let bias = bias.reshape((1, ch_out, 1, 1))?;
                 output.broadcast_add(&bias)?
             }
             None => output,
@@ -349,24 +337,13 @@ mod tests {
 
     #[test]
     fn conv1d_values_match_expected_window_sums() -> candle_core::Result<()> {
-        let mut cx = luminal::graph::Graph::new();
-        let conv = ConvND::new(
-            1,
-            1,
-            vec![3],
-            vec![1],
-            vec![1],
-            vec![1],
-            true,
-            &Ns::root().child("conv"),
-            &mut cx,
-        );
+        let conv = ConvNdConfig::new([3], [1], [1], [1]);
 
         let input = [1., 2., 3., 4., 5.];
         let weight = [1., 1., 1.];
         let bias = [0.5];
 
-        let out = candle_conv1d_output(&conv, &input, input.len(), &weight, Some(&bias))?;
+        let out = candle_conv1d_output(&conv, 1, 1, &input, input.len(), &weight, Some(&bias))?;
 
         assert_close(&out, &[3.5, 6.5, 9.5, 12.5, 9.5]);
         Ok(())
@@ -374,18 +351,7 @@ mod tests {
 
     #[test]
     fn conv2d_values_accumulate_across_channels() -> candle_core::Result<()> {
-        let mut cx = luminal::graph::Graph::new();
-        let conv = ConvND::new(
-            2,
-            1,
-            vec![2, 2],
-            vec![1, 1],
-            vec![1, 1],
-            vec![0, 0],
-            true,
-            &Ns::root().child("conv"),
-            &mut cx,
-        );
+        let conv = ConvNdConfig::new([2, 2], [1, 1], [1, 1], [0, 0]);
 
         let input = [
             1., 2., 3., 4., 5., 6., 7., 8., 9., // channel 0
@@ -394,7 +360,7 @@ mod tests {
         let weight = [1., 1., 1., 1., 2., 2., 2., 2.];
         let bias = [0.25];
 
-        let out = candle_conv2d_output(&conv, &input, 3, 3, &weight, Some(&bias))?;
+        let out = candle_conv2d_output(&conv, (2, 1), &input, 3, 3, &weight, Some(&bias))?;
 
         assert_close(&out, &[68.25, 64.25, 56.25, 52.25]);
         Ok(())
@@ -402,52 +368,30 @@ mod tests {
 
     #[test]
     fn conv1d_shapes_follow_stride_and_padding() {
-        let mut cx = luminal::graph::Graph::new();
-        let conv = ConvND::new(
-            1,
-            1,
-            vec![3],
-            vec![2],
-            vec![1],
-            vec![1],
-            false,
-            &Ns::root().child("conv"),
-            &mut cx,
-        );
+        let conv = ConvNdConfig::new([3], [2], [1], [1]);
 
         // expected length: floor((padded_len - dilation*(k-1) -1)/stride +1)
         // padded_len = 7 + 2 = 9
         // effective kernel = 3
         // => (9 -3)/2 +1 = 4
-        let inferred = conv.infer_output_shape(&[2, 1, 7]);
+        let inferred = conv.infer_output_shape(&[2, 1, 7], 1, 1);
         assert_eq!(inferred, vec![2, 1, 4]);
     }
 
     #[test]
     fn conv2d_shapes_follow_stride_and_padding() {
-        let mut cx = luminal::graph::Graph::new();
-        let conv = ConvND::new(
-            3,
-            2,
-            vec![2, 3],
-            vec![1, 2],
-            vec![1, 1],
-            vec![0, 1],
-            true,
-            &Ns::root().child("conv"),
-            &mut cx,
-        );
+        let conv = ConvNdConfig::new([2, 3], [1, 2], [1, 1], [0, 1]);
 
         // height: (5 - dilation*(2-1) -1 + 0 +0)/1 +1 = 4
         // width: (6 - dilation*(3-1) -1 + 1 +1)/2 +1 = 3
-        let inferred = conv.infer_output_shape(&[1, 3, 5, 6]);
+        let inferred = conv.infer_output_shape(&[1, 3, 5, 6], 3, 2);
         assert_eq!(inferred, vec![1, 2, 4, 3]);
     }
 }
 
 #[cfg(test)]
 mod forward_tests {
-    use super::ConvND;
+    use super::{ConvNdConfig, conv_nd};
     use luminal::prelude::*;
 
     /// ConvND forward vs a naive host-side convolution, on the reference
@@ -464,24 +408,15 @@ mod forward_tests {
             .collect();
 
         let mut cx = Graph::new();
-        let x = cx.tensor((b, ci, h, w));
-        let conv = ConvND::new(
-            ci,
-            co,
-            vec![k, k],
-            vec![1, 1],
-            vec![1, 1],
-            vec![0, 0],
-            false,
-            &Ns::root().child("conv"),
-            &mut cx,
-        );
-        let out = conv.forward(x).output();
+        let x = cx.tensor((b, ci, h, w), DType::F32);
+        let weight = cx.tensor((co, ci * k * k), DType::F32);
+        let config = ConvNdConfig::new([k, k], [1, 1], [1, 1], [0, 0]);
+        let out = conv_nd(x, weight, None, &config).output();
         let rt = luminal_reference::harness::run_reference(
             &cx,
             &[
                 (x.id, x_data.clone().into()),
-                (conv.weight.id, w_data.clone().into()),
+                (weight.id, w_data.clone().into()),
             ],
         );
         let got = rt.get_f32(out.id).unwrap().clone();
@@ -510,5 +445,27 @@ mod forward_tests {
         for (i, (g, e)) in got.iter().zip(&want).enumerate() {
             assert!((g - e).abs() < 1e-4, "element {i}: got {g}, want {e}");
         }
+    }
+
+    #[test]
+    fn convnd_applies_caller_supplied_bias() {
+        let mut cx = Graph::new();
+        let input = cx.tensor((1, 1, 2, 2), DType::F32);
+        let weight = cx.tensor((2, 1), DType::F32);
+        let bias = cx.tensor(2, DType::F32);
+        let config = ConvNdConfig::new([1, 1], [1, 1], [1, 1], [0, 0]);
+        let output = conv_nd(input, weight, Some(bias), &config).output();
+        let runtime = luminal_reference::harness::run_reference(
+            &cx,
+            &[
+                (input.id, vec![1.0, 2.0, 3.0, 4.0].into()),
+                (weight.id, vec![2.0, -1.0].into()),
+                (bias.id, vec![0.5, 1.0].into()),
+            ],
+        );
+        assert_eq!(
+            runtime.get_f32(output.id).unwrap(),
+            &[2.5, 4.5, 6.5, 8.5, 0.0, -1.0, -2.0, -3.0]
+        );
     }
 }

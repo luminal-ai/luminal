@@ -52,9 +52,9 @@ const HIDDEN: usize = N_HEADS * HEAD_DIM;
 fn build_attention_graph() -> (Graph, GraphTensor, GraphTensor, GraphTensor, GraphTensor) {
     let mut cx = Graph::default();
 
-    let q_rope = cx.named_tensor("q_rope", ('s', HIDDEN));
-    let k_ctx = cx.named_tensor("k_ctx", ('c', KV_DIM));
-    let v_ctx_input = cx.named_tensor("v_ctx", ('c', KV_DIM));
+    let q_rope = cx.named_tensor("q_rope", ('s', HIDDEN), DType::F32);
+    let k_ctx = cx.named_tensor("k_ctx", ('c', KV_DIM), DType::F32);
+    let v_ctx_input = cx.named_tensor("v_ctx", ('c', KV_DIM), DType::F32);
 
     let q = (q_rope * 1.0).split_dims(1, HEAD_DIM).transpose(0, 1);
     let k = k_ctx.split_dims(1, HEAD_DIM).permute((1, 2, 0));
@@ -557,11 +557,7 @@ fn flashinfer_jit_head_dim_assertion() {
 // Mask is built from primitive HLIR ops because the rule's mask anchor relies
 // on `Mul(allowed, Constant(1e10))` being visible in the e-graph.
 
-fn test_indptr_to_request_idx(
-    graph: &mut Graph,
-    indptr: GraphTensor,
-    n: IntExpr,
-) -> GraphTensor {
+fn test_indptr_to_request_idx(graph: &mut Graph, indptr: GraphTensor, n: IntExpr) -> GraphTensor {
     let r = indptr.dims1();
     let indices = graph.arange(n).expand_dim(1, r);
     let indptr_2d = indptr.expand_dim(0, n);
@@ -592,11 +588,7 @@ fn test_compute_attn_mask(
     allowed * 1e10 - 1e10
 }
 
-fn test_compute_triu_gather_mask(
-    graph: &mut Graph,
-    q_pos: GraphTensor,
-    c: IntExpr,
-) -> GraphTensor {
+fn test_compute_triu_gather_mask(graph: &mut Graph, q_pos: GraphTensor, c: IntExpr) -> GraphTensor {
     let s = q_pos.dims1();
     let causal_square = graph.triu(c, 1).cast(luminal::dtype::DType::F32) * -1e10;
     let row_offsets = (q_pos * c).expand_dim(1, c);
@@ -674,7 +666,9 @@ fn cache_dest_with_provenance(
     match provenance {
         TestCacheProvenance::Raw => cache,
         TestCacheProvenance::LoopInput { loop_id, stream_id } => {
-            let alt = graph.named_tensor(alt_name, (2048, kv_dim)).persist();
+            let alt = graph
+                .named_tensor(alt_name, (2048, kv_dim), DType::F32)
+                .persist();
             let id = graph.add_op(
                 luminal::hlir::LoopInput {
                     loop_id,
@@ -757,21 +751,20 @@ fn build_paged_attention_graph_with_token_dim(
 
     let mut cx = Graph::default();
 
-    let q_rope = cx.named_tensor("q_rope", (token_dim, hidden));
-    let k_rope = cx.named_tensor("k_rope", (token_dim, kv_dim));
-    let v_new = cx.named_tensor("v_new", (token_dim, kv_dim));
-    let k_cache = cx.named_tensor("k_cache", (2048, kv_dim)).persist();
-    let v_cache = cx.named_tensor("v_cache", (2048, kv_dim)).persist();
-    let scatter_idx = cx
-        .named_tensor_dtyped("scatter_idx", token_dim, luminal::dtype::DType::Int);
-    let gather_idx = cx
-        .named_tensor_dtyped("gather_idx", context_dim, luminal::dtype::DType::Int);
-    let q_pos = cx
-        .named_tensor_dtyped("q_pos", token_dim, luminal::dtype::DType::Int);
-    let qo_indptr = cx
-        .named_tensor_dtyped("qo_indptr", 'r', luminal::dtype::DType::Int);
-    let kv_indptr = cx
-        .named_tensor_dtyped("kv_indptr", 'r', luminal::dtype::DType::Int);
+    let q_rope = cx.named_tensor("q_rope", (token_dim, hidden), DType::F32);
+    let k_rope = cx.named_tensor("k_rope", (token_dim, kv_dim), DType::F32);
+    let v_new = cx.named_tensor("v_new", (token_dim, kv_dim), DType::F32);
+    let k_cache = cx
+        .named_tensor("k_cache", (2048, kv_dim), DType::F32)
+        .persist();
+    let v_cache = cx
+        .named_tensor("v_cache", (2048, kv_dim), DType::F32)
+        .persist();
+    let scatter_idx = cx.named_tensor("scatter_idx", token_dim, DType::Int);
+    let gather_idx = cx.named_tensor("gather_idx", context_dim, DType::Int);
+    let q_pos = cx.named_tensor("q_pos", token_dim, DType::Int);
+    let qo_indptr = cx.named_tensor("qo_indptr", 'r', luminal::dtype::DType::Int);
+    let kv_indptr = cx.named_tensor("kv_indptr", 'r', luminal::dtype::DType::Int);
 
     let k_dest = cache_dest_with_provenance(&mut cx, k_cache, "k_cache_alt", kv_dim, k_provenance);
     let v_dest = cache_dest_with_provenance(&mut cx, v_cache, "v_cache_alt", kv_dim, v_provenance);
@@ -979,10 +972,13 @@ fn flashinfer_rule_does_not_fire_on_unrelated_matmuls() {
     // through softmax — close to attention structurally but missing the GQA
     // broadcast / mask Add anchors. The rule must reject this.
     let mut cx = Graph::default();
-    let cache = cx.named_tensor("cache", (4096, KV_DIM)).persist();
-    let gather_idx = cx
-        .named_tensor_dtyped("gather_idx", 'c', luminal::dtype::DType::Int);
-    let weight = cx.named_tensor("weight", (HIDDEN, KV_DIM)).persist();
+    let cache = cx
+        .named_tensor("cache", (4096, KV_DIM), DType::F32)
+        .persist();
+    let gather_idx = cx.named_tensor("gather_idx", 'c', luminal::dtype::DType::Int);
+    let weight = cx
+        .named_tensor("weight", (HIDDEN, KV_DIM), DType::F32)
+        .persist();
 
     let n = gather_idx.dims1();
     let base = (gather_idx * KV_DIM).expand_dim(1, KV_DIM);
@@ -991,9 +987,11 @@ fn flashinfer_rule_does_not_fire_on_unrelated_matmuls() {
     let proj = gathered.matmul(weight.t());
     proj.output();
 
-    let a = cx.named_tensor("a", ('s', HIDDEN));
-    let b = cx.named_tensor("b", (HIDDEN, HIDDEN)).persist();
-    let c_tensor = cx.named_tensor("c_tensor", (HIDDEN, HIDDEN)).persist();
+    let a = cx.named_tensor("a", ('s', HIDDEN), DType::F32);
+    let b = cx.named_tensor("b", (HIDDEN, HIDDEN), DType::F32).persist();
+    let c_tensor = cx
+        .named_tensor("c_tensor", (HIDDEN, HIDDEN), DType::F32)
+        .persist();
     let ab = a.matmul(b.t());
     let abc = ab.softmax(1).matmul(c_tensor.t());
     abc.output();
@@ -1792,14 +1790,14 @@ fn egraph_choice_eclass_census() {
     const HEADS: usize = 2;
     const KVH: usize = 1;
     let mut cx = Graph::default();
-    let q = cx.tensor_dtyped(('s', HEADS * HD), DType::Bf16);
-    let k = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let v = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let k_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let v_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let scatter_idx = cx.tensor_dtyped('s', DType::Int);
-    let gather_idx = cx.tensor_dtyped('c', DType::Int);
-    let q_pos = cx.tensor_dtyped('s', DType::Int);
+    let q = cx.tensor(('s', HEADS * HD), DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let scatter_idx = cx.tensor('s', DType::Int);
+    let gather_idx = cx.tensor('c', DType::Int);
+    let q_pos = cx.tensor('s', DType::Int);
     let out = gemma_mini_paged_attention(
         q,
         k,
@@ -1902,14 +1900,14 @@ fn dump_gemma_sliding_attention_egglog() {
     const HEADS: usize = 2;
     const KVH: usize = 1;
     let mut cx = Graph::default();
-    let q = cx.tensor_dtyped(('s', HEADS * HD), DType::Bf16);
-    let k = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let v = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let k_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let v_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let scatter_idx = cx.tensor_dtyped('s', DType::Int);
-    let gather_idx = cx.tensor_dtyped('c', DType::Int);
-    let q_pos = cx.tensor_dtyped('s', DType::Int);
+    let q = cx.tensor(('s', HEADS * HD), DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let scatter_idx = cx.tensor('s', DType::Int);
+    let gather_idx = cx.tensor('c', DType::Int);
+    let q_pos = cx.tensor('s', DType::Int);
     let out = gemma_mini_paged_attention(
         q,
         k,
@@ -1939,14 +1937,14 @@ fn flashinfer_rule_fires_on_gemma_sliding_mask() {
     const HEADS: usize = 2;
     const KVH: usize = 1;
     let mut cx = Graph::default();
-    let q = cx.tensor_dtyped(('s', HEADS * HD), DType::Bf16);
-    let k = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let v = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let k_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let v_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let scatter_idx = cx.tensor_dtyped('s', DType::Int);
-    let gather_idx = cx.tensor_dtyped('c', DType::Int);
-    let q_pos = cx.tensor_dtyped('s', DType::Int);
+    let q = cx.tensor(('s', HEADS * HD), DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let scatter_idx = cx.tensor('s', DType::Int);
+    let gather_idx = cx.tensor('c', DType::Int);
+    let q_pos = cx.tensor('s', DType::Int);
     let out = gemma_mini_paged_attention(
         q,
         k,
@@ -1980,14 +1978,14 @@ fn flashinfer_rule_fires_on_gemma_scale_free_mask() {
     const HEADS: usize = 2;
     const KVH: usize = 1;
     let mut cx = Graph::default();
-    let q = cx.tensor_dtyped(('s', HEADS * HD), DType::Bf16);
-    let k = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let v = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-    let k_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let v_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-    let scatter_idx = cx.tensor_dtyped('s', DType::Int);
-    let gather_idx = cx.tensor_dtyped('c', DType::Int);
-    let q_pos = cx.tensor_dtyped('s', DType::Int);
+    let q = cx.tensor(('s', HEADS * HD), DType::Bf16);
+    let k = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let v = cx.tensor(('s', KVH * HD), DType::Bf16);
+    let k_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let v_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+    let scatter_idx = cx.tensor('s', DType::Int);
+    let gather_idx = cx.tensor('c', DType::Int);
+    let q_pos = cx.tensor('s', DType::Int);
     let out = gemma_mini_paged_attention(
         q,
         k,
@@ -2019,16 +2017,16 @@ fn gemma_fi_rules_six_instances_build_time() {
     const HEADS: usize = 2;
     const KVH: usize = 1;
     let mut cx = Graph::default();
-    let scatter_idx = cx.tensor_dtyped('s', DType::Int);
-    let gather_idx = cx.tensor_dtyped('c', DType::Int);
-    let q_pos = cx.tensor_dtyped('s', DType::Int);
+    let scatter_idx = cx.tensor('s', DType::Int);
+    let gather_idx = cx.tensor('c', DType::Int);
+    let q_pos = cx.tensor('s', DType::Int);
     let mut outs = Vec::new();
     for i in 0..6 {
-        let q = cx.tensor_dtyped(('s', HEADS * HD), DType::Bf16);
-        let k = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-        let v = cx.tensor_dtyped(('s', KVH * HD), DType::Bf16);
-        let k_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
-        let v_cache = cx.tensor_dtyped((16, KVH * HD), DType::Bf16);
+        let q = cx.tensor(('s', HEADS * HD), DType::Bf16);
+        let k = cx.tensor(('s', KVH * HD), DType::Bf16);
+        let v = cx.tensor(('s', KVH * HD), DType::Bf16);
+        let k_cache = cx.tensor((16, KVH * HD), DType::Bf16);
+        let v_cache = cx.tensor((16, KVH * HD), DType::Bf16);
         let sliding = if i % 2 == 0 { Some(8) } else { None };
         let out = gemma_mini_paged_attention(
             q,
@@ -2059,8 +2057,8 @@ fn gemma_fi_rules_six_instances_build_time() {
 fn dump_llama_swiglu_chain_egglog() {
     const I: usize = 8;
     let mut cx = Graph::default();
-    let xgu = cx.tensor_dtyped(('s', 2 * I), DType::Bf16);
-    let scale = cx.tensor_dtyped((), DType::F32);
+    let xgu = cx.tensor(('s', 2 * I), DType::Bf16);
+    let scale = cx.tensor((), DType::F32);
     let gate = xgu.slice((.., ..I));
     let up = xgu.slice((.., I..));
     let h = gate.swish() * up;
