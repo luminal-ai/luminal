@@ -139,6 +139,22 @@ pub(crate) fn kernel(
                 anyhow::anyhow!("i64 trunc-div refuses: {a} / {b} (zero divisor or MIN/-1)")
             })
         }),
+        // NARROW INTS WRAP at the MIN / -1 corner (carve-out
+        // 2026-09-02) — but a ZERO divisor is undefined at every width
+        // and still refuses loudly: wrapping is a defined result, a
+        // division by zero is not.
+        TypedBuffer::I8(_) => ctx.binary_elementwise_i8(|a, b| {
+            anyhow::ensure!(b != 0, "i8 trunc-div refuses: {a} / 0 (zero divisor)");
+            Ok(a.wrapping_div(b))
+        }),
+        TypedBuffer::U8(_) => ctx.binary_elementwise_u8(|a, b| {
+            anyhow::ensure!(b != 0, "u8 trunc-div refuses: {a} / 0 (zero divisor)");
+            Ok(a.wrapping_div(b))
+        }),
+        TypedBuffer::I16(_) => ctx.binary_elementwise_i16(|a, b| {
+            anyhow::ensure!(b != 0, "i16 trunc-div refuses: {a} / 0 (zero divisor)");
+            Ok(a.wrapping_div(b))
+        }),
         other => anyhow::bail!("trunc-div has no {} arm (Int only)", other.type_name()),
     }
 }

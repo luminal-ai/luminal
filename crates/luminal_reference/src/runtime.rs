@@ -401,6 +401,16 @@ impl ReferenceRuntime {
                     TypedBuffer::I64(values.clone())
                 }
                 (PlanDtype::Int64, None) => TypedBuffer::I64(vec![0; numel]),
+                // Narrow ints (ruling 2026-09-02, main #399): stored at
+                // their OWN width, never widened to i32 on the way in.
+                (PlanDtype::I8, Some(TypedBuffer::I8(values))) => TypedBuffer::I8(values.clone()),
+                (PlanDtype::I8, None) => TypedBuffer::I8(vec![0; numel]),
+                (PlanDtype::U8, Some(TypedBuffer::U8(values))) => TypedBuffer::U8(values.clone()),
+                (PlanDtype::U8, None) => TypedBuffer::U8(vec![0; numel]),
+                (PlanDtype::I16, Some(TypedBuffer::I16(values))) => {
+                    TypedBuffer::I16(values.clone())
+                }
+                (PlanDtype::I16, None) => TypedBuffer::I16(vec![0; numel]),
                 (PlanDtype::F8E4M3, Some(TypedBuffer::F8E4M3(codes))) => {
                     TypedBuffer::F8E4M3(codes.clone())
                 }
@@ -422,7 +432,8 @@ impl ReferenceRuntime {
                 ),
                 (other, None) => anyhow::bail!(
                     "buffer {} has dtype {other:?}, which the reference \
-                     runtime cannot execute (f32, f64, i32, i64, bool only)",
+                     runtime cannot execute (f32, f64, i8, u8, i16, i32, \
+                     i64, bool only)",
                     buffer.label
                 ),
             };
@@ -631,6 +642,28 @@ impl ReferenceRuntime {
     /// The i64 twin of [`Self::get_f32`].
     pub fn get_i64(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<i64>> {
         self.get_typed(self.output_buffer(tensor)?)?.as_i64()
+    }
+
+    /// The narrow-integer readers (ruling 2026-09-02, main #399's
+    /// `get_output_i8` / `get_output_u8` / `get_output_i16`). STRICTLY
+    /// NON-WIDENING, which is main's whole point and this branch's
+    /// typed-readback contract both: an I8 output reads back as `i8`,
+    /// and asking for it as `i32` refuses by name rather than quietly
+    /// promoting.
+    pub fn get_i8(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<i8>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_i8()
+    }
+
+    /// The u8 twin of [`Self::get_i8`]. Distinct from
+    /// [`Self::get_bool8`]: same storage width, different dtype, and a
+    /// U8 buffer has no two-legal-codes invariant.
+    pub fn get_u8(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<u8>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_u8()
+    }
+
+    /// The i16 twin of [`Self::get_i8`].
+    pub fn get_i16(&self, tensor: petgraph::graph::NodeIndex) -> Result<&Vec<i16>> {
+        self.get_typed(self.output_buffer(tensor)?)?.as_i16()
     }
 
     /// Buffer-id read for search internals.
@@ -1713,6 +1746,171 @@ mod tests {
         let (cx2, x2, s2) = build();
         let ours = run_reference(&cx2, &[(x2.id, x_data.into())]);
         assert_close(ours.get_f32(s2.id).unwrap(), &expected);
+    }
+
+    /// NARROW INTEGERS WRAP AT THEIR OWN WIDTH (carve-out 2026-09-02,
+    /// main #399's `reference_narrow_integer_add_wraps_in_declared_dtype`
+    /// re-expressed end to end). Main asserted this against a bare
+    /// `ReferenceData` op; here the same values go through the real
+    /// recorder / search / execute ladder and read back through the
+    /// STRICTLY NON-WIDENING getters, which is the other half of main's
+    /// claim: an I8 result is `i8`, not an i32 that happens to be small.
+    ///
+    /// This is the CARVE-OUT under review: I32 and I64 keep the
+    /// non-wrapping ruling of 2026-08-11 and would refuse these same
+    /// operands loudly.
+    #[test]
+    fn narrow_int_add_wraps_at_its_own_width() {
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor_dtyped(2, DType::I8);
+        let b = cx.tensor_dtyped(2, DType::I8);
+        let out = (a + b).output();
+        let rt = crate::harness::run_reference(
+            &cx,
+            &[
+                (a.id, TypedBuffer::I8(vec![127, -128])),
+                (b.id, TypedBuffer::I8(vec![1, -1])),
+            ],
+        );
+        assert_eq!(rt.get_i8(out.id).unwrap(), &vec![-128i8, 127]);
+
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor_dtyped(2, DType::U8);
+        let b = cx.tensor_dtyped(2, DType::U8);
+        let out = (a + b).output();
+        let rt = crate::harness::run_reference(
+            &cx,
+            &[
+                (a.id, TypedBuffer::U8(vec![255, 0])),
+                (b.id, TypedBuffer::U8(vec![1, 255])),
+            ],
+        );
+        assert_eq!(rt.get_u8(out.id).unwrap(), &vec![0u8, 255]);
+
+        let mut cx = luminal::graph::Graph::new();
+        let a = cx.tensor_dtyped(2, DType::I16);
+        let b = cx.tensor_dtyped(2, DType::I16);
+        let out = (a + b).output();
+        let rt = crate::harness::run_reference(
+            &cx,
+            &[
+                (a.id, TypedBuffer::I16(vec![32_767, -32_768])),
+                (b.id, TypedBuffer::I16(vec![1, -1])),
+            ],
+        );
+        assert_eq!(rt.get_i16(out.id).unwrap(), &vec![-32_768i16, 32_767]);
+    }
+
+    /// NARROW-INT CASTS TRUNCATE — main #399's
+    /// `reference_narrow_integer_casts_preserve_native_widths`, same
+    /// source values and the same expected results, through this
+    /// branch's cast kernel. The wide targets are NOT part of the
+    /// carve-out: `I64 -> I32` still refuses out of range, which the
+    /// last act pins.
+    #[test]
+    fn narrow_int_casts_truncate_and_wide_casts_stay_checked() {
+        let source = vec![-32_769i32, -129, -128, -1, 0, 127, 128, 255, 256];
+
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(9, DType::Int);
+        let out = x.cast(DType::I8).output();
+        let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
+        assert_eq!(
+            rt.get_i8(out.id).unwrap(),
+            &vec![-1i8, 127, -128, -1, 0, 127, -128, -1, 0]
+        );
+
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(9, DType::Int);
+        let out = x.cast(DType::U8).output();
+        let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
+        assert_eq!(
+            rt.get_u8(out.id).unwrap(),
+            &vec![255u8, 127, 128, 255, 0, 127, 128, 255, 0]
+        );
+
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(9, DType::Int);
+        let out = x.cast(DType::I16).output();
+        let rt = crate::harness::run_reference(&cx, &[(x.id, source.clone().into())]);
+        assert_eq!(
+            rt.get_i16(out.id).unwrap(),
+            &vec![32_767i16, -129, -128, -1, 0, 127, 128, 255, 256]
+        );
+
+        // The wide half of the policy, unchanged by the carve-out.
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(1, DType::I64);
+        let _out = x.cast(DType::Int).output();
+        let mut rt = ReferenceRuntime::load(&cx).expect("native load");
+        let mut data = FxHashMap::default();
+        data.insert(x.id, TypedBuffer::I64(vec![i64::from(i32::MAX) + 1]));
+        let err = rt
+            .search(&data, &luminal::test_support::harness_search_options())
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("cast i64 -> i32 out of range at value 2147483648"),
+            "i64 -> i32 must stay CHECKED (ruling 2026-08-11), got: {message}"
+        );
+    }
+
+    /// INTEGER `abs()` EXECUTES (main #399's dtype-aware `abs`,
+    /// re-expressed). Before this, `abs()` on any integer went through
+    /// `relu` -> `maximum_f32` -> `constant_float(0.0).cast(Int)`, and
+    /// that F32 -> Int cast is REFUSED at authoring, so integer `abs`
+    /// panicked before it recorded anything. Now it is
+    /// `x * (1 - 2*(x < 0))` built from INT constants.
+    ///
+    /// At the signed minimum the result is the signed minimum: |i16::MIN|
+    /// is not representable in i16, and under the narrow-int carve-out
+    /// the multiplication wraps, which is exactly what torch reports.
+    #[test]
+    fn integer_abs_executes_and_wraps_at_the_signed_minimum() {
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(4, DType::I16);
+        let out = x.abs().output();
+        let rt = crate::harness::run_reference(
+            &cx,
+            &[(x.id, TypedBuffer::I16(vec![-3, 0, 5, i16::MIN]))],
+        );
+        assert_eq!(rt.get_i16(out.id).unwrap(), &vec![3i16, 0, 5, i16::MIN]);
+
+        // Int stays proof-gated (2026-08-11), so the caller attests the
+        // range; inside it the answer is exact.
+        let mut cx = luminal::graph::Graph::new();
+        let x = cx.tensor_dtyped(4, DType::Int);
+        let out = x.abs().output();
+        let rt = crate::harness::run_reference_with_ranges(
+            &cx,
+            &[(x.id, vec![-3i32, 0, 5, -7].into())],
+            &[(x.id, -10, 10)],
+        );
+        assert_eq!(rt.get_i32(out.id).unwrap(), &vec![3i32, 0, 5, 7]);
+    }
+
+    /// A FLOAT -> NARROW-INT CAST IS STILL REFUSED. Main #399's
+    /// `to_i8_vec` family truncates from any source, floats included;
+    /// this branch does not carry that half. The carve-out is about
+    /// integer WIDTH, not about making a lossy float read implicit
+    /// (cast policy 2026-08-11), and the refusal is at AUTHORING so the
+    /// model's author sees it rather than the search.
+    #[test]
+    fn float_to_narrow_int_cast_is_refused_at_authoring() {
+        let refusal = std::panic::catch_unwind(|| {
+            let mut cx = luminal::graph::Graph::new();
+            let x = cx.tensor_dtyped(4, DType::F32);
+            let _ = x.cast(DType::I8);
+        })
+        .unwrap_err();
+        let message = refusal
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("F32") && message.contains("I8") && message.contains("refused"),
+            "expected the float -> int cast refusal, got: {message:?}"
+        );
     }
 
     /// F64 IS A REAL EXECUTABLE DTYPE (ruling 2026-09-02, main #398's

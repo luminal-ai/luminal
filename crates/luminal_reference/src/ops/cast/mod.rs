@@ -139,7 +139,16 @@ pub(crate) fn kernel(
     // REFUSAL (a lossy read is an explicit op, never a cast — the
     // Bool8 projection rule generalized); bool -> number is the exact
     // 0/1 indicator bridge; number -> bool is always the refusal.
+    //
+    // NARROW INTEGERS (ruling 2026-09-02, main #399's carve-out): five
+    // integer widths would be 25 hand-written pair arms, so any cast
+    // TOUCHING I8/U8/I16 routes through `narrow_cast` below, which
+    // states the policy once. The wide arms in this match are
+    // untouched.
     const F32_EXACT_INT: i64 = 1 << 24;
+    if is_narrow(&ctx.operands[0]) || is_narrow(&ctx.dests[0]) {
+        return narrow_cast(ctx);
+    }
     match (&ctx.operands[0], &mut ctx.dests[0]) {
         // Same-type: value-preserving copies.
         (TypedBuffer::F32(input), TypedBuffer::F32(dest)) => {
@@ -272,6 +281,117 @@ pub(crate) fn kernel(
             input.type_name(),
             dest.type_name()
         ),
+    }
+    Ok(())
+}
+
+fn is_narrow(buffer: &TypedBuffer) -> bool {
+    matches!(
+        buffer,
+        TypedBuffer::I8(_) | TypedBuffer::U8(_) | TypedBuffer::I16(_)
+    )
+}
+
+/// Any integer buffer read as i64. LOSSLESS at every integer width this
+/// runtime has (I8/U8/I16/I32/I64 all fit in i64), so the reading never
+/// loses a value — only the write side can, and only where the policy
+/// below says it may.
+fn read_integer(buffer: &TypedBuffer) -> Option<Vec<i64>> {
+    Some(match buffer {
+        TypedBuffer::I8(values) => values.iter().map(|v| i64::from(*v)).collect(),
+        TypedBuffer::U8(values) => values.iter().map(|v| i64::from(*v)).collect(),
+        TypedBuffer::I16(values) => values.iter().map(|v| i64::from(*v)).collect(),
+        TypedBuffer::I32(values) => values.iter().map(|v| i64::from(*v)).collect(),
+        TypedBuffer::I64(values) => values.clone(),
+        _ => return None,
+    })
+}
+
+/// Every cast with a narrow integer on either side. The policy, stated
+/// once (carve-out 2026-09-02 — Austin to confirm at review):
+///
+/// * int -> NARROW int TRUNCATES (`as`), which is main #399's semantics
+///   and torch's: at 8 and 16 bits a narrowing conversion is a defined
+///   wrap, not an error.
+/// * int -> `Int` / `Int64` stays CHECKED — the non-wrapping ruling of
+///   2026-08-11 is untouched for the wide types, so `I64 -> I32` still
+///   refuses out of range.
+/// * NARROW int -> float is exact BY WIDTH (|v| <= 32767, far inside the
+///   f32 2^24 exactness bound), so it satisfies the checked-exact
+///   int -> float rule with nothing left to check.
+/// * `Bool8` -> narrow int is the exact 0/1 indicator bridge.
+/// * float -> NARROW int is REFUSED, exactly like every other
+///   float -> int. This is the ONE place main's unchecked `as` is not
+///   carried: the carve-out is about integer WIDTH semantics, and it is
+///   not a licence to make a lossy float read implicit (cast policy
+///   2026-08-11). A rounding or truncation stays an explicit op.
+/// * narrow int -> `Bool8` is REFUSED: `!= 0` is a projection, never a
+///   cast.
+fn narrow_cast(ctx: &mut ReferenceKernelCtx) -> anyhow::Result<()> {
+    let source_name = ctx.operands[0].type_name();
+    let dest_name = ctx.dests[0].type_name();
+    let values: Vec<i64> = match &ctx.operands[0] {
+        TypedBuffer::Bool8(codes) => {
+            let mut values = Vec::with_capacity(codes.len());
+            for code in codes {
+                anyhow::ensure!(*code <= 1, "Bool8 buffer holds ill-formed code {code}");
+                values.push(i64::from(*code));
+            }
+            values
+        }
+        other => read_integer(other).ok_or_else(|| {
+            anyhow::anyhow!(
+                "cast {source_name} -> {dest_name} is not a reinterpretation: \
+                 a rounding or truncation is a lossy read and must appear as \
+                 an explicit op in the model, never as a cast"
+            )
+        })?,
+    };
+    anyhow::ensure!(values.len() == ctx.dests[0].len(), "cast length mismatch");
+    match &mut ctx.dests[0] {
+        TypedBuffer::I8(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = *value as i8;
+            }
+        }
+        TypedBuffer::U8(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = *value as u8;
+            }
+        }
+        TypedBuffer::I16(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = *value as i16;
+            }
+        }
+        TypedBuffer::I32(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = i32::try_from(*value).map_err(|_| {
+                    anyhow::anyhow!("cast {source_name} -> i32 out of range at value {value}")
+                })?;
+            }
+        }
+        TypedBuffer::I64(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = *value;
+            }
+        }
+        TypedBuffer::F32(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = *value as f32;
+            }
+        }
+        TypedBuffer::F64(dest) => {
+            for (out, value) in dest.iter_mut().zip(&values) {
+                *out = *value as f64;
+            }
+        }
+        TypedBuffer::Bool8(_) => anyhow::bail!(
+            "cast {source_name} -> Bool8 is not a reinterpretation: the != 0 \
+             reading is a PROJECTION and must appear as an explicit \
+             comparison in the model (LessThan), never as a cast"
+        ),
+        dest => anyhow::bail!("cast has no ({source_name} -> {}) arm", dest.type_name()),
     }
     Ok(())
 }

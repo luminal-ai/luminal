@@ -53,6 +53,11 @@ fn typed_to_bytes(data: &TypedBuffer) -> &[u8] {
         // representation, so `dtype_bytes` refuses it by name before a
         // buffer ever reaches this bridge.
         TypedBuffer::F64(_) => unreachable!("dtype_bytes refuses F64 first"),
+        // Likewise the narrow integers (ruling 2026-09-02): reference
+        // storage only, no CL kernel, no device representation.
+        TypedBuffer::I8(_) | TypedBuffer::U8(_) | TypedBuffer::I16(_) => {
+            unreachable!("dtype_bytes refuses narrow integers first")
+        }
     }
 }
 

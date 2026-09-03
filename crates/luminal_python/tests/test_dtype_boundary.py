@@ -15,6 +15,11 @@ class BoundaryNoopModel(torch.nn.Module):
         return x + torch.zeros((), dtype=x.dtype, device=x.device)
 
 
+class AbsModel(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.abs(x)
+
+
 class EmptyWeightModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -190,14 +195,14 @@ def boundary_device(request) -> torch.device:
     return torch.device(device_name)
 
 
-# Dtypes that round-trip the BoundaryNoopModel without an explicit
-# `x.to(model.input_dtypes[0])` cast at the call site. Anything not in this
-# set is a narrow integer (uint8 / int8 / int16) that luminal collapses to
-# `DType::Int` internally — the hard-reject contract makes the boundary
-# refuse the mismatched dtype, and the test for those lives in
-# `test_input_dtype_mismatch_rejects` instead.
+# Dtypes that round-trip the BoundaryNoopModel without an explicit cast at the
+# call site. Each retains both its declared dtype and exact values across input
+# upload, reference execution, and output readback.
 _FIRST_CLASS_NOOP_DTYPES = {
     "bool",
+    "uint8",
+    "int8",
+    "int16",
     "int32",
     "int64_i32_range",
     "int64_outside_i32_range",
@@ -240,9 +245,32 @@ def test_boundary_noop_preserves_dtype_and_values(
 
 
 @pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(case, id=case.name)
+        for case in DTYPE_CASES
+        if case.name in {"uint8", "int8", "int16"}
+    ],
+)
+def test_narrow_integer_abs_preserves_wrapping_semantics(case: DTypeCase) -> None:
+    model = AbsModel()
+    compiled = torch.compile(model, backend=luminal_backend, fullgraph=True)
+    x = case.values()
+
+    expected = model(x)
+    actual = compiled(x)
+
+    assert actual.dtype == expected.dtype
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
     "dtype",
     [
         pytest.param(torch.bool, id="bool"),
+        pytest.param(torch.uint8, id="uint8"),
+        pytest.param(torch.int8, id="int8"),
+        pytest.param(torch.int16, id="int16"),
         pytest.param(torch.int32, id="int32"),
         pytest.param(torch.int64, id="int64"),
         pytest.param(torch.float16, id="float16"),
@@ -369,6 +397,9 @@ def test_item_returns_exact_python_scalar(
         pytest.param(False, True, True, torch.bfloat16, False, id="bool-scalars"),
         pytest.param(0, 3.1, 1, torch.float16, True, id="keyword-end"),
         pytest.param(1, 5, 2, torch.int64, False, id="int64-output"),
+        pytest.param(0, 6, 2, torch.uint8, False, id="uint8-output"),
+        pytest.param(-3, 4, 3, torch.int8, False, id="int8-output"),
+        pytest.param(-300, 301, 300, torch.int16, False, id="int16-output"),
         pytest.param(1.1, 1.1, -1.0, torch.float32, False, id="empty"),
     ],
 )
@@ -431,42 +462,12 @@ def test_nonempty_cpu_input_rejects_null_pointer() -> None:
     [
         pytest.param(case, id=case.name)
         for case in DTYPE_CASES
-        # Narrow integer widths (uint8 / int8 / int16) aren't first-class in
-        # luminal's IR — the translator refuses them outright. int64 /
-        # float64 are first-class and round-trip without rejection.
-        if case.name in {"uint8", "int8", "int16"}
-    ],
-)
-def test_input_dtype_mismatch_rejects(
-    boundary_device: torch.device,
-    case: DTypeCase,
-) -> None:
-    """Hard-reject contract: a graph whose declared input dtype is one of
-    the narrow ints (uint8 / int8 / int16) fails at compile time with a
-    clear panic from `torch_dtype_int_to_luminal`. Previously the
-    translator silently widened narrow ints to `Int` (i32), which left
-    the user's actual dtype invisible past the FFI boundary; today the
-    failure points at the missing IR support directly.
-    """
-    model = BoundaryNoopModel().to(boundary_device)
-    compiled = torch.compile(model, backend=luminal_backend)
-    x = case.values().to(boundary_device)
-
-    # `pyo3_runtime.PanicException` inherits from `BaseException` (not
-    # `Exception`), so `pytest.raises(Exception, ...)` would miss it.
-    # Match on the panic message text — stable across torch versions.
-    with pytest.raises(BaseException, match="isn't a first-class IR type yet"):
-        compiled(x)
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        pytest.param(case, id=case.name)
-        for case in DTYPE_CASES
         if case.name
         in {
             "bool",
+            "uint8",
+            "int8",
+            "int16",
             "int32",
             "float16",
             "bfloat16",

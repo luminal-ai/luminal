@@ -157,6 +157,13 @@ pub(crate) fn kernel(
                 anyhow::anyhow!("i64 add overflow: {a} + {b} (ints are non-wrapping)")
             })
         }),
+        // NARROW INTS WRAP (carve-out 2026-09-02, main #399): torch
+        // semantics at 8 and 16 bits, and a defined result rather than
+        // an escaped error. I32/I64 above keep the checked, non-wrapping
+        // ruling of 2026-08-11.
+        TypedBuffer::I8(_) => ctx.binary_elementwise_i8(|a, b| Ok(a.wrapping_add(b))),
+        TypedBuffer::U8(_) => ctx.binary_elementwise_u8(|a, b| Ok(a.wrapping_add(b))),
+        TypedBuffer::I16(_) => ctx.binary_elementwise_i16(|a, b| Ok(a.wrapping_add(b))),
         other => anyhow::bail!("add has no {} arm", other.type_name()),
     }
 }

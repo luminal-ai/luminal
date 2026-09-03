@@ -174,6 +174,43 @@ pub(crate) fn kernel(
                 *out = u8::from(lhs[index] < rhs[index]);
             }
         }
+        // Narrow ints compare NATIVELY: an i8 compared as i32 would be
+        // correct here but would need a widening the typed-buffer
+        // ruling forbids, and a u8 compared as i8 would not be correct
+        // at all.
+        (TypedBuffer::I8(lhs), TypedBuffer::I8(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
+        (TypedBuffer::U8(lhs), TypedBuffer::U8(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
+        (TypedBuffer::I16(lhs), TypedBuffer::I16(rhs)) => {
+            let (lhs, rhs) = (lhs.clone(), rhs.clone());
+            let dest = ctx.dests[0].as_bool8_mut()?;
+            anyhow::ensure!(
+                lhs.len() == rhs.len() && lhs.len() == dest.len(),
+                "less-than kernel length mismatch"
+            );
+            for (index, out) in dest.iter_mut().enumerate() {
+                *out = u8::from(lhs[index] < rhs[index]);
+            }
+        }
         (lhs, rhs) => anyhow::bail!(
             "less-than has no ({}, {}) arm (operands must share one dtype)",
             lhs.type_name(),

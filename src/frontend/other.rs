@@ -107,7 +107,16 @@ impl GraphTensor {
             self.dtype,
             DType::F32 | DType::F64 | DType::F16 | DType::Bf16 | DType::TF32
         );
-        let int_target = matches!(dtype, DType::Int | DType::I64);
+        // The narrow integers joined the executable set on 2026-09-02
+        // (main #399). Their carve-out is about integer WIDTH — a
+        // narrowing int -> int cast truncates — and NOT a licence to
+        // make a lossy float read implicit, so they are int targets
+        // here like every other integer. (I4/U4/U16 have no storage and
+        // no kernel, so a cast to them refuses at the plan instead.)
+        let int_target = matches!(
+            dtype,
+            DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16
+        );
         assert!(
             !(float_source && int_target),
             "cast {:?} -> {:?} is refused: a float -> int conversion is a \

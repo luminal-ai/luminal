@@ -138,6 +138,22 @@ pub(crate) fn kernel(
                 anyhow::anyhow!("i64 trunc-rem refuses: {a} % {b} (zero divisor or MIN/-1)")
             })
         }),
+        // Main #399 put `i8::wrapping_rem` / `u8: x % y` /
+        // `i16::wrapping_rem` on its `Mod` op; integer remainder is
+        // spelled TruncRem on this branch (Mod is the f32 op), so the
+        // arms land here. Zero divisor still refuses loudly.
+        TypedBuffer::I8(_) => ctx.binary_elementwise_i8(|a, b| {
+            anyhow::ensure!(b != 0, "i8 trunc-rem refuses: {a} % 0 (zero divisor)");
+            Ok(a.wrapping_rem(b))
+        }),
+        TypedBuffer::U8(_) => ctx.binary_elementwise_u8(|a, b| {
+            anyhow::ensure!(b != 0, "u8 trunc-rem refuses: {a} % 0 (zero divisor)");
+            Ok(a.wrapping_rem(b))
+        }),
+        TypedBuffer::I16(_) => ctx.binary_elementwise_i16(|a, b| {
+            anyhow::ensure!(b != 0, "i16 trunc-rem refuses: {a} % 0 (zero divisor)");
+            Ok(a.wrapping_rem(b))
+        }),
         other => anyhow::bail!("trunc-rem has no {} arm (Int only)", other.type_name()),
     }
 }

@@ -32,6 +32,7 @@ Dispositions:
 | `bea18ecf` | #389 | Sdpa gqa fixes | FILE-LEVEL | branch `merge/main-389-sdpa-gqa` | parked crate + non-gating `ci/`: RULED 2026-09-02 (ruling 1) — `ci/example_output.py` SYNCS main's numbers for now, by decision; the loosened gemma / gemma4_moe TPOT figures are main's HLIR cuda_lite draws and still have to be re-baselined against CL A100 draws before they gate anything here |
 | `499d0779` | #386 | Search: early-stop candidate profiling against the best-so-far metric | MIXED — RE-EXPRESSED (core: running mean + fifth positional cutoff + predicate) / FILE-LEVEL (parks, with a stubbed predicate) | branch `merge/main-386-early-stop` (two commits) | REQUIREMENT FOR CL (ruling 4): a device `PlanProfiler` that times candidates on device, mirroring `ReferenceProfiler`'s design, and then honours the cutoff — until then `StaticProfiler` accepts and ignores it; see **#386 early-stop profiling** below |
 | `6a5313f2` | #398 | Support for PyTorch OpInfo tests | MIXED — FILE-LEVEL (python + workflow) / RE-EXPRESSED (`TypedBuffer::F64` + typed unary kernels) / DROPPED (`ConstantF64`, the empty-Vec fix) | branch `merge/main-398-opinfo` (two commits) | OpInfo harness, the arange-metadata and acos/acosh lowerings = M4 translator requirements; typed `LogicalConstant`; F32<->F64 cast policy; F64 on CL — see **#398 OpInfo + F64** below |
+| `db3c80fd` | #399 | Add native narrow integer HLIR dtypes | MIXED — FILE-LEVEL (python) / RE-EXPRESSED (I8/U8/I16 TypedBuffer + kernels, int-safe `abs`) | branch `merge/main-399-narrow-ints` (two commits) | **CARVE-OUT to confirm at review**: I8/U8/I16 wrap, I32/I64 stay checked — see **#399 narrow ints** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -373,3 +374,123 @@ Main's other two Rust tests do not move: `f64_constant_to_egglog_round_trips_exa
 tests `ConstantF64`, which is superseded, and
 `empty_bytes_preserve_reference_dtype` tests a `from_raw_parts` hazard that
 does not exist here.
+
+## #399 narrow ints — what landed, and the carve-out that needs confirming
+
+RULED 2026-09-02 (ruling 2): *"this is good and should get its content
+merged"*, with the narrow-int semantics flagged for Austin to object to at
+review. Two commits.
+
+**FILE-LEVEL (commit 1).** The seven `crates/luminal_python/**` files carry
+main's diff byte for byte (no conflicts, no re-spelling — the diff-of-diffs
+against `db3c80fd` is empty). `torch_dtype.rs` and `typed_data.rs` are the
+boundary dtype tables — the record of which torch dtype maps to which luminal
+one — and are worth having even inert. The crate is not a workspace member
+and `typed_data.rs` still names `luminal::hlir::ReferenceData`, so none of it
+builds; it is banked, not revived.
+
+**UNCARRIED.** `src/hlir.rs` (+350) and `src/dyn_backend.rs` (+87) are deleted
+here. Their content is re-expressed (below) except for the `DynBackend`
+`get_output_i8/u8/i16` trait defaults, which have no counterpart at all: this
+branch's outputs come back through `ReferenceRuntime`'s typed getters, so
+main's three trait methods become three `get_*` methods on the runtime and the
+`DynBackend`/pyo3/python reader-table plumbing around them is dropped with the
+trait. Main's two test hunks (`src/hlir.rs` `mod tests`, `src/dyn_backend.rs`)
+name deleted types and could not move as written; they are re-expressed as
+reference-runtime tests instead.
+
+**RE-EXPRESSED (commit 2): I8/U8/I16 become executable dtypes.** Ruling 2
+answered intent-row questions 1-4. `TypedBuffer` gains
+`I8(Vec<i8>) / U8(Vec<u8>) / I16(Vec<i16>)` with `len`, `type_name`, typed
+accessors, `zeroed_like`, `From<Vec<i8>>` and `From<Vec<i16>>` — but NOT
+`From<Vec<u8>>`, which is the payload type of both `U8` and `Bool8`, so an
+impl would have to guess which one caller bytes mean. Kernel arms land in
+`add`, `mul`, `less_than`, `scatter`, `reduce_sum`, `reduce_max`,
+`trunc_div`, `trunc_rem`, `cast` and (through `move_gathered`) `gather`,
+index-map materialize and the dense layout copy. `ReferenceRuntime` gains the
+three `PlanDtype` materialize arms and `get_i8` / `get_u8` / `get_i16`.
+
+> ### THE CARVE-OUT — Austin to confirm at review
+>
+> **I8, U8 and I16 arithmetic WRAPS at its own width, following main #399
+> and torch. I32 and I64 keep the non-wrapping ruling of 2026-08-11: a
+> checked overflow is a loud kernel error, discharged statically by the
+> value-bounds proof gate.**
+>
+> The two rules coexist without an egglog edit because each op's
+> `match_functional.egg` gate names `(Int)` and `(Int64)` and nothing else,
+> so a narrow-int op mints through the UNGATED arm and needs no proof. The
+> argument for the split is that a wrap is a DEFINED result at 8 and 16 bits
+> — it is what torch computes and what the OpInfo suite this feature exists
+> to serve compares against — whereas at 32 and 64 bits an overflow is an
+> escaped error that the bounds lattice can and does prove away. The
+> argument against is that it is two overflow semantics in one runtime,
+> distinguishable only by width. If ruled the other way, the change is
+> local: swap `Ok(a.wrapping_add(b))` for a `checked_add` in the six narrow
+> arms and add `(I8)/(U8)/(I16)` proof gates beside the `(Int)` ones.
+
+**Main's `as` casts: carried for integers, NOT for floats.** A cast touching
+a narrow int routes through one `narrow_cast` helper in
+`crates/luminal_reference/src/ops/cast/mod.rs` — five integer widths would
+otherwise be 25 hand-written pair arms. Policy, stated once there:
+int -> narrow int TRUNCATES (main's `as`); int -> `Int`/`Int64` stays CHECKED;
+narrow int -> float is exact by width (|v| <= 32767, well inside f32's 2^24
+bound), so the checked-exact rule has nothing left to check; `Bool8` -> narrow
+int is the 0/1 indicator bridge. The ONE place main's `as` is not carried is
+**float -> narrow int**, which stays a REFUSAL like every other float -> int:
+the carve-out is about integer WIDTH semantics, not a licence to make a lossy
+float read implicit. `GraphTensor::cast`'s authoring guard grows `I8|U8|I16`
+so the author sees that refusal, not the search. (`I4`/`U4`/`U16` are left out
+of the guard: they have no storage and no kernel, so a cast to them refuses at
+the plan instead.)
+
+**`Mod` vs `TruncRem`.** Main put its narrow arms on `Mod`. Integer remainder
+is spelled `TruncRem` here (`Mod` is the f32 op, and says so in its refusal),
+so `i8::wrapping_rem` / `u8: x % y` / `i16::wrapping_rem` land in
+`ops/trunc_rem/`. `ops/modulo/` is unchanged and still f32-only. `trunc_div`
+gets the matching `wrapping_div` arms, which main had no counterpart for. A
+ZERO divisor still refuses loudly at every width: wrapping is a defined
+result, division by zero is not.
+
+**LIVE frontend: `abs` and `neg`.** `GraphTensor::abs` takes main's
+dtype-aware body — identity for unsigned, `x * (1 - 2*(x < 0))` for signed —
+and this is a genuine bug fix, not a refinement. The old body was
+`self.relu() + (-self).relu()`, `relu` is `maximum_f32`, and `maximum_f32`
+builds its bound with `constant_float(0.0).cast(self.dtype)`; an F32 -> Int
+cast is REFUSED at authoring, so `abs()` on ANY integer PANICKED before it
+recorded anything. Main's body is rebuilt from `Graph::constant` (Int)
+instead of `constant_float` (F32) for the same reason. Landing it also
+exposed that `impl Neg for GraphTensor` was dtype-aware for `Int | I64` only;
+it now covers the whole integer family, and on an unsigned type the `-1`
+constant casts to that type's all-ones code so the wrapping multiply is
+two's-complement negation.
+
+**Tests** (all in `crates/luminal_reference/src/runtime.rs` unless noted).
+Main's two `src/hlir.rs` tests could not move — they name `ReferenceData` and
+call `.execute()` on a bare op — so both are re-expressed end to end, through
+the real recorder/search/execute ladder, which is strictly stronger:
+
+- `narrow_int_add_wraps_at_its_own_width` — main's
+  `reference_narrow_integer_add_wraps_in_declared_dtype`, same operands
+  (`127 + 1`, `-128 + -1` at i8; `255 + 1`, `0 + 255` at u8; the i16 pair) and
+  same expected wraps, read back through the non-widening getters.
+- `narrow_int_casts_truncate_and_wide_casts_stay_checked` — main's
+  `reference_narrow_integer_casts_preserve_native_widths`, the same
+  nine-element `Int` source and the same three expected result vectors,
+  plus a fourth act pinning that `I64 -> Int` still REFUSES out of range.
+- `float_to_narrow_int_cast_is_refused_at_authoring` — the one deliberate
+  divergence from main, pinned so it cannot drift back by accident.
+- `integer_abs_executes_and_wraps_at_the_signed_minimum` — `abs` on I16
+  (ungated) and on Int (attested range), with `abs(i16::MIN) == i16::MIN`,
+  which is both the wrap and what torch reports.
+- `luminal::frontend::unary::tests::unsigned_abs_is_the_identity` — `abs()`
+  on U4/U8/U16 records no op at all.
+
+Main's `src/dyn_backend.rs` test `narrow_integer_bytes_preserve_width_and_signedness`
+does not move: it tests `bytes_to_reference_data`, a byte-reinterpretation
+function with no counterpart under `TypedBuffer`.
+
+**Not carried.** `U16` stays unmapped, exactly as in main — the dtype tag
+exists, the storage does not. `crates/luminal_cuda_lite/src/device.rs` gets
+`unreachable!` arms only: `dtype_bytes` has no narrow-int row, so CL refuses
+them by name, and transport without kernels would be the half-done version.

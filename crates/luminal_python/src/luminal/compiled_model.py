@@ -193,11 +193,6 @@ class CompiledModel:
         # `torch.frombuffer`. That's a reinterpret, not a numeric
         # cast — no precision change.
         #
-        # Narrow ints (`int8` / `int16` / `uint8`) are intentionally
-        # absent — luminal's IR refuses them at the FFI boundary (cf.
-        # `pt2_util::torch_dtype_int_to_luminal`,
-        # `typed_data::from_pytorch_bytes`), so a graph can never
-        # declare a narrow-int output that reaches this dispatch.
         _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
         _output_readers = {
             torch.float32: ("get_output", torch.float32),
@@ -206,6 +201,9 @@ class CompiledModel:
             torch.bfloat16: ("get_output_bf16", torch.bfloat16),
             torch.int64: ("get_output_i64", torch.int64),
             torch.int32: ("get_output_i32", torch.int32),
+            torch.int16: ("get_output_i16", torch.int16),
+            torch.int8: ("get_output_i8", torch.int8),
+            torch.uint8: ("get_output_u8", torch.uint8),
             torch.bool: ("get_output_bool", torch.bool),
         }
 
@@ -238,7 +236,7 @@ class CompiledModel:
                 if all(d != 0 for d in shape):
                     return None
                 return torch.empty(tuple(shape), dtype=out_dtype, device=input_device)
-            if out_dtype in (torch.float16, torch.bfloat16):
+            if out_dtype in (torch.float16, torch.bfloat16, torch.uint8):
                 # Getter returned an immutable `bytes` from Rust; wrap in
                 # `bytearray` to make the storage writable (suppresses
                 # the "non-writable buffer" warning), then bit-cast via

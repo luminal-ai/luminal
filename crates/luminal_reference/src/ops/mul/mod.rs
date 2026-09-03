@@ -157,6 +157,10 @@ pub(crate) fn kernel(
                 anyhow::anyhow!("i64 mul overflow: {a} * {b} (ints are non-wrapping)")
             })
         }),
+        // NARROW INTS WRAP — see the carve-out note in the add kernel.
+        TypedBuffer::I8(_) => ctx.binary_elementwise_i8(|a, b| Ok(a.wrapping_mul(b))),
+        TypedBuffer::U8(_) => ctx.binary_elementwise_u8(|a, b| Ok(a.wrapping_mul(b))),
+        TypedBuffer::I16(_) => ctx.binary_elementwise_i16(|a, b| Ok(a.wrapping_mul(b))),
         other => anyhow::bail!("mul has no {} arm", other.type_name()),
     }
 }

@@ -50,11 +50,22 @@ impl Neg for GraphTensor {
     type Output = GraphTensor;
 
     fn neg(self) -> Self::Output {
-        // Dtype-aware: an Int tensor negates through an Int constant —
-        // the f32 literal would record a refused f32 -> Int cast
-        // (typed-buffers cast policy, 2026-08-11).
+        // Dtype-aware: an integer tensor negates through an Int
+        // constant — the f32 literal would record a refused f32 -> Int
+        // cast (typed-buffers cast policy, 2026-08-11). The narrow
+        // integers joined the executable set on 2026-09-02 (main #399)
+        // and take the same arm: on an unsigned type the -1 constant
+        // casts to that type's all-ones code and the wrapping multiply
+        // is two's-complement negation, which is what it means there.
         match self.dtype {
-            DType::Int | DType::I64 => self * IntExpr::from(-1),
+            DType::Int
+            | DType::I64
+            | DType::I4
+            | DType::U4
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16 => self * IntExpr::from(-1),
             _ => self * -1.,
         }
     }
@@ -266,9 +277,41 @@ impl GraphTensor {
         self.var_options(axes, correction).sqrt()
     }
 
-    /// Take the absolute value
+    /// Take the absolute value.
+    ///
+    /// DTYPE-AWARE (main #399, re-expressed 2026-09-02). The float path
+    /// is unchanged: `relu(x) + relu(-x)`. Integers cannot take it —
+    /// `relu` is `maximum_f32`, which builds its bound with
+    /// `constant_float(0.0).cast(self.dtype)`, and an F32 -> Int cast is
+    /// REFUSED at authoring by the cast policy of 2026-08-11, so
+    /// `abs()` on an Int tensor used to panic before it recorded
+    /// anything. So:
+    ///
+    /// * UNSIGNED integers are already their own absolute value —
+    ///   identity, and no ops recorded at all.
+    /// * SIGNED integers use main's identity `x * (1 - 2*(x < 0))`,
+    ///   built from Int constants rather than float ones so no
+    ///   float -> int cast appears. This is also CORRECT at the signed
+    ///   minimum in the only sense available: `i32::MIN` has no
+    ///   representable absolute value, and the multiplication reports
+    ///   that as an overflow (the Int kernels are checked) instead of
+    ///   returning `MIN` as `relu` + `relu` would.
     pub fn abs(self) -> GraphTensor {
-        self.relu() + (-self).relu()
+        match self.dtype {
+            DType::U4 | DType::U8 | DType::U16 => self,
+            DType::I4 | DType::I8 | DType::I16 | DType::Int | DType::I64 => {
+                let dims = self.dims();
+                let zero = self
+                    .graph()
+                    .constant(0)
+                    .cast(self.dtype)
+                    .expand_rhs(dims.clone());
+                let one = self.graph().constant(1).cast(self.dtype).expand_rhs(dims);
+                let negative = self.lt(zero).cast(self.dtype);
+                self * (one - negative * 2)
+            }
+            _ => self.relu() + (-self).relu(),
+        }
     }
 
     /// Get the sign of each element, '1' for positive and '-1' for negative
@@ -490,6 +533,24 @@ pub(super) mod tests {
     use itertools::Itertools;
     use luminal::prelude::*;
     use proptest::prelude::*;
+
+    /// `abs()` ON AN UNSIGNED INTEGER RECORDS NOTHING (main #399's
+    /// `DType::U4 | U8 | U16 => self` arm). Not a performance nicety: a
+    /// recorded no-op would be a `lt` against zero, whose answer is
+    /// constant-false for an unsigned type, followed by arithmetic that
+    /// exists only to multiply by one.
+    #[test]
+    fn unsigned_abs_is_the_identity() {
+        let mut cx = Graph::new();
+        for dtype in [DType::U4, DType::U8, DType::U16] {
+            let x = cx.tensor_dtyped(4, dtype);
+            assert_eq!(
+                x.abs().id,
+                x.id,
+                "abs() on {dtype:?} must be the identity, not a recorded op"
+            );
+        }
+    }
 
     fn cummax_ref_2d(a: Tensor) -> Tensor {
         let v = a.to_vec2::<f32>().unwrap();
