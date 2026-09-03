@@ -478,8 +478,13 @@ impl<'a> Translator<'a> {
                 quotient.cast(DType::Int).cast(a.dtype)
             }),
             _ => {
-                // No rounding mode — regular division
-                Ok(quotient.cast(a.dtype))
+                // No rounding mode is true division, which ATen builds with
+                // build_borrowing_binary_float_op — so an integral input comes
+                // back float, not cast back to `a.dtype`.
+                Ok(match self.recorded_output_dtype(node) {
+                    Some(dtype) => quotient.cast(dtype),
+                    None => quotient,
+                })
             }
         }
     }
