@@ -418,6 +418,33 @@
 
 (function rank-of (Shape) i64 :no-merge)
 (function shape-of (LogicalTensor) Shape :no-merge)
+
+; DTYPE IS A RECORD-TIME CONTRACT, NEVER AN INFERENCE PLACEHOLDER. Every
+; logical value's dtype is DECLARED where the value is minted — the
+; recorder's `LogicalNode.dtype` (src/graph.rs) — and reaches the estate
+; either as the dtype field of `LogicalTensorInputLit` or as the target of
+; `LogicalCast`. Every OTHER value's dtype is concluded by a rule keyed on
+; its OWN constructor (`src/logical_op/*/dtype.egg`: iota -> (Int),
+; less_than -> (Bool), cast -> the carried target, gather -> the data
+; operand's, add/mul -> both operands duplicatively as a tripwire). The
+; estate must therefore never carry a GENERIC first-input dtype propagation
+; rule — one that concludes a marker's or boundary op's dtype from input 0
+; regardless of opcode. `dtype-of` is `:no-merge`, so two disagreeing
+; dtypes for one class is a saturation PANIC, not last-write-wins: a
+; guessed dtype unioned over a declared one would abort the run, and it is
+; unnecessary besides, because every constructor already declares or
+; concludes its own.
+;
+; The written justification is main's #417 (`477d3626`, "Preserve concrete
+; dtypes through loop rolling"). There, loop rolling stamped `DType::F32`
+; into every loop marker it inserted and relied on exactly such a generic
+; first-input `dtype_prop` rule to repair the field afterwards; BF16 weight
+; streams and Int gather indexes came out F32. Main's fix was to make each
+; op declare its output dtype and to delete the generic propagation — i.e.
+; to adopt the law stated above. This branch has no loop rolling and no
+; marker ops, so there is nothing to repair here; the law is written down
+; so nothing reintroduces the propagation. See docs/main-rejoin/ledger.md,
+; section "#417 dtype contracts".
 (function dtype-of (LogicalTensor) Dtype :no-merge)
 (function bits-of (Dtype) BitWidth :no-merge)
 (function logical-of (LayoutTensor) LogicalTensor :no-merge)

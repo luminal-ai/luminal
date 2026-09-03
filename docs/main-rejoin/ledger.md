@@ -47,6 +47,7 @@ Dispositions:
 | `2f820521` | #414 | Expand PyTorch ATen lowering coverage | FILE-LEVEL (19 python-park files + 2 into the `cuda_lite_hlir` park) + LANDED-BY-EQUIVALENT (`src/frontend/movement.rs`) + N/A (`examples/flux2`) | branch `merge/main-414-aten-coverage` | RULED 2026-09-03: *"we can also do 414 in one go."* ~115 new ATen overloads = M4 translator requirements; the `as_float` non-finite JSON decoding is a correctness nugget worth keeping — see **#414 ATen coverage** below |
 | `b745d102` | #413 | metal: emit constants by f32 bit pattern | FILE-LEVEL (2 metal-park files) | branch `merge/main-413-metal-constants` | RULED 2026-09-03: *"same 413 is fine. we can just merge this and check later."* The CHECK is done and the answer is NO: live CUDA constant codegen has the same defect — see **#413 metal constants** below |
 | `38640588` | #416 | Allow vLLM FX region compilation | FILE-LEVEL (11 python-park files + 1 into the `cuda_lite_hlir` park) + DROPPED (the zero-extent slice special case, by ruling) + RE-EXPRESSED (one recording-only pin) | branch `merge/main-416-vllm-regions` | RULED 2026-09-03: *"let's not special case slices producing extent zero for now"* — and the answer to *"nothing bad should happen?"* is: nothing does; the shared-destination invariant is already enforced by the conflict engine — see **#416 vLLM regions** below |
+| `477d3626` | #417 | Preserve concrete dtypes through loop rolling | INTENT-ONLY (the law written into the estate beside `dtype-of`) | branch `merge/main-417-dtype-contract` | RULED 2026-09-03: *"This is good, let's merge it."* Nothing is file-mergeable — `src/hlir.rs` and `src/op.rs` are deleted and `src/graph.rs` is a different file (the recorder). The principle main paid for is already this branch's design and is now written down; the `output_dtype` table, `concrete_node_dtypes` and the marker assertions are uncarried — see **#417 dtype contracts** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1962,6 +1963,141 @@ extraction, bufferization (a zero-byte buffer) and a backend kernel launch
 zero extent ever does break something downstream, this test is where the
 investigation starts, and the fix belongs at whichever stage actually breaks —
 not as a frontend special case.
+
+## #417 dtype contracts — the law recorded beside `dtype-of`; the machinery uncarried
+
+RULED 2026-09-03: *"This is good, let's merge it."* Nothing in main's
+`477d3626` is file-mergeable, so "merge it" lands its PRINCIPLE where this
+branch keeps such laws, plus this row.
+
+**Why nothing applies file-level.** Main's three files are `src/hlir.rs`
+(+109/-30), `src/op.rs` (+18) and `src/graph.rs` (+198/-13). The first two were
+DELETED with the HLIR layer when this branch replaced it; `src/graph.rs` still
+exists but is a completely different file — main's is the HLIR graph plus its
+compile search and loop-rolling prepass, this branch's is the SSA recorder.
+There is no `HLIROp` trait to add a method to, no `Loop*` marker ops to stamp,
+and no `auto_roll_loops_prepass` to thread dtypes through: `grep -ri
+'auto_roll\|LoopStart\|LoopInput' src/ --include='*.rs'` returns nothing.
+Repeated-region collapse is not a graph prepass here at all — it is the
+extractor's problem, over the e-graph.
+
+**What main actually fixed.** Loop rolling inserted six kinds of structural
+marker (`LoopStart`, `LoopEnd`, `LoopInput`, `LoopInputStatic`, `LoopOutput`,
+`LoopOutputSelect`) and stamped `dtype: DType::F32` into every one of them,
+with a comment saying the field was "a placeholder, not a source of truth"
+because a generic first-input propagation rule (`dtype_propagation_rule` /
+`dtype_propagation_op`, ruleset `dtype_prop`) would derive the real dtype
+inside the e-graph. It did not, reliably: main's own two regression tests show
+a BF16 weight stream and an Int gather-index stream coming out of rolling as
+F32 markers. #417 inverts the direction — every op declares its output dtype
+(`HLIROp::output_dtype(&[DType]) -> DType`), `Graph::concrete_node_dtypes()`
+resolves the whole graph in topological order from those declarations before
+any marker is inserted, and the marker rewrites switch from
+`dtype_propagation_*` to `dtype_from_field_rule` / `dtype_from_kind_field`, i.e.
+the serialized field becomes the contract. The commit is, in one sentence,
+*"stop inferring a dtype you were told."*
+
+### CARRIED: the law, written beside `dtype-of`
+
+`src/egglog_core/egglog_preamble.egg:422-447`, a comment block immediately
+above the `dtype-of` declaration at `:448`. Comment only — no rule was added,
+changed or deleted, because there is nothing to change: the branch already
+obeys the law. It states that a value's dtype is DECLARED where the value is
+minted (`LogicalNode.dtype`, `src/graph.rs:357`) and reaches the estate only as
+the dtype field of `LogicalTensorInputLit` or the target of `LogicalCast`; that
+every other dtype is concluded by a rule keyed on its OWN constructor; that the
+estate must therefore never carry a generic first-input propagation; and it
+cites #417 (`477d3626`) as the written justification, naming the failure main
+hit.
+
+### Verification (both claims checked, 2026-09-03)
+
+**1. `dtype-of` is `:no-merge` — YES.**
+`src/egglog_core/egglog_preamble.egg:448`:
+
+```
+(function dtype-of (LogicalTensor) Dtype :no-merge)
+```
+
+It sits in the block whose header (`:416-417`) says *"The purpose of these
+functions it to cause runtime errors in the face of bad unions… enforcing
+invariants at runtime"*, beside `rank-of`, `shape-of`, `bits-of`,
+`buffer-access-of` and `buffer-freed-by`. `:no-merge` is STRONGER than main's
+situation, not weaker: main's marker field declaration was `:merge new`
+(last-write-wins), which is exactly why the commit message notes a
+wrongly-stamped marker could "corrupt its source class's dtype fact through the
+inline union". Here a second, disagreeing `dtype-of` for one class is a
+saturation panic. A guessed dtype unioned over a declared one cannot be a
+silent mistype on this branch; it would abort the run.
+
+**2. Is there a generic first-input `dtype-of` propagation rule? NO.**
+Every `(set (dtype-of …))` in the tree was enumerated — 29 sites in 22 files
+(`grep -rn --include='*.egg' 'set (dtype-of' .`, vendor excluded):
+
+- **1 in the preamble** (`egglog_preamble.egg:910`), and it is keyed on the
+  DECLARED FIELD, not on an input: the rule matches
+  `(LogicalTensorInputLit ?var ?shape ?dtype)` and sets `dtype-of` to `?dtype`.
+  That is structurally main's fix (`dtype_from_field_rule`), already in place.
+- **28 across the 21 per-op `src/logical_op/*/dtype.egg` files**, each keyed on
+  ITS OWN constructor. This is main's `output_dtype` table, spelled as rules:
+  `iota/dtype.egg:8` sets `(Int)` unconditionally; `less_than/dtype.egg:9` sets
+  `(Bool)` unconditionally; `cast/dtype.egg:7` sets the target dtype carried in
+  the term; `gather/dtype.egg:8` takes the DATA operand's (not operand 0's,
+  which is the coordinate list) — the same four overrides main had to write by
+  hand.
+- The remaining per-op rules do read an input's dtype (`sin`, `sqrt`, `exp`,
+  `exp2`, `log2`, `recip`, `index_map_apply`, `reduce_sum`, `reduce_max` take
+  the single input's; `add`, `mul`, `div`, `modulo`, `trunc_div`, `trunc_rem`,
+  `scatter` set from BOTH operands duplicatively, deliberately, as a `:no-merge`
+  tripwire on a mismatch). None of them is the dangerous shape: each matches one
+  named constructor, so "preserve the input's dtype" is that op's own declared
+  contract, never an opcode-blind fallback applied to a marker.
+
+**One vestige, reported and NOT touched.** The ruleset main's generic rules
+lived in still exists: `p.add_ruleset("dtype_prop")` at
+`src/egglog_core/egglog_utils/base.rs:541`. On this branch it is EMPTY — the
+only other live mention in the whole tree is the parked
+`crates/luminal_metal/src/kernel/ops.rs:3509` (`:ruleset dtype_prop`), which
+does not build. Note also that `base.rs`'s `DType` is the BACKEND/LLIR sort
+built by `base_expression_egglog_impl`, a different thing from the logical
+`Dtype` that `dtype-of` ranges over. Left in place; recorded here so a future
+reader does not mistake an empty ruleset for a live propagation.
+
+### UNCARRIED
+
+- **`HLIROp::output_dtype`** (`src/op.rs`, the trait default = "first input's
+  dtype", plus the `Box<T>` forward) and its per-op overrides in `src/hlir.rs`:
+  `Input` -> its declared field, `CustomOpKind` -> its declared field,
+  `Constant` -> `F32`, `ConstantF64` -> `F64`, `Iota` -> `Int`, `Cast` -> the
+  target, `LessThan` -> `Bool` (asserting both operands agree), `Gather` ->
+  input 1, `Scatter` -> input 2, and the six markers via `marker_output_dtype`.
+  There is no `HLIROp` trait here; the table itself exists as the per-op
+  `dtype.egg` rules above.
+- **`Graph::concrete_node_dtypes()`** — the topological resolve with "no
+  fallback dtype", including its cross-check against `input_meta`'s recorded
+  dtype. The branch's analogue is not a pass: dtype is carried on every
+  `LogicalNode` from the moment it is recorded, so there is nothing to resolve
+  after the fact.
+- **`Graph::uniform_node_dtype()`** and the rolling-site assertions (a loop slot
+  may not change dtype between its initial value, its body state output and its
+  final state output; every per-iteration source of one input stream must agree;
+  every per-iteration producer of one output stream must agree). These are
+  properties OF loop rolling, which does not exist here.
+- **`marker_output_dtype()`** — the assertion that a marker's declared field
+  equals every one of its tensor sources. No marker ops.
+- **The rewrite swap** on the six markers, `dtype_propagation_rule` /
+  `dtype_propagation_op` -> `dtype_from_field_rule` / `dtype_from_kind_field`.
+  Nothing to swap: there is no generic propagation to remove (verified above).
+- **The two regression tests**, `loop_rolling_stamps_concrete_varying_stream_dtypes`
+  (BF16 weight stream survives rolling) and
+  `loop_rolling_preserves_integer_gather_stream_dtypes` (Int index stream and
+  the F32 carried activation both survive). Untranslatable — they assert on
+  `LoopInput`/`LoopStart` fields after `auto_roll_loops_prepass_with_log`.
+
+**Nothing is owed.** Unlike most INTENT-ONLY rows in this ledger, this one does
+not name a future requirement: main's end state is this branch's starting
+state. What is owed is only that it stay that way, which is what the comment is
+for.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
