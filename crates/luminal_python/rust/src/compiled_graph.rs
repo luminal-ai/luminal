@@ -111,6 +111,9 @@ pub struct GraphTranslation {
     pub tensor_ids: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
+    /// Output node identities in exactly the same order as `output_names`.
+    /// Names are not unique when a functionalized mutation is also returned.
+    pub output_ids: Vec<NodeIndex>,
     pub output_shape_exprs: Vec<Vec<IntExpr>>,
     /// Output dtypes as PT2 dtype codes (e.g. 5 = int64, 7 = float32).
     /// Stored as PT2 codes (rather than luminal `DType`) so we can preserve
@@ -144,6 +147,7 @@ pub struct CompiledGraph {
     label_map: HashMap<String, NodeIndex>,
     pub input_names: Vec<String>,
     pub output_names: Vec<String>,
+    pub output_ids: Vec<NodeIndex>,
     pub output_shapes: Vec<Vec<usize>>,
     pub output_shape_exprs: Vec<Vec<IntExpr>>,
     /// Output dtypes as PT2 dtype codes (preserves int64 / int32 distinction
@@ -172,6 +176,7 @@ impl CompiledGraph {
             tensor_ids,
             input_names,
             output_names,
+            output_ids,
             output_shape_exprs,
             output_dtypes,
             input_shape_exprs,
@@ -214,6 +219,7 @@ impl CompiledGraph {
             label_map,
             input_names,
             output_names,
+            output_ids,
             output_shapes,
             output_shape_exprs,
             output_dtypes,
@@ -221,6 +227,34 @@ impl CompiledGraph {
             dim_param_map,
             writeback_outputs,
         })
+    }
+
+    fn output_node_at(&self, position: usize) -> PyResult<NodeIndex> {
+        self.output_ids.get(position).copied().ok_or_else(|| {
+            pyo3::exceptions::PyIndexError::new_err(format!(
+                "output position {position} is out of range for {} outputs",
+                self.output_ids.len()
+            ))
+        })
+    }
+
+    fn output_node_by_name(&self, name: &str) -> PyResult<NodeIndex> {
+        let mut matches = self
+            .output_names
+            .iter()
+            .zip(self.output_ids.iter().copied())
+            .filter_map(|(candidate, node)| (candidate == name).then_some(node));
+        let Some(node) = matches.next() else {
+            return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                "Unknown output tensor: {name}"
+            )));
+        };
+        if matches.next().is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Output tensor name '{name}' is ambiguous; use the positional output API"
+            )));
+        }
+        Ok(node)
     }
 }
 
@@ -454,16 +488,43 @@ impl CompiledGraph {
                 "set_output_device_ptr requires a GPU backend",
             ));
         }
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
+        let node_id = self.output_node_by_name(name)?;
         unsafe {
             self.runtime
-                .set_output_device_ptr(*node_id, device_ptr, n_bytes)
+                .set_output_device_ptr(node_id, device_ptr, n_bytes)
         };
+        Ok(())
+    }
+
+    /// Positional variant of `set_output_device_ptr`; unlike output names,
+    /// output positions are unique for functionalized mutation outputs.
+    fn set_output_device_ptr_at(
+        &mut self,
+        position: usize,
+        device_ptr: u64,
+        n_bytes: usize,
+    ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "set_output_device_ptr_at requires a GPU backend",
+            ));
+        }
+        let node_id = self.output_node_at(position)?;
+        unsafe {
+            self.runtime
+                .set_output_device_ptr(node_id, device_ptr, n_bytes)
+        };
+        Ok(())
+    }
+
+    fn clear_output_device_ptr_at(&mut self, position: usize) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "clear_output_device_ptr_at requires a GPU backend",
+            ));
+        }
+        let node_id = self.output_node_at(position)?;
+        self.runtime.clear_output_device_ptr(node_id);
         Ok(())
     }
 
@@ -471,13 +532,13 @@ impl CompiledGraph {
     /// Returns false for aliased outputs that need a fallback DtoD copy, or if no GPU backend.
     /// Must be called after run().
     fn output_is_zero_copy(&self, name: &str) -> PyResult<bool> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.output_is_zero_copy(*node_id))
+        let node_id = self.output_node_by_name(name)?;
+        Ok(self.runtime.output_is_zero_copy(node_id))
+    }
+
+    fn output_is_zero_copy_at(&self, position: usize) -> PyResult<bool> {
+        let node_id = self.output_node_at(position)?;
+        Ok(self.runtime.output_is_zero_copy(node_id))
     }
 
     /// Register a weight tensor from a CPU host pointer, matching by Input node label (dtype-aware).
@@ -521,24 +582,20 @@ impl CompiledGraph {
 
     /// Get output tensor data by name as f32 (copies to host).
     fn get_output(&self, name: &str) -> PyResult<Vec<f32>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_f32(*node_id))
+        Ok(self.runtime.get_output_f32(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_at(&self, position: usize) -> PyResult<Vec<f32>> {
+        Ok(self.runtime.get_output_f32(self.output_node_at(position)?))
     }
 
     /// Get output tensor data by name as i32 (copies to host).
     fn get_output_i32(&self, name: &str) -> PyResult<Vec<i32>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_i32(*node_id))
+        Ok(self.runtime.get_output_i32(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_i32_at(&self, position: usize) -> PyResult<Vec<i32>> {
+        Ok(self.runtime.get_output_i32(self.output_node_at(position)?))
     }
 
     /// Read an output as f16 (returned as raw little-endian bytes —
@@ -547,13 +604,18 @@ impl CompiledGraph {
     /// producer node must already be `DType::F16`; no widening at
     /// the read boundary.
     fn get_output_f16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        let data = self.runtime.get_output_f16(*node_id);
+        let data = self.runtime.get_output_f16(self.output_node_by_name(name)?);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    fn get_output_f16_at<'py>(
+        &self,
+        py: Python<'py>,
+        position: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let data = self.runtime.get_output_f16(self.output_node_at(position)?);
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
         Ok(PyBytes::new(py, bytes))
@@ -564,13 +626,20 @@ impl CompiledGraph {
     /// bfloat16)`). Strict: the producer node must already be
     /// `DType::Bf16`; no widening at the read boundary.
     fn get_output_bf16<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyBytes>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        let data = self.runtime.get_output_bf16(*node_id);
+        let data = self
+            .runtime
+            .get_output_bf16(self.output_node_by_name(name)?);
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+        Ok(PyBytes::new(py, bytes))
+    }
+
+    fn get_output_bf16_at<'py>(
+        &self,
+        py: Python<'py>,
+        position: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let data = self.runtime.get_output_bf16(self.output_node_at(position)?);
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
         Ok(PyBytes::new(py, bytes))
@@ -579,13 +648,11 @@ impl CompiledGraph {
     /// Read an output as i64. Strict: the producer node must already
     /// be `DType::I64`; no widening at the read boundary.
     fn get_output_i64(&self, name: &str) -> PyResult<Vec<i64>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_i64(*node_id))
+        Ok(self.runtime.get_output_i64(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_i64_at(&self, position: usize) -> PyResult<Vec<i64>> {
+        Ok(self.runtime.get_output_i64(self.output_node_at(position)?))
     }
 
     /// Read an output as i8 without widening.
@@ -624,24 +691,22 @@ impl CompiledGraph {
     /// Read an output as f64. Strict: the producer node must already
     /// be `DType::F64`; no widening at the read boundary.
     fn get_output_f64(&self, name: &str) -> PyResult<Vec<f64>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_f64(*node_id))
+        Ok(self.runtime.get_output_f64(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_f64_at(&self, position: usize) -> PyResult<Vec<f64>> {
+        Ok(self.runtime.get_output_f64(self.output_node_at(position)?))
     }
 
     /// Get output tensor data by name as bool (copies to host).
     fn get_output_bool(&self, name: &str) -> PyResult<Vec<bool>> {
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
-        Ok(self.runtime.get_output_bool(*node_id))
+        Ok(self
+            .runtime
+            .get_output_bool(self.output_node_by_name(name)?))
+    }
+
+    fn get_output_bool_at(&self, position: usize) -> PyResult<Vec<bool>> {
+        Ok(self.runtime.get_output_bool(self.output_node_at(position)?))
     }
 
     /// Copy output tensor data directly to a device pointer (DtoD).
@@ -653,16 +718,66 @@ impl CompiledGraph {
                 "copy_output_to_device_ptr requires a GPU backend",
             ));
         }
-        let node_id = self.tensor_ids.get(name).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!(
-                "Unknown output tensor: {}",
-                name
-            ))
-        })?;
+        let node_id = self.output_node_by_name(name)?;
         unsafe {
             self.runtime
-                .copy_output_to_device_ptr(*node_id, dest_ptr, n_bytes)
+                .copy_output_to_device_ptr(node_id, dest_ptr, n_bytes)
         };
+        Ok(())
+    }
+
+    fn copy_output_to_device_ptr_at(
+        &self,
+        position: usize,
+        dest_ptr: u64,
+        n_bytes: usize,
+    ) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "copy_output_to_device_ptr_at requires a GPU backend",
+            ));
+        }
+        let node_id = self.output_node_at(position)?;
+        unsafe {
+            self.runtime
+                .copy_output_to_device_ptr(node_id, dest_ptr, n_bytes)
+        };
+        Ok(())
+    }
+
+    /// Copy several outputs directly to CUDA device pointers, synchronizing
+    /// only after the entire batch has been enqueued.
+    fn copy_outputs_to_device_ptrs(&self, copies: Vec<(String, u64, usize)>) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "copy_outputs_to_device_ptrs requires a GPU backend",
+            ));
+        }
+        let resolved = copies
+            .into_iter()
+            .map(|(name, dest_ptr, n_bytes)| {
+                self.output_node_by_name(&name)
+                    .map(|node_id| (node_id, dest_ptr, n_bytes))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        unsafe { self.runtime.copy_outputs_to_device_ptrs(&resolved) };
+        Ok(())
+    }
+
+    fn copy_outputs_to_device_ptrs_at(&self, copies: Vec<(usize, u64, usize)>) -> PyResult<()> {
+        if !self.runtime.supports_device_ptrs() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "copy_outputs_to_device_ptrs_at requires a GPU backend",
+            ));
+        }
+        let resolved = copies
+            .into_iter()
+            .map(|(position, dest_ptr, n_bytes)| {
+                self.output_node_at(position)
+                    .map(|node_id| (node_id, dest_ptr, n_bytes))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        unsafe { self.runtime.copy_outputs_to_device_ptrs(&resolved) };
         Ok(())
     }
 }

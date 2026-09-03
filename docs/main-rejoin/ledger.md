@@ -33,6 +33,7 @@ Dispositions:
 | `499d0779` | #386 | Search: early-stop candidate profiling against the best-so-far metric | MIXED — RE-EXPRESSED (core: running mean + fifth positional cutoff + predicate) / FILE-LEVEL (parks, with a stubbed predicate) | branch `merge/main-386-early-stop` (two commits) | REQUIREMENT FOR CL (ruling 4): a device `PlanProfiler` that times candidates on device, mirroring `ReferenceProfiler`'s design, and then honours the cutoff — until then `StaticProfiler` accepts and ignores it; see **#386 early-stop profiling** below |
 | `6a5313f2` | #398 | Support for PyTorch OpInfo tests | MIXED — FILE-LEVEL (python + workflow) / RE-EXPRESSED (`TypedBuffer::F64` + typed unary kernels) / DROPPED (`ConstantF64`, the empty-Vec fix) | branch `merge/main-398-opinfo` (two commits) | OpInfo harness, the arange-metadata and acos/acosh lowerings = M4 translator requirements; typed `LogicalConstant`; F32<->F64 cast policy; F64 on CL — see **#398 OpInfo + F64** below |
 | `db3c80fd` | #399 | Add native narrow integer HLIR dtypes | MIXED — FILE-LEVEL (python) / RE-EXPRESSED (I8/U8/I16 TypedBuffer + kernels, int-safe `abs`) | branch `merge/main-399-narrow-ints` (two commits) | **CARVE-OUT to confirm at review**: I8/U8/I16 wrap, I32/I64 stay checked — see **#399 narrow ints** below |
+| `727918cd` | #394 | Optimize CUDA graph materialization and StaticCache writebacks | FILE-LEVEL (parks) + INTENT-ONLY (core) | branch `merge/main-394-cuda-graph-park` | REQUIREMENT FOR THE CL EXECUTOR: durable external device-pointer registration, exact binding-delta graph patching, cached reverse indexes, resource-signature reuse — see **#394 CL executor persistence** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -494,3 +495,71 @@ function with no counterpart under `TypedBuffer`.
 exists, the storage does not. `crates/luminal_cuda_lite/src/device.rs` gets
 `unreachable!` arms only: `dtype_bytes` has no narrow-int row, so CL refuses
 them by name, and transport without kernels would be the half-done version.
+
+## #394 CL executor persistence — the requirement main paid for
+
+RULED 2026-09-02 (ruling 3): *"merge this into hlir version of cl and we'll
+figure it out later"*.
+
+**FILE-LEVEL.** The five `crates/luminal_cuda_lite/` files
+(`runtime.rs` +989/-338, `kernel/to_host.rs` +300, `host/mod.rs`,
+`host/flashinfer/mod.rs`, `dyn_backend.rs`) are path-rewritten into
+`crates/luminal_cuda_lite_hlir/` per the standing park policy — the park
+TRACKS main so the target CL must eventually reach keeps moving. Every hunk
+applied cleanly over the park's existing drift; there were no rejects. The
+three `crates/luminal_python/**` files come along; `compiled_graph.rs`
+conflicted only on the branch's `Expression` -> `IntExpr` rename in the
+context around main's new `output_ids` field, and the branch spelling is
+kept. Nothing here builds: neither crate is a workspace member.
+
+**UNCARRIED — `src/dyn_backend.rs` (+14).** The file is deleted on this
+branch. Its two additions, `DynBackend::clear_output_device_ptr` and a
+default `copy_outputs_to_device_ptrs`, are the core seam of a capability CL
+does not have at all, so they are recorded here as intent rather than code.
+
+**THE REQUIREMENT, for whenever CL grows a persistent executor.** CL today is
+single-shot: `crates/luminal_cuda_lite/src/device.rs` `execute_plan`
+allocates every buffer, uploads, launches, synchronizes, downloads, and drops
+the storage — strictly worse per invocation than main's runtime even BEFORE
+this commit. What #394 is worth, in the order it would have to be rebuilt:
+
+1. **Durable external pointer registration.** A caller-owned device pointer
+   (a torch allocation) binds once; an identical re-registration is a NO-OP,
+   not a rebuild of the pointer table.
+2. **Exact binding deltas.** Track which HLIR/LLIR bindings actually changed
+   and patch only the affected graph nodes, rather than re-materializing the
+   whole captured graph per call.
+3. **Reverse indexes built once** at construction: buffer -> kernel,
+   dyn-dim -> kernel, output aliases, library buffer nodes.
+4. **Resource-signature caching.** Validate hard resources by an aggregate
+   signature so a repeated (even non-consecutive) shape configuration reuses
+   the previous validation. Main's `HostOp::resource_buffer_nodes` exists so
+   that ONLY inputs whose logical length a plan actually reads enter that
+   signature; the branch analogue would live in the bufferizer if CL ever
+   caches a device-memory plan.
+5. **One terminal synchronize** for a batch of output writebacks
+   (`copy_outputs_to_device_ptrs`), not one per output.
+
+Two correctness rules from main's tests are worth having in writing NOW,
+because they are the kind of thing a re-implementation gets wrong once each:
+
+- An external output destination that **overlaps** a graph input but is not
+  an explicit alias of it must be computed into the PLANNED buffer and copied
+  afterwards, never bound directly (`device_ranges_overlap`, saturating
+  arithmetic, zero-length is never an overlap).
+- External-pointer inputs must **not** be consumed as one-shot buffers while
+  runtime-owned ones are
+  (`should_consume(is_external, preserved_for_output) = !preserved &&
+  !is_external`), or a second invocation re-installs lifted weights.
+
+**SUPERSEDED, do not port.** The positional-output half (`output_node_at`,
+`set_output_device_ptr_at`, `get_output_*_at`) fixes duplicated output NAMES
+losing identity. This branch's outputs are already a positional
+`Vec<OutputSlot>` reached through `output_named`, so that defect is
+structurally absent.
+
+Main's eight `mod arena_plan_tests` unit tests cannot move — every field they
+poke (`CudaRuntime`, `CompiledBucket`) is absent here. The two pure helpers
+`device_ranges_overlap` and `should_consume_hlir_input` are ~15 lines and are
+the only directly liftable fragments; copy them when the CL executor needs
+them.
