@@ -5101,7 +5101,17 @@ impl<O: IntoEgglogOp> Runtime for CudaRuntimeImpl<O> {
         } else if !external_capture {
             self.prepare_materialized_bucket_slot(self.active_bucket);
             self.materialize_bucket_cuda_graphs(self.active_bucket, dyn_map, false)
-                .unwrap_or_else(|e| panic!("CUDA graph materialization failed: {e}"));
+                .unwrap_or_else(|error| {
+                    let memory = self.cuda_stream.context().mem_get_info();
+                    panic!(
+                        "CUDA graph materialization failed: {error}; active_bucket={}; \
+                         materialized_bucket_limit={:?}; materialized_bucket_lru={:?}; \
+                         device_memory={memory:?}",
+                        self.active_bucket,
+                        self.max_materialized_buckets,
+                        self.materialized_bucket_lru,
+                    )
+                });
         }
         materialize_time += timer.elapsed();
         if self.profiling {
