@@ -35,6 +35,29 @@ fn copy_host_bytes(ptr: u64, n_bytes: usize, buffer_kind: &str) -> PyResult<Vec<
 /// Maps symbolic dimension parameter names (e.g. "seq_len") to their dim symbol.
 pub type DimParamMap = HashMap<String, Symbol>;
 
+/// Inclusive runtime bounds for symbolic dimensions.
+pub type DimBoundsMap = HashMap<Symbol, (Option<usize>, Option<usize>)>;
+
+fn check_dim_bounds(
+    name: &str,
+    value: usize,
+    bounds: Option<&(Option<usize>, Option<usize>)>,
+) -> PyResult<()> {
+    let Some((minimum, maximum)) = bounds else {
+        return Ok(());
+    };
+    if minimum.is_some_and(|minimum| value < minimum)
+        || maximum.is_some_and(|maximum| value > maximum)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "dynamic dimension '{name}' expected value in [{}, {}], got {value}",
+            minimum.map_or_else(|| "-inf".to_string(), |value| value.to_string()),
+            maximum.map_or_else(|| "inf".to_string(), |value| value.to_string()),
+        )));
+    }
+    Ok(())
+}
+
 /// Recover a single-variable dim's variable value from an observed runtime size.
 ///
 /// Returns `Some((var, value))` when the expression contains exactly one
@@ -118,6 +141,7 @@ pub struct GraphTranslation {
     pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<IntExpr>>,
     pub dim_param_map: DimParamMap,
+    pub dim_bounds: DimBoundsMap,
     /// (output position, user-input name) for outputs that write back into a
     /// user input's buffer (in-place state updates like HF StaticCache k/v).
     pub writeback_outputs: Vec<(usize, String)>,
@@ -151,6 +175,7 @@ pub struct CompiledGraph {
     pub output_dtypes: Vec<u32>,
     pub input_shape_exprs: Vec<Vec<IntExpr>>,
     pub dim_param_map: DimParamMap,
+    pub dim_bounds: DimBoundsMap,
     /// See [`GraphTranslation::writeback_outputs`].
     pub writeback_outputs: Vec<(usize, String)>,
 }
@@ -178,6 +203,7 @@ impl CompiledGraph {
             output_dtypes,
             input_shape_exprs,
             dim_param_map,
+            dim_bounds,
             writeback_outputs,
         } = translation;
         let WeightData {
@@ -201,10 +227,16 @@ impl CompiledGraph {
         let rt =
             luminal::dyn_backend::compile_backend_from_factory(factory, &mut graph, compile_args)?;
 
-        // Resolve concrete output shapes from expressions
+        // Dynamic dimensions were initialized before backend compilation, so
+        // these are the representative output shapes used for this artifact.
         let output_shapes: Vec<Vec<usize>> = output_shape_exprs
             .iter()
-            .map(|exprs| exprs.iter().map(|e| e.to_usize().unwrap_or(1)).collect())
+            .map(|exprs| {
+                exprs
+                    .iter()
+                    .map(|e| e.exec(&graph.dyn_map).or_else(|| e.to_usize()).unwrap_or(1))
+                    .collect()
+            })
             .collect();
 
         let label_map = luminal::dyn_backend::build_label_map(&graph);
@@ -223,6 +255,7 @@ impl CompiledGraph {
             output_dtypes,
             input_shape_exprs,
             dim_param_map,
+            dim_bounds,
             writeback_outputs,
         })
     }
@@ -334,6 +367,7 @@ impl CompiledGraph {
                 self.dim_param_map.keys().collect::<Vec<_>>()
             ))
         })?;
+        check_dim_bounds(param_name, value, self.dim_bounds.get(ch))?;
         self.graph.set_dim(*ch, value);
         Ok(())
     }
@@ -355,14 +389,31 @@ impl CompiledGraph {
     ///
     /// Multi-variable dims are skipped here; another input's shape — or an
     /// explicit `set_dim` call — is expected to bind those.
-    fn auto_set_dims_from_input_shapes(&mut self, input_shapes: Vec<Vec<usize>>) {
+    fn auto_set_dims_from_input_shapes(&mut self, input_shapes: Vec<Vec<usize>>) -> PyResult<()> {
+        let mut inferred = HashMap::new();
         for (shape_exprs, shape) in self.input_shape_exprs.iter().zip(input_shapes.iter()) {
             for (dim_expr, &dim_val) in shape_exprs.iter().zip(shape.iter()) {
-                if let Some((var, value)) = solve_single_var_dim(dim_expr, dim_val) {
-                    self.graph.set_dim(var, value);
+                if let Some((var, value)) = solve_single_var_dim(dim_expr, dim_val)
+                    && let Some(previous) = inferred.insert(var, value)
+                    && previous != value
+                {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "a dynamic dimension was inferred as both {previous} and {value}"
+                    )));
                 }
             }
         }
+
+        for (symbol, value) in inferred {
+            let name = self
+                .dim_param_map
+                .iter()
+                .find_map(|(name, candidate)| (*candidate == symbol).then_some(name.as_str()))
+                .unwrap_or("<unknown>");
+            check_dim_bounds(name, value, self.dim_bounds.get(&symbol))?;
+            self.graph.set_dim(symbol, value);
+        }
+        Ok(())
     }
 
     /// Resolve output shapes using current dynamic dimension values.

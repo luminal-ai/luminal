@@ -46,6 +46,7 @@ Dispositions:
 | `b37eea15` | #409 | Compile-time optimization | FILE-LEVEL (26 files into the `cuda_lite_hlir` park, 1 into the metal park) + UNCARRIED (5 core files, intent recorded) + N/A (`examples/llama`) | branch `merge/main-409-compile-time-park` | RULED 2026-09-03: *"move all this stuff to the hlir park and we'll get to it later. We don't actually need to do much here."* The dense-integer e-graph extraction index, the prepare/profile candidate split, and the two `Expression` intern-identity helpers are the pieces worth revisiting — see **#409 compile-time optimization** below |
 | `2f820521` | #414 | Expand PyTorch ATen lowering coverage | FILE-LEVEL (19 python-park files + 2 into the `cuda_lite_hlir` park) + LANDED-BY-EQUIVALENT (`src/frontend/movement.rs`) + N/A (`examples/flux2`) | branch `merge/main-414-aten-coverage` | RULED 2026-09-03: *"we can also do 414 in one go."* ~115 new ATen overloads = M4 translator requirements; the `as_float` non-finite JSON decoding is a correctness nugget worth keeping — see **#414 ATen coverage** below |
 | `b745d102` | #413 | metal: emit constants by f32 bit pattern | FILE-LEVEL (2 metal-park files) | branch `merge/main-413-metal-constants` | RULED 2026-09-03: *"same 413 is fine. we can just merge this and check later."* The CHECK is done and the answer is NO: live CUDA constant codegen has the same defect — see **#413 metal constants** below |
+| `38640588` | #416 | Allow vLLM FX region compilation | FILE-LEVEL (11 python-park files + 1 into the `cuda_lite_hlir` park) + DROPPED (the zero-extent slice special case, by ruling) + RE-EXPRESSED (one recording-only pin) | branch `merge/main-416-vllm-regions` | RULED 2026-09-03: *"let's not special case slices producing extent zero for now"* — and the answer to *"nothing bad should happen?"* is: nothing does; the shared-destination invariant is already enforced by the conflict engine — see **#416 vLLM regions** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1835,6 +1836,132 @@ belong to (`ConstantDps::value` is `f64` while the destination dtype comes from
 DESTINATION width, not at f32 unconditionally), and it wants a
 reference-vs-CUDA bit-equality test of the shape main added on the Metal side.
 Recorded here as an open pin.
+
+## #416 vLLM regions — banked; the zero-extent slice question answered
+
+RULED 2026-09-03: *"this is great and we should merge it. I don't think we
+actually need to do anything, we should just be able to create zero extent
+slices and nothing bad should happen? let's not special case slices producing
+extent zero for now."*
+
+### FILE-LEVEL: 11 files in `crates/luminal_python`
+
+Applied cleanly, no conflicts and NO re-spelling: the drift-invariance check
+shows every carried file's divergence from main is byte-identical before and
+after, and the six new files (`src/luminal/{region_abi,region_compile,
+region_export}.py` and their three pytest suites) came across verbatim.
+
+The commit builds an **FX -> PT2 path**, so a host (vLLM) can hand luminal a
+`torch.fx` region built from `FakeTensor` metadata and compile it
+synchronously, instead of going through Dynamo's `.pt2` export. `region_abi.py`
+defines the calling convention, `region_export.py` turns the FX region plus its
+metadata into the schema the translator already reads, and
+`region_compile.py` drives the compile. Two properties are worth naming:
+compiled regions **preserve symbolic input relationships** (the same symbol
+appearing in two inputs stays one symbol rather than becoming two independent
+dims), and both **exact and bounded token lengths** are supported, which is
+what vLLM's bucketing needs.
+
+The Rust side is the bounds plumbing. `compiled_graph.rs` adds
+
+```rust
+/// Inclusive runtime bounds for symbolic dimensions.
+pub type DimBoundsMap = HashMap<Symbol, (Option<usize>, Option<usize>)>;
+```
+
+alongside the existing `DimParamMap = HashMap<String, Symbol>`, carries it on
+both graph structs, and `check_dim_bounds` refuses a runtime dimension outside
+its declared range by name. **The key type applied verbatim**: main's
+`DimBoundsMap` is keyed by `Symbol` and so is the park's `DimParamMap`
+(`crates/luminal_python/rust/src/compiled_graph.rs:36`, identical text in both
+trees since #396), so the crate stays self-consistent with no adaptation.
+
+### FILE-LEVEL: 1 file into the `cuda_lite_hlir` park
+
+`src/tests/consumed_buffer_tests.rs` (+50), path-rewritten. Main's new
+`test_scatter_search_handles_shared_destination_branches` builds one scatter
+whose result `shared` is read by FOUR sibling scatters, runs the search, and
+asserts that at most ONE of the five selected scatter kernels is
+`ScatterNoCopy` — i.e. *several results reading the same logical destination
+forbids mutating it in place*.
+
+**Is that invariant enforced by this branch's bufferizer? YES — it is the
+conflict engine's central rule, and it is already pinned.** `src/bufferize.rs`
+is an adaptation of MLIR One-Shot Bufferization, and its module header states
+the rule at `:58`: every copy's overwrite is ordered after *"unordered readers
+of its destination via **anti-dependency (WAR) edges**"*. The decision itself
+is check (2), read-after-write interference, at `src/bufferize.rs:1194`:
+
+> In-placing makes this op overwrite the operand's buffer. Any read of a value
+> still aliasing that buffer — other than the result we are writing there —
+> must provably happen before this op; otherwise it could observe the
+> overwritten contents. Ordering is DAG reachability, so an *unordered* reader
+> (no dependence path to this op) is a conflict, not a free pass.
+
+Applied to main's graph: each of the four branch scatters proposing to
+mutate `shared` in place finds the other three branches' reads of `shared` in
+`self.reads`, none of them `happens_before` it, none of them the result being
+written, none excused by the same-op `permits_sharing` permit (that permit is
+scoped to same-op reads only, `src/bufferize.rs:1230`) — so `false`. Only the
+producer of `shared`, which has a single ordered consumer, can be in place.
+Note this branch is if anything STRICTER than main's assertion: main allows one
+`ScatterNoCopy` among the branches, here none of the four qualifies.
+
+It is a PIN, not just a property: `unordered_reader_of_operand_forces_out_of_place`
+(`src/bufferize.rs:2664`) is exactly this case in miniature — *"the operand
+value is read by a sibling op that is unordered with the writer. Reachability
+cannot prove the read happens first, so the in-place write is refused (this is
+the case a topological order would have wrongly allowed)"* — with
+`reader_before_writer_allows_in_place` (`:2700`) as its converse and
+`cross_operand_read_of_same_value_still_rejected` (`:2768`) closing the
+per-USE hole. The WAR edges that carry the ordering into the plan are
+installed by `crate::buffer_tensor_ir::install_anti_edges`
+(`src/bufferize.rs:1776`) and are part of the plan's golden fingerprint
+(`:473`). Nothing is owed here.
+
+### DROPPED — the zero-extent slice special case
+
+Main adds a short-circuit in `GraphTensor::slice`: if any output dim is
+literally 0, overwrite the shape and return `self` without building the
+gather, *"Building gather indices for it would create an Iota expression
+containing modulo by zero"*. **Not ported, per the ruling.**
+
+**And the reason it is safe not to port it is structural, not luck.** Main's
+hazard comes from its slice lowering: it builds `flatten_strides(&new_dims,
+&index_expressions)` and feeds the result to `graph().iota(index_expression,
+new_dims)` — a FLAT index, which is where the div/mod chain (and the modulo by
+zero) comes from. This branch does not lower a start-slice that way. Since the
+views stage, a slice with any non-zero start records a **structure-preserving
+`SliceView` node** whose parameters ARE the view: per parent axis `p`, a
+`MapEntry::Coord { from_end, extent }` optionally wrapped in
+`MapEntry::Add(.., Lit(start))` (`src/frontend/movement.rs:1024`-`1060`). There
+is no `flatten_strides`, no flat iota, and no modulo — so an extent of 0
+becomes a coordinate entry with extent 0 and nothing divides by anything. A
+zero-start slice takes the other arm, `Movement::Shrink`, which only narrows
+dims; also no arithmetic.
+
+**Verified, all three ways in** (recording only, no search, no execution):
+`input.slice_along(64.., 2)` on a `(1, 4, 64)` tensor records and reports dims
+`[1, 4, 0]`; so do `slice_along(0..0, 2)` (the Shrink arm) and
+`slice_along(3..3, 2)` (the view arm with a non-zero start and zero extent).
+No panic, no refusal, no diagnostic. The answer to *"nothing bad should
+happen?"* is: nothing does.
+
+One test is kept, `zero_extent_slice_records_without_special_casing`
+(`src/frontend/movement.rs`, beside the existing slice/pad tests), pinning the
+first of those. It deliberately does NOT copy main's second assertion
+(`empty.id == input.id`, "an empty slice must not create an Iota"): that
+assertion encodes main's special case, and here the slice legitimately records
+a view node with its own id. What is pinned is the OUTCOME — recording a
+zero-extent slice yields a `[1, 4, 0]` tensor — not the absence of a node.
+
+**What is still unproven, and is deliberately out of scope.** This pins the
+RECORDER only. Whether a zero-extent tensor survives egglog saturation,
+extraction, bufferization (a zero-byte buffer) and a backend kernel launch
+(a zero-element grid) is untested here, and the ruling says *"for now"*. If a
+zero extent ever does break something downstream, this test is where the
+investigation starts, and the fix belongs at whichever stage actually breaks —
+not as a frontend special case.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

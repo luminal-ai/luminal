@@ -5,7 +5,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods};
 use std::collections::HashMap;
 
-use crate::compiled_graph::{CompiledGraph, DimParamMap, GraphTranslation, WeightData};
+use crate::compiled_graph::{
+    CompiledGraph, DimBoundsMap, DimParamMap, GraphTranslation, WeightData,
+};
 use crate::pt2_expr::parse_sympy_expr;
 use crate::pt2_parser;
 use crate::pt2_schema;
@@ -200,12 +202,11 @@ pub fn translate_pt2(
     let translated = translator::translate(&parsed)?;
     let mut graph = translated.graph;
 
-    // Set initial dynamic dim values from symbol ranges. PT2 emits
-    // `min_val: null` when the constraint is unbounded; fall back to 1 in
-    // that case (the smallest valid dim — used only as an initial value).
+    // Compile bounded graphs at their largest supported shape. Unbounded
+    // dimensions fall back to their minimum, then to 1.
     for (sym_name, c) in &translated.sym_map.sym_to_symbol {
         if let Some(rc) = translated.sym_map.ranges.get(sym_name) {
-            let initial = rc.min_val.unwrap_or(1).max(0) as usize;
+            let initial = rc.max_val.or(rc.min_val).unwrap_or(1).max(0) as usize;
             graph.set_dim(*c, initial);
         }
     }
@@ -320,10 +321,15 @@ pub fn translate_pt2(
         if !tensor_sizes.contains_key(name)
             && let Some(meta) = parsed.tensor_meta(name)
         {
-            let n: usize = meta
-                .sizes
+            let shape = resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_symbol);
+            let n: usize = shape
                 .iter()
-                .map(|s| s.hint().unwrap_or(1) as usize)
+                .zip(&meta.sizes)
+                .map(|(dim, meta_dim)| {
+                    dim.exec(&graph.dyn_map)
+                        .or_else(|| meta_dim.hint().map(|hint| hint as usize))
+                        .unwrap_or(1)
+                })
                 .product::<usize>()
                 * TorchDType::from_code(meta.dtype)
                     .map(TorchDType::storage_factor)
@@ -332,6 +338,32 @@ pub fn translate_pt2(
         }
     }
 
+    let mut dim_bounds = DimBoundsMap::new();
+    for (name, symbol) in &translated.sym_map.sym_to_symbol {
+        let Some(range) = translated.sym_map.ranges.get(name) else {
+            continue;
+        };
+        let minimum = range
+            .min_val
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| anyhow::anyhow!("negative minimum for dynamic dimension {name}"))
+            })
+            .transpose()?;
+        let maximum = range
+            .max_val
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| anyhow::anyhow!("negative maximum for dynamic dimension {name}"))
+            })
+            .transpose()?;
+        if let (Some(minimum), Some(maximum)) = (minimum, maximum)
+            && maximum < minimum
+        {
+            anyhow::bail!("invalid range for dynamic dimension {name}: [{minimum}, {maximum}]");
+        }
+        dim_bounds.insert(*symbol, (minimum, maximum));
+    }
     let dim_param_map: DimParamMap = translated.sym_map.sym_to_symbol;
 
     let translation = GraphTranslation {
@@ -345,6 +377,7 @@ pub fn translate_pt2(
         output_shape_exprs,
         input_shape_exprs,
         dim_param_map,
+        dim_bounds,
         writeback_outputs: parsed.writeback_outputs(),
     };
 

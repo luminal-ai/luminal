@@ -19,11 +19,8 @@ pub struct RangeConstraint {
     /// constraint is unbounded (no min set), so this must accept None.
     #[serde(default)]
     pub min_val: Option<i64>,
-    /// Upper bound on a symbolic dimension. Also nullable in PT2. Currently
-    /// unused on the luminal side, but accepted to avoid deserialization
-    /// errors when PT2 emits it.
+    /// Upper bound on a symbolic dimension. Also nullable in PT2.
     #[serde(default)]
-    #[allow(dead_code)]
     pub max_val: Option<i64>,
 }
 
