@@ -48,7 +48,9 @@ impl<'a> Translator<'a> {
         node: &Node,
         f: impl Fn(GraphTensor) -> GraphTensor,
     ) -> Result<GraphTensor> {
-        let a = self.get_input_tensor(node, 0)?;
+        let a = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
         Ok(f(a))
     }
 
@@ -61,37 +63,41 @@ impl<'a> Translator<'a> {
     /// behavior keeps the polynomial smooth and also makes out-of-domain real
     /// inputs produce NaN through `sqrt(1 - abs(x))`, matching PyTorch.
     ///
-    /// PyTorch promotes integral and bool inputs to F32 for inverse trig ops.
+    /// PyTorch promotes integral and bool inputs to its default floating dtype.
     #[allow(clippy::excessive_precision)]
     pub(crate) fn translate_acos(&mut self, node: &Node) -> Result<GraphTensor> {
-        let input = self.get_input_tensor(node, 0)?;
-        let input = match input.dtype {
-            DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
-                input.cast(DType::F32)
-            }
-            _ => input,
-        };
+        let input = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
+        Ok(self.real_acos(input))
+    }
+
+    /// Elementwise real acos used by both real ATen dispatch and compound
+    /// complex inverse functions.
+    #[allow(clippy::excessive_precision)]
+    pub(crate) fn real_acos(&mut self, input: GraphTensor) -> GraphTensor {
         let x = input.abs();
 
         // Horner form, highest-order coefficient first. The maximum absolute
         // approximation error in F32 is below 3e-7 over the real acos domain.
-        let polynomial = 0.000_684_531_8 * x - 0.003_974_577_8;
-        let polynomial = polynomial * x + 0.011_028_381;
-        let polynomial = polynomial * x - 0.020_727_666;
-        let polynomial = polynomial * x + 0.032_571_17;
-        let polynomial = polynomial * x - 0.050_593_574;
-        let polynomial = polynomial * x + 0.089_030_14;
-        let polynomial = polynomial * x - 0.214_601_16;
-        let polynomial = polynomial * x + std::f32::consts::FRAC_PI_2;
-        let positive = polynomial * (1.0 - x).sqrt();
+        let polynomial =
+            self.constant_like(x, 0.000_684_531_8) * x - self.constant_like(x, 0.003_974_577_8);
+        let polynomial = polynomial * x + self.constant_like(x, 0.011_028_381);
+        let polynomial = polynomial * x - self.constant_like(x, 0.020_727_666);
+        let polynomial = polynomial * x + self.constant_like(x, 0.032_571_17);
+        let polynomial = polynomial * x - self.constant_like(x, 0.050_593_574);
+        let polynomial = polynomial * x + self.constant_like(x, 0.089_030_14);
+        let polynomial = polynomial * x - self.constant_like(x, 0.214_601_16);
+        let half_pi = self.constant_like(x, std::f64::consts::FRAC_PI_2);
+        let polynomial = polynomial * x + half_pi;
+        let one = self.constant_like(x, 1.0);
+        let positive = polynomial * (one - x).sqrt();
 
-        let zero = self
-            .graph
-            .constant_float(0.0)
-            .cast(input.dtype)
-            .expand_rhs(input.dims());
+        let zero = self.constant_like(input, 0.0);
         let negative = input.lt(zero).cast(input.dtype);
-        Ok(positive + negative * (std::f32::consts::PI - 2.0 * positive))
+        let pi = self.constant_like(input, std::f64::consts::PI);
+        let two = self.constant_like(input, 2.0);
+        positive + negative * (pi - two * positive)
     }
 
     /// Translate `aten.acosh.default` into existing elementwise HLIR primitives.
@@ -103,18 +109,229 @@ impl<'a> Translator<'a> {
     ///
     /// instead. For real inputs below one, either the square root or `log(x)`
     /// naturally produces NaN, matching PyTorch's real-domain behavior.
-    /// PyTorch promotes integral and bool inputs to F32 for inverse hyperbolic
-    /// operations, while floating inputs retain their dtype.
+    /// PyTorch promotes integral and bool inputs to its default floating dtype,
+    /// while floating inputs retain their dtype.
     pub(crate) fn translate_acosh(&mut self, node: &Node) -> Result<GraphTensor> {
-        let input = self.get_input_tensor(node, 0)?;
-        let input = match input.dtype {
-            DType::Bool | DType::Int | DType::I64 | DType::I8 | DType::U8 | DType::I16 => {
-                input.cast(DType::F32)
-            }
-            _ => input,
-        };
+        let input = self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?);
+        Ok(self.real_acosh(input))
+    }
+
+    /// Elementwise real acosh used by both real ATen dispatch and compound
+    /// complex inverse functions.
+    pub(crate) fn real_acosh(&mut self, input: GraphTensor) -> GraphTensor {
         let reciprocal_squared = input.reciprocal().square();
-        Ok(input.log() + (1.0 + (1.0 - reciprocal_squared).sqrt()).log())
+        let one = self.constant_like(input, 1.0);
+        input.log() + (one + (one - reciprocal_squared).sqrt()).log()
+    }
+
+    fn unary_input(&mut self, node: &Node) -> Result<GraphTensor> {
+        Ok(self
+            .get_input_tensor(node, 0)?
+            .cast(self.output_meta_dtype(node)?))
+    }
+
+    pub(crate) fn translate_exp(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_exp(input))
+    }
+
+    /// Keep log2(e) in the tensor's actual dtype. `GraphTensor::exp` uses its
+    /// historical F32 scalar API, which is not precise enough for F64 PT2.
+    pub(crate) fn real_exp(&mut self, input: GraphTensor) -> GraphTensor {
+        let log2_e = self.constant_like(input, std::f64::consts::LOG2_E);
+        (input * log2_e).exp2()
+    }
+
+    pub(crate) fn translate_cos(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_cos(input))
+    }
+
+    /// Keep pi/2 in the tensor's actual dtype rather than narrowing F64.
+    pub(crate) fn real_cos(&mut self, input: GraphTensor) -> GraphTensor {
+        (self.constant_like(input, std::f64::consts::FRAC_PI_2) - input).sin()
+    }
+
+    pub(crate) fn translate_asin(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_asin(input))
+    }
+
+    /// `asin(x) = atan(x / sqrt(1 - x^2))` is accurate around zero and reaches
+    /// the correct signed infinities at both endpoints. The square root also
+    /// supplies PyTorch's NaN for real inputs outside [-1, 1].
+    pub(crate) fn real_asin(&mut self, input: GraphTensor) -> GraphTensor {
+        let one = self.constant_like(input, 1.0);
+        let denominator = (one - input.square()).sqrt();
+        let ratio = input / denominator;
+        self.real_atan(ratio)
+    }
+
+    pub(crate) fn translate_asinh(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_asinh(input))
+    }
+
+    /// Stable real asinh. A short odd series preserves tiny values that would
+    /// be rounded away by `log(|x| + hypot(x, 1))`; the logarithmic form covers
+    /// the rest, with `log(|x|) + log(2)` preventing finite overflow near the
+    /// largest representable value.
+    pub(crate) fn real_asinh(&mut self, input: GraphTensor) -> GraphTensor {
+        let x = self.real_abs(input);
+        let x2 = x.square();
+        let mut series = self.constant_like(x, 35.0 / 1152.0);
+        series = series * x2 - self.constant_like(x, 5.0 / 112.0);
+        series = series * x2 + self.constant_like(x, 3.0 / 40.0);
+        series = series * x2 - self.constant_like(x, 1.0 / 6.0);
+        let series = x + x * x2 * series;
+
+        let one = self.constant_like(x, 1.0);
+        let magnitude = x + self.real_hypot(x, one);
+        let regular = magnitude.log();
+        let log_two = self.constant_like(x, std::f64::consts::LN_2);
+        let large = x.log() + log_two;
+        let large_threshold = self.constant_like(
+            x,
+            match x.dtype {
+                DType::F16 => 32_752.0,
+                DType::F32 => (f32::MAX / 2.0) as f64,
+                DType::F64 => f64::MAX / 2.0,
+                DType::Bf16 => (f32::MAX / 2.0) as f64,
+                other => unreachable!("asinh has non-floating dtype {other:?}"),
+            },
+        );
+        let nonsmall = self.select(x.gt(large_threshold), large, regular);
+        let threshold = self.constant_like(x, 0.125);
+        let result = self.select(x.le(threshold), series, nonsmall);
+        self.copy_sign(result, input)
+    }
+
+    pub(crate) fn translate_atan(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_atan(input))
+    }
+
+    /// Range-reduced odd Taylor series for atan. Reciprocal reduction maps the
+    /// full real line to [0, 1], then a pi/4 transform bounds the polynomial
+    /// argument by sqrt(2)-1. Degree 27 keeps F64 error below 1e-12 while using
+    /// only ordinary real HLIR primitives.
+    pub(crate) fn real_atan(&mut self, input: GraphTensor) -> GraphTensor {
+        let x = self.real_abs(input);
+        let one = self.constant_like(x, 1.0);
+        let reciprocal_branch = x.gt(one);
+        let reduced = self.select(reciprocal_branch, x.reciprocal(), x);
+
+        let threshold = self.constant_like(reduced, std::f64::consts::SQRT_2 - 1.0);
+        let quarter_turn_branch = reduced.gt(threshold);
+        let transformed = (reduced - one) / (reduced + one);
+        let z = self.select(quarter_turn_branch, transformed, reduced);
+        let z2 = z.square();
+
+        let mut polynomial = self.constant_like(z, -1.0 / 27.0);
+        for degree in (0..13).rev() {
+            let coefficient = if degree % 2 == 0 { 1.0 } else { -1.0 } / (2 * degree + 1) as f64;
+            polynomial = polynomial * z2 + self.constant_like(z, coefficient);
+        }
+        let base = z * polynomial;
+        let quarter_pi = self.constant_like(z, std::f64::consts::FRAC_PI_4);
+        let base = self.select(quarter_turn_branch, quarter_pi + base, base);
+        let half_pi = self.constant_like(z, std::f64::consts::FRAC_PI_2);
+        let angle = self.select(reciprocal_branch, half_pi - base, base);
+        self.copy_sign(angle, input)
+    }
+
+    pub(crate) fn translate_atanh(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        Ok(self.real_atanh(input))
+    }
+
+    /// Stable real atanh. The series avoids cancellation near zero; the log
+    /// difference supplies infinities at +/-1 and NaN outside the real domain.
+    pub(crate) fn real_atanh(&mut self, input: GraphTensor) -> GraphTensor {
+        let x2 = input.square();
+        let mut series = self.constant_like(input, 1.0 / 11.0);
+        series = series * x2 + self.constant_like(input, 1.0 / 9.0);
+        series = series * x2 + self.constant_like(input, 1.0 / 7.0);
+        series = series * x2 + self.constant_like(input, 1.0 / 5.0);
+        series = series * x2 + self.constant_like(input, 1.0 / 3.0);
+        let series = input + input * x2 * series;
+
+        let one = self.constant_like(input, 1.0);
+        let half = self.constant_like(input, 0.5);
+        let regular = half * ((one + input).log() - (one - input).log());
+        let small = self.real_abs(input).le(self.constant_like(input, 0.125));
+        self.select(small, series, regular)
+    }
+
+    pub(crate) fn translate_cosh(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let output_dtype = input.dtype;
+        let opmath = if matches!(output_dtype, DType::F16 | DType::Bf16) {
+            input.cast(DType::F32)
+        } else {
+            input
+        };
+        Ok(self.real_cosh(opmath).cast(output_dtype))
+    }
+
+    pub(crate) fn real_cosh(&mut self, input: GraphTensor) -> GraphTensor {
+        let half = self.constant_like(input, 0.5);
+        half * (self.real_exp(input) + self.real_exp(input * -1.0))
+    }
+
+    pub(crate) fn real_sinh(&mut self, input: GraphTensor) -> GraphTensor {
+        let half = self.constant_like(input, 0.5);
+        let result = half * (self.real_exp(input) - self.real_exp(input * -1.0));
+        let zero = self.is_zero(input);
+        self.select(zero, input, result)
+    }
+
+    fn real_hypot(&mut self, a: GraphTensor, b: GraphTensor) -> GraphTensor {
+        let a = self.real_abs(a);
+        let b = self.real_abs(b);
+        let a_is_large = a.ge(b);
+        let large = self.select(a_is_large, a, b);
+        let small = self.select(a_is_large, b, a);
+        let one = self.constant_like(large, 1.0);
+        let large_is_zero = self.is_zero(large);
+        let safe_large = self.select(large_is_zero, one, large);
+        let ratio = small / safe_large;
+        let finite = large * (one + ratio.square()).sqrt();
+        let a_inf = self.is_inf(a);
+        let b_inf = self.is_inf(b);
+        let any_inf = self.bool_or(a_inf, b_inf);
+        let infinity = self.constant_like(finite, f64::INFINITY);
+        self.select(any_inf, infinity, finite)
+    }
+
+    pub(crate) fn translate_trunc(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.unary_input(node)?;
+        let integer_dtype = if input.dtype == DType::F64 {
+            DType::I64
+        } else {
+            DType::Int
+        };
+        let truncated = input.cast(integer_dtype).cast(input.dtype);
+        let threshold = self.constant_like(
+            input,
+            if input.dtype == DType::F64 {
+                9_223_372_036_854_775_808.0
+            } else {
+                2_147_483_648.0
+            },
+        );
+        // Beyond the integer range every representable float is already
+        // integral. Preserve those values, non-finites, and signed zero.
+        let at_limit = self.real_abs(input).ge(threshold);
+        let is_inf = self.is_inf(input);
+        let is_nan = self.is_nan(input);
+        let nonfinite = self.bool_or(is_inf, is_nan);
+        let preserve = self.bool_or(at_limit, nonfinite);
+        let is_zero = self.is_zero(input);
+        let preserve = self.bool_or(preserve, is_zero);
+        Ok(self.select(preserve, input, truncated))
     }
 
     /// Translate `aten.gelu`, honoring the `approximate` kwarg. PyTorch's default

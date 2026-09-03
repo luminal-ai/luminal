@@ -4,6 +4,7 @@
 
 mod attention;
 mod binary;
+mod complex;
 mod conv;
 mod dispatch;
 mod movement;
@@ -22,6 +23,7 @@ use crate::pt2_expr::parse_sympy_expr_with_ranges;
 use crate::pt2_parser::{InputKind, ParsedPT2, SymDimMap};
 use crate::pt2_schema::*;
 use crate::pt2_util;
+use crate::torch_dtype::TorchDType;
 
 /// Result of translating a PT2 graph to a Luminal graph.
 pub struct TranslatedGraph {
@@ -48,6 +50,9 @@ pub(crate) struct Translator<'a> {
     /// Maps PT2 tensor and scalar value names to GraphTensors. Scalars are
     /// represented as typed zero-dimensional tensors.
     pub(crate) tensors: HashMap<String, GraphTensor>,
+    /// Complex PT2 values represented as pairs of ordinary real tensors.
+    /// Complex never becomes an HLIR dtype.
+    pub(crate) complex_tensors: HashMap<String, complex::ComplexTensor>,
     pub(crate) sym_map: SymDimMap,
     pub(crate) user_input_ids: Vec<(String, NodeIndex)>,
     pub(crate) output_ids: Vec<(String, NodeIndex)>,
@@ -62,6 +67,7 @@ impl<'a> Translator<'a> {
             parsed,
             graph: Graph::new(),
             tensors: HashMap::new(),
+            complex_tensors: HashMap::new(),
             sym_map,
             user_input_ids: Vec::new(),
             output_ids: Vec::new(),
@@ -80,16 +86,22 @@ impl<'a> Translator<'a> {
 
         let output_names = self.parsed.output_names();
         for name in &output_names {
-            let tensor = self.get_tensor(name)?;
+            let tensor = if let Some(complex) = self.complex_tensors.get(name).copied() {
+                complex.pack(&mut self.graph)
+            } else {
+                self.get_tensor(name)?
+            };
             let tensor = if tensor.dtype == DType::Bool {
                 tensor.cast(DType::Int).cast(DType::Bool)
-            } else if tensor.dtype == DType::Int {
+            } else if tensor.dtype == DType::Int || tensor.legacy_tracker_ref().is_contiguous() {
                 tensor
             } else {
                 tensor + 0.0
             };
-            tensor.output();
-            self.output_ids.push((name.clone(), tensor.id));
+            // `output()` may materialize a non-contiguous view with a Gather.
+            // Record that returned node, not the pre-materialization producer.
+            let output = tensor.output();
+            self.output_ids.push((name.clone(), output.id));
         }
         Ok(())
     }
@@ -107,12 +119,7 @@ impl<'a> Translator<'a> {
                         .tensor_meta(graph_name)
                         .with_context(|| format!("Missing tensor meta for param {graph_name}"))?;
                     let shape = self.tensor_meta_to_shape(meta)?;
-                    let dtype = pt2_util::torch_dtype_int_to_luminal(meta.dtype);
-                    let tensor = self
-                        .graph
-                        .named_tensor(original_name, shape, dtype);
-                    tensor.persist();
-                    self.tensors.insert(graph_name.clone(), tensor);
+                    self.create_input_value(graph_name, original_name, shape, meta.dtype, false)?;
                 }
                 InputKind::Buffer {
                     graph_name,
@@ -123,12 +130,7 @@ impl<'a> Translator<'a> {
                         .tensor_meta(graph_name)
                         .with_context(|| format!("Missing tensor meta for buffer {graph_name}"))?;
                     let shape = self.tensor_meta_to_shape(meta)?;
-                    let dtype = pt2_util::torch_dtype_int_to_luminal(meta.dtype);
-                    let tensor = self
-                        .graph
-                        .named_tensor(original_name, shape, dtype);
-                    tensor.persist();
-                    self.tensors.insert(graph_name.clone(), tensor);
+                    self.create_input_value(graph_name, original_name, shape, meta.dtype, false)?;
                 }
                 InputKind::UserInput { graph_name } => {
                     let meta = self
@@ -136,12 +138,52 @@ impl<'a> Translator<'a> {
                         .tensor_meta(graph_name)
                         .with_context(|| format!("Missing tensor meta for input {graph_name}"))?;
                     let shape = self.tensor_meta_to_shape(meta)?;
-                    let dtype = pt2_util::torch_dtype_int_to_luminal(meta.dtype);
-                    let tensor = self.graph.named_tensor(graph_name, shape, dtype);
-                    self.user_input_ids.push((graph_name.clone(), tensor.id));
-                    self.tensors.insert(graph_name.clone(), tensor);
+                    self.create_input_value(graph_name, graph_name, shape, meta.dtype, true)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn create_input_value(
+        &mut self,
+        graph_name: &str,
+        label: &str,
+        mut logical_shape: Vec<IntExpr>,
+        dtype_code: u32,
+        user_input: bool,
+    ) -> Result<()> {
+        let torch_dtype = TorchDType::from_code(dtype_code)
+            .map_err(|code| anyhow::anyhow!("Unknown PT2 dtype code {code} for {graph_name}"))?;
+        if let Some(component_dtype) = torch_dtype.complex_component_dtype() {
+            // PyTorch complex storage is interleaved real/imaginary values.
+            // Preserve that layout in one real-valued input and split it into
+            // the two frontend-only components before translating operators.
+            logical_shape.push(IntExpr::from(2usize));
+            let backing = self
+                .graph
+                .named_tensor(label, logical_shape, component_dtype);
+            backing.persist();
+            let complex =
+                complex::ComplexTensor::from_interleaved(&mut self.graph, backing, torch_dtype)?;
+            if user_input {
+                self.user_input_ids
+                    .push((graph_name.to_string(), backing.id));
+            }
+            self.complex_tensors.insert(graph_name.to_string(), complex);
+        } else {
+            let dtype = pt2_util::torch_dtype_int_to_luminal(dtype_code);
+            let tensor = self
+                .graph
+                .named_tensor(label, logical_shape, dtype);
+            if !user_input {
+                tensor.persist();
+            }
+            if user_input {
+                self.user_input_ids
+                    .push((graph_name.to_string(), tensor.id));
+            }
+            self.tensors.insert(graph_name.to_string(), tensor);
         }
         Ok(())
     }
@@ -164,6 +206,11 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn get_tensor(&self, name: &str) -> Result<GraphTensor> {
+        if self.complex_tensors.contains_key(name) {
+            anyhow::bail!(
+                "Complex tensor {name} reached a real-only lowering; add a frontend complex lowering"
+            );
+        }
         self.tensors
             .get(name)
             .copied()
@@ -333,6 +380,24 @@ impl<'a> Translator<'a> {
             .tensor_meta(&name)
             .context("Missing tensor meta for output shape")?;
         self.tensor_meta_to_shape(meta)
+    }
+
+    /// Dtype of the node's first tensor output. PT2 metadata is authoritative
+    /// for PyTorch promotion semantics, including integral inputs promoted to
+    /// the current default floating dtype by transcendental and true-divide
+    /// operations.
+    pub(crate) fn output_meta_dtype(&self, node: &Node) -> Result<DType> {
+        let name = node
+            .outputs
+            .first()
+            .and_then(|output| output.as_tensor.as_ref())
+            .map(|tensor| tensor.name.clone())
+            .unwrap_or_default();
+
+        let meta = self
+            .tensor_meta(&name)
+            .context("Missing tensor meta for output dtype")?;
+        Ok(pt2_util::torch_dtype_int_to_luminal(meta.dtype))
     }
 
     pub(crate) fn dim_size_to_expr(&self, dim: &DimSize) -> Result<IntExpr> {

@@ -5,7 +5,7 @@ use crate::pt2_schema::*;
 use crate::pt2_util::*;
 
 use super::Translator;
-use super::reduction::ArgExtremum;
+use super::reduction::{ArgExtremum, CumExtremum};
 
 impl<'a> Translator<'a> {
     pub(crate) fn translate_node(&mut self, node: &Node) -> Result<()> {
@@ -45,8 +45,23 @@ impl<'a> Translator<'a> {
                 .first()
                 .and_then(TensorRef::value_name)
                 .context("item/local_scalar_dense is missing its scalar output name")?;
-            let scalar = reshape_tensor(self.get_input_tensor(node, 0)?, vec![]);
-            self.tensors.insert(name.to_string(), scalar);
+            let input_name = node.inputs[0]
+                .arg
+                .as_value_name()
+                .context("item/local_scalar_dense input is not tensor-backed")?;
+            if let Some(value) = self.complex_tensors.get(input_name).copied() {
+                self.complex_tensors.insert(
+                    name.to_string(),
+                    super::complex::ComplexTensor::new(
+                        reshape_tensor(value.real, vec![]),
+                        reshape_tensor(value.imag, vec![]),
+                        value.torch_dtype,
+                    ),
+                );
+            } else {
+                let scalar = reshape_tensor(self.get_tensor(input_name)?, vec![]);
+                self.tensors.insert(name.to_string(), scalar);
+            }
             return Ok(());
         }
 
@@ -55,6 +70,14 @@ impl<'a> Translator<'a> {
             .iter()
             .any(|o| o.as_tensor.is_some() || o.as_tensors.is_some());
         if !has_tensor_output {
+            return Ok(());
+        }
+
+        // Complex is a frontend virtual type. Route every node that consumes
+        // or produces one through algebraic real-component lowerings before
+        // the ordinary GraphTensor-only dispatch below.
+        if self.node_uses_complex(node, &output_name) {
+            self.translate_complex_node(node, &output_name)?;
             return Ok(());
         }
 
@@ -71,14 +94,25 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.div.Tensor" => self.translate_binary_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Scalar" => self.translate_binary_scalar_op(node, BinaryOp::Div)?,
             "torch.ops.aten.div.Tensor_mode" => self.translate_div_tensor_mode(node)?,
+            "torch.ops.aten.atan2.default" => self.translate_atan2(node)?,
+            "torch.ops.aten.copysign.Tensor" => self.translate_copysign(node)?,
+            "torch.ops.aten.copysign.Scalar" => self.translate_copysign_scalar(node)?,
+            "torch.ops.aten.fmax.default" => self.translate_fmax_fmin(node, true)?,
+            "torch.ops.aten.fmin.default" => self.translate_fmax_fmin(node, false)?,
 
             // Unary ops
             "torch.ops.aten.neg.default" => self.translate_unary_op(node, |a| a * (-1.0))?,
-            "torch.ops.aten.exp.default" => self.translate_unary_op(node, |a| a.exp())?,
+            "torch.ops.aten.exp.default" => self.translate_exp(node)?,
             "torch.ops.aten.sin.default" => self.translate_unary_op(node, |a| a.sin())?,
-            "torch.ops.aten.cos.default" => self.translate_unary_op(node, |a| a.cos())?,
+            "torch.ops.aten.cos.default" => self.translate_cos(node)?,
             "torch.ops.aten.acos.default" => self.translate_acos(node)?,
             "torch.ops.aten.acosh.default" => self.translate_acosh(node)?,
+            "torch.ops.aten.asin.default" => self.translate_asin(node)?,
+            "torch.ops.aten.asinh.default" => self.translate_asinh(node)?,
+            "torch.ops.aten.atan.default" => self.translate_atan(node)?,
+            "torch.ops.aten.atanh.default" => self.translate_atanh(node)?,
+            "torch.ops.aten.cosh.default" => self.translate_cosh(node)?,
+            "torch.ops.aten.trunc.default" => self.translate_trunc(node)?,
             "torch.ops.aten.sqrt.default" => self.translate_unary_op(node, |a| a.sqrt())?,
             "torch.ops.aten.rsqrt.default" => {
                 self.translate_unary_op(node, |a| a.sqrt().reciprocal())?
@@ -109,6 +143,11 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.upsample_nearest2d.vec" => self.translate_upsample_nearest2d(node)?,
             "torch.ops.aten.repeat.default" => self.translate_repeat(node)?,
             "torch.ops.aten.permute.default" => self.translate_permute(node)?,
+            "torch.ops.aten.flip.default" => self.translate_flip(node)?,
+            "torch.ops.aten.diagonal.default" => self.translate_diagonal(node)?,
+            "torch.ops.aten.diagonal_scatter.default" => self.translate_diagonal_scatter(node)?,
+            "torch.ops.aten.index_select.default" => self.translate_index_select(node)?,
+            "torch.ops.aten.unfold.default" => self.translate_unfold(node)?,
             "torch.ops.aten.unsqueeze.default" => {
                 let a = self.get_input_tensor(node, 0)?;
                 let dim = self.get_int_arg(node, 1)?;
@@ -146,6 +185,8 @@ impl<'a> Translator<'a> {
                 let (a, b) = ensure_same_dtype(a, b);
                 a.matmul(b)
             }
+            "torch.ops.aten.addmv.default" => self.translate_addmv(node)?,
+            "torch.ops.aten.addbmm.default" => self.translate_addbmm(node)?,
 
             // addmm: beta*input + alpha*(mat1 @ mat2)
             "torch.ops.aten.addmm.default" => {
@@ -160,6 +201,8 @@ impl<'a> Translator<'a> {
                 let (input, mm) = broadcast_binary(input, mm);
                 input * beta + mm * alpha
             }
+
+            "torch.ops.aten.copy.default" => self.translate_copy(node)?,
 
             // Convolution
             "torch.ops.aten.convolution.default" => self.translate_conv(node)?,
@@ -221,6 +264,7 @@ impl<'a> Translator<'a> {
             "torch.ops.aten.arange.start_step" => self.translate_arange(node)?,
             "torch.ops.aten.full.default" => self.translate_full(node)?,
             "torch.ops.aten.full_like.default" => self.translate_full_like(node)?,
+            "torch.ops.aten.constant_pad_nd.default" => self.translate_constant_pad_nd(node)?,
             // `empty` and `empty_permuted` allocate uninitialised tensors of
             // a given shape; the caller fills them. We lower to zeros with
             // the same shape+dtype — downstream reads are officially UB on
@@ -243,9 +287,7 @@ impl<'a> Translator<'a> {
             | "torch.ops.transformers.grouped_mm_fallback.default" => {
                 self.translate_grouped_mm(node)?
             }
-            "torch.ops.aten.scalar_tensor.default" => {
-                self.translate_scalar_tensor(node, &output_name)?
-            }
+            "torch.ops.aten.scalar_tensor.default" => self.translate_scalar_tensor(node)?,
             // Scalar comparisons
             "torch.ops.aten.gt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.gt(s))?,
             "torch.ops.aten.lt.Scalar" => self.translate_scalar_comparison(node, |a, s| a.lt(s))?,
@@ -310,9 +352,7 @@ impl<'a> Translator<'a> {
                 let a = self.get_input_tensor(node, 0)?;
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
-                let a = a.cast(DType::F32);
-                let b = b.cast(DType::F32);
-                (a + b - a * b).cast(DType::Bool)
+                self.apply_bool_or(a, b)
             }
             "torch.ops.aten.logical_xor.default" => {
                 let a = self.get_input_tensor(node, 0)?;
@@ -346,6 +386,15 @@ impl<'a> Translator<'a> {
                     let dim = normalize_dim(dim, a.legacy_tracker_ref().len());
                     a.cumsum(dim)
                 }
+            }
+            "torch.ops.aten.cumprod.default" => self.translate_cumprod(node)?,
+            "torch.ops.aten.cummax.default" => {
+                self.translate_cumextremum(node, CumExtremum::Max)?;
+                return Ok(());
+            }
+            "torch.ops.aten.cummin.default" => {
+                self.translate_cumextremum(node, CumExtremum::Min)?;
+                return Ok(());
             }
 
             // Floor / Ceil / Erf (approximations)
@@ -543,41 +592,9 @@ impl<'a> Translator<'a> {
 }
 
 impl<'a> Translator<'a> {
-    fn translate_scalar_tensor(&mut self, node: &Node, output_name: &str) -> Result<GraphTensor> {
-        let meta = self
-            .tensor_meta(output_name)
-            .context("scalar_tensor is missing output tensor metadata")?;
-        let dtype = torch_dtype_int_to_luminal(meta.dtype);
-        let arg = &node
-            .inputs
-            .first()
-            .context("scalar_tensor is missing its scalar input")?
-            .arg;
-
-        if let Some(name) = arg.as_value_name() {
-            let value = reshape_tensor(self.get_tensor(name)?, vec![]);
-            return Ok(if value.dtype == dtype {
-                value
-            } else {
-                value.cast(dtype)
-            });
-        }
-
-        if let Some(value) = arg.as_float() {
-            return Ok(if dtype == DType::F64 {
-                self.graph.constant_float64(value)
-            } else {
-                self.graph.constant_float(value as f32).cast(dtype)
-            });
-        }
-        if let Some(value) = arg.as_int() {
-            return Ok(self.graph.constant(value).cast(dtype));
-        }
-        if let Some(value) = arg.as_bool() {
-            return Ok(self.graph.constant(i64::from(value)).cast(dtype));
-        }
-
-        bail!("scalar_tensor input is not tensor-backed or a literal: {arg:?}")
+    fn translate_scalar_tensor(&mut self, node: &Node) -> Result<GraphTensor> {
+        let dtype = self.output_meta_dtype(node)?;
+        self.real_constructor_scalar(node, 0, dtype)
     }
 
     fn translate_scalar_comparison(

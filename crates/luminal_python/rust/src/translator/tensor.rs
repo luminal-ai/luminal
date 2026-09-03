@@ -9,8 +9,10 @@ use super::Translator;
 const FULL_SHAPE_ARG: usize = 0;
 const FULL_VALUE_ARG: usize = 1;
 
-const FULL_LIKE_INPUT_ARG: usize = 0;
 const FULL_LIKE_VALUE_ARG: usize = 1;
+
+const CONSTANT_PAD_INPUT_ARG: usize = 0;
+const CONSTANT_PAD_PADDING_ARG: usize = 1;
 
 const TOPK_INPUT_ARG: usize = 0;
 const TOPK_K_ARG: usize = 1;
@@ -34,7 +36,272 @@ enum ArangeScalar {
     Expr(IntExpr),
 }
 
+/// A PyTorch `Scalar` constructor argument before it is converted to the
+/// constructor's recorded output dtype.
+#[derive(Clone, Debug)]
+pub(crate) enum ConstructorScalar {
+    Value(String),
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Complex(f64, f64),
+}
+
+impl ConstructorScalar {
+    pub(crate) fn is_literal_zero(&self) -> bool {
+        match self {
+            Self::Bool(value) => !value,
+            Self::Int(value) => *value == 0,
+            Self::Float(value) => *value == 0.0,
+            Self::Complex(real, imag) => *real == 0.0 && *imag == 0.0,
+            Self::Value(_) => false,
+        }
+    }
+
+    pub(crate) fn is_literal_one(&self) -> bool {
+        match self {
+            Self::Bool(value) => *value,
+            Self::Int(value) => *value == 1,
+            Self::Float(value) => *value == 1.0,
+            Self::Complex(real, imag) => *real == 1.0 && *imag == 0.0,
+            Self::Value(_) => false,
+        }
+    }
+}
+
+/// Copy `source` into the logical shape and dtype of `destination`.
+///
+/// ATen permits the source to broadcast but never changes the destination's
+/// shape. Using the destination in `broadcast_binary` gives us its exact
+/// symbolic dimensions while rejecting the inverse case where broadcasting
+/// would have to grow a destination dimension.
+pub(crate) fn copy_tensor(
+    destination: GraphTensor,
+    source: GraphTensor,
+    dtype: DType,
+) -> Result<GraphTensor> {
+    let destination_shape = destination.dims();
+    let (broadcast_destination, mut source) = broadcast_binary(destination, source.cast(dtype));
+    anyhow::ensure!(
+        broadcast_destination.dims() == destination_shape,
+        "copy source shape {:?} cannot broadcast into destination shape {:?}",
+        source.dims(),
+        destination_shape
+    );
+    // Canonicalize dimensions to the destination spelling. Equal symbolic
+    // dimensions can arrive under different PT2 expressions, and the copied
+    // value inherits the destination's shape contract.
+    for (actual, expected) in source.legacy_tracker_mut().dims.iter_mut().zip(destination_shape) {
+        *actual = expected;
+    }
+    Ok(source)
+}
+
 impl<'a> Translator<'a> {
+    pub(crate) fn constructor_scalar_arg(
+        &self,
+        node: &Node,
+        index: usize,
+    ) -> Result<ConstructorScalar> {
+        let arg = &node
+            .inputs
+            .get(index)
+            .with_context(|| format!("{} is missing scalar input {index}", node.target))?
+            .arg;
+        if let Some(name) = arg.as_value_name() {
+            return Ok(ConstructorScalar::Value(name.to_string()));
+        }
+        if let Some((real, imag)) = arg.as_complex() {
+            return Ok(ConstructorScalar::Complex(real, imag));
+        }
+        if let Some(value) = arg.as_float() {
+            return Ok(ConstructorScalar::Float(value));
+        }
+        if let Some(value) = arg.as_int() {
+            return Ok(ConstructorScalar::Int(value));
+        }
+        if let Some(value) = arg.as_bool() {
+            return Ok(ConstructorScalar::Bool(value));
+        }
+        anyhow::bail!("{} has unsupported scalar argument {arg:?}", node.target)
+    }
+
+    pub(crate) fn typed_scalar_constant(
+        &mut self,
+        value: &ConstructorScalar,
+        dtype: DType,
+    ) -> Result<GraphTensor> {
+        let tensor = match value {
+            ConstructorScalar::Value(name) => {
+                anyhow::bail!("runtime scalar {name} is not a literal constant")
+            }
+            ConstructorScalar::Bool(value) => self.graph.constant(i64::from(*value)).cast(dtype),
+            ConstructorScalar::Int(value) => match dtype {
+                DType::F64 => self.graph.constant_float64(*value as f64),
+                DType::F32 | DType::F16 | DType::Bf16 => {
+                    self.graph.constant_float(*value as f32).cast(dtype)
+                }
+                DType::Int | DType::I64 | DType::I16 | DType::I8 | DType::U8 | DType::Bool => {
+                    self.graph.constant_i64(*value).cast(dtype)
+                }
+                other => anyhow::bail!("unsupported constructor dtype {other:?}"),
+            },
+            ConstructorScalar::Float(value) => match dtype {
+                DType::F64 => self.graph.constant_float64(*value),
+                DType::F32 | DType::F16 | DType::Bf16 => {
+                    self.graph.constant_float(*value as f32).cast(dtype)
+                }
+                DType::Int | DType::I64 | DType::I16 | DType::I8 | DType::U8 | DType::Bool => {
+                    self.graph.constant_float64(*value).cast(dtype)
+                }
+                other => anyhow::bail!("unsupported constructor dtype {other:?}"),
+            },
+            ConstructorScalar::Complex(real, imag) => {
+                anyhow::ensure!(
+                    *imag == 0.0,
+                    "complex value with nonzero imaginary component cannot construct {dtype:?}"
+                );
+                return self.typed_scalar_constant(&ConstructorScalar::Float(*real), dtype);
+            }
+        };
+        Ok(tensor)
+    }
+
+    pub(crate) fn real_constructor_scalar(
+        &mut self,
+        node: &Node,
+        index: usize,
+        dtype: DType,
+    ) -> Result<GraphTensor> {
+        let value = self.constructor_scalar_arg(node, index)?;
+        if let ConstructorScalar::Value(name) = &value {
+            anyhow::ensure!(
+                !self.complex_tensors.contains_key(name),
+                "complex runtime scalar {name} cannot construct a real tensor"
+            );
+            return Ok(reshape_tensor(self.get_tensor(name)?, vec![]).cast(dtype));
+        }
+        self.typed_scalar_constant(&value, dtype)
+    }
+
+    fn scale_by_named_scalar(
+        &mut self,
+        node: &Node,
+        name: &str,
+        value: GraphTensor,
+    ) -> Result<GraphTensor> {
+        let Some(index) = node.inputs.iter().position(|input| input.name == name) else {
+            return Ok(value);
+        };
+        let scalar = self.constructor_scalar_arg(node, index)?;
+        if scalar.is_literal_one() {
+            return Ok(value);
+        }
+        if scalar.is_literal_zero() {
+            return Ok(self
+                .typed_scalar_constant(&ConstructorScalar::Int(0), value.dtype)?
+                .expand_rhs(value.dims()));
+        }
+        let scalar = self.real_constructor_scalar(node, index, value.dtype)?;
+        Ok(value * scalar.expand_rhs(value.dims()))
+    }
+
+    pub(crate) fn translate_addmv(&mut self, node: &Node) -> Result<GraphTensor> {
+        let output_dtype = self.output_meta_dtype(node)?;
+        let compute_dtype = match output_dtype {
+            DType::F16 | DType::Bf16 => DType::F32,
+            dtype => dtype,
+        };
+        let input = self.get_input_tensor(node, 0)?.cast(compute_dtype);
+        let matrix = self.get_input_tensor(node, 1)?.cast(compute_dtype);
+        let vector = self.get_input_tensor(node, 2)?.cast(compute_dtype);
+        anyhow::ensure!(matrix.legacy_tracker_ref().len() == 2, "addmv matrix must be rank 2");
+        anyhow::ensure!(vector.legacy_tracker_ref().len() == 1, "addmv vector must be rank 1");
+
+        let product = matrix.matmul(vector.unsqueeze(1)).squeeze(1);
+        let input = self.scale_by_named_scalar(node, "beta", input)?;
+        let product = self.scale_by_named_scalar(node, "alpha", product)?;
+        let (input, product) = broadcast_binary(input, product);
+        Ok((input + product).cast(output_dtype))
+    }
+
+    pub(crate) fn translate_addbmm(&mut self, node: &Node) -> Result<GraphTensor> {
+        let output_dtype = self.output_meta_dtype(node)?;
+        let compute_dtype = match output_dtype {
+            DType::F16 | DType::Bf16 => DType::F32,
+            dtype => dtype,
+        };
+        let input = self.get_input_tensor(node, 0)?.cast(compute_dtype);
+        let batch1 = self.get_input_tensor(node, 1)?.cast(compute_dtype);
+        let batch2 = self.get_input_tensor(node, 2)?.cast(compute_dtype);
+        anyhow::ensure!(batch1.legacy_tracker_ref().len() == 3, "addbmm batch1 must be rank 3");
+        anyhow::ensure!(batch2.legacy_tracker_ref().len() == 3, "addbmm batch2 must be rank 3");
+
+        // CPU ATen evaluates addbmm as sequential fused addmm updates. A
+        // single bmm+sum changes the F32 rounding order, and for BF16 it can
+        // move by whole representable values because every update is rounded
+        // back to BF16. Preserve the observable order when the batch length is
+        // concrete; symbolic batches use the algebraically equivalent fallback.
+        if matches!(output_dtype, DType::Bf16 | DType::F32)
+            && let Some(batch_count) = batch1.legacy_tracker_ref().dims[0].to_usize()
+        {
+            let mut result = self.scale_by_named_scalar(node, "beta", input)?;
+            for batch in 0..batch_count {
+                let lhs = batch1.slice_along(batch..batch + 1, 0).squeeze(0);
+                let rhs = batch2.slice_along(batch..batch + 1, 0).squeeze(0);
+                let product = self.scale_by_named_scalar(node, "alpha", lhs.matmul(rhs))?;
+                let (result_broadcast, product) =
+                    broadcast_binary(result.cast(compute_dtype), product);
+                result = (result_broadcast + product).cast(output_dtype);
+            }
+            return Ok(result.cast(output_dtype));
+        }
+
+        let product = batch1.matmul(batch2).sum(0);
+        let input = self.scale_by_named_scalar(node, "beta", input)?;
+        let product = self.scale_by_named_scalar(node, "alpha", product)?;
+        let (input, product) = broadcast_binary(input, product);
+        Ok((input + product).cast(output_dtype))
+    }
+
+    pub(crate) fn translate_copy(&mut self, node: &Node) -> Result<GraphTensor> {
+        let dtype = self.output_meta_dtype(node)?;
+        copy_tensor(
+            self.get_input_tensor(node, 0)?,
+            self.get_input_tensor(node, 1)?,
+            dtype,
+        )
+    }
+
+    pub(crate) fn constant_pad_spec(
+        &self,
+        node: &Node,
+        rank: usize,
+    ) -> Result<Vec<(IntExpr, IntExpr)>> {
+        let raw = self.get_exprs_arg(node, CONSTANT_PAD_PADDING_ARG)?;
+        anyhow::ensure!(
+            raw.len().is_multiple_of(2),
+            "constant_pad_nd requires left/right pairs, got {} values",
+            raw.len()
+        );
+        let padded_dims = raw.len() / 2;
+        anyhow::ensure!(
+            padded_dims <= rank,
+            "constant_pad_nd received {padded_dims} padded dimensions for rank-{rank} input"
+        );
+
+        // ATen lists the last dimension first: [last_left, last_right,
+        // penultimate_left, ...]. GraphTensor::pad expects tensor-axis order.
+        let mut pairs = raw
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect::<Vec<_>>();
+        pairs.reverse();
+        let mut padding = vec![(0.into(), 0.into()); rank - padded_dims];
+        padding.extend(pairs);
+        Ok(padding)
+    }
+
     pub(crate) fn translate_arange(&mut self, node: &Node) -> Result<GraphTensor> {
         // PT2's start_step overload names these arguments even when the
         // original call used a keyword (`torch.arange(0, end=3)`). Resolve by
@@ -116,20 +383,9 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_full(&mut self, node: &Node) -> Result<GraphTensor> {
-        let shape = self.get_exprs_arg(node, FULL_SHAPE_ARG)?;
-        // fill_value can be float, int, or bool after decomposition
-        let val = if let Ok(f) = self.get_float_arg(node, FULL_VALUE_ARG) {
-            f as f32
-        } else if let Ok(b) = self.get_bool_arg(node, FULL_VALUE_ARG) {
-            if b { 1.0 } else { 0.0 }
-        } else {
-            anyhow::bail!(
-                "full: unsupported fill value type: {:?}",
-                node.inputs.get(FULL_VALUE_ARG)
-            );
-        };
+        let shape = self.output_meta_shape(node)?;
         let dtype = self.output_meta_dtype(node)?;
-        let value = self.graph.constant_float(val).cast(dtype);
+        let value = self.real_constructor_scalar(node, FULL_VALUE_ARG, dtype)?;
         Ok(if shape.is_empty() {
             value
         } else {
@@ -229,33 +485,31 @@ impl<'a> Translator<'a> {
     }
 
     pub(crate) fn translate_full_like(&mut self, node: &Node) -> Result<GraphTensor> {
-        let reference = self.get_input_tensor(node, FULL_LIKE_INPUT_ARG)?;
-        let val = if let Ok(f) = self.get_float_arg(node, FULL_LIKE_VALUE_ARG) {
-            f as f32
-        } else if let Ok(b) = self.get_bool_arg(node, FULL_LIKE_VALUE_ARG) {
-            if b { 1.0 } else { 0.0 }
-        } else {
-            anyhow::bail!(
-                "full_like: unsupported fill value type: {:?}",
-                node.inputs.get(FULL_LIKE_VALUE_ARG)
-            );
-        };
+        let shape = self.output_meta_shape(node)?;
         let dtype = self.output_meta_dtype(node)?;
-        let value = self.graph.constant_float(val).cast(dtype);
-        Ok(value.expand_rhs(reference.dims()))
+        let value = self.real_constructor_scalar(node, FULL_LIKE_VALUE_ARG, dtype)?;
+        Ok(if shape.is_empty() {
+            value
+        } else {
+            value.expand_rhs(shape)
+        })
     }
 
-    fn output_meta_dtype(&self, node: &Node) -> Result<DType> {
-        let output_name = node
-            .outputs
-            .first()
-            .and_then(|o| o.as_tensor.as_ref())
-            .map(|t| t.name.clone())
-            .unwrap_or_default();
-        let meta = self
-            .tensor_meta(&output_name)
-            .context("Missing tensor meta for output dtype")?;
-        Ok(torch_dtype_int_to_luminal(meta.dtype))
+    pub(crate) fn translate_constant_pad_nd(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, CONSTANT_PAD_INPUT_ARG)?;
+        let output_dtype = self.output_meta_dtype(node)?;
+        anyhow::ensure!(
+            input.dtype == output_dtype,
+            "constant_pad_nd changed dtype from {:?} to {output_dtype:?}",
+            input.dtype
+        );
+        let padding = self.constant_pad_spec(node, input.legacy_tracker_ref().len())?;
+        let value_index = node.inputs.iter().position(|input| input.name == "value");
+        let fill = match value_index {
+            Some(index) => self.real_constructor_scalar(node, index, output_dtype)?,
+            None => self.typed_scalar_constant(&ConstructorScalar::Int(0), output_dtype)?,
+        };
+        Ok(input.pad_with(padding, fill))
     }
 
     /// Translate `aten._grouped_mm.default(input, weight, offs)` → `Tensor[S, N]`.

@@ -374,14 +374,21 @@ impl GraphTensor {
         (-self.lt(rhs).cast(DType::F32) + 1.0).cast(DType::Bool)
     }
 
-    /// Not equal
+    /// Not equal. Returns `Bool`, like every other comparison here
+    /// (`lt`/`gt`/`le`/`ge`); the `lt + gt` sum is an internal numeric
+    /// indicator, not the result type.
     pub fn ne(self, rhs: GraphTensor) -> GraphTensor {
-        self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)
+        (self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32)).cast(DType::Bool)
     }
 
     /// Equal
     pub fn eq(self, rhs: GraphTensor) -> GraphTensor {
-        (-self.ne(rhs) + 1.0).cast(DType::Bool)
+        // Keep the inequality indicator numeric until the final cast. Calling
+        // `ne` here would create a Bool -> F32 round trip, forcing backends
+        // without Bool storage to materialize an otherwise internal boolean
+        // buffer.
+        let not_equal = self.lt(rhs).cast(DType::F32) + self.gt(rhs).cast(DType::F32);
+        (-not_equal + 1.0).cast(DType::Bool)
     }
 
     /// Raise the tensor to a power
@@ -739,7 +746,11 @@ pub(super) mod tests {
         test_binary(
             27,
             27,
-            |a, b| a.ne(b).cast(luminal::dtype::DType::F32),
+            |a, b| {
+                let result = a.ne(b);
+                assert_eq!(result.dtype, luminal::dtype::DType::Bool);
+                result.cast(luminal::dtype::DType::F32)
+            },
             |a, b| a.ne(&b).unwrap().to_dtype(DType::F32).unwrap(),
         );
     }

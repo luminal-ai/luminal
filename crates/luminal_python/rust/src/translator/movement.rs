@@ -8,10 +8,195 @@ use crate::pt2_util::*;
 
 use super::Translator;
 
+use super::movement_dynamic::{logical_flat_indices, row_major_strides};
+
 const SCATTER_INPUT_ARG: usize = 0;
 const SCATTER_DIM_ARG: usize = 1;
 const SCATTER_INDEX_ARG: usize = 2;
 const SCATTER_VALUE_ARG: usize = 3;
+
+pub(crate) fn normalize_flip_dims(dims: &[i64], rank: usize) -> Result<Vec<usize>> {
+    let mut normalized = Vec::with_capacity(dims.len());
+    for &dim in dims {
+        anyhow::ensure!(
+            dim >= -(rank as i64) && dim < rank as i64,
+            "flip dimension {dim} out of range for rank {rank}"
+        );
+        let dim = normalize_dim(dim, rank);
+        anyhow::ensure!(
+            !normalized.contains(&dim),
+            "flip dimensions must be unique, got {dims:?}"
+        );
+        normalized.push(dim);
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn normalize_diagonal_dims(dim1: i64, dim2: i64, rank: usize) -> Result<(usize, usize)> {
+    anyhow::ensure!(
+        rank >= 2,
+        "diagonal expects an input with at least two dimensions"
+    );
+    for dim in [dim1, dim2] {
+        anyhow::ensure!(
+            dim >= -(rank as i64) && dim < rank as i64,
+            "diagonal dimension {dim} out of range for rank {rank}"
+        );
+    }
+    let dims = (normalize_dim(dim1, rank), normalize_dim(dim2, rank));
+    anyhow::ensure!(dims.0 != dims.1, "diagonal dimensions must be different");
+    Ok(dims)
+}
+
+pub(crate) fn flip_indices(input: GraphTensor, dims: &[usize]) -> GraphTensor {
+    let shape = input.dims();
+    let strides = row_major_strides(&shape);
+    let contributions: Vec<IntExpr> = strides
+        .iter()
+        .enumerate()
+        .map(|(axis, &stride)| {
+            let coordinate = if dims.contains(&axis) {
+                shape[axis] - 1 - IntExpr::from('z')
+            } else {
+                IntExpr::from('z')
+            };
+            coordinate * stride
+        })
+        .collect();
+    logical_flat_indices(input.graph(), &shape, &contributions, 0.into())
+}
+
+pub(crate) fn diagonal_indices(
+    input: GraphTensor,
+    output_shape: &[IntExpr],
+    offset: i64,
+    dim1: usize,
+    dim2: usize,
+) -> Result<GraphTensor> {
+    let input_shape = input.dims();
+    anyhow::ensure!(
+        output_shape.len() + 1 == input_shape.len(),
+        "diagonal output rank {} does not match input rank {}",
+        output_shape.len(),
+        input_shape.len()
+    );
+    let strides = row_major_strides(&input_shape);
+    let mut contributions: Vec<IntExpr> = (0..input_shape.len())
+        .filter(|&axis| axis != dim1 && axis != dim2)
+        .map(|axis| IntExpr::from('z') * strides[axis])
+        .collect();
+    contributions.push(IntExpr::from('z') * (strides[dim1] + strides[dim2]));
+
+    // Positive offsets start along dim2; negative offsets start along dim1.
+    // Express negation symbolically so the full signed ATen offset range does
+    // not overflow Rust while translating an empty, out-of-bounds diagonal.
+    let base = if offset >= 0 {
+        IntExpr::from(offset) * strides[dim2]
+    } else {
+        IntExpr::from(offset) * IntExpr::from(-1) * strides[dim1]
+    };
+    Ok(logical_flat_indices(
+        input.graph(),
+        output_shape,
+        &contributions,
+        base,
+    ))
+}
+
+pub(crate) fn diagonal_scatter_tensor(
+    destination: GraphTensor,
+    source: GraphTensor,
+    offset: i64,
+    dim1: usize,
+    dim2: usize,
+) -> Result<GraphTensor> {
+    anyhow::ensure!(
+        destination.dtype == source.dtype,
+        "diagonal_scatter requires matching dtypes, got {:?} and {:?}",
+        destination.dtype,
+        source.dtype
+    );
+    let indices = diagonal_indices(destination, &source.dims(), offset, dim1, dim2)?;
+    Ok(source.scatter(indices, destination))
+}
+
+pub(crate) fn index_select_tensor(
+    input: GraphTensor,
+    index: GraphTensor,
+    dim: usize,
+    output_shape: &[IntExpr],
+) -> Result<GraphTensor> {
+    if input.legacy_tracker_ref().is_empty() {
+        anyhow::ensure!(
+            output_shape.is_empty(),
+            "scalar index_select must produce a scalar output"
+        );
+        return Ok(input);
+    }
+    anyhow::ensure!(
+        index.legacy_tracker_ref().len() <= 1,
+        "index_select index must be rank 0 or 1, got rank {}",
+        index.legacy_tracker_ref().len()
+    );
+    Ok(super::movement_dynamic::pt2_index_select(
+        input,
+        index,
+        dim,
+        output_shape,
+    ))
+}
+
+pub(crate) fn unfold_tensor(
+    input: GraphTensor,
+    dim: usize,
+    size: i64,
+    step: i64,
+    output_shape: &[IntExpr],
+) -> Result<GraphTensor> {
+    anyhow::ensure!(size >= 0, "unfold size must be nonnegative, got {size}");
+    anyhow::ensure!(step > 0, "unfold step must be positive, got {step}");
+    if input.legacy_tracker_ref().is_empty() {
+        anyhow::ensure!(
+            output_shape.len() == 1,
+            "scalar unfold must produce one output dimension"
+        );
+        anyhow::ensure!(size <= 1, "scalar unfold size cannot exceed 1");
+        return Ok(input.expand_rhs(output_shape.to_vec()));
+    }
+    if let Some(dim_size) = input.legacy_tracker_ref().dims[dim].to_usize() {
+        anyhow::ensure!(
+            size as usize <= dim_size,
+            "unfold size {size} exceeds dimension {dim} of length {dim_size}"
+        );
+    }
+
+    let rank = input.legacy_tracker_ref().len();
+    let mut kernel = vec![1usize; rank];
+    let mut strides = vec![1usize; rank];
+    kernel[dim] = size as usize;
+    strides[dim] = step as usize;
+    let mut result = input.unfold(kernel, strides, vec![1usize; rank]);
+
+    // Core unfold returns [window_dims..., kernel_dims...]. Every kernel
+    // dimension except the selected one is size 1, so remove those in reverse
+    // order; the selected kernel dimension naturally becomes PyTorch's final
+    // output dimension.
+    for kernel_dim in (0..rank).rev() {
+        if kernel_dim != dim {
+            result = result.squeeze(rank + kernel_dim);
+        }
+    }
+    anyhow::ensure!(
+        result.legacy_tracker_ref().len() == output_shape.len(),
+        "unfold produced rank {}, expected {}",
+        result.legacy_tracker_ref().len(),
+        output_shape.len()
+    );
+    for (actual, expected) in result.legacy_tracker_mut().dims.iter_mut().zip(output_shape) {
+        *actual = *expected;
+    }
+    Ok(result)
+}
 
 fn normalize_concat_dims(
     lhs: &mut GraphTensor,
@@ -195,6 +380,83 @@ impl<'a> Translator<'a> {
         Ok(a.permute(axes))
     }
 
+    pub(crate) fn translate_flip(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let dims = normalize_flip_dims(&self.get_ints_arg(node, 1)?, input.legacy_tracker_ref().len())?;
+        Ok(input.gather(flip_indices(input, &dims)))
+    }
+
+    pub(crate) fn translate_diagonal(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let offset = self.get_int_arg(node, 1).unwrap_or(0);
+        let (dim1, dim2) = normalize_diagonal_dims(
+            self.get_int_arg(node, 2).unwrap_or(0),
+            self.get_int_arg(node, 3).unwrap_or(1),
+            input.legacy_tracker_ref().len(),
+        )?;
+        let output_shape = self.output_meta_shape(node)?;
+        Ok(input.gather(diagonal_indices(input, &output_shape, offset, dim1, dim2)?))
+    }
+
+    pub(crate) fn translate_diagonal_scatter(&mut self, node: &Node) -> Result<GraphTensor> {
+        let destination = self.get_input_tensor(node, 0)?;
+        let source = self.get_input_tensor(node, 1)?;
+        let offset = self.get_int_arg(node, 2).unwrap_or(0);
+        let (dim1, dim2) = normalize_diagonal_dims(
+            self.get_int_arg(node, 3).unwrap_or(0),
+            self.get_int_arg(node, 4).unwrap_or(1),
+            destination.legacy_tracker_ref().len(),
+        )?;
+        diagonal_scatter_tensor(destination, source, offset, dim1, dim2)
+    }
+
+    pub(crate) fn translate_index_select(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let dim = if input.legacy_tracker_ref().is_empty() {
+            anyhow::ensure!(
+                raw_dim == 0 || raw_dim == -1,
+                "index_select dimension {raw_dim} out of range for a scalar"
+            );
+            0
+        } else {
+            anyhow::ensure!(
+                raw_dim >= -(input.legacy_tracker_ref().len() as i64) && raw_dim < input.legacy_tracker_ref().len() as i64,
+                "index_select dimension {raw_dim} out of range for rank {}",
+                input.legacy_tracker_ref().len()
+            );
+            normalize_dim(raw_dim, input.legacy_tracker_ref().len())
+        };
+        let index = self.get_input_tensor(node, 2)?;
+        index_select_tensor(input, index, dim, &self.output_meta_shape(node)?)
+    }
+
+    pub(crate) fn translate_unfold(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let raw_dim = self.get_int_arg(node, 1)?;
+        let dim = if input.legacy_tracker_ref().is_empty() {
+            anyhow::ensure!(
+                raw_dim == 0 || raw_dim == -1,
+                "unfold dimension {raw_dim} out of range for a scalar"
+            );
+            0
+        } else {
+            anyhow::ensure!(
+                raw_dim >= -(input.legacy_tracker_ref().len() as i64) && raw_dim < input.legacy_tracker_ref().len() as i64,
+                "unfold dimension {raw_dim} out of range for rank {}",
+                input.legacy_tracker_ref().len()
+            );
+            normalize_dim(raw_dim, input.legacy_tracker_ref().len())
+        };
+        unfold_tensor(
+            input,
+            dim,
+            self.get_int_arg(node, 2)?,
+            self.get_int_arg(node, 3)?,
+            &self.output_meta_shape(node)?,
+        )
+    }
+
     pub(crate) fn translate_expand(&mut self, node: &Node) -> Result<GraphTensor> {
         let mut a = self.get_input_tensor(node, 0)?;
         let neg1_expr = IntExpr::from(-1i32);
@@ -293,10 +555,8 @@ impl<'a> Translator<'a> {
     /// produces a rank-0 scalar. Both `dim` and `index` may be negative and
     /// are normalized against the input shape.
     ///
-    /// Lowered as `slice_along(index..index+1, dim).squeeze(dim)`. We use the
-    /// slice + squeeze decomposition (rather than `gather`) because the
-    /// composition is a pure shape manipulation with a single iota, which the
-    /// luminal compiler can fold into surrounding ops.
+    /// Slice and squeeze establish the view; gather materializes it without
+    /// arithmetic, preserving signed zero, infinity, and NaN exactly.
     pub(crate) fn translate_select(&mut self, node: &Node) -> Result<GraphTensor> {
         let a = self.get_input_tensor(node, 0)?;
         let dim = self.get_int_arg(node, 1)?;
@@ -326,7 +586,11 @@ impl<'a> Translator<'a> {
             index_raw as usize
         };
 
-        Ok(a.slice_along(index..index + 1, dim).squeeze(dim))
+        let selected = a.slice_along(index..index + 1, dim).squeeze(dim);
+        let indexes = selected
+            .graph()
+            .iota(IntExpr::from('z'), selected.dims());
+        Ok(selected.gather(indexes))
     }
 
     pub(crate) fn translate_cat(&mut self, node: &Node) -> Result<GraphTensor> {

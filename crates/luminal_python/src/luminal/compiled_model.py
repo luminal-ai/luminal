@@ -173,6 +173,11 @@ class CompiledModel:
                     "cast (and warn) on every call, which masked precision "
                     "bugs and burnt cycles on per-call allocation+copy."
                 )
+            # A conjugated complex tensor may be a metadata-only view whose
+            # physical bytes have not been conjugated. The real-component
+            # HLIR input consumes physical interleaved values, so resolve the
+            # view bit before exposing its pointer.
+            tensor = tensor.resolve_conj() if tensor.is_complex() else tensor
             if self._supports_device_ptrs and tensor.is_cuda:
                 # A contiguous caller tensor is already a valid read-only
                 # boundary input; making a detached view for every lifted
@@ -228,7 +233,20 @@ class CompiledModel:
         # `torch.frombuffer`. That's a reinterpret, not a numeric
         # cast — no precision change.
         #
-        _zero_copy_native_floats = (torch.float32, torch.float16, torch.bfloat16)
+        _complex_components = {
+            torch.complex32: torch.float16,
+            torch.complex64: torch.float32,
+            torch.complex128: torch.float64,
+        }
+        _zero_copy_native_floats = (
+            torch.float32,
+            torch.float16,
+            torch.bfloat16,
+            # These use f32/f16 HLIR output storage respectively; a complex
+            # PyTorch allocation has the same interleaved byte layout.
+            torch.complex64,
+            torch.complex32,
+        )
         _output_readers = {
             torch.float32: ("get_output", torch.float32),
             torch.float64: ("get_output_f64", torch.float64),
@@ -259,7 +277,9 @@ class CompiledModel:
             and `.view(half)` so the conversion is a reinterpret of the
             bytes, not a numeric cast.
             """
-            entry = _output_readers.get(out_dtype)
+            component_dtype = _complex_components.get(out_dtype)
+            read_dtype = component_dtype or out_dtype
+            entry = _output_readers.get(read_dtype)
             if entry is None:
                 raise NotImplementedError(
                     f"Output '{name}' declared dtype {out_dtype} isn't "
@@ -267,21 +287,25 @@ class CompiledModel:
                     f"getter for this dtype (see `_output_readers`) or cast "
                     f"the output to a supported dtype upstream."
                 )
-            getter_name, read_dtype = entry
+            getter_name, reader_dtype = entry
             data = getattr(self._graph, f"{getter_name}_at")(position)
             if len(data) == 0:
                 if all(d != 0 for d in shape):
                     return None
                 return torch.empty(tuple(shape), dtype=out_dtype, device=input_device)
-            if out_dtype in (torch.float16, torch.bfloat16, torch.uint8):
+            if read_dtype in (torch.float16, torch.bfloat16, torch.uint8):
                 # Getter returned an immutable `bytes` from Rust; wrap in
                 # `bytearray` to make the storage writable (suppresses
                 # the "non-writable buffer" warning), then bit-cast via
                 # `frombuffer` — no numeric conversion.
-                tensor = torch.frombuffer(bytearray(data), dtype=out_dtype)
+                tensor = torch.frombuffer(bytearray(data), dtype=read_dtype)
             else:
-                tensor = torch.tensor(data, dtype=read_dtype)
-            tensor = tensor.reshape(tuple(shape))
+                tensor = torch.tensor(data, dtype=reader_dtype)
+            if component_dtype is not None:
+                tensor = tensor.reshape((*tuple(shape), 2))
+                tensor = torch.view_as_complex(tensor)
+            else:
+                tensor = tensor.reshape(tuple(shape))
             return tensor.to(input_device)
 
         # Pre-allocation is GPU-only: the CUDA kernel needs the
@@ -295,33 +319,17 @@ class CompiledModel:
         # device buffer to register against.
         _use_zero_copy = self._supports_device_ptrs
         output_tensors = []
-        direct_writebacks = set()
         if _use_zero_copy:
             for i, (name, shape) in enumerate(zip(self._output_names, output_shapes)):
                 out_dtype = output_torch_dtypes[i]
                 if i in self._writeback_by_pos:
-                    # Point functionalized mutation outputs at the caller's
-                    # state tensor up front. The CUDA runtime either writes
-                    # there directly or schedules its required epilogue D2D
-                    # copy on the graph stream before the one terminal wait.
-                    target = user_inputs[self._writeback_input_pos[i]]
-                    expected_numel = math.prod(shape)
-                    if (
-                        target.is_cuda
-                        and target.is_contiguous()
-                        and target.dtype == out_dtype
-                        and target.numel() == expected_numel
-                    ):
-                        n_bytes = target.numel() * target.element_size()
-                        signature = _cuda_input_binding_signature(target, n_bytes)
-                        previous = self._cuda_writeback_bindings.get(i)
-                        if previous is None or previous[:4] != signature:
-                            self._graph.set_output_device_ptr_at(
-                                i, target.data_ptr(), n_bytes
-                            )
-                        self._cuda_writeback_bindings[i] = (*signature, target)
-                        direct_writebacks.add(i)
-                    elif i in self._cuda_writeback_bindings:
+                    # A functionalized mutation output may share its producer
+                    # with another positional output. Output registrations are
+                    # keyed by producer node, so binding such positions up
+                    # front can redirect one cache writeback into another.
+                    # Preserve positional semantics with the batched post-run
+                    # device copies below.
+                    if i in self._cuda_writeback_bindings:
                         self._graph.clear_output_device_ptr_at(i)
                         del self._cuda_writeback_bindings[i]
                     output_tensors.append(None)
@@ -344,8 +352,6 @@ class CompiledModel:
                 # the caller's tensor (the same object the model would have
                 # mutated eagerly); it is not part of the returned tuple.
                 target = user_inputs[self._writeback_input_pos[i]]
-                if i in direct_writebacks:
-                    continue
                 expected_numel = math.prod(shape)
                 can_copy_on_device = (
                     self._supports_device_ptrs

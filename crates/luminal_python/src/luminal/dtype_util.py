@@ -29,6 +29,9 @@ _TORCH_DTYPE_TO_CODE = {
     torch.float16: ScalarType.HALF.value,
     torch.float32: ScalarType.FLOAT.value,
     torch.float64: ScalarType.DOUBLE.value,
+    torch.complex32: ScalarType.COMPLEXHALF.value,
+    torch.complex64: ScalarType.COMPLEXFLOAT.value,
+    torch.complex128: ScalarType.COMPLEXDOUBLE.value,
     torch.bool: ScalarType.BOOL.value,
     torch.bfloat16: ScalarType.BFLOAT16.value,
 }

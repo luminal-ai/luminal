@@ -24,11 +24,25 @@ use luminal::prelude::*;
 use crate::dim_arith::product_of_dims;
 
 /// Row-major strides as `IntExpr`s. `stride[i] = prod(dims[i+1..])`.
-fn row_major_strides(dims: &[IntExpr]) -> Vec<IntExpr> {
+pub(super) fn row_major_strides(dims: &[IntExpr]) -> Vec<IntExpr> {
     let rank = dims.len();
     (0..rank)
         .map(|i| product_of_dims(dims[i + 1..].iter().copied()))
         .collect()
+}
+
+/// Build a tensor of logical flat indices from one contribution expression
+/// per output axis. `Gather` applies the data tensor's ShapeTracker after this
+/// mapping, so callers deliberately use logical row-major strides here rather
+/// than the data tensor's physical strides.
+pub(super) fn logical_flat_indices(
+    graph: &mut Graph,
+    output_shape: &[IntExpr],
+    axis_contributions: &[IntExpr],
+    base: IntExpr,
+) -> GraphTensor {
+    let index = base + flatten_strides(output_shape, axis_contributions);
+    graph.iota(index, output_shape.to_vec())
 }
 
 /// Build the additive non-axis contribution to a flat index over a
@@ -93,6 +107,41 @@ pub fn pt2_gather_elements(data: GraphTensor, indexes: GraphTensor, axis: usize)
     let flat_idx = non_axis_flat + idx_normalized * stride_tensor;
 
     data.gather1d(flat_idx)
+}
+
+/// `index_select` with a rank-0 or rank-1 index tensor. Unlike
+/// `gather_elements`, ATen does not wrap negative indices here; invalid index
+/// values therefore flow to Gather and fail instead of being normalized.
+pub fn pt2_index_select(
+    data: GraphTensor,
+    indices: GraphTensor,
+    axis: usize,
+    output_shape: &[IntExpr],
+) -> GraphTensor {
+    let rank = data.legacy_tracker_ref().len();
+    let indices = if indices.legacy_tracker_ref().is_empty() {
+        indices.unsqueeze(0)
+    } else {
+        indices
+    };
+    assert_eq!(
+        indices.legacy_tracker_ref().len(),
+        1,
+        "index_select index must be rank 0 or 1"
+    );
+    assert_eq!(output_shape.len(), rank);
+
+    let inserted_axes = (0..rank).filter(|&dim| dim != axis).collect::<Vec<_>>();
+    let indices = indices
+        .expand_to_shape_on_axes(output_shape.to_vec(), inserted_axes)
+        .cast(DType::Int);
+    let strides = row_major_strides(&data.dims());
+    let non_axis_flat = non_axis_flat(data.graph(), output_shape, &strides, axis);
+    let axis_stride = data
+        .graph()
+        .constant(strides[axis])
+        .expand_rhs(indices.dims());
+    data.gather(non_axis_flat + indices * axis_stride)
 }
 
 /// Translator-local `scatter_elements` that accepts symbolic shape dims.

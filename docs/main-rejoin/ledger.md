@@ -42,6 +42,7 @@ Dispositions:
 | `be22fa60` | #405 | ci: stop running the OpInfo suite in the main Python CUDA job | FILE-LEVEL | branch `merge/main-405-ci-opinfo` | — (the ignore flag is a main-side CI decision; nothing in this workflow runs on this branch) |
 | `ad437d8c` | #403 | luminal_python: promote integer operands on true division | FILE-LEVEL | branch `merge/main-403-int-div-promote` | the promotion point is a REQUIREMENT on the M4 translator re-attachment: this branch lowers `a / b` to `a * b.reciprocal()` exactly as main does, and `LogicalRecip` on an Int64 buffer refuses in the reference kernel — see **#403 int true division** below |
 | `eb7a5d6e` | #407 | metal: add fused RMSNorm and simd-group reductions | FILE-LEVEL (park) + INTENT-ONLY (CL) | branch `merge/main-407-metal-rmsnorm` | REQUIREMENT FOR CL: the live CUDA `reduce` codegen is a serial per-output loop with NO warp-level reduction, and no fused RMSNorm op exists — main`s `simd_sum`/`simd_max` block reduction is the CUDA-applicable half; see **#407 metal RMSNorm + simd reductions** below |
+| `62d3cc0d` | #406 | Expand PyTorch lowering and complex dtype coverage | MIXED — FILE-LEVEL (24 python files + `docs/design/associative-fold.md`) / FILE-LEVEL (7 files into the `cuda_lite_hlir` park) / RE-EXPRESSED (core: `ne` -> Bool, NaN-safe `pad`) / N/A (`examples/gemma4_moe`, `src/graph.rs`) / DROPPED-AS-INERT (`rowmajor-empty`) | branch `merge/main-406-pt-lowering` (two commits) | LUM-803 (ideal value types) and LUM-804 (native Bool8 select) — see **#406 PyTorch lowering + complex dtypes** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -1097,3 +1098,294 @@ recorder emits, with the equivalence reasoning left to the general rules.
   declared reads and writes; it would NOT get to invent a per-element input
   count, and it would not get a different cost for choosing a different
   shader. Do not port `bytes_loaded`.
+
+## #406 PyTorch lowering + complex dtypes — the largest split of the walk
+
+Main's `62d3cc0d` is 38 files, +4833/-279: 24 in `crates/luminal_python`, one
+new design doc, 7 in `crates/luminal_cuda_lite`, 4 in live core, one example,
+one CI-adjacent default. It splits cleanly along this branch's own seams, so it
+lands as two commits. **P4a landed; P4b landed — see the P4b subsection at the
+end of this section.**
+
+### FILE-LEVEL: the python park (24 files + `docs/design/associative-fold.md`)
+
+Main's content, this branch's spellings, per the standing park rule. Six files
+are new and came across verbatim: `translator/complex.rs` (1681 lines),
+`tests/test_{binary,complex,constructors,reduction,straightforward_lowerings}.py`,
+and `docs/design/associative-fold.md`.
+
+**The headline is complex dtypes without a complex dtype.** `ComplexTensor` is
+a pair of ordinary real tensors carried in a side map
+(`Translator::complex_tensors`), never an HLIR/logical dtype — main's own
+comment says so: *"Complex never becomes an HLIR dtype."* A complex INPUT
+arrives as PyTorch's interleaved real/imaginary storage, so
+`create_input_value` appends a trailing extent-2 axis to the declared shape,
+mints ONE real-valued named tensor over it, and splits it into components with
+`ComplexTensor::from_interleaved`; on the way out, `pack` re-interleaves. Every
+real-only lowering path that is handed a complex name now refuses by name
+(`get_tensor`: *"Complex tensor {name} reached a real-only lowering; add a
+frontend complex lowering"*) instead of silently translating the real half.
+That design — components in the frontend, interleaving only at the storage
+boundary — is directly reusable here, and it is the right shape for this branch
+too: it needs no new dtype, no new op, and no e-graph change.
+
+Riding along: `output_meta_dtype(node)` (PT2 metadata is authoritative for
+torch promotion, the same trick #403 used for true division), `constant_like`
+replacing hand-rolled `constant_float(..).cast(..).expand_rhs(..)` chains
+throughout `unary.rs`, `real_constructor_scalar` for the `*_like` family, and
+`translate_diagonal` / `translate_flip`.
+
+Four files conflicted; every resolution takes main's content in the branch's
+spelling. `translator/mod.rs` takes main's `create_input_value` in all three
+`InputKind` arms and its new `output_meta_dtype`, keeping
+`named_tensor_dtyped(name, shape, dtype)` for main's
+`named_tensor(name, shape).as_dtype(dtype)` (the `cdeb73c7` purity ruling) and
+`Result<IntExpr>` on `dim_size_to_expr`. `movement_dynamic.rs` takes main's
+`pub(super)` widening of `row_major_strides` at `&[IntExpr]`.
+`translator/tensor.rs` takes main's `real_constructor_scalar`-based
+`translate_full_like` whole (it replaces the branch's `constant_float(val)`
+line). `translator/unary.rs` takes main's `constant_like`-based `real_acos`
+whole.
+
+**Residue** (diff-of-diffs against `62d3cc0d`, per file): fourteen of the
+twenty-five files are EMPTY, including every `.py` file and the design doc.
+The rest is exclusively the three known re-spellings —
+`Expression` -> `IntExpr`, `X.shape` -> `X.legacy_tracker_ref()` /
+`X.legacy_tracker_mut()` for tracker access and `X.dims()` where the shape is
+passed BY VALUE to `expand_rhs` / `expand_to_shape_on_axes`, and
+`named_tensor(..).as_dtype(dt)` -> `named_tensor_dtyped(.., dt)`. Line counts:
+`complex.rs` 122, `movement.rs` 72, `mod.rs` 34, `tensor.rs` 24,
+`movement_dynamic.rs` 24, `reduction.rs` 10, and 2 apiece in
+`compiled_graph.rs` / `unary.rs` (hunk-header context only). Main's
+`graph().iota(Expression::from('z'), shape)` is banked as
+`IntExpr::from('z')`, matching the park's existing spelling at
+`movement_dynamic.rs:51` and `tensor.rs:338` — and it is a DANGLING call either
+way, because this branch's `Graph::iota` (`src/frontend/other.rs:35`) takes
+`(shape, closure_over_coordinates)` and its doc says outright *"The old
+flat-'z' interface is DELETED"*. That is the standing park cost, alongside
+`Graph::constant_float64` from #398 and `early_stop_exceeded` from #386.
+
+### FILE-LEVEL: 7 files into the `cuda_lite_hlir` park
+
+`src/dyn_backend.rs`, `src/kernel/{hlir,rope,to_host}.rs`, `src/runtime.rs`,
+`src/tests/{op_functional_tests,qwen_bf16_repro}.rs`, path-rewritten from
+main's `crates/luminal_cuda_lite/` into `crates/luminal_cuda_lite_hlir/`. The
+park TRACKS main's HLIR CUDA crate; this branch's live `crates/luminal_cuda_lite`
+is a DIFFERENT crate (the CL backend) and none of this goes near it — `runtime.rs`
+in particular exists in both and only the park's copy is touched.
+
+Residue: `dyn_backend.rs`, `to_host.rs`, `op_functional_tests.rs` and
+`qwen_bf16_repro.rs` are EMPTY. `hlir.rs` is one `Expression` -> `IntExpr`.
+`rope.rs` is seven, all the same rename, six of them inside egglog `relation`
+declarations — see the note under #407: in the parks' `.rs` files the sort name
+is spelled `IntExpr` too, following `ab3b5c66`. `runtime.rs` differs only in
+hunk-header line numbers (`@@ -611` vs `@@ -628`, and so on): the park's
+`runtime.rs` has drifted ~18 lines from main's through the accumulated park
+stubs (`early_stop_exceeded`, the `alloc_state_buffer` / `bind_*` drift), and
+the CONTENT of all three hunks is identical.
+
+One conflict, in `rope.rs`, at the head of the `angle_stage` egglog string:
+main adds six new relations next to the one the park had already re-spelled.
+Resolved to main's content, renamed.
+
+### N/A — two paths that do not exist here
+
+- **`examples/gemma4_moe/src/main.rs` (+1/-1)** — a comment update from
+  *"(5s candidate / 1s execution)"* to *"(60s candidate ...)"*. This branch's
+  `examples/gemma4_moe` has NO `src/main.rs`: it is `lib.rs` + `model.rs`,
+  because model-zoo members here are backend-neutral graph definitions and the
+  executables live under the runtime crate (`Cargo.toml`'s own comment).
+  Nothing to patch.
+- **`src/graph.rs` (+2/-2)** — the `CompileOptions::candidate_timeout` default
+  moving 5s -> 60s, plus its doc. `CompileOptions` does not exist on this
+  branch and `candidate_timeout` appears nowhere in `src/` or any live crate;
+  `src/graph.rs` here is the RECORDER. The *intent* — a 5-second per-candidate
+  viability budget is too tight once candidates are big — is worth remembering
+  when `ImplementationSearchOptions` grows a timeout, but there is no field to
+  move today.
+
+### DROPPED-AS-INERT — `rowmajor-empty`
+
+Main adds one line to `src/egglog_utils/base.rs`:
+
+```rust
+p.add_rule(rewrite("rowmajor-empty", rowmajor(nil()), nil()).ruleset("expr"));
+```
+
+The file is NOT deleted here, it MOVED: `src/egglog_core/egglog_utils/base.rs`,
+and it is live — `base_expression_egglog()` is what
+`IntegerExpression::egglog_equal` and the expression simplifier feed to egglog
+(`src/shape/expression.rs:636`, `:1162`, `:1215`). The rule would apply
+cleanly, and it closes a real hole in main's rowmajor recursion: the cons rule
+handles lists of length >= 2, `rowmajor-base` handles length 1, and NOTHING
+handled `RowMajor(ENil)` — a rank-0 shape, which is exactly what #406's new
+scalar constructors produce a lot of.
+
+It is not carried because on THIS branch it can never fire. `RowMajor` survives
+only as a vestigial sort in the shared expression program: nothing in `src/`,
+`crates/luminal_reference`, `crates/luminal_cuda_lite`, `crates/luminal_nn` or
+`examples/` constructs one (`grep -rn RowMajor`, excluding `egglog_core` and the
+parks, returns nothing), and `base_cleanup_egglog()` explicitly DELETES any
+`RowMajor` node that appears (`src/egglog_core/egglog_utils/base.rs:1427`, in
+the `sort_cleanups` table whose doc calls these "intermediate helper nodes").
+Adding an unfireable rule to a program that is rebuilt and re-run on every
+`egglog_equal` and every expression simplification is pure cost on a hot path.
+**If `RowMajor` is ever revived as a live construct here, this rule comes with
+it** — the hole it fixes is real, and it is a one-liner.
+
+### RE-EXPRESSED (P4b): the two core changes, under rulings 4a and 4b
+
+Main's remaining live-core hunks are `src/frontend/{binary,movement,other}.rs`.
+Both went to Austin because both are decisions, not ports.
+
+#### Ruling 4a — `GraphTensor::ne` returns `Bool` (option A, main's shape)
+
+`src/frontend/binary.rs`. `ne` was the one comparison in the family that handed
+back an F32 indicator: `lt` and `gt` record `LogicalOp::LessThan` at
+`DType::Bool` and say so in a comment (*"Comparison operations always output
+Bool"*), `le` and `ge` end in `.cast(DType::Bool)`, and `eq` ended in
+`.cast(DType::Bool)` — but `ne` returned `lt.cast(F32) + gt.cast(F32)`, the raw
+sum. It now casts, exactly as main does. `eq` no longer routes through `ne`: it
+recomputes the numeric indicator inline, because going through `ne` would make a
+Bool -> F32 round trip and force a backend without Bool storage to materialize
+an otherwise internal boolean buffer. That comment is main's, and it is worth
+keeping: the reason `eq` duplicates three tokens is a STORAGE argument, not a
+style one.
+
+**The call-site audit, in full.** `.ne(` has exactly THREE occurrences across
+`src/`, `crates/luminal_reference`, `crates/luminal_cuda_lite`,
+`crates/luminal_nn`, `examples/` and `tests/`:
+
+| site | consumes the result as | change |
+| --- | --- | --- |
+| `src/frontend/binary.rs:384` — inside `eq` | NUMBER (`-x + 1.0`) | REWRITTEN: `eq` computes its own indicator and never calls `ne` |
+| `src/frontend/binary.rs:742` — `test_ne`, luminal side | NUMBER (already `.cast(DType::F32)`) | main's `assert_eq!(result.dtype, DType::Bool)` added before the cast |
+| `src/frontend/binary.rs:743` — `test_ne`, candle side | candle's own `Tensor::ne` | untouched |
+
+No consumer anywhere else — not a mask multiply, not a sum, not a reduction —
+so nothing needed an inserted `.cast(DType::F32)`. That is the whole blast
+radius, and it is the reason this ruling was cheap HERE and will not be cheap
+the next time: the churn is small only because `ne` happened to have one
+internal caller.
+
+**LUM-803 — "Ideal value types vs machine dtypes: ops return
+Integer/Boolean, the backing dtype is chosen later."** The `ne` -> Bool churn is
+that ticket's motivating example. The question this ruling had to answer —
+*does a comparison return a number you can multiply, or a truth value you must
+convert?* — is a question about the frontend's TYPE, and it was being decided
+one operator at a time by whichever cast happened to be at the end of the
+expression. `ne` was inconsistent with `lt`/`gt`/`le`/`ge`/`eq` purely by
+accident of how it was written. Under an ideal-value-type frontend, `ne` returns
+Boolean because comparisons return Boolean, and whether that is stored as
+`Bool8`, as an F32 0/1, or as a predicate the backend never materializes is a
+LOWERING decision made later, once. Until then every such operator carries its
+storage decision in its own signature, and every one of them is a separate
+ruling.
+
+#### Ruling 4b — NaN-safe `pad` via `select_by_index` (option i, main's construction)
+
+`src/frontend/movement.rs`. **The bug, confirmed in this branch's own code
+before the fix.** `pad`'s read half is a TOTAL CLAMPED VIEW: per parent axis
+`min(max(c - before, 0), dim - 1)`, so the pad region does not read out of
+bounds — it reads the nearest EDGE value and repeats it. The fill was then
+applied arithmetically, `let masked = clamped * mask`, with `mask` 0 in the pad
+region and 1 inside. For finite data that is correct. For a tensor containing
+`NaN` or `Inf` on an edge it is not: `0.0 * NaN` is `NaN` and `0.0 * Inf` is
+`NaN`, so a padded tensor's padding was poisoned by its own contents, and the
+non-zero-fill branch (`masked + (1.0 - mask) * elem`) added the fill to that
+NaN and stayed NaN.
+
+**The construction.** `select_by_index(index, if_true, if_false)` selects
+without arithmetic ever touching the unselected branch. Both branches are PACKED
+into one buffer with a trailing extent-2 axis — `if_false` in the even slots,
+`if_true` in the odd — and the branch the Int indicator names is gathered out.
+Re-expressed on this branch's primitives, which is where it differs from main:
+
+- Main's `graph.iota(Expression::from('z') * 2, shape)` is a FLAT-index iota,
+  and that interface is deleted here (`src/frontend/other.rs:35`: *"The old
+  flat-'z' interface is DELETED"*). The packed positions are instead a real
+  COORDINATE FUNCTION over the branch shape — the row-major strides with every
+  stride DOUBLED — passed to the rank-N `Graph::iota(shape, closure)`, the same
+  idiom `scatter_nd` uses (ruling 2026-08-07, "no flat div/mod chain").
+- Main's `.scatter(indexes, dest)` / `.gather(indexes)` are the branch's
+  `scatter1d(indexes, dest)` / `gather1d(indexes)` — the flat sugar the B-tail
+  landing added, whose argument order already matches main's. No new op was
+  introduced.
+- Main mints THREE iotas over the branch shape (`even`, `odd`, and a third
+  `base` identical to `even`). This carries two: `even` IS the gather base, so
+  it is reused rather than re-minted.
+
+`pad_with(padding, elem: GraphTensor)` is the primitive, asserting the fill is
+rank 0 and shares the input's dtype; `pad(padding, elem: f32)` is the
+convenience wrapper, minting `constant_float(elem).cast(self.dtype)`. One
+deliberate divergence from main: the all-zero-padding EARLY RETURN moved up into
+`pad`, BEFORE the fill constant is minted. Main mints the constant first, which
+would leave a dead constant node in the recorded graph for `pad((0,0), x)` —
+harmless on main, but here zero padding must return a PURE-IDENTITY graph
+(pinned by `stage4b_probes::pinned_pure_identity_output`, and the reason
+`test_pad_1d` carries `prop_assume!(left + right > 0)`), and a stray constant
+would no longer be one.
+
+The mask now stays `DType::Int` — it is the select INDICATOR, not a factor —
+where it used to be `.cast(self.dtype)` for the multiply.
+
+**Tests pinned** (`src/frontend/movement.rs`):
+`pad_fill_is_exact_beside_non_finite_values` pads `[1.0, NaN]`,
+`[Inf, 2.0]` and `[-Inf, NaN]` by one on each side with fill 0 and asserts the
+pad cells by BIT pattern (`to_bits() == 0.0f32.to_bits()`, so neither a NaN nor
+a `-0.0` can pass) with the interior preserved NaN-for-NaN; and
+`pad_with_uses_a_typed_scalar_fill` pads an Int tensor with `cx.constant(-7)`
+and reads back `[-7, 1, 2, 3, -7, -7]` through `get_i32`.
+
+**LUM-804 — "pad NaN-safety via scatter/gather select is a stopgap; a native
+Bool8 select op is owed."** The cost is written into the helper's own doc
+comment. Every pad now emits: one iota for the packed zero dest (twice the
+output size, materialized), two scatters, one gather, one Int add, plus the two
+coordinate iotas — where the old form was one multiply. It also FIGHTS the views
+pad seam: the whole point of the clamped-`view_op` read half is that pad's read
+is a structure-preserving VIEW the e-graph can fold with its neighbours, and
+funnelling it through a gather over a 2N-element packed buffer materializes
+exactly what that seam exists to avoid. A native `Bool8`-driven select — one
+node, both branches read lazily, no packed buffer — collapses all of it and lets
+the view survive. Until that op exists this is the only NaN-safe construction
+available in the recorded vocabulary, and `luminal_nn::convolution` (`pad` at
+`crates/luminal_nn/src/convolution.rs:115`), `concat_along`, `pad_along` and
+`cumulative_*` all pay it.
+
+#### `Graph::constant_i64` — LANDED, not superseded
+
+The study question was whether this branch can already mint an exact `i64`
+constant beyond 32 bits. **It cannot**, and the trace is exact:
+
+1. `Graph::constant(impl Into<IntExpr>)` (`src/frontend/other.rs:5`) records a
+   `LogicalIota` — `record_iota(&expr, &[])` — and declares `DType::Int`.
+   `IntExpr` itself is fine: `Term::Num(i64)` (`src/shape/expression.rs:168`)
+   and `impl From<i64> for IntegerExpression` (`:751`) carry the value exactly
+   at the expression level.
+2. But `src/logical_op/iota/dtype.egg` sets
+   `(dtype-of (LogicalIota ?e ?shape))` to `(Int)` **unconditionally** — the
+   same shape of pin as `LogicalConstant`'s `(F32)` pin recorded under #398 —
+   and `DType::Int` is 32-bit (`src/dtype.rs:21`).
+3. So the buffer is `TypedBuffer::I32`, and the reference iota kernel's I32 arm
+   (`crates/luminal_reference/src/ops/iota/mod.rs`) does
+   `i32::try_from(value)` and REFUSES by name: *"iota value {value} overflows
+   i32 (ints are non-wrapping)"*. It does not silently truncate — this branch's
+   non-wrapping ruling holds — but it does not produce the value either.
+4. Casting afterwards cannot help: the narrow buffer already IS the value. The
+   kernel has a perfectly good `TypedBuffer::I64` arm; nothing can reach it,
+   because the dtype rule never says I64.
+
+Main's Horner assembly is therefore the right shape here too, and lands
+verbatim: each 16-bit limb fits `i32`, each is cast to `I64` FIRST, and all four
+multiplies and adds happen in 64-bit. `i64::MIN` works because `value >> 48` is
+`-32768` and the Horner chain reaches `-2^15 * 2^48 = -2^63` with no
+intermediate outside `i64`. Test `constant_i64_preserves_full_width_values`
+(`src/frontend/other.rs`) runs `[i64::MIN, -(1<<40)+7, -1, 0, 1<<40, i64::MAX]`
+through `luminal_reference::harness::run_reference` and reads each back with
+`get_i64` — main's test re-expressed against the reference runtime, since main's
+version pokes `runtime.buffers` and `ReferenceData::I64`, neither of which
+exists here.
+
+**Owed** (the same debt #398 booked for `LogicalConstant`): give `LogicalIota` a
+dtype instead of pinning `(Int)`, and `constant_i64` becomes
+`constant(value).cast(DType::I64)` — one node instead of nine.

@@ -1359,6 +1359,46 @@ impl CudaGraphOp {
         self.buffer_node_set.contains(&node)
     }
 
+    /// Release driver-side graph resources while retaining the compiled op
+    /// descriptions needed to materialize this bucket again later.
+    pub(crate) fn release_materialization(&self) {
+        let mut state = self.state.borrow_mut();
+
+        // Executable graphs can retain substantial driver allocations. Drop
+        // them before the source graph and before any buffers they reference.
+        drop(state.cuda_graph_exec.take());
+        drop(state.cuda_graph.take());
+        state.node_to_graph_node.clear();
+        state.producer_to_graph_node.clear();
+        state.kernel_params.clear();
+        state.last_dyn_values.clear();
+        state.last_buffer_ptrs.clear();
+
+        state.cublaslt_prepare_cache.clear();
+        state.flashinfer_prepare_cache.clear();
+        for op in &mut state.cublaslt_ops {
+            op.prepared = None;
+            op.ptrs = None;
+            op.signature = None;
+            op.entry_node = None;
+            op.exit_node = None;
+            op.captured_nodes.clear();
+        }
+        for op in &mut state.flashinfer_ops {
+            op.prepared = None;
+            op.ptrs = None;
+            op.signature = None;
+            op.entry_node = None;
+            op.exit_node = None;
+            op.captured_nodes.clear();
+        }
+        for kernel in &mut state.kernels {
+            kernel.graph_node = None;
+            kernel.internal_bufs.clear();
+        }
+        state.dyn_dims_buffer = None;
+    }
+
     /// Patch a CUDA graph from an exact set of changed bindings without
     /// rebuilding or comparing its complete pointer table. Returns `false`
     /// when a full materialization is required (first use, dynamic-dimension

@@ -3,6 +3,91 @@ use itertools::Itertools;
 use crate::graph::{MapEntry, Movement, movement_entries};
 use crate::prelude::*;
 
+/// Select elementwise WITHOUT arithmetic masking.
+///
+/// Multiplying an inactive branch by zero lets non-finite values leak
+/// through — `0.0 * NaN` is NaN and `0.0 * Inf` is NaN — which is exactly
+/// what padding a tensor that contains them exposes. So instead of a mask
+/// product, both branches are PACKED into one buffer carrying a trailing
+/// extent-2 axis (`if_false` in the even slots, `if_true` in the odd ones)
+/// and the branch the indicator names is GATHERED out. No arithmetic ever
+/// touches the value that is not selected.
+///
+/// `index` is an Int indicator over the branch shape: `0` selects
+/// `if_false`, `1` selects `if_true`.
+///
+/// STOPGAP — LUM-804. This costs one iota for the packed zero dest, two
+/// scatters, one gather and one Int add per call, and it materializes a
+/// buffer of twice the output size. A native `Bool8`-driven select op
+/// would be a single node reading both branches lazily; until that op
+/// exists this is the only NaN-safe construction available in the
+/// recorded vocabulary.
+fn select_by_index(index: GraphTensor, if_true: GraphTensor, if_false: GraphTensor) -> GraphTensor {
+    assert_eq!(
+        if_true.dims(),
+        if_false.dims(),
+        "select_by_index: branches share a shape"
+    );
+    assert_eq!(
+        if_true.dtype, if_false.dtype,
+        "select_by_index: branches share a dtype"
+    );
+    assert_eq!(
+        index.dims(),
+        if_true.dims(),
+        "select_by_index: the indicator shares the branch shape"
+    );
+    assert_eq!(
+        index.dtype,
+        DType::Int,
+        "select_by_index: the indicator must be Int"
+    );
+
+    let shape = if_true.dims();
+    assert!(
+        !shape.is_empty(),
+        "select_by_index: rank-0 branches have no gather axis"
+    );
+    let mut packed_shape = shape.clone();
+    packed_shape.push(IntExpr::from(2));
+
+    // Slot `2*i` holds `if_false[i]` and slot `2*i + 1` holds `if_true[i]`,
+    // so the packed positions are the row-major flat index over `shape`
+    // with every stride DOUBLED. A pure coordinate function, one iota
+    // (ruling 2026-08-07), never a flat div/mod chain.
+    let doubled_strides: Vec<IntExpr> = (0..shape.len())
+        .map(|axis| {
+            shape[axis + 1..]
+                .iter()
+                .fold(IntExpr::from(2), |acc, d| acc * *d)
+        })
+        .collect();
+    let even_strides = doubled_strides.clone();
+    let even = if_true.graph().iota(shape.clone(), move |c| {
+        (0..c.len()).fold(IntExpr::from(0), |acc, axis| {
+            acc + c[axis] * even_strides[axis]
+        })
+    });
+    let odd = if_true.graph().iota(shape, move |c| {
+        (0..c.len()).fold(IntExpr::from(1), |acc, axis| {
+            acc + c[axis] * doubled_strides[axis]
+        })
+    });
+
+    // The scatter dest. An expanded scalar would alias one element across
+    // the whole buffer, and scatter's dest is copied-then-written, so the
+    // dest is a real materialized zero tensor.
+    let dest = if_true
+        .graph()
+        .iota(packed_shape, |_| IntExpr::from(0))
+        .cast(if_true.dtype);
+    let packed = if_true.scatter1d(odd, if_false.scatter1d(even, dest));
+
+    // `even` is reused as the base rather than minted a second time: it is
+    // the same coordinate function over the same shape.
+    packed.gather1d(even + index)
+}
+
 /// ONE-APPLY view composer for macro interiors (Austin's ratified rule
 /// 2026-08-26: "one user call = one view node; macro interiors also mint
 /// ONE apply per logical construct, never per-axis loops"). A chain of
@@ -1004,8 +1089,19 @@ impl GraphTensor {
         self.slice(s)
     }
 
-    /// Pad out dimensions of a tensor with an element
-    pub fn pad(self, padding: impl ToPad, elem: f32) -> GraphTensor {
+    /// Pad out dimensions of a tensor with a typed scalar fill tensor.
+    ///
+    /// Keeping the fill as a TENSOR preserves I64, F64 and Bool fills that
+    /// the historical `f32` convenience API cannot represent exactly; it
+    /// also keeps the fill's dtype the caller's declaration rather than an
+    /// implied one.
+    pub fn pad_with(self, padding: impl ToPad, elem: GraphTensor) -> GraphTensor {
+        assert_eq!(elem.rank(), 0, "padding value must be a scalar tensor");
+        assert_eq!(
+            elem.dtype, self.dtype,
+            "padding value dtype must match the input's ({:?} vs {:?})",
+            elem.dtype, self.dtype
+        );
         let mut padding = padding.to_pad_vec();
         padding.extend(vec![(0.into(), 0.into()); self.rank() - padding.len()]); // Make sure we have a padding per dim
         if padding.iter().all(|(s, e)| *s == 0 && *e == 0) {
@@ -1073,15 +1169,26 @@ impl GraphTensor {
             .logical
             .record_mask_iota(&befores, &afters, &dims)
             .unwrap_or_else(crate::graph::unrecorded_value);
-        let mask =
-            GraphTensor::from_id(mask_id, out_dims, self.graph_ref, DType::Int).cast(self.dtype);
+        // The mask STAYS Int: it is the select indicator, not a factor.
+        // `clamped * mask` was the NaN leak — the clamped view repeats edge
+        // values into the pad region and `0.0 * NaN` is NaN, so a padded
+        // tensor containing NaN or Inf poisoned its own padding.
+        let mask = GraphTensor::from_id(mask_id, out_dims.clone(), self.graph_ref, DType::Int);
+        let fill = elem.expand_rhs(out_dims);
+        select_by_index(mask, clamped, fill)
+    }
 
-        let masked = clamped * mask;
-        if elem == 0.0 {
-            masked
-        } else {
-            masked + ((1.0 - mask) * elem)
+    /// Pad out dimensions of a tensor with an `f32` convenience value.
+    pub fn pad(self, padding: impl ToPad, elem: f32) -> GraphTensor {
+        let padding = padding.to_pad_vec();
+        // Early-return BEFORE minting the fill constant: zero padding is the
+        // identity, and a dead constant would still be a node in the
+        // recorded graph.
+        if padding.iter().all(|(s, e)| *s == 0 && *e == 0) {
+            return self;
         }
+        let fill = self.graph().constant_float(elem).cast(self.dtype);
+        self.pad_with(padding, fill)
     }
 
     /// Pad along an existing dimension
@@ -1449,6 +1556,76 @@ mod tests {
             repeated.dims(),
             vec![IntExpr::from(4usize), IntExpr::from(6usize)]
         );
+    }
+
+    /// Pad's fill must be the fill, not `0 * x`. The clamped read half
+    /// repeats EDGE values into the pad region, so the old
+    /// `clamped * mask` construction computed `0.0 * NaN` (= NaN) and
+    /// `0.0 * Inf` (= NaN) there and handed back a padded tensor whose
+    /// padding was poisoned by its own contents.
+    #[test]
+    fn pad_fill_is_exact_beside_non_finite_values() {
+        for data in [
+            vec![1.0f32, f32::NAN],
+            vec![f32::INFINITY, 2.0],
+            vec![f32::NEG_INFINITY, f32::NAN],
+        ] {
+            let mut cx = Graph::new();
+            let a = cx.tensor(2, DType::F32);
+            let b = a.pad((1, 1), 0.0).output();
+
+            let rt = luminal_reference::harness::run_reference(&cx, &[(a.id, data.clone().into())]);
+            let out = rt.get_f32(b.id).unwrap();
+            assert_eq!(out.len(), 4, "padded length: {out:?}");
+
+            // BIT equality, not `== 0.0`: a NaN would fail `==` anyway, but
+            // `-0.0 == 0.0` is true and a sign-flipped fill is still wrong.
+            assert_eq!(
+                out[0].to_bits(),
+                0.0f32.to_bits(),
+                "left pad is not exactly +0.0 for {data:?}: {out:?}"
+            );
+            assert_eq!(
+                out[3].to_bits(),
+                0.0f32.to_bits(),
+                "right pad is not exactly +0.0 for {data:?}: {out:?}"
+            );
+
+            // The interior is untouched, NaN included.
+            for (i, expected) in data.iter().enumerate() {
+                if expected.is_nan() {
+                    assert!(
+                        out[i + 1].is_nan(),
+                        "interior NaN lost for {data:?}: {out:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        out[i + 1].to_bits(),
+                        expected.to_bits(),
+                        "interior changed for {data:?}: {out:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `pad_with` takes the fill as a TYPED scalar tensor, so an Int tensor
+    /// pads with an exact Int and never round-trips through `f32`.
+    #[test]
+    fn pad_with_uses_a_typed_scalar_fill() {
+        let mut cx = Graph::new();
+        let a = cx.tensor(3, DType::Int);
+        let fill = cx.constant(-7);
+        let b = a.pad_with((1, 2), fill).output();
+
+        let rt = luminal_reference::harness::run_reference(
+            &cx,
+            &[(
+                a.id,
+                luminal::buffer_tensor_ir::TypedBuffer::I32(vec![1, 2, 3]),
+            )],
+        );
+        assert_eq!(rt.get_i32(b.id).unwrap(), &vec![-7, 1, 2, 3, -7, -7]);
     }
 
     #[test]
