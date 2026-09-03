@@ -447,6 +447,34 @@ three `PlanDtype` materialize arms and `get_i8` / `get_u8` / `get_i16`.
 > local: swap the `wrapping_*` calls for `checked_*` at the fifteen narrow
 > call sites (`add`, `mul`, `reduce_sum`, `trunc_div`, `trunc_rem`, three
 > widths each) and add `(I8)/(U8)/(I16)` proof gates beside the `(Int)` ones.
+>
+> ### Austin's response (2026-09-03): neither confirmed nor reversed — REFRAMED
+>
+> Width is a PROXY, not the principle. In Austin's words: "the intention is
+> for natural numbers, pure integers, like those born of indexing
+> expressions, to never wrap because they should never saturate. But when
+> there's some op that's in the incoming [program] and it has wrapping
+> semantics, then we need to preserve that." So the two behaviours are both
+> right, but the thing that should select between them is PROVENANCE:
+>
+> - Index-born integers — iotas, shape and stride arithmetic, gather
+>   indices, offsets — are natural numbers. An overflow there is an
+>   impossibility to prove away, never a value. Non-wrapping, proof-gated,
+>   at ANY width.
+> - Integers that arrive from the source program's own tensor arithmetic
+>   carry the source's semantics. Torch integer arithmetic wraps at every
+>   width, 32 and 64 included, so a torch int32 add is a wrapping op even
+>   though this runtime currently checks it.
+>
+> The width split is therefore wrong in principle in both directions, and
+> stands only as an admitted proxy until a principled mechanism carries
+> overflow semantics by op provenance or kind rather than by dtype width.
+> **OWED: that mechanism.** Candidates to weigh when it is designed:
+> (a) two integer op families, or a dtype flavour — natural/index versus
+> modular/data; (b) the recorder stamps ops it records from imported tensor
+> arithmetic as wrapping and its own index machinery as natural; (c) the
+> value-bounds proof gate stays for natural integers only. Do not extend the
+> width split further in the meantime.
 
 **Main's `as` casts: carried for integers, NOT for floats.** A cast touching
 a narrow int routes through one `narrow_cast` helper in
