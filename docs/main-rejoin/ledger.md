@@ -41,6 +41,7 @@ Dispositions:
 | `d6d26cbe` | #402 | translate_module: hand back the translated graph without the pytorch wrappings | FILE-LEVEL (4 seam files) + SUPERSEDED (the `scatter_nd` fix) | branch `merge/main-402-translate-seam` | the seam's REQUIREMENT for the python re-attachment: a host must be able to take the translated graph WITHOUT inheriting luminal's dim buckets or search budget — see **#402 translate_module** below |
 | `be22fa60` | #405 | ci: stop running the OpInfo suite in the main Python CUDA job | FILE-LEVEL | branch `merge/main-405-ci-opinfo` | — (the ignore flag is a main-side CI decision; nothing in this workflow runs on this branch) |
 | `ad437d8c` | #403 | luminal_python: promote integer operands on true division | FILE-LEVEL | branch `merge/main-403-int-div-promote` | the promotion point is a REQUIREMENT on the M4 translator re-attachment: this branch lowers `a / b` to `a * b.reciprocal()` exactly as main does, and `LogicalRecip` on an Int64 buffer refuses in the reference kernel — see **#403 int true division** below |
+| `eb7a5d6e` | #407 | metal: add fused RMSNorm and simd-group reductions | FILE-LEVEL (park) + INTENT-ONLY (CL) | branch `merge/main-407-metal-rmsnorm` | REQUIREMENT FOR CL: the live CUDA `reduce` codegen is a serial per-output loop with NO warp-level reduction, and no fused RMSNorm op exists — main`s `simd_sum`/`simd_max` block reduction is the CUDA-applicable half; see **#407 metal RMSNorm + simd reductions** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -965,3 +966,134 @@ two Int64 tensors today gets a kernel refusal, not an answer.
 torch, Prompt-Guard-86M at cosine 1.0 / max abs diff 7e-06, mdeberta-v3-base
 compiling — are main's, run against main's HLIR backend. `crates/luminal_python`
 is not a workspace member on this branch, so none of it was rebuilt or rerun.
+
+## #407 metal RMSNorm + simd reductions — banked, and what CL owes
+
+`crates/luminal_metal/src/kernel/ops.rs` (+456/-32) and
+`crates/luminal_metal/src/tests.rs` (+216) take main's diff. `luminal_metal` is
+parked (not a workspace member, does not build here), and the branch's ONLY
+delta to it since the split `325e2e3c` is two re-spellings — `Expression` ->
+`IntExpr` (`ab3b5c66`) and, in `tests.rs` only, `as_dtype(dt)` ->
+`tensor_dtyped(shape, dt)` (`cdeb73c7`, the purity ruling). Main's #396 and
+#386 metal hunks were already banked in batch 3, so nothing else diverges.
+
+**Residue.** `tests.rs`: EMPTY — main's new tests construct their tensors with
+`cx.tensor(...)` and never touch `as_dtype`, so the purity re-spelling had
+nothing to bite. `ops.rs`: 8 lines, every one of them `Expression` -> `IntExpr`
+(6 added lines, 2 context). One conflict, at `lower_expression_for_metal`, where
+main inserts `reduction_thread_count` immediately above a signature this branch
+had already renamed; resolved by taking main's new function verbatim and keeping
+`&IntExpr`.
+
+**The rename reaches inside the egglog strings too**, which is worth stating
+because it is not obvious. `ops.rs:428` is
+`"(relation metal_rms_rinv (IR IR f64 Expression Expression))` — an egglog SORT
+name inside a `Rule::raw` string, not a Rust type — and it was re-spelled to
+`IntExpr` like the rest. That follows the park's own precedent: `ab3b5c66`,
+the rename commit, rewrote
+`crates/luminal_metal/src/memory_analysis.rs:44-45` from
+`(relation metal_output_bytes (OpKind Expression))` to
+`(OpKind IntExpr)`, sort name and all, and every `.rs` file in both the
+`luminal_metal` and `luminal_cuda_lite_hlir` parks is uniformly `IntExpr`
+today (`git grep -c '\bExpression\b' -- 'crates/luminal_*/**/*.rs'` on
+`4ab3ce0c` returns nothing). Note the parks are NOT internally consistent about
+this: the `.egg` FILES under `crates/luminal_cuda_lite_hlir/src/host/` still say
+`Expression` (e.g. `cublaslt_output_witness.egg:23`). Nothing typechecks either
+spelling here — the HLIR schema that declared the sort went with `src/hlir.rs`
+— so the rule is simply to match the file's own crate, and for `.rs` that is
+`IntExpr`.
+
+### What the commit actually does
+
+Two things, and the smaller one is the headline.
+
+**1. `MetalRMSNorm`** — an egglog rewrite (`metal_rms_rinv`) that matches the
+`x*x -> mean -> +eps -> rsqrt -> broadcast-mul -> *weight` chain and folds it
+into one op, plus a fused shader with two code paths: a `float4`-vectorized
+path guarded on `input/weight/output` ALL being `DType::F32` and
+`cols % 1024 == 0` with `1 <= cols/1024 <= 4` (`ops.rs:586-593`), and a scalar
+path for everything else. Six new tests, four of them REFUSAL tests
+(`..._rejects_noncontiguous_input`, `..._rejects_dynamic_last_dimension`,
+`..._rejects_mismatched_square_views`) — the rewrite is guarded, and the guards
+are what the tests pin.
+
+**2. `simd_sum` / `simd_max` block reductions** in the GENERIC `MetalSumReduce`
+and `MetalMaxReduce` (`ops.rs:1425,1436,1608,1619`), replacing an 8-step
+shared-memory tree (`for stride = 128; stride > 0; stride >>= 1`, a
+`threadgroup_barrier` inside every step, 256 floats of threadgroup memory
+written by every thread) with: one `simd_sum` per SIMD group — a hardware
+reduction, no barrier — one lane-0 write per group into `partials[]`, ONE
+barrier, then group 0 folds the handful of per-group partials with a strided
+loop and one more `simd_sum`. Alongside it, `reduction_thread_count`
+(`ops.rs:76`) sizes the threadgroup to the reduction length instead of always
+launching 256: `min(reduction_len, aligned_limit)` rounded UP to a whole
+multiple of `pipeline.thread_execution_width()`, where `aligned_limit` is
+`max(256, simd_width)` clamped to `max_total_threads_per_threadgroup` and
+floored to the SIMD width. The thread count then has to be passed into the
+shader as buffer 4, because the strided load loop (`i += thread_count`) and the
+partial-count arithmetic both depend on it.
+
+### The CL intent this implies — verified against the live crate
+
+`crates/luminal_metal` is a park, so nothing here executes. But the second half
+is a strategy, not a Metal detail, and this branch's live CUDA backend does not
+have it. Three findings, all checked in the tree at `4ab3ce0c`:
+
+**(a) The live reduce is a serial per-output loop.** `crates/luminal_cuda_lite/src/kernels.rs:790`,
+`pub(crate) fn reduce(...)`, whose own doc comment says it: *"Axis reduction,
+axis zero-based FROM THE END (the DPS convention). One thread per output
+element; the reduced extent is looped."* The emitted kernel is one
+`for (unsigned long long r = 0; r < {extent}ULL; ++r) { ... acc = {fold}; }`
+per output element, with `acc` a thread-local register. There is no warp-level
+reduction anywhere in the crate: `grep -rn '__shfl|__syncthreads|__shared__|warpSize|cub::' crates/luminal_cuda_lite/src/`
+returns NOTHING. So a reduction over a long axis with few outputs — exactly the
+RMSNorm shape, one row reduced to one scalar — runs on a single thread. Main's
+strategy is CUDA-applicable essentially unchanged: `simd_sum` is
+`__shfl_down_sync`/`__reduce_add_sync` over a 32-lane warp, the threadgroup
+`partials[]` array is `__shared__`, `threadgroup_barrier` is `__syncthreads()`,
+and `reduction_thread_count`'s SIMD-width alignment is warp alignment. THAT is
+the larger half of this commit's value here, and it is owed to CL as a real
+block-reduction `reduce`, not as an RMSNorm op.
+
+**(b) No fused RMSNorm exists on CL.** `crates/luminal_cuda_lite/src/ops/`
+holds: `add cast constant cublaslt div exp exp2 gather
+index_map_apply_materialize index_map_apply_view iota less_than log2
+materialize_layout_copy modulo mul recip reduce_max reduce_sum scatter sin
+sqrt trunc_div trunc_rem`. An RMSNorm on CL today is that chain of primitives,
+each with its own kernel launch and its own round trip to global memory. A
+fused op is a legitimate future backend matcher — and per the standing doctrine
+("backend matchers match exactly"), it would match the literal chain the
+recorder emits, with the equivalence reasoning left to the general rules.
+
+**(c) Two numeric notes that do NOT transfer unexamined.**
+
+- The fused kernel accumulates in `float` and computes
+  `rsqrt(total / float(cols) + eps)` in f32 REGARDLESS of the input dtype
+  (`ops.rs:635-637` and `687-689`): `float sum`, `float total`,
+  `threadgroup float partials[256]`, and `metal_numeric_read` converts each
+  loaded element to `float` on the way in. For an f16 input that is an
+  opmath UPGRADE — arguably the right answer, and the same thing torch's
+  fused norms do — but it is a silent precision decision taken inside a
+  backend kernel, and on this branch dtype is declared, never implied. A CL
+  equivalent has to state its accumulation dtype rather than inherit one.
+  Note also that the reduction ORDER changes: a strided partial sum per lane,
+  then `simd_sum`, whose intra-warp order is unspecified. Float addition is not
+  associative, and this branch's float-assoc rewrites are dtype-gated to
+  Int/Int64 for exactly that reason — the kernel is free to do this (it is a
+  backend implementation, not an e-graph rewrite), but it means the fused
+  result is not bit-identical to the unfused chain. Main's own tolerances say
+  so: `assert_close(..., 2e-4)`.
+- `MetalRMSNorm::bytes_loaded` (`ops.rs:726-737`) reports
+  `elements * inputs_per_element * 4`, where `inputs_per_element` is **2** on
+  the vectorized path and **3** otherwise — a shader-path-dependent COST, and
+  a fictional one either way (it prices `size_of::<f32>()` regardless of the
+  actual dtype, and it prices the weight per output element rather than per
+  row). This branch's cost model is different by ruling (2026-08-10,
+  `src/extractor.rs:1684-1718`): `heuristic_cost` is bytes moved — operand
+  bytes for every declared READ plus result bytes for every declared WRITE,
+  with symbolic dims at the midpoint of their seeded interval bounds, computed
+  from the layout's own extents and the element's real bit width. A CL fused
+  RMSNorm would price itself through `candidate_heuristic_cost` from its
+  declared reads and writes; it would NOT get to invent a per-element input
+  count, and it would not get a different cost for choosing a different
+  shader. Do not port `bytes_loaded`.
