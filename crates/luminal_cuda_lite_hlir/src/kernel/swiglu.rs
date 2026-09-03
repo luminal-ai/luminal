@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaFunction, CudaModule, CudaSlice, CudaStream};
 use luminal::{
     dtype::DType, op::CustomOp, op::LLIROp, prelude::FxHashMap, prelude::GraphTensor,
-    shape::IntExpr,
+    prelude::Symbol, shape::IntExpr,
 };
 
 use crate::compile_module_image_for_current_device;
@@ -39,7 +39,7 @@ impl KernelOp for SwigluKernel {
         (IntExpr, IntExpr, IntExpr),
         (IntExpr, IntExpr, IntExpr),
         IntExpr,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let i = self.intermediate;
         let ty = crate::cuda_dtype(self.dtype);
@@ -190,7 +190,7 @@ impl KernelOp for SwigluQuantKernel {
         (IntExpr, IntExpr, IntExpr),
         (IntExpr, IntExpr, IntExpr),
         IntExpr,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let i = self.intermediate;
         let ty = crate::cuda_dtype(self.dtype);

@@ -40,6 +40,29 @@ fn is_well_formed(name: &str) -> bool {
         && !name.contains("__")
 }
 
+/// A name that cannot be a dimension — the REPORTED form of the
+/// rejection [`Symbol::new`] panics on. Main's PR #396 spells this as a
+/// two-variant enum (`Malformed` | `Reserved`); this branch retired the
+/// reserved index with 'z' (z-var retirement, 2026-08-06), so
+/// malformedness is the only way a name can fail here and the type is a
+/// struct. The `Display` text is the panic text verbatim, so the two
+/// doors report identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSymbolName(String);
+
+impl std::fmt::Display for InvalidSymbolName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "symbol name {:?} must match [A-Za-z][A-Za-z0-9_]* with no \
+             doubled underscore (reject, never sanitize)",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidSymbolName {}
+
 /// An interned symbolic-dimension name.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Symbol(&'static str);
@@ -47,13 +70,28 @@ pub struct Symbol(&'static str);
 impl Symbol {
     /// Intern a validated name — panics loudly on malformed input.
     pub fn new(name: impl AsRef<str>) -> Self {
+        Self::try_new_dim(name).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Intern a validated name, REPORTING the rejection instead of
+    /// unwinding (main's `Symbol::try_new_dim`, PR #396).
+    ///
+    /// This is the door for a name the caller did not choose. A
+    /// frontend importing someone else's graph — PT2 hands over names
+    /// like `s77`, `u0`, and occasionally things that are not
+    /// identifiers at all — must be able to see the rejection and remap,
+    /// because DROPPING an unusable dim is the worst outcome available:
+    /// a dim absent from the symbol map never gets a value, so it
+    /// freezes at the export hint while the frontend, told it was
+    /// dynamic, declines to recompile. Names are still rejected, never
+    /// sanitized: sanitizing is not injective, so `a.b` and `a-b` would
+    /// land on one symbol.
+    pub fn try_new_dim(name: impl AsRef<str>) -> Result<Self, InvalidSymbolName> {
         let name = name.as_ref();
-        assert!(
-            is_well_formed(name),
-            "symbol name {name:?} must match [A-Za-z][A-Za-z0-9_]* with no \
-             doubled underscore (reject, never sanitize)"
-        );
-        Self::intern(name)
+        if !is_well_formed(name) {
+            return Err(InvalidSymbolName(name.to_string()));
+        }
+        Ok(Self::intern(name))
     }
 
     fn intern(name: &str) -> Self {
@@ -153,6 +191,27 @@ mod tests {
     #[should_panic(expected = "reject, never sanitize")]
     fn malformed_names_are_rejected() {
         Symbol::new("a.b");
+    }
+
+    /// The fallible door reports exactly what the panicking one panics
+    /// with, and accepts exactly what it accepts. No name is reserved on
+    /// this branch, so a bare `"z"` is an ordinary dimension.
+    #[test]
+    fn try_new_dim_reports_instead_of_unwinding() {
+        assert_eq!(
+            Symbol::try_new_dim("seq_len").unwrap(),
+            Symbol::new("seq_len")
+        );
+        assert_eq!(Symbol::try_new_dim("s77").unwrap().name(), "s77");
+        assert_eq!(Symbol::try_new_dim("z").unwrap().name(), "z");
+
+        for bad in ["a.b", "a-b", "", "1st", "a__b"] {
+            let error = Symbol::try_new_dim(bad).unwrap_err().to_string();
+            assert!(
+                error.contains("reject, never sanitize") && error.contains(&format!("{bad:?}")),
+                "the report must name the offending string and the policy, got: {error}"
+            );
+        }
     }
 
     #[test]

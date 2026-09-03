@@ -168,7 +168,7 @@ pub(crate) fn static_scatter_add(
     m: usize,
     l: usize,
 ) -> Option<GraphTensor> {
-    if m > MAX_STATIC_MAP || !f.dyn_vars().iter().all(|c| *c == 'z') {
+    if m > MAX_STATIC_MAP || !f.dyn_vars().iter().all(|c| c.is_reserved()) {
         return None;
     }
     let mut vals = Vec::with_capacity(m);

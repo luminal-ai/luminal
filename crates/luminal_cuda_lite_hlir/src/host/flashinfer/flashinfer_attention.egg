@@ -17,7 +17,6 @@
 ; gather_idx input from the lowered flat gather index.
 ;
 ; Shape dimensions are egglog variables, not pinned constants.
-; Dynamic dims "s" (batch/seq) and "c" (context) stay pinned as MVar.
 
 (relation flashinfer_cache_pair (IR IR))
 
@@ -107,7 +106,7 @@
         ; softmax internals connect the mask chain to the second matmul —
         ; without this the two halves join as a cross-product across the
         ; distinct layer instances of rolled multi-layer bodies.
-        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+        (= ?smax (Op (Max ?smax_shape ?context_tokens ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
         (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
             (ICons ?smax (ICons ?nm_negone (INil)))))
@@ -117,14 +116,14 @@
             (ICons ?shifted (ICons ?sc_log2e (INil)))))
         (const_like ?sc_log2e 1.442695)
         (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
-        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+        (= ?sexpsum (Op (Sum ?ss_shape ?context_tokens ?ss_in ?ss_iter ?ss_out)
             (ICons ?sexp (INil))))
         (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
         (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
             (ICons ?sexp (ICons ?srecip (INil)))))
 
         (= ?mul2 (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?hdim (ECons ?context_tokens (ENil)))))
             ?mul2_a_strides
             ?mul2_b_strides
             ?mul2_out_strides)
@@ -133,8 +132,8 @@
         ; ── Second matmul: Sum (reduction over c) → output ──
         ; Shape: (nheads, s, hdim) — reduces c
         (= ?output (Op (Sum
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
-            (MVar "c")
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ENil))))
+            ?context_tokens
             ?out_in_strides
             (MIter)
             ?out_out_strides)
@@ -144,7 +143,7 @@
         ; Shape: (nheads, c, hdim) — 3D
         (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
-            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            (ECons ?nheads3 (ECons ?context_tokens (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?v_gqa_out_strides)
@@ -153,7 +152,7 @@
         ; ── V Gather: rows from V_cache (2D) ──
         ; Shape: (c, kvdim), Source: (num_slots, kvdim)
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
@@ -162,7 +161,7 @@
         ; ── First matmul: Mul(Q, K_gqa) ──
         ; Shape: (nheads, s, c, hdim) — 4D
         (= ?mul1 (Op (Mul
-            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            (ECons ?nheads4 (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim4 (ENil)))))
             ?mul1_a_strides
             ?mul1_b_strides
             ?mul1_out_strides)
@@ -171,7 +170,7 @@
         ; ── First matmul: Sum (reduction over hdim) → QK scores ──
         ; Shape: (nheads, s, c) — reduces hdim
         (= ?qk (Op (Sum
-            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads5 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?hdim5
             ?qk_in_strides
             (MIter)
@@ -182,7 +181,7 @@
         ; Shape: (nheads, s, c) — 3D
         ; Mask is broadcast from (s, c) via zero-stride in first dim (nheads).
         (= ?masked (Op (Add
-            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads8 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?mask_add_a_strides
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
@@ -208,7 +207,7 @@
         ; Shape: (nheads, hdim, c) — 3D
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
-            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            (ECons ?nheads6 (ECons ?hdim6 (ECons ?context_tokens (ENil))))
             ?k_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?k_gqa_out_strides)
@@ -217,7 +216,7 @@
         ; ── K Gather: rows from K_cache (2D) ──
         ; Shape: (c, kvdim), Source: (num_slots, kvdim)
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?k_gather_strides
             (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
             ?k_src_strides)
@@ -232,7 +231,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) ?input_tokens ?context_tokens ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -250,15 +249,15 @@
         ; This spelling currently lowers to the fp32 batch-decode runtime path,
         ; not prefill. It is only valid when the active dynamic-dim bucket proves
         ; s == 1.
-        (= ?s_lower (lower (MVar "s")))
-        (= ?s_upper (upper (MVar "s")))
+        (= ?s_lower (lower ?input_tokens))
+        (= ?s_upper (upper ?input_tokens))
         (> ?s_lower 0)
         (< ?s_upper 2)
 
         ; softmax internals connect the mask chain to the second matmul —
         ; without this the two halves join as a cross-product across the
         ; distinct layer instances of rolled multi-layer bodies.
-        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+        (= ?smax (Op (Max ?smax_shape ?context_tokens ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
         (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
             (ICons ?smax (ICons ?nm_negone (INil)))))
@@ -268,22 +267,22 @@
             (ICons ?shifted (ICons ?sc_log2e (INil)))))
         (const_like ?sc_log2e 1.442695)
         (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
-        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+        (= ?sexpsum (Op (Sum ?ss_shape ?context_tokens ?ss_in ?ss_iter ?ss_out)
             (ICons ?sexp (INil))))
         (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
         (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
             (ICons ?sexp (ICons ?srecip (INil)))))
 
         (= ?mul2 (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?hdim (ECons ?context_tokens (ENil)))))
             ?mul2_a_strides
             ?mul2_b_strides
             ?mul2_out_strides)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
         (= ?output (Op (Sum
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
-            (MVar "c")
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ENil))))
+            ?context_tokens
             ?out_in_strides
             (MIter)
             ?out_out_strides)
@@ -291,28 +290,28 @@
 
         (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
-            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            (ECons ?nheads3 (ECons ?context_tokens (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?v_gqa_out_strides)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         (= ?mul1 (Op (Mul
-            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            (ECons ?nheads4 (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim4 (ENil)))))
             ?mul1_a_strides
             ?mul1_b_strides
             ?mul1_out_strides)
             (ICons ?q (ICons ?k_gqa (INil)))))
 
         (= ?qk (Op (Sum
-            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads5 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?hdim5
             ?qk_in_strides
             (MIter)
@@ -320,7 +319,7 @@
             (ICons ?mul1 (INil))))
 
         (= ?masked (Op (Add
-            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads8 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?mask_add_a_strides
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
@@ -342,14 +341,14 @@
 
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
-            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            (ECons ?nheads6 (ECons ?hdim6 (ECons ?context_tokens (ENil))))
             ?k_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?k_gqa_out_strides)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?k_gather_strides
             (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
             ?k_src_strides)
@@ -363,7 +362,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) ?input_tokens ?context_tokens ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -383,15 +382,15 @@
         ;
         ; Like the direct causal spelling, this is decode-only until the fp32
         ; prefill runtime exists. The active bucket must prove s == 1.
-        (= ?s_lower (lower (MVar "s")))
-        (= ?s_upper (upper (MVar "s")))
+        (= ?s_lower (lower ?input_tokens))
+        (= ?s_upper (upper ?input_tokens))
         (> ?s_lower 0)
         (< ?s_upper 2)
 
         ; softmax internals connect the mask chain to the second matmul —
         ; without this the two halves join as a cross-product across the
         ; distinct layer instances of rolled multi-layer bodies.
-        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+        (= ?smax (Op (Max ?smax_shape ?context_tokens ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
         (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
             (ICons ?smax (ICons ?nm_negone (INil)))))
@@ -401,22 +400,22 @@
             (ICons ?shifted (ICons ?sc_log2e (INil)))))
         (const_like ?sc_log2e 1.442695)
         (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
-        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+        (= ?sexpsum (Op (Sum ?ss_shape ?context_tokens ?ss_in ?ss_iter ?ss_out)
             (ICons ?sexp (INil))))
         (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
         (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
             (ICons ?sexp (ICons ?srecip (INil)))))
 
         (= ?mul2 (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?hdim (ECons ?context_tokens (ENil)))))
             ?mul2_a_strides
             ?mul2_b_strides
             ?mul2_out_strides)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
         (= ?output (Op (Sum
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
-            (MVar "c")
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ENil))))
+            ?context_tokens
             ?out_in_strides
             (MIter)
             ?out_out_strides)
@@ -424,28 +423,28 @@
 
         (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
-            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            (ECons ?nheads3 (ECons ?context_tokens (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?v_gqa_out_strides)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         (= ?mul1 (Op (Mul
-            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            (ECons ?nheads4 (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim4 (ENil)))))
             ?mul1_a_strides
             ?mul1_b_strides
             ?mul1_out_strides)
             (ICons ?q (ICons ?k_gqa (INil)))))
 
         (= ?qk (Op (Sum
-            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads5 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?hdim5
             ?qk_in_strides
             (MIter)
@@ -453,7 +452,7 @@
             (ICons ?mul1 (INil))))
 
         (= ?masked (Op (Add
-            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads8 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?mask_add_a_strides
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
@@ -479,14 +478,14 @@
 
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
-            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            (ECons ?nheads6 (ECons ?hdim6 (ECons ?context_tokens (ENil))))
             ?k_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?k_gqa_out_strides)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?k_gather_strides
             (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
             ?k_src_strides)
@@ -500,7 +499,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) ?input_tokens ?context_tokens ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -526,7 +525,7 @@
         ; softmax internals connect the mask chain to the second matmul —
         ; without this the two halves join as a cross-product across the
         ; distinct layer instances of rolled multi-layer bodies.
-        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+        (= ?smax (Op (Max ?smax_shape ?context_tokens ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
         (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
             (ICons ?smax (ICons ?nm_negone (INil)))))
@@ -536,22 +535,22 @@
             (ICons ?shifted (ICons ?sc_log2e (INil)))))
         (const_like ?sc_log2e 1.442695)
         (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
-        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+        (= ?sexpsum (Op (Sum ?ss_shape ?context_tokens ?ss_in ?ss_iter ?ss_out)
             (ICons ?sexp (INil))))
         (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
         (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
             (ICons ?sexp (ICons ?srecip (INil)))))
 
         (= ?mul2 (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?hdim (ECons ?context_tokens (ENil)))))
             ?mul2_a_strides
             ?mul2_b_strides
             ?mul2_out_strides)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
         (= ?output (Op (Sum
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
-            (MVar "c")
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ENil))))
+            ?context_tokens
             ?out_in_strides
             (MIter)
             ?out_out_strides)
@@ -559,28 +558,28 @@
 
         (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
-            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            (ECons ?nheads3 (ECons ?context_tokens (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?v_gqa_out_strides)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
             (ICons ?k_idx (ICons ?v_cache (INil)))))
 
         (= ?mul1 (Op (Mul
-            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            (ECons ?nheads4 (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim4 (ENil)))))
             ?mul1_a_strides
             ?mul1_b_strides
             ?mul1_out_strides)
             (ICons ?q (ICons ?k_gqa (INil)))))
 
         (= ?qk (Op (Sum
-            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads5 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?hdim5
             ?qk_in_strides
             (MIter)
@@ -588,7 +587,7 @@
             (ICons ?mul1 (INil))))
 
         (= ?masked (Op (Add
-            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads8 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?mask_add_a_strides
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
@@ -614,14 +613,14 @@
 
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
-            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            (ECons ?nheads6 (ECons ?hdim6 (ECons ?context_tokens (ENil))))
             ?k_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?k_gqa_out_strides)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?k_gather_strides
             (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
             ?k_src_strides)
@@ -635,7 +634,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) ?input_tokens ?context_tokens ?dt ?sq_scale_val -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -656,28 +655,28 @@
 (rule
     (
         (= ?cmask (Op (Gather
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             ?mask_idx_strides
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            (ECons ?context_tokens (ECons ?context_tokens (ENil)))
             ?mask_src_strides)
             (ICons ?mask_indices (ICons ?scaled_blocked (INil)))))
         (= ?mask_indices (Op (Add
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             ?row_idx_strides
             ?col_idx_strides
             ?mask_idx_out_strides)
             (ICons ?row_offsets (ICons ?col_offsets (INil)))))
-        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?col_offsets (Op (Iota (MIter) ?context_tokens) (INil)))
         (= ?row_offsets (Op (Mul
-            (ECons (MVar "s") (ENil))
+            (ECons ?input_tokens (ENil))
             ?q_pos_strides
             ?ctx_scalar_strides
             ?row_offsets_out_strides)
             (ICons ?q_pos (ICons ?ctx_scalar (INil)))))
-        (= ?ctx_scalar (Op (Iota (MVar "c") (MNum 1)) (INil)))
+        (= ?ctx_scalar (Op (Iota ?context_tokens (MNum 1)) (INil)))
 
         (= ?scaled_blocked (Op (Mul
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            (ECons ?context_tokens (ECons ?context_tokens (ENil)))
             ?blocked_strides
             ?neg_scale_strides
             ?scaled_blocked_strides)
@@ -688,19 +687,19 @@
         (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
             (ICons ?blocked_bool (INil))))
         (= ?blocked_bool (Op (LessThan
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            (ECons ?context_tokens (ECons ?context_tokens (ENil)))
             ?tri_row_strides
             ?tri_col_strides
             ?blocked_out_strides)
             (ICons ?tri_iota_f32 (ICons ?tri_iota_minus_zero (INil)))))
         (= ?tri_iota_minus_zero (Op (Add
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            (ECons ?context_tokens (ECons ?context_tokens (ENil)))
             ?tri_minus_zero_a_strides
             ?tri_minus_zero_b_strides
             ?tri_minus_zero_out_strides)
             (ICons ?tri_iota_f32 (ICons ?zero_offset (INil)))))
         (= ?zero_offset (Op (Mul
-            (ECons (MVar "c") (ECons (MVar "c") (ENil)))
+            (ECons ?context_tokens (ECons ?context_tokens (ENil)))
             ?zero_offset_a_strides
             ?zero_offset_b_strides
             ?zero_offset_out_strides)
@@ -709,7 +708,7 @@
         (= ?neg_one_const (Op (Constant -1.000000) (INil)))
         (= ?tri_iota_f32 (Op (Cast ?tri_iota_cast_size (F32))
             (ICons ?tri_iota (INil))))
-        (= ?tri_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?tri_iota (Op (Iota (MIter) ?context_tokens) (INil)))
     )
     (
         (fi_triu_mask ?cmask ?q_pos)
@@ -743,7 +742,7 @@
         ;   (q_pos[:, None] < arange(c)[None, :]).cast(F32) * -1e10
         ; The "direct causal attention" island rule anchors at this fact.
         (= ?mask (Op (Mul
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             ?blocked_strides
             ?neg_scale_strides
             ?mask_out_strides)
@@ -754,12 +753,12 @@
         (= ?blocked_f32 (Op (Cast ?blocked_cast_size ?blocked_cast_dt)
             (ICons ?blocked_bool (INil))))
         (= ?blocked_bool (Op (LessThan
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             ?q_pos_cmp_strides
             ?col_cmp_strides
             ?blocked_out_strides)
             (ICons ?q_pos (ICons ?col_offsets (INil)))))
-        (= ?col_offsets (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?col_offsets (Op (Iota (MIter) ?context_tokens) (INil)))
     )
     (
         (fi_direct_causal_mask ?mask ?q_pos)
@@ -773,7 +772,7 @@
         ; window term: (col < q_pos - (W-1)) cast * -1e10; the constant W-1
         ; is FlashInfer's window_left.
         (= ?wterm (Op (Mul
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             ?wt_a_strides
             ?wt_b_strides
             ?wt_out_strides)
@@ -784,22 +783,22 @@
         (= ?w_bool_cast (Op (Cast ?w_cast_size ?w_cast_dt)
             (ICons ?w_lt (INil))))
         (= ?w_lt (Op (LessThan
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             (ECons (MNum 0) (ECons (MIter) (ENil)))
             (ECons (MIter) (ECons (MNum 0) (ENil)))
             ?w_lt_out_strides)
             (ICons ?w_col_f (ICons ?w_lo (INil)))))
         (= ?w_col_f (Op (Cast ?w_col_cast_size (F32)) (ICons ?w_col_iota (INil))))
-        (= ?w_col_iota (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?w_col_iota (Op (Iota (MIter) ?context_tokens) (INil)))
         (= ?w_lo (Op (Add
-            (ECons (MVar "s") (ENil))
+            (ECons ?input_tokens (ENil))
             ?w_lo_a_strides
             ?w_lo_b_strides
             ?w_lo_out_strides)
             (ICons ?w_qpos_f (ICons ?w_neg (INil)))))
         (= ?w_qpos_f (Op (Cast ?w_qpos_cast_size (F32)) (ICons ?w_qpos (INil))))
         (= ?w_neg (Op (Mul
-            (ECons (MVar "s") (ENil))
+            (ECons ?input_tokens (ENil))
             (ECons (MNum 0) (ENil))
             (ECons (MNum 0) (ENil))
             ?w_neg_out_strides)
@@ -819,8 +818,8 @@
         ; Gemma-4 full attention: scale-free, causal triu-gather mask.
         ; 16-bit only (covers head_dim 512); no s==1 guard — the tensor-core
         ; prefill runtime handles s>1.
-        (= ?s_lower (lower (MVar "s")))
-        (= ?s_upper (upper (MVar "s")))
+        (= ?s_lower (lower ?input_tokens))
+        (= ?s_upper (upper ?input_tokens))
         (> ?s_lower 0)
         (< ?s_upper 2)
 
@@ -828,12 +827,12 @@
         (fi_triu_mask ?mask ?q_pos)
         ; mask Add → softmax internals → second matmul: one connected chain.
         (= ?masked (Op (Add
-            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads8 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?mask_add_a_strides
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?qk (ICons ?mask (INil)))))
-        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+        (= ?smax (Op (Max ?smax_shape ?context_tokens ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
         (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
             (ICons ?smax (ICons ?nm_negone (INil)))))
@@ -843,22 +842,22 @@
             (ICons ?shifted (ICons ?sc_log2e (INil)))))
         (const_like ?sc_log2e 1.442695)
         (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
-        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+        (= ?sexpsum (Op (Sum ?ss_shape ?context_tokens ?ss_in ?ss_iter ?ss_out)
             (ICons ?sexp (INil))))
         (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
         (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
             (ICons ?sexp (ICons ?srecip (INil)))))
 
         (= ?mul2 (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?hdim (ECons ?context_tokens (ENil)))))
             ?mul2_a_strides
             ?mul2_b_strides
             ?mul2_out_strides)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
         (= ?output (Op (Sum
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
-            (MVar "c")
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ENil))))
+            ?context_tokens
             ?out_in_strides
             (MIter)
             ?out_out_strides)
@@ -866,14 +865,14 @@
 
         (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
-            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            (ECons ?nheads3 (ECons ?context_tokens (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?v_gqa_out_strides)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
@@ -881,28 +880,28 @@
 
         ; SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
         (= ?qk (Op (Sum
-            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads5 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?hdim5
             ?qk_in_strides
             (MIter)
             ?qk_out_strides)
             (ICons ?mul1 (INil))))
         (= ?mul1 (Op (Mul
-            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            (ECons ?nheads4 (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim4 (ENil)))))
             ?mul1_a_strides
             ?mul1_b_strides
             ?mul1_out_strides)
             (ICons ?q (ICons ?k_gqa (INil)))))
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
-            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            (ECons ?nheads6 (ECons ?hdim6 (ECons ?context_tokens (ENil))))
             ?k_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?k_gqa_out_strides)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?k_gather_strides
             (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
             ?k_src_strides)
@@ -916,7 +915,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 1.0 -1.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) ?input_tokens ?context_tokens ?dt 1.0 -1.0)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)
@@ -929,14 +928,14 @@
     (
         ; Gemma-4 sliding-window attention: scale-free, causal triu-gather
         ; mask + window term; window_left carried onto the op.
-        (= ?s_lower (lower (MVar "s")))
-        (= ?s_upper (upper (MVar "s")))
+        (= ?s_lower (lower ?input_tokens))
+        (= ?s_upper (upper ?input_tokens))
         (> ?s_lower 0)
         (< ?s_upper 2)
 
         (flashinfer_prefill_dt ?dt)
         (= ?mask (Op (Add
-            (ECons (MVar "s") (ECons (MVar "c") (ENil)))
+            (ECons ?input_tokens (ECons ?context_tokens (ENil)))
             ?wm_a_strides
             ?wm_b_strides
             ?wm_out_strides)
@@ -946,12 +945,12 @@
         (= ?q_pos ?q_pos2)
         ; mask Add → softmax internals → second matmul: one connected chain.
         (= ?masked (Op (Add
-            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads8 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?mask_add_a_strides
             (ECons (MNum 0) ?mask_rest_strides)
             ?mask_add_out_strides)
             (ICons ?qk (ICons ?mask (INil)))))
-        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+        (= ?smax (Op (Max ?smax_shape ?context_tokens ?smax_in ?smax_iter ?smax_out)
             (ICons ?masked (INil))))
         (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
             (ICons ?smax (ICons ?nm_negone (INil)))))
@@ -961,22 +960,22 @@
             (ICons ?shifted (ICons ?sc_log2e (INil)))))
         (const_like ?sc_log2e 1.442695)
         (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
-        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+        (= ?sexpsum (Op (Sum ?ss_shape ?context_tokens ?ss_in ?ss_iter ?ss_out)
             (ICons ?sexp (INil))))
         (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
         (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
             (ICons ?sexp (ICons ?srecip (INil)))))
 
         (= ?mul2 (Op (Mul
-            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            (ECons ?nheads (ECons ?input_tokens (ECons ?hdim (ECons ?context_tokens (ENil)))))
             ?mul2_a_strides
             ?mul2_b_strides
             ?mul2_out_strides)
             (ICons ?soft (ICons ?v_gqa (INil)))))
 
         (= ?output (Op (Sum
-            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
-            (MVar "c")
+            (ECons ?nheads2 (ECons ?input_tokens (ECons ?hdim2 (ENil))))
+            ?context_tokens
             ?out_in_strides
             (MIter)
             ?out_out_strides)
@@ -984,14 +983,14 @@
 
         (const_like ?v_gqa_const 1.000000)
         (= ?v_gqa (Op (Mul
-            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            (ECons ?nheads3 (ECons ?context_tokens (ECons ?hdim3 (ENil))))
             ?v_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?v_gqa_out_strides)
             (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
 
         (= ?v_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim (ENil)))
             ?v_gather_strides
             (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
             ?v_src_strides)
@@ -999,28 +998,28 @@
 
         ; SCALE-FREE: ?qk (the raw QK Sum) feeds the mask Add directly.
         (= ?qk (Op (Sum
-            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            (ECons ?nheads5 (ECons ?input_tokens (ECons ?context_tokens (ENil))))
             ?hdim5
             ?qk_in_strides
             (MIter)
             ?qk_out_strides)
             (ICons ?mul1 (INil))))
         (= ?mul1 (Op (Mul
-            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            (ECons ?nheads4 (ECons ?input_tokens (ECons ?context_tokens (ECons ?hdim4 (ENil)))))
             ?mul1_a_strides
             ?mul1_b_strides
             ?mul1_out_strides)
             (ICons ?q (ICons ?k_gqa (INil)))))
         (const_like ?k_gqa_const 1.000000)
         (= ?k_gqa (Op (Mul
-            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            (ECons ?nheads6 (ECons ?hdim6 (ECons ?context_tokens (ENil))))
             ?k_gqa_a_strides
             (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
             ?k_gqa_out_strides)
             (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
 
         (= ?k_gathered (Op (Gather
-            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            (ECons ?context_tokens (ECons ?kvdim3 (ENil)))
             ?k_gather_strides
             (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
             ?k_src_strides)
@@ -1034,7 +1033,7 @@
     )
     (
         (let ?fi (Op (FlashInferAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt 1.0 ?window_left)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) ?input_tokens ?context_tokens ?dt 1.0 ?window_left)
             (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx (ICons ?mask (INil))))))))
         (union ?output ?fi)
         (set (dtype ?fi) ?dt)

@@ -44,6 +44,9 @@ pub struct FlashInferAttention {
     pub head_dim: usize,
     pub page_size: usize,
     pub batch_dim: IntExpr,
+    /// Total tokens attended over. Captured from the matched shape by the
+    /// rules, so it does not depend on what the graph calls this dim.
+    pub context_dim: IntExpr,
     pub dtype: DType,
     /// Softmax scale; 0.0 = default `1/sqrt(head_dim)`.
     pub sm_scale: f64,
@@ -197,6 +200,19 @@ fn prepared_device_bytes(
         })
 }
 
+/// Rows in a CSR index pointer, from the buffer's length.
+fn indptr_rows(
+    buffer_lengths: &FxHashMap<NodeIndex, usize>,
+    node: NodeIndex,
+) -> Result<usize, ResourceViolation> {
+    buffer_lengths
+        .get(&node)
+        .map(|bytes| bytes / std::mem::size_of::<i32>())
+        .ok_or(ResourceViolation::HostResourcePlanning {
+            name: "FlashInfer indptr length",
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FlashInferResolvedDecode {
     spec: FlashInferDecodeSpec,
@@ -332,6 +348,7 @@ impl Default for FlashInferAttention {
             head_dim: 0,
             page_size: 0,
             batch_dim: IntExpr::default(),
+            context_dim: IntExpr::default(),
             dtype: DType::F32,
             sm_scale: 0.0,
             window_left: -1,
@@ -351,6 +368,7 @@ impl EgglogOp for FlashInferAttention {
                 ("head_dim", EXPRESSION),
                 ("page_size", EXPRESSION),
                 ("batch_dim", EXPRESSION),
+                ("context_dim", EXPRESSION),
                 ("dtype", DTYPE),
                 ("sm_scale", F64),
                 ("window_left", F64),
@@ -404,13 +422,14 @@ impl EgglogOp for FlashInferAttention {
             .exec(&FxHashMap::default())
             .unwrap();
         let batch_dim = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
-        let dtype = extract_dtype(egraph, kind_children[5]);
-        let sm_scale: f64 = egraph.enodes[kind_children[6]]
+        let context_dim = extract_expr(egraph, kind_children[5], expr_cache).unwrap();
+        let dtype = extract_dtype(egraph, kind_children[6]);
+        let sm_scale: f64 = egraph.enodes[kind_children[7]]
             .0
             .replace('"', "")
             .parse()
             .unwrap();
-        let window_left = egraph.enodes[kind_children[7]]
+        let window_left = egraph.enodes[kind_children[8]]
             .0
             .replace('"', "")
             .parse::<f64>()
@@ -427,6 +446,7 @@ impl EgglogOp for FlashInferAttention {
             head_dim,
             page_size,
             batch_dim,
+            context_dim,
             dtype,
             sm_scale,
             window_left,
@@ -470,7 +490,7 @@ impl FlashInferAttention {
         &self,
         inputs: &[NodeIndex],
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         enable_cuda_graph: bool,
     ) -> Result<FlashInferDeviceResourceSpec, ResourceViolation> {
         let total_q_tokens =
@@ -479,9 +499,9 @@ impl FlashInferAttention {
                 .ok_or(ResourceViolation::UnresolvedExpression {
                     resource: "FlashInfer total query tokens",
                 })?;
-        let c = dyn_map
-            .get(&'c')
-            .copied()
+        let c = self
+            .context_dim
+            .exec(dyn_map)
             .ok_or(ResourceViolation::UnresolvedExpression {
                 resource: "FlashInfer context length",
             })?;
@@ -523,13 +543,11 @@ impl FlashInferAttention {
             .unwrap_or(c);
         let explicit_indptr = inputs.len() == 6;
         let batch_size = if explicit_indptr {
-            dyn_map
-                .get(&'r')
-                .copied()
-                .ok_or(ResourceViolation::UnresolvedExpression {
-                    resource: "FlashInfer indptr rows",
-                })?
-                .saturating_sub(1)
+            // A CSR index pointer has one entry per sequence plus a terminator,
+            // so the row count is the buffer's own length. Asking dyn_map for it
+            // by name meant the caller had to declare a dim describing an input
+            // the op is already holding.
+            indptr_rows(buffer_lengths, inputs[5])?.saturating_sub(1)
         } else if total_q_tokens > 1 && dtype.supports_prefill() {
             1
         } else {
@@ -575,15 +593,16 @@ impl FlashInferAttention {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<FlashInferResolvedDecode> {
         let total_q_tokens = self
             .batch_dim
             .exec(dyn_map)
             .ok_or_else(|| anyhow::anyhow!("FlashInferAttention batch_dim is unresolved"))?;
-        let c = *dyn_map
-            .get(&'c')
-            .ok_or_else(|| anyhow::anyhow!("FlashInferAttention requires dynamic dim 'c'"))?;
+        let c = self
+            .context_dim
+            .exec(dyn_map)
+            .ok_or_else(|| anyhow::anyhow!("FlashInferAttention context_dim is unresolved"))?;
         if inputs.len() != 4 && inputs.len() != 6 {
             anyhow::bail!(
                 "FlashInferAttention expects 4 inputs (derived causal decode) or 6 inputs (explicit indptrs), got {}",
@@ -619,11 +638,14 @@ impl FlashInferAttention {
             .unwrap_or(c);
         let (kv_indptr_host, batch_size, explicit_qo_indptr, explicit_kv_indptr) =
             if inputs.len() >= 6 {
-                let r = *dyn_map.get(&'r').ok_or_else(|| {
-                    anyhow::anyhow!("FlashInferAttention requires dynamic dim 'r'")
-                })?;
                 let qo_indptr_buf = get_buf("qo_indptr", inputs[4])?;
                 let kv_indptr_buf = get_buf("kv_indptr", inputs[5])?;
+                let r = kv_indptr_buf.len() / std::mem::size_of::<i32>();
+                anyhow::ensure!(
+                    r >= 2,
+                    "FlashInferAttention: kv_indptr holds {r} rows, need at least 2 \
+                 (one per sequence plus a terminator)"
+                );
                 // Host contents are read during prepare, where stream synchronization
                 // is allowed. The pointers are part of the capture signature.
                 (
@@ -1072,7 +1094,7 @@ impl HostOp for FlashInferAttention {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         let resolved = self.resolve_for_graph(self_node, inputs, buffers, dyn_map)?;
         let ptrs = resolved.ptrs;
@@ -1104,7 +1126,7 @@ impl HostOp for FlashInferAttention {
         _self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         let resource_spec = self.device_resource_spec(inputs, buffer_lengths, dyn_map, false)?;
         Ok(HostDeviceMemoryPlan {
@@ -1203,6 +1225,7 @@ mod resource_tests {
             head_dim: 64,
             page_size: 1,
             batch_dim: 1.into(),
+            context_dim: IntExpr::from('c'),
             dtype: DType::F16,
             sm_scale: 0.0,
             window_left: -1,
@@ -1214,7 +1237,7 @@ mod resource_tests {
             (inputs[1], 4096 * kv_row_bytes),
             (inputs[2], 4096 * kv_row_bytes),
         ]);
-        let dyn_map = FxHashMap::from_iter([('c', 100)]);
+        let dyn_map = FxHashMap::from_iter([(Symbol::from('c'), 100)]);
         let resident_before = resident_shared_device_memory_allocations();
 
         let spec = attention
@@ -1243,13 +1266,14 @@ mod resource_tests {
             head_dim: 64,
             page_size: 1,
             batch_dim: 1.into(),
+            context_dim: IntExpr::from('c'),
             dtype: DType::F16,
             sm_scale: 0.0,
             window_left: -1,
             plan_info: Mutex::new(Vec::new()),
         };
         let inputs = (0..4).map(NodeIndex::new).collect_vec();
-        let dyn_map = FxHashMap::from_iter([('c', 100)]);
+        let dyn_map = FxHashMap::from_iter([(Symbol::from('c'), 100)]);
         let uninstalled_lengths = FxHashMap::from_iter([(inputs[1], 0), (inputs[2], 0)]);
 
         let spec = attention
@@ -1277,6 +1301,7 @@ mod resource_tests {
             head_dim: 64,
             page_size: 1,
             batch_dim: 2.into(),
+            context_dim: IntExpr::from('c'),
             dtype: DType::F16,
             sm_scale: 0.0,
             window_left: -1,
@@ -1287,8 +1312,11 @@ mod resource_tests {
         let lengths = FxHashMap::from_iter([
             (inputs[1], 4096 * kv_row_bytes),
             (inputs[2], 4096 * kv_row_bytes),
+            // 3 CSR rows -> batch of 2. Supplied as the buffer's length, which
+            // is where the op reads it from.
+            (inputs[5], 3 * std::mem::size_of::<i32>()),
         ]);
-        let dyn_map = FxHashMap::from_iter([('c', 100), ('r', 3)]);
+        let dyn_map = FxHashMap::from_iter([(Symbol::from('c'), 100)]);
 
         let spec = attention
             .device_resource_spec(&inputs, &lengths, &dyn_map, true)

@@ -144,7 +144,7 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()>;
 
     /// Returns the output buffer size in elements.
@@ -198,7 +198,7 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         _buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         Ok(HostDeviceMemoryPlan::default())
     }

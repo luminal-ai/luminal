@@ -147,7 +147,7 @@ impl HostOp for FusedMoE {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         if inputs.len() < 9 {
             anyhow::bail!("FusedMoE expected 9 inputs, got {}", inputs.len());

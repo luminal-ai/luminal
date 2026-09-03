@@ -1068,18 +1068,21 @@ fn bucket_range_and_singleton_cublaslt_buckets_are_captured() {
     let llir =
         extract_forced_cublaslt_llir_where(&mut cx, "bucketed s cuBLASLt graph capture", |_| true);
 
-    let dim_buckets = [('s', vec![DimBucket::new(1, 1), DimBucket::new(2, 4)])]
-        .into_iter()
-        .collect();
+    let dim_buckets = [(
+        Symbol::from('s'),
+        vec![DimBucket::new(1, 1), DimBucket::new(2, 4)],
+    )]
+    .into_iter()
+    .collect();
     let bucket_llirs = vec![
         (
-            [('s', 0usize)].into_iter().collect(),
-            [('s', 1usize)].into_iter().collect(),
+            [(Symbol::from('s'), 0usize)].into_iter().collect(),
+            [(Symbol::from('s'), 1usize)].into_iter().collect(),
             llir.clone(),
         ),
         (
-            [('s', 1usize)].into_iter().collect(),
-            [('s', 3usize)].into_iter().collect(),
+            [(Symbol::from('s'), 1usize)].into_iter().collect(),
+            [(Symbol::from('s'), 3usize)].into_iter().collect(),
             llir,
         ),
     ];

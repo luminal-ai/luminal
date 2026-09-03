@@ -105,7 +105,7 @@ impl KernelOp for KernelMeanReduce {
         (IntExpr, IntExpr, IntExpr),
         (IntExpr, IntExpr, IntExpr),
         IntExpr,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
         let vars = self
             .out_shape
@@ -386,9 +386,9 @@ impl KernelOp for KernelScatterNoCopy {
         (IntExpr, IntExpr, IntExpr),
         (IntExpr, IntExpr, IntExpr),
         IntExpr,
-        FxHashMap<char, CudaSlice<u8>>,
+        FxHashMap<Symbol, CudaSlice<u8>>,
     ) {
-        let all_vars: FxHashSet<char> = self
+        let all_vars: FxHashSet<Symbol> = self
             .dest_shape
             .iter()
             .flat_map(|e| e.dyn_vars())
@@ -461,7 +461,7 @@ extern \"C\" {{
         self.dest_shape.iter().copied().product()
     }
 
-    fn all_dyn_vars(&self) -> FxHashSet<char> {
+    fn all_dyn_vars(&self) -> FxHashSet<Symbol> {
         self.dest_shape
             .iter()
             .flat_map(|e| e.dyn_vars())

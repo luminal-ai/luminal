@@ -17,7 +17,7 @@ type PreloadResult = (Vec<(String, TypedData)>, HashMap<String, usize>);
 
 fn resolve_dim_sizes(
     sizes: &[pt2_schema::DimSize],
-    sym_to_char: &HashMap<String, char>,
+    sym_to_symbol: &HashMap<String, Symbol>,
 ) -> Vec<IntExpr> {
     sizes
         .iter()
@@ -32,10 +32,10 @@ fn resolve_dim_sizes(
                 // the bare-Symbol fast path when that fails — the parser
                 // bails on unrecognised heads (Pow, Min, etc.) and we'd
                 // rather lose the symbolic info than misinterpret it.
-                parse_sympy_expr(s, sym_to_char)
+                parse_sympy_expr(s, sym_to_symbol)
                     .or_else(|| {
                         pt2_parser::extract_symbol_name_pub(s)
-                            .and_then(|sym| sym_to_char.get(&sym).map(|c| IntExpr::from(*c)))
+                            .and_then(|sym| sym_to_symbol.get(&sym).map(|c| IntExpr::from(*c)))
                     })
                     .or_else(|| {
                         // As a last resort, if the EP gave us a concrete `hint`
@@ -133,7 +133,7 @@ pub fn translate_pt2(
     // Set initial dynamic dim values from symbol ranges. PT2 emits
     // `min_val: null` when the constraint is unbounded; fall back to 1 in
     // that case (the smallest valid dim — used only as an initial value).
-    for (sym_name, c) in &translated.sym_map.sym_to_char {
+    for (sym_name, c) in &translated.sym_map.sym_to_symbol {
         if let Some(rc) = translated.sym_map.ranges.get(sym_name) {
             let initial = rc.min_val.unwrap_or(1).max(0) as usize;
             graph.set_dim(*c, initial);
@@ -147,7 +147,7 @@ pub fn translate_pt2(
         .map(|(name, _id)| {
             parsed
                 .tensor_meta(name)
-                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_char))
+                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_symbol))
                 .unwrap_or_default()
         })
         .collect();
@@ -181,7 +181,7 @@ pub fn translate_pt2(
         .map(|(name, _id)| {
             parsed
                 .tensor_meta(name)
-                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_char))
+                .map(|meta| resolve_dim_sizes(&meta.sizes, &translated.sym_map.sym_to_symbol))
                 .unwrap_or_default()
         })
         .collect();
@@ -251,7 +251,7 @@ pub fn translate_pt2(
         }
     }
 
-    let dim_param_map: DimParamMap = translated.sym_map.sym_to_char;
+    let dim_param_map: DimParamMap = translated.sym_map.sym_to_symbol;
 
     let translation = GraphTranslation {
         graph,

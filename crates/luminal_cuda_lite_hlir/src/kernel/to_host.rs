@@ -87,11 +87,11 @@ struct CompiledKernel {
     /// Whether this compiled CUDA function has a trailing dyn_dims parameter.
     has_dyn_dims_param: bool,
     /// Dynamic dimensions that can affect launch dimensions, params, or code.
-    dyn_vars: FxHashSet<char>,
+    dyn_vars: FxHashSet<Symbol>,
     /// Internal buffers allocated for this kernel
     internal_bufs: Vec<CudaSlice<u8>>,
     /// Device constants from compile()
-    constants: FxHashMap<char, CudaSlice<u8>>,
+    constants: FxHashMap<Symbol, CudaSlice<u8>>,
     /// Graph node handle (set after graph is built)
     graph_node: Option<CUgraphNode>,
     /// Kernel name for profiling
@@ -231,7 +231,7 @@ impl RecaptureProfile {
         duration.as_secs_f64() * 1e3
     }
 
-    fn print(&self, dyn_map: &FxHashMap<char, usize>, kernels: usize, cublaslt: usize) {
+    fn print(&self, dyn_map: &DynMap, kernels: usize, cublaslt: usize) {
         if !self.enabled || (self.pending_count == 0 && self.materialize_total.is_zero()) {
             return;
         }
@@ -350,7 +350,7 @@ impl CompiledKernel {
         input_labels: Vec<String>,
         kernel_op: Arc<Box<dyn KernelOp>>,
         has_dyn_dims_param: bool,
-        constants: FxHashMap<char, CudaSlice<u8>>,
+        constants: FxHashMap<Symbol, CudaSlice<u8>>,
         kernel_name: &'static str,
         source_bytes: Option<usize>,
     ) -> Self {
@@ -441,7 +441,7 @@ struct CudaGraphOpState {
     /// Kernel params for each kernel
     kernel_params: Vec<UnifiedKernelParams>,
     /// Last dynamic dimension values (for change detection)
-    last_dyn_values: FxHashMap<char, usize>,
+    last_dyn_values: DynMap,
     /// Last buffer pointers (for change detection)
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     /// Timing events for profiling
@@ -499,7 +499,7 @@ pub struct CudaGraphOp {
     /// Buffer size requirements for extra nodes (node -> size in elements)
     buffer_sizes: FxHashMap<NodeIndex, IntExpr>,
     /// Dynamic dimensions used by this graph (sorted alphabetically)
-    dyn_dims_order: Vec<char>,
+    dyn_dims_order: Vec<Symbol>,
     /// The CUDA stream (needed for operations)
     stream: Arc<CudaStream>,
     /// Nonblocking stream used only for narrow cuBLASLt graph captures.
@@ -512,7 +512,7 @@ impl CudaGraphOp {
     fn new(
         buffer_nodes: Vec<NodeIndex>,
         buffer_sizes: FxHashMap<NodeIndex, IntExpr>,
-        dyn_dims_order: Vec<char>,
+        dyn_dims_order: Vec<Symbol>,
         stream: Arc<CudaStream>,
         capture_stream: Option<Arc<CudaStream>>,
         state: CudaGraphOpState,
@@ -604,7 +604,7 @@ impl CudaGraphOp {
     /// not consume search trials. It does not assign a cost to legal kernels.
     pub(crate) fn resource_plans(
         &self,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<Vec<KernelResourcePlan>, ResourceViolation> {
         self.state
             .borrow()
@@ -661,14 +661,14 @@ impl CudaGraphOp {
             .collect()
     }
 
-    pub(crate) fn resource_dyn_dims(&self) -> &[char] {
+    pub(crate) fn resource_dyn_dims(&self) -> &[Symbol] {
         &self.dyn_dims_order
     }
 
     fn host_device_memory_plan(
         &self,
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         let state = self.state.borrow();
         let mut persistent_bytes = self
@@ -859,7 +859,7 @@ impl HostOp for CudaGraphOp {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         self.execute_internal(stream, buffers, dyn_map)
     }
@@ -879,7 +879,7 @@ impl HostOp for CudaGraphOp {
         _self_node: NodeIndex,
         _inputs: &[NodeIndex],
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<HostDeviceMemoryPlan, ResourceViolation> {
         self.host_device_memory_plan(buffer_lengths, dyn_map)
     }
@@ -1293,10 +1293,7 @@ impl CudaGraphOp {
         }
     }
 
-    fn kernel_requires_output_buffer(
-        kernel: &CompiledKernel,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> bool {
+    fn kernel_requires_output_buffer(kernel: &CompiledKernel, dyn_map: &DynMap) -> bool {
         kernel.kernel_op.output_size().exec(dyn_map).unwrap_or(1) != 0
             && kernel.kernel_op.output_aliases_input().is_none()
     }
@@ -1305,7 +1302,7 @@ impl CudaGraphOp {
         kernel: &CompiledKernel,
         output_ptr: u64,
         input_ptrs: &[u64],
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         if Self::kernel_requires_output_buffer(kernel, dyn_map) && output_ptr == 0 {
             anyhow::bail!(
@@ -1342,7 +1339,7 @@ impl CudaGraphOp {
     /// untouched — a dim change does not dirty it. (The process-global
     /// cuBLASLt heuristic cache is deliberately kept: purging it would fight
     /// autotune and its query is not the dominant transition cost.)
-    pub(crate) fn assume_dyn_dims_stale(&self, stale_dims: &[char]) {
+    pub(crate) fn assume_dyn_dims_stale(&self, stale_dims: &[Symbol]) {
         let mut state = self.state.borrow_mut();
         for dim in stale_dims {
             state.last_dyn_values.remove(dim);
@@ -1548,7 +1545,7 @@ impl CudaGraphOp {
         &self,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         let materialize_start = Instant::now();
         let mut profile = RecaptureProfile::new();
@@ -2116,7 +2113,7 @@ impl CudaGraphOp {
         &self,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         self.materialize(stream, buffers, dyn_map)?;
 
@@ -2548,7 +2545,7 @@ impl CudaGraphOp {
         state: &mut std::cell::RefMut<'_, CudaGraphOpState>,
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         let ctx = stream.context().clone();
         let mut graph = CudaGraphHandle::new(ctx.clone())?;
@@ -3032,7 +3029,7 @@ pub fn kernel_to_host(
         }
 
         // Set global dyn dims ordering so compiles use consistent indices
-        let mut global_dyn_dims: Vec<char> = all_dyn_dims.iter().copied().collect();
+        let mut global_dyn_dims: Vec<Symbol> = all_dyn_dims.iter().copied().collect();
         global_dyn_dims.sort();
         set_global_dyn_dims(global_dyn_dims.clone());
 
@@ -3296,10 +3293,10 @@ pub fn kernel_to_host(
         clear_global_dyn_dims();
 
         // Use the final global ordering if it was extended during compilation
-        let mut dyn_dims_order: Vec<char> = if let Some(final_order) = final_global {
+        let mut dyn_dims_order: Vec<Symbol> = if let Some(final_order) = final_global {
             final_order
         } else {
-            let mut dims: Vec<char> = all_dyn_dims.into_iter().collect();
+            let mut dims: Vec<Symbol> = all_dyn_dims.into_iter().collect();
             dims.sort();
             dims
         };

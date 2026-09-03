@@ -47,7 +47,7 @@ impl DynBackend for CudaLiteDynBackend {
     fn get_output_bool(&self, node: NodeIndex) -> Vec<bool> {
         self.runtime.get_bool(node)
     }
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    fn execute(&mut self, dyn_map: &DynMap) {
         self.runtime.execute(dyn_map);
     }
     fn supports_device_ptrs(&self) -> bool {

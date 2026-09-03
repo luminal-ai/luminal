@@ -249,8 +249,8 @@ pub(crate) struct CompiledBucket {
     arena_conflicts: FxHashSet<(NodeIndex, NodeIndex)>,
     pub(crate) cached_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     pub(crate) buffer_specs: FxHashMap<NodeIndex, BufferSpec>,
-    buffer_spec_dyn_vars: FxHashMap<NodeIndex, Vec<char>>,
-    buffer_spec_nodes_by_dyn_var: FxHashMap<char, Vec<NodeIndex>>,
+    buffer_spec_dyn_vars: FxHashMap<NodeIndex, Vec<Symbol>>,
+    buffer_spec_nodes_by_dyn_var: FxHashMap<Symbol, Vec<NodeIndex>>,
     pub(crate) llir_to_hlir: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) hlir_to_llir: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) hlir_to_all_llir: FxHashMap<NodeIndex, Vec<NodeIndex>>,
@@ -259,17 +259,17 @@ pub(crate) struct CompiledBucket {
     pub(crate) output_data_map: FxHashMap<NodeIndex, NodeIndex>,
     pub(crate) preserved_hlir_inputs: FxHashSet<NodeIndex>,
     pub(crate) kernel_names: Vec<&'static str>,
-    pub(crate) last_dyn_map: FxHashMap<char, usize>,
-    pub(crate) last_allocation_dyn_map: FxHashMap<char, usize>,
+    pub(crate) last_dyn_map: DynMap,
+    pub(crate) last_allocation_dyn_map: DynMap,
     /// Bucket-capacity dimensions used by the most recent hard-resource
     /// validation. Kept separate from allocation state so validation cannot
     /// accidentally suppress a required arena refresh.
-    last_resource_validation_dyn_map: FxHashMap<char, usize>,
+    last_resource_validation_dyn_map: DynMap,
     resource_validation_complete: bool,
-    pub(crate) intermediate_buffer_dims: FxHashSet<char>,
+    pub(crate) intermediate_buffer_dims: FxHashSet<Symbol>,
     pub(crate) cached_device_buffers: FxHashMap<NodeIndex, DeviceBuffer>,
     /// Which bucket index per dim this compilation targets
-    pub(crate) bucket_indices: FxHashMap<char, usize>,
+    pub(crate) bucket_indices: DynMap,
     /// Whether HLIR pointers have been synced into this bucket's cached_buffer_ptrs
     pub(crate) hlir_synced: bool,
     /// Test/debug mode: give every intermediate a distinct arena range so
@@ -336,7 +336,7 @@ struct ArenaReleasePlan {
 
 struct ValidatedBucketSet {
     compiled_buckets: Vec<CompiledBucket>,
-    representative_dyn_maps: Vec<FxHashMap<char, usize>>,
+    representative_dyn_maps: Vec<DynMap>,
     input_lengths_complete: bool,
 }
 
@@ -386,7 +386,7 @@ pub struct CudaRuntime {
     compiled_buckets: Vec<CompiledBucket>,
     active_bucket: usize,
     /// Bucket definitions per dimension (empty = single-bucket mode)
-    dim_buckets: FxHashMap<char, Vec<DimBucket>>,
+    dim_buckets: FxHashMap<Symbol, Vec<DimBucket>>,
 
     /// Non-owning CudaSlice wrappers for external device pointers.
     /// ManuallyDrop prevents cuMemFree — the external allocator (e.g. PyTorch) owns the memory.
@@ -1554,7 +1554,7 @@ impl CudaRuntime {
     fn allocate_intermediate_buffers(
         bucket: &mut CompiledBucket,
         stream: &Arc<CudaStream>,
-        dyn_dims: &FxHashMap<char, usize>,
+        dyn_dims: &DynMap,
     ) {
         let profile_alloc = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let alloc_profile_start = std::time::Instant::now();
@@ -1716,7 +1716,7 @@ impl CudaRuntime {
         }
     }
 
-    fn buffer_plan_matches(bucket: &CompiledBucket, dyn_dims: &FxHashMap<char, usize>) -> bool {
+    fn buffer_plan_matches(bucket: &CompiledBucket, dyn_dims: &DynMap) -> bool {
         if bucket.buffer_specs.is_empty() {
             return true;
         }
@@ -1738,10 +1738,7 @@ impl CudaRuntime {
         })
     }
 
-    fn refresh_intermediate_buffer_lengths(
-        bucket: &mut CompiledBucket,
-        dyn_dims: &FxHashMap<char, usize>,
-    ) {
+    fn refresh_intermediate_buffer_lengths(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
         bucket.logical_buffer_bytes.clear();
         let buffer_lengths = bucket
             .buffer_specs
@@ -1792,7 +1789,7 @@ impl CudaRuntime {
 
     fn refresh_intermediate_buffer_lengths_for_changed_dims(
         bucket: &mut CompiledBucket,
-        dyn_dims: &FxHashMap<char, usize>,
+        dyn_dims: &DynMap,
     ) {
         if bucket.last_dyn_map.is_empty() {
             Self::refresh_intermediate_buffer_lengths(bucket, dyn_dims);
@@ -1844,10 +1841,7 @@ impl CudaRuntime {
         bucket.last_dyn_map = dyn_dims.clone();
     }
 
-    fn initialize_fixed_intermediate_buffer_plan(
-        bucket: &mut CompiledBucket,
-        dyn_dims: &FxHashMap<char, usize>,
-    ) {
+    fn initialize_fixed_intermediate_buffer_plan(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
         bucket.arena_slots.clear();
         bucket.logical_buffer_slots.clear();
 
@@ -1915,10 +1909,7 @@ impl CudaRuntime {
         }
     }
 
-    fn refresh_fixed_intermediate_buffer_plan(
-        bucket: &mut CompiledBucket,
-        dyn_dims: &FxHashMap<char, usize>,
-    ) {
+    fn refresh_fixed_intermediate_buffer_plan(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
         bucket.logical_buffer_offsets.clear();
         bucket.logical_buffer_bytes.clear();
         bucket.logical_buffer_capacity_bytes.clear();
@@ -1972,7 +1963,7 @@ impl CudaRuntime {
 
     fn planned_intermediate_buffers(
         bucket: &mut CompiledBucket,
-        dyn_dims: &FxHashMap<char, usize>,
+        dyn_dims: &DynMap,
         include_zero_sized: bool,
     ) -> Vec<PlannedBuffer> {
         bucket.intermediate_buffer_dims.clear();
@@ -2116,7 +2107,7 @@ impl CudaRuntime {
             .collect_vec()
     }
 
-    fn plan_intermediate_buffers(bucket: &mut CompiledBucket, dyn_dims: &FxHashMap<char, usize>) {
+    fn plan_intermediate_buffers(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
         let old_offsets = bucket.logical_buffer_offsets.clone();
         let old_bytes = bucket.logical_buffer_bytes.clone();
         let old_capacity_bytes = bucket.logical_buffer_capacity_bytes.clone();
@@ -2398,7 +2389,7 @@ impl CudaRuntime {
         }
     }
 
-    fn prepare_bucket_buffers(&mut self, bucket_idx: usize, dyn_map: &FxHashMap<char, usize>) {
+    fn prepare_bucket_buffers(&mut self, bucket_idx: usize, dyn_map: &DynMap) {
         debug_assert!(
             self.compiled_buckets
                 .iter()
@@ -2729,10 +2720,7 @@ impl CudaRuntime {
     /// Post-mortem aid for sticky CUDA errors during search: keep the most
     /// recent candidate's LLIR on disk so a crash identifies the genome that
     /// was executing. Gated on LUMINAL_SEARCH_DUMP_LAST_LLIR.
-    fn dump_candidate_llir_for_postmortem(
-        llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
-    ) {
+    fn dump_candidate_llir_for_postmortem(llir_graph: &LLIRGraph, dyn_map: &DynMap) {
         if std::env::var_os("LUMINAL_SEARCH_DUMP_LAST_LLIR").is_none() {
             return;
         }
@@ -2757,7 +2745,7 @@ impl CudaRuntime {
     fn materialize_bucket_cuda_graphs(
         &mut self,
         bucket_idx: usize,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         allow_missing_inputs: bool,
     ) -> anyhow::Result<()> {
         let fully_dirty = self.compiled_buckets[bucket_idx].materialization_fully_dirty;
@@ -2821,11 +2809,7 @@ impl CudaRuntime {
         Ok(())
     }
 
-    fn bucket_capacity_dyn_map(
-        &self,
-        bucket_idx: usize,
-        dyn_map: &FxHashMap<char, usize>,
-    ) -> FxHashMap<char, usize> {
+    fn bucket_capacity_dyn_map(&self, bucket_idx: usize, dyn_map: &DynMap) -> DynMap {
         let mut capacity_dyn_map = dyn_map.clone();
         let Some(bucket) = self.compiled_buckets.get(bucket_idx) else {
             return capacity_dyn_map;
@@ -2840,10 +2824,10 @@ impl CudaRuntime {
     }
 
     fn bucket_capacity_dyn_map_from_context(
-        dyn_map: &FxHashMap<char, usize>,
-        bucket_indices: &FxHashMap<char, usize>,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
-    ) -> FxHashMap<char, usize> {
+        dyn_map: &DynMap,
+        bucket_indices: &DynMap,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
+    ) -> DynMap {
         let mut capacity_dyn_map = dyn_map.clone();
         for (dim, buckets) in dim_buckets {
             let bucket_idx = bucket_indices.get(dim).copied().unwrap_or(0);
@@ -2854,10 +2838,7 @@ impl CudaRuntime {
         capacity_dyn_map
     }
 
-    fn dry_plan_intermediate_buffers(
-        bucket: &mut CompiledBucket,
-        dyn_dims: &FxHashMap<char, usize>,
-    ) {
+    fn dry_plan_intermediate_buffers(bucket: &mut CompiledBucket, dyn_dims: &DynMap) {
         let needs_new_plan =
             bucket.logical_buffer_slots.is_empty() && !bucket.buffer_specs.is_empty();
         if needs_new_plan {
@@ -2883,9 +2864,7 @@ impl CudaRuntime {
         }
     }
 
-    fn candidate_allocation_dyn_map(
-        context: luminal::op::CandidateFilterContext<'_>,
-    ) -> FxHashMap<char, usize> {
+    fn candidate_allocation_dyn_map(context: luminal::op::CandidateFilterContext<'_>) -> DynMap {
         if let Some(bucket_context) = context.bucket_context {
             Self::bucket_capacity_dyn_map_from_context(
                 context.dyn_map,
@@ -2899,7 +2878,7 @@ impl CudaRuntime {
 
     fn compiled_kernel_resource_plans(
         bucket: &CompiledBucket,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     ) -> Result<Vec<KernelResourcePlan>, ResourceViolation> {
         let mut plans = Vec::new();
         for executable in bucket.exec_graph.node_weights() {
@@ -2910,10 +2889,7 @@ impl CudaRuntime {
         Ok(plans)
     }
 
-    fn complete_resource_dyn_map(
-        bucket: &CompiledBucket,
-        mut dyn_map: FxHashMap<char, usize>,
-    ) -> FxHashMap<char, usize> {
+    fn complete_resource_dyn_map(bucket: &CompiledBucket, mut dyn_map: DynMap) -> DynMap {
         for dim in bucket
             .buffer_specs
             .values()
@@ -3106,7 +3082,7 @@ impl CudaRuntime {
 
     fn compiled_host_device_memory_plans(
         bucket: &CompiledBucket,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         buffer_lengths: &FxHashMap<NodeIndex, usize>,
     ) -> Result<Vec<HostDeviceMemoryPlan>, ResourceViolation> {
         bucket
@@ -3193,7 +3169,7 @@ impl CudaRuntime {
     /// rejected before replacing the working runtime.
     fn retained_bucket_resource_plan(
         buckets: &mut [CompiledBucket],
-        allocation_dyn_maps: &[FxHashMap<char, usize>],
+        allocation_dyn_maps: &[DynMap],
         hlir_buffer_lengths: &FxHashMap<NodeIndex, usize>,
     ) -> Result<CandidateResourcePlan, ResourceViolation> {
         assert_eq!(buckets.len(), allocation_dyn_maps.len());
@@ -3227,7 +3203,7 @@ impl CudaRuntime {
     fn validate_compiled_bucket_resources(
         &mut self,
         bucket_idx: usize,
-        allocation_dyn_map: &FxHashMap<char, usize>,
+        allocation_dyn_map: &DynMap,
     ) -> Result<(), ResourceViolation> {
         let caps = CandidateResourceCaps {
             max_intermediate_bytes: self.max_intermediate_memory_bytes,
@@ -3277,11 +3253,11 @@ impl CudaRuntime {
     /// Pre-allocate buffers and materialize CUDA graphs with the given dynamic
     /// dimension values when all required input buffers are already available.
     #[tracing::instrument(skip_all)]
-    pub fn prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) {
+    pub fn prebuild_graphs(&mut self, dyn_map: &DynMap) {
         self.try_prebuild_graphs(dyn_map).unwrap();
     }
 
-    fn try_prebuild_graphs(&mut self, dyn_map: &FxHashMap<char, usize>) -> anyhow::Result<()> {
+    fn try_prebuild_graphs(&mut self, dyn_map: &DynMap) -> anyhow::Result<()> {
         let bucket_idx = self.active_bucket;
         self.prepare_bucket_buffers(bucket_idx, dyn_map);
         self.materialize_bucket_cuda_graphs(bucket_idx, dyn_map, true)
@@ -3454,7 +3430,7 @@ impl CudaRuntime {
             // trip-difference terms by a constant per body (~3x observed on
             // gemma4_moe) regardless of the candidate's true dim
             // sensitivity.
-            let stale_dims: Vec<char> = {
+            let stale_dims: Vec<Symbol> = {
                 let bucket = &self.compiled_buckets[bucket_idx];
                 bucket
                     .last_dyn_map
@@ -3495,7 +3471,7 @@ impl CudaRuntime {
     fn profile_loaded_llir(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         trials: usize,
         timeout: Option<std::time::Duration>,
         early_stop: Option<(Duration, f64)>,
@@ -3679,7 +3655,7 @@ impl CudaRuntime {
 
     fn try_load_llir_buckets(
         &mut self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) -> anyhow::Result<()> {
         let bucket_llir_refs = bucket_llirs.iter().map(BucketLLIRRef::from).collect_vec();
@@ -3747,7 +3723,7 @@ impl CudaRuntime {
     /// load time.
     fn compile_and_validate_bucket_set(
         &mut self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIRRef<'_>],
     ) -> anyhow::Result<ValidatedBucketSet> {
         // Validate the entire stitched candidate before mutating the currently
@@ -3882,7 +3858,7 @@ impl Runtime for CudaRuntime {
 
     fn filter_llir_bucket_set(
         &mut self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIRRef<'_>],
         _search_options: &CompileOptions,
     ) -> luminal::op::CandidateFilterResult {
@@ -3979,7 +3955,7 @@ impl Runtime for CudaRuntime {
             .sum()
     }
 
-    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &FxHashMap<char, usize>) -> bool {
+    fn has_nan_outputs(&self, _llir_graph: &LLIRGraph, _dyn_map: &DynMap) -> bool {
         let _ = self.cuda_stream.synchronize();
         let bucket = self.active();
         let mut checked = FxHashSet::default();
@@ -4027,7 +4003,7 @@ impl Runtime for CudaRuntime {
     fn profile(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         trials: usize,
         timeout: Option<std::time::Duration>,
         early_stop: Option<(Self::ProfileMetric, f64)>,
@@ -4049,7 +4025,7 @@ impl Runtime for CudaRuntime {
     fn profile_with_bucket_context(
         &mut self,
         llir_graph: &LLIRGraph,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         trials: usize,
         timeout: Option<std::time::Duration>,
         early_stop: Option<(Self::ProfileMetric, f64)>,
@@ -4079,7 +4055,7 @@ impl Runtime for CudaRuntime {
     }
 
     #[tracing::instrument(skip_all)]
-    fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+    fn execute(&mut self, dyn_map: &DynMap) -> Self::ExecReturn {
         let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let runtime_profile_start = std::time::Instant::now();
         let mut bucket_dispatch_time = Duration::ZERO;
@@ -4330,7 +4306,7 @@ impl Runtime for CudaRuntime {
 
     fn load_llir_buckets(
         &mut self,
-        dim_buckets: &FxHashMap<char, Vec<DimBucket>>,
+        dim_buckets: &FxHashMap<Symbol, Vec<DimBucket>>,
         bucket_llirs: &[BucketLLIR],
     ) {
         self.try_load_llir_buckets(dim_buckets, bucket_llirs)
@@ -4626,7 +4602,7 @@ impl CudaRuntime {
     }
 
     /// Resolve which bucket matches the current dyn_map values.
-    fn resolve_bucket(&self, dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn resolve_bucket(&self, dyn_map: &DynMap) -> usize {
         self.compiled_buckets
             .iter()
             .position(|bucket| {
@@ -5378,7 +5354,7 @@ mod arena_plan_tests {
     fn bucket_memory_dry_plan_uses_bucket_capacity_dims() {
         let data = NodeIndex::new(1);
         let mut bucket = CompiledBucket::new();
-        bucket.bucket_indices.insert('s', 1);
+        bucket.bucket_indices.insert(Symbol::from('s'), 1);
         bucket.buffer_specs.insert(
             data,
             BufferSpec {
@@ -5389,10 +5365,13 @@ mod arena_plan_tests {
         bucket.output_producers.insert(NodeIndex::new(99), data);
 
         let mut dim_buckets = FxHashMap::default();
-        dim_buckets.insert('s', vec![DimBucket::new(1, 1), DimBucket::new(2, 64)]);
+        dim_buckets.insert(
+            Symbol::from('s'),
+            vec![DimBucket::new(1, 1), DimBucket::new(2, 64)],
+        );
 
         let mut representative_dyn_map = FxHashMap::default();
-        representative_dyn_map.insert('s', 16);
+        representative_dyn_map.insert(Symbol::from('s'), 16);
         let capacity_dyn_map = CudaRuntime::bucket_capacity_dyn_map_from_context(
             &representative_dyn_map,
             &bucket.bucket_indices,
@@ -5401,7 +5380,7 @@ mod arena_plan_tests {
 
         CudaRuntime::dry_plan_intermediate_buffers(&mut bucket, &capacity_dyn_map);
 
-        assert_eq!(capacity_dyn_map[&'s'], 64);
+        assert_eq!(capacity_dyn_map[&Symbol::from('s')], 64);
         assert_eq!(bucket.arena_bytes, align_up(64 * 4, ARENA_ALIGNMENT));
         assert_eq!(
             CudaRuntime::planned_allocation_bytes(&bucket),
@@ -5571,13 +5550,13 @@ mod arena_plan_tests {
         });
 
         let mut dyn_map = FxHashMap::default();
-        dyn_map.insert('s', 4);
+        dyn_map.insert(Symbol::from('s'), 4);
         CudaRuntime::refresh_fixed_intermediate_buffer_plan(&mut bucket, &dyn_map);
         let first_offset_a = bucket.logical_buffer_offsets[&a];
         let first_offset_b = bucket.logical_buffer_offsets[&b];
         let first_arena_bytes = bucket.arena_bytes;
 
-        dyn_map.insert('s', 32);
+        dyn_map.insert(Symbol::from('s'), 32);
         CudaRuntime::refresh_fixed_intermediate_buffer_plan(&mut bucket, &dyn_map);
 
         assert_eq!(bucket.logical_buffer_slots[&a], 0);

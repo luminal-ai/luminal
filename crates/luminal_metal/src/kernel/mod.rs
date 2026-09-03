@@ -15,7 +15,40 @@ use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::cell::RefCell;
 
-pub const DYN_SLOT_COUNT: usize = 26;
+thread_local! {
+    /// Layout of the shared `dyn[]` buffer: slot `i` holds the size of
+    /// `DYN_DIMS_ORDER[i]`. Codegen bakes these indices into generated source
+    /// and the runtime uploads in the same order, so both must read one list.
+    /// Built by `dyn_slot` as compilation reaches each dim.
+    static DYN_DIMS_ORDER: RefCell<Vec<Symbol>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Drop the previous graph's layout. Must run before compiling, or slots
+/// carry over and the buffer is sized for dims this graph never reads.
+pub(crate) fn clear_dyn_dims_order() {
+    DYN_DIMS_ORDER.with(|order| order.borrow_mut().clear());
+}
+
+/// The current `dyn[]` buffer layout.
+pub(crate) fn dyn_dims_order() -> Vec<Symbol> {
+    DYN_DIMS_ORDER.with(|order| order.borrow().clone())
+}
+
+/// This dim's slot, assigning the next one if it has not been seen.
+///
+/// Appends, never inserts, so a slot already baked into emitted source keeps
+/// its meaning. The runtime re-reads the layout after compiling and sizes the
+/// buffer to match.
+pub(crate) fn dyn_slot(symbol: &Symbol) -> usize {
+    DYN_DIMS_ORDER.with(|order| {
+        if let Some(slot) = order.borrow().iter().position(|d| d == symbol) {
+            return slot;
+        }
+        let mut order = order.borrow_mut();
+        order.push(*symbol);
+        order.len() - 1
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MpsMatrixDescriptorKey {
@@ -163,7 +196,7 @@ pub trait MetalKernelOp: EgglogOp {
         pipeline: &ComputePipelineState,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
     );
 
     #[allow(clippy::too_many_arguments)]
@@ -173,7 +206,7 @@ pub trait MetalKernelOp: EgglogOp {
         pipeline: Option<&ComputePipelineState>,
         inputs: &[&Buffer],
         output: &Buffer,
-        dyn_map: &FxHashMap<char, usize>,
+        dyn_map: &DynMap,
         _input_dtypes: &[DType],
         _output_dtype: DType,
     ) {
@@ -189,15 +222,15 @@ pub trait MetalKernelOp: EgglogOp {
     // Performance Metrics for MBU/MFU Calculation
     // ========================================================================
 
-    fn bytes_loaded(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_loaded(&self, _dyn_map: &DynMap) -> usize {
         0
     }
 
-    fn bytes_stored(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn bytes_stored(&self, _dyn_map: &DynMap) -> usize {
         0
     }
 
-    fn flops(&self, _dyn_map: &FxHashMap<char, usize>) -> usize {
+    fn flops(&self, _dyn_map: &DynMap) -> usize {
         0
     }
 

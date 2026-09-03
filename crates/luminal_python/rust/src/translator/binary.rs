@@ -11,7 +11,7 @@ use super::Translator;
 fn normalize_equal_dims(
     a: &mut GraphTensor,
     b: &mut GraphTensor,
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) {
     for i in 0..a.legacy_tracker_ref().len() {
         let lhs = a.legacy_tracker_ref().dims[i];
@@ -26,7 +26,7 @@ fn normalize_equal_dims(
 fn same_dims(
     lhs: &[IntExpr],
     rhs: &[IntExpr],
-    sym_ranges: &FxHashMap<char, ExprBounds>,
+    sym_ranges: &FxHashMap<Symbol, ExprBounds>,
 ) -> bool {
     lhs.len() == rhs.len()
         && lhs
@@ -185,7 +185,7 @@ mod tests {
         let lhs = (a.min(1) + a).min(a + 1) - 1;
         let rhs = (a.min(1) + a).min(a);
         let sym_ranges = [(
-            'a',
+            Symbol::from('a'),
             ExprBounds {
                 min: Some(2),
                 max: None,

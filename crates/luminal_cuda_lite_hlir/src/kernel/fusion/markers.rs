@@ -38,7 +38,7 @@ type CompileOut = (
     (IntExpr, IntExpr, IntExpr),
     (IntExpr, IntExpr, IntExpr),
     IntExpr,
-    FxHashMap<char, CudaSlice<u8>>,
+    FxHashMap<Symbol, CudaSlice<u8>>,
 );
 
 // =========================================================================

@@ -1,5 +1,5 @@
 pub mod symbol;
-pub use symbol::{DynMap, Symbol};
+pub use symbol::{DynMap, InvalidSymbolName, Symbol};
 mod expression;
 
 pub use expression::*;

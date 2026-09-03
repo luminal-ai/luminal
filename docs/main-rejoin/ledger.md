@@ -34,6 +34,7 @@ Dispositions:
 | `6a5313f2` | #398 | Support for PyTorch OpInfo tests | MIXED — FILE-LEVEL (python + workflow) / RE-EXPRESSED (`TypedBuffer::F64` + typed unary kernels) / DROPPED (`ConstantF64`, the empty-Vec fix) | branch `merge/main-398-opinfo` (two commits) | OpInfo harness, the arange-metadata and acos/acosh lowerings = M4 translator requirements; typed `LogicalConstant`; F32<->F64 cast policy; F64 on CL — see **#398 OpInfo + F64** below |
 | `db3c80fd` | #399 | Add native narrow integer HLIR dtypes | MIXED — FILE-LEVEL (python) / RE-EXPRESSED (I8/U8/I16 TypedBuffer + kernels, int-safe `abs`) | branch `merge/main-399-narrow-ints` (two commits) | **CARVE-OUT to confirm at review**: I8/U8/I16 wrap, I32/I64 stay checked — see **#399 narrow ints** below |
 | `727918cd` | #394 | Optimize CUDA graph materialization and StaticCache writebacks | FILE-LEVEL (parks) + INTENT-ONLY (core) | branch `merge/main-394-cuda-graph-park` | REQUIREMENT FOR THE CL EXECUTOR: durable external device-pointer registration, exact binding-delta graph patching, cached reverse indexes, resource-signature reuse — see **#394 CL executor persistence** below |
+| `b3b975ae` | #396 | shape: name symbolic dimensions instead of numbering them a..z | FILE-LEVEL (parks) + LANDED-BY-EQUIVALENT (core, `90f687bf`) + RE-EXPRESSED (`Symbol::try_new_dim`) | branch `merge/main-396-symbol-parked` | core: resolve later — the branch's own Symbol is the keeper; the PT2 remap and Metal's `dyn[]` slot layout are re-attachment requirements; see **#396 Symbol** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -563,3 +564,87 @@ poke (`CudaRuntime`, `CompiledBucket`) is absent here. The two pure helpers
 `device_ranges_overlap` and `should_consume_hlir_input` are ~15 lines and are
 the only directly liftable fragments; copy them when the CL executor needs
 them.
+
+## #396 Symbol — parks tracked, core landed-by-equivalent
+
+RULED 2026-09-02 (ruling 4): *"let's merge the content, we can resolve
+later"*, with the CORE files explicitly NOT applied.
+
+**CORE: LANDED-BY-EQUIVALENT, resolve later.** This branch landed the same
+design independently and deliberately on the same day, as `90f687bf` ("Symbol
+lands: string-backed validated dim names (our PR #396)", 2026-08-13). Same
+contract — `Term::Var(Symbol)`, a Copy handle to an arbitrary-length name,
+equality/hash/order BY NAME so backend slot assignment is a function of the
+graph rather than of interning order — with a simpler mechanism: this branch
+interns one leaked `&'static str` in a process-global map, so `Symbol` derives
+Eq/Hash/Ord and there is no interior mutability inside map keys, which is why
+it needs no `clippy.toml` `mutable_key_type` whitelist (main's arena version
+does, and that is the `clippy.toml` hunk this commit does NOT take). Applying
+main's `src/shape/{symbol,expression,tracker,mod}.rs`, `src/graph.rs`,
+`src/op.rs`, `src/hlir.rs`, `src/dyn_backend.rs` and `src/egglog_utils/*`
+would REGRESS the branch, not advance it; five of those files do not exist
+here at all. The two headline bugs main fixes are already fixed here: the
+extraction truncation (`name.chars().next()` turning `"s77"` into `'s'`) at
+`src/egglog_core/egglog_utils/mod.rs:214-230`, and the 26-name pool overflow,
+which cannot occur because names are strings. Main also reserves `"z"`; this
+branch reserves nothing — `z` was retired 2026-08-06.
+
+**FILE-LEVEL, into the parks.** `crates/luminal_cuda_lite/` (31 files)
+path-rewritten into `crates/luminal_cuda_lite_hlir/`, plus
+`crates/luminal_python` (7), `crates/luminal_metal` (6),
+`crates/luminal_bench` (1) and `crates/luminal_training` (4). The training
+crate is not named in the ruling's parenthetical list of parks; it is the same
+kind of thing — a non-member crate — and its four hunks are one-line
+`FxHashMap<char, usize>` -> `DynMap` retypings, so it is carried with the rest
+and flagged here rather than silently dropped.
+
+55 conflicts in the park and 17 in metal/python, all the same shape: the
+branch's `Expression` -> `IntExpr` rename (A2 quarantine) meeting main's new
+`Symbol`/`DynMap` types. Every one resolves to MAIN's content in the BRANCH's
+spelling. Two needed more than that:
+
+- `crates/luminal_cuda_lite_hlir/src/tests/flashinfer.rs` — main writes
+  `named_tensor(name, dim).as_dtype(Int)`; `as_dtype` was DELETED here
+  (frontend purity rulings 2026-07-30), so the branch's
+  `named_tensor_dtyped(name, dim, Int)` is kept with main's new `token_dim` /
+  `context_dim` variables.
+- `crates/luminal_metal/src/tests.rs` — main REPLACES its own test
+  `dynamic_const_codegen_uses_dyn_buffer` with
+  `dyn_slots_are_assigned_by_position_not_by_letter`, because the mechanism
+  the old one tested (the `dyn[byte - b'a']` ABI) is what the commit deletes.
+  Main's replacement is taken. Nothing is weakened here that this branch runs:
+  metal is not a workspace member.
+
+**UNCARRIED.** `clippy.toml` (+10) — a whitelist for a hazard the branch's
+`Symbol` does not have. `examples/qwen/src/lib.rs` (+1/-1) — no such example
+here; the branch has `examples/qwen3`, a different file, and the hunk is a
+one-line `FxHashMap<char, usize>` -> `DynMap` signature change with no
+counterpart.
+
+**RE-EXPRESSED into live core: `Symbol::try_new_dim`.** Ruling 4 makes this
+conditional on the banked PT2 remap actually referencing it, and it does —
+`crates/luminal_python/rust/src/pt2_parser.rs` calls it twice. So
+`src/shape/symbol.rs` gains the FALLIBLE door beside the panicking
+`Symbol::new` (which now delegates to it, so the two report identically and
+the existing `should_panic` test is untouched), plus an `InvalidSymbolName`
+error type. Main's is a two-variant enum (`Malformed | Reserved`); this branch
+reserves no name, so malformedness is the only failure and the type is a
+struct. The point of the fallible door, written into its doc comment: a
+frontend importing someone else's graph must be able to SEE a rejection and
+remap, because DROPPING an unusable dim is the worst available outcome — a dim
+absent from the symbol map never gets a value, so it freezes at the export
+hint while the frontend, told it was dynamic, declines to recompile. Names are
+still rejected, never sanitized. Test:
+`luminal::shape::symbol::tests::try_new_dim_reports_instead_of_unwinding`.
+
+**Requirements carried, for whenever these crates are re-attached.**
+
+1. **PT2 remap** (`crates/luminal_python/rust/src/pt2_parser.rs`): keep
+   torch's own name, remap to a COUNTED `pt2_dim_{n}` only when the name is
+   unusable, never drop and never sanitize (sanitizing is not injective —
+   `a.b` and `a-b` collide). The banked file now says this; the live door it
+   needs (`try_new_dim`) exists as of this commit.
+2. **Metal `dyn[]` slots** (`crates/luminal_metal/src/kernel/ops.rs`): the
+   per-graph DISCOVERED slot layout replaces `dyn[byte - b'a']`. Under any
+   scheme, a 27th dim writes past an unchecked pointer, so this is a
+   soundness requirement on the metal re-attachment, not a cleanup.

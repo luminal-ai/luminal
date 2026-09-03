@@ -174,7 +174,7 @@ impl HostOp for SinkAttention {
         self_node: NodeIndex,
         inputs: &[NodeIndex],
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
-        _dyn_map: &FxHashMap<char, usize>,
+        _dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             inputs.len() == 7,
