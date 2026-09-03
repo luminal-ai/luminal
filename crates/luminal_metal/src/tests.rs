@@ -35,6 +35,79 @@ fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
     }
 }
 
+#[test]
+fn metal_rms_norm_rewrite_matches_reference() {
+    const ROWS: usize = 3;
+    const COLS: usize = 2048;
+    const EPS: f32 = 1e-5;
+
+    let mut cx = Graph::default();
+    let input = cx.tensor(('s', COLS));
+    let weight = cx.tensor(COLS);
+    let output = rms_norm(input, weight, EPS).output();
+    cx.set_dim('s', ROWS);
+
+    let input_data = seeded_data(ROWS * COLS, 1.8, -0.9);
+    let weight_data = seeded_data(COLS, 0.8, 0.6);
+    let mut expected = vec![0.0; ROWS * COLS];
+    for row in 0..ROWS {
+        let values = &input_data[row * COLS..(row + 1) * COLS];
+        let mean_square = values.iter().map(|value| value * value).sum::<f32>() / COLS as f32;
+        let inv_rms = 1.0 / (mean_square + EPS).sqrt();
+        for col in 0..COLS {
+            expected[row * COLS + col] = values[col] * inv_rms * weight_data[col];
+        }
+    }
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_op(&cx, "MetalRMSNorm"),
+        "expected the decomposed RMSNorm to offer a fused Metal candidate"
+    );
+    let llir = extract_llir_with_op(&cx, "MetalRMSNorm");
+    let mut runtime = MetalRuntime::initialize(());
+    runtime.load_llir(&llir);
+    runtime.set_data(input, &input_data);
+    runtime.set_data(weight, &weight_data);
+    let selected_ops = runtime.debug_kernel_ops();
+    assert!(
+        selected_ops.iter().any(|op| op.contains("MetalRMSNorm")),
+        "expected fused RMSNorm, selected ops: {selected_ops:?}"
+    );
+    runtime.allocate_intermediate_buffers(&cx.dyn_map);
+    runtime.execute(&cx.dyn_map);
+
+    assert_close(&runtime.get_f32(output), &expected, 2e-4);
+}
+
+#[test]
+fn metal_rms_norm_preserves_small_epsilon() {
+    const ROWS: usize = 2;
+    const COLS: usize = 17;
+    const EPS: f32 = 1e-12;
+
+    let mut cx = Graph::default();
+    let input = cx.tensor((ROWS, COLS));
+    let weight = cx.tensor(COLS);
+    let output = rms_norm(input, weight, EPS).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    let llir = extract_llir_with_op(&cx, "MetalRMSNorm");
+    let mut runtime = MetalRuntime::initialize(());
+    runtime.load_llir(&llir);
+    runtime.set_data(input, vec![0.0f32; ROWS * COLS]);
+    runtime.set_data(weight, vec![1.0f32; COLS]);
+    runtime.allocate_intermediate_buffers(&cx.dyn_map);
+    runtime.execute(&cx.dyn_map);
+
+    let actual = runtime.get_f32(output);
+    assert!(
+        actual.iter().all(|value| value.is_finite()),
+        "small positive epsilon must prevent zero-input NaNs: {actual:?}"
+    );
+    assert_close(&actual, &[0.0; ROWS * COLS], 1e-6);
+}
+
 fn bytes_of<T: bytemuck::NoUninit>(values: &[T]) -> Vec<u8> {
     bytemuck::cast_slice(values).to_vec()
 }
@@ -54,6 +127,118 @@ fn egraph_has_op(cx: &Graph, op_name: &str) -> bool {
         .enodes
         .values()
         .any(|(label, _)| label == op_name)
+}
+
+fn extract_llir_with_op(cx: &Graph, op_name: &str) -> luminal::graph::LLIRGraph {
+    let egraph = cx.egraph().expect("search space should be built");
+    let ops = cx
+        .egglog_ops()
+        .expect("search space should have registered egglog ops");
+    let ir_nodes = egraph
+        .enodes
+        .iter()
+        .filter_map(|(node, (label, children))| {
+            if label != "Op" {
+                return None;
+            }
+            let kind_class = children.first()?;
+            egraph.eclasses[kind_class]
+                .1
+                .iter()
+                .any(|kind_node| egraph.enodes[kind_node].0 == op_name)
+                .then_some(node)
+        })
+        .collect::<Vec<_>>();
+    assert!(!ir_nodes.is_empty(), "no {op_name} IR candidate found");
+
+    let mut last_error = None;
+    for ir_node in ir_nodes {
+        for background in 0..64 {
+            let mut rng = StdRng::seed_from_u64(0x4D45_5441_4C00 + background);
+            let mut choices = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
+            choices.insert(&egraph.node_to_class[ir_node], ir_node);
+            if let Err(error) = luminal::egglog_utils::validate_choice_set(egraph, &choices, ops) {
+                last_error = Some(error);
+                continue;
+            }
+
+            let mut list_cache = FxHashMap::default();
+            let mut expr_cache = FxHashMap::default();
+            let llir = luminal::egglog_utils::egglog_to_llir(
+                egraph,
+                choices,
+                ops,
+                &cx.custom_ops,
+                &mut list_cache,
+                &mut expr_cache,
+                None,
+            );
+            if llir.node_indices().any(|node| {
+                llir[node]
+                    .to_dialect::<dyn crate::kernel::MetalKernelOp>()
+                    .is_some_and(|op| format!("{op:?}").contains(op_name))
+            }) {
+                return llir;
+            }
+            last_error = Some(format!("forced {op_name} candidate did not reach LLIR"));
+        }
+    }
+
+    panic!(
+        "failed to extract {op_name} candidate: {}",
+        last_error.as_deref().unwrap_or("no valid choice set")
+    );
+}
+
+#[test]
+fn metal_rms_norm_rewrite_rejects_noncontiguous_input() {
+    let mut cx = Graph::default();
+    let input = cx.tensor((32, 4)).permute((1, 0));
+    let weight = cx.tensor(32);
+    rms_norm(input, weight, 1e-5).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_op(&cx, "MetalRMSNorm"),
+        "the contiguous-only fused kernel must not replace a strided RMSNorm"
+    );
+}
+
+#[test]
+fn metal_rms_norm_rewrite_rejects_dynamic_last_dimension() {
+    let mut cx = Graph::default();
+    let input = cx.tensor(('s', 'h'));
+    let weight = cx.tensor('h');
+    rms_norm(input, weight, 1e-5).output();
+    cx.set_dim('s', 2);
+    cx.set_dim('h', 32);
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_op(&cx, "MetalRMSNorm"),
+        "the static-column fused kernel must not be selectable for a dynamic last dimension"
+    );
+}
+
+#[test]
+fn metal_rms_norm_rewrite_rejects_mismatched_square_views() {
+    const SIZE: usize = 8;
+
+    let mut cx = Graph::default();
+    let input = cx.tensor((SIZE, SIZE));
+    let weight = cx.tensor(SIZE);
+    let axis = input.shape.last_axis();
+    let inverse_rms = ((input * input.permute((1, 0))).mean(axis) + 1e-5)
+        .sqrt()
+        .reciprocal()
+        .expand_to_shape_on_axes(input.shape, axis);
+    ((inverse_rms * input) * weight.expand_lhs([SIZE])).output();
+
+    cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+    assert!(
+        !egraph_has_op(&cx, "MetalRMSNorm"),
+        "the fusion must reject a lookalike whose square reads x through different layouts"
+    );
 }
 
 fn assert_matmul_options(cx: &Graph, mps_op_name: &str) {
@@ -682,6 +867,37 @@ fn metal_simple_max_reduce() {
 
     let out = rt.get_f32(output);
     assert_close(&out, &[4.0, 8.0], 0.001);
+}
+
+#[test]
+fn metal_reductions_cover_simd_boundaries() {
+    const ROWS: usize = 2;
+
+    for cols in [17, 33, 65, 257, 1025] {
+        let mut cx = Graph::default();
+        let input = cx.tensor((ROWS, cols));
+        let sum_output = input.sum(1).output();
+        let max_output = input.max(1).output();
+        let input_data = seeded_data(ROWS * cols, 2.0, -1.0);
+        let expected_sum = input_data
+            .chunks_exact(cols)
+            .map(|row| row.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let expected_max = input_data
+            .chunks_exact(cols)
+            .map(|row| row.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+            .collect::<Vec<_>>();
+
+        cx.build_search_space::<MetalRuntime>(CompileOptions::default());
+        let mut rt = MetalRuntime::initialize(());
+        rt.set_data(input, &input_data);
+        rt = cx.search(rt, CompileOptions::default().search_graph_limit(5));
+        rt.allocate_intermediate_buffers(&cx.dyn_map);
+        rt.execute(&cx.dyn_map);
+
+        assert_close(&rt.get_f32(sum_output), &expected_sum, 0.001);
+        assert_close(&rt.get_f32(max_output), &expected_max, 0.001);
+    }
 }
 
 #[test]
