@@ -192,6 +192,56 @@ fn test_scatter_nocopy_candidate_rejected_when_dest_has_unordered_read() {
         .expect("the copying scatter remains a legal candidate");
 }
 
+/// Search must be able to select copying scatters when several results read
+/// the same logical destination and therefore cannot mutate it in place.
+#[test]
+fn test_scatter_search_handles_shared_destination_branches() {
+    let ctx = CudaContext::new(0).unwrap();
+    ctx.bind_to_thread().unwrap();
+    let stream = ctx.default_stream();
+
+    let mut cx = Graph::default();
+    let dest = cx.tensor(8).persist();
+    let indexes = cx.tensor(8).as_dtype(DType::Int).persist();
+    let zero = cx.tensor(8).persist();
+    let shared = zero.scatter(indexes, dest);
+    let sources: Vec<_> = (0..4).map(|_| cx.tensor(8).persist()).collect();
+    for source in &sources {
+        source.scatter(indexes, shared).output();
+    }
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let mut runtime = CudaRuntime::initialize(stream);
+    runtime.set_data(dest, vec![0.0f32; 8]);
+    runtime.set_data(indexes, (0..8).collect::<Vec<i32>>());
+    runtime.set_data(zero, vec![0.0f32; 8]);
+    for (value, source) in sources.into_iter().enumerate() {
+        runtime.set_data(source, vec![value as f32; 8]);
+    }
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(0x5CA7_5A4E);
+    runtime = cx.search_with_rng(
+        runtime,
+        CompileOptions::default().search_graph_limit(1),
+        &mut rng,
+    );
+    let scatter_names: Vec<_> = runtime
+        .kernel_names()
+        .iter()
+        .copied()
+        .filter(|name| name.contains("Scatter"))
+        .collect();
+    assert_eq!(scatter_names.len(), 5);
+    assert!(
+        scatter_names
+            .iter()
+            .filter(|&&name| name == "ScatterNoCopy")
+            .count()
+            <= 1,
+        "shared destination branches must use copying scatter: {scatter_names:?}",
+    );
+}
+
 /// Candidate-local validation follows every edge, including reads where the
 /// destination is not the first input (Gather takes indexes before data).
 #[test]

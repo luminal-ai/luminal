@@ -1226,6 +1226,22 @@ mod tests {
         }
     }
 
+    /// Zero-extent slices are NOT special-cased (ruling 2026-09-03, against
+    /// main's `38640588`, which short-circuits an empty slice into a
+    /// metadata-only view): recording one must simply work. This pins the
+    /// recording half only -- no search, no execution.
+    #[test]
+    fn zero_extent_slice_records_without_special_casing() {
+        let mut cx = Graph::new();
+        let input = cx.tensor((1, 4, 64), DType::F32);
+        let empty = input.slice_along(64.., 2);
+
+        assert_eq!(
+            empty.dims(),
+            vec![IntExpr::from(1), IntExpr::from(4), IntExpr::from(0)]
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(10))]
         #[test]
