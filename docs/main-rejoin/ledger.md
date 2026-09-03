@@ -37,6 +37,7 @@ Dispositions:
 | `b3b975ae` | #396 | shape: name symbolic dimensions instead of numbering them a..z | FILE-LEVEL (parks) + LANDED-BY-EQUIVALENT (core, `90f687bf`) + RE-EXPRESSED (`Symbol::try_new_dim`) | branch `merge/main-396-symbol-parked` | core: resolve later — the branch's own Symbol is the keeper; the PT2 remap and Metal's `dyn[]` slot layout are re-attachment requirements; see **#396 Symbol** below |
 | `2fbf5b6a` | #400 | cuda_lite: retype dim maps | DROPPED | — | ruling 5 of 2026-09-02: *"okay, we can drop"*. But the mismatch it repairs is now VERIFIABLY PRESENT in the park — see **#400 dropped** below, which names all 8 sites |
 | `1d07093c` | #401 | Reuse persistent CUDA intermediate arena | FILE-LEVEL (park) + INTENT-ONLY (core) | branch `merge/main-401-arena-park` | REQUIREMENT FOR THE CL EXECUTOR: honour the plan's `BufferAlloc`/`BufferFree` against one runtime-owned high-water slab; park-don't-free, keep-the-largest, re-attach-only-if-wanted — see **#401 persistent arena** below |
+| `7e7deb2a` | #404 | Spec | FILE-LEVEL (`spec.md`) | branch `merge/main-404-spec` | ruling 7 of 2026-09-02: *"this is just a snapshot, we'll update it later"* — the text describes main's architecture (translator-fed HLIR, loop-rolling, genetic LLIR extraction), NOT this branch's; see **#404 spec.md** below for the line-by-line divergence |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -748,3 +749,38 @@ cannot move — it is device-gated and pokes
 `rt.compiled_buckets[0].arena` / `rt.persistent_arena` directly, fields absent
 from this branch's `CudaRuntime`. A branch-side equivalent has to be written
 fresh against `device.rs` storage and would need an A100.
+
+## #404 spec.md — a snapshot of the OTHER architecture, landed as-is
+
+RULED 2026-09-02 (ruling 7): *"this is just a snapshot, we'll update it
+later"*. `spec.md` (128 lines) is taken byte for byte, unedited.
+
+It is worth being precise about what it currently claims, because it is a
+document a future reader will take at face value and it describes main's
+pipeline, not this one. Its compile flow reads
+`Frontend -> HLIR Graph -> Loop-rolled HLIR Graph -> Egglog Saturation ->
+EGraph -> Extraction Search (genetic) -> Looped LLIR Graph -> Backend
+Profiling -> unrolled LLIR -> Runtime`. On this branch:
+
+- **There is no HLIR.** `src/hlir.rs` and `src/op.rs` are deleted. The
+  frontend is the `GraphTensor` RECORDER (`src/graph.rs` + `src/frontend/*`)
+  producing `LogicalOp`s directly; there is no translator stage and no
+  HLIROp/EgglogOp/ReferenceOp trio.
+- **There is no loop-rolling stage.** Structure reaches egglog through the
+  logical ops' own `.egg` estates (`src/logical_op/*`), not through a rolled
+  HLIR graph.
+- **Extraction is not genetic-only, and does not produce LLIR.**
+  `src/extractor.rs` walks the e-graph to LayoutTensor ops,
+  `src/implementation_search.rs` runs the search over them, and
+  `src/bufferize.rs` lowers the winner to a `BufferIrGraph` of buffers and
+  plan nodes. "LLIR" names nothing here.
+- **What IS still true**, and is the part worth keeping when the document is
+  rewritten: semantic equivalence must hold across the whole search space; the
+  reference runtime is CPU ground truth; and the program as authored is an
+  unmodifiable statement of INTENT that the optimizer may only re-implement,
+  never redefine.
+
+**Owed:** a spec rewritten against the recorder / `egglog_core` /
+`extractor` + `implementation_search` / `bufferize` / CL flow. Adapting this
+text line by line would be worse than starting from the pipeline as it is;
+what should survive the rewrite is the contracts section, not the diagram.
