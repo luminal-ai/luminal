@@ -529,6 +529,42 @@ def test_functional_batch_norm_returns_stats_and_updates() -> None:
     _check(module, *inputs)
 
 
+class InferenceBatchNorm(torch.nn.Module):
+    def __init__(self, affine: bool):
+        super().__init__()
+        self.affine = affine
+
+    def forward(self, value, weight, bias, running_mean, running_var):
+        return torch.ops.aten._native_batch_norm_legit_no_training.default(
+            value,
+            weight if self.affine else None,
+            bias if self.affine else None,
+            running_mean,
+            running_var,
+            0.2,
+            1e-5,
+        )
+
+
+def test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats() -> (
+    None
+):
+    torch.manual_seed(11)
+    inputs = (
+        torch.randn(2, 3, 4, 5),
+        torch.randn(3),
+        torch.randn(3),
+        torch.randn(3) + 3.0,
+        torch.rand(3) + 0.5,
+    )
+    for affine in (False, True):
+        module = InferenceBatchNorm(affine)
+        expected = module(*inputs)
+        assert expected[1].numel() == 0
+        assert expected[2].numel() == 0
+        _check(module, *inputs)
+
+
 class OrderingAndDistances(torch.nn.Module):
     def forward(self, value, other, points, points2):
         return (

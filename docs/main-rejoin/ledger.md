@@ -55,6 +55,7 @@ Dispositions:
 | `188e92e8` | #435 | Add persistent compiled artifact reuse for Python and CUDA backends | FILE-LEVEL (7 files into the `cuda_lite_hlir` park + 1 metal-park file + 9 python-park files, 2 re-spelled `Expression` -> `IntExpr`) + FULL-FILE PARK (11 core files, post-#435, into `crates/luminal_cuda_lite_hlir/main_core/`) | branch `merge/main-cuda-graph-line-parks-wip` (2nd commit) | **PARITY REQUIRED — LUM-806** (https://linear.app/luminalai/issue/LUM-806). RULED 2026-09-04: *"you'll have to park it in the HLIR copy and then record that we need to get to feature parity for this. It is something we absolutely need to have eventually."* A compiled artifact must persist the SELECTED SCHEDULE so a fresh process runs without re-running the genetic search — see **#435 persistent compiled artifacts** below |
 | `a3c5df9f` | #437 | Fix signed integral aten.pow.Tensor_Scalar lowering | FILE-LEVEL | branch `merge/main-python-parks-wip` | the defect main fixes in the translator is LIVE in this branch's own frontend — `GraphTensor::pow` at `src/frontend/binary.rs:395` is the same `abs().log().mul(e).exp()`; RULED 2026-09-04 *"fix the front end"*, delivered as PR #491 — see **#437 signed integral pow** below |
 | `2b368a29` | #440 | Make cuBLASLt capture cache capacity configurable | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (3rd commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild** for the once-stated reason) — see **#440 capture cache capacity** below |
+| `e8780fc8` | #441 | Lower inference native batch norm | FILE-LEVEL | branch `merge/main-python-parks-wip` | the search-space argument is a REQUIREMENT on the M4 re-attachment: an eval-mode BatchNorm must emit no batch reductions at all, not dead ones the extractor still has to cost — see **#441 inference batch norm** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4124,6 +4125,33 @@ that has already grown still evicts instead of silently retaining forever.
 `crates/luminal_cuda_lite_hlir/src/kernel/to_host.rs` (const at `:123`, the
 reader at `:125`, the multiply at `:1337`, the eviction checks at `:3472` and
 `:3890`); diff-of-diffs identical.
+## #441 inference batch norm — banked; the dead-reduction argument recorded
+
+Main's `e8780fc8` routes
+`torch.ops.aten._native_batch_norm_legit_no_training.default` into
+`translate_batch_norm_functional` and makes that function honest about what
+inference needs: `training` is forced false for the new overload, the
+`training || functional` guard admits it, and `batch_mean` / `batch_var` become
+`Option`s computed only on the training path, with every later use taking them
+through `.context(..)`. The three files applied 3-way with one conflict, in
+`pooling.rs`, on park drift alone — main's `compute.shape` is `compute.dims()`
+here — resolved to main's content in the park's spelling; the diff-of-diffs
+against `e8780fc8` is then EMPTY modulo exactly that substitution. (`#414`'s
+other known respelling in this function, `input.shape.len()` ->
+`input.legacy_tracker_ref().len()`, sat in the hunk's context and needed no
+hand work.)
+
+The reason worth keeping is main's own comment, and it is a compiler argument
+rather than a lowering one: an eval-mode BatchNorm that still computes a batch
+mean and variance is not merely doing dead work, it *enlarges the search
+space*, because those reductions are real nodes the extractor has to cost
+before discovering nothing consumes them. That is a REQUIREMENT on the M4
+translator re-attachment — refuse to record the reductions, do not rely on
+downstream elimination — and it generalises past batch norm to every
+training/inference-forked lowering. Nothing was rebuilt or rerun:
+`crates/luminal_python` is not a workspace member here, so main's pytest
+(`test_inference_batch_norm_uses_running_stats_and_returns_empty_saved_stats`,
+affine and non-affine) remains main's.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
