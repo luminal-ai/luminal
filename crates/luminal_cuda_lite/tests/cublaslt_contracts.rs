@@ -144,6 +144,22 @@ fn to_device(stream: &Arc<cudarc::driver::CudaStream>, host: &[f32]) -> CudaSlic
     slice
 }
 
+/// The executor binds buffers to ARENA RANGES now (#422 Phase 3), so
+/// `device_call::dispatch` takes pointer+length pairs rather than
+/// `&CudaSlice` handles. These tests own whole slices; this is the
+/// one-line adapter.
+fn as_range(
+    stream: &Arc<cudarc::driver::CudaStream>,
+    slice: &CudaSlice<u8>,
+) -> device_call::DeviceRange {
+    use cudarc::driver::DevicePtr;
+    let (ptr, _record) = slice.device_ptr(stream);
+    device_call::DeviceRange {
+        ptr,
+        bytes: slice.len(),
+    }
+}
+
 fn from_device(stream: &Arc<cudarc::driver::CudaStream>, slice: &CudaSlice<u8>) -> Vec<f32> {
     let mut host = vec![0u8; slice.len()];
     stream.memcpy_dtoh(slice, &mut host).expect("D2H");
@@ -224,16 +240,16 @@ fn all_four_contract_forms_execute_green() {
 
         let dev_a = to_device(&stream, &a);
         let dev_b = to_device(&stream, &b);
-        let mut operands: Vec<&CudaSlice<u8>> = vec![&dev_a, &dev_b];
+        let mut operands = vec![as_range(&stream, &dev_a), as_range(&stream, &dev_b)];
         let dev_c = c.as_ref().map(|c| to_device(&stream, c));
         let dev_bias = bias.as_ref().map(|v| to_device(&stream, v));
         if let Some(dc) = dev_c.as_ref() {
-            operands.push(dc);
+            operands.push(as_range(&stream, dc));
         }
         if let Some(db) = dev_bias.as_ref() {
-            operands.push(db);
+            operands.push(as_range(&stream, db));
         }
-        let mut dest = stream.alloc_zeros::<u8>(m * n * 4).expect("dest alloc");
+        let dest = stream.alloc_zeros::<u8>(m * n * 4).expect("dest alloc");
 
         // Bias forms: COL D (ld = m), the order the library supports for
         // BIAS/RELU_BIAS; the epilogue adds bias[row] along D's rows.
@@ -245,7 +261,7 @@ fn all_four_contract_forms_execute_green() {
                 LtOrder::Row
             }
         );
-        device_call::dispatch(&call, &operands, &mut dest, &stream)
+        device_call::dispatch(&call, &operands, as_range(&stream, &dest), &stream)
             .unwrap_or_else(|e| panic!("{form:?} dispatch: {e:#}"));
         stream.synchronize().expect("sync");
 
@@ -283,9 +299,14 @@ fn ld_bounds_violation_refuses_before_dispatch() {
     };
     let dev_a = to_device(&stream, &weights(2, 1));
     let dev_b = to_device(&stream, &weights(16, 2));
-    let mut dest = stream.alloc_zeros::<u8>(4 * 4).expect("short dest"); // 4 f32s, needs 8
-    let err = device_call::dispatch(&call, &[&dev_a, &dev_b], &mut dest, &stream)
-        .expect_err("the short D buffer must be refused BEFORE dispatch");
+    let dest = stream.alloc_zeros::<u8>(4 * 4).expect("short dest"); // 4 f32s, needs 8
+    let err = device_call::dispatch(
+        &call,
+        &[as_range(&stream, &dev_a), as_range(&stream, &dev_b)],
+        as_range(&stream, &dest),
+        &stream,
+    )
+    .expect_err("the short D buffer must be refused BEFORE dispatch");
     let msg = format!("{err:#}");
     assert!(msg.contains("refused BEFORE dispatch"), "{msg}");
     stream.synchronize().expect("sync");
@@ -313,15 +334,15 @@ fn bias_form_with_a_row_d_is_refused_before_dispatch() {
         let b = weights(k * n, 2);
         let dev_a = to_device(&stream, &a);
         let dev_b = to_device(&stream, &b);
-        let mut operands: Vec<&CudaSlice<u8>> = vec![&dev_a, &dev_b];
+        let mut operands = vec![as_range(&stream, &dev_a), as_range(&stream, &dev_b)];
         let dev_c = form.has_c().then(|| to_device(&stream, &weights(m * n, 3)));
         let dev_bias = to_device(&stream, &weights(m, 4));
         if let Some(dc) = dev_c.as_ref() {
-            operands.push(dc);
+            operands.push(as_range(&stream, dc));
         }
-        operands.push(&dev_bias);
-        let mut dest = stream.alloc_zeros::<u8>(m * n * 4).expect("dest alloc");
-        let err = device_call::dispatch(&call, &operands, &mut dest, &stream)
+        operands.push(as_range(&stream, &dev_bias));
+        let dest = stream.alloc_zeros::<u8>(m * n * 4).expect("dest alloc");
+        let err = device_call::dispatch(&call, &operands, as_range(&stream, &dest), &stream)
             .expect_err("a ROW-order D under a bias form must trip the fence");
         let msg = format!("{err:#}");
         assert!(msg.contains("unreachable"), "{form:?}: {msg}");

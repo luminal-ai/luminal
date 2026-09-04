@@ -25,7 +25,7 @@
 use anyhow::{anyhow, Context, Result};
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaStream, DevicePtr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::exec::{CSource, LtCall, LtDesc, LtOrder};
@@ -181,16 +181,29 @@ impl Drop for Desc {
     }
 }
 
+/// One bound device range: base pointer and extent in bytes. The
+/// executor binds buffers to ARENA SLAB RANGES (#422, Phase 3 of the
+/// rejoin), which are sub-ranges of one allocation, so it can no longer
+/// hand this call `&CudaSlice` handles — several ranges are live at
+/// once and the borrow checker admits at most one mutable view of the
+/// slab. A pointer plus a length is exactly what `cublasLtMatmul`
+/// consumes anyway.
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceRange {
+    pub ptr: u64,
+    pub bytes: usize,
+}
+
 /// Dispatch one resolved call, stream-ordered on `stream` (the same
 /// stream the surrounding kernels use). `operands` are the Lit operand
-/// buffers `[a, b, c?, bias?]`; `dest` is the (fresh, executor-owned)
-/// D buffer. The caller has ALREADY run `call.validate_against` — this
-/// function re-checks (defense in depth) and then never re-derives a
-/// number the `LtCall` carries.
+/// buffers `[a, b, c?, bias?]`; `dest` is the D buffer — the range the
+/// arena assigned it. The caller has ALREADY run
+/// `call.validate_against` — this function re-checks (defense in depth)
+/// and then never re-derives a number the `LtCall` carries.
 pub fn dispatch(
     call: &LtCall,
-    operands: &[&CudaSlice<u8>],
-    dest: &mut CudaSlice<u8>,
+    operands: &[DeviceRange],
+    dest: DeviceRange,
     stream: &Arc<CudaStream>,
 ) -> Result<()> {
     // BIAS/ORDER TRIPWIRE, DEFENSE IN DEPTH (ruling 2026-09-01): a
@@ -203,8 +216,8 @@ pub fn dispatch(
     super::exec::assert_bias_destination_order(call, "dispatch")?;
     // Pre-dispatch bounds gate (contract 4) — LOUD, before any library
     // call, byte counts converted to f32 element counts.
-    let elems: Vec<usize> = operands.iter().map(|s| s.len() / 4).collect();
-    call.validate_against(&elems, dest.len() / 4)
+    let elems: Vec<usize> = operands.iter().map(|r| r.bytes / 4).collect();
+    call.validate_against(&elems, dest.bytes / 4)
         .context("cuBLASLt pre-dispatch bounds validation")?;
 
     let handle = handle()?;
@@ -260,16 +273,11 @@ pub fn dispatch(
         (&epilogue) as *const _ as *const _,
         std::mem::size_of::<sys::cublasLtEpilogue_t>(),
     )?;
-    // Held to function scope: the use-tracking record must cover the
-    // enqueued matmul, not just the descriptor write below.
-    let mut _bias_use_record = None;
     if let Some(bias_idx) = call.bias_operand {
-        let bias_slice = operands
+        let bias_ptr = operands
             .get(bias_idx)
-            .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?;
-        let (bias_ptr, record) = bias_slice.device_ptr(stream);
-        _bias_use_record = Some(record);
-        let bias_ptr = bias_ptr as u64;
+            .ok_or_else(|| anyhow!("bias operand {bias_idx} missing"))?
+            .ptr;
         set_desc(
             sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
             (&bias_ptr) as *const _ as *const _,
@@ -344,15 +352,14 @@ pub fn dispatch(
     // Pointers. Literal HOST scalars (contract 2): alpha = 1.0f const;
     // beta structural. C pointer: the c operand on the C-fold forms,
     // the D pointer otherwise (beta = 0.0f, C never read — contract 3).
-    let (a_ptr, _ra) = operands[0].device_ptr(stream);
-    let (b_ptr, _rb) = operands[1].device_ptr(stream);
-    let (d_ptr, _rd) = dest.device_ptr_mut(stream);
+    let a_ptr = operands[0].ptr;
+    let b_ptr = operands[1].ptr;
+    let d_ptr = dest.ptr;
     let (c_ptr, beta): (u64, &'static f32) = match call.c_source {
         CSource::AliasD => (d_ptr, &BETA_ZERO),
         CSource::Operand(i) => {
-            let (p, _rc) = operands[i].device_ptr(stream);
             debug_assert!(call.beta_is_one);
-            (p, &BETA_ONE)
+            (operands[i].ptr, &BETA_ONE)
         }
     };
     let (w_ptr, _rw) = workspace.device_ptr(stream);
