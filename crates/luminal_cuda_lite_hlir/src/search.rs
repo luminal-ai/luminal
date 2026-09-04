@@ -74,7 +74,9 @@ impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
             };
             match compiled {
                 Ok(validated) => {
-                    let _selected = lattice.select(set);
+                    let selected = lattice.select_with_genomes(set);
+                    self.selected_schedule =
+                        luminal::graph::SelectedSchedule::from_search(space, &selected);
                     self.install_validated_bucket_set(&space.dim_buckets, validated)
                         .unwrap_or_else(|error| {
                             panic!("failed to install the selected CUDA bucket set: {error}")

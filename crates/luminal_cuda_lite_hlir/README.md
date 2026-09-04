@@ -62,3 +62,12 @@ Choice-set validation detects correlated e-class cycles before LLIR loading.
 Random initial genomes repair only those reachable cycles; later mutations may
 still produce them, in which case candidate filtering discards them without
 profiling and continues searching the remaining legal alternatives.
+
+### `main_core/` — a record of main's core, not code
+
+`main_core/` holds full copies of files from main's own `src/` (core), mirrored
+at main's relative paths, for commits whose core half cannot be diffed onto this
+branch because the file was deleted or replaced here — it starts with the eleven
+core files of main's #435 (`188e92e8`, persistent compiled artifact reuse). It is
+a RECORD ONLY: nothing under it is a module of this crate, this crate is not a
+workspace member, and none of it is compiled, referenced or kept in sync.

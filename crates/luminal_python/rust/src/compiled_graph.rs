@@ -10,6 +10,9 @@ use std::collections::HashMap;
 
 use crate::typed_data::TypedData;
 
+mod artifact;
+pub(crate) use artifact::load_compiled_artifact;
+
 /// Copy a CPU buffer into Rust-owned storage.
 ///
 /// PyTorch legitimately reports `data_ptr() == 0` for an empty tensor, so a
@@ -178,6 +181,9 @@ pub struct CompiledGraph {
     pub dim_bounds: DimBoundsMap,
     /// See [`GraphTranslation::writeback_outputs`].
     pub writeback_outputs: Vec<(usize, String)>,
+    tensor_sizes: HashMap<String, usize>,
+    external_cuda_graph: bool,
+    serializable: bool,
 }
 
 impl CompiledGraph {
@@ -213,6 +219,8 @@ impl CompiledGraph {
             tensor_sizes,
             device_ptrs,
         } = weight_data;
+        let serializable = weights.is_empty() && device_ptrs.is_empty();
+        let artifact_tensor_sizes = tensor_sizes.clone();
 
         // Build compile args from WeightData.
         let compile_args = BackendCompileArgs {
@@ -225,6 +233,7 @@ impl CompiledGraph {
                 .collect(),
             tensor_sizes,
             device_ptrs,
+            backend_artifact: None,
         };
 
         // Create backend via the factory directly
@@ -261,6 +270,9 @@ impl CompiledGraph {
             dim_param_map,
             dim_bounds,
             writeback_outputs,
+            tensor_sizes: artifact_tensor_sizes,
+            external_cuda_graph,
+            serializable,
         })
     }
 
@@ -295,6 +307,17 @@ impl CompiledGraph {
 
 #[pymethods]
 impl CompiledGraph {
+    #[pyo3(signature = (cache_key=None))]
+    fn serialize_artifact<'py>(
+        &self,
+        py: Python<'py>,
+        cache_key: Option<String>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = artifact::serialize(self, cache_key)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
     /// Get the list of input tensor names.
     #[getter]
     fn input_names(&self) -> Vec<String> {

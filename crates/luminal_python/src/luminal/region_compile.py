@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
-from .artifact_cache import region_artifact_key
+from .artifact_cache import CompiledArtifact, get_or_load, region_artifact_key
 from .compiled_model import CompiledModel
 from .pt2 import _save_and_compile
 from .region_export import RegionExport
+
+
+def _cuda_factory():
+    try:
+        from .luminal import _cuda_lite_factory_capsule
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "region compilation requires luminal_python built with CUDA support"
+        ) from error
+    return _cuda_lite_factory_capsule()
 
 
 def compile_region(
@@ -33,13 +43,6 @@ def compile_region(
             f"got {region.device_index}"
         )
 
-    try:
-        from .luminal import _cuda_lite_factory_capsule
-    except (ImportError, AttributeError) as error:
-        raise RuntimeError(
-            "region compilation requires luminal_python built with CUDA support"
-        ) from error
-
     artifact_key = region_artifact_key(
         region.program,
         device_type=device_type,
@@ -50,7 +53,7 @@ def compile_region(
 
     return _save_and_compile(
         region.program,
-        _cuda_lite_factory_capsule(),
+        _cuda_factory(),
         search_iterations,
         user_indices=region.input_indices,
         output_spec=region.output_spec,
@@ -60,4 +63,33 @@ def compile_region(
         static_outputs=static_outputs,
         external_cuda_graph=external_cuda_graph,
         artifact_key=artifact_key,
+    )
+
+
+def load_region_artifact(
+    data,
+    *,
+    input_indices,
+    output_spec,
+    device_index,
+    static_outputs=False,
+    external_cuda_graph=False,
+) -> CompiledModel:
+    artifact = get_or_load(
+        data,
+        lambda: CompiledArtifact.deserialize(
+            data,
+            _cuda_factory(),
+            device_index=device_index,
+            external_cuda_graph=external_cuda_graph,
+        ),
+        backend="cuda",
+        device_index=device_index,
+        external_cuda_graph=external_cuda_graph,
+    )
+    return artifact.bind(
+        user_indices=input_indices,
+        output_spec=output_spec,
+        use_current_stream=True,
+        static_outputs=static_outputs,
     )
