@@ -174,7 +174,7 @@ pub fn genome_preferring(
     adopt_genome(
         luminal_cuda_lite::ops::cublaslt::election::genome_preferring(
             egraph,
-            matchers(),
+            &matchers(),
             preferences,
         ),
     )
@@ -233,7 +233,7 @@ pub fn genome_with_ordering(
     adopt_genome(
         luminal_cuda_lite::ops::cublaslt::election::genome_with_ordering(
             egraph,
-            matchers(),
+            &matchers(),
             &bridge,
         ),
     )

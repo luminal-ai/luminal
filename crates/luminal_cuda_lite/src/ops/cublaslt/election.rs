@@ -26,7 +26,7 @@ type ProducerOrdering<'a> =
 /// over the CALLER's matcher set via the genome seam.)
 pub fn genome_preferring(
     egraph: &luminal::prelude::egraph_serialize::EGraph,
-    matchers: Vec<Box<dyn OpMatcher>>,
+    matchers: &[Box<dyn OpMatcher>],
     preferences: &[&str],
 ) -> crate::extractor::Genome {
     let preferences: Vec<String> = preferences.iter().map(|s| s.to_string()).collect();
@@ -81,7 +81,7 @@ pub fn level_admits(level: usize) -> impl Fn(&str) -> bool {
 /// (dead rows are legal and free).
 pub fn genome_with_ordering(
     egraph: &luminal::prelude::egraph_serialize::EGraph,
-    matchers: Vec<Box<dyn OpMatcher>>,
+    matchers: &[Box<dyn OpMatcher>],
     ordered: ProducerOrdering<'_>,
 ) -> crate::extractor::Genome {
     use luminal::prelude::egraph_serialize::ClassId;

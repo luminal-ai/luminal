@@ -33,15 +33,30 @@ struct NativeParts {
     binding_seeds: String,
 }
 
+/// A `Default` instance holds NO program and NO op vocabulary: every
+/// ladder method past `load` refuses it by name (`load before search`),
+/// so the empty registry a default carries is never the thing a caller
+/// searches under. `load`/`load_with_cublaslt`/`load_with_registry` are
+/// the only ways to get a usable one.
 #[derive(Default)]
 pub struct CudaRuntime {
     native: Option<NativeParts>,
-    /// Train 3: assemble/search with the cuBLASLt marker vocabulary.
-    /// RULED always-on (2026-09-01); still OFF by default only until the
-    /// search budget/sampler catches up with the collapse's
-    /// re-description 2-cycle (see [`crate::ops::cuda_registry_with_cublaslt`]);
-    /// enabled through [`CudaRuntime::load_with_cublaslt`].
-    cublaslt: bool,
+    /// THE INSTANCE'S OP VOCABULARY (Phase 2, 2026-09-03): the matcher
+    /// column of the registry this runtime was LOADED with, and the
+    /// allow list derived from that same registry. Both are decided once,
+    /// at [`CudaRuntime::load_with_registry`], and never consulted from a
+    /// crate-level constant again — which op set a runtime assembles,
+    /// saturates, searches and claims with is a property of the instance,
+    /// selectable by its caller.
+    ///
+    /// The matchers are HELD rather than rebuilt because `dyn OpMatcher`
+    /// is not clonable and one instance runs many extractions (every
+    /// genome, and with buckets every Cartesian combination); everything
+    /// downstream borrows this slice.
+    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    /// The claim set derived from that same registry — see
+    /// [`CudaRuntime::allow_list_over`] for the three classes.
+    allow: Vec<&'static str>,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
     staged: FxHashMap<i64, HostBuffer>,
@@ -65,24 +80,11 @@ pub struct CudaRuntime {
 }
 
 impl CudaRuntime {
-    /// Record the graph's native program. Saturation happens in
+    /// Record the graph's native program under the DEFAULT op registry
+    /// ([`crate::ops::cuda_registry`]). Saturation happens in
     /// [`CudaRuntime::search`].
     pub fn load(graph: &graph::Graph) -> Result<Self> {
-        let (pre_schedule, input_slots, output_slots, post_checks, labeled_checks) = graph
-            .logical
-            .bound_parts(&crate::bindings::CudaBindings)
-            .map_err(|e| anyhow!(e))?;
-        Ok(Self {
-            native: Some(NativeParts {
-                pre_schedule,
-                input_slots,
-                output_slots,
-                post_checks,
-                labeled_checks,
-                binding_seeds: String::new(),
-            }),
-            ..Self::default()
-        })
+        Self::load_with_registry(graph, crate::ops::cuda_registry())
     }
 
     /// [`CudaRuntime::load`] with the cuBLASLt marker vocabulary
@@ -94,19 +96,70 @@ impl CudaRuntime {
     /// re-description 2-cycle — loudly, never a wrong plan. The 2D
     /// canonical matmul form searches and elects green; real graphs
     /// elect at 12×16.
+    ///
+    /// It is now exactly [`CudaRuntime::load_with_registry`] over the
+    /// [`crate::ops::cuda_registry_with_cublaslt`] preset — a named
+    /// convenience, not a mode.
     pub fn load_with_cublaslt(graph: &graph::Graph) -> Result<Self> {
-        let mut rt = Self::load(graph)?;
-        rt.cublaslt = true;
-        Ok(rt)
+        Self::load_with_registry(graph, crate::ops::cuda_registry_with_cublaslt())
     }
 
-    /// The matcher vocabulary this instance assembles/searches with.
-    fn matchers(&self) -> Vec<Box<dyn luminal::layout_ir::OpMatcher>> {
-        if self.cublaslt {
-            crate::ops::cuda_matchers_with_cublaslt()
-        } else {
-            crate::ops::cuda_matchers()
-        }
+    /// THE CONFIGURABLE LOAD (ruling 2026-09-03: *"you should select the
+    /// allowed ops when you initialize the runtime ... You should not
+    /// need to edit CL in order to modify this"*): record the graph's
+    /// native program and FIX this instance's op vocabulary to the given
+    /// registry. Everything downstream — the assembled egglog preamble,
+    /// the saturation, the extraction matcher set, and the derived allow
+    /// list the search claims through — reads that registry and nothing
+    /// else, so two runtimes in one process may hold different op sets.
+    ///
+    /// Build the argument with [`crate::ops::cuda_registry_filtered`]
+    /// (narrow either preset by label or constructor) or by pushing
+    /// [`crate::ops::RegisteredOp::new`] rows onto one. A row whose op
+    /// is neither kernel-bearing, plan-transparent, nor host-dispatchable
+    /// is simply not claimable — it never reaches the allow list, so the
+    /// search refuses loudly instead of electing something the device
+    /// cannot run.
+    pub fn load_with_registry(
+        graph: &graph::Graph,
+        registry: Vec<crate::ops::RegisteredOp>,
+    ) -> Result<Self> {
+        let (pre_schedule, input_slots, output_slots, post_checks, labeled_checks) = graph
+            .logical
+            .bound_parts(&crate::bindings::CudaBindings)
+            .map_err(|e| anyhow!(e))?;
+        // Derive the claim set BEFORE the rows are consumed: the allow
+        // list reads the prototypes, the search reads the matchers.
+        let allow = Self::allow_list_over(&registry);
+        let matchers = registry.into_iter().map(|entry| entry.matcher).collect();
+        Ok(Self {
+            native: Some(NativeParts {
+                pre_schedule,
+                input_slots,
+                output_slots,
+                post_checks,
+                labeled_checks,
+                binding_seeds: String::new(),
+            }),
+            matchers,
+            allow,
+            ..Self::default()
+        })
+    }
+
+    /// The matcher vocabulary this instance assembles/searches with —
+    /// LENT, never rebuilt (see the field's note).
+    fn matchers(&self) -> &[Box<dyn luminal::layout_ir::OpMatcher>] {
+        &self.matchers
+    }
+
+    /// The claim set THIS instance searches under — the allow list
+    /// derived from the registry it was loaded with. Named
+    /// `active_allow_list` because the static
+    /// [`CudaRuntime::allow_list`] (the default preset's) already owns
+    /// the plain name and inherent methods may not share one.
+    pub fn active_allow_list(&self) -> &[&'static str] {
+        &self.allow
     }
 
     /// Seed interval bounds for a dynamic dimension (facts, never pins:
@@ -238,6 +291,11 @@ impl CudaRuntime {
     ///    (`cublasLtMatmul`) — claimable because the device runs them
     ///    without any NVRTC kernel (see
     ///    [`crate::ops::cublaslt::host_dispatchable`]).
+    ///
+    /// THIS STATIC IS THE DEFAULT PRESET'S claim set — the same
+    /// derivation over [`crate::ops::cuda_registry`], for callers with no
+    /// graph in hand. A LOADED instance claims what its own registry
+    /// derives: [`CudaRuntime::active_allow_list`].
     pub fn allow_list() -> Vec<&'static str> {
         Self::allow_list_over(&crate::ops::cuda_registry())
     }
@@ -310,7 +368,7 @@ impl CudaRuntime {
         };
         let full = format!(
             "{}\n\n{}",
-            luminal::egglog_snippet::assembled_program_for(&self.matchers()),
+            luminal::egglog_snippet::assembled_program_for(self.matchers()),
             program.text
         );
         let mut egraph = luminal::egglog_snippet::new_egraph();
@@ -320,7 +378,7 @@ impl CudaRuntime {
             let mut doors = Vec::new();
             let unchecked = format!(
                 "{}\n\n{}\n{}\n{}",
-                luminal::egglog_snippet::assembled_program_for(&self.matchers()),
+                luminal::egglog_snippet::assembled_program_for(self.matchers()),
                 native.pre_schedule,
                 native.binding_seeds,
                 crate::bindings::CudaBindings::SCHEDULE
@@ -372,11 +430,9 @@ impl CudaRuntime {
             );
         }
 
-        let allow = Some(if self.cublaslt {
-            Self::allow_list_with_cublaslt()
-        } else {
-            Self::allow_list()
-        });
+        // THIS INSTANCE's claim set, derived at load from THIS
+        // instance's registry — no crate-level default is consulted.
+        let allow = Some(self.allow.clone());
 
         // Own matchers, own allow list, own ranking: nothing in this
         // search touches another runtime.
@@ -395,9 +451,7 @@ impl CudaRuntime {
             // per-bucket caller data — the ranking is device-free — so
             // the ordinary `search` entry serves both shapes.
             let assembly = crate::search::BucketAssembly {
-                assembled_program: &luminal::egglog_snippet::assembled_program_for(
-                    &self.matchers(),
-                ),
+                assembled_program: &luminal::egglog_snippet::assembled_program_for(self.matchers()),
                 pre_schedule: &native.pre_schedule,
                 binding_seeds: &native.binding_seeds,
                 schedule: crate::bindings::CudaBindings::SCHEDULE,
@@ -411,7 +465,7 @@ impl CudaRuntime {
                 &self.dim_buckets,
                 options,
                 allow,
-                || self.matchers(),
+                self.matchers(),
             )?;
             let first = plans
                 .first()

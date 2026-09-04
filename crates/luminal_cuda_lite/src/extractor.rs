@@ -40,7 +40,7 @@ struct Extractor<'a> {
     /// structural plumbing — inputs, outputs, buffer lists — is never
     /// filtered). This registry is the ONLY dispatch: an enode whose label
     /// has no entry here simply offers no implementation candidate.
-    matchers: HashMap<&'static str, Box<dyn OpMatcher>>,
+    matchers: HashMap<&'static str, &'a dyn OpMatcher>,
     class_nodes: HashMap<ClassId, Vec<NodeId>>,
     /// The shared rendering state: the render-time class index and the
     /// per-(class, depth, preference) render memo, behind an `Rc` so the
@@ -180,7 +180,7 @@ struct ProducerRef {
 /// TestRuntime seam — see `Extractor::new_with_matchers`).
 pub fn extract_layout_ir_with_matchers(
     egraph: &EGraph,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
 ) -> Result<Option<ExtractedGraph>> {
     Extractor::new_with_matchers(egraph, None, None, matchers).extract()
 }
@@ -200,7 +200,7 @@ impl<'a> ExtractionSession<'a> {
     pub fn new_with_matcher_set(
         egraph: &'a EGraph,
         allowed_ops: Option<&[&str]>,
-        matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+        matchers: &'a [Box<dyn luminal::layout_ir::OpMatcher>],
     ) -> Self {
         let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
         let mut extractor = Extractor::new_with_matchers(egraph, allowed, None, matchers);
@@ -497,7 +497,7 @@ impl<'a> ExtractionSession<'a> {
 pub fn extract_layout_ir_with_ops_and_matchers(
     egraph: &EGraph,
     allowed_ops: Option<&[&str]>,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
 ) -> Result<Option<ExtractedGraph>> {
     let allowed = allowed_ops.map(|ops| ops.iter().map(|op| op.to_string()).collect());
     let mut extractor = Extractor::new_with_matchers(egraph, allowed, None, matchers);
@@ -535,7 +535,7 @@ pub struct Genome {
 pub fn extract_layout_ir_with_genome_and_matchers(
     egraph: &EGraph,
     genome: &Genome,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
 ) -> Result<Option<ExtractedGraph>> {
     let mut extractor = Extractor::new_with_matchers(egraph, None, Some(genome), matchers);
     extractor.apply_viability_filter();
@@ -549,7 +549,7 @@ pub fn extract_layout_ir_with_genome_and_matchers(
 /// from. Classes with no producers (boundary inputs) are absent.
 pub fn producer_index_with_matchers(
     egraph: &EGraph,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
 ) -> std::collections::BTreeMap<ClassId, Vec<(String, ProducerChoice)>> {
     let mut extractor = Extractor::new_with_matchers(egraph, None, None, matchers);
     extractor.apply_viability_filter();
@@ -885,10 +885,18 @@ impl<'a> Extractor<'a> {
         egraph: &'a EGraph,
         allowed_ops: Option<HashSet<String>>,
         genome: Option<&Genome>,
-        matcher_set: Vec<Box<dyn OpMatcher>>,
+        matcher_set: &'a [Box<dyn OpMatcher>],
     ) -> Self {
-        let matchers: HashMap<&'static str, Box<dyn OpMatcher>> = matcher_set
-            .into_iter()
+        // THE MATCHER SET IS LENT, NOT OWNED (Phase 2, 2026-09-03): the
+        // vocabulary belongs to the runtime INSTANCE that was loaded
+        // with it, and one instance runs many extractions (every genome
+        // of every bucket). Borrowing is what lets the runtime hold the
+        // list once instead of rebuilding it per call — `dyn OpMatcher`
+        // is not `Clone` and the registry is chosen at `load`, so there
+        // is nothing to rebuild it FROM down here.
+        let matchers: HashMap<&'static str, &'a dyn OpMatcher> = matcher_set
+            .iter()
+            .map(|matcher| matcher.as_ref())
             .filter(|matcher| {
                 allowed_ops
                     .as_ref()

@@ -604,8 +604,13 @@ fn bufferize_cycle_tripwire(
 }
 
 /// THE SELECTION LOOP for this backend: the caller supplies its OWN
-/// matcher vocabulary (the cuBLASLt marker set is an instance option)
-/// and its OWN allow list. Deterministic for a fixed seed.
+/// matcher vocabulary and its OWN allow list — both are properties of
+/// the runtime INSTANCE, chosen when it was loaded (see
+/// [`crate::CudaRuntime::load_with_registry`]), not of this crate. The
+/// vocabulary is BORROWED: one instance runs many extractions (every
+/// genome, and with buckets every combination), and `dyn OpMatcher` is
+/// not clonable, so the list lives in the runtime and is lent here.
+/// Deterministic for a fixed seed.
 ///
 /// NO CALLER DATA (D6, 2026-09-03): candidates are ranked by
 /// [`crate::heuristic::heuristic_cost_of`], which never runs anything,
@@ -617,7 +622,7 @@ pub fn search_implementations(
     program: &LogicalProgram,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
-    matchers: Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
 ) -> Result<SearchOutcome> {
     let mut timings = SearchTimings::default();
     let analysis_start = Instant::now();
@@ -921,7 +926,7 @@ pub fn bucketed_search_implementations(
     dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
-    matchers: impl Fn() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
+    matchers: &[Box<dyn luminal::layout_ir::OpMatcher>],
 ) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
     let mut plans = Vec::new();
@@ -939,7 +944,7 @@ pub fn bucketed_search_implementations(
             &program,
             options,
             allow_override.clone(),
-            matchers(),
+            matchers,
         )?;
         plans.push(BucketPlan {
             ranges,
