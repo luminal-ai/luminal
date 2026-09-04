@@ -59,6 +59,7 @@ Dispositions:
 | `cb8d270d` | #442 | Evict cached cuBLASLt graphs before recapture | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (4th commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild**) — see **#440 capture cache capacity** and **#442 evict before recapture** below |
 | `fb6bf0a4` | #450 | Bound serving CUDA graph bucket residency | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (5th commit) | — nothing live corresponds: this branch has no per-bucket CUDA graph residency to bound (see **#430 dyn-dims on rebuild**) — see **#450 bucket residency** below |
 | `dd3d6633` | #453 | Raise Qwen3 MoE TTFT CI limit | IGNORED (nothing applied; `ci/example_output.py` deliberately NOT synced) | — | RULED 2026-09-04: *"just ignore the number in CI for now, we're eventually going to move these tests out of CI/CD into their own system"* — this reverses the earlier sync-main's-numbers decision (ruling 1 of 2026-09-02) for this one line — see **#453 qwen3_moe TTFT** below |
+| `e891a57e` | #466 | Report memory state on CUDA graph capture failure | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (7th commit) | — nothing live corresponds (no materialization to fail; see **#430 dyn-dims on rebuild**) — see **#466 capture-failure diagnostics** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4206,6 +4207,19 @@ narrows the earlier sync-main's-numbers decision (ruling 1 of 2026-09-02) to
 exclude this line. Nothing is at risk either way: this branch has never
 re-baselined `qwen3_moe` against its own CL runtime, so the figure gates nothing
 here and is a main-side A100 draw about main's HLIR CUDA backend, not ours.
+
+## #466 capture-failure diagnostics — parked
+
+Main's `e891a57e` (+11/-1, one file) is a diagnostics-only change: when
+`materialize_bucket_cuda_graphs` fails, the panic no longer says only *"CUDA
+graph materialization failed: {e}"* but also names the active bucket, the
+configured `max_materialized_buckets` limit, the current
+`materialized_bucket_lru`, and the device's live `mem_get_info()` free/total.
+The point is that the failures worth debugging here are OOMs caused by
+residency policy, and the residency state (#450) is exactly what the old
+message omitted. **Disposition: FILE-LEVEL park, path-rewritten only** —
+applied verbatim to `crates/luminal_cuda_lite_hlir/src/runtime.rs`;
+diff-of-diffs identical.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
