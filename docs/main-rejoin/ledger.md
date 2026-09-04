@@ -54,6 +54,7 @@ Dispositions:
 | `e7f9127a` | #430 | Restore CUDA dyn dims buffer on graph rebuild | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-430-487-cuda-graph-parks` (1st commit) | — nothing live corresponds: this branch's `crates/luminal_cuda_lite` captures no CUDA graphs at all, so there is no rebuild path to fix — see **#430 dyn-dims on rebuild** below, which says that once for the whole eight-commit line |
 | `188e92e8` | #435 | Add persistent compiled artifact reuse for Python and CUDA backends | FILE-LEVEL (7 files into the `cuda_lite_hlir` park + 1 metal-park file + 9 python-park files, 2 re-spelled `Expression` -> `IntExpr`) + FULL-FILE PARK (11 core files, post-#435, into `crates/luminal_cuda_lite_hlir/main_core/`) | branch `merge/main-cuda-graph-line-parks-wip` (2nd commit) | **PARITY REQUIRED — LUM-806** (https://linear.app/luminalai/issue/LUM-806). RULED 2026-09-04: *"you'll have to park it in the HLIR copy and then record that we need to get to feature parity for this. It is something we absolutely need to have eventually."* A compiled artifact must persist the SELECTED SCHEDULE so a fresh process runs without re-running the genetic search — see **#435 persistent compiled artifacts** below |
 | `a3c5df9f` | #437 | Fix signed integral aten.pow.Tensor_Scalar lowering | FILE-LEVEL | branch `merge/main-python-parks-wip` | the defect main fixes in the translator is LIVE in this branch's own frontend — `GraphTensor::pow` at `src/frontend/binary.rs:395` is the same `abs().log().mul(e).exp()`; RULED 2026-09-04 *"fix the front end"*, delivered as PR #491 — see **#437 signed integral pow** below |
+| `2b368a29` | #440 | Make cuBLASLt capture cache capacity configurable | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (3rd commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild** for the once-stated reason) — see **#440 capture cache capacity** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4106,6 +4107,23 @@ workspace member here, so main's pytest verification (the parametrised
 `test_pow_by_integral_scalar_preserves_sign`, the integer-base dtype promotion
 check, and the GPT-2 GELU regression) remains main's, measured against main's
 HLIR backend.
+
+## #440 capture cache capacity — parked
+
+Main's `2b368a29` (+12/-4, one file) turns the hard-coded cuBLASLt child-graph
+capture cache size into a knob: `CUBLASLT_CAPTURE_CACHE_CAPACITY: usize = 2`
+becomes `DEFAULT_CUBLASLT_CAPTURE_CACHE_CAPACITY` plus a
+`cublaslt_capture_cache_capacity()` reader over
+`LUMINAL_CUBLASLT_CAPTURE_CACHE_CAPACITY`, parsed and filtered to a positive
+value with the default as fallback. All three uses move to the function — the
+`persistent_device_bytes().checked_mul(...)` resource accounting so the planner
+prices whatever capacity is actually configured, and the two eviction checks,
+which also relax `==` to `>=` so a capacity lowered at runtime below a cache
+that has already grown still evicts instead of silently retaining forever.
+**Disposition: FILE-LEVEL park, path-rewritten only** — applied verbatim to
+`crates/luminal_cuda_lite_hlir/src/kernel/to_host.rs` (const at `:123`, the
+reader at `:125`, the multiply at `:1337`, the eviction checks at `:3472` and
+`:3890`); diff-of-diffs identical.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

@@ -120,7 +120,15 @@ struct CompiledCuBlasLt {
     capture_cache_hits: usize,
 }
 
-const CUBLASLT_CAPTURE_CACHE_CAPACITY: usize = 2;
+const DEFAULT_CUBLASLT_CAPTURE_CACHE_CAPACITY: usize = 2;
+
+fn cublaslt_capture_cache_capacity() -> usize {
+    std::env::var("LUMINAL_CUBLASLT_CAPTURE_CACHE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&capacity| capacity > 0)
+        .unwrap_or(DEFAULT_CUBLASLT_CAPTURE_CACHE_CAPACITY)
+}
 
 struct CachedCuBlasLtCapture {
     signature: CuBlasLtCaptureSignature,
@@ -1326,7 +1334,7 @@ impl CudaGraphOp {
             } else {
                 let cached_bytes = key
                     .persistent_device_bytes()
-                    .checked_mul(CUBLASLT_CAPTURE_CACHE_CAPACITY)
+                    .checked_mul(cublaslt_capture_cache_capacity())
                     .ok_or(ResourceViolation::ArithmeticOverflow {
                         resource: "cached cuBLASLt prepared device memory",
                     })?;
@@ -3461,7 +3469,7 @@ impl CudaGraphOp {
                 profile.capture_collect_nodes += timer.elapsed();
                 profile.captured_nodes += 1;
             }
-            if op.capture_cache.len() == CUBLASLT_CAPTURE_CACHE_CAPACITY {
+            if op.capture_cache.len() >= cublaslt_capture_cache_capacity() {
                 op.capture_cache.remove(0);
             }
             op.capture_cache.push(CachedCuBlasLtCapture {
@@ -3879,7 +3887,7 @@ impl CudaGraphOp {
                     op.prepared = Some(prepared);
                     op.ptrs = Some(ptrs);
                     op.signature = Some(signature);
-                    if op.capture_cache.len() == CUBLASLT_CAPTURE_CACHE_CAPACITY {
+                    if op.capture_cache.len() >= cublaslt_capture_cache_capacity() {
                         op.capture_cache.remove(0);
                     }
                     op.capture_cache.push(CachedCuBlasLtCapture {
