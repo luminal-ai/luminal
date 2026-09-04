@@ -40,6 +40,7 @@
 //! alias-safety convention; `ties` and `Anti` edges are honored in the
 //! toposort order but no in-place claim is made.
 
+pub mod arena;
 pub mod binding_check;
 pub mod bindings;
 pub mod extractor;

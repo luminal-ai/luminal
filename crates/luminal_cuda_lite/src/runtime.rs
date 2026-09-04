@@ -77,6 +77,14 @@ pub struct CudaRuntime {
     /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
     dims: shape::DynMap,
+    /// THE PERSISTENT DEVICE (#422, rejoin Phase 3): context, stream,
+    /// NVRTC module cache and the arena slab, created on the first
+    /// [`Self::execute`] and kept for the runtime's life — "each runtime
+    /// remembers its own buffer hygiene". `None` until then, so
+    /// `Default` still gives a device-free runtime that plans and
+    /// searches on any host.
+    #[cfg(feature = "device")]
+    device: Option<crate::device::CudaDevice>,
 }
 
 impl CudaRuntime {
@@ -518,19 +526,32 @@ impl CudaRuntime {
         if !self.bucket_plans.is_empty() {
             self.select_bucket_plan()?;
         }
-        let plan = self
-            .plan
-            .as_ref()
-            .ok_or_else(|| anyhow!("search before execute"))?;
         #[cfg(feature = "device")]
         {
-            let outputs = crate::device::execute_plan(plan, &self.staged)?;
+            // The device is created ONCE and reused: the module cache
+            // keeps every NVRTC compilation from the previous calls, and
+            // the arena slab keeps the bytes (grow-only, never parked).
+            if self.device.is_none() {
+                self.device = Some(crate::device::CudaDevice::new(0)?);
+            }
+            let plan = self
+                .plan
+                .as_ref()
+                .ok_or_else(|| anyhow!("search before execute"))?;
+            let device = self
+                .device
+                .as_mut()
+                .expect("the device was just created if it was missing");
+            let outputs = crate::device::execute_plan(device, plan, &self.staged)?;
             self.outputs_host = outputs;
             Ok(())
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = plan;
+            let _ = self
+                .plan
+                .as_ref()
+                .ok_or_else(|| anyhow!("search before execute"))?;
             bail!(
                 "cuda-lite built without the `device` feature: plans can be \
                  searched and inspected but not executed on this host"
