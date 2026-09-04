@@ -65,7 +65,7 @@ fn search_produces_a_codegen_complete_plan() {
         // the hand-computed numerics: (a+b)*a.
         rt.execute().expect("device execute");
         let got = rt.get_f32(_out.id).expect("output payload");
-        assert_eq!(got, &vec![11.0f32, 44., 99., 176., 275., 396.]);
+        assert_eq!(got, vec![11.0f32, 44., 99., 176., 275., 396.]);
     }
 }
 

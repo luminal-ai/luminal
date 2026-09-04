@@ -31,13 +31,12 @@ use luminal_cuda_lite::HostBuffer;
 /// identity, view elections the composed chain.
 fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
     let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
-    let bytes = match data {
-        HostBuffer::F32(values) => values,
-        other => panic!("output is {}, not f32", other.type_name()),
-    };
+    let bytes = data
+        .as_f32()
+        .unwrap_or_else(|err| panic!("output is not f32: {err}"));
     // The value's shape and read path both come from the RETURNED
     // LAYOUT; there is no `dims` field and no hop chain any more.
-    luminal_cuda_lite::layouts::dense_f32(bytes, &binding.layout)
+    luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
         .expect("the returned layout reads dense over its backing buffer")
 }
 use luminal_cuda_lite::ops::cublaslt::device_call;

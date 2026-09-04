@@ -81,11 +81,10 @@ pub mod device {
     /// evaluates the identity, so this is the universal readback.
     fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Result<Vec<f32>> {
         let (data, binding) = rt.fetch(out).context("escape-and-disclose fetch")?;
-        let bytes = match data {
-            HostBuffer::F32(values) => values,
-            other => bail!("output is {}, not f32", other.type_name()),
-        };
-        luminal_cuda_lite::layouts::dense_f32(bytes, &binding.layout)
+        let bytes = data
+            .as_f32()
+            .with_context(|| format!("output is {}, not f32", data.type_name()))?;
+        luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
             .context("reading the output through its returned layout")
     }
 
