@@ -57,6 +57,7 @@ Dispositions:
 | `2b368a29` | #440 | Make cuBLASLt capture cache capacity configurable | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (3rd commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild** for the once-stated reason) — see **#440 capture cache capacity** below |
 | `e8780fc8` | #441 | Lower inference native batch norm | FILE-LEVEL | branch `merge/main-python-parks-wip` | the search-space argument is a REQUIREMENT on the M4 re-attachment: an eval-mode BatchNorm must emit no batch reductions at all, not dead ones the extractor still has to cost — see **#441 inference batch norm** below |
 | `cb8d270d` | #442 | Evict cached cuBLASLt graphs before recapture | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (4th commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild**) — see **#440 capture cache capacity** and **#442 evict before recapture** below |
+| `fb6bf0a4` | #450 | Bound serving CUDA graph bucket residency | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (5th commit) | — nothing live corresponds: this branch has no per-bucket CUDA graph residency to bound (see **#430 dyn-dims on rebuild**) — see **#450 bucket residency** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4166,6 +4167,29 @@ exceed it. The fresh-prepare site needs a small scoped borrow
 path-rewritten only** — applied verbatim, no re-expression was needed because
 the park had just taken #440 verbatim and so carried main's exact preimage,
 evict-after-push at both sites included; diff-of-diffs identical.
+
+## #450 bucket residency — parked
+
+Main's `fb6bf0a4` (+128, one file) caps how many compiled buckets may hold
+materialized CUDA graph executables at once. A serving model whose kernels and
+shared arena fit comfortably can still accumulate ruinous CUDA DRIVER graph
+memory across many scheduler shapes, so `CudaRuntimeImpl` gains
+`max_materialized_buckets: Option<usize>` (`None` = today's unbounded default,
+`Some(0)` asserted invalid because the active bucket must stay usable) plus a
+`materialized_bucket_lru: VecDeque<usize>`, the setter/builder pair
+`set_max_materialized_buckets` / `with_max_materialized_buckets`, and
+`prepare_materialized_bucket_slot`, which is called BEFORE the active bucket
+materializes so peak driver memory never holds the old resident set and its
+replacement together. The eviction choice itself is factored into a pure
+function, `materialized_bucket_evictions(materialized, lru, keep, capacity)` —
+projected residency minus capacity, walking the LRU and then the bucket order,
+never evicting `keep` — and that is what the commit's one unit test pins; the
+eviction path synchronizes the stream on both sides of
+`release_bucket_cuda_graphs` and then trims driver graph memory. Only driver
+graph state is released: compiled kernels and the shared arena stay resident and
+the bucket rebuilds its graphs if it is needed again. **Disposition: FILE-LEVEL
+park, path-rewritten only** — applied verbatim to
+`crates/luminal_cuda_lite_hlir/src/runtime.rs`; diff-of-diffs identical.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
