@@ -173,67 +173,118 @@ fn freed<L: PlanLayout>(node: &BufferNode<L>) -> Option<&BufferId> {
 /// of all of them — the very number this pass exists to beat (verdict
 /// C7 of the #420/#422 soundness review).
 ///
-/// The fix is a priority among the READY nodes, not a different
-/// algorithm:
+/// Two changes to Kahn's algorithm, both aimed at the same thing —
+/// keeping a buffer's lifetime as short as the dependency structure
+/// allows:
 ///
-///  1. a `BufferFree` whose in-edges are all discharged goes FIRST —
-///     its range returns to the free list at the earliest instant the
-///     dependency structure allows;
-///  2. then any ordinary node (compute, copy, boundary);
-///  3. a `BufferAlloc` goes LAST, only when nothing else can run — so
-///     a buffer is born at the latest instant, immediately before the
-///     first node that needed it to exist.
+///  1. A `BufferFree` whose in-edges are all discharged goes FIRST. Its
+///     in-edges are Data from the final resident's producer plus Anti
+///     from every other toucher, so this is precisely "free the instant
+///     the last toucher has run".
+///  2. A `BufferAlloc` IS NEVER QUEUED AT ALL. It is PULLED: its edge to
+///     its first toucher is left out of that toucher's in-degree, and
+///     when the toucher is popped, its not-yet-issued alloc predecessors
+///     are emitted immediately before it. So an alloc lands where
+///     bufferize meant it to land — "before its buffer's first toucher"
+///     — no matter which of the ready nodes the frontier happens to
+///     pick.
 ///
-/// Ties inside a class break on node index, which is the bufferizer's
-/// own emission order ("synthesized allocs slot in before their
-/// buffer's first toucher, frees after its last toucher"), so among
-/// equally-ready allocs we mint the one the planner placed first.
+/// The pull is what makes the difference on real plans. QUEUEING allocs
+/// at the lowest priority is not enough, and the failure mode is worth
+/// recording: when the frontier stalls (every compute node waits on its
+/// own destination's alloc), the scheduler must issue SOME alloc, and a
+/// node-index tie-break issues one whose toucher is nowhere near ready.
+/// Measured on a two-layer mini-llama block (d=128, 484 nodes) under the
+/// queued policy: the six d x ff weight materializations were allocated
+/// at positions 1..27 and first touched at 447..475, and the high-water
+/// mark came to 99% of the naive sum. Pulling instead of queueing is
+/// what closes that gap.
+///
+/// An alloc that is dead (no outgoing edge) or that somehow carries
+/// in-edges of its own cannot be pulled; it stays an ordinary queued
+/// node, which is the pre-arena behaviour for it and always correct.
+///
+/// Ties inside a queue break on node index, which is the bufferizer's
+/// own emission order, so equally-ready work runs in the order the
+/// planner wrote it.
 fn issue_order<L: PlanLayout>(plan: &BufferIrGraph<L>) -> Result<Vec<NodeIndex>> {
-    let mut indegree: Vec<usize> = vec![0; plan.dag.node_bound()];
+    let bound = plan.dag.node_bound();
+    let incoming = |index: NodeIndex| {
+        plan.dag
+            .edges_directed(index, petgraph::Direction::Incoming)
+            .count()
+    };
+    // An alloc is PULLABLE iff it depends on nothing and something
+    // depends on it: then it can be emitted, always legally, at the
+    // moment its first consumer is emitted.
+    let mut pullable = vec![false; bound];
+    for index in plan.dag.node_indices() {
+        pullable[index.index()] = kind_of(&plan.dag[index]) == Kind::Alloc
+            && incoming(index) == 0
+            && plan
+                .dag
+                .edges_directed(index, petgraph::Direction::Outgoing)
+                .next()
+                .is_some();
+    }
+    // In-degrees COUNT ONLY non-pulled predecessors: a pulled alloc's
+    // edge is discharged by the pull itself.
+    let mut indegree: Vec<usize> = vec![0; bound];
     for index in plan.dag.node_indices() {
         indegree[index.index()] = plan
             .dag
             .edges_directed(index, petgraph::Direction::Incoming)
+            .filter(|edge| !pullable[edge.source().index()])
             .count();
     }
-    // Three ready queues, each min-ordered by node index (`Reverse`).
+    // Two ready queues, each min-ordered by node index (`Reverse`).
     let mut frees: BinaryHeap<std::cmp::Reverse<usize>> = BinaryHeap::new();
     let mut ordinary: BinaryHeap<std::cmp::Reverse<usize>> = BinaryHeap::new();
-    let mut allocs: BinaryHeap<std::cmp::Reverse<usize>> = BinaryHeap::new();
     let push = |index: NodeIndex,
                 frees: &mut BinaryHeap<std::cmp::Reverse<usize>>,
-                ordinary: &mut BinaryHeap<std::cmp::Reverse<usize>>,
-                allocs: &mut BinaryHeap<std::cmp::Reverse<usize>>| {
+                ordinary: &mut BinaryHeap<std::cmp::Reverse<usize>>| {
         match kind_of(&plan.dag[index]) {
             Kind::Free => frees.push(std::cmp::Reverse(index.index())),
-            Kind::Ordinary => ordinary.push(std::cmp::Reverse(index.index())),
-            Kind::Alloc => allocs.push(std::cmp::Reverse(index.index())),
+            _ => ordinary.push(std::cmp::Reverse(index.index())),
         }
     };
     for index in plan.dag.node_indices() {
-        if indegree[index.index()] == 0 {
-            push(index, &mut frees, &mut ordinary, &mut allocs);
+        if !pullable[index.index()] && indegree[index.index()] == 0 {
+            push(index, &mut frees, &mut ordinary);
         }
     }
     let mut order = Vec::with_capacity(plan.dag.node_count());
+    let mut issued = vec![false; bound];
     loop {
-        let next = frees
-            .pop()
-            .or_else(|| ordinary.pop())
-            .or_else(|| allocs.pop());
-        let Some(std::cmp::Reverse(raw)) = next else {
+        let Some(std::cmp::Reverse(raw)) = frees.pop().or_else(|| ordinary.pop()) else {
             break;
         };
         let index = NodeIndex::new(raw);
+        // THE PULL: this node's storage comes into existence right here,
+        // not at the top of the program.
+        for edge in plan
+            .dag
+            .edges_directed(index, petgraph::Direction::Incoming)
+        {
+            let source = edge.source();
+            if pullable[source.index()] && !issued[source.index()] {
+                issued[source.index()] = true;
+                order.push(source);
+            }
+        }
+        issued[index.index()] = true;
         order.push(index);
         for edge in plan
             .dag
             .edges_directed(index, petgraph::Direction::Outgoing)
         {
             let target = edge.target();
+            if pullable[target.index()] {
+                continue; // an alloc is never unlocked; it is pulled
+            }
             indegree[target.index()] -= 1;
             if indegree[target.index()] == 0 {
-                push(target, &mut frees, &mut ordinary, &mut allocs);
+                push(target, &mut frees, &mut ordinary);
             }
         }
     }
