@@ -3442,6 +3442,25 @@ run once on the device before the budget looked at it. Then the same
 search with the budget lifted installs rank 1 with zero rejections and
 executes.
 
+### Verified on the A100 (2026-09-03)
+
+`93dd7cb1` checked out on the box, `cargo test -p luminal_cuda_lite
+--features device --test device_profile --test finalists_lattice`:
+
+```
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 70.34s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.42s
+```
+
+The Phase 4 probe is unchanged by Phase 5 — mini-llama3, 6 plans
+profiled, 2 fingerprint hits, winner 3.617 ms measured, zero refusals —
+and the new device case passes, so the finalist hard filter's warmup arm
+compiles, stages and runs every finalist it materializes before the
+budget is consulted. The CPU lattice case runs identically on the box:
+winning slabs `[1280, 2560]` -> installed `[1280, 1792]` at ranks
+`[1, 2]` after 2 rejections, which is the same walk the mac produced.
+Box returned to `logical-ssa-project`.
+
 ### Deferred
 
 - **THE REFERENCE RUNTIME**, above.
