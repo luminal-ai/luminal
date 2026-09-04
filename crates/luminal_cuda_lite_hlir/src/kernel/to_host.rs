@@ -2600,6 +2600,21 @@ impl CudaGraphOp {
                 );
             }
             Self::reset_materialization_state(&mut state);
+            // Reset releases the graph-owned dynamic-dimension buffer. The
+            // replacement graph must receive a valid ABI pointer before it is
+            // built; otherwise its first binding update tries to parameterize
+            // dynamic kernels with a null dyn-dims pointer. Bucket-shared
+            // buffers survive the reset and do not need this local fallback.
+            if !self.dyn_dims_order.is_empty() && state.shared_dyn_dims_ptr.is_none() {
+                let mut buffer = stream.alloc_zeros::<i32>(self.dyn_dims_order.len())?;
+                let values = self
+                    .dyn_dims_order
+                    .iter()
+                    .map(|dim| dyn_map.get(dim).copied().unwrap_or(0) as i32)
+                    .collect_vec();
+                stream.memcpy_htod(&values, &mut buffer)?;
+                state.dyn_dims_buffer = Some(buffer);
+            }
             self.build_graph(&mut state, stream, buffers, dyn_map)?;
             current_buffer_ptrs = self
                 .buffer_nodes
