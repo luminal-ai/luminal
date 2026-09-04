@@ -58,6 +58,7 @@ Dispositions:
 | `e8780fc8` | #441 | Lower inference native batch norm | FILE-LEVEL | branch `merge/main-python-parks-wip` | the search-space argument is a REQUIREMENT on the M4 re-attachment: an eval-mode BatchNorm must emit no batch reductions at all, not dead ones the extractor still has to cost — see **#441 inference batch norm** below |
 | `cb8d270d` | #442 | Evict cached cuBLASLt graphs before recapture | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (4th commit) | — nothing live corresponds (no capture cache exists here; see **#430 dyn-dims on rebuild**) — see **#440 capture cache capacity** and **#442 evict before recapture** below |
 | `fb6bf0a4` | #450 | Bound serving CUDA graph bucket residency | FILE-LEVEL (1 file into the `cuda_lite_hlir` park) | branch `merge/main-cuda-graph-line-parks-wip` (5th commit) | — nothing live corresponds: this branch has no per-bucket CUDA graph residency to bound (see **#430 dyn-dims on rebuild**) — see **#450 bucket residency** below |
+| `dd3d6633` | #453 | Raise Qwen3 MoE TTFT CI limit | IGNORED (nothing applied; `ci/example_output.py` deliberately NOT synced) | — | RULED 2026-09-04: *"just ignore the number in CI for now, we're eventually going to move these tests out of CI/CD into their own system"* — this reverses the earlier sync-main's-numbers decision (ruling 1 of 2026-09-02) for this one line — see **#453 qwen3_moe TTFT** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -4192,6 +4193,19 @@ graph state is released: compiled kernels and the shared arena stay resident and
 the bucket rebuilds its graphs if it is needed again. **Disposition: FILE-LEVEL
 park, path-rewritten only** — applied verbatim to
 `crates/luminal_cuda_lite_hlir/src/runtime.rs`; diff-of-diffs identical.
+
+## #453 qwen3_moe TTFT — ignored by ruling, not synced
+
+Main's `dd3d6633` is one line: `ci/example_output.py`'s `PERF_GATES` raises
+`qwen3_moe`'s `max_ttft_ms` from 450.0 to 1000.0 (the companion `max_tpot_ms`
+bump to 50.0 was already synced here by an earlier walk, so 450.0/50.0 is what
+this branch's line 27 reads today). RULED 2026-09-04: *"just ignore the number
+in CI for now, we're eventually going to move these tests out of CI/CD into
+their own system"* — so nothing is applied and the branch keeps 450.0, which
+narrows the earlier sync-main's-numbers decision (ruling 1 of 2026-09-02) to
+exclude this line. Nothing is at risk either way: this branch has never
+re-baselined `qwen3_moe` against its own CL runtime, so the figure gates nothing
+here and is a main-side A100 draw about main's HLIR CUDA backend, not ours.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
