@@ -176,6 +176,10 @@ pub struct SharedDeviceMemoryAllocation {
 pub struct HostDeviceMemoryPlan {
     /// Bytes retained for as long as the compiled host op remains installed.
     pub persistent_bytes: usize,
+    /// Bytes retained only while this op's dynamic bucket is active. Bucketed
+    /// runtimes may evict materialized library plans and graph captures on a
+    /// switch, so these allocations peak across buckets instead of coexisting.
+    pub active_bucket_bytes: usize,
     /// Maximum additional bytes live during one execution of this host op.
     pub transient_peak_bytes: usize,
     /// Process/runtime-wide allocations. Aggregate planning counts each key
@@ -231,6 +235,10 @@ impl CandidateResourcePlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceViolation {
+    CandidatePlanningNodes {
+        required: usize,
+        limit: usize,
+    },
     IntermediateMemory {
         required: usize,
         limit: usize,
@@ -299,6 +307,10 @@ pub enum ResourceViolation {
 impl std::fmt::Display for ResourceViolation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::CandidatePlanningNodes { required, limit } => write!(
+                f,
+                "candidate LLIR has {required} nodes, search planning limit is {limit} nodes"
+            ),
             Self::IntermediateMemory { required, limit } => write!(
                 f,
                 "intermediate memory requires {required} bytes, hard limit is {limit} bytes"
@@ -522,7 +534,8 @@ where
         .ok_or(ResourceViolation::ArithmeticOverflow { resource })
 }
 
-pub(crate) fn eval_resource_expression(
+#[doc(hidden)]
+pub fn eval_resource_expression(
     expr: IntExpr,
     dyn_map: &DynMap,
     resource: &'static str,
@@ -750,6 +763,18 @@ fn validate_mutating_aliases(
                 let unordered = preceding_mutations & !reaches_mutation[consumer];
                 if unordered != 0 {
                     let mutation = &mutations[batch_start + unordered.trailing_zeros() as usize];
+                    if std::env::var_os("LUMINAL_CUDA_PROFILE_ALIAS_HAZARD").is_some() {
+                        eprintln!(
+                            "CUDA_ALIAS_HAZARD mutation={} source={} consumer={} mutation_op={:?} source_op={:?} consumer_op={:?}",
+                            mutation.node,
+                            source,
+                            consumer,
+                            llir[NodeIndex::new(mutation.node)],
+                            llir[NodeIndex::new(source)],
+                            llir[NodeIndex::new(consumer)],
+                        );
+                    }
+                    luminal::mask_events::ALIAS_HAZARD_REJECT.record();
                     return Err(ResourceViolation::AliasingHazard {
                         name: mutation.name,
                         reason: "a competing read is not ordered before the mutation",

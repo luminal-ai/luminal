@@ -37,6 +37,13 @@ pub struct KernelQuantF8 {
     size: IntExpr,
 }
 
+#[cfg(test)]
+impl KernelQuantF8 {
+    pub(crate) fn from_size(size: IntExpr) -> Self {
+        Self { size }
+    }
+}
+
 impl EgglogOp for KernelQuantF8 {
     fn sort(&self) -> SortDef {
         sort(OP_KIND, "KernelQuantF8", &[("size", EXPRESSION)])

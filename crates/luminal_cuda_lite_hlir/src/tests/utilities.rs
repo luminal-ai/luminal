@@ -730,9 +730,22 @@ pub(crate) fn try_extract_forced_nodes_llir_where(
     cx: &Graph,
     candidate_nodes: &[&NodeId],
     config: ForcedExtractionConfig,
+    matches: impl FnMut(&LLIRGraph) -> bool,
+) -> Result<LLIRGraph, String> {
+    let candidates = candidate_nodes
+        .iter()
+        .map(|&node| (node, None))
+        .collect::<Vec<_>>();
+    try_extract_forced_candidates_llir_where(cx, &candidates, config, matches)
+}
+
+fn try_extract_forced_candidates_llir_where(
+    cx: &Graph,
+    candidates: &[(&NodeId, Option<&str>)],
+    config: ForcedExtractionConfig,
     mut matches: impl FnMut(&LLIRGraph) -> bool,
 ) -> Result<LLIRGraph, String> {
-    if candidate_nodes.is_empty() {
+    if candidates.is_empty() {
         return Err("no matching Op enodes appeared in the egraph".into());
     }
 
@@ -742,7 +755,7 @@ pub(crate) fn try_extract_forced_nodes_llir_where(
         .expect("search space should have registered egglog ops");
     let mut last_error = None;
 
-    for (node_index, &forced_node) in candidate_nodes.iter().enumerate() {
+    for (node_index, &(forced_node, forced_kind)) in candidates.iter().enumerate() {
         for attempt in 0..config.attempts_per_node {
             let seed = config
                 .seed_base
@@ -751,6 +764,22 @@ pub(crate) fn try_extract_forced_nodes_llir_where(
             let mut rng = StdRng::seed_from_u64(seed);
             let mut choices = random_initial_choice(egraph, &mut rng);
             choices.insert(&egraph.node_to_class[forced_node], forced_node);
+            // `Op` and its `OpKind` live in independently searchable
+            // eclasses. A focused kernel test must select both the outer node
+            // and its matching kind from the otherwise random test genome.
+            if let Some(forced_kind) = forced_kind
+                && let Some(("Op", children)) = egraph
+                    .enodes
+                    .get(forced_node)
+                    .map(|(label, children)| (label.as_str(), children))
+                && let Some(kind_class) = children.first()
+                && let Some(kind_node) = egraph.eclasses[kind_class]
+                    .1
+                    .iter()
+                    .find(|kind_node| egraph.enodes[*kind_node].0 == forced_kind)
+            {
+                choices.insert(kind_class, kind_node);
+            }
 
             if let Err(error) = validate_choice_set(egraph, &choices, ops) {
                 last_error = Some(error);
@@ -776,11 +805,15 @@ pub(crate) fn try_extract_forced_op_llir_where(
     matches: impl FnMut(&LLIRGraph) -> bool,
 ) -> Result<LLIRGraph, String> {
     let egraph = cx.egraph().expect("search space should have an e-graph");
-    let candidate_nodes = kind_labels
+    let candidates = kind_labels
         .iter()
-        .flat_map(|kind_label| op_ir_nodes(egraph, kind_label))
+        .flat_map(|kind_label| {
+            op_ir_nodes(egraph, kind_label)
+                .into_iter()
+                .map(|node| (node, Some(*kind_label)))
+        })
         .collect::<Vec<_>>();
-    try_extract_forced_nodes_llir_where(cx, &candidate_nodes, config, matches)
+    try_extract_forced_candidates_llir_where(cx, &candidates, config, matches)
 }
 
 pub(crate) fn llir_kernel_names(llir: &LLIRGraph) -> Vec<&'static str> {

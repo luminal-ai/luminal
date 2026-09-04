@@ -7,8 +7,8 @@
 //     reads),
 //   - exactly 1 FusionEnd per region.
 //
-// `FusionEnd::rewrites()` carries the seven rule families that build and
-// extend regions (pair-fuse / grow / merge); the actual single-kernel
+// `FusionEnd::rewrites()` carries the destructive Egglog rule that dissolves
+// compatible boundaries between singleton regions; the actual single-kernel
 // codegen lives in `region_codegen`. Both markers' `compile()` is
 // `unreachable!()` — region codegen folds them away
 // before kernel_to_host's compile loop reaches an interior node.
@@ -64,10 +64,9 @@ impl EgglogOp for FusionStart {
         1
     }
     fn rewrites(&self) -> Vec<Rule> {
-        // No idempotence rule. `FusionStart(FusionStart(x)) ≡ FusionStart(x)`
-        // would unify nested markers and create eclass cycles via the
-        // pair-fuse rules; without it, occasional re-firings produce extra
-        // semantically-correct identity layers, bounded by the run schedule.
+        // No idempotence rule: boundary normalization belongs to the
+        // destructive FE -> FS rule below, which removes the exact spelling
+        // it absorbs instead of adding equivalent marker layers.
         Vec::new()
     }
     fn cleanup(&self) -> bool {
@@ -144,12 +143,37 @@ impl EgglogOp for FusionEnd {
         1
     }
 
+    fn egglog_declarations(&self) -> Vec<String> {
+        vec!["(ruleset fusion_inline_safe_late)".to_string()]
+    }
+
     fn rewrites(&self) -> Vec<Rule> {
-        // Multi-op fusion (the grow/merge absorption family) remains disabled
-        // until those rules encode output-layout, dtype, and metadata legality
-        // themselves. Elementwise ops still lower through singleton regions,
-        // whose metadata is copied directly from the matched HLIR operation.
-        Vec::new()
+        // Every eligible CUDA elementwise op is first lowered to a singleton
+        // `FusionStart -> Cuda*Elementwise -> FusionEnd` region.  Fuse two
+        // adjacent regions by destructively dissolving the materialized
+        // boundary between them.  Matching the complete boundary contract
+        // makes the rewrite legality-by-construction: shape, physical stride,
+        // and dtype must all agree exactly.
+        //
+        // The `subsume` is essential.  Unioning the boundary with the producer
+        // interior while retaining the `FusionStart(FusionEnd(...))` spelling
+        // leaves a cyclic extraction and, across a DAG, enumerates every split
+        // versus absorbed partition.  Subsumption removes that spelling from
+        // both future matching and extraction, so each boundary is fused once
+        // and the e-graph retains only the canonical absorbed representation.
+        vec![Rule::raw(
+            "(rule (
+                (= ?producer_fe
+                   (Op (FusionEnd ?shape ?stride ?dt) (ICons ?producer_inner (INil))))
+                (= ?boundary
+                   (Op (FusionStart ?shape ?stride ?dt) (ICons ?producer_fe (INil))))
+             ) (
+                (union ?boundary ?producer_inner)
+                (subsume
+                    (Op (FusionStart ?shape ?stride ?dt) (ICons ?producer_fe (INil))))
+             ) :ruleset fusion_inline_safe_late
+                :name \"inline-safe-FE-through-FS\")",
+        )]
     }
 
     fn cleanup(&self) -> bool {

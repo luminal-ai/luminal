@@ -41,7 +41,7 @@ use crate::{
     },
     kernel::{
         CudaFunctionExt, CudaGraphExecHandle, CudaGraphHandle, KernelOp, create_cuda_event,
-        destroy_cuda_event,
+        destroy_cuda_event, event_elapsed_ms,
         fusion::region_codegen::{self, CompileUnit},
         hlir::{clear_global_dyn_dims, get_global_dyn_dims, set_global_dyn_dims},
     },
@@ -198,6 +198,36 @@ impl CompiledFlashInferDecode {
 struct PendingFlashInferDecodeRecapture {
     prepared: Option<Rc<PreparedFlashInferDecode>>,
     signature: FlashInferDecodeCaptureSignature,
+}
+
+struct CompiledCapturedHost {
+    node: NodeIndex,
+    inputs: Vec<NodeIndex>,
+    host_op: Arc<Box<dyn HostOp>>,
+    child_graph: Option<CudaGraphHandle>,
+    graph_node: Option<CUgraphNode>,
+}
+
+impl CompiledCapturedHost {
+    fn captured_pointer_nodes(&self) -> Vec<NodeIndex> {
+        let host = self.host_op.as_ref().as_ref();
+        let inputs: Box<dyn Iterator<Item = NodeIndex> + '_> =
+            match host.cuda_graph_capture_pointer_inputs() {
+                Some(indices) => Box::new(indices.iter().map(|&index| self.inputs[index])),
+                None => Box::new(self.inputs.iter().copied()),
+            };
+        std::iter::once(self.node).chain(inputs).collect()
+    }
+
+    fn prepare_graph_capture(
+        &self,
+        stream: &Arc<CudaStream>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<()> {
+        let host = self.host_op.as_ref().as_ref();
+        host.prepare_cuda_graph_capture(stream, self.node, &self.inputs, buffers, dyn_map)
+    }
 }
 
 /// Prepared FlashInfer plan and the dependency-ordered steps that use it.
@@ -400,6 +430,7 @@ enum CompiledStep {
     Kernel(usize),
     CuBlasLt(usize),
     FlashInferDecode(usize),
+    CapturedHost(usize),
 }
 
 impl CompiledKernel {
@@ -555,7 +586,6 @@ impl CompiledKernel {
                 self.node,
             );
         }
-
         for (idx, (input_node, input_ptr)) in self.inputs.iter().zip(input_ptrs).enumerate() {
             if *input_ptr == 0 {
                 anyhow::bail!(
@@ -566,7 +596,6 @@ impl CompiledKernel {
                 );
             }
         }
-
         Ok(())
     }
 
@@ -662,6 +691,9 @@ struct CudaGraphOpState {
     cublaslt_ops: Vec<CompiledCuBlasLt>,
     /// Capturable FlashInfer decode host ops absorbed into this CUDA graph.
     flashinfer_ops: Vec<CompiledFlashInferDecode>,
+    /// Host operations captured once as reusable child graphs. These are used
+    /// for fixed-shape, stable-binding multi-kernel ops such as Marlin MoE.
+    captured_host_ops: Vec<CompiledCapturedHost>,
     /// Mixed execution steps in topological order.
     steps: Vec<CompiledStep>,
     /// Per-cuBLASLt op index into `steps`.
@@ -691,8 +723,10 @@ struct CudaGraphOpState {
     flashinfer_prepare_cache: Vec<CachedFlashInferPrepare>,
     /// Shared device buffer for dynamic dimensions
     dyn_dims_buffer: Option<CudaSlice<i32>>,
-    /// Cached before external capture to avoid CudaSlice's cross-stream event wait.
-    dyn_dims_ptr: u64,
+    /// Bucket-owned dynamic-dimension buffer shared by every graph whose
+    /// compiler ABI uses the same global dimension ordering. The bucket
+    /// uploads it once per step; this op only retains the non-owning pointer.
+    shared_dyn_dims_ptr: Option<u64>,
     /// CUDA graph handle
     cuda_graph: Option<CudaGraphHandle>,
     /// CUDA graph exec handle
@@ -704,6 +738,9 @@ struct CudaGraphOpState {
     kernel_launches: Vec<KernelLaunchConfig>,
     /// Last dynamic dimension values (for change detection)
     last_dyn_values: DynMap,
+    /// Diagnostic counter for dynamic changes satisfied solely by the shared
+    /// device ABI, without cloning bindings or touching CUDA graph nodes.
+    body_only_dyn_fast_paths: usize,
     /// Last buffer pointers (for change detection)
     last_buffer_ptrs: FxHashMap<NodeIndex, u64>,
     /// Last complete bindings. Dynamic-only rematerialization reuses these
@@ -718,17 +755,24 @@ impl CudaGraphOpState {
         kernels: Vec<CompiledKernel>,
         cublaslt_ops: Vec<CompiledCuBlasLt>,
         flashinfer_ops: Vec<CompiledFlashInferDecode>,
+        captured_host_ops: Vec<CompiledCapturedHost>,
         steps: Vec<CompiledStep>,
     ) -> Self {
         let cublaslt_step_indices = cublaslt_step_indices(&steps, cublaslt_ops.len());
         let flashinfer_step_indices = flashinfer_step_indices(&steps, flashinfer_ops.len());
-        let (step_dependencies, step_successors, step_reachability) =
-            build_step_topology(&steps, &kernels, &cublaslt_ops, &flashinfer_ops);
+        let (step_dependencies, step_successors, step_reachability) = build_step_topology(
+            &steps,
+            &kernels,
+            &cublaslt_ops,
+            &flashinfer_ops,
+            &captured_host_ops,
+        );
         let step_count = steps.len();
         Self {
             kernels,
             cublaslt_ops,
             flashinfer_ops,
+            captured_host_ops,
             steps,
             cublaslt_step_indices,
             flashinfer_step_indices,
@@ -741,12 +785,13 @@ impl CudaGraphOpState {
             cublaslt_workspace_pool: Vec::new(),
             flashinfer_prepare_cache: Vec::new(),
             dyn_dims_buffer: None,
-            dyn_dims_ptr: 0,
+            shared_dyn_dims_ptr: None,
             cuda_graph: None,
             cuda_graph_exec: None,
             kernel_params: Vec::new(),
             kernel_launches: Vec::new(),
             last_dyn_values: FxHashMap::default(),
+            body_only_dyn_fast_paths: 0,
             last_buffer_ptrs: FxHashMap::default(),
             last_buffers: FxHashMap::default(),
             timing_events: Vec::new(),
@@ -768,6 +813,12 @@ pub struct CudaGraphOp {
     kernel_users_by_dyn_dim: FxHashMap<char, Vec<usize>>,
     cublaslt_users_by_buffer: FxHashMap<NodeIndex, Vec<usize>>,
     cublaslt_users_by_dyn_dim: FxHashMap<Symbol, Vec<usize>>,
+    captured_host_buffer_nodes: FxHashSet<NodeIndex>,
+    /// Dynamic dimensions baked into a captured HostOp child graph through
+    /// graph-visible buffer shapes. A change to one of these dimensions must
+    /// rebuild the child even when ordinary CUDA kernels consume the value
+    /// through the shared dynamic-dimension device buffer.
+    captured_host_dyn_dims: FxHashSet<Symbol>,
     /// Union computed once; dynamic materialization can rule out internal
     /// reallocations without asking every kernel for its dimension set.
     internal_buffer_dyn_dims: FxHashSet<Symbol>,
@@ -878,6 +929,50 @@ impl CudaGraphArenaOrdering {
 }
 
 impl CudaGraphOp {
+    /// Whether this packaged graph currently owns both a mutable source graph
+    /// and an executable instance. Bucket-LRU eviction deliberately releases
+    /// both while retaining the compiled operation descriptions.
+    pub(crate) fn is_materialized(&self) -> bool {
+        let state = self.state.borrow();
+        state.cuda_graph.is_some() && state.cuda_graph_exec.is_some()
+    }
+
+    /// Whether cached bindings describe this exact logical dynamic shape.
+    /// Pointer identity alone is insufficient: arena-backed buffers retain
+    /// their address while their logical lengths change within a bucket.
+    pub(crate) fn materialized_dyn_values_match(&self, dyn_map: &DynMap) -> bool {
+        self.state.borrow().last_dyn_values == *dyn_map
+    }
+
+    pub(crate) fn dyn_dims_order(&self) -> &[Symbol] {
+        &self.dyn_dims_order
+    }
+
+    /// Bind a bucket-owned dynamic-dimension buffer before first
+    /// materialization. All kernels in this graph were compiled against
+    /// `dyn_dims_order`, so graphs with identical orderings can safely share
+    /// one upload and pointer.
+    pub(crate) fn bind_shared_dyn_dims(&self, ptr: u64) {
+        let mut state = self.state.borrow_mut();
+        assert!(
+            state.cuda_graph.is_none() && state.cuda_graph_exec.is_none(),
+            "shared dyn dims must be bound before CUDA graph materialization"
+        );
+        state.dyn_dims_buffer = None;
+        state.shared_dyn_dims_ptr = Some(ptr);
+        state.last_dyn_values.clear();
+    }
+
+    fn dyn_dims_ptr(state: &CudaGraphOpState, stream: &Arc<CudaStream>) -> u64 {
+        state.shared_dyn_dims_ptr.unwrap_or_else(|| {
+            state
+                .dyn_dims_buffer
+                .as_ref()
+                .map(|buf| buf.device_ptr(stream).0)
+                .unwrap_or(0)
+        })
+    }
+
     fn new(
         buffer_nodes: Vec<NodeIndex>,
         buffer_sizes: FxHashMap<NodeIndex, IntExpr>,
@@ -893,6 +988,8 @@ impl CudaGraphOp {
         let mut internal_buffer_dyn_dims = FxHashSet::default();
         let mut output_aliases = Vec::new();
         let mut library_buffer_nodes = FxHashSet::default();
+        let mut captured_host_buffer_nodes = FxHashSet::default();
+        let mut captured_host_dyn_dims = FxHashSet::default();
         // Build reverse dependency indexes once so materialization can update only the kernels
         // affected by changed buffer bindings or dynamic dimensions.
         for (idx, kernel) in state.kernels.iter().enumerate() {
@@ -932,6 +1029,33 @@ impl CudaGraphOp {
             library_buffer_nodes.insert(op.node);
             library_buffer_nodes.extend(op.inputs.iter().copied());
         }
+        for op in &state.captured_host_ops {
+            let pointer_nodes = op.captured_pointer_nodes();
+            library_buffer_nodes.extend(pointer_nodes.iter().copied());
+            captured_host_buffer_nodes.extend(pointer_nodes);
+            let host = op.host_op.as_ref().as_ref();
+            captured_host_dyn_dims.extend(host.cuda_graph_capture_dyn_dims());
+            if let Some(indices) = host.cuda_graph_capture_shape_inputs() {
+                for &index in indices {
+                    if let Some(size) = buffer_sizes.get(&op.inputs[index]) {
+                        size.collect_dyn_vars_into(&mut captured_host_dyn_dims);
+                    }
+                }
+            } else {
+                for node in std::iter::once(op.node).chain(op.inputs.iter().copied()) {
+                    if let Some(size) = buffer_sizes.get(&node) {
+                        size.collect_dyn_vars_into(&mut captured_host_dyn_dims);
+                    }
+                }
+            }
+        }
+        if !captured_host_dyn_dims.is_empty()
+            && std::env::var_os("LUMINAL_CUDA_DEBUG_CAPTURED_DIMS").is_some()
+        {
+            eprintln!(
+                "CudaGraph captured HostOp dimensions: {captured_host_dyn_dims:?} internal_buffer_dims={internal_buffer_dyn_dims:?}"
+            );
+        }
         let buffer_node_set = buffer_nodes.iter().copied().collect();
         Self {
             buffer_nodes,
@@ -940,6 +1064,8 @@ impl CudaGraphOp {
             kernel_users_by_dyn_dim,
             cublaslt_users_by_buffer,
             cublaslt_users_by_dyn_dim,
+            captured_host_buffer_nodes,
+            captured_host_dyn_dims,
             internal_buffer_dyn_dims,
             output_aliases,
             library_buffer_nodes,
@@ -971,6 +1097,42 @@ impl CudaGraphOp {
     /// graph.
     pub fn kernel_topo_order(&self) -> Vec<NodeIndex> {
         self.state.borrow().kernels.iter().map(|k| k.node).collect()
+    }
+
+    /// Human-readable kernel inventory for diagnosing an asynchronous CUDA
+    /// graph failure. Kept off the serving hot path; callers only use it after
+    /// an explicit diagnostic synchronization reports an error.
+    pub fn debug_kernel_ops(&self) -> Vec<String> {
+        self.state
+            .borrow()
+            .kernels
+            .iter()
+            .map(|kernel| format!("{}:{:?}", kernel.node.index(), kernel.kernel_op))
+            .collect()
+    }
+
+    /// Human-readable inventory of library and captured host operations.
+    /// Like [`Self::debug_kernel_ops`], this is only assembled for explicit
+    /// diagnostics and stays off the serving hot path.
+    pub fn debug_library_ops(&self) -> Vec<String> {
+        let state = self.state.borrow();
+        state
+            .cublaslt_ops
+            .iter()
+            .map(|op| format!("{}:{:?}", op.node.index(), op.host_op))
+            .chain(
+                state
+                    .flashinfer_ops
+                    .iter()
+                    .map(|op| format!("{}:{:?}", op.node.index(), op.host_op)),
+            )
+            .chain(
+                state
+                    .captured_host_ops
+                    .iter()
+                    .map(|op| format!("{}:{:?}", op.node.index(), op.host_op)),
+            )
+            .collect()
     }
 
     /// Direct LLIR-node inputs of one kernel inside this CudaGraphOp.
@@ -1051,6 +1213,10 @@ impl CudaGraphOp {
                 }
                 CompiledStep::FlashInferDecode(index) => {
                     let op = &state.flashinfer_ops[*index];
+                    (op.node, op.inputs.as_slice())
+                }
+                CompiledStep::CapturedHost(index) => {
+                    let op = &state.captured_host_ops[*index];
                     (op.node, op.inputs.as_slice())
                 }
             };
@@ -1212,12 +1378,33 @@ impl CudaGraphOp {
             }
         }
 
+        let mut transient_peak_bytes = 0usize;
+        let mut captured_shared_allocations = Vec::new();
+        for op in &state.captured_host_ops {
+            let plan =
+                op.host_op
+                    .device_memory_plan(op.node, &op.inputs, buffer_lengths, dyn_map)?;
+            persistent_bytes = persistent_bytes.checked_add(plan.persistent_bytes).ok_or(
+                ResourceViolation::ArithmeticOverflow {
+                    resource: "captured host persistent device memory",
+                },
+            )?;
+            transient_peak_bytes = transient_peak_bytes.max(plan.transient_peak_bytes);
+            captured_shared_allocations.extend(plan.shared_allocations);
+        }
+
+        let mut shared_allocations: Vec<_> = (!state.flashinfer_ops.is_empty())
+            .then(crate::host::flashinfer::shared_device_memory_allocation)
+            .into_iter()
+            .chain(captured_shared_allocations)
+            .collect();
+        shared_allocations.sort_unstable_by_key(|allocation| allocation.key);
+        shared_allocations.dedup_by_key(|allocation| allocation.key);
+
         Ok(HostDeviceMemoryPlan {
-            persistent_bytes,
-            shared_allocations: (!state.flashinfer_ops.is_empty())
-                .then(crate::host::flashinfer::shared_device_memory_allocation)
-                .into_iter()
-                .collect(),
+            active_bucket_bytes: persistent_bytes,
+            transient_peak_bytes,
+            shared_allocations,
             ..Default::default()
         })
     }
@@ -1229,6 +1416,7 @@ impl CudaGraphOp {
             .iter()
             .map(|op| op.node)
             .chain(state.flashinfer_ops.iter().map(|op| op.node))
+            .chain(state.captured_host_ops.iter().map(|op| op.node))
             .collect()
     }
 
@@ -1247,6 +1435,9 @@ impl CudaGraphOp {
                             CompiledStep::CuBlasLt(idx) => state.cublaslt_ops[*idx].entry_node,
                             CompiledStep::FlashInferDecode(idx) => {
                                 state.flashinfer_ops[*idx].entry_node
+                            }
+                            CompiledStep::CapturedHost(idx) => {
+                                state.captured_host_ops[*idx].graph_node
                             }
                         };
                         node.and_then(|node| graph.dependencies(node).ok())
@@ -1293,6 +1484,7 @@ impl CudaGraphOp {
                 .iter()
                 .map(|op| op.node)
                 .chain(state.flashinfer_ops.iter().map(|op| op.node))
+                .chain(state.captured_host_ops.iter().map(|op| op.node))
                 .collect(),
             step_dependency_counts,
         }
@@ -1306,6 +1498,7 @@ impl std::fmt::Debug for CudaGraphOp {
             .field("n_kernels", &state.kernels.len())
             .field("n_cublaslt", &state.cublaslt_ops.len())
             .field("n_flashinfer", &state.flashinfer_ops.len())
+            .field("n_captured_host", &state.captured_host_ops.len())
             .field("n_buffer_nodes", &self.buffer_nodes.len())
             .finish()
     }
@@ -1345,7 +1538,19 @@ impl HostOp for CudaGraphOp {
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
     ) -> anyhow::Result<()> {
-        self.execute_internal(stream, buffers, dyn_map)
+        self.execute_internal(stream, buffers, dyn_map, 0)
+    }
+
+    fn execute_with_id(
+        &self,
+        stream: &Arc<CudaStream>,
+        _self_node: NodeIndex,
+        _inputs: &[NodeIndex],
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+        execution_id: u64,
+    ) -> anyhow::Result<()> {
+        self.execute_internal(stream, buffers, dyn_map, execution_id)
     }
 
     fn output_size(&self) -> IntExpr {
@@ -1377,6 +1582,12 @@ impl HostOp for CudaGraphOp {
             .flashinfer_ops
             .iter()
             .flat_map(|op| op.inputs.get(1..3).unwrap_or_default().iter().copied())
+            .chain(
+                state
+                    .captured_host_ops
+                    .iter()
+                    .flat_map(|op| op.host_op.resource_buffer_nodes(&op.inputs).into_iter()),
+            )
             .unique()
             .collect()
     }
@@ -1431,11 +1642,13 @@ fn build_step_topology(
     kernels: &[CompiledKernel],
     cublaslt_ops: &[CompiledCuBlasLt],
     flashinfer_ops: &[CompiledFlashInferDecode],
+    captured_host_ops: &[CompiledCapturedHost],
 ) -> (Vec<Vec<usize>>, Vec<Vec<usize>>, Vec<FixedBitSet>) {
     let n_steps = steps.len();
     let mut producer_step: FxHashMap<NodeIndex, usize> = FxHashMap::default();
     let mut dependencies = Vec::with_capacity(n_steps);
-    let serialize_internal_steps = cublaslt_ops.is_empty() && flashinfer_ops.is_empty();
+    let serialize_internal_steps =
+        cublaslt_ops.is_empty() && flashinfer_ops.is_empty() && captured_host_ops.is_empty();
 
     for (step, graph_step) in steps.iter().enumerate() {
         let (output, inputs, aliased_input) = match graph_step {
@@ -1456,6 +1669,10 @@ fn build_step_topology(
             }
             CompiledStep::FlashInferDecode(idx) => {
                 let op = &flashinfer_ops[*idx];
+                (op.node, op.inputs.as_slice(), None)
+            }
+            CompiledStep::CapturedHost(idx) => {
+                let op = &captured_host_ops[*idx];
                 (op.node, op.inputs.as_slice(), None)
             }
         };
@@ -1479,6 +1696,7 @@ fn build_step_topology(
     // workspaces. Preserve their execution order even when no tensor edge
     // directly connects neighboring attention islands.
     add_flashinfer_workspace_serial_dependencies(steps, &mut dependencies);
+    add_captured_host_serial_dependencies(steps, &mut dependencies);
 
     let mut successors = vec![Vec::<usize>::new(); n_steps];
     for (step, deps) in dependencies.iter().enumerate() {
@@ -1488,6 +1706,20 @@ fn build_step_topology(
     }
     let reachability = transitive_step_reachability(&successors);
     (dependencies, successors, reachability)
+}
+
+fn add_captured_host_serial_dependencies(steps: &[CompiledStep], dependencies: &mut [Vec<usize>]) {
+    let mut previous = None;
+    for (step, graph_step) in steps.iter().enumerate() {
+        if matches!(graph_step, CompiledStep::CapturedHost(_)) {
+            if let Some(previous) = previous
+                && !dependencies[step].contains(&previous)
+            {
+                dependencies[step].push(previous);
+            }
+            previous = Some(step);
+        }
+    }
 }
 
 fn add_flashinfer_workspace_serial_dependencies(
@@ -1682,6 +1914,74 @@ impl CudaGraphOp {
         }
     }
 
+    fn kernel_requires_output_buffer(kernel: &CompiledKernel, dyn_map: &DynMap) -> bool {
+        kernel.kernel_op.output_size().exec(dyn_map).unwrap_or(1) != 0
+            && kernel.kernel_op.output_aliases_input().is_none()
+    }
+
+    fn kernel_launch_config(
+        kernel: &CompiledKernel,
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<KernelLaunchConfig> {
+        let config = KernelLaunchConfig {
+            grid: (
+                kernel.grid.0.exec(dyn_map).unwrap() as u32,
+                kernel.grid.1.exec(dyn_map).unwrap() as u32,
+                kernel.grid.2.exec(dyn_map).unwrap() as u32,
+            ),
+            block: (
+                kernel.block.0.exec(dyn_map).unwrap() as u32,
+                kernel.block.1.exec(dyn_map).unwrap() as u32,
+                kernel.block.2.exec(dyn_map).unwrap() as u32,
+            ),
+            shared_mem: kernel.shared_mem.exec(dyn_map).unwrap() as u32,
+        };
+        if config.grid.0 == 0
+            || config.grid.1 == 0
+            || config.grid.2 == 0
+            || config.block.0 == 0
+            || config.block.1 == 0
+            || config.block.2 == 0
+        {
+            anyhow::bail!(
+                "invalid CUDA launch dimensions for kernel {} at LLIR node {:?}: grid={:?} block={:?}",
+                kernel.kernel_name,
+                kernel.node,
+                config.grid,
+                config.block,
+            );
+        }
+        Ok(config)
+    }
+
+    fn validate_kernel_pointers(
+        kernel: &CompiledKernel,
+        output_ptr: u64,
+        input_ptrs: &[u64],
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<()> {
+        if Self::kernel_requires_output_buffer(kernel, dyn_map) && output_ptr == 0 {
+            anyhow::bail!(
+                "missing output buffer for CUDA kernel {} at LLIR node {:?}",
+                kernel.kernel_name,
+                kernel.node,
+            );
+        }
+
+        for (idx, (input_node, input_ptr)) in kernel.inputs.iter().zip(input_ptrs).enumerate() {
+            if *input_ptr == 0 {
+                anyhow::bail!(
+                    "missing input buffer {idx} for CUDA kernel {} at LLIR node {:?}; input LLIR node {:?}",
+                    kernel.kernel_name,
+                    kernel.node,
+                    input_node,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Forget every memory derived from a dynamic-dimension value, so the next
     /// materialize walks the same staleness paths a real dim change triggers:
     /// dyn-var kernels rebuild params, dyn-shaped cuBLASLt islands re-prepare
@@ -1720,22 +2020,22 @@ impl CudaGraphOp {
         self.buffer_node_set.contains(&node)
     }
 
-    /// Release driver-side graph resources while retaining the compiled op
-    /// descriptions needed to materialize this bucket again later.
-    pub(crate) fn release_materialization(&self) {
-        let mut state = self.state.borrow_mut();
-
-        // Executable graphs can retain substantial driver allocations. Drop
-        // them before the source graph and before any buffers they reference.
+    fn reset_materialization_state(state: &mut CudaGraphOpState) {
+        // Executable graphs retain references to source/child nodes and their
+        // prepared allocations. Destroy in dependency order before clearing
+        // any pointer-bearing library state.
         drop(state.cuda_graph_exec.take());
         drop(state.cuda_graph.take());
         state.kernel_params.clear();
         state.last_dyn_values.clear();
         state.last_buffer_ptrs.clear();
+        state.last_buffers.clear();
 
         state.cublaslt_prepare_cache.clear();
+        state.cublaslt_workspace_pool.clear();
         state.flashinfer_prepare_cache.clear();
         for op in &mut state.cublaslt_ops {
+            op.capture_cache.clear();
             op.prepared = None;
             op.ptrs = None;
             op.signature = None;
@@ -1755,8 +2055,64 @@ impl CudaGraphOp {
             kernel.graph_node = None;
             kernel.internal_bufs.clear();
         }
+        for op in &mut state.captured_host_ops {
+            op.child_graph = None;
+            op.graph_node = None;
+        }
         state.dyn_dims_buffer = None;
-        state.dyn_dims_ptr = 0;
+    }
+
+    /// Release driver-side graph resources while retaining the compiled op
+    /// descriptions needed to materialize this bucket again later.
+    pub(crate) fn release_materialization(&self) {
+        let mut state = self.state.borrow_mut();
+        Self::reset_materialization_state(&mut state);
+    }
+
+    /// Emit a diagnostic-only breakdown of one completed graph launch. Step
+    /// timing nodes are inserted only when `LUMINAL_CUDA_PROFILE_GRAPH_STEPS`
+    /// is present at materialization time, so production graphs carry no event
+    /// overhead.
+    pub(crate) fn print_step_profile(&self, dyn_map: &DynMap) {
+        if std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_none() {
+            return;
+        }
+        let state = self.state.borrow();
+        if state.timing_events.len() < state.steps.len() + 1 {
+            return;
+        }
+        let ctx = self.stream.context();
+        let mut totals = std::collections::BTreeMap::<&'static str, (usize, f32)>::new();
+        let mut total_ms = 0.0f32;
+        for (step_index, step) in state.steps.iter().enumerate() {
+            let Ok(elapsed_ms) = event_elapsed_ms(
+                ctx,
+                state.timing_events[step_index],
+                state.timing_events[step_index + 1],
+            ) else {
+                return;
+            };
+            total_ms += elapsed_ms;
+            let name = match *step {
+                CompiledStep::Kernel(idx) => state.kernels[idx].kernel_name,
+                CompiledStep::CuBlasLt(_) => "CuBlasLt",
+                CompiledStep::FlashInferDecode(_) => "FlashInferAttention",
+                CompiledStep::CapturedHost(idx) => state.captured_host_ops[idx]
+                    .host_op
+                    .stats_name()
+                    .unwrap_or("CapturedHost"),
+            };
+            let total = totals.entry(name).or_default();
+            total.0 += 1;
+            total.1 += elapsed_ms;
+        }
+        eprintln!(
+            "CUDA_GRAPH_STEP_PROFILE dyn={dyn_map:?} total_ms={total_ms:.3} {}",
+            totals
+                .into_iter()
+                .map(|(name, (count, ms))| format!("{name}[{count}]={ms:.3}ms"))
+                .join(" ")
+        );
     }
 
     /// Patch a CUDA graph from an exact set of changed bindings without
@@ -1773,12 +2129,46 @@ impl CudaGraphOp {
         if state.cuda_graph.is_none() || state.cuda_graph_exec.is_none() {
             return Ok(false);
         }
-        let dyn_map_changed = dyn_map.len() != state.last_dyn_values.len()
-            || dyn_map
-                .iter()
-                .any(|(dim, value)| state.last_dyn_values.get(dim) != Some(value));
-        if dyn_map_changed {
-            return Ok(false);
+        let changed_dyn_vars = dyn_map
+            .keys()
+            .chain(state.last_dyn_values.keys())
+            .copied()
+            .filter(|dim| dyn_map.get(dim) != state.last_dyn_values.get(dim))
+            .collect::<FxHashSet<_>>();
+        if !changed_dyn_vars.is_empty() {
+            // Kernel bodies read dynamic values through the bucket-shared
+            // device ABI. Do not clone every graph's complete binding map just
+            // because such a body-only value changed. Launch expressions,
+            // internal allocations, library plans, and captured HostOp child
+            // shapes remain conservative rematerialization boundaries.
+            let needs_rematerialization = state.shared_dyn_dims_ptr.is_none()
+                || !changed_dyn_vars.is_disjoint(&self.internal_buffer_dyn_dims)
+                || changed_dyn_vars
+                    .iter()
+                    .any(|dim| self.kernel_users_by_dyn_dim.contains_key(dim))
+                || changed_dyn_vars
+                    .iter()
+                    .any(|dim| self.cublaslt_users_by_dyn_dim.contains_key(dim))
+                || !changed_dyn_vars.is_disjoint(&self.captured_host_dyn_dims)
+                || !state.flashinfer_ops.is_empty();
+            if needs_rematerialization {
+                return Ok(false);
+            }
+            if changed_buffers.is_empty() {
+                state.last_dyn_values = dyn_map.clone();
+                state.body_only_dyn_fast_paths += 1;
+                if state.body_only_dyn_fast_paths == 1
+                    && std::env::var_os("LUMINAL_CUDA_DEBUG_BODY_DYN_FASTPATH").is_some()
+                {
+                    eprintln!(
+                        "CUDA graph body-only dynamic fast path: changed={changed_dyn_vars:?} kernels={} cublaslt={} captured_host={}",
+                        state.kernels.len(),
+                        state.cublaslt_ops.len(),
+                        state.captured_host_ops.len(),
+                    );
+                }
+                return Ok(true);
+            }
         }
 
         let mut changed = changed_buffers.clone();
@@ -1826,11 +2216,7 @@ impl CudaGraphOp {
         let mut dirty_kernels = dirty_kernel_set.into_iter().collect_vec();
         dirty_kernels.sort_unstable();
 
-        let dyn_dims_ptr = state
-            .dyn_dims_buffer
-            .as_ref()
-            .map(|buf| buf.device_ptr(stream).0)
-            .unwrap_or(0);
+        let dyn_dims_ptr = Self::dyn_dims_ptr(&state, stream);
         for &idx in &dirty_kernels {
             let kernel = &state.kernels[idx];
             let output_ptr = changed
@@ -1849,7 +2235,7 @@ impl CudaGraphOp {
                         .unwrap_or(0)
                 })
                 .collect_vec();
-            kernel.validate_pointers(output_ptr, &input_ptrs, dyn_map)?;
+            Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
             let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
                 dyn_dims_ptr
             } else {
@@ -1917,6 +2303,7 @@ impl CudaGraphOp {
             state.last_buffer_ptrs.insert(node, buffer.ptr());
             state.last_buffers.insert(node, buffer);
         }
+        state.last_dyn_values = dyn_map.clone();
         Ok(true)
     }
 
@@ -1949,6 +2336,121 @@ impl CudaGraphOp {
         self.materialize_impl(stream, buffers, dyn_map, false)
     }
 
+    /// Prepare a search candidate for direct step launches without creating a
+    /// full-model CUDA graph executable.
+    ///
+    /// Candidate ranking needs the compiled kernels and library plans, but a
+    /// graph executable is useful only after a finalist is selected. Repeated
+    /// instantiation leaves substantial driver memory resident on some CUDA
+    /// versions, so search uses the same prepared steps directly and final
+    /// serving compilation retains the ordinary graph path.
+    pub(crate) fn prepare_direct_profile(
+        &self,
+        stream: &Arc<CudaStream>,
+        buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
+        dyn_map: &DynMap,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.cuda_graph.is_some() || state.cuda_graph_exec.is_some() {
+            Self::reset_materialization_state(&mut state);
+        }
+
+        if !self.dyn_dims_order.is_empty()
+            && state.shared_dyn_dims_ptr.is_none()
+            && state.dyn_dims_buffer.is_none()
+        {
+            state.dyn_dims_buffer = Some(stream.alloc_zeros::<i32>(self.dyn_dims_order.len())?);
+        }
+        if !self.dyn_dims_order.is_empty() && state.shared_dyn_dims_ptr.is_none() {
+            let values = self
+                .dyn_dims_order
+                .iter()
+                .map(|dim| dyn_map.get(dim).copied().unwrap_or(0) as i32)
+                .collect_vec();
+            if let Some(buffer) = state.dyn_dims_buffer.as_mut() {
+                stream.memcpy_htod(&values, buffer)?;
+            }
+        }
+
+        let mut workspace_pool_plan = state.cublaslt_workspace_pool.clone();
+        workspace_pool_plan.extend(
+            state
+                .cublaslt_prepare_cache
+                .iter()
+                .map(|entry| entry.prepared.workspace()),
+        );
+        let mut cublaslt_prepare_cache = Vec::new();
+        for idx in 0..state.cublaslt_ops.len() {
+            let resolved = {
+                let op = &state.cublaslt_ops[idx];
+                op.cublaslt()
+                    .resolve_for_graph(op.node, &op.inputs, buffers, dyn_map)?
+            };
+            let signature = resolved.signature();
+            let prepare_key = resolved.prepare_key();
+            let step = state.cublaslt_step_indices[idx];
+            let (prepared, _) = {
+                let op = &state.cublaslt_ops[idx];
+                get_or_prepare_cublaslt(
+                    &mut cublaslt_prepare_cache,
+                    &state.step_reachability,
+                    prepare_key,
+                    step,
+                    || {
+                        op.cublaslt().prepare_resolved_for_graph_with_workspace(
+                            stream,
+                            resolved,
+                            workspace_pool_plan.pop(),
+                        )
+                    },
+                )?
+            };
+            let op = &mut state.cublaslt_ops[idx];
+            op.prepared = Some(prepared);
+            op.ptrs = Some(signature.ptrs);
+            op.signature = Some(signature);
+        }
+
+        let mut flashinfer_prepare_cache = state.flashinfer_prepare_cache.clone();
+        for idx in 0..state.flashinfer_ops.len() {
+            let resolved = {
+                let op = &state.flashinfer_ops[idx];
+                op.flashinfer()
+                    .resolve_for_graph(op.node, &op.inputs, buffers, dyn_map)?
+            };
+            let plan_c = resolved.graph_plan_capacity(None);
+            let signature = resolved.signature_for_graph_plan(plan_c);
+            let step = state.flashinfer_step_indices[idx];
+            remove_flashinfer_prepare_cache_user(&mut flashinfer_prepare_cache, step);
+            let key = FlashInferPrepareKey::for_inputs(
+                signature.spec.clone(),
+                &state.flashinfer_ops[idx].inputs,
+            );
+            let (prepared, _) = get_or_prepare_flashinfer(
+                &mut flashinfer_prepare_cache,
+                &state.step_reachability,
+                key,
+                step,
+                || {
+                    state.flashinfer_ops[idx]
+                        .flashinfer()
+                        .prepare_resolved_for_graph(stream, resolved, true)
+                },
+            )?;
+            let op = &mut state.flashinfer_ops[idx];
+            op.prepared = Some(prepared);
+            op.ptrs = Some(signature.ptrs);
+            op.signature = Some(signature);
+        }
+
+        state.cublaslt_prepare_cache = cublaslt_prepare_cache;
+        state.cublaslt_workspace_pool = workspace_pool_plan;
+        state.flashinfer_prepare_cache = flashinfer_prepare_cache;
+        state.last_dyn_values = dyn_map.clone();
+        state.last_buffers = buffers.clone();
+        Ok(())
+    }
+
     fn materialize_impl(
         &self,
         stream: &Arc<CudaStream>,
@@ -1977,6 +2479,16 @@ impl CudaGraphOp {
             FxHashSet::default()
         };
 
+        // Standalone child captures bake HostOp launch geometry into their
+        // kernels. Rebuild the enclosing graph when one of those dimensions
+        // changes (notably request-indptr rows during continuous batching).
+        // Body-only context growth remains on the shared-workspace fast path.
+        let captured_host_shape_changed = state.cuda_graph.is_some()
+            && !changed_dyn_vars.is_disjoint(&self.captured_host_dyn_dims);
+        if captured_host_shape_changed {
+            Self::reset_materialization_state(&mut state);
+        }
+
         // Check if any kernel's internal buffer dimensions changed
         let needs_internal_realloc = !changed_dyn_vars.is_disjoint(&self.internal_buffer_dyn_dims);
 
@@ -1999,16 +2511,20 @@ impl CudaGraphOp {
         }
 
         // Allocate dyn_dims_buffer if needed
-        if !self.dyn_dims_order.is_empty() && state.dyn_dims_buffer.is_none() {
-            let buffer = stream
-                .alloc_zeros::<i32>(self.dyn_dims_order.len())
-                .expect("Failed to allocate dyn_dims buffer");
-            state.dyn_dims_ptr = buffer.device_ptr(stream).0;
-            state.dyn_dims_buffer = Some(buffer);
+        if !self.dyn_dims_order.is_empty()
+            && state.shared_dyn_dims_ptr.is_none()
+            && state.dyn_dims_buffer.is_none()
+        {
+            state.dyn_dims_buffer = Some(
+                stream
+                    .alloc_zeros::<i32>(self.dyn_dims_order.len())
+                    .expect("Failed to allocate dyn_dims buffer"),
+            );
         }
 
         // Update shared dyn_dims buffer if dyn_map changed
-        if dyn_map_changed && !self.dyn_dims_order.is_empty() {
+        if dyn_map_changed && !self.dyn_dims_order.is_empty() && state.shared_dyn_dims_ptr.is_none()
+        {
             let timer = Instant::now();
             let values: Vec<i32> = self
                 .dyn_dims_order
@@ -2058,6 +2574,45 @@ impl CudaGraphOp {
         }
         profile.collect_buffer_ptrs += timer.elapsed();
 
+        // Child captures bake HostOp pointer arguments into their graph. The
+        // serving arena keeps these bindings stable, but integrations may
+        // replace an external pointer; rebuild only in that uncommon case.
+        let changed_captured_nodes = changed_buffer_nodes
+            .iter()
+            .filter(|node| self.captured_host_buffer_nodes.contains(node))
+            .copied()
+            .collect_vec();
+        if !changed_captured_nodes.is_empty() {
+            if std::env::var_os("LUMINAL_CUDA_DEBUG_CAPTURED_REBUILD").is_some() {
+                let pointer_changes = changed_captured_nodes
+                    .iter()
+                    .take(16)
+                    .map(|node| {
+                        (
+                            *node,
+                            state.last_buffer_ptrs.get(node).copied(),
+                            current_buffer_ptrs.get(node).copied(),
+                        )
+                    })
+                    .collect_vec();
+                eprintln!(
+                    "CudaGraph captured HostOp pointer rebuild: nodes={changed_captured_nodes:?} changes={pointer_changes:?} dyn={dyn_map:?}"
+                );
+            }
+            Self::reset_materialization_state(&mut state);
+            self.build_graph(&mut state, stream, buffers, dyn_map)?;
+            current_buffer_ptrs = self
+                .buffer_nodes
+                .iter()
+                .filter_map(|node| buffers.get(node).map(|buffer| (*node, buffer.ptr())))
+                .collect();
+            for &(input, output) in &self.output_aliases {
+                if let Some(&input_ptr) = current_buffer_ptrs.get(&input) {
+                    current_buffer_ptrs.insert(output, input_ptr);
+                }
+            }
+        }
+
         // Reset any per-invocation kernel state before updating the graph.
         let timer = Instant::now();
         for kernel in &mut state.kernels {
@@ -2101,7 +2656,7 @@ impl CudaGraphOp {
             // before touching either the mutable or executable CUDA graph.
             let mut launch_overrides = FxHashMap::default();
             for idx in launch_candidate_set {
-                let launch = state.kernels[idx].launch_config(dyn_map)?;
+                let launch = Self::kernel_launch_config(&state.kernels[idx], dyn_map)?;
                 if state.kernel_launches.get(idx) != Some(&launch) {
                     dirty_kernel_set.insert(idx);
                     launch_overrides.insert(idx, launch);
@@ -2113,11 +2668,7 @@ impl CudaGraphOp {
             dirty_kernels.sort_unstable();
 
             // Update kernel params
-            let dyn_dims_ptr = state
-                .dyn_dims_buffer
-                .as_ref()
-                .map(|buf| buf.device_ptr(stream).0)
-                .unwrap_or(0);
+            let dyn_dims_ptr = Self::dyn_dims_ptr(&state, stream);
 
             // Build params for each kernel first
             let timer = Instant::now();
@@ -2129,7 +2680,7 @@ impl CudaGraphOp {
                     .iter()
                     .map(|inp| current_buffer_ptrs.get(inp).copied().unwrap_or(0))
                     .collect();
-                kernel.validate_pointers(output_ptr, &input_ptrs, dyn_map)?;
+                Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
                 let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
                     dyn_dims_ptr
                 } else {
@@ -2568,12 +3119,37 @@ impl CudaGraphOp {
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
+        execution_id: u64,
     ) -> anyhow::Result<()> {
         self.materialize(stream, buffers, dyn_map)?;
+        self.prepare_execution(stream, dyn_map, execution_id)?;
 
         let state = self.state.borrow();
         state.cuda_graph_exec.as_ref().unwrap().launch(stream)?;
 
+        Ok(())
+    }
+
+    /// Refresh host-planned metadata consumed by captured library kernels.
+    /// Stable tensor bindings remain in `last_buffers`, so the serving hot
+    /// path does not have to reconstruct a graph-wide buffer map.
+    pub(crate) fn prepare_execution(
+        &self,
+        stream: &Arc<CudaStream>,
+        dyn_map: &DynMap,
+        execution_id: u64,
+    ) -> anyhow::Result<()> {
+        let state = self.state.borrow();
+        for op in &state.captured_host_ops {
+            op.host_op.prepare_cuda_graph_execution(
+                stream,
+                op.node,
+                &op.inputs,
+                &state.last_buffers,
+                dyn_map,
+                execution_id,
+            )?;
+        }
         Ok(())
     }
 
@@ -2593,6 +3169,7 @@ impl CudaGraphOp {
         stream: &Arc<CudaStream>,
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &DynMap,
+        execution_id: u64,
     ) -> anyhow::Result<()> {
         stream.context().bind_to_thread()?;
         let mut state = self.state.borrow_mut();
@@ -2612,7 +3189,7 @@ impl CudaGraphOp {
                 buffer_ptrs.insert(output, ptr);
             }
         }
-        let dyn_dims_ptr = state.dyn_dims_ptr;
+        let dyn_dims_ptr = Self::dyn_dims_ptr(&state, stream);
 
         for step_index in 0..state.steps.len() {
             let (step_name, result) = match state.steps[step_index] {
@@ -2631,6 +3208,20 @@ impl CudaGraphOp {
                     "FlashInfer",
                     state.flashinfer_ops[index].enqueue_prepared(stream, buffers, dyn_map),
                 ),
+                CompiledStep::CapturedHost(index) => {
+                    let op = &state.captured_host_ops[index];
+                    (
+                        op.host_op.stats_name().unwrap_or("CapturedHost"),
+                        op.host_op.execute_with_id(
+                            stream,
+                            op.node,
+                            &op.inputs,
+                            buffers,
+                            dyn_map,
+                            execution_id,
+                        ),
+                    )
+                }
             };
             result.map_err(|error| {
                 anyhow::anyhow!("external {step_name} step {step_index} failed: {error}")
@@ -3046,12 +3637,21 @@ impl CudaGraphOp {
         for kernel in &mut state.kernels {
             kernel.graph_node = None;
         }
+        for op in &mut state.captured_host_ops {
+            op.graph_node = None;
+            op.child_graph = None;
+        }
 
         let tracing_enabled = enabled!(Level::TRACE)
             && state.cublaslt_ops.is_empty()
             && state.flashinfer_ops.is_empty();
-        if tracing_enabled {
-            let needed_events = num_kernels + 1;
+        let step_profile = std::env::var_os("LUMINAL_CUDA_PROFILE_GRAPH_STEPS").is_some();
+        if tracing_enabled || step_profile {
+            let needed_events = if step_profile {
+                state.steps.len() + 1
+            } else {
+                num_kernels + 1
+            };
             while state.timing_events.len() < needed_events {
                 state.timing_events.push(create_cuda_event(&ctx)?);
             }
@@ -3081,11 +3681,7 @@ impl CudaGraphOp {
             }
         }
 
-        let dyn_dims_ptr = state
-            .dyn_dims_buffer
-            .as_ref()
-            .map(|buf| buf.device_ptr(stream).0)
-            .unwrap_or(0);
+        let dyn_dims_ptr = Self::dyn_dims_ptr(state, stream);
 
         graph.ctx.bind_to_thread()?;
 
@@ -3098,7 +3694,12 @@ impl CudaGraphOp {
             .map(Vec::len)
             .max()
             .unwrap_or(0);
-        let mut deps = Vec::with_capacity(max_dependencies);
+        let mut deps = Vec::with_capacity(max_dependencies + usize::from(step_profile));
+        let mut profile_previous_event = if step_profile {
+            Some(graph.add_event_record_node(&[], state.timing_events[0])?)
+        } else {
+            None
+        };
 
         for step_index in 0..n_steps {
             deps.clear();
@@ -3107,6 +3708,11 @@ impl CudaGraphOp {
                     .iter()
                     .map(|dependency| state.step_output_nodes[*dependency]),
             );
+            if let Some(previous_event) = profile_previous_event
+                && !deps.contains(&previous_event)
+            {
+                deps.push(previous_event);
+            }
             debug_assert!(deps.iter().all(|node| !node.is_null()));
 
             let step = state.steps[step_index];
@@ -3128,7 +3734,7 @@ impl CudaGraphOp {
                     }
 
                     let kernel = &state.kernels[idx];
-                    let launch = kernel.launch_config(dyn_map)?;
+                    let launch = Self::kernel_launch_config(kernel, dyn_map)?;
 
                     let output_ptr = buffer_ptrs.get(&kernel.node).copied().unwrap_or(0);
                     let input_ptrs: Vec<u64> = kernel
@@ -3136,7 +3742,7 @@ impl CudaGraphOp {
                         .iter()
                         .map(|inp| buffer_ptrs.get(inp).copied().unwrap_or(0))
                         .collect();
-                    kernel.validate_pointers(output_ptr, &input_ptrs, dyn_map)?;
+                    Self::validate_kernel_pointers(kernel, output_ptr, &input_ptrs, dyn_map)?;
                     let kernel_dyn_dims_ptr = if kernel.has_dyn_dims_param {
                         dyn_dims_ptr
                     } else {
@@ -3320,6 +3926,41 @@ impl CudaGraphOp {
                     state.step_entry_nodes[step_index] = entry_node;
                     state.step_output_nodes[step_index] = exit_node;
                 }
+                CompiledStep::CapturedHost(idx) => {
+                    let capture_stream = self.capture_stream()?;
+                    {
+                        let op = &state.captured_host_ops[idx];
+                        op.prepare_graph_capture(&capture_stream, buffers, dyn_map)?;
+                    }
+                    CudaGraphHandle::begin_standalone_capture(&capture_stream)?;
+                    {
+                        let op = &state.captured_host_ops[idx];
+                        op.host_op.execute_with_id(
+                            &capture_stream,
+                            op.node,
+                            &op.inputs,
+                            buffers,
+                            dyn_map,
+                            0,
+                        )?;
+                    }
+                    let child_graph = CudaGraphHandle::end_standalone_capture(&capture_stream)?;
+                    let child_node = graph.add_child_graph_node(&deps, &child_graph)?;
+                    let op = &mut state.captured_host_ops[idx];
+                    op.child_graph = Some(child_graph);
+                    op.graph_node = Some(child_node);
+                    state.step_entry_nodes[step_index] = child_node;
+                    state.step_output_nodes[step_index] = child_node;
+                }
+            }
+            if step_profile {
+                let output = state.step_output_nodes[step_index];
+                let event = graph.add_event_record_node(
+                    std::slice::from_ref(&output),
+                    state.timing_events[step_index + 1],
+                )?;
+                state.step_output_nodes[step_index] = event;
+                profile_previous_event = Some(event);
             }
         }
 
@@ -3339,6 +3980,11 @@ impl CudaGraphOp {
         state.flashinfer_prepare_cache = flashinfer_prepare_cache_plan;
         state.last_dyn_values = dyn_map.clone();
         state.last_buffer_ptrs = buffer_ptrs;
+        // Execution-time library preparation can need planner-only inputs that
+        // are intentionally absent from captured kernel pointer sets. A full
+        // build is authoritative for the
+        // complete binding snapshot, including cached-binding rebuilds.
+        state.last_buffers = buffers.clone();
 
         Ok(())
     }
@@ -3441,6 +4087,34 @@ pub(crate) fn prepare_kernel_to_host_plan_with_topo_and_source_cache(
     let source_counters_before = source_cache.counters();
     let total_start = Instant::now();
     let classify_start = Instant::now();
+    let mut first_capture_state = FxHashMap::default();
+    let mut capture_state_resource_by_node = FxHashMap::default();
+    let mut incompatible_capture_state = FxHashSet::default();
+    for &node in global_topo_order {
+        let Some(op) = llir_graph[node].to_dialect::<dyn HostOp>() else {
+            continue;
+        };
+        let inputs = llir_graph
+            .edges_directed(node, Direction::Incoming)
+            .sorted_by_key(|edge| edge.id())
+            .map(|edge| edge.source())
+            .collect_vec();
+        let Some(state) = op
+            .as_ref()
+            .as_ref()
+            .cuda_graph_capture_shared_state(&inputs)
+        else {
+            continue;
+        };
+        capture_state_resource_by_node.insert(node, state.resource);
+        if let Some(first) = first_capture_state.get(state.resource) {
+            if first != &state.equivalence_key {
+                incompatible_capture_state.insert(state.resource);
+            }
+        } else {
+            first_capture_state.insert(state.resource, state.equivalence_key);
+        }
+    }
     let mut graph_packagable_ops = FxHashSet::default();
     let mut kernel_topo_order = Vec::with_capacity(global_topo_order.len());
     let mut materialized_kernel_nodes = FxHashSet::default();
@@ -3451,6 +4125,19 @@ pub(crate) fn prepare_kernel_to_host_plan_with_topo_and_source_cache(
             if kernel.output_aliases_input().is_none() {
                 materialized_kernel_nodes.insert(node);
             }
+        } else if llir_graph[node].to_op::<LoopStart>().is_some()
+            || llir_graph[node].to_op::<LoopEnd>().is_some()
+            || llir_graph[node].to_op::<LoopInput>().is_some()
+            || llir_graph[node].to_op::<LoopInputStatic>().is_some()
+            || llir_graph[node].to_op::<LoopOutput>().is_some()
+            || llir_graph[node].to_op::<LoopOutputSelect>().is_some()
+        {
+            // These nodes carry loop wiring but enqueue no device work. The
+            // compiler already resolves through them when binding a packaged
+            // kernel input; include them in convex partitioning as transparent
+            // connectors so an unrolled layer boundary does not force a new
+            // CUDA graph launch.
+            graph_packagable_ops.insert(node);
         } else if llir_graph[node]
             .to_dialect::<dyn HostOp>()
             .is_some_and(|op| {
@@ -3466,6 +4153,10 @@ pub(crate) fn prepare_kernel_to_host_plan_with_topo_and_source_cache(
                                 llir_graph.edges_directed(node, Direction::Incoming).count();
                             incoming == flashinfer.graph_inputs() || incoming == 6
                         })
+                    || (host.cuda_graph_capture_arity().is_some()
+                        && capture_state_resource_by_node
+                            .get(&node)
+                            .is_none_or(|resource| !incompatible_capture_state.contains(resource)))
             })
         {
             graph_packagable_ops.insert(node);
@@ -3796,6 +4487,8 @@ pub(crate) fn kernel_to_host_with_prepared(
         let mut cublaslt_step_by_node: FxHashMap<NodeIndex, usize> = FxHashMap::default();
         let mut flashinfer_ops = Vec::new();
         let mut flashinfer_step_by_node: FxHashMap<NodeIndex, usize> = FxHashMap::default();
+        let mut captured_host_ops = Vec::new();
+        let mut captured_host_step_by_node: FxHashMap<NodeIndex, usize> = FxHashMap::default();
         for node in topo_order {
             let Some(host_op) = llir_graph[*node].to_dialect::<dyn HostOp>() else {
                 continue;
@@ -3866,6 +4559,39 @@ pub(crate) fn kernel_to_host_with_prepared(
                     Arc::clone(host_op),
                 ));
                 flashinfer_step_by_node.insert(*node, idx);
+                continue;
+            }
+
+            let host = host_op.as_ref().as_ref();
+            if let Some(captured_arity) = host.cuda_graph_capture_arity() {
+                let inputs: Vec<NodeIndex> = llir_graph
+                    .edges_directed(*node, Direction::Incoming)
+                    .sorted_by_key(|edge| edge.id())
+                    .map(|edge| resolve_transparent_input(llir_graph, edge.source()))
+                    .collect_vec();
+                assert_eq!(
+                    inputs.len(),
+                    captured_arity,
+                    "invalid captured HostOp arity"
+                );
+                all_buffer_nodes.insert(*node);
+                all_buffer_sizes.insert(*node, host_op.output_size());
+                all_buffer_nodes.extend(inputs.iter().copied());
+                external_inputs.extend(
+                    inputs
+                        .iter()
+                        .copied()
+                        .filter(|input| !subgraph.contains(input)),
+                );
+                let idx = captured_host_ops.len();
+                captured_host_ops.push(CompiledCapturedHost {
+                    node: *node,
+                    inputs,
+                    host_op: Arc::clone(host_op),
+                    child_graph: None,
+                    graph_node: None,
+                });
+                captured_host_step_by_node.insert(*node, idx);
             }
         }
 
@@ -3880,6 +4606,9 @@ pub(crate) fn kernel_to_host_with_prepared(
             if let Some(&idx) = flashinfer_step_by_node.get(node) {
                 steps.push(CompiledStep::FlashInferDecode(idx));
             }
+            if let Some(&idx) = captured_host_step_by_node.get(node) {
+                steps.push(CompiledStep::CapturedHost(idx));
+            }
         }
 
         // Get the possibly-extended global ordering (kernels may have discovered new dims)
@@ -3893,7 +4622,13 @@ pub(crate) fn kernel_to_host_with_prepared(
 
         let buffer_nodes: Vec<NodeIndex> = all_buffer_nodes.into_iter().collect();
 
-        let state = CudaGraphOpState::new(kernels, cublaslt_ops, flashinfer_ops, steps);
+        let state = CudaGraphOpState::new(
+            kernels,
+            cublaslt_ops,
+            flashinfer_ops,
+            captured_host_ops,
+            steps,
+        );
 
         let cuda_graph_op = CudaGraphOp::new(
             buffer_nodes,
@@ -3981,7 +4716,7 @@ pub(crate) fn kernel_to_host_with_prepared(
     // a single fused CUDA function anchored at each region's root
     // FusionEnd; the absorbed nodes have no consumers outside the region
     // and never need their own buffers. Removing them keeps later
-    // per-execute walks (e.g., `allocate_intermediate_buffers`) from
+    // per-execute walks (e.g., intermediate-buffer planning) from
     // chewing through dead nodes every decode token.
     //
     // Root FusionEnd nodes are NOT in `globally_absorbed` (they were the

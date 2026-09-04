@@ -98,7 +98,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
                                                     float* tmp_s, bool enable_pdl,
                                                     cudaStream_t stream);
 }
-
 // Explicit instantiation: decode kernels (f32 only up to HEAD_DIM 256 —
 // f32 at 512 needs vec_bits 512 which exceeds cp.async's 256-bit limit)
 #if LUMINAL_HEAD_DIM <= 256

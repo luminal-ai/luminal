@@ -1,7 +1,7 @@
 //! Search-reliability harness: a tiny attention+MoE model with real KV-cache
 //! scatter/gather and per-step promote, compiled across many seeds. The op
 //! patterns mirror the fused-op rewrites (FlashInfer-matchable attention,
-//! GLUMoE / KernelMoEGemv-matchable experts, ScatterNoCopy-matchable cache
+//! GLUMoE-matchable experts, ScatterNoCopy-matchable cache
 //! update), so the search faces the same kernel-family basins as the full
 //! models — but a seed compiles in ~1 minute, making exploration/metric
 //! changes testable in minutes.
@@ -62,7 +62,7 @@ fn scatter_rows(
 }
 
 /// Expert-gather idiom shared with the qwen3/gemma MoE frontends (must match
-/// the GLUMoE / KernelMoEGemv rewrite patterns).
+/// the GLUMoE rewrite patterns).
 fn gather_experts(
     graph_source: GraphTensor,
     top_k_indices: GraphTensor,

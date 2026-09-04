@@ -1,5 +1,10 @@
 # Luminal Core Spec
 
+> NOTE (2026-09-03): this file is a snapshot of main's HLIR/LLIR architecture
+> (main #404, #420) and is OUT OF DATE for this branch. The branch's pipeline
+> is recorder -> egglog_core -> runtime-owned extraction/search -> bufferize ->
+> runtime. It will be re-authored once the main rejoin completes.
+
 This document describes the core design, semantics, and contracts of the Luminal compiler.
 
 ## Compile Flow

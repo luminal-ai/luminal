@@ -1578,7 +1578,6 @@ fn round_to_bf16(data: &[f32]) -> Vec<f32> {
         .map(|v| half::bf16::from_f32(*v).to_f32())
         .collect()
 }
-
 #[test]
 fn flashinfer_bf16_decode_bs1_ctx4() {
     if !crate::tests::utilities::gpu_supports_flashinfer() {

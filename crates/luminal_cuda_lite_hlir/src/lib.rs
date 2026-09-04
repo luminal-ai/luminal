@@ -8,6 +8,7 @@ pub mod host;
 pub mod kernel;
 mod resource;
 pub mod runtime;
+mod search;
 use std::{
     cell::Cell,
     ffi::{CStr, CString},
@@ -77,7 +78,12 @@ mod kernel_source_limit_tests {
     }
 }
 
-fn cuda_dtype(dtype: DType) -> &'static str {
+/// Map a Luminal dtype to the CUDA C++ storage type used by generated kernels.
+///
+/// This is public so full CUDA can layer additional kernels on Lite's shared
+/// code-generation/runtime foundation without duplicating the dtype contract.
+#[doc(hidden)]
+pub fn cuda_dtype(dtype: DType) -> &'static str {
     match dtype {
         DType::F64 => "double",
         DType::F32 => "float",
@@ -103,8 +109,9 @@ fn cuda_dtype(dtype: DType) -> &'static str {
 
 const CUDA_NVRTC_INCLUDE_PATHS: [&str; 2] = ["/usr/local/cuda/include", "/usr/include"];
 
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) enum CudaModuleImageCompileFailure {
+pub enum CudaModuleImageCompileFailure {
     ComputeCapability(DriverError),
     Nvrtc {
         stage: &'static str,
@@ -113,8 +120,9 @@ pub(crate) enum CudaModuleImageCompileFailure {
     NoModuleImageProduced,
 }
 
+#[doc(hidden)]
 #[derive(Debug)]
-pub(crate) struct CudaModuleImageCompileError {
+pub struct CudaModuleImageCompileError {
     pub target_arch: Option<String>,
     pub driver_version: Option<i32>,
     pub runtime_version: Option<i32>,
@@ -382,7 +390,8 @@ fn cuda_driver_diagnostics() -> (Option<i32>, Option<i32>) {
 /// instead of launching kernels whose symbols aren't in the cubin
 /// (`CUDA_ERROR_NOT_FOUND`). Defaults to 8 (Ampere) if detection fails, so
 /// detection problems don't silently disable the feature on capable GPUs.
-pub(crate) fn device_compute_major() -> i32 {
+#[doc(hidden)]
+pub fn device_compute_major() -> i32 {
     static MAJOR: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *MAJOR.get_or_init(|| {
         // Override to validate the older-arch fallback path (e.g. force a
@@ -495,7 +504,8 @@ fn get_cubin(program: nvrtc_sys::nvrtcProgram) -> Result<Vec<u8>, NvrtcError> {
     Ok(cubin)
 }
 
-pub(crate) fn compile_module_image_for_current_device<S: AsRef<str>>(
+#[doc(hidden)]
+pub fn compile_module_image_for_current_device<S: AsRef<str>>(
     ctx: &Arc<CudaContext>,
     src: S,
 ) -> Result<Ptx, CudaModuleImageCompileError> {

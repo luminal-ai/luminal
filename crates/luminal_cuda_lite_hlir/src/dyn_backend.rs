@@ -2,19 +2,21 @@
 
 use luminal::dtype::DType;
 use luminal::dyn_backend::{BackendCompileArgs, DynBackend, compile_backend};
+use luminal::op::IntoEgglogOp;
 use luminal::prelude::*;
 
 use crate::cudarc::driver::CudaContext;
-use crate::runtime::CudaRuntime;
+use crate::runtime::{CudaRuntimeImpl, DefaultCudaOps};
 
 /// [`DynBackend`] wrapper for [`CudaRuntime`].
-pub struct CudaLiteDynBackend {
-    pub runtime: CudaRuntime,
+pub struct CudaDynBackend<O = DefaultCudaOps> {
+    pub runtime: CudaRuntimeImpl<O>,
+    backend_name: &'static str,
 }
 
-impl DynBackend for CudaLiteDynBackend {
+impl<O: IntoEgglogOp + 'static> DynBackend for CudaDynBackend<O> {
     fn name(&self) -> &str {
-        "cuda_lite"
+        self.backend_name
     }
     fn device_type(&self) -> &str {
         "cuda"
@@ -91,9 +93,11 @@ impl DynBackend for CudaLiteDynBackend {
     }
 }
 
-pub fn cuda_lite_factory(
+#[doc(hidden)]
+pub fn cuda_factory_for<O: IntoEgglogOp + 'static>(
     graph: &mut Graph,
     args: BackendCompileArgs,
+    backend_name: &'static str,
 ) -> Result<Box<dyn DynBackend>, String> {
     let device_index = args
         .device_index
@@ -106,18 +110,32 @@ pub fn cuda_lite_factory(
     let cuda_ctx = CudaContext::new(device_index).map_err(|e| format!("CUDA init failed: {e}"))?;
     let stream = cuda_ctx.default_stream();
     let external_cuda_graph = args.external_cuda_graph;
-    compile_backend::<CudaRuntime>(
+    compile_backend::<CudaRuntimeImpl<O>>(
         graph,
         args,
         || {
-            let mut runtime = CudaRuntime::initialize(stream);
-            runtime.external_cuda_graph = external_cuda_graph;
+            let mut runtime = CudaRuntimeImpl::<O>::initialize(stream);
+            runtime.set_external_cuda_graph(external_cuda_graph);
             Ok(runtime)
         },
         |rt, node, bytes, _dtype| {
             rt.set_data(node, bytes);
         },
         Some(&|rt, node, ptr, n| unsafe { rt.set_device_ptr(node, ptr, n) }),
-        |rt| Box::new(CudaLiteDynBackend { runtime: rt }),
+        |rt| {
+            Box::new(CudaDynBackend {
+                runtime: rt,
+                backend_name,
+            })
+        },
     )
+}
+
+pub type CudaLiteDynBackend = CudaDynBackend<DefaultCudaOps>;
+
+pub fn cuda_lite_factory(
+    graph: &mut Graph,
+    args: BackendCompileArgs,
+) -> Result<Box<dyn DynBackend>, String> {
+    cuda_factory_for::<DefaultCudaOps>(graph, args, "cuda_lite")
 }

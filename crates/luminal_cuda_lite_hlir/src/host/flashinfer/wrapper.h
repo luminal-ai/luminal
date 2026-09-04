@@ -7,7 +7,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
 // dtype codes shared with the Rust side: 0 = f32, 1 = f16, 2 = bf16.
 // Q / K / V / output buffers must all use the same dtype.
 
