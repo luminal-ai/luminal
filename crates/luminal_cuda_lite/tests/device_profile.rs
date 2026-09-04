@@ -243,3 +243,81 @@ fn a_zero_budget_times_every_candidate_out_and_says_so() {
         "the refusal must name the timeout, not something else: {text}"
     );
 }
+
+/// PHASE 5 ON DEVICE: the finalist hard filter is a real warmup, and the
+/// aggregate device budget is enforced against real arena slabs.
+///
+/// The two halves the CPU suite (`finalists_lattice.rs`) cannot reach:
+///
+///  * `CompileOptions::device_budget_bytes: Some(0)` cannot hold any plan
+///    of this fixture, so every set in the lattice is rejected and the
+///    search refuses NAMING THE BUDGET. That the message is about the
+///    budget and NOT about a warmup is the pin that the hard filter
+///    passed on every finalist it materialized — under
+///    `profile_on_device` each of them was compiled, staged and RUN once
+///    on the device before the budget ever looked at it.
+///  * With the budget lifted, the same search installs its own winner
+///    (rank 1, zero rejections) and the installed plan executes.
+#[test]
+fn the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced() {
+    let (cx, floats, ints, _out) = mini_llama3_fixture();
+    let data: FxHashMap<NodeIndex, HostBuffer> = floats
+        .iter()
+        .map(|(id, v)| (*id, HostBuffer::from(v.clone())))
+        .chain(
+            ints.iter()
+                .map(|(id, v)| (*id, HostBuffer::from(v.clone()))),
+        )
+        .collect();
+
+    // A budget nothing meets: every finalist is warmed up on the device,
+    // every set is refused for its slab, and the walk runs out.
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    let err = rt
+        .search(
+            &data,
+            &CompileOptions {
+                profile_on_device: true,
+                keep_finalists: 3,
+                device_budget_bytes: Some(0),
+                ..luminal_cuda_lite::harness_search_options()
+            },
+        )
+        .expect_err("a zero device budget leaves no viable plan set");
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("0-byte device budget"),
+        "the refusal must name the budget: {text}"
+    );
+    assert!(
+        !text.contains("device warmup"),
+        "every finalist should have warmed up successfully; the refusal is the \
+         budget's, not the device's: {text}"
+    );
+
+    // Budget lifted: the search installs its own winner and it runs.
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    let outcome = rt
+        .search(
+            &data,
+            &CompileOptions {
+                profile_on_device: true,
+                keep_finalists: 3,
+                device_budget_bytes: Some(usize::MAX),
+                ..luminal_cuda_lite::harness_search_options()
+            },
+        )
+        .expect("a budget nothing exceeds installs the winner");
+    assert_eq!(
+        outcome.lattice_rejections, 0,
+        "an unreachable budget must reject nothing"
+    );
+    for (id, v) in &floats {
+        rt.set_data(*id, v.clone());
+    }
+    for (id, v) in &ints {
+        rt.set_data(*id, v.clone());
+    }
+    rt.execute()
+        .expect("the plan the lattice installed executes on the device");
+}
