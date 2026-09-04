@@ -120,7 +120,7 @@ impl OpMatcher for TruncDivFunctionalMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Truncated integer division (toward zero). checked_div covers both
 /// loud cases: zero divisor and the MIN / -1 overflow corner.

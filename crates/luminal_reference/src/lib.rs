@@ -21,6 +21,7 @@ pub mod layouts;
 pub mod ops;
 pub mod runtime;
 pub mod search;
+pub mod typed_buffer;
 
 pub use bindings::ReferenceBindings;
 pub use harness::{extract_layout_ir, extract_layout_ir_with_genome, producer_index_with_ops};
@@ -30,6 +31,7 @@ pub use search::{
     harness_search_options, search_implementations, search_implementations_with_ops,
     CompileOptions, SearchOutcome,
 };
+pub use typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// The reference-registry assembled program (core's
 /// `assembled_program_for` with this crate's matchers), memoized.

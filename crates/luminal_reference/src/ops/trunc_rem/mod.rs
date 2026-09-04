@@ -120,7 +120,7 @@ impl OpMatcher for TruncRemFunctionalMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Truncated integer remainder (sign follows the dividend).
 pub(crate) fn kernel(

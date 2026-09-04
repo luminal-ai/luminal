@@ -19,12 +19,12 @@
 //! pinned against hand-computed values. WRITE sides stay fail-closed:
 //! `codegen_identity::strided::expression_kernel_write_sides_stay_fail_closed`.
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CompileOptions;
+use luminal_cuda_lite::HostBuffer;
 use luminal_cuda_lite::{kernels, CudaRuntime};
 
 /// The view fixtures' search budget (mirrors `view_admission`):
@@ -47,11 +47,11 @@ fn view_search_options(seed: u64) -> CompileOptions {
 /// Load → search on the CUDA runtime; return the best plan.
 fn plan_for(
     cx: &Graph,
-    inputs: &[(NodeIndex, TypedBuffer)],
+    inputs: &[(NodeIndex, HostBuffer)],
     seed: u64,
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
-    let data: FxHashMap<NodeIndex, TypedBuffer> = inputs.iter().cloned().collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
         .search(&data, &view_search_options(seed))
         .expect("cuda search");
@@ -154,8 +154,45 @@ fn assert_no_traps(source: &str) {
 /// materialization — it never folds), checked against hand-computed
 /// values. The CL side of the differential is textual on CPU; the
 /// device half is the A100 pass.
-fn reference_values(cx: &Graph, inputs: &[(NodeIndex, TypedBuffer)], out: NodeIndex, want: &[f32]) {
-    let reference = luminal_reference::harness::run_reference(cx, inputs);
+/// THE TWO RUNTIMES TAKE DIFFERENT HOST PAYLOADS (ruling D4,
+/// 2026-09-03): CL stages `HostBuffer` (bytes plus a dtype tag), the
+/// reference stages `TypedBuffer` (typed slices its kernels read). These
+/// fixtures name their data ONCE, as CL payloads, and this bridge
+/// re-stages it for the reference side — decoding the bytes back through
+/// the very dtype tag they were written under, so nothing is
+/// reinterpreted. Test-local on purpose: neither runtime knows about the
+/// other's payload type.
+fn as_reference(
+    inputs: &[(NodeIndex, HostBuffer)],
+) -> Vec<(NodeIndex, luminal_reference::TypedBuffer)> {
+    inputs
+        .iter()
+        .map(|(id, payload)| {
+            let staged = match payload.dtype {
+                luminal::dtype::PlanDtype::F32 => {
+                    luminal_reference::TypedBuffer::F32(payload.as_f32().expect("f32 payload"))
+                }
+                luminal::dtype::PlanDtype::Int => {
+                    luminal_reference::TypedBuffer::I32(payload.as_i32().expect("i32 payload"))
+                }
+                luminal::dtype::PlanDtype::Int64 => {
+                    luminal_reference::TypedBuffer::I64(payload.as_i64().expect("i64 payload"))
+                }
+                luminal::dtype::PlanDtype::Bool | luminal::dtype::PlanDtype::Bool8 => {
+                    luminal_reference::TypedBuffer::bool8(
+                        payload.as_bool8().expect("bool8 payload").to_vec(),
+                    )
+                    .expect("bool8 codes are legal")
+                }
+                other => panic!("no reference staging for {other:?}"),
+            };
+            (*id, staged)
+        })
+        .collect()
+}
+
+fn reference_values(cx: &Graph, inputs: &[(NodeIndex, HostBuffer)], out: NodeIndex, want: &[f32]) {
+    let reference = luminal_reference::harness::run_reference(cx, &as_reference(inputs));
     let got = reference.get_f32(out).expect("reference output");
     assert_eq!(
         got.as_slice(),
@@ -180,7 +217,7 @@ fn gather_lowers_a_folded_coordinate_operand() {
     let out = data.gather(&[row_coord, cols]).output();
 
     let data_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
-    let inputs: Vec<(NodeIndex, TypedBuffer)> =
+    let inputs: Vec<(NodeIndex, HostBuffer)> =
         vec![(data.id, data_vals.into()), (rows.id, vec![2i32, 0].into())];
 
     // Numeric truth: out[i][j] = data[rows[i]][j] with rows = [2, 0].
@@ -249,7 +286,7 @@ fn gather_lowers_a_folded_data_operand() {
     let out = data.gather(&[rows.expand_dim(1, 3usize), cols]).output();
 
     let base_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
-    let inputs: Vec<(NodeIndex, TypedBuffer)> =
+    let inputs: Vec<(NodeIndex, HostBuffer)> =
         vec![(base.id, base_vals.into()), (rows.id, vec![2i32, 0].into())];
 
     // data[i][j] = base[j][i] = j*4 + i; rows = [2, 0]:
@@ -303,7 +340,7 @@ fn scatter_lowers_a_folded_coordinate_operand() {
     let row_coord = rows.expand_dim(1, 3usize);
     let out = init.scatter(&[row_coord, cols], src).output();
 
-    let inputs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let inputs: Vec<(NodeIndex, HostBuffer)> = vec![
         (init.id, vec![0.0f32; 12].into()),
         (
             src.id,
@@ -387,7 +424,7 @@ fn scatter_lowers_all_read_side_folds() {
 
     let init_vals: Vec<f32> = (0..12).map(|v| 100.0 + v as f32).collect();
     let src_vals: Vec<f32> = (0..12).map(|v| v as f32).collect();
-    let inputs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let inputs: Vec<(NodeIndex, HostBuffer)> = vec![
         (init_base.id, init_vals.into()),
         (src_base.id, src_vals.into()),
         (rows.id, vec![3i32, 1].into()),
@@ -464,7 +501,7 @@ fn materialize_lowers_a_folded_input_operand() {
     // materializes — and the other folds onto its input operand.
     let out = x.permute((1, 0)).slice((0..2, ..)).output();
 
-    let inputs: Vec<(NodeIndex, TypedBuffer)> =
+    let inputs: Vec<(NodeIndex, HostBuffer)> =
         vec![(x.id, (0..6).map(|v| v as f32).collect::<Vec<f32>>().into())];
 
     // x^T rows 0..2 of (3,2): [[0,3],[1,4]].

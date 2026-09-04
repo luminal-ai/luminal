@@ -35,7 +35,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use luminal::buffer_tensor_ir::TypedBuffer;
+use crate::typed_buffer::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 use luminal::graph::LogicalProgram;
 use luminal::layouts::DecodedLayout;
@@ -804,7 +804,7 @@ pub fn search_implementations_with_ops(
     let allow_override = allow_override.or_else(|| Some(reference_allow_list()));
     // Tensor-keyed at the boundary (the retired-HLIR-keyspace design);
     // buffer-keyed internally via the program's slots.
-    let buffer_data: FxHashMap<i64, luminal::buffer_tensor_ir::TypedBuffer> = input_data
+    let buffer_data: FxHashMap<i64, crate::typed_buffer::TypedBuffer> = input_data
         .iter()
         .map(|(tensor, data)| {
             let slot = program

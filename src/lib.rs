@@ -36,7 +36,6 @@ pub mod visualization;
 pub mod tests;
 
 pub mod prelude {
-    pub use crate::buffer_tensor_ir::TypedBuffer;
     pub use crate::dtype::DType;
     pub use crate::frontend::binary::F32Pow;
     pub use crate::frontend::*;

@@ -139,7 +139,7 @@ impl OpMatcher for ReduceMaxMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::expect_op;
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Axis reduce-max. Int max needs no overflow check (max never leaves
 /// the operand range).

@@ -222,10 +222,7 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
 /// (`luminal_reference::harness_search_options`).
 pub fn run_reference(
     cx: &luminal::graph::Graph,
-    inputs: &[(
-        petgraph::graph::NodeIndex,
-        luminal::buffer_tensor_ir::TypedBuffer,
-    )],
+    inputs: &[(petgraph::graph::NodeIndex, crate::typed_buffer::TypedBuffer)],
 ) -> crate::runtime::ReferenceRuntime {
     run_reference_with_ranges(cx, inputs, &[])
 }
@@ -238,10 +235,7 @@ pub fn run_reference(
 /// `bind_value_range` between load and search.
 pub fn run_reference_with_ranges(
     cx: &luminal::graph::Graph,
-    inputs: &[(
-        petgraph::graph::NodeIndex,
-        luminal::buffer_tensor_ir::TypedBuffer,
-    )],
+    inputs: &[(petgraph::graph::NodeIndex, crate::typed_buffer::TypedBuffer)],
     ranges: &[(petgraph::graph::NodeIndex, i64, i64)],
 ) -> crate::runtime::ReferenceRuntime {
     let mut rt =

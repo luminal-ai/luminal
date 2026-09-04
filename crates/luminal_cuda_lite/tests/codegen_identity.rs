@@ -119,7 +119,7 @@ fn searched_plan(
         &mut luminal::graph::Graph,
     ) -> FxHashMap<
         luminal::prelude::petgraph::graph::NodeIndex,
-        luminal::buffer_tensor_ir::TypedBuffer,
+        luminal_cuda_lite::HostBuffer,
     >,
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut cx = luminal::graph::Graph::new();

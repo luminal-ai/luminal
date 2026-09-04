@@ -27,13 +27,13 @@
 //!    creation; the decoded `L` IS the read path, and how it is spelled
 //!    is the e-graph's business.)
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::{BufferIrGraph, BufferNode};
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 
 /// Search budget for the view fixtures: profiling is static (bytes
 /// moved), so generations are cheap — enough sampling that the
@@ -53,10 +53,10 @@ fn view_search_options() -> CompileOptions {
 /// Load → search on the CUDA runtime; return the best plan.
 fn plan_for(
     cx: &Graph,
-    inputs: &[(NodeIndex, TypedBuffer)],
+    inputs: &[(NodeIndex, HostBuffer)],
 ) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
-    let data: FxHashMap<NodeIndex, TypedBuffer> = inputs.iter().cloned().collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
         .search(&data, &view_search_options())
         .expect("cuda search");

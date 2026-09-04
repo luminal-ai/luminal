@@ -4,6 +4,7 @@
 //! the baseline and transparent worktrees; measurement-only.
 
 use luminal::prelude::*;
+use luminal_reference::TypedBuffer;
 use std::time::Instant;
 
 fn random_vec(n: usize) -> Vec<f32> {

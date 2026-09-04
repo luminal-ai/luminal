@@ -5,12 +5,12 @@
 //! suites; a mini model smoke test only proves that its complete small graph
 //! can be searched, staged, executed, and read back.
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{GraphTensor, NodeIndex};
 use luminal::shape::IntExpr;
 use luminal_reference::ReferenceRuntime;
+use luminal_reference::TypedBuffer;
 
 fn values(n: usize, seed: usize) -> Vec<f32> {
     (0..n)

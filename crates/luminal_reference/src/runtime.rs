@@ -19,7 +19,7 @@ use anyhow::{anyhow, ensure, Context, Result};
 use petgraph::algo::toposort;
 use rustc_hash::FxHashMap;
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, OutputBinding};
 
 use luminal::layouts::DecodedLayout;
@@ -739,8 +739,8 @@ impl ReferenceRuntime {
 #[cfg(test)]
 mod tests {
     use crate::harness::run_reference;
+    use crate::typed_buffer::TypedBuffer;
     use crate::ReferenceRuntime;
-    use luminal::buffer_tensor_ir::TypedBuffer;
     use luminal::dtype::DType;
     use luminal::graph::Graph;
     use rustc_hash::FxHashMap;

@@ -11,8 +11,8 @@
 //! not a measurement). Only `execute` requires the `device` feature and
 //! a CUDA device.
 
+use crate::host_buffer::HostBuffer;
 use anyhow::{anyhow, bail, Context, Result};
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 
 use crate::search::{CompileOptions, SearchOutcome};
@@ -44,18 +44,12 @@ pub struct CudaRuntime {
     cublaslt: bool,
     plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
-    staged: FxHashMap<i64, TypedBuffer>,
+    staged: FxHashMap<i64, HostBuffer>,
     /// Host copies of each output slot's BACKING buffer plus its elected
     /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
     /// keyed by slot index (an escaped slot's backing buffer is a minted
     /// allocation with no BufferLit, so slot order is the stable key).
-    outputs_host: FxHashMap<
-        usize,
-        (
-            TypedBuffer,
-            luminal::bufferize::OutputBinding<DecodedLayout>,
-        ),
-    >,
+    outputs_host: FxHashMap<usize, (HostBuffer, luminal::bufferize::OutputBinding<DecodedLayout>)>,
     input_buffers: FxHashMap<NodeIndex, i64>,
     /// Bound output tensor → its slot index (program slot order).
     output_index: FxHashMap<NodeIndex, usize>,
@@ -250,7 +244,7 @@ impl CudaRuntime {
     /// isolation to name the door, mirroring the reference runtime.
     pub fn search(
         &mut self,
-        input_data: &FxHashMap<NodeIndex, TypedBuffer>,
+        input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
         let (serialized, program) = self.assemble_and_saturate()?;
@@ -306,7 +300,7 @@ impl CudaRuntime {
 
     /// Stage input payload for a bound tensor (host side; H2D happens
     /// inside execute).
-    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<TypedBuffer>) {
+    pub fn set_data(&mut self, tensor: NodeIndex, data: impl Into<HostBuffer>) {
         let Some(&buffer) = self.input_buffers.get(&tensor) else {
             panic!("set_data on a tensor with no input binding");
         };
@@ -365,11 +359,27 @@ impl CudaRuntime {
     /// [`Self::output_layout`], read by [`crate::layouts::dense_f32`])
     /// remains correct for every layout and is what callers that cannot
     /// assume a dense output should use.
-    pub fn get_f32(&self, tensor: NodeIndex) -> Result<&Vec<f32>> {
-        match self.fetch(tensor)? {
-            (TypedBuffer::F32(values), _) => Ok(values),
-            (other, _) => bail!("output is {}, not f32", other.type_name()),
-        }
+    pub fn get_f32(&self, tensor: NodeIndex) -> Result<Vec<f32>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_f32()
+    }
+
+    /// [`Self::get_f32`] for 32-bit integer outputs.
+    pub fn get_i32(&self, tensor: NodeIndex) -> Result<Vec<i32>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_i32()
+    }
+
+    /// [`Self::get_f32`] for 64-bit integer outputs.
+    pub fn get_i64(&self, tensor: NodeIndex) -> Result<Vec<i64>> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_i64()
+    }
+
+    /// [`Self::get_f32`] for boolean outputs: the two-legal-code bytes.
+    pub fn get_bool8(&self, tensor: NodeIndex) -> Result<&[u8]> {
+        let (payload, _) = self.fetch(tensor)?;
+        payload.as_bool8()
     }
 
     /// The universal escape-and-disclose fetch: the output slot's backing
@@ -379,7 +389,7 @@ impl CudaRuntime {
         &self,
         tensor: NodeIndex,
     ) -> Result<(
-        &TypedBuffer,
+        &HostBuffer,
         &luminal::bufferize::OutputBinding<DecodedLayout>,
     )> {
         let index = self

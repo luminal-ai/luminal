@@ -16,8 +16,9 @@ impl Graph {
     /// `constant` records a `LogicalIota`, and `src/logical_op/iota/dtype.egg`
     /// pins every iota's dtype to `(Int)` — 32 bits — unconditionally. So a
     /// literal wider than `i32` cannot be minted directly: the reference
-    /// kernel's `TypedBuffer::I32` arm does `i32::try_from(value)` and
-    /// REFUSES ("iota value {value} overflows i32 (ints are non-wrapping)"),
+    /// kernel's `luminal_reference::TypedBuffer::I32` arm does
+    /// `i32::try_from(value)` and REFUSES ("iota value {value} overflows
+    /// i32 (ints are non-wrapping)"),
     /// and casting after the fact is too late because the narrow buffer is
     /// already the value. Horner assembly instead keeps every limb inside
     /// `i32`, casts each to `I64` FIRST, and does all four multiplies and

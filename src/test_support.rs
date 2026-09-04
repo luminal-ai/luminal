@@ -2938,12 +2938,10 @@ mod subst_guard_study {
         let x = cx.named_tensor("x", ('s', 3usize), DType::F32);
         let _ = (x.squeeze(0) * 2.0).output();
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
-        let data: rustc_hash::FxHashMap<_, _> = [(
-            x.id,
-            luminal::buffer_tensor_ir::TypedBuffer::from(vec![0.0f32; 6]),
-        )]
-        .into_iter()
-        .collect();
+        let data: rustc_hash::FxHashMap<_, _> =
+            [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 6]))]
+                .into_iter()
+                .collect();
         rt.bind_dyn_range('s', 2, 2).expect("bind");
         let err = rt
             .search(&data, &luminal_reference::CompileOptions::default())
@@ -2998,12 +2996,10 @@ mod subst_guard_study {
         let x = cx.named_tensor("x", ('s',), DType::F32);
         let _ = x.unfold((3usize,), (1usize,), (1usize,)).sum(1).output();
         let mut rt = luminal_reference::ReferenceRuntime::load(&cx).expect("records + loads");
-        let data: rustc_hash::FxHashMap<_, _> = [(
-            x.id,
-            luminal::buffer_tensor_ir::TypedBuffer::from(vec![0.0f32; 2]),
-        )]
-        .into_iter()
-        .collect();
+        let data: rustc_hash::FxHashMap<_, _> =
+            [(x.id, luminal_reference::TypedBuffer::from(vec![0.0f32; 2]))]
+                .into_iter()
+                .collect();
         rt.bind_dyn_range('s', 2, 2).expect("bind");
         let err = rt
             .search(&data, &luminal_reference::CompileOptions::default())

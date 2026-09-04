@@ -30,7 +30,6 @@
 
 use std::collections::BTreeSet;
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferNode;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
@@ -38,6 +37,7 @@ use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal_cuda_lite::ops::cublaslt::exec::{bind_destination, plan_call, LtOrder};
 use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtDps};
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 
 /// Deterministic values (the shared example seeding discipline).
 fn weights(n: usize, seed: usize) -> Vec<f32> {
@@ -202,10 +202,10 @@ fn linear_with_bias_mints_the_bias_form_on_a_left_major_d() {
 #[test]
 fn search_elects_the_bias_form_and_binds_a_col_d() {
     let (cx, x, w, b, _out) = linear_with_bias();
-    let data: FxHashMap<NodeIndex, TypedBuffer> = [
-        (x, TypedBuffer::from(weights(M * K, 1))),
-        (w, TypedBuffer::from(weights(K * N, 2))),
-        (b, TypedBuffer::from(weights(N, 3))),
+    let data: FxHashMap<NodeIndex, HostBuffer> = [
+        (x, HostBuffer::from(weights(M * K, 1))),
+        (w, HostBuffer::from(weights(K * N, 2))),
+        (b, HostBuffer::from(weights(N, 3))),
     ]
     .into_iter()
     .collect();

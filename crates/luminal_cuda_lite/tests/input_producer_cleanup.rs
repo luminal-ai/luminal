@@ -38,12 +38,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 
 /// Deterministic values (the shared example seeding discipline).
 fn weights(n: usize, seed: usize) -> Vec<f32> {
@@ -348,7 +348,7 @@ fn sampled_genomes_never_hand_bufferize_a_cyclic_graph() {
     for seed in 0..SEEDS {
         let (cx, a, b) = marker_matmul();
         let mut rt = CudaRuntime::load_with_cublaslt(&cx).expect("load");
-        let data: FxHashMap<NodeIndex, TypedBuffer> =
+        let data: FxHashMap<NodeIndex, HostBuffer> =
             [(a, weights(32, 1).into()), (b, weights(24, 2).into())]
                 .into_iter()
                 .collect();

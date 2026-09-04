@@ -30,11 +30,11 @@ pub fn require_device(example: &str) {
 #[cfg(feature = "device")]
 pub mod device {
     use anyhow::{anyhow, bail, Context, Result};
-    use luminal::buffer_tensor_ir::TypedBuffer;
     use luminal::bufferize::BufferNode;
     use luminal::graph::Graph;
     use luminal::prelude::{FxHashMap, NodeIndex};
     use luminal_cuda_lite::CudaRuntime;
+    use luminal_cuda_lite::HostBuffer;
 
     /// Fill every logical input in a model graph. Callers provide the
     /// semantically constrained runtime inputs (token ids, cache indices,
@@ -42,8 +42,8 @@ pub mod device {
     /// receive deterministic synthetic values.
     pub fn seeded_graph_inputs(
         cx: &Graph,
-        overrides: Vec<(NodeIndex, TypedBuffer)>,
-    ) -> Result<Vec<(NodeIndex, TypedBuffer)>> {
+        overrides: Vec<(NodeIndex, HostBuffer)>,
+    ) -> Result<Vec<(NodeIndex, HostBuffer)>> {
         let mut overrides: FxHashMap<_, _> = overrides.into_iter().collect();
         let mut pairs = Vec::new();
         for (seed, spec) in cx.logical.input_specs().into_iter().enumerate() {
@@ -82,7 +82,7 @@ pub mod device {
     fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Result<Vec<f32>> {
         let (data, binding) = rt.fetch(out).context("escape-and-disclose fetch")?;
         let bytes = match data {
-            TypedBuffer::F32(values) => values,
+            HostBuffer::F32(values) => values,
             other => bail!("output is {}, not f32", other.type_name()),
         };
         luminal_cuda_lite::layouts::dense_f32(bytes, &binding.layout)
@@ -135,7 +135,7 @@ pub mod device {
     pub fn run_cuda(
         name: &str,
         cx: &Graph,
-        pairs: Vec<(NodeIndex, TypedBuffer)>,
+        pairs: Vec<(NodeIndex, HostBuffer)>,
         outputs: &[(&str, NodeIndex)],
     ) -> Result<()> {
         // 1. CUDA-lite: record → search (harness budget) → plan.
@@ -148,7 +148,7 @@ pub mod device {
         }
         // Own one copy of the hardware-sized parameter set. Search borrows it;
         // staging then moves the same buffers into the runtime.
-        let mut data: FxHashMap<NodeIndex, TypedBuffer> = pairs.into_iter().collect();
+        let mut data: FxHashMap<NodeIndex, HostBuffer> = pairs.into_iter().collect();
         let t = std::time::Instant::now();
         let outcome = rt
             .search(&data, &luminal_cuda_lite::harness_search_options())

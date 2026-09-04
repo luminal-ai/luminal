@@ -213,7 +213,7 @@ impl OpMatcher for ScatterFunctionalMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::{coordinate_columns, expect_op};
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// The CHECKED scatter kernel (ruling 2026-08-06): dest starts as a copy
 /// of init, then dest[coords(i)] = src[i] over the src iteration space.

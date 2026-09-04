@@ -207,7 +207,7 @@ impl OpMatcher for GatherMatcher {
 // ---------------------------------------------------------------------------
 
 use crate::kernels::{coordinate_columns, expect_op, move_gathered};
-use luminal::buffer_tensor_ir::ReferenceKernelCtx;
+use crate::typed_buffer::ReferenceKernelCtx;
 
 /// Coordinate gather: `dest[flat] = data[coords(flat)]` with loud
 /// bounds checks (out-of-bounds is UB per the scatter/gather ruling,

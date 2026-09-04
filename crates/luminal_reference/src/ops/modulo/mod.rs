@@ -134,7 +134,7 @@ impl OpMatcher for ModFunctionalMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// Same story as the Div kernel: f32 `%` only; integer remainder is
 /// TruncRem.

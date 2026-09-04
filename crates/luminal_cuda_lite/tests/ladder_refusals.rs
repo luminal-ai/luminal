@@ -16,12 +16,12 @@
 //! nonzero refusal count here would be the sampler-vs-view-2-cycles
 //! regression the ladder exists to catch.
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::graph::Graph;
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
 use luminal::shape::IntExpr;
 use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
 use mini_llama3::{model_support::Namespace, MiniLlama3Layer};
 
 /// Deterministic pseudo-random weights (the nn harness's `weights`
@@ -86,7 +86,7 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
     }
     let _ = h.output();
 
-    let mut pairs: Vec<(NodeIndex, TypedBuffer)> = vec![
+    let mut pairs: Vec<(NodeIndex, HostBuffer)> = vec![
         (x.id, weights(d, 90).into()),
         (gather_idx.id, vec![0i32, 1].into()),
         (scatter_idx.id, vec![1i32].into()),
@@ -123,7 +123,7 @@ fn run_rung(layers: usize, d: usize, default_budget: bool) -> (usize, usize, usi
             weights(SLOTS * kv_dim, 99 + layer as u64).into(),
         ));
     }
-    let data: FxHashMap<NodeIndex, TypedBuffer> = pairs.into_iter().collect();
+    let data: FxHashMap<NodeIndex, HostBuffer> = pairs.into_iter().collect();
 
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
     let budget = if default_budget {

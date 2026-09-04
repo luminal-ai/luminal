@@ -47,7 +47,7 @@ fn measure(
     }
     let typed: Vec<_> = inputs
         .into_iter()
-        .map(|(id, v)| (id, luminal::buffer_tensor_ir::TypedBuffer::from(v)))
+        .map(|(id, v)| (id, luminal_reference::TypedBuffer::from(v)))
         .collect();
     let t_search = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

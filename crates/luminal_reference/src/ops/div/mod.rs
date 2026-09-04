@@ -134,7 +134,7 @@ impl OpMatcher for DivFunctionalMatcher {
 // 2026-08-13: everything about an op lives in the op's folder).
 // ---------------------------------------------------------------------------
 
-use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
+use crate::typed_buffer::{ReferenceKernelCtx, TypedBuffer};
 
 /// IEEE f32 division — a zero divisor yields inf/nan exactly as their
 /// runtime would; no special-casing. Int operands REFUSE here: integer

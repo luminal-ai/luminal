@@ -6,11 +6,12 @@
 //! the elementwise/reduce core.
 #![cfg(feature = "device")]
 
-use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::HostBuffer;
+use luminal_reference::TypedBuffer;
 
 /// Read the device output DENSELY through its RETURNED LAYOUT
 /// (escape-and-disclose + the corrected contract, 2026-08-31): a
@@ -22,13 +23,12 @@ use luminal_cuda_lite::CudaRuntime;
 /// the identity, so this stays the universal readback.
 fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
     let (data, binding) = rt.fetch(out).expect("escape-and-disclose fetch");
-    let bytes = match data {
-        TypedBuffer::F32(values) => values,
-        other => panic!("output is {}, not f32", other.type_name()),
-    };
+    let bytes = data
+        .as_f32()
+        .unwrap_or_else(|err| panic!("output is not f32: {err}"));
     // The value's shape and read path both come from the RETURNED
     // LAYOUT; there is no `dims` field and no hop chain any more.
-    luminal_cuda_lite::layouts::dense_f32(bytes, &binding.layout)
+    luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
         .expect("the returned layout reads dense over its backing buffer")
 }
 
@@ -43,7 +43,11 @@ fn run_both(cx: &Graph, inputs: &[(NodeIndex, Vec<f32>)], out: NodeIndex) -> (Ve
 
     // Device side.
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
-    let data: FxHashMap<NodeIndex, TypedBuffer> = inputs
+    // THE TWO RUNTIMES TAKE DIFFERENT HOST PAYLOADS (ruling D4,
+    // 2026-09-03): the reference side stages `TypedBuffer` (its kernels
+    // read typed slices), the CL side `HostBuffer` (bytes plus a dtype
+    // tag, ready for an H2D copy). Same numbers, staged twice.
+    let data: FxHashMap<NodeIndex, HostBuffer> = inputs
         .iter()
         .map(|(id, v)| (*id, v.clone().into()))
         .collect();

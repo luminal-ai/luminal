@@ -30,6 +30,7 @@ pub mod binding_check;
 pub mod bindings;
 pub mod extractor;
 pub mod heuristic;
+pub mod host_buffer;
 pub mod kernels;
 pub mod layouts;
 pub mod ops;
@@ -40,6 +41,7 @@ pub mod search;
 pub mod device;
 
 pub use bindings::CudaBindings;
+pub use host_buffer::HostBuffer;
 pub use layouts::CudaPlan;
 pub use runtime::CudaRuntime;
 pub use search::{harness_search_options, CompileOptions, SearchOutcome};
