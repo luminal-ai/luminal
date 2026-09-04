@@ -668,11 +668,12 @@ pub(crate) fn cuda_type(dtype: PlanDtype) -> Result<&'static str> {
 /// The non-finite cases go through bit patterns rather than the
 /// `INFINITY`/`NAN` macros because this runtime compiles kernels with
 /// NVRTC (`cudarc::nvrtc::compile_ptx`, see `device.rs`), which has no
-/// host math headers, so those macros do not exist there — the same
-/// reason, and the same technique, as the `-inf` reduction identity in
-/// [`crate::ops::reduce_max`]. The bit patterns are `float`-typed; the
-/// caller's existing `({to})` cast converts to the destination type
-/// exactly as it does for a finite literal.
+/// host math headers, so those macros do not exist there. This function
+/// is the ONLY place in the crate where a non-finite literal is spelled:
+/// every emitter that needs one calls it, including the `-inf` seed of
+/// the reduction identity in [`crate::ops::reduce_max`]. The bit patterns
+/// are `float`-typed; the caller's existing `({to})` cast converts to the
+/// destination type exactly as it does for a finite literal.
 pub(crate) fn cuda_f64_literal(v: f64) -> String {
     if v.is_nan() {
         return "__uint_as_float(0x7fc00000u)".to_string();
