@@ -6,6 +6,13 @@
 //! allow-list seam — but executing on a CUDA device with
 //! NVRTC-compiled kernels instead of host loops.
 //!
+//! THE OP SET IS CHOSEN AT INITIALIZATION (ruling 2026-09-03, #420/#422
+//! rejoin Phase 2): a runtime's matcher vocabulary and its derived allow
+//! list come from the `Vec<RegisteredOp>` handed to
+//! [`CudaRuntime::load_with_registry`] — [`cuda_registry`] and
+//! [`cuda_registry_with_cublaslt`] are presets, and
+//! [`cuda_registry_filtered`] narrows either without editing this crate.
+//!
 //! THIS CRATE OWNS ITS SEARCH (ruling 2026-09-03, #420/#422 rejoin
 //! Phase 1): [`extractor`] and [`search`] are this runtime's own copies
 //! — core keeps the shared machinery (program, assembly, `dps_rewrite`,
@@ -50,6 +57,7 @@ pub mod device;
 pub use bindings::CudaBindings;
 pub use host_buffer::HostBuffer;
 pub use layouts::CudaPlan;
+pub use ops::{cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt, RegisteredOp};
 pub use runtime::CudaRuntime;
 pub use search::{harness_search_options, CompileOptions, SearchOutcome};
 
@@ -76,12 +84,18 @@ pub fn plan_transparent(op: &dyn luminal::layout_ir::LayoutIrOp) -> bool {
         && op.to_dps().is_none()
 }
 
-/// The op labels this runtime claims — the CUDA analogue of
-/// `reference_allow_list()`: search may only elect ops the backend can
+/// The op labels the DEFAULT registry preset claims — the CUDA analogue
+/// of `reference_allow_list()`: search may only elect ops the backend can
 /// actually EXECUTE (a codegen row in the kernel table) or provably
 /// FOLD (the plan-transparent class above). Labels follow house policy:
 /// the egglog constructor minus the `LayoutTensorOp` prefix, nothing
 /// else added or stripped.
+///
+/// A LOADED RUNTIME'S OWN claim set is
+/// [`CudaRuntime::active_allow_list`], derived from the registry it was
+/// initialized with ([`CudaRuntime::load_with_registry`]); this
+/// crate-level function is the preset's, for callers with no graph in
+/// hand.
 pub fn cuda_allow_list() -> Vec<&'static str> {
     CudaRuntime::allow_list()
         .into_iter()

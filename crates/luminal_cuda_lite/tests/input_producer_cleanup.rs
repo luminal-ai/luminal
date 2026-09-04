@@ -296,7 +296,7 @@ fn the_producer_index_offers_no_producer_for_an_input_terminal() {
 
     let index = luminal_cuda_lite::extractor::producer_index_with_matchers(
         &egraph,
-        luminal_cuda_lite::ops::cuda_matchers_with_cublaslt(),
+        &luminal_cuda_lite::ops::cuda_matchers_with_cublaslt(),
     );
 
     // Holds under #444's retain alone; pinned here because the stratum

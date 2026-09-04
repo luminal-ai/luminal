@@ -8,6 +8,31 @@
 //! FUNCTIONAL forms only in CL-1 — the runtime is out-of-place by
 //! design, so the mutating/alias-safe family is deliberately absent
 //! from this assembly (it arrives with the in-place ties in CL-4).
+//!
+//! THE REGISTRY IS A VALUE, NOT A CONSTANT (ruling 2026-09-03, #420/#422
+//! rejoin Phase 2: *"you should select the allowed ops when you
+//! initialize the runtime ... You should not need to edit CL in order to
+//! modify this. It should be configurable."*). [`cuda_registry`] and
+//! [`cuda_registry_with_cublaslt`] are just the two PRESETS this crate
+//! ships; what a [`crate::CudaRuntime`] assembles, saturates, searches
+//! and claims with is the `Vec<RegisteredOp>` it was handed at
+//! [`crate::CudaRuntime::load_with_registry`]. A caller narrows the
+//! vocabulary with [`cuda_registry_filtered`] over
+//! [`RegisteredOp::label`] / [`RegisteredOp::constructor`], or extends it
+//! with [`RegisteredOp::new`] — from OUTSIDE this crate, with no edit
+//! here.
+//!
+//! WHAT IS STILL CL-ONLY: adding a KERNEL-BEARING op. Claim derivation
+//! reads three classes (see [`crate::CudaRuntime::allow_list`]); the
+//! matcher-only ones — plan-transparent and host-dispatchable — are
+//! trait answers on the prototype and travel with a `RegisteredOp`, but
+//! a row that must actually be EXECUTED needs a codegen row in
+//! [`crate::kernels`], which is keyed by `TypeId` inside this crate.
+//! An outside row without one is simply not claimable: search never
+//! elects it (it is absent from the derived allow list), so the failure
+//! is a refusal, never a wrong plan. Composing an external kernel
+//! superset onto Lite's codegen ("cuda heavy") is PUNTED — no execution
+//! face on `RegisteredOp`, no change to the kernel table's keying.
 
 pub mod add;
 pub mod cast;
@@ -47,6 +72,38 @@ use luminal::layout_ir::{LayoutIrOp, OpMatcher};
 pub struct RegisteredOp {
     pub matcher: Box<dyn OpMatcher>,
     pub prototype: Box<dyn LayoutIrOp>,
+}
+
+impl RegisteredOp {
+    /// Register a matcher with a prototype of the op its `extract`
+    /// produces — the public constructor, so a registry row can be built
+    /// from outside this crate (see the module header for what such a
+    /// row can and cannot claim).
+    pub fn new(matcher: Box<dyn OpMatcher>, prototype: Box<dyn LayoutIrOp>) -> Self {
+        Self { matcher, prototype }
+    }
+
+    /// This row's egglog constructor — the name the estate mints and the
+    /// name the derived allow list carries.
+    pub fn constructor(&self) -> &'static str {
+        self.matcher.egglog_constructor()
+    }
+
+    /// This row's op LABEL: the egglog constructor minus the
+    /// `LayoutTensorOp` prefix and NOTHING else (house policy — op names
+    /// are IR identity: never add `Dps`, never strip `Generic`). It is
+    /// the same string the prototype's own `LayoutIrOp::label` returns,
+    /// which the `labels_agree_with_the_prototypes` pin states outright.
+    ///
+    /// So the `Generic` suffix IS part of a label: filter on
+    /// `"ReduceMaxGeneric"`, not `"ReduceMax"`. (The kernel table's
+    /// `label` column is a different, Generic-less vocabulary; the allow
+    /// list's kernel-bearing test tolerates the difference, callers of
+    /// this method should not have to guess about it.)
+    pub fn label(&self) -> &'static str {
+        let ctor = self.constructor();
+        ctor.strip_prefix("LayoutTensorOp").unwrap_or(ctor)
+    }
 }
 
 /// The registry this runtime assembles, extracts, and derives claims
@@ -137,6 +194,13 @@ pub fn cuda_registry() -> Vec<RegisteredOp> {
 /// assembly through this EXPLICIT seam
 /// ([`crate::CudaRuntime::load_with_cublaslt`]), and the 2D
 /// canonical-form election pin runs marker-enabled.
+///
+/// AS OF PHASE 2 this preset is nothing but a registry VALUE: it is what
+/// [`crate::CudaRuntime::load_with_cublaslt`] hands to
+/// [`crate::CudaRuntime::load_with_registry`], and any caller can build
+/// the same list (or half of it) with [`cuda_registry_filtered`]. The
+/// default's Train-2 set is a BUDGET decision, not a capability one, and
+/// it now costs a caller one argument to overrule.
 pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
     let mut registry = cuda_registry();
     for form in cublaslt::CublasLtForm::ALL {
@@ -148,8 +212,42 @@ pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
     registry
 }
 
-/// The matcher set this runtime assembles and extracts with — the
-/// registry's matcher column.
+/// THE CONFIGURATION SEAM: the FULL registry (every row this crate
+/// ships, cuBLASLt markers included) narrowed by the caller's own
+/// predicate. This is how a vocabulary is chosen without editing CL:
+///
+/// ```no_run
+/// # use luminal_cuda_lite::{cuda_registry_filtered, CudaRuntime};
+/// # let cx = luminal::graph::Graph::new();
+/// // Everything except the max reduction:
+/// let rt = CudaRuntime::load_with_registry(
+///     &cx,
+///     cuda_registry_filtered(|op| op.label() != "ReduceMaxGeneric"),
+/// )?;
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+///
+/// It starts from the marker-enabled superset ON PURPOSE, so one
+/// predicate can opt a row IN as easily as OUT — `keep` sees every row
+/// that exists. The two presets remain available whole
+/// ([`cuda_registry`], [`cuda_registry_with_cublaslt`]).
+///
+/// A PREDICATE THAT MATCHES NOTHING IS SILENT — it returns the full
+/// registry, and the search then simply has the op available. Assert on
+/// the resulting length (or on
+/// [`crate::CudaRuntime::active_allow_list`]) if the narrowing is
+/// load-bearing; labels carry their `Generic` suffix (see
+/// [`RegisteredOp::label`]).
+pub fn cuda_registry_filtered(keep: impl Fn(&RegisteredOp) -> bool) -> Vec<RegisteredOp> {
+    cuda_registry_with_cublaslt()
+        .into_iter()
+        .filter(|entry| keep(entry))
+        .collect()
+}
+
+/// The matcher set the DEFAULT preset assembles and extracts with — the
+/// registry's matcher column. An instance's own column is derived from
+/// the registry it was loaded with, never from this.
 pub fn cuda_matchers() -> Vec<Box<dyn OpMatcher>> {
     cuda_registry()
         .into_iter()

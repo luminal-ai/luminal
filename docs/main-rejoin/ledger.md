@@ -2405,6 +2405,80 @@ coalescing, library dispatch); the arena allocator behind the runtimes'
 `bufferize` call; whatever consolidation the three copies eventually
 earn, which is a question to ask after the runtimes diverge, not before.
 
+## Program: #420/#422 rejoin — Phase 2 (configurable registry)
+
+**The ruling** (Austin, 2026-09-03): *"you should select the allowed ops
+when you initialize the runtime. we should have a function for filtering
+which ops, which matchers are present, etc. You should not need to edit
+CL in order to modify this. It should be configurable."*
+
+**What changed.** `CudaRuntime`'s private `cublaslt: bool` is gone. An
+instance now HOLDS its op vocabulary: the matcher column of the registry
+it was loaded with, plus the allow list derived from that same registry,
+both fixed once in `load_with_registry(graph, Vec<RegisteredOp>)`.
+`load` is that call over `cuda_registry()`; `load_with_cublaslt` is it
+over `cuda_registry_with_cublaslt()` — the marker preset is a registry
+VALUE now, not a mode, and its default-off status stays a budget
+decision that costs a caller one argument to overrule. Assembly,
+saturation, extraction and search all read the instance's list;
+`active_allow_list()` is what a loaded runtime claims. The static
+`CudaRuntime::allow_list()` / `allow_list_with_cublaslt()` /
+`cuda_allow_list()` survive unchanged as the PRESETS' claim sets, for
+callers with no graph in hand.
+
+**The configuration surface** (all outside-callable, no CL edit):
+`cuda_registry_filtered(|op| ...)` narrows the FULL registry (marker rows
+included, so a predicate can opt a row in as easily as out);
+`RegisteredOp::new(matcher, prototype)` builds a row from outside;
+`RegisteredOp::constructor()` / `RegisteredOp::label()` are what a
+predicate reads. `label()` is the house label — the egglog constructor
+minus the `LayoutTensorOp` prefix and nothing else, so it keeps its
+`Generic` suffix and equals the prototype's own `LayoutIrOp::label`
+(pinned).
+
+**Decisions inside the latitude.**
+
+- *The matcher list is LENT, not rebuilt.* `dyn OpMatcher` is not
+  clonable and the registry is a value the caller hands over once, so
+  there is nothing to rebuild it from; the runtime holds
+  `Vec<Box<dyn OpMatcher>>` and `search_implementations` /
+  `bucketed_search_implementations` / the extractor's
+  `new_with_matcher_set` take `&[Box<dyn OpMatcher>]`. The extractor's
+  dispatch map became `HashMap<&'static str, &'a dyn OpMatcher>` — the
+  `'a` it already carried for the e-graph. The bucketed entry's
+  `impl Fn() -> Vec<..>` factory parameter collapsed into that slice.
+  The alternative, a `boxed_clone` supertrait on core's `OpMatcher`,
+  would have forced `#[derive(Clone)]` onto every matcher in three
+  crates for nothing. NO CORE EDIT was needed.
+- *The instance accessor is `active_allow_list`,* not `allow_list`:
+  inherent methods may not share a name, and the static one is the
+  documented preset seam with existing callers. It returns
+  `&[&'static str]` — the instance owns the vector, and nothing needs a
+  copy.
+- *Kernel-bearing rows stay CL-only.* An outside `RegisteredOp` reaches
+  the allow list through the two DERIVED matcher-only classes
+  (plan-transparent, host-dispatchable); a row that must actually be
+  executed needs a codegen entry in `kernels`, keyed by `TypeId` inside
+  this crate. A row without one is simply never claimed, so the failure
+  is a refusal at search, never a wrong plan.
+
+**The punt, recorded.** Composing an external kernel superset onto
+Lite's codegen ("cuda heavy") is NOT started: no execution face on
+`RegisteredOp`, no change to the kernel table's `TypeId` keying, no
+change to cuBLASLt's dispatch arm. Value-level registry rows are the
+whole extension axis for now, which is the same call the Phase 1 park
+made about `CudaRuntimeImpl<O: IntoEgglogOp>`.
+
+**Pinned** (`crates/luminal_cuda_lite/tests/registry_selection.rs`, host
+only): the two presets equal their `load_with_registry` spellings and
+the marker preset is the default plus exactly the four host-call
+contracts; a registry filtered of the add row makes `a + b` REFUSE at
+search with the exhaustion message diagnosing a dead end (choice-cycles
+0), while the same graph under the default registry plans; a marker row
+pushed on from the test crate through `RegisteredOp::new` joins the
+instance claim set and the other three forms stay out; every row's
+`label()` agrees with its prototype's.
+
 ## #420 search into the runtime — parks banked, the boundary move scheduled
 
 RULED 2026-09-03: *"we're going to ignore all the loop unrolling, loop rolling
