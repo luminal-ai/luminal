@@ -149,7 +149,25 @@ fn a_dim_cannot_be_both_pinned_and_bucketed() {
     let err = rt
         .bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
         .expect_err("a pinned dim must not take buckets");
-    assert!(format!("{err:#}").contains("already pinned"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("already carries a range binding [3, 3]"),
+        "{err:#}"
+    );
+
+    // A NON-TIGHT range is just as exclusive: it seeds the same IntVar's
+    // bounds, and `lower-bound-of`/`upper-bound-of` MERGE (max/min) rather
+    // than error, so a second seed set would silently intersect with the
+    // per-bucket one instead of refusing.
+    let (cx, _out) = elementwise_graph();
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    rt.bind_dyn_range('a', 2, 8).expect("range binds");
+    let err = rt
+        .bind_dim_buckets('a', vec![DimBucket::new(5, 9)])
+        .expect_err("a range-bound dim must not take buckets");
+    assert!(
+        format!("{err:#}").contains("already carries a range binding [2, 8]"),
+        "{err:#}"
+    );
 
     let (cx, _out) = elementwise_graph();
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");

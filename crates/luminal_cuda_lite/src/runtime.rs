@@ -77,6 +77,14 @@ pub struct CudaRuntime {
     /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
     dims: shape::DynMap,
+    /// EVERY dim [`Self::bind_dyn_range`] has bound, tight or not, with
+    /// the interval it was given. `dims` records only the `[n, n]` pins,
+    /// so it cannot answer the exclusivity question: buckets and range
+    /// bindings must refuse each other in BOTH orders, and a non-tight
+    /// range under a later bucket would otherwise seed the same `IntVar`
+    /// twice and INTERSECT under the bounds lattice's merge rather than
+    /// refuse.
+    range_bound: std::collections::BTreeMap<shape::Symbol, (u64, u64)>,
     /// THE PERSISTENT DEVICE (#422, rejoin Phase 3): context, stream,
     /// NVRTC module cache and the arena slab, created on the first
     /// [`Self::execute`] and kept for the runtime's life — "each runtime
@@ -192,7 +200,10 @@ impl CudaRuntime {
             "(set (lower-bound-of (IntVar \"{name}\")) (bigint {lower}))\n\
              (set (upper-bound-of (IntVar \"{name}\")) (bigint {upper}))\n"
         ));
-        // A tight [n, n] binding IS a pin: remember it, so a bucketed
+        // EVERY range binding is remembered, so `bind_dim_buckets` can
+        // refuse this dim whatever the interval was.
+        self.range_bound.insert(name, (lower, upper));
+        // A tight [n, n] binding IS a pin: remember it too, so a bucketed
         // plan's representative records the whole assignment.
         if lower == upper {
             self.dims.insert(name, lower as usize);
@@ -217,10 +228,17 @@ impl CudaRuntime {
     ) -> Result<()> {
         let dim = dim.into();
         anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
+        if let Some((lo, hi)) = self.range_bound.get(&dim) {
+            anyhow::bail!(
+                "dim `{dim}` already carries a range binding [{lo}, {hi}] from \
+                 bind_dyn_range; a bucketed dim is seeded per bucket and must not \
+                 carry a second range binding"
+            );
+        }
         anyhow::ensure!(
             !self.dims.contains_key(&dim),
-            "dim `{dim}` is already pinned by bind_dyn_range; a bucketed dim is \
-             seeded per bucket and must not carry a second range binding"
+            "dim `{dim}` already has a value from set_dim; bind buckets before \
+             setting the execution dim"
         );
         for pair in buckets.windows(2) {
             anyhow::ensure!(

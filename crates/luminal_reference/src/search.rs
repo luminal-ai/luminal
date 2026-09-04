@@ -1084,8 +1084,10 @@ pub struct BucketAssembly<'a> {
     /// The recorded model, before the schedule.
     pub pre_schedule: &'a str,
     /// The caller's own `bind_*` seeds — for the dims that are NOT
-    /// bucketed. A bucketed dim is refused a range binding, so these
-    /// never collide with the per-bucket seeds appended after them.
+    /// bucketed. Buckets and range bindings refuse each other in BOTH
+    /// orders (a range-bound dim is refused buckets, a bucketed dim is
+    /// refused a range binding), so these never collide with the
+    /// per-bucket seeds appended after them.
     pub binding_seeds: &'a str,
     /// The runtime's schedule text.
     pub schedule: &'a str,

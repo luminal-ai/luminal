@@ -90,6 +90,14 @@ pub struct ReferenceRuntime {
     /// `bind_dyn_range` pin, plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
     dims: luminal::shape::DynMap,
+    /// EVERY dim [`Self::bind_dyn_range`] has bound, tight or not, with
+    /// the interval it was given. `dims` records only the `[n, n]` pins,
+    /// so it cannot answer the exclusivity question: buckets and range
+    /// bindings must refuse each other in BOTH orders, and a non-tight
+    /// range under a later bucket would otherwise seed the same `IntVar`
+    /// twice and INTERSECT under the bounds lattice's merge rather than
+    /// refuse.
+    range_bound: std::collections::BTreeMap<luminal::shape::Symbol, (u64, u64)>,
 }
 
 impl ReferenceRuntime {
@@ -177,7 +185,10 @@ impl ReferenceRuntime {
             "(set (lower-bound-of (IntVar \"{var}\")) (bigint {lower}))\n\
              (set (upper-bound-of (IntVar \"{var}\")) (bigint {upper}))\n"
         ));
-        // A tight [n, n] binding IS a pin: remember it, so a bucketed
+        // EVERY range binding is remembered, so `bind_dim_buckets` can
+        // refuse this dim whatever the interval was.
+        self.range_bound.insert(var, (lower, upper));
+        // A tight [n, n] binding IS a pin: remember it too, so a bucketed
         // plan's representative map records the whole assignment and
         // `select_bucket` sees every dim.
         if lower == upper {
@@ -203,10 +214,17 @@ impl ReferenceRuntime {
     ) -> Result<()> {
         let dim = dim.into();
         ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
+        if let Some((lo, hi)) = self.range_bound.get(&dim) {
+            anyhow::bail!(
+                "dim `{dim}` already carries a range binding [{lo}, {hi}] from \
+                 bind_dyn_range; a bucketed dim is seeded per bucket and must not \
+                 carry a second range binding"
+            );
+        }
         ensure!(
             !self.dims.contains_key(&dim),
-            "dim `{dim}` is already pinned by bind_dyn_range; a bucketed dim is \
-             seeded per bucket and must not carry a second range binding"
+            "dim `{dim}` already has a value from set_dim; bind buckets before \
+             setting the execution dim"
         );
         for pair in buckets.windows(2) {
             ensure!(
@@ -2419,5 +2437,55 @@ mod tests {
             .bind_dim_buckets('a', vec![])
             .expect_err("an empty bucket list must refuse");
         assert!(format!("{err:#}").contains("no buckets"), "{err:#}");
+    }
+
+    /// BUCKETS AND RANGE BINDINGS ARE EXCLUSIVE PER DIM, BOTH ORDERS,
+    /// LOUDLY — and the range need not be tight. Both seed the same
+    /// `IntVar`'s `lower-bound-of` / `upper-bound-of`, which MERGE
+    /// (`max` / `min`) rather than error, so two seed sets on one dim
+    /// would silently INTERSECT: a bucket [5, 9] under a prior range
+    /// [2, 8] would be validated over [5, 8] while the plan claims 9.
+    #[test]
+    fn a_dim_cannot_be_both_range_bound_and_bucketed() {
+        use luminal::graph::DimBucket;
+
+        let graph = || {
+            let mut cx = Graph::new();
+            cx.set_dim('a', 3);
+            let x = cx.tensor(('a', 2), DType::F32);
+            let _out = (x * x).output();
+            cx
+        };
+
+        // A NON-TIGHT range, then buckets: the case `dims` could not see.
+        let mut rt = ReferenceRuntime::load(&graph()).expect("records + loads");
+        rt.bind_dyn_range('a', 2, 8).expect("range binds");
+        let err = rt
+            .bind_dim_buckets('a', vec![DimBucket::new(5, 9)])
+            .expect_err("a range-bound dim must not take buckets");
+        assert!(
+            format!("{err:#}").contains("already carries a range binding [2, 8]"),
+            "{err:#}"
+        );
+
+        // A tight [n, n] pin is a range binding too.
+        let mut rt = ReferenceRuntime::load(&graph()).expect("records + loads");
+        rt.bind_dyn_range('a', 3, 3).expect("pin binds");
+        let err = rt
+            .bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
+            .expect_err("a pinned dim must not take buckets");
+        assert!(
+            format!("{err:#}").contains("already carries a range binding [3, 3]"),
+            "{err:#}"
+        );
+
+        // And the other order.
+        let mut rt = ReferenceRuntime::load(&graph()).expect("records + loads");
+        rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
+            .expect("buckets bind");
+        let err = rt
+            .bind_dyn_range('a', 2, 8)
+            .expect_err("a bucketed dim must not take a range binding");
+        assert!(format!("{err:#}").contains("has buckets bound"), "{err:#}");
     }
 }
