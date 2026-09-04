@@ -729,7 +729,7 @@ git diff 2fbf5b6a^ 2fbf5b6a \
   | git apply -3
 ```
 
-## #401 persistent arena — the three rules, and where they would land
+## #401 persistent arena — superseded by #422: one shared slab, and where it lands
 
 RULED 2026-09-02 (ruling 6): *"just put this in the HLIR version and we'll
 merge it later"*.
