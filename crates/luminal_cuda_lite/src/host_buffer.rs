@@ -16,7 +16,7 @@
 //! one set of numbers to compare — which is the point of the split, not
 //! a hole in it.
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use luminal::dtype::PlanDtype;
 
 /// Bytes this runtime can put on a device, tagged with the dtype they

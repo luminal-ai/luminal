@@ -21,8 +21,8 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     use luminal::prelude::*;
     use whisper::{
-        model_support::{named_kv_cache_pool, Namespace},
         Whisper, WhisperDims,
+        model_support::{Namespace, named_kv_cache_pool},
     };
 
     let dims = WhisperDims::whisper_tiny_en();

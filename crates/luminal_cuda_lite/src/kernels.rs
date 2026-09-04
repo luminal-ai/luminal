@@ -15,7 +15,7 @@
 //! gather, scatter). The allow list stays honest by construction —
 //! search can only elect what this table generates.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use luminal::buffer_tensor_ir::BufferTensorIrOp;
 use luminal::bufferize::SlotDescriptor;
 use luminal::dtype::PlanDtype;

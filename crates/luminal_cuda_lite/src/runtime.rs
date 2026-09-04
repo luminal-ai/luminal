@@ -17,7 +17,7 @@
 //! prior.
 
 use crate::host_buffer::HostBuffer;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use luminal::bufferize::BufferIrGraph;
 
 use crate::search::{CompileOptions, SearchOutcome};

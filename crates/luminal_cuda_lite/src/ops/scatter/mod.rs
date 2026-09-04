@@ -17,10 +17,10 @@ use luminal::layout_ir::{
 };
 
 use crate::kernels::{
-    coord_prelude, cuda_type, layout_read_index, numel, strides_of, CodegenCtx, Coords,
-    KernelSource,
+    CodegenCtx, Coords, KernelSource, coord_prelude, cuda_type, layout_read_index, numel,
+    strides_of,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Walk the LayoutTensorCons spine at `child` counting elements — the
 /// rank reader for the scatter matcher (same class-resolving walk as

@@ -29,7 +29,7 @@ use luminal::dtype::DType;
 use luminal::graph::{DimBucket, Graph};
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
-use luminal_cuda_lite::{harness_search_options, CompileOptions, CudaRuntime, HostBuffer};
+use luminal_cuda_lite::{CompileOptions, CudaRuntime, HostBuffer, harness_search_options};
 
 /// A plan's structural signature — node/edge/buffer counts plus the
 /// multiset of elected compute labels. Two plans with the same signature

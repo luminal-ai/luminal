@@ -109,7 +109,7 @@
 //! spec-only DEFAULT (ROW), and the executor calls [`bind_destination`]
 //! with the result slot's elected layout before dispatch.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use super::{CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec};
 

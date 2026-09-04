@@ -20,8 +20,8 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use gemma3::{
-        model_support::{named_kv_cache_pool, Namespace},
         Gemma3, Gemma3Dims,
+        model_support::{Namespace, named_kv_cache_pool},
     };
     use luminal::prelude::*;
     use luminal_nn::{rope_pairing_matrix, rope_tables_split_half};

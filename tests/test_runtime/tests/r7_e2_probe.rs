@@ -128,7 +128,9 @@ fn e2_composition_canonicalization_probe() {
         })
         .count();
     match nested_class {
-        Some(_) => println!("E2 composition probe: nested spelling SURVIVES; {one_level} one-level"),
+        Some(_) => {
+            println!("E2 composition probe: nested spelling SURVIVES; {one_level} one-level")
+        }
         None => println!(
             "E2 composition probe: NESTED SPELLING GONE (canonicalized away); {one_level} one-level apply-of-const spelling(s) remain"
         ),

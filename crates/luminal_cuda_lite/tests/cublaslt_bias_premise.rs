@@ -34,10 +34,10 @@ use luminal::bufferize::BufferNode;
 use luminal::graph::Graph;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph, Node};
 use luminal::prelude::{DType, FxHashMap, NodeIndex};
-use luminal_cuda_lite::ops::cublaslt::exec::{bind_destination, plan_call, LtOrder};
-use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtDps};
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
+use luminal_cuda_lite::ops::cublaslt::exec::{LtOrder, bind_destination, plan_call};
+use luminal_cuda_lite::ops::cublaslt::{CublasLt, CublasLtDps};
 
 /// Deterministic values (the shared example seeding discipline).
 fn weights(n: usize, seed: usize) -> Vec<f32> {

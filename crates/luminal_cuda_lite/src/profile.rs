@@ -48,7 +48,7 @@ use luminal::bufferize::BufferIrGraph;
 use luminal::layouts::DecodedLayout;
 use luminal::prelude::FxHashMap;
 
-use crate::device::{execute_plan, CudaDevice};
+use crate::device::{CudaDevice, execute_plan};
 use crate::host_buffer::HostBuffer;
 use crate::search::early_stop_exceeded;
 

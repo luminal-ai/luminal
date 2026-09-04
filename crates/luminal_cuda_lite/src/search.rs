@@ -34,7 +34,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{Result, anyhow, ensure};
 use colored::Colorize;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};

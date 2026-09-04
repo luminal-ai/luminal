@@ -26,7 +26,7 @@ pub struct Iota {
     pub expr: Option<IotaExpr>,
 }
 
-pub use luminal::index_expr::{parse_int_expr, parse_int_expr_memo, IotaExpr, ParseMemo};
+pub use luminal::index_expr::{IotaExpr, ParseMemo, parse_int_expr, parse_int_expr_memo};
 
 impl OpSlotNames for Iota {}
 

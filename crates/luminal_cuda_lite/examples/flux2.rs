@@ -21,7 +21,7 @@ fn main() {
 #[cfg(feature = "device")]
 fn run() -> anyhow::Result<()> {
     use flux2::transformer::{
-        build_rope_tables, Flux2Transformer, HEAD_DIM, IN_CHANNELS, JOINT_ATTENTION_DIM,
+        Flux2Transformer, HEAD_DIM, IN_CHANNELS, JOINT_ATTENTION_DIM, build_rope_tables,
     };
     use luminal::prelude::*;
 

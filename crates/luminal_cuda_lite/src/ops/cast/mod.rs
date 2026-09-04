@@ -10,7 +10,7 @@ use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{cuda_type, unary, CodegenCtx, KernelSource};
+use crate::kernels::{CodegenCtx, KernelSource, cuda_type, unary};
 use anyhow::Result;
 
 /// `CastGeneric(input) -> out` — pure dataflow form.

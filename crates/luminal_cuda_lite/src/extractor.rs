@@ -17,7 +17,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -26,7 +26,7 @@ use luminal::layout_ir::{
     FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
     OpMatcher, OpNode, OutputNode, OutputSlot,
 };
-use luminal::logical_op::{logical_op_for, LogicalRender};
+use luminal::logical_op::{LogicalRender, logical_op_for};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;

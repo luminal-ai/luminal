@@ -74,12 +74,12 @@
 //! occupant's bytes, and would need the memset this note says we do
 //! not do.
 
-use crate::arena::{buffer_bytes, plan_arena, ArenaPlan};
+use crate::arena::{ArenaPlan, buffer_bytes, plan_arena};
 use crate::host_buffer::HostBuffer;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use cudarc::driver::{
-    result as cu, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr,
-    LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, LaunchConfig,
+    PushKernelArg, result as cu,
 };
 use cudarc::nvrtc::compile_ptx;
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, EdgeKind, OutputBinding};
@@ -88,7 +88,7 @@ use luminal::prelude::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::kernels::{codegen_for, CodegenCtx};
+use crate::kernels::{CodegenCtx, codegen_for};
 
 /// STAGING AND READBACK are memcpys now (ruling D4, 2026-09-03): a
 /// [`HostBuffer`] IS bytes plus a dtype tag, which is exactly what an
@@ -292,10 +292,11 @@ pub fn execute_plan(
     // ordering is enforced by construction). Everything below walks
     // `arena.order`.
     let arena = plan_arena(plan, buffer_bytes).context("arena planning")?;
-    debug_assert!(plan
-        .dag
-        .edge_weights()
-        .all(|e| matches!(e.kind, EdgeKind::Data | EdgeKind::Anti)));
+    debug_assert!(
+        plan.dag
+            .edge_weights()
+            .all(|e| matches!(e.kind, EdgeKind::Data | EdgeKind::Anti))
+    );
     device.ensure_slab(arena.slab_bytes)?;
     let stream = device.stream.clone();
     let slab_base = match &device.slab {

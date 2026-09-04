@@ -22,7 +22,7 @@
 //! heuristic results is a loud bail); stream-ordered on the CALLER's
 //! stream (the same stream the surrounding NVRTC kernels run on).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cudarc::cublaslt::result as lt;
 use cudarc::cublaslt::sys;
 use cudarc::driver::{CudaStream, DevicePtr};

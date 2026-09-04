@@ -22,7 +22,7 @@ use luminal::shape::IntExpr;
 use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::CudaRuntime;
 use luminal_cuda_lite::HostBuffer;
-use mini_llama3::{model_support::Namespace, MiniLlama3Layer};
+use mini_llama3::{MiniLlama3Layer, model_support::Namespace};
 
 /// Deterministic pseudo-random weights (the nn harness's `weights`
 /// discipline: value content is irrelevant, only geometry matters).

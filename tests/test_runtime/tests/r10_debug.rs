@@ -127,9 +127,17 @@ fn r10_debug_fixture1() {
                     if let Some(spec) = &c.spec {
                         println!(
                             "  spec m={} n={} k={} ta={} tb={} lda={} ldb={} ldd={} a_buf={:?} b_buf={:?} d_buf={:?}",
-                            spec.m, spec.n, spec.k, spec.trans_a, spec.trans_b,
-                            spec.lda, spec.ldb, spec.ldd,
-                            spec.desc_a_buffer, spec.desc_b_buffer, spec.d_buffer
+                            spec.m,
+                            spec.n,
+                            spec.k,
+                            spec.trans_a,
+                            spec.trans_b,
+                            spec.lda,
+                            spec.ldb,
+                            spec.ldd,
+                            spec.desc_a_buffer,
+                            spec.desc_b_buffer,
+                            spec.d_buffer
                         );
                     } else {
                         println!("  spec: None");

@@ -29,7 +29,7 @@ pub fn require_device(example: &str) {
 
 #[cfg(feature = "device")]
 pub mod device {
-    use anyhow::{anyhow, bail, Context, Result};
+    use anyhow::{Context, Result, anyhow, bail};
     use luminal::bufferize::BufferNode;
     use luminal::graph::Graph;
     use luminal::prelude::{FxHashMap, NodeIndex};

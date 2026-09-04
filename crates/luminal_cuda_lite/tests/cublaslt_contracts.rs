@@ -39,10 +39,10 @@ fn walked_dense(rt: &CudaRuntime, out: NodeIndex) -> Vec<f32> {
     luminal_cuda_lite::layouts::dense_f32(&bytes, &binding.layout)
         .expect("the returned layout reads dense over its backing buffer")
 }
+use luminal_cuda_lite::CudaRuntime;
+use luminal_cuda_lite::ops::cublaslt::CublasLtForm;
 use luminal_cuda_lite::ops::cublaslt::device_call;
 use luminal_cuda_lite::ops::cublaslt::exec::{CSource, LtCall, LtDesc, LtOrder};
-use luminal_cuda_lite::ops::cublaslt::CublasLtForm;
-use luminal_cuda_lite::CudaRuntime;
 use std::sync::Arc;
 
 /// REDUCTION-ORDER CONTRACT (Item 4, documented at the comparison

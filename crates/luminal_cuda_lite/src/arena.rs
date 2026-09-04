@@ -58,10 +58,10 @@
 //! candidate plans a search evaluates) is Phase 4's; this pass sizes
 //! ONE installed plan.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use luminal::bufferize::{Buffer, BufferId, BufferIrGraph, BufferNode, Owner, PlanLayout};
 use luminal::layout_ir::FreedBy;
-use luminal::prelude::{petgraph, FxHashMap, NodeIndex};
+use luminal::prelude::{FxHashMap, NodeIndex, petgraph};
 use petgraph::visit::{EdgeRef, NodeIndexable};
 use std::collections::{BTreeMap, BinaryHeap};
 
@@ -558,7 +558,7 @@ mod tests {
     use super::*;
     use luminal::index_expr::IotaExpr;
     use luminal::layout_ir::Access;
-    use luminal::test_support::{bufferize_mock, MockLayout, MockOp, MockViewWithMap, TestGraph};
+    use luminal::test_support::{MockLayout, MockOp, MockViewWithMap, TestGraph, bufferize_mock};
 
     /// Every buffer is the same size, so the numbers below are counts of
     /// buffers and nothing else.

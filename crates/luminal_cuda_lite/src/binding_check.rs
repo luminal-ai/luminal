@@ -14,7 +14,7 @@
 //! Deliberately device-free (no cudarc types): pointer ranges are plain
 //! integers so the checker itself is unit-testable on any host.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// One bound storage range: a buffer's display name, its base address,
 /// and its extent in bytes.
@@ -58,7 +58,7 @@ pub fn assert_disjoint(ranges: &[BoundRange]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{assert_disjoint, BoundRange};
+    use super::{BoundRange, assert_disjoint};
 
     fn range(buffer: &str, base: u64, bytes: u64) -> BoundRange {
         BoundRange {

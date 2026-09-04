@@ -85,9 +85,9 @@ pub mod profile;
 pub use bindings::CudaBindings;
 pub use host_buffer::HostBuffer;
 pub use layouts::CudaPlan;
-pub use ops::{cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt, RegisteredOp};
+pub use ops::{RegisteredOp, cuda_registry, cuda_registry_filtered, cuda_registry_with_cublaslt};
 pub use runtime::CudaRuntime;
-pub use search::{harness_search_options, CompileOptions, Evaluator, SearchOutcome};
+pub use search::{CompileOptions, Evaluator, SearchOutcome, harness_search_options};
 
 /// PLAN-TRANSPARENT (M4 Phase 5): claimable WITHOUT a kernel iff the
 /// op's DECLARED EFFECTS prove the planner folds it — no operand ever

@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use egraph_serialize::{ClassId, EGraph, Node, NodeId};
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -27,7 +27,7 @@ use luminal::layout_ir::{
     FreedBy, InputNode, LayoutInfo, LayoutIrOp, LayoutTensorInfo, LazyText, LogicalInfo, OpInput,
     OpMatcher, OpNode, OutputNode, OutputSlot,
 };
-use luminal::logical_op::{logical_op_for, LogicalRender};
+use luminal::logical_op::{LogicalRender, logical_op_for};
 
 type Bounds = (Option<i128>, Option<i128>);
 type BoundsIndex = HashMap<ClassId, Bounds>;
@@ -4265,7 +4265,7 @@ mod chain_stride_tests {
     /// consumer resolves for itself.
     #[test]
     fn chain_strides_destructure_contract() {
-        use super::{chain_strides, ChainStride};
+        use super::{ChainStride, chain_strides};
         let body = r#"
 (let psh (ShapeLit (IntExprCons (IntLit 2) (IntExprCons (IntLit 3) (IntExprNil)))))
 (let p (RightMajorContiguousElementLayoutLit psh (bits-of (F32))))
@@ -4328,11 +4328,7 @@ mod chain_stride_tests {
                     n2.op == "RightMajorContiguousElementLayoutLit"
                         && serialized.nid_to_cid(nid2) == &layout
                 });
-                if is_rm {
-                    None
-                } else {
-                    Some(layout)
-                }
+                if is_rm { None } else { Some(layout) }
             })
             .expect("view LayoutTensor exists");
         let v = chain_strides(&serialized, &view_layout).expect("view destructures");

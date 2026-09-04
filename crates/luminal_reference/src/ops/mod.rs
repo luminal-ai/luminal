@@ -274,7 +274,7 @@ pub fn reference_ops() -> &'static [ReferenceOp] {
 // =============================================================================
 #[cfg(test)]
 mod registry_contract {
-    use luminal::layout_ir::{permits_sharing, LayoutIrOp, Sharing};
+    use luminal::layout_ir::{LayoutIrOp, Sharing, permits_sharing};
 
     /// The built-in functional ops take the conservative out-of-place
     /// defaults: no ties, results written into planner-allocated storage

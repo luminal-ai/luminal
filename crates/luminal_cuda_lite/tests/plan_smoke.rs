@@ -6,7 +6,7 @@
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::prelude::FxHashMap;
-use luminal_cuda_lite::{kernels, CudaRuntime};
+use luminal_cuda_lite::{CudaRuntime, kernels};
 
 #[test]
 fn search_produces_a_codegen_complete_plan() {

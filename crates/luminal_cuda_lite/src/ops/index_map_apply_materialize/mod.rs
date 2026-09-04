@@ -7,17 +7,17 @@
 //! codegen, and the map-entry parser all live here.
 
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use luminal::index_expr::{parse_int_expr_memo, IotaExpr, ParseMemo};
+use luminal::index_expr::{IotaExpr, ParseMemo, parse_int_expr_memo};
 use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 use luminal::prelude::egraph_serialize;
 
 use crate::kernels::{
-    coord_prelude, cuda_type, layout_read_index, lower_expr, numel, CodegenCtx, Coords,
-    KernelSource,
+    CodegenCtx, Coords, KernelSource, coord_prelude, cuda_type, layout_read_index, lower_expr,
+    numel,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// `IndexMapApplyMaterialize(input) -> out` — pure dataflow form.
 /// Note the label: the egglog name has no `Generic` suffix, so neither

@@ -30,7 +30,7 @@ use luminal::graph::Graph;
 use luminal::layout_ir::{ExtractedGraph, ExtractedNode, ExtractionSite};
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
 use test_runtime::cublaslt_marker::{
-    parse_spec, CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec,
+    CuDim, CuEpilogue, CublasLt, CublasLtForm, LtMatmulSpec, parse_spec,
 };
 
 type GraphBuilder = Box<dyn Fn(&mut Graph)>;
@@ -995,7 +995,9 @@ fn attack_a5_chained_mixed_amk_bkn_amk_bnk() {
     let s = test_runtime::serialize_fixture(&text);
     let (sites, a, ..) = census(&s);
     let a_ops = operations_of(&s, "CublasLtOperandADescriptor");
-    println!("a5 mixed A[m,k],B[k,n] / A[m,k],B[n,k]: sites={sites} a_readings={a} operations(T?)={a_ops:?}");
+    println!(
+        "a5 mixed A[m,k],B[k,n] / A[m,k],B[n,k]: sites={sites} a_readings={a} operations(T?)={a_ops:?}"
+    );
     // ROUND-10 RE-PIN: original + transpose-sandwich sibling site per matmul.
     assert_eq!(sites, 4);
     // ROUND-11 RE-PIN: canonicalization + the canonical-form sandwich give
@@ -1192,7 +1194,9 @@ fn attack_a7_amk_bnk_n1_k1_canonicalizes() {
     let s = test_runtime::serialize_fixture(&fx.text());
     let (sites, a, b, d, ops) = census(&s);
     let a_ops = operations_of(&s, "CublasLtOperandADescriptor");
-    println!("a7 A[m,k],B[n,k] n=k=1: sites={sites} a={a} b={b} d={d} ops={ops} A-operations(T?)={a_ops:?}");
+    println!(
+        "a7 A[m,k],B[n,k] n=k=1: sites={sites} a={a} b={b} d={d} ops={ops} A-operations(T?)={a_ops:?}"
+    );
     // ROUND-10 RE-PIN: every matmul carries the original site plus its
     // transpose-sandwich sibling; sibling readings are additional SOUND
     // candidates in the swapped frame (per-candidate soundness is checked
@@ -1271,7 +1275,9 @@ fn attack_a8_amk_bnk_n1_k4() {
     let s = test_runtime::serialize_fixture(&fx.text());
     let (sites, a, b, d, ops) = census(&s);
     let a_ops = operations_of(&s, "CublasLtOperandADescriptor");
-    println!("a8 A[m,k],B[n,k] n=1 k=4: sites={sites} a={a} b={b} d={d} ops={ops} A-operations(T?)={a_ops:?}");
+    println!(
+        "a8 A[m,k],B[n,k] n=1 k=4: sites={sites} a={a} b={b} d={d} ops={ops} A-operations(T?)={a_ops:?}"
+    );
     // ROUND-10 RE-PIN: every matmul carries the original site plus its
     // transpose-sandwich sibling; sibling readings are additional SOUND
     // candidates in the swapped frame (per-candidate soundness is checked
@@ -3262,9 +3268,10 @@ fn attack_o1_the_oracles_discriminate() {
     short.lda = CuDim::Literal(1);
     let msg = panic_message(|| assert_ld_clamps(&short, "o1-short"));
     println!("o1 lda=1: {msg:?}");
-    assert!(msg
-        .expect("the clamp REJECTS an uncallable ld")
-        .contains("UNCALLABLE"),);
+    assert!(
+        msg.expect("the clamp REJECTS an uncallable ld")
+            .contains("UNCALLABLE"),
+    );
 
     // Coverage: how many candidates across a spread of fixtures were really
     // compared by the oracle (as opposed to skipped for symbolic extents)?

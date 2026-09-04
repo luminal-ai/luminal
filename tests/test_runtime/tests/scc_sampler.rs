@@ -45,8 +45,8 @@ use luminal::dtype::DType;
 use luminal::graph::Graph;
 use luminal::layout_ir::ExtractedNode;
 use luminal::prelude::egraph_serialize::{ClassId, EGraph};
-use test_runtime::extractor::{edges_have_cycle, ExtractionSession, Genome, SamplingSpace};
-use test_runtime::sampler::{mutate_genome_with_seed, sample_genome_with_seed, ProducerIndex};
+use test_runtime::extractor::{ExtractionSession, Genome, SamplingSpace, edges_have_cycle};
+use test_runtime::sampler::{ProducerIndex, mutate_genome_with_seed, sample_genome_with_seed};
 
 // ---------------------------------------------------------------------------
 // Shared machinery.

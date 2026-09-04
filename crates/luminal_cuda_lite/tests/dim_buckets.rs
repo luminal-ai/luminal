@@ -15,7 +15,7 @@
 use luminal::dtype::DType;
 use luminal::graph::{DimBucket, Graph};
 use luminal::shape::{DynMap, Symbol};
-use luminal_cuda_lite::{harness_search_options, CudaRuntime};
+use luminal_cuda_lite::{CudaRuntime, harness_search_options};
 
 fn elementwise_graph() -> (Graph, luminal::prelude::GraphTensor) {
     let mut cx = Graph::new();

@@ -25,7 +25,7 @@ use luminal::graph::Graph;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal_cuda_lite::CompileOptions;
 use luminal_cuda_lite::HostBuffer;
-use luminal_cuda_lite::{kernels, CudaRuntime};
+use luminal_cuda_lite::{CudaRuntime, kernels};
 
 /// The view fixtures' search budget (mirrors `view_admission`):
 /// profiling is static bytes-moved, so folds win deterministically

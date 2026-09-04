@@ -7,13 +7,13 @@
 //! snippets, and codegen all live here.
 
 use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use luminal::index_expr::{parse_int_expr, IotaExpr};
+use luminal::index_expr::{IotaExpr, parse_int_expr};
 use luminal::layout_ir::{
     AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
 };
 
-use crate::kernels::{coord_prelude, cuda_type, lower_expr, numel, CodegenCtx, KernelSource};
-use anyhow::{bail, Result};
+use crate::kernels::{CodegenCtx, KernelSource, coord_prelude, cuda_type, lower_expr, numel};
+use anyhow::{Result, bail};
 
 /// `IotaGeneric() -> out` — pure dataflow source form.
 #[derive(Debug, Clone, PartialEq, Eq)]

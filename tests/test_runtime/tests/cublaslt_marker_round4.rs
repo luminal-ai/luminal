@@ -268,9 +268,9 @@ fn t6a_accumulate_intermediate_c_donation_observed() {
         let y = cx.tensor((4usize, 3usize), DType::F32);
         let z = cx.tensor((4usize, 3usize), DType::F32);
         let c = y + z; // intermediate C (program-freed once consumed)
-                       // Original boundary-flowing spelling (restored under
-                       // escape-and-disclose: the view-produced bound output escapes);
-                       // this probe's subject is donation.
+        // Original boundary-flowing spelling (restored under
+        // escape-and-disclose: the view-produced bound output escapes);
+        // this probe's subject is donation.
         let _ = (x.matmul(w) + c).output();
         cx.logical
             .bound_program(&test_runtime::TestRuntimeBindings)
