@@ -913,10 +913,10 @@ impl ReferenceRuntime {
             .as_ref()
             .ok_or_else(|| anyhow!("no plan loaded"))?;
         for node in plan.dag.node_weights() {
-            if let BufferNode::BufferOutput { slots } = node {
-                if let Some(slot) = slots.iter().find(|slot| slot.index == index) {
-                    return Ok(slot);
-                }
+            if let BufferNode::BufferOutput { slots } = node
+                && let Some(slot) = slots.iter().find(|slot| slot.index == index)
+            {
+                return Ok(slot);
             }
         }
         Err(anyhow!("no output slot {index} in the loaded plan"))

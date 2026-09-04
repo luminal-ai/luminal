@@ -331,18 +331,18 @@ pub fn execute_plan(
         let mut slice = stream
             .alloc_zeros::<u8>(bytes.max(1))
             .with_context(|| format!("device alloc {} bytes for {:?}", bytes, buffer.label))?;
-        if let Some(lit) = buffer.lit {
-            if let Some(data) = staged.get(&lit) {
-                let host = typed_to_bytes(data);
-                if host.len() != bytes {
-                    bail!(
-                        "staged buffer {lit} is {} bytes, plan expects {bytes} for {:?}",
-                        host.len(),
-                        buffer.label
-                    );
-                }
-                stream.memcpy_htod(host, &mut slice).context("H2D")?;
+        if let Some(lit) = buffer.lit
+            && let Some(data) = staged.get(&lit)
+        {
+            let host = typed_to_bytes(data);
+            if host.len() != bytes {
+                bail!(
+                    "staged buffer {lit} is {} bytes, plan expects {bytes} for {:?}",
+                    host.len(),
+                    buffer.label
+                );
             }
+            stream.memcpy_htod(host, &mut slice).context("H2D")?;
         }
         let ptr = {
             let (ptr, _record) = slice.device_ptr(&stream);
@@ -433,16 +433,16 @@ pub fn execute_plan(
                 // buffer demoted for want of a lifetime pair) is bound
                 // from Phase 1 and its alloc is a no-op.
                 if label == "BufferAlloc" {
-                    if let Some(buffer) = writes.first() {
-                        if let Some(slice) = arena.slices.get(buffer) {
-                            bindings.insert(
-                                buffer.clone(),
-                                Bound {
-                                    ptr: slab_base + slice.offset as u64,
-                                    bytes: slice.bytes,
-                                },
-                            );
-                        }
+                    if let Some(buffer) = writes.first()
+                        && let Some(slice) = arena.slices.get(buffer)
+                    {
+                        bindings.insert(
+                            buffer.clone(),
+                            Bound {
+                                ptr: slab_base + slice.offset as u64,
+                                bytes: slice.bytes,
+                            },
+                        );
                     }
                     continue;
                 }

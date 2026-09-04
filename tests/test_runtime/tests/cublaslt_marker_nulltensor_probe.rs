@@ -44,12 +44,12 @@ fn nulltensor_probe_egglog_side() {
         .expect("null tensor exists");
     let mut fact_rows: Vec<&str> = Vec::new();
     for node in s.nodes.values() {
-        if let Some(child) = node.children.first() {
-            if let Some(cn) = s.nodes.get(child) {
-                if cn.eclass == null_class && node.op != "CublasLtNullTensor" {
-                    fact_rows.push(node.op.as_str());
-                }
-            }
+        if let Some(child) = node.children.first()
+            && let Some(cn) = s.nodes.get(child)
+            && cn.eclass == null_class
+            && node.op != "CublasLtNullTensor"
+        {
+            fact_rows.push(node.op.as_str());
         }
     }
     fact_rows.sort();

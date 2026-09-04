@@ -76,22 +76,22 @@ fn dump_layouts_for(s: &EGraph, label: &str, logical_class: &ClassId) {
         // render the strided chain if there is one
         let mut shown: Vec<ClassId> = Vec::new();
         for m in s.nodes.values() {
-            if m.eclass == ly.eclass && m.op == "StridedElementLayoutLit" {
-                if let Some(ch) = m.children.get(1).and_then(|id| s.nodes.get(id)) {
-                    if shown.contains(&ch.eclass) {
-                        continue;
-                    }
-                    shown.push(ch.eclass.clone());
-                    println!("     chain = {}", render(s, &ch.eclass, 0));
+            if m.eclass == ly.eclass
+                && m.op == "StridedElementLayoutLit"
+                && let Some(ch) = m.children.get(1).and_then(|id| s.nodes.get(id))
+            {
+                if shown.contains(&ch.eclass) {
+                    continue;
                 }
+                shown.push(ch.eclass.clone());
+                println!("     chain = {}", render(s, &ch.eclass, 0));
             }
             if m.eclass == ly.eclass
                 && (m.op == "LeftMajorContiguousElementLayoutLit"
                     || m.op == "RightMajorContiguousElementLayoutLit")
+                && let Some(sh) = m.children.first().and_then(|id| s.nodes.get(id))
             {
-                if let Some(sh) = m.children.first().and_then(|id| s.nodes.get(id)) {
-                    println!("     {} over shape {}", m.op, render(s, &sh.eclass, 0));
-                }
+                println!("     {} over shape {}", m.op, render(s, &sh.eclass, 0));
             }
         }
         // which buffers does this (logical, layout) pair sit in?

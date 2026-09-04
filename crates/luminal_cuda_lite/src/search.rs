@@ -1293,12 +1293,12 @@ pub fn finalist_validate(
     let _ = (pending, options);
     #[cfg(feature = "device")]
     {
-        if options.profile_on_device {
-            if let Evaluator::Device { device, staged } = evaluator {
-                let ran = crate::device::execute_plan(device, &pending.plan, staged);
-                device.release_slab();
-                ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
-            }
+        if options.profile_on_device
+            && let Evaluator::Device { device, staged } = evaluator
+        {
+            let ran = crate::device::execute_plan(device, &pending.plan, staged);
+            device.release_slab();
+            ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
         }
     }
     #[cfg(not(feature = "device"))]

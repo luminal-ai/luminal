@@ -294,25 +294,24 @@ fn r10_debug_c6() {
     let mut terminals: std::collections::BTreeSet<ClassId> = Default::default();
     let mut boundary_lts: Vec<ClassId> = Vec::new();
     for n in s.nodes.values() {
-        if n.op == "BufferTensorLit" {
-            if let Some(lt) = n.children.first().and_then(|id| s.nodes.get(id)) {
-                // input terminals: ReadOnly buffers
-                boundary_lts.push(lt.eclass.clone());
-            }
+        if n.op == "BufferTensorLit"
+            && let Some(lt) = n.children.first().and_then(|id| s.nodes.get(id))
+        {
+            // input terminals: ReadOnly buffers
+            boundary_lts.push(lt.eclass.clone());
         }
     }
     // crude: treat lts of LogicalTensorInputLit values as terminals
     for lt_class in &boundary_lts {
         for n in s.nodes.values() {
-            if n.eclass == *lt_class && n.op == "LayoutTensorLit" {
-                if let Some(lg) = n.children.first().and_then(|id| s.nodes.get(id)) {
-                    if s.nodes
-                        .values()
-                        .any(|m| m.eclass == lg.eclass && m.op == "LogicalTensorInputLit")
-                    {
-                        terminals.insert(lt_class.clone());
-                    }
-                }
+            if n.eclass == *lt_class
+                && n.op == "LayoutTensorLit"
+                && let Some(lg) = n.children.first().and_then(|id| s.nodes.get(id))
+                && s.nodes
+                    .values()
+                    .any(|m| m.eclass == lg.eclass && m.op == "LogicalTensorInputLit")
+            {
+                terminals.insert(lt_class.clone());
             }
         }
     }
@@ -354,20 +353,20 @@ fn r10_debug_a4() {
                 .map(|o| format!("{} (logical {})", o.eclass, o.logical.eclass))
                 .collect();
             println!("PLAN {}: ins={ins:?} outs={outs:?}", op.op.label());
-            if let Some(c) = (*op.op).as_any().downcast_ref::<CublasLt>() {
-                if let Some(spec) = &c.spec {
-                    println!(
-                        "   spec m={} n={} k={} ta={} tb={} logical_a={} logical_b={} site_out={}",
-                        spec.m,
-                        spec.n,
-                        spec.k,
-                        spec.trans_a,
-                        spec.trans_b,
-                        spec.logical_a,
-                        spec.logical_b,
-                        spec.logical_site_out
-                    );
-                }
+            if let Some(c) = (*op.op).as_any().downcast_ref::<CublasLt>()
+                && let Some(spec) = &c.spec
+            {
+                println!(
+                    "   spec m={} n={} k={} ta={} tb={} logical_a={} logical_b={} site_out={}",
+                    spec.m,
+                    spec.n,
+                    spec.k,
+                    spec.trans_a,
+                    spec.trans_b,
+                    spec.logical_a,
+                    spec.logical_b,
+                    spec.logical_site_out
+                );
             }
         }
     }

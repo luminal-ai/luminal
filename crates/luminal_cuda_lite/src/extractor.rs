@@ -1084,10 +1084,9 @@ impl<'a> Extractor<'a> {
                             .children
                             .first()
                             .and_then(|c| self.egraph.nodes.get(c).map(|n| n.eclass.clone()))
+                            && self.memo.get(&element).cloned().flatten().is_none()
                         {
-                            if self.memo.get(&element).cloned().flatten().is_none() {
-                                failing.push(index);
-                            }
+                            failing.push(index);
                         }
                         index += 1;
                         spine = cons
@@ -1879,10 +1878,10 @@ impl<'a> Extractor<'a> {
     fn plan_dtype_value(&self, class: &ClassId) -> Option<luminal::dtype::PlanDtype> {
         for node_id in self.class_nodes.get(class)? {
             let node = self.egraph.nodes.get(node_id)?;
-            if node.children.is_empty() {
-                if let Some(dtype) = luminal::dtype::PlanDtype::from_egglog_name(&node.op) {
-                    return Some(dtype);
-                }
+            if node.children.is_empty()
+                && let Some(dtype) = luminal::dtype::PlanDtype::from_egglog_name(&node.op)
+            {
+                return Some(dtype);
             }
         }
         None
@@ -1893,10 +1892,10 @@ impl<'a> Extractor<'a> {
     fn bigint_value(&self, class: &ClassId) -> Option<i128> {
         for node_id in self.class_nodes.get(class)? {
             let node = self.egraph.nodes.get(node_id)?;
-            if node.children.is_empty() {
-                if let Ok(value) = node.op.parse::<i128>() {
-                    return Some(value);
-                }
+            if node.children.is_empty()
+                && let Ok(value) = node.op.parse::<i128>()
+            {
+                return Some(value);
             }
         }
         None
@@ -2726,15 +2725,15 @@ impl<'a> ClassRenderer<'a> {
             if let Some(dtype) = self.logical_dtype(&logical_class) {
                 details.push(("dtype".to_string(), dtype));
             }
-            if !details.iter().any(|(key, _)| key == "shape") {
-                if let Some(shape) = self.layout_shape(&layout_class) {
-                    details.push(("shape".to_string(), shape));
-                }
+            if !details.iter().any(|(key, _)| key == "shape")
+                && let Some(shape) = self.layout_shape(&layout_class)
+            {
+                details.push(("shape".to_string(), shape));
             }
-            if !details.iter().any(|(key, _)| key == "dtype") {
-                if let Some(dtype) = self.layout_dtype(&layout_class) {
-                    details.push(("dtype".to_string(), dtype));
-                }
+            if !details.iter().any(|(key, _)| key == "dtype")
+                && let Some(dtype) = self.layout_dtype(&layout_class)
+            {
+                details.push(("dtype".to_string(), dtype));
             }
             details.push(("layout".to_string(), self.canonical_layout(&layout_class)));
             details.push(("layout_eclass".to_string(), layout_class.to_string()));
@@ -3954,15 +3953,15 @@ fn choose_render_node<'a>(
     node_ids: &'a [NodeId],
     preferred_op: Option<&str>,
 ) -> Option<&'a NodeId> {
-    if let Some(preferred_op) = preferred_op {
-        if let Some(node_id) = node_ids.iter().find(|node_id| {
+    if let Some(preferred_op) = preferred_op
+        && let Some(node_id) = node_ids.iter().find(|node_id| {
             egraph
                 .nodes
                 .get(*node_id)
                 .is_some_and(|node| node.op == preferred_op)
-        }) {
-            return Some(node_id);
-        }
+        })
+    {
+        return Some(node_id);
     }
 
     if let Some(node_id) = node_ids.iter().find(|node_id| {

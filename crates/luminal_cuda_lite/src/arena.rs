@@ -363,12 +363,12 @@ impl FreeList {
         // No hole fits. If the LAST hole runs right up to the top, grow
         // through it instead of stranding it (coalescing with the
         // wilderness — the classic dlmalloc move).
-        if let Some((&offset, &len)) = self.holes.iter().next_back() {
-            if offset + len == self.top {
-                self.holes.remove(&offset);
-                self.top = offset + need;
-                return offset;
-            }
+        if let Some((&offset, &len)) = self.holes.iter().next_back()
+            && offset + len == self.top
+        {
+            self.holes.remove(&offset);
+            self.top = offset + need;
+            return offset;
         }
         let offset = self.top;
         self.top += need;
@@ -379,19 +379,19 @@ impl FreeList {
         let mut offset = offset;
         let mut len = len;
         // Coalesce with the predecessor hole, if it ends here.
-        if let Some((&prev, &prev_len)) = self.holes.range(..offset).next_back() {
-            if prev + prev_len == offset {
-                self.holes.remove(&prev);
-                offset = prev;
-                len += prev_len;
-            }
+        if let Some((&prev, &prev_len)) = self.holes.range(..offset).next_back()
+            && prev + prev_len == offset
+        {
+            self.holes.remove(&prev);
+            offset = prev;
+            len += prev_len;
         }
         // …and with the successor, if it starts where we end.
-        if let Some((&next, &next_len)) = self.holes.range(offset + len..).next() {
-            if next == offset + len {
-                self.holes.remove(&next);
-                len += next_len;
-            }
+        if let Some((&next, &next_len)) = self.holes.range(offset + len..).next()
+            && next == offset + len
+        {
+            self.holes.remove(&next);
+            len += next_len;
         }
         self.holes.insert(offset, len);
     }
@@ -432,23 +432,23 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
     let mut alloc_node: FxHashMap<BufferId, NodeIndex> = FxHashMap::default();
     let mut free_node: FxHashMap<BufferId, NodeIndex> = FxHashMap::default();
     for index in plan.dag.node_indices() {
-        if let Some(buffer) = allocated(&plan.dag[index]) {
-            if alloc_node.insert(buffer.clone(), index).is_some() {
-                bail!(
-                    "arena: buffer {buffer:?} is allocated twice — one \
+        if let Some(buffer) = allocated(&plan.dag[index])
+            && alloc_node.insert(buffer.clone(), index).is_some()
+        {
+            bail!(
+                "arena: buffer {buffer:?} is allocated twice — one \
                      BufferAlloc per buffer is the plan's invariant, and a \
                      second one would re-let a live range"
-                );
-            }
+            );
         }
-        if let Some(buffer) = freed(&plan.dag[index]) {
-            if free_node.insert(buffer.clone(), index).is_some() {
-                bail!(
-                    "arena: buffer {buffer:?} is freed twice — one BufferFree \
+        if let Some(buffer) = freed(&plan.dag[index])
+            && free_node.insert(buffer.clone(), index).is_some()
+        {
+            bail!(
+                "arena: buffer {buffer:?} is freed twice — one BufferFree \
                      per buffer is the plan's invariant, and a second one \
                      would hand a live range to the next allocation"
-                );
-            }
+            );
         }
     }
 
@@ -512,26 +512,26 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
             };
             let need = align_up(bytes.max(1));
             let offset = free_list.alloc(need);
-            if let Some((&prev, (prev_len, prev_id))) = live.range(..offset).next_back() {
-                if prev + prev_len > offset {
-                    bail!(
-                        "CONTRACT-1 violation (arena): {prev_id:?} holds \
+            if let Some((&prev, (prev_len, prev_id))) = live.range(..offset).next_back()
+                && prev + prev_len > offset
+            {
+                bail!(
+                    "CONTRACT-1 violation (arena): {prev_id:?} holds \
                          [{prev}, {}) and {buffer:?} was given [{offset}, {}) \
                          — simultaneously bound BufferIds must be disjoint",
-                        prev + prev_len,
-                        offset + need
-                    );
-                }
+                    prev + prev_len,
+                    offset + need
+                );
             }
-            if let Some((&next, (_, next_id))) = live.range(offset..).next() {
-                if offset + need > next {
-                    bail!(
-                        "CONTRACT-1 violation (arena): {buffer:?} was given \
+            if let Some((&next, (_, next_id))) = live.range(offset..).next()
+                && offset + need > next
+            {
+                bail!(
+                    "CONTRACT-1 violation (arena): {buffer:?} was given \
                          [{offset}, {}) and {next_id:?} holds [{next}, …) — \
                          simultaneously bound BufferIds must be disjoint",
-                        offset + need
-                    );
-                }
+                    offset + need
+                );
             }
             live.insert(offset, (need, buffer.clone()));
             live_bytes += need;
@@ -540,13 +540,13 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
                 .slices
                 .insert(buffer.clone(), ArenaSlice { offset, bytes });
         }
-        if let Some(buffer) = freed(&plan.dag[index]) {
-            if let Some(slice) = arena.slices.get(buffer) {
-                let need = align_up(slice.bytes.max(1));
-                live.remove(&slice.offset);
-                live_bytes -= need;
-                free_list.free(slice.offset, need);
-            }
+        if let Some(buffer) = freed(&plan.dag[index])
+            && let Some(slice) = arena.slices.get(buffer)
+        {
+            let need = align_up(slice.bytes.max(1));
+            live.remove(&slice.offset);
+            live_bytes -= need;
+            free_list.free(slice.offset, need);
         }
     }
     arena.slab_bytes = free_list.top;

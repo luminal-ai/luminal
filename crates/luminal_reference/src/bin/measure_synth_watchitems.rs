@@ -91,17 +91,15 @@ fn measure_plan(
             if line.starts_with("anti (") {
                 in_ops = false;
             }
-            if in_ops {
-                if let Some(rest) = line.strip_prefix("  ") {
-                    let label = rest.split(':').next().unwrap_or("");
-                    if label.contains("Materialize") {
-                        mats += 1;
-                    }
-                    if label == "BufferAlloc" {
-                        allocs += 1;
-                    }
-                    total += 1;
+            if in_ops && let Some(rest) = line.strip_prefix("  ") {
+                let label = rest.split(':').next().unwrap_or("");
+                if label.contains("Materialize") {
+                    mats += 1;
                 }
+                if label == "BufferAlloc" {
+                    allocs += 1;
+                }
+                total += 1;
             }
         }
         println!("{name}: PLAN total_ops={total} materialize={mats} buffer_alloc={allocs}");

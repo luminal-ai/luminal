@@ -477,10 +477,10 @@ fn entry_pitch_class(site: &ExtractionSite<'_>, entry: &ClassId) -> Option<Class
             if !other_is_coord {
                 continue;
             }
-            if let Some(factor) = site.class_of_child(mul, child) {
-                if !factors.contains(&factor) {
-                    factors.push(factor);
-                }
+            if let Some(factor) = site.class_of_child(mul, child)
+                && !factors.contains(&factor)
+            {
+                factors.push(factor);
             }
         }
     }
@@ -566,18 +566,17 @@ fn leading_dimension(
     } else {
         None
     };
-    if let Some((pitch_slot, unit_slot)) = orientation {
-        if !dead(pitch_slot) {
-            if let Some(factor) = entry_pitch_class(site, &chain[pitch_slot]) {
-                let dim = parse_dim(site, &factor);
-                // A unit factor is a unit stride, never a pitch; a factor
-                // equal to the unit axis's extent class is contiguous.
-                let expectation = &storage[unit_slot].1;
-                let padded = dim != 1i64 && factor != *expectation;
-                if padded {
-                    return dim;
-                }
-            }
+    if let Some((pitch_slot, unit_slot)) = orientation
+        && !dead(pitch_slot)
+        && let Some(factor) = entry_pitch_class(site, &chain[pitch_slot])
+    {
+        let dim = parse_dim(site, &factor);
+        // A unit factor is a unit stride, never a pitch; a factor
+        // equal to the unit axis's extent class is contiguous.
+        let expectation = &storage[unit_slot].1;
+        let padded = dim != 1i64 && factor != *expectation;
+        if padded {
+            return dim;
         }
     }
     rows_prime.clone()
