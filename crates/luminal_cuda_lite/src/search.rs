@@ -1,16 +1,24 @@
-//! THE IMPLEMENTATION SEARCH — the CUDA-lite runtime's copy.
+//! THE IMPLEMENTATION SEARCH — the CUDA-lite runtime's selection.
 //!
 //! There is NO search at the logical level: saturation discovers the
 //! implementations, and this module only SELECTS among them.
 //!
-//! RUNTIME-OWNED (ruling 2026-09-03, #420/#422 rejoin Phase 1). This was
-//! `luminal::implementation_search`, generic over a `PlanProfiler` trait
-//! core defined and two runtimes implemented. Both the loop and the
-//! extractor it drives now live in each runtime, duplicated rather than
-//! generalized ("just put this search in the cuda lite runtime\'s crate.
-//! it\'s fine."), and the profiler trait is GONE: candidates are ranked
-//! INLINE by whichever [`Evaluator`] the caller hands in — there is no
-//! trait, no object, and no third implementation waiting to be written.
+//! WHAT STAYS HERE, AND WHY. The loop must price a plan in the middle of
+//! every iteration, and this crate's prices are its own — a heuristic
+//! over the extracted graph, or a real timed run on a real device. That
+//! is why the loop is here and not in core ("just put this search in the
+//! cuda lite runtime\'s crate. it\'s fine."), and the `PlanProfiler`
+//! trait core used to define is GONE: candidates are ranked INLINE by
+//! whichever [`Evaluator`] the caller hands in — there is no trait, no
+//! object, and no third implementation waiting to be written. The option
+//! knobs, the outcome shape, the finalist/lattice policy and the
+//! bucketed driver are here for the same reason: they are choices.
+//!
+//! WHAT DOES NOT: drawing genomes, counting refusals, attributing
+//! wall-clock and printing progress decide nothing, were byte-identical
+//! in every copy, and are [`luminal::search_support`] (#420/#422 rejoin
+//! Phase 8). The names this module used to define are re-exported below
+//! so callers read the same.
 //!
 //! TWO EVALUATORS (Phase 4, 2026-09-03):
 //!
@@ -27,23 +35,35 @@
 //! not consulted at all (D6's "doesn't bias search too much", taken at
 //! full strength — a device build ranks on measured time only).
 //!
-//! The search-loop tests live with the reference copy
-//! (`luminal_reference::search`); this file carries only
-//! `early_stop_tests`, for its own copy of `early_stop_exceeded`.
+//! The tests for what moved live with it, in core; the dedup search
+//! test that drives a whole runtime stays with the reference copy
+//! (`luminal_reference::search`).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
 use colored::Colorize;
+use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 
-use crate::extractor::{self, Genome, ProducerChoice, SamplingSpace};
+use crate::extractor::{self, Genome};
 use luminal::bufferize::BufferIrGraph;
 use luminal::graph::LogicalProgram;
-use luminal::prelude::egraph_serialize::{self, ClassId};
-use luminal::prelude::{FxHashMap, FxHashSet};
+use luminal::prelude::FxHashMap;
+use luminal::prelude::egraph_serialize;
+
+// The pieces that decide nothing, in core since Phase 8. Re-exported
+// under this module's own name: every public path this crate used to
+// offer still resolves (`crate::search::early_stop_exceeded` is
+// `profile.rs`'s, and the tests read `RefusalBreakdown` off the
+// outcome).
+pub use luminal::search_support::{
+    CaptureAwareStderr, ProducerIndex, RefusalBreakdown, SearchProgress, SearchTimings,
+    bufferize_cycle_tripwire, early_stop_exceeded, log_channel_enabled, mutate_genome,
+    mutate_genome_reporting, mutate_genome_with_seed, sample_genome, sample_genome_reporting,
+    sample_genome_with_seed,
+};
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -136,143 +156,6 @@ impl CompileOptions {
     }
 }
 
-fn parse_log_flag(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-/// Main's `log_channel_enabled` (its `src/egglog_utils/mod.rs`), which
-/// this branch has no counterpart for: `LUMINAL_LOG=1` forces every
-/// channel on, an explicit channel variable overrides the programmatic
-/// setting, and otherwise the option stands.
-pub fn log_channel_enabled(option_enabled: bool, channel_env: &str) -> bool {
-    if std::env::var("LUMINAL_LOG").is_ok_and(|value| parse_log_flag(&value)) {
-        return true;
-    }
-    if let Ok(value) = std::env::var(channel_env) {
-        return parse_log_flag(&value);
-    }
-    option_enabled
-}
-
-/// A profiled candidate's cost, as the progress lines spell it.
-fn display_nanos(nanos: u128) -> String {
-    format!("{:.3} ms", nanos as f64 / 1e6)
-}
-
-/// The production sink for [`SearchProgress`].
-///
-/// Writing to `std::io::stderr()` directly bypasses libtest's output
-/// capture, so every test that leaves `search_log` on would leak
-/// progress lines (including unterminated transient `Slower` rows)
-/// into the harness output. Routing the same bytes through the
-/// `eprint!` macro goes through the capture-aware path instead, so the
-/// suites stay silent unless run with `--nocapture` while real runs
-/// still print to stderr.
-pub(crate) struct CaptureAwareStderr;
-
-impl std::io::Write for CaptureAwareStderr {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        eprint!("{}", String::from_utf8_lossy(buf));
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        // `eprint!` already writes through on each call; nothing buffered here.
-        Ok(())
-    }
-}
-
-/// Live search progress, re-expressing main's #391 three-state report
-/// (`Start` once, a permanent `Faster` per improvement, one transient
-/// `Slower x{n}`) for this branch's selection loop.
-///
-/// THE ONE DIVERGENCE from main: main draws progress bars under the
-/// report and walks the cursor up over them (`\x1b[1A` per bar row)
-/// before printing. This branch's search draws no bars, so all of that
-/// cursor arithmetic is dropped; the transient `Slower` line is instead
-/// written WITHOUT a newline and every subsequent line starts by
-/// clearing it in place (`\r\x1b[2K`). A `Faster` line therefore
-/// replaces the pending `Slower` line rather than being appended below
-/// it, and ends with a newline, so improvements accumulate as
-/// scrollback exactly as on main.
-pub(crate) struct SearchProgress<W: std::io::Write> {
-    out: W,
-    /// The baseline has been announced.
-    started: bool,
-    /// Consecutive non-improving candidates since the last improvement.
-    slower_since_faster: usize,
-    /// A transient `Slower` line is currently on screen, unterminated.
-    slower_line_visible: bool,
-}
-
-impl<W: std::io::Write> SearchProgress<W> {
-    pub(crate) fn new(out: W) -> Self {
-        Self {
-            out,
-            started: false,
-            slower_since_faster: 0,
-            slower_line_visible: false,
-        }
-    }
-
-    /// The BASELINE: the first profiled plan, announced once. (Main
-    /// renamed this label from `Search` to `Start` in the same commit:
-    /// the first line reports the baseline, not a search result.)
-    pub(crate) fn start(&mut self, nanos: u128) {
-        if self.started {
-            return;
-        }
-        self.started = true;
-        let _ = writeln!(
-            self.out,
-            "   {:>6} {}",
-            "Start".cyan().bold(),
-            display_nanos(nanos)
-        );
-        let _ = self.out.flush();
-    }
-
-    /// One profiled candidate after the baseline: a permanent `Faster`
-    /// line carrying the new best, or the transient `Slower x{n}`
-    /// counter (reset to zero by every improvement).
-    pub(crate) fn report(&mut self, improved: bool, nanos: u128) {
-        let _ = write!(self.out, "\r\x1b[2K");
-        if improved {
-            self.slower_since_faster = 0;
-            self.slower_line_visible = false;
-            let _ = writeln!(
-                self.out,
-                "   {:>6} {}",
-                "Faster".green().bold(),
-                display_nanos(nanos)
-            );
-        } else {
-            self.slower_since_faster += 1;
-            self.slower_line_visible = true;
-            let _ = write!(
-                self.out,
-                "   {:>6} x{}",
-                "Slower".yellow().bold(),
-                self.slower_since_faster
-            );
-        }
-        let _ = self.out.flush();
-    }
-
-    /// End of search: clear a pending transient `Slower` line so it
-    /// does not survive as a half-written row.
-    pub(crate) fn finish(&mut self) {
-        if self.slower_line_visible {
-            let _ = write!(self.out, "\r\x1b[2K");
-            self.slower_line_visible = false;
-        }
-        let _ = self.out.flush();
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub best_plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
@@ -312,63 +195,6 @@ pub struct SearchOutcome {
     /// reports. Stamped by the runtime after the lattice runs; the
     /// genetic search itself always leaves it 0.
     pub lattice_rejections: usize,
-}
-
-/// Aggregated classification of rejected genomes across one search.
-#[derive(Debug, Clone, Default)]
-pub struct RefusalBreakdown {
-    /// Genomes whose extraction produced no plan for some output.
-    pub extract_refusals: usize,
-    /// ...of those, how many involved a CHOICE-CYCLE (the genome's
-    /// chosen producers block on each other).
-    ///
-    /// INVARIANT (2026-09-02): sampling and mutation both keep a
-    /// genome's chosen-edge graph acyclic, so for a SAMPLED genome this
-    /// can only be nonzero through the sampler's documented full-list
-    /// fallback — a component position with no acyclic option at all.
-    /// A choice cycle on an acyclic chosen-edge graph is a sampler bug
-    /// and stops the search (see `search_implementations`).
-    /// Genomes assembled by hand (the election boards) are of course
-    /// still free to name cycles, and are still counted here.
-    pub with_choice_cycles: usize,
-    /// ...and how many involved a DEAD-END (an unplanned class with no
-    /// candidate at all).
-    pub with_dead_ends: usize,
-    /// Genomes that extracted but failed bufferize / execute.
-    ///
-    /// UNDER DEVICE PROFILING (Phase 4) the plan-build count also
-    /// carries candidates whose PREPARE step failed — NVRTC compilation,
-    /// module load, staging, or the warmup execution. That is a
-    /// deliberate classification (D10: *"runtimes can choose how to
-    /// handle failures at different points"*): a plan the device cannot
-    /// compile is an ordinary unfit candidate, indistinguishable in kind
-    /// from one bufferize refused, and it must NOT fail the ladder.
-    pub plan_build_refusals: usize,
-    /// Failures in a TIMED trial, after the warmup already succeeded.
-    pub execute_refusals: usize,
-    /// Candidates whose TIMED RUN exceeded
-    /// [`CompileOptions::candidate_timeout`]. NOT a refusal in the
-    /// execute sense — nothing failed, the plan is simply too slow to
-    /// finish measuring — so it is counted apart and is not part of the
-    /// zero-refusal ladder acceptance.
-    pub timed_out: usize,
-    /// First few classified summaries, verbatim.
-    pub exemplars: Vec<String>,
-}
-
-impl RefusalBreakdown {
-    pub fn summary(&self) -> String {
-        format!(
-            "extract refusals {} (choice-cycles {}, dead-ends {}), bufferize {}, execute {}, \
-             timed out {}",
-            self.extract_refusals,
-            self.with_choice_cycles,
-            self.with_dead_ends,
-            self.plan_build_refusals,
-            self.execute_refusals,
-            self.timed_out
-        )
-    }
 }
 
 /// HOW ONE CANDIDATE IS PRICED — the whole of what used to be a
@@ -430,386 +256,6 @@ impl Evaluator<'_> {
             false
         }
     }
-}
-
-/// Main's `early_stop_exceeded` (its `src/op.rs`), retyped from
-/// `Duration` to this branch's u128 nanos: true once a candidate's mean
-/// trial cost exceeds `best * factor`, i.e. the candidate has already
-/// lost by at least that margin and further trials can only refine a
-/// metric that is out of contention.
-///
-/// THE DEVICE EVALUATOR ([`crate::profile`]) applies it at `factor =
-/// 1.0` to a LOWER BOUND on the candidate's final mean (the trials so
-/// far divided by ALL of them, i.e. assuming every remaining trial costs
-/// zero), which makes the stop exact rather than heuristic: a candidate
-/// whose best conceivable final mean already exceeds the incumbent
-/// cannot win. The factor survives because it is main's semantics and
-/// main's tuning knob (`CompileOptions::early_stop_factor`).
-///
-/// Duplicated from `luminal_reference::search` under the duplication
-/// ruling — the two runtimes share no search code.
-pub fn early_stop_exceeded(mean_nanos: u128, best_nanos: u128, factor: f64) -> bool {
-    mean_nanos as f64 > best_nanos as f64 * factor
-}
-
-#[cfg(test)]
-mod early_stop_tests {
-    use super::early_stop_exceeded;
-
-    /// Main's `test_early_stop_exceeded` (`src/op.rs`), retyped from
-    /// `Duration` to nanos.
-    #[test]
-    fn early_stop_exceeded_keeps_mains_margin_semantics() {
-        const MS: u128 = 1_000_000;
-        let best = 5 * MS;
-        // 2x cutoff: 10ms mean is at the boundary, not over it.
-        assert!(!early_stop_exceeded(10 * MS, best, 2.0));
-        assert!(early_stop_exceeded(11 * MS, best, 2.0));
-        // A candidate faster than best never stops early.
-        assert!(!early_stop_exceeded(4 * MS, best, 2.0));
-        // Factor 1.0 stops anything slower than best.
-        assert!(early_stop_exceeded(6 * MS, best, 1.0));
-        // ...and NOT a tie: the incumbent keeps its seat, but a tied
-        // candidate is still worth finishing (it is not yet losing).
-        assert!(!early_stop_exceeded(5 * MS, best, 1.0));
-    }
-}
-
-/// Stage wall-clock totals for one search, in nanoseconds. Saturation
-/// and serialization happen in the runtime's `search` wrapper and are
-/// stamped there; the rest accumulate inside the selection loop.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SearchTimings {
-    /// egglog parse + saturation to fixpoint (one per search).
-    pub saturation_nanos: u128,
-    /// e-graph serialization (one per search).
-    pub serialize_nanos: u128,
-    /// ExtractionSession::new + producer index + viability fixpoint.
-    pub analysis_nanos: u128,
-    /// All genome extractions (extract_with_genome, cumulative).
-    pub extract_nanos: u128,
-    /// All DPS rewrites + bufferizations (cumulative).
-    pub plan_build_nanos: u128,
-    /// All candidate executions: warmup + timed trials (cumulative) —
-    /// the part that shrinks with a faster runtime.
-    pub profile_nanos: u128,
-}
-
-impl SearchTimings {
-    /// A compact human-readable ms breakdown for test logs.
-    pub fn summary(&self) -> String {
-        let ms = |n: u128| n as f64 / 1e6;
-        format!(
-            "saturation {:.0}ms, serialize {:.0}ms, analysis {:.0}ms, extract {:.0}ms, \
-             plan-build {:.0}ms, profile-exec {:.0}ms",
-            ms(self.saturation_nanos),
-            ms(self.serialize_nanos),
-            ms(self.analysis_nanos),
-            ms(self.extract_nanos),
-            ms(self.plan_build_nanos),
-            ms(self.profile_nanos)
-        )
-    }
-}
-
-/// Producer index shorthand: class -> its candidate `(constructor
-/// name, choice)` entries, in the index's own deterministic order.
-pub type ProducerIndex = BTreeMap<ClassId, Vec<(String, ProducerChoice)>>;
-
-/// Pick a position: uniformly among `allowed`, or — when nothing is
-/// admissible — uniformly over the FULL candidate list.
-///
-/// THE FALLBACK is deliberate and unchanged from the 2026-08-07
-/// sampler: a class every one of whose candidates sources from a member
-/// of its own component that is not yet assigned has no acyclic option
-/// at this position, which means its component holds no acyclic genome
-/// at all through this class. Refusing to choose would silently shrink
-/// the space; choosing anyway keeps the refusal accounting (and the
-/// blockage anatomy) as the loud diagnosis for that corner.
-fn choose_position(rng: &mut StdRng, allowed: &[usize], total: usize) -> usize {
-    if allowed.is_empty() {
-        rng.random_range(0..total)
-    } else {
-        allowed[rng.random_range(0..allowed.len())]
-    }
-}
-
-/// GENERATION-0 SAMPLING: a FOREST inside every component.
-///
-/// Each component's members are assigned in a random order built one
-/// step at a time. A member may elect a candidate with
-/// intra-component sources only when ALL of them are already assigned,
-/// so every chosen intra-component edge points BACKWARD along the
-/// order — acyclic by construction.
-///
-/// THE ORDER IS DRAWN FROM THE ADMISSIBLE ONES: at each step the next
-/// member is picked uniformly among those that still HAVE an
-/// admissible candidate, so the first member always progresses and no
-/// member is forced into the fallback by an unlucky shuffle. (A
-/// uniformly random order over all members would sometimes lead with a
-/// member that cannot progress — e.g. a layout copy whose only sources
-/// are its own component — and then the fallback could weld a cycle
-/// the 2026-08-07 sampler would have refused. Restricting to
-/// admissible orders removes no genome: see COVERAGE.)
-///
-/// COVERAGE. This admits chains and forests, not just the 2026-08-07
-/// star (one elected primary, everyone else copying it): for any
-/// acyclic assignment of intra-component candidates there is a
-/// topological order of the chosen edges, at every prefix of which the
-/// next member's own chosen candidate is admissible — so that member
-/// is in the pool, and the assignment is reachable. The only genomes
-/// excluded are the cyclic ones. Classes outside every component are
-/// sampled freely: their candidates' edges all leave the component,
-/// and the condensation of the SCC decomposition is a DAG.
-pub fn sample_genome(index: &ProducerIndex, space: &SamplingSpace, rng: &mut StdRng) -> Genome {
-    sample_genome_reporting(index, space, rng).0
-}
-
-/// [`sample_genome`] plus the classes that had to take the full-list
-/// fallback, in the order they took it — the sampler's own account of
-/// where its acyclicity invariant was unenforceable. An EMPTY list is
-/// the guarantee: the genome's chosen-edge graph is acyclic.
-pub fn sample_genome_reporting(
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    rng: &mut StdRng,
-) -> (Genome, Vec<ClassId>) {
-    let mut genome = Genome::default();
-    let mut fallbacks: Vec<ClassId> = Vec::new();
-    for members in &space.components {
-        // Per member, per candidate: how many of its intra-component
-        // sources are still unassigned. Zero = admissible now. (Sources
-        // are deduplicated, so one decrement each.)
-        let mut pending: Vec<Vec<usize>> = members
-            .iter()
-            .map(|class| {
-                space.intra_sources[class]
-                    .iter()
-                    .map(Vec::len)
-                    .collect::<Vec<usize>>()
-            })
-            .collect();
-        // How many admissible candidates each member currently has.
-        let mut admissible: Vec<usize> = pending
-            .iter()
-            .map(|per_candidate| per_candidate.iter().filter(|left| **left == 0).count())
-            .collect();
-        // source class -> the (member, candidate) counters it releases.
-        let mut dependents: std::collections::BTreeMap<&ClassId, Vec<(usize, usize)>> =
-            std::collections::BTreeMap::new();
-        for (member, class) in members.iter().enumerate() {
-            for (candidate, sources) in space.intra_sources[class].iter().enumerate() {
-                for source in sources {
-                    dependents
-                        .entry(source)
-                        .or_default()
-                        .push((member, candidate));
-                }
-            }
-        }
-
-        let mut assigned = vec![false; members.len()];
-        for _ in 0..members.len() {
-            // The next member: uniform over those that can still choose
-            // admissibly, or — when none can — over whoever is left,
-            // which is the full-list fallback.
-            let mut pool: Vec<usize> = (0..members.len())
-                .filter(|member| !assigned[*member] && admissible[*member] > 0)
-                .collect();
-            let forced = pool.is_empty();
-            if forced {
-                pool = (0..members.len())
-                    .filter(|member| !assigned[*member])
-                    .collect();
-            }
-            let member = pool[rng.random_range(0..pool.len())];
-            let class = &members[member];
-            let candidates = &index[class];
-            let allowed: Vec<usize> = (0..candidates.len())
-                .filter(|position| pending[member][*position] == 0)
-                .collect();
-            debug_assert_eq!(allowed.is_empty(), forced);
-            if forced {
-                fallbacks.push(class.clone());
-            }
-            let position = choose_position(rng, &allowed, candidates.len());
-            genome
-                .choices
-                .insert(class.clone(), candidates[position].1.clone());
-            assigned[member] = true;
-            for (other, candidate) in dependents.get(class).into_iter().flatten() {
-                pending[*other][*candidate] -= 1;
-                if pending[*other][*candidate] == 0 {
-                    admissible[*other] += 1;
-                }
-            }
-        }
-    }
-    for (class, candidates) in index {
-        if genome.choices.contains_key(class) {
-            continue;
-        }
-        let position = rng.random_range(0..candidates.len());
-        genome
-            .choices
-            .insert(class.clone(), candidates[position].1.clone());
-    }
-    (genome, fallbacks)
-}
-
-/// Would routing `class` through `sources` close a cycle in the genome's
-/// chosen intra-component edge graph? A DFS from each source over the
-/// OTHER members' current choices; reaching `class` again — or a source
-/// that IS `class` — is the cycle. Intra-component edges never leave the
-/// component, so the walk is component-local and small.
-fn flip_closes_cycle(
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    genome: &Genome,
-    class: &ClassId,
-    sources: &[ClassId],
-) -> bool {
-    let mut stack: Vec<ClassId> = sources.to_vec();
-    let mut seen: FxHashSet<ClassId> = FxHashSet::default();
-    while let Some(node) = stack.pop() {
-        if &node == class {
-            return true;
-        }
-        if !seen.insert(node.clone()) {
-            continue;
-        }
-        let Some(position) = space.chosen_position(index, genome, &node) else {
-            continue;
-        };
-        if let Some(next) = space
-            .intra_sources
-            .get(&node)
-            .and_then(|per_candidate| per_candidate.get(position))
-        {
-            stack.extend(next.iter().cloned());
-        }
-    }
-    false
-}
-
-/// POINT MUTATION under the same invariant: a flip of one class to one
-/// candidate is admissible exactly when the resulting chosen-edge graph
-/// closes no cycle through that class (see [`flip_closes_cycle`]).
-/// Progressing candidates have no intra-component sources and so are
-/// always admissible; a candidate sourcing from its own class never is.
-/// Mutations hit ANY producer class, dead rows included (deliberately —
-/// a dead-row mutation is free now and pre-stages the choice a later
-/// route flip lands on).
-pub fn mutate_genome(
-    parent: &Genome,
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    classes: &[ClassId],
-    rng: &mut StdRng,
-    count: usize,
-) -> Genome {
-    mutate_genome_reporting(parent, index, space, classes, rng, count).0
-}
-
-/// [`mutate_genome`] plus the classes whose flip found NO admissible
-/// candidate and took the full-list fallback (see
-/// [`sample_genome_reporting`]).
-pub fn mutate_genome_reporting(
-    parent: &Genome,
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    classes: &[ClassId],
-    rng: &mut StdRng,
-    count: usize,
-) -> (Genome, Vec<ClassId>) {
-    let mut child = parent.clone();
-    let mut fallbacks: Vec<ClassId> = Vec::new();
-    if classes.is_empty() {
-        return (child, fallbacks); // one-point genome space: nothing to mutate
-    }
-    for _ in 0..count {
-        let class = &classes[rng.random_range(0..classes.len())];
-        let candidates = &index[class];
-        let sources = &space.intra_sources[class];
-        let allowed: Vec<usize> = (0..candidates.len())
-            .filter(|&position| !flip_closes_cycle(index, space, &child, class, &sources[position]))
-            .collect();
-        if allowed.is_empty() {
-            fallbacks.push(class.clone());
-        }
-        let position = choose_position(rng, &allowed, candidates.len());
-        child
-            .choices
-            .insert(class.clone(), candidates[position].1.clone());
-    }
-    (child, fallbacks)
-}
-
-/// [`sample_genome_reporting`] from a seed — the entry the
-/// sampler-invariant boards use, so a test crate needs no `rand` of its
-/// own. Returns the genome and its fallback classes.
-pub fn sample_genome_with_seed(
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    seed: u64,
-) -> (Genome, Vec<ClassId>) {
-    sample_genome_reporting(index, space, &mut StdRng::seed_from_u64(seed))
-}
-
-/// [`mutate_genome_reporting`] from a seed (see
-/// [`sample_genome_with_seed`]).
-pub fn mutate_genome_with_seed(
-    parent: &Genome,
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    count: usize,
-    seed: u64,
-) -> (Genome, Vec<ClassId>) {
-    let classes: Vec<ClassId> = index.keys().cloned().collect();
-    mutate_genome_reporting(
-        parent,
-        index,
-        space,
-        &classes,
-        &mut StdRng::seed_from_u64(seed),
-        count,
-    )
-}
-
-/// THE BUFFERIZE TRIPWIRE (2026-09-02), the second half of the sampler
-/// invariant. Sampling and mutation keep a genome's chosen intra-component
-/// edges acyclic, and the extractor plans an input terminal from the
-/// boundary rather than from any producer, so no sampled or mutated genome
-/// can extract a graph with a cycle in it. If one reaches bufferize anyway,
-/// the sampler's candidate graph has drifted from the plan the extractor
-/// actually emits: the search STOPS and names the genome's own chosen
-/// intra-component edges alongside the cycle bufferize found, instead of
-/// quietly losing that genome as an ordinary refusal. Every other
-/// bufferize refusal (dead ends, unsupported ownership, unschedulable
-/// anti-edges) passes through untouched.
-fn bufferize_cycle_tripwire(
-    err: &anyhow::Error,
-    index: &ProducerIndex,
-    space: &SamplingSpace,
-    genome: &Genome,
-) -> Result<()> {
-    let text = format!("{err:#}");
-    if !text.contains(luminal::bufferize::EXTRACTED_GRAPH_CYCLE) {
-        return Ok(());
-    }
-    let intra = space.chosen_intra_edges(index, genome);
-    let intra: Vec<String> = intra
-        .iter()
-        .map(|(class, sources)| format!("{class} <- {sources:?}"))
-        .collect();
-    Err(anyhow!(
-        "sampler invariant violated: a sampled genome extracted a CYCLIC graph \
-         (bufferize refused it). Sampling and mutation keep the chosen \
-         intra-component edges acyclic and input terminals are planned from the \
-         boundary, so this means the sampler's candidate graph disagrees with the \
-         plan the extractor emitted. Chosen intra-component edges: [{}]. {text}",
-        intra.join("; ")
-    ))
 }
 
 /// INSERT ONE MEASURED CANDIDATE INTO THE RANKING (Phase 5), keeping

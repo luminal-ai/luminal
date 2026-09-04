@@ -47,6 +47,7 @@ pub mod subst_primitive;
 // amendment, resident-geometry cleanup 2026-08-31).
 pub mod layouts;
 pub mod logical_op;
+pub mod search_support;
 pub mod test_support;
 pub mod visualization;
 

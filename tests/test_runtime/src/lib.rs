@@ -27,13 +27,14 @@
 //!
 //! The charter is about RUNTIMES ("anything it turns out to want from
 //! another runtime gets REPLICATED here, never borrowed"); core is not
-//! a runtime. [`extractor`] is core's e-graph walk under this crate's
-//! old module name (#420/#422 rejoin Phase 8, 2026-09-04 — it was a
-//! verbatim copy here through Phases 1-7), and [`sampler`] is still
-//! this crate's own.
+//! a runtime. [`extractor`] and [`sampler`] are core's e-graph walk and
+//! genome sampler under this crate's old module names (#420/#422 rejoin
+//! Phase 8, 2026-09-04 — both were verbatim copies here through Phases
+//! 1-7). There is no selection loop either way: this runtime does not
+//! execute plans, so it has nothing to price them with.
 
 pub use luminal::extraction as extractor;
-pub mod sampler;
+pub use luminal::search_support as sampler;
 
 pub mod bindings;
 pub mod ops;
