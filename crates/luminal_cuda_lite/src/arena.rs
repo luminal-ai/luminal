@@ -102,6 +102,12 @@ pub struct ArenaPlan {
     /// The high-water mark: how many bytes the slab must hold for this
     /// plan under this order.
     pub slab_bytes: usize,
+    /// The FRAGMENTATION-FREE lower bound: the largest total of
+    /// simultaneously-live reservations over the same order. A perfect
+    /// allocator would need exactly this; `slab_bytes - peak_live_bytes`
+    /// is what first-fit's holes cost. Diagnostic only — nothing binds
+    /// to it.
+    pub peak_live_bytes: usize,
     /// Slab members (the INTERIOR row) and their ranges.
     pub slices: FxHashMap<BufferId, ArenaSlice>,
     /// Buffers that live OUTSIDE the slab in their own allocations: the
@@ -401,6 +407,7 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
     // two neighbours). The executor keeps `binding_check::assert_disjoint`
     // for the allocations it makes itself.
     let mut live: BTreeMap<usize, (usize, BufferId)> = BTreeMap::new();
+    let mut live_bytes = 0usize;
     for &index in &arena.order {
         if let Some(buffer) = allocated(&plan.dag[index]) {
             let Some(&bytes) = sizes.get(buffer) else {
@@ -430,6 +437,8 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
                 }
             }
             live.insert(offset, (need, buffer.clone()));
+            live_bytes += need;
+            arena.peak_live_bytes = arena.peak_live_bytes.max(live_bytes);
             arena
                 .slices
                 .insert(buffer.clone(), ArenaSlice { offset, bytes });
@@ -438,6 +447,7 @@ pub(crate) fn plan_arena_over<L: PlanLayout>(
             if let Some(slice) = arena.slices.get(buffer) {
                 let need = align_up(slice.bytes.max(1));
                 live.remove(&slice.offset);
+                live_bytes -= need;
                 free_list.free(slice.offset, need);
             }
         }

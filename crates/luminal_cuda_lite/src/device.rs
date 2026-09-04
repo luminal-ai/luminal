@@ -641,10 +641,11 @@ fn arena_report(
         .filter_map(|b| buffer_bytes(b).ok())
         .sum();
     eprintln!(
-        "[cl-arena] slab high-water {} B (resident {} B) for {} interior buffers \
-         summing {} B; standalone+donated {} B over {} buffers; whole-plan sum \
-         (the CL-2 cost) {} B; total now {} B",
+        "[cl-arena] slab high-water {} B (peak live {} B, resident {} B) for {} \
+         interior buffers summing {} B; standalone+donated {} B over {} buffers; \
+         whole-plan sum (the CL-2 cost) {} B; total now {} B",
         arena.slab_bytes,
+        arena.peak_live_bytes,
         slab_now,
         arena.slices.len(),
         slab_sum,
