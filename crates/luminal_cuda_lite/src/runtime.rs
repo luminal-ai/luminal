@@ -136,6 +136,12 @@ impl CudaRuntime {
     /// is simply not claimable — it never reaches the allow list, so the
     /// search refuses loudly instead of electing something the device
     /// cannot run.
+    ///
+    /// ONE EXCEPTION TO ROW-BY-ROW SELECTION: the four cuBLASLt marker
+    /// rows are ONE vocabulary, declared and minted by the Base row's
+    /// snippets. A registry holding a non-Base marker row without Base is
+    /// REFUSED here — such a row would be claimed but never declared, an
+    /// op that cannot be elected under a claim set that says it can.
     pub fn load_with_registry(
         graph: &graph::Graph,
         registry: Vec<crate::ops::RegisteredOp>,
@@ -144,6 +150,36 @@ impl CudaRuntime {
             .logical
             .bound_parts(&crate::bindings::CudaBindings)
             .map_err(|e| anyhow!(e))?;
+        // THE FOUR cuBLASLt MARKER ROWS ARE ONE VOCABULARY. Only the
+        // Base row emits snippets, and that one snippet set declares all
+        // four constructors and every minting rule. A registry holding a
+        // non-Base marker WITHOUT Base would derive a claim for an op the
+        // assembled program never declares and never mints: claimed,
+        // un-electable, and `active_allow_list()` — the check this
+        // module's doc recommends — would say it is available. Refuse the
+        // configuration at load instead, keyed on constructor names.
+        {
+            use crate::ops::cublaslt::CublasLtForm;
+            let has = |ctor: &str| {
+                registry
+                    .iter()
+                    .any(|entry| entry.matcher.egglog_constructor() == ctor)
+            };
+            if let Some(orphan) = CublasLtForm::ALL
+                .into_iter()
+                .filter(|form| *form != CublasLtForm::Base)
+                .find(|form| has(form.constructor_name()))
+            {
+                anyhow::ensure!(
+                    has(CublasLtForm::Base.constructor_name()),
+                    "registry holds the cuBLASLt `{}` row without the Base row `{}`: \
+                     the Base row declares and mints the whole marker vocabulary, so \
+                     the four marker rows must be kept or dropped together",
+                    orphan.constructor_name(),
+                    CublasLtForm::Base.constructor_name()
+                );
+            }
+        }
         // Derive the claim set BEFORE the rows are consumed: the allow
         // list reads the prototypes, the search reads the matchers.
         let allow = Self::allow_list_over(&registry);

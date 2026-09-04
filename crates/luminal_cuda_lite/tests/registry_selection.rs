@@ -217,3 +217,63 @@ fn registry_labels_agree_with_the_prototypes() {
         );
     }
 }
+
+/// THE ONE ESTATE THAT IS NOT ROW-BY-ROW: only the Base cuBLASLt matcher
+/// emits egglog snippets, and that one snippet set declares all four
+/// marker constructors and every minting rule. A registry holding a
+/// non-Base marker WITHOUT Base would claim an op the assembled program
+/// never declares and never mints — un-electable, while
+/// `active_allow_list()` says it is available. `load_with_registry`
+/// refuses that configuration by name.
+#[test]
+fn a_non_base_cublaslt_row_without_base_is_refused_at_load() {
+    let (cx, _a, _b) = add_graph();
+
+    let mut registry = cuda_registry();
+    registry.push(RegisteredOp::new(
+        Box::new(CublasLtMarkerMatcher {
+            form: CublasLtForm::Bias,
+        }),
+        Box::new(CublasLt {
+            form: CublasLtForm::Bias,
+            spec: None,
+        }),
+    ));
+    let err = match CudaRuntime::load_with_registry(&cx, registry) {
+        Ok(_) => panic!("a Bias row without Base must be refused"),
+        Err(err) => err,
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("LayoutTensorOpCublasLtBias"), "{msg}");
+    assert!(msg.contains("without the Base row"), "{msg}");
+
+    // Dropping Base out of the WHOLE preset is the same configuration,
+    // however the caller arrives at it.
+    let err = match CudaRuntime::load_with_registry(
+        &cx,
+        cuda_registry_filtered(|op| op.constructor() != CublasLtForm::Base.constructor_name()),
+    ) {
+        Ok(_) => panic!("the preset minus Base must be refused"),
+        Err(err) => err,
+    };
+    assert!(
+        format!("{err:#}").contains("without the Base row"),
+        "{err:#}"
+    );
+
+    // Base alone, and all four together, both load.
+    let (cx, _a, _b) = add_graph();
+    CudaRuntime::load_with_registry(&cx, cuda_registry_with_cublaslt())
+        .expect("the whole marker estate loads");
+    let mut base_only = cuda_registry();
+    base_only.push(RegisteredOp::new(
+        Box::new(CublasLtMarkerMatcher {
+            form: CublasLtForm::Base,
+        }),
+        Box::new(CublasLt {
+            form: CublasLtForm::Base,
+            spec: None,
+        }),
+    ));
+    CudaRuntime::load_with_registry(&cx, base_only).expect("Base alone loads");
+}

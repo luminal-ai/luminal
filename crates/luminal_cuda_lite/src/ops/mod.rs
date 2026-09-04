@@ -232,6 +232,14 @@ pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
 /// that exists. The two presets remain available whole
 /// ([`cuda_registry`], [`cuda_registry_with_cublaslt`]).
 ///
+/// THE FOUR cuBLASLt MARKER ROWS ARE ONE ESTATE, not four independent
+/// ones: the Base row's snippets declare all four constructors and mint
+/// all four forms, so a predicate that drops Base must drop all four.
+/// [`crate::CudaRuntime::load_with_registry`] refuses the other
+/// combination; `active_allow_list` alone cannot tell you, because a
+/// claim is derived from the prototype and says nothing about whether
+/// the assembled program declares the constructor.
+///
 /// A PREDICATE THAT MATCHES NOTHING IS SILENT — it returns the full
 /// registry, and the search then simply has the op available. Assert on
 /// the resulting length (or on
