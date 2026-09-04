@@ -59,8 +59,10 @@
 //!   scatters into it. Same stream, so the phases are ordered.
 //! * CUBLASLT D: `beta = 0` on the non-fold forms, which is the BLAS
 //!   skip — C (aliased to D) is not read, D is fully written. The
-//!   C-fold forms read a separate C OPERAND buffer with `beta = 1`,
-//!   never the destination's prior bytes.
+//!   C-fold forms read their C operand at `beta = 1`; C is a DEFINED
+//!   resident — a distinct buffer, or D's own range when the bufferizer
+//!   seeded D onto C's ReadWrite caller buffer through the May permit —
+//!   never an undefined recycled range.
 //!
 //! So no memset is emitted anywhere. The one standing assumption is
 //! that a destination's `numel(dest_dims)` covers its buffer's SPAN:
@@ -139,9 +141,13 @@ impl KernelCache {
 ///
 /// The slab is GROW-ONLY and never parked (#401 as amended by #422):
 /// one runtime-owned allocation, resized upward when an installed plan
-/// needs more than it holds, never released between calls. Nothing has
-/// to be invalidated on a grow — CL captures no CUDA graphs and holds
-/// no device pointers across calls.
+/// needs more than it holds. SERVING never releases it between
+/// [`CudaRuntime::execute`](crate::CudaRuntime::execute) calls; the
+/// SEARCH is the one exception — it releases the slab after every
+/// profiled candidate through [`Self::release_slab`] (#422's search-time
+/// policy), and the next [`execute_plan`] re-allocates through
+/// `ensure_slab`. Nothing has to be invalidated on a grow — CL captures
+/// no CUDA graphs and holds no device pointers across calls.
 pub struct CudaDevice {
     #[allow(dead_code)]
     ctx: Arc<CudaContext>,
@@ -464,9 +470,16 @@ pub fn execute_plan(
                 // NVRTC kernel. The destination is the arena range the
                 // planner assigned (it was a fresh zeroed slice before
                 // Phase 3 of the rejoin); the C-fold forms read their C
-                // operand buffer and write D (C != D pointers, beta =
-                // 1.0f — legal, identical layouts by the marker's rule
-                // guard), and the non-fold forms run beta = 0, which is
+                // operand buffer and write D at beta = 1.0f. C is USUALLY
+                // a distinct live range, but when the program binds D's
+                // output slot onto the same ReadWrite caller buffer that
+                // holds C, the seed is admitted through CublasLtDps's May
+                // permit on operand 2 and C == D — legal, because
+                // `bind_destination` emits identical C and D descriptors,
+                // which is the API's C == D precondition. (Recorder-
+                // produced programs never bind an output onto an input
+                // buffer, so this arises only for hand-authored
+                // boundaries.) The non-fold forms run beta = 0, which is
                 // the BLAS skip, so D's prior bytes are never read.
                 if let Some(dps) = op
                     .as_any()

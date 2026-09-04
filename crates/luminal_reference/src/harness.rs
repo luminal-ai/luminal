@@ -206,7 +206,12 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     // VALUE-keyed table: decode over the POST-DPS graph bufferize sees.
     let dps = luminal::dps::dps_rewrite(&extracted);
-    let layouts = luminal::layouts::decode_layout_table(&serialized, &dps, "plain plan")?;
+    let layouts = luminal::layouts::decode_layout_table(
+        &serialized,
+        &dps,
+        "plain plan",
+        &mut luminal::layouts::LayoutDecodeCache::new(),
+    )?;
     luminal::bufferize::bufferize(&dps, &layouts)?;
     eprintln!("[plain-plan] dps+bufferize {:?}", start.elapsed());
     Ok(())

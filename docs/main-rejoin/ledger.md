@@ -30,7 +30,7 @@ Dispositions:
 | `7423ca37` | #391 | compile search progress UI | RE-EXPRESSED (`search_log` + Start/Faster/Slower) | branch `merge/main-391-search-ui` (2nd commit) | see **#391 progress UI** below |
 | `7d2817fa` | — | luminal_python: search_iterations pass through more places | FILE-LEVEL | branch `merge/main-7d2817fa-search-iterations` | parked crate: re-point `search_iterations` at `ImplementationSearchOptions` when luminal_python is re-attached to the recorder |
 | `bea18ecf` | #389 | Sdpa gqa fixes | FILE-LEVEL | branch `merge/main-389-sdpa-gqa` | parked crate + non-gating `ci/`: RULED 2026-09-02 (ruling 1) — `ci/example_output.py` SYNCS main's numbers for now, by decision; the loosened gemma / gemma4_moe TPOT figures are main's HLIR cuda_lite draws and still have to be re-baselined against CL A100 draws before they gate anything here |
-| `499d0779` | #386 | Search: early-stop candidate profiling against the best-so-far metric | MIXED — RE-EXPRESSED (core: running mean + fifth positional cutoff + predicate) / FILE-LEVEL (parks, with a stubbed predicate) | branch `merge/main-386-early-stop` (two commits) | REQUIREMENT FOR CL (ruling 4): a device `PlanProfiler` that times candidates on device, mirroring `ReferenceProfiler`'s design, and then honours the cutoff — until then `StaticProfiler` accepts and ignores it; see **#386 early-stop profiling** below |
+| `499d0779` | #386 | Search: early-stop candidate profiling against the best-so-far metric | MIXED — RE-EXPRESSED (core: running mean + fifth positional cutoff + predicate) / FILE-LEVEL (parks, with a stubbed predicate) | branch `merge/main-386-early-stop` (two commits) | REQUIREMENT FOR CL (ruling 4): a device `PlanProfiler` that times candidates on device, mirroring `ReferenceProfiler`'s design, and then honours the cutoff — until then `StaticProfiler` accepts and ignores it; see **#386 early-stop profiling** below — DELIVERED Phase 4 (2026-09-03): `crates/luminal_cuda_lite/src/profile.rs` + `Evaluator::Device` behind `CompileOptions::profile_on_device`, same lower-bound cutoff at factor 1.0; the `PlanProfiler` trait, `StaticProfiler`, `ReferenceProfiler` and `src/implementation_search.rs` named here were deleted in Phase 1 (search is runtime-owned), see **Program: #420/#422 rejoin — Phase 4 (device evaluator)** |
 | `6a5313f2` | #398 | Support for PyTorch OpInfo tests | MIXED — FILE-LEVEL (python + workflow) / RE-EXPRESSED (`TypedBuffer::F64` + typed unary kernels) / DROPPED (`ConstantF64`, the empty-Vec fix) | branch `merge/main-398-opinfo` (two commits) | OpInfo harness, the arange-metadata and acos/acosh lowerings = M4 translator requirements; typed `LogicalConstant`; F32<->F64 cast policy; F64 on CL — see **#398 OpInfo + F64** below |
 | `db3c80fd` | #399 | Add native narrow integer HLIR dtypes | MIXED — FILE-LEVEL (python) / RE-EXPRESSED (I8/U8/I16 TypedBuffer + kernels, int-safe `abs`) | branch `merge/main-399-narrow-ints` (two commits) | **CARVE-OUT to confirm at review**: I8/U8/I16 wrap, I32/I64 stay checked — see **#399 narrow ints** below |
 | `727918cd` | #394 | Optimize CUDA graph materialization and StaticCache writebacks | FILE-LEVEL (parks) + INTENT-ONLY (core) | branch `merge/main-394-cuda-graph-park` | REQUIREMENT FOR THE CL EXECUTOR: durable external device-pointer registration, exact binding-delta graph patching, cached reverse indexes, resource-signature reuse — see **#394 CL executor persistence** below |
@@ -50,7 +50,7 @@ Dispositions:
 | `477d3626` | #417 | Preserve concrete dtypes through loop rolling | INTENT-ONLY (the law written into the estate beside `dtype-of`) | branch `merge/main-417-dtype-contract` | RULED 2026-09-03: *"This is good, let's merge it."* Nothing is file-mergeable — `src/hlir.rs` and `src/op.rs` are deleted and `src/graph.rs` is a different file (the recorder). The principle main paid for is already this branch's design and is now written down; the `output_dtype` table, `concrete_node_dtypes` and the marker assertions are uncarried — see **#417 dtype contracts** below |
 | `6681720b` | #418 | Add CUDA serving runtime support for vLLM integration | FILE-LEVEL (12 python-park files + 4 into the `cuda_lite_hlir` park + 1 metal-park file) + UNCARRIED (`src/dyn_backend.rs`, deleted on this branch) | branch `merge/main-418-serving-parks` | RULED 2026-09-03: *"we'll record only, we'll eventually have to get to parity."* Five EMBEDDABILITY REQUIREMENTS on the live CL executor, each checked against today's `crates/luminal_cuda_lite/src/device.rs`: device selection, a caller-owned borrowed stream with a synchronize-or-not policy, fixed-capacity caller-owned output buffers, functionalized mutation writebacks, and a versioned FFI seam — see **#418 vLLM serving** below |
 | `f285d229` | #420 | Move post-saturation search into the runtime | FILE-LEVEL (3 files into the `cuda_lite_hlir` park + 1 metal-park file) + INTENT-ONLY (15 core/doc files, nothing applied) + DROPPED (all loop unroll / roll / packed machinery, main's `Runtime` trait shape) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"we're going to ignore all the loop unrolling, loop rolling stuff, but we're going to follow all the other aspects and move all of that functionality out of core and into the runtimes."* The boundary move is the program's thesis and lands in later phases; THIS row is record-and-park — see **#420 search into the runtime** below |
-| `598e5ca7` | #422 | Share reusable CUDA runtime through Lite | FILE-LEVEL (41 files into the `cuda_lite_hlir` park, incl. 5 deletions + 1 non-gating `ci/` file) + INTENT-ONLY (arena, runtime-configurable op/matcher selection) + PUNTED-TO-PARK (fusion, attention, cuda-heavy composition) + DROPPED (the `subsume` fusion rule and the four `delete` rules, `CudaRuntimeImpl<O>`) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"put these fusion changes in hlir and punt on them temporarily"*, *"we're going to copy it into the hlir folder and then actually implement it once we're caught up"* (attention/FA3), *"Update the hlir_folder so we have a record of what the target code looks like"* (full-CUDA downstream), *"no code for now"* (zero-copy rebinding) — see **#422 reusable CUDA runtime** below |
+| `598e5ca7` | #422 | Share reusable CUDA runtime through Lite | FILE-LEVEL (41 files into the `cuda_lite_hlir` park, incl. 5 deletions + 1 non-gating `ci/` file) + INTENT-ONLY at walk — DELIVERED by Phase 3 (arena) and PARTIALLY by Phase 2 (runtime-configurable op/matcher selection: the registry half; the execution face still PUNTED) + PUNTED-TO-PARK (fusion, attention, cuda-heavy composition) + DROPPED (the `subsume` fusion rule and the four `delete` rules, `CudaRuntimeImpl<O>`) | branch `rejoin/p0-record-and-park` | RULED 2026-09-03: *"put these fusion changes in hlir and punt on them temporarily"*, *"we're going to copy it into the hlir folder and then actually implement it once we're caught up"* (attention/FA3), *"Update the hlir_folder so we have a record of what the target code looks like"* (full-CUDA downstream), *"no code for now"* (zero-copy rebinding) — see **#422 reusable CUDA runtime** below |
 
 ## #391 progress UI — re-expressed in `src/implementation_search.rs`
 
@@ -262,6 +262,19 @@ profiler's design** — warmup, timed trials, a mean metric, and the same
 lower-bound cutoff — at which point `StaticProfiler`'s ignored argument becomes
 a real one. That is a larger question than the cutoff itself, and it is not in
 this batch.
+
+**UPDATE (Phase 4, 2026-09-03).** The precondition above is discharged: CL
+profiles candidates on device when `CompileOptions::profile_on_device` is set
+(`crates/luminal_cuda_lite/src/profile.rs::profile_candidate`; `runtime.rs`'s
+`search` builds `Evaluator::Device`), applying `early_stop_exceeded` at factor
+1.0 to the same lower bound. The names in this section are HISTORICAL:
+`PlanProfiler` / `StaticProfiler` / `ReferenceProfiler`,
+`ImplementationSearchOptions::early_stop_factor` and
+`src/implementation_search.rs` were all deleted in Phase 1, and
+`search_passes_the_incumbent_metric_to_every_later_profile_call` was deleted
+rather than moved (see the Phase 1 section, and finding C6 there for what that
+leaves unpinned); the predicate stays pinned by `early_stop_tests` in each
+runtime's own `search.rs` copy.
 
 ## #398 OpInfo + F64 — what landed, and what is owed
 
@@ -547,11 +560,13 @@ branch. Its two additions, `DynBackend::clear_output_device_ptr` and a
 default `copy_outputs_to_device_ptrs`, are the core seam of a capability CL
 does not have at all, so they are recorded here as intent rather than code.
 
-**THE REQUIREMENT, for whenever CL grows a persistent executor.** CL today is
-single-shot: `crates/luminal_cuda_lite/src/device.rs` `execute_plan`
-allocates every buffer, uploads, launches, synchronizes, downloads, and drops
-the storage — strictly worse per invocation than main's runtime even BEFORE
-this commit. What #394 is worth, in the order it would have to be rebuilt:
+**THE REQUIREMENT, for the persistent executor CL now has (Phase 3, below).**
+CL at this walk (before Phase 3, 2026-09-03) was single-shot:
+`crates/luminal_cuda_lite/src/device.rs` `execute_plan` allocated every buffer,
+uploaded, launched, synchronized, downloaded, and dropped the storage —
+strictly worse per invocation than main's runtime even BEFORE this commit.
+Phase 3 has since made the context, stream, NVRTC module cache and
+interior-buffer slab persistent; items 1-5 below remain unbuilt. What #394 is worth, in the order it would have to be rebuilt:
 
 1. **Durable external pointer registration.** A caller-owned device pointer
    (a torch allocation) binds once; an identical re-registration is a NO-OP,
@@ -758,18 +773,23 @@ is removed by #422 (`598e5ca7`): `PersistentArena` / `park_*` / `attach_*` /
 `intermediate_buffer_bytes` = shared arena len; `clear_intermediate_buffers`
 is a true free again.
 
-**INTENT for CL.** The branch has NO analogue and, importantly, has not yet
-reached the problem: `crates/luminal_cuda_lite/src/device.rs` materializes one
-fresh `alloc_zeros` per `BufferId` per execute and treats the plan's
-`BufferAlloc`/`BufferFree` nodes as explicit no-ops, and CL's search profiles
-candidates on the reference HOST executor (a documented cost proxy), so it
-never churns device arenas. When CL grows on-device candidate profiling or
+**INTENT for CL.** AT ITS WALK the branch had NO analogue and, importantly,
+had not yet reached the problem: `crates/luminal_cuda_lite/src/device.rs`
+materialized one fresh `alloc_zeros` per `BufferId` per execute and treated the
+plan's `BufferAlloc`/`BufferFree` nodes as explicit no-ops, and CL's search
+ranked candidates by a device-free static prior, so it never churned device
+arenas. When CL grows on-device candidate profiling or
 bucketed re-execution, the re-expression is a persistent-allocation field on
 `CudaRuntime` plus honouring `BufferAlloc`/`BufferFree` against ONE
 runtime-owned high-water slab in `device.rs`, kept across `execute` calls
 rather than dropped with the `storage` map (= #422's `SharedArena` form; if CL
 ever profiles candidates on-device, decide explicitly whether to follow #422's
 per-candidate free or #401's retention — they conflict).
+
+DELIVERED 2026-09-03 — Phase 3 (`arena.rs` honours `BufferAlloc`/`BufferFree`
+against one grow-only runtime-owned slab on the persistent `CudaDevice`) and
+Phase 4 (on-device candidate profiling, which is exactly the trigger this
+paragraph names; #422's per-candidate `release_slab()` is the policy chosen).
 
 The transferable design, after #422:
 
@@ -823,11 +843,15 @@ Profiling -> unrolled LLIR -> Runtime`. On this branch:
 - **There is no loop-rolling stage.** Structure reaches egglog through the
   logical ops' own `.egg` estates (`src/logical_op/*`), not through a rolled
   HLIR graph.
-- **Extraction is not genetic-only, and does not produce LLIR.**
-  `src/extractor.rs` walks the e-graph to LayoutTensor ops,
+- **Extraction is not genetic-only, and does not produce LLIR.** AT
+  2026-09-02: `src/extractor.rs` walks the e-graph to LayoutTensor ops,
   `src/implementation_search.rs` runs the search over them, and
   `src/bufferize.rs` lowers the winner to a `BufferIrGraph` of buffers and
-  plan nodes. "LLIR" names nothing here.
+  plan nodes. Since Phase 1 of the #420/#422 rejoin the extractor and the
+  search are RUNTIME-OWNED — `luminal_reference::{extractor, search}`,
+  `luminal_cuda_lite::{extractor, search}` — and only `bufferize` remains in
+  core; see **Program: #420/#422 rejoin — Phase 1**. "LLIR" names nothing
+  here.
 - **What IS still true**, and is the part worth keeping when the document is
   rewritten: semantic equivalence must hold across the whole search space; the
   reference runtime is CPU ground truth; and the program as authored is an
@@ -835,9 +859,11 @@ Profiling -> unrolled LLIR -> Runtime`. On this branch:
   never redefine.
 
 **Owed:** a spec rewritten against the recorder / `egglog_core` /
-`extractor` + `implementation_search` / `bufferize` / CL flow. Adapting this
-text line by line would be worse than starting from the pipeline as it is;
-what should survive the rewrite is the contracts section, not the diagram.
+runtime-owned `extractor` + `search` (per runtime crate, Phase 1) /
+`bufferize` / CL flow — the shape already stated in the note at the top of
+`spec.md`. Adapting this text line by line would be worse than starting from
+the pipeline as it is; what should survive the rewrite is the contracts
+section, not the diagram.
 
 ## #402 translate_module — the seam banked, the scatter fix superseded
 
@@ -2215,6 +2241,17 @@ Each is stated as a requirement on the live CL executor — `execute_plan` in
 `CudaRuntime::execute` (`crates/luminal_cuda_lite/src/runtime.rs:299-307`) —
 with today's state verified in the tree, not assumed.
 
+**STATE AS OF `acde9ac1` (2026-09-03, BEFORE Phase 3 of the #420/#422
+rejoin).** Phases 3 and 4 below changed the executor's shape, so read every
+*Today* item and every `device.rs:NNN` cite in this section as pre-Phase-3:
+`CudaDevice` now persists the context, the one stream, the NVRTC module cache
+and the arena slab across calls, created once and owned by `CudaRuntime`;
+INTERIOR buffers are sub-ranges of that slab rather than fresh allocations; and
+payloads are `HostBuffer`, not `TypedBuffer`. Still true as written: device 0
+is hardcoded, standalone and escaping (output-backing) allocations are fresh
+per call, outputs are D2H'd into fresh host vectors, and the terminal
+synchronize is unconditional. EVERY REQUIREMENT BELOW STILL STANDS.
+
 **(1) Explicit CUDA device selection.** *Today: device 0 is hardcoded, and the
 context is created per call.* `crates/luminal_cuda_lite/src/device.rs:156`:
 
@@ -2268,16 +2305,21 @@ capture demands a stable address, so a per-shape allocation is not an option);
 and the planner/allocator must be forbidden from handing that buffer's range to
 anything else (main's fix is literally a filter — `external_output_nodes`
 excluded from `logical_buffer_offsets` before arena assignment).
-**The seam already exists and already says so.** `device.rs:215-222`, the
-CONTRACT-1 bind-time check, is written for exactly this future:
+**The seam already exists and already says so.** `device.rs:215-222` at
+`acde9ac1` (re-scoped by Phase 3 — see **CONTRACT-1: re-scoped, not dropped,
+not duplicated**), the CONTRACT-1 bind-time check, was written for exactly this
+future:
 
 > distinct BufferIds must be backed by disjoint device ranges … Fresh
 > `alloc_zeros` per buffer makes this hold by construction today; the assert is
 > the contract's enforcement face for when raw caller pointers arrive at this
 > binding surface. Loud refusal, never mistranslation.
 
-That is where a caller pointer table would be bound, and the disjointness
-assert is what would catch a host handing in two overlapping ranges.
+The "fresh `alloc_zeros`" clause is gone since Phase 3: the executor's assert
+now covers only the standalone and donated rows it allocates itself, and the
+slab's half is decided at planning time in `arena.rs`. That is still where a
+caller pointer table would be bound, and the disjointness assert is what would
+catch a host handing in two overlapping ranges.
 #422's zero-copy fix implies: a registration carries `(ptr, capacity)`; a grown
 dynamic output must be re-registered before the plan is bound, never patched in
 the executor — RECORDED ONLY, no runtime checks by ruling (2026-09-03).
@@ -2378,8 +2420,17 @@ failures.
   `search_passes_the_incumbent_metric_to_every_later_profile_call`. It
   drove a hand-written `PlanProfiler` to observe the `best_so_far`
   cutoff crossing the trait boundary — and that boundary no longer
-  exists. #386's semantics stay pinned by `early_stop_exceeded`'s own
-  board, which is where the predicate lives.
+  exists. The PREDICATE's semantics stay pinned by
+  `early_stop_exceeded`'s own board
+  (`luminal_reference::search::early_stop_tests`, and since Phase 4 a
+  copy in `luminal_cuda_lite::search` too). AMENDED 2026-09-03 (review
+  finding C6): the loop's PLUMBING that the deleted test also pinned —
+  `None` for the baseline candidate, the incumbent's mean for every
+  later one, one evaluation per profiled plan (the `best_so_far`
+  binding handed to `profile_on_reference_runtime`) — is currently
+  UNPINNED. With the profiler seam gone there is no hook to observe it
+  short of adding one, and the stop is exact, so no selection outcome
+  can witness it. Recorded, not solved.
 - *The per-candidate input clone stays.* Each candidate gets a fresh
   `ReferenceRuntime` and `set_data_buffer` takes ownership. Removing it
   is a runtime-surface change (a borrowing stage API), not a Phase 1
@@ -2399,11 +2450,19 @@ value inside that bucket, naming the representative and pointing at the
 open item — symbolic plans (spans as expressions) and the capacity
 contract that goes with them. Pinned on both sides.
 
-**Still owed.** Device profiling for CUDA-lite (the heuristic is a weak
-prior — bytes moved is uncorrelated with occupancy, launch count,
-coalescing, library dispatch); the arena allocator behind the runtimes'
-`bufferize` call; whatever consolidation the three copies eventually
-earn, which is a question to ask after the runtimes diverge, not before.
+**Still owed** (as written at Phase 1; AMENDED at Phase 5, 2026-09-03).
+Device profiling for CUDA-lite (the heuristic is a weak prior — bytes
+moved is uncorrelated with occupancy, launch count, coalescing, library
+dispatch) — DELIVERED in Phase 4: `CompileOptions::profile_on_device`,
+`crates/luminal_cuda_lite/src/profile.rs`, see **Program: #420/#422
+rejoin — Phase 4 (device evaluator)** below. The arena allocator behind
+the runtimes' `bufferize` call — DELIVERED for CUDA-lite in Phase 3:
+`crates/luminal_cuda_lite/src/arena.rs`, see **Phase 3 (the arena and
+the persistent device)** below; the reference runtime has none, by
+ruling. Still open: the spec re-authoring against this shape (see
+**#404 spec.md**), and whatever consolidation the three copies
+eventually earn — a question to ask after the runtimes diverge, not
+before.
 
 ## Program: #420/#422 rejoin — Phase 2 (configurable registry)
 
@@ -2459,8 +2518,19 @@ minus the `LayoutTensorOp` prefix and nothing else, so it keeps its
   the allow list through the two DERIVED matcher-only classes
   (plan-transparent, host-dispatchable); a row that must actually be
   executed needs a codegen entry in `kernels`, keyed by `TypeId` inside
-  this crate. A row without one is simply never claimed, so the failure
-  is a refusal at search, never a wrong plan.
+  this crate. AMENDED 2026-09-03 (review finding C12): the kernel-bearing
+  test is by LABEL, codegen by `TypeId`. A row whose label is not in the
+  kernel table is never claimed (refusal at search); a row that REUSES a
+  kernel-table label with a different op type IS claimed and refuses at
+  `execute` (`no cuda codegen for <label>`) — never a wrong plan, but
+  not at search.
+- *One estate that is NOT row-by-row* (added 2026-09-03, review finding
+  C11): the four cuBLASLt marker rows share one egglog vocabulary,
+  declared and minted by the Base row's snippets. A registry holding a
+  non-Base marker row without Base would derive a claim for an op the
+  assembled program never declares — `load_with_registry` refuses that
+  configuration by name (`registry_selection.rs`
+  `a_non_base_cublaslt_row_without_base_is_refused_at_load`).
 
 **The punt, recorded.** Composing an external kernel superset onto
 Lite's codegen ("cuda heavy") is NOT started: no execution face on
@@ -2682,7 +2752,7 @@ graphs and synchronizes. Search is the exception and deliberately reverses
 `discard_search_bucket_compilation_state` at every bucket boundary, because
 *"a slow copying alternative can require several GiB more than the eventual
 winner, and retaining that losing arena starves later candidate
-compilation."* Today CL is nowhere near this: `execute_plan`
+compilation."* At row time (p0, `5b0e3c25`) CL was nowhere near this: `execute_plan`
 (`crates/luminal_cuda_lite/src/device.rs`) materializes one fresh
 `alloc_zeros` per `BufferId` per execute and treats the plan's `BufferAlloc` /
 `BufferFree` nodes as explicit no-ops. The re-expression is a runtime-owned
@@ -2693,18 +2763,31 @@ Two things the spec must get right: exclusion from the slab keys on
 `FreedBy::Caller`, not `Owner::Caller`, and the issue order must be
 liveness-aware or the slab is a sum-of-buffers peak with extra steps.
 
+DELIVERED 2026-09-03 — Phase 3 (`crates/luminal_cuda_lite/src/arena.rs`'s
+`plan_arena` plus the `BufferAlloc` / `BufferFree` arms in `device.rs`, a
+grow-only slab on the persistent `CudaDevice`; both spec points honoured — the
+exclusion keys on `FreedBy::Caller` and the order is liveness-aware), and the
+per-candidate `release_slab()` of Phase 4. See **Program: #420/#422 rejoin —
+Phase 3 (the arena and the persistent device)** and **Phase 4**.
+
 **(2) Configurable op / matcher selection at runtime init.** Main's answer is
 a type tuple (`CudaRuntimeImpl<O: IntoEgglogOp>`, `DefaultCudaOps =
 (kernel::Ops, host::Ops)`, `CudaDynBackend<O>`, `cuda_factory_for`). The
 intent — a downstream backend picks its op set and inherits the compiler,
 resource planner, arena, graph capture and search — is carried; the TYPE
-tuple is not (see DROPPED). The branch form is a value-level registry with the
-execution face injected at load: the estate already composes that way
-(`assembled_program_for` over any matcher list), branch ops carry their rules
-as `.egg` files rather than Rust methods, and the refactor deletes the two
-closed seams that exist today (the `host_dispatchable` name list and the
-executor's downcast arm). Do that BEFORE flipping cuBLASLt always-on, or
-always-on lands as a third registry function the refactor immediately deletes.
+tuple is not (see DROPPED). The branch form is a value-level registry —
+DELIVERED as `load_with_registry` / `cuda_registry_filtered` /
+`RegisteredOp::new`, see **Program: #420/#422 rejoin — Phase 2 (configurable
+registry)**. The estate already composes that way (`assembled_program_for` over
+any matcher list) and branch ops carry their rules as `.egg` files rather than
+Rust methods. The SECOND half — an execution face injected at load, which is
+what would let the refactor delete the two closed seams that exist today (the
+`host_dispatchable` prototype DOWNCAST in `ops/cublaslt/mod.rs`, never a name
+list, and the executor's `CublasLtDps` downcast arm in `device.rs`) — is
+PUNTED; see Phase 2, *The punt, recorded*. Both seams are live at the tip
+(`runtime.rs`'s `allow_list_over`, `device.rs`'s host-call arm). Land the
+execution face BEFORE flipping cuBLASLt always-on, or always-on lands as a
+third registry function the refactor immediately deletes.
 
 **(3) Fusion — PUNTED to the park, by ruling.** #422 turns on the first
 multi-op fusion Lite has ever had: a singleton region per eligible elementwise
@@ -2920,8 +3003,15 @@ lives at the top of `device.rs`):
   destination is completely written before the second launch scatters
   into it; same stream, so the phases are ordered;
 - **cuBLASLt D** — `beta = 0` on the non-fold forms, which is the BLAS
-  skip (C, aliased to D, is not read); the C-fold forms read a separate C
-  OPERAND buffer at `beta = 1`, never the destination's prior bytes.
+  skip (C, aliased to D, is not read); the C-fold forms read their C
+  operand at `beta = 1`. AMENDED 2026-09-03 (review finding C13): C is a
+  DEFINED resident — usually a distinct live range, but D's own range
+  when the program binds an output slot onto the ReadWrite caller buffer
+  that holds C, admitted through `CublasLtDps`'s May permit on operand 2
+  and legal because `bind_destination` emits identical C and D
+  descriptors (the API's C == D precondition). Never an undefined
+  recycled range, which is the property this bullet is for; the earlier
+  "C != D pointers" wording was the pre-arena fresh-slice justification.
 
 Standing assumption, recorded rather than checked: a destination's
 `numel(dest_dims)` covers its buffer's SPAN. True for every codegen'd
@@ -3482,6 +3572,128 @@ Box returned to `logical-ssa-project`.
   real searches. A unit test over hand-built finalists would pin the
   best-first ordering directly; it would also need a public way to inject
   them, which is test scaffolding in the library.
+
+## Program: #420/#422 rejoin — review fix-ups
+
+An adversarial review of the six-branch stack (`rejoin/p0` … `rejoin/p5`)
+confirmed 26 findings. They land on `rejoin/p6-review-fixups`, one commit per
+code finding plus two doc commits, except C1/C8 which had to move DOWN the
+stack — the branch whose commit broke the build is the branch that must repair
+it. Four findings are behaviour; the rest are statements in the tree that the
+stack's own phases falsified. Listed by number, with where each was fixed.
+
+**Behaviour (code).**
+
+- **C1 / C8 — Step B breaks the CUDA-lite `device` feature build in three
+  places (hidden from the CPU gate).** `HostBuffer` became a struct and three
+  `cfg(feature = "device")` sites still matched `HostBuffer::F32(values)` /
+  compared `Vec<f32>` to `&Vec<f32>`, so no A100 example and no device test
+  built from Step B onward. Phase 3 carried the repairs two branches too late,
+  and its carry-fix commit named three sites while fixing two. Fixed by a
+  fix-up commit at the Phase 1 tip ("Step B fix-up: the HostBuffer swap
+  reaches the device-gated files") carrying all three repairs; the stack was
+  rebased onto it and Phase 3's carry-fix commit disappeared as empty.
+  `cargo build -p luminal_cuda_lite --all-targets --features device` now
+  passes at every branch tip.
+- **C2 / C9 — `bind_dim_buckets` accepted a dim that already carried a
+  non-tight RANGE binding, so the two seed sets intersected under the bounds
+  lattice's merge instead of refusing.** Both runtimes now keep `range_bound`
+  (every `bind_dyn_range` call with its interval) and refuse buckets on it,
+  naming the interval; the leftover `dims` check now says what it actually
+  covers (`set_dim`). Commit "Buckets and range bindings are exclusive,
+  whatever the interval"; tests in the reference battery (all three arms) and
+  `crates/luminal_cuda_lite/tests/dim_buckets.rs`.
+- **C3 / C10 — the CUDA-lite bucketed `search` ran a full, discarded
+  saturation of the UNBUCKETED program first**, whose bucketed dims carry no
+  seeds — so a bounds-dependent authoring check (`reduce_max`'s
+  `require_extent_at_least`, an iota's value bounds) refused a bucketed search
+  every per-bucket render accepts. The base program is now rendered only on
+  the single-pin path and the bound-input check reads `native.input_slots`.
+  Commit "The bucketed CUDA search renders no base program"; the new
+  `a_bucketed_dim_may_carry_a_bounds_dependent_check` is the witness.
+- **C4 — the decoded-layout cache shrank from per-search to per-candidate.**
+  `decode_layout_table` allocated its cache per call, and every decode builds
+  a fresh `Reader` over the whole serialized e-graph, so each candidate paid
+  one index per distinct layout class. `decode_layout_table` takes
+  `&mut LayoutDecodeCache` again; each search copy owns one, `Finalists` owns
+  one, one-shot callers pass a fresh map. Commit "The decoded-layout cache is
+  the caller's again, and spans candidates".
+- **C11 — a non-Base cuBLASLt marker row without the Base row was CLAIMED but
+  never declared or minted**, because only the Base matcher emits snippets —
+  a silent no-op that `active_allow_list()` reports as available.
+  `load_with_registry` refuses that configuration by name. Commit "A non-Base
+  cuBLASLt marker row without Base is refused at load"; pinned in
+  `tests/registry_selection.rs`.
+
+**Doc truth, in the source tree** (commit "Doc truth: the comments the
+rejoin's five phases made false").
+
+- **C5 — BRINGUP.md still said CL profiles candidates on the reference HOST
+  executor and described a profiler seam that exists nowhere**; two later
+  bullets still named `TypedBuffer` for `execute_plan`.
+- **C7 / C25 — doc comments referencing symbols the move deleted:**
+  `src/bufferize.rs` linked `crate::extractor::decoded_layout_table` twice
+  (now `crate::layouts::decode_layout_table`), and both `RefusalBreakdown`
+  docs named `search_implementations_with_runtime`, a function in neither
+  copy (now each copy's own loop).
+- **C12 — "an outside row without a codegen entry is never claimed; refusal
+  at search" is false:** the kernel-bearing class is LABEL-keyed while codegen
+  is `TypeId`-keyed and consulted at execute. Corrected in
+  `ops/mod.rs`, in `load_with_registry`'s doc, and in the Phase 2 section
+  above.
+- **C13 — the cuBLASLt arm comments claimed C != D pointers and that D's
+  prior bytes are never read**, a justification that rested on the fresh-slice
+  convention Phase 3 deleted. Corrected in `device.rs` (twice) and in the
+  Phase 3 kernel-invariant bullet above.
+- **C14 / C16 — the `runtime.rs` module header said everything before
+  `execute` is device-free and only `execute` needs the feature**; a
+  `profile_on_device` search needs both. Header and `device` field doc
+  amended.
+- **C15 / C21 — the `CudaDevice` struct doc said the slab is never released
+  between calls**; the search releases it after every profiled candidate.
+- **C19 — both search headers said the CUDA-lite copy carries no tests**;
+  Phase 4 gave it `early_stop_tests`.
+- **C20 — CL `lib.rs` still said kernels "write fresh destinations"**; since
+  Phase 3 they write recycled, unzeroed slab ranges, which is why the KERNEL
+  INVARIANT exists.
+
+**Doc truth, in this ledger** (commit "Ledger: the rejoin's own rows,
+amended in place"). Each is an in-place amendment in the ledger's
+"SUPERSEDED / DELIVERED — see **…**" style; no history is deleted.
+
+- **C6 — the Phase 1 deleted-test bullet claimed "#386's semantics stay
+  pinned".** Only the PREDICATE is pinned; the loop's `best_so_far` plumbing
+  is unpinned and now says so. (No test-only evaluator hook: that would
+  reintroduce the seam the rulings deleted.)
+- **C17 — #422 INTENT (1) still said "Today CL is nowhere near" the arena
+  Phase 3 landed**, and row 53 still marked the arena and registry
+  INTENT-ONLY. Amended, with the #401 INTENT-for-CL paragraph as its
+  companion.
+- **C18 — row 33 and the #386 section still owed CL a device `PlanProfiler`
+  with `StaticProfiler` as the stopgap**; both types are deleted and Phase 4
+  delivered the profiler.
+- **C22 — Phase 1 "Still owed" listed device profiling and the arena**, both
+  delivered later in this same stack.
+- **C23 — #422 INTENT (2) promised a refactor deleting `host_dispatchable`
+  and the executor downcast arm**; Phase 2 punted exactly that, and
+  `host_dispatchable` was never a name list.
+- **C24 — the #418 / #394 "today" snapshots of the executor** (fresh alloc
+  per buffer, single-shot, `TypedBuffer` outputs, the quoted CONTRACT-1
+  comment) are pre-Phase-3; they carry a STATE-AS-OF note and the
+  requirements below them still stand.
+- **C26 — the #404 section described the pipeline and the owed spec rewrite
+  in terms of `src/extractor.rs` / `src/implementation_search.rs`**, which
+  Phase 1 removed from core.
+
+**Not taken, and why.** The reviewer's alternative for C6 (a test-only
+evaluator hook to re-pin the `best_so_far` plumbing) is refused: it
+reintroduces the profiler seam the rulings deleted, to observe a stop that is
+exact and therefore cannot change any outcome. C12's "make the statement true"
+option — keying the kernel-bearing test on the prototype's DPS `TypeId` — is
+recorded, not taken: it changes allow-list derivation and would need checking
+against every shipped prototype. C25's optional aside (the pre-existing
+LAYOUT-vs-VALUE e-class contradiction in `bufferize`'s doc paragraph, identical
+at trunk) is left alone as out of this program's scope.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

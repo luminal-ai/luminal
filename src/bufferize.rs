@@ -1535,7 +1535,7 @@ fn validate_input_program(graph: &ExtractedGraph) -> Result<()> {
 /// `layouts` is the decoded-layout table, keyed by LAYOUT e-class (each
 /// value's `LayoutTensorInfo::layout.eclass`): the runtime's decoder
 /// produced one opaque `L` per layout class it elected (see
-/// [`crate::extractor::decoded_layout_table`]). The table must cover
+/// [`crate::layouts::decode_layout_table`]). The table must cover
 /// every value's layout class — a miss is a loud error, never a default
 /// (every LayoutTensor carries a Layout by construction, so a missing
 /// row means the decoder refused and the plan must too). Keying by
@@ -1547,7 +1547,7 @@ pub fn bufferize<L: PlanLayout>(
     layouts: &HashMap<ClassId, L>,
 ) -> Result<BufferIrGraph<L>> {
     // `layouts` is keyed by VALUE e-class (the runtime's decoded table,
-    // [`crate::extractor::decoded_layout_table`]).
+    // [`crate::layouts::decode_layout_table`]).
     let value_layouts = extraction_layouts(graph, layouts)?;
     let mut plan = lower(buffer_tensor_plan(graph, &value_layouts)?, &value_layouts)?;
     annotate_boundary_lits(&mut plan, graph);

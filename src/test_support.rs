@@ -1475,8 +1475,13 @@ mod harness_tests {
         let egraph = serialize_fixture("boundary_gather.egg");
         let graph = luminal::dps::dps_rewrite(&extract_fixture("boundary_gather.egg"));
         // The POST-DPS graph: value-keyed tables cover poisons.
-        let table = luminal::layouts::decode_layout_table(&egraph, &graph, "dtype row test")
-            .expect("the decoder covers every elected value");
+        let table = luminal::layouts::decode_layout_table(
+            &egraph,
+            &graph,
+            "dtype row test",
+            &mut luminal::layouts::LayoutDecodeCache::new(),
+        )
+        .expect("the decoder covers every elected value");
         let plan = bufferize::bufferize(&graph, &table).expect("mixed-dtype plan bufferizes");
 
         let mut by_lit: std::collections::HashMap<i64, PlanDtype> = Default::default();

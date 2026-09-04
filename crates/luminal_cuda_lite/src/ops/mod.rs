@@ -28,11 +28,18 @@
 //! trait answers on the prototype and travel with a `RegisteredOp`, but
 //! a row that must actually be EXECUTED needs a codegen row in
 //! [`crate::kernels`], which is keyed by `TypeId` inside this crate.
-//! An outside row without one is simply not claimable: search never
-//! elects it (it is absent from the derived allow list), so the failure
-//! is a refusal, never a wrong plan. Composing an external kernel
-//! superset onto Lite's codegen ("cuda heavy") is PUNTED — no execution
-//! face on `RegisteredOp`, no change to the kernel table's keying.
+//! The kernel-bearing class is matched by LABEL (the constructor minus
+//! `LayoutTensorOp`, `Generic` suffix tolerated) against the kernel
+//! table, while codegen is looked up by `TypeId` at execute. An outside
+//! row whose label matches no kernel-table label never reaches the allow
+//! list, so search refuses. An outside row that REUSES a kernel-table
+//! label IS claimed and can be elected; if the op it extracts is not the
+//! CL type behind that label, the plan is refused at
+//! [`crate::CudaRuntime::execute`] (`no cuda codegen for <label>`) —
+//! loud, never a wrong plan, but not at search. Composing an external
+//! kernel superset onto Lite's codegen ("cuda heavy") is PUNTED — no
+//! execution face on `RegisteredOp`, no change to the kernel table's
+//! keying.
 
 pub mod add;
 pub mod cast;
@@ -231,6 +238,14 @@ pub fn cuda_registry_with_cublaslt() -> Vec<RegisteredOp> {
 /// predicate can opt a row IN as easily as OUT — `keep` sees every row
 /// that exists. The two presets remain available whole
 /// ([`cuda_registry`], [`cuda_registry_with_cublaslt`]).
+///
+/// THE FOUR cuBLASLt MARKER ROWS ARE ONE ESTATE, not four independent
+/// ones: the Base row's snippets declare all four constructors and mint
+/// all four forms, so a predicate that drops Base must drop all four.
+/// [`crate::CudaRuntime::load_with_registry`] refuses the other
+/// combination; `active_allow_list` alone cannot tell you, because a
+/// claim is derived from the prototype and says nothing about whether
+/// the assembled program declares the constructor.
 ///
 /// A PREDICATE THAT MATCHES NOTHING IS SILENT — it returns the full
 /// registry, and the search then simply has the op available. Assert on

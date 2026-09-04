@@ -110,6 +110,10 @@ pub struct Finalists<'a> {
     accepted: Vec<PendingFinalist>,
     rejections: usize,
     last_rejection: Option<String>,
+    /// This walk's decoded-layout cache — one per `Finalists`, because
+    /// every rank it re-extracts decodes over the SAME `egraph` and
+    /// decoding is a pure function of `(layout class, dtype)`.
+    layout_cache: luminal::layouts::LayoutDecodeCache,
 }
 
 impl<'a> Finalists<'a> {
@@ -142,6 +146,7 @@ impl<'a> Finalists<'a> {
             accepted: Vec::new(),
             rejections: 0,
             last_rejection: None,
+            layout_cache: luminal::layouts::LayoutDecodeCache::new(),
         }
     }
 
@@ -237,7 +242,7 @@ impl<'a> Finalists<'a> {
             Err(err) => return Err(format!("extract: {err:#}")),
         };
         let dps = luminal::dps::dps_rewrite(&graph);
-        luminal::layouts::decode_layout_table(self.egraph, &dps, "finalist")
+        luminal::layouts::decode_layout_table(self.egraph, &dps, "finalist", &mut self.layout_cache)
             .and_then(|table| luminal::bufferize::bufferize(&dps, &table))
             .map_err(|err| format!("bufferize: {err:#}"))
     }

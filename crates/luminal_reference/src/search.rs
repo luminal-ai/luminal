@@ -22,7 +22,10 @@
 //! duplicates reuse the cached measurement instead of burning profile
 //! time (the plan-hash dedup ruling, 2026-07-27).
 //!
-//! THE TESTS FOR ALL THREE SEARCH COPIES LIVE HERE. The CUDA-lite copy
+//! THE SEARCH-LOOP TESTS FOR ALL THREE COPIES LIVE HERE (`progress_tests`,
+//! `sampler_tests`, the dedup search test). The one exception is
+//! `early_stop_tests`: each runtime copy carries its own, beside its
+//! duplicated `early_stop_exceeded` (Phase 4). `test_runtime::sampler`
 //! carries none.
 
 use std::collections::BTreeMap;
@@ -325,7 +328,7 @@ pub struct RefusalBreakdown {
     /// can only be nonzero through the sampler's documented full-list
     /// fallback — a component position with no acyclic option at all.
     /// A choice cycle on an acyclic chosen-edge graph is a sampler bug
-    /// and stops the search (see `search_implementations_with_runtime`).
+    /// and stops the search (see `search_implementations_with_ops`).
     /// Genomes assembled by hand (the election boards) are of course
     /// still free to name cycles, and are still counted here.
     pub with_choice_cycles: usize,
@@ -851,6 +854,14 @@ pub fn search_implementations_with_ops(
 
     // fingerprint → measured nanos (the dedup cache).
     let mut cache: FxHashMap<u64, u128> = FxHashMap::default();
+    // THE DECODED-LAYOUT CACHE, one per search and CALLER-OWNED
+    // (`decode_layout_table` takes it by `&mut`). Decoding is a pure
+    // function of `(layout class, dtype)`, and every decode builds a
+    // fresh `Reader` over the whole serialized e-graph — so a cache that
+    // did not span candidates would pay that index once per distinct
+    // layout class per candidate. `egraph` is fixed for this loop, which
+    // is what makes the `ClassId` keys comparable across candidates.
+    let mut layout_cache = luminal::layouts::LayoutDecodeCache::new();
     let mut plans_profiled = 0usize;
     let mut fingerprint_hits = 0usize;
     // Refusal accounting, minimal form (Step 5 down-payment): keep the
@@ -960,6 +971,7 @@ pub fn search_implementations_with_ops(
                         egraph,
                         &dps,
                         "implementation search",
+                        &mut layout_cache,
                     )
                     .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
                     timings.plan_build_nanos += build_start.elapsed().as_nanos();
@@ -1026,9 +1038,13 @@ pub fn search_implementations_with_ops(
             {
                 let build_start = Instant::now();
                 let dps = luminal::dps::dps_rewrite(&graph);
-                let built =
-                    luminal::layouts::decode_layout_table(egraph, &dps, "implementation search")
-                        .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
+                let built = luminal::layouts::decode_layout_table(
+                    egraph,
+                    &dps,
+                    "implementation search",
+                    &mut layout_cache,
+                )
+                .and_then(|table| luminal::bufferize::bufferize(&dps, &table));
                 timings.plan_build_nanos += build_start.elapsed().as_nanos();
                 let plan = match built {
                     Ok(plan) => plan,
@@ -1084,8 +1100,10 @@ pub struct BucketAssembly<'a> {
     /// The recorded model, before the schedule.
     pub pre_schedule: &'a str,
     /// The caller's own `bind_*` seeds — for the dims that are NOT
-    /// bucketed. A bucketed dim is refused a range binding, so these
-    /// never collide with the per-bucket seeds appended after them.
+    /// bucketed. Buckets and range bindings refuse each other in BOTH
+    /// orders (a range-bound dim is refused buckets, a bucketed dim is
+    /// refused a range binding), so these never collide with the
+    /// per-bucket seeds appended after them.
     pub binding_seeds: &'a str,
     /// The runtime's schedule text.
     pub schedule: &'a str,

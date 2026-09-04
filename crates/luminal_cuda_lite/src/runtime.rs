@@ -3,13 +3,18 @@
 //! search claiming only this backend's codegen inventory and execution
 //! delegated to the `device` module.
 //!
-//! Everything up to `execute` is device-free and runs anywhere: load
-//! accumulates the native program parts, bind_* appends bounds seeds,
-//! search assembles + saturates + runs THIS crate's genetic search
-//! ([`crate::search`]) with OUR allow list, ranking candidates by the
-//! device-free heuristic ([`crate::heuristic`] — a weak static prior,
-//! not a measurement). Only `execute` requires the `device` feature and
-//! a CUDA device.
+//! Everything up to `execute` is device-free BY DEFAULT and runs
+//! anywhere: load accumulates the native program parts, bind_* appends
+//! bounds seeds, search assembles + saturates + runs THIS crate's
+//! genetic search ([`crate::search`]) with OUR allow list, ranking
+//! candidates by the device-free heuristic ([`crate::heuristic`] — a
+//! weak static prior, not a measurement). Two things need the `device`
+//! feature and a CUDA device: `execute`, and a `search` with
+//! [`crate::search::CompileOptions::profile_on_device`] set (Phase 4),
+//! which creates the device lazily, stages the caller's payloads, and
+//! ranks by measured time (the `profile` module, `device` only) — on a
+//! device-free build it refuses by name rather than falling back to the
+//! prior.
 
 use crate::host_buffer::HostBuffer;
 use anyhow::{anyhow, bail, Context, Result};
@@ -77,12 +82,21 @@ pub struct CudaRuntime {
     /// `bind_dyn_range` pin plus whatever [`Self::set_dim`] sets. With
     /// buckets bound this is what picks the plan at execute time.
     dims: shape::DynMap,
+    /// EVERY dim [`Self::bind_dyn_range`] has bound, tight or not, with
+    /// the interval it was given. `dims` records only the `[n, n]` pins,
+    /// so it cannot answer the exclusivity question: buckets and range
+    /// bindings must refuse each other in BOTH orders, and a non-tight
+    /// range under a later bucket would otherwise seed the same `IntVar`
+    /// twice and INTERSECT under the bounds lattice's merge rather than
+    /// refuse.
+    range_bound: std::collections::BTreeMap<shape::Symbol, (u64, u64)>,
     /// THE PERSISTENT DEVICE (#422, rejoin Phase 3): context, stream,
-    /// NVRTC module cache and the arena slab, created on the first
-    /// [`Self::execute`] and kept for the runtime's life — "each runtime
-    /// remembers its own buffer hygiene". `None` until then, so
-    /// `Default` still gives a device-free runtime that plans and
-    /// searches on any host.
+    /// NVRTC module cache and the arena slab, created lazily — by the
+    /// first device-profiled [`Self::search`] (Phase 4) or by the first
+    /// [`Self::execute`], whichever comes first — and kept for the
+    /// runtime's life, "each runtime remembers its own buffer hygiene".
+    /// `None` until then, so `Default` still gives a device-free runtime
+    /// that plans and searches by the heuristic on any host.
     #[cfg(feature = "device")]
     device: Option<crate::device::CudaDevice>,
 }
@@ -123,11 +137,20 @@ impl CudaRuntime {
     ///
     /// Build the argument with [`crate::ops::cuda_registry_filtered`]
     /// (narrow either preset by label or constructor) or by pushing
-    /// [`crate::ops::RegisteredOp::new`] rows onto one. A row whose op
-    /// is neither kernel-bearing, plan-transparent, nor host-dispatchable
-    /// is simply not claimable — it never reaches the allow list, so the
-    /// search refuses loudly instead of electing something the device
-    /// cannot run.
+    /// [`crate::ops::RegisteredOp::new`] rows onto one. A row whose op is
+    /// neither plan-transparent, host-dispatchable, nor spelled with a
+    /// LABEL the kernel table carries is simply not claimable — it never
+    /// reaches the allow list, so the search refuses loudly instead of
+    /// electing something the device cannot run. A row that REUSES a
+    /// kernel-table label is claimed; if its extracted op is not the CL
+    /// type behind that label, the `TypeId` lookup misses and the plan is
+    /// refused at [`Self::execute`], not at search.
+    ///
+    /// ONE EXCEPTION TO ROW-BY-ROW SELECTION: the four cuBLASLt marker
+    /// rows are ONE vocabulary, declared and minted by the Base row's
+    /// snippets. A registry holding a non-Base marker row without Base is
+    /// REFUSED here — such a row would be claimed but never declared, an
+    /// op that cannot be elected under a claim set that says it can.
     pub fn load_with_registry(
         graph: &graph::Graph,
         registry: Vec<crate::ops::RegisteredOp>,
@@ -136,6 +159,36 @@ impl CudaRuntime {
             .logical
             .bound_parts(&crate::bindings::CudaBindings)
             .map_err(|e| anyhow!(e))?;
+        // THE FOUR cuBLASLt MARKER ROWS ARE ONE VOCABULARY. Only the
+        // Base row emits snippets, and that one snippet set declares all
+        // four constructors and every minting rule. A registry holding a
+        // non-Base marker WITHOUT Base would derive a claim for an op the
+        // assembled program never declares and never mints: claimed,
+        // un-electable, and `active_allow_list()` — the check this
+        // module's doc recommends — would say it is available. Refuse the
+        // configuration at load instead, keyed on constructor names.
+        {
+            use crate::ops::cublaslt::CublasLtForm;
+            let has = |ctor: &str| {
+                registry
+                    .iter()
+                    .any(|entry| entry.matcher.egglog_constructor() == ctor)
+            };
+            if let Some(orphan) = CublasLtForm::ALL
+                .into_iter()
+                .filter(|form| *form != CublasLtForm::Base)
+                .find(|form| has(form.constructor_name()))
+            {
+                anyhow::ensure!(
+                    has(CublasLtForm::Base.constructor_name()),
+                    "registry holds the cuBLASLt `{}` row without the Base row `{}`: \
+                     the Base row declares and mints the whole marker vocabulary, so \
+                     the four marker rows must be kept or dropped together",
+                    orphan.constructor_name(),
+                    CublasLtForm::Base.constructor_name()
+                );
+            }
+        }
         // Derive the claim set BEFORE the rows are consumed: the allow
         // list reads the prototypes, the search reads the matchers.
         let allow = Self::allow_list_over(&registry);
@@ -192,7 +245,10 @@ impl CudaRuntime {
             "(set (lower-bound-of (IntVar \"{name}\")) (bigint {lower}))\n\
              (set (upper-bound-of (IntVar \"{name}\")) (bigint {upper}))\n"
         ));
-        // A tight [n, n] binding IS a pin: remember it, so a bucketed
+        // EVERY range binding is remembered, so `bind_dim_buckets` can
+        // refuse this dim whatever the interval was.
+        self.range_bound.insert(name, (lower, upper));
+        // A tight [n, n] binding IS a pin: remember it too, so a bucketed
         // plan's representative records the whole assignment.
         if lower == upper {
             self.dims.insert(name, lower as usize);
@@ -217,10 +273,17 @@ impl CudaRuntime {
     ) -> Result<()> {
         let dim = dim.into();
         anyhow::ensure!(!buckets.is_empty(), "dim `{dim}` was given no buckets");
+        if let Some((lo, hi)) = self.range_bound.get(&dim) {
+            anyhow::bail!(
+                "dim `{dim}` already carries a range binding [{lo}, {hi}] from \
+                 bind_dyn_range; a bucketed dim is seeded per bucket and must not \
+                 carry a second range binding"
+            );
+        }
         anyhow::ensure!(
             !self.dims.contains_key(&dim),
-            "dim `{dim}` is already pinned by bind_dyn_range; a bucketed dim is \
-             seeded per bucket and must not carry a second range binding"
+            "dim `{dim}` already has a value from set_dim; bind buckets before \
+             setting the execution dim"
         );
         for pair in buckets.windows(2) {
             anyhow::ensure!(
@@ -411,12 +474,15 @@ impl CudaRuntime {
     /// Assemble, saturate, and search — with THIS backend's allow list.
     /// On saturation failure the labeled post-checks are re-run in
     /// isolation to name the door, mirroring the reference runtime.
+    ///
+    /// With `options.profile_on_device` this needs the `device` feature
+    /// and a CUDA device: it creates the device lazily and ranks by
+    /// measured time (see the `profile` module, `device` only).
     pub fn search(
         &mut self,
         input_data: &FxHashMap<NodeIndex, HostBuffer>,
         options: &CompileOptions,
     ) -> Result<SearchOutcome> {
-        let (serialized, program) = self.assemble_and_saturate()?;
         let native = self
             .native
             .as_ref()
@@ -429,12 +495,14 @@ impl CudaRuntime {
         // heuristic (D6, 2026-09-03) never runs anything and so needs
         // nothing staged, while device profiling (Phase 4) executes each
         // candidate and needs exactly these bytes.
+        //
+        // The slot list is the LOAD-TIME one, `native.input_slots` — the
+        // same list a rendered program's `input_slots` is cloned from, and
+        // the one the bucketed ladder has, which renders no base program
+        // at all.
         for tensor in input_data.keys() {
             assert!(
-                program
-                    .input_slots
-                    .iter()
-                    .any(|slot| slot.tensor == *tensor),
+                native.input_slots.iter().any(|slot| slot.tensor == *tensor),
                 "tensor {tensor:?} is not a bound input"
             );
         }
@@ -452,7 +520,7 @@ impl CudaRuntime {
         // gigabytes; the search must borrow them, never copy them.
         #[cfg(feature = "device")]
         let staged_for_search: FxHashMap<i64, &HostBuffer> = if options.profile_on_device {
-            program
+            native
                 .input_slots
                 .iter()
                 .filter_map(|slot| input_data.get(&slot.tensor).map(|data| (slot.buffer, data)))
@@ -467,6 +535,26 @@ impl CudaRuntime {
         if options.profile_on_device && self.device.is_none() {
             self.device = Some(crate::device::CudaDevice::new(0)?);
         }
+
+        // THE BASE PROGRAM IS RENDERED AND SATURATED ONLY FOR THE
+        // SINGLE-PIN LADDER. A bucketed dim carries no seeds in this
+        // render — `bind_dyn_range` is refused on it, and the intervals
+        // are seeded per bucket inside `bucketed_search_implementations`
+        // — so an unbucketed render validates nothing the bucketed
+        // search will use, and an authoring check that NEEDS bounds
+        // (`reduce_max`'s `require_extent_at_least`, an iota's value
+        // bounds) would refuse the whole bucketed search over a program
+        // every per-bucket render accepts. It is also a full fixpoint
+        // whose result the bucketed arm discards. The reference ladder's
+        // `search_buckets` never rendered one.
+        //
+        // Computed HERE, before the evaluator borrows `self.device`
+        // mutably: `assemble_and_saturate` takes `&self`.
+        let base = if self.dim_buckets.is_empty() {
+            Some(self.assemble_and_saturate()?)
+        } else {
+            None
+        };
 
         // THIS INSTANCE's claim set, derived at load from THIS
         // instance's registry — no crate-level default is consulted.
@@ -506,7 +594,8 @@ impl CudaRuntime {
         // plan is whichever FINALIST the bucket lattice selected under the
         // aggregate device budget. With no budget set they coincide,
         // which is why every existing caller sees the trajectory it had.
-        let (outcome, unbucketed_plan, searched_buckets) = if self.dim_buckets.is_empty() {
+        let (outcome, unbucketed_plan, searched_buckets) = if let Some((serialized, program)) = base
+        {
             let mut outcome = crate::search::search_implementations(
                 &serialized,
                 &program,

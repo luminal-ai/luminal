@@ -17,8 +17,9 @@
 //! Phase 1): [`extractor`] and [`search`] are this runtime's own copies
 //! — core keeps the shared machinery (program, assembly, `dps_rewrite`,
 //! `decode_layout_table`, `bufferize`) and nothing that decides which
-//! implementation wins. Candidates rank through [`heuristic`], a
-//! device-free byte-move prior; there is no profiler trait anywhere any
+//! implementation wins. Candidates rank, by default, through
+//! [`heuristic`], a device-free byte-move prior (CL-5 below is the
+//! opt-in device measurement); there is no profiler trait anywhere any
 //! more, in core or here. Host payloads are [`host_buffer::HostBuffer`],
 //! not the reference runtime's `TypedBuffer`.
 //!
@@ -45,10 +46,16 @@
 //!   the arena slab the runtime will hold. Unconstrained (the default)
 //!   the walk installs the search's own winner and costs nothing.
 //!
-//! Out-of-place by design: kernels read operand buffers and
-//! write fresh destinations, mirroring the reference executor's
-//! alias-safety convention; `ties` and `Anti` edges are honored in the
-//! toposort order but no in-place claim is made.
+//! Out-of-place by design: kernels read operand buffers and write a
+//! destination that shares no byte with any simultaneously bound buffer
+//! — the same alias-safety PROPERTY as the reference executor, by a
+//! different mechanism. Since Phase 3 (#420/#422 rejoin) the destination
+//! is a recycled slab range assigned by [`arena`] (its CONTRACT-1
+//! live-range check; [`binding_check`] covers the standalone rows), NOT
+//! a fresh zeroed slice: nothing is zeroed, so every kernel must write
+//! every element it owns and never read its destination — the KERNEL
+//! INVARIANT recorded at the top of `device.rs`. `ties` and `Anti` edges
+//! are honored in the toposort order but no in-place claim is made.
 
 pub mod arena;
 pub mod binding_check;

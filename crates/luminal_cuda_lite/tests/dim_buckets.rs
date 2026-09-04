@@ -149,7 +149,25 @@ fn a_dim_cannot_be_both_pinned_and_bucketed() {
     let err = rt
         .bind_dim_buckets('a', vec![DimBucket::new(2, 4)])
         .expect_err("a pinned dim must not take buckets");
-    assert!(format!("{err:#}").contains("already pinned"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("already carries a range binding [3, 3]"),
+        "{err:#}"
+    );
+
+    // A NON-TIGHT range is just as exclusive: it seeds the same IntVar's
+    // bounds, and `lower-bound-of`/`upper-bound-of` MERGE (max/min) rather
+    // than error, so a second seed set would silently intersect with the
+    // per-bucket one instead of refusing.
+    let (cx, _out) = elementwise_graph();
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    rt.bind_dyn_range('a', 2, 8).expect("range binds");
+    let err = rt
+        .bind_dim_buckets('a', vec![DimBucket::new(5, 9)])
+        .expect_err("a range-bound dim must not take buckets");
+    assert!(
+        format!("{err:#}").contains("already carries a range binding [2, 8]"),
+        "{err:#}"
+    );
 
     let (cx, _out) = elementwise_graph();
     let mut rt = CudaRuntime::load(&cx).expect("cuda load");
@@ -159,4 +177,26 @@ fn a_dim_cannot_be_both_pinned_and_bucketed() {
         .bind_dyn_range('a', 3, 3)
         .expect_err("a bucketed dim must not take a range binding");
     assert!(format!("{err:#}").contains("has buckets bound"), "{err:#}");
+}
+
+/// A BOUNDS-DEPENDENT AUTHORING CHECK UNDER BUCKETS (review C3/C10).
+/// `reduce_max` emits `require_extent_at_least` on its axis, which needs
+/// `lower-bound-of` for that dim. A bucketed dim is seeded PER BUCKET,
+/// never in a base render — so a base render of this graph carries no
+/// bounds for 'a' at all and the check refuses. The bucketed ladder must
+/// never render one: every per-bucket render seeds the interval and
+/// passes.
+#[test]
+fn a_bucketed_dim_may_carry_a_bounds_dependent_check() {
+    let mut cx = Graph::new();
+    cx.set_dim('a', 3);
+    let x = cx.tensor(('a', 2), DType::F32);
+    let _out = x.max(0).output();
+
+    let mut rt = CudaRuntime::load(&cx).expect("cuda load");
+    rt.bind_dim_buckets('a', vec![DimBucket::new(2, 4), DimBucket::new(5, 9)])
+        .expect("disjoint sorted buckets bind");
+    rt.search(&Default::default(), &harness_search_options())
+        .expect("a bucketed search never renders the unseeded base program");
+    assert_eq!(rt.bucket_plans().len(), 2, "one plan per bucket");
 }
