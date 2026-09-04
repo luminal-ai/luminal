@@ -177,6 +177,29 @@ fn device_profiled_search_ranks_by_measurement_and_keeps_the_numbers() {
         outcome.best_nanos
     );
 
+    // THE SAME SEARCH, RANKED BY THE PRIOR — reported, not asserted.
+    // Same seed, same budget, same candidates: the only difference is
+    // what decides the winner. Printing the byte cost of each winner is
+    // the direct measurement of D6's "doesn't bias search too much"
+    // question, and it is the reason `best_heuristic_cost` exists.
+    // No assertion: which plan measures fastest is device- and
+    // noise-dependent, and pinning it would pin the noise.
+    let mut prior_rt = CudaRuntime::load(&cx).expect("cuda load");
+    let prior = prior_rt
+        .search(&data, &luminal_cuda_lite::harness_search_options())
+        .expect("heuristic search finds a plan");
+    println!(
+        "device-profiled mini-llama3: the PRIOR would elect a plan of {} bytes moved; \
+         the MEASUREMENT elected one of {} ({})",
+        prior.best_heuristic_cost.saturating_sub(1),
+        outcome.best_heuristic_cost.saturating_sub(1),
+        if prior.best_heuristic_cost == outcome.best_heuristic_cost {
+            "same byte cost"
+        } else {
+            "DIFFERENT — the measurement did not pick the prior's winner"
+        }
+    );
+
     // The plan the measurement elected still computes the same thing.
     for (id, v) in &floats {
         rt.set_data(*id, v.clone());

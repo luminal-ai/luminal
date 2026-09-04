@@ -3028,6 +3028,246 @@ laptop gate, not a box-only one.
 - **Kernel-count printing** in the examples' support module counts
   `Compute` nodes including `BufferAlloc`/`BufferFree`; left as is.
 
+## Program: #420/#422 rejoin — Phase 4 (device evaluator)
+
+**The move.** CUDA-lite now profiles candidate plans ON THE DEVICE. Since
+CL-1 this runtime's search has ranked by `heuristic::heuristic_cost_of` —
+bytes moved over the extracted graph, a weak static prior — and `lib.rs`
+carried the debt in writing ("STILL OWED: profiling ON DEVICE, mirroring
+the reference evaluator's design"). `CompileOptions::profile_on_device`
+discharges it: each candidate plan is compiled, warmed and TIMED on a
+real GPU, and the winner is the fastest plan measured, not the plan that
+touches the least memory.
+
+**Austin's rulings this implements** (2026-09-03). Ruling 4 on #386: CL
+must eventually profile on device *"just like the existing profiler
+actually does. we need to mirror that design"* — the reference runtime's
+evaluator is the template, not a new invention. D2: the GA stays. D6: the
+CL-local device-free evaluator stays, is called `heuristic`, and must
+*"not bias search too much"*. Ambiguity 1: *"timeout should just cover
+run"*. D10: *"CL search lives in the runtime. Runtimes can choose how to
+handle failures at different points."* #422's policy on the slab at
+search time, reversing #401's retention. And throughout: keep it simple,
+no new traits.
+
+### What landed
+
+| Where | What |
+| --- | --- |
+| `crates/luminal_cuda_lite/src/profile.rs` (new, `#[cfg(feature = "device")]`) | The device evaluator: `profile_candidate(&mut CudaDevice, plan, staged, trials, best_so_far, candidate_timeout) -> Result<Measurement, ProfileFailure>`. |
+| `crates/luminal_cuda_lite/src/search.rs` | `CompileOptions::{profile_on_device, candidate_timeout}`; `Evaluator<'_>` (the enum that took over the deleted `PlanProfiler` trait's job); `RefusalBreakdown::timed_out`; `SearchOutcome::best_heuristic_cost`; `early_stop_exceeded` + its test, carried over from the reference copy (Phase 1 had dropped it as dead); the one `profiled` site became a two-arm choice. |
+| `crates/luminal_cuda_lite/src/runtime.rs` | `CudaRuntime::search` BUILDS the evaluator: lazily creates `self.device`, stages the caller's payloads by BufferLit id (by reference), and lends both. The bound-input check Phase 1 added stays. |
+| `crates/luminal_cuda_lite/src/device.rs` | `CudaDevice::release_slab()`; `execute_plan`'s `staged` is now `&FxHashMap<i64, &HostBuffer>`. |
+| `crates/luminal_cuda_lite/src/heuristic.rs` | One paragraph: on device it is not consulted at all. |
+| `crates/luminal_cuda_lite/examples/support/mod.rs` | `run_cuda` profiles on device and prints the winner's measurement beside its heuristic cost. |
+| `crates/luminal_cuda_lite/tests/device_profile.rs` (new, device-gated) | The probe (below). |
+
+`Measurement` is `Timed { mean_nanos, completed_trials }` or `TimedOut {
+elapsed_nanos, completed_trials }`; `ProfileFailure` is `Prepare(err)` or
+`Execute(err)`. The evaluator is
+
+```rust
+pub enum Evaluator<'a> {
+    Heuristic,
+    #[cfg(feature = "device")]
+    Device { device: &'a mut CudaDevice, staged: &'a FxHashMap<i64, &'a HostBuffer> },
+}
+```
+
+with a `reborrow(&mut self)` so the bucketed entry can lend the SAME
+device to every Cartesian combination. NO TRAIT: there are exactly two
+ways this crate prices a plan, both live in this crate, and an enum names
+them with an exhaustive match. `search_implementations` takes it as ONE
+extra argument and refuses UP FRONT if `profile_on_device` and the
+evaluator disagree — a request to measure is never answered with a prior.
+
+### What is mirrored from the reference evaluator, and the two divergences
+
+MIRRORED, from `luminal_reference::search::profile_on_reference_runtime`:
+one warmup execution (validity + first-touch), then `trials` timed
+executions; the metric is the MEAN over trials (ruling 2, 2026-09-02 — a
+mean only rises as trials accumulate, which is what makes the early stop
+an exact argument); the early stop applies `early_stop_exceeded` at
+factor 1.0 to a LOWER BOUND on the final mean (the sum so far divided by
+ALL trials, i.e. assuming every remaining trial is free), so it fires
+exactly when the candidate has provably lost.
+
+DIVERGENCE 1 — THE DEVICE IS PERSISTENT, the runtime is not rebuilt. The
+reference builds a fresh `ReferenceRuntime` per candidate because its
+runtime is a cheap host object. The CL equivalent would throw away the
+CUDA context and the NVRTC module cache between candidates and recompile
+every kernel — most of a CUDA search's wall time. So Phase 3's device is
+REUSED and compilation is paid once per distinct kernel source across the
+whole search. What is not carried between candidates is the slab (below).
+
+DIVERGENCE 2 — THE TIMED REGION INCLUDES STAGING AND READBACK.
+`execute_plan` is one call that allocates, H2Ds the staged inputs,
+launches, synchronizes and D2Hs the outputs; the reference's `execute()`
+runs only the kernels because its `set_data_buffer` is a separate ladder
+step. Splitting CL's execute into stage-once/run-many is real surgery on
+the executor and was NOT done. Stated rather than hidden: the H2D/D2H
+term is essentially the same for every candidate (same inputs, same
+outputs), so the RANKING is preserved while the absolute numbers are
+inflated. Read a CL device measurement as "the cost of one whole
+`execute` call" — which is what the serving ladder pays anyway.
+
+### Timeout semantics: the timed RUN, and nothing else
+
+`candidate_timeout` budgets ONLY the timed run. The clock starts at the
+FIRST TIMED TRIAL — after compile, stage and warmup — and is read BETWEEN
+trials, plus once after the last one (so a single trial longer than the
+whole budget is caught too). A trial in flight is never interrupted:
+there is no cancel for a launched kernel, so the honest thing is to
+finish the trial and then stop.
+
+WHY COMPILE IS OUT. NVRTC time is a once-per-distinct-source cost across
+the whole search, paid by whichever candidate happens to hit a cold
+module cache. Charging it to that candidate would time out plans for a
+cost their successors get for free — the budget would be measuring cache
+luck, not the plan.
+
+A timed-out candidate is NOT RANKED. A partial mean under a timeout is a
+measurement of the budget, not of the plan. It is counted in a NEW
+counter, `RefusalBreakdown::timed_out`, kept apart from
+`execute_refusals`: nothing failed, the plan is merely too slow to finish
+measuring, and the zero-refusal ladder acceptance stays about failures.
+`run_cuda` prints it and does not gate on it.
+
+### Failure handling (D10)
+
+| When | Counted as | Why |
+| --- | --- | --- |
+| NVRTC compile, module load, staging geometry, escape guard, warmup execution | `plan_build_refusals` | An ordinary unfit candidate. A plan this backend cannot compile or stage is indistinguishable in kind from one bufferize refused; the search drops it and tries others. It never fails the ladder. |
+| A TIMED trial, after the warmup already succeeded | `execute_refusals` | The same plan ran once and then did not — an OOM at a larger slab, a launch failure. That is a genuine execution refusal. |
+| The timed run exceeded the budget | `timed_out` | Not a failure at all. |
+
+The `RefusalBreakdown::summary()` string gained a `, timed out {n}`
+field; `run_cuda`'s gate is unchanged (extract / plan-build / execute).
+
+### The slab at search time
+
+`CudaDevice::release_slab()` is called by the search after EVERY profiled
+candidate (#422's policy, reversing #401's retention for this one
+caller). One candidate's arena high-water mark therefore cannot hold
+device memory for the rest of the search and starve its successors; the
+next `execute_plan` re-allocates through `ensure_slab`. SERVING KEEPS IT:
+`CudaRuntime::execute` never releases, so the grow-only slab Phase 3
+landed is exactly what a served runtime still has. Nothing else is
+released — the context, the stream and the module cache all survive,
+which is what makes compilation a once-per-source cost.
+
+### The heuristic's bias, reported instead of argued about
+
+D6 says the device-free evaluator must not bias search too much. Taken at
+full strength: with `profile_on_device` set, the heuristic is NOT
+CONSULTED — no blend, no tie-break, no prior seeding generation 0. It
+still runs once per profiled candidate for one reason only: so the
+winner's byte-move cost can be REPORTED beside its measurement, as
+`SearchOutcome::best_heuristic_cost`. `run_cuda` and the probe print the
+pair. That makes the prior's bias a number someone can look at rather
+than a claim.
+
+### Options: nothing existing moved
+
+`CompileOptions::default()` keeps every value it had (generations 8,
+generation_size 8, mutations 2, trials 3, seed 0, search_log true) and
+gains `profile_on_device: false`, `candidate_timeout: None`.
+`harness_search_options()` is unchanged in behaviour. The eight
+exhaustive struct literals in the suites took `..Default::default()`.
+Every CPU trajectory is byte-for-byte the one it was, which the suites
+pin.
+
+`execute_plan`'s `staged` became a map of REFERENCES. The search stages
+the CALLER's payload map, and for a full-size model that is gigabytes of
+weights on the host; a map of owned payloads would have meant a second
+copy of them for the length of the search. One pointer per input instead.
+
+### A100 (branch `rejoin/p4-device-evaluator`, `8b49752d`)
+
+`cargo test -p luminal_cuda_lite --features device --no-fail-fast`: every
+suite green except one PRE-EXISTING failure (below) — lib 11, codegen 13,
+composed_read_families 5, cublaslt_bias_premise 3, cublaslt_contracts 5
+passed / 1 FAILED, cublaslt_contracts_cpu 19, cublaslt_election 9,
+device_fidelity 6, **device_profile 2**, device_view_differentials 4,
+dim_buckets 4, example_smoke 1, input_producer_cleanup 5,
+ladder_refusals 3 (+3 ignored), plan_smoke 2, registry_selection 4,
+scc_sampler_marker 1, view_admission 4 + 1.
+
+THE PROBE, `tests/device_profile.rs` on the mini-llama3 decode block
+(embedding gather, QKV, KV-cache scatter/gather, attention, SwiGLU,
+output projection) at the 2x4 harness budget with `profile_on_device`:
+
+```
+search 12017 ms | plans profiled 6 | fingerprint hits 2
+  [saturation 0ms, serialize 0ms, analysis 88ms, extract 1207ms,
+   plan-build 5996ms, profile-exec 3411ms]
+winner 3.559355 ms measured on device, heuristic cost 11680847 bytes moved
+refusals extract 0 (choice-cycles 0, dead-ends 0), bufferize 0, execute 0, timed out 0
+```
+
+Six plans profiled on the GPU, ZERO compile/stage/warmup failures, zero
+execute failures, zero timeouts, and the elected plan still matches the
+reference runtime's logits to the fidelity battery's tolerance (1e-5
+relative). PROFILE-EXEC IS NOW 28% OF THE SEARCH (3.4 s of 12.0 s) where
+it used to be ~0 — that is the cost of measuring, and plan-build (6.0 s)
+is still the larger term. The debug-build numbers are what they are: the
+3.56 ms includes the whole `execute` call (divergence 2 above).
+
+The second probe pins the timeout semantics: `candidate_timeout:
+Some(Duration::ZERO)` times EVERY candidate out, so none is ranked and
+the search refuses NAMING THE TIMEOUT rather than reporting an execution
+failure.
+
+TRUNK ATTRIBUTION for the cuBLASLt election pin. Phase 3 found
+`cublaslt_contracts::marker_elected_bias_plan_matches_decomposed_route_tolerance_based`
+failing at the Phase 1 tip. Run at TRUNK (`logical-ssa-project`,
+`acde9ac1`) it fails IDENTICALLY — "the fused route must elect
+CublasLtBias for this comparison (seed 0 measured electing on the CPU
+pin)". So it is a PRE-EXISTING TRUNK FAILURE, not a rejoin regression:
+the election that the seed-0 pin records no longer happens. Attribution
+only; not fixed here. The bias-premise sweep (`cublaslt_bias_premise`, 3
+tests) passes on both, which is the test that exists precisely to say how
+election-dependent that pin is.
+
+### Deferred
+
+- **CUDA-EVENT TIMING.** The trials are timed HOST-SIDE with `Instant`
+  around `execute_plan`, which synchronizes the stream before it returns,
+  so the host clock is honest about the device work. Events would measure
+  the same interval minus host-side launch overhead. A refinement, not a
+  correction — and it would want the stage/run split (next item) to be
+  worth much.
+- **STAGE-ONCE / RUN-MANY.** Divergence 2. Splitting `execute_plan` into
+  a staging phase and a launch phase would let the timed region be the
+  kernels alone, which is what the reference times, and would stop
+  re-H2Ding a full-size model's weights on every trial. It is executor
+  surgery and is the single biggest remaining fidelity gap between the
+  two evaluators.
+- **The full-size examples' search cost.** `run_cuda` now measures on
+  device, which multiplies a full-size search's wall time by roughly
+  (1 warmup + `trials` executes) per distinct plan. At the 2x4 harness
+  budget with `trials: 1` that is ~2 whole model executions per profiled
+  plan. The yolo_v11n baseline (search 94 min under the heuristic,
+  2026-09-01) says a full-size device-profiled search is an hours-scale
+  run.
+- **Finalists / BucketLattice.** Not adopted. A two-tier scheme (rank
+  everything by the heuristic, then re-measure the top k on device) would
+  cut device time, but it puts the prior back on the critical path —
+  exactly what D6 warns about — and it was not asked for.
+- **Two-tier graph re-ranking** (measure at one shape, extrapolate to
+  others) — not adopted, same reason plus the static-plan limitation
+  buckets already carry.
+- **`best_nanos` is a union type in spirit.** Under the heuristic it is a
+  byte count with a unit-shaped name; under device profiling it is
+  nanoseconds. `best_heuristic_cost` now lets a reader tell which, but
+  the field is still called `best_nanos`. Renaming it is a wider API
+  change than this phase wanted.
+- **The fingerprint cache** dedups identical plans across genomes, so a
+  repeated plan is measured ONCE and its first measurement is reused.
+  With device noise that is a deliberate choice (one measurement per
+  distinct plan, not per genome); re-measuring and averaging is the
+  alternative nobody asked for.
+
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
 Ruling 4b's "option i" (`select_by_index`: packed 2N iota + two `scatter1d` +
