@@ -353,7 +353,7 @@ impl FreeList {
         // offset assignment over whole lifetimes (the greedy-by-size
         // arena planners), which is a different pass, not a different
         // line.
-        if let Some((&offset, &len)) = self.holes.iter().find(|(_, &len)| len >= need) {
+        if let Some((&offset, &len)) = self.holes.iter().find(|&(_, &len)| len >= need) {
             self.holes.remove(&offset);
             if len > need {
                 self.holes.insert(offset + need, len - need);

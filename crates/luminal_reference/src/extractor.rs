@@ -1492,10 +1492,14 @@ impl<'a> Extractor<'a> {
         // this as `if let ... = self.op_cache.borrow().get(..) { .. }
         // else { ..borrow_mut().. }` reads correctly and panics in
         // edition 2021, where the scrutinee temporary outlives the
-        // `else` arm (edition 2024 shortened exactly this scope). These
-        // copies live in 2021 crates, so the lookup takes its own
-        // statement and the guard is released by the time the miss path
-        // writes.
+        // `else` arm; edition 2024 shortened exactly that scope, and
+        // since Phase 7 all three copies live in 2024 crates, so that
+        // spelling would compile-and-run correctly here too. It is
+        // still not used: a lookup in its own statement drops the
+        // `Ref` at the semicolon, so the guard is released before the
+        // miss path writes in EVERY edition, and these three files are
+        // hand-kept copies whose correctness should not depend on the
+        // edition of whichever crate is holding them.
         let cached = self.op_cache.borrow().get(node_id).cloned();
         let op: Box<dyn LayoutIrOp> = match cached {
             Some(cached) => cached,
