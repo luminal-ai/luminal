@@ -182,7 +182,8 @@ fn combination_of(
 /// corner, and the same behaviour, as the 2026-08-07 sampler's
 /// copy-only groups.
 fn cross_check(name: &str, egraph: &EGraph) -> (usize, usize) {
-    let session = ExtractionSession::new_with_matcher_set(egraph, None, test_runtime::matchers());
+    let matchers = test_runtime::matchers();
+    let session = ExtractionSession::new_with_matcher_set(egraph, None, &matchers);
     let index = session.producer_index();
     let space = session.sampling_space(&index);
     assert!(!index.is_empty(), "{name}: nothing to sample");
@@ -359,7 +360,8 @@ fn coverage_on_the_re_description_program() {
 #[test]
 fn marker_matmul_components_span_different_logical_values() {
     let egraph = test_runtime::serialize_fixture(&marker_matmul_program());
-    let session = ExtractionSession::new_with_matcher_set(&egraph, None, test_runtime::matchers());
+    let matchers = test_runtime::matchers();
+    let session = ExtractionSession::new_with_matcher_set(&egraph, None, &matchers);
     let index = session.producer_index();
     let space = session.sampling_space(&index);
     assert!(
@@ -479,7 +481,8 @@ fn re_description_program() -> String {
 #[test]
 fn union_of_b_and_y_is_a_leaf_weld_not_a_cycle() {
     let egraph = test_runtime::serialize_fixture(&re_description_program());
-    let session = ExtractionSession::new_with_matcher_set(&egraph, None, test_runtime::matchers());
+    let matchers = test_runtime::matchers();
+    let session = ExtractionSession::new_with_matcher_set(&egraph, None, &matchers);
     let index = session.producer_index();
     let space = session.sampling_space(&index);
 
@@ -529,8 +532,8 @@ fn union_of_b_and_y_is_a_leaf_weld_not_a_cycle() {
 #[test]
 fn union_extraction_never_cycles() {
     let egraph = test_runtime::serialize_fixture(&re_description_program());
-    let mut session =
-        ExtractionSession::new_with_matcher_set(&egraph, None, test_runtime::matchers());
+    let matchers = test_runtime::matchers();
+    let mut session = ExtractionSession::new_with_matcher_set(&egraph, None, &matchers);
     let index = session.producer_index();
     let space = session.sampling_space(&index);
 
@@ -738,8 +741,8 @@ fn an_input_terminal_keeps_its_buffer_input_and_never_a_producer() {
         "the board is vacuous unless some input terminal has a producer spelling"
     );
 
-    let mut session =
-        ExtractionSession::new_with_matcher_set(&egraph, None, test_runtime::matchers());
+    let matchers = test_runtime::matchers();
+    let mut session = ExtractionSession::new_with_matcher_set(&egraph, None, &matchers);
     let index = session.producer_index();
     for terminal in &terminals {
         assert!(

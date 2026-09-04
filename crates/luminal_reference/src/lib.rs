@@ -6,15 +6,19 @@
 //! snippets, kernels), and the defaulting conveniences that assume
 //! this registry.
 //!
-//! POST-SATURATION SEARCH IS OURS (ruling 2026-09-03, #420/#422 rejoin
-//! Phase 1): [`extractor`] and [`search`] are this crate's own copies of
-//! machinery that used to live in core. Core keeps what every runtime
-//! shares — the logical program, the e-graph assembly, `dps_rewrite`,
-//! `decode_layout_table`, `bufferize` — and nothing that decides which
-//! implementation wins.
+//! POST-SATURATION SELECTION IS OURS ([`search`]): the op registry, the
+//! allow list, the host-timing evaluator, the option knobs, the outcome
+//! shape and the GA loop that runs them. What decides nothing — the
+//! e-graph walk and the genome sampler — is core's
+//! (`luminal::extraction`, `luminal::search_support`), and [`extractor`]
+//! below is this crate's name for the walk (#420/#422 rejoin Phase 8,
+//! 2026-09-04; it was a verbatim copy here through Phases 1-7).
 
 pub mod bindings;
-pub mod extractor;
+/// The e-graph walk, in core: every runtime calls it with its own
+/// matcher list and it names no runtime type. Kept under this crate's
+/// old module name so call sites read the same.
+pub use luminal::extraction as extractor;
 pub mod harness;
 pub mod kernels;
 pub mod layouts;

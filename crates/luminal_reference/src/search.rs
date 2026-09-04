@@ -823,7 +823,7 @@ pub fn search_implementations_with_ops(
     // The allow list narrows this crate's matcher set; None = the whole set.
     let allow = allow_override;
     let mut session =
-        extractor::ExtractionSession::new_with_matcher_set(egraph, allow.as_deref(), matchers);
+        extractor::ExtractionSession::new_with_matcher_set(egraph, allow.as_deref(), &matchers);
     let index = session.producer_index();
     timings.analysis_nanos = analysis_start.elapsed().as_nanos();
     // An empty index is NOT an error: a graph with no searchable producer

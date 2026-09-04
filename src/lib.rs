@@ -15,17 +15,27 @@ pub mod shape;
 // beside the ops; the fixture suite runs as core tests. See src/egglog_core/
 // for the core preamble and fixtures.
 //
-// WHAT IS NOT HERE (ruling 2026-09-03, #420/#422 rejoin Phase 1):
-// post-saturation SEARCH. The extractor and the selection loop are
-// runtime-owned — `luminal_reference::{extractor, search}`,
-// `luminal_cuda_lite::{extractor, search}`, `test_runtime::{extractor,
-// sampler}` — and core keeps only what every runtime shares: the
-// logical program, the egglog assembly, `dps_rewrite`,
-// `layouts::decode_layout_table`, `bufferize`, and the IR types.
+// WHAT IS NOT HERE: post-saturation SELECTION. Each runtime owns the
+// loop that chooses an implementation and everything that decides — the
+// op registry, the allow list, the evaluator that prices a plan, the
+// option knobs and outcome shape, the finalist policy:
+// `luminal_reference::search`, `luminal_cuda_lite::search`.
+//
+// What core keeps is what decides nothing: the logical program, the
+// egglog assembly, `dps_rewrite`, `layouts::decode_layout_table`,
+// `bufferize`, the IR types — and, since #420/#422 rejoin Phase 8
+// (2026-09-04), [`extraction`], the e-graph walk that turns a genome
+// into an `ExtractedGraph`. It left core in Phase 1 and was duplicated
+// verbatim into all three runtimes; seven phases later the copies
+// differed by one API-shape hunk and zero logic lines, so the ruling's
+// own "maybe if there are some core utilities, they can belong in core"
+// clause was taken. The runtime modules named `extractor` are aliases
+// for it.
 pub mod buffer_tensor_ir;
 pub mod bufferize;
 pub mod dps;
 pub mod egglog_snippet;
+pub mod extraction;
 pub mod index_expr;
 pub mod layout_ir;
 pub mod poison;

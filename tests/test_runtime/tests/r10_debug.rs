@@ -168,13 +168,14 @@ fn r10_debug_c6() {
     // Plain deterministic min-cost extraction:
     let s = test_runtime::serialize_fixture(&text);
     let graph =
-        test_runtime::extractor::extract_layout_ir_with_matchers(&s, test_runtime::matchers());
+        test_runtime::extractor::extract_layout_ir_with_matchers(&s, &test_runtime::matchers());
     println!(
         "plain extraction: {:?}",
         graph.as_ref().map(|g| g.is_some())
     );
     // Walk the genome choices from the boundary lt: which class dies?
-    let index = test_runtime::extractor::producer_index_with_matchers(&s, test_runtime::matchers());
+    let index =
+        test_runtime::extractor::producer_index_with_matchers(&s, &test_runtime::matchers());
     let genome = test_runtime::genome_preferring(&s, PIN);
     fn lit_inputs_of_op_class(s: &EGraph, op_class: &ClassId) -> Vec<Vec<ClassId>> {
         let mut lists = Vec::new();

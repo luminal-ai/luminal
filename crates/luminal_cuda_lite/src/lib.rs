@@ -60,7 +60,10 @@
 pub mod arena;
 pub mod binding_check;
 pub mod bindings;
-pub mod extractor;
+/// The e-graph walk, in core (#420/#422 rejoin Phase 8): every runtime
+/// calls it with its own matcher list and it names no runtime type.
+/// Kept under this crate's old module name so call sites read the same.
+pub use luminal::extraction as extractor;
 /// FINALISTS (Phase 5 of the #420/#422 rejoin): a bucket's ranked
 /// genomes, re-materialized one at a time under a hard filter.
 pub mod finalists;

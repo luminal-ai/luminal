@@ -31,7 +31,7 @@ fn fixture_path(script: &str) -> String {
 pub fn extract_layout_ir(
     egraph: &egraph_serialize::EGraph,
 ) -> anyhow::Result<Option<ExtractedGraph>> {
-    extractor::extract_layout_ir_with_matchers(egraph, crate::ops::built_in_matchers())
+    extractor::extract_layout_ir_with_matchers(egraph, &crate::ops::built_in_matchers())
 }
 
 /// Genome-driven extraction (the selection adapter's walk) over the
@@ -43,7 +43,7 @@ pub fn extract_layout_ir_with_genome(
     extractor::extract_layout_ir_with_genome_and_matchers(
         egraph,
         genome,
-        crate::ops::built_in_matchers(),
+        &crate::ops::built_in_matchers(),
     )
 }
 
@@ -58,7 +58,7 @@ pub fn producer_index_with_ops(
     extractor::ExtractionSession::new_with_matcher_set(
         egraph,
         allowed_ops,
-        crate::ops::built_in_matchers(),
+        &crate::ops::built_in_matchers(),
     )
     .producer_index()
 }
@@ -161,7 +161,7 @@ pub fn try_extract_fixture_with_ops(
     extractor::extract_layout_ir_with_ops_and_matchers(
         &serialized,
         Some(allowed),
-        crate::ops::built_in_matchers(),
+        &crate::ops::built_in_matchers(),
     )
 }
 
@@ -199,7 +199,7 @@ pub fn plain_plan_exists(cx: &luminal::graph::Graph) -> anyhow::Result<()> {
     let extracted = extractor::extract_layout_ir_with_ops_and_matchers(
         &serialized,
         Some(&allow),
-        crate::ops::built_in_matchers(),
+        &crate::ops::built_in_matchers(),
     )?
     .ok_or_else(|| anyhow::anyhow!("no output boundary reached"))?;
     eprintln!("[plain-plan] extract {:?}", start.elapsed());
