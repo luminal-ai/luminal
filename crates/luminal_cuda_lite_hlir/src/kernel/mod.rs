@@ -17,7 +17,6 @@ pub mod gemv;
 pub mod generic_matmul;
 pub mod hlir;
 pub mod matmul2d;
-pub mod moe_gemv;
 pub mod other_ops;
 pub mod quant_f8;
 pub mod rms_norm;
@@ -39,16 +38,11 @@ pub type Ops = (
     hlir::Ops,
     argmax::KernelArgmax,
     gemv::KernelGemv,
-    gemv::KernelGemvF8,
-    moe_gemv::KernelMoEGemv,
     rms_norm::KernelRMSNorm,
-    rms_norm::KernelRMSNormQuant,
     rope::RoPEHalfKernel,
     rope::RoPEScatterKernel,
     rope::KernelRoPE,
-    rope::KernelRoPEScatterFused,
     swiglu::KernelSwiglu,
-    swiglu::KernelSwigluQuant,
     topk::KernelStableSortIdx,
     quant_f8::KernelQuantF8,
     other_ops::Ops,

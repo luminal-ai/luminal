@@ -311,12 +311,10 @@ fn test_bf16_reciprocal_region_compiles() {
     assert_close(&result, &expected, tol, tol);
 }
 
-/// Growth keeps both materialized and absorbed FS/FE boundary choices. Some
-/// correlated choices form an LLIR cycle; reject those selected candidates
-/// without deleting the legal acyclic choices from the egraph.
+/// Destructive FE -> FS subsumption must make the bf16 cast/residual topology
+/// acyclic by construction instead of relying on candidate-time rejection.
 #[test]
-#[ignore = "multi-op elementwise fusion removed pending legality-by-construction rework (the legality-by-construction rework): the cycle-producing absorbed-boundary choices this exercises no longer exist"]
-fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
+fn bf16_cast_sandwich_fusion_is_acyclic_by_construction() {
     use luminal::egglog_utils::{
         egglog_to_llir, extract_generation, hash_choice_set, random_initial_choice,
         validate_choice_set,
@@ -340,7 +338,6 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
     let mut base = random_initial_choice(egraph, &mut rng);
     let mut seen = FxHashSet::default();
     seen.insert(hash_choice_set(&base));
-    let mut cycles = 0;
     let mut acyclic = 0;
     for _ in 0..100 {
         let generation = extract_generation(egraph, &base, 16, 4, &mut seen, &mut rng);
@@ -350,8 +347,7 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
         for choices in generation {
             match validate_choice_set(egraph, &choices, ops) {
                 Err(error) if error.contains("dependency cycle") => {
-                    cycles += 1;
-                    continue;
+                    panic!("destructive fusion produced a cyclic choice: {error}")
                 }
                 Err(_) => continue,
                 Ok(()) => {}
@@ -378,21 +374,11 @@ fn bf16_cast_sandwich_rejects_only_selected_cyclic_llir() {
                 }
                 Err(other) => panic!("unexpected static candidate rejection: {other}"),
             }
-            if cycles > 0 && acyclic > 0 {
-                break;
-            }
-        }
-        if cycles > 0 && acyclic > 0 {
-            break;
         }
     }
     assert!(
-        cycles > 0,
-        "expected to exercise at least one cyclic choice"
-    );
-    assert!(
         acyclic > 0,
-        "cycle validation must retain legal acyclic materialized/absorbed choices"
+        "expected at least one legal candidate from the destructively fused graph"
     );
 }
 
@@ -895,6 +881,23 @@ fn fused_argmax_matches_decomposed() {
 }
 
 #[test]
+fn fused_argmax_matches_dynamic_bf16_serving_shape() {
+    let mut cx = Graph::default();
+    let x = cx.named_tensor("logits", ('n', 201_088), DType::Bf16);
+    let _out = x.argmax(1).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    assert!(
+        egraph_has_enode(&cx, "KernelArgmax", None),
+        "dynamic bf16 serving argmax must offer the fused kernel"
+    );
+    assert!(
+        !egraph_has_op_alternatives(&cx, &["KernelArgmaxKind", "KernelMaxKind"]),
+        "the argmax output must not retain the decomposed KernelMax candidate"
+    );
+}
+
+#[test]
 fn fused_swiglu_matches_decomposed() {
     use crate::kernel::swiglu::fused_swiglu;
     const ROWS: usize = 3;
@@ -1156,8 +1159,8 @@ fn quant_f8_linear_chain_matches_reference() {
         "fp8 quant chain should offer the fused quant candidate"
     );
     assert!(
-        egraph_has_enode(&cx, "KernelGemvF8", None),
-        "m=1 fp8 matmul + dequant chain should offer the tensor-core GEMV candidate"
+        !egraph_has_enode(&cx, "KernelGemvF8", None),
+        "Lite must leave the tensor-core FP8 GEMV specialization to full CUDA"
     );
     assert!(
         egraph_has_op_alternatives(&cx, &["GenericMatmul", "cublaslt"]),
@@ -1253,8 +1256,8 @@ fn gemv_f8_unaligned_shape_matches_reference() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     assert!(
-        egraph_has_enode(&cx, "KernelGemvF8", None),
-        "unaligned m=1 fp8 chain should still offer the tensor-core GEMV"
+        !egraph_has_enode(&cx, "KernelGemvF8", None),
+        "Lite must not register full CUDA's unaligned FP8 GEMV specialization"
     );
 
     let xb: Vec<bf16> = x_data.iter().map(|v| bf16::from_f32(*v)).collect();
@@ -1338,7 +1341,7 @@ fn rope_scatter_fusion_matches_reference() {
     // apply_rope_half on a head group inside a fused (s, pitch) row, scattered
     // in place into a cache pool. Egglog keeps both materialized and fused
     // representations available for measured search.
-    use crate::kernel::rope::apply_rope_half;
+    use crate::kernel::rope::apply_rope_half_as;
     use luminal_nn::scatter_rows;
 
     const S: usize = 3;
@@ -1353,10 +1356,7 @@ fn rope_scatter_fusion_matches_reference() {
         return;
     };
 
-    let x_data: Vec<f32> = random_f32_vec(S * PITCH, 0x20, -1.0, 1.0)
-        .into_iter()
-        .map(|v| bf16::from_f32(v).to_f32())
-        .collect();
+    let x_data: Vec<f32> = random_f32_vec(S * PITCH, 0x20, -1.0, 1.0);
     let cos_data = random_f32_vec(S * HALF, 0x21, -1.0, 1.0);
     let sin_data = random_f32_vec(S * HALF, 0x22, -1.0, 1.0);
     let cache_data: Vec<f32> = random_f32_vec(SLOTS * KVD, 0x23, -1.0, 1.0)
@@ -1366,12 +1366,12 @@ fn rope_scatter_fusion_matches_reference() {
     let idx_data: Vec<i32> = vec![4, 7, 2];
 
     let mut cx = Graph::default();
-    let x = cx.tensor((S, PITCH), DType::Bf16);
+    let x = cx.tensor((S, PITCH));
     let cos = cx.tensor((S, HALF), DType::F32);
     let sin = cx.tensor((S, HALF), DType::F32);
     let cache = cx.tensor((SLOTS, KVD), DType::Bf16);
     let idx = cx.tensor(S, DType::Int);
-    let k_rope = apply_rope_half(x, OFFSET, H, D, cos, sin);
+    let k_rope = apply_rope_half_as(x, OFFSET, H, D, cos, sin, DType::Bf16);
     let out = scatter_rows(k_rope, idx, cache, KVD)
         .cast(DType::F32)
         .output();
@@ -1423,12 +1423,11 @@ fn rope_scatter_fusion_matches_reference() {
         }
     }
 
-    let xb: Vec<bf16> = x_data.iter().map(|v| bf16::from_f32(*v)).collect();
     let cacheb: Vec<bf16> = cache_data.iter().map(|v| bf16::from_f32(*v)).collect();
     let tol = dtype_epsilon(DType::Bf16) * TOLERANCE_SAFETY_FACTOR;
 
     let load = |rt: &mut CudaRuntime| {
-        rt.set_data(x, xb.clone());
+        rt.set_data(x, x_data.clone());
         rt.set_data(cos, cos_data.clone());
         rt.set_data(sin, sin_data.clone());
         rt.set_data(cache, cacheb.clone());
@@ -1441,236 +1440,4 @@ fn rope_scatter_fusion_matches_reference() {
     rt.execute(&cx.dyn_map);
     let result = rt.get_f32(out.id);
     assert_close(&result[..SLOTS * KVD], &expected, tol, tol);
-}
-
-/// Nearest-e4m3 emulation for CPU references: decode all 256 codes once and
-/// pick the closest (ties to the smaller magnitude are fine within the
-/// tolerance used).
-fn nearest_e4m3(v: f32) -> f32 {
-    fn decode(b: u8) -> Option<f32> {
-        if b & 0x7F == 0x7F {
-            return None; // NaN codes
-        }
-        let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
-        let exp = ((b >> 3) & 0xF) as i32;
-        let man = (b & 7) as f32;
-        Some(if exp == 0 {
-            sign * (man / 8.0) * 2f32.powi(-6)
-        } else {
-            sign * (1.0 + man / 8.0) * 2f32.powi(exp - 7)
-        })
-    }
-    let mut best = 0.0f32;
-    let mut best_err = f32::INFINITY;
-    for b in 0..=255u8 {
-        if let Some(x) = decode(b) {
-            let err = (x - v).abs();
-            if err < best_err {
-                best_err = err;
-                best = x;
-            }
-        }
-    }
-    best
-}
-
-#[test]
-fn fused_norm_quant_linear_chain_matches_reference() {
-    // fused_rms_norm_quant (f8 custom op) feeding the scaled-fp8 GEMM chain:
-    //   y = Cast(Bf16)(Cast(F32)(q @ w.t()) * (in_scale * w_scale))
-    // The cuBLASLt and tensor-core GEMV rule variants must match the custom
-    // op as the pre-quantized A operand (scale in the last input slot).
-    use crate::kernel::rms_norm::fused_rms_norm_quant;
-
-    const ROWS: usize = 1;
-    const COLS: usize = 256; // k: multiple of 16 for cuBLASLt fp8
-    const N: usize = 128;
-    const EPS: f32 = 1e-5;
-    const IN_SCALE: f32 = 0.5;
-    const W_SCALE: f32 = 0.25;
-    let Some(stream) = get_cuda_stream() else {
-        return;
-    };
-    if !crate::tests::utilities::gpu_supports_dtype(DType::F8E4M3) {
-        return;
-    }
-
-    let x_data: Vec<f32> = random_f32_vec(ROWS * COLS, 0x31, -1.0, 1.0)
-        .into_iter()
-        .map(|v| bf16::from_f32(v).to_f32())
-        .collect();
-    let nw_data = random_f32_vec(COLS, 0x32, 0.5, 1.5);
-    const W_VALUES: [f32; 7] = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
-    const W_BYTES: [u8; 7] = [0xC0, 0xB8, 0xB0, 0x00, 0x30, 0x38, 0x40];
-    let w_idx: Vec<usize> = (0..N * COLS).map(|i| (i * 5 + 2) % 7).collect();
-    let w_bytes: Vec<u8> = w_idx.iter().map(|&i| W_BYTES[i]).collect();
-    let w_data: Vec<f32> = w_idx.iter().map(|&i| W_VALUES[i]).collect();
-
-    let mut cx = Graph::default();
-    let x = cx.tensor((ROWS, COLS), DType::Bf16);
-    let nw = cx.tensor(COLS, DType::F32);
-    let in_scale = cx.tensor((), DType::F32);
-    let w_scale = cx.tensor((), DType::F32);
-    let w = cx.tensor((N, COLS), DType::F8E4M3);
-    let q = fused_rms_norm_quant(x, nw, EPS, in_scale);
-    let deq = q.matmul(w.t()).cast(DType::F32);
-    let out = (deq * (in_scale * w_scale).expand_rhs(deq.dims()))
-        .cast(DType::Bf16)
-        .cast(DType::F32)
-        .output();
-
-    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-    assert!(
-        egraph_has_enode(&cx, "cublaslt_scaled", None),
-        "custom f8 op should match the scaled cuBLASLt rule variant"
-    );
-    assert!(
-        egraph_has_enode(&cx, "KernelGemvF8", None),
-        "custom f8 op should match the tensor-core GEMV rule variant"
-    );
-
-    // CPU reference with e4m3 emulation of the quantized activation.
-    let sumsq: f32 = x_data.iter().map(|v| v * v).sum();
-    let rinv = 1.0 / (sumsq / COLS as f32 + EPS).sqrt();
-    let q_ref: Vec<f32> = (0..COLS)
-        .map(|i| nearest_e4m3(x_data[i] * rinv * nw_data[i] / IN_SCALE))
-        .collect();
-    let expected: Vec<f32> = (0..N)
-        .map(|r| {
-            let dot: f32 = (0..COLS).map(|i| q_ref[i] * w_data[r * COLS + i]).sum();
-            bf16::from_f32(dot * IN_SCALE * W_SCALE).to_f32()
-        })
-        .collect();
-
-    let xb: Vec<bf16> = x_data.iter().map(|v| bf16::from_f32(*v)).collect();
-    // Tolerance: the GPU rounds the pre-quant value once (f32) where the
-    // reference computes it exactly; one e4m3 ulp of slack on top of bf16
-    // epsilon covers boundary flips on individual elements, scaled by the
-    // dot length.
-    let tol = 0.13 * (COLS as f32).sqrt() / 4.0;
-    fuzz_genomes::<f32>(
-        &cx,
-        &stream,
-        |rt| {
-            rt.set_data(x, xb.clone());
-            rt.set_data(nw, nw_data.clone());
-            rt.set_data(w, w_bytes.clone());
-            rt.set_data(in_scale, vec![IN_SCALE]);
-            rt.set_data(w_scale, vec![W_SCALE]);
-        },
-        out.id,
-        &expected,
-        tol,
-        tol,
-        crate::tests::utilities::GENOME_FUZZ_COUNT,
-        0x33,
-    );
-}
-
-#[test]
-fn moe_gemv_matches_hlir_reference() {
-    // The pure-HLIR gather-experts spelling (flat-index iota chain → Gather →
-    // Cast(F32) → batched mat-vec) must offer the fused KernelMoEGemv
-    // candidate, and every genome (fused kernel, gathered-weights fallback)
-    // must agree with a CPU reference. Covers both x layouts: shared (s, D)
-    // (gate_up) and per-slot (s, k, D) (down).
-    const S: usize = 3;
-    const K: usize = 2;
-    const E: usize = 4;
-    const O: usize = 16;
-    const D: usize = 24;
-    let Some(stream) = get_cuda_stream() else {
-        return;
-    };
-
-    let x_shared = random_f32_vec(S * D, 0x41, -1.0, 1.0);
-    let x_per_k = random_f32_vec(S * K * D, 0x42, -1.0, 1.0);
-    let w_data: Vec<f32> = random_f32_vec(E * O * D, 0x43, -1.0, 1.0)
-        .into_iter()
-        .map(|v| bf16::from_f32(v).to_f32())
-        .collect();
-    let idx_data: Vec<i32> = vec![0, 3, 2, 2, 1, 0];
-
-    // Mirrors the MoE examples' gather_experts helper.
-    fn gather_experts(top_k_indices: GraphTensor, weights: GraphTensor) -> GraphTensor {
-        let (_, d1, d2) = weights.dims3();
-        let io = d1 * d2;
-        let base = top_k_indices * io;
-        let within = weights.graph().iota(IntExpr::from('z'), (d1, d2));
-        let n_base = base.dims().len();
-        let exp_base = base.expand_dim(n_base, d1).expand_dim(n_base + 1, d2);
-        let mut exp_within = within;
-        for (i, dim) in base.dims().iter().enumerate() {
-            exp_within = exp_within.expand_dim(i, *dim);
-        }
-        weights.gather(exp_base + exp_within)
-    }
-
-    for (per_expert, dyn_s) in [(false, false), (true, false), (false, true), (true, true)] {
-        let mut cx = Graph::default();
-        let s_dim: IntExpr = if dyn_s {
-            IntExpr::from('s')
-        } else {
-            IntExpr::from(S)
-        };
-        if dyn_s {
-            cx.set_dim('s', S);
-        }
-        let x = if per_expert {
-            cx.tensor((s_dim, K, D), DType::F32)
-        } else {
-            cx.tensor((s_dim, D), DType::F32)
-        };
-        let idx = cx.tensor((s_dim, K), DType::Int);
-        let w = cx.tensor((E, O, D), DType::Bf16);
-
-        let gathered = gather_experts(idx, w).cast(DType::F32); // [S,K,O,D]
-        let x_exp = if per_expert {
-            x.unsqueeze(2) // [S,K,1,D]
-        } else {
-            x.expand_dim(1, K).unsqueeze(2) // [S,K,1,D]
-        };
-        let out = x_exp.matmul(gathered.transpose(2, 3)).squeeze(2).output(); // [S,K,O]
-
-        cx.build_search_space::<CudaRuntime>(CompileOptions::default());
-        assert!(
-            egraph_has_enode(&cx, "KernelMoEGemv", None),
-            "expert-gather matmul (per_expert={per_expert}, dyn_s={dyn_s}) should offer the fused MoE GEMV"
-        );
-
-        let x_data = if per_expert { &x_per_k } else { &x_shared };
-        let mut expected = vec![0.0f32; S * K * O];
-        for s in 0..S {
-            for k in 0..K {
-                let e = idx_data[s * K + k] as usize;
-                let xr = if per_expert {
-                    &x_data[(s * K + k) * D..(s * K + k + 1) * D]
-                } else {
-                    &x_data[s * D..(s + 1) * D]
-                };
-                for o in 0..O {
-                    let dot: f32 = (0..D).map(|i| xr[i] * w_data[(e * O + o) * D + i]).sum();
-                    expected[(s * K + k) * O + o] = dot;
-                }
-            }
-        }
-
-        let wb: Vec<bf16> = w_data.iter().map(|v| bf16::from_f32(*v)).collect();
-        let tol = 1e-5;
-        fuzz_genomes::<f32>(
-            &cx,
-            &stream,
-            |rt| {
-                rt.set_data(x, x_data.clone());
-                rt.set_data(idx, idx_data.clone());
-                rt.set_data(w, wb.clone());
-            },
-            out.id,
-            &expected,
-            tol,
-            tol,
-            crate::tests::utilities::GENOME_FUZZ_COUNT,
-            0x44,
-        );
-    }
 }

@@ -1,25 +1,24 @@
-//! The CUDA runtime's search strategy.
+//! The full CUDA runtime's search strategy.
 //!
-//! Luminal's genetic search, driven explicitly: each candidate is compiled,
-//! resource-validated, installed, and profiled in one straight-line step;
-//! the persistent intermediate arena is parked exactly where the loop
-//! retires a candidate; and the bucket set that passes aggregate validation
-//! is installed as compiled, never compiled a second time at load.
+//! CUDA drives Luminal's generic search state machine explicitly so candidate
+//! compilation, hard resource validation, installation, and profiling share
+//! one straight-line path. Candidate selection is the ordinary unbiased
+//! genetic search over the alternatives produced by CUDA's egglog rewrites.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use luminal::graph::CompileOptions;
+use luminal::op::IntoEgglogOp;
 use luminal::prelude::*;
 use luminal::search::{
     BucketContext, BucketLattice, Candidate, Finalists, GeneticSearch, Outcome, PendingFinalist,
-    SearchSpace, diagnostics,
+    Ranked, SearchSpace, diagnostics,
 };
 
-use crate::runtime::CudaRuntime;
+use crate::runtime::CudaRuntimeImpl;
 
-impl CudaRuntime {
-    /// Search every bucket of `space` and install the selected programs.
+impl<O: IntoEgglogOp> CudaRuntimeImpl<O> {
     pub(crate) fn search_and_load(
         &mut self,
         space: &SearchSpace,
@@ -31,21 +30,17 @@ impl CudaRuntime {
         let contexts = space.bucket_contexts(dyn_map);
         let mut finalists = Vec::with_capacity(contexts.len());
         for ctx in &contexts {
-            // Profiling the previous bucket left its arena attached; every
-            // bucket search starts from runtime scope.
-            self.clear_intermediate_buffers();
             let mut search = GeneticSearch::<Duration>::new(space, ctx, options, search_started_at);
             while let Some(mut candidate) = search.next_candidate(rng) {
                 let outcome = self.evaluate_candidate(&mut candidate, ctx, options);
                 search.report(candidate, outcome);
+                self.release_search_candidate_allocations();
             }
-            finalists.push(Finalists::new(
-                search.into_ranked(),
-                space,
-                ctx,
-                options,
-                search_started_at,
-            ));
+            let ranked = search.into_ranked();
+            let bucket_finalists =
+                self.rerank_cuda_graph_finalists(ranked, space, ctx, options, search_started_at);
+            self.discard_search_bucket_compilation_state();
+            finalists.push(bucket_finalists);
         }
 
         let mut lattice = BucketLattice::new(
@@ -59,7 +54,6 @@ impl CudaRuntime {
             else {
                 panic!("{}", lattice.failure_message());
             };
-            self.clear_intermediate_buffers();
             let refs = lattice.llirs(&set);
             let compiled = catch_unwind(AssertUnwindSafe(|| {
                 self.compile_and_validate_bucket_set(&space.dim_buckets, &refs)
@@ -80,10 +74,7 @@ impl CudaRuntime {
             };
             match compiled {
                 Ok(validated) => {
-                    // Dumps the selection under LLIR_DUMP_DIR; the validated
-                    // set is the exact executable, so install it directly.
                     let _selected = lattice.select(set);
-                    self.clear_intermediate_buffers();
                     self.install_validated_bucket_set(&space.dim_buckets, validated)
                         .unwrap_or_else(|error| {
                             panic!("failed to install the selected CUDA bucket set: {error}")
@@ -97,13 +88,16 @@ impl CudaRuntime {
         }
     }
 
-    /// Compile, resource-validate, install, and profile one candidate.
     fn evaluate_candidate(
         &mut self,
         candidate: &mut Candidate<Duration>,
         ctx: &BucketContext<'_>,
         options: &CompileOptions,
     ) -> Outcome<Duration> {
+        // Snapshot before static preparation as well as execution: candidate
+        // planning/codegen is synchronous and may itself be the phase that
+        // needs post-mortem diagnosis.
+        Self::dump_candidate_llir_for_postmortem(&candidate.llir, &candidate.profile_dyn_map);
         let prepared = catch_unwind(AssertUnwindSafe(|| {
             self.prepare_search_candidate(&candidate.llir, &candidate.profile_dyn_map, ctx)
         }));
@@ -111,19 +105,13 @@ impl CudaRuntime {
             Ok(Ok(display)) => display,
             Ok(Err(reason)) => return Outcome::Rejected(reason),
             Err(payload) => {
-                // A candidate whose LLIR fails to compile (e.g. an egglog
-                // rule that mis-fires and produces an inconsistent kernel
-                // op) is rejected like any other, not a search abort.
                 luminal::mask_events::CANDIDATE_PANIC
                     .record_with(|| luminal::mask_events::panic_payload(payload.as_ref()));
                 diagnostics::dump_failed_candidate(candidate, &ctx.representative_dyn_map);
                 return Outcome::Rejected("candidate compile panicked".to_string());
             }
         };
-        // The candidate timeout budgets profiling; NVRTC compilation above
-        // is bounded by its own resource caps.
         candidate.restart_timer();
-        Self::dump_candidate_llir_for_postmortem(&candidate.llir, &candidate.profile_dyn_map);
         let profiled = catch_unwind(AssertUnwindSafe(|| {
             self.profile_loaded_llir(
                 &candidate.llir,
@@ -138,13 +126,121 @@ impl CudaRuntime {
                 metric,
                 diagnostics::append_filter_display(display, Some(&resource_display)),
             ),
-            Err(_) => Outcome::Invalid("candidate profiling panicked".to_string()),
+            Err(_) => {
+                self.cancel_search_profile();
+                Outcome::Invalid("candidate profiling panicked".to_string())
+            }
         }
     }
 
-    /// Compile and validate a candidate as the one-bucket set profiling
-    /// runs, then install that exact executable. Returns the resource
-    /// display for the search log.
+    /// Direct step launch is cheap enough for broad exploration, but serving
+    /// uses materialized CUDA graphs and can rank close schedules differently.
+    /// Re-extract the search's best parent-width set and measure that exact
+    /// deployment path before bucket-lattice selection. No schedule is named
+    /// or forced: both stages are ordered solely by measured device time.
+    fn rerank_cuda_graph_finalists<'a>(
+        &mut self,
+        ranked: Ranked<Duration>,
+        space: &'a SearchSpace,
+        ctx: &'a BucketContext<'a>,
+        options: &'a CompileOptions,
+        search_started_at: Instant,
+    ) -> Finalists<'a, Duration> {
+        let target = options.keep_best.max(1).min(ranked.len());
+        let mut deployment_ranked = Vec::with_capacity(target);
+
+        for (direct_metric, genome) in &ranked {
+            // Use Core's ordinary extractor on a one-genome ranked set. This
+            // preserves the exact final extraction/unroll path the lattice
+            // will use after the deployment metrics have been sorted.
+            let mut extracted = Finalists::new(
+                vec![(*direct_metric, genome.clone())],
+                space,
+                ctx,
+                options,
+                search_started_at,
+            );
+            let Some(pending) = extracted.extract_next() else {
+                continue;
+            };
+            let candidate_started_at = Instant::now();
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                self.profile_finalist_cuda_graph(&pending, ctx, options)
+            }));
+            self.release_search_candidate_allocations();
+
+            let profiled = match result {
+                Ok(Ok(metric)) => Ok(metric),
+                Ok(Err(reason)) => Err(reason),
+                Err(payload) => {
+                    self.cancel_search_profile();
+                    luminal::mask_events::CANDIDATE_PANIC
+                        .record_with(|| luminal::mask_events::panic_payload(payload.as_ref()));
+                    Err("deployment CUDA-graph profiling panicked".to_string())
+                }
+            };
+            let profiled = if options
+                .candidate_timeout
+                .is_some_and(|timeout| candidate_started_at.elapsed() >= timeout)
+            {
+                Err(format!(
+                    "deployment CUDA-graph profiling exceeded candidate timeout after {:?}",
+                    candidate_started_at.elapsed()
+                ))
+            } else {
+                profiled
+            };
+
+            match profiled {
+                Ok(metric) => {
+                    if options.search_log_enabled() {
+                        println!(
+                            "   Search  deployment finalist direct={direct_metric:?} graph={metric:?}"
+                        );
+                    }
+                    deployment_ranked.push((metric, genome.clone()));
+                    if deployment_ranked.len() == target {
+                        break;
+                    }
+                }
+                Err(reason) => {
+                    if options.search_log_enabled() {
+                        println!("   Search  deployment finalist reject: {reason}");
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !deployment_ranked.is_empty(),
+            "search found measured CUDA candidates, but none could execute as a deployment CUDA graph"
+        );
+        deployment_ranked.sort_by(|(left, _), (right, _)| {
+            left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Finalists::new(deployment_ranked, space, ctx, options, search_started_at)
+    }
+
+    fn profile_finalist_cuda_graph(
+        &mut self,
+        pending: &PendingFinalist<Duration>,
+        ctx: &BucketContext<'_>,
+        options: &CompileOptions,
+    ) -> Result<Duration, String> {
+        let candidate =
+            self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)?;
+        self.install_validated_bucket_set(ctx.dim_buckets(), candidate.buckets)
+            .map_err(|error| format!("deployment CUDA-graph load reject: {error}"))?;
+        let (metric, _) = self.profile_loaded_cuda_graph(
+            &pending.llir,
+            &pending.dyn_map,
+            options.trials,
+            options.execution_timeout,
+            None,
+        );
+        Ok(metric)
+    }
+
     fn prepare_search_candidate(
         &mut self,
         llir_graph: &LLIRGraph,
@@ -154,20 +250,37 @@ impl CudaRuntime {
         let candidate =
             self.compile_and_validate_profile_candidate(llir_graph, profile_dyn_map, ctx)?;
         let display = candidate.display;
-        self.install_validated_bucket_set(ctx.dim_buckets(), candidate.buckets)
+        self.install_validated_profile_candidate(ctx.dim_buckets(), candidate.buckets)
             .map_err(|error| format!("{display}; candidate load reject: {error}"))?;
         Ok(display)
     }
 
-    /// Hard filter for a re-extracted finalist: it must compile and plan
-    /// within the hard resource limits at the bucket's dyn values.
     fn validate_finalist(
         &mut self,
         pending: &PendingFinalist<Duration>,
         ctx: &BucketContext<'_>,
     ) -> Result<(), String> {
-        self.clear_intermediate_buffers();
-        self.compile_and_validate_profile_candidate(&pending.llir, &pending.dyn_map, ctx)
+        // This genome was already compiled and timed during search. Re-run the
+        // exact CUDA/resource checks for deployment, but do not apply the
+        // cheap candidate-planning node guard: that guard bounds exploration
+        // work and is not a property of the measured graph.
+        self.compile_and_validate_finalist_candidate(&pending.llir, &pending.dyn_map, ctx)
             .map(|_| ())
     }
+}
+
+pub(crate) fn safe_fusion_late_pass() -> luminal::egglog_utils::LateEgglogPass {
+    // Singleton elementwise regions already exist when this late pass runs.
+    // One Egglog round sees every materialized FE -> FS boundary in the DAG;
+    // the rule dissolves and subsumes those boundaries simultaneously, giving
+    // us maximal destructive fusion without enumerating fusion partitions.
+    luminal::egglog_utils::LateEgglogPass::new(
+        "",
+        "(seq
+            fusion_inline_safe_late
+            (saturate expr)
+            (saturate cleanup)
+            (saturate post_cleanup)
+            (saturate base_cleanup))",
+    )
 }

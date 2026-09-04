@@ -11,6 +11,7 @@ mod cublaslt_rewrite_tests;
 #[cfg(test)]
 mod dtype_contract;
 #[cfg(test)]
+#[cfg(test)]
 mod flashinfer;
 #[cfg(test)]
 mod fusion;

@@ -1,6 +1,5 @@
 pub mod find_indptrs;
 pub mod jit;
-pub mod sink_attention;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -293,7 +292,8 @@ const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 static FLOAT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
 static INT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
 
-pub(crate) fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
+#[doc(hidden)]
+pub fn shared_device_memory_allocation() -> SharedDeviceMemoryAllocation {
     SharedDeviceMemoryAllocation {
         key: "flashinfer-global-workspaces",
         bytes: FLOAT_WORKSPACE_SIZE + INT_WORKSPACE_SIZE,
@@ -313,9 +313,9 @@ pub(crate) fn resident_shared_device_memory_allocations() -> Vec<SharedDeviceMem
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
 
 /// Process-wide page-locked (pinned) staging buffer for FlashInfer's
-/// host-side plan writes. Allocated once, never freed; shared by the FA2 and
-/// FA3 (SinkAttention) plan paths.
-pub(crate) fn page_locked_workspace() -> &'static PageLockedPtr {
+/// host-side plan writes. Allocated once and never freed.
+#[doc(hidden)]
+pub fn page_locked_workspace() -> &'static PageLockedPtr {
     PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
@@ -326,7 +326,8 @@ pub(crate) fn page_locked_workspace() -> &'static PageLockedPtr {
     })
 }
 
-pub(crate) struct PageLockedPtr(pub(crate) *mut u8);
+#[doc(hidden)]
+pub struct PageLockedPtr(pub *mut u8);
 
 // SAFETY: The pointer is page-locked CUDA memory allocated once via
 // posix_memalign + cudaHostRegister and only mutated during OnceLock
@@ -1166,7 +1167,27 @@ fn flashinfer_workspaces(
     (float_ws, float_ptr, int_ws, int_ptr)
 }
 
-fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
+/// Stable shared float scratch used by generic FlashInfer operations and by
+/// backend-owned attention implementations executing on the same stream.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashInferFloatWorkspace {
+    pub ptr: u64,
+    pub bytes: usize,
+}
+
+#[doc(hidden)]
+pub fn flashinfer_float_workspace(stream: &Arc<CudaStream>) -> FlashInferFloatWorkspace {
+    let float = FLOAT_WORKSPACE
+        .get_or_init(|| unsafe { stream.alloc::<u8>(FLOAT_WORKSPACE_SIZE).unwrap() });
+    FlashInferFloatWorkspace {
+        ptr: float.device_ptr(stream).0,
+        bytes: FLOAT_WORKSPACE_SIZE,
+    }
+}
+
+#[doc(hidden)]
+pub fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
     let len = bytes.len() / std::mem::size_of::<i32>();
     let mut bytes = std::mem::ManuallyDrop::new(bytes);
     unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut i32, len, len) }
@@ -1255,7 +1276,10 @@ mod resource_tests {
         // Capacity tier 256: kv indptr (8), current-c (4), indices
         // (1024), last-page length (4), and temporary output (512).
         assert_eq!(spec.prepared_device_bytes().unwrap(), 1_552);
-        assert_eq!(shared_device_memory_allocation().bytes, 136 * 1024 * 1024);
+        assert_eq!(
+            shared_device_memory_allocation().bytes,
+            FLOAT_WORKSPACE_SIZE + INT_WORKSPACE_SIZE
+        );
     }
 
     #[test]

@@ -11,10 +11,57 @@ use crate::runtime::CudaRuntime;
 
 #[allow(unused_imports)]
 use super::utilities::{
-    GENOME_FUZZ_COUNT, TOLERANCE_SAFETY_FACTOR, assert_close, dtype_epsilon, fuzz_genomes,
-    gen_slice_range, get_cuda_stream, gpu_supports_dtype, op_ir_nodes, random_f32_vec,
-    random_i32_vec, test_binary_cuda, test_mod, test_unary_cuda, to_candle_dtype,
+    ForcedExtractionConfig, GENOME_FUZZ_COUNT, TOLERANCE_SAFETY_FACTOR, assert_close,
+    dtype_epsilon, fuzz_genomes, gen_slice_range, get_cuda_stream, gpu_supports_dtype,
+    llir_kernel_names, op_ir_nodes, random_f32_vec, random_i32_vec, test_binary_cuda, test_mod,
+    test_unary_cuda, to_candle_dtype, try_extract_forced_op_llir_where,
 };
+
+#[test]
+fn dynamic_wide_mul_sum_reduction_executes_without_oob() {
+    const ROWS: usize = 64;
+    const CONTEXT: usize = 512;
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+
+    let mut cx = Graph::default();
+    let lhs = cx.named_tensor("lhs", (ROWS, 1, 'c'));
+    let rhs = cx.named_tensor("rhs", (ROWS, 1, 'c'));
+    let output = (lhs * rhs).sum(2).output();
+    cx.set_dim('c', CONTEXT);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+
+    // This is the exact fallback family used by a dense attention dot:
+    // materialized elementwise multiplication followed by a dynamic reduction.
+    let llir = try_extract_forced_op_llir_where(
+        &cx,
+        &["KernelSum"],
+        ForcedExtractionConfig::new(0xD07_5A11)
+            .attempts_per_node(32)
+            .node_seed_stride(97),
+        |llir| {
+            let names = llir_kernel_names(llir);
+            names.contains(&"CudaBinaryElementwise") && names.contains(&"SumReduce")
+        },
+    )
+    .expect("dynamic Mul + SumReduce fallback should be extractable");
+
+    let lhs_data = vec![0.25f32; ROWS * CONTEXT];
+    let rhs_data = vec![0.5f32; ROWS * CONTEXT];
+    let mut runtime = CudaRuntime::initialize(stream);
+    runtime.set_data(lhs, lhs_data);
+    runtime.set_data(rhs, rhs_data);
+    runtime.load_llir(&llir);
+    runtime.execute(&cx.dyn_map);
+
+    assert_close(
+        &runtime.get_f32(output.id),
+        &vec![64.0f32; ROWS],
+        1e-5,
+        1e-5,
+    );
+}
 
 // The property-based op tests each build/search CUDA graphs for multiple random
 // shapes. They are ignored by default to keep the main CUDA unit suite short;
