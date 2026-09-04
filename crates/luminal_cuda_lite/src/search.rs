@@ -22,13 +22,11 @@ use colored::Colorize;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::extractor::{self, Genome, ProducerChoice, SamplingSpace};
 use luminal::bufferize::BufferIrGraph;
 use luminal::graph::LogicalProgram;
 use luminal::prelude::egraph_serialize::{self, ClassId};
 use luminal::prelude::{FxHashMap, FxHashSet};
-use luminal::runtime_binding::RuntimeBindingsGenerator;
-
-use crate::extractor::{self, Genome, ProducerChoice, SamplingSpace};
 
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
@@ -210,7 +208,7 @@ impl<W: std::io::Write> SearchProgress<W> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SearchOutcome {
     pub best_plan: BufferIrGraph<luminal::layouts::DecodedLayout>,
     pub best_genome: Genome,
@@ -875,102 +873,60 @@ pub struct BucketPlan {
     pub outcome: SearchOutcome,
 }
 
-/// Range-seeded bucketed search, mirroring their per-bucket model: one
-/// Cartesian combination of `DimBucket`s per search, each combination run
-/// TWICE — a bucket-wide RANGE-seeded render whose fixpoint checks prove
-/// the model sound over the whole interval (validation only; ranges do not
-/// collapse), then a representative-pinned render that is searched and
-/// profiled. `select_bucket` picks the covering plan at runtime.
+/// The pre-search program parts a bucketed search re-renders from — the
+/// runtime's own `load`-time capture. The MODEL TEXT never changes
+/// across buckets; only the bounds seeds do, which is the whole point of
+/// the bucket model.
+pub struct BucketAssembly<'a> {
+    /// The runtime's assembled egglog preamble (matchers + registry).
+    pub assembled_program: &'a str,
+    /// The recorded model, before the schedule.
+    pub pre_schedule: &'a str,
+    /// The caller's own `bind_*` seeds — for the dims that are NOT
+    /// bucketed. A bucketed dim is refused a range binding, so these
+    /// never collide with the per-bucket seeds appended after them.
+    pub binding_seeds: &'a str,
+    /// The runtime's schedule text.
+    pub schedule: &'a str,
+    /// The authoring-contract checks. THEY RUN IN THE BUCKET-WIDE
+    /// VALIDATION RENDER TOO: the base logical program must be valid over
+    /// the WHOLE interval, not merely at the representative (Austin,
+    /// 2026-09-03).
+    pub post_checks: &'a str,
+    pub input_slots: &'a [luminal::graph::InputSlot],
+    pub output_slots: &'a [luminal::graph::OutputSlot],
+    /// Dim values the runtime already holds, carried into every bucket's
+    /// representative map so a plan records the full pin it was searched
+    /// at.
+    pub base_dims: &'a luminal::shape::DynMap,
+}
+
+/// Range-seeded bucketed search: one Cartesian combination of
+/// `DimBucket`s per search, each combination run TWICE — a bucket-wide
+/// RANGE-seeded render whose WHOLE FIXPOINT (authoring checks included)
+/// must pass, proving the base logical program valid over the entire
+/// interval, then a representative-pinned render that is searched.
+/// [`select_bucket`] picks the covering plan at execute time.
 ///
-/// Slice note (documented divergence from their symbolic LLIR): each
-/// winning plan is STATIC at its representative; executing at another pin
-/// re-renders — genome transfer across renders is future work.
+/// THE LIMITATION, stated rather than solved (Phase 1 scope): each
+/// winning plan is STATIC at its representative — plans carry LITERAL
+/// spans, so a plan searched at `a = 3` allocates and indexes for `a =
+/// 3` and nothing else. Executing a bucket's plan at any OTHER value
+/// inside that bucket is REFUSED loudly by the runtime, naming the
+/// representative; it is never silently run. Lifting this needs symbolic
+/// plans (spans as expressions) and the capacity contract that goes with
+/// them — the open item this note points at.
 pub fn bucketed_search_implementations(
-    graph: &luminal::graph::Graph,
+    assembly: &BucketAssembly<'_>,
     dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
     options: &CompileOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: impl Fn() -> Vec<Box<dyn luminal::layout_ir::OpMatcher>>,
 ) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
-    let bindings = &crate::bindings::CudaBindings;
-    let assembled_program = luminal::egglog_snippet::assembled_program_for(&matchers());
-    let assembled_program = assembled_program.as_str();
-
-    // M3 Topic C: buckets assemble NATIVELY — one recorder model, per-
-    // bucket binding seeds (ranges for the bucket-wide validation render,
-    // tight [n,n] pins for the representative render). The model text
-    // never changes across buckets; only the binding does.
-    let (pre, input_slots, output_slots, post, _labeled) = graph
-        .logical
-        .bound_parts(bindings)
-        .map_err(|reason| anyhow!("native load refused: {reason}"))?;
-    let seeds_text = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| {
-        let mut text = String::new();
-        for (var, (lower, upper)) in seeds {
-            text.push_str(&format!(
-                "(set (lower-bound-of (IntVar \"{var}\")) (bigint {lower}))\n\
-                 (set (upper-bound-of (IntVar \"{var}\")) (bigint {upper}))\n"
-            ));
-        }
-        text
-    };
-    let assemble =
-        |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| luminal::graph::LogicalProgram {
-            text: format!("{pre}{}{}{post}", seeds_text(seeds), bindings.schedule()),
-            input_slots: input_slots.clone(),
-            output_slots: output_slots.clone(),
-        };
-
-    // Cartesian combinations, dims in sorted order (their bucket_combinations).
-    let dims: Vec<&luminal::shape::Symbol> = dim_buckets.keys().collect();
-    let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
-    for dim in &dims {
-        let count = dim_buckets[*dim].len();
-        combos = combos
-            .into_iter()
-            .flat_map(|combo| {
-                (0..count).map(move |index| {
-                    let mut next = combo.clone();
-                    next.push(index);
-                    next
-                })
-            })
-            .collect();
-    }
-
     let mut plans = Vec::new();
-    for combo in combos {
-        let mut ranges = BTreeMap::new();
-        let mut representative = graph.dyn_map.clone();
-        for (dim, bucket_index) in dims.iter().zip(&combo) {
-            let bucket = &dim_buckets[*dim][*bucket_index];
-            ranges.insert(**dim, (bucket.min, bucket.max));
-            representative.insert(**dim, bucket.representative_value());
-        }
-
-        // Bucket-wide soundness: the range-seeded render must run its whole
-        // fixpoint (authoring-contract checks included) over the interval.
-        let mut validation_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, value) in &representative {
-            validation_seeds.insert(*dim, (*value as u64, *value as u64));
-        }
-        for (dim, (min, max)) in &ranges {
-            validation_seeds.insert(*dim, (*min as u64, *max as u64));
-        }
-        let validation = assemble(&validation_seeds);
-        let text = format!("{}\n\n{}", assembled_program, validation.text);
-        luminal::egglog_snippet::new_egraph()
-            .parse_and_run_program(None, &text)
-            .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
-
-        // Representative render: pinned via tight bounds, searched, profiled.
-        let mut pin_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
-        for (dim, value) in &representative {
-            pin_seeds.insert(*dim, (*value as u64, *value as u64));
-        }
-        let program = assemble(&pin_seeds);
-        let text = format!("{}\n\n{}", assembled_program, program.text);
+    for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
+        let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
         egraph
             .parse_and_run_program(None, &text)
@@ -993,6 +949,99 @@ pub fn bucketed_search_implementations(
         });
     }
     Ok(plans)
+}
+
+/// One bucket combination's `(ranges, representative pins, pinned
+/// render)`, in sorted-dim Cartesian order. Each combination's
+/// BUCKET-WIDE VALIDATION render runs here, before its pinned render is
+/// handed back to be searched: the range-seeded program's whole fixpoint
+/// — authoring-contract checks included — must pass, which is what makes
+/// "the base logical program is valid over the whole bucket" a checked
+/// claim rather than an assumption. Ranges are seeded as intervals and
+/// do NOT collapse; only the representative render pins `[n, n]`.
+type BucketRender = (
+    BTreeMap<luminal::shape::Symbol, (usize, usize)>,
+    luminal::shape::DynMap,
+    LogicalProgram,
+);
+
+fn bucket_renders(
+    assembly: &BucketAssembly<'_>,
+    dim_buckets: &BTreeMap<luminal::shape::Symbol, Vec<luminal::graph::DimBucket>>,
+) -> Result<Vec<BucketRender>> {
+    let seeds_text = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| {
+        let mut text = String::new();
+        for (var, (lower, upper)) in seeds {
+            text.push_str(&format!(
+                "(set (lower-bound-of (IntVar \"{var}\")) (bigint {lower}))\n\
+                 (set (upper-bound-of (IntVar \"{var}\")) (bigint {upper}))\n"
+            ));
+        }
+        text
+    };
+    let assemble = |seeds: &BTreeMap<luminal::shape::Symbol, (u64, u64)>| LogicalProgram {
+        text: format!(
+            "{}{}{}{}{}",
+            assembly.pre_schedule,
+            assembly.binding_seeds,
+            seeds_text(seeds),
+            assembly.schedule,
+            assembly.post_checks
+        ),
+        input_slots: assembly.input_slots.to_vec(),
+        output_slots: assembly.output_slots.to_vec(),
+    };
+
+    // Cartesian combinations, dims in sorted order.
+    let dims: Vec<&luminal::shape::Symbol> = dim_buckets.keys().collect();
+    let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
+    for dim in &dims {
+        let count = dim_buckets[*dim].len();
+        combos = combos
+            .into_iter()
+            .flat_map(|combo| {
+                (0..count).map(move |index| {
+                    let mut next = combo.clone();
+                    next.push(index);
+                    next
+                })
+            })
+            .collect();
+    }
+
+    let mut renders = Vec::new();
+    for combo in combos {
+        let mut ranges = BTreeMap::new();
+        let mut representative = assembly.base_dims.clone();
+        for (dim, bucket_index) in dims.iter().zip(&combo) {
+            let bucket = &dim_buckets[*dim][*bucket_index];
+            ranges.insert(**dim, (bucket.min, bucket.max));
+            representative.insert(**dim, bucket.representative_value());
+        }
+
+        // BUCKET-WIDE SOUNDNESS: the range-seeded render must run its
+        // whole fixpoint over the interval.
+        let mut validation_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
+        for (dim, value) in &representative {
+            validation_seeds.insert(*dim, (*value as u64, *value as u64));
+        }
+        for (dim, (min, max)) in &ranges {
+            validation_seeds.insert(*dim, (*min as u64, *max as u64));
+        }
+        let validation = assemble(&validation_seeds);
+        let text = format!("{}\n\n{}", assembly.assembled_program, validation.text);
+        luminal::egglog_snippet::new_egraph()
+            .parse_and_run_program(None, &text)
+            .map_err(|err| anyhow!("bucket {ranges:?} fails bucket-wide validation: {err}"))?;
+
+        // Representative render: pinned via tight bounds.
+        let mut pin_seeds: BTreeMap<luminal::shape::Symbol, (u64, u64)> = BTreeMap::new();
+        for (dim, value) in &representative {
+            pin_seeds.insert(*dim, (*value as u64, *value as u64));
+        }
+        renders.push((ranges, representative, assemble(&pin_seeds)));
+    }
+    Ok(renders)
 }
 
 /// The covering bucket plan for a concrete dim assignment, if any.
