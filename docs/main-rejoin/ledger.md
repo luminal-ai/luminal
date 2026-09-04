@@ -2792,6 +2792,242 @@ shape of the target; nothing here yet has a downstream to serve.
 - **`detach_dirty_external_output_bindings`**: not reachable; folded into #418
   requirement 3 as a sentence (above).
 
+## Program: #420/#422 rejoin — Phase 3 (persistent device + arena)
+
+**The move.** The CUDA-lite runtime got a device that outlives a call and
+a memory plan. Before this, every `execute` built a fresh `CudaContext`,
+a fresh `KernelCache` (so every kernel was recompiled from source), and
+one `alloc_zeros` per plan buffer — every buffer live for the whole call,
+which is the SUM of everything the plan names. The bufferizer had been
+computing lifetimes (`BufferAlloc` opens storage, `BufferFree` closes it,
+the containment certificate puts every toucher between the two) and
+nothing consumed them. #422's arena consumes them.
+
+**Austin's rulings this implements** (2026-09-03). "The arena lives in
+the cuda runtime… first produce the bufferizer, this will do the
+allocations / frees. Then a separate thing will map those allocation /
+frees to slices on memory in the arena allocator." "Runtime owns this
+code. Try to factor it into a reasonable module." "Buckets will always be
+concrete, not symbolic, so we should be good on sizing." #401 as
+superseded by #422: ONE runtime-owned slab, grow-only, never parked.
+Zero-copy rebinding: "let's not implement any checks in the runtime… I
+don't want to touch this code unnecessarily, let's keep it simple" — no
+new invariant checks were added; the one existing check was re-scoped
+(below). Each runtime remembers its own buffer hygiene.
+
+### What landed
+
+| Where | What |
+| --- | --- |
+| `crates/luminal_cuda_lite/src/arena.rs` (new) | The device-free planning pass. `plan_arena(plan, bytes_of) -> ArenaPlan`, generic over `L: PlanLayout`, no cudarc — it compiles and its five tests run on a laptop. |
+| `crates/luminal_cuda_lite/src/device.rs` | `CudaDevice` (context + one stream + module cache + slab), `execute_plan(&mut CudaDevice, plan, staged)`, arena-bound storage, the kernel-invariant record. |
+| `crates/luminal_cuda_lite/src/runtime.rs` | One field: `device: Option<CudaDevice>`, created on the first `execute`. `CudaRuntime: Default` unchanged. |
+| `crates/luminal_cuda_lite/src/ops/cublaslt/device_call.rs` | `dispatch` takes `DeviceRange` (pointer + length) instead of `&CudaSlice`/`&mut CudaSlice`. |
+| `crates/luminal_cuda_lite/src/lib.rs` | `pub mod arena;` |
+
+`ArenaPlan` is `{ order: Vec<NodeIndex>, slab_bytes, peak_live_bytes,
+slices: FxHashMap<BufferId, ArenaSlice{offset, bytes}>, standalone:
+Vec<BufferId>, donated: Vec<BufferId> }`. `bytes_of` is the caller's, so
+tests plan with mock sizes and the executor passes the one real rule
+(`literal_span_elements() * dtype_bytes`) — the same closure the arena
+and Phase 1 both call, so the two can never disagree about a size.
+Alignment is 256 bytes. `peak_live_bytes` is diagnostic: the largest
+total of simultaneously-live reservations, i.e. what a perfect allocator
+would need, so the gap against `slab_bytes` prices fragmentation.
+
+### The ownership rows: only one is recyclable
+
+| row | `Owner` | `FreedBy` | alloc | free | arena |
+| --- | --- | --- | --- | --- | --- |
+| BOUNDARY | `Caller` | `Caller` | — | — | `standalone` |
+| DONATED | `Caller` | `Program` | — | yes | `donated` |
+| ESCAPING | `System` | `Caller` | yes | — | `standalone` |
+| INTERIOR | `System` | `Program` | yes | yes | **slab member** |
+
+Only INTERIOR has both ends of its lifetime inside the program, which is
+the precondition for handing its bytes to a later buffer. ESCAPING bytes
+are the caller's from return on — re-letting them would hand the caller a
+range the next call overwrites. DONATED storage came from the caller and
+the program's free RELEASES it; that is not a licence to re-let it (in CL
+the "caller's slice" is the device copy of the staged host payload, so it
+is allocated in Phase 1 like the standalone rows and simply never
+recycled). An INTERIOR buffer whose alloc/free pair is missing from the
+dag — a hand-built or externally loaded plan — is DEMOTED to standalone,
+which is exactly CL-2's behaviour, so those plans still run and
+`slab_bytes` is 0.
+
+### The order policy, and the thing that was measured
+
+The issue order is the arena's, not `petgraph::algo::toposort`'s. Raw
+toposort is legal and terrible: allocs have in-degree zero, Kahn hoists
+every one of them to the front, and the high-water mark equals the sum
+(verdict C7). The policy is:
+
+1. a `BufferFree` whose in-edges are discharged goes FIRST (its in-edges
+   are Data from the final resident's producer plus Anti from every other
+   toucher, so this is "free the instant the last toucher has run");
+2. a `BufferAlloc` **is never queued at all — it is PULLED**: its edge to
+   its first toucher is left out of that toucher's in-degree, and popping
+   the toucher emits its not-yet-issued alloc predecessors immediately
+   before it;
+3. ties break on node index — the bufferizer's own emission order.
+
+**Rule 2 is the finding.** Queueing allocs at the LOWEST priority is not
+enough, and the first cut did exactly that. The frontier stalls
+constantly (every compute node waits on its own destination's alloc), so
+the scheduler must issue *some* alloc, and a node-index tie-break issues
+one whose toucher is nowhere near ready. Measured on a two-layer
+mini-llama block (d=128, 484 plan nodes) on the A100: the six d×ff weight
+materializations were allocated at positions 1..27 and first TOUCHED at
+447..475; median lifetime was 233 of 484 nodes; the high-water mark came
+to 1 823 744 B against a naive sum of 1 845 482 B — a 1% saving. Peak-live
+equalled the high-water almost exactly, so it was never fragmentation:
+the order really was holding everything live. With the pull, on the same
+plan: median lifetime 6 nodes, high-water 596 480 B.
+
+Against bufferize's own node-index placement (the alternative the brief
+named): on the CPU chain fixture both give the peak (2 048 B for five
+1 000 B buffers; raw toposort gives 5 120 B = the sum). The pulled order
+is never worse there, and unlike node-index order it is a topological
+order by construction on any plan, so it ships. The test asserts all
+three numbers.
+
+The allocator is first fit over the free list in offset order, coalescing
+both neighbours on a free and growing through a tail hole rather than
+stranding it. **Best fit was tried and is WORSE** — 663 040 B against
+596 480 B on the same plan, because it shaves every large hole into
+slivers nothing later fits into. Recorded at the allocator. The next move,
+if this is ever worth more, is offset assignment over whole lifetimes
+(the greedy-by-size arena planners), which is a different pass rather
+than a different line.
+
+### The kernel invariant
+
+A recycled range arrives holding the previous occupant's bytes, so NO
+memset is emitted anywhere and every family had to be audited (the record
+lives at the top of `device.rs`):
+
+- **elementwise / cast / constant / iota / gather / index-map
+  materialize / copy** — one thread per destination element, `out[i] =
+  <expr>` over `n = numel(dest_dims)`; and the destination is not even
+  passed to the launch (the executor hands the kernel
+  `reads[..reads.len()-writes.len()]`, which drops the DPS dest operand),
+  so it cannot be read;
+- **reduce** — `out[i] = acc` over `n = outer*inner`, the whole
+  destination, `acc` seeded from `init`;
+- **scatter** — two launches: the first is `out[i] = init[...]` over the
+  FULL destination numel (a rank/extent mismatch bails), so the
+  destination is completely written before the second launch scatters
+  into it; same stream, so the phases are ordered;
+- **cuBLASLt D** — `beta = 0` on the non-fold forms, which is the BLAS
+  skip (C, aliased to D, is not read); the C-fold forms read a separate C
+  OPERAND buffer at `beta = 1`, never the destination's prior bytes.
+
+Standing assumption, recorded rather than checked: a destination's
+`numel(dest_dims)` covers its buffer's SPAN. True for every codegen'd
+kernel because the elected destination layout must be right-major
+contiguous (the egglog write-capability guard, 2026-09-01) and for
+cuBLASLt because `bind_destination` admits only the two dense orders. A
+future non-dense destination would leave the span's tail holding the
+previous occupant's bytes and would need the memset this note says we do
+not do.
+
+### CONTRACT-1: re-scoped, not dropped, not duplicated
+
+The whole-plan `binding_check::assert_disjoint` at bind time would now
+fire BY DESIGN — every slab member is a sub-range of one allocation. It
+was not the right question for them either: what folded-view reads and
+WAR ordering need is that two SIMULTANEOUSLY BOUND `BufferId`s do not
+share a byte. So the check splits along the same seam as the memory:
+
+- the executor still runs `assert_disjoint` over the allocations IT makes
+  (the standalone and donated rows) — the raw-pointer binding surface the
+  module was written for, one call per execute;
+- the slab's half is decided at PLANNING time, in `arena.rs`, as each
+  range is carved: the live set is kept sorted by offset and the new
+  range is checked against its two neighbours (a sorted disjoint set stays
+  disjoint iff every insertion clears its neighbours). O(log k) per alloc,
+  device-free, and it refuses with the same CONTRACT-1 vocabulary.
+
+No other check was added. `BufferFree` drops the binding, so a plan that
+reads a freed buffer gets a loud "no live binding" instead of stale bytes;
+that is the absence of stale state, not a new fence. The owned
+allocations themselves are held to the end of the call.
+
+### Bindings are pointers now
+
+A slab range is a BORROW of one allocation, and no set of
+`CudaView`/`CudaViewMut` handles can coexist under the borrow checker
+when a launch reads several ranges and writes another. Storage is
+therefore `(pointer, length)`: pushing the pointer as a kernel argument
+is ABI-identical to pushing a `&CudaSlice` (cudarc pushes exactly that
+`CUdeviceptr`), copies go through `cudarc::driver::result::memcpy_*_async`
+on the one stream — the same calls cudarc's own safe wrappers make — and
+the stream-event bookkeeping those handles carry is inert here, because
+CL issues everything on one stream and
+`is_managing_stream_synchronization()` is false. A multi-stream executor
+would owe those events; that is written down at the type.
+
+### Measurements (A100, `LUMINAL_CL_ARENA=1`)
+
+mini-llama blocks through the real ladder (load → search at the harness
+budget → execute), all numbers in bytes:
+
+| plan | nodes | interior buffers | interior SUM | slab high-water | peak live | whole-plan sum (CL-2) | total now |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| L1 d128 | 257 | 84 | 907 730 | 298 496 | 296 192 | 1 404 382 | 795 148 |
+| L2 d128 | 484 | 159 | 1 845 482 | 596 480 | 498 176 | 2 837 750 | 1 588 748 |
+| L4 d256 | 872 | 287 | 15 892 710 | 5 254 656 | 5 254 144 | 23 791 858 | 13 153 804 |
+
+The interior row shrinks by 3.0–3.1× and the whole device footprint by
+1.77–1.81× (weights and boundary storage are most of what is left, and
+they are not the arena's to shrink). Fragmentation is under 1% at L1 and
+L4 and 20% at L2. Median buffer lifetime is 6 plan nodes at every size.
+The device_fidelity fixtures are all under 1 KB, so 256-byte alignment
+dominates there and the slab reads LARGER than the sum; the signal at
+that scale is the slot count (5 interior buffers into 3 slots, 3 into 2).
+
+Device suites at `0446476b`, A100-SXM4-40GB: unit 10/10, codegen_identity
+13/13, composed_read_families 5/5, cublaslt_bias_premise 3/3,
+cublaslt_contracts_cpu 19/19, cublaslt_election 9/9, **device_fidelity
+6/6**, **device_view_differentials 4/4**, dim_buckets 4/4, example_smoke
+1/1, input_producer_cleanup 5/5, ladder_refusals 3/3 (3 ignored),
+plan_smoke 2/2, scc_sampler_marker 1/1, view_admission 4/4.
+cublaslt_contracts 5/6: `marker_elected_bias_plan_matches_decomposed_
+route_tolerance_based` fails on its ELECTION assert (seed 0 no longer
+elects `CublasLtBias`), which is PRE-EXISTING — reproduced at the Phase 1
+tip and on a laptop with no GPU, i.e. entirely in the device-free search
+path. It is the pin class the 2026-09-02 permutation-invariance ruling
+already parked. `all_four_contract_forms_execute_green` passes, so the
+`DeviceRange` dispatch is device-verified.
+
+**Also carried** (separate commit): `--features device --all-targets` did
+not build at the Phase 1 tip — Step B's `TypedBuffer`→`HostBuffer` swap
+left `HostBuffer::F32(values)` in the example support module and the
+cuBLASLt contract test, plus a `Vec<f32> == &Vec<f32>` in plan_smoke's
+device arm. cudarc builds fine on macOS (dynamic loading), so this is a
+laptop gate, not a box-only one.
+
+### Deferred
+
+- **Search-time slab policy** → Phase 4. This pass sizes ONE installed
+  plan; sizing across the candidate plans a search evaluates (and whether
+  the search should rank on arena footprint at all) is that phase's.
+- **Zero-copy outputs.** Phase 4 D2Hs every output slot into a fresh host
+  vector, as before. Handing the caller device memory it can keep is the
+  ESCAPING row's whole point and nothing here consumes it yet.
+- **Symbolic sizing.** `bytes_of` refuses a symbolic span. Buckets are
+  concrete by ruling, so nothing needs it today.
+- **The 32 MiB cuBLASLt workspace** is still allocated per call inside
+  `device_call::dispatch`. Now that the device is persistent it should
+  live on `CudaDevice`; it is untouched here because the file belongs to
+  the cuBLASLt estate.
+- **Multi-stream.** Everything is issued on one stream and the
+  recycling's soundness rests on that: issue order IS execution order.
+  Events/barriers are owed the day a second stream appears.
+- **Kernel-count printing** in the examples' support module counts
+  `Compute` nodes including `BufferAlloc`/`BufferFree`; left as is.
+
 ## #406 pad — the select construction REVERTED (2026-09-03)
 
 Ruling 4b's "option i" (`select_by_index`: packed 2N iota + two `scatter1d` +
