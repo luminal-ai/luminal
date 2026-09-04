@@ -20,11 +20,13 @@ the self-contained repo-side summary.
 - `CudaRuntime::allow_list()` derives from the table — search can
   only elect what codegen covers. Pinned as a strict subset of the
   reference inventory (`tests/plan_smoke.rs`).
-- Candidate profiling during search runs on the reference HOST
-  executor — a documented CL-1 cost proxy (the profiler seam
-  parameterization is CL-3; the loop now lives in
-  `crates/luminal_cuda_lite/src/search.rs`, ranking through
-  `crates/luminal_cuda_lite/src/heuristic.rs`).
+- Candidate ranking during search is DEVICE-FREE BY DEFAULT: the loop
+  is this crate's own copy (`crates/luminal_cuda_lite/src/search.rs`)
+  and ranks by `src/heuristic.rs::heuristic_cost_of` — a bytes-moved
+  prior, never a measurement. There is no profiler trait in core or
+  here any more. On-device candidate profiling arrived in Phase 4 of
+  the #420/#422 rejoin, behind `CompileOptions::profile_on_device`
+  (`src/profile.rs`), and needs the `device` feature and a device.
 - `execute` is behind the `device` feature and refuses loudly
   without it. Plan-layer tests are green on macOS.
 - The predecessor crate targeting the deleted HLIR pipeline is parked
@@ -51,7 +53,9 @@ egglog-experimental #60.)
 ## CL-2: device bring-up (the work on the CUDA machine)
 
 1. Write `src/device.rs` (`#[cfg(feature = "device")]`,
-   `execute_plan(plan, staged) -> Result<FxHashMap<i64, TypedBuffer>>`):
+   `execute_plan(plan, staged: &FxHashMap<i64, HostBuffer>) ->
+   Result<FxHashMap<usize, (HostBuffer, OutputBinding<DecodedLayout>)>>`,
+   keyed by output slot):
    - Phase 1 — materialize: for every plan `Buffer`, require
      `dims`+`dtype` (loud on `None`), device-alloc `numel × bytes`;
      H2D staged `lit` buffers (length/dtype-checked, no conversion);
@@ -66,7 +70,9 @@ egglog-experimental #60.)
      operand device pointers in slot order then dest pointers then
      `n`. OUT-OF-PLACE: allocate fresh dests (mirrors the reference
      alias-safety convention; `ties` honored only as ordering).
-   - Phase 4 — D2H every output-role buffer into `TypedBuffer`s.
+   - Phase 4 — D2H every output-role buffer into `HostBuffer`s
+     (`src/host_buffer.rs`; CL does not use the reference runtime's
+     `TypedBuffer`, ruling D4).
    - Salvage: NVRTC compile-to-CUBIN with header-version probing is
      `../luminal_cuda_lite_hlir/src/lib.rs`
      (`compile_module_image_for_current_device`); kernel-cache and
@@ -85,9 +91,11 @@ egglog-experimental #60.)
 
 - CL-3: CUDA-native ops (cuBLASLt matmul first) — needs the
   matcher-injectable search (`ExtractionSession::new_with_matchers`,
-  `search_implementations_with_matchers`) and the profiler
-  parameterization; the parked crate's `host/cublaslt/` carries the
-  kernels and ten `.egg` rewrite files as raw material.
+  `search_implementations_with_matchers`); the parked crate's
+  `host/cublaslt/` carries the kernels and ten `.egg` rewrite files as
+  raw material. (No profiler seam is needed or exists: ranking is
+  either the device-free heuristic or Phase 4's direct device
+  measurement.)
 - CL-4: in-place ties (the Mutating family — deferred per Austin
   2026-08-17: "don't worry about retiring mutation… cleaning later"),
   view admission + resident-geometry join

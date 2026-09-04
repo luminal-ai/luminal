@@ -3,13 +3,18 @@
 //! search claiming only this backend's codegen inventory and execution
 //! delegated to the `device` module.
 //!
-//! Everything up to `execute` is device-free and runs anywhere: load
-//! accumulates the native program parts, bind_* appends bounds seeds,
-//! search assembles + saturates + runs THIS crate's genetic search
-//! ([`crate::search`]) with OUR allow list, ranking candidates by the
-//! device-free heuristic ([`crate::heuristic`] — a weak static prior,
-//! not a measurement). Only `execute` requires the `device` feature and
-//! a CUDA device.
+//! Everything up to `execute` is device-free BY DEFAULT and runs
+//! anywhere: load accumulates the native program parts, bind_* appends
+//! bounds seeds, search assembles + saturates + runs THIS crate's
+//! genetic search ([`crate::search`]) with OUR allow list, ranking
+//! candidates by the device-free heuristic ([`crate::heuristic`] — a
+//! weak static prior, not a measurement). Two things need the `device`
+//! feature and a CUDA device: `execute`, and a `search` with
+//! [`crate::search::CompileOptions::profile_on_device`] set (Phase 4),
+//! which creates the device lazily, stages the caller's payloads, and
+//! ranks by measured time (the `profile` module, `device` only) — on a
+//! device-free build it refuses by name rather than falling back to the
+//! prior.
 
 use crate::host_buffer::HostBuffer;
 use anyhow::{anyhow, bail, Context, Result};
@@ -86,11 +91,12 @@ pub struct CudaRuntime {
     /// refuse.
     range_bound: std::collections::BTreeMap<shape::Symbol, (u64, u64)>,
     /// THE PERSISTENT DEVICE (#422, rejoin Phase 3): context, stream,
-    /// NVRTC module cache and the arena slab, created on the first
-    /// [`Self::execute`] and kept for the runtime's life — "each runtime
-    /// remembers its own buffer hygiene". `None` until then, so
-    /// `Default` still gives a device-free runtime that plans and
-    /// searches on any host.
+    /// NVRTC module cache and the arena slab, created lazily — by the
+    /// first device-profiled [`Self::search`] (Phase 4) or by the first
+    /// [`Self::execute`], whichever comes first — and kept for the
+    /// runtime's life, "each runtime remembers its own buffer hygiene".
+    /// `None` until then, so `Default` still gives a device-free runtime
+    /// that plans and searches by the heuristic on any host.
     #[cfg(feature = "device")]
     device: Option<crate::device::CudaDevice>,
 }
@@ -131,11 +137,14 @@ impl CudaRuntime {
     ///
     /// Build the argument with [`crate::ops::cuda_registry_filtered`]
     /// (narrow either preset by label or constructor) or by pushing
-    /// [`crate::ops::RegisteredOp::new`] rows onto one. A row whose op
-    /// is neither kernel-bearing, plan-transparent, nor host-dispatchable
-    /// is simply not claimable — it never reaches the allow list, so the
-    /// search refuses loudly instead of electing something the device
-    /// cannot run.
+    /// [`crate::ops::RegisteredOp::new`] rows onto one. A row whose op is
+    /// neither plan-transparent, host-dispatchable, nor spelled with a
+    /// LABEL the kernel table carries is simply not claimable — it never
+    /// reaches the allow list, so the search refuses loudly instead of
+    /// electing something the device cannot run. A row that REUSES a
+    /// kernel-table label is claimed; if its extracted op is not the CL
+    /// type behind that label, the `TypeId` lookup misses and the plan is
+    /// refused at [`Self::execute`], not at search.
     ///
     /// ONE EXCEPTION TO ROW-BY-ROW SELECTION: the four cuBLASLt marker
     /// rows are ONE vocabulary, declared and minted by the Base row's
@@ -465,6 +474,10 @@ impl CudaRuntime {
     /// Assemble, saturate, and search — with THIS backend's allow list.
     /// On saturation failure the labeled post-checks are re-run in
     /// isolation to name the door, mirroring the reference runtime.
+    ///
+    /// With `options.profile_on_device` this needs the `device` feature
+    /// and a CUDA device: it creates the device lazily and ranks by
+    /// measured time (see the `profile` module, `device` only).
     pub fn search(
         &mut self,
         input_data: &FxHashMap<NodeIndex, HostBuffer>,

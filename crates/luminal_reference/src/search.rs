@@ -22,7 +22,10 @@
 //! duplicates reuse the cached measurement instead of burning profile
 //! time (the plan-hash dedup ruling, 2026-07-27).
 //!
-//! THE TESTS FOR ALL THREE SEARCH COPIES LIVE HERE. The CUDA-lite copy
+//! THE SEARCH-LOOP TESTS FOR ALL THREE COPIES LIVE HERE (`progress_tests`,
+//! `sampler_tests`, the dedup search test). The one exception is
+//! `early_stop_tests`: each runtime copy carries its own, beside its
+//! duplicated `early_stop_exceeded` (Phase 4). `test_runtime::sampler`
 //! carries none.
 
 use std::collections::BTreeMap;
@@ -325,7 +328,7 @@ pub struct RefusalBreakdown {
     /// can only be nonzero through the sampler's documented full-list
     /// fallback — a component position with no acyclic option at all.
     /// A choice cycle on an acyclic chosen-edge graph is a sampler bug
-    /// and stops the search (see `search_implementations_with_runtime`).
+    /// and stops the search (see `search_implementations_with_ops`).
     /// Genomes assembled by hand (the election boards) are of course
     /// still free to name cycles, and are still counted here.
     pub with_choice_cycles: usize,

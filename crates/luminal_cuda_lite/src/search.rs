@@ -27,7 +27,9 @@
 //! not consulted at all (D6's "doesn't bias search too much", taken at
 //! full strength — a device build ranks on measured time only).
 //!
-//! Tests live with the reference copy (`luminal_reference::search`).
+//! The search-loop tests live with the reference copy
+//! (`luminal_reference::search`); this file carries only
+//! `early_stop_tests`, for its own copy of `early_stop_exceeded`.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -325,7 +327,7 @@ pub struct RefusalBreakdown {
     /// can only be nonzero through the sampler's documented full-list
     /// fallback — a component position with no acyclic option at all.
     /// A choice cycle on an acyclic chosen-edge graph is a sampler bug
-    /// and stops the search (see `search_implementations_with_runtime`).
+    /// and stops the search (see `search_implementations`).
     /// Genomes assembled by hand (the election boards) are of course
     /// still free to name cycles, and are still counted here.
     pub with_choice_cycles: usize,

@@ -28,11 +28,18 @@
 //! trait answers on the prototype and travel with a `RegisteredOp`, but
 //! a row that must actually be EXECUTED needs a codegen row in
 //! [`crate::kernels`], which is keyed by `TypeId` inside this crate.
-//! An outside row without one is simply not claimable: search never
-//! elects it (it is absent from the derived allow list), so the failure
-//! is a refusal, never a wrong plan. Composing an external kernel
-//! superset onto Lite's codegen ("cuda heavy") is PUNTED — no execution
-//! face on `RegisteredOp`, no change to the kernel table's keying.
+//! The kernel-bearing class is matched by LABEL (the constructor minus
+//! `LayoutTensorOp`, `Generic` suffix tolerated) against the kernel
+//! table, while codegen is looked up by `TypeId` at execute. An outside
+//! row whose label matches no kernel-table label never reaches the allow
+//! list, so search refuses. An outside row that REUSES a kernel-table
+//! label IS claimed and can be elected; if the op it extracts is not the
+//! CL type behind that label, the plan is refused at
+//! [`crate::CudaRuntime::execute`] (`no cuda codegen for <label>`) —
+//! loud, never a wrong plan, but not at search. Composing an external
+//! kernel superset onto Lite's codegen ("cuda heavy") is PUNTED — no
+//! execution face on `RegisteredOp`, no change to the kernel table's
+//! keying.
 
 pub mod add;
 pub mod cast;
