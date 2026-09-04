@@ -1,50 +1,19 @@
-//! The CUDA-lite runtime's LAYOUT vocabulary and decoder (resident-
-//! geometry cleanup, ruling 2026-08-31; Option B rework). Core's
-//! bufferizer is generic over an opaque layout type; this backend
-//! instantiates it with a TYPED layout — the shared mirror vocabulary
-//! (`luminal::layouts`, a core convenience module the bufferizer itself
-//! never calls) plus the value's `dtype-of` fact. Its own choice, not a
-//! core contract: a backend may bring layouts core has never heard of.
-//! The dtype rides the RUNTIME's own type, not plan vocabulary, and is
-//! what makes Option-B plans self-contained for externally loaded plans.
+//! The CUDA-lite runtime's PLAN-LAYOUT vocabulary and its read-back
+//! helpers.
+//!
+//! There is no CUDA-flavored layout type and no CUDA-flavored decoder
+//! any more (ruling D9, 2026-09-03): core owns the decoder and publishes
+//! the struct it produces ([`luminal::layouts::DecodedLayout`] — the
+//! shared mirror vocabulary plus the value's `dtype-of` fact), and the
+//! runtimes import it directly. A backend that wants a layout core has
+//! never heard of is still free to bring its own type; this one does
+//! not.
 
 use anyhow::Result;
-use luminal::layout_ir::LayoutTensorInfo;
-use luminal::prelude::egraph_serialize::EGraph;
-
-/// The CUDA-lite runtime's opaque plan-layout type: the decoded mirror
-/// layout plus the value's dtype fact (`None` bails loudly at use,
-/// never silently).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CudaLayout {
-    pub mirror: luminal::layouts::MirrorLayout,
-    pub dtype: Option<luminal::dtype::PlanDtype>,
-}
+pub use luminal::layouts::DecodedLayout;
 
 /// The CUDA-lite bufferized plan.
-pub type CudaPlan = luminal::bufferize::BufferIrGraph<CudaLayout>;
-
-/// The extraction-side layout decoder: minimal-faithful — the five
-/// constructor spellings decode into the mirror structs, preferring the
-/// most-structured spelling present (a decoding preference only), with
-/// the value's dtype fact carried alongside. No normalization, no
-/// analysis; failure is loud and refuses the plan. Pure in
-/// `(layout class, dtype fact)` — the decoder cache contract.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CudaLayoutDecoder;
-
-impl luminal::layout_ir::LayoutDecoder<CudaLayout> for CudaLayoutDecoder {
-    fn decode(&self, egraph: &EGraph, value: &LayoutTensorInfo) -> Result<CudaLayout> {
-        Ok(CudaLayout {
-            mirror: luminal::layouts::decode_layout_for(
-                egraph,
-                &value.layout.eclass,
-                "cuda-lite layout decoder",
-            )?,
-            dtype: value.dtype_enum,
-        })
-    }
-}
+pub type CudaPlan = luminal::bufferize::BufferIrGraph<DecodedLayout>;
 
 // ===========================================================================
 // READING BACK through a returned layout — this runtime evaluating its OWN
@@ -96,7 +65,7 @@ pub fn eval_term(expr: &luminal::layouts::IntExprTerm, coords: &[usize]) -> Resu
 /// flat ELEMENT index into the backing buffer. Fail-closed on symbolic
 /// extents, foreign-rank coordinates, out-of-domain coordinates, a
 /// mid-element bit offset, and a negative result.
-pub fn element_index(layout: &CudaLayout, coords: &[usize]) -> Result<usize> {
+pub fn element_index(layout: &DecodedLayout, coords: &[usize]) -> Result<usize> {
     use luminal::layouts::MirrorLayout as M;
     let extents = layout
         .mirror
@@ -152,7 +121,7 @@ pub fn element_index(layout: &CudaLayout, coords: &[usize]) -> Result<usize> {
 /// it in dense" comparison helper. THE BACKING LENGTH IS THE ONLY REACH
 /// AUTHORITY (offset-form layouts disclose none), so every index is
 /// bounds-checked against it.
-pub fn dense_f32(backing: &[f32], layout: &CudaLayout) -> Result<Vec<f32>> {
+pub fn dense_f32(backing: &[f32], layout: &DecodedLayout) -> Result<Vec<f32>> {
     let dims = layout
         .mirror
         .literal_extents()

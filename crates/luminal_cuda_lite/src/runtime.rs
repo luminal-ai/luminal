@@ -14,9 +14,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use luminal::buffer_tensor_ir::TypedBuffer;
 use luminal::bufferize::BufferIrGraph;
 
-use crate::layouts::CudaLayout;
 use luminal::graph;
 use luminal::implementation_search::{ImplementationSearchOptions, SearchOutcome};
+use luminal::layouts::DecodedLayout;
 use luminal::prelude::{FxHashMap, NodeIndex};
 use luminal::shape;
 
@@ -41,14 +41,20 @@ pub struct CudaRuntime {
     /// re-description 2-cycle (see [`crate::ops::cuda_registry_with_cublaslt`]);
     /// enabled through [`CudaRuntime::load_with_cublaslt`].
     cublaslt: bool,
-    plan: Option<BufferIrGraph<CudaLayout>>,
+    plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Host-staged input payloads by BufferLit id, H2D'd at execute.
     staged: FxHashMap<i64, TypedBuffer>,
     /// Host copies of each output slot's BACKING buffer plus its elected
     /// layout, filled by execute (D2H) — the escape-and-disclose fetch,
     /// keyed by slot index (an escaped slot's backing buffer is a minted
     /// allocation with no BufferLit, so slot order is the stable key).
-    outputs_host: FxHashMap<usize, (TypedBuffer, luminal::bufferize::OutputBinding<CudaLayout>)>,
+    outputs_host: FxHashMap<
+        usize,
+        (
+            TypedBuffer,
+            luminal::bufferize::OutputBinding<DecodedLayout>,
+        ),
+    >,
     input_buffers: FxHashMap<NodeIndex, i64>,
     /// Bound output tensor → its slot index (program slot order).
     output_index: FxHashMap<NodeIndex, usize>,
@@ -245,7 +251,7 @@ impl CudaRuntime {
         &mut self,
         input_data: &FxHashMap<NodeIndex, TypedBuffer>,
         options: &ImplementationSearchOptions,
-    ) -> Result<SearchOutcome<CudaLayout>> {
+    ) -> Result<SearchOutcome> {
         let (serialized, program) = self.assemble_and_saturate()?;
         let native = self
             .native
@@ -266,7 +272,6 @@ impl CudaRuntime {
                 Self::allow_list()
             }),
             self.matchers(),
-            &crate::layouts::CudaLayoutDecoder,
             &mut luminal::implementation_search::StaticProfiler,
         )?;
 
@@ -359,7 +364,10 @@ impl CudaRuntime {
     pub fn fetch(
         &self,
         tensor: NodeIndex,
-    ) -> Result<(&TypedBuffer, &luminal::bufferize::OutputBinding<CudaLayout>)> {
+    ) -> Result<(
+        &TypedBuffer,
+        &luminal::bufferize::OutputBinding<DecodedLayout>,
+    )> {
         let index = self
             .output_index
             .get(&tensor)
@@ -374,12 +382,12 @@ impl CudaRuntime {
     pub fn output_layout(
         &self,
         tensor: NodeIndex,
-    ) -> Result<&luminal::bufferize::OutputBinding<CudaLayout>> {
+    ) -> Result<&luminal::bufferize::OutputBinding<DecodedLayout>> {
         Ok(self.fetch(tensor)?.1)
     }
 
     /// The searched plan, for inspection and tests.
-    pub fn plan(&self) -> Option<&BufferIrGraph<CudaLayout>> {
+    pub fn plan(&self) -> Option<&BufferIrGraph<DecodedLayout>> {
         self.plan.as_ref()
     }
 }

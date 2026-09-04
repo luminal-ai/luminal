@@ -91,9 +91,9 @@ use crate::layout_ir::{
 /// classifies, sizes, or even COMPARES them (layout equality is
 /// enforced in the e-graph, where all spellings of a layout class
 /// denote one function — no tripwire is re-derived here). There is no
-/// layout vocabulary in core: the RUNTIME provides the concrete type
-/// when it builds plans (its extraction-side layout decoder produces
-/// the values — see [`crate::layout_ir::LayoutDecoder`]), and backends
+/// layout vocabulary in core: the CALLER provides the concrete type
+/// when it builds plans (both shipped runtimes pass core's decoded
+/// struct — see [`crate::layouts::decode_layout_table`]), and backends
 /// are free to use layouts core has never heard of.
 /// Blanket-implemented: the bound IS the whole contract.
 pub trait PlanLayout: Clone + std::fmt::Debug {}

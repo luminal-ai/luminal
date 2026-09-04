@@ -49,7 +49,7 @@ fn plan_for(
     cx: &Graph,
     inputs: &[(NodeIndex, TypedBuffer)],
     seed: u64,
-) -> BufferIrGraph<luminal_cuda_lite::CudaLayout> {
+) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
     let data: FxHashMap<NodeIndex, TypedBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
@@ -63,7 +63,7 @@ fn plan_for(
 /// (descriptor ctx → codegen row). Returns
 /// (label, launch sources, composed operand slots).
 fn rendered(
-    plan: &BufferIrGraph<luminal_cuda_lite::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
 ) -> Vec<(String, Vec<String>, Vec<usize>)> {
     let mut out = Vec::new();
     for node in plan.dag.node_weights() {
@@ -112,7 +112,7 @@ fn rendered(
 
 /// The single node with `label` in the plan, rendered.
 fn the_one(
-    plan: &BufferIrGraph<luminal_cuda_lite::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
     label: &str,
 ) -> (Vec<String>, Vec<usize>) {
     let hits: Vec<_> = rendered(plan)
@@ -485,7 +485,7 @@ fn materialize_lowers_a_folded_input_operand() {
         use luminal::layouts::{
             BitWidthTerm, IntExprTerm, MirrorLayout, ShapeTerm, StridedElementLayout,
         };
-        use luminal_cuda_lite::layouts::CudaLayout;
+        use luminal_cuda_lite::layouts::DecodedLayout;
 
         let dims =
             |extents: &[i64]| ShapeTerm(extents.iter().map(|&e| IntExprTerm::Lit(e)).collect());
@@ -493,7 +493,7 @@ fn materialize_lowers_a_folded_input_operand() {
         // x^T seen at the parent VALUE's coordinates (3,2): x is (2,3)
         // row-major, so x^T[a][b] = x flat b*3 + a — the chain
         // [c_last, c_first*3] over domain (3,2).
-        let composed = CudaLayout {
+        let composed = DecodedLayout {
             mirror: MirrorLayout::Strided(StridedElementLayout {
                 shape: dims(&[3, 2]),
                 // Coord counts FROM THE END: p0 (first axis) is
@@ -506,14 +506,14 @@ fn materialize_lowers_a_folded_input_operand() {
             }),
             dtype: Some(luminal::dtype::PlanDtype::F32),
         };
-        let rm = |extents: &[i64]| CudaLayout {
+        let rm = |extents: &[i64]| DecodedLayout {
             mirror: MirrorLayout::RightMajor(luminal::layouts::RightMajorContiguousElementLayout {
                 shape: dims(extents),
                 width: BitWidthTerm(32),
             }),
             dtype: Some(luminal::dtype::PlanDtype::F32),
         };
-        let slot = |layout: CudaLayout| luminal::bufferize::SlotDescriptor {
+        let slot = |layout: DecodedLayout| luminal::bufferize::SlotDescriptor {
             value: luminal::prelude::egraph_serialize::ClassId::from("probe"),
             buffer: luminal::bufferize::BufferId::Allocated(0),
             layout,

@@ -1455,7 +1455,7 @@ mod harness_tests {
     /// the bounds-row encoding), but they NO LONGER thread onto plan
     /// buffers: `PlanDtype` left the plan and bufferizer vocabulary
     /// entirely. What they thread onto is the RUNTIME'S OWN `L` — here
-    /// `RefLayout { mirror, dtype }` — which the reference decoder folds
+    /// `DecodedLayout { mirror, dtype }` — which the reference decoder folds
     /// at extraction time and which Option B then carries on each
     /// assignment entry.
     ///
@@ -1471,14 +1471,9 @@ mod harness_tests {
         use luminal::dtype::PlanDtype;
         let egraph = serialize_fixture("boundary_gather.egg");
         let graph = luminal::dps::dps_rewrite(&extract_fixture("boundary_gather.egg"));
-        let mut cache = std::collections::HashMap::new();
-        let table = luminal::extractor::decoded_layout_table(
-            &egraph,
-            &graph, // the POST-DPS graph: value-keyed tables cover poisons
-            &luminal_reference::ReferenceLayoutDecoder,
-            &mut cache,
-        )
-        .expect("the reference decoder covers every elected value");
+        // The POST-DPS graph: value-keyed tables cover poisons.
+        let table = luminal::layouts::decode_layout_table(&egraph, &graph, "dtype row test")
+            .expect("the decoder covers every elected value");
         let plan = bufferize::bufferize(&graph, &table).expect("mixed-dtype plan bufferizes");
 
         let mut by_lit: std::collections::HashMap<i64, PlanDtype> = Default::default();
@@ -3921,20 +3916,21 @@ mod escape_execution_tests {
         OutputBinding, Owner,
     };
     use luminal::layout_ir::{Access, FreedBy};
+    use luminal::layouts::DecodedLayout;
     use luminal::prelude::petgraph::graph::DiGraph;
-    use luminal_reference::{RefLayout, ReferenceRuntime};
+    use luminal_reference::ReferenceRuntime;
 
     /// A hand-built plan's carried layout. THE ONLY SIZING INPUT: the
     /// executor allocates span-of-layout elements in the layout's dtype —
     /// no dims field, no walk, no vote.
-    fn rm_layout(dims: &[i64]) -> RefLayout {
+    fn rm_layout(dims: &[i64]) -> DecodedLayout {
         // Dep-world discipline: `luminal::layouts`, never `crate::layouts` —
-        // RefLayout is the plain `luminal` build's MirrorLayout, and the
+        // DecodedLayout is the plain `luminal` build's MirrorLayout, and the
         // cfg(test) build's types do not unify with it.
         use luminal::layouts::{
             BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
         };
-        RefLayout {
+        DecodedLayout {
             mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
                 shape: ShapeTerm(dims.iter().map(|&d| IntExprTerm::Lit(d)).collect()),
                 width: BitWidthTerm(32),
@@ -3947,12 +3943,12 @@ mod escape_execution_tests {
     /// `L` the e-graph would mint for the view value (shape `[3,2]`,
     /// reading its dense `[2,3]` parent): element (i,j) at parent flat
     /// j*3 + i, spelled as the strided chain from-end [coord0*3, coord1].
-    fn transpose_strided_layout() -> RefLayout {
+    fn transpose_strided_layout() -> DecodedLayout {
         use luminal::layouts::{
             BitWidthTerm, IntExprTerm, MirrorLayout, ShapeTerm, StridedElementLayout,
         };
         let coord = |axis_from_end: i64| IntExprTerm::Coord { axis_from_end };
-        RefLayout {
+        DecodedLayout {
             mirror: MirrorLayout::Strided(StridedElementLayout {
                 shape: ShapeTerm(vec![IntExprTerm::Lit(3), IntExprTerm::Lit(2)]),
                 chain: vec![
@@ -3970,7 +3966,7 @@ mod escape_execution_tests {
     /// producing the parent there), and the output slot binds the
     /// TRANSPOSE VIEW of that parent — backed by A, `freed_by` flipped to
     /// the escape cell.
-    fn escaped_plan(freed_by: FreedBy) -> BufferIrGraph<RefLayout> {
+    fn escaped_plan(freed_by: FreedBy) -> BufferIrGraph<DecodedLayout> {
         let x = ClassId::from("val$x");
         let v = ClassId::from("val$v");
         let input_id = BufferId::Boundary(ClassId::from("buf$B"));
@@ -4005,7 +4001,7 @@ mod escape_execution_tests {
                 layout: rm_layout(&[2, 3]),
             },
         );
-        let mut dag: DiGraph<BufferNode<RefLayout>, BufferEdge> = DiGraph::new();
+        let mut dag: DiGraph<BufferNode<DecodedLayout>, BufferEdge> = DiGraph::new();
         let input = dag.add_node(BufferNode::BufferInput {
             slots: vec![InputBinding {
                 value: x.clone(),

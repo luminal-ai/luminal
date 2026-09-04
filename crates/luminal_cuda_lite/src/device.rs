@@ -119,9 +119,9 @@ impl KernelCache {
 /// [`OutputBinding`] (the elected layout) — the escape-and-disclose
 /// fetch, universal over dense and view elections.
 pub fn execute_plan(
-    plan: &BufferIrGraph<crate::layouts::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
     staged: &FxHashMap<i64, TypedBuffer>,
-) -> Result<FxHashMap<usize, (TypedBuffer, OutputBinding<crate::layouts::CudaLayout>)>> {
+) -> Result<FxHashMap<usize, (TypedBuffer, OutputBinding<luminal::layouts::DecodedLayout>)>> {
     // ESCAPE GUARD (ruling 2026-08-27): an output slot's backing storage
     // must SURVIVE the call — FreedBy::Caller, whatever the owner.
     // FreedBy::Program backing an output hands the caller bytes the

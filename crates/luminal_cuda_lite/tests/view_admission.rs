@@ -54,7 +54,7 @@ fn view_search_options() -> ImplementationSearchOptions {
 fn plan_for(
     cx: &Graph,
     inputs: &[(NodeIndex, TypedBuffer)],
-) -> BufferIrGraph<luminal_cuda_lite::CudaLayout> {
+) -> BufferIrGraph<luminal::layouts::DecodedLayout> {
     let mut rt = CudaRuntime::load(cx).expect("cuda load");
     let data: FxHashMap<NodeIndex, TypedBuffer> = inputs.iter().cloned().collect();
     let outcome = rt
@@ -68,9 +68,9 @@ fn plan_for(
 /// (compute_count, copy_count, buffer_count, folded slots) — a "folded
 /// slot" being an operand whose carried layout does NOT reduce to the
 /// identity read over its own domain.
-type FoldedSlot = (String, usize, luminal_cuda_lite::CudaLayout);
+type FoldedSlot = (String, usize, luminal::layouts::DecodedLayout);
 fn audit(
-    plan: &BufferIrGraph<luminal_cuda_lite::CudaLayout>,
+    plan: &BufferIrGraph<luminal::layouts::DecodedLayout>,
 ) -> (usize, usize, usize, Vec<FoldedSlot>) {
     let mut computes = 0usize;
     let mut copies = 0usize;
@@ -204,7 +204,7 @@ fn eval_term(expr: &luminal::layouts::IntExprTerm, coords: &[usize]) -> i64 {
 /// frames. (Honesty note carried from the kernels module: with the chain
 /// gone, the only bounds fence is the final index against the layout's
 /// span where the constructor discloses one.)
-fn flat_index(layout: &luminal_cuda_lite::CudaLayout, out_coord: &[usize]) -> i64 {
+fn flat_index(layout: &luminal::layouts::DecodedLayout, out_coord: &[usize]) -> i64 {
     use luminal::layouts::MirrorLayout as M;
     let flat = match &layout.mirror {
         M::RightMajor(rm) => {

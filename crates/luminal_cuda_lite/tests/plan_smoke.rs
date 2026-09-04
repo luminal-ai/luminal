@@ -77,8 +77,8 @@ fn codegen_emits_wellformed_sources() {
     use luminal::layouts::{
         BitWidthTerm, IntExprTerm, MirrorLayout, RightMajorContiguousElementLayout, ShapeTerm,
     };
-    fn rm_layout(dims: &[i64]) -> luminal_cuda_lite::layouts::CudaLayout {
-        luminal_cuda_lite::layouts::CudaLayout {
+    fn rm_layout(dims: &[i64]) -> luminal_cuda_lite::layouts::DecodedLayout {
+        luminal_cuda_lite::layouts::DecodedLayout {
             mirror: MirrorLayout::RightMajor(RightMajorContiguousElementLayout {
                 shape: ShapeTerm(dims.iter().map(|&d| IntExprTerm::Lit(d)).collect()),
                 width: BitWidthTerm(32),

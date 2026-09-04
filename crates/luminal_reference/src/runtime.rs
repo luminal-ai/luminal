@@ -4,7 +4,7 @@
 //!
 //! Executes a [`BufferIrGraph`] directly: every buffer is a [`TypedBuffer`]
 //! sized by ASSIGNMENT LOOKUP (corrected contract, 2026-08-31) — the plan
-//! says which tensor a buffer backs, the carried [`RefLayout`] is that
+//! says which tensor a buffer backs, the carried [`DecodedLayout`] is that
 //! tensor's elected layout, and allocation is span-of-layout elements in
 //! the layout's own dtype. No sizing walk, no voting: every consumer
 //! takes the BufferId blindly. Compute nodes dispatch through THIS
@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 use luminal::buffer_tensor_ir::{ReferenceKernelCtx, TypedBuffer};
 use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, OutputBinding};
 
-use crate::layouts::RefLayout;
+use luminal::layouts::DecodedLayout;
 
 /// The reference backend's implementation inventory, DERIVED from the
 /// kernel registry: a matcher's op is claimed iff a kernel bearing its
@@ -64,7 +64,7 @@ struct NativeSpec {
 
 #[derive(Default)]
 pub struct ReferenceRuntime {
-    plan: Option<BufferIrGraph<RefLayout>>,
+    plan: Option<BufferIrGraph<DecodedLayout>>,
     /// Caller-staged data by numeric `BufferLit` id, consumed at `execute`.
     staged: FxHashMap<i64, TypedBuffer>,
     /// Post-execute storage, kept for `get_f32` / `get_bool`.
@@ -114,7 +114,7 @@ impl ReferenceRuntime {
     ///
     /// Boundary bindings likewise ride the plan: `Buffer::lit` is the
     /// numeric `BufferLit` key caller data binds by, indexed here.
-    pub fn load_plan(&mut self, plan: BufferIrGraph<RefLayout>) {
+    pub fn load_plan(&mut self, plan: BufferIrGraph<DecodedLayout>) {
         self.lit_index = plan
             .buffers
             .values()
@@ -214,7 +214,7 @@ impl ReferenceRuntime {
         &mut self,
         input_data: &FxHashMap<petgraph::graph::NodeIndex, TypedBuffer>,
         options: &luminal::implementation_search::ImplementationSearchOptions,
-    ) -> Result<luminal::implementation_search::SearchOutcome<RefLayout>> {
+    ) -> Result<luminal::implementation_search::SearchOutcome> {
         let spec = self
             .native
             .take()
@@ -344,7 +344,7 @@ impl ReferenceRuntime {
         // Materialize every buffer by ASSIGNMENT LOOKUP: the buffer backs
         // one tensor, whose carried layout gives the span (elements) and
         // the typed representation (the dtype fact rides the runtime's
-        // own RefLayout — width alone cannot pick a variant:
+        // own DecodedLayout — width alone cannot pick a variant:
         // bits-of(Int) == bits-of(F32)). Staged caller data is
         // variant-checked against that dtype and length-checked against
         // the span; zeros otherwise. A staged payload of the wrong
@@ -693,7 +693,10 @@ impl ReferenceRuntime {
     pub fn output_slot(
         &self,
         index: usize,
-    ) -> Result<(&TypedBuffer, &OutputBinding<crate::layouts::RefLayout>)> {
+    ) -> Result<(
+        &TypedBuffer,
+        &OutputBinding<luminal::layouts::DecodedLayout>,
+    )> {
         let binding = self.output_layout(index)?;
         let data = self
             .storage
@@ -704,7 +707,10 @@ impl ReferenceRuntime {
 
     /// Output slot `index`'s binding — buffer identity plus the elected
     /// layout (see [`Self::output_slot`]).
-    pub fn output_layout(&self, index: usize) -> Result<&OutputBinding<crate::layouts::RefLayout>> {
+    pub fn output_layout(
+        &self,
+        index: usize,
+    ) -> Result<&OutputBinding<luminal::layouts::DecodedLayout>> {
         let plan = self
             .plan
             .as_ref()
@@ -1478,13 +1484,8 @@ mod tests {
         .expect("extracts")
         .expect("plan");
         let dps = luminal::dps::dps_rewrite(&extracted);
-        let layouts = luminal::extractor::decoded_layout_table(
-            &serialized,
-            &dps,
-            &crate::layouts::ReferenceLayoutDecoder,
-            &mut std::collections::HashMap::new(),
-        )
-        .expect("layouts decode");
+        let layouts = luminal::layouts::decode_layout_table(&serialized, &dps, "test")
+            .expect("layouts decode");
         let plan = luminal::bufferize::bufferize(&dps, &layouts).expect("bufferizes");
         let mut rt = crate::ReferenceRuntime::default();
         rt.stage_slots(&program.input_slots, &program.output_slots);

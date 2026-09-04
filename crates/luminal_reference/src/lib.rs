@@ -16,7 +16,7 @@ pub mod search;
 
 pub use bindings::ReferenceBindings;
 pub use harness::{extract_layout_ir, extract_layout_ir_with_genome, producer_index_with_ops};
-pub use layouts::{RefLayout, ReferenceLayoutDecoder, ReferencePlan};
+pub use layouts::ReferencePlan;
 pub use runtime::{reference_allow_list, ReferenceRuntime};
 pub use search::{search_implementations, search_implementations_with_ops, ReferenceProfiler};
 

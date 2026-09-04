@@ -318,7 +318,7 @@ pub fn validate_ld_bounds(who: &str, desc: &LtDesc, elems: usize) -> Result<()> 
 /// form's C operand is stored the same way its D is.
 pub fn bind_destination(
     call: &mut LtCall,
-    dest: &crate::layouts::CudaLayout,
+    dest: &luminal::layouts::DecodedLayout,
     who: &str,
 ) -> Result<()> {
     use luminal::layouts::MirrorLayout as M;

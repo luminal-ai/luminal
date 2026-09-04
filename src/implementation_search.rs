@@ -280,8 +280,8 @@ mod progress_tests {
 }
 
 #[derive(Debug)]
-pub struct SearchOutcome<L: crate::bufferize::PlanLayout> {
-    pub best_plan: BufferIrGraph<L>,
+pub struct SearchOutcome {
+    pub best_plan: BufferIrGraph<crate::layouts::DecodedLayout>,
     pub best_genome: Genome,
     pub best_nanos: u128,
     /// Plans actually profiled (distinct fingerprints).
@@ -383,7 +383,7 @@ impl SearchTimings {
 /// how its candidates are timed); the in-core implementations are the
 /// reference host executor (the historical behavior) and a static
 /// ranker that never executes.
-pub trait PlanProfiler<L: crate::bufferize::PlanLayout> {
+pub trait PlanProfiler {
     /// The plan's cost over `trials` with buffer-keyed inputs; smaller
     /// wins. `heuristic_cost` is the extracted graph's summed
     /// bytes-moved estimate, for profilers that rank without running.
@@ -399,7 +399,7 @@ pub trait PlanProfiler<L: crate::bufferize::PlanLayout> {
     /// ones already out of contention. Ignoring it is always correct.
     fn profile(
         &mut self,
-        plan: &crate::bufferize::BufferIrGraph<L>,
+        plan: &crate::bufferize::BufferIrGraph<crate::layouts::DecodedLayout>,
         input_data: &FxHashMap<i64, crate::buffer_tensor_ir::TypedBuffer>,
         trials: usize,
         heuristic_cost: u64,
@@ -454,10 +454,10 @@ mod early_stop_tests {
 #[derive(Default)]
 pub struct StaticProfiler;
 
-impl<L: crate::bufferize::PlanLayout> PlanProfiler<L> for StaticProfiler {
+impl PlanProfiler for StaticProfiler {
     fn profile(
         &mut self,
-        _plan: &crate::bufferize::BufferIrGraph<L>,
+        _plan: &crate::bufferize::BufferIrGraph<crate::layouts::DecodedLayout>,
         _input_data: &FxHashMap<i64, crate::buffer_tensor_ir::TypedBuffer>,
         _trials: usize,
         heuristic_cost: u64,
@@ -778,16 +778,15 @@ fn bufferize_cycle_tripwire(
     clippy::too_many_arguments,
     reason = "the public runtime boundary keeps each independently owned search input explicit"
 )]
-pub fn search_implementations_with_runtime<L: crate::bufferize::PlanLayout>(
+pub fn search_implementations_with_runtime(
     egraph: &egraph_serialize::EGraph,
     program: &LogicalProgram,
     input_data: &FxHashMap<petgraph::graph::NodeIndex, crate::buffer_tensor_ir::TypedBuffer>,
     options: &ImplementationSearchOptions,
     allow_override: Option<Vec<&'static str>>,
     matchers: Vec<Box<dyn crate::layout_ir::OpMatcher>>,
-    layout_decoder: &dyn crate::layout_ir::LayoutDecoder<L>,
-    profiler: &mut dyn PlanProfiler<L>,
-) -> Result<SearchOutcome<L>> {
+    profiler: &mut dyn PlanProfiler,
+) -> Result<SearchOutcome> {
     // Tensor-keyed at the boundary (the retired-HLIR-keyspace design);
     // buffer-keyed internally via the program's slots.
     let buffer_data: FxHashMap<i64, crate::buffer_tensor_ir::TypedBuffer> = input_data
@@ -839,12 +838,6 @@ pub fn search_implementations_with_runtime<L: crate::bufferize::PlanLayout>(
 
     // fingerprint → measured nanos (the dedup cache).
     let mut cache: FxHashMap<u64, u128> = FxHashMap::default();
-    // Decoded layouts are pure functions of (layout class, dtype fact)
-    // — the decoder cache contract — so one cache serves every genome.
-    let mut layout_cache: std::collections::HashMap<
-        (egraph_serialize::ClassId, Option<crate::dtype::PlanDtype>),
-        L,
-    > = std::collections::HashMap::new();
     let mut plans_profiled = 0usize;
     let mut fingerprint_hits = 0usize;
     // Refusal accounting, minimal form (Step 5 down-payment): keep the
@@ -852,7 +845,7 @@ pub fn search_implementations_with_runtime<L: crate::bufferize::PlanLayout>(
     // causes instead of shrugging.
     let mut refusals: Vec<String> = Vec::new();
     let mut breakdown = RefusalBreakdown::default();
-    let mut best: Option<(u128, Genome, BufferIrGraph<L>)> = None;
+    let mut best: Option<(u128, Genome, BufferIrGraph<crate::layouts::DecodedLayout>)> = None;
     // Live progress (#391), on stderr (via the capture-aware adapter, so
     // test output stays clean) and never on a caller's stdout.
     // `None` = the option (or `SEARCH_LOG`) says quiet.
@@ -950,13 +943,9 @@ pub fn search_implementations_with_runtime<L: crate::bufferize::PlanLayout>(
                     // AND dtype fact, so every poison is a decoder-cache
                     // HIT: value-keying costs no extra decoder calls.
                     let dps = crate::dps::dps_rewrite(&graph);
-                    let built = extractor::decoded_layout_table(
-                        egraph,
-                        &dps,
-                        layout_decoder,
-                        &mut layout_cache,
-                    )
-                    .and_then(|table| crate::bufferize::bufferize(&dps, &table));
+                    let built =
+                        crate::layouts::decode_layout_table(egraph, &dps, "implementation search")
+                            .and_then(|table| crate::bufferize::bufferize(&dps, &table));
                     timings.plan_build_nanos += build_start.elapsed().as_nanos();
                     let plan = match built {
                         Ok(plan) => plan,
@@ -1030,13 +1019,9 @@ pub fn search_implementations_with_runtime<L: crate::bufferize::PlanLayout>(
             {
                 let build_start = Instant::now();
                 let dps = crate::dps::dps_rewrite(&graph);
-                let built = extractor::decoded_layout_table(
-                    egraph,
-                    &dps,
-                    layout_decoder,
-                    &mut layout_cache,
-                )
-                .and_then(|table| crate::bufferize::bufferize(&dps, &table));
+                let built =
+                    crate::layouts::decode_layout_table(egraph, &dps, "implementation search")
+                        .and_then(|table| crate::bufferize::bufferize(&dps, &table));
                 timings.plan_build_nanos += build_start.elapsed().as_nanos();
                 let plan = match built {
                     Ok(plan) => plan,
@@ -1075,11 +1060,11 @@ pub fn search_implementations_with_runtime<L: crate::bufferize::PlanLayout>(
 /// One bucket combination's finished search: the dim ranges it covers, the
 /// representative pins it was searched at, and the winning plan.
 #[derive(Debug)]
-pub struct BucketPlan<L: crate::bufferize::PlanLayout> {
+pub struct BucketPlan {
     pub ranges: BTreeMap<crate::shape::Symbol, (usize, usize)>,
     pub representative: crate::shape::DynMap,
     pub program: LogicalProgram,
-    pub outcome: SearchOutcome<L>,
+    pub outcome: SearchOutcome,
 }
 
 /// Range-seeded bucketed search, mirroring their per-bucket model: one
@@ -1096,7 +1081,7 @@ pub struct BucketPlan<L: crate::bufferize::PlanLayout> {
     clippy::too_many_arguments,
     reason = "bucket search composes independently owned graph, runtime, matcher, and profiling inputs"
 )]
-pub fn bucketed_search_implementations<L: crate::bufferize::PlanLayout>(
+pub fn bucketed_search_implementations(
     graph: &crate::graph::Graph,
     dim_buckets: &BTreeMap<crate::shape::Symbol, Vec<crate::graph::DimBucket>>,
     input_data: impl Fn(
@@ -1106,10 +1091,9 @@ pub fn bucketed_search_implementations<L: crate::bufferize::PlanLayout>(
     options: &ImplementationSearchOptions,
     assembled_program: &str,
     matchers: impl Fn() -> Vec<Box<dyn crate::layout_ir::OpMatcher>>,
-    layout_decoder: &dyn crate::layout_ir::LayoutDecoder<L>,
-    profiler: &mut dyn PlanProfiler<L>,
+    profiler: &mut dyn PlanProfiler,
     bindings: &dyn crate::runtime_binding::RuntimeBindingsGenerator,
-) -> Result<Vec<BucketPlan<L>>> {
+) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
 
     // M3 Topic C: buckets assemble NATIVELY — one recorder model, per-
@@ -1199,7 +1183,6 @@ pub fn bucketed_search_implementations<L: crate::bufferize::PlanLayout>(
             options,
             None,
             matchers(),
-            layout_decoder,
             profiler,
         )?;
         plans.push(BucketPlan {
@@ -1213,10 +1196,10 @@ pub fn bucketed_search_implementations<L: crate::bufferize::PlanLayout>(
 }
 
 /// The covering bucket plan for a concrete dim assignment, if any.
-pub fn select_bucket<'a, L: crate::bufferize::PlanLayout>(
-    plans: &'a [BucketPlan<L>],
+pub fn select_bucket<'a>(
+    plans: &'a [BucketPlan],
     dims: &crate::shape::DynMap,
-) -> Option<&'a BucketPlan<L>> {
+) -> Option<&'a BucketPlan> {
     plans.iter().find(|plan| {
         plan.ranges.iter().all(|(dim, (min, max))| {
             dims.get(dim)
@@ -1333,12 +1316,10 @@ mod tests {
             seen: Vec<Option<u128>>,
         }
 
-        impl luminal::implementation_search::PlanProfiler<luminal_reference::RefLayout>
-            for RecordingProfiler
-        {
+        impl luminal::implementation_search::PlanProfiler for RecordingProfiler {
             fn profile(
                 &mut self,
-                _plan: &luminal::bufferize::BufferIrGraph<luminal_reference::RefLayout>,
+                _plan: &luminal::bufferize::BufferIrGraph<luminal::layouts::DecodedLayout>,
                 _input_data: &FxHashMap<i64, luminal::buffer_tensor_ir::TypedBuffer>,
                 _trials: usize,
                 _heuristic_cost: u64,
@@ -1392,7 +1373,6 @@ mod tests {
             &options,
             Some(luminal_reference::reference_allow_list()),
             luminal_reference::ops::built_in_matchers(),
-            &luminal_reference::ReferenceLayoutDecoder,
             &mut profiler,
         )
         .expect("search finds an executable plan");
@@ -1470,7 +1450,6 @@ mod tests {
             &ImplementationSearchOptions::default(),
             luminal_reference::assembled_program(),
             luminal_reference::ops::built_in_matchers,
-            &luminal_reference::ReferenceLayoutDecoder,
             &mut luminal_reference::ReferenceProfiler,
             &luminal_reference::ReferenceBindings,
         )
