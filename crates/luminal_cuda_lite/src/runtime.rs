@@ -280,7 +280,7 @@ impl CudaRuntime {
                 );
             }
         }
-        self.plan = Some(plan.outcome.best_plan.clone());
+        self.plan = Some(plan.plan.clone());
         Ok(())
     }
 
@@ -470,13 +470,13 @@ impl CudaRuntime {
 
         // THIS INSTANCE's claim set, derived at load from THIS
         // instance's registry — no crate-level default is consulted.
-        let allow = Some(self.allow.clone());
+        let allow = self.allow.clone();
         // FIELD BORROWS, not `self.matchers()`: the device evaluator
         // holds `&mut self.device` at the same time, and only disjoint
         // FIELD borrows can coexist — a `&self` method would borrow the
         // whole runtime.
         let matchers = &self.matchers;
-        let evaluator = {
+        let mut evaluator = {
             #[cfg(feature = "device")]
             {
                 if options.profile_on_device {
@@ -499,15 +499,45 @@ impl CudaRuntime {
 
         // Own matchers, own allow list, own ranking: nothing in this
         // search touches another runtime.
-        let outcome = if self.dim_buckets.is_empty() {
-            crate::search::search_implementations(
+        //
+        // WHAT `search` RETURNS is a pair: the outcome to report, and the
+        // plan to install. They are no longer the same thing (Phase 5):
+        // the outcome is the genetic search's report, while the installed
+        // plan is whichever FINALIST the bucket lattice selected under the
+        // aggregate device budget. With no budget set they coincide,
+        // which is why every existing caller sees the trajectory it had.
+        let (outcome, unbucketed_plan, searched_buckets) = if self.dim_buckets.is_empty() {
+            let mut outcome = crate::search::search_implementations(
                 &serialized,
                 &program,
                 options,
-                allow,
+                Some(allow.clone()),
                 matchers,
-                evaluator,
-            )?
+                evaluator.reborrow(),
+            )?;
+            // THE UNBUCKETED LATTICE (Phase 5) — a lattice over ONE
+            // bucket, so unbucketed and bucketed installs run the same
+            // code. Main's "one designed difference" from its pre-#420
+            // behaviour, adopted for the same reason: whether the
+            // installed plan fits the caller's device budget is a
+            // property of what is installed, and an unbucketed install is
+            // a set of one.
+            let finalists = vec![crate::finalists::Finalists::new(
+                "the search",
+                &serialized,
+                Some(allow.clone()),
+                matchers,
+                outcome.ranked.clone(),
+                Some(outcome.best_plan.clone()),
+            )];
+            let (selected, rejections) =
+                crate::search::select_finalist_set(finalists, options, &mut evaluator)?;
+            outcome.lattice_rejections = rejections;
+            let (_, finalist) = selected
+                .into_iter()
+                .next()
+                .expect("a one-bucket lattice selects exactly one finalist");
+            (outcome, Some(finalist.plan), Vec::new())
         } else {
             // BUCKETED (D7): one search per Cartesian combination, each
             // validated bucket-wide before its representative is
@@ -528,7 +558,7 @@ impl CudaRuntime {
                 &assembly,
                 &self.dim_buckets,
                 options,
-                allow,
+                Some(allow),
                 matchers,
                 evaluator,
             )?;
@@ -536,9 +566,11 @@ impl CudaRuntime {
                 .first()
                 .map(|plan| plan.outcome.clone())
                 .ok_or_else(|| anyhow!("bucketed search produced no plans"))?;
-            self.bucket_plans = plans;
-            first
+            (first, None, plans)
         };
+        if !searched_buckets.is_empty() {
+            self.bucket_plans = searched_buckets;
+        }
 
         let native = self
             .native
@@ -555,8 +587,12 @@ impl CudaRuntime {
             .enumerate()
             .map(|(index, slot)| (slot.tensor, index))
             .collect();
-        if self.bucket_plans.is_empty() {
-            self.plan = Some(outcome.best_plan.clone());
+        if let Some(plan) = unbucketed_plan {
+            // THE LATTICE'S CHOICE, not `outcome.best_plan` (Phase 5).
+            // Unconstrained they are the same plan — the rank-0 finalist
+            // re-extracts the winning genome — but the installed one is
+            // the one that passed the aggregate check.
+            self.plan = Some(plan);
         } else {
             // With buckets the plan is chosen at execute time; load
             // eagerly only if the runtime already sits at a covered pin.

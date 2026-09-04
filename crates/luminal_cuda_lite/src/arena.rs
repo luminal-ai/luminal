@@ -58,12 +58,46 @@
 //! candidate plans a search evaluates) is Phase 4's; this pass sizes
 //! ONE installed plan.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use luminal::bufferize::{Buffer, BufferId, BufferIrGraph, BufferNode, Owner, PlanLayout};
 use luminal::layout_ir::FreedBy;
 use luminal::prelude::{petgraph, FxHashMap, NodeIndex};
 use petgraph::visit::{EdgeRef, NodeIndexable};
 use std::collections::{BTreeMap, BinaryHeap};
+
+/// THE ONE SIZING RULE: the buffer backs one tensor, its carried layout
+/// gives the span in elements and the dtype fact gives the byte width
+/// (ALLOCATION BY ASSIGNMENT LOOKUP, corrected contract 2026-08-31 — no
+/// walk, no voting).
+///
+/// IT LIVES HERE, not in `crate::device`, because it is DEVICE-FREE and
+/// two callers need it: the executor's `execute_plan` (which is behind
+/// the `device` feature) and the search's finalist arena planning
+/// (Phase 5, which runs on any host so a budget can be checked without a
+/// GPU). One rule, one place, so the two can never disagree about a
+/// buffer's size.
+pub fn buffer_bytes(buffer: &Buffer<luminal::layouts::DecodedLayout>) -> Result<usize> {
+    let numel = buffer
+        .layout
+        .mirror
+        .literal_span_elements()
+        .ok_or_else(|| {
+            anyhow!(
+                "buffer {:?} (backing {}) has no literal span — symbolic or \
+                 undisclosed-reach layouts are not executable",
+                buffer.label,
+                buffer.backs
+            )
+        })?;
+    let dtype = buffer.layout.dtype.ok_or_else(|| {
+        anyhow!(
+            "buffer {:?} (backing {}) carries no dtype fact",
+            buffer.label,
+            buffer.backs
+        )
+    })?;
+    Ok(numel * crate::host_buffer::dtype_bytes(dtype)?)
+}
 
 /// Device allocations are 256-byte aligned, so every slab range is too:
 /// a sub-range handed to a kernel must satisfy the same alignment the

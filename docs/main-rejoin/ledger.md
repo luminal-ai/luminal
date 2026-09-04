@@ -3283,6 +3283,11 @@ election-dependent that pin is.
   everything by the heuristic, then re-measure the top k on device) would
   cut device time, but it puts the prior back on the critical path —
   exactly what D6 warns about — and it was not asked for.
+  *(SUPERSEDED by Phase 5, below — Austin's D8 on this deferral was
+  "defer temporarily, but then add". What landed there is the finalist
+  fallback and the aggregate set constraint, NOT the two-tier
+  heuristic-then-measure scheme this bullet argues against; the prior
+  never returns to the critical path.)*
 - **Two-tier graph re-ranking** (measure at one shape, extrapolate to
   others) — not adopted, same reason plus the static-plan limitation
   buckets already carry.
@@ -3296,6 +3301,187 @@ election-dependent that pin is.
   With device noise that is a deliberate choice (one measurement per
   distinct plan, not per genome); re-measuring and averaging is the
   alternative nobody asked for.
+
+## Program: #420/#422 rejoin — Phase 5 (finalists + bucket lattice)
+
+**The move.** Phase 4 landed the device evaluator and deferred main's
+`Finalists` / `BucketLattice` pair in writing ("**Finalists /
+BucketLattice.** Not adopted."). Austin's D8 on that deferral was *"defer
+temporarily, but then add"*. This is the "then add". CUDA-lite's search
+now keeps a RANKED list of genomes rather than only the winner, and what
+gets INSTALLED is chosen by a best-first walk over the buckets' finalist
+ranks under one aggregate constraint.
+
+**Why a runtime with buckets needs one.** Until now each bucket installed
+its own GA winner. That is right exactly while nothing constrains the
+buckets JOINTLY. This runtime has one such resource: `CudaDevice` keeps a
+single grow-only arena slab for its whole life and `ensure_slab` grows it
+to whatever the plan being executed needs, so a runtime serving several
+bucket plans ends up holding `max` over their `slab_bytes`. A caller's
+device budget therefore applies to the SET, and no single bucket's search
+can see the number it must meet.
+
+### What landed
+
+| Where | What |
+| --- | --- |
+| `crates/luminal_cuda_lite/src/finalists.rs` (new) | `Finalists<'a>` + `PendingFinalist`: one bucket's ranked genomes, re-materialized ONE AT A TIME (`extract_next` / `accept` / `reject` / `ensure(target, validate)` / `take` / `failure_message`). |
+| `crates/luminal_cuda_lite/src/lattice.rs` (new) | `BucketLattice<'a>` + `BucketSet` + `sum_metrics`: `new(buckets, aggregate)`, `next(validate)`, `reject(set, reason, validate)`, `slab_bytes(set)`, `ranks(set)`, `select(set)`, `failure_message()`. |
+| `crates/luminal_cuda_lite/src/search.rs` | `CompileOptions::{keep_finalists (default 4), device_budget_bytes (default None)}`; `SearchOutcome::{ranked, lattice_rejections}`; `rank_insert`; `finalist_validate`, `validate_set`, `select_finalist_set` (the driver loop); `BucketPlan::{plan, finalist_rank, slab_bytes}`; `bucket_label`. |
+| `crates/luminal_cuda_lite/src/runtime.rs` | `CudaRuntime::search` runs the lattice on BOTH paths and installs its choice; `select_bucket_plan` loads `BucketPlan::plan` (the installed finalist), not `outcome.best_plan`. |
+| `crates/luminal_cuda_lite/src/arena.rs` | `buffer_bytes` MOVED here from `device.rs` (it was `fn`-private and device-gated). It is device-free and now has two callers: the executor and the finalists' arena planning, which must run on a laptop for a budget to be checkable without a GPU. One rule, one place. |
+| `crates/luminal_cuda_lite/tests/finalists_lattice.rs` (new, CPU) | The four pins (below). |
+| `crates/luminal_cuda_lite/tests/device_profile.rs` | One device-gated case: the hard filter warms up on device, and the budget is enforced against real slabs. |
+
+### The aggregate and the constraint
+
+The aggregate is `sum_metrics` — Σ of the per-bucket metrics, saturating.
+It must be COORDINATE-MONOTONE (raising one coordinate to a slower
+finalist must not lower the aggregate), which Σ over nonnegative metrics
+is; that is what makes "expand into one-coordinate-slower successors,
+always pop the strictly-smallest aggregate" enumerate the lattice in
+nondecreasing cost order. A `visited` set stops a point entering the
+frontier along two paths, so no set is proposed twice.
+
+The constraint is `max_i(arena_i.slab_bytes) <= device_budget_bytes`.
+THE ALTERNATIVE READING WAS CONSIDERED AND REJECTED: adding each plan's
+standalone (boundary + escaping) allocations to its slab. Those buffers
+are allocated inside one `execute_plan` call and dropped at its end, so
+they are never resident across buckets; charging a budget for memory that
+is never simultaneously held would be a lie about the resource. The slab
+IS the retained footprint. `None` (the default) is unconstrained, which
+is every pre-Phase-5 caller.
+
+The FINALIST-level filter (`finalist_validate`) is main's hard filter,
+re-expressed: device-free it is trivially satisfied (a candidate that got
+this far extracted, bufferized and arena-planned, and there is nothing
+further a host with no GPU can check); under `profile_on_device` with a
+live device it is ONE warmup `execute_plan` — compile, stage, launch,
+synchronize — after which the slab is released, matching the search's own
+per-candidate hygiene. `candidate_timeout` is NOT applied here: Phase 4
+ruled it covers a TIMED RUN, and a warmup is not one.
+
+### Two deliberate departures from a literal port
+
+RANK 1 IS HANDED OVER, NOT RE-EXTRACTED. Main's `Finalists` builds
+another extractor per bucket and re-extracts even the winner. Here the
+genetic search already built the winner's plan, and `Finalists::new`
+takes it: rank 1 costs one arena plan instead of a whole extraction, and
+the extraction session is built LAZILY, on the first genome that actually
+needs it. Measured on this crate's CPU suite: the eager version cost
++27 s over a 61 s baseline (`cublaslt_election` alone 36 s -> 49 s); with
+the hand-over it is +10 s, and the residue is the arena plan and the plan
+clone. It also makes "an unconstrained search installs what it searched"
+true by construction rather than by an argument about determinism.
+
+THE UNBUCKETED PATH RUNS THE LATTICE TOO, over one bucket — main's "one
+designed difference" from its pre-#420 behaviour, adopted for the same
+reason: whether the installed plan fits the caller's budget is a property
+of what is installed, and an unbucketed install is a set of one. There is
+one selection path to reason about instead of two.
+
+### Dropped from main's version
+
+Everything LLIR-shaped, because this branch has no LLIR: `pre_unroll`
+graphs, the `LLIR_DUMP_DIR` / `LLIR_DUMP_PRE_UNROLL` dump machinery in
+`Finalists::take` and `BucketLattice::select`, and `unroll` on the
+re-extraction path. The ANSI progress bars stay dropped (Phase 4's
+`SearchProgress` is kept and unchanged; the lattice adds ONE line, main's
+"aggregate fallback" report, printed only when a fallback actually
+happened). Main's `search_time_limit` clock over finalization is not
+carried — this branch has no such option, and its one timeout is
+documented to cover a timed device run only, so it was not re-purposed.
+
+### The reference runtime is deliberately untouched
+
+`luminal_reference` gets none of this. It has NO aggregate resource
+across buckets: its executor allocates per call on the host and keeps no
+shared arena, so `validate_set` there would be `Ok(())` unconditionally
+and the lattice would degenerate to "install each bucket's winner" — the
+code it already has, wrapped in machinery that could never reject
+anything. Adding it there is a later phase's job, and it should wait
+until that runtime has a set-level constraint worth checking.
+
+### Tests
+
+CPU (`tests/finalists_lattice.rs`, 4 tests):
+
+- `an_unconstrained_search_installs_the_searched_winner` — zero
+  rejections, `ranked[0]` IS `best_genome`/`best_nanos`, and the
+  installed plan's structural signature (node/edge/buffer counts + sorted
+  compute labels) equals `best_plan`'s. This is the pin that Phase 5
+  costs the existing suites nothing.
+- `a_device_budget_forces_the_lattice_to_a_slower_set` — two passes over
+  a two-bucket attention-shaped fixture. Pass 1 is unconstrained and
+  REPORTS what the winning set needs; pass 2 sets the budget one byte
+  under that, so the winning set is refused by construction. The
+  installed set must fit, and some bucket must install a rank > 1. The
+  budget is self-calibrating rather than a constant, so the test says
+  "one byte too little" whatever the planner's numbers become. Measured
+  at this fixture and seed: winning slabs `[1280, 2560]`, installed
+  `[1280, 1792]` at ranks `[1, 2]` after 2 rejections.
+- `a_budget_nothing_meets_refuses_and_names_it` — a zero budget: every
+  set rejected, and the error names the budget, says the LATTICE failed
+  (not the search), and says why no slower set was tried.
+- `keep_finalists_bounds_the_ranked_list` — `keep_finalists: 1` keeps
+  one, which is the pre-Phase-5 world exactly.
+
+THE REJECTION COUNT IS A LOWER BOUND, NOT A PIN. Which successor is
+proposed after a rejection is decided by the METRIC aggregate, not by the
+slabs, so more than one proposal may be over budget before a fitting one
+comes up (this fixture: 2). Pinning the exact count would pin the
+sampler's ordering, which is the kind of pin the permutation-invariance
+ruling (2026-09-02) says not to write.
+
+Device (`tests/device_profile.rs`,
+`the_finalist_filter_warms_up_on_device_and_the_budget_is_enforced`): a
+zero budget over the mini-llama3 fixture must refuse NAMING THE BUDGET
+and NOT naming a warmup — which is the pin that the hard filter passed on
+every finalist it materialized, i.e. that each was compiled, staged and
+run once on the device before the budget looked at it. Then the same
+search with the budget lifted installs rank 1 with zero rejections and
+executes.
+
+### Verified on the A100 (2026-09-03)
+
+`93dd7cb1` checked out on the box, `cargo test -p luminal_cuda_lite
+--features device --test device_profile --test finalists_lattice`:
+
+```
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 70.34s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.42s
+```
+
+The Phase 4 probe is unchanged by Phase 5 — mini-llama3, 6 plans
+profiled, 2 fingerprint hits, winner 3.617 ms measured, zero refusals —
+and the new device case passes, so the finalist hard filter's warmup arm
+compiles, stages and runs every finalist it materializes before the
+budget is consulted. The CPU lattice case runs identically on the box:
+winning slabs `[1280, 2560]` -> installed `[1280, 1792]` at ranks
+`[1, 2]` after 2 rejections, which is the same walk the mac produced.
+Box returned to `logical-ssa-project`.
+
+### Deferred
+
+- **THE REFERENCE RUNTIME**, above.
+- **A SET-LEVEL METRIC OTHER THAN Σ.** `AggregateFn` is a plain `fn`
+  pointer and the lattice is generic in it, but there is exactly one
+  aggregate in this crate. A weighted sum (buckets are not equally
+  likely) is the obvious next one and wants a bucket-frequency model
+  nobody has asked for.
+- **STANDALONE BYTES IN THE BUDGET.** Rejected above as a lie about the
+  resource, but the honest version — a per-execution peak that includes
+  the boundary and escaping rows — is a different (and also useful)
+  budget, and would want its own option rather than overloading this one.
+- **A FALLBACK REASON IN `SearchOutcome`.** The outcome reports HOW MANY
+  sets the lattice rejected, not WHY each was rejected; the reasons are
+  in the failure message only when the walk fails outright. A structured
+  per-rejection record is more accounting than anyone has asked for.
+- **`Finalists` HAS NO SYNTHETIC CONSTRUCTOR.** Every finalist comes from
+  a real genome, so the lattice's walk order is only exercised through
+  real searches. A unit test over hand-built finalists would pin the
+  best-first ordering directly; it would also need a public way to inject
+  them, which is test scaffolding in the library.
 
 ## #406 pad — the select construction REVERTED (2026-09-03)
 

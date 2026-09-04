@@ -37,6 +37,13 @@
 //!   device time ([`profile`]) instead of by [`heuristic`]'s weak prior.
 //!   The heuristic remains the default and the device-free hosts' only
 //!   option; the two are never blended.
+//! - CL-6 (#420/#422 rejoin Phase 5, 2026-09-03): FINALISTS AND THE
+//!   BUCKET LATTICE ([`finalists`], [`lattice`]). The search keeps a
+//!   ranked list of genomes and the plan that gets INSTALLED is chosen by
+//!   a best-first walk over the buckets' finalist ranks under one
+//!   aggregate constraint — `CompileOptions::device_budget_bytes` bounds
+//!   the arena slab the runtime will hold. Unconstrained (the default)
+//!   the walk installs the search's own winner and costs nothing.
 //!
 //! Out-of-place by design: kernels read operand buffers and
 //! write fresh destinations, mirroring the reference executor's
@@ -47,9 +54,15 @@ pub mod arena;
 pub mod binding_check;
 pub mod bindings;
 pub mod extractor;
+/// FINALISTS (Phase 5 of the #420/#422 rejoin): a bucket's ranked
+/// genomes, re-materialized one at a time under a hard filter.
+pub mod finalists;
 pub mod heuristic;
 pub mod host_buffer;
 pub mod kernels;
+/// THE BUCKET LATTICE (Phase 5): best-first selection of ONE finalist
+/// per bucket under a coordinate-monotone aggregate.
+pub mod lattice;
 pub mod layouts;
 pub mod ops;
 pub mod runtime;

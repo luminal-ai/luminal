@@ -72,15 +72,15 @@
 //! occupant's bytes, and would need the memset this note says we do
 //! not do.
 
-use crate::arena::{plan_arena, ArenaPlan};
-use crate::host_buffer::{dtype_bytes, HostBuffer};
+use crate::arena::{buffer_bytes, plan_arena, ArenaPlan};
+use crate::host_buffer::HostBuffer;
 use anyhow::{anyhow, bail, Context, Result};
 use cudarc::driver::{
     result as cu, CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr,
     LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::compile_ptx;
-use luminal::bufferize::{Buffer, BufferId, BufferIrGraph, BufferNode, EdgeKind, OutputBinding};
+use luminal::bufferize::{BufferId, BufferIrGraph, BufferNode, EdgeKind, OutputBinding};
 use luminal::dtype::PlanDtype;
 use luminal::prelude::FxHashMap;
 use std::collections::HashMap;
@@ -232,34 +232,6 @@ fn bound_of(bindings: &FxHashMap<BufferId, Bound>, id: &BufferId, who: &str) -> 
              or its BufferFree already ran"
         )
     })
-}
-
-/// The one sizing rule: the buffer backs one tensor, its carried layout
-/// gives the span in elements and the dtype fact gives the byte width
-/// (ALLOCATION BY ASSIGNMENT LOOKUP, corrected contract 2026-08-31 — no
-/// walk, no voting). Shared by the arena planner and Phase 1 so the two
-/// can never disagree about a buffer's size.
-fn buffer_bytes(buffer: &Buffer<luminal::layouts::DecodedLayout>) -> Result<usize> {
-    let numel = buffer
-        .layout
-        .mirror
-        .literal_span_elements()
-        .ok_or_else(|| {
-            anyhow!(
-                "buffer {:?} (backing {}) has no literal span — symbolic or \
-                 undisclosed-reach layouts are not executable",
-                buffer.label,
-                buffer.backs
-            )
-        })?;
-    let dtype = buffer.layout.dtype.ok_or_else(|| {
-        anyhow!(
-            "buffer {:?} (backing {}) carries no dtype fact",
-            buffer.label,
-            buffer.backs
-        )
-    })?;
-    Ok(numel * dtype_bytes(dtype)?)
 }
 
 /// Execute a bufferized plan on `device`. Returns, per output slot

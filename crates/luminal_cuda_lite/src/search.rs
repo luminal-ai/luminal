@@ -82,6 +82,26 @@ pub struct CompileOptions {
     /// happened to hit a cold cache would time out plans for a cost
     /// their successors do not pay.
     pub candidate_timeout: Option<Duration>,
+    /// HOW MANY RANKED GENOMES THE SEARCH KEEPS (Phase 5, 2026-09-03),
+    /// fastest first, for [`crate::finalists::Finalists`] to fall back
+    /// through. 1 reproduces the pre-Phase-5 behaviour exactly (only the
+    /// winner is ever installable); the default 4 gives the bucket
+    /// lattice three runners-up per bucket to walk into when a set-level
+    /// constraint refuses the fastest.
+    ///
+    /// It costs NOTHING when nothing refuses: finalists past rank 0 are
+    /// extracted only if the walk reaches them.
+    pub keep_finalists: usize,
+    /// THE AGGREGATE DEVICE BUDGET (Phase 5): an upper bound, in bytes,
+    /// on the arena slab the installed plan set will need. `None` (the
+    /// default) is unconstrained and is what every existing caller gets.
+    ///
+    /// It is a SET constraint, which is why it is checked by the bucket
+    /// lattice and not by the per-candidate evaluator: the serving slab
+    /// is grown once and sized to the LARGEST installed plan, so what
+    /// has to fit is `max` over the buckets, and no single bucket's
+    /// search can see that number.
+    pub device_budget_bytes: Option<usize>,
 }
 
 impl Default for CompileOptions {
@@ -95,6 +115,8 @@ impl Default for CompileOptions {
             search_log: true,
             profile_on_device: false,
             candidate_timeout: None,
+            keep_finalists: 4,
+            device_budget_bytes: None,
         }
     }
 }
@@ -273,6 +295,21 @@ pub struct SearchOutcome {
     /// What rejected genomes were rejected FOR (diagnosis ruling
     /// 2026-08-07: understand the breakdown, no auto-repair).
     pub refusal_breakdown: RefusalBreakdown,
+    /// THE RANKED MEASURED GENOMES (Phase 5), fastest first, at most
+    /// `CompileOptions::keep_finalists` of them. `ranked[0]` is the
+    /// winner — the same genome as `best_genome`, by construction.
+    ///
+    /// This is the raw material for [`crate::finalists::Finalists`]: the
+    /// runner-ups a set-level constraint can fall back to. Genomes, not
+    /// plans, because a plan is the expensive half and the walk may
+    /// never need it.
+    pub ranked: Vec<(u128, Genome)>,
+    /// HOW MANY PLAN SETS THE BUCKET LATTICE REJECTED before installing
+    /// one (Phase 5). 0 means the search's own winner (per bucket) was
+    /// installed unchanged — which is what every unconstrained search
+    /// reports. Stamped by the runtime after the lattice runs; the
+    /// genetic search itself always leaves it 0.
+    pub lattice_rejections: usize,
 }
 
 /// Aggregated classification of rejected genomes across one search.
@@ -773,6 +810,27 @@ fn bufferize_cycle_tripwire(
     ))
 }
 
+/// INSERT ONE MEASURED CANDIDATE INTO THE RANKING (Phase 5), keeping
+/// `ranked` sorted fastest-first and no longer than `keep`.
+///
+/// TIES GO AFTER (main's `report_evolving` rule, `genetic.rs:469-479`):
+/// the insertion point is the FIRST position whose metric the newcomer
+/// strictly beats, so an equal-cost incumbent keeps the better rank.
+/// That is what makes `ranked[0]` the same genome the incumbent logic
+/// crowns — the incumbent is only replaced on a strict improvement too.
+fn rank_insert(ranked: &mut Vec<(u128, Genome)>, nanos: u128, genome: &Genome, keep: usize) {
+    let keep = keep.max(1);
+    if ranked.len() >= keep && ranked.last().is_some_and(|(worst, _)| nanos >= *worst) {
+        return; // cannot displace anyone
+    }
+    let position = ranked
+        .iter()
+        .position(|(metric, _)| nanos < *metric)
+        .unwrap_or(ranked.len());
+    ranked.insert(position, (nanos, genome.clone()));
+    ranked.truncate(keep);
+}
+
 /// The incumbent: the best-ranked candidate so far, its plan, and the
 /// heuristic cost of the same graph (carried alongside, never mixed into
 /// the ranking — see [`SearchOutcome::best_heuristic_cost`]).
@@ -882,6 +940,12 @@ pub fn search_implementations(
     // causes instead of shrugging.
     let mut refusals: Vec<String> = Vec::new();
     let mut breakdown = RefusalBreakdown::default();
+    // THE RANKED MEASURED GENOMES (Phase 5): the finalist fallback list.
+    // Only NEWLY PROFILED candidates enter it — a fingerprint cache hit
+    // is the same plan under a different genome, and two identical
+    // finalists at two ranks would waste the lattice's depth on one
+    // choice.
+    let mut ranked: Vec<(u128, Genome)> = Vec::new();
     let mut best: Option<Best> = None;
     // Live progress (#391), on stderr (via the capture-aware adapter, so
     // test output stays clean) and never on a caller's stdout.
@@ -1102,6 +1166,7 @@ pub fn search_implementations(
                     };
                     cache.insert(fingerprint, nanos);
                     plans_profiled += 1;
+                    rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
                     let improved = best
                         .as_ref()
                         .is_none_or(|incumbent| nanos < incumbent.nanos);
@@ -1143,6 +1208,7 @@ pub fn search_implementations(
                         continue;
                     }
                 };
+                rank_insert(&mut ranked, nanos, &genome, options.keep_finalists);
                 best = Some(Best {
                     nanos,
                     heuristic: crate::heuristic::heuristic_cost_of(&graph),
@@ -1173,17 +1239,166 @@ pub fn search_implementations(
         fingerprint_hits,
         timings,
         refusal_breakdown: breakdown,
+        ranked,
+        // The lattice has not run yet; the runtime stamps this once it
+        // has (see [`select_finalist_set`]).
+        lattice_rejections: 0,
     })
 }
 
+// ===========================================================================
+// PHASE 5: FINALISTS AND THE BUCKET LATTICE — how a searched winner becomes
+// an INSTALLED plan.
+// ===========================================================================
+
+/// THE FINALIST HARD FILTER — the per-plan half of the Phase 5 gate.
+///
+/// MAIN'S SHAPE (`validate_finalist` = `clear_intermediate_buffers` +
+/// `compile_and_validate_profile_candidate`): a finalist is viable only
+/// if the runtime can actually stand it up. Here that means:
+///
+/// * DEVICE-FREE (the heuristic evaluator, which is what most of this
+///   crate's suite runs under): a candidate that reached this function
+///   already extracted, bufferized and arena-planned, and there is
+///   nothing further a host with no GPU can check. The filter passes.
+/// * ON DEVICE (`profile_on_device` with a live evaluator): ONE warmup
+///   `execute_plan` — NVRTC compile, stage, launch, synchronize — which
+///   is exactly the viability check the profiler's prepare phase is. The
+///   slab is released afterwards, matching the search's own per-candidate
+///   hygiene (#422): finalist validation must not leave an outsized
+///   allocation behind for the next bucket.
+///
+/// The candidate timeout is NOT applied here. It is documented to cover
+/// a TIMED RUN (Phase 4's ruling) and a warmup is not one.
+pub fn finalist_validate(
+    pending: &crate::finalists::PendingFinalist,
+    options: &CompileOptions,
+    evaluator: &mut Evaluator<'_>,
+) -> Result<(), String> {
+    let _ = (pending, options);
+    #[cfg(feature = "device")]
+    {
+        if options.profile_on_device {
+            if let Evaluator::Device { device, staged } = evaluator {
+                let ran = crate::device::execute_plan(device, &pending.plan, staged);
+                device.release_slab();
+                ran.map_err(|err| format!("device warmup of ranked #{}: {err:#}", pending.rank))?;
+            }
+        }
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = evaluator;
+    }
+    Ok(())
+}
+
+/// THE SET CONSTRAINT — the aggregate half of the Phase 5 gate, and the
+/// whole reason a lattice exists on this runtime.
+///
+/// WHAT IS AGGREGATE HERE. This runtime's one resource that spans bucket
+/// plans is the ARENA SLAB: [`crate::device::CudaDevice`] keeps a single
+/// grow-only slab for its whole life and `ensure_slab` grows it to
+/// whatever the plan being executed needs, so a runtime serving several
+/// bucket plans ends up holding `max` over their `slab_bytes`. That
+/// maximum is what a device budget has to bound, and no single bucket's
+/// search can see it — which is precisely a set-level constraint.
+///
+/// WHY `max` AND NOT A SUM. The alternative reading — add each plan's
+/// standalone (boundary + escaping) allocations to the slab — was
+/// considered and rejected: those buffers are allocated inside one
+/// `execute_plan` call and dropped at its end, so they are never
+/// resident across buckets and adding them would charge a budget for
+/// memory that is never simultaneously held. The slab IS the retained
+/// footprint; everything else is per-execution.
+///
+/// `None` budget = unconstrained, which is every pre-Phase-5 caller.
+fn validate_set(slab_bytes: &[usize], options: &CompileOptions) -> Result<(), String> {
+    let Some(budget) = options.device_budget_bytes else {
+        return Ok(());
+    };
+    let peak = slab_bytes.iter().copied().max().unwrap_or(0);
+    if peak > budget {
+        return Err(format!(
+            "the set's plans need an arena slab of {peak} bytes (per-bucket \
+             {slab_bytes:?}), over the {budget}-byte device budget"
+        ));
+    }
+    Ok(())
+}
+
+/// RUN THE BUCKET LATTICE and return the installed finalist per bucket,
+/// plus how many sets were rejected on the way.
+///
+/// The driver loop is main's (`§2.7`), minus the LLIR compile step this
+/// branch does not have: propose the cheapest untried set, check the
+/// aggregate constraint over it, install it or reject it and let the
+/// lattice open the one-coordinate-slower successors.
+///
+/// UNBUCKETED CALLERS PASS ONE BUCKET. That is main's "one designed
+/// difference" and it is deliberate here too: there is one selection
+/// path, and an unbucketed install is a set of one.
+pub fn select_finalist_set(
+    buckets: Vec<crate::finalists::Finalists<'_>>,
+    options: &CompileOptions,
+    evaluator: &mut Evaluator<'_>,
+) -> Result<(Vec<(usize, crate::finalists::PendingFinalist)>, usize)> {
+    let mut lattice = crate::lattice::BucketLattice::new(buckets, crate::lattice::sum_metrics);
+    let mut validate = |pending: &crate::finalists::PendingFinalist| -> Result<(), String> {
+        finalist_validate(pending, options, evaluator)
+    };
+    loop {
+        let Some(set) = lattice.next(&mut validate) else {
+            return Err(anyhow!("{}", lattice.failure_message()));
+        };
+        // Owned numbers, so the immutable borrow of the lattice ends
+        // before a rejection takes it mutably.
+        let slabs = lattice.slab_bytes(&set);
+        match validate_set(&slabs, options) {
+            Ok(()) => {
+                let rejections = lattice.rejections();
+                if rejections > 0 && options.search_log_enabled() {
+                    // MAIN'S FALLBACK LINE ("aggregate fallback: selected
+                    // per-bucket finalist ranks …"): the one moment the
+                    // installed plan is NOT the search's winner is worth
+                    // saying out loud.
+                    eprintln!(
+                        "   {} finalist ranks {:?} after {rejections} rejection(s)",
+                        "Fallback".yellow().bold(),
+                        lattice.ranks(&set)
+                    );
+                }
+                return Ok((lattice.select(&set), rejections));
+            }
+            Err(reason) => lattice.reject(&set, reason, &mut validate),
+        }
+    }
+}
+
 /// One bucket combination's finished search: the dim ranges it covers, the
-/// representative pins it was searched at, and the winning plan.
+/// representative pins it was searched at, and the plan the bucket
+/// lattice INSTALLED for it.
 #[derive(Debug)]
 pub struct BucketPlan {
     pub ranges: BTreeMap<luminal::shape::Symbol, (usize, usize)>,
     pub representative: luminal::shape::DynMap,
     pub program: LogicalProgram,
+    /// This bucket's own genetic search — its winner, its accounting,
+    /// its ranked finalists. It is the SEARCH's report and is left
+    /// exactly as the search wrote it.
     pub outcome: SearchOutcome,
+    /// THE INSTALLED PLAN (Phase 5): the finalist the bucket lattice
+    /// selected. It is `outcome.best_plan` whenever nothing refused the
+    /// search's winner — which is every unconstrained search — and a
+    /// runner-up when the aggregate device budget refused the faster
+    /// set. `execute` loads THIS.
+    pub plan: crate::layouts::CudaPlan,
+    /// The installed finalist's 1-BASED rank in `outcome.ranked`. 1 =
+    /// the search's own winner.
+    pub finalist_rank: usize,
+    /// The installed plan's arena high-water mark, in bytes — what the
+    /// budget was checked against.
+    pub slab_bytes: usize,
 }
 
 /// The pre-search program parts a bucketed search re-renders from — the
@@ -1238,7 +1453,14 @@ pub fn bucketed_search_implementations(
     mut evaluator: Evaluator<'_>,
 ) -> Result<Vec<BucketPlan>> {
     ensure!(!dim_buckets.is_empty(), "no dim buckets supplied");
-    let mut plans = Vec::new();
+    // The per-combination e-graphs are kept ALIVE across the whole
+    // routine, not dropped at the end of each search: Phase 5's
+    // finalists re-extract from them once every bucket has been
+    // searched. They are locals rather than fields of [`BucketPlan`] so
+    // they go away when this function returns — a serialized e-graph for
+    // a real model is large, and nothing after selection reads it.
+    let mut egraphs: Vec<egraph_serialize::EGraph> = Vec::new();
+    let mut searched: Vec<SearchedBucket> = Vec::new();
     for (ranges, representative, program) in bucket_renders(assembly, dim_buckets)? {
         let text = format!("{}\n\n{}", assembly.assembled_program, program.text);
         let mut egraph = luminal::egglog_snippet::new_egraph();
@@ -1259,14 +1481,74 @@ pub fn bucketed_search_implementations(
             // combinations, so the evaluator is lent, not rebuilt.
             evaluator.reborrow(),
         )?;
+        egraphs.push(serialized);
+        searched.push((ranges, representative, program, outcome));
+    }
+
+    // PHASE 5: the buckets' ranked genomes become finalists, and the
+    // lattice picks one SET of them under the aggregate budget.
+    let (selected, rejections) = {
+        let buckets: Vec<crate::finalists::Finalists<'_>> = searched
+            .iter()
+            .zip(&egraphs)
+            .enumerate()
+            .map(|(index, ((ranges, _, _, outcome), egraph))| {
+                crate::finalists::Finalists::new(
+                    bucket_label(index, ranges),
+                    egraph,
+                    allow_override.clone(),
+                    matchers,
+                    outcome.ranked.clone(),
+                    Some(outcome.best_plan.clone()),
+                )
+            })
+            .collect();
+        select_finalist_set(buckets, options, &mut evaluator)?
+    };
+
+    let mut installed: BTreeMap<usize, crate::finalists::PendingFinalist> =
+        selected.into_iter().collect();
+    let mut plans = Vec::new();
+    for (index, (ranges, representative, program, mut outcome)) in searched.into_iter().enumerate()
+    {
+        let finalist = installed
+            .remove(&index)
+            .ok_or_else(|| anyhow!("the lattice selected no plan for bucket {index}"))?;
+        outcome.lattice_rejections = rejections;
         plans.push(BucketPlan {
             ranges,
             representative,
             program,
             outcome,
+            slab_bytes: finalist.arena.slab_bytes,
+            finalist_rank: finalist.rank,
+            plan: finalist.plan,
         });
     }
     Ok(plans)
+}
+
+/// One combination after its genetic search, before the lattice has
+/// chosen which of its finalists to install: `(ranges, representative,
+/// pinned render, the search's report)`.
+type SearchedBucket = (
+    BTreeMap<luminal::shape::Symbol, (usize, usize)>,
+    luminal::shape::DynMap,
+    LogicalProgram,
+    SearchOutcome,
+);
+
+/// How a bucket names itself in a lattice failure message —
+/// `"bucket 0 (a in [2, 4])"`.
+pub(crate) fn bucket_label(
+    index: usize,
+    ranges: &BTreeMap<luminal::shape::Symbol, (usize, usize)>,
+) -> String {
+    let dims: Vec<String> = ranges
+        .iter()
+        .map(|(dim, (min, max))| format!("{dim} in [{min}, {max}]"))
+        .collect();
+    format!("bucket {index} ({})", dims.join(", "))
 }
 
 /// One bucket combination's `(ranges, representative pins, pinned
